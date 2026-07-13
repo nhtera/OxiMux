@@ -4,6 +4,28 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-13 — Session-history import: agent-type filter + mode-aware routing
+
+**What shipped:** the centered session-history / import modal (`⌘⇧H`) gained
+agent-type segmentation and surface-aware import, in `oximux-app` +
+`oximux-settings`.
+
+- **Agent-type filter chips.** A header chip row (`All | Claude | Codex |
+  OpenCode`) narrows the list to one agent family; click a chip or press `Tab`
+  to cycle. Pure logic (`AgentTypeFilter`, `filter_sessions_typed`) lives in
+  `session_history/picker.rs`, composing the type gate with the existing fuzzy
+  query. OpenCode has no indexed sessions yet (its store is a SQLite DB — a
+  follow-up); its segment shows a "coming soon" hint so the category is
+  discoverable now.
+- **Mode-aware default import.** `↵` / row-click now opens the highlighted
+  session on the surface its adapter is configured for — a chat tab when the
+  resolved open mode is `Chat` and the adapter is chat-capable, else a terminal
+  resume. The gate is the single `AgentLaunchSettings::opens_as_chat(id)` helper
+  shared with the new-agent launcher (no drift). `⇧↵` still forks; `⌘↵` still
+  force-opens as chat.
+
+---
+
 ### 2026-07-13 — Agent Chat round-5 P1 wave (6 product-parity features)
 
 **What shipped:** the deferred P1 backlog from the round-4 research report plus two

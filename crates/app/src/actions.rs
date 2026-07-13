@@ -358,6 +358,12 @@ actions!(
         /// Cmd-modified keys through `performKeyEquivalent:` and they never
         /// reach element key listeners.
         OpenHistoryEntryAsChat,
+        /// Cycle the session-history agent-type filter segment
+        /// (All→Claude→Codex→OpenCode→All). Dispatched by a modal-scoped `Tab`
+        /// binding — a real action rather than the modal's `on_key_down`,
+        /// because GPUI consumes `Tab` for focus-navigation before it reaches
+        /// element key listeners.
+        CycleSessionTypeFilter,
         /// Split the focused pane horizontally — new pane on the right.
         /// Alias of `SplitRight`. Kept for legacy callers; the Cmd+D
         /// keybinding now drives `SplitSubPaneRight` instead so it

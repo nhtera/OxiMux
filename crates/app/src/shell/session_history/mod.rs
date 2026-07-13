@@ -1,10 +1,14 @@
 //! Session-history picker modal (`⌘⇧H`).
 //!
 //! A centered overlay — same shape as the command palette — listing past
-//! Claude Code and Codex sessions newest-first. Type to fuzzy-filter; `↵`
-//! resumes the highlighted session, `⇧↵` forks it. The index is built off
-//! the main thread on open (a small head/tail read per log) and the chosen
-//! session is relaunched by dispatching [`ResumeAgentSession`], handled in
+//! Claude Code and Codex sessions newest-first. Type to fuzzy-filter, or narrow
+//! to one agent family with the header chips (`All | Claude | Codex | OpenCode`,
+//! cycled by `Tab`). `↵` imports the highlighted session on its configured
+//! surface — a chat tab when the agent's resolved open mode is Chat, else a
+//! terminal resume (see [`SessionHistoryModal::import_selected`]); `⇧↵` forks,
+//! `⌘↵` force-opens as chat. The index is built off the main thread on open (a
+//! small head/tail read per log) and the chosen session is relaunched by
+//! dispatching [`ResumeAgentSession`] / [`OpenChatSession`], handled in
 //! `WorkspaceRoot` so it can resolve the active project's cwd when a Codex
 //! entry doesn't record one.
 //!
@@ -27,8 +31,11 @@ use oximux_agents::session_log::{
     session_preview::{PreviewMessage, PreviewRole, load_session_preview},
 };
 
-use crate::actions::{OpenChatSession, OpenHistoryEntryAsChat, ResumeAgentSession};
-use crate::shell::session_history::picker::LaunchKind;
+use crate::actions::{
+    CycleSessionTypeFilter, OpenChatSession, OpenHistoryEntryAsChat, ResumeAgentSession,
+};
+use crate::shell::agent_ui::agent_presentation::adapter_icon_path;
+use crate::shell::session_history::picker::{AGENT_TYPE_FILTERS, AgentTypeFilter, LaunchKind};
 use crate::ui::FloatingSurface;
 
 /// Key context carried by the modal's root while it's open, so the
@@ -42,11 +49,21 @@ const SESSION_HISTORY_KEY_CONTEXT: &str = "SessionHistoryModal";
 /// `on_key_down` case) because macOS delivers Cmd-modified keys via
 /// `performKeyEquivalent:`, bypassing element key listeners.
 pub fn register_session_history_key_bindings(cx: &mut App) {
-    cx.bind_keys([gpui::KeyBinding::new(
-        "cmd-enter",
-        OpenHistoryEntryAsChat,
-        Some(SESSION_HISTORY_KEY_CONTEXT),
-    )]);
+    cx.bind_keys([
+        gpui::KeyBinding::new(
+            "cmd-enter",
+            OpenHistoryEntryAsChat,
+            Some(SESSION_HISTORY_KEY_CONTEXT),
+        ),
+        // `Tab` cycles the agent-type filter. A context-scoped binding, not an
+        // `on_key_down` case: GPUI consumes `Tab` for focus-navigation before it
+        // reaches element key listeners, so it must be a keymap action.
+        gpui::KeyBinding::new(
+            "tab",
+            CycleSessionTypeFilter,
+            Some(SESSION_HISTORY_KEY_CONTEXT),
+        ),
+    ]);
 }
 
 const MODAL_WIDTH: f32 = 940.0;
@@ -79,6 +96,8 @@ pub struct SessionHistoryModal {
     scope_paths: Vec<String>,
     /// When true, ignore `scope_paths` and list every project (the ⌃A view).
     show_all: bool,
+    /// Which agent-type segment the list is narrowed to (chips + `Tab`).
+    type_filter: AgentTypeFilter,
     /// Entry index the preview pane currently shows (or is loading). `None`
     /// before the first load / when nothing is selected.
     preview_idx: Option<usize>,
@@ -110,6 +129,7 @@ impl SessionHistoryModal {
             now_ms: 0,
             scope_paths: Vec::new(),
             show_all: false,
+            type_filter: AgentTypeFilter::All,
             preview_idx: None,
             preview_msgs: Vec::new(),
             preview_loading: false,
@@ -170,9 +190,28 @@ impl SessionHistoryModal {
         self.now_ms = now_unix_ms();
         self.scope_paths = scope_paths;
         self.show_all = self.scope_paths.is_empty();
+        self.type_filter = AgentTypeFilter::All;
         window.focus(&self.focus_handle, cx);
         self.rescan(cx);
         cx.notify();
+    }
+
+    /// Set the agent-type segment (chip click), reset the selection, and
+    /// refresh the preview against the new list. No re-scan — the index already
+    /// holds every adapter; the filter is applied in `filtered()`.
+    fn set_type_filter(&mut self, filter: AgentTypeFilter, cx: &mut Context<Self>) {
+        if self.type_filter == filter {
+            return;
+        }
+        self.type_filter = filter;
+        self.selected_idx = 0;
+        self.refresh_preview(cx);
+        cx.notify();
+    }
+
+    /// Advance to the next agent-type segment (`Tab`).
+    fn cycle_type_filter(&mut self, cx: &mut Context<Self>) {
+        self.set_type_filter(self.type_filter.next(), cx);
     }
 
     /// Flip between this-project and all-projects scope, then re-scan (⌃A).
@@ -293,7 +332,7 @@ impl SessionHistoryModal {
     }
 
     fn filtered(&self) -> Vec<usize> {
-        picker::filter_sessions(&self.query, &self.entries)
+        picker::filter_sessions_typed(&self.query, self.type_filter, &self.entries)
     }
 
     /// Short scope label for the header: the project folder name when scoped,
@@ -378,6 +417,35 @@ impl SessionHistoryModal {
         self.close(cx);
         window.dispatch_action(Box::new(action), cx);
     }
+
+    /// Default import for a row (click / plain `↵`): open the session on the
+    /// surface its adapter is configured for. Routes to the structured chat view
+    /// when the resolved open mode is `Chat` and the adapter is chat-capable —
+    /// the same gate the new-agent launcher uses (`open_mode_for` layers a
+    /// per-agent override + a preset's Chat default over the global
+    /// `default_open_mode`) — otherwise resumes in a terminal. So a user who set
+    /// their agent to open as chat gets a chat tab on import; the classic
+    /// terminal-default user is unchanged.
+    fn import_selected(&mut self, list_idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let order = self.filtered();
+        let Some(&entry_idx) = order.get(list_idx) else {
+            return;
+        };
+        let Some(entry) = self.entries.get(entry_idx) else {
+            return;
+        };
+        let id = picker::adapter_slug(entry.adapter);
+        let open_chat = entry_opens_as_chat(entry)
+            && cx
+                .try_global::<oximux_settings::AgentLaunchSettings>()
+                .map(|s| s.opens_as_chat(id))
+                .unwrap_or(false);
+        if open_chat {
+            self.open_as_chat(list_idx, window, cx);
+        } else {
+            self.launch(list_idx, LaunchKind::Resume, window, cx);
+        }
+    }
 }
 
 /// Whether a session can reopen as a chat tab. Claude and Codex both import into
@@ -429,8 +497,18 @@ impl Render for SessionHistoryModal {
         if self.loading {
             list = list.child(hint_row("Scanning sessions…", theme, &typography));
         } else if row_count == 0 {
-            let msg = if self.entries.is_empty() {
+            let seg_msg;
+            let msg = if self.type_filter == AgentTypeFilter::OpenCode {
+                // OpenCode sessions aren't indexed yet (SQLite store) — the chip
+                // exists so the segment is discoverable; indexing is a follow-up.
+                "OpenCode session import is coming soon"
+            } else if self.entries.is_empty() {
                 "No past sessions found"
+            } else if self.query.is_empty() && self.type_filter != AgentTypeFilter::All {
+                // A specific segment with an empty query but no rows: that adapter
+                // simply has no sessions in scope — say so, not "no match".
+                seg_msg = format!("No {} sessions", self.type_filter.label());
+                seg_msg.as_str()
             } else {
                 "No matching sessions"
             };
@@ -465,13 +543,30 @@ impl Render for SessionHistoryModal {
                         .text_color(theme.fg_subtle)
                         .child(subtitle),
                 );
+                // Leading agent glyph categorizes each row by adapter (Claude /
+                // Codex / …), mirroring the reference import list. Fixed size,
+                // never shrinks; the text column takes the rest.
+                let icon = Icon::default()
+                    .path(adapter_icon_path(picker::adapter_slug(entry.adapter)))
+                    .size(px(15.))
+                    .flex_shrink_0()
+                    .text_color(theme.fg_muted);
+                let text_col = div()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .gap(px(2.))
+                    .flex_1()
+                    .min_w_0()
+                    .child(title_line)
+                    .child(subtitle_line);
                 list = list.child(
                     div()
                         .id(("session-row", i))
                         .flex()
-                        .flex_col()
-                        .justify_center()
-                        .gap(px(2.))
+                        .flex_row()
+                        .items_center()
+                        .gap(px(9.))
                         .h(px(ROW_HEIGHT))
                         .w_full()
                         .px(px(10.))
@@ -482,11 +577,11 @@ impl Render for SessionHistoryModal {
                         .on_mouse_down(
                             MouseButton::Left,
                             move |_e, window, cx| {
-                                ent.update(cx, |m, cx| m.launch(i, LaunchKind::Resume, window, cx));
+                                ent.update(cx, |m, cx| m.import_selected(i, window, cx));
                             },
                         )
-                        .child(title_line)
-                        .child(subtitle_line),
+                        .child(icon)
+                        .child(text_col),
                 );
             }
         }
@@ -579,6 +674,12 @@ impl Render for SessionHistoryModal {
                 theme,
                 &typography,
             ))
+            .child(type_filter_chips(
+                self.type_filter,
+                theme,
+                &typography,
+                entity.clone(),
+            ))
             .child(divider(theme))
             .child(body)
             .child(divider(theme))
@@ -604,6 +705,9 @@ impl Render for SessionHistoryModal {
             .on_action(cx.listener(|this, _: &OpenHistoryEntryAsChat, window, cx| {
                 this.open_as_chat(this.selected_idx, window, cx);
             }))
+            .on_action(cx.listener(|this, _: &CycleSessionTypeFilter, _window, cx| {
+                this.cycle_type_filter(cx);
+            }))
             .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
                 let key = event.keystroke.key.as_str();
                 match key {
@@ -611,17 +715,18 @@ impl Render for SessionHistoryModal {
                     "up" => this.move_selection(-1, row_count, cx),
                     "down" => this.move_selection(1, row_count, cx),
                     "enter" => {
-                        // Plain ↵ resumes, ⇧↵ forks — both into a terminal.
-                        // ⌘↵ (open as chat) can't be handled here: macOS routes
+                        // Plain ↵ imports on the session's configured surface
+                        // (chat when its open mode is Chat + chat-capable, else a
+                        // terminal resume); ⇧↵ forks into a terminal. ⌘↵ (force
+                        // open as chat) can't be handled here: macOS routes
                         // Cmd-modified keys through `performKeyEquivalent:`, so
                         // they never reach `on_key_down`. It's a modal-scoped
                         // action instead (`OpenHistoryEntryAsChat`).
-                        let kind = if event.keystroke.modifiers.shift {
-                            LaunchKind::Fork
+                        if event.keystroke.modifiers.shift {
+                            this.launch(this.selected_idx, LaunchKind::Fork, window, cx);
                         } else {
-                            LaunchKind::Resume
-                        };
-                        this.launch(this.selected_idx, kind, window, cx);
+                            this.import_selected(this.selected_idx, window, cx);
+                        }
                     }
                     "backspace" => {
                         this.query.pop();
@@ -735,6 +840,58 @@ fn header_row(
         .child(query_area)
 }
 
+/// The agent-type segment chips (`All | Claude | Codex | OpenCode`). The active
+/// segment is filled; the rest are dim + hover-lit. Clicking a chip narrows the
+/// list via [`SessionHistoryModal::set_type_filter`]; `Tab` cycles them.
+fn type_filter_chips(
+    active: AgentTypeFilter,
+    theme: Theme,
+    typography: &Typography,
+    entity: gpui::Entity<SessionHistoryModal>,
+) -> impl IntoElement {
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.))
+        .px(px(12.))
+        .py(px(6.));
+    for (i, &filter) in AGENT_TYPE_FILTERS.iter().enumerate() {
+        let is_active = filter == active;
+        let ent = entity.clone();
+        row = row.child(
+            div()
+                .id(("type-chip", i))
+                .px(px(10.))
+                .py(px(3.))
+                .rounded(px(6.))
+                .cursor_pointer()
+                .text_size(px(typography.t_sub_label))
+                .when(is_active, |d| d.bg(theme.selection).text_color(theme.fg_base))
+                .when(!is_active, |d| {
+                    d.text_color(theme.fg_subtle)
+                        .hover(|s| s.bg(theme.hover_overlay))
+                })
+                .on_mouse_down(MouseButton::Left, move |_e, window, cx| {
+                    cx.stop_propagation();
+                    // A chip is a child of the modal's `track_focus` root; the
+                    // mouse-down blurs the modal's focus handle, which would
+                    // otherwise leave search/↑↓/Tab/Esc dead while the modal
+                    // stays open. Restore focus — deferred so it lands after the
+                    // click's own focus settling (see the focus-in-mousedown
+                    // clobber pattern).
+                    let handle = ent.update(cx, |m, cx| {
+                        m.set_type_filter(filter, cx);
+                        m.focus_handle.clone()
+                    });
+                    window.defer(cx, move |window, cx| window.focus(&handle, cx));
+                })
+                .child(filter.label()),
+        );
+    }
+    row
+}
+
 /// Friendly name for the assistant side of a previewed transcript.
 fn adapter_display(adapter: oximux_core::AgentAdapter) -> &'static str {
     match adapter {
@@ -819,7 +976,8 @@ fn footer_hints(
         .h(px(FOOTER_HEIGHT))
         .px(px(12.))
         .child(hint("↑↓ navigate"))
-        .child(hint("↵ resume"))
+        .child(hint("⇥ filter"))
+        .child(hint("↵ open"))
         .child(hint("⇧↵ fork"))
         .child(hint("⌘↵ open as chat"))
         // The scope toggle is meaningless with no active project (always all).

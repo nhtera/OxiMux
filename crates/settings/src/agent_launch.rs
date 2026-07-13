@@ -366,6 +366,15 @@ impl AgentLaunchSettings {
         self.default_open_mode
     }
 
+    /// The routing gate shared by the new-agent launcher and session import:
+    /// a launch of `adapter_id` opens as a structured chat when its resolved
+    /// open mode is `Chat` AND the adapter is chat-capable. Every terminal-only
+    /// adapter (and every Terminal-mode agent) takes the classic terminal path.
+    /// Single source of truth so the two call sites can never drift apart.
+    pub fn opens_as_chat(&self, adapter_id: &str) -> bool {
+        self.open_mode_for(adapter_id) == OpenMode::Chat && self.chat_capable(adapter_id)
+    }
+
     /// Whether `adapter_id` is hidden from the picker.
     pub fn is_disabled(&self, adapter_id: &str) -> bool {
         self.for_agent(adapter_id).map(|a| a.disabled).unwrap_or(false)
@@ -647,6 +656,23 @@ acp_args = "--acp"
         // Round-trips through TOML.
         let parsed = AgentLaunchSettings::from_toml_str(&s.to_toml_string()).expect("round-trip");
         assert_eq!(parsed.open_mode_for("aider"), OpenMode::Terminal);
+    }
+
+    #[test]
+    fn opens_as_chat_requires_both_chat_mode_and_chat_capable() {
+        // Built-in chat adapter (Claude) with global Chat mode → opens as chat.
+        let s = AgentLaunchSettings { default_open_mode: OpenMode::Chat, ..Default::default() };
+        assert!(s.opens_as_chat("claude-code"));
+        // Same adapter under the default Terminal mode → terminal path.
+        let s = AgentLaunchSettings::default();
+        assert!(!s.opens_as_chat("claude-code"));
+        // A non-chat-capable adapter never opens as chat, even in Chat mode.
+        let s = AgentLaunchSettings { default_open_mode: OpenMode::Chat, ..Default::default() };
+        assert!(!s.opens_as_chat("aider"));
+        // An ACP preset (chat-capable, preset Chat default) opens as chat even
+        // when the global default is Terminal.
+        let s = AgentLaunchSettings::default();
+        assert!(s.opens_as_chat("opencode"));
     }
 
     #[test]

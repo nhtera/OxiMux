@@ -1748,19 +1748,34 @@ impl ComposerView {
     }
 
     /// The "Import session" control, shown only in the unbound *New Agent* flow:
-    /// a ghost button that opens the shared session-history modal (the same list
-    /// the Cmd+Shift+H picker shows), from which a past Claude or Codex session
-    /// reopens as a chat tab. One list, two entry points.
+    /// an outlined pill that sits ABOVE the input box (matching the reference
+    /// cockpit's placement, not buried in the toolbar row) and opens the shared
+    /// session-history modal — the same list the Cmd+Shift+H picker shows — from
+    /// which a past Claude or Codex session reopens as a chat tab. One list, two
+    /// entry points.
     fn render_import_session_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         Button::new("chat-import-session-btn")
             .icon(Icon::default().path("icons/history.svg"))
-            .label("Import")
-            .ghost()
+            .label("Import session")
+            .outline()
             .small()
             .tooltip("Reopen a past Claude or Codex session as a chat")
             .on_click(cx.listener(|_this, _ev, window, cx| {
                 window.dispatch_action(Box::new(crate::actions::OpenSessionHistory), cx);
             }))
+    }
+
+    /// The row that carries [`Self::render_import_session_button`] above the
+    /// input pill in the New Agent draft — left-aligned so the button hugs the
+    /// reading column's left edge (reference-cockpit placement). Rendered only
+    /// while unbound; once a subprocess is bound, importing no longer applies.
+    fn render_import_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .child(self.render_import_session_button(cx))
     }
 
     /// The image-attach control (far left of the toolbar): a flat ghost button
@@ -2481,9 +2496,6 @@ impl Render for ComposerView {
         // binds a subprocess. Hidden once bound (transport is fixed at spawn).
         if self.unbound && !self.agent_options.is_empty() {
             controls = controls.child(self.render_agent_picker(cx));
-            // A second entry point (besides Cmd+Shift+H) into the shared
-            // session-history list — reopen a past Claude/Codex session as chat.
-            controls = controls.child(self.render_import_session_button(cx));
         }
         // Show the model picker only when the backend advertises models (like the
         // mode/effort pickers). A vocab-less/disconnected state hides it rather
@@ -2619,6 +2631,9 @@ impl Render for ComposerView {
                     .children(self.render_usage_hint(cx))
                     .when(!self.queued.is_empty(), |d| d.child(self.render_queued(cx)))
                     .children(self.render_history_indicator())
+                    // New Agent draft: the "Import session" button sits above the
+                    // input pill (reference-cockpit placement), not in the toolbar.
+                    .when(self.unbound, |d| d.child(self.render_import_row(cx)))
                     .child(pill)
                     .child(controls),
             )

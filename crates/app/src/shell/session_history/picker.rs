@@ -20,6 +20,59 @@ pub enum LaunchKind {
     Fork,
 }
 
+/// The agent-type segment the picker is filtered to. `All` merges every
+/// adapter; the rest restrict the list to one agent family so a busy history
+/// can be narrowed the way the reference import modal does. `OpenCode` has no
+/// indexed sessions yet (its store is a SQLite DB, handled in a follow-up) —
+/// the enum reserves the segment so the chip + its "coming soon" empty state
+/// exist now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentTypeFilter {
+    All,
+    Claude,
+    Codex,
+    OpenCode,
+}
+
+/// Chip order shown in the header and cycled by `Tab`.
+pub const AGENT_TYPE_FILTERS: [AgentTypeFilter; 4] = [
+    AgentTypeFilter::All,
+    AgentTypeFilter::Claude,
+    AgentTypeFilter::Codex,
+    AgentTypeFilter::OpenCode,
+];
+
+impl AgentTypeFilter {
+    /// Short chip label.
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentTypeFilter::All => "All",
+            AgentTypeFilter::Claude => "Claude",
+            AgentTypeFilter::Codex => "Codex",
+            AgentTypeFilter::OpenCode => "OpenCode",
+        }
+    }
+
+    /// The next segment in [`AGENT_TYPE_FILTERS`] order, wrapping — the `Tab`
+    /// cycle.
+    pub fn next(self) -> AgentTypeFilter {
+        let i = AGENT_TYPE_FILTERS.iter().position(|&f| f == self).unwrap_or(0);
+        AGENT_TYPE_FILTERS[(i + 1) % AGENT_TYPE_FILTERS.len()]
+    }
+
+    /// Does `adapter` belong to this segment? `All` accepts everything;
+    /// `OpenCode` matches nothing today (no OpenCode adapter identity in the
+    /// index yet), so its list stays empty until indexing lands.
+    pub fn accepts(self, adapter: AgentAdapter) -> bool {
+        match self {
+            AgentTypeFilter::All => true,
+            AgentTypeFilter::Claude => adapter == AgentAdapter::ClaudeCode,
+            AgentTypeFilter::Codex => adapter == AgentAdapter::Codex,
+            AgentTypeFilter::OpenCode => false,
+        }
+    }
+}
+
 impl LaunchKind {
     /// Map the chosen action onto the adapter-agnostic resumption value the
     /// spawn layer consumes.
@@ -115,9 +168,29 @@ fn home_abbrev(path: &str, home: Option<&str>) -> String {
 /// terse "hi", so metadata is what makes search useful). Returns indices into
 /// `entries`, newest-first when the query is empty (entries arrive sorted).
 pub fn filter_sessions(query: &str, entries: &[SessionEntry]) -> Vec<usize> {
+    filter_sessions_typed(query, AgentTypeFilter::All, entries)
+}
+
+/// [`filter_sessions`] gated first by agent-type segment: entries the segment
+/// rejects never enter the fuzzy rank, so the returned indices are the
+/// intersection of `type_filter` and `query`. The rank still operates on the
+/// full entry list (indices stay valid into `entries`); rejected rows are
+/// filtered out afterward, preserving newest-first order.
+pub fn filter_sessions_typed(
+    query: &str,
+    type_filter: AgentTypeFilter,
+    entries: &[SessionEntry],
+) -> Vec<usize> {
     let haystacks: Vec<String> = entries.iter().map(session_search_text).collect();
     let refs: Vec<&str> = haystacks.iter().map(String::as_str).collect();
     filter_and_rank(query, &refs)
+        .into_iter()
+        .filter(|&i| {
+            entries
+                .get(i)
+                .is_some_and(|e| type_filter.accepts(e.adapter))
+        })
+        .collect()
 }
 
 /// The searchable text for one entry: title first (so title hits rank high),
@@ -346,6 +419,70 @@ mod tests {
         assert_eq!(filter_sessions("oximux", &entries), vec![1]);
         // Branch matches too.
         assert_eq!(filter_sessions("feat/agents", &entries), vec![1]);
+    }
+
+    fn codex(title: Option<&str>) -> SessionEntry {
+        entry(Fields {
+            adapter: AgentAdapter::Codex,
+            title,
+            branch: None,
+            ts: None,
+            size: None,
+        })
+    }
+
+    #[test]
+    fn agent_type_filter_cycles_all_claude_codex_opencode() {
+        assert_eq!(AgentTypeFilter::All.next(), AgentTypeFilter::Claude);
+        assert_eq!(AgentTypeFilter::Claude.next(), AgentTypeFilter::Codex);
+        assert_eq!(AgentTypeFilter::Codex.next(), AgentTypeFilter::OpenCode);
+        // Wraps back to All.
+        assert_eq!(AgentTypeFilter::OpenCode.next(), AgentTypeFilter::All);
+    }
+
+    #[test]
+    fn agent_type_filter_accepts_matching_adapter_only() {
+        assert!(AgentTypeFilter::All.accepts(AgentAdapter::ClaudeCode));
+        assert!(AgentTypeFilter::All.accepts(AgentAdapter::Codex));
+        assert!(AgentTypeFilter::Claude.accepts(AgentAdapter::ClaudeCode));
+        assert!(!AgentTypeFilter::Claude.accepts(AgentAdapter::Codex));
+        assert!(AgentTypeFilter::Codex.accepts(AgentAdapter::Codex));
+        assert!(!AgentTypeFilter::Codex.accepts(AgentAdapter::ClaudeCode));
+        // OpenCode has no indexed adapter identity yet — matches nothing.
+        assert!(!AgentTypeFilter::OpenCode.accepts(AgentAdapter::ClaudeCode));
+        assert!(!AgentTypeFilter::OpenCode.accepts(AgentAdapter::Codex));
+    }
+
+    #[test]
+    fn typed_filter_restricts_to_segment_then_ranks_by_query() {
+        let entries = vec![
+            claude(Some("write parser tests")),
+            codex(Some("refactor parser")),
+            claude(Some("unrelated")),
+        ];
+        // All + empty query → newest-first (original) order.
+        assert_eq!(
+            filter_sessions_typed("", AgentTypeFilter::All, &entries),
+            vec![0, 1, 2]
+        );
+        // Claude segment drops the Codex row.
+        assert_eq!(
+            filter_sessions_typed("", AgentTypeFilter::Claude, &entries),
+            vec![0, 2]
+        );
+        // Codex segment keeps only the Codex row.
+        assert_eq!(
+            filter_sessions_typed("", AgentTypeFilter::Codex, &entries),
+            vec![1]
+        );
+        // Query composes with the type gate: "parser" matches rows 0 & 1, but
+        // the Claude segment keeps only row 0.
+        assert_eq!(
+            filter_sessions_typed("parser", AgentTypeFilter::Claude, &entries),
+            vec![0]
+        );
+        // OpenCode segment is always empty today.
+        assert!(filter_sessions_typed("", AgentTypeFilter::OpenCode, &entries).is_empty());
     }
 
     #[test]

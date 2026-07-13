@@ -721,12 +721,7 @@ impl WorkspaceRoot {
                     // for ACP it already requires a command. Every terminal-only
                     // adapter (and Terminal mode) takes the classic path unchanged.
                     let launch = cx.try_global::<oximux_settings::AgentLaunchSettings>();
-                    let open_chat = launch
-                        .map(|s| {
-                            s.open_mode_for(id) == oximux_settings::OpenMode::Chat
-                                && s.chat_capable(id)
-                        })
-                        .unwrap_or(false);
+                    let open_chat = launch.map(|s| s.opens_as_chat(id)).unwrap_or(false);
                     if open_chat {
                         // `open_chat` is only true when `launch` is `Some`.
                         let backend = launch
