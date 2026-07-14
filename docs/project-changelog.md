@@ -4,6 +4,63 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-15 — Worktree isolation becomes a composer pill; two composer state-sync bugs fixed
+
+**The "Run in a fresh worktree" checkbox is now a pill above the input.** It used
+to render as a bare full-width column while every sibling control lives in the
+composer's centered 720px reading column — so it sat ~97px left of everything
+else, and **the gap grew with the window** (~430px adrift at 1600px logical),
+which is why it read as broken rather than merely tight. It also floated above
+the composer's top border with no chrome, reflowed the composer when enabled, and
+gave a once-per-session setting the loudest control on screen.
+
+It now sits in `render_context_row`, beside Import session, above the input. The
+split follows Claude Desktop: session **context** (where this runs) above the
+input, session **behavior** (permissions, model, effort) below. Context is
+answered once before the first send and fixed for the session's life; behavior is
+retuned constantly — so the worktree pick does not belong next to the model
+picker. Being inside the composer's column, the alignment is now structural
+rather than a matched constant.
+
+The pill drives a `Popover` directly rather than reusing `render_dropdown_shell`
+(whose `PopupMenu` rows cannot host a text field), with the two isolation choices
+and the branch slug inside it — so opening it overlays the transcript instead of
+pushing the composer around. Behavior is otherwise unchanged: still opt-in, still
+hidden once bound or on a non-git project, same slug validation, same
+create/failure banner (which now stays out of the way at rest instead of
+reserving an empty strip).
+
+**Two real bugs, same class, opposite directions.** `ComposerView` keeps its
+**own** `unbound` flag, separate from `AgentChatView`'s and pushed down by it:
+
+1. **Checking the worktree box stripped the draft's pickers.** `sync_composer`
+   unconditionally pushed the bound-chat shape (`set_agent_picker(false, …)` plus
+   a caps-derived vocab that is *empty* for a connection-less draft). The worktree
+   toggle syncs the composer, so arming a worktree silently removed the agent
+   picker, the model picker and the Import row from a live New Agent draft, with
+   no way to get them back — the user could no longer change agent or model. Fixed
+   by guarding the bound pushes and re-asserting the draft's shape via
+   `sync_unbound_composer`. This was the cause of a long-standing "why do these two
+   screenshots disagree?" puzzle; it was never a stale build.
+2. **The pill lingered on a bound chat.** `set_worktree_draft` was pushed only from
+   `sync_unbound_composer`, which stops running once bound, so the pill stayed
+   (dimmed) beside a live session's controls. Fixed by clearing it in
+   `sync_composer`'s bound branch. Found by driving the real app — no unit test
+   bound a view, which is exactly why it survived; `make_bound_for_test` now
+   closes that gap.
+
+**Verified live**, including the paths that matter: alignment tracks the column at
+two window widths, the popover does not move the composer, slug edits update the
+hint and pill label live, invalid slugs error in place, and a forced create failure
+(colliding branch) shows the real git error with Retry / "Continue without
+worktree" — the latter sends the staged message into the project with no orphaned
+workspace. Escape does not dismiss the popover, but the sibling model picker
+behaves identically, so that is a pre-existing app-wide pattern, not a regression.
+
+Tests: `oximux-app --lib` **1259/0**; workspace **2972/0**.
+
+---
+
 ### 2026-07-15 — Live MCP elicitation verified; import-bridge bubbles keep their provider
 
 **MCP elicitation, live: PASS.** `scripts/mcp-elicitation-probe.py` ran as a real

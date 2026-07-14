@@ -12,10 +12,10 @@
 use std::ops::Range;
 
 use gpui::{
-    Anchor, App, AppContext, ClipboardEntry, Context, DismissEvent, Entity, EventEmitter,
-    FocusHandle, Focusable, ImageSource, InteractiveElement, IntoElement, MouseButton, ObjectFit,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
-    div, img, prelude::FluentBuilder, px,
+    Anchor, AnyElement, App, AppContext, ClipboardEntry, Context, DismissEvent, Entity,
+    EventEmitter, FocusHandle, Focusable, ImageSource, InteractiveElement, IntoElement, MouseButton,
+    ObjectFit, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Window, div, img, prelude::FluentBuilder, px,
 };
 use gpui::StyledImage as _;
 use gpui_component::Icon;
@@ -26,7 +26,8 @@ use gpui_component::input::{
     IndentInline, Input, InputEvent, InputState, MoveDown, MoveUp, Paste, Escape as InputEscape,
 };
 use gpui_component::menu::{PopupMenu, PopupMenuItem};
-use gpui_component::popover::Popover;
+use gpui_component::Disableable as _;
+use gpui_component::popover::{Popover, PopoverState};
 use gpui_component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_component::select::{Select, SelectEvent, SelectState};
 use oximux_agents::thread::{
@@ -236,6 +237,12 @@ pub enum ComposerEvent {
     /// dropdown (an adapter id, e.g. `codex`/`opencode`). The parent rebuilds the
     /// backend + default model and re-pushes the picker. Only fired while unbound.
     AgentPicked(String),
+    /// The user picked an isolation mode in the unbound *New Agent* draft's
+    /// worktree pill: `true` = run the first send in a fresh git worktree,
+    /// `false` = run in the project itself. The parent owns the flip (it also
+    /// creates/drops the slug input), so this carries the DESIRED state rather
+    /// than a toggle — picking the already-active row is a no-op there.
+    WorktreeIsolationPicked(bool),
     /// The `@` overlay just opened. The parent refreshes the composer's context
     /// sources (esp. the live sibling-terminal list) in response, so the "Context"
     /// section is current without the composer reaching into the pane group.
@@ -244,6 +251,156 @@ pub enum ComposerEvent {
     /// the content (clipboard / git diff / terminal scrollback) and hands the
     /// resulting chip back via [`ComposerView::add_context_chip`].
     CaptureContext(ContextRequest),
+}
+
+/// The worktree pill's popover body: two isolation rows, then the slug field
+/// while a worktree is armed. A plain panel rather than a `PopupMenu` because
+/// menu rows can't host a text input — see [`ComposerView::render_worktree_picker`].
+fn worktree_popover_panel(
+    draft: WorktreeDraft,
+    view: Entity<ComposerView>,
+    theme: Theme,
+    typo: &Typography,
+    cx: &mut Context<PopoverState>,
+) -> AnyElement {
+    let mut panel = div()
+        .flex()
+        .flex_col()
+        .w(px(260.0))
+        .p(px(4.0))
+        .gap(px(2.0));
+
+    for (enabled, label, detail) in [
+        (false, "This project", "Run in the project directory"),
+        (true, "New worktree", "Run in an isolated branch"),
+    ] {
+        let selected = draft.enabled == enabled;
+        let view = view.clone();
+        panel = panel.child(
+            div()
+                .id(SharedString::from(if enabled { "wt-row-new" } else { "wt-row-local" }))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(8.0))
+                .py(px(6.0))
+                .rounded(px(6.0))
+                .hover(|s| s.bg(theme.hover_overlay))
+                .cursor_pointer()
+                .on_click(move |_ev, _window, cx| {
+                    view.update(cx, |_v, cx| {
+                        // Emit the DESIRED state; the parent no-ops on a re-pick.
+                        cx.emit(ComposerEvent::WorktreeIsolationPicked(enabled));
+                    });
+                })
+                .child(
+                    div()
+                        .w(px(12.0))
+                        .text_size(px(typo.t_body_sm))
+                        .text_color(theme.fg_base)
+                        .child(if selected { "\u{2713}" } else { " " }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.0))
+                        .child(
+                            div()
+                                .text_size(px(typo.t_body_sm))
+                                .text_color(theme.fg_base)
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(typo.t_body_sm))
+                                .text_color(theme.fg_subtle)
+                                .child(detail),
+                        ),
+                ),
+        );
+    }
+
+    if draft.enabled && let Some(input) = draft.slug_input.clone() {
+        panel = panel
+            .child(
+                div()
+                    .my(px(4.0))
+                    .h(px(1.0))
+                    .w_full()
+                    .bg(theme.border_inactive),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .px(px(8.0))
+                    .pb(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(typo.t_body_sm))
+                            .text_color(theme.fg_subtle)
+                            .child("Branch"),
+                    )
+                    .child(Input::new(&input).small())
+                    .child(
+                        div()
+                            .text_size(px(typo.t_body_sm))
+                            .text_color(if draft.hint_is_error {
+                                theme.status_error
+                            } else {
+                                theme.fg_subtle
+                            })
+                            .child(draft.hint.clone()),
+                    ),
+            );
+    }
+
+    let _ = cx;
+    panel.into_any_element()
+}
+
+/// The *New Agent* draft's worktree-isolation state, projected by the parent for
+/// the composer's pill. The parent owns every field; this is a render-time
+/// snapshot, not a second source of truth — `slug_input` is a shared handle to
+/// the parent's own `InputState`, so the text itself lives in exactly one place.
+#[derive(Clone)]
+pub struct WorktreeDraft {
+    /// Whether the first send runs in a fresh worktree.
+    pub enabled: bool,
+    /// The parent's slug field, present only while `enabled`. Rendered inside the
+    /// popover; edits flow straight back to the parent's `InputState`.
+    pub slug_input: Option<Entity<InputState>>,
+    /// A create is in flight (or failed with a message still staged) — the pick
+    /// is frozen until the banner resolves it. Mirrors the parent's refusal to
+    /// flip in that state rather than duplicating the rule.
+    pub busy: bool,
+    /// The live `oximux/<slug>` preview, or the validation error when the slug is
+    /// malformed. Computed by the parent (it owns `validate_slug`).
+    pub hint: String,
+    /// Whether `hint` is an error (drives its color).
+    pub hint_is_error: bool,
+}
+
+impl PartialEq for WorktreeDraft {
+    /// Entity handles compare by identity, which is what the change-guard in
+    /// [`ComposerView::set_worktree_draft`] wants: a re-push carrying the same
+    /// input handle and the same rendered strings is a no-op, but the slug's
+    /// *text* changing is picked up via `hint` (recomputed by the parent on every
+    /// keystroke) rather than by reaching into the shared `InputState`.
+    fn eq(&self, other: &Self) -> bool {
+        self.enabled == other.enabled
+            && self.busy == other.busy
+            && self.hint == other.hint
+            && self.hint_is_error == other.hint_is_error
+            && match (&self.slug_input, &other.slug_input) {
+                (Some(a), Some(b)) => a == b,
+                (None, None) => true,
+                _ => false,
+            }
+    }
 }
 
 /// The composer's `auto_grow` input grows one row per WRAPPED line of the draft
@@ -313,6 +470,11 @@ pub struct ComposerView {
     /// The currently-picked agent `(id, display)`, for the agent-picker button
     /// label + the menu checkmark. `None` when bound / not yet seeded.
     current_agent: Option<(String, String)>,
+    /// The *New Agent* draft's worktree-isolation state, or `None` when the pill
+    /// doesn't apply (bound chat, or a non-git project). Pushed by the parent via
+    /// [`Self::set_worktree_draft`]; the parent owns the truth, this only renders
+    /// the pill and emits [`ComposerEvent::WorktreeIsolationPicked`].
+    worktree_draft: Option<WorktreeDraft>,
     /// Images staged for the next send (via the paperclip, ⌘V, or drag-drop).
     /// Each holds both its wire/persist [`ChatImage`] and a pre-decoded thumbnail
     /// so the chip row doesn't re-decode on every keystroke repaint. Cleared on
@@ -477,6 +639,7 @@ impl ComposerView {
             unbound: false,
             agent_options: Vec::new(),
             current_agent: None,
+            worktree_draft: None,
             pending_images: Vec::new(),
             slash_commands: Vec::new(),
             slash_catalog: CommandCatalog::new(),
@@ -716,6 +879,17 @@ impl ComposerView {
             self.unbound = unbound;
             self.agent_options = agents;
             self.current_agent = current;
+            cx.notify();
+        }
+    }
+
+    /// Push the *New Agent* draft's worktree-isolation state, or `None` to hide
+    /// the pill (bound chat / non-git project). The parent owns the flip and the
+    /// slug's `InputState`; this view only renders. Only repaints when something
+    /// actually changed.
+    pub fn set_worktree_draft(&mut self, draft: Option<WorktreeDraft>, cx: &mut Context<Self>) {
+        if self.worktree_draft != draft {
+            self.worktree_draft = draft;
             cx.notify();
         }
     }
@@ -1434,6 +1608,90 @@ impl ComposerView {
         )
     }
 
+    /// The *New Agent* draft's worktree control: a ghost pill in the bottom
+    /// toolbar, sibling to the agent/model pickers, opening a popover with the
+    /// two isolation choices and (when a worktree is picked) the branch slug.
+    ///
+    /// This cannot reuse [`Self::render_dropdown_shell`] — that builds a
+    /// `PopupMenu`, whose rows are menu items and cannot host a text field. So it
+    /// drives `Popover` directly with a panel, mirroring the shell's popover
+    /// setup (`appearance(false)` + upward anchor + `open_dropdown` tracking) so
+    /// it still reads and behaves like its siblings.
+    ///
+    /// Placement matters: living inside the toolbar means the control inherits
+    /// the composer's centered reading column instead of laying itself out
+    /// independently — which is what stranded the previous full-width checkbox
+    /// ~97px to the left of every sibling (and further the wider the window got).
+    fn render_worktree_picker(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let draft = self.worktree_draft.clone()?;
+        let theme = self.theme;
+        let typo = self.typography.clone();
+        let view = cx.entity();
+
+        // Label: the slug when a worktree is armed (it's the thing the user
+        // actually wants to see at a glance), "Local" otherwise.
+        let label = if draft.enabled {
+            self.worktree_slug_text(cx).unwrap_or_else(|| "Worktree".to_string())
+        } else {
+            "Local".to_string()
+        };
+        let trigger = Button::new("chat-worktree-btn")
+            .icon(Icon::default().path(if draft.enabled {
+                "icons/git-branch.svg"
+            } else {
+                "icons/folder-plus.svg"
+            }))
+            .label(label)
+            .ghost()
+            .small()
+            .dropdown_caret(true)
+            .disabled(draft.busy);
+
+        let popover = Popover::new("chat-worktree-pop")
+            .anchor(Anchor::BottomLeft)
+            .trigger(trigger)
+            .on_open_change({
+                let view = view.clone();
+                move |open: &bool, _window, cx| {
+                    let open = *open;
+                    view.update(cx, |v, cx| {
+                        if open {
+                            v.open_dropdown = Some(SharedString::from("chat-worktree"));
+                        } else if v.open_dropdown.as_deref() == Some("chat-worktree") {
+                            v.open_dropdown = None;
+                        }
+                        cx.notify();
+                    });
+                }
+            })
+            .content({
+                let view = view.clone();
+                let draft = draft.clone();
+                move |_state, _window, cx| {
+                    let view = view.clone();
+                    let draft = draft.clone();
+                    worktree_popover_panel(draft, view, theme, &typo, cx)
+                }
+            });
+
+        // No tooltip, unlike the sibling pickers: theirs explain abbreviated
+        // labels ("Opus", "high"), while this one already reads as a full phrase
+        // next to a branch glyph. The siblings' tooltip is also a custom
+        // `group_hover` overlay owned by `render_dropdown_shell` (gpui's native
+        // one anchors to the cursor, off-center), and reproducing that here to
+        // caption a self-describing control isn't worth the duplication.
+        Some(div().flex_none().child(popover).into_any_element())
+    }
+
+    /// The slug field's current text, read through the shared handle the parent
+    /// owns — so the pill's label tracks typing without the composer keeping a
+    /// copy that could drift.
+    fn worktree_slug_text(&self, cx: &App) -> Option<String> {
+        let input = self.worktree_draft.as_ref()?.slug_input.as_ref()?;
+        let text = input.read(cx).value().trim().to_string();
+        (!text.is_empty()).then_some(text)
+    }
+
     /// The shared shell behind every footer dropdown (permission / effort /
     /// feature-select / agent picker): a ghost trigger button that opens a menu
     /// upward, plus a hover tooltip centered directly above the control and
@@ -1765,16 +2023,28 @@ impl ComposerView {
             }))
     }
 
-    /// The row that carries [`Self::render_import_session_button`] above the
-    /// input pill in the New Agent draft — left-aligned so the button hugs the
-    /// reading column's left edge (reference-cockpit placement). Rendered only
-    /// while unbound; once a subprocess is bound, importing no longer applies.
-    fn render_import_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The row above the input pill in the New Agent draft: **where this agent
+    /// runs** (the worktree pill) plus Import session, left-aligned against the
+    /// reading column's left edge.
+    ///
+    /// The split is deliberate and follows Claude Desktop: session *context* —
+    /// what this agent is pointed at — sits ABOVE the input, while the toolbar
+    /// BELOW carries how it behaves (safety mode, model, effort). The worktree
+    /// pick is the former: it's answered once, before the first send, and then
+    /// never again for the life of the session.
+    ///
+    /// Rendered only while unbound; once a subprocess is bound, neither importing
+    /// nor re-rooting applies.
+    fn render_context_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .flex_row()
             .items_center()
             .w_full()
+            .gap(px(self.density.gap_inline))
+            // Leftmost, mirroring Claude Desktop's "Local" chip: the first
+            // question is where the work lands.
+            .children(self.render_worktree_picker(cx))
             .child(self.render_import_session_button(cx))
     }
 
@@ -2631,9 +2901,10 @@ impl Render for ComposerView {
                     .children(self.render_usage_hint(cx))
                     .when(!self.queued.is_empty(), |d| d.child(self.render_queued(cx)))
                     .children(self.render_history_indicator())
-                    // New Agent draft: the "Import session" button sits above the
-                    // input pill (reference-cockpit placement), not in the toolbar.
-                    .when(self.unbound, |d| d.child(self.render_import_row(cx)))
+                    // New Agent draft: where-this-runs + Import session sit above
+                    // the input pill (reference-cockpit placement), not in the
+                    // toolbar below — see `render_context_row`.
+                    .when(self.unbound, |d| d.child(self.render_context_row(cx)))
                     .child(pill)
                     .child(controls),
             )
@@ -2642,6 +2913,36 @@ impl Render for ComposerView {
 
 #[cfg(test)]
 impl ComposerView {
+    /// The composer's OWN `unbound` flag — distinct from the parent view's, and
+    /// pushed down via [`Self::set_agent_picker`]. The agent picker, the
+    /// Import-session row and the placeholder's agent name all read this one, so
+    /// a test asserting they survive a parent-side sync must read it here rather
+    /// than the parent's.
+    pub(crate) fn unbound_for_test(&self) -> bool {
+        self.unbound
+    }
+
+    /// How many agents the picker currently offers — cleared to zero by a
+    /// bound-chat sync, which is the other half of the same push.
+    pub(crate) fn agent_options_len_for_test(&self) -> usize {
+        self.agent_options.len()
+    }
+
+    /// Whether the worktree pill is currently offered. Pushed by the parent, and
+    /// cleared by a bound sync — a live session's cwd can't change.
+    pub(crate) fn worktree_draft_is_some_for_test(&self) -> bool {
+        self.worktree_draft.is_some()
+    }
+
+    /// How many models the picker currently offers. Gated independently of
+    /// `unbound` (the picker reads `!vocab.models.is_empty()`), so a test
+    /// asserting only the two above would miss a regression that blanks the
+    /// model list alone — which is exactly what pushing a connection-less
+    /// draft's empty caps-derived vocab does.
+    pub(crate) fn vocab_models_len_for_test(&self) -> usize {
+        self.vocab.models.len()
+    }
+
     /// Set the draft text so a `#[gpui::test]` can exercise submit / newline /
     /// palette routing without synthesising keystrokes. Parks the caret at the
     /// end (as if the text were typed) so trigger detection sees the token.

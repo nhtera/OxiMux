@@ -25,14 +25,14 @@
 // belong on the vocabulary.
 #![allow(dead_code)]
 
-use gpui::prelude::FluentBuilder as _;
 use gpui::{
     div, px, AnyElement, App, AppContext, ClickEvent, Context, IntoElement, ParentElement, Styled,
     Window,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::checkbox::Checkbox;
-use gpui_component::input::{Input, InputEvent, InputState};
+
+use super::composer::WorktreeDraft;
+use gpui_component::input::{InputEvent, InputState};
 use oximux_agents::thread::{claude_model_choices, ChatImage, ModelChoice};
 use oximux_agents::{AdapterRegistry, RegistryEntry};
 use oximux_core::AgentAdapter;
@@ -191,6 +191,23 @@ impl AgentChatView {
     /// silently discard `pending_worktree_send` (MEDIUM finding). The user
     /// must resolve via the failure banner's Retry / "continue without a
     /// worktree" instead, both of which route the staged message onward.
+    /// Set the draft's isolation to `enabled` (the composer pill emits the
+    /// DESIRED state, not a flip, so a re-pick of the active row is a no-op).
+    /// Delegates the actual flip — and every guard on it — to
+    /// [`Self::toggle_worktree_draft`], so there is one rule about when the
+    /// choice may change, not two.
+    pub(super) fn set_worktree_isolation(
+        &mut self,
+        enabled: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.worktree_draft_enabled == enabled {
+            return;
+        }
+        self.toggle_worktree_draft(window, cx);
+    }
+
     pub(super) fn toggle_worktree_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.unbound || !self.is_git_project {
             return;
@@ -225,10 +242,17 @@ impl AgentChatView {
                     .placeholder("slug")
                     .default_value(default_worktree_slug())
             });
-            // Repaint on every keystroke so the live `oximux/<slug>` preview /
-            // validation error tracks what the user is typing (an embedded
-            // `Input` doesn't self-repaint its owner).
-            let sub = cx.subscribe(&input, |_this, _input, _ev: &InputEvent, cx| cx.notify());
+            // Re-push on every keystroke so the live `oximux/<slug>` preview /
+            // validation error / pill label track what the user is typing. A
+            // bare `cx.notify()` is NOT enough now that those render inside the
+            // composer: the hint is computed here and pushed across, so without
+            // the re-sync the parent would repaint while the popover kept the
+            // stale hint. (An embedded `Input` doesn't repaint its owner either,
+            // which is why the subscription exists at all.)
+            let sub = cx.subscribe(&input, |this, _input, _ev: &InputEvent, cx| {
+                this.sync_unbound_composer(cx);
+                cx.notify();
+            });
             self.worktree_slug_input = Some(input);
             self._worktree_slug_sub = Some(sub);
         }
@@ -343,67 +367,69 @@ impl AgentChatView {
         self.start_worktree_then_send(text, images, cx);
     }
 
-    /// Render the *New Agent* draft's "Run in a fresh worktree" toggle +
-    /// (while on) the slug field and any create-state feedback. `None` once
-    /// bound or for a non-git project — the toggle never appears there.
-    pub(super) fn render_worktree_toggle(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The worktree draft's state, projected for the composer's pill. `None` once
+    /// bound or for a non-git project — the pill never appears there.
+    ///
+    /// The `hint` is computed here rather than in the composer because this view
+    /// owns `validate_slug` and the slug's `InputState`; the composer gets a
+    /// render-ready snapshot plus a shared handle to the field itself, so the
+    /// slug text lives in exactly one place.
+    pub(super) fn worktree_draft_for_composer(&self, cx: &Context<Self>) -> Option<WorktreeDraft> {
         if !self.unbound || !self.is_git_project {
+            return None;
+        }
+        let enabled = self.worktree_draft_enabled;
+        let (hint, hint_is_error) = match self.worktree_slug_input.as_ref() {
+            Some(input) if enabled => {
+                let slug_text = input.read(cx).value().to_string();
+                let trimmed = slug_text.trim();
+                match validate_slug(trimmed) {
+                    Ok(()) if !trimmed.is_empty() => (format!("oximux/{trimmed}"), false),
+                    Ok(()) => ("oximux/…".to_string(), false),
+                    Err(err) => (err.to_string(), true),
+                }
+            }
+            _ => (String::new(), false),
+        };
+        Some(WorktreeDraft {
+            enabled,
+            slug_input: self.worktree_slug_input.clone(),
+            // Creating OR Failed — anything other than Idle means a message is
+            // staged in `pending_worktree_send` and the pick must not flip
+            // (`toggle_worktree_draft` itself refuses in this state; this just
+            // carries the rule to the pill so it can render disabled).
+            busy: !matches!(self.worktree_create_state, WorktreeCreateState::Idle),
+            hint,
+            hint_is_error,
+        })
+    }
+
+    /// The worktree create's transient feedback — a banner above the composer
+    /// while a create is in flight or has failed with a message still staged.
+    /// `None` at rest: the isolation *choice* lives in the composer's pill, this
+    /// is only the in-flight/failure state, which belongs with the other pinned
+    /// banners rather than inside a popover the user has to open to see.
+    pub(super) fn render_worktree_status_banner(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.unbound || !self.is_git_project {
+            return None;
+        }
+        // At rest there is nothing to say — bail before building the column so a
+        // draft doesn't carry an empty padded strip above its composer. (The old
+        // toggle always rendered because the checkbox itself lived here.)
+        if matches!(self.worktree_create_state, WorktreeCreateState::Idle) {
             return None;
         }
         let theme = self.theme;
         let typo = self.typography.clone();
         let enabled = self.worktree_draft_enabled;
         let creating = matches!(self.worktree_create_state, WorktreeCreateState::Creating);
-        // Creating OR Failed — anything other than Idle means a message is
-        // staged in `pending_worktree_send` and the toggle must not flip
-        // (`toggle_worktree_draft` itself refuses in this state; the dim here
-        // is just the visual cue, since this widget has no `disabled` prop).
-        let busy = !matches!(self.worktree_create_state, WorktreeCreateState::Idle);
 
-        let mut col = div()
-            .flex()
-            .flex_col()
-            .px(px(10.0))
-            .pb(px(6.0))
-            .gap(px(4.0))
-            .child(
-                div().when(busy, |d| d.opacity(0.5)).child(
-                    Checkbox::new("worktree-draft-toggle")
-                        .checked(enabled)
-                        .label("Run in a fresh worktree")
-                        .on_click(cx.listener(|this, _checked: &bool, window, cx| {
-                            this.toggle_worktree_draft(window, cx);
-                        })),
-                ),
-            );
+        let mut col = div().flex().flex_col().px(px(10.0)).pb(px(6.0)).gap(px(4.0));
 
         if enabled {
-            if let Some(input) = self.worktree_slug_input.clone() {
-                let slug_text = input.read(cx).value().to_string();
-                let trimmed = slug_text.trim();
-                let validity = validate_slug(trimmed);
-                let hint = match &validity {
-                    Ok(()) if !trimmed.is_empty() => format!("oximux/{trimmed}"),
-                    Ok(()) => "oximux/…".to_string(),
-                    Err(err) => err.to_string(),
-                };
-                let hint_color = if validity.is_err() { theme.status_error } else { theme.fg_subtle };
-                col = col.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(div().w(px(160.0)).child(Input::new(&input)))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(typo.t_body_sm))
-                                .text_color(hint_color)
-                                .child(hint),
-                        ),
-                );
-            }
             if creating {
                 col = col.child(
                     div()

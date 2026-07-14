@@ -974,9 +974,13 @@ impl AgentChatView {
         // react when it reports a finished submission — so typing never touches
         // this view (and thus never rebuilds the transcript, which is the lag we
         // want to avoid).
-        let subscriptions = vec![cx.subscribe(
+        // `subscribe_in` rather than `subscribe`: the worktree pick has to create
+        // or drop the slug `InputState`, which needs a `Window`. Every other arm
+        // ignores it.
+        let subscriptions = vec![cx.subscribe_in(
             &composer,
-            |this, _composer, ev: &ComposerEvent, cx| match ev {
+            window,
+            |this, _composer, ev: &ComposerEvent, window, cx| match ev {
                 ComposerEvent::Submit { text, images } => {
                     // A staged edit reroutes: rewind to the edited message, then
                     // send the edited text into the forked session.
@@ -996,6 +1000,9 @@ impl AgentChatView {
                     this.change_feature(id.clone(), value.clone(), cx)
                 }
                 ComposerEvent::AgentPicked(id) => this.change_agent(id.clone(), cx),
+                ComposerEvent::WorktreeIsolationPicked(enabled) => {
+                    this.set_worktree_isolation(*enabled, window, cx)
+                }
                 ComposerEvent::MentionOpened => this.refresh_context_sources(cx),
                 ComposerEvent::CaptureContext(request) => {
                     this.capture_context(request.clone(), cx)
@@ -1637,17 +1644,45 @@ impl AgentChatView {
             });
         let meter_window = self.thread.last_known_context_window;
         let meter_cost = self.thread.session_cost_usd;
+        // An unbound draft has no `connection`, so `caps`/`vocab` above are the
+        // *empty* defaults — pushing them would blank the draft's pre-bind model
+        // list. Its picker shape is owned by `sync_unbound_composer` instead.
+        let unbound = self.unbound;
         self.composer.update(cx, |c, cx| {
             c.set_state(disconnected, turn_active, cx);
-            c.set_controls(model, permission_mode, effort, caps.supports_modes, caps.supports_config, vocab, cx);
             c.set_usage_meter(meter_used, meter_window, meter_cost, cx);
             c.set_slash_commands(slash_commands, slash_descriptions, slash_hints, cx);
             c.set_provider_label(provider_label, cx);
-            // A bound chat never shows the agent picker (its transport is fixed);
-            // clearing here is what hides it after `bind_now` (cheap no-op once
-            // already cleared).
-            c.set_agent_picker(false, Vec::new(), None, cx);
+            if !unbound {
+                c.set_controls(model, permission_mode, effort, caps.supports_modes, caps.supports_config, vocab, cx);
+                // A bound chat never shows the agent picker (its transport is
+                // fixed) or the worktree pill (its cwd is fixed); clearing both
+                // here is what hides them after `bind_now` (cheap no-op once
+                // already cleared). The pill is pushed from
+                // `sync_unbound_composer`, which stops running once bound — so
+                // without this clear the composer would keep rendering the stale
+                // draft against a live session.
+                c.set_agent_picker(false, Vec::new(), None, cx);
+                c.set_worktree_draft(None, cx);
+            }
         });
+        // The composer keeps its own `unbound` flag, and the agent picker, the
+        // Import-session row and the placeholder's agent name all read it. Any
+        // sync while the draft is still unbound must therefore re-assert the
+        // draft's shape rather than the bound-chat shape, or flipping an
+        // unrelated control (the worktree toggle syncs here) silently strips
+        // those three from a New Agent draft with no way to get them back.
+        //
+        // This and the `if !unbound` guard above are INDEPENDENT safety nets:
+        // either one alone repairs the symptom today, so neither is redundant in
+        // the sense of being deletable. The guard stops a connection-less draft's
+        // empty vocab being pushed at all; this re-asserts the real shape for
+        // every one of `sync_composer`'s callers rather than just the ones that
+        // happen to seed it. Removing either leaves the invariant resting on a
+        // single accident of ordering.
+        if unbound {
+            self.sync_unbound_composer(cx);
+        }
     }
 
     /// Seed the composer for an unbound *New Agent* draft: push the chat roster
@@ -1690,10 +1725,15 @@ impl AgentChatView {
             })
             .unwrap_or_default();
         let model = self.model.clone();
+        // The worktree pill is draft-only state, so it is pushed from here rather
+        // than `sync_composer` — that one derives its vocab from `self.connection`,
+        // which a draft doesn't have.
+        let worktree_draft = self.worktree_draft_for_composer(cx);
         self.composer.update(cx, |c, cx| {
             c.set_agent_picker(true, agents, current, cx);
             // Pre-bind: only the model picker (no modes/effort until the live conn).
             c.set_controls(model, None, None, false, false, vocab, cx);
+            c.set_worktree_draft(worktree_draft, cx);
         });
     }
 
@@ -2995,6 +3035,15 @@ impl AgentChatView {
         self.unbound_agent_id = Some("claude-code".to_string());
         self.backend = ChatBackend::stream_json();
         self.model = Some("opus".to_string());
+    }
+
+    /// Test-only: the inverse of [`Self::make_unbound_for_test`] — mark the draft
+    /// as bound the way a successful first send does, without spawning anything.
+    /// The stub connection the test harness injects stands in for the real one.
+    #[cfg(test)]
+    fn make_bound_for_test(&mut self) {
+        self.unbound = false;
+        self.unbound_agent_id = None;
     }
 
     /// Test-only: override `is_git_project` — the real constructor derives it
@@ -5032,7 +5081,7 @@ impl Render for AgentChatView {
             .children(self.render_rewind_confirm(window, cx))
             // *New Agent* draft only: "Run in a fresh worktree" toggle + slug
             // field + create-state feedback, hidden once bound or non-git.
-            .children(self.render_worktree_toggle(cx))
+            .children(self.render_worktree_status_banner(cx))
             // An import bridge swaps the live composer for a Resume-in-terminal
             // footer (no in-app backend to send to); every other chat renders the
             // real composer.
@@ -6733,11 +6782,15 @@ mod tests {
             .expect("window update");
     }
 
-    /// The *New Agent* draft's "Run in a fresh worktree" toggle only renders
-    /// once unbound AND for a git project — never on a bound chat, never on a
-    /// non-git one (the two gates `render_worktree_toggle` checks).
+    /// The *New Agent* draft's worktree control only offers itself once unbound
+    /// AND for a git project — never on a bound chat, never on a non-git one.
+    ///
+    /// Asserted on `worktree_draft_for_composer` because that is what now carries
+    /// the choice (the composer renders the pill from it). The gate itself is
+    /// unchanged from when a checkbox rendered it in this view; only its owner
+    /// moved.
     #[gpui::test]
-    async fn worktree_toggle_hidden_unless_unbound_and_git(cx: &mut TestAppContext) {
+    async fn worktree_control_hidden_unless_unbound_and_git(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
@@ -6754,19 +6807,166 @@ mod tests {
         window
             .update(cx, |view, _window, cx| {
                 // Bound (the constructor's default) + git: still hidden — the
-                // toggle is a pre-bind-only affordance.
+                // control is a pre-bind-only affordance.
                 view.set_git_project_for_test(true);
-                assert!(view.render_worktree_toggle(cx).is_none(), "bound chats never show it");
+                assert!(
+                    view.worktree_draft_for_composer(cx).is_none(),
+                    "bound chats never show it"
+                );
 
-                // Unbound but non-git (the constructor's default `is_git_project`):
-                // hidden.
+                // Unbound but non-git: hidden.
                 view.make_unbound_for_test();
                 view.set_git_project_for_test(false);
-                assert!(view.render_worktree_toggle(cx).is_none(), "non-git projects never show it");
+                assert!(
+                    view.worktree_draft_for_composer(cx).is_none(),
+                    "non-git projects never show it"
+                );
 
-                // Unbound + git: visible.
+                // Unbound + git: offered.
                 view.set_git_project_for_test(true);
-                assert!(view.render_worktree_toggle(cx).is_some(), "unbound + git shows it");
+                assert!(
+                    view.worktree_draft_for_composer(cx).is_some(),
+                    "unbound + git offers the control"
+                );
+
+                // The status banner is a different thing: it carries only the
+                // in-flight/failure state, so at rest it stays out of the way
+                // rather than reserving an empty strip above the composer.
+                assert!(
+                    view.render_worktree_status_banner(cx).is_none(),
+                    "no banner while the create state is Idle"
+                );
+            })
+            .expect("window update");
+    }
+
+    /// The pill emits the DESIRED isolation, not a flip, so re-picking the row
+    /// that is already active must be a no-op rather than silently toggling the
+    /// choice to the opposite of what the user clicked.
+    #[gpui::test]
+    async fn worktree_isolation_pick_is_idempotent_and_reaches_the_draft(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, window, cx| {
+                view.make_unbound_for_test();
+                view.set_git_project_for_test(true);
+                assert!(!view.worktree_draft_enabled_for_test());
+
+                // Pick "New worktree" → armed, and the slug field materializes.
+                view.set_worktree_isolation(true, window, cx);
+                assert!(view.worktree_draft_enabled_for_test());
+                let draft = view.worktree_draft_for_composer(cx).expect("offered");
+                assert!(draft.enabled);
+                assert!(draft.slug_input.is_some(), "arming creates the slug field");
+                assert!(draft.hint.starts_with("oximux/"), "hint previews the branch: {}", draft.hint);
+
+                // Re-picking the SAME row must not flip it back off.
+                view.set_worktree_isolation(true, window, cx);
+                assert!(
+                    view.worktree_draft_enabled_for_test(),
+                    "re-picking the active row is a no-op, not a toggle"
+                );
+
+                // Picking the other row disarms.
+                view.set_worktree_isolation(false, window, cx);
+                assert!(!view.worktree_draft_enabled_for_test());
+            })
+            .expect("window update");
+    }
+
+    /// Binding must clear the worktree pill from the composer: a live session's
+    /// cwd is fixed, so offering to change it is a lie.
+    ///
+    /// This is the mirror of `sync_while_unbound_keeps_the_draft_picker_shape`.
+    /// The pill is pushed from `sync_unbound_composer`, which stops running once
+    /// bound — so the *bound* sync has to clear it explicitly, exactly as it
+    /// already clears the agent picker. Caught live (the dimmed pill lingered
+    /// beside a bound chat's real controls), not by the unit tests above: none of
+    /// them bind, which is precisely the gap this closes.
+    #[gpui::test]
+    async fn binding_clears_the_worktree_pill(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, window, cx| {
+                view.make_unbound_for_test();
+                view.set_git_project_for_test(true);
+                view.set_worktree_isolation(true, window, cx);
+                assert!(
+                    view.composer.read(cx).worktree_draft_is_some_for_test(),
+                    "precondition: an armed draft shows the pill"
+                );
+
+                // Bind, as a successful worktree create + send would.
+                view.make_bound_for_test();
+                view.sync_composer(cx);
+
+                assert!(
+                    !view.composer.read(cx).worktree_draft_is_some_for_test(),
+                    "a bound chat's cwd is fixed — the pill must not linger"
+                );
+            })
+            .expect("window update");
+    }
+
+    /// The pill must carry the parent's refusal to change the pick while a create
+    /// is in flight / has failed with a message staged — otherwise it would
+    /// render enabled and swallow clicks, which reads as a broken control.
+    #[gpui::test]
+    async fn worktree_draft_reports_busy_while_create_is_not_idle(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, window, cx| {
+                view.make_unbound_for_test();
+                view.set_git_project_for_test(true);
+                view.set_worktree_isolation(true, window, cx);
+                assert!(!view.worktree_draft_for_composer(cx).expect("offered").busy);
+
+                view.send_text("hello".into(), Vec::new(), cx);
+
+                let draft = view.worktree_draft_for_composer(cx).expect("offered");
+                assert!(draft.busy, "an in-flight create freezes the pick");
+                // And the underlying rule still holds: the pick cannot change.
+                view.set_worktree_isolation(false, window, cx);
+                assert!(
+                    view.worktree_draft_enabled_for_test(),
+                    "the pick must not change while a message is staged"
+                );
             })
             .expect("window update");
     }
@@ -6864,6 +7064,76 @@ mod tests {
                     roster::WorktreeCreateState::Creating
                 ));
                 assert!(view.thread.entries.is_empty());
+            })
+            .expect("window update");
+    }
+
+    /// Regression: syncing the composer while the draft is still UNBOUND must
+    /// not push the bound-chat shape into it. The composer keeps its own
+    /// `unbound` flag, and the agent picker, the Import-session row and the
+    /// placeholder's agent name all read that one — so a `sync_composer` that
+    /// unconditionally cleared it stripped all three from a live New Agent
+    /// draft, with no way to restore them.
+    ///
+    /// The worktree toggle is the trigger that made this reachable (it syncs the
+    /// composer to reflect its own busy state), but the bug is in the sync, not
+    /// the toggle: every one of `sync_composer`'s ~23 callers could hit it while
+    /// unbound. Asserted through the toggle because that is the path a user
+    /// actually walks.
+    #[gpui::test]
+    async fn sync_while_unbound_keeps_the_draft_picker_shape(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, window, cx| {
+                view.make_unbound_for_test();
+                view.set_git_project_for_test(true);
+                // Seed the draft's picker shape the way the real constructor does.
+                view.sync_unbound_composer(cx);
+                assert!(
+                    view.composer.read(cx).unbound_for_test(),
+                    "precondition: the draft seeds the composer as unbound"
+                );
+                let seeded_agents = view.composer.read(cx).agent_options_len_for_test();
+                assert!(seeded_agents > 0, "precondition: the draft offers agents to pick");
+                let seeded_models = view.composer.read(cx).vocab_models_len_for_test();
+                assert!(seeded_models > 0, "precondition: the draft offers models to pick");
+
+                // Flipping the worktree toggle syncs the composer. Before the fix
+                // this reached `set_agent_picker(false, vec![], None)` and blanked
+                // the draft.
+                view.toggle_worktree_draft(window, cx);
+
+                assert!(
+                    view.composer.read(cx).unbound_for_test(),
+                    "the toggle must not bind the composer — the Import row and the \
+                     placeholder's agent name are gated on this flag"
+                );
+                assert_eq!(
+                    view.composer.read(cx).agent_options_len_for_test(),
+                    seeded_agents,
+                    "the agent picker must survive an unbound sync"
+                );
+                // Asserted separately: the model picker reads `vocab.models`, not
+                // `unbound`, so the two assertions above would both hold while the
+                // model list was blanked on its own.
+                assert_eq!(
+                    view.composer.read(cx).vocab_models_len_for_test(),
+                    seeded_models,
+                    "the model picker must survive an unbound sync — a draft has no \
+                     connection, so the caps-derived vocab is empty"
+                );
             })
             .expect("window update");
     }
