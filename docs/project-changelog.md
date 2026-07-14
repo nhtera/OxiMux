@@ -4,6 +4,34 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-15 — Live MCP elicitation verified; import-bridge bubbles keep their provider
+
+**MCP elicitation, live: PASS.** `scripts/mcp-elicitation-probe.py` ran as a real
+Codex MCP server (codex-cli 0.144.3) and both halves of the contract round-trip:
+Allow → `elicitation result: action=accept content={}`, Reject → `action=decline
+content=None`. That confirms `to_codex_elicitation`: an elicitation answers with
+`{action}` (accept/decline), not an approval's `{decision}`, and decline omits
+`content` per the nullable schema — `content=None` is the proof. A wrong shape
+would hang the server rather than error, which is why this needed a live run and
+not just a fixture.
+
+Worth knowing for the next person: under the `On request` policy a single tool
+call raises **two** cards in sequence — Codex's own tool-approval gate ("Allow the
+… MCP server to run tool X?") first, the elicitation ("MCP · {server}: {message}")
+second. Only the second is the elicitation.
+
+**Fix: import-bridge bubbles are captioned with their own provider.** A bridge has
+no live backend, so it assembles on an inert stream-json placeholder — and
+`provider_label` read that placeholder's name, captioning a Pi or OpenCode
+transcript as "Claude". It now prefers the bridge's own `provider_display`, which
+was already populated for the footer note. Regression test
+`import_bridge_labels_bubbles_with_its_own_provider`; verified to fail when the
+preference is removed. GUI-verified on a Pi bridge.
+
+Tests: `oximux-app --lib` 1255 passed / 0 failed.
+
+---
+
 ### 2026-07-14 — Fix catalog probe leaking an OS thread out of the test scheduler
 
 **Symptom:** `cargo test -p oximux-app --lib` aborted with SIGABRT, reporting
