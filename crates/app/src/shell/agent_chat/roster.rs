@@ -29,6 +29,8 @@ use gpui::{
     div, px, AnyElement, App, AppContext, ClickEvent, Context, IntoElement, ParentElement, Styled,
     Window,
 };
+use gpui_component::Icon;
+use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants};
 
 use super::composer::WorktreeDraft;
@@ -180,6 +182,54 @@ pub(crate) fn default_worktree_slug() -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!("agent-{secs}")
+}
+
+/// Turn a raw worktree-create failure into a headline a person can act on, plus
+/// an optional second line.
+///
+/// The raw chain reads e.g. `add_worktree: git exited with code 255: Preparing
+/// worktree (new branch 'oximux/x')\nfatal: a branch named 'oximux/x' already
+/// exists` — an internal fn name, an exit code, and git's own progress chatter
+/// wrapped around the one clause that matters. Showing that verbatim asks the
+/// user to parse our stack trace.
+///
+/// `branch` is passed in rather than scraped from the text: the caller already
+/// knows the slug it tried, so the headline can name it without a regex that
+/// would drift the moment git rewords its output.
+///
+/// Recognized cases get a clean headline and a next step. **Anything else keeps
+/// git's own `fatal:`/`error:` line** — an unrecognized failure the user cannot
+/// see is one they cannot search for or report, so this humanizes what it knows
+/// and passes through what it doesn't.
+fn humanize_worktree_error(raw: &str, branch: &str) -> (String, Option<String>) {
+    const PICK_ANOTHER: &str = "Pick a different branch name, or continue without a worktree.";
+    // git: "fatal: a branch named 'oximux/x' already exists"
+    if raw.contains("a branch named") && raw.contains("already exists") {
+        return (format!("Branch {branch} already exists"), Some(PICK_ANOTHER.to_string()));
+    }
+    // git: "fatal: '<path>' already exists" — the sibling directory is occupied
+    // even though the branch itself is free.
+    if raw.contains("already exists") {
+        return (format!("A folder for {branch} already exists"), Some(PICK_ANOTHER.to_string()));
+    }
+    if raw.contains("not a valid object name") || raw.contains("invalid reference") {
+        return (
+            "Couldn't branch from the current HEAD".to_string(),
+            Some("This repository may not have any commits yet.".to_string()),
+        );
+    }
+    // Unrecognized: lead with a plain headline but surface git's own last
+    // diagnostic line, which is the part worth searching for.
+    let detail = raw
+        .lines()
+        .rev()
+        .find(|l| {
+            let t = l.trim_start();
+            t.starts_with("fatal:") || t.starts_with("error:")
+        })
+        .map(|l| l.trim().to_string())
+        .unwrap_or_else(|| raw.trim().to_string());
+    ("Couldn't create the worktree".to_string(), Some(detail))
 }
 
 impl AgentChatView {
@@ -404,11 +454,17 @@ impl AgentChatView {
         })
     }
 
-    /// The worktree create's transient feedback — a banner above the composer
-    /// while a create is in flight or has failed with a message still staged.
-    /// `None` at rest: the isolation *choice* lives in the composer's pill, this
-    /// is only the in-flight/failure state, which belongs with the other pinned
-    /// banners rather than inside a popover the user has to open to see.
+    /// The worktree create's transient feedback — shown above the composer while
+    /// a create is in flight or has failed with a message still staged. `None` at
+    /// rest: the isolation *choice* lives in the composer's pill, this is only
+    /// the in-flight/failure state, which belongs with the other pinned banners
+    /// rather than inside a popover the user has to open to see.
+    ///
+    /// Laid out in the composer's own centered reading column. It is a sibling of
+    /// the composer, not a child, so nothing gives it that column for free — a
+    /// bare full-width row here strands the text against the pane's left edge,
+    /// hundreds of px from the input it belongs to, and the gap grows with the
+    /// window.
     pub(super) fn render_worktree_status_banner(
         &mut self,
         cx: &mut Context<Self>,
@@ -416,63 +472,130 @@ impl AgentChatView {
         if !self.unbound || !self.is_git_project {
             return None;
         }
-        // At rest there is nothing to say — bail before building the column so a
+        // At rest there is nothing to say — bail before building anything so a
         // draft doesn't carry an empty padded strip above its composer. (The old
         // toggle always rendered because the checkbox itself lived here.)
         if matches!(self.worktree_create_state, WorktreeCreateState::Idle) {
             return None;
         }
+        if !self.worktree_draft_enabled {
+            return None;
+        }
         let theme = self.theme;
         let typo = self.typography.clone();
-        let enabled = self.worktree_draft_enabled;
-        let creating = matches!(self.worktree_create_state, WorktreeCreateState::Creating);
+        let pad = self.density.pad_panel;
 
-        let mut col = div().flex().flex_col().px(px(10.0)).pb(px(6.0)).gap(px(4.0));
-
-        if enabled {
-            if creating {
-                col = col.child(
-                    div()
-                        .text_size(px(typo.t_body_sm))
-                        .text_color(theme.fg_subtle)
-                        .child("Creating worktree…"),
-                );
-            }
-            if let WorktreeCreateState::Failed(msg) = &self.worktree_create_state {
-                col = col.child(
+        let body: AnyElement = match &self.worktree_create_state {
+            WorktreeCreateState::Creating => div()
+                .text_size(px(typo.t_body_sm))
+                .text_color(theme.fg_subtle)
+                .child("Creating worktree…")
+                .into_any_element(),
+            WorktreeCreateState::Failed(msg) => {
+                let branch = self
+                    .worktree_slug_input
+                    .as_ref()
+                    .map(|i| format!("oximux/{}", i.read(cx).value().trim()))
+                    .unwrap_or_else(|| "the branch".to_string());
+                let (headline, detail) = humanize_worktree_error(msg, &branch);
+                // Matches `error_card.rs`'s established failure look rather than
+                // inventing a second error style.
+                let mut card = div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .min_w_0()
+                    .gap(px(6.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(theme.status_error.opacity(0.4))
+                    .bg(theme.status_error.opacity(0.08))
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                Icon::default()
+                                    .path("icons/alert-triangle.svg")
+                                    .size(px(13.0))
+                                    .text_color(theme.status_error),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(typo.t_body_sm))
+                                    .text_color(theme.status_error)
+                                    .child(headline),
+                            ),
+                    );
+                if let Some(detail) = detail {
+                    card = card.child(
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .text_size(px(typo.t_body_sm))
+                            .text_color(theme.fg_muted)
+                            .child(detail),
+                    );
+                }
+                card.child(
+                    // Actions sit under their own message rather than flung to
+                    // the far edge by a spacer — at this column's width that put
+                    // them ~600px from the text explaining them.
                     div()
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(8.0))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(typo.t_body_sm))
-                                .text_color(theme.status_error)
-                                .child(format!("Couldn't create worktree: {msg}")),
-                        )
-                        .child(
-                            Button::new("worktree-create-retry")
-                                .ghost()
-                                .label("Retry")
-                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                    this.retry_worktree_create(cx);
-                                })),
-                        )
+                        .justify_end()
+                        .gap(px(6.0))
                         .child(
                             Button::new("worktree-create-fallback")
                                 .ghost()
+                                .small()
                                 .label("Continue without worktree")
                                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                                     this.send_without_worktree(cx);
                                 })),
+                        )
+                        .child(
+                            Button::new("worktree-create-retry")
+                                .outline()
+                                .small()
+                                .label("Retry")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.retry_worktree_create(cx);
+                                })),
                         ),
-                );
+                )
+                .into_any_element()
             }
-        }
+            WorktreeCreateState::Idle => return None,
+        };
 
-        Some(col.into_any_element())
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .w_full()
+                .px(px(pad))
+                .pb(px(6.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .min_w_0()
+                        .max_w(px(super::CONTENT_MAX_W))
+                        .child(body),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Footer for an import-bridge tab (OpenCode / Pi opened as chat): a short
@@ -532,6 +655,62 @@ impl AgentChatView {
 mod tests {
     use super::*;
     use oximux_core::AgentAdapter;
+
+    /// The real failure a user hits: the branch already exists. The headline must
+    /// name the branch and say nothing about `add_worktree` or exit codes.
+    #[test]
+    fn humanize_branch_exists_names_the_branch_and_drops_the_git_chatter() {
+        let raw = "add_worktree: git exited with code 255: Preparing worktree (new branch \
+                   'oximux/xxx')\nfatal: a branch named 'oximux/xxx' already exists";
+        let (headline, detail) = humanize_worktree_error(raw, "oximux/xxx");
+        assert_eq!(headline, "Branch oximux/xxx already exists");
+        assert_eq!(
+            detail.as_deref(),
+            Some("Pick a different branch name, or continue without a worktree.")
+        );
+        // The whole point: none of our plumbing reaches the user.
+        for leak in ["add_worktree", "exited with code", "Preparing worktree", "fatal:"] {
+            assert!(!headline.contains(leak), "headline leaks {leak:?}: {headline}");
+            assert!(
+                !detail.as_deref().unwrap().contains(leak),
+                "detail leaks {leak:?}"
+            );
+        }
+    }
+
+    /// A path collision reports the folder, not the branch — the branch is free,
+    /// so "branch already exists" would send the user to the wrong fix.
+    #[test]
+    fn humanize_path_collision_reports_the_folder() {
+        let raw = "add_worktree: git exited with code 128: fatal: '/tmp/oximux-wt-x' already exists";
+        let (headline, _) = humanize_worktree_error(raw, "oximux/x");
+        assert_eq!(headline, "A folder for oximux/x already exists");
+    }
+
+    /// An UNRECOGNIZED failure must still surface git's own diagnostic. Swallowing
+    /// it would leave the user with a headline they can neither act on nor search
+    /// for — worse than the raw dump this humanizer replaces.
+    #[test]
+    fn humanize_unknown_error_passes_through_gits_own_line() {
+        let raw = "add_worktree: git exited with code 128: some progress noise\n\
+                   fatal: could not create work tree dir 'x': Permission denied";
+        let (headline, detail) = humanize_worktree_error(raw, "oximux/x");
+        assert_eq!(headline, "Couldn't create the worktree");
+        assert_eq!(
+            detail.as_deref(),
+            Some("fatal: could not create work tree dir 'x': Permission denied"),
+            "the last fatal: line is the part worth searching for"
+        );
+    }
+
+    /// No `fatal:`/`error:` line to find — fall back to the raw text rather than
+    /// showing an empty detail.
+    #[test]
+    fn humanize_unknown_error_without_a_fatal_line_keeps_the_raw_text() {
+        let (headline, detail) = humanize_worktree_error("something strange happened", "oximux/x");
+        assert_eq!(headline, "Couldn't create the worktree");
+        assert_eq!(detail.as_deref(), Some("something strange happened"));
+    }
 
     /// The built-in registry as `detect_available()` would report it (all
     /// available), so tests exercise `chat_roster` without touching the FS.
