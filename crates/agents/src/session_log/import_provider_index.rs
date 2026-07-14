@@ -19,7 +19,22 @@
 //! can tag, filter, and resume it without a first-class core adapter.
 //!
 //! [`load_import_provider_preview`] renders the opening turns for the preview
-//! pane from the same stores (OpenCode/Copilot SQLite tables, Pi rollout JSONL).
+//! pane from the same stores (OpenCode/Copilot SQLite tables, Pi rollout JSONL)
+//! shown while browsing the ⌘⇧H history picker, before a session is resumed.
+//!
+//! [`load_import_provider_transcript`] renders the *full* chat-transcript shape
+//! (`Vec<ThreadEntry>` — bubbles, plus tool activity as plain notice rows,
+//! never raw JSON) that a live chat surface would seed from, matching the
+//! fidelity the Claude/Codex importers hold (`thread::session_import`,
+//! `thread::codex_session_import`). OpenCode and Pi have full mappers
+//! ([`super::import_transcript_opencode`], [`super::import_transcript_pi`]).
+//! Copilot does not: a spike of a live `~/.copilot/session-store.db` found its
+//! `turns.user_message`/`assistant_response` columns *are* populated (readable
+//! prose, not empty — [`copilot_preview`] already renders a picker blurb from
+//! them), but Copilot has no ACP/live-chat backend in OxiMux at all — it only
+//! ever reopens as a terminal resume (`copilot --resume=<id>`), so there is no
+//! consumer for a full transcript today. Copilot stays resume-only for
+//! [`load_import_provider_transcript`] until a chat surface exists to seed.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -50,7 +65,10 @@ const PI_MAX_DEPTH: usize = 5;
 
 /// Open a provider SQLite store read-only. `None` when the file is absent or
 /// can't be opened; the URI flag lets SQLite read a live WAL database.
-fn open_ro(db: &Path) -> Option<Connection> {
+/// `pub(super)` so the sibling transcript mappers ([`super::import_transcript_opencode`])
+/// reuse the same never-write-lock guarantee instead of opening their own
+/// connection.
+pub(super) fn open_ro(db: &Path) -> Option<Connection> {
     if !db.exists() {
         return None;
     }
@@ -413,6 +431,28 @@ pub fn load_import_provider_preview(
         COPILOT => copilot_preview(home, session_id, max_messages),
         PI => path
             .map(|p| pi_preview(Path::new(p), max_messages))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// The full chat-transcript shape (`Vec<ThreadEntry>`) for an import-provider
+/// row, so a chat surface can seed it before a live resume connects — the
+/// counterpart of [`load_import_provider_preview`]'s short blurb. OpenCode
+/// reads its SQLite store by `session_id`; Pi reads its rollout JSONL by
+/// `path`. Copilot has no chat-surface consumer yet (see the module docs), so
+/// it yields an empty transcript here — its picker blurb still works via
+/// [`load_import_provider_preview`], and it always resumes in a terminal.
+pub fn load_import_provider_transcript(
+    home: &Path,
+    preset_id: &str,
+    session_id: &str,
+    path: Option<&str>,
+) -> Vec<crate::thread::ThreadEntry> {
+    match preset_id {
+        OPENCODE => super::import_transcript_opencode::opencode_transcript(home, session_id),
+        PI => path
+            .map(|p| super::import_transcript_pi::pi_transcript(Path::new(p)))
             .unwrap_or_default(),
         _ => Vec::new(),
     }
@@ -851,5 +891,54 @@ mod tests {
         // The `thinking` block is dropped; only the `text` block is kept.
         assert_eq!(msgs[1].role, PreviewRole::Assistant);
         assert_eq!(msgs[1].text, "done");
+    }
+
+    // --- Transcript dispatch ---
+    //
+    // The mapping logic itself (turn ordering, tool degrade, corrupt-store
+    // handling) is covered in each sibling mapper's own tests
+    // (`import_transcript_opencode`, `import_transcript_pi`); these just prove
+    // `load_import_provider_transcript` routes to the right one.
+
+    #[test]
+    fn transcript_dispatch_routes_opencode_by_session_id() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".local/share/opencode");
+        fs::create_dir_all(&dir).unwrap();
+        let conn = Connection::open(dir.join("opencode.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+             INSERT INTO message VALUES ('m1','s1',1,'{\"role\":\"user\"}');
+             INSERT INTO part VALUES ('p1','m1','s1',1,'{\"type\":\"text\",\"text\":\"hi\"}');",
+        )
+        .unwrap();
+        let entries = load_import_provider_transcript(home.path(), OPENCODE, "s1", None);
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn transcript_dispatch_routes_pi_by_path() {
+        let home = tempfile::tempdir().unwrap();
+        write_pi_session(
+            home.path(),
+            "s.jsonl",
+            "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        );
+        let path = home.path().join(".pi/agent/sessions/s.jsonl");
+        let entries = load_import_provider_transcript(
+            home.path(),
+            PI,
+            "unused",
+            Some(path.to_str().unwrap()),
+        );
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn transcript_dispatch_yields_empty_for_copilot_and_unknown_presets() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(load_import_provider_transcript(home.path(), COPILOT, "s1", None).is_empty());
+        assert!(load_import_provider_transcript(home.path(), "unknown", "s1", None).is_empty());
     }
 }
