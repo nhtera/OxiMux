@@ -2515,6 +2515,23 @@ impl AgentChatView {
         if self.rewinding {
             return;
         }
+        // A never-bound *New Agent* draft is ALREADY a fresh conversation, so
+        // there is nothing to clear: `bind_now` drops `unbound` before the first
+        // message can land, which makes an empty transcript an invariant here,
+        // and no child exists to reap.
+        //
+        // The reason this is a guard and not just an optimization: `respawn`
+        // below would spawn a subprocess while `unbound` stayed true, leaving a
+        // live connection the view still treats as a draft — it would keep
+        // offering the pre-bind agent picker and static model list for a session
+        // already advertising its real capabilities, and the spawn is thrown away
+        // by `bind_now`'s own respawn on the first real send. Binding here
+        // instead would be worse: the transport is deliberately choosable right
+        // up until that first send, and `/clear` is not a request to commit to an
+        // agent.
+        if self.unbound {
+            return;
+        }
         self.thread.clear();
         // Transient view state keyed to the old transcript must not survive.
         self.pending_edit = None;
@@ -3077,6 +3094,14 @@ impl AgentChatView {
     #[cfg(test)]
     fn unbound_agent_id_for_test(&self) -> Option<&str> {
         self.unbound_agent_id.as_deref()
+    }
+
+    /// Test-only: whether a subprocess connection exists at all — distinct from
+    /// [`Self::is_bound_for_test`], which also requires the view to *know* it's
+    /// bound. The gap between the two is exactly the bug `/clear` used to cause.
+    #[cfg(test)]
+    fn connection_is_live_for_test(&self) -> bool {
+        self.connection.is_some()
     }
 
     #[cfg(test)]
@@ -6885,6 +6910,88 @@ mod tests {
             })
             .expect("window update");
     }
+
+    /// `/clear` on a never-bound *New Agent* draft must do nothing — above all it
+    /// must not spawn.
+    ///
+    /// A draft is already a fresh conversation: `bind_now` drops `unbound` before
+    /// the first message can land, so an empty transcript is an invariant here.
+    /// `new_chat` used to respawn unconditionally, which spawned a subprocess
+    /// while `unbound` stayed true — a live connection the view still treated as
+    /// a draft, so the composer kept offering the pre-bind agent picker and
+    /// static model list for a session already advertising real capabilities.
+    ///
+    /// Catching a stray spawn takes BOTH assertions below, because `respawn` can
+    /// fail as well as succeed and the two leave different traces:
+    /// - it succeeded → `connection` is `Some`
+    /// - it failed → `disconnected` + `last_error` are set (`respawn_with_env`'s
+    ///   `Err` arm)
+    ///
+    /// Only the second bites in a unit test, where `connect()` cannot succeed (no
+    /// Tokio runtime). Asserting on `connection` alone looks right and proves
+    /// nothing — it stays `None` whether or not the guard exists.
+    #[gpui::test]
+    async fn clear_on_an_unbound_draft_does_not_spawn_or_bind(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.make_unbound_for_test();
+                view.sync_unbound_composer(cx);
+                assert!(
+                    !view.connection_is_live_for_test(),
+                    "precondition: a draft has no subprocess"
+                );
+
+                view.send_text("/clear".into(), Vec::new(), cx);
+
+                assert!(
+                    !view.connection_is_live_for_test(),
+                    "/clear on a draft must not spawn — the transport is choosable \
+                     until the first real send"
+                );
+                // The one that actually bites here: a *failed* spawn attempt is
+                // still an attempt, and it leaves these behind.
+                assert!(
+                    !view.disconnected,
+                    "/clear must not even attempt a spawn — a draft is already fresh"
+                );
+                assert!(
+                    view.thread.last_error.is_none(),
+                    "a draft that was never sent to cannot have failed to resume: {:?}",
+                    view.thread.last_error
+                );
+                assert!(view.is_unbound(), "/clear must not bind the draft");
+                assert!(view.thread.entries.is_empty(), "a draft has nothing to clear");
+                // The draft's composer shape is untouched: the user can still pick
+                // an agent after typing /clear.
+                assert!(
+                    view.composer.read(cx).unbound_for_test(),
+                    "the draft keeps its pre-bind picker shape"
+                );
+            })
+            .expect("window update");
+    }
+
+    // NOTE: `/clear` on a BOUND chat is deliberately not unit-tested. `new_chat`
+    // reaches `respawn` → `connect()`, which starts a real subprocess — a unit
+    // test must not do that (the same hazard that made the catalog probe SIGABRT
+    // the suite). Covering it needs a spawn seam on `respawn`, which every other
+    // respawn path shares (Stop-resume, model switch, auth, rewind), so that is a
+    // design change on its own merits rather than a rider on this fix. Splitting
+    // the transcript-reset into a helper and asserting on that instead would only
+    // prove the helper works, not that `new_chat` still calls it.
 
     /// Binding must clear the worktree pill from the composer: a live session's
     /// cwd is fixed, so offering to change it is a lie.
