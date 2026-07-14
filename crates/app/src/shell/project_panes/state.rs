@@ -96,6 +96,16 @@ impl ProjectPanes {
         self.groups.get(&self.manager.active_group_id()).cloned()
     }
 
+    /// The active group's active-tab Agent Chat view, if any. Used by the
+    /// `CreateWorktreeWorkspaceForActiveChat` route-up handler to reach the chat
+    /// that armed the worktree draft (it's the focused tab that just sent).
+    pub fn active_agent_chat_view(
+        &self,
+        cx: &App,
+    ) -> Option<Entity<crate::shell::agent_chat::AgentChatView>> {
+        self.active_group()?.read(cx).active_agent_chat_view()
+    }
+
     pub fn group(&self, id: PaneGroupId) -> Option<Entity<PaneGroup>> {
         self.groups.get(&id).cloned()
     }

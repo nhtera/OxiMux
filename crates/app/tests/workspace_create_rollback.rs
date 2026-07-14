@@ -137,6 +137,18 @@ async fn create_workspace_happy_path_inserts_row_and_keeps_worktree() {
     assert_eq!(workspace.branch, "oximux/new-feat");
     assert!(worktree_path.exists(), "worktree dir should exist on disk");
 
+    // The row is enumerable by the sidebar's `list_for_project` gather — this
+    // is what makes a New-Agent worktree show up as a first-class workspace
+    // card + ⌘J entry (round-7 worktree-as-workspace).
+    let listed = workspace_repo
+        .list_for_project(&project.id)
+        .expect("list_for_project");
+    assert!(
+        listed.iter().any(|w| w.id == workspace.id && w.slug == slug),
+        "new workspace row should be enumerable for the sidebar; got: {:?}",
+        listed.iter().map(|w| &w.slug).collect::<Vec<_>>()
+    );
+
     let repo = Repository::open(project_root).await.expect("open");
     let branches = repo.list_branches().await.expect("list");
     assert!(

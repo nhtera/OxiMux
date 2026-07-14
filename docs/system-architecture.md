@@ -1,6 +1,6 @@
 # OxiMux — System Architecture
 
-**Updated**: 2026-06-16  
+**Updated**: 2026-07-14  
 **Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open, lifecycle scripts, Create PR + CI, floating PiP terminal, markdown preview) shipped
 
 ---
@@ -730,6 +730,85 @@ The `ThreadEvent` seam is the normalization point: e.g. Claude `compact_boundary
 - **Codex MCP elicitation.** `mcpServer/elicitation/request` (`codex/approvals.rs`) now surfaces as a permission card — tagged `PermissionKind::Mcp`, labeled "MCP · \<server\>" — instead of being auto-declined. Because an elicitation's reply uses a different JSON-RPC shape (`{action}`) than a tool approval, pending elicitations are tracked in a separate `pending_elicitations` map (`codex/mod.rs`) so `resolve_permission` can route the reply through `to_codex_elicitation` rather than the tool-approval encoder.
 - **Codex approval-policy + sandbox controls.** Two composer `FeatureControl` selects (`codex_approval_policy`, `codex_sandbox`; `codex/mod.rs`) expose Codex's posture directly — previously owned entirely by `~/.codex/config.toml`. The chosen posture seeds `thread/start`/`thread/resume` and is re-sent as a per-turn override on every `turn/start`, so switching either select mid-session takes effect on the next send with no respawn; the posture also persists on the session struct across turns.
 - **Fork-to-new-tab stays Claude-only.** "Fork from here" (`agent_chat/mod.rs`) reads the on-disk `~/.claude` session log to write a new file cut at the target message. Codex has no equivalent on-disk log — its rewind is connection-only — so the action is gated off (`!fork_to_tab_server_side`) and hidden for Codex threads.
+
+---
+
+## Round-6 close-out (`plans/260714-0248-agent-chat-round6-closeout-worktree/`)
+
+Three independent closeouts, verified against a fresh bundled build of HEAD:
+
+- **Signed-bundle notifications.** `scripts/bundle-macos.sh` gained an opt-in
+  `--sign <identity>` flag / `OXIMUX_CODESIGN_IDENTITY` env (ad-hoc default
+  unchanged, `verify_signature` fails the build if the requested identity
+  doesn't show in the sealed bundle's Authority chain). Ad-hoc-signed bundles
+  silently drop the `UNUserNotificationCenter` one-time authorization grant on
+  some macOS versions, so round-5's attention banners never appeared even
+  after accepting the permission prompt; a real identity (or a local
+  self-signed codesigning cert) gives the grant a stable identity to stick to.
+- **Import transcript preview mappers.** `session_log/import_transcript_{opencode,pi}.rs`
+  map OpenCode's SQLite `message`/`part` rows and Pi's JSONL `message` lines
+  into the same `Vec<ThreadEntry>` shape Claude/Codex chat imports build,
+  dispatched by `load_import_provider_transcript` (`import_provider_index.rs`).
+  Picker preview blurbs for all five import providers (including these two)
+  already shipped in round-5 (`99b4650`); these new mappers produce the
+  *full* chat transcript but were **not yet wired into open-as-chat** at the
+  time — both still resumed as a terminal PTY. **Wired in round-7** below:
+  `⌘↵` on an OpenCode/Pi row now opens a transcript-only chat tab seeded from
+  these mappers.
+- **Worktree-per-agent** (Paseo/Super parity). The New Agent composer's
+  worktree toggle (`agent_chat/roster.rs`) created a *git-only* worktree
+  (`Repository::add_worktree`, no `WorkspaceRepo` write — the agent-chat view
+  has no storage-layer handle) before the first send, rebinding the chat's
+  `cwd` and tab label to it. Inline failure banner offers Retry or "continue
+  without a worktree"; hidden for non-git projects. **Superseded in round-7**
+  below: the git-only helper was retired in favor of routing up to a real
+  `Workspace` insert, so the worktree agent gets a sidebar card + `⌘J` entry.
+
+---
+
+## Round-7 close-out (`plans/260714-1020-agent-chat-round7-worktree-workspace-import-wiring/`)
+
+Closes the two round-6 follow-ups above. Phases 1–2 code-complete + tested
+(`oximux-app --lib` 1254/0); Phase 3 (signed-bundle notifications, Codex
+OAuth, live MCP elicitation, live GUI walk-through) stays user-gated.
+
+- **New-Agent worktree → first-class `Workspace`.** `ChatWorktreeOutcome`
+  (`workspace_ops.rs`) now maps down from the richer `CreateOutcome` returned
+  by the existing `create_workspace_with_rollback` — the same git-worktree
+  **+** DB `Workspace`-row-insert (with full rollback) the manual
+  `worktree_panel/` form uses — instead of standing up a git-only path with no
+  DB row. The route-up chain: `roster.rs` emits
+  `AgentChatEvent::WorktreeWorkspaceRequested{slug}` → `pane_group/tabs.rs`
+  dispatches the new `CreateWorktreeWorkspaceForActiveChat{slug}` action →
+  `workspace_root/render.rs`'s handler resolves the active chat view (new
+  `active_agent_chat_view` accessors on `pane_group/state.rs` +
+  `project_panes/state.rs`, captured **synchronously** before the async create
+  so a tab switch mid-create can't misroute the callback), runs
+  `create_workspace_with_rollback`, calls `mark_rail_dirty`, and hands the
+  outcome back through `AgentChatView::on_worktree_create_outcome` (rebinds
+  `cwd`, resumes the staged send). The row is enumerable by the sidebar's
+  `list_for_project` gather, so the worktree agent now gets a sidebar card +
+  `⌘J` entry and is removable via the Worktree panel — the git-only
+  `create_agent_chat_worktree` helper (and its tests) was retired; coverage
+  moved to `workspace_create_rollback.rs`, which gained an enumerability
+  assertion.
+- **OpenCode/Pi open as a chat (transcript bridge).** `⌘↵` on an OpenCode/Pi
+  row in the `⌘⇧H` picker (`entry_opens_as_chat` now also matches
+  `preset_id` `opencode`/`pi`) builds a chat tab via
+  `pane_group/tabs.rs::open_import_bridge_chat`: `AgentChatView::new_import_bridge`
+  (new `ImportBridge` struct + field) seeds the transcript through the round-6
+  `load_import_provider_transcript` dispatcher with `connect_now: false` — no
+  live connection, `send_text` guarded to a no-op — and the composer is
+  swapped for a `render_import_bridge_footer` "Resume in terminal" action that
+  re-dispatches the existing `ResumeAgentSession` PTY resume via
+  `import_resume_command`. `OpenChatSession`/`entry_opens_as_chat` gained a
+  `preset_id`. Default `↵` / click is unchanged — still resumes in a terminal;
+  the bridge is only reachable via the explicit force-open. Bridge tabs carry
+  no live session id, so they are excluded from tab persistence (a
+  resumed-chat restore would spawn a live subprocess and drop the imported
+  history); they re-open from Session History instead, deduped on
+  `(preset_id, session_id)` (`import_bridge_key`). Copilot stays resume-only —
+  no transcript mapper wired.
 
 ---
 

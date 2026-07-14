@@ -430,6 +430,83 @@ impl Render for WorkspaceRoot {
                     });
                 },
             ))
+            .on_action(cx.listener(
+                |this, action: &CreateWorktreeWorkspaceForActiveChat, _window, cx| {
+                    // A *New Agent* worktree draft sent: make the worktree a
+                    // first-class `Workspace` (DB row + git worktree via
+                    // `create_workspace_with_rollback`, full rollback on failure)
+                    // so it gets a sidebar card + ⌘J entry, then hand the outcome
+                    // back to the chat that raised it. The leaf owns no
+                    // `WorkspaceRepo`; this is the single seam that does.
+                    let Some(project) = this.active_project.clone() else {
+                        tracing::warn!("create-worktree-workspace: no active project");
+                        return;
+                    };
+                    let Some(view) = this
+                        .active_project_panes()
+                        .and_then(|panes| panes.read(cx).active_agent_chat_view(cx))
+                    else {
+                        tracing::warn!("create-worktree-workspace: no active chat view");
+                        return;
+                    };
+                    let weak_view = view.downgrade();
+                    let slug = action.slug.clone();
+                    let project_root = std::path::PathBuf::from(&project.root_path);
+                    // Sibling `oximux-wt-<slug>` path — the same convention the
+                    // manual "New Worktree" form and the retired git-only path
+                    // used, so both land in one place.
+                    let worktree_path = std::path::PathBuf::from(
+                        crate::shell::worktree_panel::list_render::suggest_worktree_path(
+                            &project_root,
+                            &slug,
+                        ),
+                    );
+                    let workspace_repo = this.app_state.workspace_repo.clone();
+                    let project_id = project.id.clone();
+                    cx.spawn(async move |weak_root, cx| {
+                        use crate::shell::workspace_ops::{
+                            ChatWorktreeOutcome, CreateOutcome, create_workspace_with_rollback,
+                        };
+                        // `name` = slug: the human label derived from the branch
+                        // slug (collision handled inside `insert`).
+                        let outcome = create_workspace_with_rollback(
+                            &project_root,
+                            &project_id,
+                            &slug,
+                            &slug,
+                            &worktree_path,
+                            None,
+                            &workspace_repo,
+                        )
+                        .await;
+                        let chat_outcome = match outcome {
+                            CreateOutcome::Created(ws) => ChatWorktreeOutcome::Created {
+                                path: std::path::PathBuf::from(&ws.worktree_path),
+                                branch: ws.branch.clone(),
+                            },
+                            CreateOutcome::GitFailed(msg) => ChatWorktreeOutcome::GitFailed(msg),
+                            CreateOutcome::StorageFailedRollbackClean(err) => {
+                                ChatWorktreeOutcome::GitFailed(err.to_string())
+                            }
+                            CreateOutcome::StorageFailedRollbackDirty {
+                                insert_error,
+                                rollback_error,
+                            } => ChatWorktreeOutcome::GitFailed(format!(
+                                "{insert_error}; rollback: {rollback_error}"
+                            )),
+                        };
+                        // Refresh the rail so the new workspace card + ⌘J entry
+                        // appear without a manual reload.
+                        let _ = weak_root.update(cx, |root, cx| root.mark_rail_dirty(cx));
+                        // Hand the outcome to the chat: on success it rebinds cwd
+                        // and resumes the staged send; on failure it surfaces the
+                        // error banner with Retry / continue-without-worktree.
+                        let _ = weak_view
+                            .update(cx, |v, cx| v.on_worktree_create_outcome(chat_outcome, cx));
+                    })
+                    .detach();
+                },
+            ))
             .on_action(cx.listener(|this, _: &OpenQuickOpen, window, cx| {
                 // Mutex with every other full-window overlay (close-then-open).
                 this.close_modal_overlays(cx);

@@ -294,6 +294,7 @@ impl SessionHistoryPanel {
             cwd: cwd.to_string(),
             // This panel lists only Claude sessions (filtered at build time).
             adapter: AgentAdapter::ClaudeCode,
+            preset_id: None,
         };
         col.child(
             div().flex().flex_row().pt(px(2.0)).child(
@@ -350,6 +351,8 @@ impl SessionHistoryPanel {
                 path: entry.path.clone().unwrap_or_default(),
                 cwd,
                 adapter: entry.adapter,
+                // This panel lists only Claude sessions.
+                preset_id: None,
             }),
             cx,
         );
@@ -698,6 +701,7 @@ fn build_session_menu(menu: PopupMenu, sid: String, path: String, cwd: String) -
                         cwd: open_cwd.clone(),
                         // This panel lists only Claude sessions.
                         adapter: AgentAdapter::ClaudeCode,
+                        preset_id: None,
                     }),
                     cx,
                 );

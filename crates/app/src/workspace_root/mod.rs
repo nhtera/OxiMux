@@ -77,6 +77,7 @@ use crate::actions::{
     ApplyLayoutStacked, CloseGroup, CloseTab, DismissOverlay, MoveTabToNewWindow,
     OpenAddProjectDialog, OpenComposerBar,
     OpenCommandPalette, OpenCommitContextMenuAt, OpenCommitDialog, OpenFileFromContextMenu,
+    CreateWorktreeWorkspaceForActiveChat,
     OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
     NewBrowserTab, NewTab, OpenChatSession, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory,
     OpenSettings,

@@ -355,6 +355,23 @@ pub async fn create_workspace_with_rollback(
     }
 }
 
+/// Outcome the *New Agent in a fresh worktree* flow hands back to the chat view.
+/// The host resolves the worktree create as a first-class `Workspace` (DB row +
+/// git worktree via [`create_workspace_with_rollback`]) and maps its richer
+/// [`CreateOutcome`] down to this shape, which the chat's
+/// `on_worktree_create_outcome` consumes to rebind its cwd / surface an error.
+#[derive(Debug, Clone)]
+pub enum ChatWorktreeOutcome {
+    /// Worktree + branch + `Workspace` row created; the chat binds to `path`.
+    Created { path: PathBuf, branch: String },
+    /// `slug` failed [`validate_slug`] — surfaced before any IO ran.
+    InvalidSlug(String),
+    /// The git step OR the storage insert failed (rollback attempted); carries
+    /// the underlying message so the chat can offer inline retry or the
+    /// "continue without a worktree" fallback.
+    GitFailed(String),
+}
+
 /// Resolve the static adapter slug used by `start_session` for each
 /// built-in agent variant. Inline 4-arm match — KISS over adding a
 /// method to `oximux-core`.

@@ -70,6 +70,26 @@ use gpui_component::scroll::Scrollbar;
 /// text edge-to-edge — the calm, focused feel of a dedicated chat surface.
 pub(super) const CONTENT_MAX_W: f32 = 720.0;
 
+/// One direct child of the scrolling transcript: a reading-measure column,
+/// `width` px wide. Callers pass [`AgentChatView::content_width`].
+///
+/// The **definite** width is load-bearing, and the obvious spelling
+/// (`w_full().max_w(px(CONTENT_MAX_W))`) is what this must never go back to.
+/// Under that spelling taffy sizes the column's height against the container's
+/// *available* width and only clamps to the max-width afterwards — so a reply
+/// measured across the full pane re-wraps into more lines once it is capped to
+/// the reading measure, and paints those extra lines outside the height it
+/// reported. The turn below then draws on top of the tail (a ~475px reply
+/// reporting 400px was the observed case). Sizing the column to one already-
+/// capped number keeps measure width == paint width, so a reply's box always
+/// matches the text in it.
+///
+/// `flex().flex_col()` matters too: a bare block lets a wide bubble escape the
+/// column.
+fn transcript_column(width: f32) -> gpui::Div {
+    div().flex().flex_col().flex_shrink_0().w(px(width))
+}
+
 /// Width of the left timeline gutter (the message tick-rail). The reading column
 /// sits to its right; overlays (jump dropdown, hover preview) offset by this.
 pub(super) const RAIL_W: f32 = 30.0;
@@ -214,6 +234,25 @@ pub enum AgentChatEvent {
     /// at `cwd` so the user can run `/login`. Carries the CLI adapter id so the
     /// host picks the right binary.
     OpenLoginTerminalRequested { adapter_id: &'static str, cwd: PathBuf },
+    /// A *New Agent* draft with the worktree toggle armed just sent its first
+    /// message: the leaf has no `WorkspaceRepo`, so it asks the host to create a
+    /// fresh worktree **as a first-class `Workspace`** (DB row + git worktree via
+    /// `create_workspace_with_rollback`). The host dispatches
+    /// `CreateWorktreeWorkspaceForActiveChat`, which routes up to `WorkspaceRoot`;
+    /// the outcome comes back through [`AgentChatView::on_worktree_create_outcome`],
+    /// which rebinds this draft's cwd and resumes the staged send.
+    WorktreeWorkspaceRequested { slug: String },
+    /// An import-bridge tab's "Resume in terminal" control was clicked: the host
+    /// should spawn the provider's own PTY resume (via `ResumeAgentSession` →
+    /// `import_resume_command`). Routed as an event (not a direct
+    /// `window.dispatch_action` from the render closure, which does not reach the
+    /// host's action handlers) — the same seam `OpenLoginTerminalRequested` uses.
+    ResumeInTerminalRequested {
+        preset_id: String,
+        resume_handle: String,
+        session_id: String,
+        cwd: PathBuf,
+    },
     /// A live chat turn reached a state the user should be told about while they
     /// may be looking elsewhere — the turn finished / errored, or it paused on a
     /// permission / question / auth prompt. The host (which owns the notifier +
@@ -377,6 +416,27 @@ use oximux_git::GitCmd;
 use oximux_pty::TerminalSessionId;
 use oximux_settings::{AgentLaunchSettings, Density, Theme, Typography};
 
+/// A transcript-only **import bridge**: an OpenCode / Pi session opened as a
+/// chat tab for its history, with NO live connection (these providers have no
+/// in-app chat backend). The composer is swapped for a "Resume in terminal"
+/// action that re-dispatches the provider's own PTY resume via
+/// [`crate::actions::ResumeAgentSession`]. Mirrors the terminal-resume bridge
+/// pattern: read the past turns here, continue the session in a terminal.
+#[derive(Clone, Debug)]
+pub struct ImportBridge {
+    /// Import-provider preset id (`opencode`/`pi`) — routes the resume dispatch.
+    pub preset_id: String,
+    /// The session id the row was scanned under (OpenCode/Pi).
+    pub session_id: String,
+    /// The provider's native resume handle (OpenCode session id / Pi rollout
+    /// path) fed to `import_resume_command`.
+    pub resume_handle: String,
+    /// Where the terminal resume should root.
+    pub cwd: PathBuf,
+    /// Human provider label for the footer note ("imported OpenCode session…").
+    pub provider_display: String,
+}
+
 pub struct AgentChatView {
     /// The conversation model. Owned directly (not a nested entity) — the view
     /// is its sole mutator, on the foreground thread.
@@ -471,6 +531,16 @@ pub struct AgentChatView {
     /// config → drop) fills these off-thread on agent pick; Claude isn't here
     /// (its models are static in the roster). Only consulted while `unbound`.
     probed_catalogs: HashMap<String, ProbeState>,
+    /// Whether picking an agent may run a *live* catalog probe — i.e. spawn the
+    /// real agent binary on a throwaway thread. True for every real view; false
+    /// for the test constructor, which injects a `StubConnection` precisely so no
+    /// subprocess is spawned. Without this seam `change_agent` reaches straight
+    /// past the injected connection to the real binary: the probe thread is a raw
+    /// `std::thread::spawn` that outlives the `#[gpui::test]` scheduler, so its
+    /// completion lands during a LATER test and gpui aborts the process for
+    /// non-determinism. The probe's result is discarded in that state anyway — a
+    /// draft on a stub has no real catalog to show.
+    probe_catalogs_live: bool,
     /// Whether the tab shows the chat or its companion terminal.
     view_mode: ChatViewMode,
     /// Companion interactive terminal — the same agent session resumed in a raw
@@ -625,6 +695,38 @@ pub struct AgentChatView {
     /// group already owns this view's `Entity`). `None` in tests / standalone use,
     /// which simply omits the terminal sources.
     pane_group: Option<WeakEntity<PaneGroup>>,
+    /// True when `cwd` sits inside a git repo, checked once at construction via
+    /// a cheap `.git` stat (the same heuristic `workspaces_with_primary_for`
+    /// uses for the synthesized primary-row check). Gates the *New Agent*
+    /// draft's "Run in a fresh worktree" toggle — hidden entirely for a
+    /// non-git project, since `git worktree add` can't possibly work there.
+    is_git_project: bool,
+    /// While `unbound`: the user has opted into running this draft's first send
+    /// inside a freshly created git worktree (branch `oximux/<slug>`) instead of
+    /// the project root. Cleared once the worktree exists (or the user opts out
+    /// via the failure banner's "continue without a worktree" fallback).
+    worktree_draft_enabled: bool,
+    /// Slug text input for the worktree toggle, created lazily when the toggle
+    /// turns on and dropped when it turns off (mirrors `env_inputs`'s
+    /// create-on-demand pattern). `None` while the toggle is off.
+    worktree_slug_input: Option<Entity<InputState>>,
+    /// Repaints the chat on every keystroke in the slug field so the live
+    /// `oximux/<slug>` / validation-error preview stays in sync.
+    _worktree_slug_sub: Option<Subscription>,
+    /// State of the last worktree-create attempt for this draft.
+    worktree_create_state: roster::WorktreeCreateState,
+    /// The message staged while a worktree create is in flight (or has
+    /// failed) — resent automatically on success, or via the failure banner's
+    /// "continue without a worktree" fallback. Cleared once actually sent.
+    pending_worktree_send: Option<(String, Vec<ChatImage>)>,
+    /// `oximux/<slug>` once the worktree exists, folded into the post-bind tab
+    /// label (see `bind_now`) so the tab shows the branch, not just the
+    /// picked agent's name.
+    worktree_branch_label: Option<String>,
+    /// `Some` for an OpenCode / Pi **import bridge** tab: transcript seeded, no
+    /// live connection, composer swapped for Resume-in-terminal. Gated strictly
+    /// so it never touches the live chat paths (send / respawn are no-ops).
+    import_bridge: Option<ImportBridge>,
 }
 
 /// Compute, for each USER turn in order, its child index within the flattened
@@ -785,6 +887,51 @@ impl AgentChatView {
         view
     }
 
+    /// Construct a transcript-only **import bridge** for an OpenCode / Pi
+    /// session: seed the transcript, but spawn NO subprocess (`connect_now:
+    /// false`) — these providers have no in-app chat backend. Unlike a *New
+    /// Agent* draft (also connection-less), this is not `unbound`: the composer
+    /// is swapped for a Resume-in-terminal action ([`Self::import_bridge`]), and
+    /// `send_text` is a no-op, so it can never masquerade as a live chat.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_import_bridge(
+        cwd: PathBuf,
+        entries: Vec<ThreadEntry>,
+        bridge: ImportBridge,
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // Seed the transcript with no session id (no `--resume` this view can
+        // drive) and the Claude backend as an inert placeholder — it's never
+        // connected (`connect_now: false`). The placeholder must not leak into
+        // the UI: `provider_label` reads the bridge's own name, so bubbles are
+        // captioned with the provider the transcript actually came from.
+        let thread = ChatThread::rehydrated(None, None, entries, Vec::new());
+        let mut view = Self::assemble(
+            cwd,
+            None,
+            ChatBackend::stream_json(),
+            thread,
+            false,
+            None,
+            theme,
+            density,
+            typography,
+            window,
+            cx,
+        );
+        // A bridge is NOT the New-Agent draft: clear the unbound picker shape so
+        // it never offers agent selection / worktree toggle / a live send.
+        view.unbound = false;
+        view.unbound_agent_id = None;
+        view.title_generated = true;
+        view.import_bridge = Some(bridge);
+        view
+    }
+
     /// Shared construction for [`new`]/[`new_resumed`]: wire the composer, spawn
     /// the subprocess (resuming when `thread.session_id` is set), and start the
     /// event drain. A spawn failure degrades to a read-only error state so the
@@ -809,6 +956,10 @@ impl AgentChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Cheap, sync `.git` stat (not an async `Repository::open`) — this
+        // only gates whether the *New Agent* draft's worktree toggle renders
+        // at all, run on every construction so it's ready before first paint.
+        let is_git_project = cwd.join(".git").exists();
         let composer = cx.new(|cx| {
             ComposerView::new(
                 theme,
@@ -1029,6 +1180,7 @@ impl AgentChatView {
             unbound: !connect_now,
             unbound_agent_id,
             probed_catalogs: HashMap::new(),
+            probe_catalogs_live: true,
             view_mode: ChatViewMode::Chat,
             terminal: None,
             companion_session: None,
@@ -1071,6 +1223,14 @@ impl AgentChatView {
             menu_hover: false,
             title_generated: false,
             title_task: None,
+            is_git_project,
+            worktree_draft_enabled: false,
+            worktree_slug_input: None,
+            _worktree_slug_sub: None,
+            worktree_create_state: roster::WorktreeCreateState::default(),
+            pending_worktree_send: None,
+            worktree_branch_label: None,
+            import_bridge: None,
         }
     }
 
@@ -1093,7 +1253,15 @@ impl AgentChatView {
     /// permission prompts ("Claude" for stream-json, "Codex" for app-server).
     /// Sourced from the transport (fixed at launch) so it's correct even before a
     /// connection exists — the empty state and composer render immediately.
-    fn provider_label(&self) -> &'static str {
+    ///
+    /// An import bridge is the exception: it has no live backend, so it assembles
+    /// on an inert stream-json placeholder whose name ("Claude") would caption
+    /// every bubble of a transcript that is demonstrably *not* Claude's. Its own
+    /// provider name is authoritative there.
+    fn provider_label(&self) -> &str {
+        if let Some(bridge) = self.import_bridge.as_ref() {
+            return &bridge.provider_display;
+        }
         self.backend.provider_display_name()
     }
 
@@ -1152,6 +1320,24 @@ impl AgentChatView {
     /// "New Agent" and to skip persisting the empty draft.
     pub fn is_unbound(&self) -> bool {
         self.unbound
+    }
+
+    /// Whether this is a transcript-only import bridge (OpenCode/Pi). The host
+    /// reads this to skip persisting the tab — a bridge has no live session id,
+    /// so restoring it through the normal resumed-chat path would spawn a live
+    /// subprocess and drop the imported transcript; it re-opens from Session
+    /// History instead (like Diff/Tasks tabs).
+    pub fn is_import_bridge(&self) -> bool {
+        self.import_bridge.is_some()
+    }
+
+    /// `(preset_id, session_id)` identity of an import bridge tab, for reopen
+    /// dedup (a bridge thread carries no `session_id()` to key on). `None` for
+    /// non-bridge chats.
+    pub fn import_bridge_key(&self) -> Option<(&str, &str)> {
+        self.import_bridge
+            .as_ref()
+            .map(|b| (b.preset_id.as_str(), b.session_id.as_str()))
     }
 
     /// The unsent composer draft text, for the layout snapshot (so a typed but
@@ -1396,9 +1582,17 @@ impl AgentChatView {
     fn sync_composer(&self, cx: &mut Context<Self>) {
         // A rewind in flight — or a pending ACP auth prompt (the session can't
         // accept input until the user signs in) — disables the composer just like
-        // a disconnect until it resolves.
-        let (disconnected, turn_active) =
-            (self.disconnected || self.rewinding || self.auth.is_some(), self.thread.turn_active);
+        // a disconnect until it resolves. A worktree create in flight (or one
+        // that failed with a message still staged) folds in the same way: the
+        // composer's own `submit()` short-circuits on `disconnected` before it
+        // ever emits a second `Submit`, which is what keeps a second distinct
+        // send from falling through `send_text`'s `bind_now` at the ORIGINAL
+        // cwd while the worktree step is still pending (HIGH finding).
+        let worktree_busy = !matches!(self.worktree_create_state, roster::WorktreeCreateState::Idle);
+        let (disconnected, turn_active) = (
+            self.disconnected || self.rewinding || self.auth.is_some() || worktree_busy,
+            self.thread.turn_active,
+        );
         // Advertise controls by capability, not by hard-coding the provider.
         let caps = self
             .connection
@@ -1545,11 +1739,15 @@ impl AgentChatView {
 
     /// Kick off a throwaway catalog probe for the picked agent so the draft's
     /// model picker can fill before the user commits. No-op for an agent with a
-    /// static roster list (Claude) or one already probed/probing. The blocking
+    /// static roster list (Claude), one already probed/probing, or a view with
+    /// [`Self::probe_catalogs_live`] off (tests). The blocking
     /// probe runs on a dedicated thread — the connection spawns its own workers,
     /// so no GPUI executor or tokio reactor is touched — and its result is folded
     /// back on the UI thread, re-syncing the composer only if the pick still holds.
     fn maybe_probe_catalog(&mut self, id: String, cx: &mut Context<Self>) {
+        if !self.probe_catalogs_live {
+            return; // a view built on a stub connection has no real binary to probe
+        }
         if self.probed_catalogs.contains_key(&id) {
             return; // already probing, ready, or a settled failure — don't re-run
         }
@@ -1637,6 +1835,12 @@ impl AgentChatView {
     /// Record + transmit a submitted prompt (from the composer's Submit event).
     /// The composer has already cleared its own input.
     fn send_text(&mut self, text: String, images: Vec<ChatImage>, cx: &mut Context<Self>) {
+        // An import bridge has no live backend — its composer is swapped for
+        // Resume-in-terminal, so no send path should ever construct here. Guard
+        // defensively in case a stray Submit event slips through.
+        if self.import_bridge.is_some() {
+            return;
+        }
         if text.is_empty() && images.is_empty() {
             return;
         }
@@ -1647,6 +1851,35 @@ impl AgentChatView {
         if images.is_empty() && text.trim() == "/clear" {
             self.new_chat(cx);
             return;
+        }
+        // Unbound draft with the worktree toggle armed: the FIRST send creates
+        // the worktree (an async git op) before any subprocess spawns, then
+        // resumes this exact send once it lands — see `start_worktree_then_send`.
+        if self.unbound && self.worktree_draft_enabled {
+            match self.worktree_create_state {
+                roster::WorktreeCreateState::Idle => {
+                    self.start_worktree_then_send(text, images, cx);
+                    return;
+                }
+                roster::WorktreeCreateState::Creating | roster::WorktreeCreateState::Failed(_) => {
+                    // A create is already in flight for an earlier staged
+                    // message, or one failed and is awaiting Retry / "continue
+                    // without a worktree". A second distinct Submit must NEVER
+                    // fall through to `bind_now` below — that would silently
+                    // bind at the ORIGINAL cwd (defeating the toggle) and, once
+                    // the in-flight create landed, `on_worktree_create_outcome`
+                    // would re-send the FIRST staged message into that
+                    // now-wrongly-bound session — duplicated, out-of-order
+                    // sends plus an orphaned worktree (HIGH finding). In normal
+                    // use this is unreachable — `sync_composer` folds this state
+                    // into the composer's own `disconnected`, so its `submit()`
+                    // already refuses a second Submit before this method is
+                    // even called. This is the defense-in-depth backstop: drop
+                    // the new text/images rather than clobbering the message
+                    // already staged in `pending_worktree_send`.
+                    return;
+                }
+            }
         }
         // First message on an unbound *New Agent* draft: spawn the picked agent
         // now (deferred binding), then send into the fresh session. A bind failure
@@ -2304,9 +2537,16 @@ impl AgentChatView {
         // `provider_display_name` (ACP → "Agent"). Falls back to the transport
         // name if the roster can't resolve it. A user rename still wins; see the
         // host's `TitleChanged` handling.
-        let label = self
+        let mut label = self
             .unbound_agent_display(cx)
             .unwrap_or_else(|| self.backend.provider_display_name().to_string());
+        // A worktree-bound draft (see `start_worktree_then_send`) folds its
+        // branch into the same label, read once here at bind time — no new
+        // poller, matching the "read once at create + on workspace activation"
+        // requirement.
+        if let Some(branch) = &self.worktree_branch_label {
+            label = format!("{label} · {branch}");
+        }
         cx.emit(AgentChatEvent::TitleChanged(label));
     }
 
@@ -2669,6 +2909,8 @@ impl AgentChatView {
             backend: ChatBackend::stream_json(),
             composer,
             probed_catalogs: HashMap::new(),
+            // The injected StubConnection is the whole point: no subprocess.
+            probe_catalogs_live: false,
             focus_handle: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
             stick_to_bottom: true,
@@ -2732,6 +2974,14 @@ impl AgentChatView {
             menu_hover: false,
             title_generated: false,
             title_task: None,
+            is_git_project: false,
+            worktree_draft_enabled: false,
+            worktree_slug_input: None,
+            _worktree_slug_sub: None,
+            worktree_create_state: roster::WorktreeCreateState::default(),
+            pending_worktree_send: None,
+            worktree_branch_label: None,
+            import_bridge: None,
         }
     }
 
@@ -2745,6 +2995,24 @@ impl AgentChatView {
         self.unbound_agent_id = Some("claude-code".to_string());
         self.backend = ChatBackend::stream_json();
         self.model = Some("opus".to_string());
+    }
+
+    /// Test-only: override `is_git_project` — the real constructor derives it
+    /// from a `.git` stat on `cwd`, which a `#[gpui::test]`'s throwaway path
+    /// never has, so tests that need the worktree-toggle to render set it here.
+    #[cfg(test)]
+    fn set_git_project_for_test(&mut self, is_git: bool) {
+        self.is_git_project = is_git;
+    }
+
+    #[cfg(test)]
+    fn worktree_draft_enabled_for_test(&self) -> bool {
+        self.worktree_draft_enabled
+    }
+
+    #[cfg(test)]
+    fn worktree_create_state_for_test(&self) -> &roster::WorktreeCreateState {
+        &self.worktree_create_state
     }
 
     #[cfg(test)]
@@ -3960,6 +4228,23 @@ impl AgentChatView {
         )
     }
 
+    /// The width every transcript child is built at: the reading measure
+    /// ([`CONTENT_MAX_W`]) on a roomy pane, or the pane itself once it is
+    /// narrower (a split pane, a dragged-in window edge).
+    ///
+    /// This is resolved here, in the view, rather than left to
+    /// `max_w(px(CONTENT_MAX_W))` on the children, because the children's text
+    /// must be *measured* at the width it will *paint* at — see
+    /// [`transcript_column`]. The scroll box's own width is the only reading of
+    /// "how much room is there", and it is last frame's: a fresh view has no
+    /// bounds yet and a resize lands one frame late, so fall back to the cap and
+    /// let the next frame settle it. No feedback loop — the scroll box is
+    /// full-width regardless of what its children ask for.
+    fn content_width(&self) -> f32 {
+        let painted = f32::from(self.list_scroll.bounds().size.width) - self.density.pad_panel * 2.0;
+        if painted <= 0.0 { CONTENT_MAX_W } else { painted.min(CONTENT_MAX_W) }
+    }
+
     /// The scrollable transcript column. Entries stack in a centered reading
     /// column ([`CONTENT_MAX_W`]) so wide windows don't stretch text edge-to-
     /// edge; the outer element only scrolls and centers.
@@ -3967,6 +4252,7 @@ impl AgentChatView {
         let theme = self.theme;
         let density = self.density;
         let typo = self.typography.clone();
+        let content_w = self.content_width();
         let scroll = div()
             .id("agent-chat-list")
             .flex()
@@ -3982,6 +4268,8 @@ impl AgentChatView {
             // the scroll offset. Pinning min-height to 0 lets it shrink so
             // `overflow_y_scroll` actually bounds the box to the visible area.
             .min_h(px(0.0))
+            // Same reasoning on the cross axis — see the note in `wrap_scroll`.
+            .min_w_0()
             .px(px(density.pad_panel))
             .py(px(density.pad_panel))
             .overflow_y_scroll()
@@ -4014,11 +4302,7 @@ impl AgentChatView {
             // runs once there are entries) and the empty greeting would shadow it.
             let body = if self.auth.is_some() {
                 let card = self.render_auth_card(cx);
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .max_w(px(CONTENT_MAX_W))
+                transcript_column(content_w)
                     .child(card)
                     .into_any_element()
             } else {
@@ -4224,7 +4508,7 @@ impl AgentChatView {
         for row in rows {
             if let Some(el) = row.el {
                 let mut wrap =
-                    div().flex().flex_col().w_full().max_w(px(CONTENT_MAX_W)).child(el);
+                    transcript_column(content_w).child(el);
                 if row.dimmed {
                     // A staged edit dims the messages it will remove on send.
                     wrap = wrap.opacity(0.4);
@@ -4241,7 +4525,7 @@ impl AgentChatView {
             }
             if let Some(expander) = row.expander {
                 scroll = scroll.child(
-                    div().flex().flex_col().w_full().max_w(px(CONTENT_MAX_W)).child(expander),
+                    transcript_column(content_w).child(expander),
                 );
             }
         }
@@ -4250,11 +4534,7 @@ impl AgentChatView {
         // across turns until cleared. Reuses the `TodoWrite` checklist renderer.
         if let Some(entries) = self.thread.plan.as_ref().filter(|e| !e.is_empty()) {
             scroll = scroll.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .max_w(px(CONTENT_MAX_W))
+                transcript_column(content_w)
                     .child(plan_panel::render_plan_entries(entries, theme, density, &typo)),
             );
         }
@@ -4272,11 +4552,7 @@ impl AgentChatView {
                 .unwrap_or_else(|| "Agent process exited.".to_string());
             let retry = self.retry_button(cx);
             scroll = scroll.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .max_w(px(CONTENT_MAX_W))
+                transcript_column(content_w)
                     .child(error_card::error_card(&msg, theme, &typo, retry)),
             );
         } else if self.auth.is_some() {
@@ -4287,7 +4563,7 @@ impl AgentChatView {
             // EnvVar-auth respawn clears `self.auth`, so the two never coexist.)
             let card = self.render_auth_card(cx);
             scroll = scroll.child(
-                div().flex().flex_col().w_full().max_w(px(CONTENT_MAX_W)).child(card),
+                transcript_column(content_w).child(card),
             );
         } else if self.thread.turn_active {
             // While a question card is pending, the agent isn't working — it's
@@ -4303,7 +4579,7 @@ impl AgentChatView {
                     working_indicator(self.provider_label(), theme, &typo)
                 };
                 scroll = scroll.child(
-                    div().flex().flex_col().w_full().max_w(px(CONTENT_MAX_W)).child(indicator),
+                    transcript_column(content_w).child(indicator),
                 );
             }
         } else if self.is_signed_out() && self.login_adapter_id().is_some() {
@@ -4314,11 +4590,7 @@ impl AgentChatView {
             // actionable version of the same state.
             let action = self.open_login_terminal_button(cx);
             scroll = scroll.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .max_w(px(CONTENT_MAX_W))
+                transcript_column(content_w)
                     .child(login_card::login_card(self.provider_label(), theme, &typo, action)),
             );
         } else if let Some(err) = self.thread.last_error.clone() {
@@ -4328,11 +4600,7 @@ impl AgentChatView {
             // `last_error` only paints when the transcript is empty.
             let retry = self.retry_button(cx);
             scroll = scroll.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .max_w(px(CONTENT_MAX_W))
+                transcript_column(content_w)
                     .child(error_card::error_card(&err, theme, &typo, retry)),
             );
         } else {
@@ -4346,59 +4614,31 @@ impl AgentChatView {
                 .filter(|s| !s.is_empty())
             {
                 scroll = scroll.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .w_full()
-                        .max_w(px(CONTENT_MAX_W))
+                    transcript_column(content_w)
                         .child(summary_line(summary, theme, &typo)),
                 );
             }
             if let Some(usage) = self.thread.usage.as_ref() {
                 scroll = scroll.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .w_full()
-                        .max_w(px(CONTENT_MAX_W))
+                    transcript_column(content_w)
                         .child(usage_footer(usage, theme, &typo)),
                 );
             }
         }
-        // Trailing clearance INSIDE the scrollable content, above the composer.
-        // `scroll_to_bottom` pins the offset to gpui's `scroll_max`, derived from
-        // the content height sampled at layout. The catch: gpui-component's
-        // markdown reports a height that counts only its FIRST block — the rest of
-        // a multi-paragraph reply paints correctly but falls OUTSIDE the measured
-        // `content_size` (only the last message is affected; earlier ones sit
-        // above enough content to stay in range). The scroll box clips at its own
-        // viewport, not at `content_size`, so the fix is to add enough real
-        // scrollable room below the last message that scroll-to-bottom can bring
-        // the whole reply — overflow and all — up into the viewport. Size that
-        // room to the last reply's under-counted tail so short replies keep a
-        // tight bottom margin while long ones are fully reachable.
+        // Trailing clearance INSIDE the scrollable content, above the composer:
+        // a plain breathing margin below the last line. It used to carry a second,
+        // much larger term estimating a reply's "under-counted tail", back when a
+        // multi-paragraph reply painted past the height it reported and
+        // `scroll_to_bottom` — which pins to gpui's `scroll_max`, derived from the
+        // measured content height — could not reach the end of it. Transcript
+        // children are now measured at the width they paint at (see
+        // [`transcript_column`]), so the measured content height is the real one
+        // and no extra reveal room is needed. A pending question keeps a roomier
+        // margin so its Allow/Reject controls clear the composer.
         let tail_gap = if self.thread.pending_question().is_some() {
             px(160.0)
         } else {
-            // `base` is the breathing margin below the last line; `reveal` is the
-            // extra scroll room a multi-block reply needs to bring its under-
-            // counted tail into view. Stack them so the reveal room is always
-            // topped with a consistent margin (the reveal estimate alone can land
-            // flush against the composer), while keeping the estimate un-inflated
-            // so the bottom gap stays modest.
-            let base = density.pad_panel * 4.0;
-            let reveal = self
-                .thread
-                .entries
-                .iter()
-                .rev()
-                .find_map(|e| match e {
-                    ThreadEntry::Assistant(m) if !m.text.is_empty() => Some(m.text.as_str()),
-                    _ => None,
-                })
-                .map(|t| markdown_reveal_gap(t, &typo))
-                .unwrap_or(0.0);
-            px(base + reveal)
+            px(density.pad_panel * 4.0)
         };
         scroll = scroll.child(div().flex_none().w_full().h(tail_gap));
         // Compose the timeline row: the left tick-rail, the scrolling transcript,
@@ -4430,6 +4670,17 @@ impl AgentChatView {
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
+            // The horizontal twin of `min_h(0)`, and just as load-bearing. A flex
+            // item defaults to `min-width: auto`, i.e. "never shrink below my
+            // content's min-content width" — and the transcript's children are
+            // sized to a definite width taken from THIS box's measured width
+            // ([`AgentChatView::content_width`]). Leave the default on and the two
+            // feed each other: the children pin the box open at the reading
+            // measure, the box reports that width back, and a pane narrower than
+            // the measure never shrinks — it just clips the text. Zeroing the
+            // min-width breaks the cycle, so the box always reports the room it
+            // actually has.
+            .min_w_0()
             .child(scroll_box)
             .child(Scrollbar::vertical(&self.list_scroll))
     }
@@ -4584,6 +4835,9 @@ impl Render for AgentChatView {
         // Build (or tear down) the masked secret fields for an EnvVar-auth card —
         // here because `InputState::new` needs the `Window` the event fold lacks.
         self.reconcile_env_inputs(window, cx);
+        // Same reconcile-on-demand pattern for the *New Agent* draft's worktree
+        // slug field (needs `Window` too).
+        self.reconcile_worktree_slug_input(window, cx);
         // Keyboard focus must live on the composer, not this view's root. The
         // pane focuses the composer on open, but an inline focus during action/
         // click dispatch is clobbered onto the root's tracked handle — so
@@ -4776,50 +5030,23 @@ impl Render for AgentChatView {
             // any open confirm).
             .children(self.render_pending_edit_banner(window, cx))
             .children(self.render_rewind_confirm(window, cx))
-            .child(self.composer.clone())
+            // *New Agent* draft only: "Run in a fresh worktree" toggle + slug
+            // field + create-state feedback, hidden once bound or non-git.
+            .children(self.render_worktree_toggle(cx))
+            // An import bridge swaps the live composer for a Resume-in-terminal
+            // footer (no in-app backend to send to); every other chat renders the
+            // real composer.
+            .child(if self.import_bridge.is_some() {
+                self.render_import_bridge_footer(cx).into_any_element()
+            } else {
+                self.composer.clone().into_any_element()
+            })
             // The image lightbox overlays everything when a thumbnail is opened.
             .children(self.render_image_preview(cx))
             // The fullscreen tool-payload sheet overlays everything when open.
             .children(self.render_tool_sheet(cx))
             .into_any_element()
     }
-}
-
-/// Estimate the extra scrollable room needed to reveal a reply's under-counted
-/// tail (see the tail-gap comment in `render_transcript`). gpui-component's
-/// markdown folds only its FIRST block into the measured height; the remaining
-/// blocks paint but sit past `content_size`, so scroll-to-bottom can't bring them
-/// into view without extra room. This returns a padded over-estimate of those
-/// trailing blocks' height — a text heuristic (wrapped lines × line height plus a
-/// per-block gap), biased high so a slightly-off estimate errs toward a hair of
-/// bottom slack rather than re-clipping, and capped so a runaway reply can't
-/// reserve an absurd gap. A single-block reply reserves nothing (it measures
-/// whole), keeping its bottom margin tight.
-fn markdown_reveal_gap(body: &str, typo: &Typography) -> f32 {
-    let Some((_, rest)) = body.split_once("\n\n") else {
-        return 0.0;
-    };
-    let rest = rest.trim();
-    if rest.is_empty() {
-        return 0.0;
-    }
-    // Roughly the chars that fit on one line of the reading column at the body
-    // font size, times a per-line height plus a per-block gap. The markdown body
-    // renders at ~2x the font size per line (line + inter-line leading), so the
-    // reveal tracks that rather than a tight 1.5x — a smaller factor lands the
-    // gap just short of the reply's last line. Capped so a runaway reply can't
-    // reserve an absurd gap.
-    let chars_per_line = (CONTENT_MAX_W / (typo.t_body_md * 0.5)).max(1.0);
-    let line_height = typo.t_body_md * 2.0;
-    let mut lines = 0.0f32;
-    let mut blocks = 0.0f32;
-    for block in rest.split("\n\n") {
-        blocks += 1.0;
-        for raw in block.lines() {
-            lines += (raw.chars().count() as f32 / chars_per_line).ceil().max(1.0);
-        }
-    }
-    (lines * line_height + blocks * typo.t_body_md).min(1100.0)
 }
 
 /// A live "<provider> is working…" row shown at the tail of the transcript while
@@ -5266,27 +5493,6 @@ mod tests {
         assert!(entry_child_indices(&[], &[], &[]).is_empty());
     }
 
-    #[test]
-    fn markdown_reveal_gap_zero_for_single_block_and_scales_with_tail() {
-        let typo = Typography::default();
-        // A single-block reply is measured whole → no extra reveal room.
-        assert_eq!(markdown_reveal_gap("just one paragraph, no blank line", &typo), 0.0);
-        assert_eq!(markdown_reveal_gap("", &typo), 0.0);
-        // The blocks AFTER the first drive the gap; more trailing text → more room.
-        let one_tail = markdown_reveal_gap("first\n\nsecond paragraph", &typo);
-        let two_tails =
-            markdown_reveal_gap("first\n\nsecond paragraph\n\nthird paragraph here", &typo);
-        assert!(one_tail > 0.0);
-        assert!(two_tails > one_tail);
-        // Runaway replies are capped so the tail can't reserve an absurd gap.
-        let huge = "first\n\n".to_string() + &"x ".repeat(20_000);
-        assert!(markdown_reveal_gap(&huge, &typo) <= 1100.0);
-    }
-
-    /// The spike's central fail-closed requirement: if the agent channel
-    /// disconnects (process exit / EOF) while a permission is pending, the view
-    /// rejects it — clearing the prompt and sending a best-effort deny — rather
-    /// than leaving a dangling approval.
     #[gpui::test]
     async fn disconnect_fails_closed_pending_permission(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
@@ -6295,6 +6501,82 @@ mod tests {
             .expect("window update");
     }
 
+    /// Picking a dynamic-model agent on a test view must NOT start a live catalog
+    /// probe. The probe spawns the real agent binary on a raw `std::thread`, which
+    /// reaches past the injected `StubConnection` and — being owned by no executor
+    /// — outlives this test; its completion then lands mid-way through a LATER
+    /// test and gpui aborts the whole run for scheduler non-determinism. An empty
+    /// `probed_catalogs` is the observable proof no probe was started.
+    #[gpui::test]
+    async fn draft_agent_pick_does_not_start_a_live_catalog_probe(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.make_unbound_for_test();
+                // Codex/ACP are exactly the dynamic-model agents a live probe targets.
+                view.change_agent("codex".into(), cx);
+                view.change_agent("opencode".into(), cx);
+                assert!(
+                    view.probed_catalogs.is_empty(),
+                    "a stub-connection view must not spawn a live catalog probe"
+                );
+            })
+            .expect("window update");
+    }
+
+    /// An import bridge captions its bubbles with the provider the transcript
+    /// actually came from, not the inert stream-json placeholder it assembles on
+    /// — otherwise a Pi/OpenCode transcript reads as Claude's.
+    #[gpui::test]
+    async fn import_bridge_labels_bubbles_with_its_own_provider(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::new_import_bridge(
+                PathBuf::from("/tmp/oximux-bridge-label"),
+                vec![ThreadEntry::Assistant(AssistantMessage {
+                    text: "hi from pi".into(),
+                    thinking: String::new(),
+                })],
+                ImportBridge {
+                    preset_id: "pi".into(),
+                    session_id: "ses-1".into(),
+                    resume_handle: "/tmp/rollout.jsonl".into(),
+                    cwd: PathBuf::from("/tmp/oximux-bridge-label"),
+                    provider_display: "Pi".into(),
+                },
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, _cx| {
+                assert!(view.is_import_bridge());
+                assert_eq!(
+                    view.provider_label(),
+                    "Pi",
+                    "a Pi transcript must not be captioned with the placeholder backend's name"
+                );
+            })
+            .expect("window update");
+    }
+
     /// The companion-terminal launch spec is offered only for a bound chat that
     /// has minted a session on a resumable transport; a draft, a session-less
     /// chat, and (implicitly) an unbound draft all decline. `set_view_mode` to
@@ -6447,6 +6729,271 @@ mod tests {
                 view.make_unbound_for_test();
                 view.change_agent("opencode".into(), cx);
                 assert_eq!(view.login_adapter_id(), None);
+            })
+            .expect("window update");
+    }
+
+    /// The *New Agent* draft's "Run in a fresh worktree" toggle only renders
+    /// once unbound AND for a git project — never on a bound chat, never on a
+    /// non-git one (the two gates `render_worktree_toggle` checks).
+    #[gpui::test]
+    async fn worktree_toggle_hidden_unless_unbound_and_git(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                // Bound (the constructor's default) + git: still hidden — the
+                // toggle is a pre-bind-only affordance.
+                view.set_git_project_for_test(true);
+                assert!(view.render_worktree_toggle(cx).is_none(), "bound chats never show it");
+
+                // Unbound but non-git (the constructor's default `is_git_project`):
+                // hidden.
+                view.make_unbound_for_test();
+                view.set_git_project_for_test(false);
+                assert!(view.render_worktree_toggle(cx).is_none(), "non-git projects never show it");
+
+                // Unbound + git: visible.
+                view.set_git_project_for_test(true);
+                assert!(view.render_worktree_toggle(cx).is_some(), "unbound + git shows it");
+            })
+            .expect("window update");
+    }
+
+    /// Toggling on creates the lazily-built slug `InputState` (and the toggle
+    /// keeps rendering with it); toggling back off drops it and resets any
+    /// stale create-state — mirroring `reconcile_env_inputs`'s create-on-demand
+    /// pattern for the EnvVar-auth fields.
+    #[gpui::test]
+    async fn toggling_worktree_draft_creates_and_drops_the_slug_input(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, window, cx| {
+                view.make_unbound_for_test();
+                view.set_git_project_for_test(true);
+                assert!(!view.worktree_draft_enabled_for_test());
+
+                view.toggle_worktree_draft(window, cx);
+                assert!(view.worktree_draft_enabled_for_test(), "first toggle enables it");
+                assert!(view.worktree_slug_input.is_some(), "slug input created on enable");
+
+                view.toggle_worktree_draft(window, cx);
+                assert!(!view.worktree_draft_enabled_for_test(), "second toggle disables it");
+                assert!(view.worktree_slug_input.is_none(), "slug input dropped on disable");
+            })
+            .expect("window update");
+    }
+
+    /// The first send on an armed draft is gated on the (async) worktree
+    /// create landing first — `start_worktree_then_send` validates the slug,
+    /// marks the create in-flight (`Creating`), stages the message, and emits
+    /// `WorktreeWorkspaceRequested` for the host to run the DB-backed create.
+    /// It does NOT bind/spawn or push the message to the transcript yet. With no
+    /// host subscriber wired in this unit harness the request is inert, so the
+    /// state parks at `Creating` — letting this assert the staging invariants
+    /// (nothing bound, nothing in the transcript) without any git/process side
+    /// effects.
+    #[gpui::test]
+    async fn send_on_armed_draft_stages_the_message_instead_of_binding(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, window, cx| {
+                view.make_unbound_for_test();
+                view.set_git_project_for_test(true);
+                view.toggle_worktree_draft(window, cx);
+                assert!(view.worktree_draft_enabled_for_test());
+
+                view.send_text("hello".into(), Vec::new(), cx);
+
+                // The roster stages the send and hands the create to the host —
+                // the state is in-flight (`Creating`), never bound, transcript
+                // still empty.
+                assert!(
+                    matches!(
+                        view.worktree_create_state_for_test(),
+                        roster::WorktreeCreateState::Creating
+                    ),
+                    "armed send marks the worktree create in-flight"
+                );
+                assert!(!view.is_bound_for_test(), "must not bind before the worktree step lands");
+                assert!(
+                    view.thread.entries.is_empty(),
+                    "the message stays staged, never pushed to the transcript"
+                );
+
+                // Retry re-enters the same path with the same staged text —
+                // still in-flight, still nothing pushed.
+                view.retry_worktree_create(cx);
+                assert!(matches!(
+                    view.worktree_create_state_for_test(),
+                    roster::WorktreeCreateState::Creating
+                ));
+                assert!(view.thread.entries.is_empty());
+            })
+            .expect("window update");
+    }
+
+    /// HIGH regression: a SECOND, distinct Submit while a worktree create is
+    /// already in flight (or one failed with a message still staged) must
+    /// NEVER fall through `send_text`'s `bind_now` — that would bind at the
+    /// ORIGINAL cwd (silently defeating the toggle), and once the in-flight
+    /// create landed, the FIRST staged message would be re-sent into that
+    /// now-wrongly-bound session: duplicated/out-of-order sends plus an
+    /// orphaned worktree. `worktree_create_state` is set to `Creating`
+    /// directly (mirroring what `start_worktree_then_send` does before the
+    /// git op resolves) so this is exercised without a real async race.
+    #[gpui::test]
+    async fn second_submit_during_worktree_creating_does_not_bind_or_duplicate(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, window, cx| {
+                view.make_unbound_for_test();
+                view.set_git_project_for_test(true);
+                view.toggle_worktree_draft(window, cx);
+                assert!(view.worktree_draft_enabled_for_test());
+
+                // Simulate the async create landing mid-flight: the first
+                // message is already staged and the create is running.
+                view.worktree_create_state = roster::WorktreeCreateState::Creating;
+                view.pending_worktree_send = Some(("first message".to_string(), Vec::new()));
+                view.sync_composer(cx);
+
+                // A second, distinct Submit arrives (e.g. a stray dispatch —
+                // the composer itself is already disabled for this via
+                // `sync_composer`'s fold into `disconnected`, so this is the
+                // defense-in-depth path `send_text` itself must also close).
+                view.send_text("second message".into(), Vec::new(), cx);
+
+                assert!(
+                    !view.is_bound_for_test(),
+                    "must not bind at the original cwd while the worktree create is in flight"
+                );
+                assert!(
+                    view.thread.entries.is_empty(),
+                    "no message should reach the transcript until the worktree step lands"
+                );
+                assert_eq!(
+                    view.pending_worktree_send.as_ref().map(|(t, _)| t.as_str()),
+                    Some("first message"),
+                    "the original staged message must survive untouched, not be clobbered"
+                );
+                assert!(
+                    matches!(view.worktree_create_state_for_test(), roster::WorktreeCreateState::Creating),
+                    "state is unchanged by the dropped second submit"
+                );
+            })
+            .expect("window update");
+    }
+
+    /// MEDIUM regression: the toggle checkbox must refuse to flip while a
+    /// worktree create has failed with a message still staged — otherwise
+    /// unchecking it silently discards `pending_worktree_send`. The user must
+    /// go through Retry / "continue without a worktree" instead, both of
+    /// which route the staged message onward.
+    #[gpui::test]
+    async fn toggle_is_inert_while_worktree_create_failed_so_the_staged_message_survives(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, window, cx| {
+                view.make_unbound_for_test();
+                view.set_git_project_for_test(true);
+                view.toggle_worktree_draft(window, cx);
+                assert!(view.worktree_draft_enabled_for_test());
+
+                // Simulate a landed failure with the message still staged.
+                view.worktree_create_state =
+                    roster::WorktreeCreateState::Failed("slug already exists".to_string());
+                view.pending_worktree_send = Some(("keep me".to_string(), Vec::new()));
+                view.sync_composer(cx);
+
+                // A click on the checkbox while Failed must be a no-op.
+                view.toggle_worktree_draft(window, cx);
+
+                assert!(
+                    view.worktree_draft_enabled_for_test(),
+                    "the toggle must stay on — it must not flip while Failed"
+                );
+                assert!(
+                    matches!(
+                        view.worktree_create_state_for_test(),
+                        roster::WorktreeCreateState::Failed(_)
+                    ),
+                    "the failed state is untouched by the ignored toggle"
+                );
+                assert_eq!(
+                    view.pending_worktree_send.as_ref().map(|(t, _)| t.as_str()),
+                    Some("keep me"),
+                    "the staged message must survive the ignored toggle"
+                );
+                // The only sanctioned way out is Retry / `send_without_worktree`
+                // (the failure banner's buttons) — not exercised here since
+                // both ultimately reach `bind_now`'s real subprocess spawn,
+                // which this pure state-transition test intentionally avoids
+                // (mirrors every other `make_unbound_for_test` test in this
+                // file never calling into a real connect()).
             })
             .expect("window update");
     }

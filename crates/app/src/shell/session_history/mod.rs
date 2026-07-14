@@ -445,10 +445,14 @@ impl SessionHistoryModal {
             session_id: entry.session_id.clone(),
             // Empty when the log omits a transcript path: the handler imports/
             // locates the transcript itself (Codex) or resumes with no
-            // pre-rendered history (Claude with no path).
+            // pre-rendered history (Claude with no path). For Pi, this is the
+            // rollout path the transcript mapper reads.
             path: entry.path.clone().unwrap_or_default(),
             cwd: entry.cwd.clone().unwrap_or_default(),
             adapter: entry.adapter,
+            // `Some` for OpenCode/Pi → the handler builds a transcript bridge
+            // instead of a live resume.
+            preset_id: entry.preset_id.clone(),
         };
         self.close(cx);
         window.dispatch_action(Box::new(action), cx);
@@ -484,14 +488,21 @@ impl SessionHistoryModal {
     }
 }
 
-/// Whether a session can reopen as a chat tab. Claude and Codex both import into
-/// the chat surface (Claude via `--resume` + JSONL, Codex via `thread/resume` +
-/// rollout); other adapters (ACP presets, custom terminal) resume in a terminal.
+/// Whether a session can reopen as a chat tab. Claude and Codex import into the
+/// live chat surface (Claude via `--resume` + JSONL, Codex via `thread/resume` +
+/// rollout). OpenCode and Pi open as a transcript-only **bridge** — their store
+/// yields a readable transcript, but they have no in-app chat backend, so the
+/// tab seeds the history and swaps the composer for Resume-in-terminal. Copilot
+/// stays resume-only (no transcript mapper wired); ACP presets / custom terminal
+/// resume in a terminal.
 fn entry_opens_as_chat(entry: &SessionEntry) -> bool {
-    matches!(
+    if matches!(
         entry.adapter,
         oximux_core::AgentAdapter::ClaudeCode | oximux_core::AgentAdapter::Codex
-    )
+    ) {
+        return true;
+    }
+    matches!(entry.preset_id.as_deref(), Some("opencode") | Some("pi"))
 }
 
 impl EventEmitter<SessionHistoryEvent> for SessionHistoryModal {}

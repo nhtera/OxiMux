@@ -304,6 +304,19 @@ impl PaneGroup {
             .count()
     }
 
+    /// The active tab's Agent Chat view, if the active tab is a chat. Lets a
+    /// route-up handler (`CreateWorktreeWorkspaceForActiveChat`) reach the chat
+    /// that raised the request without threading a handle back through the
+    /// action payload.
+    pub fn active_agent_chat_view(
+        &self,
+    ) -> Option<Entity<crate::shell::agent_chat::AgentChatView>> {
+        match &self.active_tab()?.content {
+            PaneContent::AgentChat(view) => Some(view.clone()),
+            _ => None,
+        }
+    }
+
     /// The active tab's agent session id, if the active tab is an agent.
     /// Used by "send to active agent" actions to route directly to the
     /// agent in the focused tab — the most common layout has terminal +

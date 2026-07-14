@@ -125,12 +125,14 @@ impl ProjectPanes {
     /// Reopen a past session as a chat tab in the active group (from the
     /// Session History side panel). Dedups an already-open session; otherwise
     /// imports the transcript from `path` and spawns a resumed chat.
+    #[allow(clippy::too_many_arguments)]
     pub fn open_session_as_chat_in_active_group(
         &mut self,
         session_id: &str,
         path: Option<&str>,
         cwd: PathBuf,
         adapter: oximux_core::AgentAdapter,
+        preset_id: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -145,7 +147,7 @@ impl ProjectPanes {
         self.set_active_group(target_id, window, cx);
         if let Some(target) = self.groups.get(&target_id).cloned() {
             target.update(cx, |g, cx| {
-                g.open_session_as_chat(session_id, path, cwd, adapter, window, cx);
+                g.open_session_as_chat(session_id, path, cwd, adapter, preset_id, window, cx);
             });
         }
     }
@@ -509,6 +511,14 @@ impl ProjectPanes {
                                 &tab.content
                             {
                                 let v = view.read(cx);
+                                // Import-bridge tabs (OpenCode/Pi transcript view,
+                                // no live backend) are NOT persisted: they carry no
+                                // session id, so the resumed-chat restore path would
+                                // spawn a live subprocess and lose the imported
+                                // transcript. Re-open from Session History instead.
+                                if v.is_import_bridge() {
+                                    continue;
+                                }
                                 let draft = {
                                     let d = v.draft_text(cx);
                                     (!d.trim().is_empty()).then_some(d)

@@ -1024,6 +1024,47 @@ impl PaneGroup {
             crate::shell::agent_chat::AgentChatEvent::AttentionNeeded { kind, body } => {
                 self.notify_chat_attention(view, *kind, body.clone());
             }
+            crate::shell::agent_chat::AgentChatEvent::WorktreeWorkspaceRequested { slug } => {
+                // Route up to `WorkspaceRoot` (owns `app_state`/`WorkspaceRepo`):
+                // it resolves the active chat, creates the worktree + `Workspace`
+                // row, and feeds the outcome back to this view's
+                // `on_worktree_create_outcome`. The pane group has no repo handle,
+                // so it just forwards — the dispatch bubbles up the action tree.
+                window.dispatch_action(
+                    Box::new(crate::actions::CreateWorktreeWorkspaceForActiveChat {
+                        slug: slug.clone(),
+                    }),
+                    cx,
+                );
+            }
+            crate::shell::agent_chat::AgentChatEvent::ResumeInTerminalRequested {
+                preset_id,
+                resume_handle,
+                session_id: _,
+                cwd,
+            } => {
+                // Spawn the provider's PTY resume DIRECTLY in a terminal tab (the
+                // same seam `OpenLoginTerminalRequested` uses: a local shell at
+                // `cwd` fed the resume command). Going through a window action from
+                // here does not reliably reach the host's action handler, so build
+                // the command from `import_resume_command` and run it inline.
+                let Some((program, args)) =
+                    oximux_settings::import_resume_command(preset_id, resume_handle)
+                else {
+                    tracing::warn!(%preset_id, "no import resume command for provider");
+                    return;
+                };
+                // Single-quote each arg (rollout paths / session ids) so a path is
+                // passed as one word; escape any embedded single quote.
+                let mut script = program;
+                for a in &args {
+                    script.push_str(" '");
+                    script.push_str(&a.replace('\'', "'\\''"));
+                    script.push('\'');
+                }
+                let title = SharedString::from(format!("{preset_id} (resumed)"));
+                self.open_script_terminal_tab(cwd.clone(), title, &script, window, cx);
+            }
         }
     }
 
@@ -1240,15 +1281,25 @@ impl PaneGroup {
     /// Open a past session (chosen in the Session History side panel) as a chat tab.
     /// Already-open sessions just activate their tab; otherwise the transcript
     /// is imported from the session `.jsonl` and a resumed chat is opened.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn open_session_as_chat(
         &mut self,
         session_id: &str,
         path: Option<&str>,
         cwd: PathBuf,
         adapter: AgentAdapter,
+        preset_id: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Import-provider bridge (OpenCode/Pi): no live chat backend, so build a
+        // transcript-only bridge tab instead of a resume. Handled before the
+        // dedup + adapter match because these rows carry a `preset_id` and their
+        // seeded thread has no session id to dedup on.
+        if let Some(preset) = preset_id.filter(|p| matches!(*p, "opencode" | "pi")) {
+            self.open_import_bridge_chat(session_id, path, cwd, preset, window, cx);
+            return;
+        }
         // Dedup: if this session is already open in a chat tab, activate it
         // rather than spawning a second resume on the same session.
         if let Some(idx) = self.tabs.iter().position(|t| {
@@ -1322,6 +1373,88 @@ impl PaneGroup {
                 );
             }
         }
+    }
+
+    /// Build a transcript-only **import bridge** chat tab for an OpenCode / Pi
+    /// session: seed the transcript via `load_import_provider_transcript` (no
+    /// live connection), and swap the composer for a Resume-in-terminal action.
+    /// Copilot is excluded upstream (`entry_opens_as_chat`), so `preset` is only
+    /// ever `opencode`/`pi` here.
+    fn open_import_bridge_chat(
+        &mut self,
+        session_id: &str,
+        path: Option<&str>,
+        cwd: PathBuf,
+        preset: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Dedup: a bridge thread has no `session_id()`, so key the "already open"
+        // check on the bridge's own `(preset, session_id)` identity instead.
+        if let Some(idx) = self.tabs.iter().position(|t| {
+            matches!(&t.content, PaneContent::AgentChat(v)
+                if v.read(cx).import_bridge_key() == Some((preset, session_id)))
+        }) {
+            self.active = idx;
+            self.bump_mru(idx);
+            self.focus_active(window, cx);
+            cx.notify();
+            return;
+        }
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => {
+                tracing::warn!("import bridge: no home dir");
+                return;
+            }
+        };
+        let entries = oximux_agents::session_log::import_provider_index::load_import_provider_transcript(
+            &home, preset, session_id, path,
+        );
+        // Root the (later) terminal resume at the recorded cwd, else the process
+        // cwd — these rows may omit a cwd.
+        let cwd = if cwd.as_os_str().is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        } else {
+            cwd
+        };
+        // Pi resumes by rollout file path; OpenCode by session id — mirrors the
+        // `import_resume_command` handle contract in the Session History launch.
+        let resume_handle = if preset == "pi" {
+            path.map(|p| p.to_string()).unwrap_or_else(|| session_id.to_string())
+        } else {
+            session_id.to_string()
+        };
+        let provider_display = match preset {
+            "opencode" => "OpenCode",
+            "pi" => "Pi",
+            other => other,
+        }
+        .to_string();
+        let bridge = crate::shell::agent_chat::ImportBridge {
+            preset_id: preset.to_string(),
+            session_id: session_id.to_string(),
+            resume_handle,
+            cwd: cwd.clone(),
+            provider_display,
+        };
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let cwd_for_view = cwd.clone();
+        let view = cx.new(|cx| {
+            crate::shell::agent_chat::AgentChatView::new_import_bridge(
+                cwd_for_view,
+                entries,
+                bridge,
+                theme,
+                density,
+                typography,
+                window,
+                cx,
+            )
+        });
+        self.push_agent_chat_view(view, cwd, None, window, cx);
     }
 
     /// Open or activate a commit-detail tab. Dedup key is the full

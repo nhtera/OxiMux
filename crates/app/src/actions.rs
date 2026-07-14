@@ -347,6 +347,28 @@ pub struct OpenChatSession {
     /// transport + transcript importer (Claude `--resume` + JSONL, Codex
     /// `thread/resume` + rollout). Defaults to Claude for older call sites.
     pub adapter: oximux_core::AgentAdapter,
+    /// Import-provider preset id (`opencode`/`pi`) for a row whose store the
+    /// index scanned directly. When set, the reopen builds a transcript-only
+    /// **bridge** chat (seeded via `load_import_provider_transcript`, no live
+    /// connection) whose composer is swapped for a Resume-in-terminal action —
+    /// these providers have no in-app chat backend. `None` for native rows.
+    pub preset_id: Option<String>,
+}
+
+/// Route-up action raised when a *New Agent* draft's "Run in a fresh worktree"
+/// send lands: the leaf chat view carries no `WorkspaceRepo`, so it emits an
+/// `AgentChatEvent` that the pane group turns into this action. `WorkspaceRoot`
+/// (which owns `app_state`) resolves the active chat, creates the worktree +
+/// `Workspace` DB row via `create_workspace_with_rollback`, then feeds the
+/// outcome back through the chat's `on_worktree_create_outcome` callback so the
+/// staged send resumes at the new worktree cwd. Mirrors the
+/// [`SendTextToActiveAgent`] "resolve the active agent on the spot" shape.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct CreateWorktreeWorkspaceForActiveChat {
+    /// Pre-validated slug (`validate_slug` ran in the roster before this fired);
+    /// the branch is `oximux/<slug>`.
+    pub slug: String,
 }
 
 actions!(

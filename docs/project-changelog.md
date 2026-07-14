@@ -4,6 +4,217 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-14 — Fix catalog probe leaking an OS thread out of the test scheduler
+
+**Symptom:** `cargo test -p oximux-app --lib` aborted with SIGABRT, reporting
+`Detected activity on thread None ThreadId(N), but test scheduler is running on
+Some("unbound_draft_switches_agent_and_model_without_binding")`. The suite passed
+with that one test skipped, and the test passed alone — a race, which is why it
+had been green until timing shifted.
+
+**Root cause:** `maybe_probe_catalog` spawns the real agent binary on a raw
+`std::thread::spawn` (deliberately: the probe blocks, and the connection runs its
+own workers, so no GPUI executor or tokio reactor is touched). The early-return
+that skips the spawn keys off the `CatalogCache` global, which no test installs —
+so `change_agent("codex")` reached straight past the injected `StubConnection` to
+the real binary. The thread is owned by no executor, so it outlived the
+`#[gpui::test]` scheduler and its completion landed during a later test.
+
+This broke a contract the test seams already state: `with_connection_for_test`
+injects a stub "instead of spawning a real subprocess", and `make_unbound_for_test`
+exists so a test can "drive `change_agent`/`change_model` on a draft without
+spawning a subprocess".
+
+- **New `AgentChatView::probe_catalogs_live` seam** — true in `assemble` (every
+  real view), false in `with_connection_for_test`. `maybe_probe_catalog`
+  early-returns when it is off. A draft on a stub has no real catalog to show and
+  discarded the probe's result anyway, so nothing is lost.
+- **Regression test `draft_agent_pick_does_not_start_a_live_catalog_probe`**
+  asserts `probed_catalogs` stays empty after picking Codex and OpenCode (the two
+  dynamic-model agents a probe targets). Verified to fail when the seam is flipped
+  back on, so it genuinely bites.
+
+The production path is unchanged: real views still probe live off-thread.
+
+Verified: six consecutive unskipped `cargo test -p oximux-app --lib` runs, no
+SIGABRT, 1254 passed / 0 failed each (1253 baseline + the new test). Whole
+workspace 2967 passed / 0 failed.
+
+---
+
+### 2026-07-14 — Agent Chat: fix transcript messages painting on top of each other
+
+**Symptom:** a reply's last paragraphs drew underneath the next user bubble, the
+hover action row, and the settled-turn summary/cost footer.
+
+**Root cause (the previous diagnosis was wrong).** The transcript's children were
+`div().flex().flex_col().w_full().max_w(px(CONTENT_MAX_W))`. As a flex item that
+makes taffy size the column's height against the *container's available* width
+and apply the max-width only afterwards, so a reply measured across the full pane
+re-wraps into more lines once it is capped to the reading measure — and paints
+those extra lines outside the height it reported. Measured with a temporary probe
+over `ScrollHandle::bounds_for_item`: the 300-word reply reported **400px** and
+painted ~475px. The child rects themselves were always correct and never
+overlapped; this was a paint overflow, not a layout overlap.
+
+This also retires the old "gpui-component's markdown counts only its FIRST block"
+theory recorded in the `tail_gap` comment — markdown measures multi-block content
+correctly; only the width it measured at was wrong.
+
+- **Transcript children are now built at a definite width** (`transcript_column(width)`
+  → `w(px(width))`), resolved by the new `AgentChatView::content_width()` as
+  `min(scroll box width − padding, CONTENT_MAX_W)`, so measure width == paint width.
+- **`min_w_0()` added to `wrap_scroll`'s container and the scroll box** — the
+  horizontal twin of the existing `min_h(px(0.0))`. Without it a flex item's
+  default `min-width: auto` refuses to shrink below the now-definite children, so
+  the children pin the box open at the reading measure, `content_width()` reads
+  that back, and a pane narrower than the measure clips text instead of wrapping.
+  Verified live at a ~260px pane: text wraps, nothing clips.
+- **`markdown_reveal_gap` deleted** (fn + test + its use). It reserved up to
+  1100px of extra scroll room so `scroll_to_bottom` could out-scroll the
+  under-count; with honest heights it is unnecessary, and it was leaving a ~565px
+  blank gap under the last message. `tail_gap` is now just the breathing margin.
+
+Tests: whole workspace green — 2967 passed / 0 failed (`oximux-app --lib` 1254,
+`oximux-agents` 614).
+
+---
+
+### 2026-07-14 — Agent Chat round-7: worktree-as-workspace + OpenCode/Pi open-as-chat bridge
+
+**What shipped:** the two round-6 follow-ups, closing the "deferred" / "known
+limitation" notes in the round-6 entry below
+(`plans/260714-1020-agent-chat-round7-worktree-workspace-import-wiring/`). Phases
+1–2 code-complete + tested; Phase 3 (signed-bundle notifications, Codex OAuth,
+live MCP elicitation, live GUI walk-through) stays user-gated.
+
+- **A New-Agent worktree is now a first-class `Workspace`.** The "Run in a fresh
+  worktree" send no longer creates a git-only worktree with no sidebar presence.
+  The leaf carries no `WorkspaceRepo` (Orca thin-leaf), so it routes up: the
+  roster emits `AgentChatEvent::WorktreeWorkspaceRequested{slug}` → the pane
+  group dispatches the new `CreateWorktreeWorkspaceForActiveChat{slug}` action →
+  `WorkspaceRoot` (owns `app_state`) resolves the active chat, runs the existing
+  `create_workspace_with_rollback` (git worktree **+** DB `Workspace` row, full
+  rollback on failure), refreshes the rail, and hands the outcome back through
+  the chat's `on_worktree_create_outcome` (which rebinds the cwd + resumes the
+  staged send). The row is enumerable by the sidebar's `list_for_project` gather,
+  so the worktree agent gets a sidebar card + `⌘J` jump entry, and removal via
+  the Worktree panel deletes both the worktree and the row. The active chat-view
+  handle is captured **synchronously** before the async create, so a tab switch
+  mid-create can't misroute the callback. The git-only `create_agent_chat_worktree`
+  helper + its tests were retired (coverage preserved by
+  `workspace_create_rollback.rs`, which gained an enumerability assertion).
+  **Why.** Round-6 shipped the worktree but not its workspace identity; this
+  routes the one flow through the DB-inserting op the sidebar already renders,
+  rather than reimplementing anything.
+- **OpenCode and Pi sessions open as a chat (transcript bridge).** `⌘↵` on an
+  OpenCode/Pi row in the `⌘⇧H` picker now builds a chat tab that renders the
+  seeded transcript (via the round-6 `load_import_provider_transcript`
+  dispatcher) — but since neither provider has an in-app chat backend, the
+  composer is swapped for a **Resume in terminal** action. The button emits
+  `AgentChatEvent::ResumeInTerminalRequested`; the pane group spawns the
+  provider's own TUI directly into a terminal tab (`open_script_terminal_tab`
+  fed the `import_resume_command` argv, e.g. `pi --session '<rollout>'`) — the
+  same seam `OpenLoginTerminalRequested` uses. **Why not a window action:** a
+  `ResumeAgentSession` dispatched from the pane group never reaches
+  `WorkspaceRoot`'s handler (it works from the Session History modal), so the
+  button was inert; spawning inline removes the dispatch dependency entirely.
+  New `AgentChatView::new_import_bridge` (seeded transcript, `connect_now:false`,
+  `unbound:false`, `send_text` guarded to a no-op) + `render_import_bridge_footer`;
+  `entry_opens_as_chat`/`OpenChatSession` gained a `preset_id`. Default Enter /
+  click still resumes in a terminal — the bridge is the explicit "open as chat"
+  path, never a fake live send. Bridge tabs are excluded from tab persistence
+  (they carry no live session id, so a resumed-chat restore would silently spawn
+  a live `claude` and drop the imported history) — they re-open from Session
+  History like Diff/Tasks tabs; reopen dedups on `(preset_id, session_id)`.
+  Copilot stays resume-only (no transcript mapper wired). **Why.** Modeled on
+  Super Conductor's terminal-resume bridge (Validation Session 1): read the past
+  turns in Chat View, continue the session in a terminal.
+- **Verification.** Full workspace test suite green (`oximux-app --lib` 1254/0);
+  the round-6 `send_on_armed_draft_stages_the_message_instead_of_binding` test was
+  updated to the new stage-and-emit architecture (state parks at `Creating`, not
+  `Failed`, since the runtime/git step moved from the roster to the host).
+  **Both phases live-verified** on a fresh `dist/OxiMux.app` build: a New-Agent
+  worktree (`r7-verify`) produced a sidebar card + `⌘J` entry + git worktree +
+  `oximux/r7-verify` branch + DB row, the agent bound and replied, and Delete
+  cleaned up worktree/branch/row/dir; an imported Pi session opened as a bridge
+  with its multi-turn transcript seeded as chat bubbles (no raw JSON), and
+  Resume-in-terminal spawned a live `pi (resumed)` TUI on the same conversation.
+  Bridge tabs correctly do NOT survive a restart (persistence exclusion), and the
+  default terminal-PTY resume path is unregressed. The three round-6 user-gated
+  carry-overs (signed-bundle notifications, Codex ChatGPT-OAuth, live MCP
+  elicitation) remain open. **Known cosmetic nit:** bridge assistant bubbles are
+  labeled "Claude" rather than the provider, since the bridge assembles on an
+  inert Claude placeholder backend.
+
+---
+
+### 2026-07-14 — Agent Chat round-6: signed-bundle notifications, import transcript previews, worktree-per-agent
+
+**What shipped:** three independent closeouts from the round-6 plan
+(`plans/260714-0248-agent-chat-round6-closeout-worktree/`), across
+`scripts/bundle-macos.sh`, `oximux-agents`, and `oximux-app`.
+
+- **Opt-in codesigning for real notification grants.** `bundle-macos.sh` gained
+  a `--sign <identity>` flag + `OXIMUX_CODESIGN_IDENTITY` env var (the legacy
+  `OXIMUX_SIGN_ID` still works), read ahead of the script's existing
+  positional-arg parsing so `--debug-fast`/profile handling is untouched. The
+  ad-hoc (`-`) default is byte-identical to before — only a real identity
+  triggers `verify_signature`, which fails the build loudly if the sealed
+  bundle's `codesign -dv` Authority chain doesn't show the requested identity.
+  **Why.** `UNUserNotificationCenter` silently drops the one-time
+  authorization grant for ad-hoc-signed bundles on some macOS versions, so
+  round-5's attention-notification banners never appeared even after
+  accepting the permission prompt; a real "Apple Development: …" / "Developer
+  ID Application: …" identity (or a local self-signed codesigning cert, see
+  the script header) gives a stable identity the grant sticks to.
+- **OpenCode and Pi sessions reopen with a real transcript, not a blank chat.**
+  `session_log/import_transcript_opencode.rs` (SQLite `message`/`part` rows,
+  read-only) and `session_log/import_transcript_pi.rs` (JSONL `message` lines)
+  map each provider's native records into `Vec<ThreadEntry>` previews — the
+  same shape Claude/Codex import already produced — dispatched by
+  `load_import_provider_transcript` in `import_provider_index.rs`. Consecutive
+  text parts fold into one bubble, reasoning/thinking folds into the
+  assistant entry, and anything unrecognized (tool parts, unknown blocks)
+  degrades to a plain notice row rather than ever rendering raw JSON. The
+  `⌘⇧H` picker's preview blurb for these two rows already shipped in
+  `99b4650`; **app-side open-as-chat wiring for OpenCode/Pi is deferred**
+  _(closed in round-7 — see the entry above)_ —
+  today both still resume as a terminal PTY, this round only prepared the
+  transcript-shaped data for that future wiring. Investigated Copilot's
+  `session-store.db` `turns` table along the way: it does hold readable
+  `user_message`/`assistant_response` text, but Copilot has no chat surface in
+  OxiMux to seed, so it stays resume-only (documented for a future round).
+- **"New Agent in a fresh worktree."** The New Agent composer's worktree
+  toggle now creates a real git worktree before the first send:
+  `roster.rs`'s toggle + slug input calls
+  `workspace_ops::create_agent_chat_worktree(repo_root, slug)` (branch
+  `oximux/<slug>`, sibling path via the same `suggest_worktree_path` helper
+  the manual Worktree panel form uses) → on success rebinds the chat's `cwd`
+  to the new worktree and labels the tab `oximux/<slug>`; on failure shows an
+  inline banner with Retry or "continue without a worktree." Hidden entirely
+  for non-git projects. **Known limitation** _(closed in round-7 — see the entry
+  above)_**:** the created worktree gets no
+  sidebar workspace card / `⌘J` entry — `AgentChatView` has no
+  `WorkspaceRepo` handle (it's built from a bare `cwd`, not the app's storage
+  layer), so there's no DB `Workspace` row to insert; the worktree still works
+  identically for terminals/SCM/diff since those key off the filesystem path.
+  Round-7 routes this up (leaf emits an event → `WorkspaceRoot` runs the
+  DB-inserting `create_workspace_with_rollback`) so the worktree becomes a
+  first-class workspace.
+- **Verification.** Full round-5 observation backlog re-checked live against a
+  fresh `dist/OxiMux.app` build of HEAD: subagent log, Codex session reopen,
+  mid-turn Codex rewind (rewinds an active turn without crashing the session),
+  and cold restore all confirmed working; live MCP elicitation and Codex
+  OAuth remain user-gated follow-ups (fixture/unit coverage stands for
+  elicitation; OAuth's RPC login-start was already verified live in
+  round-5). code-reviewer flagged and fixed a submit-during-Creating race and
+  a worktree-toggle message-loss bug, both closed with regression tests.
+  Tests: workspace suite green; `oximux-app` lib 1258 tests (verified this
+  session).
+
+---
+
 ### 2026-07-14 — Import session history for OpenCode, Copilot, and Pi
 
 **What shipped:** the `⌘⇧H` history / import modal now indexes and resumes
