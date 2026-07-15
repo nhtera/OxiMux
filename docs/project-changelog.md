@@ -4,6 +4,87 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-15 — Agent Chat: Codex diff cards, batched streaming, subagent log fidelity (`6c8a7a8`)
+
+Render-fidelity pass closing gaps against native agent UIs. All inside the
+existing `ThreadEvent`/`ToolDetail` seams — no architecture change.
+
+**Shipped:**
+- **Codex `apply_patch` renders as a diff card.** Previously raw JSON, and the
+  result body repeated the whole patch. New `agent_chat/apply_patch.rs` turns
+  Codex's `changes` array (per-file, `add`/`delete`/`update`) into the same
+  `DiffLine` stream the diff card already renders for Claude/ACP edits, with a
+  file-path header; the result body no longer echoes the patch.
+- **Stream deltas coalesce into batched repaints.** Long turns stay smooth;
+  non-delta events still repaint immediately.
+- **Bash command wrapper unwrapped via the structured `command` field**, not
+  token parsing — the wire flips quote style between turns, so parsing tokens
+  was fragile.
+- **Diff rows syntax-highlighted**, memoized per `(path, line)`. Load-bearing,
+  not cosmetic: the transcript is not virtualized, so an expanded diff card
+  would otherwise re-tokenize via syntect on every unrelated repaint, at the
+  new ~20Hz batching rate — caught as a regression risk during review of this
+  same change.
+- **Session-detail popover** (new `agent_chat/session_detail.rs`): read-only
+  view of what a session advertised at init — model, cwd, tools, MCP servers +
+  status, subagents — cached with the transcript so a restored chat can answer
+  before its resumed process speaks. Hidden entirely for backends that
+  advertise nothing (Codex, ACP today).
+- **Auto-declined server requests** log a muted divider, deduped so a repeated
+  decline doesn't stack identical rows.
+- **Subagent logs** capture failed child results + thinking lines; a chatty
+  subagent's full log is reachable via the tool sheet.
+
+**Withdrawn — evidence below; do not re-attempt without new upstream data:**
+
+1. **Codex `fileChange` output deltas.** `item/fileChange/outputDelta` does
+   not exist on Codex 0.144.3. Live-probed twice (300- and 400-line patches):
+   `fileChange` goes `started` → `completed` with zero deltas. The sibling
+   `item/commandExecution/outputDelta` *does* stream (`{itemId, delta}`) —
+   that's what made the field name look plausible. Needs a Codex version that
+   actually emits it.
+2. **Claude live status line.** `system/status` never fires on Claude Code
+   2.x. Probed twice; only `hook_started`, `hook_response`, `init`, and
+   `post_turn_summary` appear. The closest real source is
+   `post_turn_summary` (carries `status_category` + `status_detail`),
+   already decoded into `ChatThread.last_summary` — but that's post-turn, not
+   live, so it's a different feature, not a substitute. Round-9 candidate:
+   render a status chip from `last_summary` instead of chasing a live event
+   that doesn't exist.
+3. **Context-meter catalog seed.** The model catalog carries no context
+   windows: `ModelChoice` is `{wire, label, description}`
+   (`crates/agents/src/thread/connection.rs:56`), and
+   `session_restore/catalog_cache.rs` stores no window field. Building this
+   would mean hardcoding a model→window table that goes stale as models ship
+   and that the server corrects one turn later anyway. The meter's real seed
+   already exists: `ChatThread.last_known_context_window` is stashed from
+   both settled `TurnUsage` (`state.rs:449`) and `LiveUsage` (`state.rs:551`)
+   and already feeds the meter.
+
+**Wire fact worth keeping:** a subagent `tool_result` block carries
+`{tool_use_id, type, content, is_error}` and never the tool's `name` (the name
+appears only on the earlier `tool_use` block). A per-line decoder can't title
+a result "done: \<tool\>". Failed child results are logged by their error text;
+successful ones aren't logged at all — the `tool_use` line already recorded
+the action.
+
+**Round-9 backlog:**
+- Persist `last_known_context_window` — it's in-memory only, absent from
+  `PersistedChatTranscript`, so a restored chat loses its context-bar
+  denominator until its next turn settles. One `#[serde(default)]` field.
+- Render the `post_turn_summary` status chip `ChatThread.last_summary`
+  already stores (see withdrawal #2 above).
+- Subagent detach-to-tab (not attempted this round).
+
+**Verification:** phases live-verified by driving a real running app cover
+the apply_patch diff card, batched-repaint streaming, the auto-declined
+divider, and subagent log capture. The session-detail popover is
+unit-verified only — **not** live-verified, since it only renders for Claude
+and Claude was unauthenticated under the sandboxed `HOME` used to run a dev
+build alongside the session that authored this change.
+
+---
+
 ### 2026-07-15 — Worktree isolation becomes a composer pill; two composer state-sync bugs fixed
 
 **The "Run in a fresh worktree" checkbox is now a pill above the input.** It used

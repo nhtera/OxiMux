@@ -696,7 +696,7 @@ Separate from the raw-PTY terminal runtime above, the **chat** view runs a struc
 | inline tool-result image | ✓ | ○ | ✓ |
 | message resource-link / image | — | — | ✓ (link→md, image→placeholder) |
 | slash-command descriptions + arg hints | ○ | — | ✓ (`available_commands_update` desc + `input` hint) |
-| live tool-output streaming | ○ | ✓ (`outputDelta`) | ○ |
+| live tool-output streaming | ○ | ✓ (`commandExecution/outputDelta` only — `fileChange` emits none, verified on 0.144.3) | ○ |
 | plan panel | ✓ (`TodoWrite`) | ✓ (`turn/plan/updated`) | ✓ (`Plan`) |
 | clarifying question card | ✓ (`AskUserQuestion`) | ✓ (`requestUserInput`) | ○ |
 | plan-approval card | ✓ (`ExitPlanMode` → dedicated 3-way card) | — | — |
@@ -809,6 +809,91 @@ OAuth, live MCP elicitation, live GUI walk-through) stays user-gated.
   history); they re-open from Session History instead, deduped on
   `(preset_id, session_id)` (`import_bridge_key`). Copilot stays resume-only —
   no transcript mapper wired.
+
+---
+
+## Round-8 close-out — render fidelity
+
+Closes rendering gaps against native agent UIs. All work sits inside the
+existing `ThreadEvent`/`ToolDetail` seams — no adapter-boundary or
+`ChatThread` architecture change.
+
+**Shipped:**
+
+- **Codex `apply_patch` diff card** (new `agent_chat/apply_patch.rs`, split
+  out of `diff_card.rs` to keep it reviewable). Codex reports an edit as an
+  `apply_patch` tool call carrying a `changes` array of per-file patches — a
+  different shape from Claude's `Edit` (old/new strings) and ACP's normalized
+  diff — but the module converts it into the same `DiffLine` stream the diff
+  card already renders, so all three providers converge on one visual instead
+  of Codex showing raw JSON with the patch duplicated into the result body.
+- **Batched repaint on stream deltas.** Delta events (`input_json_delta`,
+  `outputDelta`, text deltas) coalesce into a single repaint tick instead of
+  one repaint per delta; non-delta events still repaint immediately. Keeps
+  long turns smooth.
+- **Bash command unwrap reads the structured `command` field**, not token
+  parsing — the wire flips quote style between turns, which made token
+  parsing unreliable.
+- **Diff-row syntax highlighting, memoized per `(path, line)`.** The memo is
+  load-bearing, not an optimization nicety: the transcript is not
+  virtualized, so an expanded diff card would otherwise re-tokenize via
+  syntect on every unrelated repaint, at the new ~20Hz batching rate above.
+- **Session-detail popover** (new `agent_chat/session_detail.rs`): a
+  read-only view of what the session advertised at `system/init` — model,
+  cwd, tools, MCP servers + connect status, subagent types — cached with the
+  transcript (`SessionMeta`) so a restored chat answers before its resumed
+  process speaks. Backends differ in what they advertise (Claude's
+  `system/init` carries all of it; Codex and ACP carry none today), so the
+  trigger hides entirely rather than opening onto an empty panel.
+- **Auto-declined server requests** log a muted divider, deduped so a
+  repeated decline doesn't stack identical rows.
+- **Subagent log fidelity:** failed child tool results and thinking lines are
+  now captured into the parent's `subagent_log`; a chatty subagent's full log
+  is reachable via the tool sheet. A subagent `tool_result` block carries
+  `{tool_use_id, type, content, is_error}` and never the tool's `name` (the
+  name only appears on the earlier `tool_use` block), so a failed result is
+  logged by its error text rather than a "\<tool\> failed" title; successful
+  results stay unlogged since the `tool_use` line already recorded the
+  action.
+
+**Withdrawn — live-probed, premise disproved; do not re-attempt without new
+upstream evidence:**
+
+- **Codex `fileChange` output deltas.** `item/fileChange/outputDelta` does
+  not exist on Codex 0.144.3 — live-probed twice against 300- and 400-line
+  patches, `fileChange` goes `started` → `completed` with zero deltas. The
+  sibling `item/commandExecution/outputDelta` does stream (`{itemId, delta}`,
+  see the adapter matrix above), which is what made the field name look
+  plausible.
+- **Claude live status line.** `system/status` never fires on Claude Code
+  2.x — probed twice, only `hook_started`, `hook_response`, `init`, and
+  `post_turn_summary` appear. The closest real signal is `post_turn_summary`
+  (`status_category` + `status_detail`), already decoded into
+  `ChatThread.last_summary`, but it lands after the turn, not during it — a
+  different feature (a status chip fed by `last_summary`), not a substitute
+  for a live line.
+- **Context-meter catalog seed.** The model catalog carries no context
+  windows — `ModelChoice` is `{wire, label, description}`
+  (`crates/agents/src/thread/connection.rs:56`) and the disk-persisted
+  `session_restore/catalog_cache.rs` stores no window field. A hardcoded
+  model→window table would go stale as models ship and would be
+  authoritatively corrected by the server one turn later anyway. The meter's
+  real seed already exists and is unaffected: `ChatThread.last_known_context_window`
+  is stashed from both settled `TurnUsage` (`state.rs:449`) and `LiveUsage`
+  (`state.rs:551`).
+
+**Round-9 backlog surfaced by this round:** persist
+`last_known_context_window` into `PersistedChatTranscript` (currently
+in-memory only, so a restored chat loses its context-bar denominator until
+its next turn settles — one `#[serde(default)]` field); render the
+`post_turn_summary` status chip `last_summary` already stores; subagent
+detach-to-tab.
+
+**Verification:** the apply_patch diff card, batched-repaint streaming, the
+auto-declined divider, and subagent log capture were live-verified driving a
+real running app. The session-detail popover is unit-verified only — it
+renders for Claude alone, and Claude was unauthenticated under the sandboxed
+`HOME` used to run a dev build alongside the authoring session.
 
 ---
 
