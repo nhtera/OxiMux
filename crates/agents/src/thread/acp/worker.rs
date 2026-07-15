@@ -394,6 +394,9 @@ async fn session(
                 model: String::new(),
                 permission_mode,
                 slash_commands: Vec::new(),
+                // ACP's init advertises no tool/MCP/agent inventory, so the
+                // session-detail popover stays hidden for these sessions.
+                meta: Default::default(),
             });
 
             // Prompt loop: one turn per queued Outbound::Prompt. `block_task()`

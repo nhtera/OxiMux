@@ -22,9 +22,10 @@ pub enum ServerRequestAction {
     /// A permission/question card was emitted and the request's id stashed —
     /// do NOT answer yet (the reply follows the user's decision).
     Emit(Vec<ThreadEvent>),
-    /// Answer this request immediately with the given `result` (unhandled /
-    /// declined requests, so a turn never stalls waiting on us).
-    AutoRespond(Value),
+    /// Answer this request immediately with `result` (unhandled / declined
+    /// requests, so a turn never stalls waiting on us), surfacing `events`
+    /// alongside so the reply isn't invisible to the user.
+    AutoRespond { result: Value, events: Vec<ThreadEvent> },
 }
 
 /// Classify a server → client request. For the two interactive approval RPCs,
@@ -94,7 +95,10 @@ pub fn map_server_request(
         "item/tool/requestUserInput" => {
             let questions = parse_codex_questions(params);
             if questions.is_empty() {
-                return ServerRequestAction::AutoRespond(json!({ "answers": {} }));
+                return ServerRequestAction::AutoRespond {
+                    result: json!({ "answers": {} }),
+                    events: Vec::new(),
+                };
             }
             let item_id = params.get("itemId").and_then(|v| v.as_str()).unwrap_or_default();
             let key = id_key(id);
@@ -133,8 +137,15 @@ pub fn map_server_request(
             }])
         }
         // Everything else (legacy exec/apply-patch approvals, permissions,
-        // attestation, …): decline with the common shape.
-        _ => ServerRequestAction::AutoRespond(json!({ "decision": "decline" })),
+        // attestation, …): decline with the common shape. Declining stays the
+        // safe default — turning an unknown request into a permission card
+        // would block the turn on a protocol message we can't honour either
+        // way. But say so in the transcript: silently refusing leaves the agent
+        // working around something the user never saw, which reads as a stall.
+        _ => ServerRequestAction::AutoRespond {
+            result: json!({ "decision": "decline" }),
+            events: vec![ThreadEvent::Notice(format!("Auto-declined: {method}"))],
+        },
     }
 }
 
@@ -311,7 +322,20 @@ mod tests {
         // elicitation was promoted out of it.
         let mut st = CodexState::default();
         match map_server_request(&json!(1), "attestation/generate", &json!({}), &mut st) {
-            ServerRequestAction::AutoRespond(v) => assert_eq!(v["decision"], "decline"),
+            ServerRequestAction::AutoRespond { result, events } => {
+                assert_eq!(result["decision"], "decline");
+                // The decline leaves a trace naming the method, so the attempt
+                // isn't invisible to the user.
+                match &events[..] {
+                    [ThreadEvent::Notice(text)] => {
+                        assert!(
+                            text.contains("attestation/generate"),
+                            "notice names the declined method, got {text:?}"
+                        );
+                    }
+                    other => panic!("expected one Notice, got {other:?}"),
+                }
+            }
             _ => panic!("expected AutoRespond"),
         }
         assert!(st.pending_approvals.is_empty());
@@ -361,7 +385,12 @@ mod tests {
         // No answerable questions → auto-empty reply (never a stalled turn).
         let mut st = CodexState::default();
         match map_server_request(&json!(2), "item/tool/requestUserInput", &json!({"questions": []}), &mut st) {
-            ServerRequestAction::AutoRespond(v) => assert!(v["answers"].is_object()),
+            ServerRequestAction::AutoRespond { result, events } => {
+                assert!(result["answers"].is_object());
+                // A handled request that simply had nothing to ask — not a
+                // refusal, so it needs no notice.
+                assert!(events.is_empty(), "an empty question set is not worth a divider");
+            }
             _ => panic!("expected AutoRespond"),
         }
         assert!(st.pending_approvals.is_empty(), "nothing stashed for an empty question set");

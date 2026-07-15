@@ -115,7 +115,7 @@ fn input_str<'a>(tc: &'a ToolCall, key: &str) -> &'a str {
 /// tone and an interrupted run is called out; otherwise the flattened result is
 /// shown as one block.
 fn render_bash(tc: &ToolCall, full: bool, theme: Theme, density: Density, typo: &Typography) -> AnyElement {
-    let cmd = input_str(tc, "command");
+    let cmd = super::bubble::display_command(tc);
     let mut col = div().flex().flex_col().gap(px(4.0)).w_full();
 
     if !cmd.trim().is_empty() {
@@ -216,19 +216,40 @@ fn render_agent(tc: &ToolCall, full: bool, theme: Theme, density: Density, typo:
     // The subagent's live action log (child tool calls / text summaries), shown
     // as muted rows collapsed to the most recent few with a "+N earlier" marker,
     // so the parent card reveals what the subagent is doing without the child
-    // events leaking into the root transcript.
+    // events leaking into the root transcript. The sheet lifts the collapse and
+    // shows the whole log — that is what the "+N earlier" marker points at.
     if !tc.subagent_log.is_empty() {
         col = col.child(caption("Subagent activity".to_string(), theme, typo));
-        col = col.child(code_block(&subagent_log_text(&tc.subagent_log), theme.fg_muted, full, theme, density, typo));
+        col = col.child(code_block(
+            &subagent_log_text(&tc.subagent_log, full),
+            theme.fg_muted,
+            full,
+            theme,
+            density,
+            typo,
+        ));
     }
     col.into_any_element()
 }
 
-/// Render the subagent action log to display text: the most recent
-/// [`SUBAGENT_LOG_VISIBLE`] lines in order, prefixed with a `+N earlier` marker
-/// when older lines were elided. Keeps the card compact for a chatty subagent.
-fn subagent_log_text(log: &[String]) -> String {
-    const SUBAGENT_LOG_VISIBLE: usize = 3;
+/// How many trailing log lines an inline card shows before collapsing the rest
+/// behind a `+N earlier` marker. The sheet is the way to see past it, so
+/// [`super::tool_sheet::is_sheet_expandable`] reads this to decide whether a
+/// subagent card has anything more to reveal.
+pub(super) const SUBAGENT_LOG_VISIBLE: usize = 3;
+
+/// Render the subagent action log to display text. Inline (`full = false`): the
+/// most recent [`SUBAGENT_LOG_VISIBLE`] lines in order, prefixed with a `+N
+/// earlier` marker when older lines were elided, keeping the card compact for a
+/// chatty subagent. In the sheet (`full = true`): every retained line, oldest
+/// first — the log is already capped at the source ([`MAX_SUBAGENT_LOG`]), so
+/// this can never be unbounded.
+///
+/// [`MAX_SUBAGENT_LOG`]: oximux_agents::thread::tool_call::MAX_SUBAGENT_LOG
+fn subagent_log_text(log: &[String], full: bool) -> String {
+    if full {
+        return log.join("\n");
+    }
     let mut lines: Vec<String> = Vec::new();
     if log.len() > SUBAGENT_LOG_VISIBLE {
         lines.push(format!("+{} earlier", log.len() - SUBAGENT_LOG_VISIBLE));
@@ -443,11 +464,19 @@ mod tests {
 
     #[test]
     fn subagent_log_text_collapses_to_recent_with_earlier_marker() {
-        assert_eq!(subagent_log_text(&["a".into(), "b".into()]), "a\nb");
+        assert_eq!(subagent_log_text(&["a".into(), "b".into()], false), "a\nb");
         assert_eq!(
-            subagent_log_text(&["a".into(), "b".into(), "c".into(), "d".into(), "e".into()]),
+            subagent_log_text(&["a".into(), "b".into(), "c".into(), "d".into(), "e".into()], false),
             "+2 earlier\nc\nd\ne",
         );
+    }
+
+    /// The sheet is where the collapsed "+N earlier" lines are recoverable, so
+    /// at full caps every retained line shows, oldest first and marker-free.
+    #[test]
+    fn subagent_log_text_is_complete_in_the_sheet() {
+        let log: Vec<String> = ["a", "b", "c", "d", "e"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(subagent_log_text(&log, true), "a\nb\nc\nd\ne");
     }
 
     #[test]

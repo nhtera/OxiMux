@@ -608,6 +608,8 @@ fn worker_loop(
         model: resolved_model,
         permission_mode: String::new(),
         slash_commands: Vec::new(),
+            // Codex/ACP init advertises no tool/MCP/agent inventory.
+            meta: Default::default(),
     });
 
     // Proactive sign-in detection: `thread/start` succeeds even when logged out,
@@ -746,8 +748,13 @@ fn map_inbound(
                             }
                         }
                     }
-                    ServerRequestAction::AutoRespond(result) => {
+                    ServerRequestAction::AutoRespond { result, events } => {
                         let _ = rpc.respond(id, result);
+                        for ev in events {
+                            if event_tx.send(ev).is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
             }

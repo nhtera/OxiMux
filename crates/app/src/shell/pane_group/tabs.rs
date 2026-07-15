@@ -804,6 +804,7 @@ impl PaneGroup {
         session_id: Option<String>,
         entries: Vec<oximux_agents::thread::ThreadEntry>,
         slash_commands: Vec<String>,
+        session_meta: oximux_agents::thread::SessionMeta,
         thinking_level: crate::shell::agent_chat::ThinkingLevel,
         codex_posture: Option<(String, String)>,
         draft: Option<String>,
@@ -824,6 +825,7 @@ impl PaneGroup {
                 session_id,
                 entries,
                 slash_commands,
+                session_meta,
                 thinking_level,
                 codex_posture,
                 theme,
@@ -979,6 +981,7 @@ impl PaneGroup {
                 session_id,
                 entries,
                 slash_commands,
+                session_meta,
                 thinking_level,
             } => {
                 // Open the truncated fork as a separate tab; the source tab is
@@ -991,6 +994,7 @@ impl PaneGroup {
                     Some(session_id.clone()),
                     entries.clone(),
                     slash_commands.clone(),
+                    session_meta.clone(),
                     *thinking_level,
                     None, // codex_posture — Fork is Claude-only
                     None,
@@ -1337,6 +1341,9 @@ impl PaneGroup {
                     Some(session_id.to_string()),
                     entries,
                     Vec::new(),
+                    // Imported history carries no `system/init`, so there is no
+                    // advertised metadata to seed; the next turn's init fills it.
+                    Default::default(),
                     crate::shell::agent_chat::ThinkingLevel::default(),
                     // codex_posture — starts at the app default (on-request /
                     // workspace-write); the rollout's original approval/sandbox
@@ -1364,6 +1371,9 @@ impl PaneGroup {
                     Some(session_id.to_string()),
                     entries,
                     Vec::new(),
+                    // Imported history carries no `system/init`, so there is no
+                    // advertised metadata to seed; the next turn's init fills it.
+                    Default::default(),
                     crate::shell::agent_chat::ThinkingLevel::default(),
                     None, // codex_posture — Claude session-history reopen
                     None,

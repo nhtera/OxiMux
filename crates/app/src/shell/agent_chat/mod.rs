@@ -11,6 +11,7 @@
 //! Fail-closed: if the subprocess dies (stdout EOF) while a permission is
 //! pending, the drain task rejects it rather than leaving a dangling prompt.
 
+mod apply_patch;
 mod auth_card;
 mod background_tasks_panel;
 mod bubble;
@@ -31,6 +32,7 @@ mod plan_approval_card;
 mod plan_panel;
 mod question_card;
 mod rewind_menu;
+mod session_detail;
 mod roster;
 mod slash_command_catalog;
 mod slash_palette;
@@ -109,6 +111,15 @@ const AUTH_TERMINAL_KEY: &str = "__acp_auth_terminal__";
 /// 60fps) comfortably outlasts the async markdown parse/layout of a normal reply
 /// so the follow catches the message's settled height, then stops (no idle spin).
 const FOLLOW_FRAMES: u8 = 10;
+
+/// Shortest gap between transcript repaints while only streamed deltas are
+/// arriving (see [`AgentChatView::notify_throttled`]). Each repaint re-parses
+/// the whole growing markdown body, so an unthrottled fast model costs one full
+/// re-parse per token. 50 ms caps that at ~20 repaints/sec — well under a
+/// 60fps frame budget, and far faster than anyone reads, so streaming still
+/// looks continuous. Only deltas are throttled; anything the user can act on
+/// paints immediately.
+const NOTIFY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// How many frames the jumped-to-message highlight lingers before it clears.
 /// ~48 frames (≈0.8s at 60fps) — long enough to catch the eye after a jump,
@@ -227,6 +238,7 @@ pub enum AgentChatEvent {
         session_id: String,
         entries: Vec<ThreadEntry>,
         slash_commands: Vec<String>,
+        session_meta: oximux_agents::thread::SessionMeta,
         thinking_level: ThinkingLevel,
     },
     /// The signed-out banner's "Open terminal to sign in" control was clicked;
@@ -476,6 +488,16 @@ pub struct AgentChatView {
     /// keeps growing the follow re-arms; once it holds steady the follow winds
     /// down and the frame loop stops (no idle repaint).
     last_max_offset: f32,
+    /// Whether the session-detail popover is open (see [`session_detail`]).
+    session_detail_open: bool,
+    /// When the transcript last repainted, used to rate-limit streaming
+    /// repaints (see [`Self::notify_throttled`]).
+    last_notify: std::time::Instant,
+    /// Whether a trailing repaint is already queued for deltas applied since
+    /// [`Self::last_notify`]. Guards against stacking one timer per delta, and
+    /// is cleared by any repaint so a timer that fires after an immediate paint
+    /// becomes a no-op.
+    flush_scheduled: bool,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -868,6 +890,7 @@ impl AgentChatView {
         session_id: Option<String>,
         entries: Vec<ThreadEntry>,
         slash_commands: Vec<String>,
+        session_meta: oximux_agents::thread::SessionMeta,
         thinking_level: ThinkingLevel,
         codex_posture: Option<(String, String)>,
         theme: Theme,
@@ -876,7 +899,10 @@ impl AgentChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let thread = ChatThread::rehydrated(session_id, model.clone(), entries, slash_commands);
+        let mut thread = ChatThread::rehydrated(session_id, model.clone(), entries, slash_commands);
+        // Seeded from the blob so the session-detail popover is populated on a
+        // restored chat; a later live init overwrites it.
+        thread.session_meta = session_meta;
         let mut view = Self::assemble(
             cwd, model, backend, thread, true, codex_posture, theme, density, typography, window, cx,
         );
@@ -1164,6 +1190,9 @@ impl AgentChatView {
             connection,
             backend,
             composer,
+            session_detail_open: false,
+            last_notify: std::time::Instant::now(),
+            flush_scheduled: false,
             focus_handle: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
             stick_to_bottom: true,
@@ -1282,6 +1311,7 @@ impl AgentChatView {
             model: self.thread.model.clone().or_else(|| self.model.clone()),
             entries: self.thread.entries.clone(),
             slash_commands: self.thread.slash_commands.clone(),
+            session_meta: self.thread.session_meta.clone(),
             thinking_level: self.thinking_level,
             // The backend that minted this session, so a restored tab reconnects
             // the same provider (Claude stream-json / Codex app-server / an ACP
@@ -2965,6 +2995,9 @@ impl AgentChatView {
             connection: Some(connection),
             backend: ChatBackend::stream_json(),
             composer,
+            session_detail_open: false,
+            last_notify: std::time::Instant::now(),
+            flush_scheduled: false,
             probed_catalogs: HashMap::new(),
             // The injected StubConnection is the whole point: no subprocess.
             probe_catalogs_live: false,
@@ -3130,7 +3163,15 @@ impl AgentChatView {
         });
         cx.spawn(async move |this: WeakEntity<Self>, cx| {
             while let Some(ev) = fwd_rx.next().await {
-                if this.update(cx, |view, cx| view.on_event(ev, cx)).is_err() {
+                // Drain whatever else is already queued behind this event and
+                // apply the lot as one batch: under a burst (a fast model's
+                // token stream) this collapses N repaints into one for free,
+                // with no added latency — these events had all arrived anyway.
+                let mut batch = vec![ev];
+                while let Ok(queued) = fwd_rx.try_recv() {
+                    batch.push(queued);
+                }
+                if this.update(cx, |view, cx| view.apply_batch(batch, cx)).is_err() {
                     return; // view dropped
                 }
             }
@@ -3138,8 +3179,75 @@ impl AgentChatView {
         })
     }
 
-    /// Fold one decoded event into the thread and repaint.
+    /// Fold a drained batch into the thread, then repaint once for the whole
+    /// batch instead of once per event.
+    ///
+    /// Every event is applied immediately — only the repaint is deferred — so
+    /// the thread state, persistence and rewind see no difference. A batch of
+    /// nothing but deltas is rate-limited (the user cannot read faster than
+    /// [`NOTIFY_INTERVAL`], and each repaint re-parses the whole streaming
+    /// message); anything else paints at once.
+    fn apply_batch(&mut self, batch: Vec<ThreadEvent>, cx: &mut Context<Self>) {
+        let all_delta = batch.iter().all(ThreadEvent::is_delta);
+        for ev in batch {
+            self.apply_event(ev, cx);
+        }
+        if all_delta {
+            self.notify_throttled(cx);
+        } else {
+            self.notify_now(cx);
+        }
+    }
+
+    /// Repaint now, standing down any queued trailing repaint.
+    fn notify_now(&mut self, cx: &mut Context<Self>) {
+        self.last_notify = std::time::Instant::now();
+        self.flush_scheduled = false;
+        cx.notify();
+    }
+
+    /// Repaint at most once per [`NOTIFY_INTERVAL`] while streaming.
+    ///
+    /// When the budget isn't up yet, queue a single trailing repaint rather
+    /// than skipping: the last few streamed characters would otherwise sit
+    /// invisible until whatever event came next — and at the end of a turn's
+    /// text that could be a long wait.
+    fn notify_throttled(&mut self, cx: &mut Context<Self>) {
+        let since = self.last_notify.elapsed();
+        if since >= NOTIFY_INTERVAL {
+            self.notify_now(cx);
+            return;
+        }
+        if self.flush_scheduled {
+            return; // a trailing repaint is already queued; it will show this too
+        }
+        self.flush_scheduled = true;
+        let delay = NOTIFY_INTERVAL.saturating_sub(since);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |view, cx| {
+                // Cleared if something painted in the meantime — that paint
+                // already showed these deltas.
+                if view.flush_scheduled {
+                    view.notify_now(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Test-only: deliver a single event the way the drain would. Production
+    /// always arrives via [`Self::apply_batch`], which this routes through so
+    /// tests exercise the real path rather than a parallel one.
+    #[cfg(test)]
     fn on_event(&mut self, ev: ThreadEvent, cx: &mut Context<Self>) {
+        self.apply_batch(vec![ev], cx);
+    }
+
+    /// Fold one decoded event into the thread. Never repaints — the repaint is
+    /// the batch's call to make ([`Self::apply_batch`]), once for all its
+    /// events.
+    fn apply_event(&mut self, ev: ThreadEvent, cx: &mut Context<Self>) {
         let was_active = self.thread.turn_active;
         self.thread.apply(&ev);
         // A couple of ACP session updates drive view/host state the ChatThread
@@ -3243,7 +3351,6 @@ impl AgentChatView {
         // The turn's active flag may have flipped (e.g. `TurnEnded`); keep the
         // composer's status line in step.
         self.sync_composer(cx);
-        cx.notify();
         // A turn just completed normally (active→idle edge) — release the next
         // message the user queued while it streamed, as a fresh turn. Skipped
         // after an intentional Stop (`interrupted`) or a dead process
@@ -4728,6 +4835,7 @@ impl AgentChatView {
             .children(self.render_message_rail(cx))
             .child(self.wrap_scroll(scroll))
             .children(self.render_jump_list(cx))
+            .children(self.render_session_detail(cx))
             .children(self.render_find_bar(cx))
             .into_any_element()
     }
@@ -5655,6 +5763,101 @@ mod tests {
                 );
                 assert_eq!(view.thread.entries.len(), 2, "user + assistant");
                 assert!(!view.thread.turn_active, "turn ended");
+            })
+            .expect("window update");
+    }
+
+    /// A burst of streamed deltas folds into the transcript in full while
+    /// costing one throttled repaint, not one per token.
+    #[gpui::test]
+    async fn delta_batch_concatenates_text_and_defers_one_repaint(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.push_user_message("hi");
+                // A fresh view has just painted, so the budget isn't up yet and
+                // this batch must defer rather than paint.
+                view.last_notify = std::time::Instant::now();
+                let batch: Vec<ThreadEvent> = (0..10)
+                    .map(|i| ThreadEvent::AssistantTextDelta(format!("tok{i} ")))
+                    .collect();
+                view.apply_batch(batch, cx);
+
+                assert!(
+                    view.flush_scheduled,
+                    "an all-delta batch inside the interval queues a trailing repaint"
+                );
+                // Every delta is applied regardless — only the paint waits.
+                let text = match view.thread.entries.last() {
+                    Some(oximux_agents::thread::ThreadEntry::Assistant(m)) => m.text.clone(),
+                    other => panic!("expected a streaming assistant entry, got {other:?}"),
+                };
+                assert_eq!(
+                    text, "tok0 tok1 tok2 tok3 tok4 tok5 tok6 tok7 tok8 tok9 ",
+                    "every delta lands, in order — throttling the paint must not drop or reorder text"
+                );
+            })
+            .expect("window update");
+
+        // The trailing repaint lands on its own, without another event to carry
+        // it — otherwise a turn's final characters would sit invisible.
+        cx.executor().advance_clock(NOTIFY_INTERVAL * 2);
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _window, _cx| {
+                assert!(!view.flush_scheduled, "the trailing repaint fired and cleared the flag");
+            })
+            .expect("window update");
+    }
+
+    /// Anything the user can act on paints immediately — a tool card must not
+    /// wait behind the streaming throttle.
+    #[gpui::test]
+    async fn non_delta_in_a_batch_repaints_immediately(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.push_user_message("hi");
+                view.last_notify = std::time::Instant::now();
+                view.apply_batch(
+                    vec![
+                        ThreadEvent::AssistantTextDelta("thinking".into()),
+                        ThreadEvent::ToolCallStarted {
+                            id: "t1".into(),
+                            name: "Bash".into(),
+                            input: json!({"command": "ls"}),
+                        },
+                    ],
+                    cx,
+                );
+                assert!(
+                    !view.flush_scheduled,
+                    "a batch carrying a non-delta paints now, leaving nothing queued"
+                );
             })
             .expect("window update");
     }

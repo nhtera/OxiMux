@@ -167,6 +167,31 @@ pub(super) fn tool_display_name(name: &str) -> String {
     }
 }
 
+/// The shell command to present for `tc`: the script the agent actually ran,
+/// rather than the login shell Codex wraps every exec in (`/bin/zsh -lc
+/// '<script>'`), which is noise on every command card.
+///
+/// Codex reports the script itself in `commandActions`, so we read that instead
+/// of parsing it back out of the wrapper — recovering it from the quoted string
+/// would mean re-implementing shell quoting, and Codex switches between `'` and
+/// `"` depending on the script's own quotes. Falls back to the raw command, so
+/// a provider that already sends a bare command (Claude) is untouched. The raw
+/// wrapper stays on the input for the copy and raw-JSON views.
+pub(super) fn display_command(tc: &ToolCall) -> &str {
+    let raw = tc.input.get("command").and_then(Value::as_str).unwrap_or_default();
+    unwrapped_command(&tc.input).unwrap_or(raw)
+}
+
+/// The lone script `commandActions` reports for this exec, if it reports
+/// exactly one. Several actions are left alone: re-joining them would mean
+/// guessing the operator that ran between them, and `a && b` shown as two lines
+/// reads as something the agent didn't do.
+fn unwrapped_command(input: &Value) -> Option<&str> {
+    let actions = input.get("commandActions")?.as_array()?;
+    let [only] = actions.as_slice() else { return None };
+    only.get("command").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+}
+
 /// A short human target for the tool line — the file it touches, the command it
 /// runs, the query it searches, a click coordinate, or a subagent/task brief.
 /// `None` when the input carries none. Kept legible for the collapsed header,
@@ -179,8 +204,26 @@ pub(super) fn tool_target(tc: &ToolCall) -> Option<String> {
             return Some(s.to_string());
         }
     }
-    // A command / pattern / url / query the tool acts on.
-    for key in ["command", "pattern", "url", "query"] {
+    // A Codex `apply_patch` names its files inside `changes[]` rather than at
+    // the top level: one file reads as its path, several as a count (the diff
+    // rows caption each path individually). Gated by name, not shape — a
+    // server-defined MCP tool is free to take an unrelated `changes` array.
+    if tc.name == "apply_patch"
+        && let Some(changes) = input.get("changes").and_then(Value::as_array).filter(|a| !a.is_empty())
+    {
+        if let [only] = changes.as_slice()
+            && let Some(path) = only.get("path").and_then(Value::as_str)
+        {
+            return Some(path.to_string());
+        }
+        return Some(format!("{} files", changes.len()));
+    }
+    // The command a shell tool runs, minus any wrapper shell.
+    if input.get("command").and_then(Value::as_str).is_some() {
+        return Some(display_command(tc).to_string());
+    }
+    // A pattern / url / query the tool acts on.
+    for key in ["pattern", "url", "query"] {
         if let Some(s) = input.get(key).and_then(Value::as_str) {
             return Some(s.to_string());
         }
@@ -254,6 +297,108 @@ mod tests {
         );
         assert_eq!(
             tool_target(&tc("Task", json!({"x": 1}), ToolCallStatus::InProgress)),
+            None
+        );
+    }
+
+    #[test]
+    fn display_command_unwraps_the_codex_login_shell() {
+        // Wire shapes captured from `codex app-server` 0.144.3. Note the quote
+        // style flips with the script's own quotes — which is exactly why the
+        // structured action is read instead of the wrapper being parsed.
+        let single = tc(
+            "Bash",
+            json!({
+                "command": "/bin/zsh -lc 'echo hello'",
+                "commandActions": [{"type": "unknown", "command": "echo hello"}]
+            }),
+            ToolCallStatus::InProgress,
+        );
+        assert_eq!(display_command(&single), "echo hello");
+
+        let double = tc(
+            "Bash",
+            json!({
+                "command": "/bin/zsh -lc \"sed -n '1,2p' sample.txt\"",
+                "commandActions": [
+                    {"type": "read", "command": "sed -n '1,2p' sample.txt", "path": "/x/sample.txt"}
+                ]
+            }),
+            ToolCallStatus::InProgress,
+        );
+        assert_eq!(display_command(&double), "sed -n '1,2p' sample.txt");
+
+        // Operators live inside a single action — the card must show the whole
+        // script, not a truncated first clause.
+        let compound = tc(
+            "Bash",
+            json!({
+                "command": "/bin/zsh -lc 'echo a && echo b || echo c'",
+                "commandActions": [{"type": "unknown", "command": "echo a && echo b || echo c"}]
+            }),
+            ToolCallStatus::InProgress,
+        );
+        assert_eq!(display_command(&compound), "echo a && echo b || echo c");
+    }
+
+    #[test]
+    fn display_command_falls_back_to_the_raw_command() {
+        // Claude sends a bare command with no actions — unchanged.
+        let claude = tc("Bash", json!({"command": "ls -la"}), ToolCallStatus::InProgress);
+        assert_eq!(display_command(&claude), "ls -la");
+        assert_eq!(tool_target(&claude), Some("ls -la".to_string()));
+
+        // Several actions are ambiguous to re-join, so the raw wrapper shows
+        // rather than a reconstruction that might not be what ran.
+        let multi = tc(
+            "Bash",
+            json!({
+                "command": "/bin/zsh -lc 'a; b'",
+                "commandActions": [{"command": "a"}, {"command": "b"}]
+            }),
+            ToolCallStatus::InProgress,
+        );
+        assert_eq!(display_command(&multi), "/bin/zsh -lc 'a; b'");
+
+        // A malformed/empty action never blanks the card.
+        let empty = tc(
+            "Bash",
+            json!({"command": "/bin/zsh -lc 'x'", "commandActions": [{"command": "  "}]}),
+            ToolCallStatus::InProgress,
+        );
+        assert_eq!(display_command(&empty), "/bin/zsh -lc 'x'");
+        let no_cmd = tc("Read", json!({"file_path": "a.rs"}), ToolCallStatus::InProgress);
+        assert_eq!(display_command(&no_cmd), "");
+    }
+
+    #[test]
+    fn tool_target_reads_codex_apply_patch_paths() {
+        // One change → its path, like an Edit's `file_path`.
+        assert_eq!(
+            tool_target(&tc(
+                "apply_patch",
+                json!({"changes": [{"path": "a.rs", "kind": {"type": "update"}}]}),
+                ToolCallStatus::InProgress
+            )),
+            Some("a.rs".to_string())
+        );
+        // Several → a count; the per-file paths caption the diff rows instead.
+        assert_eq!(
+            tool_target(&tc(
+                "apply_patch",
+                json!({"changes": [{"path": "a.rs"}, {"path": "b.rs"}]}),
+                ToolCallStatus::InProgress
+            )),
+            Some("2 files".to_string())
+        );
+        // An unrelated tool that happens to take a `changes` array is not a
+        // patch — it must not be read as one.
+        assert_eq!(
+            tool_target(&tc(
+                "mcp__store__patch_doc",
+                json!({"changes": [{"path": "/a/b", "op": "replace"}]}),
+                ToolCallStatus::InProgress
+            )),
             None
         );
     }

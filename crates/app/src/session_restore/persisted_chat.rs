@@ -48,6 +48,13 @@ pub struct PersistedChatTranscript {
     /// by the next init).
     #[serde(default)]
     pub slash_commands: Vec<String>,
+    /// What the session advertised at `system/init` (tools, MCP servers,
+    /// subagents, cwd), cached for the same reason `slash_commands` is: a
+    /// resumed session sends no init until the first message, so without this
+    /// the session-detail popover would be empty on a restored chat.
+    /// `#[serde(default)]` keeps blobs written before this field loadable.
+    #[serde(default)]
+    pub session_meta: oximux_agents::thread::SessionMeta,
     /// The chat-wide thinking display level. `#[serde(default)]` (→ `Auto`)
     /// keeps blobs written before this field loadable.
     #[serde(default)]
@@ -129,6 +136,7 @@ mod tests {
     fn round_trips_a_transcript() {
         let repo = repo();
         let t = PersistedChatTranscript {
+            session_meta: Default::default(),
             session_id: "sid-1".into(),
             model: Some("opus".into()),
             entries: vec![
@@ -162,6 +170,7 @@ mod tests {
         // filled by the serde default).
         let repo = repo();
         let t = PersistedChatTranscript {
+            session_meta: Default::default(),
             session_id: "acp-sess".into(),
             model: None,
             entries: vec![],

@@ -158,6 +158,9 @@ impl AgentChatView {
         let cwd = self.cwd.clone();
         let model = self.model.clone();
         let slash_commands = self.thread.slash_commands.clone();
+        // The fork resumes the same underlying session, so it inherits what that
+        // session advertised — no empty popover until its first turn re-inits.
+        let session_meta = self.thread.session_meta.clone();
         let thinking_level = self.thinking_level;
 
         let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
@@ -183,6 +186,7 @@ impl AgentChatView {
                         session_id,
                         entries,
                         slash_commands,
+                        session_meta,
                         thinking_level,
                     });
                 }

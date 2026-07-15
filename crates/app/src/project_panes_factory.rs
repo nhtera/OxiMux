@@ -197,6 +197,19 @@ fn restore_chat_slash_commands(snap: &PersistedTabs, session_id: Option<&str>) -
         .unwrap_or_default()
 }
 
+/// The persisted session metadata for a restored chat (empty when the blob
+/// predates the field or the session isn't found), so the session-detail popover
+/// is populated before the resumed session sends a fresh init.
+fn restore_chat_session_meta(
+    snap: &PersistedTabs,
+    session_id: Option<&str>,
+) -> oximux_agents::thread::SessionMeta {
+    session_id
+        .and_then(|sid| snap.chat_transcripts.iter().find(|t| t.session_id == sid))
+        .map(|t| t.session_meta.clone())
+        .unwrap_or_default()
+}
+
 /// The persisted thinking-display level for a restored chat (defaults to `Auto`
 /// when the blob predates the field or the session isn't found).
 fn restore_chat_thinking_level(
@@ -386,6 +399,7 @@ pub(crate) fn build_project_panes(
                         } else {
                             let entries = restore_chat_entries(&snap, session_id.as_deref());
                             let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
+                            let session_meta = restore_chat_session_meta(&snap, session_id.as_deref());
                             let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
                             let backend = restore_chat_backend(&snap, session_id.as_deref());
                             let resume_id = restore_chat_resume_id(&snap, session_id.as_deref());
@@ -393,7 +407,8 @@ pub(crate) fn build_project_panes(
                             group.update(cx, |g, cx| {
                                 g.open_agent_chat_tab_restored(
                                     chat_cwd, model, backend, resume_id, entries, slash_commands,
-                                    thinking_level, codex_posture, draft, queued, window, cx,
+                                    session_meta, thinking_level, codex_posture, draft, queued, window,
+                                    cx,
                                 );
                             });
                         }
@@ -563,13 +578,14 @@ fn restore_multi_group(
                         } else {
                             let entries = restore_chat_entries(&snap, session_id.as_deref());
                             let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
+                            let session_meta = restore_chat_session_meta(&snap, session_id.as_deref());
                             let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
                             let backend = restore_chat_backend(&snap, session_id.as_deref());
                             let resume_id = restore_chat_resume_id(&snap, session_id.as_deref());
                             let codex_posture = restore_chat_codex_posture(&snap, session_id.as_deref());
                             p.open_agent_chat_in_group_restore(
                                 group_id, chat_cwd, model, backend, resume_id, entries, slash_commands,
-                                thinking_level, codex_posture, draft, queued, window, cx,
+                                session_meta, thinking_level, codex_posture, draft, queued, window, cx,
                             );
                         }
                         p.place_restored_last_tab(Some(group_id), meta, cx);
@@ -1991,6 +2007,7 @@ mod tests {
         let repo = SettingsRepo::new(db);
         let sid = "sess-chat-roundtrip";
         let transcript = PersistedChatTranscript {
+            session_meta: Default::default(),
             session_id: sid.into(),
             model: Some("opus".into()),
             entries: vec![
@@ -2058,6 +2075,7 @@ mod tests {
         // backend). Heals layouts written before the save-side lockstep.
         use crate::persisted_chat::PersistedChatTranscript;
         let present = PersistedChatTranscript {
+            session_meta: Default::default(),
             session_id: "72def46c-08c6-413f-9777-2c321bfbb56c".into(),
             model: None,
             entries: vec![],

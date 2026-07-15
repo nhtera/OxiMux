@@ -35,6 +35,12 @@ pub(super) fn is_sheet_expandable(tc: &ToolCall) -> bool {
     if diff_card::build_edit_diff(tc).is_some() {
         return true;
     }
+    // A subagent whose activity log outran the inline preview has more to show
+    // even when its own result is short (or hasn't landed yet) — the sheet is
+    // where the elided "+N earlier" lines live.
+    if tc.subagent_log.len() > tool_bodies::SUBAGENT_LOG_VISIBLE {
+        return true;
+    }
     tc.result.as_deref().map(|r| r.chars().count()).unwrap_or(0) > SUBSTANTIAL_CHARS
 }
 
@@ -356,6 +362,21 @@ mod tests {
         let mut big = ToolCall::new("t", "Bash", json!({"command": "seq 1000"}));
         big.result = Some("x".repeat(SUBSTANTIAL_CHARS + 1));
         assert!(is_sheet_expandable(&big));
+    }
+
+    /// A Task card's own result can be short (or absent mid-run) while its
+    /// subagent log has already outrun the 3-line inline preview. The elided
+    /// lines are only reachable through the sheet, so the affordance must appear
+    /// on the log's account alone.
+    #[test]
+    fn a_chatty_subagent_is_expandable_even_with_a_short_result() {
+        let mut task = ToolCall::new("t", "Task", json!({"description": "audit"}));
+        for i in 0..tool_bodies::SUBAGENT_LOG_VISIBLE {
+            task.push_subagent_action(format!("Read f{i}.rs"));
+        }
+        assert!(!is_sheet_expandable(&task), "nothing elided yet → nothing to expand to");
+        task.push_subagent_action("Read one_more.rs");
+        assert!(is_sheet_expandable(&task), "log outran the preview → sheet holds the rest");
     }
 
     #[test]

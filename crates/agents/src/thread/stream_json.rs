@@ -9,7 +9,7 @@
 use serde_json::Value;
 
 use super::background_task::BackgroundTaskKind;
-use super::event::{ThreadEvent, TurnUsage};
+use super::event::{McpServerStatus, SessionMeta, ThreadEvent, TurnUsage};
 use super::question::parse_questions;
 use super::tool_call::{
     PermissionKind, PermissionSuggestion, extract_tool_result_images, flatten_tool_result_content,
@@ -34,11 +34,11 @@ fn decode_value(v: &Value) -> Vec<ThreadEvent> {
     // A subagent's internal turn streams inline, every event tagged with the
     // spawning tool's id in `parent_tool_use_id`. Those events must NOT fold into
     // the main transcript as the parent agent's own — but a completed child action
-    // (a tool call, or the child's visible text) is routed into the spawning tool
-    // card's log via `SubagentAction`, so the user sees what the subagent is doing
-    // inline. Deltas, tool results, and stream framing stay dropped (the log holds
-    // completed items only, no per-delta churn). The `system/task_*` events still
-    // drive the separate Background Tasks panel.
+    // (a tool call, the child's visible text or thinking, or a failed result) is
+    // routed into the spawning tool card's log via `SubagentAction`, so the user
+    // sees what the subagent is doing inline. Deltas and stream framing stay
+    // dropped (the log holds completed items only, no per-delta churn). The
+    // `system/task_*` events still drive the separate Background Tasks panel.
     if let Some(parent) = v.get("parent_tool_use_id").and_then(Value::as_str) {
         return decode_subagent(v, parent);
     }
@@ -54,30 +54,44 @@ fn decode_value(v: &Value) -> Vec<ThreadEvent> {
 }
 
 /// Classify a `parent_tool_use_id`-tagged (subagent) line into zero-or-more
-/// `SubagentAction` log lines for the spawning tool card. Only an `assistant`
-/// line's completed blocks route here — a `tool_use` block becomes a
-/// `{name} {primary arg}` line; a non-empty visible `text` block becomes a
-/// first-line summary. Thinking, tool results, deltas, and stream framing are
-/// dropped (the log holds completed, user-meaningful items only — no per-delta
-/// churn). Parent id = the tag.
+/// `SubagentAction` log lines for the spawning tool card.
+///
+/// An `assistant` line's completed blocks route here — a `tool_use` block
+/// becomes a `{name} {primary arg}` line, a non-empty visible `text` block a
+/// first-line summary, and a `thinking` block a truncated `[thinking] …` line. A
+/// `user` line routes only its *failed* `tool_result` blocks; the child's prompt
+/// (a `user`/`text` block) and successful results stay dropped — see
+/// [`subagent_failure_line`]. Deltas and stream framing stay dropped too: the log
+/// holds completed, user-meaningful items only, no per-delta churn. Parent id =
+/// the tag.
 fn decode_subagent(v: &Value, parent: &str) -> Vec<ThreadEvent> {
-    if v.get("type").and_then(Value::as_str) != Some("assistant") {
+    let kind = v.get("type").and_then(Value::as_str);
+    if !matches!(kind, Some("assistant" | "user")) {
         return Vec::new();
     }
+    let from_agent = kind == Some("assistant");
     let Some(blocks) = v["message"]["content"].as_array() else {
         return Vec::new();
     };
     let mut out = Vec::new();
     for b in blocks {
-        let line = match b.get("type").and_then(Value::as_str) {
-            Some("tool_use" | "server_tool_use" | "mcp_tool_use") => {
+        let bt = b.get("type").and_then(Value::as_str);
+        let line = match bt {
+            Some("tool_use" | "server_tool_use" | "mcp_tool_use") if from_agent => {
                 subagent_tool_line(str_field(b, "name"), b.get("input"))
             }
-            Some("text") => b
+            Some("text") if from_agent => b
                 .get("text")
                 .and_then(Value::as_str)
                 .map(subagent_text_summary)
                 .filter(|s| !s.is_empty()),
+            Some("thinking") if from_agent => b
+                .get("thinking")
+                .and_then(Value::as_str)
+                .map(subagent_text_summary)
+                .filter(|s| !s.is_empty())
+                .map(|s| format!("[thinking] {s}")),
+            _ if is_tool_result_block(bt) && !from_agent => subagent_failure_line(b),
             _ => None,
         };
         if let Some(line) = line {
@@ -88,6 +102,27 @@ fn decode_subagent(v: &Value, parent: &str) -> Vec<ThreadEvent> {
         }
     }
     out
+}
+
+/// A *failed* child tool result → a `✗ {message}` log line; `None` for anything
+/// that succeeded.
+///
+/// Only failures are logged, for two reasons. The child's `tool_use` block
+/// already logged the action, so a matching "it worked" line would double the
+/// log's length to say nothing the reader didn't assume — whereas a failure is
+/// the surprising event, and it is what explains a subagent that went quiet or
+/// changed course. And the wire leaves no choice about the wording: a
+/// `tool_result` block carries `tool_use_id` but never the tool's *name* (the
+/// name appears only on the earlier `tool_use` block), so a per-line decoder
+/// cannot title this "✗ Read" without correlating ids across lines. The error
+/// text stands on its own instead — "File does not exist. …" needs no title.
+fn subagent_failure_line(b: &Value) -> Option<String> {
+    if b.get("is_error").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let text = flatten_tool_result_content(b.get("content"));
+    let summary = subagent_text_summary(&text);
+    (!summary.is_empty()).then(|| format!("✗ {summary}"))
 }
 
 /// A one-line subagent action label from a child tool call: `{name} {primary
@@ -139,6 +174,12 @@ fn decode_system(v: &Value) -> Vec<ThreadEvent> {
             model: str_field(v, "model"),
             permission_mode: str_field(v, "permissionMode"),
             slash_commands: str_list_field(v, "slash_commands"),
+            meta: SessionMeta {
+                cwd: v.get("cwd").and_then(Value::as_str).map(str::to_string),
+                tools: str_list_field(v, "tools"),
+                mcp_servers: mcp_servers(v),
+                agents: str_list_field(v, "agents"),
+            },
         }],
         Some("post_turn_summary") => vec![ThreadEvent::TurnSummary {
             detail: str_field(v, "status_detail"),
@@ -584,6 +625,29 @@ fn str_field(v: &Value, key: &str) -> String {
 /// Decode a JSON array of strings into `Vec<String>`. Missing key or non-array
 /// → empty; non-string array entries are skipped (defensive against a wire
 /// shape drift). Used for `init.slash_commands`.
+/// `mcp_servers: [{name, status}]` from an init line. A malformed entry is
+/// skipped rather than failing the whole init — the popover is informational,
+/// and a missing row beats a lost session.
+fn mcp_servers(v: &Value) -> Vec<McpServerStatus> {
+    v.get("mcp_servers")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|s| {
+                    Some(McpServerStatus {
+                        name: s.get("name").and_then(Value::as_str)?.to_string(),
+                        status: s
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn str_list_field(v: &Value, key: &str) -> Vec<String> {
     v.get(key)
         .and_then(Value::as_array)
@@ -617,7 +681,36 @@ mod tests {
         assert_eq!(decode_line(&l), vec![ThreadEvent::SessionInit {
             session_id: "sid-1".into(), model: "claude-sonnet-5".into(),
             permission_mode: "default".into(),
-            slash_commands: vec!["compact".into(), "research".into(), "codex:rescue".into()] }]);
+            slash_commands: vec!["compact".into(), "research".into(), "codex:rescue".into()],
+            meta: SessionMeta::default() }]);
+    }
+
+    #[test]
+    fn session_init_captures_the_advertised_metadata() {
+        // Field names/shapes captured from a live `claude -p --output-format
+        // stream-json --verbose` init line (Claude Code 2.x).
+        let l = json!({"type":"system","subtype":"init","session_id":"s","model":"m",
+            "permissionMode":"default","cwd":"/repo",
+            "tools":["Bash","Read",7],
+            "mcp_servers":[{"name":"ctx7","status":"connected"},
+                           {"name":"tg","status":"pending"},
+                           {"status":"nameless — skipped"}],
+            "agents":["code-reviewer","planner"]}).to_string();
+        match &decode_line(&l)[..] {
+            [ThreadEvent::SessionInit { meta, .. }] => {
+                assert_eq!(meta.cwd.as_deref(), Some("/repo"));
+                // Non-string entries are skipped, not fatal.
+                assert_eq!(meta.tools, vec!["Bash".to_string(), "Read".to_string()]);
+                assert_eq!(meta.agents, vec!["code-reviewer".to_string(), "planner".to_string()]);
+                // A server without a name is dropped; the rest still land, and an
+                // unknown status string is displayed verbatim rather than matched.
+                assert_eq!(meta.mcp_servers.len(), 2);
+                assert_eq!(meta.mcp_servers[0].name, "ctx7");
+                assert_eq!(meta.mcp_servers[0].status, "connected");
+                assert_eq!(meta.mcp_servers[1].status, "pending");
+            }
+            other => panic!("expected SessionInit, got {other:?}"),
+        }
     }
 
     #[test]
@@ -627,7 +720,8 @@ mod tests {
             "model":"m","permissionMode":"default"}).to_string();
         assert_eq!(decode_line(&l), vec![ThreadEvent::SessionInit {
             session_id: "s".into(), model: "m".into(),
-            permission_mode: "default".into(), slash_commands: vec![] }]);
+            permission_mode: "default".into(), slash_commands: vec![],
+            meta: SessionMeta::default() }]);
     }
 
     #[test]
@@ -1153,6 +1247,31 @@ mod tests {
 
     // --- Background-task stream hygiene (subagents + background bash) ---
 
+    /// A subagent's thinking becomes one truncated `[thinking] …` log line
+    /// (first line only) rather than a wall of reasoning in a card.
+    ///
+    /// The block shape (`{"type":"thinking","thinking":"…"}`) is the one the main
+    /// agent's own path already decodes and is verified there. Subagents were not
+    /// observed emitting thinking in live probing — the main agent thinks under
+    /// identical flags, but two subagent probes produced none, one of which asked
+    /// for step-by-step reasoning explicitly. So this arm is coverage for a shape
+    /// that is known-correct but currently unobserved on this path: dormant if
+    /// subagents never think, right if they start.
+    #[test]
+    fn subagent_thinking_becomes_one_truncated_line() {
+        let long = "x".repeat(200);
+        let think = json!({"type":"assistant","parent_tool_use_id":"toolu_ABC","message":{"content":[
+            {"type":"thinking","thinking":format!("First I should check the config.\n{long}")}]}})
+        .to_string();
+        assert_eq!(decode_line(&think), vec![ThreadEvent::SubagentAction {
+            parent_tool_call_id: "toolu_ABC".into(),
+            line: "[thinking] First I should check the config.".into() }]);
+        // Empty thinking contributes no line.
+        let empty = json!({"type":"assistant","parent_tool_use_id":"toolu_ABC",
+            "message":{"content":[{"type":"thinking","thinking":"   "}]}}).to_string();
+        assert!(decode_line(&empty).is_empty(), "empty thinking logs nothing");
+    }
+
     /// A subagent's internal `tool_use` streams inline tagged with the spawning
     /// tool's id; it must NOT fold as the parent agent's own tool card — instead
     /// it routes to that card's log as a `SubagentAction` line.
@@ -1171,13 +1290,31 @@ mod tests {
         }).to_string();
         assert_eq!(decode_line(&txt), vec![ThreadEvent::SubagentAction {
             parent_tool_call_id: "toolu_ABC".into(), line: "Looking at the auth module.".into() }]);
-        // Child deltas / tool results / thinking are still dropped (no churn).
+        // Child deltas are still dropped (no per-delta churn in the log).
         let delta = json!({"type":"stream_event","parent_tool_use_id":"toolu_ABC",
             "event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}}).to_string();
         assert!(decode_line(&delta).is_empty(), "child delta stays dropped");
+        // A SUCCESSFUL child result stays dropped: the `tool_use` line above
+        // already logged the action, so a second line saying it worked is noise.
         let result = json!({"type":"user","parent_tool_use_id":"toolu_ABC",
             "message":{"content":[{"type":"tool_result","tool_use_id":"t","content":"out"}]}}).to_string();
-        assert!(decode_line(&result).is_empty(), "child tool result stays dropped");
+        assert!(decode_line(&result).is_empty(), "successful child result stays dropped");
+        // A FAILED child result is logged — it is the surprising event, and the
+        // one that explains a subagent going quiet or changing course. Payload is
+        // a real captured `Read /nonexistent` failure.
+        let failed = json!({"type":"user","parent_tool_use_id":"toolu_ABC","message":{"content":[
+            {"tool_use_id":"toolu_01Tpfm","type":"tool_result","is_error":true,
+             "content":"File does not exist. Note: your current working directory is /tmp/p."}]}}).to_string();
+        assert_eq!(decode_line(&failed), vec![ThreadEvent::SubagentAction {
+            parent_tool_call_id: "toolu_ABC".into(),
+            line: "✗ File does not exist. Note: your current working directory is /tmp/p.".into() }]);
+        // The child's PROMPT echoes back as a tagged `user`/`text` line. It is not
+        // an action the subagent took, and the card already shows the Task's own
+        // description — so it must not open the log with a duplicate of it.
+        let prompt = json!({"type":"user","parent_tool_use_id":"toolu_ABC","message":{"content":[
+            {"type":"text","text":"read sample.rs in the cwd and reply with the word it prints"}]}}).to_string();
+        assert!(decode_line(&prompt).is_empty(), "child prompt echo is not an action");
+
         // The same tool_use WITHOUT the tag decodes as a real tool card.
         let main = json!({
             "type":"assistant",

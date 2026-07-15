@@ -203,8 +203,15 @@ fn map_root_notification(method: &str, params: &Value, st: &mut CodexState) -> V
         }],
 
         // Housekeeping / telemetry / not-yet-surfaced — intentionally ignored:
-        // thread/started, thread/*, turn/diff/updated, item/fileChange/outputDelta,
-        // mcpServer/*, skills/changed, remoteControl/*, …
+        // thread/started, thread/*, turn/diff/updated, mcpServer/*,
+        // skills/changed, remoteControl/*, …
+        //
+        // `item/fileChange/outputDelta` is deliberately absent from this list:
+        // probing app-server 0.144.3 with 300- and 400-line patches, a
+        // `fileChange` item goes started → completed emitting no output deltas
+        // at all (its `commandExecution` sibling does stream them). There is no
+        // such notification to handle, so a live-progress arm for it would be
+        // dead code keyed to a guessed field name.
         _ => Vec::new(),
     }
 }
@@ -489,7 +496,15 @@ fn tool_call(item: &Value) -> Option<(String, Value)> {
         "commandExecution" => {
             let command = item.get("command").and_then(|v| v.as_str()).unwrap_or_default();
             let cwd = item.get("cwd").and_then(|v| v.as_str()).unwrap_or_default();
-            Some(("Bash".to_string(), json!({ "command": command, "cwd": cwd })))
+            // `command` is the login-shell wrapper Codex runs everything through
+            // (`/bin/zsh -lc '<script>'`); `commandActions` reports the script
+            // itself. Carry both: the wrapper stays authoritative for copy/raw
+            // views, while the renderer can show the script the agent meant.
+            let actions = item.get("commandActions").cloned().unwrap_or(Value::Null);
+            Some((
+                "Bash".to_string(),
+                json!({ "command": command, "cwd": cwd, "commandActions": actions }),
+            ))
         }
         "fileChange" => Some(("apply_patch".to_string(), json!({ "changes": item.get("changes").cloned().unwrap_or(Value::Null) }))),
         "mcpToolCall" => {
@@ -698,6 +713,29 @@ mod tests {
             &mut st(),
         );
         assert!(matches!(&done[0], ThreadEvent::ToolResult { is_error: true, .. }));
+    }
+
+    #[test]
+    fn command_execution_carries_the_wrapper_and_the_script() {
+        // Codex runs every exec through the login shell and reports the script
+        // it wrapped in `commandActions`. Both reach the card: the wrapper stays
+        // authoritative for copy/raw views, the script is what gets displayed.
+        let started = map_notification(
+            "item/started",
+            &json!({"item": {"type": "commandExecution", "id": "c1",
+                             "command": "/bin/zsh -lc 'echo hello'",
+                             "cwd": "/tmp/x",
+                             "commandActions": [{"type": "unknown", "command": "echo hello"}]}}),
+            &mut st(),
+        );
+        match &started[..] {
+            [ThreadEvent::ToolCallStarted { name, input, .. }] => {
+                assert_eq!(name, "Bash");
+                assert_eq!(input["command"], "/bin/zsh -lc 'echo hello'");
+                assert_eq!(input["commandActions"][0]["command"], "echo hello");
+            }
+            other => panic!("expected a Bash ToolCallStarted, got {other:?}"),
+        }
     }
 
     #[test]

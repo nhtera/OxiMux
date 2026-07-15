@@ -100,7 +100,13 @@ pub(super) fn render_tool_card(
         if tc.name == "Write" {
             card = card.child(write_replace_hint(theme, typo));
         }
-        card = card.child(diff_card::render_diff(lines, theme, density, typo));
+        card = card.child(diff_card::render_diff(
+            lines,
+            diff_card::diff_path(tc),
+            theme,
+            density,
+            typo,
+        ));
     }
 
     if let ToolCallStatus::WaitingForConfirmation(req) = &tc.status {
@@ -111,8 +117,13 @@ pub(super) fn render_tool_card(
         if diff.is_some() {
             // Edit/Write/MultiEdit: the diff is shown above; add any textual
             // result too (e.g. an error message). Skip an empty result — an ACP
-            // edit's body is the diff, so its result text is often blank.
-            if let Some(result) = tc.result.as_deref().filter(|s| !s.trim().is_empty()) {
+            // edit's body is the diff, so its result text is often blank — and
+            // an `apply_patch`, whose result text IS the patch just rendered
+            // above and would otherwise repeat it verbatim.
+            let repeats_diff = tc.name == "apply_patch";
+            if let Some(result) =
+                tc.result.as_deref().filter(|s| !s.trim().is_empty() && !repeats_diff)
+            {
                 card = card.child(result_block(result, theme, density, typo));
             }
         } else if let Some(body) = tool_bodies::render_tool_body(tc, false, theme, density, typo) {

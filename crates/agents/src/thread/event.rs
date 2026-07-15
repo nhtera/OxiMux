@@ -5,6 +5,7 @@
 //! their wire events into `ThreadEvent`, so the state machine and view never
 //! learn which backend produced them.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::entry::ChatImage;
@@ -78,6 +79,39 @@ pub struct PlanEntryLite {
     pub priority: String,
 }
 
+/// What a session advertised about itself at init — the read-only facts behind
+/// the session-detail popover (which tools are loaded, which MCP servers
+/// connected, where it's rooted).
+///
+/// Serialized so a restored chat can show the same detail without waiting for a
+/// fresh init: `--resume` stays silent until the first message. Every field is
+/// `#[serde(default)]` for the same reason the sibling fields on the persisted
+/// transcript are — blobs written before this existed must stay loadable.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionMeta {
+    /// Working directory the agent was rooted at.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Tool names the agent loaded.
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// MCP servers and the status each reported (`connected`, `pending`, …).
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerStatus>,
+    /// Subagent types available to the session.
+    #[serde(default)]
+    pub agents: Vec<String>,
+}
+
+/// One MCP server as reported at session init.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpServerStatus {
+    pub name: String,
+    /// Verbatim status string — displayed, never matched on, so a new status
+    /// value the backend invents shows up rather than being dropped.
+    pub status: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ThreadEvent {
     /// Session bootstrap (`system/init`).
@@ -90,6 +124,11 @@ pub enum ThreadEvent {
         /// Empty when the backend doesn't advertise any. The UI offers these in
         /// a composer palette; the command itself rides as ordinary user text.
         slash_commands: Vec<String>,
+        /// What this session was started with, for the session-detail popover.
+        /// Empty/`None` fields when the backend doesn't advertise them (Codex
+        /// and ACP send far less than Claude's `system/init`), which the popover
+        /// renders by omitting those rows rather than showing blanks.
+        meta: SessionMeta,
     },
     /// A live streaming text delta (from `content_block_delta` text_delta).
     /// The UI may render these for smooth typing; the authoritative text
@@ -353,6 +392,86 @@ pub enum ThreadEvent {
         parent_tool_call_id: String,
         line: String,
     },
+    /// Something the agent tried that the app quietly handled on the user's
+    /// behalf, worth a trace in the transcript but not an error and not a
+    /// prompt. Today: a server → client request we don't implement and
+    /// auto-decline — without this the agent's attempt leaves no mark and the
+    /// turn just looks like it stalled. Folds to a muted divider, like the
+    /// other non-message notices.
+    Notice(String),
     /// A protocol/parse/transport error to surface in the thread.
     Error(String),
+}
+
+impl ThreadEvent {
+    /// Whether this event only extends content the transcript already shows — a
+    /// streamed token, a growing tool argument or output, a usage tick — rather
+    /// than changing its shape.
+    ///
+    /// A repaint re-parses the whole (growing) markdown body of the streaming
+    /// message, so a fast model emitting hundreds of tokens a second would cost
+    /// hundreds of full re-parses. Deltas are safe to coalesce into one repaint
+    /// because the intermediate frames only differ by a few characters nobody
+    /// can read at that rate. Everything else — a tool card appearing, a
+    /// permission prompt, a turn ending — changes what the user can act on, so
+    /// it must paint immediately.
+    pub fn is_delta(&self) -> bool {
+        matches!(
+            self,
+            Self::AssistantTextDelta(_)
+                | Self::ThinkingDelta(_)
+                | Self::ToolInputDelta { .. }
+                | Self::ToolOutputDelta { .. }
+                | Self::LiveUsage(_)
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_content_extending_events_are_deltas() {
+        assert!(ThreadEvent::AssistantTextDelta("hi".into()).is_delta());
+        assert!(ThreadEvent::ThinkingDelta("hm".into()).is_delta());
+        assert!(
+            ThreadEvent::ToolInputDelta {
+                tool_call_id: "t".into(),
+                partial_json: "{".into()
+            }
+            .is_delta()
+        );
+        assert!(ThreadEvent::ToolOutputDelta { id: "t".into(), chunk: "out".into() }.is_delta());
+        assert!(ThreadEvent::LiveUsage(TurnUsage::default()).is_delta());
+    }
+
+    #[test]
+    fn turn_shape_events_are_never_deltas() {
+        // These change what the user can see or act on, so coalescing them
+        // behind a timer would delay a tool card, a prompt, or a turn ending.
+        assert!(!ThreadEvent::AssistantText("done".into()).is_delta());
+        assert!(!ThreadEvent::AssistantThinking("thought".into()).is_delta());
+        assert!(
+            !ThreadEvent::ToolCallStarted {
+                id: "t".into(),
+                name: "Bash".into(),
+                input: serde_json::Value::Null
+            }
+            .is_delta()
+        );
+        assert!(
+            !ThreadEvent::ToolResult {
+                tool_use_id: "t".into(),
+                content: "ok".into(),
+                is_error: false,
+                structured: None
+            }
+            .is_delta()
+        );
+        assert!(
+            !ThreadEvent::TurnEnded { result: None, usage: None, is_error: false }.is_delta()
+        );
+        assert!(!ThreadEvent::Error("boom".into()).is_delta());
+    }
 }

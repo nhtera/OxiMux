@@ -48,7 +48,10 @@ pub use session_import::{transcript_from_jsonl, transcript_from_str, MAX_IMPORT_
 pub use codex_session_import::{
     import_codex_rollout, locate_rollout, transcript_from_codex_str, CodexRolloutImport,
 };
-pub use event::{AuthMethodInfo, AuthMethodKind, PlanEntryLite, ThreadEvent, TurnUsage};
+pub use event::{
+    AuthMethodInfo, AuthMethodKind, McpServerStatus, PlanEntryLite, SessionMeta, ThreadEvent,
+    TurnUsage,
+};
 pub use question::{
     parse_questions, updated_input_json, AskQuestion, QuestionAnswer, QuestionAnswers,
     QuestionKind, QuestionOption, QuestionRequest,

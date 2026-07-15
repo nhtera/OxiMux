@@ -14,7 +14,7 @@
 
 use super::background_task::{BackgroundTask, TaskStatus};
 use super::entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};
-use super::event::{PlanEntryLite, ThreadEvent, TurnUsage};
+use super::event::{PlanEntryLite, SessionMeta, ThreadEvent, TurnUsage};
 use super::question::QuestionRequest;
 use super::tool_call::{PermissionRequest, ToolCall, ToolCallStatus};
 
@@ -29,6 +29,12 @@ pub struct ChatThread {
     /// backend advertises none. Rides the restore snapshot so a resumed session
     /// keeps its palette without waiting for a fresh init.
     pub slash_commands: Vec<String>,
+    /// What the session advertised about itself at init (tools, MCP servers,
+    /// subagents, cwd), behind the session-detail popover. Rides the restore
+    /// snapshot for the same reason the palette does: `--resume` sends no init
+    /// until the first message, so without the cache a restored chat would show
+    /// an empty popover until then.
+    pub session_meta: SessionMeta,
     /// One-line description per slash command, keyed by command name (ACP agents
     /// like Cursor advertise them; Claude/Codex don't). Ephemeral — NOT persisted;
     /// repopulated when the agent re-advertises via `SlashCommandsUpdated`, so a
@@ -192,7 +198,7 @@ impl ChatThread {
     /// Fold one decoded event into the transcript.
     pub fn apply(&mut self, event: &ThreadEvent) {
         match event {
-            ThreadEvent::SessionInit { session_id, model, permission_mode, slash_commands } => {
+            ThreadEvent::SessionInit { session_id, model, permission_mode, slash_commands, meta } => {
                 self.session_id = Some(session_id.clone());
                 self.model = Some(model.clone());
                 self.permission_mode = Some(permission_mode.clone());
@@ -200,6 +206,12 @@ impl ChatThread {
                 // palette before init, and a later init should never blank it.
                 if !slash_commands.is_empty() {
                     self.slash_commands = slash_commands.clone();
+                }
+                // Same rule as the palette: a restored session seeds this from
+                // the persisted blob, so an init that advertises nothing (Codex,
+                // ACP) must not blank what restore already showed.
+                if meta != &SessionMeta::default() {
+                    self.session_meta = meta.clone();
                 }
             }
             ThreadEvent::AssistantTextDelta(t) => {
@@ -549,6 +561,22 @@ impl ChatThread {
             // interleaved `SessionInit` minted (before this error arrived) must
             // survive — then drop a divider notice so the next send omits
             // `--resume` and starts a clean session.
+            // A quietly-handled event: same muted divider as the other notices,
+            // so it persists with the transcript and can't be mistaken for
+            // something the agent said. An agent that retries the same
+            // unimplemented request repeats the notice verbatim; collapse those
+            // so a retry loop leaves one divider rather than a wall of them
+            // (each would also split the streaming reply into another bubble).
+            ThreadEvent::Notice(text) => {
+                let repeat = matches!(
+                    self.entries.last(),
+                    Some(ThreadEntry::ContextCompaction { summary }) if summary == text
+                );
+                if !repeat {
+                    self.end_assistant_window();
+                    self.entries.push(ThreadEntry::ContextCompaction { summary: text.clone() });
+                }
+            }
             ThreadEvent::SessionResumeStale { attempted_id } => {
                 if self.session_id.as_deref() == Some(attempted_id.as_str()) {
                     self.session_id = None;
@@ -1482,6 +1510,7 @@ mod tests {
         let mut t = ChatThread::new();
         t.push_user_message("hello");
         t.apply(&ThreadEvent::SessionInit {
+            meta: Default::default(),
             session_id: "sid-1".into(),
             model: "claude-opus".into(),
             permission_mode: "default".into(),
@@ -1648,6 +1677,28 @@ mod tests {
         let err2 = t.last_error.clone().expect("second error");
         assert!(!err2.contains("stale noise"), "old diagnostic leaked into a later turn: {err2}");
         assert_eq!(err2, "turn ended with error", "generic fallback, no leaked stash");
+    }
+
+    #[test]
+    fn notice_folds_to_a_muted_divider() {
+        // A quietly-handled event reads as a divider, never as agent speech.
+        let mut t = ChatThread::new();
+        t.apply(&ThreadEvent::Notice("Auto-declined: attestation/generate".into()));
+        match t.entries.last() {
+            Some(ThreadEntry::ContextCompaction { summary }) => {
+                assert_eq!(summary, "Auto-declined: attestation/generate");
+            }
+            other => panic!("a notice folds to a muted divider, got {other:?}"),
+        }
+
+        // A retried request repeats the notice — one divider, not a wall.
+        t.apply(&ThreadEvent::Notice("Auto-declined: attestation/generate".into()));
+        t.apply(&ThreadEvent::Notice("Auto-declined: attestation/generate".into()));
+        assert_eq!(t.entries.len(), 1, "consecutive identical notices collapse");
+
+        // A different notice is still its own divider.
+        t.apply(&ThreadEvent::Notice("Auto-declined: permissions/request".into()));
+        assert_eq!(t.entries.len(), 2, "a distinct notice still shows");
     }
 
     #[test]

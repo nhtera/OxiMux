@@ -6,7 +6,12 @@
 //! (which needs a `Repository`): a tool card diffs two in-memory strings and
 //! only displays them, so it needs neither hunk line numbers nor staging.
 
-use gpui::{AnyElement, IntoElement, ParentElement, SharedString, Styled, div, px};
+use super::apply_patch;
+use crate::shell::diff_view::syntax;
+use gpui::{
+    AnyElement, HighlightStyle, Hsla, IntoElement, ParentElement, SharedString, StyledText, Styled,
+    div, px,
+};
 use oximux_agents::thread::ToolCall;
 use oximux_core::{DiffLine, DiffLineKind};
 use oximux_settings::{Density, Theme, Typography};
@@ -35,6 +40,12 @@ pub(super) fn build_edit_diff(tc: &ToolCall) -> Option<Vec<DiffLine>> {
         } else {
             lines_from_change(old, new)
         });
+    }
+    // Codex names its file edits `apply_patch` and carries them as a `changes`
+    // array of per-file patches — a different payload shape to Claude's Edit,
+    // but the same card.
+    if tc.name == "apply_patch" {
+        return apply_patch::diff(tc);
     }
     let obj = tc.input.as_object()?;
     match tc.name.as_str() {
@@ -67,6 +78,23 @@ pub(super) fn build_edit_diff(tc: &ToolCall) -> Option<Vec<DiffLine>> {
     }
 }
 
+/// The file this card's diff belongs to, for syntax highlighting — `None` when
+/// the payload names no single file, in which case rows render plain rather
+/// than guessed at.
+///
+/// A multi-file `apply_patch` deliberately yields `None`: one card's rows can
+/// span several languages, and highlighting them all as the first file's would
+/// be worse than not highlighting at all.
+pub(super) fn diff_path(tc: &ToolCall) -> Option<&str> {
+    if let Some(d) = acp_diff(tc) {
+        return d.get("path").and_then(Value::as_str);
+    }
+    if tc.name == "apply_patch" {
+        return apply_patch::single_path(tc);
+    }
+    tc.input.get("file_path").and_then(Value::as_str)
+}
+
 /// The normalized ACP diff payload (`{path, old_text, new_text}`) for this tool
 /// call, from the input (edit start) or the structured result (late diff), if any.
 fn acp_diff(tc: &ToolCall) -> Option<&Value> {
@@ -95,12 +123,20 @@ fn lines_from_change(old: &str, new: &str) -> Vec<DiffLine> {
 /// Render a diff line stream as a bordered code block: added rows green-tinted,
 /// removed red-tinted, context muted. Rows are capped; a trailing note reports
 /// any overflow.
+///
+/// `path` names the file the rows came from, which decides the grammar used to
+/// colour their tokens; `None` renders plain. Highlighting reuses DiffView's
+/// tokenizer, so an edit reads the same in a tool card as in the diff pane.
 pub(super) fn render_diff(
     lines: &[DiffLine],
+    path: Option<&str>,
     theme: Theme,
     density: Density,
     typo: &Typography,
 ) -> AnyElement {
+    // Resolved once per card, not once per row: the grammar lookup is a
+    // syntax-set search, and the rows all share a file.
+    let style = path.map(|p| RowStyle { lang: syntax::detect_language(std::path::Path::new(p)), path: p });
     let mut col = div()
         .flex()
         .flex_col()
@@ -138,10 +174,7 @@ pub(super) fn render_diff(
                         .child(SharedString::from(prefix)),
                 )
                 .child(
-                    div()
-                        .flex_1()
-                        .text_color(fg)
-                        .child(SharedString::from(line.content.clone())),
+                    div().flex_1().text_color(fg).child(row_text(&line.content, style.as_ref())),
                 ),
         );
     }
@@ -160,6 +193,91 @@ pub(super) fn render_diff(
         );
     }
     col.into_any_element()
+}
+
+/// The grammar a card's rows are coloured with, plus the path that selected it
+/// (which doubles as the highlight cache's key).
+struct RowStyle<'a> {
+    lang: syntax::Language,
+    path: &'a str,
+}
+
+/// One row's highlight runs, ready to hand to `StyledText`.
+type Runs = Vec<(std::ops::Range<usize>, HighlightStyle)>;
+
+/// Memoized row highlights, keyed by the file path and the row's exact text.
+///
+/// The transcript is not virtualized, so every visible entry — including an
+/// expanded diff card — rebuilds its elements on each repaint, and streaming
+/// drives repaints up to `NOTIFY_INTERVAL`-fast. Without this, a card the user
+/// expanded once would re-tokenize all of its rows tens of times a second for
+/// the rest of the session, while the rows never change. Syntect's per-line
+/// tokenize is deterministic, so a hit is always exact.
+///
+/// Thread-local because rendering only ever happens on the foreground thread.
+const HL_CACHE_MAX: usize = 4096;
+thread_local! {
+    static HL_CACHE: std::cell::RefCell<std::collections::HashMap<(String, String), Runs>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// A diff row's text, syntax-coloured when a grammar matched the file.
+///
+/// Falls back to the row's flat colour whenever highlighting produces nothing —
+/// no grammar, an empty row, or token ranges that don't line up with the
+/// content — so a bad match degrades to plain text and can never blank a row.
+/// Untokenized spans inherit the row's colour from the parent element.
+fn row_text(content: &str, style: Option<&RowStyle<'_>>) -> AnyElement {
+    let text = SharedString::from(content.to_string());
+    let Some(style) = style else {
+        return text.into_any_element();
+    };
+    let runs = cached_runs(content, style);
+    if runs.is_empty() {
+        return text.into_any_element();
+    }
+    StyledText::new(text).with_highlights(runs).into_any_element()
+}
+
+/// This row's highlight runs, tokenizing only on a cache miss.
+fn cached_runs(content: &str, style: &RowStyle<'_>) -> Runs {
+    let key = (style.path.to_string(), content.to_string());
+    HL_CACHE.with(|c| {
+        if let Some(hit) = c.borrow().get(&key) {
+            return hit.clone();
+        }
+        let runs = highlight_runs(content, style.lang);
+        let mut cache = c.borrow_mut();
+        // A whole session's diffs must not accumulate forever. Rows are cheap
+        // to recompute, so drop everything rather than track recency — the
+        // working set (one open card) refills on the next frame.
+        if cache.len() >= HL_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(key, runs.clone());
+        runs
+    })
+}
+
+/// Tokenize one row into colour runs, skipping any token whose byte range
+/// doesn't land on a char boundary of this row.
+fn highlight_runs(content: &str, lang: syntax::Language) -> Runs {
+    syntax::highlight_line(content, lang)
+        .into_iter()
+        .filter_map(|t| {
+            let (start, end) = (t.start.min(content.len()), t.end.min(content.len()));
+            if start >= end || !content.is_char_boundary(start) || !content.is_char_boundary(end) {
+                return None;
+            }
+            let color = Hsla::from(gpui::Rgba {
+                r: t.r as f32 / 255.0,
+                g: t.g as f32 / 255.0,
+                b: t.b as f32 / 255.0,
+                a: 1.0,
+            });
+            Some((start..end, HighlightStyle { color: Some(color), ..Default::default() }))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -216,6 +334,87 @@ mod tests {
         let lines = build_edit_diff(&tc).expect("acp write diff");
         assert_eq!(lines.len(), 2);
         assert!(lines.iter().all(|l| l.kind == DiffLineKind::Added));
+    }
+
+    #[test]
+    fn diff_path_names_the_file_to_highlight_as() {
+        // Claude's Edit/Write carry it directly.
+        let edit = ToolCall::new("id", "Edit", json!({"file_path": "src/a.rs", "old_string": "a", "new_string": "b"}));
+        assert_eq!(diff_path(&edit), Some("src/a.rs"));
+        // An ACP edit's normalized payload names its own path.
+        let acp = ToolCall::new(
+            "id",
+            "Edit",
+            json!({"__acp_diff__": {"path": "src/b.rs", "old_text": "a", "new_text": "b"}}),
+        );
+        assert_eq!(diff_path(&acp), Some("src/b.rs"));
+        // A single-file patch → its path.
+        let one = ToolCall::new(
+            "id",
+            "apply_patch",
+            json!({"changes": [{"path": "src/c.rs", "kind": {"type": "add"}, "diff": "x"}]}),
+        );
+        assert_eq!(diff_path(&one), Some("src/c.rs"));
+        // A multi-file patch spans languages → no single grammar, so plain rows
+        // rather than colouring everything as the first file.
+        let many = ToolCall::new(
+            "id",
+            "apply_patch",
+            json!({"changes": [
+                {"path": "a.rs", "kind": {"type": "add"}, "diff": "x"},
+                {"path": "b.py", "kind": {"type": "add"}, "diff": "y"},
+            ]}),
+        );
+        assert_eq!(diff_path(&many), None);
+        // No path at all → plain.
+        let bare = ToolCall::new("id", "Write", json!({"content": "x"}));
+        assert_eq!(diff_path(&bare), None);
+    }
+
+    #[test]
+    fn cached_runs_match_a_fresh_tokenize_and_key_on_the_file() {
+        let rs = RowStyle { lang: syntax::detect_language(std::path::Path::new("a.rs")), path: "a.rs" };
+        let line = "let x = \"hi\";";
+        let fresh = highlight_runs(line, rs.lang);
+        // First call populates, second hits — both must equal a fresh tokenize,
+        // or the cache would silently paint a row wrong.
+        assert_eq!(cached_runs(line, &rs), fresh);
+        assert_eq!(cached_runs(line, &rs), fresh);
+        assert!(!fresh.is_empty(), "rust tokenizes, so this test is not vacuous");
+
+        // Same text in a different language must not collide on the cache key.
+        let py = RowStyle { lang: syntax::detect_language(std::path::Path::new("a.py")), path: "a.py" };
+        assert_eq!(cached_runs(line, &py), highlight_runs(line, py.lang));
+
+        // Growth only happens on a miss, so that is where the bound is enforced:
+        // a full cache plus one new row evicts rather than growing forever.
+        HL_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            cache.clear();
+            for i in 0..HL_CACHE_MAX {
+                cache.insert(("f.rs".into(), format!("line{i}")), Vec::new());
+            }
+        });
+        let fresh_row = "let evicting = 1;";
+        assert_eq!(
+            cached_runs(fresh_row, &rs),
+            highlight_runs(fresh_row, rs.lang),
+            "a miss against a full cache still returns correct runs"
+        );
+        HL_CACHE.with(|c| assert!(c.borrow().len() <= HL_CACHE_MAX, "cache stays bounded"));
+    }
+
+    #[test]
+    fn row_highlighting_degrades_to_plain_text() {
+        // A grammar that matches produces token runs...
+        let rust = syntax::detect_language(std::path::Path::new("a.rs"));
+        assert!(!syntax::highlight_line("let x = 1;", rust).is_empty(), "rust tokenizes");
+        // ...while an unknown extension yields none, which `row_text` renders
+        // as flat text rather than a blank row.
+        let unknown = syntax::detect_language(std::path::Path::new("a.zzzz"));
+        assert!(syntax::highlight_line("let x = 1;", unknown).is_empty());
+        // An empty row is safe in either language.
+        assert!(syntax::highlight_line("", rust).is_empty());
     }
 
     #[test]
