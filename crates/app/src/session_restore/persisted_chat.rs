@@ -83,6 +83,16 @@ pub struct PersistedChatTranscript {
     /// loadable and defaults them to on-request / workspace-write.
     #[serde(default)]
     pub codex_posture: Option<(String, String)>,
+    /// Pi's session-level tool posture chosen via the composer, so a reopened Pi
+    /// chat resumes under the same allowlist. `#[serde(default)]` (→ `None`)
+    /// keeps older / non-Pi blobs loadable.
+    ///
+    /// Pi has no per-call approval, so this posture is the only thing standing
+    /// between the session and an ungated `bash`. A restore that dropped it
+    /// would silently *widen* what the agent may do — hence it is persisted
+    /// rather than re-derived.
+    #[serde(default)]
+    pub pi_posture: Option<oximux_agents::thread::pi::posture::PiPosture>,
 }
 
 /// Write one transcript blob. A serialize failure is logged and skipped rather
@@ -133,6 +143,47 @@ mod tests {
     }
 
     #[test]
+    fn pi_posture_round_trips_so_a_restore_cannot_silently_widen_it() {
+        use oximux_agents::thread::pi::posture::{PiPosture, TOOLS_READ_ONLY};
+        let repo = repo();
+        let t = PersistedChatTranscript {
+            session_meta: Default::default(),
+            session_id: "pi-sess".into(),
+            model: Some("gpt-5.5".into()),
+            entries: vec![],
+            slash_commands: vec![],
+            thinking_level: Default::default(),
+            provider: Transport::Rpc,
+            acp_command: None,
+            acp_args: vec![],
+            codex_posture: None,
+            pi_posture: Some(PiPosture { tools: TOOLS_READ_ONLY.into(), context_files: false }),
+        };
+        save_chat_transcript(&repo, &t);
+        let loaded = load_chat_transcript(&repo, "pi-sess").expect("blob loads");
+        assert_eq!(loaded.provider, Transport::Rpc);
+        // Pi has no per-call approval, so this posture is the session's only tool
+        // gate — and the default is the MOST permissive option. Losing it here
+        // would silently hand a restricted session `bash` back.
+        let p = loaded.pi_posture.expect("posture must survive the round trip");
+        assert_eq!(p.tools, TOOLS_READ_ONLY);
+        assert!(!p.context_files);
+        assert_ne!(p, PiPosture::default(), "must not have reverted to the permissive default");
+    }
+
+    #[test]
+    fn a_blob_predating_pi_posture_still_loads() {
+        // Older blobs have no `pi_posture` key at all; they must not fail to
+        // parse (which would drop the whole transcript).
+        let repo = repo();
+        let raw = r#"{"session_id":"old","entries":[],"provider":"streamjson"}"#;
+        repo.set(&chat_settings_key("old"), raw).expect("seed");
+        let loaded = load_chat_transcript(&repo, "old").expect("older blob must still load");
+        assert_eq!(loaded.pi_posture, None);
+        assert_eq!(loaded.provider, Transport::StreamJson);
+    }
+
+    #[test]
     fn round_trips_a_transcript() {
         let repo = repo();
         let t = PersistedChatTranscript {
@@ -149,6 +200,7 @@ mod tests {
             acp_command: None,
             acp_args: vec![],
             codex_posture: None,
+            pi_posture: None,
         };
         save_chat_transcript(&repo, &t);
         assert_eq!(load_chat_transcript(&repo, "sid-1"), Some(t));
@@ -180,6 +232,7 @@ mod tests {
             acp_command: Some("gemini".into()),
             acp_args: vec!["--experimental-acp".into()],
             codex_posture: None,
+            pi_posture: None,
         };
         save_chat_transcript(&repo, &t);
         let loaded = load_chat_transcript(&repo, "acp-sess").unwrap();

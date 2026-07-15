@@ -222,17 +222,27 @@ fn restore_chat_thinking_level(
         .unwrap_or_default()
 }
 
-/// The persisted Codex posture `(approval_policy, sandbox)` for a restored chat,
-/// so a reopened Codex session resumes under the same Approvals/Sandbox choice.
-/// `None` when the blob predates the field, the session isn't found, or it was a
-/// non-Codex chat.
-fn restore_chat_codex_posture(
+/// The persisted backend posture for a restored chat, so a reopened session
+/// resumes under the same choice rather than a default. Empty when the blob
+/// predates the fields, the session isn't found, or the backend has no posture.
+///
+/// For Pi this is a safety property, not just fidelity: pi has no per-call
+/// approval, so its posture is the session's only tool gate — and the default is
+/// the most permissive option, so dropping the saved value on restore would
+/// silently re-enable `bash` for a session the user had restricted.
+fn restore_chat_posture(
     snap: &PersistedTabs,
     session_id: Option<&str>,
-) -> Option<(String, String)> {
-    session_id
+) -> crate::shell::agent_chat::RestoredPosture {
+    let Some(t) = session_id
         .and_then(|sid| snap.chat_transcripts.iter().find(|t| t.session_id == sid))
-        .and_then(|t| t.codex_posture.clone())
+    else {
+        return Default::default();
+    };
+    crate::shell::agent_chat::RestoredPosture {
+        codex: t.codex_posture.clone(),
+        pi: t.pi_posture.clone(),
+    }
 }
 
 /// The persisted backend for a restored chat, so it reconnects the same
@@ -403,11 +413,11 @@ pub(crate) fn build_project_panes(
                             let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
                             let backend = restore_chat_backend(&snap, session_id.as_deref());
                             let resume_id = restore_chat_resume_id(&snap, session_id.as_deref());
-                            let codex_posture = restore_chat_codex_posture(&snap, session_id.as_deref());
+                            let posture = restore_chat_posture(&snap, session_id.as_deref());
                             group.update(cx, |g, cx| {
                                 g.open_agent_chat_tab_restored(
                                     chat_cwd, model, backend, resume_id, entries, slash_commands,
-                                    session_meta, thinking_level, codex_posture, draft, queued, window,
+                                    session_meta, thinking_level, posture, draft, queued, window,
                                     cx,
                                 );
                             });
@@ -582,10 +592,10 @@ fn restore_multi_group(
                             let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
                             let backend = restore_chat_backend(&snap, session_id.as_deref());
                             let resume_id = restore_chat_resume_id(&snap, session_id.as_deref());
-                            let codex_posture = restore_chat_codex_posture(&snap, session_id.as_deref());
+                            let posture = restore_chat_posture(&snap, session_id.as_deref());
                             p.open_agent_chat_in_group_restore(
                                 group_id, chat_cwd, model, backend, resume_id, entries, slash_commands,
-                                session_meta, thinking_level, codex_posture, draft, queued, window, cx,
+                                session_meta, thinking_level, posture, draft, queued, window, cx,
                             );
                         }
                         p.place_restored_last_tab(Some(group_id), meta, cx);
@@ -1095,6 +1105,7 @@ fn static_adapter_id(adapter: AgentAdapter) -> &'static str {
     match adapter {
         AgentAdapter::ClaudeCode => "claude-code",
         AgentAdapter::Codex => "codex",
+        AgentAdapter::Pi => "pi",
         AgentAdapter::Aider => "aider",
         AgentAdapter::Custom => "custom",
     }
@@ -2023,6 +2034,7 @@ mod tests {
             acp_command: None,
             acp_args: vec![],
             codex_posture: None,
+            pi_posture: None,
         };
         let snap = PersistedTabs {
             tabs: vec![PersistedTab {
@@ -2085,6 +2097,7 @@ mod tests {
             acp_command: None,
             acp_args: vec![],
             codex_posture: None,
+            pi_posture: None,
         };
         let snap =
             PersistedTabs { chat_transcripts: vec![present.clone()], ..PersistedTabs::default() };

@@ -13,8 +13,10 @@ use serde::{Deserialize, Serialize};
 /// native stream-json subprocess — the default, so an old persisted blob that
 /// names no provider restores as Claude. `AppServer` drives Codex over its
 /// native `codex app-server` JSON-RPC. `Acp` drives an external agent over the
-/// Agent Client Protocol. Serde `lowercase` so the persisted tag is a stable
-/// short string (`"streamjson"` / `"appserver"` / `"acp"`).
+/// Agent Client Protocol. `Rpc` drives Pi over its own newline-JSON `--mode rpc`
+/// protocol (Pi speaks neither ACP nor app-server). Serde `lowercase` so the
+/// persisted tag is a stable short string (`"streamjson"` / `"appserver"` /
+/// `"acp"` / `"rpc"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
@@ -22,6 +24,7 @@ pub enum Transport {
     StreamJson,
     AppServer,
     Acp,
+    Rpc,
 }
 
 impl Transport {
@@ -36,6 +39,7 @@ impl Transport {
             Transport::StreamJson => "Claude",
             Transport::AppServer => "Codex",
             Transport::Acp => "Agent",
+            Transport::Rpc => "Pi",
         }
     }
 }
@@ -53,8 +57,11 @@ mod tests {
     fn serde_round_trips_lowercase() {
         assert_eq!(serde_json::to_string(&Transport::StreamJson).unwrap(), "\"streamjson\"");
         assert_eq!(serde_json::to_string(&Transport::Acp).unwrap(), "\"acp\"");
+        assert_eq!(serde_json::to_string(&Transport::Rpc).unwrap(), "\"rpc\"");
         let acp: Transport = serde_json::from_str("\"acp\"").unwrap();
         assert_eq!(acp, Transport::Acp);
+        let rpc: Transport = serde_json::from_str("\"rpc\"").unwrap();
+        assert_eq!(rpc, Transport::Rpc);
     }
 
     #[test]
@@ -62,5 +69,6 @@ mod tests {
         assert_eq!(Transport::StreamJson.provider_display_name(), "Claude");
         assert_eq!(Transport::AppServer.provider_display_name(), "Codex");
         assert_eq!(Transport::Acp.provider_display_name(), "Agent");
+        assert_eq!(Transport::Rpc.provider_display_name(), "Pi");
     }
 }

@@ -36,6 +36,9 @@ pub enum Transport {
     StreamJson,
     AppServer,
     Acp,
+    /// Pi's own newline-JSON protocol (`pi --mode rpc`). Pi speaks neither ACP
+    /// nor app-server, so it needs its own transport rather than reusing one.
+    Rpc,
 }
 
 /// One agent's launch defaults. All fields optional via `#[serde(default)]`
@@ -168,10 +171,17 @@ pub fn acp_preset(id: &str) -> Option<&'static AcpPreset> {
 /// The interactive terminal resume invocation for an import-provider session
 /// surfaced in the history picker — `(program, argv)` spawned as a `Custom` PTY.
 /// `handle` is the provider's native resume handle: the session id for OpenCode
-/// (`opencode --session <id>`) and Copilot (`copilot --resume=<id>`), or the
-/// rollout file path for Pi (`pi --session <file>`, which is non-ACP so it has
-/// no `AcpPreset` row). `None` for an unrecognized id. Keeps every provider's
-/// resume argv in one place so the index, picker, and spawn layer can't drift.
+/// (`opencode --session <id>`) and Copilot (`copilot --resume=<id>`). `None` for
+/// an unrecognized id. Keeps every provider's resume argv in one place so the
+/// index, picker, and spawn layer can't drift.
+///
+/// Pi (`pi --session <handle>`) accepts **either** a session id or a rollout file
+/// path, and the two are not equivalent: an id is looked up in the project's
+/// store and a miss exits 1 with a message, while a path is taken literally with
+/// no existence check — a stale one makes pi create an empty session there and
+/// start as though it had resumed. **Prefer the id.** The history picker passes a
+/// path (it has one, and it exists — it was just read to build the row); the chat's
+/// companion terminal passes the id.
 pub fn import_resume_command(preset_id: &str, handle: &str) -> Option<(String, Vec<String>)> {
     match preset_id {
         "opencode" => Some(("opencode".to_string(), vec!["--session".to_string(), handle.to_string()])),
@@ -294,6 +304,7 @@ impl AgentLaunchSettings {
         }
         match adapter_id {
             "codex" => Transport::AppServer,
+            "pi" => Transport::Rpc,
             _ => Transport::StreamJson,
         }
     }
@@ -301,13 +312,18 @@ impl AgentLaunchSettings {
     /// Whether `adapter_id` can open as a structured chat (vs a raw terminal).
     /// This is the capability seam the chat-routing gate consults instead of a
     /// hard-coded provider name. An adapter qualifies when it is either:
-    /// - a built-in chat adapter — Claude (`claude-code`, native stream-json) or
-    ///   Codex (`codex`, native app-server); or
+    /// - a built-in chat adapter — Claude (`claude-code`, native stream-json),
+    ///   Codex (`codex`, native app-server), or Pi (`pi`, native `--mode rpc`); or
     /// - configured with `transport = "acp"` and a non-empty `acp_command`
     ///   (an external ACP agent to spawn); or
     /// - a built-in ACP preset (Cursor/Amp) the user hasn't overridden.
+    ///
+    /// The built-in check must stay ahead of the `for_agent` branch below: that
+    /// branch only recognises ACP, so a built-in that merely *has* a configured
+    /// entry (a model, some args) would otherwise fall into it and report
+    /// `false` — silently un-chat-able for exactly the users who customised it.
     pub fn chat_capable(&self, adapter_id: &str) -> bool {
-        if matches!(adapter_id, "claude-code" | "codex") {
+        if matches!(adapter_id, "claude-code" | "codex" | "pi") {
             return true;
         }
         if let Some(a) = self.for_agent(adapter_id) {
@@ -592,6 +608,36 @@ acp_args = "--experimental-acp --foo"
         s.entry_mut("gemini").acp_command = "gemini".into();
         assert!(s.chat_capable("gemini"));
         assert_eq!(s.transport_for("gemini"), Transport::Acp);
+    }
+
+    #[test]
+    fn pi_is_a_builtin_rpc_chat_adapter() {
+        let s = AgentLaunchSettings::default();
+        assert!(s.chat_capable("pi"), "pi opens as chat with zero config");
+        assert_eq!(
+            s.transport_for("pi"),
+            Transport::Rpc,
+            "pi speaks its own newline-JSON rpc protocol, not stream-json"
+        );
+    }
+
+    #[test]
+    fn pi_stays_chat_capable_once_configured() {
+        // Configuring any field creates an entry. The ACP-only `for_agent`
+        // branch must not claim a built-in and report it terminal-only.
+        let mut s = AgentLaunchSettings::default();
+        s.entry_mut("pi").model = "gpt-5.5".into();
+        assert!(s.chat_capable("pi"), "a configured model must not disable pi chat");
+        assert_eq!(s.transport_for("pi"), Transport::Rpc);
+    }
+
+    #[test]
+    fn an_unknown_adapter_never_silently_becomes_pi() {
+        // The `_` arm defaults to Claude's transport. That is the documented
+        // fallback and the reason a new adapter needs an explicit arm here.
+        let s = AgentLaunchSettings::default();
+        assert_eq!(s.transport_for("totally-unknown"), Transport::StreamJson);
+        assert!(!s.chat_capable("totally-unknown"));
     }
 
     #[test]

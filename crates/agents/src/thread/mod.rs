@@ -22,6 +22,7 @@ pub mod connection;
 pub mod context_chip;
 pub mod entry;
 pub mod event;
+pub mod pi;
 pub mod question;
 pub mod session_file_fork;
 pub mod session_import;
@@ -34,6 +35,7 @@ pub mod transport;
 pub use acp::AcpConnection;
 pub use claude_stream_json::{build_args, claude_model_choices, ClaudeStreamJsonConnection};
 pub use codex::CodexAppServerConnection;
+pub use pi::PiRpcConnection;
 pub use connect::{connect, probe_catalog, ChatBackend, ConnectSpec, ProbedCatalog};
 pub use connection::{
     control_response_json, question_answer_json, user_message_json, user_message_json_with_images,

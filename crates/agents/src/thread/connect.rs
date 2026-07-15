@@ -14,6 +14,8 @@ use super::claude_stream_json::ClaudeStreamJsonConnection;
 use super::codex::CodexAppServerConnection;
 use super::connection::{AgentConnection, ModelChoice};
 use super::event::ThreadEvent;
+use super::pi::posture::PiPosture;
+use super::pi::PiRpcConnection;
 use super::transport::Transport;
 
 /// Which backend a chat tab runs over, plus — for ACP — the external command to
@@ -83,6 +85,20 @@ pub struct ConnectSpec {
     /// reopened Codex session keeps its Approvals/Sandbox choice; `None` starts at
     /// the default posture (on-request / workspace-write).
     pub codex_posture: Option<(String, String)>,
+    /// An explicit path to the `pi` binary (only read by the `Rpc` arm). `None`
+    /// falls back to PATH, then a login-shell probe — needed because a
+    /// Finder-launched app inherits no shell PATH and pi usually lives under a
+    /// version manager. Deliberately its own field rather than reusing
+    /// `acp_command`: these are per-adapter launch details that happen to be
+    /// strings, not a shared abstraction.
+    pub pi_command: Option<String>,
+    /// Pi's session-level tool posture (only read by the `Rpc` arm). `None` uses
+    /// the deliberate default (Standard — see `PiPosture::default`). Its own
+    /// field rather than a second meaning for `codex_posture`: that one is
+    /// documented Codex-specific, and this struct already carries one launch
+    /// field per transport (`permission_mode`, `effort`, `codex_posture`) — a
+    /// convention, not a shared abstraction.
+    pub pi_posture: Option<PiPosture>,
 }
 
 impl ConnectSpec {
@@ -114,6 +130,8 @@ impl ConnectSpec {
             // Set only when restoring a Codex chat with a persisted posture; a
             // fresh launch starts at the default posture.
             codex_posture: None,
+            pi_command: None,
+            pi_posture: None,
         }
     }
 }
@@ -161,6 +179,22 @@ pub fn connect(spec: ConnectSpec) -> Result<(Box<dyn AgentConnection>, Receiver<
                 spec.resume_session_id.clone(),
                 spec.env.clone(),
                 spec.auth_method.clone(),
+            )?;
+            Ok((Box::new(conn), rx))
+        }
+        Transport::Rpc => {
+            // `None` → the deliberate default, never an accidental "no flags".
+            let posture = spec.pi_posture.clone().unwrap_or_default();
+            // Pi resumes by session id (`--session`), scoped to the store for
+            // `cwd`'s project — so the caller must pass the session's own cwd.
+            // A path here is refused rather than resumed: pi would silently mint
+            // an empty session at it (see `pi::build_args`).
+            let (conn, rx) = PiRpcConnection::spawn(
+                &spec.cwd,
+                spec.model.as_deref(),
+                spec.pi_command.as_deref(),
+                posture,
+                spec.resume_session_id.as_deref(),
             )?;
             Ok((Box::new(conn), rx))
         }
@@ -237,6 +271,8 @@ mod tests {
             env: vec![],
             auth_method: None,
             codex_posture: None,
+            pi_command: None,
+            pi_posture: None,
         };
         // Can't `expect_err` — the Ok payload (`Box<dyn AgentConnection>`) isn't
         // `Debug`; match instead.
@@ -265,6 +301,8 @@ mod tests {
             env: vec![],
             auth_method: None,
             codex_posture: None,
+            pi_command: None,
+            pi_posture: None,
         };
         let err = probe_catalog(spec).expect_err("probe must fail without a command");
         assert!(err.to_string().contains("acp_command"), "unexpected error: {err}");

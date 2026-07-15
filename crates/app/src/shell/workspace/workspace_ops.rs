@@ -373,12 +373,13 @@ pub enum ChatWorktreeOutcome {
 }
 
 /// Resolve the static adapter slug used by `start_session` for each
-/// built-in agent variant. Inline 4-arm match — KISS over adding a
+/// built-in agent variant. Inline match — KISS over adding a
 /// method to `oximux-core`.
 fn agent_adapter_id(kind: AgentAdapter) -> &'static str {
     match kind {
         AgentAdapter::ClaudeCode => "claude-code",
         AgentAdapter::Codex => "codex",
+        AgentAdapter::Pi => "pi",
         AgentAdapter::Aider => "aider",
         AgentAdapter::Custom => "custom",
     }

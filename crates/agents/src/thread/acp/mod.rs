@@ -138,7 +138,8 @@ pub(crate) struct AcpState {
 /// of `modes`/`config_options`; `supports_slash`/`emits_usage` reflect that the
 /// ACP adapter wires `AvailableCommands`/`Usage` session updates (empty until one
 /// arrives, which harmlessly disables the affordance). `supports_rewind` is always
-/// `false` — ACP has no on-disk session log to truncate-fork.
+/// `false` — ACP has no on-disk session log to truncate-fork — and so is
+/// `supports_steer`: ACP has no mid-turn message queue.
 fn caps_from_handshake(
     modes: Option<&SessionModeState>,
     config_options: &[SessionConfigOption],
@@ -149,6 +150,7 @@ fn caps_from_handshake(
         supports_config: !config_options.is_empty(),
         emits_usage: true,
         supports_rewind: false,
+        supports_steer: false,
     }
 }
 

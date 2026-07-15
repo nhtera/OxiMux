@@ -151,6 +151,7 @@ fn to_agents_transport(t: oximux_settings::Transport) -> oximux_agents::thread::
         oximux_settings::Transport::StreamJson => oximux_agents::thread::Transport::StreamJson,
         oximux_settings::Transport::AppServer => oximux_agents::thread::Transport::AppServer,
         oximux_settings::Transport::Acp => oximux_agents::thread::Transport::Acp,
+        oximux_settings::Transport::Rpc => oximux_agents::thread::Transport::Rpc,
     }
 }
 
@@ -542,9 +543,13 @@ impl WorkspaceRoot {
         let typography = Typography::cockpit();
 
         // Construct the CLI agent runtime + adapter registry once per
-        // workspace. The registry is built with all four built-in adapters
-        // in dialog order; each adapter is also registered into the runtime
-        // so `start_session` can resolve them by `AgentAdapter` enum.
+        // workspace. The registry is built with every built-in adapter in dialog
+        // order; each is also registered into the runtime so `start_session` can
+        // resolve them by `AgentAdapter` enum. The runtime's set is *derived*
+        // from the registry rather than listed again here — a second list drifts
+        // silently, and the failure is invisible until launch: the row renders,
+        // the click routes, and `start_session` dies with "no adapter registered"
+        // in a log nobody is reading.
         // Detection (`registry.detect_available()`) is intentionally lazy —
         // the Cmd+Shift+A action handler calls it at spawn time. Step 10's
         // popover will switch to fire-on-startup once the UX needs the
@@ -557,12 +562,7 @@ impl WorkspaceRoot {
             crate::shell::terminal_view::shared_backend(),
         ));
         let adapter_registry = Arc::new(AdapterRegistry::with_builtin_adapters());
-        for kind in [
-            AgentAdapter::ClaudeCode,
-            AgentAdapter::Codex,
-            AgentAdapter::Aider,
-            AgentAdapter::Custom,
-        ] {
+        for kind in adapter_registry.builtin_kinds() {
             if let Some(adapter) = adapter_registry.adapter_for(kind) {
                 cli_runtime.register_adapter(kind, adapter);
             }

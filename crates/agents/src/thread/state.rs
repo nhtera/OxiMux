@@ -78,6 +78,12 @@ pub struct ChatThread {
     /// denominator cache for the % meter. Claude's live events omit the window,
     /// so this is seeded from a settled turn and reused for the current turn's
     /// live %. Never cleared on a new turn (the window doesn't change per turn).
+    ///
+    /// A turn is not the only writer: a backend that knows its window without
+    /// running one ([`AgentConnection::context_window`], which Pi answers from
+    /// its handshake) seeds this at connect, and refreshes it when a live model
+    /// switch changes the window — pi's models range from 128K to 372K, so the
+    /// denominator genuinely follows the model.
     pub last_known_context_window: Option<u64>,
     /// Cumulative USD spend across every settled turn THIS app-session ("cost
     /// since open"). Resets to zero on restore (persisted entries carry no

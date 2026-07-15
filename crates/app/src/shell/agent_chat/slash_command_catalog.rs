@@ -4,10 +4,16 @@
 //! plugin commands/skills under `~/.claude/plugins/cache`, project
 //! `.claude/commands/*.md`) plus a small built-in map. The scan is pure I/O run
 //! off the main thread; the palette looks up each advertised name in the result.
+//!
+//! That scan hard-codes one CLI's directory layout, so it is enrichment **for
+//! that CLI** — not a general answer. A backend that describes its own commands
+//! skips it entirely via [`catalog_from_backend`].
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use oximux_agents::thread::connection::SlashCommandInfo;
 
 /// Which section a command sorts under in the palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,6 +62,30 @@ pub fn discover_catalog(cwd: &Path) -> CommandCatalog {
     }
     scan_project_commands(&cwd.join(".claude/commands"), &mut cat);
     cat
+}
+
+/// The catalog for a backend that describes its own commands, replacing
+/// [`discover_catalog`]'s disk scan.
+///
+/// No I/O and no guessing: the agent is the authority on its own commands, so
+/// each row renders exactly what it said. `argument_hint` stays `None` — a
+/// backend that has hints advertises them through the palette's own hint channel,
+/// and inventing one here would put words in the agent's mouth.
+pub fn catalog_from_backend(commands: &[SlashCommandInfo]) -> CommandCatalog {
+    commands
+        .iter()
+        .map(|c| {
+            (
+                c.name.clone(),
+                CommandMeta {
+                    description: c.description.clone().map(truncate_desc),
+                    argument_hint: None,
+                    group: if c.is_skill { CommandGroup::Skill } else { CommandGroup::BuiltIn },
+                    source_label: c.source_label.clone(),
+                },
+            )
+        })
+        .collect()
 }
 
 /// Descriptions for the common native CLI commands (which have no on-disk file).
@@ -309,6 +339,48 @@ mod tests {
         let got = frontmatter_field(&fm, "description").unwrap();
         assert!(got.chars().count() <= 401, "got {} chars", got.chars().count());
         assert!(got.ends_with('…'));
+    }
+
+    #[test]
+    fn a_backend_that_describes_its_commands_is_taken_at_its_word() {
+        let cat = catalog_from_backend(&[
+            SlashCommandInfo {
+                name: "skill:gpui-action".into(),
+                description: Some("Action definitions and keyboard shortcuts in GPUI.".into()),
+                is_skill: true,
+                source_label: Some("project".into()),
+            },
+            SlashCommandInfo {
+                name: "review".into(),
+                description: None,
+                is_skill: false,
+                source_label: Some("user".into()),
+            },
+        ]);
+        assert_eq!(cat["skill:gpui-action"].group, CommandGroup::Skill);
+        assert_eq!(cat["skill:gpui-action"].source_label.as_deref(), Some("project"));
+        assert_eq!(cat["review"].group, CommandGroup::BuiltIn);
+        // No hint is invented for a backend that advertised none.
+        assert_eq!(cat["review"].argument_hint, None);
+        assert_eq!(cat["review"].description, None);
+    }
+
+    #[test]
+    fn a_backends_own_catalog_carries_none_of_another_clis_built_ins() {
+        // The disk scan seeds Claude's native commands (`/compact`, `/context`, …)
+        // and reads `~/.claude`. Those belong to one CLI: an agent that describes
+        // its own commands must get exactly its own, or the palette would offer
+        // rows that agent has never heard of and attribute a same-named command to
+        // whatever file happened to share its name.
+        let cat = catalog_from_backend(&[SlashCommandInfo {
+            name: "review".into(),
+            description: Some("pi's own review".into()),
+            is_skill: false,
+            source_label: None,
+        }]);
+        assert_eq!(cat.len(), 1);
+        assert!(!cat.contains_key("compact"), "another CLI's natives must not leak in");
+        assert_eq!(cat["review"].description.as_deref(), Some("pi's own review"));
     }
 
     #[test]

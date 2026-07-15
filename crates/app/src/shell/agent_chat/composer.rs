@@ -221,6 +221,13 @@ pub enum ComposerEvent {
         text: String,
         images: Vec<ChatImage>,
     },
+    /// The user pressed a queued chip's ↑ **during** a live turn, on a backend
+    /// that can take it (`supports_steer`). The parent hands it to the running
+    /// turn rather than parking it until the turn ends. Text-only: the chip
+    /// reorders instead when it carries attachments.
+    SteerNow {
+        text: String,
+    },
     /// The user pressed Stop while a turn was streaming — interrupt it.
     Stop,
     /// The user picked a model in the bottom toolbar (a Claude alias).
@@ -438,6 +445,11 @@ pub struct ComposerView {
     /// Mirrors the parent's connection state, for the status line + Send button.
     disconnected: bool,
     turn_active: bool,
+    /// Whether the backend can take a message *during* a live turn
+    /// (`AgentCapabilities::supports_steer`). Changes only what a queued chip's ↑
+    /// does mid-turn: with it, "send now" means now; without it, the message can
+    /// only be moved to the front of the queue.
+    can_steer: bool,
     /// Mirrors of the parent's session controls, for the bottom toolbar pickers.
     /// The parent owns the truth (it respawns on a change) and pushes updates via
     /// [`Self::set_controls`]; the composer only renders them and emits a pick.
@@ -653,6 +665,7 @@ impl ComposerView {
             context_chips: Vec::new(),
             history: PromptHistory::new(),
             queued: Vec::new(),
+            can_steer: false,
             meter_used_tokens: None,
             meter_window: None,
             meter_cost: 0.0,
@@ -760,6 +773,14 @@ impl ComposerView {
         if self.disconnected != disconnected || self.turn_active != turn_active {
             self.disconnected = disconnected;
             self.turn_active = turn_active;
+            cx.notify();
+        }
+    }
+
+    /// Whether the backend accepts a mid-turn message ([`Self::can_steer`]).
+    pub fn set_can_steer(&mut self, can_steer: bool, cx: &mut Context<Self>) {
+        if self.can_steer != can_steer {
+            self.can_steer = can_steer;
             cx.notify();
         }
     }
@@ -1410,16 +1431,30 @@ impl ComposerView {
         }
     }
 
-    /// A queued chip's "send now" (↑). While a turn is streaming there is nothing
-    /// to safely interrupt, so move the message to the FRONT — it becomes the very
-    /// next one auto-drained when the turn ends (a no-op if already at the front).
-    /// While IDLE (the restored-queue case — no active turn to interrupt) genuinely
-    /// dequeue it and submit right away, which is exactly what the user is asking.
+    /// A queued chip's "send now" (↑).
+    ///
+    /// While IDLE, dequeue and submit right away — exactly what the user asked.
+    ///
+    /// Mid-turn it depends on the backend. A [`Self::can_steer`] one takes the
+    /// message into the running turn and redirects the agent, so "now" is
+    /// honoured literally ([`ComposerEvent::SteerNow`]). Otherwise there is
+    /// nothing to hand it to, so the message only moves to the FRONT of the queue
+    /// and goes out first when the turn ends (a no-op if already there).
+    ///
+    /// Steering is deliberately reachable ONLY here, never from `submit`: pi
+    /// cannot un-queue a steered message, so handing one over must be an explicit
+    /// act. A message parked as a chip stays editable and cancellable until the
+    /// user presses this button.
+    ///
+    /// A message with attachments never steers — pi's `steer` does carry images,
+    /// but OxiMux has never sent one and won't find out at the cost of silently
+    /// dropping the user's. It reorders instead, keeping the images intact for
+    /// the ordinary drain.
     fn send_queued_now(&mut self, idx: usize, cx: &mut Context<Self>) {
         if idx >= self.queued.len() {
             return;
         }
-        if self.turn_active {
+        if self.turn_active && !(self.can_steer && self.queued[idx].images.is_empty()) {
             if idx != 0 {
                 let m = self.queued.remove(idx);
                 self.queued.insert(0, m);
@@ -1427,13 +1462,17 @@ impl ComposerView {
             }
             return;
         }
-        // Idle: no turn to interrupt — dequeue and send it now.
+        let steering = self.turn_active;
         let QueuedMessage { text, images, context } = self.queued.remove(idx);
         self.history.record(&text);
         let images: Vec<ChatImage> = images.into_iter().map(|p| p.chat).collect();
         let wire = prepend_context(&context, &text);
         cx.notify();
-        cx.emit(ComposerEvent::Submit { text: wire, images });
+        if steering {
+            cx.emit(ComposerEvent::SteerNow { text: wire });
+        } else {
+            cx.emit(ComposerEvent::Submit { text: wire, images });
+        }
     }
 
     /// The text of each queued message, oldest first, for persistence. Text-only
@@ -1940,6 +1979,7 @@ impl ComposerView {
             Some("plan" | "list-todo" | "list") => "icons/list-tree.svg",
             Some("bot" | "check" | "auto-accept") => "icons/check.svg",
             Some("shield" | "lock" | "permission") => "icons/lock.svg",
+            Some("file" | "file-text" | "context") => "icons/file-text.svg",
             _ => "icons/settings-2.svg",
         }
     }
@@ -1962,13 +2002,30 @@ impl ComposerView {
                 FeatureKind::Toggle { on } => {
                     let on = *on;
                     let id = feature.id.clone();
+                    // The glyph itself carries the state, and the tooltip says it
+                    // in words. A ghost button's `selected` styling alone was not
+                    // legible at this size — the control rendered IDENTICALLY on
+                    // and off, so flipping it looked like a dead click even though
+                    // it was respawning the agent underneath. For a switch that
+                    // decides whether repo instruction files reach the model, an
+                    // unreadable state is worse than no control.
+                    let icon = if on {
+                        Self::feature_icon_path(feature.icon.as_deref())
+                    } else {
+                        "icons/circle-slash.svg"
+                    };
+                    let tooltip = SharedString::from(format!(
+                        "{} · {}",
+                        feature.label,
+                        if on { "on" } else { "off" }
+                    ));
                     row = row.child(
                         Button::new(btn_id)
-                            .icon(Icon::default().path(Self::feature_icon_path(feature.icon.as_deref())))
+                            .icon(Icon::default().path(icon))
                             .ghost()
                             .small()
                             .selected(on)
-                            .tooltip(feature.label.clone())
+                            .tooltip(tooltip)
                             .on_click(cx.listener(move |this, _ev, _w, cx| {
                                 this.pick_feature(id.clone(), FeatureValue::Bool(!on), cx);
                             })),
@@ -2190,6 +2247,10 @@ impl ComposerView {
         let draft_empty = self.draft_is_empty(cx);
         let turn_active = self.turn_active;
         for (idx, m) in self.queued.iter().enumerate() {
+            // Whether ↑ on THIS chip would reach the running turn (see
+            // `send_queued_now`) — decided per chip, since an attachment keeps a
+            // message out of the steer path even on a backend that steers.
+            let steers = turn_active && self.can_steer && m.images.is_empty();
             // Prefer the caption; fall back to an image count for an image-only
             // queued message so its chip isn't blank.
             let preview = if !m.text.is_empty() {
@@ -2227,11 +2288,12 @@ impl ComposerView {
                         .text_color(theme.fg_muted)
                         .child(SharedString::from(preview)),
                 )
-                // "Send now" (↑): while a turn streams it jumps this message to
-                // the front of the queue (hidden at index 0, already next);
-                // while idle it dequeues + sends immediately. Shown in both
-                // states except the mid-turn already-at-front no-op.
-                .when(!turn_active || idx != 0, |row| {
+                // "Send now" (↑). Idle: dequeue + send immediately. Mid-turn on a
+                // steering backend: hand it to the running turn — which is a real
+                // action at every index, front one included. Mid-turn otherwise:
+                // jump it to the front of the queue, so it's hidden at index 0
+                // where that would do nothing.
+                .when(!turn_active || steers || idx != 0, |row| {
                     row.child(
                         div()
                             .id(("chat-queued-send-now", idx))
@@ -3018,6 +3080,21 @@ impl ComposerView {
     pub(crate) fn context_chips_len_for_test(&self) -> usize {
         self.context_chips.len()
     }
+
+    /// The palette enrichment currently in effect (descriptions + grouping).
+    pub(crate) fn slash_catalog_for_test(&self) -> &CommandCatalog {
+        &self.slash_catalog
+    }
+
+    /// Stage an attachment directly (as the picker/paste path would), so a test
+    /// can exercise the with-images branches without decoding a real image.
+    pub(crate) fn stage_image_for_test(&mut self, chat: ChatImage) {
+        let render = image_attach::decode_render(&chat);
+        self.pending_images.push(PendingImage {
+            chat,
+            render: render.expect("a test image must decode"),
+        });
+    }
 }
 
 #[cfg(test)]
@@ -3155,6 +3232,58 @@ mod tests {
                 // No-op at index 0.
                 c.send_queued_now(0, cx);
                 assert_eq!(c.queued_texts(), vec!["three", "one", "two"], "index 0 is a no-op");
+            })
+            .expect("window update");
+    }
+
+    /// On a backend that takes a mid-turn message, "send now" means now: the chip
+    /// leaves the queue for the running turn instead of shuffling within it.
+    #[gpui::test]
+    async fn send_queued_now_steers_mid_turn_when_the_backend_takes_it(cx: &mut TestAppContext) {
+        let window = test_composer(cx);
+        window
+            .update(cx, |c, window, cx| {
+                c.set_state(false, true, cx); // streaming turn
+                c.set_can_steer(true, cx);
+                for t in ["one", "two"] {
+                    c.set_draft_for_test(t, window, cx);
+                    c.submit(window, cx);
+                }
+                // Even at index 0 — the case that is a no-op without steering —
+                // the message goes out rather than being re-parked at the front.
+                c.send_queued_now(0, cx);
+                assert_eq!(c.queued_texts(), vec!["two"], "the steered message left the queue");
+                // It counts as sent, so ↑ recall offers it.
+                c.send_queued_now(0, cx);
+                assert_eq!(c.queued_texts(), Vec::<String>::new());
+            })
+            .expect("window update");
+    }
+
+    /// A queued message carrying an image never steers — pi's `steer` accepts
+    /// images but OxiMux has never sent one, and reordering keeps the attachment
+    /// rather than quietly dropping it.
+    #[gpui::test]
+    async fn a_queued_message_with_an_image_reorders_instead_of_steering(cx: &mut TestAppContext) {
+        let window = test_composer(cx);
+        window
+            .update(cx, |c, window, cx| {
+                c.set_state(false, true, cx);
+                c.set_can_steer(true, cx);
+                c.set_draft_for_test("text only", window, cx);
+                c.submit(window, cx);
+                c.stage_image_for_test(ChatImage {
+                    media_type: "image/png".into(),
+                    data: "QUJD".into(),
+                });
+                c.set_draft_for_test("has an image", window, cx);
+                c.submit(window, cx);
+                c.send_queued_now(1, cx);
+                assert_eq!(
+                    c.queued_texts(),
+                    vec!["has an image", "text only"],
+                    "moved to the front, still queued — its image is intact"
+                );
             })
             .expect("window update");
     }

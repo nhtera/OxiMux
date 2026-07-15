@@ -97,6 +97,7 @@ pub fn adapter_slug(adapter: AgentAdapter) -> &'static str {
     match adapter {
         AgentAdapter::ClaudeCode => "claude-code",
         AgentAdapter::Codex => "codex",
+        AgentAdapter::Pi => "pi",
         AgentAdapter::Aider => "aider",
         AgentAdapter::Custom => "custom",
     }
@@ -121,6 +122,7 @@ fn provider_tag(entry: &SessionEntry) -> &str {
         .unwrap_or_else(|| match entry.adapter {
             AgentAdapter::ClaudeCode => "claude",
             AgentAdapter::Codex => "codex",
+            AgentAdapter::Pi => "pi",
             AgentAdapter::Aider => "aider",
             AgentAdapter::Custom => "custom",
         })

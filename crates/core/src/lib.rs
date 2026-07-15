@@ -49,6 +49,10 @@ pub enum AgentAdapter {
     ClaudeCode,
     Codex,
     Aider,
+    /// The `pi` CLI. A TUI in a PTY like the others, and additionally a chat
+    /// backend of its own (`pi --mode rpc`) — the same dual nature Claude and
+    /// Codex have.
+    Pi,
     /// Arbitrary shell command launched in a PTY. The program + args travel
     /// on `AgentSessionConfig::custom_command`; status detection falls back
     /// to the StatusMachine's Idle/Running/exit-code defaults since there

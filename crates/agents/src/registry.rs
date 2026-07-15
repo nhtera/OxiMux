@@ -30,6 +30,7 @@ use oximux_core::AgentAdapter;
 
 use crate::cli::{
     AiderAdapter, ClaudeCodeAdapter, CliAgentAdapter, CodexAdapter, CustomCommandAdapter,
+    PiAdapter,
 };
 
 /// One adapter entry the launch-dialog UI consumes. `&'static str` for
@@ -78,14 +79,20 @@ pub struct AdapterRegistry {
 }
 
 impl AdapterRegistry {
-    /// Registry preloaded with the four v1 adapters in launch-dialog
-    /// order: Claude Code, Codex, Aider, Custom. Order is significant —
-    /// the dialog dropdown renders in this order; `Custom` last so the
-    /// escape hatch sits at the bottom where users learn to expect it.
+    /// Registry preloaded with the built-in adapters in launch-dialog order:
+    /// Claude Code, Codex, Pi, Aider, Custom. Order is significant — the dialog
+    /// dropdown renders in this order; the chat-capable adapters lead, and
+    /// `Custom` sits last so the escape hatch is where users learn to expect it.
+    ///
+    /// This registry is also what the **chat** roster enumerates, so an adapter
+    /// missing here is unreachable as a chat backend no matter what
+    /// `AgentLaunchSettings::chat_capable` says about it — that function is only
+    /// ever asked about ids these entries produce.
     pub fn with_builtin_adapters() -> Self {
         let mut reg = Self::empty();
         reg.register(AgentAdapter::ClaudeCode, Arc::new(ClaudeCodeAdapter));
         reg.register(AgentAdapter::Codex, Arc::new(CodexAdapter));
+        reg.register(AgentAdapter::Pi, Arc::new(PiAdapter));
         reg.register(AgentAdapter::Aider, Arc::new(AiderAdapter));
         reg.register(AgentAdapter::Custom, Arc::new(CustomCommandAdapter));
         reg
@@ -179,6 +186,17 @@ impl AdapterRegistry {
             });
         }
         entries
+    }
+
+    /// Every registered adapter's kind, in registration order.
+    ///
+    /// Exists so a consumer that must act on all of them (the runtime, which
+    /// registers each for `start_session` to resolve) can *derive* the set
+    /// instead of restating it. A restated list drifts the moment an adapter is
+    /// added, and drifts invisibly: the new agent renders in every menu, its
+    /// click routes, and only `start_session` fails — into a log.
+    pub fn builtin_kinds(&self) -> Vec<AgentAdapter> {
+        self.slots.iter().map(|s| s.kind).collect()
     }
 
     /// One [`RegistryEntry`] per registered adapter WITHOUT running `detect()`,
@@ -294,9 +312,9 @@ mod tests {
     }
 
     #[test]
-    fn builtin_registry_holds_all_four_in_dialog_order() {
+    fn builtin_registry_holds_every_adapter_in_dialog_order() {
         let reg = AdapterRegistry::with_builtin_adapters();
-        assert_eq!(reg.len(), 4);
+        assert_eq!(reg.len(), 5);
         // Order contract — the launch dialog renders in this sequence.
         let order: Vec<AgentAdapter> = reg.slots.iter().map(|s| s.kind).collect();
         assert_eq!(
@@ -304,11 +322,46 @@ mod tests {
             vec![
                 AgentAdapter::ClaudeCode,
                 AgentAdapter::Codex,
+                AgentAdapter::Pi,
                 AgentAdapter::Aider,
                 AgentAdapter::Custom,
             ],
             "dropdown order is significant; Custom must remain last"
         );
+    }
+
+    /// Every chat backend must have a registry entry, because the chat roster is
+    /// built from this list — an adapter missing here is unreachable in the UI no
+    /// matter how complete its backend is, and `chat_capable` will never be asked
+    /// about it. Pi shipped in exactly that state until this was caught by
+    /// driving the real app.
+    #[test]
+    fn every_chat_capable_adapter_is_registered() {
+        let ids: Vec<&str> = AdapterRegistry::with_builtin_adapters()
+            .entries_without_detection()
+            .iter()
+            .map(|e| e.adapter_id)
+            .collect();
+        for chat_id in ["claude-code", "codex", "pi"] {
+            assert!(
+                ids.contains(&chat_id),
+                "{chat_id} is chat-capable but absent from the registry, so no menu can offer it"
+            );
+        }
+    }
+
+    /// `builtin_kinds` is what the runtime registers from, so it must cover every
+    /// slot. When it didn't, Pi rendered in the menu, its click routed, and the
+    /// launch died with "no adapter registered for Pi" in a log — nothing at all
+    /// happened on screen.
+    #[test]
+    fn builtin_kinds_covers_every_registered_slot() {
+        let reg = AdapterRegistry::with_builtin_adapters();
+        let kinds = reg.builtin_kinds();
+        assert_eq!(kinds.len(), reg.len(), "a kind per slot, or the runtime misses one");
+        for kind in kinds {
+            assert!(reg.adapter_for(kind).is_some(), "{kind:?} resolves to an adapter");
+        }
     }
 
     #[test]
@@ -317,11 +370,15 @@ mod tests {
         let entries = reg.entries_without_detection();
         // One per slot, in registration order, all forced available (no detect).
         let ids: Vec<&str> = entries.iter().map(|e| e.adapter_id).collect();
-        assert_eq!(ids, ["claude-code", "codex", "aider", "custom"]);
+        assert_eq!(ids, ["claude-code", "codex", "pi", "aider", "custom"]);
         assert!(entries.iter().all(|e| e.available));
         // Static vocab rides along (the roster's pre-bind model source).
         let claude = entries.iter().find(|e| e.adapter_id == "claude-code").unwrap();
         assert_eq!(claude.models, ["opus", "sonnet", "haiku"]);
+        // Pi declares none: its catalog is per-user, and a static list would have
+        // to name bare ids, which pi fuzzy-matches across providers.
+        let pi = entries.iter().find(|e| e.adapter_id == "pi").unwrap();
+        assert!(pi.models.is_empty(), "a static bare-id list would misresolve");
     }
 
     #[test]
@@ -330,6 +387,7 @@ mod tests {
         for kind in [
             AgentAdapter::ClaudeCode,
             AgentAdapter::Codex,
+            AgentAdapter::Pi,
             AgentAdapter::Aider,
             AgentAdapter::Custom,
         ] {
@@ -401,13 +459,14 @@ mod tests {
     async fn detect_available_returns_one_entry_per_adapter() {
         let reg = AdapterRegistry::with_builtin_adapters();
         let entries = reg.detect_available().await;
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 5);
         let kinds: Vec<AgentAdapter> = entries.iter().map(|e| e.adapter_enum).collect();
         assert_eq!(
             kinds,
             vec![
                 AgentAdapter::ClaudeCode,
                 AgentAdapter::Codex,
+                AgentAdapter::Pi,
                 AgentAdapter::Aider,
                 AgentAdapter::Custom,
             ],

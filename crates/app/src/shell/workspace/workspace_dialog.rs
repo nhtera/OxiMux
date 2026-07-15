@@ -45,6 +45,7 @@ const FIELD_HEIGHT: f32 = 32.0;
 const AGENT_CHOICES: &[AgentAdapter] = &[
     AgentAdapter::ClaudeCode,
     AgentAdapter::Codex,
+    AgentAdapter::Pi,
     AgentAdapter::Aider,
     AgentAdapter::Custom,
 ];
@@ -357,6 +358,7 @@ pub fn agent_label(agent: Option<AgentAdapter>) -> &'static str {
         None => "Skip (no agent)",
         Some(AgentAdapter::ClaudeCode) => "Claude Code",
         Some(AgentAdapter::Codex) => "Codex",
+        Some(AgentAdapter::Pi) => "Pi",
         Some(AgentAdapter::Aider) => "Aider",
         Some(AgentAdapter::Custom) => "Custom",
     }
@@ -663,8 +665,9 @@ fn agent_option_row(
         None => 0,
         Some(AgentAdapter::ClaudeCode) => 1,
         Some(AgentAdapter::Codex) => 2,
-        Some(AgentAdapter::Aider) => 3,
-        Some(AgentAdapter::Custom) => 4,
+        Some(AgentAdapter::Pi) => 3,
+        Some(AgentAdapter::Aider) => 4,
+        Some(AgentAdapter::Custom) => 5,
     };
     div()
         .id(("ws-dialog-agent-opt", id))
@@ -768,6 +771,7 @@ mod tests {
             &[
                 AgentAdapter::ClaudeCode,
                 AgentAdapter::Codex,
+                AgentAdapter::Pi,
                 AgentAdapter::Aider,
                 AgentAdapter::Custom,
             ]

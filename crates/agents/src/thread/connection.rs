@@ -39,6 +39,12 @@ pub struct AgentCapabilities {
     /// can read (`~/.claude/projects/*.jsonl`). Claude sets this true; ACP
     /// backends without such a log report false → the UI hides rewind for them.
     pub supports_rewind: bool,
+    /// The backend accepts a message **during** a live turn and delivers it at the
+    /// next turn boundary, redirecting the agent before its next model call
+    /// (pi `steer`). False for backends where a mid-turn message has nowhere to go
+    /// — there the composer parks it and sends it when the turn ends, which is the
+    /// default for everything else.
+    pub supports_steer: bool,
 }
 
 /// One selectable model for the model picker. `wire` is passed to the backend
@@ -65,6 +71,26 @@ pub struct ModelChoice {
 pub struct ModeChoice {
     pub wire: String,
     pub label: String,
+}
+
+/// What a backend knows about one of its own slash commands.
+///
+/// Most backends advertise command *names* only, which is why the app recovers
+/// descriptions and grouping by scanning the CLI's on-disk definitions. That scan
+/// encodes one CLI's directory layout, so it is only correct for the backend it
+/// was written against. A backend that can describe its own commands fills this
+/// instead (pi's `get_commands` returns all of it in one request), and the app
+/// skips the scan rather than enriching one agent's commands from another's
+/// config directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashCommandInfo {
+    /// Without the leading slash, exactly as it must be typed.
+    pub name: String,
+    pub description: Option<String>,
+    /// Whether the palette files this under Skills rather than Built-in.
+    pub is_skill: bool,
+    /// Attribution shown muted on the right of the row (pi: `user`/`project`).
+    pub source_label: Option<String>,
 }
 
 /// One reasoning-effort level for the effort picker, `(wire, label)`.
@@ -140,6 +166,23 @@ pub trait AgentConnection: Send {
     fn send_user_message_with_images(&self, text: &str, images: &[ChatImage]) -> Result<()> {
         let _ = images;
         self.send_user_message(text)
+    }
+
+    /// Send a message into the turn that is already streaming, to redirect it.
+    ///
+    /// Only meaningful for an [`AgentCapabilities::supports_steer`] backend. The
+    /// message is delivered at the next turn boundary — after the running tool
+    /// finishes, before the agent's next model call — and arrives as an ordinary
+    /// user message, so the caller pushes the user bubble exactly as it would for
+    /// a normal send.
+    ///
+    /// **Not withdrawable.** pi exposes no way to un-queue a steered message over
+    /// RPC (`clearQueue` exists on its session object but is not an RPC command),
+    /// so this is only ever called when the user explicitly says "send this now"
+    /// — never as the automatic destination for a message they might still edit
+    /// or cancel. Unsupported by default.
+    fn steer(&self, _text: &str) -> Result<()> {
+        anyhow::bail!("this agent cannot accept a message mid-turn")
     }
 
     /// Answer a pending permission request by its `request_id`.
@@ -243,6 +286,14 @@ pub trait AgentConnection: Send {
         Vec::new()
     }
 
+    /// What this backend knows about its own slash commands. Default: nothing →
+    /// the app falls back to scanning the CLI's on-disk definitions for
+    /// descriptions and grouping. A non-empty answer replaces that scan entirely;
+    /// see [`SlashCommandInfo`].
+    fn slash_commands(&self) -> Vec<SlashCommandInfo> {
+        Vec::new()
+    }
+
     /// The reasoning-effort levels this backend offers in the effort picker.
     /// Default: none.
     fn efforts(&self) -> Vec<EffortChoice> {
@@ -252,6 +303,19 @@ pub trait AgentConnection: Send {
     /// The model shown as current when the user hasn't picked one (the
     /// backend's own default). Default: none.
     fn default_model(&self) -> Option<String> {
+        None
+    }
+
+    /// The current model's context window, when the backend knows it **without
+    /// having run a turn** — the context meter's denominator.
+    ///
+    /// Default `None`: Claude and Codex report a window only inside a turn's
+    /// usage, so their meter stays count-only until the first reply and this
+    /// changes nothing for them. Pi reports `contextWindow` per model at the
+    /// handshake, so it can seed the meter at connect and move it on a live model
+    /// switch (the windows differ by model — 272K vs 128K — so a denominator
+    /// pinned at connect would silently measure against the wrong one).
+    fn context_window(&self) -> Option<u64> {
         None
     }
 
@@ -406,6 +470,9 @@ pub struct StubConnection {
     /// unconfigured stub behaves like the trait default. A test that exercises a
     /// capability-gated affordance (e.g. rewind) sets it via `with_capabilities`.
     caps: AgentCapabilities,
+    /// Self-described slash commands, for tests that exercise the palette's
+    /// backend-metadata path. Empty by default (like a names-only backend).
+    commands: Vec<SlashCommandInfo>,
 }
 
 impl StubConnection {
@@ -420,6 +487,13 @@ impl StubConnection {
     /// for UI tests that gate on `supports_rewind`).
     pub fn with_capabilities(mut self, caps: AgentCapabilities) -> Self {
         self.caps = caps;
+        self
+    }
+
+    /// Make the stub describe its own slash commands, as a backend with a
+    /// command catalog of its own does (pi's `get_commands`).
+    pub fn with_slash_commands(mut self, commands: Vec<SlashCommandInfo>) -> Self {
+        self.commands = commands;
         self
     }
 
@@ -440,6 +514,16 @@ impl AgentConnection for StubConnection {
         self.record(user_message_json(text));
         Ok(())
     }
+    /// Recorded distinctly from a plain send so a test can tell a message that
+    /// went INTO a running turn from one that started a new one. Honours
+    /// `supports_steer` so an unconfigured stub still refuses, like the default.
+    fn steer(&self, text: &str) -> Result<()> {
+        if !self.caps.supports_steer {
+            anyhow::bail!("this agent cannot accept a message mid-turn")
+        }
+        self.record(json!({"type": "steer", "message": text}));
+        Ok(())
+    }
     fn resolve_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {
         self.record(control_response_json(request_id, &decision));
         Ok(())
@@ -455,6 +539,9 @@ impl AgentConnection for StubConnection {
     }
     fn capabilities(&self) -> AgentCapabilities {
         self.caps
+    }
+    fn slash_commands(&self) -> Vec<SlashCommandInfo> {
+        self.commands.clone()
     }
     fn shutdown(&self) {}
 }
@@ -574,6 +661,9 @@ mod tests {
         assert!(!stub.capabilities().emits_usage);
         assert!(stub.set_mode("acceptEdits").is_err(), "runtime mode refused by default");
         assert!(stub.set_config("reasoning", json!("high")).is_err());
+        // A backend that only learns its window from a turn's usage reports none
+        // here, leaving the meter to be seeded by that usage exactly as before.
+        assert_eq!(stub.context_window(), None);
     }
 
     #[test]

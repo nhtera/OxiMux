@@ -733,6 +733,14 @@ mod tests {
                 efforts: &[],
             },
             RegistryEntry {
+                adapter_id: "pi",
+                display_name: "Pi",
+                adapter_enum: AgentAdapter::Pi,
+                available: true,
+                models: &[],
+                efforts: &[],
+            },
+            RegistryEntry {
                 adapter_id: "aider",
                 display_name: "Aider",
                 adapter_enum: AgentAdapter::Aider,
@@ -756,9 +764,35 @@ mod tests {
         let s = AgentLaunchSettings::default();
         let roster = chat_roster(&builtin_entries(), &s);
         let ids: Vec<&str> = roster.iter().map(|e| e.id.as_str()).collect();
-        // Built-ins first (Claude, Codex), then the three ACP presets. Aider
+        // Built-ins first (Claude, Codex, Pi), then the three ACP presets. Aider
         // (terminal-only) and Custom are absent.
-        assert_eq!(ids, ["claude-code", "codex", "cursor", "amp", "opencode"]);
+        assert_eq!(ids, ["claude-code", "codex", "pi", "cursor", "amp", "opencode"]);
+    }
+
+    /// The roster is built by filtering the registry through `chat_capable`, so a
+    /// chat backend the registry omits vanishes from every agent menu while every
+    /// unit test still passes — `chat_capable` is simply never asked about it.
+    /// Pi shipped in exactly that state; this pins the whole path, not the flag.
+    #[test]
+    fn a_chat_capable_builtin_missing_from_the_registry_is_unreachable() {
+        let s = AgentLaunchSettings::default();
+        assert!(s.chat_capable("pi"), "pi is chat-capable by the gate's own reckoning");
+
+        // Registry without pi — what shipped before this was caught by driving
+        // the real app.
+        let without_pi: Vec<RegistryEntry> =
+            builtin_entries().into_iter().filter(|e| e.adapter_id != "pi").collect();
+        let ids: Vec<String> =
+            chat_roster(&without_pi, &s).into_iter().map(|e| e.id).collect();
+        assert!(
+            !ids.iter().any(|id| id == "pi"),
+            "the gate says yes, yet no menu can offer pi — being chat_capable is not enough"
+        );
+
+        // With the entry, it lands, carrying its own transport.
+        let roster = chat_roster(&builtin_entries(), &s);
+        let pi = roster.iter().find(|e| e.id == "pi").expect("pi is offered");
+        assert_eq!(pi.transport, Transport::Rpc);
     }
 
     #[test]

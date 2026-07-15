@@ -806,7 +806,7 @@ impl PaneGroup {
         slash_commands: Vec<String>,
         session_meta: oximux_agents::thread::SessionMeta,
         thinking_level: crate::shell::agent_chat::ThinkingLevel,
-        codex_posture: Option<(String, String)>,
+        posture: crate::shell::agent_chat::RestoredPosture,
         draft: Option<String>,
         queued: Vec<String>,
         window: &mut Window,
@@ -827,7 +827,7 @@ impl PaneGroup {
                 slash_commands,
                 session_meta,
                 thinking_level,
-                codex_posture,
+                posture,
                 theme,
                 density,
                 typography,
@@ -996,7 +996,7 @@ impl PaneGroup {
                     slash_commands.clone(),
                     session_meta.clone(),
                     *thinking_level,
-                    None, // codex_posture — Fork is Claude-only
+                    Default::default(), // posture — Fork is Claude-only
                     None,
                     Vec::new(),
                     window,
@@ -1217,9 +1217,18 @@ impl PaneGroup {
         // None` and resume through their own `--resume` via `resumption`.
         let is_custom = adapter == AgentAdapter::Custom;
         let custom_command = is_custom
-            .then(|| oximux_settings::acp_preset(adapter_id))
-            .flatten()
-            .and_then(|p| p.interactive_resume.map(|f| (p.command.to_string(), f(&session_id))));
+            .then(|| {
+                oximux_settings::acp_preset(adapter_id)
+                    .and_then(|p| p.interactive_resume.map(|f| (p.command.to_string(), f(&session_id))))
+                    // Pi is not an ACP preset (it speaks its own RPC), so it has
+                    // no `AcpPreset` row to read a resume argv from — but it does
+                    // resume interactively, by the same session id. Without this
+                    // fallback a Custom adapter with no preset would spawn with
+                    // NO resume argv and `SessionResumption::None`, i.e. a fresh
+                    // agent wearing a resumed chat's tab.
+                    .or_else(|| oximux_settings::import_resume_command(adapter_id, &session_id))
+            })
+            .flatten();
         cx.spawn_in(window, async move |group, cx| {
             let cfg = AgentSessionConfig {
                 adapter,
@@ -1296,11 +1305,19 @@ impl PaneGroup {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Import-provider bridge (OpenCode/Pi): no live chat backend, so build a
+        // Pi has a live backend now, so its rows resume for real instead of
+        // rendering a read-only transcript with a Resume-in-terminal button.
+        // Narrow on the preset id: the bridge still serves OpenCode, which has no
+        // live backend.
+        if preset_id == Some("pi") {
+            self.open_pi_session_live(session_id, path, cwd, window, cx);
+            return;
+        }
+        // Import-provider bridge (OpenCode): no live chat backend, so build a
         // transcript-only bridge tab instead of a resume. Handled before the
         // dedup + adapter match because these rows carry a `preset_id` and their
         // seeded thread has no session id to dedup on.
-        if let Some(preset) = preset_id.filter(|p| matches!(*p, "opencode" | "pi")) {
+        if let Some(preset) = preset_id.filter(|p| *p == "opencode") {
             self.open_import_bridge_chat(session_id, path, cwd, preset, window, cx);
             return;
         }
@@ -1345,11 +1362,11 @@ impl PaneGroup {
                     // advertised metadata to seed; the next turn's init fills it.
                     Default::default(),
                     crate::shell::agent_chat::ThinkingLevel::default(),
-                    // codex_posture — starts at the app default (on-request /
+                    // posture — starts at the app default (Codex on-request /
                     // workspace-write); the rollout's original approval/sandbox
                     // policy isn't re-applied, so the user re-picks via the
                     // composer's Approvals/Sandbox controls if they want it stricter.
-                    None,
+                    Default::default(),
                     None,
                     Vec::new(),
                     window,
@@ -1375,7 +1392,7 @@ impl PaneGroup {
                     // advertised metadata to seed; the next turn's init fills it.
                     Default::default(),
                     crate::shell::agent_chat::ThinkingLevel::default(),
-                    None, // codex_posture — Claude session-history reopen
+                    Default::default(), // posture — Claude session-history reopen
                     None,
                     Vec::new(),
                     window,
@@ -1385,7 +1402,82 @@ impl PaneGroup {
         }
     }
 
-    /// Build a transcript-only **import bridge** chat tab for an OpenCode / Pi
+    /// Open a Pi session from history as a **live** chat — the payoff of the Pi
+    /// adapter round, replacing the read-only bridge that could only offer
+    /// Resume-in-terminal.
+    ///
+    /// Two details are load-bearing:
+    ///
+    /// - **Resume by session id, never by the row's path.** pi does not check
+    ///   that a session path exists; it silently creates an empty session there
+    ///   and starts as if it had resumed, which would render this transcript
+    ///   above an agent that remembers none of it. An id makes a stale row fail
+    ///   loudly instead (see `pi::build_args`). The path is still used — to read
+    ///   the transcript, which is what it is good for.
+    /// - **Spawn in the session's own cwd**, not the current project's. pi scopes
+    ///   its session store per project; an id from elsewhere makes pi ask
+    ///   `Fork this session into current directory? [y/N]` on stdin, which in rpc
+    ///   mode is the command pipe. Rows carry the cwd from pi's own session
+    ///   header, so this is normally exact; a row without one can only fall back
+    ///   to the process cwd, and then pi reports the session as not found.
+    fn open_pi_session_live(
+        &mut self,
+        session_id: &str,
+        path: Option<&str>,
+        cwd: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Dedup on the session id — unlike a bridge thread, a resumed Pi chat
+        // carries pi's real session id, so it keys the same way Claude/Codex do.
+        if let Some(idx) = self.tabs.iter().position(|t| {
+            matches!(&t.content, PaneContent::AgentChat(v) if v.read(cx).session_id() == Some(session_id))
+        }) {
+            self.active = idx;
+            self.bump_mru(idx);
+            self.focus_active(window, cx);
+            cx.notify();
+            return;
+        }
+        let entries = match dirs::home_dir() {
+            Some(home) => {
+                oximux_agents::session_log::import_provider_index::load_import_provider_transcript(
+                    &home, "pi", session_id, path,
+                )
+            }
+            None => {
+                tracing::warn!("pi resume: no home dir; opening with an empty transcript");
+                Vec::new()
+            }
+        };
+        let cwd = if cwd.as_os_str().is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        } else {
+            cwd
+        };
+        self.open_agent_chat_tab_restored(
+            cwd,
+            None,
+            oximux_agents::thread::ChatBackend::from(oximux_agents::thread::Transport::Rpc),
+            Some(session_id.to_string()),
+            entries,
+            Vec::new(),
+            // Imported history carries no init, so there is no advertised
+            // metadata to seed; the next turn's init fills it.
+            Default::default(),
+            crate::shell::agent_chat::ThinkingLevel::default(),
+            // posture — a history reopen starts at the app default (Standard),
+            // like the Codex arm above: the session file records no posture, and
+            // inventing one would misreport what the agent may do.
+            Default::default(),
+            None,
+            Vec::new(),
+            window,
+            cx,
+        );
+    }
+
+    /// Build a transcript-only **import bridge** chat tab for an OpenCode
     /// session: seed the transcript via `load_import_provider_transcript` (no
     /// live connection), and swap the composer for a Resume-in-terminal action.
     /// Copilot is excluded upstream (`entry_opens_as_chat`), so `preset` is only

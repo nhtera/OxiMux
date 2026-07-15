@@ -127,6 +127,48 @@ const NOTIFY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50
 /// frames so it fades out rather than snapping off.
 const FLASH_FRAMES: u8 = 48;
 
+/// Give the composer's palette the metadata for `connection`'s commands:
+/// descriptions, grouping, and attribution (the advertised list is bare names).
+///
+/// A backend that describes its own commands is taken at its word. Only one that
+/// can't gets the on-disk scan, which reads a specific CLI's config directories
+/// and so is only meaningful for the CLI it models — pointing it at another
+/// agent's commands would attribute them to whatever file happened to share a
+/// name. The scan reads ~100 small files, so it runs off the main thread and
+/// pushes its result in when ready.
+///
+/// Called for every connection, not just the one a chat is constructed with: a
+/// *New Agent* draft has no connection until its first send, so seeding this at
+/// construction alone left every deferred-bound chat with names but no metadata
+/// — every row filed under "Built-in", undescribed. Caught by driving the app.
+fn push_slash_catalog(
+    connection: Option<&dyn AgentConnection>,
+    composer: &Entity<ComposerView>,
+    cwd: &std::path::Path,
+    cx: &mut Context<AgentChatView>,
+) {
+    let Some(conn) = connection else { return };
+    if !conn.capabilities().supports_slash {
+        return;
+    }
+    let advertised = conn.slash_commands();
+    if !advertised.is_empty() {
+        let catalog = slash_command_catalog::catalog_from_backend(&advertised);
+        composer.update(cx, |c, cx| c.set_command_catalog(catalog, cx));
+        return;
+    }
+    let scan_cwd = cwd.to_path_buf();
+    cx.spawn(async move |this, cx| {
+        let catalog = cx
+            .background_spawn(async move { slash_command_catalog::discover_catalog(&scan_cwd) })
+            .await;
+        let _ = this.update(cx, |this, cx| {
+            this.composer.update(cx, |c, cx| c.set_command_catalog(catalog, cx));
+        });
+    })
+    .detach();
+}
+
 /// Bundle the live connection's picker vocabulary (models / permission modes /
 /// efforts + their "current when unset" defaults) for the composer. Empty when
 /// there's no connection (spawn failed) — the pickers then show only the current
@@ -148,17 +190,40 @@ fn control_vocab_of(conn: Option<&dyn AgentConnection>) -> ControlVocab {
     }
 }
 
-/// Build the initial composer feature-pick overlay for a restored chat: a Codex
-/// posture `(approval_policy, sandbox)` becomes the two Approvals/Sandbox select
-/// picks so the reopened session shows (and re-persists) its choice. Empty for a
-/// fresh launch or a non-Codex backend (`None`).
-fn seed_posture_feature_values(
-    posture: Option<(String, String)>,
-) -> HashMap<String, FeatureValue> {
+/// A restored chat's persisted, backend-specific posture. Seeded into both the
+/// connection spawn and the composer's feature picks so a reopened session keeps
+/// the choice the user made rather than reverting to a default. Empty (all
+/// `None`) for a fresh launch.
+///
+/// One field per backend that has a posture — mirroring `ConnectSpec`'s
+/// one-launch-field-per-transport convention. Carried as a struct so adding a
+/// backend doesn't grow the arity of the construction chain it threads through.
+#[derive(Debug, Clone, Default)]
+pub struct RestoredPosture {
+    /// Codex `(approval_policy, sandbox)`.
+    pub codex: Option<(String, String)>,
+    /// Pi's tool allowlist + context-file choice.
+    pub pi: Option<PiPosture>,
+}
+
+/// Build the initial composer feature-pick overlay for a restored chat, so the
+/// reopened session shows (and re-persists) the posture it was saved with.
+///
+/// For Pi this is load-bearing rather than cosmetic: its posture is the only
+/// tool gate that exists, and the default is the most permissive option — so a
+/// restore that dropped the picks would silently widen what the agent may do.
+fn seed_posture_feature_values(posture: &RestoredPosture) -> HashMap<String, FeatureValue> {
     let mut map = HashMap::new();
-    if let Some((approval, sandbox)) = posture {
+    if let Some((approval, sandbox)) = posture.codex.clone() {
         map.insert("codex_approval_policy".to_string(), FeatureValue::Choice(approval));
         map.insert("codex_sandbox".to_string(), FeatureValue::Choice(sandbox));
+    }
+    if let Some(pi) = posture.pi.clone() {
+        map.insert(pi_posture::FEATURE_TOOLS.to_string(), FeatureValue::Choice(pi.tools));
+        map.insert(
+            pi_posture::FEATURE_CONTEXT_FILES.to_string(),
+            FeatureValue::Bool(pi.context_files),
+        );
     }
     map
 }
@@ -416,6 +481,7 @@ use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_view::TerminalView;
+use oximux_agents::thread::pi::posture::{self as pi_posture, PiPosture};
 use oximux_agents::thread::{
     connect, probe_catalog, AgentConnection, AssistantMessage, AuthMethodKind, ChatBackend,
     ChatImage, ChatThread, ConnectSpec, FeatureControl, FeatureKind, FeatureValue,
@@ -821,7 +887,7 @@ impl AgentChatView {
             backend,
             ChatThread::new(),
             true,
-            None,
+            RestoredPosture::default(),
             theme,
             density,
             typography,
@@ -852,7 +918,7 @@ impl AgentChatView {
             backend,
             ChatThread::new(),
             false,
-            None,
+            RestoredPosture::default(),
             theme,
             density,
             typography,
@@ -892,7 +958,7 @@ impl AgentChatView {
         slash_commands: Vec<String>,
         session_meta: oximux_agents::thread::SessionMeta,
         thinking_level: ThinkingLevel,
-        codex_posture: Option<(String, String)>,
+        posture: RestoredPosture,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -904,7 +970,7 @@ impl AgentChatView {
         // restored chat; a later live init overwrites it.
         thread.session_meta = session_meta;
         let mut view = Self::assemble(
-            cwd, model, backend, thread, true, codex_posture, theme, density, typography, window, cx,
+            cwd, model, backend, thread, true, posture, theme, density, typography, window, cx,
         );
         view.thinking_level = thinking_level;
         // A resumed chat that already has history must NOT regenerate (or
@@ -942,7 +1008,7 @@ impl AgentChatView {
             ChatBackend::stream_json(),
             thread,
             false,
-            None,
+            RestoredPosture::default(),
             theme,
             density,
             typography,
@@ -971,11 +1037,10 @@ impl AgentChatView {
         // `false` opens an unbound **New Agent** draft: skip the subprocess spawn
         // entirely and wait for the first send to bind (see [`Self::new_unbound`]).
         connect_now: bool,
-        // A restored Codex chat's persisted posture `(approval_policy, sandbox)`,
-        // seeded into the connection spawn + the composer's feature picks so the
-        // reopened session keeps its Approvals/Sandbox choice. `None` for fresh
-        // launches and non-Codex backends.
-        codex_posture: Option<(String, String)>,
+        // A restored chat's persisted, backend-specific posture, seeded into the
+        // connection spawn + the composer's feature picks so the reopened session
+        // keeps the choice it was saved with. Empty for fresh launches.
+        posture: RestoredPosture,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -1016,6 +1081,7 @@ impl AgentChatView {
                         this.send_text(text.clone(), images.clone(), cx)
                     }
                 }
+                ComposerEvent::SteerNow { text } => this.steer_text(text.clone(), cx),
                 ComposerEvent::Stop => this.stop_turn(cx),
                 ComposerEvent::ModelPicked(model) => this.change_model(model.clone(), cx),
                 ComposerEvent::PermissionModePicked(mode) => {
@@ -1055,8 +1121,11 @@ impl AgentChatView {
                 None,
                 None,
             );
-            // A restored Codex chat resumes under its persisted posture.
-            spec.codex_posture = codex_posture.clone();
+            // A restored chat resumes under its persisted posture. For Pi this is
+            // the only tool gate there is, so losing it would silently widen the
+            // session to the (permissive) default.
+            spec.codex_posture = posture.codex.clone();
+            spec.pi_posture = posture.pi.clone();
             match connect(spec) {
                 Ok((conn, rx)) => {
                     connection = Some(conn);
@@ -1068,6 +1137,14 @@ impl AgentChatView {
                 }
             }
         }
+
+        // Seed the context meter from the backend when it knows its window
+        // without having run a turn (Pi reports it per model at the handshake).
+        // Without this the meter has no denominator until the first reply lands.
+        // `.or()` keeps a restored transcript's cached window when the backend
+        // has nothing to offer.
+        thread.last_known_context_window =
+            connection.as_ref().and_then(|c| c.context_window()).or(thread.last_known_context_window);
 
         // Seed the composer's bottom-toolbar pickers now, so they're correct on
         // the very first paint — a restored chat that isn't streaming fires no
@@ -1096,6 +1173,7 @@ impl AgentChatView {
         // A restored bound chat with a session can open its terminal view right
         composer.update(cx, |c, cx| {
             c.set_state(disconnected, thread.turn_active, cx);
+            c.set_can_steer(caps.supports_steer, cx);
             c.set_controls(model.clone(), None, None, caps.supports_modes, caps.supports_config, vocab, cx);
             // Descriptions + hints aren't persisted — a restored session shows
             // names only until the live agent re-advertises via SlashCommandsUpdated.
@@ -1108,23 +1186,7 @@ impl AgentChatView {
             c.seed_history(history_seed);
         });
 
-        // Enrich the palette with on-disk descriptions + grouping (the init list
-        // is bare names). The scan reads ~100 small files, so it runs off the
-        // main thread and pushes the result in when ready.
-        if caps.supports_slash {
-            let scan_cwd = cwd.clone();
-            cx.spawn(async move |this, cx| {
-                let catalog = cx
-                    .background_spawn(async move {
-                        slash_command_catalog::discover_catalog(&scan_cwd)
-                    })
-                    .await;
-                let _ = this.update(cx, |this, cx| {
-                    this.composer.update(cx, |c, cx| c.set_command_catalog(catalog, cx));
-                });
-            })
-            .detach();
-        }
+        push_slash_catalog(connection.as_deref(), &composer, &cwd, cx);
 
         // Resolve the git checkpoint engine for `cwd` off-thread (it shells out
         // to `git rev-parse`). Folds into `checkpoint_engine` when ready; a
@@ -1181,6 +1243,7 @@ impl AgentChatView {
                 Transport::StreamJson => "claude-code",
                 Transport::AppServer => "codex",
                 Transport::Acp => "cursor",
+                Transport::Rpc => "pi",
             }
             .to_string()
         });
@@ -1208,9 +1271,9 @@ impl AgentChatView {
             model,
             permission_mode: None,
             effort: None,
-            // Seed the composer's Approvals/Sandbox picks from the restored Codex
-            // posture so they display (and re-persist) the resumed choice.
-            feature_values: seed_posture_feature_values(codex_posture),
+            // Seed the composer's posture picks from the restored blob so they
+            // display (and re-persist) the resumed choice.
+            feature_values: seed_posture_feature_values(&posture),
             disconnected,
             interrupted: false,
             unbound: !connect_now,
@@ -1322,7 +1385,70 @@ impl AgentChatView {
             acp_command: self.backend.acp_command.clone(),
             acp_args: self.backend.acp_args.clone(),
             codex_posture: self.codex_posture_snapshot(),
+            pi_posture: self.pi_posture_snapshot(),
         })
+    }
+
+    /// Pi's tool posture, read from the composer's feature picks. `None` for a
+    /// non-Pi chat or when nothing was changed (restore then applies the
+    /// deliberate default).
+    ///
+    /// Unlike Codex's, this posture is the session's ONLY tool gate — pi never
+    /// asks before running anything — so it is snapshotted for persistence
+    /// rather than left to be re-derived.
+    /// The [`ConnectSpec`] a respawn launches on: the session's identity (model,
+    /// resume id, mode, effort) plus every spawn-time choice the user has made.
+    ///
+    /// Split out from `respawn` so what a reconnect *carries* is assertable
+    /// without spawning a subprocess. That is not a testing nicety here: a
+    /// backend whose gating is spawn-time (pi's `--tools` allowlist) has its
+    /// entire safety posture decided by this struct, and a field missing from it
+    /// fails silently in the worst direction — the control still moves, the agent
+    /// just isn't bound by it.
+    fn respawn_spec(
+        &self,
+        env: Vec<(String, String)>,
+        auth_method: Option<String>,
+    ) -> ConnectSpec {
+        let mut spec = ConnectSpec::for_backend(
+            &self.backend,
+            self.cwd.clone(),
+            self.model.clone(),
+            self.thread.session_id.clone(),
+            self.permission_mode.clone(),
+            self.effort.clone(),
+        );
+        spec.env = env;
+        spec.auth_method = auth_method;
+        // Preserve the chosen Codex posture across the respawn (Stop-resume, a
+        // rewind fork), so it isn't silently reset to the default on reconnect.
+        spec.codex_posture = self.codex_posture_snapshot();
+        // Pi's tool gating is a spawn-time allowlist, so a respawn is the ONLY
+        // way a posture change takes effect — and this is the line that carries
+        // it. Without it, picking Read-only respawned pi on the DEFAULT posture:
+        // the pill read "Read-only" while the agent kept writing files, which is
+        // worse than having no pill at all. It also silently reset the posture on
+        // every unrelated respawn (Stop-then-send, a model switch).
+        spec.pi_posture = self.pi_posture_snapshot();
+        spec
+    }
+
+    fn pi_posture_snapshot(&self) -> Option<PiPosture> {
+        if self.backend.transport != Transport::Rpc {
+            return None;
+        }
+        let tools = match self.feature_values.get(pi_posture::FEATURE_TOOLS) {
+            Some(FeatureValue::Choice(wire)) => Some(wire.clone()),
+            _ => None,
+        };
+        let context_files = match self.feature_values.get(pi_posture::FEATURE_CONTEXT_FILES) {
+            Some(FeatureValue::Bool(on)) => Some(*on),
+            _ => None,
+        };
+        if tools.is_none() && context_files.is_none() {
+            return None;
+        }
+        Some(PiPosture::from_parts(tools.as_deref(), context_files))
     }
 
     /// The Codex posture `(approval_policy, sandbox)` the user has selected, read
@@ -1453,6 +1579,20 @@ impl AgentChatView {
                     return None;
                 }
                 (AgentAdapter::Custom, preset.id)
+            }
+            // Pi resumes by session id in the session's own project — the same
+            // `pi --session <id>` the chat itself spawns with. (An earlier note
+            // here claimed a `--session <uuid>` "silently resumes nothing" and
+            // that only the file path worked; probing the real binary showed the
+            // reverse — the id resolves against the project's store and a miss
+            // exits 1, while a stale *path* is what silently mints an empty
+            // session.) `cwd` is the chat's cwd, which is the session's project,
+            // so the id resolves.
+            Transport::Rpc => {
+                if !is_safe_resume_session_id(&session_id) {
+                    return None;
+                }
+                (AgentAdapter::Custom, "pi")
             }
         };
         Some(ChatTerminalSpec {
@@ -1680,6 +1820,7 @@ impl AgentChatView {
         let unbound = self.unbound;
         self.composer.update(cx, |c, cx| {
             c.set_state(disconnected, turn_active, cx);
+            c.set_can_steer(caps.supports_steer, cx);
             c.set_usage_meter(meter_used, meter_window, meter_cost, cx);
             c.set_slash_commands(slash_commands, slash_descriptions, slash_hints, cx);
             c.set_provider_label(provider_label, cx);
@@ -2005,6 +2146,34 @@ impl AgentChatView {
         cx.notify();
     }
 
+    /// Hand a message to the turn that is already streaming (a queued chip's ↑ on
+    /// a `supports_steer` backend). The agent picks it up at the next turn
+    /// boundary and changes course.
+    ///
+    /// Deliberately not routed through [`Self::send_text`]. That path is the
+    /// *start* of a turn: it binds an unbound draft, respawns an interrupted
+    /// child, generates the tab title and takes the pre-turn checkpoint. None of
+    /// that applies to a message going into a turn that is already running — and
+    /// the checkpoint especially must not: it anchors rewind to the repo as it
+    /// stood *before* a turn, and taking one now would capture a tree the running
+    /// turn's own tools are halfway through editing.
+    fn steer_text(&mut self, text: String, cx: &mut Context<Self>) {
+        if text.is_empty() || !self.thread.turn_active {
+            return;
+        }
+        let Some(conn) = &self.connection else { return };
+        // The bubble goes in at the point the user sent it, which is also where
+        // the agent will act on it — the turn's remaining output lands after.
+        match conn.steer(&text) {
+            Ok(()) => self.thread.push_user_message(&text),
+            Err(e) => self.thread.last_error = Some(format!("Steer failed: {e}")),
+        }
+        self.stick_to_bottom = true;
+        self.list_scroll.scroll_to_bottom();
+        self.sync_composer(cx);
+        cx.notify();
+    }
+
     /// Kick off a one-shot LLM title generation for this chat's first message.
     /// Owned on `title_task` so a tab close drops it. The generation runs a child
     /// process needing a tokio reactor, so it's handed to the tokio runtime and
@@ -2170,6 +2339,9 @@ impl AgentChatView {
             Transport::StreamJson => Some("claude-code"),
             Transport::AppServer => Some("codex"),
             Transport::Acp => None,
+            // Pi's protocol exposes no sign-in command — authentication happens
+            // in the `pi` CLI itself, which is exactly what this banner opens.
+            Transport::Rpc => Some("pi"),
         }
     }
 
@@ -2667,23 +2839,7 @@ impl AgentChatView {
         if let Some(old) = self.connection.take() {
             old.shutdown();
         }
-        let session_id = self.thread.session_id.clone();
-        let model = self.model.clone();
-        let permission_mode = self.permission_mode.clone();
-        let effort = self.effort.clone();
-        let mut spec = ConnectSpec::for_backend(
-            &self.backend,
-            self.cwd.clone(),
-            model,
-            session_id,
-            permission_mode,
-            effort,
-        );
-        spec.env = env;
-        spec.auth_method = auth_method;
-        // Preserve the chosen Codex posture across the respawn (Stop-resume, a
-        // rewind fork), so it isn't silently reset to the default on reconnect.
-        spec.codex_posture = self.codex_posture_snapshot();
+        let spec = self.respawn_spec(env, auth_method);
         match connect(spec) {
             Ok((conn, rx)) => {
                 self.connection = Some(conn);
@@ -2695,6 +2851,10 @@ impl AgentChatView {
                 self.interrupted = false;
                 self.disconnected = false;
                 self.thread.last_error = None;
+                // This is the FIRST connection for a deferred-bound *New Agent*
+                // draft, so its palette metadata arrives here or not at all.
+                let (composer, cwd) = (self.composer.clone(), self.cwd.clone());
+                push_slash_catalog(self.connection.as_deref(), &composer, &cwd, cx);
             }
             Err(e) => {
                 self.thread.last_error = Some(format!("Failed to resume agent: {e}"));
@@ -2740,6 +2900,11 @@ impl AgentChatView {
             .is_some_and(|c| c.set_model(&model).is_ok());
         if !switched_live {
             self.respawn(cx);
+        } else if let Some(w) = self.connection.as_ref().and_then(|c| c.context_window()) {
+            // The window is per-model and can differ a lot (272K vs 128K), so a
+            // live switch must move the meter's denominator with it — otherwise
+            // it keeps measuring against the model the user just left.
+            self.thread.last_known_context_window = Some(w);
         }
         self.sync_composer(cx); // reflect the new model in the toolbar label
         // Persist only for spawn-fixed backends: an ACP model is a session-local
@@ -2990,6 +3155,9 @@ impl AgentChatView {
                 cx,
             )
         });
+        // Mirror `new`: seed the palette's command metadata from the backend, so
+        // a test exercises the same path the real constructor takes.
+        push_slash_catalog(Some(connection.as_ref()), &composer, std::path::Path::new(""), cx);
         Self {
             thread: ChatThread::new(),
             connection: Some(connection),
@@ -5461,6 +5629,7 @@ fn thinking_block(
 mod tests {
     use super::*;
     use gpui::TestAppContext;
+    use oximux_agents::thread::connection::AgentCapabilities;
     use oximux_agents::thread::StubConnection;
     use serde_json::json;
 
@@ -5983,6 +6152,194 @@ mod tests {
                     cx,
                 );
                 assert_eq!(count_users(view), 2, "no phantom re-send when the queue is empty");
+            })
+            .expect("window update");
+    }
+
+    /// Steering hands a message to the turn that is already streaming: the stub
+    /// records a `steer` (not a fresh send), the bubble appears at once, and the
+    /// turn keeps running — unlike a normal send, which starts one.
+    #[gpui::test]
+    async fn steering_feeds_the_live_turn_instead_of_starting_a_new_one(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let stub = StubConnection::default().with_capabilities(AgentCapabilities {
+            supports_steer: true,
+            ..AgentCapabilities::default()
+        });
+        let recorder = stub.clone();
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(stub),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let count_users = |view: &AgentChatView| {
+            view.thread.entries.iter().filter(|e| matches!(e, ThreadEntry::User { .. })).count()
+        };
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.send_text("first".into(), Vec::new(), cx);
+                assert!(view.thread.turn_active);
+
+                view.steer_text("actually, stop".into(), cx);
+                assert_eq!(count_users(view), 2, "the steered message is in the transcript now");
+                assert!(view.thread.turn_active, "the turn it steers is still running");
+                assert_eq!(view.thread.last_error, None);
+
+                // Nothing to steer once the turn is over — that message would be
+                // an ordinary send, and this path must not fake one.
+                view.on_event(
+                    ThreadEvent::TurnEnded { result: None, usage: None, is_error: false },
+                    cx,
+                );
+                view.steer_text("too late".into(), cx);
+                assert_eq!(count_users(view), 2, "no bubble for a message that went nowhere");
+            })
+            .expect("window update");
+
+        let sent = recorder.sent();
+        assert_eq!(sent.len(), 2, "the idle steer sent nothing");
+        assert_eq!(sent[0]["message"]["content"], "first", "the send that started the turn");
+        assert_eq!(sent[1]["type"], "steer", "steered rather than starting a turn");
+        assert_eq!(sent[1]["message"], "actually, stop");
+    }
+
+    /// A backend with no mid-turn queue refuses the steer, and the refusal is
+    /// surfaced rather than swallowed into a bubble the agent never received.
+    #[gpui::test]
+    async fn a_refused_steer_surfaces_and_pushes_no_bubble(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let stub = StubConnection::default(); // supports_steer: false
+        let recorder = stub.clone();
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(stub),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.send_text("first".into(), Vec::new(), cx);
+                view.steer_text("second".into(), cx);
+                assert_eq!(
+                    view.thread.entries.iter().filter(|e| matches!(e, ThreadEntry::User { .. })).count(),
+                    1,
+                    "a message the backend rejected must not render as sent"
+                );
+                assert!(view.thread.last_error.as_deref().unwrap_or_default().contains("Steer failed"));
+            })
+            .expect("window update");
+
+        assert_eq!(recorder.sent().len(), 1, "only the send that started the turn");
+    }
+
+    /// Picking Read-only must reach the SPAWN, because pi's gating is a
+    /// spawn-time allowlist and a respawn is the only thing that applies it.
+    ///
+    /// This is the round's load-bearing safety property, and it shipped broken:
+    /// `respawn` carried `codex_posture` but not `pi_posture`, so the pill read
+    /// "Read-only" while pi ran wide open. Live, it wrote `breach.txt` on demand.
+    /// The posture is only real if this spec carries it.
+    #[gpui::test]
+    async fn picking_a_pi_posture_reaches_the_respawn_spec(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, _cx| {
+                // A Pi chat that has had its tools pill set to read-only.
+                view.backend = ChatBackend::from(Transport::Rpc);
+                view.feature_values.insert(
+                    pi_posture::FEATURE_TOOLS.to_string(),
+                    FeatureValue::Choice(pi_posture::TOOLS_READ_ONLY.to_string()),
+                );
+
+                let spec = view.respawn_spec(Vec::new(), None);
+                let posture = spec
+                    .pi_posture
+                    .expect("the respawn must carry the posture, or the pill is decoration");
+                assert_eq!(posture.tools, pi_posture::TOOLS_READ_ONLY);
+                // And it reaches the child as real argv, not just a struct field.
+                let args = oximux_agents::thread::pi::build_args(None, &posture, None)
+                    .expect("build argv");
+                assert!(
+                    args.windows(2).any(|w| w[0] == "--tools"),
+                    "read-only must arrive as pi's own allowlist flag: {args:?}"
+                );
+
+                // A non-Pi chat carries nothing here (the field is Rpc-only).
+                view.backend = ChatBackend::stream_json();
+                assert_eq!(view.respawn_spec(Vec::new(), None).pi_posture, None);
+            })
+            .expect("window update");
+    }
+
+    /// A backend that describes its own commands drives the palette's grouping,
+    /// descriptions and attribution — no on-disk scan of another CLI's config.
+    #[gpui::test]
+    async fn a_backends_own_command_metadata_reaches_the_palette(cx: &mut TestAppContext) {
+        use oximux_agents::thread::connection::SlashCommandInfo;
+
+        cx.update(gpui_component::init);
+        let stub = StubConnection::default()
+            .with_capabilities(AgentCapabilities {
+                supports_slash: true,
+                ..AgentCapabilities::default()
+            })
+            .with_slash_commands(vec![SlashCommandInfo {
+                name: "skill:verify-notes".into(),
+                description: Some("Summarize the notes file.".into()),
+                is_skill: true,
+                source_label: Some("user".into()),
+            }]);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Box::new(stub),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.composer.update(cx, |c, _cx| {
+                    let cat = c.slash_catalog_for_test();
+                    let meta = cat
+                        .get("skill:verify-notes")
+                        .expect("the backend's own command is in the palette's catalog");
+                    assert_eq!(meta.group, super::slash_command_catalog::CommandGroup::Skill);
+                    assert_eq!(meta.description.as_deref(), Some("Summarize the notes file."));
+                    assert_eq!(meta.source_label.as_deref(), Some("user"));
+                    // Nothing from another CLI's on-disk catalog leaked in.
+                    assert!(!cat.contains_key("compact"));
+                });
             })
             .expect("window update");
     }
@@ -6815,7 +7172,11 @@ mod tests {
 
     /// An import bridge captions its bubbles with the provider the transcript
     /// actually came from, not the inert stream-json placeholder it assembles on
-    /// — otherwise a Pi/OpenCode transcript reads as Claude's.
+    /// — otherwise an OpenCode transcript reads as Claude's.
+    ///
+    /// Uses OpenCode deliberately: Pi used to be the other bridge provider, but
+    /// it now opens as a live chat, so a Pi fixture here would assert a route
+    /// that no longer exists.
     #[gpui::test]
     async fn import_bridge_labels_bubbles_with_its_own_provider(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
@@ -6823,15 +7184,15 @@ mod tests {
             AgentChatView::new_import_bridge(
                 PathBuf::from("/tmp/oximux-bridge-label"),
                 vec![ThreadEntry::Assistant(AssistantMessage {
-                    text: "hi from pi".into(),
+                    text: "hi from opencode".into(),
                     thinking: String::new(),
                 })],
                 ImportBridge {
-                    preset_id: "pi".into(),
+                    preset_id: "opencode".into(),
                     session_id: "ses-1".into(),
-                    resume_handle: "/tmp/rollout.jsonl".into(),
+                    resume_handle: "ses-1".into(),
                     cwd: PathBuf::from("/tmp/oximux-bridge-label"),
-                    provider_display: "Pi".into(),
+                    provider_display: "OpenCode".into(),
                 },
                 Theme::default(),
                 Density::default(),
@@ -6847,8 +7208,8 @@ mod tests {
                 assert!(view.is_import_bridge());
                 assert_eq!(
                     view.provider_label(),
-                    "Pi",
-                    "a Pi transcript must not be captioned with the placeholder backend's name"
+                    "OpenCode",
+                    "an imported transcript must not be captioned with the placeholder backend's name"
                 );
             })
             .expect("window update");

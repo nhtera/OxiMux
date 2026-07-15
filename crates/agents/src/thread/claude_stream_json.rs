@@ -403,6 +403,7 @@ impl AgentConnection for ClaudeStreamJsonConnection {
             supports_config: true,  // reasoning effort via `--effort <level>`
             emits_usage: true,      // result + stream_event carry token/cost usage
             supports_rewind: true,  // keeps ~/.claude/projects/*.jsonl for truncate-fork
+            supports_steer: false,  // stdin mid-turn has no queue to land in
         }
     }
 

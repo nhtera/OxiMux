@@ -274,6 +274,7 @@ impl AgentConnection for CodexAppServerConnection {
             // JSONL needed). The rewind UI gates light up; the flow branches on
             // `rewind_is_server_side` to fork the live thread instead of a file.
             supports_rewind: true,
+            supports_steer: false, // no mid-turn queue in app-server
         }
     }
 
