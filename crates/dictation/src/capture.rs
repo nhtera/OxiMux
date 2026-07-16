@@ -42,28 +42,46 @@ impl SessionBuffer {
 const LEVEL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Build + run the capture stream until `stop` is set, then drop it. Blocking;
-/// call on its own thread. All failures are reported as [`DictationEvent::Error`]
-/// (never a silent zeroed-audio "success").
+/// call on its own thread. `device` selects a named input device (by cpal name);
+/// `None` — or a name that no longer resolves — uses the system default. All
+/// failures are reported as [`DictationEvent::Error`] (never a silent
+/// zeroed-audio "success").
 pub fn run(
     shared: Arc<Mutex<SessionBuffer>>,
     events: UnboundedSender<DictationEvent>,
     stop: Arc<AtomicBool>,
+    device: Option<String>,
 ) {
-    if let Err(e) = run_inner(&shared, &events, &stop) {
+    if let Err(e) = run_inner(&shared, &events, &stop, device.as_deref()) {
         let _ = events.unbounded_send(DictationEvent::Error(format!("microphone: {e}")));
         stop.store(true, Ordering::SeqCst);
     }
+}
+
+/// Resolve the requested input device: the first device whose cpal name matches
+/// `wanted`, else the system default. A stale/unplugged name falls back rather
+/// than erroring so a saved device that vanished never wedges dictation.
+fn resolve_device(host: &cpal::Host, wanted: Option<&str>) -> anyhow::Result<cpal::Device> {
+    // cpal 0.18: `DeviceTrait` has no `name()`; the device name is its `Display`
+    // (`to_string()`), which is what the settings/picker store.
+    if let Some(name) = wanted.map(str::trim).filter(|s| !s.is_empty())
+        && let Ok(mut devices) = host.input_devices()
+        && let Some(dev) = devices.find(|d| d.to_string() == name)
+    {
+        return Ok(dev);
+    }
+    host.default_input_device()
+        .ok_or_else(|| anyhow::anyhow!("no default input device"))
 }
 
 fn run_inner(
     shared: &Arc<Mutex<SessionBuffer>>,
     events: &UnboundedSender<DictationEvent>,
     stop: &Arc<AtomicBool>,
+    wanted_device: Option<&str>,
 ) -> anyhow::Result<()> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("no default input device"))?;
+    let device = resolve_device(&host, wanted_device)?;
     let supported = device.default_input_config()?;
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
@@ -168,4 +186,23 @@ fn run_inner(
 /// button's "no microphone" state, checked without opening a stream.
 pub fn has_input_device() -> bool {
     cpal::default_host().default_input_device().is_some()
+}
+
+/// Names of the available input devices, for the device-picker menu. The system
+/// default is presented separately (empty selection), so it is not included
+/// here. Names are what [`run`]'s `device` argument matches against. Best-effort:
+/// a host that can't enumerate returns an empty list.
+pub fn list_input_devices() -> Vec<String> {
+    let host = cpal::default_host();
+    let Ok(devices) = host.input_devices() else {
+        return Vec::new();
+    };
+    // Device name = its `Display` (cpal 0.18 dropped `DeviceTrait::name`). Drop
+    // duplicate names (aggregate/virtual devices can repeat, not necessarily
+    // adjacently) while keeping enumeration order.
+    let mut seen = std::collections::HashSet::new();
+    devices
+        .map(|d| d.to_string())
+        .filter(|n| seen.insert(n.clone()))
+        .collect()
 }

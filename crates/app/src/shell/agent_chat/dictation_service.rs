@@ -16,12 +16,54 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
-use gpui::{App, BorrowAppContext, Global, WeakEntity};
+use gpui::{App, BorrowAppContext, Global, WeakEntity, Window};
+use gpui_component::WindowExt as _;
 use oximux_dictation::{
     DictationController, DictationEvent, ModelManager, ModelPaths, ModelStatus, Readiness,
 };
+use oximux_settings::DictationSettings;
 
 use super::composer::ComposerView;
+use super::dictation_hud::DictationHud;
+
+/// Where a live dictation session delivers its events + transcript. The composer
+/// receives events directly (it renders its own in-line recording bar); every
+/// other pane (terminal, code editor) is driven by the global [`DictationHud`],
+/// which owns the concrete terminal/editor sink and renders the floating pill.
+#[derive(Clone)]
+pub enum DictationTarget {
+    Composer(WeakEntity<ComposerView>),
+    Hud(WeakEntity<DictationHud>),
+}
+
+impl DictationTarget {
+    /// Whether the receiving entity is still alive (its tab/window wasn't closed
+    /// mid-session). The HUD outlives panes, so a HUD target reports alive here
+    /// and the HUD itself watches its terminal/editor sink for death.
+    fn is_alive(&self) -> bool {
+        match self {
+            DictationTarget::Composer(w) => w.upgrade().is_some(),
+            DictationTarget::Hud(w) => w.upgrade().is_some(),
+        }
+    }
+}
+
+/// The synchronous outcome of the pre-recording checks (settings enabled, model
+/// ready, permission). Callers turn `Ready`/`NeedsPermission` into a `start`.
+pub enum StartDecision {
+    /// All clear — begin immediately with these resolved paths + device.
+    Ready {
+        paths: ModelPaths,
+        device: Option<String>,
+    },
+    /// Mic permission is undetermined — request it, then begin on grant.
+    NeedsPermission {
+        paths: ModelPaths,
+        device: Option<String>,
+    },
+    /// Can't start (disabled / no model / denied) — a toast was already shown.
+    Blocked,
+}
 
 /// Same per-user data dir as the settings TOMLs; models live under
 /// `speech-models/`.
@@ -38,9 +80,11 @@ fn models_dir() -> PathBuf {
 pub struct DictationService {
     manager: Arc<ModelManager>,
     controller: DictationController,
-    /// The composer currently recording (registered on `start`), so the event
-    /// drain knows where to deliver the transcript.
-    active: Option<WeakEntity<ComposerView>>,
+    /// Where the current session (if any) delivers its events — a composer, or
+    /// the (per-window) HUD driving a terminal/editor pane. The `Hud` variant
+    /// carries its own window's HUD handle, so routing never needs a global HUD
+    /// pointer (which would misroute across multiple windows).
+    target: Option<DictationTarget>,
     /// In-flight download cancel flags, keyed by model id.
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
@@ -57,7 +101,7 @@ pub fn install(cx: &mut App) {
     cx.set_global(DictationService {
         manager,
         controller,
-        active: None,
+        target: None,
         cancels: Mutex::new(HashMap::new()),
     });
 
@@ -80,23 +124,49 @@ pub fn install(cx: &mut App) {
 }
 
 fn route_event(cx: &mut App, ev: DictationEvent) {
-    let Some(svc) = cx.try_global::<DictationService>() else {
+    // Record every completed transcript to the on-disk history BEFORE routing —
+    // this is the single choke point all panes share, so history is captured even
+    // if the target pane was closed mid-session. A repaint surfaces it live in an
+    // open Voice pane. Blank transcripts are dropped by `record`.
+    if let DictationEvent::Final(text) = &ev {
+        super::dictation_history::record(text);
+        cx.refresh_windows();
+    }
+    let target = {
+        let Some(svc) = cx.try_global::<DictationService>() else {
+            return;
+        };
+        svc.target.clone()
+    };
+    let Some(target) = target else {
         return;
     };
-    let Some(active) = svc.active.clone() else {
-        return;
-    };
-    if let Some(entity) = active.upgrade() {
-        entity.update(cx, |composer, cx| composer.on_dictation_event(ev, cx));
-    } else {
-        // The composer that started recording is gone (its chat tab was closed
-        // mid-session). Cancel the orphaned session so the mic doesn't stay hot
-        // until the 2-minute cap with no on-screen way to stop it. Recording
-        // emits Level events ~10 Hz, so this fires within ~100 ms of the close.
+    // The receiving entity is gone (its tab/window closed mid-session). Cancel
+    // the orphaned session so the mic doesn't stay hot until the 2-minute cap.
+    // Level events fire ~10 Hz, so this fires within ~100 ms of the close.
+    if !target.is_alive() {
         cx.update_global::<DictationService, _>(|svc, _| {
             svc.controller.cancel();
-            svc.active = None;
+            svc.target = None;
         });
+        return;
+    }
+    // Deliver to the target's OWN entity (not a process-global HUD pointer): with
+    // multiple workspace windows each owning a `DictationHud`, routing by a shared
+    // pointer would deliver the older window's session events to the newer
+    // window's HUD, which would self-cancel it. The `Hud(weak)` carried here is
+    // the exact HUD that began the session.
+    match target {
+        DictationTarget::Composer(weak) => {
+            if let Some(entity) = weak.upgrade() {
+                entity.update(cx, |composer, cx| composer.on_dictation_event(ev, cx));
+            }
+        }
+        DictationTarget::Hud(weak) => {
+            if let Some(hud) = weak.upgrade() {
+                hud.update(cx, |hud, cx| hud.on_dictation_event(ev, cx));
+            }
+        }
     }
 }
 
@@ -125,9 +195,15 @@ pub fn resolve_paths(cx: &App, id: &str, language: Option<String>) -> Option<Mod
         .and_then(|s| s.manager.resolve_paths(id, language))
 }
 
-/// Register `who` as the active recorder and start capture. Returns false if a
-/// session is already active (one recorder at a time) or the service is absent.
-pub fn start(cx: &mut App, who: WeakEntity<ComposerView>, paths: ModelPaths) -> bool {
+/// Register `target` as the active recorder and start capture from `device`
+/// (`None` = system default). Returns false if a session is already active (one
+/// recorder at a time) or the service is absent.
+pub fn start(
+    cx: &mut App,
+    target: DictationTarget,
+    paths: ModelPaths,
+    device: Option<String>,
+) -> bool {
     if cx.try_global::<DictationService>().is_none() {
         return false;
     }
@@ -135,9 +211,67 @@ pub fn start(cx: &mut App, who: WeakEntity<ComposerView>, paths: ModelPaths) -> 
         if svc.controller.is_active() {
             return false;
         }
-        svc.active = Some(who);
-        svc.controller.start(paths)
+        svc.target = Some(target);
+        svc.controller.start(paths, device)
     })
+}
+
+/// Whether a recording session is live right now (any target).
+pub fn is_active(cx: &App) -> bool {
+    cx.try_global::<DictationService>()
+        .map(|s| s.controller.is_active())
+        .unwrap_or(false)
+}
+
+/// Run the synchronous pre-recording checks (enabled → model ready → resolve
+/// paths → permission) shared by the composer and the HUD. Emits the right toast
+/// and returns [`StartDecision::Blocked`] on any failure; otherwise returns the
+/// resolved paths + device so the caller can begin (immediately, or after a
+/// permission prompt).
+pub fn prepare_start(cx: &mut App, window: &mut Window) -> StartDecision {
+    let settings = cx
+        .try_global::<DictationSettings>()
+        .cloned()
+        .unwrap_or_default();
+    if !settings.enabled {
+        window.push_notification("Dictation is disabled — enable it in Settings › Voice", cx);
+        return StartDecision::Blocked;
+    }
+    let model_id = settings.model_id.clone();
+    match readiness(cx, &model_id) {
+        Readiness::Ready => {}
+        Readiness::Downloading(p) => {
+            let pct = (p * 100.0).round() as u32;
+            window.push_notification(format!("Downloading dictation model… {pct}%"), cx);
+            return StartDecision::Blocked;
+        }
+        Readiness::Missing => {
+            window.push_notification(
+                "No dictation model yet — download one in Settings › Voice",
+                cx,
+            );
+            return StartDecision::Blocked;
+        }
+    }
+    let Some(paths) = resolve_paths(cx, &model_id, settings.language_param()) else {
+        window.push_notification("Dictation model isn't ready", cx);
+        return StartDecision::Blocked;
+    };
+    let device = settings.device_name();
+    match crate::mic_permission::status() {
+        crate::mic_permission::MicPermission::Granted => StartDecision::Ready { paths, device },
+        crate::mic_permission::MicPermission::Denied
+        | crate::mic_permission::MicPermission::Restricted => {
+            window.push_notification(
+                "Microphone access is off — enable it in System Settings › Privacy › Microphone",
+                cx,
+            );
+            StartDecision::Blocked
+        }
+        crate::mic_permission::MicPermission::Undetermined => {
+            StartDecision::NeedsPermission { paths, device }
+        }
+    }
 }
 
 /// Stop recording → transcribe → deliver the transcript to the active composer.

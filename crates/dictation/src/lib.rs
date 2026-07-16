@@ -18,6 +18,7 @@ pub mod model_catalog;
 pub mod model_manager;
 pub mod resample;
 
+pub use capture::{has_input_device, list_input_devices};
 pub use controller::{DictationController, DictationEvent, MAX_RECORDING_SECS};
 pub use engine::{Engine, EngineKind, ModelPaths};
 pub use model_catalog::{ModelSpec, catalog, spec_for, DEFAULT_MODEL_ID};

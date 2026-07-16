@@ -12,8 +12,10 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use sherpa_rs::sense_voice::{SenseVoiceConfig, SenseVoiceRecognizer};
 use sherpa_rs::transducer::{TransducerConfig, TransducerRecognizer};
 use sherpa_rs::whisper::{WhisperConfig, WhisperRecognizer};
+use sherpa_rs::zipformer::{ZipFormer, ZipFormerConfig};
 
 use crate::resample::TARGET_SAMPLE_RATE;
 
@@ -25,6 +27,12 @@ pub enum EngineKind {
     Whisper { language: Option<String> },
     /// NeMo transducer (Parakeet). English/European only.
     Transducer,
+    /// Icefall zipformer offline transducer (e.g. the dedicated Vietnamese
+    /// models). Same 4 files as a transducer, but a distinct sherpa recognizer
+    /// (`ZipFormer`, generic model type — not `nemo_transducer`).
+    Zipformer,
+    /// SenseVoice — a single-file multilingual (zh/en/ja/ko/yue) offline model.
+    SenseVoice,
 }
 
 /// Concrete on-disk model files resolved by the Phase 2 catalog for a ready
@@ -38,24 +46,39 @@ pub struct ModelPaths {
     pub kind: EngineKind,
     pub encoder: PathBuf,
     pub decoder: PathBuf,
-    /// Transducer models only. `None` for whisper.
+    /// Transducer / zipformer models only. `None` for whisper / sense-voice.
     pub joiner: Option<PathBuf>,
     pub tokens: PathBuf,
+    /// Single-file model families (SenseVoice). `None` for the encoder/decoder
+    /// families (whisper / transducer / zipformer).
+    pub model: Option<PathBuf>,
 }
 
 impl ModelPaths {
     fn require_files(&self) -> Result<()> {
-        let mut missing: Vec<&Path> = Vec::new();
-        for p in [&self.encoder, &self.decoder, &self.tokens] {
-            if !p.exists() {
-                missing.push(p);
+        // Single-file families (SenseVoice) carry only `model` + `tokens`; the
+        // encoder/decoder families carry encoder/decoder/tokens (+joiner).
+        let needed: Vec<&Path> = match &self.kind {
+            EngineKind::SenseVoice => {
+                let mut v = vec![self.tokens.as_path()];
+                if let Some(m) = &self.model {
+                    v.push(m.as_path());
+                }
+                v
             }
-        }
-        if let Some(j) = &self.joiner
-            && !j.exists()
-        {
-            missing.push(j);
-        }
+            _ => {
+                let mut v = vec![
+                    self.encoder.as_path(),
+                    self.decoder.as_path(),
+                    self.tokens.as_path(),
+                ];
+                if let Some(j) = &self.joiner {
+                    v.push(j.as_path());
+                }
+                v
+            }
+        };
+        let missing: Vec<&Path> = needed.into_iter().filter(|p| !p.exists()).collect();
         if !missing.is_empty() {
             bail!("model {} missing files: {:?}", self.id, missing);
         }
@@ -78,6 +101,8 @@ pub struct Engine {
 enum Recognizer {
     Whisper(WhisperRecognizer),
     Transducer(TransducerRecognizer),
+    Zipformer(ZipFormer),
+    SenseVoice(SenseVoiceRecognizer),
 }
 
 impl Engine {
@@ -132,6 +157,42 @@ impl Engine {
                         .with_context(|| format!("model {}", paths.id))?,
                 )
             }
+            EngineKind::Zipformer => {
+                let joiner = paths
+                    .joiner
+                    .as_ref()
+                    .context("zipformer model requires a joiner file")?;
+                let cfg = ZipFormerConfig {
+                    encoder: path_str(&paths.encoder),
+                    decoder: path_str(&paths.decoder),
+                    joiner: path_str(joiner),
+                    tokens: path_str(&paths.tokens),
+                    num_threads: Some(default_threads()),
+                    ..Default::default()
+                };
+                Recognizer::Zipformer(
+                    ZipFormer::new(cfg)
+                        .map_err(|e| anyhow::anyhow!("zipformer load failed: {e}"))
+                        .with_context(|| format!("model {}", paths.id))?,
+                )
+            }
+            EngineKind::SenseVoice => {
+                let model = paths
+                    .model
+                    .as_ref()
+                    .context("sense-voice model requires a model file")?;
+                let cfg = SenseVoiceConfig {
+                    model: path_str(model),
+                    tokens: path_str(&paths.tokens),
+                    num_threads: Some(default_threads()),
+                    ..Default::default()
+                };
+                Recognizer::SenseVoice(
+                    SenseVoiceRecognizer::new(cfg)
+                        .map_err(|e| anyhow::anyhow!("sense-voice load failed: {e}"))
+                        .with_context(|| format!("model {}", paths.id))?,
+                )
+            }
         };
         Ok(Self {
             model_id: paths.id.clone(),
@@ -144,6 +205,9 @@ impl Engine {
         match &mut self.inner {
             Recognizer::Whisper(w) => w.transcribe(TARGET_SAMPLE_RATE, samples_16k).text,
             Recognizer::Transducer(t) => t.transcribe(TARGET_SAMPLE_RATE, samples_16k),
+            // `ZipFormer::decode` takes an owned buffer.
+            Recognizer::Zipformer(z) => z.decode(TARGET_SAMPLE_RATE, samples_16k.to_vec()),
+            Recognizer::SenseVoice(s) => s.transcribe(TARGET_SAMPLE_RATE, samples_16k).text,
         }
     }
 

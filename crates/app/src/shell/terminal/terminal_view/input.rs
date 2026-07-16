@@ -975,6 +975,17 @@ impl TerminalView {
         }
     }
 
+    /// Insert dictated text into the PTY as if it had been typed. Unlike
+    /// `paste_text` there is no bracketed-paste envelope and no ESC stripping —
+    /// dictation output is plain UTF-8 with no control bytes. Wakes a dormant
+    /// (restored) pane first, same as any typed input. Used by voice dictation
+    /// when a terminal is the focused pane.
+    pub(crate) fn insert_dictation_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if !text.is_empty() {
+            self.send_bytes(text.as_bytes(), cx);
+        }
+    }
+
     /// F3.4: window-less variant of `respawn_if_dormant` used from
     /// `send_bytes`. The promote-to-live + poll-task arm steps don't
     /// actually need a `&mut Window` (no focus changes, no platform

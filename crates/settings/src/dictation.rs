@@ -21,6 +21,23 @@ pub const DEFAULT_MODEL_ID: &str = "whisper-small";
 /// Accepted whisper language selectors. `auto` = detect; `vi`/`en` pin it.
 pub const LANGUAGES: &[&str] = &["auto", "vi", "en"];
 
+/// How a dictation press behaves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DictationMode {
+    /// Press ⌘E / click the mic once to start, again to stop.
+    #[default]
+    Toggle,
+    /// Dictate only while ⌘E / the mic is held; release to stop-and-insert.
+    Hold,
+}
+
+impl DictationMode {
+    pub fn is_hold(self) -> bool {
+        matches!(self, DictationMode::Hold)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DictationSettings {
@@ -32,6 +49,11 @@ pub struct DictationSettings {
     /// Whisper language: `"auto"` | `"vi"` | `"en"` (ignored by transducer
     /// models, which are English/European only).
     pub language: String,
+    /// cpal input-device name to capture from. `None`/empty = system default.
+    /// A stale name (device unplugged) falls back to default at the use-site.
+    pub input_device: Option<String>,
+    /// Toggle vs. press-and-hold dictation.
+    pub mode: DictationMode,
 }
 
 impl Default for DictationSettings {
@@ -40,6 +62,8 @@ impl Default for DictationSettings {
             enabled: true,
             model_id: DEFAULT_MODEL_ID.to_string(),
             language: "auto".to_string(),
+            input_device: None,
+            mode: DictationMode::Toggle,
         }
     }
 }
@@ -65,6 +89,17 @@ impl DictationSettings {
         }
     }
 
+    /// The capture device name, or `None` for the system default. An empty
+    /// string is treated as "default" so a hand-edited `input_device = ""` in
+    /// the TOML doesn't try to open a device named "".
+    pub fn device_name(&self) -> Option<String> {
+        self.input_device
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
     /// Trim + normalize hand-edited values: blank model → default, unknown
     /// language → `auto`. Model id is only trimmed here (the live catalog at the
     /// use-site is the authority on whether an id resolves).
@@ -77,6 +112,8 @@ impl DictationSettings {
         if !LANGUAGES.contains(&self.language.as_str()) {
             self.language = "auto".to_string();
         }
+        // Collapse a blank device name to "system default".
+        self.input_device = self.device_name();
         self
     }
 }
@@ -100,10 +137,43 @@ mod tests {
             enabled: false,
             model_id: "whisper-tiny".into(),
             language: "vi".into(),
+            input_device: Some("MacBook Pro Microphone".into()),
+            mode: DictationMode::Hold,
         };
         let parsed = DictationSettings::from_toml_str(&s.to_toml_string()).expect("round-trip");
         assert_eq!(parsed, s);
         assert_eq!(parsed.language_param(), Some("vi".into()));
+        assert_eq!(parsed.device_name(), Some("MacBook Pro Microphone".into()));
+        assert!(parsed.mode.is_hold());
+    }
+
+    #[test]
+    fn missing_new_keys_default_to_system_default_toggle() {
+        // A pre-existing dictation.toml (before these fields existed) must load.
+        let legacy = "enabled = true\nmodel_id = \"whisper-small\"\nlanguage = \"auto\"\n";
+        let s = DictationSettings::from_toml_str(legacy).expect("legacy parses");
+        assert_eq!(s.input_device, None);
+        assert_eq!(s.mode, DictationMode::Toggle);
+        assert_eq!(s.device_name(), None);
+    }
+
+    #[test]
+    fn blank_device_name_is_system_default() {
+        let s = DictationSettings {
+            input_device: Some("   ".into()),
+            ..Default::default()
+        };
+        assert_eq!(s.device_name(), None, "blank → default at read time");
+        assert_eq!(s.sanitized().input_device, None, "sanitize collapses blank");
+    }
+
+    #[test]
+    fn dictation_mode_serializes_lowercase() {
+        let s = DictationSettings {
+            mode: DictationMode::Hold,
+            ..Default::default()
+        };
+        assert!(s.to_toml_string().contains("mode = \"hold\""));
     }
 
     #[test]
@@ -119,6 +189,7 @@ mod tests {
             enabled: true,
             model_id: "   ".into(),
             language: "FR".into(),
+            ..Default::default()
         }
         .sanitized();
         assert_eq!(s.model_id, "whisper-small", "blank model → default");

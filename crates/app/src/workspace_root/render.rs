@@ -50,6 +50,9 @@ impl Render for WorkspaceRoot {
         self.toast_layer.update(cx, |layer, _| {
             layer.set_tokens(theme, density, typography.clone());
         });
+        self.dictation_hud.update(cx, |hud, _| {
+            hud.set_tokens(theme, density, typography.clone());
+        });
 
         // Status-bar pane count = visible pane-group leaves in the active
         // project (1 when no splits, N after Cmd+D).
@@ -393,6 +396,13 @@ impl Render for WorkspaceRoot {
             .on_action(cx.listener(|this, _: &ToggleLeftSidebar, _window, cx| {
                 this.left_rail_open = !this.left_rail_open;
                 cx.notify();
+            }))
+            // ⌘E dictates into whatever text pane is focused. A focused chat
+            // composer consumes this first (its own handler stops propagation);
+            // reaching here means a terminal/editor/other pane is focused, so
+            // route to the global HUD (or toast if the pane can't take text).
+            .on_action(cx.listener(|this, _: &ToggleDictation, window, cx| {
+                this.dictate_focused_pane(window, cx);
             }))
             .on_action(cx.listener(
                 |this, action: &SendTextToActiveAgent, _window, cx| {
@@ -1719,6 +1729,10 @@ impl Render for WorkspaceRoot {
             // layer is non-interactive and bottom-right, so it doesn't steal
             // clicks from whatever is beneath it.
             .child(self.toast_layer.clone())
+            // Voice-dictation HUD: a pass-through, bottom-center floating
+            // "Listening…" pill shown while dictating into a terminal/editor
+            // pane. Renders nothing when idle; never steals clicks.
+            .child(self.dictation_hud.clone())
             // gpui-component notification layer. `Root::render` does not mount
             // it automatically, so leaf views that call `push_notification`
             // (e.g. the editor breadcrumb's copy/reveal actions) need it here

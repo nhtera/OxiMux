@@ -49,8 +49,13 @@ const IDLE_TEARDOWN: Duration = Duration::from_secs(600);
 /// How often the worker polls for stop/cancel/cap while recording.
 const POLL_INTERVAL: Duration = Duration::from_millis(30);
 
+// One command per user press over an mpsc channel — never hot. Boxing the large
+// Start payload to shrink Stop/Cancel would only add an allocation for no gain.
+#[allow(clippy::large_enum_variant)]
 enum Command {
-    Start(ModelPaths),
+    /// Begin a session with the given model and optional named input device
+    /// (`None` = system default).
+    Start(ModelPaths, Option<String>),
     Stop,
     Cancel,
 }
@@ -77,13 +82,14 @@ impl DictationController {
         (Self { cmd_tx, active }, evt_rx)
     }
 
-    /// Begin a recording session with `paths`. A second start while active is a
-    /// no-op (returns `false`) — one session at a time.
-    pub fn start(&self, paths: ModelPaths) -> bool {
+    /// Begin a recording session with `paths`, capturing from `device` (a cpal
+    /// input-device name, or `None` for the system default). A second start
+    /// while active is a no-op (returns `false`) — one session at a time.
+    pub fn start(&self, paths: ModelPaths, device: Option<String>) -> bool {
         if self.active.swap(true, Ordering::SeqCst) {
             return false; // already recording
         }
-        self.cmd_tx.send(Command::Start(paths)).is_ok()
+        self.cmd_tx.send(Command::Start(paths, device)).is_ok()
     }
 
     /// Stop recording and transcribe → emits `Transcribing` then `Final`.
@@ -137,8 +143,8 @@ fn worker_loop(
             Err(RecvTimeoutError::Disconnected) => break,
         };
 
-        let paths = match cmd {
-            Command::Start(paths) => paths,
+        let (paths, device) = match cmd {
+            Command::Start(paths, device) => (paths, device),
             // Stop/Cancel with no active session: stale, ignore.
             Command::Stop | Command::Cancel => continue,
         };
@@ -149,7 +155,7 @@ fn worker_loop(
         // worker thread, `active` would stay stuck `true`, and every future
         // press would report "busy" until an app restart.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_session(&cmd_rx, &evt_tx, &mut engine, paths);
+            run_session(&cmd_rx, &evt_tx, &mut engine, paths, device);
         }));
         active.store(false, Ordering::SeqCst);
         if outcome.is_err() {
@@ -169,6 +175,7 @@ fn run_session(
     evt_tx: &UnboundedSender<DictationEvent>,
     engine: &mut Option<Engine>,
     paths: ModelPaths,
+    device: Option<String>,
 ) {
     let shared = Arc::new(Mutex::new(SessionBuffer::default()));
     {
@@ -182,7 +189,7 @@ fn run_session(
     let cap_stop = Arc::clone(&capture_stop);
     let capture_handle = std::thread::Builder::new()
         .name("oximux-dictation-capture".into())
-        .spawn(move || capture::run(cap_shared, cap_events, cap_stop))
+        .spawn(move || capture::run(cap_shared, cap_events, cap_stop, device))
         .ok();
 
     let _ = evt_tx.unbounded_send(DictationEvent::Started);
@@ -271,7 +278,7 @@ fn poll_recording(cmd_rx: &Receiver<Command>, shared: &Arc<Mutex<SessionBuffer>>
         match cmd_rx.try_recv() {
             Ok(Command::Stop) => return Outcome::Stop,
             Ok(Command::Cancel) => return Outcome::Cancel,
-            Ok(Command::Start(_)) => { /* ignore re-start during a session */ }
+            Ok(Command::Start(..)) => { /* ignore re-start during a session */ }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => return Outcome::Disconnected,
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
@@ -299,9 +306,10 @@ mod tests {
             decoder: "/nonexistent/d.onnx".into(),
             joiner: None,
             tokens: "/nonexistent/t.txt".into(),
+            model: None,
         };
-        assert!(ctrl.start(paths.clone()), "first start accepted");
-        assert!(!ctrl.start(paths), "second start rejected while active");
+        assert!(ctrl.start(paths.clone(), None), "first start accepted");
+        assert!(!ctrl.start(paths, None), "second start rejected while active");
     }
 
     #[test]

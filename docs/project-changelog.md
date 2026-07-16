@@ -4,6 +4,92 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-16 — Voice dictation everywhere: any pane, device picker, recording waveform (`feat/voice-dictation-vietnamese`)
+
+Follow-on to the initial dictation ship. Dictation is no longer chat-only, and
+the recording UX + model choice grew.
+
+**Shipped:**
+- **Dictate into any focused pane** — ⌘E now transcribes into a terminal PTY, a
+  code editor, or the chat composer, whichever is focused. Routing generalized
+  from a composer-only `WeakEntity` to a `DictationTarget` enum; a focused chat
+  composer keeps its in-line bar (and stops action propagation), while terminal /
+  editor sessions are driven by a new global **`DictationHud`** — a pass-through
+  floating "Listening…" pill (waveform + timer) mounted at the workspace root
+  (ToastLayer pattern). New `TerminalView::insert_dictation_text` seam; editor
+  reuses `InputState::insert`.
+- **Mic device picker + Hold-to-record** in the composer — a chevron next to the
+  mic opens a menu listing the system default + every enumerated input device
+  (checkmarked), plus a "Hold to record" toggle. Capture now selects a named
+  cpal device (`capture::run(device)`, `list_input_devices()`); persisted as
+  `input_device` / `mode` in `dictation.toml`.
+- **ChatGPT-style recording bar** — while recording, an opaque bar **overlays
+  the input field itself** (the input stays mounted underneath so focus +
+  Escape/Enter keep working): ■ stop + a scrolling waveform (client-side ring
+  buffer over the ~10 Hz RMS `Level` events) + mm:ss timer + ✕ cancel + ↑ send.
+  Shared waveform renderer reused by the global HUD pill.
+- **Expanded offline catalog** (3 → 8 models, all verified k2-fsa URLs): added
+  **Zipformer Vietnamese** (57 MB, dedicated `vi`) + its 30M lite (25 MB) via a
+  new `zipformer` engine path, **Whisper Base** (198 MB), **Parakeet TDT v2**
+  (460 MB, best English), and **SenseVoice** (158 MB, zh/en/ja/ko/yue) via a new
+  single-file `sense_voice` engine path. `Family`/`EngineKind` gained `Zipformer`
+  + `SenseVoice`; `ModelSpec`/`ModelPaths` gained a single-file `model` slot.
+- **Voice pane**: added a Dictation Mode (Toggle/Hold) segmented control and a
+  microphone-device chip group, alongside the expanded model list.
+
+All suites green (dictation crate + settings + app-lib); the new engine paths
+compile against the real sherpa-rs 0.6.8 `ZipFormer`/`SenseVoiceRecognizer` API.
+
+---
+
+### 2026-07-17 — Voice UX polish: ChatGPT-parity dropdown + dictation history (`feat/voice-dictation-vietnamese`)
+
+Round-3 follow-ups on the voice work, all live-verified in the running app.
+
+**Shipped:**
+- **Fuller recording waveform** — the composer's recording-bar waveform now fills
+  the whole bar edge-to-edge (always a full-width strip, left-padded with a fine
+  dotted baseline, finer bars) instead of a short right-aligned cluster, matching
+  the ChatGPT desktop app. `WaveformBuffer::filled_bars` + a `fill` layout mode.
+- **Send button centered** — the composer input pill switched from `items_end` to
+  `items_center`, so the ↑ sits on the text midline on a one-line draft.
+- **Mic menu repositioned + restyled** — the composer mic-device popover now opens
+  up-and-to-the-right off the button (`Anchor::BottomLeft`, Claude-Desktop
+  placement) via a per-control anchor on the shared dropdown shell. The Voice
+  pane's device control became a proper **`DropdownButton`** (was a chip grid),
+  labeled with the current device (defaults to "System default"); its menu puts
+  the check on the RIGHT with a divider after "System default" (ChatGPT layout).
+- **Dictation history** — a new "Dictation history" section in the Voice pane
+  lists recent transcripts (newest first): timestamp · text · a copy button, with
+  a Clear action. Backed by a JSONL store (`dictation-history.jsonl` in the app
+  data dir, capped at 50) recorded at the single `DictationEvent::Final` choke
+  point in `route_event` (captures every pane's transcripts); stored on-device
+  only, formatted with `chrono`.
+- **Speech-model picker collapsed to a dropdown** (Orca-style) — the per-model
+  list (8 full rows of Download/Select/Delete chips) became a single "Speech
+  model" row: a `DropdownButton` labeled with the active model, its description
+  tracking that model's coverage. The menu shows every catalog model as a
+  two-line row — name + a green **recommended** badge on the default + a
+  right-aligned state ("Download · NN MB" / "Downloading… NN%" / "NN MB"), a
+  coverage blurb beneath, a left check on the active model, and a trash on
+  downloaded ones. Clicking a downloaded model selects it; clicking an
+  undownloaded one selects **and** starts its download (activates when ready);
+  clicking a downloading one cancels (keeps the `.partial`); the trash consumes
+  its own press (`stop_propagation`) so deleting never also selects. Each row
+  pulls `model_status` **live inside its render closure** (not a snapshot at
+  menu-open), so an open menu reflects download progress + delete in real time —
+  the download drain's `refresh_windows` (and the trash's own repaint) tick the
+  rows without a close/reopen. Both the model and mic dropdowns right-align under
+  their button (`Anchor::TopRight`, grows down-and-left) so their wide rows never
+  overflow the pane's right edge.
+  Added `trash.svg` + `copy.svg` assets (the latter also un-blanks the history
+  copy icon). Collapses the pane so model + language + permission + history all
+  fit one screen.
+
+Rendering + select/dismiss verified live; app-lib 1325 green (+6 history-store
+tests). Not yet built: CoreAudio transport-type suffixes ("Bluetooth"/"Built-in"/
+"Virtual") on device names — cpal doesn't expose them.
+
 ### 2026-07-16 — Voice dictation (Vietnamese-first, offline) for Agent Chat (`feat/voice-dictation-vietnamese`)
 
 Local speech-to-text in the Agent Chat composer. Vietnamese is the priority, so

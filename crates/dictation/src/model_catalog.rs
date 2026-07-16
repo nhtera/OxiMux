@@ -18,6 +18,11 @@
 pub enum Family {
     Whisper,
     Transducer,
+    /// Icefall zipformer offline transducer (e.g. dedicated Vietnamese models).
+    /// Same encoder/decoder/joiner/tokens layout as `Transducer`.
+    Zipformer,
+    /// SenseVoice — a single-file multilingual model (`model` + `tokens`).
+    SenseVoice,
 }
 
 /// One downloadable model. File names are relative to the extracted model dir
@@ -36,26 +41,43 @@ pub struct ModelSpec {
     pub archive_sha256: Option<&'static str>,
     pub encoder: &'static str,
     pub decoder: &'static str,
-    /// Transducer models only.
+    /// Transducer / zipformer models only.
     pub joiner: Option<&'static str>,
     pub tokens: &'static str,
+    /// Single-file model families (SenseVoice). `None` for the encoder/decoder
+    /// families, which use `encoder`/`decoder`(/`joiner`).
+    pub model: Option<&'static str>,
 }
 
 impl ModelSpec {
     /// The files that must exist after extraction for the model to be Ready.
     pub fn required_files(&self) -> Vec<&'static str> {
-        let mut v = vec![self.encoder, self.decoder, self.tokens];
-        if let Some(j) = self.joiner {
-            v.push(j);
+        match self.family {
+            // Single-file: only the model graph + tokens.
+            Family::SenseVoice => {
+                let mut v = vec![self.tokens];
+                if let Some(m) = self.model {
+                    v.push(m);
+                }
+                v
+            }
+            _ => {
+                let mut v = vec![self.encoder, self.decoder, self.tokens];
+                if let Some(j) = self.joiner {
+                    v.push(j);
+                }
+                v
+            }
         }
-        v
     }
 }
 
 /// The default model id — Vietnamese priority (whisper-small covers `vi`).
 pub const DEFAULT_MODEL_ID: &str = "whisper-small";
 
-/// The full catalog, in display order (default first).
+/// The full catalog, in display order (default first). URLs + sizes are
+/// HEAD/range-verified against the live k2-fsa `asr-models` release; in-archive
+/// file names were read from the actual `tar.bz2` listings, not guessed.
 pub const CATALOG: &[ModelSpec] = &[
     // Default: multilingual incl. Vietnamese. 610 MB (only the fp32 archive is
     // published; the `.int8` archive 404s). Uses the int8 graphs bundled inside.
@@ -72,6 +94,40 @@ pub const CATALOG: &[ModelSpec] = &[
         decoder: "small-decoder.int8.onnx",
         joiner: None,
         tokens: "small-tokens.txt",
+        model: None,
+    },
+    // Dedicated Vietnamese zipformer — ~1/10th the size of whisper-small, better
+    // vi accuracy, but Vietnamese-only (no code-switching). 57 MB.
+    ModelSpec {
+        id: "zipformer-vi",
+        label: "Zipformer Vietnamese",
+        family: Family::Zipformer,
+        langs: "Vietnamese · dedicated",
+        size_mb: 57,
+        archive_url:
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-vi-int8-2025-04-20.tar.bz2",
+        archive_sha256: None,
+        encoder: "encoder-epoch-12-avg-8.int8.onnx",
+        decoder: "decoder-epoch-12-avg-8.onnx",
+        joiner: Some("joiner-epoch-12-avg-8.int8.onnx"),
+        tokens: "tokens.txt",
+        model: None,
+    },
+    // Fills the tiny↔small gap; same Vietnamese coverage as small. 198 MB.
+    ModelSpec {
+        id: "whisper-base",
+        label: "Whisper Base",
+        family: Family::Whisper,
+        langs: "Multilingual · Vietnamese",
+        size_mb: 198,
+        archive_url:
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-base.tar.bz2",
+        archive_sha256: None,
+        encoder: "base-encoder.int8.onnx",
+        decoder: "base-decoder.int8.onnx",
+        joiner: None,
+        tokens: "base-tokens.txt",
+        model: None,
     },
     // Fast starter: multilingual but weak Vietnamese. 111 MB.
     ModelSpec {
@@ -87,13 +143,14 @@ pub const CATALOG: &[ModelSpec] = &[
         decoder: "tiny-decoder.int8.onnx",
         joiner: None,
         tokens: "tiny-tokens.txt",
+        model: None,
     },
-    // Best English quality (both reference apps default to this). 465 MB. No vi.
+    // 25 European languages incl. best-in-class multilingual. 465 MB. No vi.
     ModelSpec {
         id: "parakeet-tdt-0.6b-v3-int8",
         label: "Parakeet TDT 0.6B v3",
         family: Family::Transducer,
-        langs: "25 European languages · best English",
+        langs: "25 European languages · multilingual",
         size_mb: 465,
         archive_url:
             "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2",
@@ -102,6 +159,55 @@ pub const CATALOG: &[ModelSpec] = &[
         decoder: "decoder.int8.onnx",
         joiner: Some("joiner.int8.onnx"),
         tokens: "tokens.txt",
+        model: None,
+    },
+    // English-only, topped the OpenASR leaderboard — best English WER. 460 MB.
+    ModelSpec {
+        id: "parakeet-tdt-0.6b-v2-int8",
+        label: "Parakeet TDT 0.6B v2",
+        family: Family::Transducer,
+        langs: "English only · best English WER",
+        size_mb: 460,
+        archive_url:
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2",
+        archive_sha256: None,
+        encoder: "encoder.int8.onnx",
+        decoder: "decoder.int8.onnx",
+        joiner: Some("joiner.int8.onnx"),
+        tokens: "tokens.txt",
+        model: None,
+    },
+    // SenseVoice — single-file multilingual (zh/en/ja/ko/yue), fast. 158 MB. No vi.
+    ModelSpec {
+        id: "sense-voice-zh-en-ja-ko-yue-int8",
+        label: "SenseVoice Small",
+        family: Family::SenseVoice,
+        langs: "Chinese · English · Japanese · Korean · Cantonese",
+        size_mb: 158,
+        archive_url:
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09.tar.bz2",
+        archive_sha256: None,
+        encoder: "",
+        decoder: "",
+        joiner: None,
+        tokens: "tokens.txt",
+        model: Some("model.int8.onnx"),
+    },
+    // Lighter Vietnamese zipformer for low-resource machines. 25 MB.
+    ModelSpec {
+        id: "zipformer-vi-30m",
+        label: "Zipformer Vietnamese 30M",
+        family: Family::Zipformer,
+        langs: "Vietnamese · lite",
+        size_mb: 25,
+        archive_url:
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-vi-30M-int8-2026-02-09.tar.bz2",
+        archive_sha256: None,
+        encoder: "encoder.int8.onnx",
+        decoder: "decoder.onnx",
+        joiner: Some("joiner.int8.onnx"),
+        tokens: "tokens.txt",
+        model: None,
     },
 ];
 
@@ -126,11 +232,21 @@ mod tests {
     }
 
     #[test]
-    fn transducer_has_joiner_whisper_does_not() {
+    fn family_file_shape_is_consistent() {
         for m in catalog() {
             match m.family {
                 Family::Whisper => assert!(m.joiner.is_none(), "{} whisper has no joiner", m.id),
-                Family::Transducer => assert!(m.joiner.is_some(), "{} needs joiner", m.id),
+                // Both transducer flavors need encoder/decoder/joiner.
+                Family::Transducer | Family::Zipformer => {
+                    assert!(m.joiner.is_some(), "{} needs a joiner", m.id);
+                    assert!(m.model.is_none(), "{} is not single-file", m.id);
+                }
+                // Single-file: a `model`, no joiner.
+                Family::SenseVoice => {
+                    assert!(m.model.is_some(), "{} needs a model file", m.id);
+                    assert!(m.joiner.is_none(), "{} sense-voice has no joiner", m.id);
+                    assert!(m.required_files().contains(&m.tokens), "{} needs tokens", m.id);
+                }
             }
         }
     }

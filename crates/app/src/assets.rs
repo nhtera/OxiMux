@@ -200,6 +200,13 @@ const APP_ICONS: &[(&str, &[u8])] = &[
     ),
     // Voice-dictation mic button in the Agent Chat composer.
     ("icons/mic.svg", include_bytes!("../assets/icons/mic.svg")),
+    // Voice-dictation history row: copy the transcript; trash removes a
+    // downloaded speech model from the Speech-model dropdown.
+    ("icons/copy.svg", include_bytes!("../assets/icons/copy.svg")),
+    (
+        "icons/trash.svg",
+        include_bytes!("../assets/icons/trash.svg"),
+    ),
 ];
 
 impl AssetSource for AppAssets {

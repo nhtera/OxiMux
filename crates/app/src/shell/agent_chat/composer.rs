@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use gpui::{
     Anchor, AnyElement, App, AppContext, ClipboardEntry, Context, DismissEvent, Entity,
-    EventEmitter, FocusHandle, Focusable, Hsla, ImageSource, InteractiveElement, IntoElement,
+    EventEmitter, FocusHandle, Focusable, ImageSource, InteractiveElement, IntoElement,
     MouseButton,
     ObjectFit, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
     Subscription, Window, div, img, prelude::FluentBuilder, px,
@@ -37,12 +37,13 @@ use oximux_agents::thread::{
     prepend_context, ChatImage, ContextChip, EffortChoice, FeatureControl, FeatureKind,
     FeatureValue, ModeChoice, ModelChoice,
 };
-use oximux_dictation::{DictationEvent, Readiness};
-use oximux_settings::DictationSettings;
+use oximux_dictation::{DictationEvent, ModelPaths, Readiness};
+use oximux_settings::{DictationMode, DictationSettings};
 
 use crate::actions::ToggleDictation;
-use super::dictation_service;
-use super::dictation_ui::{dictation_spacing, format_elapsed, DictationUiState};
+use super::dictation_service::{self, DictationTarget, StartDecision};
+use super::dictation_ui::{DictationUiState, WaveformBuffer, dictation_spacing, format_elapsed};
+use super::dictation_waveform::{WaveformStyle, render_waveform};
 
 /// A transcript waiting to be inserted at the cursor. Stashed by
 /// [`ComposerView::on_dictation_event`] (which has no `Window`) and applied on
@@ -510,9 +511,16 @@ pub struct ComposerView {
     /// so the chip row doesn't re-decode on every keystroke repaint. Cleared on
     /// submit.
     pending_images: Vec<PendingImage>,
-    /// Voice-dictation UI state for this composer (mic button + recording pill).
+    /// Voice-dictation UI state for this composer (mic button + recording bar).
     /// Driven by [`dictation_service`] events via [`Self::on_dictation_event`].
     dictation: DictationUiState,
+    /// Recent RMS levels driving the recording bar's scrolling waveform. Reset
+    /// on start; pushed on each `Level` event.
+    dictation_waveform: WaveformBuffer,
+    /// Set when a Hold-mode press is released before an async mic-permission
+    /// grant resolves, so the pending start aborts instead of going hot after
+    /// the gesture ended (first-ever-use race). Cleared on each hold press.
+    dictation_hold_released: bool,
     /// True when the current recording was stopped via Enter (submit once the
     /// transcript lands), vs the mic/Cmd+E toggle (insert only). Set at stop,
     /// consumed on the final transcript.
@@ -686,6 +694,8 @@ impl ComposerView {
             worktree_draft: None,
             pending_images: Vec::new(),
             dictation: DictationUiState::Idle,
+            dictation_waveform: WaveformBuffer::default(),
+            dictation_hold_released: false,
             dictation_send_after: false,
             pending_transcript: None,
             pending_toast: None,
@@ -1157,49 +1167,18 @@ impl ComposerView {
 
     /// Toggle dictation: start when idle (after enabled/model/permission checks),
     /// stop-and-insert when already recording. Bound to Cmd+E and the mic button.
+    /// The shared pre-flight lives in [`dictation_service::prepare_start`] so the
+    /// composer and the global HUD (terminal/editor dictation) behave identically.
     pub fn toggle_dictation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let settings = Self::dictation_settings(cx);
-        if !settings.enabled {
-            window.push_notification("Dictation is disabled — enable it in Settings › Voice", cx);
-            return;
-        }
         // Already recording → stop (insert only; Enter path sets send_after).
         if self.dictation.is_active() {
             self.dictation_send_after = false;
             dictation_service::stop(cx);
             return;
         }
-        // Idle → check the model is present before opening the mic.
-        let model_id = settings.model_id.clone();
-        match dictation_service::readiness(cx, &model_id) {
-            Readiness::Ready => {}
-            Readiness::Downloading(p) => {
-                let pct = (p * 100.0).round() as u32;
-                window.push_notification(format!("Downloading dictation model… {pct}%"), cx);
-                return;
-            }
-            Readiness::Missing => {
-                window.push_notification(
-                    "No dictation model yet — download one in Settings › Voice",
-                    cx,
-                );
-                return;
-            }
-        }
-        // Permission gate.
-        let language = settings.language_param();
-        match crate::mic_permission::status() {
-            crate::mic_permission::MicPermission::Granted => {
-                self.begin_recording(model_id, language, cx);
-            }
-            crate::mic_permission::MicPermission::Denied
-            | crate::mic_permission::MicPermission::Restricted => {
-                window.push_notification(
-                    "Microphone access is off — enable it in System Settings › Privacy › Microphone",
-                    cx,
-                );
-            }
-            crate::mic_permission::MicPermission::Undetermined => {
+        match dictation_service::prepare_start(cx, window) {
+            StartDecision::Ready { paths, device } => self.begin_recording(paths, device, cx),
+            StartDecision::NeedsPermission { paths, device } => {
                 // Request access; when granted, start on the main thread via a
                 // oneshot the foreground task awaits (the block fires on an
                 // arbitrary queue).
@@ -1210,37 +1189,39 @@ impl ComposerView {
                 cx.spawn(async move |this, cx| {
                     if let Ok(true) = rx.await {
                         let _ = this.update(cx, |this, cx| {
-                            this.begin_recording(model_id, language, cx);
+                            // A Hold-mode press that was released before the grant
+                            // resolved must NOT start recording after the fact.
+                            if std::mem::take(&mut this.dictation_hold_released) {
+                                return;
+                            }
+                            this.begin_recording(paths, device, cx);
                         });
                     }
                 })
                 .detach();
             }
+            StartDecision::Blocked => {}
         }
     }
 
-    /// Resolve the model + hand off to the service, moving to the Starting state.
-    /// No `Window` needed (the transcript inserts later, on render).
+    /// Hand the resolved model + device off to the service, moving to the
+    /// Starting state. No `Window` needed (the transcript inserts later, on
+    /// render).
     fn begin_recording(
         &mut self,
-        model_id: String,
-        language: Option<String>,
+        paths: ModelPaths,
+        device: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        let Some(paths) = dictation_service::resolve_paths(cx, &model_id, language) else {
-            self.dictation = DictationUiState::Failed("model not ready".into());
-            self.pending_toast = Some("Dictation model isn't ready".into());
-            cx.notify();
-            return;
-        };
         let weak = cx.entity().downgrade();
-        if !dictation_service::start(cx, weak, paths) {
+        if !dictation_service::start(cx, DictationTarget::Composer(weak), paths, device) {
             self.pending_toast = Some("Dictation is busy in another composer".into());
             cx.notify();
             return;
         }
         self.dictation = DictationUiState::Starting;
         self.dictation_send_after = false;
+        self.dictation_waveform.clear();
         cx.notify();
         self.spawn_recording_ticker(cx);
     }
@@ -1279,16 +1260,16 @@ impl ComposerView {
             DictationEvent::Started => {
                 self.dictation = DictationUiState::Recording {
                     started_at: Instant::now(),
-                    level: 0.0,
                 };
             }
             DictationEvent::Level(level) => {
-                if let DictationUiState::Recording { started_at, .. } = self.dictation {
-                    self.dictation = DictationUiState::Recording { started_at, level };
-                }
+                self.dictation_waveform.push(level);
+                cx.notify();
+                return;
             }
             DictationEvent::Transcribing => {
                 self.dictation = DictationUiState::Transcribing;
+                self.dictation_waveform.clear();
             }
             DictationEvent::Capped => {
                 self.pending_toast = Some("Recording stopped at the 2-minute limit".into());
@@ -1876,7 +1857,14 @@ impl ComposerView {
                 }
                 menu
             };
-        self.render_dropdown_shell("chat-agent".into(), "Coding agent".into(), trigger, build_menu, cx)
+        self.render_dropdown_shell(
+            "chat-agent".into(),
+            "Coding agent".into(),
+            trigger,
+            Anchor::BottomRight,
+            build_menu,
+            cx,
+        )
     }
 
     /// The model control in the bottom toolbar: a borderless (`appearance(false)`)
@@ -1999,6 +1987,12 @@ impl ComposerView {
         ctrl_id: SharedString,
         tooltip_text: SharedString,
         trigger: Button,
+        // Which corner of the popup anchors to the trigger. Far-RIGHT toolbar
+        // pickers (model/effort/agent) use `BottomRight` so the menu grows up
+        // and to the LEFT, staying inside the window. Left-of-toolbar controls
+        // (the mic device menu) pass `BottomLeft` so it opens up and to the
+        // RIGHT off the button — the Claude Desktop mic-popover placement.
+        anchor: Anchor,
         build_menu: impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -2013,7 +2007,7 @@ impl ComposerView {
         let popover = Popover::new(pop_id)
             .appearance(false)
             .overlay_closable(false)
-            .anchor(Anchor::BottomRight)
+            .anchor(anchor)
             .trigger(trigger)
             .on_open_change({
                 let view = view.clone();
@@ -2157,7 +2151,7 @@ impl ComposerView {
                 }
                 menu
             };
-        self.render_dropdown_shell(ctrl_id, tooltip_text, trigger, build_menu, cx)
+        self.render_dropdown_shell(ctrl_id, tooltip_text, trigger, Anchor::BottomRight, build_menu, cx)
     }
 
     /// The permission-mode control in the bottom toolbar: a flat ghost button
@@ -2371,103 +2365,331 @@ impl ComposerView {
             .on_click(cx.listener(|this, _ev, _window, cx| this.attach_from_picker(cx)))
     }
 
-    /// The dictation control: the mic button when idle, the recording pill while
-    /// a session is live. Rendered only when dictation is enabled in settings.
-    fn render_dictation_control(&self, cx: &mut Context<Self>) -> AnyElement {
-        if self.dictation.is_active() {
-            self.render_recording_pill(cx)
-        } else {
-            self.render_mic_button(cx)
-        }
-    }
-
-    /// The idle mic button. Its tooltip reflects model readiness so the user
-    /// knows why a click won't record yet (still lets the click through — the
-    /// toggle then surfaces the actionable toast).
+    /// The idle mic control: the mic button plus a chevron opening the
+    /// device-picker + Hold-to-record menu (Claude-Desktop style). In Hold mode
+    /// the mic is press-and-hold (mouse down starts, release stops+inserts); in
+    /// Toggle mode a click toggles. The tooltip reflects model readiness so the
+    /// user knows why a click won't record yet.
+    ///
+    /// Hold caveat: the up-listener fires only when the release lands on the
+    /// button (gpui has no window-wide mouse-up capture), so a press-drag-off
+    /// leaves the session running — recoverable via the recording bar's Stop /
+    /// Cancel or ⌘E. Acceptable for a hold gesture users rarely drag off.
     fn render_mic_button(&self, cx: &mut Context<Self>) -> AnyElement {
-        let model_id = Self::dictation_settings(cx).model_id;
-        // A just-failed session surfaces its reason on the mic tooltip (the
-        // toast is transient); otherwise the tooltip reflects model readiness.
-        let tooltip = if let DictationUiState::Failed(msg) = &self.dictation {
-            format!("Dictation failed: {msg}")
-        } else {
-            match dictation_service::readiness(cx, &model_id) {
-                Readiness::Ready => "Dictate (⌘E)".to_string(),
-                Readiness::Downloading(p) => {
-                    format!("Downloading model… {}%", (p * 100.0).round() as u32)
-                }
-                Readiness::Missing => "Download a voice model in Settings › Voice".to_string(),
+        let settings = Self::dictation_settings(cx);
+        let model_id = settings.model_id.clone();
+        let hold = settings.mode.is_hold();
+        // Tooltip reflects model readiness so the user knows why a click won't
+        // record yet (the click still surfaces an actionable toast).
+        let tooltip = match dictation_service::readiness(cx, &model_id) {
+            Readiness::Ready if hold => "Hold to dictate (⌘E)".to_string(),
+            Readiness::Ready => "Dictate (⌘E)".to_string(),
+            Readiness::Downloading(p) => {
+                format!("Downloading model… {}%", (p * 100.0).round() as u32)
             }
+            Readiness::Missing => "Download a voice model in Settings › Voice".to_string(),
         };
-        Button::new("chat-dictate-btn")
-            .icon(Icon::default().path("icons/mic.svg"))
-            .ghost()
-            .small()
-            .tooltip(tooltip)
-            .on_click(cx.listener(|this, _ev, window, cx| this.toggle_dictation(window, cx)))
-            .into_any_element()
-    }
 
-    /// The active recording pill: a filled stop square (click to stop), the mm:ss
-    /// timer, a live RMS meter, and an "Esc" hint. Explicit filled styling — the
-    /// `.selected()` variant renders pixel-identically to resting, so the active
-    /// state must be drawn deliberately.
-    fn render_recording_pill(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
-        let density = self.density;
-        let typo = &self.typography;
-        let (label, level, recording) = match &self.dictation {
-            DictationUiState::Recording { started_at, level } => {
-                (format_elapsed(*started_at), *level, true)
-            }
-            DictationUiState::Starting => ("Starting…".to_string(), 0.0, false),
-            DictationUiState::Transcribing => ("Transcribing…".to_string(), 0.0, false),
-            _ => (String::new(), 0.0, false),
+        let mic: AnyElement = if hold {
+            // Press-and-hold: start on mouse-down, stop+insert on release. Both
+            // go through `toggle_dictation`, which flips on the current state.
+            div()
+                .id("chat-dictate-btn")
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(24.0))
+                .rounded(px(6.0))
+                .text_color(theme.fg_muted)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.bg_overlay).text_color(theme.fg_base))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev, window, cx| {
+                        if !this.dictation.is_active() {
+                            this.dictation_hold_released = false;
+                            this.toggle_dictation(window, cx);
+                        }
+                    }),
+                )
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _ev, window, cx| {
+                        if this.dictation.is_active() {
+                            this.toggle_dictation(window, cx);
+                        } else {
+                            // Released before an async permission grant resolved
+                            // (first use): tell the pending start to abort so the
+                            // mic doesn't go hot after the gesture ended.
+                            this.dictation_hold_released = true;
+                        }
+                    }),
+                )
+                .child(Icon::default().path("icons/mic.svg"))
+                .into_any_element()
+        } else {
+            Button::new("chat-dictate-btn")
+                .icon(Icon::default().path("icons/mic.svg"))
+                .ghost()
+                .small()
+                .tooltip(tooltip)
+                .on_click(cx.listener(|this, _ev, window, cx| this.toggle_dictation(window, cx)))
+                .into_any_element()
         };
-        // RMS is small for speech; scale generously and clamp for a lively meter.
-        let meter_w = (level * 240.0).clamp(2.0, 44.0);
-
-        let stop_square = div()
-            .size(px(10.0))
-            .rounded(px(2.0))
-            .bg(theme.status_error);
 
         div()
-            .id("chat-dictate-pill")
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
-            .h(px(density.h_overlay_item))
-            .px(px(8.0))
-            .rounded(px(density.r_chip))
-            .border_1()
-            .border_color(theme.status_error)
-            .bg(Hsla { a: 0.12, ..theme.status_error })
-            .text_size(px(typo.t_body_sm))
-            .text_color(theme.fg_base)
+            .child(mic)
+            .child(self.render_mic_menu(&settings, cx))
+            .into_any_element()
+    }
+
+    /// The mic device-picker + Hold-to-record dropdown (a chevron next to the
+    /// mic). Lists the system-default input plus every enumerated device with a
+    /// checkmark on the active one, then a Hold-to-record toggle. Picking a row
+    /// persists to `dictation.toml` (the settings watcher swaps the global).
+    fn render_mic_menu(
+        &self,
+        settings: &DictationSettings,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let view = cx.entity();
+        let current_device = settings.device_name().unwrap_or_default();
+        let hold = settings.mode.is_hold();
+        let trigger = Button::new("chat-dictate-menu-btn")
+            .icon(Icon::default().path("icons/chevron-down.svg"))
+            .ghost()
+            .small();
+
+        let build_menu = move |mut menu: PopupMenu,
+                               window: &mut Window,
+                               _cx: &mut Context<PopupMenu>| {
+            menu = menu.label("Microphone");
+            let mut options: Vec<(String, String)> =
+                vec![(String::new(), "System default".to_string())];
+            // Enumerate devices only when the menu actually opens (a CoreAudio
+            // HAL call — must never run on the per-render/per-keystroke path).
+            for d in oximux_dictation::list_input_devices() {
+                options.push((d.clone(), d));
+            }
+            for (wire, label) in options {
+                let selected = current_device == wire;
+                let display = if selected {
+                    format!("\u{2713} {label}")
+                } else {
+                    format!("   {label}")
+                };
+                let view = view.clone();
+                menu = menu.item(
+                    PopupMenuItem::element(move |_w, _c| div().child(display.clone())).on_click(
+                        window.listener_for(
+                            &view,
+                            move |v: &mut ComposerView, _e: &gpui::ClickEvent, _w, cx| {
+                                let dev =
+                                    (!wire.is_empty()).then(|| wire.clone());
+                                v.update_dictation_settings(cx, |s| s.input_device = dev.clone());
+                            },
+                        ),
+                    ),
+                );
+            }
+            menu = menu.separator();
+            let hold_display = if hold {
+                "\u{2713} Hold to record".to_string()
+            } else {
+                "   Hold to record".to_string()
+            };
+            let view = view.clone();
+            menu = menu.item(
+                PopupMenuItem::element(move |_w, _c| div().child(hold_display.clone())).on_click(
+                    window.listener_for(
+                        &view,
+                        move |v: &mut ComposerView, _e: &gpui::ClickEvent, _w, cx| {
+                            v.update_dictation_settings(cx, |s| {
+                                s.mode = if s.mode.is_hold() {
+                                    DictationMode::Toggle
+                                } else {
+                                    DictationMode::Hold
+                                };
+                            });
+                        },
+                    ),
+                ),
+            );
+            menu
+        };
+
+        self.render_dropdown_shell(
+            "chat-dictate-menu".into(),
+            "Microphone & mode".into(),
+            trigger,
+            // Open up-and-to-the-RIGHT off the mic button (Claude Desktop
+            // placement), not up-left over the transcript.
+            Anchor::BottomLeft,
+            build_menu,
+            cx,
+        )
+    }
+
+    /// Read the dictation settings global, apply `f`, sanitize, and persist to
+    /// `dictation.toml`. Used by the mic menu (device + Hold toggle). Writes the
+    /// file ONLY — the settings watcher reparses + swaps the global (the module
+    /// contract: writers must not `set_global` themselves and race the
+    /// debouncer). The swap lands within the debounce window (~250 ms).
+    fn update_dictation_settings(
+        &self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut DictationSettings),
+    ) {
+        let mut s = Self::dictation_settings(cx);
+        f(&mut s);
+        let s = s.sanitized();
+        if let Err(err) = crate::dictation_settings::save(&s) {
+            tracing::warn!(%err, "composer: failed to persist dictation settings");
+        }
+    }
+
+    /// The active recording bar — a ChatGPT-style row that OVERLAYS the input
+    /// field (absolute, opaque): a filled stop square (■ = stop + insert), a live
+    /// scrolling waveform filling the width, the mm:ss timer, and cancel (✕ / Esc)
+    /// + send (↑ / Enter) controls. Mounted as an absolute child of the input pill
+    /// (which stays mounted underneath so focus + Escape/Enter keep working).
+    fn render_recording_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let density = self.density;
+        let typo = &self.typography;
+        let (status_text, timer_text, recording) = match &self.dictation {
+            DictationUiState::Recording { started_at } => {
+                (String::new(), format_elapsed(*started_at), true)
+            }
+            DictationUiState::Starting => ("Starting…".to_string(), String::new(), false),
+            DictationUiState::Transcribing => ("Transcribing…".to_string(), String::new(), false),
+            _ => (String::new(), String::new(), false),
+        };
+        let bars = self.dictation_waveform.filled_bars(22.0, 0.05);
+
+        // Stop (■): finalize the recording and insert into the box (no send).
+        let stop_square = div()
+            .id("chat-dictate-stop")
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .size(px(20.0))
+            .rounded(px(5.0))
+            .bg(theme.status_error)
             .cursor_pointer()
+            .hover(|s| s.opacity(0.85))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev, window, cx| this.toggle_dictation(window, cx)),
             )
+            .child(div().size(px(9.0)).rounded(px(2.0)).bg(theme.bg_base));
+
+        // Cancel (✕): discard the recording.
+        let cancel = div()
+            .id("chat-dictate-cancel")
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .size(px(24.0))
+            .rounded(px(6.0))
+            .text_color(theme.fg_muted)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.bg_overlay).text_color(theme.fg_base))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _window, cx| {
+                    this.dictation_escape(cx);
+                }),
+            )
+            .child(Icon::default().path("icons/x.svg").size(px(14.0)));
+
+        // Send (↑): stop + submit. Mirrors the composer's circular send button.
+        let send = div()
+            .id("chat-dictate-send")
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(28.0))
+            .rounded_full()
+            .bg(theme.status_info)
+            .text_color(theme.bg_base)
+            .cursor_pointer()
+            .hover(|s| s.opacity(0.85))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, _window, cx| {
+                    this.dictation_enter(cx);
+                }),
+            )
+            .child(
+                div().relative().top(px(1.0)).child(
+                    Icon::default()
+                        .path("icons/arrow-up.svg")
+                        .size(px(15.0))
+                        .text_color(theme.bg_base),
+                ),
+            );
+
+        // Center: the scrolling waveform (right-aligned so the newest audio shows
+        // and older bars clip off the left) while recording, else the status word.
+        let center = if recording {
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .flex()
+                .flex_row()
+                .items_center()
+                .child(render_waveform(
+                    &bars,
+                    WaveformStyle {
+                        height: 22.0,
+                        bar_w: 2.5,
+                        gap: 2.0,
+                        color: theme.status_error,
+                        // Spread the bars across the whole bar so the waveform
+                        // fills it edge-to-edge (ChatGPT desktop app), instead
+                        // of a short right-aligned cluster leaving empty space.
+                        fill: true,
+                    },
+                ))
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(typo.t_body_sm))
+                .text_color(theme.fg_muted)
+                .child(status_text)
+                .into_any_element()
+        };
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(density.gap_inline))
+            .rounded(px(14.0))
+            .bg(theme.bg_panel_alt)
+            .px(px(density.pad_panel))
+            .text_size(px(typo.t_body_sm))
+            .text_color(theme.fg_base)
             .child(stop_square)
-            .child(div().min_w(px(28.0)).child(label))
+            .child(center)
             .when(recording, |d| {
-                d.child(
-                    div()
-                        .h(px(4.0))
-                        .w(px(meter_w))
-                        .rounded(px(2.0))
-                        .bg(theme.status_error),
-                )
-                .child(
-                    div()
-                        .text_size(px(typo.t_sub_label))
-                        .text_color(theme.fg_muted)
-                        .child("Esc"),
-                )
+                d.child(div().flex_none().child(timer_text.clone()))
             })
+            .child(cancel)
+            .child(send)
             .into_any_element()
     }
 
@@ -3171,10 +3393,12 @@ impl Render for ComposerView {
         // Paperclip/image attach anchors the far left, before the safety mode.
         // (New-chat + terminal-view moved to the tab header's view-options menu.)
         controls = controls.child(self.render_attach_button(cx));
-        // Voice dictation mic/pill, next to the paperclip. Hidden entirely when
-        // dictation is disabled in Settings › Voice.
-        if Self::dictation_settings(cx).enabled {
-            controls = controls.child(self.render_dictation_control(cx));
+        // Voice dictation mic (+ device menu), next to the paperclip. Hidden when
+        // dictation is disabled, and while recording — the recording bar then
+        // overlays the input field itself (ChatGPT-style), carrying its own
+        // stop/send, so a toolbar mic would be redundant.
+        if Self::dictation_settings(cx).enabled && !self.dictation.is_active() {
+            controls = controls.child(self.render_mic_button(cx));
         }
         if self.supports_modes {
             controls = controls.child(self.render_permission_picker(cx));
@@ -3217,10 +3441,12 @@ impl Render for ComposerView {
         // The pill: a rounded, focus-reactive frame holding the borderless input
         // AND the Send/Stop action at its right edge (like a native chat field).
         // The input takes the remaining width (`flex_1`); the circular action is
-        // pinned to the BOTTOM-right (`items_end`) so it stays put as the field
-        // grows upward. `appearance(false)` drops the input's own box so it
-        // doesn't nest a second frame inside. The other controls (attach, mode,
-        // model, effort) live on the row below.
+        // vertically CENTERED (`items_center`) so on a one-line draft it sits on
+        // the text's midline instead of dropping to the bottom edge. As the field
+        // grows it stays centered on the taller box (the common chat-composer
+        // look). `appearance(false)` drops the input's own box so it doesn't nest
+        // a second frame inside. The other controls (attach, mode, model, effort)
+        // live on the row below.
         //
         // Height: NO explicit `.h()` — the `auto_grow(1, MAX_COMPOSER_ROWS)` input
         // sizes itself to its content, growing one line per WRAPPED row (not just
@@ -3228,9 +3454,10 @@ impl Render for ComposerView {
         // An earlier hand-rolled `.h()` counted only `\n`s, so a long soft-wrapped
         // draft under-measured and spilled its text over the controls below.
         let pill = div()
+            .relative()
             .flex()
             .flex_row()
-            .items_end()
+            .items_center()
             .w_full()
             .rounded(px(14.0))
             .border_1()
@@ -3246,7 +3473,14 @@ impl Render for ComposerView {
                         .text_size(px(typo.t_body_md)),
                 ),
             )
-            .child(action_button);
+            .child(action_button)
+            // While recording, the ChatGPT-style recording bar overlays the input
+            // field (waveform + timer + stop + send). The input stays mounted
+            // underneath so its focus + the outer Escape/Enter capture-actions keep
+            // working; the opaque overlay just hides the draft text meanwhile.
+            .when(self.dictation.is_active(), |d| {
+                d.child(self.render_recording_bar(cx))
+            });
 
         div()
             .flex()
@@ -3310,9 +3544,12 @@ impl Render for ComposerView {
                 }
             }))
             // Cmd+E toggles dictation for this composer when it's the focused
-            // surface. Global-scoped action; if focus is elsewhere it never
-            // reaches here (a no-op, as intended).
+            // surface. Global-scoped action dispatched from the focused element
+            // up its ancestors; the composer is deeper than the workspace root,
+            // so it fires first and stops propagation, keeping the root-level
+            // handler (terminal/editor dictation) from also firing.
             .on_action(cx.listener(|this, _: &ToggleDictation, window, cx| {
+                cx.stop_propagation();
                 this.toggle_dictation(window, cx);
             }))
             .child(

@@ -142,6 +142,8 @@ impl ModelManager {
         let kind = match spec.family {
             Family::Whisper => EngineKind::Whisper { language },
             Family::Transducer => EngineKind::Transducer,
+            Family::Zipformer => EngineKind::Zipformer,
+            Family::SenseVoice => EngineKind::SenseVoice,
         };
         Some(ModelPaths {
             id: id.to_string(),
@@ -151,6 +153,7 @@ impl ModelManager {
             decoder: dir.join(spec.decoder),
             joiner: spec.joiner.map(|j| dir.join(j)),
             tokens: dir.join(spec.tokens),
+            model: spec.model.map(|m| dir.join(m)),
         })
     }
 

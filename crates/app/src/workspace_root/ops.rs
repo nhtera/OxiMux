@@ -192,6 +192,57 @@ impl WorkspaceRoot {
         self.project_panes_by_project.get(id).cloned()
     }
 
+    /// ⌘E over a non-composer pane (a focused chat composer consumes it first).
+    /// Stops a live session if one is running, else resolves a text sink for the
+    /// active pane and hands it to the dictation HUD. Panes that can't take text
+    /// (diff / browser / tasks) get a hint toast instead of a silent no-op.
+    pub(crate) fn dictate_focused_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if crate::shell::agent_chat::dictation_is_active(cx) {
+            crate::shell::agent_chat::dictation_stop(cx);
+            return;
+        }
+        let Some(sink) = self.focused_dictation_sink(cx) else {
+            self.push_toast(
+                ToastKind::Info,
+                "Focus a terminal, editor, or chat box to dictate",
+                cx,
+            );
+            return;
+        };
+        self.dictation_hud
+            .clone()
+            .update(cx, |hud, cx| hud.toggle(sink, window, cx));
+    }
+
+    /// The dictation sink for the active project's active tab, if that pane can
+    /// receive dictated text: a terminal's active sub-pane, or a code editor's
+    /// input. `None` for diff / browser / tasks / chat (chat dictates through the
+    /// composer's own handler, never here).
+    fn focused_dictation_sink(
+        &self,
+        cx: &gpui::App,
+    ) -> Option<crate::shell::agent_chat::HudSink> {
+        use crate::shell::agent_chat::HudSink;
+        use crate::shell::panes::pane_content::PaneContent;
+        let panes = self.active_project_panes()?;
+        let group = {
+            let mgr = panes.read(cx);
+            let gid = mgr.manager().active_group_id();
+            mgr.group(gid)?
+        };
+        let g = group.read(cx);
+        let content = &g.active_tab()?.content;
+        match content {
+            PaneContent::Terminal(_) => content
+                .terminal_active_view()
+                .map(|v| HudSink::Terminal(v.downgrade())),
+            PaneContent::Editor(view) => {
+                view.read(cx).state().map(|s| HudSink::Editor(s.downgrade()))
+            }
+            _ => None,
+        }
+    }
+
     /// Reopen a past session as a chat tab in the active project's active pane
     /// group. Raised by the Session History side panel (`OpenChatSession`).
     pub(crate) fn open_chat_session(

@@ -19,8 +19,11 @@ mod composer;
 mod composer_history;
 mod acp_terminal_host;
 mod context_meter;
+mod dictation_history;
+mod dictation_hud;
 mod dictation_service;
 mod dictation_ui;
+mod dictation_waveform;
 mod context_providers;
 mod diff_card;
 mod error_card;
@@ -58,6 +61,20 @@ pub use dictation_service::install as install_dictation_service;
 pub(crate) use dictation_service::{
     cancel_download as cancel_model_download, delete as delete_model, download as download_model,
     status as model_status,
+};
+
+/// The per-window "Listening…" HUD entity + its terminal/editor sink, plus the
+/// service hooks the workspace root uses to route ⌘E into whatever text pane is
+/// focused (dictation is no longer chat-only).
+pub(crate) use dictation_hud::{DictationHud, HudSink};
+pub(crate) use dictation_service::{
+    is_active as dictation_is_active, stop as dictation_stop,
+};
+
+/// Recent-transcript store for the Voice pane's "Dictation history" card.
+pub(crate) use dictation_history::{
+    HistoryEntry, clear as clear_dictation_history, entries as dictation_history_entries,
+    format_ts as format_history_ts,
 };
 
 use std::cell::RefCell;

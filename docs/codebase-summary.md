@@ -391,26 +391,33 @@ Backs the **Agent Chat** view (`crates/app/src/shell/agent_chat/`): three provid
 
 ## crates/dictation — offline voice dictation
 
-Local speech-to-text for the Agent Chat composer. No GPUI dependency (mirrors
-`crates/pty`): the app consumes a channel-based handle and never sees a cpal or
-sherpa type. Vietnamese-first — Whisper is the default engine; Parakeet is the
-best-English option.
+Local speech-to-text for ANY focused pane — chat composer, terminal, or code
+editor (⌘E). No GPUI dependency (mirrors `crates/pty`): the app consumes a
+channel-based handle and never sees a cpal or sherpa type. Vietnamese-first —
+Whisper is the default; a dedicated Vietnamese zipformer + Parakeet (English) +
+SenseVoice (CJK) round out the catalog.
 
 | File | Role |
 |---|---|
-| `capture.rs` | cpal CoreAudio capture on a dedicated thread (owns the `!Send` stream). Device-default rate (never request 16 kHz — macOS silence pitfall), downmix to mono, append to a shared `SessionBuffer`, throttled RMS level events, 2-min hard cap. |
+| `capture.rs` | cpal CoreAudio capture on a dedicated thread (owns the `!Send` stream). Selectable input device (`run(device)`, `list_input_devices()`; cpal 0.18 → device name is its `Display`). Device-default rate (never request 16 kHz — macOS silence pitfall), downmix to mono, shared `SessionBuffer`, throttled RMS level events, 2-min hard cap. |
 | `resample.rs` | Linear any-rate → 16 kHz mono resampler + downmix. Every buffer passes through before the engine (sherpa aborts on inconsistent rates). |
-| `engine.rs` | sherpa-rs `WhisperRecognizer`/`TransducerRecognizer` wrapper (CPU-only upstream). Silence gate (int16 peak < 300), 30 s chunk splitter cutting at the quietest 100 ms window (SIGTRAP #7925 mitigation). |
-| `controller.rs` | Session state machine (Idle→Recording→Transcribing) on one worker thread + warm engine cache (10-min idle teardown). Emits `DictationEvent` over a `futures::mpsc`. `Drop` only signals — never joins (no main-thread block). |
-| `model_catalog.rs` | Static catalog: whisper-small (default, `vi`), whisper-tiny, parakeet-v3-int8. URLs HEAD-verified against k2-fsa `asr-models`; sha256 unpinned (`None`) until hashed on a trusted machine. |
-| `model_manager.rs` | Download (resumable HTTP Range) → optional SHA-256 verify → `tar` extract → file-existence gate → Ready. Disk is source of truth on init (no phantom Ready). Pull (`status`/`readiness`) + push (`ModelEvent`) APIs. |
+| `engine.rs` | sherpa-rs wrapper: `WhisperRecognizer` / `TransducerRecognizer` (NeMo Parakeet) / `ZipFormer` (icefall, incl. Vietnamese) / `SenseVoiceRecognizer` (single-file, CJK). CPU-only. Silence gate (int16 peak < 300), 30 s chunk splitter at the quietest 100 ms window (SIGTRAP #7925 mitigation). `ModelPaths.model` = single-file slot; `require_files` is kind-aware. |
+| `controller.rs` | Session state machine (Idle→Recording→Transcribing) on one worker thread + warm engine cache (10-min idle teardown). `start(paths, device)`. Emits `DictationEvent` over a `futures::mpsc`. `Drop` only signals — never joins (no main-thread block). |
+| `model_catalog.rs` | 8-model catalog across 4 families (`Whisper`/`Transducer`/`Zipformer`/`SenseVoice`): whisper small(default)/base/tiny, zipformer-vi + 30M lite, parakeet v3/v2, sense-voice. URLs HEAD/range-verified against k2-fsa `asr-models`; sha256 unpinned (`None`). |
+| `model_manager.rs` | Download (resumable HTTP Range) → optional SHA-256 verify → `tar` extract → file-existence gate → Ready. Disk is source of truth on init. Pull (`status`/`readiness`) + push (`ModelEvent`) APIs. |
 
 App glue: `shell/agent_chat/dictation_service.rs` (process-wide `Global`: one
-`DictationController` + `ModelManager`, routes events to the recording composer
-via `WeakEntity`), `dictation_ui.rs` (UI state enum + smart-space helper),
-composer mic button/pill + `Cmd+E`/Escape/Enter, `platform/mic_permission.rs`
-(`AVCaptureDevice` TCC), `settings_modal/pane_voice.rs` + `settings/dictation.rs`
-(`DictationSettings` → `dictation.toml`).
+`DictationController` + `ModelManager`; routes events to a `DictationTarget`
+enum — the recording composer, or the global HUD for terminal/editor panes —
+via `WeakEntity`; shared `prepare_start` pre-flight), `dictation_hud.rs` (the
+floating "Listening…" pill + terminal/editor sink, mounted at `WorkspaceRoot`),
+`dictation_ui.rs` (UI state + `WaveformBuffer` ring + smart-space helper),
+`dictation_waveform.rs` (shared waveform renderer), composer recording bar +
+mic device/hold dropdown, `WorkspaceRoot::dictate_focused_pane` (⌘E → focused
+pane → sink), `terminal_view/input.rs::insert_dictation_text`,
+`platform/mic_permission.rs` (`AVCaptureDevice` TCC), `settings_modal/pane_voice.rs`
++ `settings/dictation.rs` (`DictationSettings{input_device, mode}` →
+`dictation.toml`).
 
 ---
 
