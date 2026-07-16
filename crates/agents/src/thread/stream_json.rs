@@ -564,7 +564,7 @@ fn decode_result(v: &Value) -> Vec<ThreadEvent> {
             attempted_id: str_field(v, "session_id"),
         });
     }
-    out.push(ThreadEvent::TurnEnded { result, usage: decode_usage(v), is_error });
+    out.push(ThreadEvent::TurnEnded { result, usage: decode_usage(v), is_error, turn_diff: None });
     out
 }
 
@@ -960,7 +960,7 @@ mod tests {
                 "cache_read_input_tokens":16681,"cache_creation_input_tokens":5571},
             "modelUsage":{"claude-opus-4-8":{"contextWindow":200000}}}).to_string();
         match &decode_line(&ok)[0] {
-            ThreadEvent::TurnEnded { result, usage, is_error } => {
+            ThreadEvent::TurnEnded { result, usage, is_error, .. } => {
                 assert_eq!(result.as_deref(), Some("Done."));
                 assert!(!is_error);
                 let u = usage.as_ref().expect("usage decoded");
@@ -1189,7 +1189,7 @@ mod tests {
         // A compaction that never reaches a boundary clears on turn end.
         t.apply(&ThreadEvent::CompactionStarted);
         assert!(t.compacting);
-        t.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: false });
+        t.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None });
         assert!(!t.compacting, "turn end clears a dangling spinner");
     }
 

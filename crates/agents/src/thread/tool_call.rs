@@ -63,6 +63,15 @@ pub struct ToolCall {
     /// loadable.
     #[serde(default)]
     pub kind: Option<String>,
+    /// This call asked a question the backend flagged `isSecret`, so whatever it
+    /// reports back echoes a credential the user typed. Set when the answer is
+    /// sent (the only moment the secret-ness is known — the awaiting status that
+    /// carries it is replaced at that instant), and read by the fold to redact
+    /// the result before it can reach the persisted transcript. `#[serde(default)]`
+    /// keeps older persisted blobs loadable; it persists so a restored session
+    /// keeps redacting if the backend re-reports the call.
+    #[serde(default)]
+    pub redact_result: bool,
     /// Transient accumulator for a tool call whose arguments are still streaming
     /// in as `input_json_delta` fragments (Claude live tool-input). Holds the raw
     /// partial-JSON string; the renderer best-effort parses it to preview the
@@ -98,6 +107,7 @@ impl ToolCall {
             result: None,
             structured: None,
             images: Vec::new(),
+            redact_result: false,
             terminal_id: None,
             kind: None,
             partial_input: String::new(),

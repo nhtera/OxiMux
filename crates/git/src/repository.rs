@@ -635,6 +635,16 @@ impl Repository {
                 let ranged = self.diff_range_all(&base, &head).await?;
                 push_all(ranged, FileGroup::Committed);
             }
+            // A turn diff is content the caller already holds, not a slice of the
+            // repo to assemble — it arrives via `DiffView::load_virtual`. Reaching
+            // here means a caller routed a virtual scope down the fetch path, and
+            // an empty result would render as "this turn changed nothing", which
+            // is a lie. Say so instead.
+            CombinedDiffScope::TurnDiff { .. } => {
+                return Err(GitError::parse(
+                    "a turn diff is supplied by its caller, not fetched from the repo",
+                ));
+            }
         }
         Ok(CombinedDiff { diffs, groups })
     }

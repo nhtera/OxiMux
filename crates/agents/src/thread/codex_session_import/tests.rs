@@ -42,6 +42,7 @@ fn maps_user_assistant_reasoning_and_tool_roundtrip() {
             ThreadEntry::Assistant(_) => "assistant",
             ThreadEntry::ToolCall(_) => "tool",
             ThreadEntry::ContextCompaction { .. } => "divider",
+            ThreadEntry::TurnDiff { .. } => "turn-diff",
         })
         .collect();
     assert_eq!(kinds, ["user", "thinking", "tool", "assistant"]);

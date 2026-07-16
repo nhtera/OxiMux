@@ -205,6 +205,14 @@ fn render_agent(tc: &ToolCall, full: bool, theme: Theme, density: Density, typo:
         if !bits.is_empty() {
             col = col.child(caption(bits.join(" · "), theme, typo));
         }
+        // A Codex collab call reports the agents it addressed rather than Claude's
+        // single-agent token/duration stats: one row per agent, so a mixed-status
+        // spawn shows WHICH agent errored instead of just the rolled-up verdict.
+        if let Some(agents) = s.get("agents").and_then(Value::as_array).filter(|a| !a.is_empty()) {
+            for a in agents {
+                col = col.child(agent_state_row(a, theme, typo));
+            }
+        }
         if let Some(content) = s.get("content").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
         {
             col = col.child(code_block(content, theme.fg_muted, full, theme, density, typo));
@@ -382,6 +390,61 @@ fn code_block(
         );
     }
     block.into_any_element()
+}
+
+/// One `agentsStates` row on a Codex collab card: a status-tinted glyph, the
+/// child agent's short thread id, and any message the backend attached to that
+/// state. Laid out as a row with the text column `min_w_0`, so a long message
+/// wraps inside the card instead of measuring at its unwrapped width.
+fn agent_state_row(a: &Value, theme: Theme, typo: &Typography) -> AnyElement {
+    let status = a.get("status").and_then(Value::as_str).unwrap_or_default();
+    let id = a.get("id").and_then(Value::as_str).unwrap_or_default();
+    let msg = a.get("message").and_then(Value::as_str).unwrap_or_default();
+    let (glyph, color) = collab_agent_glyph(status, theme);
+    let head = if status.is_empty() {
+        short_thread_id(id)
+    } else {
+        format!("{} · {status}", short_thread_id(id))
+    };
+    let label = if msg.trim().is_empty() { head } else { format!("{head} — {}", msg.replace('\n', " ")) };
+    div()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(6.0))
+        .w_full()
+        .child(div().flex_none().text_size(px(typo.t_label_xs)).text_color(color).child(glyph))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .text_size(px(typo.t_label_xs))
+                .text_color(theme.fg_muted)
+                .child(SharedString::from(bubble::elide(&label, 200))),
+        )
+        .into_any_element()
+}
+
+/// Glyph + tint for a `CollabAgentStatus`. An unknown/future state gets the
+/// neutral marker rather than borrowing a success or failure tint it may not
+/// have earned.
+fn collab_agent_glyph(status: &str, theme: Theme) -> (&'static str, Hsla) {
+    match status {
+        "completed" => ("✓", theme.status_ok),
+        "errored" | "notFound" => ("✗", theme.status_error),
+        "running" | "pendingInit" => ("●", theme.status_warn),
+        "interrupted" | "shutdown" => ("⊘", theme.fg_subtle),
+        _ => ("·", theme.fg_subtle),
+    }
+}
+
+/// A collab thread id shortened for a card row — the ids are opaque and long,
+/// and the row identifies an agent rather than addressing it.
+fn short_thread_id(id: &str) -> String {
+    match id.char_indices().nth(8) {
+        Some((cut, _)) => format!("{}…", &id[..cut]),
+        None => id.to_string(),
+    }
 }
 
 fn caption(label: String, theme: Theme, typo: &Typography) -> AnyElement {

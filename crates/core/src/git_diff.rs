@@ -128,6 +128,15 @@ pub enum CombinedDiffScope {
     Untracked,
     /// A committed revision range (`base..head`), all files — read-only.
     Branch { base: String, head: String },
+    /// A diff the caller already HAS, rather than a slice of the repo to go and
+    /// fetch: an agent turn's accumulated diff, opened from the chat's turn-end
+    /// card. Read-only, and the only scope the git layer never assembles — the
+    /// content arrives through `DiffView::load_virtual`, so asking the repo to
+    /// fetch it is a programming error rather than a query.
+    ///
+    /// `key` distinguishes one turn's tab from another's; the diff body is NOT
+    /// carried here, since a scope is compared, cloned, and used as a tab key.
+    TurnDiff { key: String },
 }
 
 impl CombinedDiffScope {
@@ -139,6 +148,7 @@ impl CombinedDiffScope {
             CombinedDiffScope::Staged => "Staged Changes",
             CombinedDiffScope::Untracked => "Untracked",
             CombinedDiffScope::Branch { .. } => "Branch Diff",
+            CombinedDiffScope::TurnDiff { .. } => "Turn Changes",
         }
     }
 
@@ -150,6 +160,9 @@ impl CombinedDiffScope {
     pub fn tab_key(&self) -> String {
         match self {
             CombinedDiffScope::Branch { base, head } => format!("Branch Diff {base}..{head}"),
+            // Each turn is its own tab: reviewing turn 5 must not reactivate the
+            // stale tab that turn 2 opened.
+            CombinedDiffScope::TurnDiff { key } => format!("Turn Changes {key}"),
             other => other.title().to_string(),
         }
     }
@@ -357,6 +370,41 @@ fn region_from_window(
         stage_hunk,
         anchor_new,
         anchor_old,
+    }
+}
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+
+    #[test]
+    fn each_turn_diff_gets_its_own_tab() {
+        // The dedup key is what stops "Review" on turn 5 from reactivating the
+        // tab turn 2 opened — every turn's diff is a different diff, and they all
+        // share the same display title.
+        let a = CombinedDiffScope::TurnDiff { key: "2".into() };
+        let b = CombinedDiffScope::TurnDiff { key: "5".into() };
+        assert_ne!(a.tab_key(), b.tab_key(), "two turns must not share a tab");
+        assert_eq!(a.title(), b.title(), "…while still reading the same in the tab strip");
+        assert_eq!(a.title(), "Turn Changes");
+        // Same turn re-reviewed reactivates its existing tab.
+        assert_eq!(a.tab_key(), CombinedDiffScope::TurnDiff { key: "2".into() }.tab_key());
+    }
+
+    #[test]
+    fn turn_diff_keys_do_not_collide_with_the_repo_scopes() {
+        let keys = [
+            CombinedDiffScope::AllChanges.tab_key(),
+            CombinedDiffScope::Unstaged.tab_key(),
+            CombinedDiffScope::Staged.tab_key(),
+            CombinedDiffScope::Untracked.tab_key(),
+            CombinedDiffScope::Branch { base: "main".into(), head: "dev".into() }.tab_key(),
+            CombinedDiffScope::TurnDiff { key: "1".into() }.tab_key(),
+        ];
+        let mut unique = keys.to_vec();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), keys.len(), "a turn tab must not hijack a repo-scope tab");
     }
 }
 

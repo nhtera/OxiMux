@@ -31,6 +31,7 @@ mod pending_edit;
 mod plan_approval_card;
 mod plan_panel;
 mod question_card;
+mod turn_summary_card;
 mod rewind_menu;
 mod session_detail;
 mod roster;
@@ -54,7 +55,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, AppContext, ClipboardItem, Context, Entity,
+    Animation, AnimationExt as _, AnyElement, App, AppContext, ClickEvent, ClipboardItem, Context,
+    Entity,
     EventEmitter, ExternalPaths, FocusHandle, Focusable, Image, ImageSource, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ObjectFit, ParentElement, Render, ScrollHandle,
     SharedString,
@@ -330,6 +332,12 @@ pub enum AgentChatEvent {
         session_id: String,
         cwd: PathBuf,
     },
+    /// A turn-end card's "Review" was clicked: the host should open the turn's
+    /// accumulated diff in a `DiffView` (via `load_virtual` — the diff is here,
+    /// not in the repo). Routed as an event for the same reason the seams above
+    /// are: a `window.dispatch_action` from a render closure does not reach the
+    /// host's action handlers. `key` makes each turn its own tab.
+    ReviewTurnDiffRequested { key: String, diff: String },
     /// A live chat turn reached a state the user should be told about while they
     /// may be looking elsewhere — the turn finished / errored, or it paused on a
     /// permission / question / auth prompt. The host (which owns the notifier +
@@ -359,7 +367,7 @@ fn attention_for_event(
     match ev {
         // An intentional Stop suppresses BOTH shapes of turn end it can produce: a
         // Claude interrupt arrives as `is_error: true`, but an ACP cancel replies
-        // `StopReason::Cancelled` → `TurnEnded { is_error: false }`. Either way,
+        // `StopReason::Cancelled` → `TurnEnded { is_error: false, turn_diff: None }`. Either way,
         // `interrupted` means the user pressed Stop, so no "finished"/"failed"
         // banner should fire — check it before the error split.
         ThreadEvent::TurnEnded { .. } if was_active && interrupted => None,
@@ -476,7 +484,7 @@ impl ThinkingLevel {
 use composer::{ComposerEvent, ComposerView, ControlVocab};
 use context_providers::{ContextRequest, ContextSource};
 use question_card::{QuestionCard, QuestionCardEvent};
-use tool_grouping::{plan_tool_grouping, EntryDisplay};
+use tool_grouping::{plan_tool_grouping, summarize_tool_run, EntryDisplay, GroupSummary, GroupedTool};
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
@@ -486,7 +494,8 @@ use oximux_agents::thread::{
     connect, probe_catalog, AgentConnection, AssistantMessage, AuthMethodKind, ChatBackend,
     ChatImage, ChatThread, ConnectSpec, FeatureControl, FeatureKind, FeatureValue,
     PermissionDecision, PermissionSuggestion, ProbedCatalog, QuestionAnswers,
-    QuestionRequest, ThreadEntry, ThreadEvent, ToolCall, ToolCallStatus, Transport, TurnUsage,
+    QuestionRequest, ThreadEntry, ThreadEvent, ToolCall, ToolCallStatus, ToolDetail, Transport,
+    TurnUsage,
 };
 use oximux_agents::SharedBackend;
 use oximux_core::{AgentAdapter, AgentSessionId};
@@ -3767,15 +3776,24 @@ impl AgentChatView {
         cx.notify();
     }
 
-    /// The "… N more tool calls" expander for a collapsed run.
+    /// The expander for a collapsed run: what the hidden cards did ("··· Edited 3
+    /// files · ran 2 commands"), with any failures called out in the error tint so
+    /// a broken call behind the fold isn't invisible. Falls back to the bare count
+    /// when there is nothing to summarize.
     fn render_tool_run_expander(
         &self,
         run_start: usize,
         hidden: usize,
+        summary: GroupSummary,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = self.theme;
-        div()
+        let label = if summary.label.is_empty() {
+            format!("··· {hidden} more tool calls")
+        } else {
+            format!("··· {}", summary.label)
+        };
+        let mut row = div()
             .id(("tool-run-expander", run_start))
             .flex()
             .items_center()
@@ -3786,12 +3804,20 @@ impl AgentChatView {
             .text_color(t.fg_subtle)
             .cursor_pointer()
             .hover(|s| s.text_color(t.fg_base))
-            .child(SharedString::from(format!("··· {hidden} more tool calls")))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _e, _w, cx| this.expand_tool_run(run_start, cx)),
-            )
-            .into_any_element()
+            .child(SharedString::from(label));
+        if summary.failed > 0 {
+            row = row.child(
+                div()
+                    .flex_none()
+                    .text_color(t.status_error)
+                    .child(SharedString::from(format!("· {} failed", summary.failed))),
+            );
+        }
+        row.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _e, _w, cx| this.expand_tool_run(run_start, cx)),
+        )
+        .into_any_element()
     }
 
     /// Cycle the chat-wide thinking level (Hidden → Auto → Expanded → …), from
@@ -4139,7 +4165,16 @@ impl AgentChatView {
             return;
         };
         if let Some(conn) = &self.connection {
+            // The reply carries the REAL answer — the backend asked for it, and a
+            // masked/redacted value would just fail whatever it feeds.
             let _ = conn.answer_question(&request_id, &questions, &answers);
+        }
+        // …but from here on the value is a credential we refuse to keep: flag the
+        // call so the fold redacts the result the backend echoes back, before it
+        // can reach the persisted transcript. Must happen before the status change
+        // below, which drops the `AwaitingAnswer` that carries `is_secret`.
+        if questions.iter().any(|q| q.is_secret) {
+            self.thread.mark_secret_answer(&tool_id);
         }
         self.thread.set_tool_status(&tool_id, ToolCallStatus::InProgress);
         self.question_cards.remove(&tool_id);
@@ -4824,11 +4859,54 @@ impl AgentChatView {
                 ThreadEntry::ContextCompaction { summary } => {
                     Some(compaction_divider(summary, theme, &typo).into_any_element())
                 }
+                // What the turn changed on disk, closing the turn. Review opens the
+                // turn's own diff; it is offered only when the backend reported
+                // one, since a derived summary has no hunks to show.
+                ThreadEntry::TurnDiff { files, diff } => {
+                    let on_review = diff.clone().map(|d| {
+                        // Key the tab by the DIFF ITSELF, not by anything
+                        // positional. An entry index is not an identity: it is
+                        // scoped to one transcript, so two chats' first editing
+                        // turn would both key "2" and one would silently
+                        // reactivate the other's tab; and rewind/edit-resend
+                        // truncate and repopulate from the same index, so a
+                        // post-rewind turn would reactivate the pre-rewind tab.
+                        // Both show the WRONG diff under the right label.
+                        //
+                        // Content-addressing makes a collision mean the content is
+                        // identical, in which case reusing the tab is correct.
+                        let key = diff_tab_key(&d);
+                        Box::new(cx.listener(move |_this, _e: &ClickEvent, _w, cx| {
+                            cx.emit(AgentChatEvent::ReviewTurnDiffRequested {
+                                key: key.clone(),
+                                diff: d.clone(),
+                            });
+                        })) as Box<_>
+                    });
+                    Some(turn_summary_card::render(files, theme, density, &typo, on_review))
+                }
             };
             // A collapsed tool-run expander follows its anchor entry as its own child.
             let expander = match group_plan[idx] {
                 EntryDisplay::ShowThenExpander { run_start, hidden } => {
-                    Some(self.render_tool_run_expander(run_start, hidden, cx))
+                    // Summarize the cards the collapse HIDES — what's behind the
+                    // fold is exactly what the user can't see for themselves. The
+                    // run is the consecutive tool block from `run_start`, the same
+                    // extent `plan_tool_grouping` collapsed.
+                    let collapsed: Vec<GroupedTool> = (run_start..is_tool.len())
+                        .take_while(|&i| is_tool[i])
+                        .filter(|&i| matches!(group_plan[i], EntryDisplay::Hide))
+                        .filter_map(|i| match self.thread.entries.get(i) {
+                            Some(ThreadEntry::ToolCall(tc)) => Some(GroupedTool {
+                                kind: ToolDetail::classify(&tc.name, tc.kind.as_deref(), &tc.input),
+                                failed: matches!(tc.status, ToolCallStatus::Failed(_)),
+                                target: bubble::tool_target(tc),
+                            }),
+                            _ => None,
+                        })
+                        .collect();
+                    let summary = summarize_tool_run(&collapsed);
+                    Some(self.render_tool_run_expander(run_start, hidden, summary, cx))
                 }
                 _ => None,
             };
@@ -5449,6 +5527,19 @@ fn spinner_row(text: &str, theme: Theme, typo: &Typography) -> AnyElement {
 
 /// A muted one-line turn summary (the backend's `post_turn_summary` detail),
 /// shown under a settled turn like a subtle status caption.
+/// A dedup key identifying a turn diff by its CONTENT, for the Review tab.
+///
+/// Only ever compared against other keys live in this process — turn-diff tabs
+/// are not persisted into the saved layout — so a hasher with no cross-run
+/// stability guarantee is fine here. It must never be written to disk or
+/// compared across runs.
+fn diff_tab_key(diff: &str) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    diff.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 fn summary_line(text: &str, theme: Theme, typo: &Typography) -> AnyElement {
     div()
         .w_full()
@@ -5639,7 +5730,7 @@ mod tests {
         // A finished turn (a turn was active) → Done, empty body.
         assert_eq!(
             attention_for_event(
-                &ThreadEvent::TurnEnded { result: None, usage: None, is_error: false },
+                &ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None },
                 true,
                 false,
             ),
@@ -5649,8 +5740,7 @@ mod tests {
         assert_eq!(
             attention_for_event(
                 &ThreadEvent::TurnEnded {
-                    result: Some("boom happened\nmore".into()), usage: None, is_error: true
-                },
+                    result: Some("boom happened\nmore".into()), usage: None, is_error: true, turn_diff: None },
                 true,
                 false,
             ),
@@ -5659,7 +5749,7 @@ mod tests {
         // An intentional Stop (interrupted) errored turn → no banner (Claude shape).
         assert_eq!(
             attention_for_event(
-                &ThreadEvent::TurnEnded { result: Some("aborted".into()), usage: None, is_error: true },
+                &ThreadEvent::TurnEnded { result: Some("aborted".into()), usage: None, is_error: true, turn_diff: None },
                 true,
                 true,
             ),
@@ -5669,7 +5759,7 @@ mod tests {
         // end while interrupted; it must NOT fire a "finished" banner.
         assert_eq!(
             attention_for_event(
-                &ThreadEvent::TurnEnded { result: None, usage: None, is_error: false },
+                &ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None },
                 true,
                 true,
             ),
@@ -5678,7 +5768,7 @@ mod tests {
         // A turn end with no prior active turn → no banner (stray result).
         assert_eq!(
             attention_for_event(
-                &ThreadEvent::TurnEnded { result: None, usage: None, is_error: false },
+                &ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None },
                 false,
                 false,
             ),
@@ -5926,8 +6016,7 @@ mod tests {
                     ThreadEvent::TurnEnded {
                         result: Some("Hello!".into()),
                         usage: None,
-                        is_error: false,
-                    },
+                        is_error: false, turn_diff: None },
                     cx,
                 );
                 assert_eq!(view.thread.entries.len(), 2, "user + assistant");
@@ -6140,7 +6229,7 @@ mod tests {
 
                 // The turn completes → the queued message is released as a new turn.
                 view.on_event(
-                    ThreadEvent::TurnEnded { result: None, usage: None, is_error: false },
+                    ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None },
                     cx,
                 );
                 assert_eq!(count_users(view), 2, "queued message sent on turn end");
@@ -6148,7 +6237,7 @@ mod tests {
 
                 // Queue now empty → a second turn end sends nothing more.
                 view.on_event(
-                    ThreadEvent::TurnEnded { result: None, usage: None, is_error: false },
+                    ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None },
                     cx,
                 );
                 assert_eq!(count_users(view), 2, "no phantom re-send when the queue is empty");
@@ -6196,7 +6285,7 @@ mod tests {
                 // Nothing to steer once the turn is over — that message would be
                 // an ordinary send, and this path must not fake one.
                 view.on_event(
-                    ThreadEvent::TurnEnded { result: None, usage: None, is_error: false },
+                    ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None },
                     cx,
                 );
                 view.steer_text("too late".into(), cx);
@@ -6692,8 +6781,7 @@ mod tests {
                     ThreadEvent::TurnEnded {
                         result: None,
                         usage: None,
-                        is_error: true,
-                    },
+                        is_error: true, turn_diff: None },
                     cx,
                 );
                 assert!(
@@ -6742,7 +6830,7 @@ mod tests {
 
                 // A late error result then folds in — still suppressed.
                 view.on_event(
-                    ThreadEvent::TurnEnded { result: None, usage: None, is_error: true },
+                    ThreadEvent::TurnEnded { result: None, usage: None, is_error: true, turn_diff: None },
                     cx,
                 );
                 assert!(view.thread.last_error.is_none());
@@ -6850,8 +6938,7 @@ mod tests {
                 view.thread.apply(&ThreadEvent::TurnEnded {
                     result: None,
                     usage: None,
-                    is_error: false,
-                });
+                    is_error: false, turn_diff: None });
 
                 // Guard: while a turn is active, regenerate stages nothing.
                 view.thread.turn_active = true;
@@ -6911,8 +6998,7 @@ mod tests {
                 view.thread.apply(&ThreadEvent::TurnEnded {
                     result: None,
                     usage: None,
-                    is_error: false,
-                });
+                    is_error: false, turn_diff: None });
                 let entries_before = view.thread.entries.clone();
 
                 // The user was mid-typing an unrelated draft WITH a staged image.
@@ -7001,6 +7087,31 @@ mod tests {
     }
 
     #[test]
+    fn a_review_tab_is_keyed_by_diff_content_not_by_position() {
+        // The Review tab dedups on this key across the WHOLE pane group, and a
+        // match just reactivates the existing tab without reloading it. So a key
+        // that two different diffs can share means showing the wrong diff under
+        // the right label — silently.
+        let turn_a = "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n@@ -0,0 +1 @@\n+a\n";
+        let turn_b = "diff --git a/b.rs b/b.rs\n+++ b/b.rs\n@@ -0,0 +1 @@\n+b\n";
+
+        // Two chats' first editing turn both sit at entry index 2; keying on the
+        // index would collide here. Keying on content does not.
+        assert_ne!(
+            diff_tab_key(turn_a),
+            diff_tab_key(turn_b),
+            "two different turn diffs must never share a Review tab"
+        );
+        // A rewind repopulates the same index with a different diff — likewise
+        // must not reactivate the pre-rewind tab.
+        let after_rewind = "diff --git a/a.rs b/a.rs\n+++ b/a.rs\n@@ -0,0 +1 @@\n+a2\n";
+        assert_ne!(diff_tab_key(turn_a), diff_tab_key(after_rewind));
+        // Reviewing the SAME diff twice reuses its tab — a collision here means
+        // the content is identical, so the tab already shows the right thing.
+        assert_eq!(diff_tab_key(turn_a), diff_tab_key(turn_a));
+    }
+
+    #[test]
     fn tool_grouping_leaves_short_runs_and_messages_alone() {
         // messages interleaved with short tool runs: nothing collapses.
         let is_tool = vec![false, true, true, false, true, false];
@@ -7036,8 +7147,7 @@ mod tests {
                 view.thread.apply(&ThreadEvent::TurnEnded {
                     result: Some("API error: overloaded".into()),
                     usage: None,
-                    is_error: true,
-                });
+                    is_error: true, turn_diff: None });
 
                 // Precondition the tail error-card arm keys on: idle, connected,
                 // non-empty transcript, an error recorded — and nothing sent yet.

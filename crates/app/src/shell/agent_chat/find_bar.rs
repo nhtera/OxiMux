@@ -65,6 +65,11 @@ fn entry_haystack(entry: &ThreadEntry) -> String {
             s
         }
         ThreadEntry::ContextCompaction { summary } => summary.clone(),
+        // The paths a turn changed — searching a filename should find the turn
+        // that touched it, not just the edit card.
+        ThreadEntry::TurnDiff { files, .. } => {
+            files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join("\n")
+        }
     }
 }
 

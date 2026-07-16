@@ -32,6 +32,10 @@ pub const M_ACCOUNT_READ: &str = "account/read";
 pub const M_ACCOUNT_LOGIN_START: &str = "account/login/start";
 /// Server → client notification fired when a browser OAuth login resolves.
 pub const N_ACCOUNT_LOGIN_COMPLETED: &str = "account/login/completed";
+/// Server → client notification carrying the turn's accumulated unified diff
+/// (`{diff, threadId, turnId}`). Cumulative — each restates the whole turn — and
+/// it covers files written by shell commands as well as by patch items.
+pub const N_TURN_DIFF_UPDATED: &str = "turn/diff/updated";
 
 // --- Client → server notifications ---------------------------------------
 pub const N_INITIALIZED: &str = "initialized";

@@ -142,8 +142,7 @@ pub fn map_event(v: &Value, st: &mut PiState) -> Vec<ThreadEvent> {
             vec![ThreadEvent::TurnEnded {
                 result: None,
                 usage: st.last_usage.take(),
-                is_error: false,
-            }]
+                is_error: false, turn_diff: None }]
         }
         "compaction_start" => vec![ThreadEvent::CompactionStarted],
         "compaction_end" => {

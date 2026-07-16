@@ -31,6 +31,7 @@ pub mod stream_json;
 pub mod tool_call;
 pub mod tool_detail;
 pub mod transport;
+pub mod turn_diff;
 
 pub use acp::AcpConnection;
 pub use claude_stream_json::{build_args, claude_model_choices, ClaudeStreamJsonConnection};
@@ -46,6 +47,7 @@ pub use transport::Transport;
 pub use background_task::{BackgroundTask, BackgroundTaskKind, TaskStatus};
 pub use context_chip::{prepend_context, ContextChip, ContextKind};
 pub use entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};
+pub use turn_diff::TurnFileChange;
 pub use session_import::{transcript_from_jsonl, transcript_from_str, MAX_IMPORT_ENTRIES};
 pub use codex_session_import::{
     import_codex_rollout, locate_rollout, transcript_from_codex_str, CodexRolloutImport,

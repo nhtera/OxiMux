@@ -252,6 +252,15 @@ pub enum ThreadEvent {
         result: Option<String>,
         usage: Option<TurnUsage>,
         is_error: bool,
+        /// The unified diff of everything this turn changed, when the backend
+        /// reports one. Codex accumulates it over the turn (`turn/diff/updated`,
+        /// cumulative — the last one wins) and the mapper attaches it here at
+        /// `turn/completed`; it covers files written by SHELL COMMANDS as well as
+        /// by patch items, which is why it beats summing the turn's edit cards.
+        ///
+        /// `None` for backends that report no such diff (Claude, ACP, Pi) — the
+        /// fold then derives the turn's changes from its own edit cards instead.
+        turn_diff: Option<String>,
     },
     /// A background task (subagent / background bash) started
     /// (`system/task_started`). Feeds the Background Tasks panel; the task's own
@@ -470,7 +479,7 @@ mod tests {
             .is_delta()
         );
         assert!(
-            !ThreadEvent::TurnEnded { result: None, usage: None, is_error: false }.is_delta()
+            !ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None }.is_delta()
         );
         assert!(!ThreadEvent::Error("boom".into()).is_delta());
     }

@@ -17,6 +17,11 @@ use super::entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};
 use super::event::{PlanEntryLite, SessionMeta, ThreadEvent, TurnUsage};
 use super::question::QuestionRequest;
 use super::tool_call::{PermissionRequest, ToolCall, ToolCallStatus};
+use super::turn_diff;
+
+/// Stands in for a secret answer's echoed result everywhere a result is read —
+/// the transcript blob, the settled card summary, Copy, the raw sheet.
+pub const SECRET_PLACEHOLDER: &str = "[secret]";
 
 #[derive(Debug, Default)]
 pub struct ChatThread {
@@ -309,6 +314,20 @@ impl ChatThread {
                 // tool call to attach it to) rather than mutating the wrong
                 // entry — see the `tool_result_for_unknown_id_is_ignored` test.
                 if let Some(tc) = self.tool_call_mut(tool_use_id) {
+                    // This call answered a secret question, so the backend's
+                    // report echoes the credential back at us. Redact it HERE —
+                    // the one place a result becomes part of an entry — so the
+                    // secret reaches neither the persisted blob nor any surface
+                    // that reads the card (the settled summary, Copy, the sheet).
+                    // The whole result goes, not just the secret span: the echo is
+                    // backend-formatted prose, so there is no reliable way to
+                    // excise one answer from it, and under-redacting is the one
+                    // failure this must not have.
+                    let (content, structured) = if tc.redact_result {
+                        (&SECRET_PLACEHOLDER.to_string(), &None)
+                    } else {
+                        (content, structured)
+                    };
                     // Completion replaces the streamed body — but a blank final
                     // (a cancelled/partial Codex command whose `aggregatedOutput`
                     // is empty) must not erase text the user already saw stream in
@@ -343,6 +362,15 @@ impl ChatThread {
                 // card's result body. `ToolResult` at completion replaces this
                 // with the authoritative full output.
                 if let Some(tc) = self.tool_call_mut(id) {
+                    // A card that answered a secret question refuses streamed
+                    // output for the same reason it refuses the final result: no
+                    // backend echo of that answer becomes transcript content. No
+                    // backend streams deltas onto a question card today — this
+                    // keeps the "a secret never reaches disk" invariant a property
+                    // of the fold rather than of which events happen to be wired.
+                    if tc.redact_result {
+                        return;
+                    }
                     match &mut tc.result {
                         Some(existing) => existing.push_str(chunk),
                         None => tc.result = Some(chunk.clone()),
@@ -439,7 +467,7 @@ impl ChatThread {
                 self.end_assistant_window();
                 self.entries.push(ThreadEntry::ContextCompaction { summary: summary.clone() });
             }
-            ThreadEvent::TurnEnded { is_error, result, usage } => {
+            ThreadEvent::TurnEnded { is_error, result, usage, turn_diff } => {
                 self.turn_active = false;
                 // Clear a dangling compaction spinner if the turn ended without a
                 // boundary event (e.g. a compaction that failed or was aborted).
@@ -469,6 +497,7 @@ impl ChatThread {
                     }
                     self.last_error = Some(msg);
                 }
+                self.close_turn_with_diff(turn_diff.as_deref());
             }
             ThreadEvent::BackgroundTaskStarted { task_id, tool_use_id, kind, description } => {
                 // Idempotent: a duplicate start (defensive against a re-emit) just
@@ -715,6 +744,36 @@ impl ChatThread {
         }
     }
 
+    /// Close a turn with its files-changed card, when it changed anything.
+    ///
+    /// `wire_diff` is the backend's own turn diff (Codex); it is authoritative
+    /// because it also sees files written by shell commands. Without one, the
+    /// turn's edit cards are summed instead, and no diff is recorded — Review
+    /// needs real hunks, and edit cards carry fragments.
+    ///
+    /// A turn that changed nothing adds no entry, so a conversational turn costs
+    /// nothing and looks unchanged.
+    fn close_turn_with_diff(&mut self, wire_diff: Option<&str>) {
+        let (files, diff) = match wire_diff {
+            Some(d) => (turn_diff::stats_from_unified_diff(d), Some(d.to_string())),
+            None => (turn_diff::stats_from_turn_entries(&self.entries), None),
+        };
+        if files.is_empty() {
+            return;
+        }
+        self.entries.push(ThreadEntry::TurnDiff { files, diff });
+    }
+
+    /// Mark a tool call as having answered a secret question, so the fold redacts
+    /// the result the backend echoes back. Called when the answer is sent —
+    /// answering replaces the `AwaitingAnswer` status that carries `is_secret`,
+    /// so this is the last moment the secret-ness is knowable.
+    pub fn mark_secret_answer(&mut self, tool_id: &str) {
+        if let Some(tc) = self.tool_call_mut(tool_id) {
+            tc.redact_result = true;
+        }
+    }
+
     /// The pending permission request (if any) awaiting a decision.
     pub fn pending_permission(&self) -> Option<(&str, &PermissionRequest)> {
         self.entries.iter().find_map(|e| match e {
@@ -818,6 +877,7 @@ mod tests {
     use super::*;
     use super::super::background_task::BackgroundTaskKind;
     use super::super::tool_call::PermissionKind;
+    use super::super::turn_diff::TurnFileChange;
     use serde_json::json;
 
     fn assistant_text(e: &ThreadEntry) -> &str {
@@ -834,7 +894,7 @@ mod tests {
         t.apply(&ThreadEvent::AssistantTextDelta("Hel".into()));
         t.apply(&ThreadEvent::AssistantTextDelta("lo".into()));
         t.apply(&ThreadEvent::AssistantText("Hello!".into())); // finalize reconciles
-        t.apply(&ThreadEvent::TurnEnded { result: Some("Hello!".into()), usage: None, is_error: false });
+        t.apply(&ThreadEvent::TurnEnded { result: Some("Hello!".into()), usage: None, is_error: false, turn_diff: None });
 
         assert_eq!(t.entries.len(), 2);
         assert_eq!(t.entries[0], ThreadEntry::User { text: "hi".into(), images: vec![], checkpoint: None });
@@ -1021,6 +1081,173 @@ mod tests {
         }
     }
 
+    /// The `TurnDiff` entry a turn closed with, if any.
+    fn turn_card(t: &ChatThread) -> Option<(&Vec<TurnFileChange>, &Option<String>)> {
+        t.entries.iter().find_map(|e| match e {
+            ThreadEntry::TurnDiff { files, diff } => Some((files, diff)),
+            _ => None,
+        })
+    }
+
+    fn ended(turn_diff: Option<&str>) -> ThreadEvent {
+        ThreadEvent::TurnEnded {
+            result: None,
+            usage: None,
+            is_error: false,
+            turn_diff: turn_diff.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_codex_turn_closes_with_its_wire_diff() {
+        let mut t = ChatThread::new();
+        t.push_user_message("edit it");
+        t.apply(&ended(Some(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1,2 @@\n ctx\n+added\n",
+        )));
+        let (files, diff) = turn_card(&t).expect("an editing turn closes with a card");
+        assert_eq!(files, &vec![TurnFileChange { path: "a.rs".into(), added: 1, removed: 0 }]);
+        assert!(diff.is_some(), "the wire diff is kept so Review has real hunks");
+    }
+
+    #[test]
+    fn a_claude_turn_closes_with_stats_derived_from_its_edit_cards() {
+        let mut t = ChatThread::new();
+        t.push_user_message("edit it");
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "e1".into(),
+            name: "Edit".into(),
+            input: json!({"file_path": "b.rs", "old_string": "x", "new_string": "y\nz"}),
+        });
+        t.apply(&ThreadEvent::ToolResult {
+            tool_use_id: "e1".into(), content: "ok".into(), is_error: false, structured: None });
+        // No wire diff — the fold sums the turn's own edit cards instead.
+        t.apply(&ended(None));
+        let (files, diff) = turn_card(&t).expect("an editing turn closes with a card");
+        assert_eq!(files, &vec![TurnFileChange { path: "b.rs".into(), added: 2, removed: 1 }]);
+        assert!(diff.is_none(), "no diff is fabricated from fragment-shaped edit cards");
+    }
+
+    #[test]
+    fn a_turn_that_changed_nothing_closes_with_no_card() {
+        let mut t = ChatThread::new();
+        t.push_user_message("just talk");
+        t.apply(&ThreadEvent::AssistantText("hello".into()));
+        t.apply(&ended(None));
+        assert!(turn_card(&t).is_none(), "a conversational turn must not add a card");
+        // …and neither does a wire diff that is empty or unparseable.
+        let mut t = ChatThread::new();
+        t.push_user_message("go");
+        t.apply(&ended(Some("")));
+        assert!(turn_card(&t).is_none());
+    }
+
+    #[test]
+    fn each_turns_card_counts_only_that_turn() {
+        let mut t = ChatThread::new();
+        t.push_user_message("one");
+        t.apply(&ended(Some("diff --git a/a.rs b/a.rs\n+++ b/a.rs\n@@ -0,0 +1 @@\n+one\n")));
+        t.push_user_message("two");
+        t.apply(&ended(Some("diff --git a/b.rs b/b.rs\n+++ b/b.rs\n@@ -0,0 +1 @@\n+two\n")));
+        let cards: Vec<_> = t
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                ThreadEntry::TurnDiff { files, .. } => Some(files),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cards.len(), 2, "one card per editing turn");
+        assert_eq!(cards[0][0].path, "a.rs");
+        assert_eq!(cards[1][0].path, "b.rs", "the second turn must not restate the first");
+    }
+
+    #[test]
+    fn a_transcript_written_before_turn_cards_still_loads() {
+        // The blob predates `TurnDiff`, so it simply has no such entry — the new
+        // variant must not make an old persisted transcript unreadable.
+        let old = r#"[{"User":{"text":"hi"}},{"Assistant":{"text":"hey","thinking":""}}]"#;
+        let entries: Vec<ThreadEntry> =
+            serde_json::from_str(old).expect("an older transcript blob still loads");
+        assert_eq!(entries.len(), 2);
+        // …and a card round-trips through the same blob format.
+        let with_card = vec![ThreadEntry::TurnDiff {
+            files: vec![TurnFileChange { path: "a.rs".into(), added: 1, removed: 0 }],
+            diff: Some("diff --git a/a.rs b/a.rs\n".into()),
+        }];
+        let blob = serde_json::to_string(&with_card).expect("serialize");
+        let back: Vec<ThreadEntry> = serde_json::from_str(&blob).expect("round-trip");
+        assert_eq!(back, with_card);
+    }
+
+    #[test]
+    fn a_secret_answers_echo_is_redacted_before_it_can_be_persisted() {
+        use crate::thread::question::parse_questions;
+        let mut t = ChatThread::new();
+        t.push_user_message("deploy");
+        let input = json!({"questions":[{"question":"API token?","header":"Token",
+            "options":[],"multiSelect":false}]});
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "toolu_s".into(), name: "AskUserQuestion".into(), input: input.clone() });
+        let mut questions = parse_questions(&input);
+        questions[0].is_secret = true;
+        t.apply(&ThreadEvent::QuestionAsked {
+            request_id: "rid-s".into(), tool_use_id: Some("toolu_s".into()), questions });
+
+        // Answering is the last moment `is_secret` is knowable — the awaiting
+        // status that carries it is replaced right after.
+        t.mark_secret_answer("toolu_s");
+        t.set_tool_status("toolu_s", ToolCallStatus::InProgress);
+
+        // The backend echoes the credential back in its result…
+        t.apply(&ThreadEvent::ToolResult {
+            tool_use_id: "toolu_s".into(),
+            content: "Your questions have been answered: \"API token?\"=\"sk-live-abc123\".".into(),
+            is_error: false,
+            structured: Some(json!({"answers": {"API token?": "sk-live-abc123"}})) });
+
+        let tc = match &t.entries[1] {
+            ThreadEntry::ToolCall(tc) => tc,
+            other => panic!("expected a tool call, got {other:?}"),
+        };
+        assert_eq!(tc.status, ToolCallStatus::Completed, "redacting must not break settling");
+        assert_eq!(tc.result.as_deref(), Some(SECRET_PLACEHOLDER));
+        assert!(tc.structured.is_none(), "the structured echo carries the secret too");
+
+        // The real guarantee: the secret is nowhere in what gets written to disk.
+        let blob = serde_json::to_string(&t.entries).expect("entries serialize");
+        assert!(!blob.contains("sk-live-abc123"), "the secret must not reach the transcript blob");
+        assert!(blob.contains(SECRET_PLACEHOLDER));
+    }
+
+    #[test]
+    fn a_non_secret_answer_is_still_recorded_verbatim() {
+        // The redaction must be scoped to secret questions — a normal answer is
+        // transcript content the user wants to keep.
+        use crate::thread::question::parse_questions;
+        let mut t = ChatThread::new();
+        t.push_user_message("choose");
+        let input = json!({"questions":[{"question":"Tabs or spaces?","header":"Indent",
+            "options":[{"label":"Tabs","description":""}],"multiSelect":false}]});
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "toolu_q".into(), name: "AskUserQuestion".into(), input: input.clone() });
+        t.apply(&ThreadEvent::QuestionAsked {
+            request_id: "rid-q".into(), tool_use_id: Some("toolu_q".into()),
+            questions: parse_questions(&input) });
+        t.set_tool_status("toolu_q", ToolCallStatus::InProgress);
+        t.apply(&ThreadEvent::ToolResult {
+            tool_use_id: "toolu_q".into(),
+            content: "Your questions have been answered: \"Tabs or spaces?\"=\"Tabs\".".into(),
+            is_error: false, structured: None });
+        match &t.entries[1] {
+            ThreadEntry::ToolCall(tc) => {
+                assert!(tc.result.as_deref().expect("a result").contains("Tabs"));
+                assert!(!tc.redact_result);
+            }
+            other => panic!("expected a tool call, got {other:?}"),
+        }
+    }
+
     #[test]
     fn rehydrate_and_interrupt_fail_close_a_pending_question() {
         use crate::thread::question::parse_questions;
@@ -1140,8 +1367,7 @@ mod tests {
                 cache_read_tokens: 16681, cache_creation_tokens: 5571,
                 context_window: Some(200000), cost_usd: Some(0.33),
             }),
-            is_error: false,
-        });
+            is_error: false, turn_diff: None });
         let u = t.usage.as_ref().expect("usage stored");
         assert_eq!(u.input_tokens, 714);
         assert_eq!(u.output_tokens, 7);
@@ -1157,7 +1383,7 @@ mod tests {
         t.apply(&ThreadEvent::TurnEnded {
             result: Some("a".into()),
             usage: Some(TurnUsage { input_tokens: 100, ..Default::default() }),
-            is_error: false,
+            is_error: false, turn_diff: None,
         });
         assert!(t.usage.is_some() && t.last_summary.is_some());
 
@@ -1205,7 +1431,7 @@ mod tests {
         // trailing events that arrive after SIGINT, before stdout EOF:
         t.apply(&ThreadEvent::AssistantTextDelta(" and Design".into()));
         t.apply(&ThreadEvent::AssistantText("The History and Design of Rust".into()));
-        t.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: true });
+        t.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: true, turn_diff: None });
 
         let assistants: Vec<&str> = t.entries.iter().filter_map(|e| match e {
             ThreadEntry::Assistant(m) => Some(m.text.as_str()), _ => None }).collect();
@@ -1492,7 +1718,7 @@ mod tests {
 
         // A new turn keeps the plan/title pinned (they persist across turns) even
         // as the footer/summary reset.
-        t.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: false });
+        t.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None });
         t.push_user_message("next");
         assert!(t.plan.is_some(), "plan survives a turn boundary");
         assert_eq!(t.title.as_deref(), Some("Fix auth"), "title survives a turn boundary");
@@ -1635,7 +1861,7 @@ mod tests {
         assert_eq!(t.last_known_context_window, Some(200_000), "window cached as denominator");
         assert!(t.usage.is_none(), "settled footer untouched by a live event");
         // A new turn clears the live meter but keeps the cached window.
-        t.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: false });
+        t.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None });
         t.push_user_message("next");
         assert!(t.live_usage.is_none(), "live meter cleared at new turn");
         assert_eq!(t.last_known_context_window, Some(200_000), "window survives the turn boundary");
@@ -1646,19 +1872,19 @@ mod tests {
         let mut t = ChatThread::new();
         t.push_user_message("a");
         t.apply(&ThreadEvent::TurnEnded {
-            result: None, is_error: false,
+            result: None, is_error: false, turn_diff: None,
             usage: Some(TurnUsage { cost_usd: Some(0.10), ..Default::default() }),
         });
         t.push_user_message("b");
         t.apply(&ThreadEvent::TurnEnded {
-            result: None, is_error: false,
+            result: None, is_error: false, turn_diff: None,
             usage: Some(TurnUsage { cost_usd: Some(0.25), ..Default::default() }),
         });
         assert!((t.session_cost_usd - 0.35).abs() < 1e-9, "cost sums across turns: {}", t.session_cost_usd);
         // A turn with no cost (Codex reports None) doesn't change the accumulator.
         t.push_user_message("c");
         t.apply(&ThreadEvent::TurnEnded {
-            result: None, is_error: false,
+            result: None, is_error: false, turn_diff: None,
             usage: Some(TurnUsage { cost_usd: None, ..Default::default() }),
         });
         assert!((t.session_cost_usd - 0.35).abs() < 1e-9, "None cost is a no-op");
@@ -1669,7 +1895,7 @@ mod tests {
         let mut t = ChatThread::new();
         // A diagnostic stashed before an error TurnEnded appends to last_error.
         t.apply(&ThreadEvent::Diagnostic("stderr: connection reset".into()));
-        t.apply(&ThreadEvent::TurnEnded { result: Some("api error".into()), usage: None, is_error: true });
+        t.apply(&ThreadEvent::TurnEnded { result: Some("api error".into()), usage: None, is_error: true, turn_diff: None });
         let err = t.last_error.clone().expect("error recorded");
         assert!(err.contains("api error"));
         assert!(err.contains("stderr: connection reset"), "diagnostic folded in: {err}");
@@ -1677,9 +1903,9 @@ mod tests {
         // A stashed diagnostic must NOT leak into a LATER turn's error text.
         t.apply(&ThreadEvent::Diagnostic("stale noise".into()));
         // This turn succeeds → the stash is consumed (dropped), not shown.
-        t.apply(&ThreadEvent::TurnEnded { result: Some("done".into()), usage: None, is_error: false });
+        t.apply(&ThreadEvent::TurnEnded { result: Some("done".into()), usage: None, is_error: false, turn_diff: None });
         t.push_user_message("again");
-        t.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: true });
+        t.apply(&ThreadEvent::TurnEnded { result: None, usage: None, is_error: true, turn_diff: None });
         let err2 = t.last_error.clone().expect("second error");
         assert!(!err2.contains("stale noise"), "old diagnostic leaked into a later turn: {err2}");
         assert_eq!(err2, "turn ended with error", "generic fallback, no leaked stash");

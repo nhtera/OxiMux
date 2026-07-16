@@ -428,7 +428,7 @@ async fn session(
                         // later turn that reports no fresh usage).
                         let (result, is_error) = turn_outcome(resp);
                         let usage = state.lock().ok().and_then(|s| s.last_usage.clone());
-                        let _ = event_tx.send(ThreadEvent::TurnEnded { result, usage, is_error });
+                        let _ = event_tx.send(ThreadEvent::TurnEnded { result, usage, is_error, turn_diff: None });
                     }
                     Outbound::SetMode(mode) => {
                         // Fire-and-forget: a rejected mode change just leaves the
@@ -576,8 +576,7 @@ async fn run_auth(
                     let _ = event_tx.send(ThreadEvent::TurnEnded {
                         result: Some("sign in to continue".to_string()),
                         usage: None,
-                        is_error: true,
-                    });
+                        is_error: true, turn_diff: None });
                 }
                 Some(_) => continue,
             }

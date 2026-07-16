@@ -84,13 +84,14 @@ impl ToolDetail {
             "WebFetch" => ToolDetail::Fetch,
             // Codex names its web search `web_search`; Claude's is `WebSearch`.
             "WebSearch" | "web_search" => ToolDetail::WebSearch,
-            // Codex sub-agent items pass their raw type name (the 0.144.1
-            // `collabAgentToolCall.tool` field is a freeform collab-tool name, so
-            // the type is the stable SubAgent signal); `sub_agent` covers the
-            // no-`tool` fallback.
-            "Agent" | "Task" | "sub_agent" | "collabAgentToolCall" | "subAgentActivity" => {
-                ToolDetail::SubAgent
-            }
+            // Codex sub-agent items are named by their mapper (`Agent` /
+            // `Agent activity`); `sub_agent` covers the no-`tool` fallback. The
+            // raw `collabAgentToolCall`/`subAgentActivity` type names stay listed
+            // because transcripts persisted before the mapper humanized them
+            // still carry the raw type as the tool name, and a restored session
+            // must classify the same way it did when it was live.
+            "Agent" | "Agent activity" | "Task" | "sub_agent" | "collabAgentToolCall"
+            | "subAgentActivity" => ToolDetail::SubAgent,
             "TodoWrite" => ToolDetail::Plan,
             _ => ToolDetail::Unknown,
         }

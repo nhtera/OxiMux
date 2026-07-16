@@ -239,6 +239,15 @@ pub(super) fn tool_target(tc: &ToolCall) -> Option<String> {
         let n = actions.len();
         return Some(format!("{n} action{}", if n == 1 { "" } else { "s" }));
     }
+    // A Codex collab/sub-agent item: its action verb and who it targets, rather
+    // than the `prompt` the generic fallback below would pick — the prompt
+    // already reads in full on the card body, and "Spawn agent · 2 agents" is
+    // what distinguishes two collab cards in a collapsed run. Gated on the item
+    // `type` Codex carries on the input, so a Claude `Agent` call (no `type`
+    // field) still falls through to its brief.
+    if let Some(t) = collab_target(input) {
+        return Some(t);
+    }
     // Typed text / key chord, or a subagent/task brief → its first line.
     for key in ["text", "description", "prompt"] {
         if let Some(s) = input.get(key).and_then(Value::as_str) {
@@ -249,6 +258,58 @@ pub(super) fn tool_target(tc: &ToolCall) -> Option<String> {
         }
     }
     None
+}
+
+/// The header target for a Codex collab (`collabAgentToolCall`) or sub-agent
+/// activity (`subAgentActivity`) card. `None` for any other input, including a
+/// Claude subagent call.
+///
+/// A collab call reads as its action plus the number of agents it addresses
+/// ("Spawn agent · 2 agents"); a single-agent call stays just the verb, since
+/// "1 agent" is what every collab call that isn't a broadcast looks like. An
+/// activity beat reads as the agent it belongs to.
+fn collab_target(input: &Value) -> Option<String> {
+    match input.get("type").and_then(Value::as_str)? {
+        "collabAgentToolCall" => {
+            let verb = input.get("tool").and_then(Value::as_str).map(collab_tool_label);
+            let receivers = input
+                .get("receiverThreadIds")
+                .and_then(Value::as_array)
+                .map(|a| a.len())
+                .unwrap_or(0);
+            match (verb, receivers) {
+                (Some(v), n) if n > 1 => Some(format!("{v} · {n} agents")),
+                (Some(v), _) => Some(v),
+                (None, n) if n > 0 => Some(format!("{n} agent{}", if n == 1 { "" } else { "s" })),
+                (None, _) => None,
+            }
+        }
+        "subAgentActivity" => {
+            let path = input.get("agentPath").and_then(Value::as_str).filter(|s| !s.is_empty());
+            let kind = input.get("kind").and_then(Value::as_str).filter(|s| !s.is_empty());
+            match (path, kind) {
+                (Some(p), Some(k)) => Some(format!("{p} · {k}")),
+                (Some(p), None) => Some(p.to_string()),
+                (None, Some(k)) => Some(k.to_string()),
+                (None, None) => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Humanize a `CollabAgentTool` enum value (`spawnAgent` → "Spawn agent"). An
+/// unrecognized value renders verbatim rather than being guessed at — a future
+/// collab action should read as itself, not as the wrong verb.
+fn collab_tool_label(tool: &str) -> String {
+    match tool {
+        "spawnAgent" => "Spawn agent".to_string(),
+        "sendInput" => "Send input".to_string(),
+        "resumeAgent" => "Resume agent".to_string(),
+        "wait" => "Wait".to_string(),
+        "closeAgent" => "Close agent".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// A JSON number rendered as a whole integer (drops `.0` on coordinates).
@@ -400,6 +461,80 @@ mod tests {
                 ToolCallStatus::InProgress
             )),
             None
+        );
+    }
+
+    #[test]
+    fn tool_target_reads_codex_collab_action_and_agent_count() {
+        // The collab ACTION verb leads, humanized from the wire enum…
+        assert_eq!(
+            tool_target(&tc(
+                "Agent",
+                json!({"type": "collabAgentToolCall", "tool": "spawnAgent",
+                       "receiverThreadIds": ["t1"]}),
+                ToolCallStatus::InProgress
+            )),
+            Some("Spawn agent".to_string())
+        );
+        // …with the receiver count only when it addresses more than one agent.
+        assert_eq!(
+            tool_target(&tc(
+                "Agent",
+                json!({"type": "collabAgentToolCall", "tool": "sendInput",
+                       "receiverThreadIds": ["t1", "t2"]}),
+                ToolCallStatus::InProgress
+            )),
+            Some("Send input · 2 agents".to_string())
+        );
+        // The verb beats the `prompt` the generic fallback would otherwise pick —
+        // the prompt reads on the card body instead.
+        assert_eq!(
+            tool_target(&tc(
+                "Agent",
+                json!({"type": "collabAgentToolCall", "tool": "spawnAgent",
+                       "receiverThreadIds": [], "prompt": "Verify the parser"}),
+                ToolCallStatus::InProgress
+            )),
+            Some("Spawn agent".to_string())
+        );
+        // An unknown future action renders verbatim, never as a guessed verb.
+        assert_eq!(
+            tool_target(&tc(
+                "Agent",
+                json!({"type": "collabAgentToolCall", "tool": "teleportAgent",
+                       "receiverThreadIds": []}),
+                ToolCallStatus::InProgress
+            )),
+            Some("teleportAgent".to_string())
+        );
+        // No `tool` on the wire → fall back to who it targets.
+        assert_eq!(
+            tool_target(&tc(
+                "Agent",
+                json!({"type": "collabAgentToolCall", "receiverThreadIds": ["t1", "t2"]}),
+                ToolCallStatus::InProgress
+            )),
+            Some("2 agents".to_string())
+        );
+        // An activity beat identifies its agent.
+        assert_eq!(
+            tool_target(&tc(
+                "Agent activity",
+                json!({"type": "subAgentActivity", "agentPath": "reviewer",
+                       "agentThreadId": "t7", "kind": "started"}),
+                ToolCallStatus::InProgress
+            )),
+            Some("reviewer · started".to_string())
+        );
+        // A Claude subagent call carries no item `type` — it must keep reading as
+        // its brief rather than being treated as a collab item.
+        assert_eq!(
+            tool_target(&tc(
+                "Task",
+                json!({"description": "Audit the parser", "prompt": "Check X"}),
+                ToolCallStatus::InProgress
+            )),
+            Some("Audit the parser".to_string())
         );
     }
 

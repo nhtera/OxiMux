@@ -952,6 +952,40 @@ impl PaneGroup {
         cx: &mut Context<Self>,
     ) {
         match ev {
+            // A turn-end card's Review: open THIS turn's diff in a diff tab. The
+            // diff travels with the event (the chat holds it; the repo never had
+            // it), so the tab loads virtually rather than fetching. The repo is
+            // still needed for the repo-relative parts of the viewer, and it is
+            // opened at the requesting chat's OWN cwd — a chat rooted in a
+            // worktree must review against that worktree, not the active project.
+            crate::shell::agent_chat::AgentChatEvent::ReviewTurnDiffRequested { key, diff } => {
+                let cwd = self.tabs.iter().find_map(|t| match (&t.content, &t.kind) {
+                    (PaneContent::AgentChat(v), PaneGroupTabKind::AgentChat { cwd, .. })
+                        if v.entity_id() == view.entity_id() =>
+                    {
+                        Some(cwd.clone())
+                    }
+                    _ => None,
+                });
+                let Some(cwd) = cwd else { return };
+                let (key, diff) = (key.clone(), diff.clone());
+                cx.spawn_in(window, async move |group, cx| {
+                    let Ok(repo) = oximux_git::Repository::open(&cwd).await else {
+                        // The chat's cwd isn't a repo — nothing to open the diff
+                        // against. The card stays; only Review is a no-op.
+                        tracing::warn!(
+                            target: "oximux_app::pane_group",
+                            cwd = %cwd.display(),
+                            "turn-diff review: chat cwd is not a git repo"
+                        );
+                        return;
+                    };
+                    let _ = group.update_in(cx, |g, window, cx| {
+                        g.open_or_activate_turn_diff_tab(repo, &key, &diff, window, cx);
+                    });
+                })
+                .detach();
+            }
             crate::shell::agent_chat::AgentChatEvent::ModelChanged(model) => {
                 for tab in &mut self.tabs {
                     if let PaneContent::AgentChat(v) = &tab.content
@@ -1728,6 +1762,68 @@ impl PaneGroup {
             let mut v =
                 crate::shell::diff_view::DiffView::new(repo, theme, density, typography, cx);
             v.load_combined(scope_for_load, cx);
+            v
+        });
+        let opener = cx.weak_entity();
+        view.update(cx, |v, _| v.set_opener(opener));
+        let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
+        let tab = PaneGroupTab {
+            label,
+            content: PaneContent::Diff(view),
+            kind: PaneGroupTabKind::CombinedDiff { scope_key },
+            color: None,
+            custom_title: None,
+            pinned: false,
+            is_preview: false,
+            external_mutation: None,
+            restore_rank: None,
+            _observer: observer,
+            _status_task: None,
+        };
+        self.tabs.push(tab);
+        let new_idx = self.tabs.len() - 1;
+        self.tab_order.push(new_idx);
+        self.active = new_idx;
+        self.bump_mru(new_idx);
+        self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
+        cx.notify();
+        new_idx
+    }
+
+    /// Open or activate a tab showing a diff the CALLER already has — an agent
+    /// turn's accumulated diff, from the chat's turn-end Review.
+    ///
+    /// Deliberately the same tab machinery and the same `DiffView` as
+    /// `open_or_activate_combined_diff_tab`; only the load differs
+    /// (`load_virtual`, no repo fetch). A `Repository` is still required because
+    /// `DiffView` uses it for the things that remain repo-relative even for a
+    /// virtual diff — opening a file in the editor, review notes.
+    pub fn open_or_activate_turn_diff_tab(
+        &mut self,
+        repo: oximux_git::Repository,
+        key: &str,
+        diff: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let scope = oximux_core::CombinedDiffScope::TurnDiff { key: key.to_string() };
+        let scope_key = SharedString::from(scope.tab_key());
+        let label = SharedString::from(scope.title());
+        if let Some(idx) = self.tabs.iter().position(|t| {
+            matches!(&t.kind, PaneGroupTabKind::CombinedDiff { scope_key: k } if k == &scope_key)
+        }) {
+            self.set_active(idx, window, cx);
+            return idx;
+        }
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let diff_owned = diff.to_string();
+        let view = cx.new(|cx| {
+            let mut v =
+                crate::shell::diff_view::DiffView::new(repo, theme, density, typography, cx);
+            v.load_virtual(scope, &diff_owned, cx);
             v
         });
         let opener = cx.weak_entity();

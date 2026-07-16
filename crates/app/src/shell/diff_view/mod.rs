@@ -874,6 +874,11 @@ impl DiffView {
                     (base.clone(), head.clone(), path.clone(), title.clone());
                 self.load_range(base, head, path, title, cx);
             }
+            // A turn diff has no fetch to retry: its content came from the caller,
+            // and `diff_combined` rejects the scope by design. Retrying would swap
+            // the real parse error for a confusing internal one and could never
+            // succeed, so the failure stands — reopen Review to try again.
+            DiffViewState::CombinedFailed { scope: CombinedDiffScope::TurnDiff { .. }, .. } => {}
             DiffViewState::CombinedFailed { scope, .. } => {
                 let scope = scope.clone();
                 self.load_combined(scope, cx);
@@ -1145,6 +1150,44 @@ impl DiffView {
             });
         });
         self._load_task = Some(task);
+    }
+
+    /// Render a diff the caller ALREADY HAS, instead of fetching one from the
+    /// repo — an agent turn's accumulated diff, opened from the chat's turn-end
+    /// card.
+    ///
+    /// This is the whole virtual path: parse with the same
+    /// [`oximux_git::parse_unified_diff`] the fetch path uses, then hand the
+    /// result to the same [`Self::apply_combined_result`] the fetch path ends at.
+    /// No shellout, no task, no second viewer — the only difference from
+    /// [`Self::load_combined`] is where the bytes came from.
+    ///
+    /// Every file is tagged [`FileGroup::Committed`] (read-only): a turn diff is
+    /// a record of what happened, and the working tree may have moved since, so
+    /// offering Stage/Discard against it would act on a file that no longer
+    /// matches what is on screen. Read-only also means no hunk op, which means
+    /// nothing can trigger the reload path back into git for a scope git cannot
+    /// fetch.
+    pub fn load_virtual(&mut self, scope: CombinedDiffScope, raw_diff: &str, cx: &mut Context<Self>) {
+        // Same drop-on-entry + fresh-selection reset as `load_combined`.
+        self._op_task = None;
+        self._load_task = None;
+        self.invalidate_plan();
+        self.collapsed.clear();
+        self.expanded_folds.clear();
+        self.reset_rail_state();
+        self.notes.clear();
+        self.images.clear();
+        let result = oximux_git::parse_unified_diff(raw_diff)
+            .map(|diffs| {
+                let groups = vec![FileGroup::Committed; diffs.len()];
+                oximux_core::CombinedDiff { diffs, groups }
+            })
+            .map_err(|e| e.to_string());
+        self.apply_combined_result(scope, result);
+        self.reload_notes();
+        self.fetch_image_blobs(cx);
+        cx.notify();
     }
 
     fn apply_combined_result(

@@ -245,7 +245,14 @@ impl QuestionCard {
         let mut others = Vec::with_capacity(n);
         let mut subs = Vec::new();
         for i in 0..n {
-            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Other…"));
+            // A question the backend flagged `isSecret` takes a credential, so its
+            // field renders password-style. `masked` is display-only — `value()`
+            // still returns the real text for the reply — and the widget offers
+            // its own reveal toggle for typo-checking.
+            let secret = request.questions.get(i).is_some_and(|q| q.is_secret);
+            let input = cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Other…").masked(secret)
+            });
             let sub = cx.subscribe(&input, move |this: &mut Self, _input, ev: &InputEvent, cx| {
                 if matches!(ev, InputEvent::Change) {
                     // Typing an "Other" answer deselects that question's options
@@ -262,8 +269,17 @@ impl QuestionCard {
             others.push(input);
             subs.push(sub);
         }
-        let overall =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Or reply in your own words…"));
+        // The overall response supersedes every question, so it is also where a
+        // user may type the credential a secret question asked for. Mask it
+        // whenever ANY question in the set is secret: over-masking a field that
+        // has a reveal toggle costs nothing, while leaving the one bypass route
+        // in plaintext would defeat the per-question masking above.
+        let any_secret = request.questions.iter().any(|q| q.is_secret);
+        let overall = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Or reply in your own words…")
+                .masked(any_secret)
+        });
         subs.push(cx.subscribe(&overall, |_this, _input, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change | InputEvent::Focus | InputEvent::Blur) {
                 cx.notify();
@@ -431,15 +447,17 @@ impl Render for QuestionCard {
                 .text_color(theme.fg_base)
                 .child(SharedString::from(question)),
         );
-        // Sensitive-answer hint (Codex `isSecret`): the answer still rides back to
-        // the agent, so warn the user it's treated as a credential. Full input
-        // masking + transcript no-persist is a follow-up.
+        // Sensitive-answer hint (Codex `isSecret`): the field is masked and the
+        // answer is kept out of the saved transcript, but it does still travel to
+        // the agent that asked — which is the part the user has to decide about.
         if is_secret {
             title = title.child(
                 div()
                     .text_size(px(typo.t_label_xs))
                     .text_color(theme.status_warn)
-                    .child(SharedString::from("🔒 Sensitive — your answer is sent to the agent")),
+                    .child(SharedString::from(
+                        "🔒 Sensitive — sent to the agent, not saved to this transcript",
+                    )),
             );
         }
         if multi {

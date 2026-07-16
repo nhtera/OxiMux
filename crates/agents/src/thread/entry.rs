@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::tool_call::ToolCall;
+use super::turn_diff::TurnFileChange;
 
 /// One rendered item in the conversation, in arrival order.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,6 +37,25 @@ pub enum ThreadEntry {
     /// `CompactBoundary`, and by the stale-`--resume` recovery notice
     /// ("Session no longer resumable — starting fresh").
     ContextCompaction { summary: String },
+    /// What a turn changed on disk, closing that turn. Rendered as a
+    /// "N files changed +A −D" card, so an editing turn ends with what it did
+    /// rather than only what it said.
+    ///
+    /// Pushed at turn end and only when the turn changed something, so a
+    /// conversational turn adds nothing.
+    TurnDiff {
+        /// Per-file stats for the card's rows. Always populated — this is what
+        /// the card renders.
+        files: Vec<TurnFileChange>,
+        /// The turn's unified diff, when the backend reported one (Codex
+        /// `turn/diff/updated`). `Review` needs real hunks, so it is offered only
+        /// when this is present. Claude/ACP/Pi report no turn diff and their edit
+        /// cards carry fragments rather than line-numbered hunks, so their stats
+        /// are derived but this stays `None` rather than fabricating a diff whose
+        /// line numbers would be invented.
+        #[serde(default)]
+        diff: Option<String>,
+    },
 }
 
 /// A git checkpoint anchored to a user message. `sha` is the dangling commit

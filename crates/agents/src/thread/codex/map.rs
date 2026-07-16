@@ -164,7 +164,23 @@ fn map_root_notification(method: &str, params: &Value, st: &mut CodexState) -> V
             st.subagent_parent_by_thread.clear();
             st.subagent_buffer.clear();
             let usage = st.last_usage.take();
-            vec![ThreadEvent::TurnEnded { result: None, usage, is_error }]
+            // Take, don't clone: the diff belongs to the turn that just ended, and
+            // a turn that changes nothing must not inherit the previous turn's.
+            let turn_diff = st.turn_diff.take();
+            vec![ThreadEvent::TurnEnded { result: None, usage, is_error, turn_diff }]
+        }
+
+        // The turn's accumulated file changes. Each notification restates the
+        // WHOLE turn's diff (verified on captured 0.144.3 wire), so the newest
+        // simply replaces the last; `turn/completed` attaches it to `TurnEnded`.
+        // Stashed rather than emitted — a card per intermediate diff would churn
+        // the transcript for what is one summary.
+        super::protocol::N_TURN_DIFF_UPDATED => {
+            let diff = params.get("diff").and_then(|v| v.as_str()).unwrap_or_default();
+            // An empty diff means the turn's net change is nothing (an edit was
+            // reverted) — drop the stash rather than showing a card with no files.
+            st.turn_diff = (!diff.trim().is_empty()).then(|| diff.to_string());
+            Vec::new()
         }
 
         // --- usage --------------------------------------------------------
@@ -203,8 +219,7 @@ fn map_root_notification(method: &str, params: &Value, st: &mut CodexState) -> V
         }],
 
         // Housekeeping / telemetry / not-yet-surfaced — intentionally ignored:
-        // thread/started, thread/*, turn/diff/updated, mcpServer/*,
-        // skills/changed, remoteControl/*, …
+        // thread/started, thread/*, mcpServer/*, skills/changed, remoteControl/*, …
         //
         // `item/fileChange/outputDelta` is deliberately absent from this list:
         // probing app-server 0.144.3 with 300- and 400-line patches, a
@@ -451,7 +466,24 @@ fn item_completed(item: &Value, cwd: &std::path::Path) -> Vec<ThreadEvent> {
         }
         _ if tool_call(item).is_some() => {
             let (content, is_error, structured) = tool_result(ty, item);
-            vec![ThreadEvent::ToolResult { tool_use_id: id, content, is_error, structured }]
+            let mut out = Vec::new();
+            // A `subAgentActivity` is delivered ONLY as `item/completed` — codex
+            // never announces its start (verified on captured 0.144.3 wire). A
+            // result for an id the fold has never seen is dropped, so its card
+            // never existed, and the child-activity log addressed to that card id
+            // silently went nowhere. Open the card here so completion has
+            // something to settle.
+            //
+            // Deliberately NOT done for every tool item: an item's completed
+            // payload does not have to repeat its start fields (a completed
+            // `commandExecution` carries no `command`), so re-asserting a card
+            // from it would overwrite good input with empty values. This type
+            // carries its whole payload on completion, so it is safe here.
+            if ty == "subAgentActivity" {
+                out.extend(item_started(item));
+            }
+            out.push(ThreadEvent::ToolResult { tool_use_id: id, content, is_error, structured });
+            out
         }
         // userMessage/plan/hookPrompt/contextCompaction/review-modes/sleep: not
         // surfaced in the transcript here (sub-agent + image items route through
@@ -510,7 +542,7 @@ fn tool_call(item: &Value) -> Option<(String, Value)> {
         "mcpToolCall" => {
             let server = item.get("server").and_then(|v| v.as_str()).unwrap_or_default();
             let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or_default();
-            Some((format!("{server}.{tool}"), item.get("arguments").cloned().unwrap_or(Value::Null)))
+            Some((mcp_tool_name(server, tool), item.get("arguments").cloned().unwrap_or(Value::Null)))
         }
         "dynamicToolCall" => {
             let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("tool");
@@ -524,19 +556,156 @@ fn tool_call(item: &Value) -> Option<(String, Value)> {
         // `item/completed` follow-up can fill it with an inline thumbnail.
         "imageView" => Some(("view_image".to_string(), item.clone())),
         "imageGeneration" => Some(("generate_image".to_string(), item.clone())),
-        // Sub-agent items must always classify as SubAgent. The 0.144.1 schema
-        // populates `collabAgentToolCall.tool` with a freeform collab-tool name
-        // (`subAgentActivity` has no `tool` field), so the old `tool`-as-name
-        // path would fall to a generic card. Pass the item TYPE as the name —
-        // the tool-detail classifier recognizes it — and carry the full item as
-        // input so the card body still has the collab details.
-        "collabAgentToolCall" | "subAgentActivity" => Some((ty.to_string(), item.clone())),
+        // Sub-agent items. `collabAgentToolCall.tool` is a closed enum naming the
+        // collab ACTION (spawnAgent/sendInput/…), not the delegated tool, so it
+        // can't serve as the card name; `subAgentActivity` has no `tool` at all.
+        // Emit a display name here — the rest of the Codex normalization (shell
+        // unwrap, apply_patch) names at the mapper too — and carry the full item
+        // as input so the card body keeps the collab details. Both names classify
+        // as SubAgent; the raw types stay in the classifier for transcripts
+        // persisted before this rename.
+        "collabAgentToolCall" => Some((COLLAB_TOOL_NAME.to_string(), item.clone())),
+        "subAgentActivity" => Some((SUBAGENT_ACTIVITY_TOOL_NAME.to_string(), item.clone())),
         // Known non-tool items — not tool cards.
         "agentMessage" | "reasoning" | "plan" | "userMessage" | "hookPrompt"
         | "contextCompaction" | "enteredReviewMode" | "exitedReviewMode" | "sleep" => None,
         // Unknown type → a generic card keyed by the raw type, never dropped.
         other => Some((other.to_string(), item.clone())),
     }
+}
+
+/// The canonical `mcp__<server>__<tool>` name for a Codex MCP call, matching how
+/// Claude journals the same call. The mapper KNOWS this item is an MCP call, so
+/// naming it here lights up every existing `mcp__` path for free — the classifier
+/// (`ToolDetail::Mcp` → the `render_mcp` body) and the `<server> · <tool>` header
+/// humanizer — with no name heuristics anywhere else and no false positives on a
+/// genuinely dotted tool name.
+///
+/// The humanizer splits at the FIRST `__` after the prefix, so a server name
+/// containing `__` would be split in the wrong place; that case keeps the old
+/// `<server>.<tool>` name and its generic card. A `__` in the TOOL is harmless —
+/// it lands after the split — and result unwrapping is keyed on the item type,
+/// not the name, so even a fallback-named call still gets a legible body.
+fn mcp_tool_name(server: &str, tool: &str) -> String {
+    if server.is_empty() || tool.is_empty() || server.contains("__") {
+        return format!("{server}.{tool}");
+    }
+    format!("mcp__{server}__{tool}")
+}
+
+/// Flatten an `McpToolCallResult` envelope (`{content[], structuredContent?,
+/// _meta?}`) into the text a card body should show, so a card reads as the tool's
+/// output instead of the transport envelope.
+///
+/// Returns `(text, is_error)`. Precedence: the `content[]` text parts joined by
+/// newlines; else `structuredContent` pretty-printed; else the compact envelope
+/// JSON as a last resort, so an unrecognized shape still shows SOMETHING rather
+/// than an empty card. Non-text content parts (images, resource links) name their
+/// type — the body says "[image]" rather than dumping base64.
+///
+/// `isError` is not part of the codex envelope (a failed call is reported by the
+/// item's own `error`/`status`), but the underlying MCP `CallToolResult` defines
+/// it, so it is honoured if a server passes one through.
+fn unwrap_mcp_result(result: &Value) -> (String, bool) {
+    let is_error = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    let parts: Vec<String> = result
+        .get("content")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(mcp_content_part).collect())
+        .unwrap_or_default();
+    if !parts.is_empty() {
+        return (parts.join("\n"), is_error);
+    }
+    match result.get("structuredContent") {
+        Some(sc) if !sc.is_null() => {
+            (serde_json::to_string_pretty(sc).unwrap_or_else(|_| sc.to_string()), is_error)
+        }
+        _ => (result.to_string(), is_error),
+    }
+}
+
+/// One MCP content block → its display text. Text blocks yield their text; other
+/// block types yield a bracketed marker naming the kind. `None` for a block with
+/// nothing to show, so it doesn't contribute a blank line.
+fn mcp_content_part(block: &Value) -> Option<String> {
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") | None => {
+            let t = block.get("text").and_then(Value::as_str)?;
+            (!t.is_empty()).then(|| t.to_string())
+        }
+        Some(other) => Some(format!("[{other}]")),
+    }
+}
+
+/// Display name for a Codex `collabAgentToolCall` card. Its own `tool` field
+/// names the collab action and rides the card's target line instead.
+const COLLAB_TOOL_NAME: &str = "Agent";
+/// Display name for a Codex `subAgentActivity` card.
+const SUBAGENT_ACTIVITY_TOOL_NAME: &str = "Agent activity";
+
+/// One entry of a collab call's `agentsStates` map: the child thread id and the
+/// backend's last-known `CollabAgentState` for it.
+struct CollabAgent {
+    id: String,
+    status: String,
+    message: Option<String>,
+}
+
+/// Read `collabAgentToolCall.agentsStates` — a map of child thread id →
+/// `CollabAgentState { status, message? }`. Entries are sorted by id so a card
+/// body doesn't reshuffle between repaints (serde_json maps preserve insertion
+/// order, but the backend's is not promised to be stable). A non-object or
+/// absent map yields no agents rather than an error: the field is required by
+/// the schema, but a thin/older payload must still render a card.
+fn collab_agents(item: &Value) -> Vec<CollabAgent> {
+    let Some(map) = item.get("agentsStates").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let mut agents: Vec<CollabAgent> = map
+        .iter()
+        .map(|(id, state)| CollabAgent {
+            id: id.clone(),
+            // A state that isn't the documented object shape still names the
+            // agent — its status just reads as unknown.
+            status: state.get("status").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            message: state
+                .get("message")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string),
+        })
+        .collect();
+    agents.sort_by(|a, b| a.id.cmp(&b.id));
+    agents
+}
+
+/// Roll the per-agent states of a collab call up into the one status the card
+/// shows, by severity: any errored/notFound agent makes the group errored, any
+/// still-starting or running agent makes it running, an interrupted agent
+/// outranks a clean finish. `shutdown` counts as done (the agent was closed on
+/// purpose — `closeAgent` is a normal collab action).
+///
+/// A status outside the documented `CollabAgentStatus` enum is returned verbatim
+/// rather than being folded into "completed": a future backend state must read
+/// as itself on the card, not as a wrong success.
+fn rollup_agent_status(agents: &[CollabAgent]) -> Option<String> {
+    if agents.is_empty() {
+        return None;
+    }
+    let any = |s: &str| agents.iter().any(|a| a.status == s);
+    if any("errored") || any("notFound") {
+        return Some("errored".to_string());
+    }
+    if any("running") || any("pendingInit") {
+        return Some("running".to_string());
+    }
+    if any("interrupted") {
+        return Some("interrupted".to_string());
+    }
+    if let Some(unknown) = agents.iter().find(|a| !matches!(a.status.as_str(), "completed" | "shutdown")) {
+        return Some(unknown.status.clone());
+    }
+    Some("completed".to_string())
 }
 
 /// Build the `ToolResult` payload for a completed tool item.
@@ -563,7 +732,30 @@ fn tool_result(ty: &str, item: &Value) -> (String, bool, Option<Value>) {
                 .unwrap_or_default();
             (diffs, failed, item.get("changes").cloned())
         }
-        "mcpToolCall" | "dynamicToolCall" => {
+        // An MCP call's `result` is a `McpToolCallResult` envelope — unwrap it so
+        // the body reads as the tool's output. An `error` (`{message}`) wins over
+        // the result and reads as its message; the full envelope stays on
+        // `structured` for the raw/sheet views.
+        "mcpToolCall" => {
+            let err = item.get("error").filter(|e| !e.is_null());
+            if let Some(e) = err {
+                let msg = e
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| e.to_string());
+                return (msg, true, item.get("result").cloned());
+            }
+            match item.get("result").filter(|r| !r.is_null()) {
+                Some(result) => {
+                    let (content, envelope_error) = unwrap_mcp_result(result);
+                    (content, failed || envelope_error, Some(result.clone()))
+                }
+                None => (String::new(), failed, None),
+            }
+        }
+        // A dynamic tool's `result` has no envelope contract — render it verbatim.
+        "dynamicToolCall" => {
             let err = item.get("error");
             let is_error = failed || err.map(|e| !e.is_null()).unwrap_or(false);
             let content = err
@@ -572,6 +764,52 @@ fn tool_result(ty: &str, item: &Value) -> (String, bool, Option<Value>) {
                 .map(|v| v.to_string())
                 .unwrap_or_default();
             (content, is_error, item.get("result").cloned())
+        }
+        // A completed collab call: its own `status` decides whether the CALL
+        // failed, while `agentsStates` describes the agents it targeted. Both are
+        // surfaced — the rolled-up agent status is what the body leads with, and
+        // the per-agent rows carry any message the backend attached.
+        "collabAgentToolCall" => {
+            let agents = collab_agents(item);
+            let rolled = rollup_agent_status(&agents);
+            let n = agents.len();
+            let mut bits = Vec::new();
+            if n > 0 {
+                bits.push(format!("{n} agent{}", if n == 1 { "" } else { "s" }));
+            }
+            if let Some(r) = rolled.clone() {
+                bits.push(r);
+            } else if !status.is_empty() {
+                // No agent states on the wire — the call's own status is all the
+                // body can honestly report, which still beats an empty card.
+                bits.push(status.to_string());
+            }
+            let structured = json!({
+                "type": ty,
+                "tool": item.get("tool").cloned().unwrap_or(Value::Null),
+                "status": rolled.unwrap_or_else(|| status.to_string()),
+                "callStatus": status,
+                "agents": agents
+                    .iter()
+                    .map(|a| json!({ "id": a.id, "status": a.status, "message": a.message }))
+                    .collect::<Vec<_>>(),
+            });
+            (bits.join(" · "), failed, Some(structured))
+        }
+        // `subAgentActivity` reports one child agent's lifecycle beat. It carries
+        // no `status` field at all (so it never reads as failed) — `kind` and the
+        // agent's identity are the whole payload.
+        "subAgentActivity" => {
+            let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or_default();
+            let path = item.get("agentPath").and_then(|v| v.as_str()).unwrap_or_default();
+            let body = [kind, path].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
+            let structured = json!({
+                "type": ty,
+                "status": kind,
+                "agentPath": path,
+                "agentThreadId": item.get("agentThreadId").cloned().unwrap_or(Value::Null),
+            });
+            (body, false, Some(structured))
         }
         // A completed web search carries the query + the action taken (search /
         // openPage / find). It has no separate results field on the wire, so the
@@ -653,6 +891,131 @@ fn join_strings(v: Option<&Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::thread::state::ChatThread;
+    use crate::thread::{ThreadEntry, ToolCallStatus, ToolDetail};
+
+    /// Replay a captured `codex app-server` session, mapping every line exactly
+    /// as the live worker does, and fold the result into the REAL `ChatThread` —
+    /// so the assertions are about the transcript a user actually sees rather
+    /// than a re-implementation of the fold rules.
+    ///
+    /// The fixtures are real server→client bytes from codex-cli **0.144.3**,
+    /// captured over the same handshake `protocol.rs` drives (initialize →
+    /// initialized → thread/start → turn/start), then trimmed of the operator's
+    /// personal channels (hooks, account/rate limits, MCP server list) and
+    /// redacted of home paths. JSON-RPC responses are excluded: the transport
+    /// correlates those and the mapper never sees them.
+    ///
+    /// To regenerate after a codex upgrade: drive that handshake against
+    /// `codex app-server`, tee every server→client line, and re-run the same
+    /// prompts — "Use the node_repl MCP tool to evaluate 6*7" and "Spawn a
+    /// collaborator subagent to verify <file>, then wait for it".
+    fn replay(fixture: &str) -> (Vec<ThreadEvent>, CodexState) {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/thread/testdata/");
+        let raw = std::fs::read_to_string(format!("{dir}{fixture}")).expect("fixture");
+        let mut st = CodexState::default();
+        let mut out = Vec::new();
+        for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+            let v: Value = serde_json::from_str(line).expect("captured line must parse");
+            let method = v.get("method").and_then(Value::as_str).expect("a notification");
+            let params = v.get("params").cloned().unwrap_or(Value::Null);
+            // The worker records the root thread id from the thread/start
+            // response; the fixture holds only notifications, so seed it from
+            // `thread/started` the same way — this is what makes a sub-agent's
+            // thread read as foreign.
+            if method == "thread/started"
+                && let Some(id) = params.pointer("/thread/id").and_then(Value::as_str)
+            {
+                st.thread_id = Some(id.to_string());
+            }
+            out.extend(map_notification(method, &params, &mut st));
+        }
+        (out, st)
+    }
+
+    /// Fold replayed events into the transcript the user sees.
+    fn render(events: &[ThreadEvent]) -> ChatThread {
+        let mut t = ChatThread::default();
+        for e in events {
+            t.apply(e);
+        }
+        t
+    }
+
+    /// Every tool card in the folded transcript, in order.
+    fn tool_cards(t: &ChatThread) -> Vec<&crate::thread::tool_call::ToolCall> {
+        t.entries
+            .iter()
+            .filter_map(|e| match e {
+                ThreadEntry::ToolCall(tc) => Some(tc),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn replays_a_captured_mcp_turn_into_a_humanized_unwrapped_card() {
+        let (events, _) = replay("codex-mcp-call-turn.jsonl");
+        let thread = render(&events);
+        let cards = tool_cards(&thread);
+        let mcp = cards
+            .iter()
+            .find(|c| c.name.starts_with("mcp__"))
+            .expect("the captured turn made an MCP call");
+
+        // Named like Claude journals the same call, so it classifies + humanizes.
+        assert_eq!(mcp.name, "mcp__node_repl__js");
+        assert_eq!(ToolDetail::classify(&mcp.name, None, &mcp.input), ToolDetail::Mcp);
+        // The regression this fixture locks: the body was the raw envelope
+        // (`{"content":[{"type":"text","text":""}],...}`), not the tool's answer.
+        assert_eq!(mcp.result.as_deref(), Some("42"), "body reads the tool's text");
+        assert!(matches!(mcp.status, ToolCallStatus::Completed));
+        // The envelope survives for the raw/sheet view.
+        assert!(mcp.structured.as_ref().expect("envelope kept")["content"].is_array());
+    }
+
+    #[test]
+    fn replays_a_captured_collab_turn_into_a_humanized_card_with_child_activity() {
+        let (events, _) = replay("codex-collab-turn.jsonl");
+        let thread = render(&events);
+        let cards = tool_cards(&thread);
+
+        // The real spawn surfaces as a `subAgentActivity` naming the child, and a
+        // separate `wait` collab call — NOT as a `spawnAgent` collab call. Both
+        // read as humanized SubAgent cards rather than raw camelCase types.
+        for c in &cards {
+            assert_eq!(
+                ToolDetail::classify(&c.name, None, &c.input),
+                ToolDetail::SubAgent,
+                "every card in this turn is a sub-agent card, got {}",
+                c.name
+            );
+        }
+        let activity = cards.iter().find(|c| c.name == "Agent activity").expect("an activity card");
+        assert_eq!(activity.structured.as_ref().unwrap()["agentPath"], "/root/verify_scratch_file");
+
+        let wait = cards.iter().find(|c| c.name == "Agent").expect("a collab card");
+        assert_eq!(wait.input["tool"], "wait");
+        // This capture's `agentsStates` is EMPTY — a real spawn+wait reports no
+        // per-agent states at all, so the body must degrade to the call's own
+        // status instead of rendering blank (the live-verified round-9 bug).
+        assert_eq!(wait.input["agentsStates"], json!({}));
+        assert_eq!(wait.result.as_deref(), Some("completed"), "thin payload still gets a body");
+
+        // The child thread's work is attached to its parent card rather than
+        // leaking into the root transcript.
+        let log: Vec<&String> = cards.iter().flat_map(|c| c.subagent_log.iter()).collect();
+        assert!(!log.is_empty(), "the child's actions attach to a parent card");
+        assert!(
+            log.iter().any(|l| l.contains("scratch-verify.txt")),
+            "the child's command shows in the parent's activity log, got {log:?}"
+        );
+        // …and the root transcript never grows a card for the child's own tools.
+        assert!(
+            !cards.iter().any(|c| c.name == "Bash"),
+            "the sub-agent's command must not surface as a root card"
+        );
+    }
 
     fn st() -> CodexState {
         CodexState::default()
@@ -694,14 +1057,18 @@ mod tests {
                              "aggregatedOutput": "total 0", "exitCode": 0}}),
             &mut s,
         );
-        match &done[..] {
-            [ThreadEvent::ToolResult { tool_use_id, content, is_error, .. }] => {
-                assert_eq!(tool_use_id, "it1");
-                assert_eq!(content, "total 0");
-                assert!(!is_error);
-            }
-            other => panic!("expected one ToolResult, got {other:?}"),
-        }
+        let (content, is_error, _) = result_of(&done);
+        assert_eq!(content, "total 0");
+        assert!(!is_error);
+        // One started + one completed settle ONE card, and completion must not
+        // clobber the input the start established — a completed command item
+        // does not repeat its `command`.
+        let thread = render(&[started, done].concat());
+        let cards = tool_cards(&thread);
+        assert_eq!(cards.len(), 1, "one card for one command, got {cards:?}");
+        assert_eq!(cards[0].id, "it1");
+        assert_eq!(cards[0].input["command"], "ls -la", "the started input survives completion");
+        assert!(matches!(cards[0].status, ToolCallStatus::Completed));
     }
 
     #[test]
@@ -712,7 +1079,7 @@ mod tests {
                              "aggregatedOutput": "boom", "exitCode": 2}}),
             &mut st(),
         );
-        assert!(matches!(&done[0], ThreadEvent::ToolResult { is_error: true, .. }));
+        assert!(result_of(&done).1, "a nonzero exit fails the card");
     }
 
     #[test]
@@ -746,14 +1113,9 @@ mod tests {
                              "changes": [{"path": "a.txt", "kind": "update", "diff": "@@ -1 +1 @@\n-a\n+b"}]}}),
             &mut st(),
         );
-        match &done[..] {
-            [ThreadEvent::ToolResult { tool_use_id, content, is_error, .. }] => {
-                assert_eq!(tool_use_id, "f1");
-                assert!(content.contains("+b"));
-                assert!(!is_error);
-            }
-            other => panic!("expected ToolResult with diff, got {other:?}"),
-        }
+        let (content, is_error, _) = result_of(&done);
+        assert!(content.contains("+b"));
+        assert!(!is_error);
     }
 
     #[test]
@@ -1234,19 +1596,251 @@ mod tests {
             &json!({"itemId":"c1","stdin":""}), &mut st()).is_empty());
     }
 
+    /// Complete an `mcpToolCall` carrying `result`/`error`, and read back its
+    /// `(content, is_error, structured)`.
+    fn mcp_completed(payload: Value) -> (String, bool, Value) {
+        let mut item = json!({
+            "type": "mcpToolCall", "id": "m1", "server": "node_repl", "tool": "js",
+            "arguments": {"code": "6*7"}, "status": "completed",
+        });
+        for (k, v) in payload.as_object().unwrap() {
+            item[k] = v.clone();
+        }
+        result_of(&map_notification("item/completed", &json!({ "item": item }), &mut st()))
+    }
+
     #[test]
-    fn sub_agent_items_classify_via_type_name() {
-        // A `collabAgentToolCall` with a populated `tool` field must still be a
-        // SubAgent card — the mapper passes the item TYPE as the name so the
-        // classifier recognizes it (the `tool` value would otherwise be generic).
+    fn mcp_call_is_named_like_claude_and_classifies_as_mcp() {
         let started = map_notification(
             "item/started",
-            &json!({"item":{"type":"collabAgentToolCall","id":"sa1","tool":"spawn","status":"inProgress"}}),
+            &json!({"item":{"type":"mcpToolCall","id":"m1","server":"node_repl","tool":"js",
+                    "arguments":{"code":"6*7"},"status":"inProgress"}}),
             &mut st(),
         );
         match &started[..] {
-            [ThreadEvent::ToolCallStarted { name, .. }] => assert_eq!(name, "collabAgentToolCall"),
+            [ThreadEvent::ToolCallStarted { name, input, .. }] => {
+                assert_eq!(name, "mcp__node_repl__js", "canonical mcp__server__tool name");
+                assert_eq!(ToolDetail::classify(name, None, input), ToolDetail::Mcp);
+                assert_eq!(input["code"], "6*7", "arguments stay the card input");
+            }
             other => panic!("expected ToolCallStarted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mcp_tool_name_falls_back_when_the_server_would_break_the_split() {
+        // The header humanizer splits at the first `__`, so a server containing
+        // `__` keeps the old name rather than rendering a mis-split header.
+        assert_eq!(mcp_tool_name("my__srv", "x"), "my__srv.x");
+        // A `__` in the TOOL lands after the split — still canonical.
+        assert_eq!(mcp_tool_name("srv", "my__tool"), "mcp__srv__my__tool");
+        // Absent server/tool must not produce a `mcp____x` name.
+        assert_eq!(mcp_tool_name("", "x"), ".x");
+        assert_eq!(mcp_tool_name("srv", ""), "srv.");
+    }
+
+    #[test]
+    fn mcp_result_envelope_unwraps_to_its_text() {
+        // The live-verified regression: the envelope itself was the body.
+        let (content, is_error, structured) = mcp_completed(json!({
+            "result": {"content": [{"type": "text", "text": "42"}],
+                       "structuredContent": null, "_meta": null}
+        }));
+        assert_eq!(content, "42", "the tool's text, not the envelope JSON");
+        assert!(!is_error);
+        assert!(structured["content"].is_array(), "the full envelope stays for the sheet");
+    }
+
+    #[test]
+    fn mcp_result_covers_the_envelope_variants() {
+        // Several text parts join by newline.
+        let (content, ..) = mcp_completed(json!({
+            "result": {"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}
+        }));
+        assert_eq!(content, "a\nb");
+        // Non-text parts name their kind instead of dumping bytes.
+        let (content, ..) = mcp_completed(json!({
+            "result": {"content": [{"type": "image", "data": "iVBORw0KGgo="}]}
+        }));
+        assert_eq!(content, "[image]");
+        // Empty text + structuredContent → the structured payload, pretty-printed.
+        let (content, ..) = mcp_completed(json!({
+            "result": {"content": [{"type": "text", "text": ""}],
+                       "structuredContent": {"answer": 42}}
+        }));
+        assert!(content.contains("\"answer\": 42"), "structuredContent rendered, got {content:?}");
+        // Neither → the compact envelope, so the card is never blank.
+        let (content, ..) = mcp_completed(json!({"result": {"content": []}}));
+        assert_eq!(content, r#"{"content":[]}"#);
+        // A non-object result must not panic.
+        let (content, ..) = mcp_completed(json!({"result": "plain"}));
+        assert_eq!(content, "\"plain\"");
+        // No result at all → an empty body, not a crash.
+        let (content, is_error, _) = mcp_completed(json!({"result": Value::Null}));
+        assert_eq!(content, "");
+        assert!(!is_error);
+    }
+
+    #[test]
+    fn mcp_errors_mark_the_card_failed() {
+        // An item-level error reads as its message.
+        let (content, is_error, _) =
+            mcp_completed(json!({"status": "failed", "error": {"message": "server crashed"}}));
+        assert_eq!(content, "server crashed");
+        assert!(is_error);
+        // A failed status alone still fails the card.
+        let (_, is_error, _) = mcp_completed(json!({
+            "status": "failed", "result": {"content": [{"type": "text", "text": "nope"}]}
+        }));
+        assert!(is_error);
+        // An MCP-level `isError` envelope fails the card too.
+        let (content, is_error, _) = mcp_completed(json!({
+            "result": {"content": [{"type": "text", "text": "bad input"}], "isError": true}
+        }));
+        assert_eq!(content, "bad input");
+        assert!(is_error, "an isError envelope must fail the card");
+    }
+
+    #[test]
+    fn sub_agent_items_get_humanized_names_that_still_classify() {
+        // The mapper names collab items for the header; both names must classify
+        // as SubAgent, and the raw item (incl. its `type`) must stay on the input
+        // so the card can render the collab detail.
+        let started = map_notification(
+            "item/started",
+            &json!({"item":{"type":"collabAgentToolCall","id":"sa1","tool":"spawnAgent","status":"inProgress"}}),
+            &mut st(),
+        );
+        match &started[..] {
+            [ThreadEvent::ToolCallStarted { name, input, .. }] => {
+                assert_eq!(name, "Agent");
+                assert_eq!(input["type"], "collabAgentToolCall");
+                assert_eq!(ToolDetail::classify(name, None, input), ToolDetail::SubAgent);
+            }
+            other => panic!("expected ToolCallStarted, got {other:?}"),
+        }
+        let activity = map_notification(
+            "item/started",
+            &json!({"item":{"type":"subAgentActivity","id":"act1","agentPath":"reviewer","agentThreadId":"t9","kind":"started"}}),
+            &mut st(),
+        );
+        match &activity[..] {
+            [ThreadEvent::ToolCallStarted { name, input, .. }] => {
+                assert_eq!(name, "Agent activity");
+                assert_eq!(ToolDetail::classify(name, None, input), ToolDetail::SubAgent);
+            }
+            other => panic!("expected ToolCallStarted, got {other:?}"),
+        }
+    }
+
+    /// Build a completed `collabAgentToolCall` with the given `agentsStates` map.
+    fn collab_completed(states: Value, call_status: &str) -> Vec<ThreadEvent> {
+        map_notification(
+            "item/completed",
+            &json!({"item":{
+                "type":"collabAgentToolCall","id":"c1","tool":"spawnAgent",
+                "senderThreadId":"root","receiverThreadIds":["t1"],
+                "status":call_status,"agentsStates":states,
+            }}),
+            &mut st(),
+        )
+    }
+
+    /// The `(content, is_error, structured)` of the ToolResult in `evs`.
+    fn result_of(evs: &[ThreadEvent]) -> (String, bool, Value) {
+        match evs.iter().find(|e| matches!(e, ThreadEvent::ToolResult { .. })) {
+            Some(ThreadEvent::ToolResult { content, is_error, structured, .. }) => {
+                (content.clone(), *is_error, structured.clone().unwrap_or(Value::Null))
+            }
+            _ => panic!("expected a ToolResult in {evs:?}"),
+        }
+    }
+
+    #[test]
+    fn collab_completion_body_reports_agents_and_rolled_up_status() {
+        let (content, is_error, structured) = result_of(&collab_completed(
+            json!({"t1": {"status": "completed"}, "t2": {"status": "completed"}}),
+            "completed",
+        ));
+        assert_eq!(content, "2 agents · completed");
+        assert!(!is_error);
+        assert_eq!(structured["status"], "completed");
+        assert_eq!(structured["tool"], "spawnAgent");
+        assert_eq!(structured["agents"].as_array().unwrap().len(), 2);
+        assert_eq!(structured["agents"][0]["id"], "t1");
+    }
+
+    #[test]
+    fn collab_status_rolls_up_by_severity() {
+        // Any errored agent makes the group errored, even alongside a runner.
+        let (content, _, s) = result_of(&collab_completed(
+            json!({"a": {"status": "completed"}, "b": {"status": "errored"}, "c": {"status": "running"}}),
+            "completed",
+        ));
+        assert_eq!(s["status"], "errored");
+        assert_eq!(content, "3 agents · errored");
+        // …then running outranks a clean finish,
+        let (_, _, s) = result_of(&collab_completed(
+            json!({"a": {"status": "completed"}, "b": {"status": "running"}}),
+            "completed",
+        ));
+        assert_eq!(s["status"], "running");
+        // …a pending agent counts as running,
+        let (_, _, s) =
+            result_of(&collab_completed(json!({"a": {"status": "pendingInit"}}), "inProgress"));
+        assert_eq!(s["status"], "running");
+        // …interrupted outranks completed,
+        let (_, _, s) = result_of(&collab_completed(
+            json!({"a": {"status": "interrupted"}, "b": {"status": "completed"}}),
+            "completed",
+        ));
+        assert_eq!(s["status"], "interrupted");
+        // …a deliberately closed agent is done, not a failure,
+        let (_, _, s) = result_of(&collab_completed(
+            json!({"a": {"status": "shutdown"}, "b": {"status": "completed"}}),
+            "completed",
+        ));
+        assert_eq!(s["status"], "completed");
+        // …and a missing agent is a failure.
+        let (_, _, s) = result_of(&collab_completed(json!({"a": {"status": "notFound"}}), "completed"));
+        assert_eq!(s["status"], "errored");
+    }
+
+    #[test]
+    fn collab_result_is_lenient_about_thin_or_unknown_payloads() {
+        // No agentsStates at all → the call's own status carries the body.
+        let (content, _, s) = result_of(&collab_completed(json!({}), "completed"));
+        assert_eq!(content, "completed");
+        assert_eq!(s["agents"].as_array().unwrap().len(), 0);
+        // An unknown future state renders verbatim rather than as a wrong success.
+        let (_, _, s) = result_of(&collab_completed(json!({"a": {"status": "teleporting"}}), "completed"));
+        assert_eq!(s["status"], "teleporting");
+        // A failed CALL marks the card failed regardless of agent states.
+        let (_, is_error, _) =
+            result_of(&collab_completed(json!({"a": {"status": "completed"}}), "failed"));
+        assert!(is_error, "a failed collab call must mark its card failed");
+        // The backend's per-agent message rides along for the card row.
+        let (_, _, s) = result_of(&collab_completed(
+            json!({"a": {"status": "errored", "message": "boom"}}),
+            "completed",
+        ));
+        assert_eq!(s["agents"][0]["message"], "boom");
+    }
+
+    #[test]
+    fn sub_agent_activity_completion_reports_kind_and_path() {
+        // `subAgentActivity` has no `status` field on the wire — it must never
+        // read as a failure just because status is absent.
+        let evs = map_notification(
+            "item/completed",
+            &json!({"item":{"type":"subAgentActivity","id":"a1","agentPath":"reviewer",
+                    "agentThreadId":"t7","kind":"started"}}),
+            &mut st(),
+        );
+        let (content, is_error, s) = result_of(&evs);
+        assert_eq!(content, "started · reviewer");
+        assert!(!is_error);
+        assert_eq!(s["status"], "started");
+        assert_eq!(s["agentPath"], "reviewer");
     }
 }

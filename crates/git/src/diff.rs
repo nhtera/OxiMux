@@ -406,6 +406,56 @@ fn parse_range_spec(s: &str) -> Option<(u32, u32)> {
 }
 
 #[cfg(test)]
+mod turn_diff_tests {
+    use super::*;
+
+    /// A real `turn/diff/updated` payload from codex-cli 0.144.3 — the bytes the
+    /// chat's turn-end "Review" hands to `DiffView::load_virtual`. That path
+    /// renders whatever THIS parser returns, so an agent turn's diff has to parse
+    /// like any `git diff -p` stdout, not merely almost.
+    const CODEX_TURN_DIFF: &str = "\
+diff --git a/notes.txt b/notes.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..1bf1b6700c0ad94e7e27c1a6b81455992f3cf510
+--- /dev/null
++++ b/notes.txt
+@@ -0,0 +1,2 @@
++First note
++Second note
+diff --git a/scratch-verify.txt b/scratch-verify.txt
+index ce013625030ba8dba906f756967f9e9ca394464a..13f7029cea893004d08af7999d068a2bb6d24788
+--- a/scratch-verify.txt
++++ b/scratch-verify.txt
+@@ -1 +1,2 @@
+ hello
++verified
+";
+
+    #[test]
+    fn a_captured_codex_turn_diff_parses_like_git_stdout() {
+        let files = parse_unified_diff(CODEX_TURN_DIFF).expect("codex turn diff parses");
+        assert_eq!(files.len(), 2, "the turn changed two files");
+
+        // A file the turn CREATED must read as added, not as a mystery edit —
+        // its pre-image is /dev/null.
+        assert_eq!(files[0].path, std::path::Path::new("notes.txt"));
+        assert_eq!(files[0].status, DiffStatus::Added);
+        assert_eq!(files[0].mode, Some(0o100644), "the new file's mode survives");
+
+        // …and a file it appended to reads as modified, with the context line kept
+        // so the hunk renders as a diff rather than a bare insert.
+        assert_eq!(files[1].path, std::path::Path::new("scratch-verify.txt"));
+        assert_eq!(files[1].status, DiffStatus::Modified);
+        let lines = &files[1].hunks[0].lines;
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].kind, DiffLineKind::Context);
+        assert_eq!(lines[0].content, "hello");
+        assert_eq!(lines[1].kind, DiffLineKind::Added);
+        assert_eq!(lines[1].content, "verified");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

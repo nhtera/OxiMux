@@ -84,6 +84,11 @@ struct CodexState {
     /// Tool items (commandExecution / fileChange) by itemId, so a later approval
     /// request — which carries only the itemId — can show the command / changes.
     cmd_items: HashMap<String, Value>,
+    /// The turn's accumulated unified diff, from the latest `turn/diff/updated`.
+    /// The notification is CUMULATIVE (each one restates the whole turn's diff),
+    /// so the last one wins; `turn/completed` takes it onto `TurnEnded` and
+    /// leaves this empty for the next turn.
+    turn_diff: Option<String>,
     /// Pending approvals: our permission-card `request_id` → the Codex JSON-RPC
     /// request id we must answer with a `{decision}` once the user chooses.
     pending_approvals: HashMap<String, Value>,
