@@ -19,6 +19,8 @@ mod composer;
 mod composer_history;
 mod acp_terminal_host;
 mod context_meter;
+mod dictation_service;
+mod dictation_ui;
 mod context_providers;
 mod diff_card;
 mod error_card;
@@ -45,6 +47,18 @@ mod tool_grouping;
 /// Install the ACP embedded-terminal host at app boot so ACP agents can drive
 /// live inline terminals (re-exported for `main` to call once).
 pub use acp_terminal_host::install as install_acp_terminal_host;
+
+/// Install the process-wide voice-dictation service (controller + model
+/// manager) at app boot — re-exported for `main` to call once.
+pub use dictation_service::install as install_dictation_service;
+
+/// Model-management entry points the Voice settings pane drives (the recorder
+/// `start`/`stop` stay internal — they carry a `ComposerView` handle). Re-exported
+/// at crate scope so `settings_modal` can reach them without the private module.
+pub(crate) use dictation_service::{
+    cancel_download as cancel_model_download, delete as delete_model, download as download_model,
+    status as model_status,
+};
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};

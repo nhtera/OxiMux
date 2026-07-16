@@ -21,7 +21,8 @@ use crate::actions::{
     SelectSourceControlTab,
     SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SplitHorizontal,
     SplitSubPaneDown, SplitSubPaneRight, SplitVertical, ToggleChatTerminalView,
-    ToggleFloatingTerminal, ToggleLeftSidebar, ToggleRightSidebar, ToggleZoomSubPane,
+    ToggleDictation, ToggleFloatingTerminal, ToggleLeftSidebar, ToggleRightSidebar,
+    ToggleZoomSubPane,
 };
 use crate::menu::{HideApp, HideOthers, Minimize, Quit};
 use oximux_editor::{EditorZoomIn, EditorZoomOut, EditorZoomReset, SaveFile};
@@ -55,6 +56,7 @@ pub const ACTIONS: &[ActionSpec] = &[
     entry!("open_workspace_create", "New workspace", Global, "cmd-shift-n", OpenWorkspaceCreate),
     entry!("new_agent", "New agent", Global, "cmd-shift-a", NewAgent),
     entry!("new_agent_chat", "New agent chat", Global, "cmd-shift-c", NewAgentChat),
+    entry!("toggle_dictation", "Toggle voice dictation", Global, "cmd-e", ToggleDictation),
     entry!(
         "toggle_floating_terminal",
         "Toggle floating terminal",

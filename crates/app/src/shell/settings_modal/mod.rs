@@ -19,6 +19,7 @@ mod pane_agents_launch;
 mod pane_keybindings;
 mod pane_notifications;
 mod pane_terminal;
+mod pane_voice;
 mod view;
 
 pub use nav::SettingsPane;
@@ -32,7 +33,8 @@ use gpui::{
 };
 use gpui_component::input::{InputEvent, InputState};
 use oximux_settings::{
-    AgentLaunchSettings, CommitMessageAiSettings, Density, TerminalSettings, Theme, Typography,
+    AgentLaunchSettings, CommitMessageAiSettings, Density, DictationSettings, TerminalSettings,
+    Theme, Typography,
 };
 use oximux_storage::SettingsRepo;
 
@@ -67,6 +69,9 @@ pub struct SettingsModal {
     /// global at each `open()`. Edits mutate this, then write
     /// `agent_launch.toml`; the watcher reloads + swaps the global.
     pub(crate) agent_launch: AgentLaunchSettings,
+    /// Working copy of the voice-dictation settings; reseeded from the live
+    /// global at each `open()`. Edits mutate this, then write `dictation.toml`.
+    pub(crate) dictation: DictationSettings,
     /// Live notification prefs shared with the notifier. The Agents pane
     /// toggles flip these atomics directly (interior mutability) so the
     /// change takes effect on the next dispatch without a reload.
@@ -122,6 +127,7 @@ impl SettingsModal {
             terminal: TerminalSettings::default(),
             ai: CommitMessageAiSettings::default(),
             agent_launch: AgentLaunchSettings::default(),
+            dictation: DictationSettings::default(),
             notify,
             notify_repo,
             notifier,
@@ -160,6 +166,10 @@ impl SettingsModal {
             .unwrap_or_default();
         self.agent_launch = cx
             .try_global::<AgentLaunchSettings>()
+            .cloned()
+            .unwrap_or_default();
+        self.dictation = cx
+            .try_global::<DictationSettings>()
             .cloned()
             .unwrap_or_default();
         // Reseed the keybinding overrides from disk (hand edits since boot
@@ -254,6 +264,15 @@ impl SettingsModal {
     pub(super) fn persist_agent_launch(&mut self, cx: &mut Context<Self>) {
         if let Err(err) = crate::agent_launch_settings::save(&self.agent_launch) {
             tracing::warn!(%err, "settings modal: failed to write agent_launch.toml");
+        }
+        cx.notify();
+    }
+
+    /// Persist the voice working copy to `dictation.toml`. The watcher reloads +
+    /// swaps the global; we never set the global here.
+    pub(super) fn persist_voice(&mut self, cx: &mut Context<Self>) {
+        if let Err(err) = crate::dictation_settings::save(&self.dictation) {
+            tracing::warn!(%err, "settings modal: failed to write dictation.toml");
         }
         cx.notify();
     }

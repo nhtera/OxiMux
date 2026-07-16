@@ -198,6 +198,8 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/columns.svg",
         include_bytes!("../assets/icons/columns.svg"),
     ),
+    // Voice-dictation mic button in the Agent Chat composer.
+    ("icons/mic.svg", include_bytes!("../assets/icons/mic.svg")),
 ];
 
 impl AssetSource for AppAssets {

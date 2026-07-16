@@ -22,6 +22,7 @@ const NAV_WIDTH: f32 = 184.0;
 pub enum SettingsPane {
     Terminal,
     Agents,
+    Voice,
     Notifications,
     Keybindings,
     Appearance,
@@ -29,9 +30,10 @@ pub enum SettingsPane {
 }
 
 impl SettingsPane {
-    pub(super) const ALL: [SettingsPane; 6] = [
+    pub(super) const ALL: [SettingsPane; 7] = [
         SettingsPane::Terminal,
         SettingsPane::Agents,
+        SettingsPane::Voice,
         SettingsPane::Notifications,
         SettingsPane::Keybindings,
         SettingsPane::Appearance,
@@ -42,6 +44,7 @@ impl SettingsPane {
         match self {
             SettingsPane::Terminal => "Terminal",
             SettingsPane::Agents => "Agents / AI",
+            SettingsPane::Voice => "Voice",
             SettingsPane::Notifications => "Notifications",
             SettingsPane::Keybindings => "Keybindings",
             SettingsPane::Appearance => "Appearance",
@@ -56,6 +59,7 @@ impl SettingsPane {
         match self {
             SettingsPane::Terminal => "icons/square-terminal.svg",
             SettingsPane::Agents => "icons/sparkles.svg",
+            SettingsPane::Voice => "icons/mic.svg",
             SettingsPane::Notifications => "icons/bell.svg",
             SettingsPane::Keybindings => "icons/keyboard.svg",
             SettingsPane::Appearance => "icons/palette.svg",

@@ -7,6 +7,7 @@
 
 pub mod app_nap;
 pub mod menu;
+pub mod mic_permission;
 pub mod single_instance;
 pub mod window_factory;
 pub mod window_registry;

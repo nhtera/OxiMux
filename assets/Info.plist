@@ -30,5 +30,7 @@
     <false/>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>OxiMux uses the microphone for voice dictation.</string>
 </dict>
 </plist>

@@ -11,7 +11,7 @@ use oximux_settings::{Density, Typography};
 
 use super::{
     CARD_HEIGHT, CARD_WIDTH, SettingsModal, SettingsPane, layout, nav, pane_about, pane_agents,
-    pane_keybindings, pane_notifications, pane_terminal,
+    pane_keybindings, pane_notifications, pane_terminal, pane_voice,
 };
 
 /// Drag payload marker for the title-bar move gesture. Mirrors the floating
@@ -49,6 +49,10 @@ impl SettingsModal {
                     pane_agents::entries(self, theme, density, typography, cx),
                 ),
                 (
+                    SettingsPane::Voice.label(),
+                    pane_voice::entries(self, theme, density, typography, cx),
+                ),
+                (
                     SettingsPane::Notifications.label(),
                     pane_notifications::entries(self, theme, density, typography, cx),
                 ),
@@ -71,6 +75,7 @@ impl SettingsModal {
         match self.selected {
             SettingsPane::Terminal => pane_terminal::render(self, theme, density, typography, cx),
             SettingsPane::Agents => pane_agents::render(self, theme, density, typography, cx),
+            SettingsPane::Voice => pane_voice::render(self, theme, density, typography, cx),
             SettingsPane::Notifications => {
                 pane_notifications::render(self, theme, density, typography, cx)
             }

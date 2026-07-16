@@ -4,6 +4,35 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-16 — Voice dictation (Vietnamese-first, offline) for Agent Chat (`feat/voice-dictation-vietnamese`)
+
+Local speech-to-text in the Agent Chat composer. Vietnamese is the priority, so
+the engine is **sherpa-onnx** running **Whisper** offline (multilingual incl.
+`vi`), with **Parakeet TDT v3** as the best-English option. No cloud, no audio
+leaves the process.
+
+**Shipped:**
+- **New `crates/dictation`** (mirrors the `crates/pty` convention, no GPUI dep):
+  cpal capture at device rate → linear resample to 16 kHz → sherpa-rs offline
+  decode on a dedicated worker thread. Silence gate, 30 s chunked decode
+  (SIGTRAP mitigation), 2-minute hard cap, warm engine cache w/ 10-min idle
+  teardown. `Drop` only signals — never blocks the GPUI main thread.
+- **Model catalog + download manager**: 3 models (whisper-small default,
+  whisper-tiny, parakeet-v3-int8) from k2-fsa releases; resumable HTTP Range
+  download, optional SHA-256 verify, `tar` extract, disk-truth status scan.
+- **Composer UI**: mic button + recording pill (mm:ss + RMS meter), `Cmd+E`
+  toggle, Escape cancels, Enter stops→inserts→sends, transcript inserted at the
+  cursor with smart spacing. macOS mic permission via `AVCaptureDevice`
+  (`NSMicrophoneUsageDescription` added to Info.plist).
+- **Settings › Voice pane**: enable toggle, per-model download/select/delete
+  with live progress, language (Auto / Tiếng Việt / English), mic-permission
+  status + actions. Persists to `dictation.toml` with a live-reload watcher.
+
+Build-spike confirmed sherpa-rs links on macOS arm64 (dynamic onnxruntime dylib
+— the bundle must copy it in). Unit tests green (crate + settings + smart-space);
+**live mic round-trip pending developer verification** (needs a physical mic +
+the 610 MB model downloaded + a bundled build for the TCC prompt).
+
 ### 2026-07-15 — Agent Chat: Codex diff cards, batched streaming, subagent log fidelity (`6c8a7a8`)
 
 Render-fidelity pass closing gaps against native agent UIs. All inside the
