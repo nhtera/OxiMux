@@ -90,6 +90,25 @@ Rendering + select/dismiss verified live; app-lib 1325 green (+6 history-store
 tests). Not yet built: CoreAudio transport-type suffixes ("Bluetooth"/"Built-in"/
 "Virtual") on device names — cpal doesn't expose them.
 
+**Fix — Vietnamese dictation/typing garbled in terminals (`<XX>` meta bytes):**
+Dictating (or pasting/typing) Vietnamese into a terminal pane echoed some
+multibyte chars as `<0090>`/`<0087>` control markers (e.g. "Việt" → "Vi�<0087>t"),
+seemingly at random. Root cause was **not** the dictation text (proven valid
+UTF-8 end-to-end: sherpa `.text` is `to_string_lossy`, the transcript is written
+whole in one PTY frame). The daemon that spawns shells is launched detached by a
+GUI app, so it inherits **no `LANG`/`LC_*`** from LaunchServices (Terminal.app
+injects one; a Finder-launched app does not). The child `zsh` therefore fell back
+to the **C locale**, where its line editor can't decode multibyte input and
+flushes the trailing byte of a UTF-8 sequence as a `<XX>` meta glyph — which
+chars break depends on ZLE read-buffer timing, hence the intermittent, partial
+corruption. Fix: `seed_utf8_locale` sets `LANG=en_US.UTF-8` on every spawned
+shell **only when the environment supplies no locale**, applied before the caller
+env and the user's rc so any explicit locale still wins. Added at all three spawn
+sites (relay daemon `registry::spawn`, both `portable_pty_backend` paths).
+Verified: an unset-locale zsh reproduces the exact `<0087>` breakage; with
+`LANG=en_US.UTF-8` the identical whole-buffer write echoes cleanly; the live
+daemon confirmed to carry no locale in its env.
+
 ### 2026-07-16 — Voice dictation (Vietnamese-first, offline) for Agent Chat (`feat/voice-dictation-vietnamese`)
 
 Local speech-to-text in the Agent Chat composer. Vietnamese is the priority, so
