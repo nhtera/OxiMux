@@ -27,3 +27,5 @@ dirs = { workspace = true }
 [dev-dependencies]
 # WAV fixtures for the offline-decode integration tests.
 hound = { workspace = true }
+# Eval-set manifest parsing for the on-demand Vietnamese WER bench.
+serde_json = { workspace = true }

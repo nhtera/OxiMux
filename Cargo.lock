@@ -5592,6 +5592,7 @@ dependencies = [
  "futures",
  "hound",
  "serde",
+ "serde_json",
  "sha2",
  "sherpa-rs",
  "tracing",
