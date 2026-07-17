@@ -220,17 +220,22 @@ impl DictationHud {
         let Some(text) = self.pending.take() else {
             return;
         };
+        let trailing = dictation_service::append_trailing_space(cx);
         match self.sink.take() {
             Some(HudSink::Terminal(weak)) => {
                 if let Some(term) = weak.upgrade() {
-                    let insert = text.trim().to_string();
+                    // Empty `before_cursor` deliberately suppresses the leading
+                    // space: at a shell prompt a leading space is significant
+                    // (`HISTCONTROL=ignorespace` drops the command from history).
+                    // The trailing space still applies.
+                    let insert = dictation_spacing("", &text, trailing);
                     term.update(cx, |view, cx| view.insert_dictation_text(&insert, cx));
                 }
             }
             Some(HudSink::Editor(weak)) => {
                 if let Some(state) = weak.upgrade() {
                     let before = state.read(cx).value().to_string();
-                    let insert = dictation_spacing(&before, &text);
+                    let insert = dictation_spacing(&before, &text, trailing);
                     if !insert.is_empty() {
                         state.update(cx, |st, cx| st.insert(insert, window, cx));
                     }

@@ -18,10 +18,11 @@ use std::sync::{Arc, Mutex};
 use futures::StreamExt;
 use gpui::{App, BorrowAppContext, Global, WeakEntity, Window};
 use gpui_component::WindowExt as _;
+use oximux_dictation::feedback::Cue;
 use oximux_dictation::{
     DictationController, DictationEvent, ModelManager, ModelPaths, ModelStatus, Readiness,
 };
-use oximux_settings::DictationSettings;
+use oximux_settings::{DictationSettings, ModelUnloadTimeout};
 
 use super::composer::ComposerView;
 use super::dictation_hud::DictationHud;
@@ -139,6 +140,12 @@ fn route_event(cx: &mut App, ev: DictationEvent) {
         super::dictation_history::record(text);
         cx.refresh_windows();
     }
+    // Capture ended — cue the user before the (possibly slow) insert path.
+    // (The optional trailing space is NOT applied here: every sink inserts via
+    // `dictation_spacing`, which trims, so the separator belongs there.)
+    if matches!(ev, DictationEvent::Final(_) | DictationEvent::Cancelled) {
+        play_feedback(cx, Cue::Stop);
+    }
     let target = {
         let Some(svc) = cx.try_global::<DictationService>() else {
             return;
@@ -233,18 +240,52 @@ pub fn start(
     if cx.try_global::<DictationService>().is_none() {
         return false;
     }
-    // Read the VAD toggle before the mutable global borrow below.
-    let vad_enabled = cx
+    // Read the VAD toggle + unload policy before the mutable global borrow below.
+    // Absent settings (unit tests) fall back to the shipped defaults.
+    let (vad_enabled, unload) = cx
         .try_global::<DictationSettings>()
-        .map(|s| s.vad_enabled)
-        .unwrap_or(true);
-    cx.update_global::<DictationService, _>(|svc, _| {
+        .map(|s| (s.vad_enabled, s.model_unload_timeout.as_duration()))
+        .unwrap_or((true, ModelUnloadTimeout::default().as_duration()));
+    let started = cx.update_global::<DictationService, _>(|svc, _| {
         if svc.controller.is_active() {
             return false;
         }
         svc.target = Some(target);
-        svc.controller.start(paths, device, vad_enabled)
-    })
+        svc.controller.start(paths, device, vad_enabled, unload)
+    });
+    // Cue the user that capture is live, once the session is actually accepted.
+    if started {
+        play_feedback(cx, Cue::Start);
+    }
+    started
+}
+
+/// Whether an inserted transcript gets a trailing space. Absent settings (unit
+/// tests) → off, matching the shipped default.
+pub fn append_trailing_space(cx: &App) -> bool {
+    cx.try_global::<DictationSettings>()
+        .map(|s| s.append_trailing_space)
+        .unwrap_or(false)
+}
+
+/// Whether a dictated transcript landing in the composer sends it automatically.
+/// Absent settings (unit tests) → off, matching the shipped default.
+pub fn auto_submit(cx: &App) -> bool {
+    cx.try_global::<DictationSettings>()
+        .map(|s| s.auto_submit)
+        .unwrap_or(false)
+}
+
+/// Play a start/stop capture cue when audio feedback is enabled. No-op when the
+/// setting is off or the settings global is absent (unit tests).
+fn play_feedback(cx: &App, cue: Cue) {
+    let on = cx
+        .try_global::<DictationSettings>()
+        .map(|s| s.audio_feedback_enabled)
+        .unwrap_or(false);
+    if on {
+        oximux_dictation::feedback::play(cue);
+    }
 }
 
 /// Whether a recording session is live right now (any target).

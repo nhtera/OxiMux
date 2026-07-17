@@ -37,6 +37,77 @@ impl DictationMode {
     }
 }
 
+/// How long a warm recognizer lingers after a dictation before being dropped to
+/// release its ONNX memory. Trades idle RAM against the reload cost of the next
+/// press (seconds for the larger models).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ModelUnloadTimeout {
+    /// Keep the engine warm forever — fastest, holds the most memory.
+    #[serde(rename = "never")]
+    Never,
+    /// Drop the engine as soon as a dictation finishes decoding.
+    #[serde(rename = "immediately")]
+    Immediately,
+    #[serde(rename = "2m")]
+    Min2,
+    #[serde(rename = "5m")]
+    Min5,
+    /// The historical hardcoded behaviour, kept as the default.
+    #[default]
+    #[serde(rename = "10m")]
+    Min10,
+    #[serde(rename = "15m")]
+    Min15,
+    #[serde(rename = "1h")]
+    Hour1,
+}
+
+impl ModelUnloadTimeout {
+    /// The idle window before teardown. `None` means "never unload"; a zero
+    /// duration means "unload immediately after each decode". This is the shape
+    /// the dictation controller consumes (it cannot depend on this crate).
+    pub fn as_duration(self) -> Option<std::time::Duration> {
+        use std::time::Duration;
+        match self {
+            ModelUnloadTimeout::Never => None,
+            ModelUnloadTimeout::Immediately => Some(Duration::ZERO),
+            ModelUnloadTimeout::Min2 => Some(Duration::from_secs(2 * 60)),
+            ModelUnloadTimeout::Min5 => Some(Duration::from_secs(5 * 60)),
+            ModelUnloadTimeout::Min10 => Some(Duration::from_secs(10 * 60)),
+            ModelUnloadTimeout::Min15 => Some(Duration::from_secs(15 * 60)),
+            ModelUnloadTimeout::Hour1 => Some(Duration::from_secs(60 * 60)),
+        }
+    }
+
+    /// Voice-pane label.
+    pub fn label(self) -> &'static str {
+        match self {
+            ModelUnloadTimeout::Never => "Never",
+            ModelUnloadTimeout::Immediately => "Immediately",
+            ModelUnloadTimeout::Min2 => "2 minutes",
+            ModelUnloadTimeout::Min5 => "5 minutes",
+            ModelUnloadTimeout::Min10 => "10 minutes",
+            ModelUnloadTimeout::Min15 => "15 minutes",
+            ModelUnloadTimeout::Hour1 => "1 hour",
+        }
+    }
+
+    /// All variants in display order.
+    pub const ALL: &'static [ModelUnloadTimeout] = &[
+        ModelUnloadTimeout::Never,
+        ModelUnloadTimeout::Hour1,
+        ModelUnloadTimeout::Min15,
+        ModelUnloadTimeout::Min10,
+        ModelUnloadTimeout::Min5,
+        ModelUnloadTimeout::Min2,
+        ModelUnloadTimeout::Immediately,
+    ];
+}
+
+// NOTE: no `auto_submit_key` setting. The composer has exactly one send path
+// (`ComposerView::submit`) — there is no distinct Cmd+Enter send to choose
+// between, so a key picker here would be a knob that changes nothing.
+
 // No `Eq`: `word_correction_threshold` is an f64. `PartialEq` suffices for the
 // change-detection the settings watcher does.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,6 +140,17 @@ pub struct DictationSettings {
     /// Clean transcripts of filler words, stutters, and whole-output whisper
     /// hallucinations ("(sad music)"). Language-gated fillers; defaults on.
     pub filler_filter_enabled: bool,
+    /// How long the warm recognizer survives idle before it is torn down.
+    pub model_unload_timeout: ModelUnloadTimeout,
+    /// Append a single space after an inserted transcript so back-to-back
+    /// dictations don't run together. Off by default (the space is unwanted when
+    /// dictating a single value into a field).
+    pub append_trailing_space: bool,
+    /// Send the composer automatically once a dictated transcript lands in it.
+    /// Off by default — a mis-fire would send a half-written message.
+    pub auto_submit: bool,
+    /// Play a short system sound when recording starts and stops.
+    pub audio_feedback_enabled: bool,
 }
 
 impl Default for DictationSettings {
@@ -83,6 +165,10 @@ impl Default for DictationSettings {
             custom_words: Vec::new(),
             word_correction_threshold: DEFAULT_WORD_CORRECTION_THRESHOLD,
             filler_filter_enabled: true,
+            model_unload_timeout: ModelUnloadTimeout::Min10,
+            append_trailing_space: false,
+            auto_submit: false,
+            audio_feedback_enabled: false,
         }
     }
 }
@@ -181,6 +267,10 @@ mod tests {
             custom_words: vec!["OxiMux".into(), "ChargeBee".into()],
             word_correction_threshold: 0.2,
             filler_filter_enabled: false,
+            model_unload_timeout: ModelUnloadTimeout::Immediately,
+            append_trailing_space: true,
+            auto_submit: true,
+            audio_feedback_enabled: true,
         };
         let parsed = DictationSettings::from_toml_str(&s.to_toml_string()).expect("round-trip");
         assert_eq!(parsed, s);
@@ -199,6 +289,45 @@ mod tests {
         assert_eq!(s.device_name(), None);
         // A pre-VAD dictation.toml must default the new toggle on.
         assert!(s.vad_enabled, "vad defaults on for legacy stores");
+        // The phase-05 keys must load absent, preserving prior behaviour: the
+        // historical 10-minute teardown and no space/submit/sound side effects.
+        assert_eq!(s.model_unload_timeout, ModelUnloadTimeout::Min10);
+        assert!(!s.append_trailing_space);
+        assert!(!s.auto_submit);
+        assert!(!s.audio_feedback_enabled);
+    }
+
+    #[test]
+    fn unload_timeout_maps_to_durations() {
+        use std::time::Duration;
+        // `None` = never unload; ZERO = unload right after each decode. The
+        // controller keys off exactly these two sentinels.
+        assert_eq!(ModelUnloadTimeout::Never.as_duration(), None);
+        assert_eq!(
+            ModelUnloadTimeout::Immediately.as_duration(),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            ModelUnloadTimeout::Min10.as_duration(),
+            Some(Duration::from_secs(600)),
+            "default must match the historical hardcoded teardown"
+        );
+        assert_eq!(
+            ModelUnloadTimeout::Hour1.as_duration(),
+            Some(Duration::from_secs(3600))
+        );
+        // Every variant is offered in the picker.
+        assert_eq!(ModelUnloadTimeout::ALL.len(), 7);
+    }
+
+    #[test]
+    fn unload_timeout_serializes_stably() {
+        let s = DictationSettings {
+            model_unload_timeout: ModelUnloadTimeout::Hour1,
+            ..Default::default()
+        };
+        let toml = s.to_toml_string();
+        assert!(toml.contains("model_unload_timeout = \"1h\""), "{toml}");
     }
 
     #[test]

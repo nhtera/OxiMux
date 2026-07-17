@@ -45,8 +45,10 @@ pub enum DictationEvent {
 /// memory); the UI shows its own timer/toast.
 pub const MAX_RECORDING_SECS: u64 = 120;
 
-/// Drop a warm engine after this long idle to release ONNX memory.
-const IDLE_TEARDOWN: Duration = Duration::from_secs(600);
+/// Idle window before a warm engine is dropped to release ONNX memory, used
+/// until the first `Start` carries the user's configured policy. Matches the
+/// settings default (10 minutes), so behaviour is unchanged when untouched.
+const DEFAULT_IDLE_TEARDOWN: Duration = Duration::from_secs(600);
 /// How often the worker polls for stop/cancel/cap while recording.
 const POLL_INTERVAL: Duration = Duration::from_millis(30);
 
@@ -55,8 +57,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(30);
 #[allow(clippy::large_enum_variant)]
 enum Command {
     /// Begin a session with the given model, optional named input device
-    /// (`None` = system default), and whether Silero VAD silence-trimming is on.
-    Start(ModelPaths, Option<String>, bool),
+    /// (`None` = system default), whether Silero VAD silence-trimming is on, and
+    /// the idle-teardown policy for the warm engine (`None` = never unload,
+    /// `Some(ZERO)` = unload right after this decode).
+    Start(ModelPaths, Option<String>, bool, Option<Duration>),
     Stop,
     Cancel,
 }
@@ -85,14 +89,23 @@ impl DictationController {
 
     /// Begin a recording session with `paths`, capturing from `device` (a cpal
     /// input-device name, or `None` for the system default). `vad_enabled` turns
-    /// on Silero VAD silence-trimming for this session. A second start while
-    /// active is a no-op (returns `false`) — one session at a time.
-    pub fn start(&self, paths: ModelPaths, device: Option<String>, vad_enabled: bool) -> bool {
+    /// on Silero VAD silence-trimming for this session. `unload` is the warm
+    /// engine's idle-teardown policy: `None` keeps it forever, `Some(ZERO)` drops
+    /// it as soon as this decode finishes, any other duration is the idle window.
+    /// A second start while active is a no-op (returns `false`) — one session at
+    /// a time.
+    pub fn start(
+        &self,
+        paths: ModelPaths,
+        device: Option<String>,
+        vad_enabled: bool,
+        unload: Option<Duration>,
+    ) -> bool {
         if self.active.swap(true, Ordering::SeqCst) {
             return false; // already recording
         }
         self.cmd_tx
-            .send(Command::Start(paths, device, vad_enabled))
+            .send(Command::Start(paths, device, vad_enabled, unload))
             .is_ok()
     }
 
@@ -137,20 +150,36 @@ fn worker_loop(
     // VAD detector is NOT warmed — sherpa-rs 0.6.8 has no full reset, so a reused
     // detector leaks state; a fresh one is built per recording (see maybe_vad_trim).
     let mut engine: Option<Engine> = None;
+    // Idle-teardown policy, refreshed from every `Start` (the dictation crate
+    // can't read app settings). Only meaningful once an engine is warm.
+    let mut unload: Option<Duration> = Some(DEFAULT_IDLE_TEARDOWN);
 
     loop {
         // Block for the next Start, tearing the engine down if idle too long.
-        let cmd = match cmd_rx.recv_timeout(IDLE_TEARDOWN) {
-            Ok(cmd) => cmd,
-            Err(RecvTimeoutError::Timeout) => {
-                engine = None; // release ONNX memory
-                continue;
+        // With nothing warm to release — or a "never unload" policy — wait
+        // indefinitely instead: a zero-duration timeout with no engine would
+        // otherwise spin this thread at 100% CPU.
+        let cmd = if engine.is_none() || unload.is_none() {
+            match cmd_rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => break, // sender dropped
             }
-            Err(RecvTimeoutError::Disconnected) => break,
+        } else {
+            match cmd_rx.recv_timeout(unload.unwrap_or(DEFAULT_IDLE_TEARDOWN)) {
+                Ok(cmd) => cmd,
+                Err(RecvTimeoutError::Timeout) => {
+                    engine = None; // release ONNX memory
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
         };
 
         let (paths, device, vad_enabled) = match cmd {
-            Command::Start(paths, device, vad_enabled) => (paths, device, vad_enabled),
+            Command::Start(paths, device, vad_enabled, policy) => {
+                unload = policy;
+                (paths, device, vad_enabled)
+            }
             // Stop/Cancel with no active session: stale, ignore.
             Command::Stop | Command::Cancel => continue,
         };
@@ -356,9 +385,13 @@ mod tests {
             tokens: "/nonexistent/t.txt".into(),
             model: None,
         };
-        assert!(ctrl.start(paths.clone(), None, false), "first start accepted");
+        let unload = Some(DEFAULT_IDLE_TEARDOWN);
         assert!(
-            !ctrl.start(paths, None, false),
+            ctrl.start(paths.clone(), None, false, unload),
+            "first start accepted"
+        );
+        assert!(
+            !ctrl.start(paths, None, false, unload),
             "second start rejected while active"
         );
     }

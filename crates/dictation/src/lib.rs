@@ -15,6 +15,7 @@ pub mod capture;
 pub mod controller;
 pub mod custom_words;
 pub mod engine;
+pub mod feedback;
 pub mod model_catalog;
 pub mod model_manager;
 pub mod resample;

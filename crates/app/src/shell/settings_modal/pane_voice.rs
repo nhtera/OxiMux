@@ -17,7 +17,8 @@ use oximux_dictation::{
     DEFAULT_MODEL_ID, Family, ModelSpec, ModelStatus, catalog, list_input_devices, spec_for,
 };
 use oximux_settings::{
-    Density, DictationMode, Theme, Typography, WHISPER_LANGUAGES, language_display_name,
+    Density, DictationMode, ModelUnloadTimeout, Theme, Typography, WHISPER_LANGUAGES,
+    language_display_name,
 };
 
 use super::SettingsModal;
@@ -333,6 +334,68 @@ pub(super) fn entries(
         ));
     }
 
+    // Insertion behaviour: a separator after the inserted transcript.
+    let trailing = toggle_switch(
+        "voice-trailing-space",
+        modal.dictation.append_trailing_space,
+        theme,
+        |this, _w, cx| {
+            this.dictation.append_trailing_space = !this.dictation.append_trailing_space;
+            this.persist_voice(cx);
+        },
+        cx,
+    );
+    rows.push(entry(
+        "Append trailing space",
+        "Leave a space after each inserted transcript, so back-to-back dictations \
+         don't run together.",
+        trailing,
+    ));
+
+    // Auto-submit: composer-only, and off by default (it sends for you).
+    let auto_submit = toggle_switch(
+        "voice-auto-submit",
+        modal.dictation.auto_submit,
+        theme,
+        |this, _w, cx| {
+            this.dictation.auto_submit = !this.dictation.auto_submit;
+            this.persist_voice(cx);
+        },
+        cx,
+    );
+    rows.push(entry(
+        "Send after dictation",
+        "Send the chat message as soon as a transcript lands in the composer. \
+         Only applies to the composer — never the terminal or editor.",
+        auto_submit,
+    ));
+
+    // Audible start/stop cue.
+    let sound = toggle_switch(
+        "voice-sound",
+        modal.dictation.audio_feedback_enabled,
+        theme,
+        |this, _w, cx| {
+            this.dictation.audio_feedback_enabled = !this.dictation.audio_feedback_enabled;
+            this.persist_voice(cx);
+        },
+        cx,
+    );
+    rows.push(entry(
+        "Sound feedback",
+        "Play a short system sound when recording starts and stops.",
+        sound,
+    ));
+
+    // Warm-engine lifetime — a memory/latency trade, so it sits with the
+    // advanced controls rather than the everyday ones.
+    rows.push(entry(
+        "Unload model after",
+        "How long the speech model stays in memory after a dictation. Shorter \
+         frees memory sooner; longer keeps the next dictation instant.",
+        unload_control(modal, cx),
+    ));
+
     // Microphone permission status + action.
     rows.push(entry(
         "Microphone",
@@ -341,6 +404,58 @@ pub(super) fn entries(
     ));
 
     rows
+}
+
+/// The idle-teardown picker: a dropdown labeled with the active policy, opening
+/// the full [`ModelUnloadTimeout`] set. Mirrors the language picker's shape.
+fn unload_control(modal: &SettingsModal, cx: &mut gpui::Context<SettingsModal>) -> AnyElement {
+    let entity = cx.entity();
+    let current = modal.dictation.model_unload_timeout;
+    DropdownButton::new("voice-unload")
+        .button(
+            Button::new("voice-unload-btn")
+                .label(current.label())
+                .small()
+                .outline(),
+        )
+        .small()
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, window, _cx| {
+            for opt in ModelUnloadTimeout::ALL {
+                menu = menu.item(unload_item(window, &entity, *opt, *opt == current));
+            }
+            menu
+        })
+        .into_any_element()
+}
+
+/// One idle-teardown row: label + right-aligned check on the active policy.
+fn unload_item(
+    window: &mut Window,
+    entity: &Entity<SettingsModal>,
+    opt: ModelUnloadTimeout,
+    selected: bool,
+) -> PopupMenuItem {
+    PopupMenuItem::element(move |_window, _cx| {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(28.0))
+            .min_w(px(180.0))
+            .child(div().child(opt.label()))
+            .child(div().w(px(16.0)).flex_none().flex().justify_center().when(
+                selected,
+                |d| d.child(Icon::default().path("icons/check.svg").size(px(14.0))),
+            ))
+    })
+    .on_click(window.listener_for(
+        entity,
+        move |m: &mut SettingsModal, _ev: &ClickEvent, _window, cx| {
+            m.dictation.model_unload_timeout = opt;
+            m.persist_voice(cx);
+        },
+    ))
 }
 
 fn set_language(this: &mut SettingsModal, lang: &str, cx: &mut gpui::Context<SettingsModal>) {

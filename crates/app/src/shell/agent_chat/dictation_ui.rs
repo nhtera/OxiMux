@@ -106,19 +106,25 @@ fn starts_with_close_punct(s: &str) -> bool {
 /// already end in whitespace, and the transcript does not begin with closing
 /// punctuation. Mirrors the reference apps' smart-space rule (the CJK no-space
 /// case doesn't apply to Vietnamese, but the punctuation rule does).
-pub fn dictation_spacing(before_cursor: &str, transcript: &str) -> String {
+///
+/// `trailing_space` appends one space after the transcript (the
+/// `append_trailing_space` setting), leaving the cursor ready for the next word.
+/// This is the one place the insertion seam is built — every sink (composer,
+/// terminal, editor) routes through here, so the rule stays identical across
+/// them. It also trims the transcript, which is why the separator cannot be
+/// bolted on upstream: it would be trimmed straight back off.
+pub fn dictation_spacing(before_cursor: &str, transcript: &str, trailing_space: bool) -> String {
     let transcript = transcript.trim();
+    // A blank transcript inserts nothing at all — never a lone separator.
     if transcript.is_empty() {
         return String::new();
     }
     let needs_space = !before_cursor.is_empty()
         && !before_cursor.ends_with(char::is_whitespace)
         && !starts_with_close_punct(transcript);
-    if needs_space {
-        format!(" {transcript}")
-    } else {
-        transcript.to_string()
-    }
+    let lead = if needs_space { " " } else { "" };
+    let trail = if trailing_space { " " } else { "" };
+    format!("{lead}{transcript}{trail}")
 }
 
 /// Elapsed recording time as `m:ss` (no hours — the hard cap is 2 minutes).
@@ -133,41 +139,61 @@ mod tests {
 
     #[test]
     fn empty_transcript_inserts_nothing() {
-        assert_eq!(dictation_spacing("hello", "   "), "");
-        assert_eq!(dictation_spacing("", ""), "");
+        assert_eq!(dictation_spacing("hello", "   ", false), "");
+        assert_eq!(dictation_spacing("", "", false), "");
     }
 
     #[test]
     fn empty_input_no_leading_space() {
-        assert_eq!(dictation_spacing("", "xin chào"), "xin chào");
+        assert_eq!(dictation_spacing("", "xin chào", false), "xin chào");
     }
 
     #[test]
     fn trailing_space_no_double_space() {
-        assert_eq!(dictation_spacing("hello ", "world"), "world");
+        assert_eq!(dictation_spacing("hello ", "world", false), "world");
     }
 
     #[test]
     fn mid_sentence_gets_a_space() {
-        assert_eq!(dictation_spacing("hello", "world"), " world");
+        assert_eq!(dictation_spacing("hello", "world", false), " world");
     }
 
     #[test]
     fn punctuation_hugs_preceding_word() {
-        assert_eq!(dictation_spacing("hello", ", world"), ", world");
-        assert_eq!(dictation_spacing("done", "."), ".");
+        assert_eq!(dictation_spacing("hello", ", world", false), ", world");
+        assert_eq!(dictation_spacing("done", ".", false), ".");
     }
 
     #[test]
     fn vietnamese_diacritics_preserved() {
         // The helper must not mangle multibyte chars — a mid-sentence insert of
         // Vietnamese text just gets a leading space.
-        assert_eq!(dictation_spacing("Tôi", "nói tiếng Việt"), " nói tiếng Việt");
+        assert_eq!(dictation_spacing("Tôi", "nói tiếng Việt", false), " nói tiếng Việt");
     }
 
     #[test]
     fn transcript_is_trimmed() {
-        assert_eq!(dictation_spacing("", "  hi there  "), "hi there");
+        assert_eq!(dictation_spacing("", "  hi there  ", false), "hi there");
+    }
+
+    #[test]
+    fn trailing_space_setting_appends_one_space() {
+        // Enabled: the cursor lands after a separator, ready for the next word —
+        // and it survives the trim that would strip an upstream-appended space.
+        assert_eq!(dictation_spacing("", "hello", true), "hello ");
+        assert_eq!(dictation_spacing("  hi  ", "  there  ", true), "there ");
+        // Composes with the leading-space rule rather than replacing it.
+        assert_eq!(dictation_spacing("hello", "world", true), " world ");
+        // ...and with the punctuation-hugging rule.
+        assert_eq!(dictation_spacing("done", ".", true), ". ");
+    }
+
+    #[test]
+    fn trailing_space_never_inserts_a_lone_separator() {
+        // A blank transcript must stay a no-op even with the setting on —
+        // otherwise a silent recording would type a stray space.
+        assert_eq!(dictation_spacing("hello", "   ", true), "");
+        assert_eq!(dictation_spacing("", "", true), "");
     }
 
     #[test]

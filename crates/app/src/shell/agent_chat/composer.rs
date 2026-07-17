@@ -1279,7 +1279,11 @@ impl ComposerView {
                 self.dictation_send_after = false;
             }
             DictationEvent::Final(text) => {
-                let send_after = std::mem::take(&mut self.dictation_send_after);
+                // Either the explicit Enter-while-recording gesture, or the
+                // auto-submit setting, sends once the transcript lands. Both ride
+                // the same `send_after` path, so the empty-transcript guard below
+                // covers auto-submit too — a silent recording never sends.
+                let send_after = std::mem::take(&mut self.dictation_send_after) || dictation_service::auto_submit(cx);
                 self.dictation = DictationUiState::Idle;
                 if !text.trim().is_empty() {
                     self.pending_transcript = Some(PendingTranscript { text, send_after });
@@ -1302,7 +1306,7 @@ impl ComposerView {
         }
         if let Some(pending) = self.pending_transcript.take() {
             let before = self.input.read(cx).value().to_string();
-            let insert = dictation_spacing(&before, &pending.text);
+            let insert = dictation_spacing(&before, &pending.text, dictation_service::append_trailing_space(cx));
             if !insert.is_empty() {
                 self.input.update(cx, |s, cx| s.insert(insert, window, cx));
             }
