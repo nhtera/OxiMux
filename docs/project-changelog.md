@@ -4,6 +4,40 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-17 — Voice dictation: settings polish (`feat/voice-dictation-vietnamese`)
+
+Phase 05 of the dictation plan — four independent, default-off (or
+behaviour-preserving) settings. **No new crate dependency.**
+
+- **Configurable model-unload timeout** — the warm recognizer's idle teardown
+  was a hardcoded 10 minutes; it's now a `model_unload_timeout` setting (Never /
+  1h / 15 / 10 / 5 / 2 min / Immediately) with a Voice-pane dropdown, defaulting
+  to 10 minutes so existing behaviour is unchanged. The dictation crate can't
+  read app settings, so the policy rides `Command::Start` (like `vad_enabled`).
+  `Never` and "nothing warm to release" both block on `recv()` rather than
+  polling — a zero-duration timeout would otherwise spin the worker at 100% CPU.
+- **Append trailing space** — optional space after an inserted transcript so
+  back-to-back dictations don't run together (default off). Applied inside
+  `dictation_spacing`, the one helper every sink already routes through: it
+  trims, so the separator cannot be bolted on upstream without being stripped.
+  The terminal sink passes an empty `before_cursor`, which suppresses the
+  *leading* space (a leading space at a shell prompt is significant —
+  `HISTCONTROL=ignorespace` drops the command from history) while still getting
+  the trailing one.
+- **Send after dictation** — auto-submit the composer once a transcript lands
+  (default off). Rides the existing `send_after` path used by the
+  Enter-while-recording gesture, so it inherits that path's guards: composer
+  only, final transcripts only, and never on an empty transcript.
+- **Sound feedback** — a short start/stop cue (default off). Uses stock macOS
+  system sounds via `afplay` rather than pulling in an audio-playback crate plus
+  bundled wav assets; playback is fire-and-forget and reaps its child, and
+  non-macOS targets compile to a no-op.
+
+Not built: an `auto_submit_key` (Enter vs Cmd+Enter) picker. The composer has
+exactly one send path, so the setting would have changed nothing.
+
+---
+
 ### 2026-07-17 — Voice dictation: VAD word-clipping fixes + higher-accuracy speech models (`feat/voice-dictation-vietnamese`)
 
 Follow-up hardening after a multilingual stability pass (real-pipeline decode
