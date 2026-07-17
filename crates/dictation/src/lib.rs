@@ -13,14 +13,17 @@
 
 pub mod capture;
 pub mod controller;
+pub mod custom_words;
 pub mod engine;
 pub mod model_catalog;
 pub mod model_manager;
 pub mod resample;
+pub mod text_filter;
+pub mod vad;
 
 pub use capture::{has_input_device, list_input_devices};
 pub use controller::{DictationController, DictationEvent, MAX_RECORDING_SECS};
 pub use engine::{Engine, EngineKind, ModelPaths};
-pub use model_catalog::{ModelSpec, catalog, spec_for, DEFAULT_MODEL_ID};
+pub use model_catalog::{Family, ModelSpec, catalog, spec_for, DEFAULT_MODEL_ID};
 pub use model_manager::{ModelEvent, ModelManager, ModelStatus, Readiness};
 pub use resample::TARGET_SAMPLE_RATE;

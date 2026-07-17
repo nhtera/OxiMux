@@ -20,6 +20,7 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use crate::capture::{self, SessionBuffer};
 use crate::engine::{Engine, ModelPaths, is_silent};
 use crate::resample::{TARGET_SAMPLE_RATE, resample_linear};
+use crate::vad::Vad;
 
 /// Events emitted to the app for one session. Level is pre-throttled (~10 Hz).
 #[derive(Debug, Clone)]
@@ -53,9 +54,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(30);
 // Start payload to shrink Stop/Cancel would only add an allocation for no gain.
 #[allow(clippy::large_enum_variant)]
 enum Command {
-    /// Begin a session with the given model and optional named input device
-    /// (`None` = system default).
-    Start(ModelPaths, Option<String>),
+    /// Begin a session with the given model, optional named input device
+    /// (`None` = system default), and whether Silero VAD silence-trimming is on.
+    Start(ModelPaths, Option<String>, bool),
     Stop,
     Cancel,
 }
@@ -83,13 +84,16 @@ impl DictationController {
     }
 
     /// Begin a recording session with `paths`, capturing from `device` (a cpal
-    /// input-device name, or `None` for the system default). A second start
-    /// while active is a no-op (returns `false`) — one session at a time.
-    pub fn start(&self, paths: ModelPaths, device: Option<String>) -> bool {
+    /// input-device name, or `None` for the system default). `vad_enabled` turns
+    /// on Silero VAD silence-trimming for this session. A second start while
+    /// active is a no-op (returns `false`) — one session at a time.
+    pub fn start(&self, paths: ModelPaths, device: Option<String>, vad_enabled: bool) -> bool {
         if self.active.swap(true, Ordering::SeqCst) {
             return false; // already recording
         }
-        self.cmd_tx.send(Command::Start(paths, device)).is_ok()
+        self.cmd_tx
+            .send(Command::Start(paths, device, vad_enabled))
+            .is_ok()
     }
 
     /// Stop recording and transcribe → emits `Transcribing` then `Final`.
@@ -129,22 +133,25 @@ fn worker_loop(
     evt_tx: UnboundedSender<DictationEvent>,
     active: Arc<AtomicBool>,
 ) {
-    // Warm engine cache: kept across presses, dropped after idle teardown.
+    // Warm caches: kept across presses, dropped after idle teardown. The VAD
+    // detector is model-independent, so it survives model switches.
     let mut engine: Option<Engine> = None;
+    let mut vad: Option<Vad> = None;
 
     loop {
-        // Block for the next Start, tearing the engine down if idle too long.
+        // Block for the next Start, tearing the caches down if idle too long.
         let cmd = match cmd_rx.recv_timeout(IDLE_TEARDOWN) {
             Ok(cmd) => cmd,
             Err(RecvTimeoutError::Timeout) => {
                 engine = None; // release ONNX memory
+                vad = None;
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => break,
         };
 
-        let (paths, device) = match cmd {
-            Command::Start(paths, device) => (paths, device),
+        let (paths, device, vad_enabled) = match cmd {
+            Command::Start(paths, device, vad_enabled) => (paths, device, vad_enabled),
             // Stop/Cancel with no active session: stale, ignore.
             Command::Stop | Command::Cancel => continue,
         };
@@ -155,13 +162,22 @@ fn worker_loop(
         // worker thread, `active` would stay stuck `true`, and every future
         // press would report "busy" until an app restart.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_session(&cmd_rx, &evt_tx, &mut engine, paths, device);
+            run_session(
+                &cmd_rx,
+                &evt_tx,
+                &mut engine,
+                &mut vad,
+                paths,
+                device,
+                vad_enabled,
+            );
         }));
         active.store(false, Ordering::SeqCst);
         if outcome.is_err() {
-            // The engine may be in an inconsistent state after a panic — drop
-            // it so the next session rebuilds cleanly.
+            // A cache may be in an inconsistent state after a panic — drop both
+            // so the next session rebuilds cleanly.
             engine = None;
+            vad = None;
             let _ = evt_tx.unbounded_send(DictationEvent::Error(
                 "dictation recovered from an internal error; try again".into(),
             ));
@@ -170,12 +186,15 @@ fn worker_loop(
 }
 
 /// Drive one Start→(Stop|Cancel|Cap) session end to end.
+#[allow(clippy::too_many_arguments)]
 fn run_session(
     cmd_rx: &Receiver<Command>,
     evt_tx: &UnboundedSender<DictationEvent>,
     engine: &mut Option<Engine>,
+    vad: &mut Option<Vad>,
     paths: ModelPaths,
     device: Option<String>,
+    vad_enabled: bool,
 ) {
     let shared = Arc::new(Mutex::new(SessionBuffer::default()));
     {
@@ -233,6 +252,18 @@ fn run_session(
         resample_linear(&samples, device_rate, TARGET_SAMPLE_RATE)
     };
 
+    // Trim silence with Silero VAD when enabled — keeps only speech spans so
+    // whisper never sees the pauses it hallucinates captions over. VAD is
+    // best-effort: a missing/unloadable model falls back to the raw buffer, and
+    // the peak gate below still guards a fully-silent recording.
+    let s16 = if vad_enabled {
+        let data_dir = paths.dir.parent().map(std::path::Path::to_path_buf);
+        maybe_vad_trim(vad, data_dir.as_deref(), s16)
+    } else {
+        *vad = None; // release the VAD model when the feature is off
+        s16
+    };
+
     if is_silent(&s16) {
         let _ = evt_tx.unbounded_send(DictationEvent::Final(String::new()));
         return;
@@ -272,6 +303,38 @@ fn ensure_engine(
     }
 }
 
+/// Trim `samples` to speech spans with the warm VAD, lazily loading (and
+/// downloading) the model on first use. Any failure — no data dir, download
+/// error offline, load error — falls back to the untrimmed buffer so dictation
+/// still works; the caller's peak gate remains the silent-recording guard.
+fn maybe_vad_trim(
+    vad: &mut Option<Vad>,
+    data_dir: Option<&std::path::Path>,
+    samples: Vec<f32>,
+) -> Vec<f32> {
+    let Some(data_dir) = data_dir else {
+        return samples;
+    };
+    if vad.is_none() {
+        match crate::vad::ensure_downloaded(data_dir).and_then(|p| Vad::load(&p)) {
+            Ok(v) => *vad = Some(v),
+            Err(e) => {
+                tracing::warn!(error = %e, "Silero VAD unavailable; using untrimmed audio");
+                return samples;
+            }
+        }
+    }
+    match vad.as_mut() {
+        Some(v) => {
+            let trimmed = v.keep_speech(&samples);
+            // An empty result means "no speech" — return it so the peak gate
+            // reports silence. A non-empty trim replaces the raw buffer.
+            trimmed
+        }
+        None => samples,
+    }
+}
+
 /// Poll the command channel + shared cap flag until the session ends.
 fn poll_recording(cmd_rx: &Receiver<Command>, shared: &Arc<Mutex<SessionBuffer>>) -> Outcome {
     loop {
@@ -308,8 +371,11 @@ mod tests {
             tokens: "/nonexistent/t.txt".into(),
             model: None,
         };
-        assert!(ctrl.start(paths.clone(), None), "first start accepted");
-        assert!(!ctrl.start(paths, None), "second start rejected while active");
+        assert!(ctrl.start(paths.clone(), None, false), "first start accepted");
+        assert!(
+            !ctrl.start(paths, None, false),
+            "second start rejected while active"
+        );
     }
 
     #[test]

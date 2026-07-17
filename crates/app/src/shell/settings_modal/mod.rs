@@ -95,6 +95,12 @@ pub struct SettingsModal {
     pub(super) search_input: Option<Entity<InputState>>,
     /// Keeps the `InputEvent::Change` → repaint subscription alive.
     _search_sub: Option<Subscription>,
+    /// Voice pane's custom-words editor input. Lazily built on `open()` (needs a
+    /// `Window`), seeded from `dictation.custom_words`. `None` before first open.
+    pub(super) custom_words_input: Option<Entity<InputState>>,
+    /// Keeps the custom-words `InputEvent::Change` → parse+persist subscription
+    /// alive.
+    _custom_words_sub: Option<Subscription>,
     /// Working copy of the `keybindings.toml` override map; reseeded from
     /// disk at each `open()`. Edits persist + apply to the live keymap
     /// immediately (see `pane_keybindings`).
@@ -105,6 +111,21 @@ pub struct SettingsModal {
     pub(crate) recording_action: Option<&'static str>,
     /// The interceptor subscription — alive exactly while recording.
     pub(super) recording_sub: Option<Subscription>,
+}
+
+/// Parse the custom-words editor field into a de-duplicated dictionary. Splits
+/// on commas and newlines only (NOT spaces) so a multi-word entry like
+/// "New York" can be one dictionary unit — the matcher collapses spaces when
+/// scoring. Trims, drops blanks, keeps first-seen order (case-insensitive
+/// dedup). `sanitized()` re-applies the same cleanup on load.
+pub(super) fn parse_custom_words(raw: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    raw.split([',', '\n', '\r'])
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .filter(|w| seen.insert(w.to_lowercase()))
+        .map(str::to_string)
+        .collect()
 }
 
 impl SettingsModal {
@@ -135,6 +156,8 @@ impl SettingsModal {
             drag_grab: None,
             search_input: None,
             _search_sub: None,
+            custom_words_input: None,
+            _custom_words_sub: None,
             keybind_overrides: BTreeMap::new(),
             recording_action: None,
             recording_sub: None,
@@ -187,6 +210,37 @@ impl SettingsModal {
         }));
         let input_focus = input.read(cx).focus_handle(cx);
         self.search_input = Some(input);
+
+        // Voice pane's custom-words editor: a comma/space separated field seeded
+        // from the working copy. On every edit, reparse into `custom_words` and
+        // persist (the watcher reloads the global) so the dictionary applies to
+        // the next dictation without a modal round-trip.
+        let seed = self.dictation.custom_words.join(", ");
+        let cw_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("e.g. OxiMux, ChargeBee, ChatGPT")
+                .default_value(seed)
+        });
+        // Update the in-memory working copy on every keystroke, but only PERSIST
+        // (disk write + watcher reload) when the field is committed — on blur or
+        // Enter — so typing a dictionary entry isn't a per-character fs::write on
+        // the main thread. This matches the modal's persist-on-discrete-action
+        // convention (the search field, three lines up, likewise does no I/O).
+        self._custom_words_sub =
+            Some(
+                cx.subscribe(&cw_input, |this, input, ev: &InputEvent, cx| match ev {
+                    InputEvent::Change => {
+                        let raw = input.read(cx).value().to_string();
+                        this.dictation.custom_words = parse_custom_words(&raw);
+                    }
+                    InputEvent::Blur | InputEvent::PressEnter { .. } => {
+                        this.persist_voice(cx);
+                    }
+                    _ => {}
+                }),
+            );
+        self.custom_words_input = Some(cw_input);
+
         self.open = true;
         self.pos = None;
         self.drag_grab = None;
@@ -227,6 +281,8 @@ impl SettingsModal {
         // orphaned after the modal is hidden.
         self.search_input = None;
         self._search_sub = None;
+        self.custom_words_input = None;
+        self._custom_words_sub = None;
         // A close mid-recording must release the keystroke interceptor or
         // every subsequent key press in the app would be swallowed.
         self.recording_action = None;

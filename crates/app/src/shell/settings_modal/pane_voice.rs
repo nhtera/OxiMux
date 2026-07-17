@@ -11,9 +11,14 @@ use gpui::{
 use gpui_component::Icon;
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, DropdownButton};
+use gpui_component::input::Input;
 use gpui_component::menu::PopupMenuItem;
-use oximux_dictation::{DEFAULT_MODEL_ID, ModelSpec, ModelStatus, catalog, list_input_devices, spec_for};
-use oximux_settings::{Density, DictationMode, Theme, Typography};
+use oximux_dictation::{
+    DEFAULT_MODEL_ID, Family, ModelSpec, ModelStatus, catalog, list_input_devices, spec_for,
+};
+use oximux_settings::{
+    Density, DictationMode, Theme, Typography, WHISPER_LANGUAGES, language_display_name,
+};
 
 use super::SettingsModal;
 use super::controls::{toggle_switch, value_chip};
@@ -251,30 +256,82 @@ pub(super) fn entries(
         model_control(modal, theme, typography, cx),
     ));
 
-    // Language selector (whisper models; transducers ignore it).
-    let lang = segmented(
-        "voice-lang",
-        vec![
-            Segment::new("Auto", modal.dictation.language == "auto", |this, _w, cx| {
-                set_language(this, "auto", cx)
-            }),
-            Segment::new("Tiếng Việt", modal.dictation.language == "vi", |this, _w, cx| {
-                set_language(this, "vi", cx)
-            }),
-            Segment::new("English", modal.dictation.language == "en", |this, _w, cx| {
-                set_language(this, "en", cx)
-            }),
-        ],
+    // Language selector — only whisper models honor a language; Parakeet,
+    // Zipformer and SenseVoice decode a fixed set, so the picker shows only for
+    // whisper models. Non-whisper models get a read-only coverage blurb instead.
+    let is_whisper = spec_for(&modal.dictation.model_id)
+        .map(|s| s.family == Family::Whisper)
+        .unwrap_or(false);
+    if is_whisper {
+        rows.push(entry(
+            "Language",
+            "Transcription language for whisper. Auto-detect, or pin one.",
+            language_control(modal, cx),
+        ));
+    } else {
+        let langs = spec_for(&modal.dictation.model_id)
+            .map(|s| s.langs)
+            .unwrap_or("Fixed language set.");
+        rows.push(entry(
+            "Language",
+            "This model decodes a fixed language set (no selection).",
+            div()
+                .text_size(px(typography.t_body_sm))
+                .text_color(theme.fg_muted)
+                .child(SharedString::from(langs))
+                .into_any_element(),
+        ));
+    }
+
+    // Silence trimming via Silero VAD.
+    let vad = toggle_switch(
+        "voice-vad",
+        modal.dictation.vad_enabled,
         theme,
-        density,
-        typography,
+        |this, _w, cx| {
+            this.dictation.vad_enabled = !this.dictation.vad_enabled;
+            this.persist_voice(cx);
+        },
         cx,
     );
     rows.push(entry(
-        "Language",
-        "Whisper transcription language. Parakeet (English/EU) ignores this.",
-        lang,
+        "Trim silence (VAD)",
+        "Detect speech and drop silent gaps before transcribing — cleaner results, \
+         fewer phantom captions. Downloads a small model on first use.",
+        vad,
     ));
+
+    // Clean fillers / stutters / whisper hallucinations from the transcript.
+    let filler = toggle_switch(
+        "voice-filler",
+        modal.dictation.filler_filter_enabled,
+        theme,
+        |this, _w, cx| {
+            this.dictation.filler_filter_enabled = !this.dictation.filler_filter_enabled;
+            this.persist_voice(cx);
+        },
+        cx,
+    );
+    rows.push(entry(
+        "Clean transcript",
+        "Remove filler words (um, uh, ừ), stutters, and phantom captions like \
+         \"(sad music)\". Filler words are language-aware.",
+        filler,
+    ));
+
+    // Custom words: a comma/space-separated dictionary the transcript is
+    // fuzzy-corrected toward. The InputState lives on the modal (built on open);
+    // its Change subscription parses + persists.
+    if let Some(state) = modal.custom_words_input.as_ref() {
+        rows.push(entry(
+            "Custom words",
+            "Brand, command, or proper names to correct toward (comma-separated).",
+            Input::new(state)
+                .small()
+                .text_size(px(typography.t_body_sm))
+                .into_any_element(),
+        ));
+    }
 
     // Microphone permission status + action.
     rows.push(entry(
@@ -364,6 +421,64 @@ fn device_item(
         move |m: &mut SettingsModal, _ev: &ClickEvent, _window, cx| {
             m.dictation.input_device = device.clone();
             m.persist_voice(cx);
+        },
+    ))
+}
+
+/// The language picker (whisper models only): a dropdown button labeled by the
+/// active language's display name, opening a scrollable menu of the full whisper
+/// language set — `Auto-detect` first, then a common cluster (Vietnamese-first),
+/// then the rest alphabetically. A scrollable menu (no search box) keeps the
+/// ~99-item list compact without adding a filter-input entity. Picking a row
+/// writes `language` and persists via the settings watcher.
+fn language_control(modal: &SettingsModal, cx: &mut gpui::Context<SettingsModal>) -> AnyElement {
+    let entity = cx.entity();
+    let current = modal.dictation.language.clone();
+    let label = language_display_name(&current).to_string();
+    DropdownButton::new("voice-lang")
+        .button(Button::new("voice-lang-btn").label(label).small().outline())
+        .small()
+        // `TopRight` right-aligns the menu under the button; `scrollable` + a
+        // capped height keep the long language list on-screen.
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, window, _cx| {
+            menu = menu.scrollable(true).max_h(px(320.0));
+            for (code, name) in WHISPER_LANGUAGES {
+                let selected = current == *code;
+                menu = menu.item(language_item(window, &entity, code, name, selected));
+            }
+            menu
+        })
+        .into_any_element()
+}
+
+/// One language row — a display name with a trailing check on the active
+/// language (right-aligned, ChatGPT-style), writing `language` on click. The
+/// `code` is `&'static` so the click closure needs no owned clone.
+fn language_item(
+    window: &mut Window,
+    entity: &Entity<SettingsModal>,
+    code: &'static str,
+    name: &'static str,
+    selected: bool,
+) -> PopupMenuItem {
+    PopupMenuItem::element(move |_window, _cx| {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(28.0))
+            .min_w(px(200.0))
+            .child(div().child(name))
+            .child(div().w(px(16.0)).flex_none().flex().justify_center().when(
+                selected,
+                |d| d.child(Icon::default().path("icons/check.svg").size(px(14.0))),
+            ))
+    })
+    .on_click(window.listener_for(
+        entity,
+        move |m: &mut SettingsModal, _ev: &ClickEvent, _window, cx| {
+            set_language(m, code, cx);
         },
     ))
 }

@@ -124,6 +124,13 @@ pub fn install(cx: &mut App) {
 }
 
 fn route_event(cx: &mut App, ev: DictationEvent) {
+    // Post-process a final transcript once at this shared choke point (before
+    // history + every target pane) so the cleaned text is what gets recorded and
+    // inserted. Non-final events pass through untouched.
+    let ev = match ev {
+        DictationEvent::Final(text) => DictationEvent::Final(post_process_transcript(cx, text)),
+        other => other,
+    };
     // Record every completed transcript to the on-disk history BEFORE routing —
     // this is the single choke point all panes share, so history is captured even
     // if the target pane was closed mid-session. A repaint surfaces it live in an
@@ -170,6 +177,25 @@ fn route_event(cx: &mut App, ev: DictationEvent) {
     }
 }
 
+/// Clean a final transcript per the live dictation settings: filler/hallucination
+/// filtering first (drops "(sad music)", "um", stutters), then fuzzy custom-word
+/// correction toward the user's dictionary. Reads the settings global; absent
+/// (unit tests) → identity.
+fn post_process_transcript(cx: &App, text: String) -> String {
+    let Some(settings) = cx.try_global::<DictationSettings>() else {
+        return text;
+    };
+    // Filter first so fillers/phantoms don't get fuzzy-matched to a custom word,
+    // then correct the surviving words toward the dictionary.
+    let filtered =
+        oximux_dictation::text_filter::filter(&text, &settings.language, settings.filler_filter_enabled);
+    oximux_dictation::custom_words::apply(
+        &filtered,
+        &settings.custom_words,
+        settings.word_correction_threshold,
+    )
+}
+
 // NOTE: every accessor tolerates the global being absent (returns a safe
 // "missing"/no-op result) rather than `cx.global()` which panics. The service
 // is installed at app boot, but the composer/settings render paths run in unit
@@ -207,12 +233,17 @@ pub fn start(
     if cx.try_global::<DictationService>().is_none() {
         return false;
     }
+    // Read the VAD toggle before the mutable global borrow below.
+    let vad_enabled = cx
+        .try_global::<DictationSettings>()
+        .map(|s| s.vad_enabled)
+        .unwrap_or(true);
     cx.update_global::<DictationService, _>(|svc, _| {
         if svc.controller.is_active() {
             return false;
         }
         svc.target = Some(target);
-        svc.controller.start(paths, device)
+        svc.controller.start(paths, device, vad_enabled)
     })
 }
 

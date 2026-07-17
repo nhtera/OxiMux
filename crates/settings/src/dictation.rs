@@ -18,8 +18,7 @@ use serde::{Deserialize, Serialize};
 /// use-site clamps back when the id isn't in the live catalog).
 pub const DEFAULT_MODEL_ID: &str = "whisper-small";
 
-/// Accepted whisper language selectors. `auto` = detect; `vi`/`en` pin it.
-pub const LANGUAGES: &[&str] = &["auto", "vi", "en"];
+use crate::dictation_languages;
 
 /// How a dictation press behaves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -38,7 +37,9 @@ impl DictationMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// No `Eq`: `word_correction_threshold` is an f64. `PartialEq` suffices for the
+// change-detection the settings watcher does.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DictationSettings {
     /// Master switch. `false` hides the mic button and turns the Cmd+E
@@ -54,6 +55,20 @@ pub struct DictationSettings {
     pub input_device: Option<String>,
     /// Toggle vs. press-and-hold dictation.
     pub mode: DictationMode,
+    /// Trim silence with Silero VAD before decoding. Keeps only speech spans so
+    /// whisper never hallucinates captions over pauses. Defaults on; the ~629 KB
+    /// VAD model downloads once on first use, and a missing model degrades to the
+    /// plain silence gate.
+    pub vad_enabled: bool,
+    /// Dictionary of proper nouns / brand / command names the transcript is
+    /// fuzzy-corrected toward (e.g. "OxiMux", "ChargeBee"). Empty = no correction.
+    pub custom_words: Vec<String>,
+    /// Acceptance threshold for custom-word correction (lower = stricter). `0`
+    /// disables it even with a non-empty dictionary.
+    pub word_correction_threshold: f64,
+    /// Clean transcripts of filler words, stutters, and whole-output whisper
+    /// hallucinations ("(sad music)"). Language-gated fillers; defaults on.
+    pub filler_filter_enabled: bool,
 }
 
 impl Default for DictationSettings {
@@ -64,9 +79,18 @@ impl Default for DictationSettings {
             language: "auto".to_string(),
             input_device: None,
             mode: DictationMode::Toggle,
+            vad_enabled: true,
+            custom_words: Vec::new(),
+            word_correction_threshold: DEFAULT_WORD_CORRECTION_THRESHOLD,
+            filler_filter_enabled: true,
         }
     }
 }
+
+/// Default fuzzy custom-word acceptance threshold. Kept in sync with the
+/// dictation crate's `custom_words::DEFAULT_THRESHOLD` (the settings crate must
+/// not depend on the engine crate, so the constant is duplicated).
+pub const DEFAULT_WORD_CORRECTION_THRESHOLD: f64 = 0.18;
 
 impl Global for DictationSettings {}
 
@@ -109,11 +133,25 @@ impl DictationSettings {
             self.model_id = DEFAULT_MODEL_ID.to_string();
         }
         self.language = self.language.trim().to_lowercase();
-        if !LANGUAGES.contains(&self.language.as_str()) {
+        if !dictation_languages::is_supported(&self.language) {
             self.language = "auto".to_string();
         }
         // Collapse a blank device name to "system default".
         self.input_device = self.device_name();
+        // Trim custom words, drop blanks and duplicates (case-insensitive).
+        let mut seen = std::collections::HashSet::new();
+        self.custom_words = std::mem::take(&mut self.custom_words)
+            .into_iter()
+            .map(|w| w.trim().to_string())
+            .filter(|w| !w.is_empty() && seen.insert(w.to_lowercase()))
+            .collect();
+        // Clamp the threshold to a sane range; a NaN/negative reads as "off",
+        // an over-1 value would accept anything.
+        if !self.word_correction_threshold.is_finite() || self.word_correction_threshold < 0.0 {
+            self.word_correction_threshold = 0.0;
+        } else if self.word_correction_threshold > 1.0 {
+            self.word_correction_threshold = 1.0;
+        }
         self
     }
 }
@@ -139,6 +177,10 @@ mod tests {
             language: "vi".into(),
             input_device: Some("MacBook Pro Microphone".into()),
             mode: DictationMode::Hold,
+            vad_enabled: false,
+            custom_words: vec!["OxiMux".into(), "ChargeBee".into()],
+            word_correction_threshold: 0.2,
+            filler_filter_enabled: false,
         };
         let parsed = DictationSettings::from_toml_str(&s.to_toml_string()).expect("round-trip");
         assert_eq!(parsed, s);
@@ -155,6 +197,8 @@ mod tests {
         assert_eq!(s.input_device, None);
         assert_eq!(s.mode, DictationMode::Toggle);
         assert_eq!(s.device_name(), None);
+        // A pre-VAD dictation.toml must default the new toggle on.
+        assert!(s.vad_enabled, "vad defaults on for legacy stores");
     }
 
     #[test]
@@ -188,12 +232,27 @@ mod tests {
         let s = DictationSettings {
             enabled: true,
             model_id: "   ".into(),
-            language: "FR".into(),
+            // "zz" is not a whisper language code — must clamp to auto. (A real
+            // code like "fr" now stays, since the full set is accepted.)
+            language: "ZZ".into(),
             ..Default::default()
         }
         .sanitized();
         assert_eq!(s.model_id, "whisper-small", "blank model → default");
         assert_eq!(s.language, "auto", "unknown language → auto");
+    }
+
+    #[test]
+    fn sanitize_keeps_a_broad_whisper_language() {
+        // Regression guard for the widened language set: a non-vi/en code the
+        // legacy 3-item list would have clamped must now survive.
+        let s = DictationSettings {
+            language: "TH".into(),
+            ..Default::default()
+        }
+        .sanitized();
+        assert_eq!(s.language, "th", "thai is a valid whisper language");
+        assert_eq!(s.language_param(), Some("th".into()));
     }
 
     #[test]

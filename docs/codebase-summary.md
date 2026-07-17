@@ -402,9 +402,12 @@ SenseVoice (CJK) round out the catalog.
 | `capture.rs` | cpal CoreAudio capture on a dedicated thread (owns the `!Send` stream). Selectable input device (`run(device)`, `list_input_devices()`; cpal 0.18 → device name is its `Display`). Device-default rate (never request 16 kHz — macOS silence pitfall), downmix to mono, shared `SessionBuffer`, throttled RMS level events, 2-min hard cap. |
 | `resample.rs` | Linear any-rate → 16 kHz mono resampler + downmix. Every buffer passes through before the engine (sherpa aborts on inconsistent rates). |
 | `engine.rs` | sherpa-rs wrapper: `WhisperRecognizer` / `TransducerRecognizer` (NeMo Parakeet) / `ZipFormer` (icefall, incl. Vietnamese) / `SenseVoiceRecognizer` (single-file, CJK). CPU-only. Silence gate (int16 peak < 300), 30 s chunk splitter at the quietest 100 ms window (SIGTRAP #7925 mitigation). `ModelPaths.model` = single-file slot; `require_files` is kind-aware. |
-| `controller.rs` | Session state machine (Idle→Recording→Transcribing) on one worker thread + warm engine cache (10-min idle teardown). `start(paths, device)`. Emits `DictationEvent` over a `futures::mpsc`. `Drop` only signals — never joins (no main-thread block). |
+| `vad.rs` | Silero VAD (sherpa's bundled `silero_vad`, no new dep): `keep_speech` segments a 16 kHz buffer into speech spans and drops silence before decode (also kills whisper's silence hallucination). `ensure_downloaded` fetches the ~629 KB `silero_vad.onnx` on demand (atomic temp+rename, cleaned on failure); missing/offline → caller falls back to the peak gate. |
+| `custom_words.rs` | Pure fuzzy dictionary correction: `apply(transcript, &[word], threshold)` over 1–3-word windows, self-contained Levenshtein + length prefilter + exact-key shortcut, case/punct preserved. **No soundex** (coarse phonetic collisions over-corrected common words). |
+| `text_filter.rs` | Pure transcript cleanup: `filter(text, language, enabled)` — language-gated filler removal (en/vi/auto; unknown langs remove none), bracketed/music-note strip, 3+-repeat stutter collapse, whole-output-only whisper hallucination guard. |
+| `controller.rs` | Session state machine (Idle→Recording→Transcribing) on one worker thread + warm engine **and VAD** caches (10-min idle teardown). `start(paths, device, vad_enabled)`. `run_session` trims with `maybe_vad_trim` (best-effort) before the silence gate. Emits `DictationEvent` over a `futures::mpsc`. `Drop` only signals — never joins (no main-thread block). |
 | `model_catalog.rs` | 8-model catalog across 4 families (`Whisper`/`Transducer`/`Zipformer`/`SenseVoice`): whisper small(default)/base/tiny, zipformer-vi + 30M lite, parakeet v3/v2, sense-voice. URLs HEAD/range-verified against k2-fsa `asr-models`; sha256 unpinned (`None`). |
-| `model_manager.rs` | Download (resumable HTTP Range) → optional SHA-256 verify → `tar` extract → file-existence gate → Ready. Disk is source of truth on init. Pull (`status`/`readiness`) + push (`ModelEvent`) APIs. |
+| `model_manager.rs` | Download (resumable HTTP Range) → optional SHA-256 verify → `tar` extract → file-existence gate → Ready. Disk is source of truth on init. Pull (`status`/`readiness`) + push (`ModelEvent`) APIs. (VAD's single-file `.onnx` uses `vad.rs`'s own fetch, not this archive path.) |
 
 App glue: `shell/agent_chat/dictation_service.rs` (process-wide `Global`: one
 `DictationController` + `ModelManager`; routes events to a `DictationTarget`
@@ -416,8 +419,13 @@ floating "Listening…" pill + terminal/editor sink, mounted at `WorkspaceRoot`)
 mic device/hold dropdown, `WorkspaceRoot::dictate_focused_pane` (⌘E → focused
 pane → sink), `terminal_view/input.rs::insert_dictation_text`,
 `platform/mic_permission.rs` (`AVCaptureDevice` TCC), `settings_modal/pane_voice.rs`
-+ `settings/dictation.rs` (`DictationSettings{input_device, mode}` →
-`dictation.toml`).
++ `settings/dictation.rs` (`DictationSettings{input_device, mode, vad_enabled,
+custom_words, word_correction_threshold, filler_filter_enabled}` →
+`dictation.toml`; full-Whisper language table in `settings/dictation_languages.rs`).
+`dictation_service::route_event` post-processes the Final transcript once
+(`text_filter::filter` → `custom_words::apply`) at the shared choke point so
+history + every target pane get the cleaned text. The Voice pane's custom-words
+editor is an `InputState` on the modal (persists on blur/Enter, not per-key).
 
 ---
 

@@ -4,6 +4,46 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-17 — Voice dictation: full language picker, Silero VAD, custom words, transcript cleanup (`feat/voice-dictation-vietnamese`)
+
+Handy-parity quick-wins bundle (plan `plans/260717-0203-voice-dictation-handy-parity-enhancements/`).
+Research: comparison against the open-source Handy app surfaced richer settings +
+better silence handling. All on the existing `sherpa-rs 0.6.8` stack — **no new
+crate dependency** (Silero VAD ships inside sherpa-rs).
+
+**Shipped:**
+- **Full language picker** — the dictation language grew from 3 options
+  (auto/vi/en) to the complete Whisper set (~99 languages), a scrollable
+  searchless dropdown gated to whisper-family models (transducer/zipformer/
+  sense-voice show a fixed-coverage blurb). New `dictation_languages` table
+  (`is_supported`/`display_name`); `sanitized()` validates the full set.
+- **Silero VAD silence trimming** — a new `dictation::vad` module wraps
+  sherpa's bundled Silero VAD to segment speech and drop silent gaps before
+  decode, which also kills whisper's "(sad music)" ambient-silence
+  hallucination. The ~629 KB model downloads once on demand (atomic write, temp
+  cleaned on failure); a missing/offline model degrades to the plain peak gate.
+  Warmed alongside the recognizer; `vad_enabled` setting (default on) + toggle.
+- **Custom-words dictionary** — a user dictionary the transcript is fuzzy-
+  corrected toward ("oxy mux" → "OxiMux", "charge bee" → "ChargeBee"). Pure
+  `custom_words::apply` (self-contained Levenshtein, n-gram 3→2→1 windows, length
+  prefilter, exact-key shortcut, case/punct preservation). **No phonetic/soundex
+  bonus** — it coarsely collided common words (later↔Ladder) and was cut after
+  review. Comma-separated editor field (persists on blur/Enter, not per-key).
+- **Transcript cleanup** — new `text_filter::filter`: language-gated filler
+  removal (en/vi/auto lists; unknown languages remove none), bracketed/music-note
+  stripping, 3+-repeat stutter collapse, and a whole-output-only whisper
+  hallucination guard. `filler_filter_enabled` setting (default on) + toggle.
+- Both text passes run at the shared `route_event` Final choke point (filter →
+  custom-words), so history + every target pane get the cleaned text.
+
+New settings fields (`vad_enabled`, `custom_words`, `word_correction_threshold`,
+`filler_filter_enabled`) load back-compat via `#[serde(default)]`; a pre-existing
+`dictation.toml` is unaffected. Code-reviewed (one confirmed over-correction bug
+found + fixed). Suites green: 39 dictation + 99 settings + 1325 app-lib; clippy
+clean.
+
+---
+
 ### 2026-07-16 — Voice dictation everywhere: any pane, device picker, recording waveform (`feat/voice-dictation-vietnamese`)
 
 Follow-on to the initial dictation ship. Dictation is no longer chat-only, and
