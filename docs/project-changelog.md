@@ -4,6 +4,28 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-17 — Voice dictation: language-aware model recommendation (`feat/voice-dictation-vietnamese`)
+
+Benchmarking the speech models against **real Vietnamese speech** (40 clips / 520
+words, `doof-ferb/fpt_fosd`, cc-by-4.0) turned up a gap worth surfacing in the UI:
+
+| Model | WER | Speed | Size |
+|---|---|---|---|
+| `zipformer-vi` | **10.2 %** | ×96.5 | 57 MB |
+| `whisper-small` (default) | 31.7 % | ×5.8 | 610 MB |
+
+The dedicated Vietnamese model is **3× more accurate, 16× faster and 10× smaller**
+than the default — but nothing pointed a user at it. The Voice pane's "recommended"
+badge is now **language-aware** (`recommended_model_id`): pinning `vi` badges
+`zipformer-vi`, pinning `en` badges Parakeet TDT v2 (best English WER), and
+`auto` keeps the multilingual default — `auto` implies the user may code-switch, and
+both dedicated models are single-language.
+
+`DEFAULT_MODEL_ID` still backs a fresh install and the deleted-model fallback; it is
+now explicitly the *safe multilingual* default rather than the *best* model.
+
+---
+
 ### 2026-07-17 — Voice dictation: settings polish (`feat/voice-dictation-vietnamese`)
 
 Phase 05 of the dictation plan — four independent, default-off (or

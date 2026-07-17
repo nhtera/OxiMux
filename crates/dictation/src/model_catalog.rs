@@ -73,8 +73,34 @@ impl ModelSpec {
     }
 }
 
-/// The default model id — Vietnamese priority (whisper-small covers `vi`).
+/// The default model id — the safe multilingual starting point (whisper-small
+/// covers every language incl. `vi`). This is what an untouched install uses and
+/// what a deleted-model fallback lands on; it is NOT always the *best* model for
+/// a given language — see [`recommended_model_id`].
 pub const DEFAULT_MODEL_ID: &str = "whisper-small";
+
+/// The best model to steer a user toward when they have pinned `language`
+/// (a whisper language code, or `"auto"`).
+///
+/// A dedicated single-language model beats the general multilingual one by a
+/// wide margin, so pinning a language should surface it:
+/// - **`vi`** → `zipformer-vi`. Measured on 40 clips of real Vietnamese speech:
+///   **10.2 % WER vs whisper-small's 31.7 %** — 3× more accurate, while also
+///   being 16× faster and 10× smaller.
+/// - **`en`** → `parakeet-tdt-0.6b-v2-int8`, the catalog's best-English-WER entry
+///   (it topped the OpenASR leaderboard). Not benchmarked here, unlike `vi`.
+/// - anything else (incl. `auto`) → [`DEFAULT_MODEL_ID`].
+///
+/// Both dedicated models are single-language and cannot code-switch, which is
+/// exactly why this is keyed off an explicitly *pinned* language: `auto` implies
+/// the user may mix languages, so it keeps the multilingual default.
+pub fn recommended_model_id(language: &str) -> &'static str {
+    match language.trim().to_lowercase().as_str() {
+        "vi" => "zipformer-vi",
+        "en" => "parakeet-tdt-0.6b-v2-int8",
+        _ => DEFAULT_MODEL_ID,
+    }
+}
 
 /// The full catalog, in display order (default first). URLs + sizes are
 /// HEAD/range-verified against the live k2-fsa `asr-models` release; in-archive
@@ -295,6 +321,42 @@ mod tests {
         assert_eq!(whisper.required_files().len(), 3);
         let para = spec_for("parakeet-tdt-0.6b-v3-int8").unwrap();
         assert_eq!(para.required_files().len(), 4);
+    }
+
+    #[test]
+    fn recommendation_prefers_dedicated_model_for_a_pinned_language() {
+        // vi: the measured 3x accuracy win over the multilingual default.
+        assert_eq!(recommended_model_id("vi"), "zipformer-vi");
+        assert_eq!(recommended_model_id("VI"), "zipformer-vi", "case-insensitive");
+        assert_eq!(recommended_model_id(" vi "), "zipformer-vi", "trimmed");
+        assert_eq!(recommended_model_id("en"), "parakeet-tdt-0.6b-v2-int8");
+        // `auto` means the user may code-switch, so a single-language model must
+        // NOT be recommended — keep the multilingual default.
+        assert_eq!(recommended_model_id("auto"), DEFAULT_MODEL_ID);
+        assert_eq!(recommended_model_id(""), DEFAULT_MODEL_ID);
+        // A language with no dedicated model falls back to the multilingual one.
+        assert_eq!(recommended_model_id("th"), DEFAULT_MODEL_ID);
+        assert_eq!(recommended_model_id("ja"), DEFAULT_MODEL_ID);
+    }
+
+    #[test]
+    fn every_recommendation_resolves_to_a_real_catalog_model() {
+        // A recommendation pointing at a non-existent id would badge nothing and
+        // silently mislead; guard every branch against catalog drift.
+        for lang in ["vi", "en", "auto", "th", "zz"] {
+            let id = recommended_model_id(lang);
+            assert!(spec_for(id).is_some(), "{lang} -> {id} not in catalog");
+        }
+    }
+
+    #[test]
+    fn recommended_single_language_models_actually_cover_that_language() {
+        // The vi recommendation must be a Vietnamese model, not a stale id that
+        // happens to exist.
+        let vi = spec_for(recommended_model_id("vi")).unwrap();
+        assert!(vi.langs.to_lowercase().contains("vietnamese"), "{}", vi.langs);
+        let en = spec_for(recommended_model_id("en")).unwrap();
+        assert!(en.langs.to_lowercase().contains("english"), "{}", en.langs);
     }
 
     #[test]

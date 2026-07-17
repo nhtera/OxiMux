@@ -25,6 +25,8 @@ pub mod vad;
 pub use capture::{has_input_device, list_input_devices};
 pub use controller::{DictationController, DictationEvent, MAX_RECORDING_SECS};
 pub use engine::{Engine, EngineKind, ModelPaths};
-pub use model_catalog::{Family, ModelSpec, catalog, spec_for, DEFAULT_MODEL_ID};
+pub use model_catalog::{
+    Family, ModelSpec, catalog, recommended_model_id, spec_for, DEFAULT_MODEL_ID,
+};
 pub use model_manager::{ModelEvent, ModelManager, ModelStatus, Readiness};
 pub use resample::TARGET_SAMPLE_RATE;

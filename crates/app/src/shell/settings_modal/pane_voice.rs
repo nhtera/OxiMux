@@ -14,7 +14,8 @@ use gpui_component::button::{Button, DropdownButton};
 use gpui_component::input::Input;
 use gpui_component::menu::PopupMenuItem;
 use oximux_dictation::{
-    DEFAULT_MODEL_ID, Family, ModelSpec, ModelStatus, catalog, list_input_devices, spec_for,
+    DEFAULT_MODEL_ID, Family, ModelSpec, ModelStatus, catalog, list_input_devices,
+    recommended_model_id, spec_for,
 };
 use oximux_settings::{
     Density, DictationMode, ModelUnloadTimeout, Theme, Typography, WHISPER_LANGUAGES,
@@ -618,6 +619,11 @@ fn model_control(
         .map(|s| s.label.to_string())
         .unwrap_or_else(|| "Select model".to_string());
     let typo = typography.clone();
+    // Which model the badge points at depends on the pinned language: a pinned
+    // `vi`/`en` gets steered to the dedicated (much more accurate) model, while
+    // `auto` keeps the multilingual default. Computed per menu build — changing
+    // the language closes this menu, so it can never go stale while open.
+    let recommended = recommended_model_id(&modal.dictation.language);
     DropdownButton::new("voice-model")
         .button(Button::new("voice-model-btn").label(label).small().outline())
         .small()
@@ -631,7 +637,15 @@ fn model_control(
             menu = menu.max_w(px(420.0));
             for spec in catalog() {
                 let selected = current_id == spec.id;
-                menu = menu.item(model_item(window, &entity, spec, selected, theme, &typo));
+                menu = menu.item(model_item(
+                    window,
+                    &entity,
+                    spec,
+                    selected,
+                    spec.id == recommended,
+                    theme,
+                    &typo,
+                ));
             }
             menu
         })
@@ -648,13 +662,13 @@ fn model_item(
     entity: &Entity<SettingsModal>,
     spec: &'static ModelSpec,
     selected: bool,
+    recommended: bool,
     theme: Theme,
     typography: &Typography,
 ) -> PopupMenuItem {
     let id = spec.id.to_string();
     let label = spec.label.to_string();
     let langs = spec.langs.to_string();
-    let is_default = spec.id == DEFAULT_MODEL_ID;
     let typo = typography.clone();
     let del_entity = entity.clone();
 
@@ -698,7 +712,7 @@ fn model_item(
                     .text_color(theme.fg_base)
                     .child(label.clone()),
             );
-        if is_default {
+        if recommended {
             line1 = line1.child(recommended_badge(theme, &typo));
         }
         line1 = line1.child(div().flex_1()).child(
