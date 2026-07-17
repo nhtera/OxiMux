@@ -101,6 +101,11 @@ pub struct SettingsModal {
     /// Keeps the custom-words `InputEvent::Change` → parse+persist subscription
     /// alive.
     _custom_words_sub: Option<Subscription>,
+    /// The custom-words value at `open()`, so `close()` can flush a pending edit
+    /// that was typed but never committed via blur/Enter (clicking dead space
+    /// doesn't blur a gpui input) — otherwise closing the modal would silently
+    /// drop the typed dictionary.
+    custom_words_seed: Vec<String>,
     /// Working copy of the `keybindings.toml` override map; reseeded from
     /// disk at each `open()`. Edits persist + apply to the live keymap
     /// immediately (see `pane_keybindings`).
@@ -158,6 +163,7 @@ impl SettingsModal {
             _search_sub: None,
             custom_words_input: None,
             _custom_words_sub: None,
+            custom_words_seed: Vec::new(),
             keybind_overrides: BTreeMap::new(),
             recording_action: None,
             recording_sub: None,
@@ -215,6 +221,7 @@ impl SettingsModal {
         // from the working copy. On every edit, reparse into `custom_words` and
         // persist (the watcher reloads the global) so the dictionary applies to
         // the next dictation without a modal round-trip.
+        self.custom_words_seed = self.dictation.custom_words.clone();
         let seed = self.dictation.custom_words.join(", ");
         let cw_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -277,6 +284,14 @@ impl SettingsModal {
         // modal. See the matching guard in `command_palette::PaletteModal::close`.
         let was_open = self.open;
         self.open = false;
+        // Flush a custom-words edit that was typed but never committed (blur/Enter)
+        // before dropping the input — the working copy is synced on every
+        // keystroke, so persist only when it actually changed since open. Without
+        // this, typing a dictionary then closing via ✕/Esc would drop the edit.
+        if self.custom_words_input.is_some() && self.dictation.custom_words != self.custom_words_seed
+        {
+            self.persist_voice(cx);
+        }
         // Drop the search input so its focus handle can't keep window focus
         // orphaned after the modal is hidden.
         self.search_input = None;
