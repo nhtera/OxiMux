@@ -9,6 +9,10 @@ rust-version.workspace = true
 
 [dependencies]
 oximux-core = { workspace = true }
+# Portable fold + wire vocabulary + stream-json decoder, re-exported under the
+# original `crate::thread::*` paths (see src/thread/mod.rs). Split out so the
+# phone's Rust core can reuse the fold without pty/sqlite/ACP deps.
+oximux-agent-core = { workspace = true }
 oximux-pty = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }

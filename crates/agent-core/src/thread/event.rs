@@ -58,7 +58,7 @@ pub enum AuthMethodKind {
     Terminal { args: Vec<String>, env: Vec<(String, String)> },
     /// The agent hands back an OAuth URL the client opens in a browser (Codex's
     /// merged ChatGPT sign-in: `account/login/start` → `authUrl`). Clicking the
-    /// pill calls [`AgentConnection::begin_browser_login`](super::connection::AgentConnection::begin_browser_login),
+    /// pill calls `AgentConnection::begin_browser_login` (in `oximux-agents`),
     /// which returns the URL to open; a later `account/login/completed` resolves
     /// the card via [`ThreadEvent::AuthOutcome`]. No `args`/`env`: the agent runs
     /// its own callback server, the client only opens the URL.
@@ -326,7 +326,7 @@ pub enum ThreadEvent {
     },
     /// The agent produced a browser sign-in URL to open (Codex `account/login/
     /// start` → `authUrl`). Emitted asynchronously by the worker after a
-    /// [`begin_browser_login`](super::connection::AgentConnection::begin_browser_login)
+    /// `begin_browser_login` (on `AgentConnection`, in `oximux-agents`)
     /// request (so the click that triggers it never blocks the UI on the RPC).
     /// The app opens it in the system browser; the flow resolves later via
     /// [`ThreadEvent::AuthOutcome`]. Ephemeral, view-owned — the fold ignores it.

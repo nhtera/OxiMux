@@ -7,6 +7,7 @@ members = [
     "crates/dictation",
     "crates/pty",
     "crates/git",
+    "crates/agent-core",
     "crates/agents",
     "crates/editor",
     "crates/storage",
@@ -34,6 +35,7 @@ oximux-core     = { path = "crates/core" }
 oximux-dictation = { path = "crates/dictation" }
 oximux-pty      = { path = "crates/pty" }
 oximux-git      = { path = "crates/git" }
+oximux-agent-core = { path = "crates/agent-core" }
 oximux-agents   = { path = "crates/agents" }
 oximux-editor   = { path = "crates/editor" }
 oximux-storage  = { path = "crates/storage" }

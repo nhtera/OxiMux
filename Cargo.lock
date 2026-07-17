@@ -5489,6 +5489,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "oximux-agent-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "oximux-agents"
 version = "0.1.0"
 dependencies = [
@@ -5499,6 +5508,7 @@ dependencies = [
  "chrono",
  "futures",
  "libc",
+ "oximux-agent-core",
  "oximux-core",
  "oximux-git",
  "oximux-pty",

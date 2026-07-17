@@ -1,0 +1,21 @@
+[package]
+name = "oximux-agent-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# Dependency-minimal, mobile-portable core: the ThreadEvent wire vocabulary, the
+# stream-json decoder, and the ChatThread fold — with NO oximux-pty / rusqlite /
+# agent-client-protocol / gpui deps. Both the desktop `oximux-agents` crate and
+# the phone's Rust core (`mobile-core`/`remote-session`) depend on this, so the
+# fold that renders a transcript is shared verbatim across desktop and mobile.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
