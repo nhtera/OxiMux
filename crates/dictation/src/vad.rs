@@ -90,8 +90,11 @@ pub fn ensure_downloaded(data_dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// A warm Silero VAD detector. Reused across recordings; call [`Vad::clear`]
-/// between them.
+/// A single-use Silero VAD detector. Construct one per recording and drop it —
+/// sherpa-rs 0.6.8 exposes only `clear()` (the segment queue), NOT a full model
+/// reset, so a reused detector would leak the previous recording's buffer + LSTM
+/// state and progressively corrupt detection. The model is small (~629 KB) so a
+/// fresh load per recording is cheap.
 pub struct Vad {
     inner: SileroVad,
 }
@@ -116,26 +119,32 @@ impl Vad {
     }
 
     /// Return only the speech portions of a 16 kHz mono buffer, silence trimmed,
-    /// with segments concatenated in order. An empty result means the detector
-    /// found no speech (caller should treat it as silence). Resets detector
-    /// state first so a prior recording can't leak in.
+    /// segments concatenated in order. An empty result means the detector found
+    /// no speech.
+    ///
+    /// The detector's speech/silence state machine advances one `window_size`
+    /// frame at a time, so audio MUST be fed in `window_size` chunks — feeding
+    /// one large buffer collapses the state machine (its segment start is taken
+    /// relative to the post-feed buffer tail, yielding only a tiny tail
+    /// fragment). Segments are drained as they close during feeding, then a
+    /// final `flush` emits any still-open segment.
     pub fn keep_speech(&mut self, samples_16k: &[f32]) -> Vec<f32> {
-        self.inner.clear();
-        self.inner.accept_waveform(samples_16k.to_vec());
-        self.inner.flush();
-
         let mut out = Vec::new();
+        for chunk in samples_16k.chunks(WINDOW_SIZE as usize) {
+            self.inner.accept_waveform(chunk.to_vec());
+            self.drain_into(&mut out);
+        }
+        self.inner.flush();
+        self.drain_into(&mut out);
+        out
+    }
+
+    /// Move every currently-queued speech segment's samples into `out`.
+    fn drain_into(&mut self, out: &mut Vec<f32>) {
         while !self.inner.is_empty() {
             let seg = self.inner.front();
             out.extend_from_slice(&seg.samples);
             self.inner.pop();
         }
-        out
-    }
-
-    /// Reset detector state between recordings (also done at the start of
-    /// [`Vad::keep_speech`], but exposed for explicit teardown).
-    pub fn clear(&mut self) {
-        self.inner.clear();
     }
 }

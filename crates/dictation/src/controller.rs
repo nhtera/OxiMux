@@ -133,18 +133,17 @@ fn worker_loop(
     evt_tx: UnboundedSender<DictationEvent>,
     active: Arc<AtomicBool>,
 ) {
-    // Warm caches: kept across presses, dropped after idle teardown. The VAD
-    // detector is model-independent, so it survives model switches.
+    // Warm engine cache: kept across presses, dropped after idle teardown. The
+    // VAD detector is NOT warmed — sherpa-rs 0.6.8 has no full reset, so a reused
+    // detector leaks state; a fresh one is built per recording (see maybe_vad_trim).
     let mut engine: Option<Engine> = None;
-    let mut vad: Option<Vad> = None;
 
     loop {
-        // Block for the next Start, tearing the caches down if idle too long.
+        // Block for the next Start, tearing the engine down if idle too long.
         let cmd = match cmd_rx.recv_timeout(IDLE_TEARDOWN) {
             Ok(cmd) => cmd,
             Err(RecvTimeoutError::Timeout) => {
                 engine = None; // release ONNX memory
-                vad = None;
                 continue;
             }
             Err(RecvTimeoutError::Disconnected) => break,
@@ -162,22 +161,13 @@ fn worker_loop(
         // worker thread, `active` would stay stuck `true`, and every future
         // press would report "busy" until an app restart.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_session(
-                &cmd_rx,
-                &evt_tx,
-                &mut engine,
-                &mut vad,
-                paths,
-                device,
-                vad_enabled,
-            );
+            run_session(&cmd_rx, &evt_tx, &mut engine, paths, device, vad_enabled);
         }));
         active.store(false, Ordering::SeqCst);
         if outcome.is_err() {
-            // A cache may be in an inconsistent state after a panic — drop both
+            // The engine may be in an inconsistent state after a panic — drop it
             // so the next session rebuilds cleanly.
             engine = None;
-            vad = None;
             let _ = evt_tx.unbounded_send(DictationEvent::Error(
                 "dictation recovered from an internal error; try again".into(),
             ));
@@ -186,12 +176,10 @@ fn worker_loop(
 }
 
 /// Drive one Start→(Stop|Cancel|Cap) session end to end.
-#[allow(clippy::too_many_arguments)]
 fn run_session(
     cmd_rx: &Receiver<Command>,
     evt_tx: &UnboundedSender<DictationEvent>,
     engine: &mut Option<Engine>,
-    vad: &mut Option<Vad>,
     paths: ModelPaths,
     device: Option<String>,
     vad_enabled: bool,
@@ -254,13 +242,13 @@ fn run_session(
 
     // Trim silence with Silero VAD when enabled — keeps only speech spans so
     // whisper never sees the pauses it hallucinates captions over. VAD is
-    // best-effort: a missing/unloadable model falls back to the raw buffer, and
-    // the peak gate below still guards a fully-silent recording.
+    // best-effort: a missing/unloadable model, or a VAD miss on non-silent
+    // audio, falls back to the raw buffer, and the peak gate below still guards
+    // a fully-silent recording.
     let s16 = if vad_enabled {
-        let data_dir = paths.dir.parent().map(std::path::Path::to_path_buf);
-        maybe_vad_trim(vad, data_dir.as_deref(), s16)
+        let data_dir = paths.dir.parent();
+        maybe_vad_trim(data_dir, s16)
     } else {
-        *vad = None; // release the VAD model when the feature is off
         s16
     };
 
@@ -303,36 +291,33 @@ fn ensure_engine(
     }
 }
 
-/// Trim `samples` to speech spans with the warm VAD, lazily loading (and
-/// downloading) the model on first use. Any failure — no data dir, download
-/// error offline, load error — falls back to the untrimmed buffer so dictation
-/// still works; the caller's peak gate remains the silent-recording guard.
-fn maybe_vad_trim(
-    vad: &mut Option<Vad>,
-    data_dir: Option<&std::path::Path>,
-    samples: Vec<f32>,
-) -> Vec<f32> {
+/// Trim `samples` to speech spans with a FRESH Silero VAD (built per recording —
+/// the detector can't be safely reused, see [`Vad`]), downloading the model on
+/// first use. Any failure — no data dir, download error offline, load error —
+/// falls back to the untrimmed buffer so dictation still works.
+///
+/// Safety net: if the VAD returns empty but the audio is NOT silent, that is a
+/// VAD miss, not real silence — return the original audio rather than silently
+/// dropping a whole spoken utterance. Genuine silence still yields empty (the
+/// caller's peak gate then reports it).
+fn maybe_vad_trim(data_dir: Option<&std::path::Path>, samples: Vec<f32>) -> Vec<f32> {
     let Some(data_dir) = data_dir else {
         return samples;
     };
-    if vad.is_none() {
-        match crate::vad::ensure_downloaded(data_dir).and_then(|p| Vad::load(&p)) {
-            Ok(v) => *vad = Some(v),
-            Err(e) => {
-                tracing::warn!(error = %e, "Silero VAD unavailable; using untrimmed audio");
-                return samples;
-            }
+    let vad = crate::vad::ensure_downloaded(data_dir).and_then(|p| Vad::load(&p));
+    let mut vad = match vad {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "Silero VAD unavailable; using untrimmed audio");
+            return samples;
         }
+    };
+    let trimmed = vad.keep_speech(&samples);
+    if trimmed.is_empty() && !is_silent(&samples) {
+        tracing::warn!("Silero VAD found no speech in non-silent audio; using untrimmed audio");
+        return samples;
     }
-    match vad.as_mut() {
-        Some(v) => {
-            let trimmed = v.keep_speech(&samples);
-            // An empty result means "no speech" — return it so the peak gate
-            // reports silence. A non-empty trim replaces the raw buffer.
-            trimmed
-        }
-        None => samples,
-    }
+    trimmed
 }
 
 /// Poll the command channel + shared cap flag until the session ends.
