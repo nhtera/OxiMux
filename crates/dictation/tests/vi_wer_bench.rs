@@ -93,6 +93,23 @@ fn paths_for(root: &Path, id: &str, language: Option<String>) -> Option<ModelPat
         .then_some(p)
 }
 
+/// Trim silence with a freshly-built Silero VAD, matching the production
+/// single-use lifecycle and its fall-back-to-untrimmed safety net.
+fn vad_trim(model_root: &Path, samples: Vec<f32>) -> Vec<f32> {
+    use oximux_dictation::vad::{self, Vad};
+    let Ok(path) = vad::ensure_downloaded(model_root) else {
+        return samples;
+    };
+    let Ok(mut v) = Vad::load(&path) else {
+        return samples;
+    };
+    let trimmed = v.keep_speech(&samples);
+    if trimmed.is_empty() && !oximux_dictation::engine::is_silent(&samples) {
+        return samples;
+    }
+    trimmed
+}
+
 #[derive(serde::Deserialize)]
 struct Item {
     file: String,
@@ -115,6 +132,12 @@ fn vietnamese_wer_of_current_stack() {
 
     println!("\n=== Vietnamese WER — current (sherpa, CPU) ===");
     println!("eval: {} clips from {}\n", items.len(), eval.display());
+
+    // `OXIMUX_VI_EVAL_VAD=1` trims with Silero first, mirroring the shipped
+    // default (`vad_enabled` is on) — so the bench can measure the config users
+    // actually run, not just a raw decode.
+    let use_vad = std::env::var("OXIMUX_VI_EVAL_VAD").is_ok_and(|v| v == "1");
+    println!("VAD trim: {}\n", if use_vad { "ON" } else { "off" });
 
     // Pin whisper to `vi`; zipformer-vi is Vietnamese-only and ignores language.
     for (id, lang) in [
@@ -139,7 +162,10 @@ fn vietnamese_wer_of_current_stack() {
         let (mut errs, mut words, mut audio_s, mut dec_ms) = (0usize, 0usize, 0f32, 0u128);
         for it in &items {
             let name = it.file.rsplit('/').next().unwrap();
-            let pcm = load_16k(&eval.join("wav16").join(name));
+            let mut pcm = load_16k(&eval.join("wav16").join(name));
+            if use_vad {
+                pcm = vad_trim(&root, pcm);
+            }
             audio_s += pcm.len() as f32 / resample::TARGET_SAMPLE_RATE as f32;
             let t = std::time::Instant::now();
             let hyp = engine.decode_recording(&pcm);
