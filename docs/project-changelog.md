@@ -4,6 +4,33 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-17 — Voice dictation: ampersand custom words + more filler languages (`feat/voice-dictation-vietnamese`)
+
+Second cross-check of the transcript pipeline against the open-source reference
+implementation. Two real gaps closed, one divergence reaffirmed.
+
+- **Custom words with `&` now match their spoken form.** `clean_key` drops the
+  `&`, so "R&D" keyed as "rd" while speech "R and D" cleans to "randd" — edit
+  distance 3, far past the 0.18 threshold, so it never matched. Such words now
+  register a second key for the expanded form. "R and D" / "RD" / "R&D" all
+  correct to "R&D"; a guard test pins that unrelated speech ("the random
+  developer") still doesn't match.
+- **Filler lists extended** from en/vi to also cover es/pt/fr/de/it/ru/id. The
+  language picker offers ~99 languages while only two had lists, so a pinned
+  `fr` got no filler removal at all. Lists stay deliberately narrow: "um" appears
+  only under `en` (Portuguese "um" = "a/an"), "ha" and "eh" nowhere.
+- **No zh/ja/ko/th lists, deliberately.** Filler removal tokenizes on whitespace
+  and those scripts are written without it ("嗯我觉得可以" is one token), so a
+  list could never match real text; and their stock fillers are ambiguous real
+  words (zh "那个" / ja "あの" / ko "그" all mean "that"), which on spaced output
+  would delete real words. A test guards the empty behaviour.
+
+Reaffirmed divergence: the reference gives phonetic (soundex) matches a 0.3x
+score boost. We removed that earlier after it over-corrected common words
+("later" → "Ladder"), and this pass found no reason to restore it.
+
+---
+
 ### 2026-07-17 — Voice dictation: fix ALL-CAPS output from the Vietnamese zipformers (`feat/voice-dictation-vietnamese`)
 
 Dictating with `zipformer-vi` typed SHOUTING TEXT ("TẠI SAO LẠI BIẾT HOA VẬY").

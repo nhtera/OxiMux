@@ -88,15 +88,44 @@ fn strip_bracketed_nonspeech(text: &str) -> String {
     out
 }
 
-/// Filler words for a language code. `en` and `vi` have curated lists; `auto`
-/// uses their union (the app's common case). Every other language returns an
-/// empty set so a pinned language we have no list for never loses real words.
+/// Filler words for a language code. Curated lists exist for the common
+/// space-separated dictation languages; `auto` uses the conservative en+vi union
+/// (the app's common case, where the language is unknown). Every other language
+/// — including every unspaced script — returns an empty set, so a pinned
+/// language we have no list for never loses real words.
 fn fillers_for(language: &str) -> &'static [&'static str] {
     // Near-universal English disfluencies; the ambiguous "ah"/"like"/"so" are
     // deliberately excluded.
     const EN: &[&str] = &["um", "umm", "uhm", "uh", "uhh", "uhhh", "er", "erm", "hmm", "mm", "mhm"];
     // Vietnamese hesitation sounds only; real words like "à"/"thì" are excluded.
-    const VI: &[&str] = &["ừ", "ừm", "ờ", "ờm", "ưm"];
+    const VI: &[&str] = &["ừ", "ừm", "ờ", "ờm", "ưm", "hmm", "mmm"];
+    // Per-language lists for the other common *space-separated* dictation
+    // languages. Each is deliberately narrow: only sounds that are NOT also a
+    // real word in that language. Notably "um" appears only under `en`
+    // (Portuguese "um" = "a/an"), "ha" nowhere (Spanish "ha" = "has"), and "eh"
+    // nowhere (a real interjection in several).
+    const ES: &[&str] = &["ehm", "mmm", "hmm"];
+    const PT: &[&str] = &["ahm", "hmm", "mmm"];
+    const FR: &[&str] = &["euh", "heu", "hmm", "mmm"];
+    const DE: &[&str] = &["äh", "ähm", "öh", "hmm", "mmm"];
+    const IT: &[&str] = &["ehm", "hmm", "mmm"];
+    // Russian: only the clearly non-lexical sounds. "ну"/"вот"/"как бы" are real
+    // words used as fillers and are deliberately absent.
+    const RU: &[&str] = &["хм", "ммм"];
+    const ID: &[&str] = &["hmm", "mmm"];
+    // NOTE: no zh/ja/ko/th lists. Two independent reasons, either one fatal:
+    // (1) `remove_fillers` tokenizes on whitespace, and those scripts are written
+    //     without spaces — "嗯我觉得可以" is a single token, so a filler entry
+    //     could never match the way it is actually written; and
+    // (2) their common fillers are ambiguous real words — zh "那个" / ja "あの" /
+    //     ko "그" all mean "that" — so on the rare spaced output they would delete
+    //     real words, exactly the hazard this module exists to avoid.
+    // Removing nothing is the correct behaviour until a script-aware tokenizer
+    // makes (1) tractable and (2) can be resolved with real evidence.
+    // `auto` is the app's common case and cannot know the language, so it stays
+    // the conservative en+vi union rather than the union of everything: a French
+    // "euh" removed from Vietnamese speech is a lost word, and the cost of
+    // leaving one filler in is far lower than deleting a real one.
     const AUTO: &[&str] = &[
         "um", "umm", "uhm", "uh", "uhh", "uhhh", "er", "erm", "hmm", "mm", "mhm", "ừ", "ừm", "ờ",
         "ờm", "ưm",
@@ -104,7 +133,16 @@ fn fillers_for(language: &str) -> &'static [&'static str] {
     match language {
         "en" => EN,
         "vi" => VI,
+        "es" => ES,
+        "pt" => PT,
+        "fr" => FR,
+        "de" => DE,
+        "it" => IT,
+        "ru" => RU,
+        "id" => ID,
         "auto" | "" => AUTO,
+        // A language we have no curated list for removes NOTHING: guessing risks
+        // deleting real words, which is far worse than leaving a filler in.
         _ => &[],
     }
 }
@@ -190,6 +228,54 @@ fn is_hallucination_phrase(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    #[test]
+    fn new_language_filler_lists_remove_their_own_hesitations() {
+        assert_eq!(filter("euh je pense que oui", "fr", true), "je pense que oui");
+        assert_eq!(filter("ähm ich denke schon", "de", true), "ich denke schon");
+        assert_eq!(filter("ehm creo que sí", "es", true), "creo que sí");
+        assert_eq!(filter("ehm penso di sì", "it", true), "penso di sì");
+    }
+
+    #[test]
+    fn language_lists_never_delete_real_words_of_that_language() {
+        // The whole hazard of per-language lists. Portuguese "um" = "a/an" and
+        // Spanish "ha" = "has" must survive — they are only fillers in English.
+        assert_eq!(filter("um gato bonito", "pt", true), "um gato bonito");
+        assert_eq!(filter("ha sido un buen día", "es", true), "ha sido un buen día");
+        // ...but English still strips its own "um".
+        assert_eq!(filter("um I think so", "en", true), "I think so");
+    }
+
+    #[test]
+    fn auto_stays_the_conservative_en_vi_union() {
+        // `auto` can't know the language, so it must NOT inherit other languages'
+        // fillers — "euh" is a real-word risk elsewhere and stays untouched.
+        assert_eq!(filter("euh je pense", "auto", true), "euh je pense");
+        // It still strips the en + vi sounds it does own.
+        assert_eq!(filter("um tôi nghĩ ừ vậy", "auto", true), "tôi nghĩ vậy");
+    }
+
+    #[test]
+    fn unspaced_scripts_have_no_filler_list() {
+        // zh/ja/ko/th are deliberately unlisted: the whitespace tokenizer cannot
+        // reach a filler inside unspaced text, and their stock "fillers" are
+        // ambiguous real words ("那个"/"あの"/"그" = "that"). Removing nothing is
+        // correct — this guards against someone "helpfully" adding them back.
+        assert_eq!(filter("嗯我觉得可以", "zh", true), "嗯我觉得可以");
+        assert_eq!(filter("嗯 我觉得可以", "zh", true), "嗯 我觉得可以");
+        assert_eq!(filter("えーと そうですね", "ja", true), "えーと そうですね");
+        // The demonstrative that must never be eaten.
+        assert_eq!(filter("那个 苹果很好", "zh", true), "那个 苹果很好");
+    }
+
+    #[test]
+    fn unlisted_language_removes_nothing() {
+        // Guard the deliberate fallback: no curated list => no removal.
+        let input = "eee bir şey düşünüyorum";
+        assert_eq!(filter(input, "tr", true), input);
+    }
 
     #[test]
     fn sentence_case_fixes_shouting_vietnamese() {

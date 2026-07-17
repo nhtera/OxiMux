@@ -33,19 +33,29 @@ pub fn apply(transcript: &str, words: &[String], threshold: f64) -> String {
         return transcript.to_string();
     }
 
-    // Precompute each dictionary word's match key once.
+    // Precompute each dictionary word's match key(s) once. A word may contribute
+    // more than one key — all pointing at the same replacement.
     let dict: Vec<DictWord> = words
         .iter()
-        .filter_map(|w| {
-            let key = clean_key(w);
-            if key.is_empty() {
-                None
-            } else {
-                Some(DictWord {
-                    display: w.clone(),
-                    key,
-                })
+        .flat_map(|w| {
+            let mut keys: Vec<String> = Vec::with_capacity(2);
+            let primary = clean_key(w);
+            if !primary.is_empty() {
+                keys.push(primary.clone());
             }
+            // "R&D" is spoken "R and D", but `clean_key` drops the `&` — so the
+            // written key is "rd" while the spoken n-gram cleans to "randd",
+            // far too distant to match. Register the spoken form as a second key.
+            if w.contains('&') {
+                let expanded = clean_key(&w.replace('&', " and "));
+                if !expanded.is_empty() && expanded != primary {
+                    keys.push(expanded);
+                }
+            }
+            keys.into_iter().map(|key| DictWord {
+                display: w.clone(),
+                key,
+            })
         })
         .collect();
     if dict.is_empty() {
@@ -174,6 +184,35 @@ fn levenshtein(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ampersand_word_matches_its_spoken_form() {
+        let dict = vec!["R&D".to_string()];
+        // Spoken: `clean_key` drops the `&`, so the written key is "rd" while the
+        // spoken n-gram cleans to "randd" — only the expanded key bridges them.
+        assert_eq!(
+            apply("send it to R and D for review", &dict, DEFAULT_THRESHOLD),
+            "send it to R&D for review"
+        );
+        // Written/initialism form still matches the primary key.
+        assert_eq!(
+            apply("send it to RD for review", &dict, DEFAULT_THRESHOLD),
+            "send it to R&D for review"
+        );
+        // Already correct → unchanged.
+        assert_eq!(
+            apply("send it to R&D for review", &dict, DEFAULT_THRESHOLD),
+            "send it to R&D for review"
+        );
+    }
+
+    #[test]
+    fn ampersand_expansion_does_not_over_match_plain_words() {
+        // The extra key must not turn unrelated speech into the dictionary word.
+        let dict = vec!["R&D".to_string()];
+        let input = "the random developer wrote code";
+        assert_eq!(apply(input, &dict, DEFAULT_THRESHOLD), input);
+    }
 
     fn dict(words: &[&str]) -> Vec<String> {
         words.iter().map(|s| s.to_string()).collect()
