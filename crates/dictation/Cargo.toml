@@ -1,0 +1,31 @@
+[package]
+name = "oximux-dictation"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+# sherpa-onnx bindings (Whisper + Parakeet transducer). See workspace note.
+# The build-spike gate (Phase 1) confirmed this compiles + links on macOS arm64.
+sherpa-rs = { workspace = true }
+# CoreAudio capture. Device-default rate → we resample to 16k (macOS silence
+# pitfall: never request 16k from the device directly).
+cpal = { workspace = true }
+# Model download manager (Phase 2): resumable HTTP Range + SHA-256 verify.
+ureq = { workspace = true }
+sha2 = { workspace = true }
+# App-data dir resolution for the model store (matches the app crate's usage).
+dirs = { workspace = true }
+
+[dev-dependencies]
+# WAV fixtures for the offline-decode integration tests.
+hound = { workspace = true }
+# Eval-set manifest parsing for the on-demand Vietnamese WER bench.
+serde_json = { workspace = true }

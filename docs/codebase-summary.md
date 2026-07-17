@@ -389,6 +389,47 @@ Backs the **Agent Chat** view (`crates/app/src/shell/agent_chat/`): three provid
 
 ---
 
+## crates/dictation — offline voice dictation
+
+Local speech-to-text for ANY focused pane — chat composer, terminal, or code
+editor (⌘E). No GPUI dependency (mirrors `crates/pty`): the app consumes a
+channel-based handle and never sees a cpal or sherpa type. Vietnamese-first —
+Whisper is the default; a dedicated Vietnamese zipformer + Parakeet (English) +
+SenseVoice (CJK) round out the catalog.
+
+| File | Role |
+|---|---|
+| `capture.rs` | cpal CoreAudio capture on a dedicated thread (owns the `!Send` stream). Selectable input device (`run(device)`, `list_input_devices()`; cpal 0.18 → device name is its `Display`). Device-default rate (never request 16 kHz — macOS silence pitfall), downmix to mono, shared `SessionBuffer`, throttled RMS level events, 2-min hard cap. |
+| `resample.rs` | Linear any-rate → 16 kHz mono resampler + downmix. Every buffer passes through before the engine (sherpa aborts on inconsistent rates). |
+| `engine.rs` | sherpa-rs wrapper: `WhisperRecognizer` / `TransducerRecognizer` (NeMo Parakeet) / `ZipFormer` (icefall, incl. Vietnamese) / `SenseVoiceRecognizer` (single-file, CJK). CPU-only. Silence gate (int16 peak < 300), 30 s chunk splitter at the quietest 100 ms window (SIGTRAP #7925 mitigation). `ModelPaths.model` = single-file slot; `require_files` is kind-aware. |
+| `vad.rs` | Silero VAD (sherpa's bundled `silero_vad`, no new dep): `keep_speech` segments a 16 kHz buffer into speech spans and drops silence before decode (also kills whisper's silence hallucination). `ensure_downloaded` fetches the ~629 KB `silero_vad.onnx` on demand (atomic temp+rename, cleaned on failure); missing/offline → caller falls back to the peak gate. |
+| `custom_words.rs` | Pure fuzzy dictionary correction: `apply(transcript, &[word], threshold)` over 1–3-word windows, self-contained Levenshtein + length prefilter + exact-key shortcut, case/punct preserved. **No soundex** (coarse phonetic collisions over-corrected common words). |
+| `text_filter.rs` | Pure transcript cleanup: `filter(text, language, enabled)` — language-gated filler removal (en/vi/auto; unknown langs remove none), bracketed/music-note strip, 3+-repeat stutter collapse, whole-output-only whisper hallucination guard. |
+| `controller.rs` | Session state machine (Idle→Recording→Transcribing) on one worker thread + a warm **engine** cache (the VAD is NOT cached — sherpa-rs 0.6.8 has no full reset, so a fresh detector is built per recording). Idle teardown is the caller's `model_unload_timeout` policy, passed per session: `start(paths, device, vad_enabled, unload)` where `None` = never unload and `Some(ZERO)` = unload right after the decode; with nothing warm (or "never") the worker blocks on `recv()` instead of polling. `run_session` trims with `maybe_vad_trim` (best-effort) before the silence gate. Emits `DictationEvent` over a `futures::mpsc`. `Drop` only signals — never joins (no main-thread block). |
+| `feedback.rs` | Optional start/stop capture cues (`audio_feedback_enabled`). Plays stock macOS system sounds (`Tink`/`Pop`) via `afplay` — deliberately **no audio-playback dep and no bundled assets**. Fire-and-forget (never blocks the GPUI main thread) but reaps its child in a short-lived thread so no zombies accumulate; no-op off macOS. |
+| `model_catalog.rs` | 10-model catalog across 4 families (`Whisper`/`Transducer`/`Zipformer`/`SenseVoice`): whisper small(default)/turbo/large-v3/base/tiny, zipformer-vi + 30M lite, parakeet v3/v2, sense-voice. URLs HEAD/range-verified against k2-fsa `asr-models`; sha256 unpinned (`None`). `recommended_model_id(language)` drives the Voice pane's "recommended" badge: a pinned `vi`→`zipformer-vi` (measured 10.2% WER vs whisper-small's 31.7%), `en`→parakeet v2, else the multilingual `DEFAULT_MODEL_ID` (`auto` implies code-switching, so no single-language model is suggested). |
+| `model_manager.rs` | Download (resumable HTTP Range) → optional SHA-256 verify → `tar` extract → file-existence gate → Ready. Disk is source of truth on init. Pull (`status`/`readiness`) + push (`ModelEvent`) APIs. (VAD's single-file `.onnx` uses `vad.rs`'s own fetch, not this archive path.) |
+
+App glue: `shell/agent_chat/dictation_service.rs` (process-wide `Global`: one
+`DictationController` + `ModelManager`; routes events to a `DictationTarget`
+enum — the recording composer, or the global HUD for terminal/editor panes —
+via `WeakEntity`; shared `prepare_start` pre-flight), `dictation_hud.rs` (the
+floating "Listening…" pill + terminal/editor sink, mounted at `WorkspaceRoot`),
+`dictation_ui.rs` (UI state + `WaveformBuffer` ring + smart-space helper),
+`dictation_waveform.rs` (shared waveform renderer), composer recording bar +
+mic device/hold dropdown, `WorkspaceRoot::dictate_focused_pane` (⌘E → focused
+pane → sink), `terminal_view/input.rs::insert_dictation_text`,
+`platform/mic_permission.rs` (`AVCaptureDevice` TCC), `settings_modal/pane_voice.rs`
++ `settings/dictation.rs` (`DictationSettings{input_device, mode, vad_enabled,
+custom_words, word_correction_threshold, filler_filter_enabled}` →
+`dictation.toml`; full-Whisper language table in `settings/dictation_languages.rs`).
+`dictation_service::route_event` post-processes the Final transcript once
+(`text_filter::filter` → `custom_words::apply`) at the shared choke point so
+history + every target pane get the cleaned text. The Voice pane's custom-words
+editor is an `InputState` on the modal (persists on blur/Enter, not per-key).
+
+---
+
 ## crates/pty — terminal backend
 
 | File | Role |

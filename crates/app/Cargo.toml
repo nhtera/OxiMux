@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 oximux-agents = { workspace = true }
 oximux-core = { workspace = true }
+oximux-dictation = { workspace = true }
 oximux-editor = { workspace = true }
 oximux-git = { workspace = true }
 oximux-proc-cwd = { workspace = true }
@@ -99,6 +100,15 @@ objc2-foundation = { version = "0.3", features = [
   "NSError",
 ] }
 objc2-user-notifications = "0.3"
+# Voice-dictation microphone permission (`platform::mic_permission`):
+# AVCaptureDevice.authorizationStatus / requestAccess(for: .audio) with a
+# block2 completion handler. Same objc2 0.3 family as the app-kit/foundation
+# bindings already in the graph.
+objc2-av-foundation = { version = "0.3", features = [
+  "AVCaptureDevice",
+  "AVMediaFormat",
+  "block2",
+] }
 block2 = "0.6"
 # Embedded browser-tab engine: one Rust API over the platform webview
 # (WKWebView on macOS). `build_as_child` attaches the webview to GPUI's

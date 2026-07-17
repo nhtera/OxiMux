@@ -99,6 +99,12 @@ set -- ${ARGS[@]+"${ARGS[@]}"}
 # app's resource envelope last so it captures both.
 sign_bundle() {
     local sign_id="${SIGN_FLAG:-${OXIMUX_CODESIGN_IDENTITY:-${OXIMUX_SIGN_ID:--}}}"
+    # Sign the bundled dylibs (voice-dictation's onnxruntime + sherpa-onnx)
+    # before the executables so the nested-first seal order holds. The `[[ -e ]]`
+    # guard skips the literal glob when no dylibs are present.
+    for dylib in "$APP_DIR/Contents/MacOS"/*.dylib; do
+        [[ -e "$dylib" ]] && codesign --force -s "$sign_id" "$dylib"
+    done
     codesign --force -s "$sign_id" "$APP_DIR/Contents/MacOS/oximux-relay"
     codesign --force -s "$sign_id" "$APP_DIR/Contents/MacOS/oximux"
     codesign --force -s "$sign_id" "$APP_DIR"
@@ -132,6 +138,37 @@ verify_signature() {
     fi
 }
 
+# Copy the voice-dictation engine's dynamic dylibs into the bundle and add an
+# `@executable_path` rpath so they resolve at launch. sherpa-rs builds
+# onnxruntime + the sherpa C-API as *dynamic* libraries under
+# `target/<profile>/`; `cargo run`/`cargo test` locate them via an injected
+# DYLD_FALLBACK_LIBRARY_PATH, but a launched `.app` has no such path — without
+# this the bundle crashes on launch resolving `@rpath/libonnxruntime.*.dylib`.
+# `$1` = the target subdir (`debug` / `release`).
+bundle_dylibs() {
+    local src="target/$1"
+    local macos="$APP_DIR/Contents/MacOS"
+    local found=0
+    shopt -s nullglob
+    for dylib in "$src"/libonnxruntime*.dylib "$src"/libsherpa-onnx*.dylib; do
+        # `-a` preserves the versionless symlink alongside the real dylib.
+        cp -a "$dylib" "$macos/"
+        found=1
+    done
+    shopt -u nullglob
+    if [[ "$found" -eq 0 ]]; then
+        echo "error: no onnxruntime/sherpa dylibs found in $src." >&2
+        echo "       The dictation engine links them dynamically, so the bundle" >&2
+        echo "       would crash on launch. Run 'cargo build -p oximux-app' first." >&2
+        exit 1
+    fi
+    # Add the rpath only if absent — install_name_tool errors on a duplicate.
+    if ! otool -l "$macos/oximux" | grep -qE '^\s*path @executable_path \(offset'; then
+        install_name_tool -add_rpath @executable_path "$macos/oximux"
+    fi
+    echo "==> Bundled dictation dylibs + @executable_path rpath"
+}
+
 # Fast path: refresh the bundled binary in place. Fail loudly if there
 # is no existing bundle to refresh — implicit `mkdir` would mask a
 # missing full-bundle step and surface as a launch failure later.
@@ -160,6 +197,8 @@ if [[ "${1:-}" == "--debug-fast" ]]; then
         mkdir -p "$APP_DIR/Contents/Resources"
         cp -f "assets/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
     fi
+    # The fresh binary carries no rpath, so re-copy the dylibs + re-add it.
+    bundle_dylibs debug
     sign_bundle
     echo "==> Refreshed $APP_DIR/Contents/{MacOS,Info.plist,Resources} from target/debug"
     exit 0
@@ -198,6 +237,9 @@ cp "assets/Info.plist" "$APP_DIR/Contents/Info.plist"
 if [[ -f "assets/AppIcon.icns" ]]; then
     cp "assets/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 fi
+
+# Voice-dictation runtime dylibs (onnxruntime + sherpa-onnx) + rpath.
+bundle_dylibs "$TARGET_SUBDIR"
 
 sign_bundle
 

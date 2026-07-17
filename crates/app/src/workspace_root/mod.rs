@@ -86,8 +86,8 @@ use crate::actions::{
     SelectFilesTab, SelectHistoryTab,
     SelectSearchTab,
     SelectSourceControlTab, SendTextToActiveAgent, SplitDown, SplitGroupAt, SplitHorizontal,
-    SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleChatTerminalView, ToggleFloatingTerminal,
-    ToggleLeftSidebar, ToggleRightSidebar,
+    SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleChatTerminalView, ToggleDictation,
+    ToggleFloatingTerminal, ToggleLeftSidebar, ToggleRightSidebar,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
@@ -256,6 +256,11 @@ pub struct WorkspaceRoot {
     /// cross-surface events (agent done, commit failed, PR opened, clipboard)
     /// that the status bar's persistent state doesn't cover.
     pub(crate) toast_layer: Entity<ToastLayer>,
+    /// The global "Listening…" voice-dictation HUD. Renders a floating pill when
+    /// ⌘E dictates into a terminal or editor pane (the chat composer has its own
+    /// in-line recording bar). Registered with the dictation service so the event
+    /// drain can reach it.
+    pub(crate) dictation_hud: Entity<crate::shell::agent_chat::DictationHud>,
     /// In-window floating ("PiP") terminal. `None` until first toggled;
     /// retained across hides (PTY persists) until the card's close button
     /// drops it. `floating_terminal_visible` gates whether it renders.
@@ -829,6 +834,13 @@ impl WorkspaceRoot {
         // Register this window's layer as the active toast surface up front so
         // toasts work before the first window-activation event arrives.
         crate::shell::toast::set_active_toast_layer(cx, toast_layer.downgrade());
+        // This window's voice-dictation HUD (floating "Listening…" pill for
+        // terminal/editor panes). Each window owns its own; the session's
+        // `DictationTarget::Hud` carries this handle, so no global registration
+        // is needed (and none would be correct with multiple windows).
+        let dictation_hud = cx.new(|_| {
+            crate::shell::agent_chat::DictationHud::new(theme, density, typography.clone())
+        });
         // Keybinding-override problems found at boot predate any window;
         // surface them now that a toast layer exists (first window drains).
         for warning in crate::keybindings_settings::take_boot_warnings() {
@@ -1167,6 +1179,7 @@ impl WorkspaceRoot {
             project_picker,
             settings_modal,
             toast_layer,
+            dictation_hud,
             workspace_dialog,
             confirm_dialog: None,
             rename_tab_dialog: None,

@@ -4,6 +4,316 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-17 — Voice dictation: ampersand custom words + more filler languages (`feat/voice-dictation-vietnamese`)
+
+Second cross-check of the transcript pipeline against the open-source reference
+implementation. Two real gaps closed, one divergence reaffirmed.
+
+- **Custom words with `&` now match their spoken form.** `clean_key` drops the
+  `&`, so "R&D" keyed as "rd" while speech "R and D" cleans to "randd" — edit
+  distance 3, far past the 0.18 threshold, so it never matched. Such words now
+  register a second key for the expanded form. "R and D" / "RD" / "R&D" all
+  correct to "R&D"; a guard test pins that unrelated speech ("the random
+  developer") still doesn't match.
+- **Filler lists extended** from en/vi to also cover es/pt/fr/de/it/ru/id. The
+  language picker offers ~99 languages while only two had lists, so a pinned
+  `fr` got no filler removal at all. Lists stay deliberately narrow: "um" appears
+  only under `en` (Portuguese "um" = "a/an"), "ha" and "eh" nowhere.
+- **No zh/ja/ko/th lists, deliberately.** Filler removal tokenizes on whitespace
+  and those scripts are written without it ("嗯我觉得可以" is one token), so a
+  list could never match real text; and their stock fillers are ambiguous real
+  words (zh "那个" / ja "あの" / ko "그" all mean "that"), which on spaced output
+  would delete real words. A test guards the empty behaviour.
+
+Reaffirmed divergence: the reference gives phonetic (soundex) matches a 0.3x
+score boost. We removed that earlier after it over-corrected common words
+("later" → "Ladder"), and this pass found no reason to restore it.
+
+---
+
+### 2026-07-17 — Voice dictation: fix ALL-CAPS output from the Vietnamese zipformers (`feat/voice-dictation-vietnamese`)
+
+Dictating with `zipformer-vi` typed SHOUTING TEXT ("TẠI SAO LẠI BIẾT HOA VẬY").
+Not a decode bug: both dedicated Vietnamese zipformers have an **all-uppercase
+token vocabulary** (1945 vs 3, and 1569 vs 4 lowercase-bearing tokens — the few
+being `<blk>`/`<sos/eos>`/`<unk>`), because they are trained on uppercase-normalized
+text, the usual icefall convention. They cannot emit lowercase at all.
+
+`ModelSpec::uppercase_output` now flags such models, and their transcripts run
+through `text_filter::sentence_case`. It is applied **before** the custom-words
+pass — running it after would undo the dictionary's capitalization
+("OxiMux" → "Oximux"). Whisper is mixed-case and is never rewritten; a guard test
+pins the flagged set to exactly the two zipformers.
+
+True casing is unrecoverable (the model never encoded it), so proper nouns come
+back lowercase — the custom-words dictionary is the way to restore specific ones.
+
+Note this was invisible to the WER benchmark, which lowercases both sides before
+comparing: the accuracy numbers were right while the on-screen text was unusable.
+
+---
+
+### 2026-07-17 — Voice dictation: language-aware model recommendation (`feat/voice-dictation-vietnamese`)
+
+Benchmarking the speech models against **real Vietnamese speech** (40 clips / 520
+words, `doof-ferb/fpt_fosd`, cc-by-4.0) turned up a gap worth surfacing in the UI:
+
+| Model | WER | Speed | Size |
+|---|---|---|---|
+| `zipformer-vi` | **10.2 %** | ×96.5 | 57 MB |
+| `whisper-small` (default) | 31.7 % | ×5.8 | 610 MB |
+
+The dedicated Vietnamese model is **3× more accurate, 16× faster and 10× smaller**
+than the default — but nothing pointed a user at it. The Voice pane's "recommended"
+badge is now **language-aware** (`recommended_model_id`): pinning `vi` badges
+`zipformer-vi`, pinning `en` badges Parakeet TDT v2 (best English WER), and
+`auto` keeps the multilingual default — `auto` implies the user may code-switch, and
+both dedicated models are single-language.
+
+`DEFAULT_MODEL_ID` still backs a fresh install and the deleted-model fallback; it is
+now explicitly the *safe multilingual* default rather than the *best* model.
+
+---
+
+### 2026-07-17 — Voice dictation: settings polish (`feat/voice-dictation-vietnamese`)
+
+Phase 05 of the dictation plan — four independent, default-off (or
+behaviour-preserving) settings. **No new crate dependency.**
+
+- **Configurable model-unload timeout** — the warm recognizer's idle teardown
+  was a hardcoded 10 minutes; it's now a `model_unload_timeout` setting (Never /
+  1h / 15 / 10 / 5 / 2 min / Immediately) with a Voice-pane dropdown, defaulting
+  to 10 minutes so existing behaviour is unchanged. The dictation crate can't
+  read app settings, so the policy rides `Command::Start` (like `vad_enabled`).
+  `Never` and "nothing warm to release" both block on `recv()` rather than
+  polling — a zero-duration timeout would otherwise spin the worker at 100% CPU.
+- **Append trailing space** — optional space after an inserted transcript so
+  back-to-back dictations don't run together (default off). Applied inside
+  `dictation_spacing`, the one helper every sink already routes through: it
+  trims, so the separator cannot be bolted on upstream without being stripped.
+  The terminal sink passes an empty `before_cursor`, which suppresses the
+  *leading* space (a leading space at a shell prompt is significant —
+  `HISTCONTROL=ignorespace` drops the command from history) while still getting
+  the trailing one.
+- **Send after dictation** — auto-submit the composer once a transcript lands
+  (default off). Rides the existing `send_after` path used by the
+  Enter-while-recording gesture, so it inherits that path's guards: composer
+  only, final transcripts only, and never on an empty transcript.
+- **Sound feedback** — a short start/stop cue (default off). Uses stock macOS
+  system sounds via `afplay` rather than pulling in an audio-playback crate plus
+  bundled wav assets; playback is fire-and-forget and reaps its child, and
+  non-macOS targets compile to a no-op.
+
+Not built: an `auto_submit_key` (Enter vs Cmd+Enter) picker. The composer has
+exactly one send path, so the setting would have changed nothing.
+
+---
+
+### 2026-07-17 — Voice dictation: VAD word-clipping fixes + higher-accuracy speech models (`feat/voice-dictation-vietnamese`)
+
+Follow-up hardening after a multilingual stability pass (real-pipeline decode
+across 7 languages via generated speech fixtures) and a cross-check against the
+open-source Handy VAD implementation.
+
+**Fixed:**
+- **VAD dropped whole utterances** (`94f6fc6`) — sherpa's Silero state machine
+  advances one 512-sample frame per `accept_waveform`; feeding the whole buffer
+  at once collapsed it to a ~160 ms tail, so dictation inserted nothing. Now fed
+  in window-sized chunks, with a fresh detector per recording (0.6.8 has no full
+  reset) and a safety net that falls back to untrimmed audio on a VAD miss.
+- **VAD clipped the first/last word** (`a073498`, `2bcbdfc`) — Silero flags
+  speech a few frames after the true onset, so each segment start landed late.
+  Now the segment `start` offset re-slices the original buffer with pre/post
+  padding. Padding widened to 0.45 s each end to match a real-voice-tuned
+  offline reference (soft mic onsets rise more gradually than synthesized test
+  speech). Silence is still trimmed (a 7.6 s clip with 5 s dead air → 3.4 s).
+- New on-demand (`#[ignore]`d) integration test drives the real pipeline across
+  seven languages + silence/padded fixtures, asserting determinism, speech→non-
+  empty, silence→empty, and no word-clipping.
+
+**Added:**
+- **Whisper Turbo** (large-v3-turbo, 537 MB) and **Whisper Large v3** (1018 MB)
+  speech models (`4716331`) — higher-accuracy tiers above whisper-small, both
+  multilingual including Vietnamese. Reuse the existing whisper engine
+  unchanged; the Voice pane, language picker, and download manager pick them up
+  automatically. Catalog now offers 10 models.
+
+---
+
+### 2026-07-17 — Voice dictation: full language picker, Silero VAD, custom words, transcript cleanup (`feat/voice-dictation-vietnamese`)
+
+Handy-parity quick-wins bundle (plan `plans/260717-0203-voice-dictation-handy-parity-enhancements/`).
+Research: comparison against the open-source Handy app surfaced richer settings +
+better silence handling. All on the existing `sherpa-rs 0.6.8` stack — **no new
+crate dependency** (Silero VAD ships inside sherpa-rs).
+
+**Shipped:**
+- **Full language picker** — the dictation language grew from 3 options
+  (auto/vi/en) to the complete Whisper set (~99 languages), a scrollable
+  searchless dropdown gated to whisper-family models (transducer/zipformer/
+  sense-voice show a fixed-coverage blurb). New `dictation_languages` table
+  (`is_supported`/`display_name`); `sanitized()` validates the full set.
+- **Silero VAD silence trimming** — a new `dictation::vad` module wraps
+  sherpa's bundled Silero VAD to segment speech and drop silent gaps before
+  decode, which also kills whisper's "(sad music)" ambient-silence
+  hallucination. The ~629 KB model downloads once on demand (atomic write, temp
+  cleaned on failure); a missing/offline model degrades to the plain peak gate.
+  Warmed alongside the recognizer; `vad_enabled` setting (default on) + toggle.
+- **Custom-words dictionary** — a user dictionary the transcript is fuzzy-
+  corrected toward ("oxy mux" → "OxiMux", "charge bee" → "ChargeBee"). Pure
+  `custom_words::apply` (self-contained Levenshtein, n-gram 3→2→1 windows, length
+  prefilter, exact-key shortcut, case/punct preservation). **No phonetic/soundex
+  bonus** — it coarsely collided common words (later↔Ladder) and was cut after
+  review. Comma-separated editor field (persists on blur/Enter, not per-key).
+- **Transcript cleanup** — new `text_filter::filter`: language-gated filler
+  removal (en/vi/auto lists; unknown languages remove none), bracketed/music-note
+  stripping, 3+-repeat stutter collapse, and a whole-output-only whisper
+  hallucination guard. `filler_filter_enabled` setting (default on) + toggle.
+- Both text passes run at the shared `route_event` Final choke point (filter →
+  custom-words), so history + every target pane get the cleaned text.
+
+New settings fields (`vad_enabled`, `custom_words`, `word_correction_threshold`,
+`filler_filter_enabled`) load back-compat via `#[serde(default)]`; a pre-existing
+`dictation.toml` is unaffected. Code-reviewed (one confirmed over-correction bug
+found + fixed). Suites green: 39 dictation + 99 settings + 1325 app-lib; clippy
+clean.
+
+---
+
+### 2026-07-16 — Voice dictation everywhere: any pane, device picker, recording waveform (`feat/voice-dictation-vietnamese`)
+
+Follow-on to the initial dictation ship. Dictation is no longer chat-only, and
+the recording UX + model choice grew.
+
+**Shipped:**
+- **Dictate into any focused pane** — ⌘E now transcribes into a terminal PTY, a
+  code editor, or the chat composer, whichever is focused. Routing generalized
+  from a composer-only `WeakEntity` to a `DictationTarget` enum; a focused chat
+  composer keeps its in-line bar (and stops action propagation), while terminal /
+  editor sessions are driven by a new global **`DictationHud`** — a pass-through
+  floating "Listening…" pill (waveform + timer) mounted at the workspace root
+  (ToastLayer pattern). New `TerminalView::insert_dictation_text` seam; editor
+  reuses `InputState::insert`.
+- **Mic device picker + Hold-to-record** in the composer — a chevron next to the
+  mic opens a menu listing the system default + every enumerated input device
+  (checkmarked), plus a "Hold to record" toggle. Capture now selects a named
+  cpal device (`capture::run(device)`, `list_input_devices()`); persisted as
+  `input_device` / `mode` in `dictation.toml`.
+- **ChatGPT-style recording bar** — while recording, an opaque bar **overlays
+  the input field itself** (the input stays mounted underneath so focus +
+  Escape/Enter keep working): ■ stop + a scrolling waveform (client-side ring
+  buffer over the ~10 Hz RMS `Level` events) + mm:ss timer + ✕ cancel + ↑ send.
+  Shared waveform renderer reused by the global HUD pill.
+- **Expanded offline catalog** (3 → 8 models, all verified k2-fsa URLs): added
+  **Zipformer Vietnamese** (57 MB, dedicated `vi`) + its 30M lite (25 MB) via a
+  new `zipformer` engine path, **Whisper Base** (198 MB), **Parakeet TDT v2**
+  (460 MB, best English), and **SenseVoice** (158 MB, zh/en/ja/ko/yue) via a new
+  single-file `sense_voice` engine path. `Family`/`EngineKind` gained `Zipformer`
+  + `SenseVoice`; `ModelSpec`/`ModelPaths` gained a single-file `model` slot.
+- **Voice pane**: added a Dictation Mode (Toggle/Hold) segmented control and a
+  microphone-device chip group, alongside the expanded model list.
+
+All suites green (dictation crate + settings + app-lib); the new engine paths
+compile against the real sherpa-rs 0.6.8 `ZipFormer`/`SenseVoiceRecognizer` API.
+
+---
+
+### 2026-07-17 — Voice UX polish: ChatGPT-parity dropdown + dictation history (`feat/voice-dictation-vietnamese`)
+
+Round-3 follow-ups on the voice work, all live-verified in the running app.
+
+**Shipped:**
+- **Fuller recording waveform** — the composer's recording-bar waveform now fills
+  the whole bar edge-to-edge (always a full-width strip, left-padded with a fine
+  dotted baseline, finer bars) instead of a short right-aligned cluster, matching
+  the ChatGPT desktop app. `WaveformBuffer::filled_bars` + a `fill` layout mode.
+- **Send button centered** — the composer input pill switched from `items_end` to
+  `items_center`, so the ↑ sits on the text midline on a one-line draft.
+- **Mic menu repositioned + restyled** — the composer mic-device popover now opens
+  up-and-to-the-right off the button (`Anchor::BottomLeft`, Claude-Desktop
+  placement) via a per-control anchor on the shared dropdown shell. The Voice
+  pane's device control became a proper **`DropdownButton`** (was a chip grid),
+  labeled with the current device (defaults to "System default"); its menu puts
+  the check on the RIGHT with a divider after "System default" (ChatGPT layout).
+- **Dictation history** — a new "Dictation history" section in the Voice pane
+  lists recent transcripts (newest first): timestamp · text · a copy button, with
+  a Clear action. Backed by a JSONL store (`dictation-history.jsonl` in the app
+  data dir, capped at 50) recorded at the single `DictationEvent::Final` choke
+  point in `route_event` (captures every pane's transcripts); stored on-device
+  only, formatted with `chrono`.
+- **Speech-model picker collapsed to a dropdown** (Orca-style) — the per-model
+  list (8 full rows of Download/Select/Delete chips) became a single "Speech
+  model" row: a `DropdownButton` labeled with the active model, its description
+  tracking that model's coverage. The menu shows every catalog model as a
+  two-line row — name + a green **recommended** badge on the default + a
+  right-aligned state ("Download · NN MB" / "Downloading… NN%" / "NN MB"), a
+  coverage blurb beneath, a left check on the active model, and a trash on
+  downloaded ones. Clicking a downloaded model selects it; clicking an
+  undownloaded one selects **and** starts its download (activates when ready);
+  clicking a downloading one cancels (keeps the `.partial`); the trash consumes
+  its own press (`stop_propagation`) so deleting never also selects. Each row
+  pulls `model_status` **live inside its render closure** (not a snapshot at
+  menu-open), so an open menu reflects download progress + delete in real time —
+  the download drain's `refresh_windows` (and the trash's own repaint) tick the
+  rows without a close/reopen. Both the model and mic dropdowns right-align under
+  their button (`Anchor::TopRight`, grows down-and-left) so their wide rows never
+  overflow the pane's right edge.
+  Added `trash.svg` + `copy.svg` assets (the latter also un-blanks the history
+  copy icon). Collapses the pane so model + language + permission + history all
+  fit one screen.
+
+Rendering + select/dismiss verified live; app-lib 1325 green (+6 history-store
+tests). Not yet built: CoreAudio transport-type suffixes ("Bluetooth"/"Built-in"/
+"Virtual") on device names — cpal doesn't expose them.
+
+**Fix — Vietnamese dictation/typing garbled in terminals (`<XX>` meta bytes):**
+Dictating (or pasting/typing) Vietnamese into a terminal pane echoed some
+multibyte chars as `<0090>`/`<0087>` control markers (e.g. "Việt" → "Vi�<0087>t"),
+seemingly at random. Root cause was **not** the dictation text (proven valid
+UTF-8 end-to-end: sherpa `.text` is `to_string_lossy`, the transcript is written
+whole in one PTY frame). The daemon that spawns shells is launched detached by a
+GUI app, so it inherits **no `LANG`/`LC_*`** from LaunchServices (Terminal.app
+injects one; a Finder-launched app does not). The child `zsh` therefore fell back
+to the **C locale**, where its line editor can't decode multibyte input and
+flushes the trailing byte of a UTF-8 sequence as a `<XX>` meta glyph — which
+chars break depends on ZLE read-buffer timing, hence the intermittent, partial
+corruption. Fix: `seed_utf8_locale` sets `LANG=en_US.UTF-8` on every spawned
+shell **only when the environment supplies no locale**, applied before the caller
+env and the user's rc so any explicit locale still wins. Added at all three spawn
+sites (relay daemon `registry::spawn`, both `portable_pty_backend` paths).
+Verified: an unset-locale zsh reproduces the exact `<0087>` breakage; with
+`LANG=en_US.UTF-8` the identical whole-buffer write echoes cleanly; the live
+daemon confirmed to carry no locale in its env.
+
+### 2026-07-16 — Voice dictation (Vietnamese-first, offline) for Agent Chat (`feat/voice-dictation-vietnamese`)
+
+Local speech-to-text in the Agent Chat composer. Vietnamese is the priority, so
+the engine is **sherpa-onnx** running **Whisper** offline (multilingual incl.
+`vi`), with **Parakeet TDT v3** as the best-English option. No cloud, no audio
+leaves the process.
+
+**Shipped:**
+- **New `crates/dictation`** (mirrors the `crates/pty` convention, no GPUI dep):
+  cpal capture at device rate → linear resample to 16 kHz → sherpa-rs offline
+  decode on a dedicated worker thread. Silence gate, 30 s chunked decode
+  (SIGTRAP mitigation), 2-minute hard cap, warm engine cache w/ 10-min idle
+  teardown. `Drop` only signals — never blocks the GPUI main thread.
+- **Model catalog + download manager**: 3 models (whisper-small default,
+  whisper-tiny, parakeet-v3-int8) from k2-fsa releases; resumable HTTP Range
+  download, optional SHA-256 verify, `tar` extract, disk-truth status scan.
+- **Composer UI**: mic button + recording pill (mm:ss + RMS meter), `Cmd+E`
+  toggle, Escape cancels, Enter stops→inserts→sends, transcript inserted at the
+  cursor with smart spacing. macOS mic permission via `AVCaptureDevice`
+  (`NSMicrophoneUsageDescription` added to Info.plist).
+- **Settings › Voice pane**: enable toggle, per-model download/select/delete
+  with live progress, language (Auto / Tiếng Việt / English), mic-permission
+  status + actions. Persists to `dictation.toml` with a live-reload watcher.
+
+Build-spike confirmed sherpa-rs links on macOS arm64 (dynamic onnxruntime dylib
+— the bundle must copy it in). Unit tests green (crate + settings + smart-space);
+**live mic round-trip pending developer verification** (needs a physical mic +
+the 610 MB model downloaded + a bundled build for the TCC prompt).
+
 ### 2026-07-15 — Agent Chat: Codex diff cards, batched streaming, subagent log fidelity (`6c8a7a8`)
 
 Render-fidelity pass closing gaps against native agent UIs. All inside the

@@ -19,6 +19,7 @@ mod pane_agents_launch;
 mod pane_keybindings;
 mod pane_notifications;
 mod pane_terminal;
+mod pane_voice;
 mod view;
 
 pub use nav::SettingsPane;
@@ -32,7 +33,8 @@ use gpui::{
 };
 use gpui_component::input::{InputEvent, InputState};
 use oximux_settings::{
-    AgentLaunchSettings, CommitMessageAiSettings, Density, TerminalSettings, Theme, Typography,
+    AgentLaunchSettings, CommitMessageAiSettings, Density, DictationSettings, TerminalSettings,
+    Theme, Typography,
 };
 use oximux_storage::SettingsRepo;
 
@@ -67,6 +69,9 @@ pub struct SettingsModal {
     /// global at each `open()`. Edits mutate this, then write
     /// `agent_launch.toml`; the watcher reloads + swaps the global.
     pub(crate) agent_launch: AgentLaunchSettings,
+    /// Working copy of the voice-dictation settings; reseeded from the live
+    /// global at each `open()`. Edits mutate this, then write `dictation.toml`.
+    pub(crate) dictation: DictationSettings,
     /// Live notification prefs shared with the notifier. The Agents pane
     /// toggles flip these atomics directly (interior mutability) so the
     /// change takes effect on the next dispatch without a reload.
@@ -90,6 +95,17 @@ pub struct SettingsModal {
     pub(super) search_input: Option<Entity<InputState>>,
     /// Keeps the `InputEvent::Change` → repaint subscription alive.
     _search_sub: Option<Subscription>,
+    /// Voice pane's custom-words editor input. Lazily built on `open()` (needs a
+    /// `Window`), seeded from `dictation.custom_words`. `None` before first open.
+    pub(super) custom_words_input: Option<Entity<InputState>>,
+    /// Keeps the custom-words `InputEvent::Change` → parse+persist subscription
+    /// alive.
+    _custom_words_sub: Option<Subscription>,
+    /// The custom-words value at `open()`, so `close()` can flush a pending edit
+    /// that was typed but never committed via blur/Enter (clicking dead space
+    /// doesn't blur a gpui input) — otherwise closing the modal would silently
+    /// drop the typed dictionary.
+    custom_words_seed: Vec<String>,
     /// Working copy of the `keybindings.toml` override map; reseeded from
     /// disk at each `open()`. Edits persist + apply to the live keymap
     /// immediately (see `pane_keybindings`).
@@ -100,6 +116,21 @@ pub struct SettingsModal {
     pub(crate) recording_action: Option<&'static str>,
     /// The interceptor subscription — alive exactly while recording.
     pub(super) recording_sub: Option<Subscription>,
+}
+
+/// Parse the custom-words editor field into a de-duplicated dictionary. Splits
+/// on commas and newlines only (NOT spaces) so a multi-word entry like
+/// "New York" can be one dictionary unit — the matcher collapses spaces when
+/// scoring. Trims, drops blanks, keeps first-seen order (case-insensitive
+/// dedup). `sanitized()` re-applies the same cleanup on load.
+pub(super) fn parse_custom_words(raw: &str) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    raw.split([',', '\n', '\r'])
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .filter(|w| seen.insert(w.to_lowercase()))
+        .map(str::to_string)
+        .collect()
 }
 
 impl SettingsModal {
@@ -122,6 +153,7 @@ impl SettingsModal {
             terminal: TerminalSettings::default(),
             ai: CommitMessageAiSettings::default(),
             agent_launch: AgentLaunchSettings::default(),
+            dictation: DictationSettings::default(),
             notify,
             notify_repo,
             notifier,
@@ -129,6 +161,9 @@ impl SettingsModal {
             drag_grab: None,
             search_input: None,
             _search_sub: None,
+            custom_words_input: None,
+            _custom_words_sub: None,
+            custom_words_seed: Vec::new(),
             keybind_overrides: BTreeMap::new(),
             recording_action: None,
             recording_sub: None,
@@ -162,6 +197,10 @@ impl SettingsModal {
             .try_global::<AgentLaunchSettings>()
             .cloned()
             .unwrap_or_default();
+        self.dictation = cx
+            .try_global::<DictationSettings>()
+            .cloned()
+            .unwrap_or_default();
         // Reseed the keybinding overrides from disk (hand edits since boot
         // show up here; load problems were already toasted at boot).
         self.keybind_overrides = crate::keybindings_settings::load_overrides().0;
@@ -177,6 +216,38 @@ impl SettingsModal {
         }));
         let input_focus = input.read(cx).focus_handle(cx);
         self.search_input = Some(input);
+
+        // Voice pane's custom-words editor: a comma/space separated field seeded
+        // from the working copy. On every edit, reparse into `custom_words` and
+        // persist (the watcher reloads the global) so the dictionary applies to
+        // the next dictation without a modal round-trip.
+        self.custom_words_seed = self.dictation.custom_words.clone();
+        let seed = self.dictation.custom_words.join(", ");
+        let cw_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("e.g. OxiMux, ChargeBee, ChatGPT")
+                .default_value(seed)
+        });
+        // Update the in-memory working copy on every keystroke, but only PERSIST
+        // (disk write + watcher reload) when the field is committed — on blur or
+        // Enter — so typing a dictionary entry isn't a per-character fs::write on
+        // the main thread. This matches the modal's persist-on-discrete-action
+        // convention (the search field, three lines up, likewise does no I/O).
+        self._custom_words_sub =
+            Some(
+                cx.subscribe(&cw_input, |this, input, ev: &InputEvent, cx| match ev {
+                    InputEvent::Change => {
+                        let raw = input.read(cx).value().to_string();
+                        this.dictation.custom_words = parse_custom_words(&raw);
+                    }
+                    InputEvent::Blur | InputEvent::PressEnter { .. } => {
+                        this.persist_voice(cx);
+                    }
+                    _ => {}
+                }),
+            );
+        self.custom_words_input = Some(cw_input);
+
         self.open = true;
         self.pos = None;
         self.drag_grab = None;
@@ -213,10 +284,20 @@ impl SettingsModal {
         // modal. See the matching guard in `command_palette::PaletteModal::close`.
         let was_open = self.open;
         self.open = false;
+        // Flush a custom-words edit that was typed but never committed (blur/Enter)
+        // before dropping the input — the working copy is synced on every
+        // keystroke, so persist only when it actually changed since open. Without
+        // this, typing a dictionary then closing via ✕/Esc would drop the edit.
+        if self.custom_words_input.is_some() && self.dictation.custom_words != self.custom_words_seed
+        {
+            self.persist_voice(cx);
+        }
         // Drop the search input so its focus handle can't keep window focus
         // orphaned after the modal is hidden.
         self.search_input = None;
         self._search_sub = None;
+        self.custom_words_input = None;
+        self._custom_words_sub = None;
         // A close mid-recording must release the keystroke interceptor or
         // every subsequent key press in the app would be swallowed.
         self.recording_action = None;
@@ -254,6 +335,15 @@ impl SettingsModal {
     pub(super) fn persist_agent_launch(&mut self, cx: &mut Context<Self>) {
         if let Err(err) = crate::agent_launch_settings::save(&self.agent_launch) {
             tracing::warn!(%err, "settings modal: failed to write agent_launch.toml");
+        }
+        cx.notify();
+    }
+
+    /// Persist the voice working copy to `dictation.toml`. The watcher reloads +
+    /// swaps the global; we never set the global here.
+    pub(super) fn persist_voice(&mut self, cx: &mut Context<Self>) {
+        if let Err(err) = crate::dictation_settings::save(&self.dictation) {
+            tracing::warn!(%err, "settings modal: failed to write dictation.toml");
         }
         cx.notify();
     }

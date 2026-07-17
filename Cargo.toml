@@ -4,6 +4,7 @@ members = [
     "crates/app",
     "crates/ui",
     "crates/core",
+    "crates/dictation",
     "crates/pty",
     "crates/git",
     "crates/agents",
@@ -30,6 +31,7 @@ rust-version = "1.89"
 oximux-app      = { path = "crates/app" }
 oximux-ui       = { path = "crates/ui" }
 oximux-core     = { path = "crates/core" }
+oximux-dictation = { path = "crates/dictation" }
 oximux-pty      = { path = "crates/pty" }
 oximux-git      = { path = "crates/git" }
 oximux-agents   = { path = "crates/agents" }
@@ -125,6 +127,22 @@ dirs = { version = "5", default-features = false }
 # we don't need the GTK/XDG portal stacks the default features pull in
 # (Linux is not a v1 target).
 rfd = { version = "0.14", default-features = false }
+
+# Voice dictation (crates/dictation). `sherpa-rs` = sherpa-onnx Rust bindings
+# (offline Whisper for Vietnamese + Parakeet transducer for English). Default
+# features drop `tts` (we only transcribe) and keep `download-binaries` so the
+# build fetches a prebuilt onnxruntime instead of compiling it from source.
+# NOTE: the spike confirmed onnxruntime links as a *dynamic* dylib
+# (target/<profile>/deps/libonnxruntime.*.dylib) — the bundled `.app` must copy
+# it in + set rpath. The `static` feature is the alternative if that proves
+# painful. `cpal` = CoreAudio capture; `hound` = wav I/O for fixtures/tests;
+# `ureq` = model download (matches sherpa-rs's own transitive http client, no
+# graph dup); `sha2` = archive verification.
+sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"] }
+cpal = "0.18"
+hound = "3.5"
+ureq = "2.12"
+sha2 = "0.10"
 
 # Phase 5 step 3 — file tree backend. `ignore` is the gitignore-aware
 # walker ripgrep uses; `WalkBuilder::max_depth(Some(1))` gives lazy

@@ -33,15 +33,17 @@ pub mod session_restore;
 pub use agent_glue::{agent_awake, agent_hooks_global, agent_status_hooks};
 #[doc(inline)]
 pub use app_settings::{
-    agent_launch_settings, commit_message_ai_settings, keybindings_settings, motion_settings,
-    scm_layout_settings, terminal_settings,
+    agent_launch_settings, commit_message_ai_settings, dictation_settings, keybindings_settings,
+    motion_settings, scm_layout_settings, terminal_settings,
 };
 #[doc(inline)]
 pub use loaders::{
     browser_profiles, custom_commands_loader, file_http_client, project_scripts_loader,
 };
 #[doc(inline)]
-pub use platform::{app_nap, menu, single_instance, window_factory, window_registry};
+pub use platform::{
+    app_nap, menu, mic_permission, single_instance, window_factory, window_registry,
+};
 #[doc(inline)]
 pub use session_restore::{
     catalog_cache, git_state_cache, persisted_chat, persisted_terminals, relay_cold_restore,

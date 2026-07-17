@@ -251,6 +251,12 @@ fn main() {
         // at launch time, so installing here means the first launch after
         // boot already honours the user's configured defaults.
         oximux_app::agent_launch_settings::install(cx);
+        // Voice-dictation settings (enabled/model/language) + the process-wide
+        // dictation service (recorder + model manager). The composer mic button
+        // reads the settings global at record time and the service global to
+        // start/stop, so both install before any window opens.
+        oximux_app::dictation_settings::install(cx);
+        oximux_app::shell::agent_chat::install_dictation_service(cx);
         // Resolve the reduced-motion preference once and install the Motion
         // global before any window opens, so the first animated surface reads
         // the right durations.

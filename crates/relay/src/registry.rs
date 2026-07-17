@@ -189,6 +189,7 @@ impl PtyRegistry {
         // Pane handle for `oximux notify` (set before the caller loop so an
         // explicit override still wins, though callers shouldn't set it).
         command.env("OXIMUX_PTY_ID", &pty_id);
+        seed_utf8_locale(&mut command);
         for (k, v) in &args.env {
             command.env(k, v);
         }
@@ -738,4 +739,22 @@ fn fan_out(subscribers: &Arc<Mutex<Vec<Sender<Notification>>>>, notif: Notificat
         }
         Err(TrySendError::Closed(_)) => false,
     });
+}
+
+/// Seed a UTF-8 locale on a spawned shell when the environment supplies none.
+///
+/// A GUI-launched app — and the detached daemon it spawns — inherits no
+/// `LANG`/`LC_*` from LaunchServices, unlike Terminal.app, which injects a
+/// locale on startup. Without one, an interactive `zsh` falls back to the C
+/// locale and its line editor mangles multibyte input: Vietnamese/CJK text
+/// (typed, pasted, or dictated) echoes back as `<XX>` meta bytes rather than
+/// the intended glyphs. Seed a UTF-8 ctype only when nothing is set, and
+/// before the caller/user rc runs so any explicit locale still wins.
+fn seed_utf8_locale(command: &mut CommandBuilder) {
+    if std::env::var_os("LC_ALL").is_none()
+        && std::env::var_os("LC_CTYPE").is_none()
+        && std::env::var_os("LANG").is_none()
+    {
+        command.env("LANG", "en_US.UTF-8");
+    }
 }

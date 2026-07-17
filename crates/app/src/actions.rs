@@ -378,6 +378,10 @@ actions!(
         /// elevated multi-line draft with `@file` autocomplete. No-op when the
         /// active tab is not an agent.
         OpenComposerBar,
+        /// Toggle voice dictation in the focused Agent Chat composer (mic on/off).
+        /// Bound to Cmd+E. No-op when the active surface isn't a chat composer or
+        /// dictation is disabled in Settings.
+        ToggleDictation,
         /// Open the session-history picker — a centered modal listing past
         /// Claude Code / Codex sessions to resume or fork. Bound to Cmd+Shift+H.
         OpenSessionHistory,
