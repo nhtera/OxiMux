@@ -4,6 +4,37 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-17 — Voice dictation: VAD word-clipping fixes + higher-accuracy speech models (`feat/voice-dictation-vietnamese`)
+
+Follow-up hardening after a multilingual stability pass (real-pipeline decode
+across 7 languages via generated speech fixtures) and a cross-check against the
+open-source Handy VAD implementation.
+
+**Fixed:**
+- **VAD dropped whole utterances** (`94f6fc6`) — sherpa's Silero state machine
+  advances one 512-sample frame per `accept_waveform`; feeding the whole buffer
+  at once collapsed it to a ~160 ms tail, so dictation inserted nothing. Now fed
+  in window-sized chunks, with a fresh detector per recording (0.6.8 has no full
+  reset) and a safety net that falls back to untrimmed audio on a VAD miss.
+- **VAD clipped the first/last word** (`a073498`, `2bcbdfc`) — Silero flags
+  speech a few frames after the true onset, so each segment start landed late.
+  Now the segment `start` offset re-slices the original buffer with pre/post
+  padding. Padding widened to 0.45 s each end to match a real-voice-tuned
+  offline reference (soft mic onsets rise more gradually than synthesized test
+  speech). Silence is still trimmed (a 7.6 s clip with 5 s dead air → 3.4 s).
+- New on-demand (`#[ignore]`d) integration test drives the real pipeline across
+  seven languages + silence/padded fixtures, asserting determinism, speech→non-
+  empty, silence→empty, and no word-clipping.
+
+**Added:**
+- **Whisper Turbo** (large-v3-turbo, 537 MB) and **Whisper Large v3** (1018 MB)
+  speech models (`4716331`) — higher-accuracy tiers above whisper-small, both
+  multilingual including Vietnamese. Reuse the existing whisper engine
+  unchanged; the Voice pane, language picker, and download manager pick them up
+  automatically. Catalog now offers 10 models.
+
+---
+
 ### 2026-07-17 — Voice dictation: full language picker, Silero VAD, custom words, transcript cleanup (`feat/voice-dictation-vietnamese`)
 
 Handy-parity quick-wins bundle (plan `plans/260717-0203-voice-dictation-handy-parity-enhancements/`).
