@@ -43,13 +43,17 @@ const MIN_SPEECH_SECS: f32 = 0.10;
 /// audio, so this only bounds the detector's internal buffer.
 const MAX_SPEECH_SECS: f32 = 30.0;
 /// Samples of audio to keep *before* each detected segment start. Silero flags
-/// speech only once its probability crosses [`THRESHOLD`], a few frames after
+/// speech only once its probability crosses [`THRESHOLD`], several frames after
 /// the true onset, so the reported start lands late and clips the first (often
-/// short) word. Backing up ~0.25 s recovers that onset. 0.25 s × 16 kHz.
-const PRE_PAD_SAMPLES: usize = (0.25 * crate::resample::TARGET_SAMPLE_RATE as f32) as usize;
+/// short) word — worse for real mic input, whose onsets rise more gradually
+/// than synthesized speech. 0.45 s of pre-roll (a well-established offline-VAD
+/// prefill value, ~15 frames of 30 ms) recovers that onset even for soft
+/// consonants. 0.45 s × 16 kHz.
+const PRE_PAD_SAMPLES: usize = (0.45 * crate::resample::TARGET_SAMPLE_RATE as f32) as usize;
 /// Samples to keep *after* each segment end — the mirror case, recovering a
-/// trailing word whose tail dips below threshold before it truly ends. 0.20 s.
-const POST_PAD_SAMPLES: usize = (0.20 * crate::resample::TARGET_SAMPLE_RATE as f32) as usize;
+/// trailing word whose tail dips below threshold before it truly ends. 0.45 s
+/// mirrors the pre-roll (the established offline-VAD hangover).
+const POST_PAD_SAMPLES: usize = (0.45 * crate::resample::TARGET_SAMPLE_RATE as f32) as usize;
 
 /// The path the VAD model lives at, given the dictation data dir (the parent of
 /// the per-model directories).
