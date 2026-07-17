@@ -42,6 +42,14 @@ const MIN_SPEECH_SECS: f32 = 0.10;
 /// Never let a single segment exceed this (s); the whisper chunker handles long
 /// audio, so this only bounds the detector's internal buffer.
 const MAX_SPEECH_SECS: f32 = 30.0;
+/// Samples of audio to keep *before* each detected segment start. Silero flags
+/// speech only once its probability crosses [`THRESHOLD`], a few frames after
+/// the true onset, so the reported start lands late and clips the first (often
+/// short) word. Backing up ~0.25 s recovers that onset. 0.25 s × 16 kHz.
+const PRE_PAD_SAMPLES: usize = (0.25 * crate::resample::TARGET_SAMPLE_RATE as f32) as usize;
+/// Samples to keep *after* each segment end — the mirror case, recovering a
+/// trailing word whose tail dips below threshold before it truly ends. 0.20 s.
+const POST_PAD_SAMPLES: usize = (0.20 * crate::resample::TARGET_SAMPLE_RATE as f32) as usize;
 
 /// The path the VAD model lives at, given the dictation data dir (the parent of
 /// the per-model directories).
@@ -118,9 +126,8 @@ impl Vad {
         Ok(Self { inner })
     }
 
-    /// Return only the speech portions of a 16 kHz mono buffer, silence trimmed,
-    /// segments concatenated in order. An empty result means the detector found
-    /// no speech.
+    /// Return only the speech portions of a 16 kHz mono buffer, silence trimmed.
+    /// An empty result means the detector found no speech.
     ///
     /// The detector's speech/silence state machine advances one `window_size`
     /// frame at a time, so audio MUST be fed in `window_size` chunks — feeding
@@ -128,23 +135,58 @@ impl Vad {
     /// relative to the post-feed buffer tail, yielding only a tiny tail
     /// fragment). Segments are drained as they close during feeding, then a
     /// final `flush` emits any still-open segment.
+    ///
+    /// Rather than concatenating each segment's clipped `samples`, we take the
+    /// segment's `start` offset and re-slice the ORIGINAL buffer with pre/post
+    /// padding (see [`PRE_PAD_SAMPLES`]). That restores the word onset Silero's
+    /// threshold lag would otherwise cut, and keeps the untouched original audio
+    /// (no re-extraction artifacts). Padded ranges are merged so overlapping
+    /// segments never duplicate samples.
     pub fn keep_speech(&mut self, samples_16k: &[f32]) -> Vec<f32> {
-        let mut out = Vec::new();
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
         for chunk in samples_16k.chunks(WINDOW_SIZE as usize) {
             self.inner.accept_waveform(chunk.to_vec());
-            self.drain_into(&mut out);
+            self.collect_ranges(&mut ranges, samples_16k.len());
         }
         self.inner.flush();
-        self.drain_into(&mut out);
-        out
+        self.collect_ranges(&mut ranges, samples_16k.len());
+        Self::slice_padded(samples_16k, &ranges)
     }
 
-    /// Move every currently-queued speech segment's samples into `out`.
-    fn drain_into(&mut self, out: &mut Vec<f32>) {
+    /// Append every currently-queued speech segment as a `[start, end)` sample
+    /// range into the original buffer (bounds-clamped), then drop it from the
+    /// queue. `start` is the segment's absolute offset in the fed stream, which
+    /// — since the whole recording is fed once into a fresh detector — indexes
+    /// straight into the original buffer.
+    fn collect_ranges(&mut self, ranges: &mut Vec<(usize, usize)>, len: usize) {
         while !self.inner.is_empty() {
             let seg = self.inner.front();
-            out.extend_from_slice(&seg.samples);
+            let start = (seg.start.max(0) as usize).min(len);
+            let end = start.saturating_add(seg.samples.len()).min(len);
+            if end > start {
+                ranges.push((start, end));
+            }
             self.inner.pop();
         }
+    }
+
+    /// Slice the original buffer for each range, padded and merged. Ranges arrive
+    /// in emission order (ascending start), so a single forward merge suffices.
+    fn slice_padded(samples_16k: &[f32], ranges: &[(usize, usize)]) -> Vec<f32> {
+        let n = samples_16k.len();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for &(s, e) in ranges {
+            let s = s.saturating_sub(PRE_PAD_SAMPLES);
+            let e = (e + POST_PAD_SAMPLES).min(n);
+            match merged.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => merged.push((s, e)),
+            }
+        }
+        let mut out = Vec::new();
+        for (s, e) in merged {
+            out.extend_from_slice(&samples_16k[s..e]);
+        }
+        out
     }
 }
