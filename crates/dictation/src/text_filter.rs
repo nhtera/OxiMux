@@ -10,6 +10,38 @@
 //! Pure + unit-tested; over-removal of real words is the hazard, so the ambiguous
 //! ones ("ah", "like", Portuguese "um") are excluded from the lists.
 
+/// Rewrite an ALL-CAPS transcript to sentence case.
+///
+/// Some models can only emit uppercase — their BPE vocabulary contains no
+/// lowercase tokens at all (the dedicated Vietnamese zipformers are trained on
+/// uppercase-normalized text, the usual icefall convention). Inserting their raw
+/// output types SHOUTING TEXT at the cursor, so it is normalized here.
+///
+/// Only call this for models flagged [`crate::ModelSpec::uppercase_output`]:
+/// applying it to a mixed-case model (whisper) would destroy real capitalization.
+/// Original casing is unrecoverable — the model never encoded it — so proper
+/// nouns come back lowercase; the custom-words dictionary is the way to restore
+/// specific ones, which is why this must run *before* that pass.
+pub fn sentence_case(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    // Capitalize the first letter, and any letter starting a new sentence (these
+    // models emit no punctuation today, but a mid-string `.` must not stay lower
+    // if one ever does).
+    let mut at_sentence_start = true;
+    for c in text.to_lowercase().chars() {
+        if at_sentence_start && c.is_alphabetic() {
+            out.extend(c.to_uppercase());
+            at_sentence_start = false;
+        } else {
+            if matches!(c, '.' | '!' | '?') {
+                at_sentence_start = true;
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Clean `text` for the given whisper language code (`"auto"`, `"vi"`, `"en"`,
 /// …). `enabled == false` returns the text unchanged. Language-agnostic steps
 /// (bracketed non-speech, stutters, whole-output phantom phrases) always run
@@ -158,6 +190,36 @@ fn is_hallucination_phrase(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sentence_case_fixes_shouting_vietnamese() {
+        // The exact shape the vi zipformers emit: all caps, no punctuation.
+        assert_eq!(
+            sentence_case("TẠI SAO LẠI BIẾT HOA VẬY MÌNH CÓ BIẾT HOA ĐÂU"),
+            "Tại sao lại biết hoa vậy mình có biết hoa đâu"
+        );
+    }
+
+    #[test]
+    fn sentence_case_preserves_vietnamese_diacritics() {
+        // Unicode-aware casing: Ế→ế, Ạ→ạ must survive intact.
+        assert_eq!(sentence_case("XIN CHÀO THẾ GIỚI"), "Xin chào thế giới");
+        assert_eq!(sentence_case("ĐƯỢC"), "Được");
+    }
+
+    #[test]
+    fn sentence_case_capitalizes_after_terminal_punctuation() {
+        assert_eq!(sentence_case("MỘT. HAI! BA?"), "Một. Hai! Ba?");
+    }
+
+    #[test]
+    fn sentence_case_handles_empty_and_non_letter_starts() {
+        assert_eq!(sentence_case(""), "");
+        assert_eq!(sentence_case("   "), "   ");
+        // Leading non-letters must not consume the capitalization.
+        assert_eq!(sentence_case("  XIN CHÀO"), "  Xin chào");
+        assert_eq!(sentence_case("123 MỘT"), "123 Một");
+    }
 
     #[test]
     fn disabled_is_identity() {

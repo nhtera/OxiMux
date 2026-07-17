@@ -4,6 +4,28 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-17 — Voice dictation: fix ALL-CAPS output from the Vietnamese zipformers (`feat/voice-dictation-vietnamese`)
+
+Dictating with `zipformer-vi` typed SHOUTING TEXT ("TẠI SAO LẠI BIẾT HOA VẬY").
+Not a decode bug: both dedicated Vietnamese zipformers have an **all-uppercase
+token vocabulary** (1945 vs 3, and 1569 vs 4 lowercase-bearing tokens — the few
+being `<blk>`/`<sos/eos>`/`<unk>`), because they are trained on uppercase-normalized
+text, the usual icefall convention. They cannot emit lowercase at all.
+
+`ModelSpec::uppercase_output` now flags such models, and their transcripts run
+through `text_filter::sentence_case`. It is applied **before** the custom-words
+pass — running it after would undo the dictionary's capitalization
+("OxiMux" → "Oximux"). Whisper is mixed-case and is never rewritten; a guard test
+pins the flagged set to exactly the two zipformers.
+
+True casing is unrecoverable (the model never encoded it), so proper nouns come
+back lowercase — the custom-words dictionary is the way to restore specific ones.
+
+Note this was invisible to the WER benchmark, which lowercases both sides before
+comparing: the accuracy numbers were right while the on-screen text was unusable.
+
+---
+
 ### 2026-07-17 — Voice dictation: language-aware model recommendation (`feat/voice-dictation-vietnamese`)
 
 Benchmarking the speech models against **real Vietnamese speech** (40 clips / 520

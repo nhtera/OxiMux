@@ -192,7 +192,15 @@ fn post_process_transcript(cx: &App, text: String) -> String {
     let Some(settings) = cx.try_global::<DictationSettings>() else {
         return text;
     };
-    // Filter first so fillers/phantoms don't get fuzzy-matched to a custom word,
+    // Fix casing FIRST, for models that can only emit uppercase (the dedicated
+    // Vietnamese zipformers): their raw output would otherwise type SHOUTING TEXT
+    // at the cursor. It must precede custom-words — running it after would undo
+    // the dictionary's capitalization ("OxiMux" → "Oximux").
+    let text = match oximux_dictation::spec_for(&settings.model_id) {
+        Some(spec) if spec.uppercase_output => oximux_dictation::text_filter::sentence_case(&text),
+        _ => text,
+    };
+    // Filter next so fillers/phantoms don't get fuzzy-matched to a custom word,
     // then correct the surviving words toward the dictionary.
     let filtered =
         oximux_dictation::text_filter::filter(&text, &settings.language, settings.filler_filter_enabled);

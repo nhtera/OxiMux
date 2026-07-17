@@ -48,6 +48,13 @@ pub struct ModelSpec {
     /// Single-file model families (SenseVoice). `None` for the encoder/decoder
     /// families, which use `encoder`/`decoder`(/`joiner`).
     pub model: Option<&'static str>,
+    /// This model can ONLY emit uppercase — its token vocabulary contains no
+    /// lowercase pieces at all (verified by inspecting `tokens.txt`), because it
+    /// was trained on uppercase-normalized text. Its raw output must be run
+    /// through `text_filter::sentence_case` or it types SHOUTING TEXT at the
+    /// cursor. Never set this for a mixed-case model: the rewrite would destroy
+    /// real capitalization.
+    pub uppercase_output: bool,
 }
 
 impl ModelSpec {
@@ -122,6 +129,7 @@ pub const CATALOG: &[ModelSpec] = &[
         joiner: None,
         tokens: "small-tokens.txt",
         model: None,
+        uppercase_output: false,
     },
     // Whisper large-v3-turbo — top-tier accuracy at roughly half large-v3's size
     // (the encoder is distilled), multilingual incl. Vietnamese. Same file layout
@@ -141,6 +149,7 @@ pub const CATALOG: &[ModelSpec] = &[
         joiner: None,
         tokens: "turbo-tokens.txt",
         model: None,
+        uppercase_output: false,
     },
     // Whisper large-v3 — the maximum-accuracy tier, multilingual incl. Vietnamese.
     // Slower and larger than turbo; for users who want the best possible decode.
@@ -159,6 +168,7 @@ pub const CATALOG: &[ModelSpec] = &[
         joiner: None,
         tokens: "large-v3-tokens.txt",
         model: None,
+        uppercase_output: false,
     },
     // Dedicated Vietnamese zipformer — ~1/10th the size of whisper-small, better
     // vi accuracy, but Vietnamese-only (no code-switching). 57 MB.
@@ -176,6 +186,7 @@ pub const CATALOG: &[ModelSpec] = &[
         joiner: Some("joiner-epoch-12-avg-8.int8.onnx"),
         tokens: "tokens.txt",
         model: None,
+        uppercase_output: true,
     },
     // Fills the tiny↔small gap; same Vietnamese coverage as small. 198 MB.
     ModelSpec {
@@ -192,6 +203,7 @@ pub const CATALOG: &[ModelSpec] = &[
         joiner: None,
         tokens: "base-tokens.txt",
         model: None,
+        uppercase_output: false,
     },
     // Fast starter: multilingual but weak Vietnamese. 111 MB.
     ModelSpec {
@@ -208,6 +220,7 @@ pub const CATALOG: &[ModelSpec] = &[
         joiner: None,
         tokens: "tiny-tokens.txt",
         model: None,
+        uppercase_output: false,
     },
     // 25 European languages incl. best-in-class multilingual. 465 MB. No vi.
     ModelSpec {
@@ -224,6 +237,7 @@ pub const CATALOG: &[ModelSpec] = &[
         joiner: Some("joiner.int8.onnx"),
         tokens: "tokens.txt",
         model: None,
+        uppercase_output: false,
     },
     // English-only, topped the OpenASR leaderboard — best English WER. 460 MB.
     ModelSpec {
@@ -240,6 +254,7 @@ pub const CATALOG: &[ModelSpec] = &[
         joiner: Some("joiner.int8.onnx"),
         tokens: "tokens.txt",
         model: None,
+        uppercase_output: false,
     },
     // SenseVoice — single-file multilingual (zh/en/ja/ko/yue), fast. 158 MB. No vi.
     ModelSpec {
@@ -256,6 +271,7 @@ pub const CATALOG: &[ModelSpec] = &[
         joiner: None,
         tokens: "tokens.txt",
         model: Some("model.int8.onnx"),
+        uppercase_output: false,
     },
     // Lighter Vietnamese zipformer for low-resource machines. 25 MB.
     ModelSpec {
@@ -272,6 +288,7 @@ pub const CATALOG: &[ModelSpec] = &[
         joiner: Some("joiner.int8.onnx"),
         tokens: "tokens.txt",
         model: None,
+        uppercase_output: true,
     },
 ];
 
@@ -321,6 +338,22 @@ mod tests {
         assert_eq!(whisper.required_files().len(), 3);
         let para = spec_for("parakeet-tdt-0.6b-v3-int8").unwrap();
         assert_eq!(para.required_files().len(), 4);
+    }
+
+    #[test]
+    fn only_the_vietnamese_zipformers_emit_uppercase() {
+        // Verified by inspecting each model's tokens.txt: both vi zipformers have
+        // an all-uppercase vocabulary (1945 vs 3, and 1569 vs 4 lowercase-bearing
+        // tokens — the 3-4 being <blk>/<sos/eos>/<unk>). Flagging a mixed-case
+        // model here would destroy real capitalization, so guard the exact set.
+        let flagged: Vec<&str> = catalog()
+            .iter()
+            .filter(|m| m.uppercase_output)
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(flagged, vec!["zipformer-vi", "zipformer-vi-30m"]);
+        // Whisper is mixed-case and must never be rewritten.
+        assert!(!spec_for("whisper-small").unwrap().uppercase_output);
     }
 
     #[test]
