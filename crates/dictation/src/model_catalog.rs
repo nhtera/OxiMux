@@ -3,7 +3,8 @@
 //! All archives come from the k2-fsa sherpa-onnx `asr-models` release, extract
 //! with `--strip-components=1` so the inner files land directly in the model
 //! dir, and run at 16 kHz. The URLs + byte sizes were HEAD-verified against the
-//! live release on 2026-07-16.
+//! live release on 2026-07-16 (the whisper turbo + large-v3 tiers on 2026-07-17;
+//! their in-archive prefixes were read from the live tar listing).
 //!
 //! ⚠️ `archive_sha256` is `None` for every entry: GitHub does not publish a
 //! checksum for release assets, and fabricating one would break real downloads.
@@ -94,6 +95,43 @@ pub const CATALOG: &[ModelSpec] = &[
         decoder: "small-decoder.int8.onnx",
         joiner: None,
         tokens: "small-tokens.txt",
+        model: None,
+    },
+    // Whisper large-v3-turbo — top-tier accuracy at roughly half large-v3's size
+    // (the encoder is distilled), multilingual incl. Vietnamese. Same file layout
+    // as the other whisper tiers (prefix `turbo-`), so it reuses the whisper
+    // engine unchanged. 537 MB.
+    ModelSpec {
+        id: "whisper-turbo",
+        label: "Whisper Turbo",
+        family: Family::Whisper,
+        langs: "Multilingual · Vietnamese · high accuracy",
+        size_mb: 537,
+        archive_url:
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-turbo.tar.bz2",
+        archive_sha256: None,
+        encoder: "turbo-encoder.int8.onnx",
+        decoder: "turbo-decoder.int8.onnx",
+        joiner: None,
+        tokens: "turbo-tokens.txt",
+        model: None,
+    },
+    // Whisper large-v3 — the maximum-accuracy tier, multilingual incl. Vietnamese.
+    // Slower and larger than turbo; for users who want the best possible decode.
+    // Prefix `large-v3-`, same whisper layout. 1018 MB.
+    ModelSpec {
+        id: "whisper-large-v3",
+        label: "Whisper Large v3",
+        family: Family::Whisper,
+        langs: "Multilingual · Vietnamese · max accuracy",
+        size_mb: 1018,
+        archive_url:
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-large-v3.tar.bz2",
+        archive_sha256: None,
+        encoder: "large-v3-encoder.int8.onnx",
+        decoder: "large-v3-decoder.int8.onnx",
+        joiner: None,
+        tokens: "large-v3-tokens.txt",
         model: None,
     },
     // Dedicated Vietnamese zipformer — ~1/10th the size of whisper-small, better
@@ -257,6 +295,21 @@ mod tests {
         assert_eq!(whisper.required_files().len(), 3);
         let para = spec_for("parakeet-tdt-0.6b-v3-int8").unwrap();
         assert_eq!(para.required_files().len(), 4);
+    }
+
+    #[test]
+    fn whisper_accuracy_tiers_are_present_and_whisper_family() {
+        // The higher-accuracy tiers reuse the whisper engine (no joiner, no
+        // single-file model), so they must stay in the Whisper family with the
+        // encoder/decoder/tokens layout the engine expects.
+        for id in ["whisper-turbo", "whisper-large-v3"] {
+            let m = spec_for(id).unwrap_or_else(|| panic!("{id} in catalog"));
+            assert_eq!(m.family, Family::Whisper, "{id} is whisper");
+            assert!(m.joiner.is_none(), "{id} has no joiner");
+            assert!(m.model.is_none(), "{id} is not single-file");
+            assert_eq!(m.required_files().len(), 3, "{id} needs encoder/decoder/tokens");
+            assert!(m.encoder.ends_with(".onnx") && m.tokens.ends_with(".txt"));
+        }
     }
 
     #[test]
