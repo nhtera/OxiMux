@@ -19,6 +19,7 @@ members = [
     "crates/remote-host",
     "crates/remote-session",
     "crates/remote-iroh",
+    "crates/mobile-core",
     "crates/proc-cwd",
     "xtask",
 ]
@@ -51,6 +52,7 @@ oximux-remote-proto = { path = "crates/remote-proto" }
 oximux-remote-host = { path = "crates/remote-host" }
 oximux-remote-session = { path = "crates/remote-session" }
 oximux-remote-iroh = { path = "crates/remote-iroh" }
+oximux-mobile-core = { path = "crates/mobile-core" }
 oximux-proc-cwd = { path = "crates/proc-cwd" }
 
 # GPUI — see docs/gpui-pins.md. We deliberately do NOT pin `rev` here. The
@@ -98,6 +100,10 @@ postcard = "1"
 # landed in 1.0 — write concrete calls against the 1.0 surface, not the 0.96
 # vendored reference.
 iroh = "1"
+# Mobile FFI (crates/mobile-core): uniffi 0.31 wraps remote-session + iroh into a
+# Swift/Kotlin/JSI surface for the React Native app. 0.31 is the version
+# uniffi-bindgen-react-native and n0's iroh-ffi both track.
+uniffi = { version = "0.31", features = ["cli", "tokio"] }
 # Remote-control host auth (crates/remote-host). Separate app-signing Ed25519
 # identity + a QR HMAC-SHA256 pairing proof, decoupled from the iroh transport
 # key. `rand` (OsRng) mints host keys, challenge nonces, and session tokens.
