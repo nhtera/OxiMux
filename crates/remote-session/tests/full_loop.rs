@@ -6,14 +6,32 @@ use std::sync::Arc;
 
 use futures::executor::block_on;
 use futures::future::join;
-use oximux_agent_core::thread::{PermissionDecision, PermissionKind, ThreadEvent};
+use oximux_agent_core::thread::{ChatThread, PermissionDecision, PermissionKind, ThreadEntry, ThreadEvent};
 use oximux_agents::session_registry::SessionRegistry;
 use oximux_agents::thread::{AgentCapabilities, StubConnection};
 use oximux_remote_host::{AuthStore, Dispatcher, PairingSlot};
-use oximux_remote_proto::PairingTicket;
+use oximux_remote_proto::messages::SessionStatusWire;
+use oximux_remote_proto::{HostEvent, PairingTicket};
 use oximux_remote_proto::testing::duplex_pair;
-use oximux_remote_session::{ClientSigner, RemoteSession};
+use oximux_remote_session::{ClientSigner, FoldOutcome, RemoteSession, SessionSubscription};
 use serde_json::json;
+
+/// All assistant-message text folded into a thread, whitespace-stripped — asserts
+/// the fold saw the events without coupling to entry chunking or the `\n`
+/// separators the fold inserts between finalized blocks.
+fn assistant_text(thread: &ChatThread) -> String {
+    thread
+        .entries
+        .iter()
+        .filter_map(|e| match e {
+            ThreadEntry::Assistant(msg) => Some(msg.text.as_str()),
+            _ => None,
+        })
+        .collect::<String>()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
 
 const NOW: u64 = 1_700_000_000;
 fn clock() -> u64 {
@@ -93,6 +111,100 @@ fn client_pairs_and_drives_a_session_over_the_loopback() {
     };
 
     block_on(join(serve, script));
+}
+
+#[test]
+fn client_subscribes_and_folds_backlog_then_live_events() {
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let registry = seeded_registry();
+    // A handle clone the script ingests into after subscribing, to drive the live
+    // edge (the registry itself moves into the dispatcher).
+    let handle = registry.get("sess-1").expect("seeded session");
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock);
+
+    let (client_transport, server) = duplex_pair();
+    let client = RemoteSession::new(Arc::new(client_transport), ClientSigner::from_seed(&CLIENT_SEED));
+
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        client.pair(&ticket(None), "phone", NOW).await.expect("pair");
+
+        // Subscribe replays the backlog (seq 1 = "hi", seq 2 = permission request).
+        let mut sub = SessionSubscription::new("sess-1");
+        let backlog = client.subscribe("sess-1", 0).await.expect("subscribe");
+        assert_eq!(backlog.len(), 2);
+        assert_eq!(sub.apply_batch(&backlog).unwrap(), FoldOutcome::Applied { seq: 2 });
+        assert_eq!(sub.last_seq(), 2);
+        assert_eq!(assistant_text(sub.thread()), "hi", "backlog folded into the thread");
+
+        // A live event ingested now arrives as a pushed frame and folds in order.
+        handle.ingest(ThreadEvent::AssistantText("there".into()));
+        let frame = client.next_event().await.expect("next_event").expect("a live frame");
+        assert_eq!(frame.seq, 3);
+        assert_eq!(sub.apply(&frame).unwrap(), FoldOutcome::Applied { seq: 3 });
+        assert_eq!(sub.last_seq(), 3);
+        assert_eq!(assistant_text(sub.thread()), "hithere", "live event folded onto the backlog");
+        // client dropped here → serve loop ends
+    };
+
+    block_on(join(serve, script));
+}
+
+/// A `seq` jump is reported as a gap (not folded); after `events_since` backfills
+/// the hole, re-feeding the frames in order folds cleanly. Pure — no transport.
+#[test]
+fn subscription_detects_gap_and_resyncs_in_order() {
+    let status = SessionStatusWire { last_seq: 5, awaiting_permission: false };
+    let frame = |seq: u64, text: &str| {
+        HostEvent::new("s", seq, &ThreadEvent::AssistantText(text.into()), status.clone()).unwrap()
+    };
+
+    let mut sub = SessionSubscription::new("s");
+    assert_eq!(sub.apply(&frame(1, "a")).unwrap(), FoldOutcome::Applied { seq: 1 });
+    assert_eq!(sub.apply(&frame(2, "b")).unwrap(), FoldOutcome::Applied { seq: 2 });
+
+    // seq 5 skips 3,4 → gap, not folded, cursor unmoved.
+    assert_eq!(sub.apply(&frame(5, "e")).unwrap(), FoldOutcome::Gap { resume_from: 2 });
+    assert_eq!(sub.last_seq(), 2, "a gapped frame does not advance the cursor");
+
+    // events_since(2) would return 3,4,5; re-feeding them in order catches up.
+    assert_eq!(
+        sub.apply_batch(&[frame(3, "c"), frame(4, "d"), frame(5, "e")]).unwrap(),
+        FoldOutcome::Applied { seq: 5 }
+    );
+    assert_eq!(sub.last_seq(), 5);
+    assert_eq!(assistant_text(sub.thread()), "abcde", "no gap, no dupe after resync");
+
+    // A re-sent duplicate is ignored, cursor holds.
+    assert_eq!(sub.apply(&frame(4, "d")).unwrap(), FoldOutcome::Applied { seq: 5 });
+    assert_eq!(assistant_text(sub.thread()), "abcde", "duplicate not re-folded");
+}
+
+/// When the missed span has aged out of the host's backlog, an `events_since`
+/// reply starts ahead of the cursor and re-feeding it yields the SAME
+/// `resume_from` — the unrecoverable-history signal a driver uses to reset from a
+/// fresh snapshot rather than retry forever.
+#[test]
+fn subscription_reports_permanent_gap_when_history_aged_out() {
+    let status = SessionStatusWire { last_seq: 60, awaiting_permission: false };
+    let frame = |seq: u64| {
+        HostEvent::new("s", seq, &ThreadEvent::AssistantText("x".into()), status.clone()).unwrap()
+    };
+
+    let mut sub = SessionSubscription::new("s");
+    // A live jump from the fresh cursor (0) to seq 51 → gap, resume_from 0.
+    assert_eq!(sub.apply(&frame(51)).unwrap(), FoldOutcome::Gap { resume_from: 0 });
+
+    // events_since(0) can only return what's still retained — say 51.. (1..=50 aged
+    // out). Re-feeding still starts ahead of the cursor → the SAME resume_from.
+    let retained: Vec<HostEvent> = (51..=53).map(frame).collect();
+    assert_eq!(
+        sub.apply_batch(&retained).unwrap(),
+        FoldOutcome::Gap { resume_from: 0 },
+        "unchanged resume_from across a backfill = unrecoverable, reset from snapshot"
+    );
+    assert_eq!(sub.last_seq(), 0, "cursor never advanced past the lost span");
 }
 
 #[test]

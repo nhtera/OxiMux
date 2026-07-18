@@ -8,6 +8,7 @@
 //! later slices layered on this.
 
 mod handshake;
+mod subscribe;
 
 use std::sync::{Arc, Mutex};
 
