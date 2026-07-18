@@ -14,6 +14,7 @@ pub mod osc_sideband;
 pub mod poll_helpers;
 pub mod registry;
 pub mod runtime;
+pub mod session_registry;
 pub mod runtime_impl;
 pub mod session_log;
 pub mod status_machine;

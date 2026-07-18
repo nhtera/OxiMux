@@ -153,7 +153,12 @@ pub enum FeatureValue {
 /// existing impls (and the test stub) compile unchanged; a backend overrides
 /// only what it supports. The trait is deliberately grown once, provider-
 /// agnostically, so the future ACP backend satisfies the same seam.
-pub trait AgentConnection: Send {
+// `Sync` (not just `Send`) so the session registry can hold the connection as a
+// shared `Arc<dyn AgentConnection>` and call it from an off-thread task while the
+// desktop view holds the same `Arc` — `Arc<T>` is only `Send`/shareable when
+// `T: Send + Sync`. All impls hold channel senders / handles (no `Rc`/`RefCell`),
+// so they already satisfy `Sync`.
+pub trait AgentConnection: Send + Sync {
     /// Send a user prompt, starting a new turn. (The transport also accepts a
     /// message mid-turn, but the chat UI currently gates sending behind Stop
     /// while a turn is streaming, so a live steer isn't issued from the UI.)
