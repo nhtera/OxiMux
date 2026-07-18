@@ -1,11 +1,13 @@
 //! Remote-control wire protocol shared by the OxiMux desktop host and the
 //! phone's Rust core.
 //!
-//! Two concerns, no transport:
+//! Three concerns:
 //! - [`proto`] — the append-only RPC envelope (`Request`/`Response`), the
 //!   [`HostEvent`](proto::HostEvent) stream frame, and their postcard codec.
 //! - [`pairing`] — the [`PairingTicket`](pairing::PairingTicket) a QR carries
 //!   and the `oximux://connect?ticket=` URL helpers.
+//! - [`transport`] — the [`Transport`](transport::Transport) trait the dispatcher
+//!   speaks over, so iroh is one impl and an in-memory loopback drives tests.
 //!
 //! **Wire codec = postcard** (compact, non-self-describing). The envelope is
 //! versioned and extended by appending variants — never by reordering or
@@ -25,6 +27,7 @@
 pub mod messages;
 pub mod pairing;
 pub mod proto;
+pub mod transport;
 
 pub use messages::{
     AuthProveReq, ConnectReq, HostEvent, RegisterReq, ResolvePermissionReq, SendPromptReq,
@@ -32,3 +35,4 @@ pub use messages::{
 };
 pub use pairing::{PairingError, PairingTicket};
 pub use proto::{PROTOCOL_VERSION, Request, Response, RpcError, WireError};
+pub use transport::{Transport, TransportError};

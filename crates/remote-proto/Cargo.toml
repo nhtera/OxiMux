@@ -8,11 +8,12 @@ publish.workspace = true
 rust-version.workspace = true
 
 # The remote-control wire vocabulary: the append-only RPC envelope, the
-# `HostEvent` stream frame, and the `PairingTicket` codec. Deliberately
-# dependency-minimal and transport-free — no iroh, no irpc, no tokio, no gpui.
-# The host (`remote-host`) and the phone's Rust core (`mobile-core` via
-# `remote-session`) both speak this crate, so it must cross-compile to
-# aarch64-apple-ios / aarch64-linux-android with no desktop-only deps.
+# `HostEvent` stream frame, the `PairingTicket` codec, and the transport-agnostic
+# `Transport` seam. Deliberately dependency-minimal — no iroh, no irpc, no tokio
+# runtime, no gpui. `async-trait` is the sole async dep (a proc-macro, no
+# runtime), so the crate still cross-compiles to aarch64-apple-ios /
+# aarch64-linux-android with no desktop-only deps. The host (`remote-host`) and
+# the phone's Rust core (`mobile-core` via `remote-session`) both speak it.
 [dependencies]
 oximux-agent-core = { workspace = true }
 serde = { workspace = true }
@@ -20,3 +21,10 @@ serde_json = { workspace = true }
 postcard = { workspace = true, features = ["use-std"] }
 base64 = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+# In-memory loopback `Transport` for the seam tests (a runtime-agnostic executor
+# + channels; keeps tokio out of the crate). When `remote-host`'s integration
+# test needs the same loopback cross-crate, promote it behind a `testing` feature.
+futures = { workspace = true }
