@@ -1,0 +1,38 @@
+[package]
+name = "oximux-remote-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# The in-app remote-control host: the transport-agnostic RPC dispatcher, the
+# two-key pairing/auth handshake + ACL, and the host identity. Consumes the
+# Phase-2 `SessionRegistry` (in `oximux-agents`) to serve session list/subscribe/
+# command RPCs. Desktop-only (runs in-process in OxiMux), so depending on the
+# heavier `oximux-agents` is fine — this crate never ships to mobile.
+#
+# The live iroh `Endpoint` binding + QR display live in later slices; everything
+# here is driven over the `remote-proto` `Transport` seam and is unit-testable
+# with the in-memory loopback (no network).
+[dependencies]
+oximux-remote-proto = { workspace = true }
+oximux-agent-core = { workspace = true }
+oximux-agents = { workspace = true }
+# Durable paired-device/ACL persistence (RemoteDeviceRepo). Desktop-only host,
+# so the rusqlite pull-in is fine — this crate never ships to mobile.
+oximux-storage = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+ed25519-dalek = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+oximux-remote-proto = { workspace = true, features = ["testing"] }
+futures = { workspace = true }

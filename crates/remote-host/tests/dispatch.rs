@@ -1,0 +1,278 @@
+//! End-to-end dispatcher tests over the in-memory loopback transport — a full
+//! pair → command → revoke conversation, plus the Ed25519 reconnect handshake,
+//! with no network.
+
+use std::sync::Arc;
+
+use ed25519_dalek::{Signer, SigningKey};
+use futures::executor::block_on;
+use futures::future::join;
+use oximux_agent_core::thread::{PermissionDecision, PermissionKind, ThreadEvent};
+use oximux_agents::session_registry::SessionRegistry;
+use oximux_agents::thread::{AgentCapabilities, StubConnection};
+use oximux_remote_host::{AuthStore, Dispatcher, PairingSlot, registration_proof};
+use oximux_remote_proto::messages::{ConnectReq, RegisterReq, SendPromptReq};
+use oximux_remote_proto::proto::{Request, Response, RpcError};
+use oximux_remote_proto::testing::duplex_pair;
+use oximux_remote_proto::{AuthProveReq, ResolvePermissionReq, Transport};
+use serde_json::json;
+
+const NOW: u64 = 1_700_000_000;
+fn clock() -> u64 {
+    NOW
+}
+const SECRET: [u8; 16] = [0x22; 16];
+
+/// One request → one response over a client transport.
+async fn call(client: &dyn Transport, req: Request) -> Response {
+    client.send(req.to_bytes().unwrap()).await.unwrap();
+    let frame = client.recv().await.unwrap().expect("a response frame");
+    Response::from_bytes(&frame).unwrap()
+}
+
+fn register_req(pubkey: [u8; 32]) -> RegisterReq {
+    RegisterReq {
+        app_pubkey: pubkey,
+        device_name: "phone".into(),
+        proof: registration_proof(&SECRET, &pubkey, NOW),
+        timestamp_secs: NOW,
+        session_id: None,
+    }
+}
+
+/// A registry with one session `sess-1` that has already streamed a text event
+/// and an outstanding permission request.
+fn seeded_registry() -> Arc<SessionRegistry> {
+    let registry = Arc::new(SessionRegistry::new());
+    // A steer-capable stub so the Steer RPC exercises the ack path (a default
+    // stub refuses mid-turn steer, which would instead exercise error mapping).
+    let conn = StubConnection::default()
+        .with_capabilities(AgentCapabilities { supports_steer: true, ..Default::default() });
+    let handle = registry.register("sess-1".into(), Arc::new(conn));
+    handle.ingest(ThreadEvent::AssistantText("hi".into()));
+    handle.ingest(ThreadEvent::PermissionRequested {
+        request_id: "req-1".into(),
+        tool_use_id: None,
+        tool_name: "Bash".into(),
+        input: json!({ "command": "ls" }),
+        description: "run ls".into(),
+        suggestions: vec![],
+        kind: PermissionKind::Tool,
+    });
+    registry
+}
+
+#[test]
+fn full_pairing_and_session_control_over_the_loopback() {
+    let registry = seeded_registry();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false)); // static full-access ticket
+    let dispatcher = Dispatcher::new(registry, auth.clone()).with_clock(clock);
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        // Unauthenticated: a session RPC is refused before pairing.
+        assert_eq!(
+            call(&client, Request::ListSessions).await,
+            Response::Error(RpcError::Unauthorized),
+            "no session access before auth"
+        );
+
+        // Pair.
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        // List reflects the seeded session's real seq + awaiting-permission.
+        let Response::Sessions(sessions) = call(&client, Request::ListSessions).await else {
+            panic!("expected Sessions");
+        };
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "sess-1");
+        assert_eq!(sessions[0].last_seq, 2);
+        assert!(sessions[0].awaiting_permission);
+
+        // Backlog replay decodes back into the exact events, Value intact.
+        let Response::Events(frames) = call(
+            &client,
+            Request::EventsSince { session_id: "sess-1".into(), after_seq: 0 },
+        )
+        .await
+        else {
+            panic!("expected Events");
+        };
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].event().unwrap(), ThreadEvent::AssistantText("hi".into()));
+        assert!(matches!(frames[1].event().unwrap(), ThreadEvent::PermissionRequested { .. }));
+
+        // Commands ack.
+        assert_eq!(
+            call(
+                &client,
+                Request::SendPrompt(SendPromptReq {
+                    session_id: "sess-1".into(),
+                    text: "go".into(),
+                    images: vec![],
+                    corr_id: 1,
+                })
+            )
+            .await,
+            Response::Ack
+        );
+        assert_eq!(
+            call(&client, Request::Steer { session_id: "sess-1".into(), text: "focus".into() }).await,
+            Response::Ack
+        );
+        assert_eq!(
+            call(&client, Request::Cancel { session_id: "sess-1".into() }).await,
+            Response::Ack
+        );
+
+        // Resolve is idempotent: first wins, a re-resolve reports AlreadyDecided.
+        let resolve = Request::ResolvePermission(
+            ResolvePermissionReq::new(
+                "sess-1",
+                "req-1",
+                &PermissionDecision::Allow { updated_input: json!({}) },
+            )
+            .unwrap(),
+        );
+        assert_eq!(call(&client, resolve.clone()).await, Response::Ack);
+        assert_eq!(
+            call(&client, resolve).await,
+            Response::Error(RpcError::AlreadyDecided)
+        );
+
+        // Unknown session is distinguished from unauthorized.
+        assert_eq!(
+            call(&client, Request::GetSessionInfo { session_id: "nope".into() }).await,
+            Response::Error(RpcError::UnknownSession)
+        );
+        let Response::SessionInfo(_) =
+            call(&client, Request::GetSessionInfo { session_id: "sess-1".into() }).await
+        else {
+            panic!("expected SessionInfo");
+        };
+
+        // Revoke mid-connection: Ping still works, but session RPCs now fail the
+        // per-RPC recheck even though the connection stayed open and authenticated.
+        auth.revoke(&pubkey);
+        assert_eq!(call(&client, Request::Ping).await, Response::Pong);
+        assert_eq!(
+            call(&client, Request::ListSessions).await,
+            Response::Error(RpcError::Unauthorized),
+            "revocation bites an already-open connection"
+        );
+        // client dropped here → serve loop ends
+    };
+
+    block_on(join(serve, script));
+}
+
+#[test]
+fn list_sessions_respects_device_scope() {
+    let registry = Arc::new(SessionRegistry::new());
+    registry.register("sess-1".into(), Arc::new(StubConnection::default()));
+    registry.register("sess-2".into(), Arc::new(StubConnection::default()));
+    let auth = Arc::new(AuthStore::new());
+    // A session-bound ticket → the device is scoped to sess-1 only.
+    auth.set_pairing(PairingSlot::new(SECRET, Some("sess-1".into()), false));
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock);
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let reg = RegisterReq {
+            app_pubkey: pubkey,
+            device_name: "phone".into(),
+            proof: registration_proof(&SECRET, &pubkey, NOW),
+            timestamp_secs: NOW,
+            session_id: Some("sess-1".into()),
+        };
+        let Response::Registered { .. } = call(&client, Request::Register(reg)).await else {
+            panic!("expected Registered");
+        };
+
+        // The list is filtered to the device's scope — sess-2 must not leak.
+        let Response::Sessions(sessions) = call(&client, Request::ListSessions).await else {
+            panic!("expected Sessions");
+        };
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["sess-1"], "a session-scoped device never enumerates other sessions");
+
+        // And it cannot reach sess-2 directly.
+        assert_eq!(
+            call(&client, Request::GetSessionInfo { session_id: "sess-2".into() }).await,
+            Response::Error(RpcError::Unauthorized)
+        );
+    };
+    block_on(join(serve, script));
+}
+
+#[test]
+fn reconnect_via_challenge_and_token() {
+    let registry = seeded_registry();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+
+    // Pre-authorize a real Ed25519 client key (as if it had already paired).
+    let client_key = SigningKey::from_bytes(&[7u8; 32]);
+    let client_pub = client_key.verifying_key().to_bytes();
+    auth.register(&register_req(client_pub), NOW).expect("pre-authorize");
+
+    let dispatcher = Dispatcher::new(registry, auth.clone()).with_clock(clock);
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        // No token → challenge.
+        let Response::Challenge { nonce } = call(
+            &client,
+            Request::Connect(ConnectReq { app_pubkey: client_pub, session_token: None }),
+        )
+        .await
+        else {
+            panic!("expected Challenge");
+        };
+
+        // Sign the nonce with the app key → Connected + a token.
+        let signature = client_key.sign(&nonce).to_bytes().to_vec();
+        let Response::Connected { session_token } =
+            call(&client, Request::AuthProve(AuthProveReq { signature })).await
+        else {
+            panic!("expected Connected");
+        };
+        // Authenticated now.
+        assert!(matches!(call(&client, Request::ListSessions).await, Response::Sessions(_)));
+
+        // The issued token is a valid fast-path reconnect credential.
+        let Response::Connected { .. } = call(
+            &client,
+            Request::Connect(ConnectReq { app_pubkey: client_pub, session_token: Some(session_token) }),
+        )
+        .await
+        else {
+            panic!("expected Connected via token");
+        };
+
+        // A wrong signature is rejected.
+        let Response::Challenge { .. } = call(
+            &client,
+            Request::Connect(ConnectReq { app_pubkey: client_pub, session_token: None }),
+        )
+        .await
+        else {
+            panic!("expected Challenge");
+        };
+        assert_eq!(
+            call(&client, Request::AuthProve(AuthProveReq { signature: vec![0u8; 64] })).await,
+            Response::Error(RpcError::Unauthorized),
+            "a bad signature does not authenticate"
+        );
+    };
+
+    block_on(join(serve, script));
+}

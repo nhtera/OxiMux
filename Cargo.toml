@@ -16,6 +16,7 @@ members = [
     "crates/relay",
     "crates/relay-client",
     "crates/remote-proto",
+    "crates/remote-host",
     "crates/proc-cwd",
     "xtask",
 ]
@@ -45,6 +46,7 @@ oximux-relay-proto = { path = "crates/relay-proto" }
 oximux-relay    = { path = "crates/relay" }
 oximux-relay-client = { path = "crates/relay-client" }
 oximux-remote-proto = { path = "crates/remote-proto" }
+oximux-remote-host = { path = "crates/remote-host" }
 oximux-proc-cwd = { path = "crates/proc-cwd" }
 
 # GPUI — see docs/gpui-pins.md. We deliberately do NOT pin `rev` here. The
@@ -86,6 +88,12 @@ bincode = { version = "2", features = ["serde"] }
 # cannot deserialize `Value` (it's non-self-describing; `deserialize_any` is
 # unsupported), and JSON is already those types' persisted representation.
 postcard = "1"
+# Remote-control host auth (crates/remote-host). Separate app-signing Ed25519
+# identity + a QR HMAC-SHA256 pairing proof, decoupled from the iroh transport
+# key. `rand` (OsRng) mints host keys, challenge nonces, and session tokens.
+ed25519-dalek = "2"
+hmac = "0.12"
+rand = "0.8"
 # Phase 5 relay daemon: lock-free concurrent map for PtyRegistry. Used
 # only by the relay binary; declared centrally for future reuse.
 dashmap = "5"
