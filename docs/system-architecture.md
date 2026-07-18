@@ -42,6 +42,9 @@
 │  crates/agents — AgentRuntime trait + CliRuntime    │
 │                  CliAgentAdapter + StatusMachine     │
 │                  SessionRegistry (event bus, WIP)    │
+│  crates/remote-proto — Remote Control wire vocab:   │
+│                  postcard envelope, HostEvent,       │
+│                  PairingTicket, Transport (WIP)      │
 │  crates/settings — terminal.toml, commit_message_ai.toml,│
 │                    ProjectScripts (.oximux/scripts.toml)  │
 │  crates/core   — shared domain types (no deps)      │
@@ -69,6 +72,7 @@ backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
 | `git` | `oximux-git` | `src/lib.rs` | `Repository`, `StatusPoller`, git ops, `GhCmd` |
 | `agent-core` | `oximux-agent-core` | `src/lib.rs` | portable `ThreadEvent` vocabulary + stream-json decoder + `ChatThread` fold (serde/serde_json/tracing only, no pty/rusqlite/ACP/gpui/tokio — mobile-portable); re-exported by `agents` under `crate::thread::*` |
 | `agents` | `oximux-agents` | `src/lib.rs` | `AgentRuntime` trait, `CliRuntime`, `StatusMachine`; `SessionRegistry` (gpui-free session event bus + command surface, built for Remote Control, not yet wired into the view) |
+| `remote-proto` | `oximux-remote-proto` | `src/lib.rs` | transport-free Remote Control wire vocabulary — postcard RPC envelope, `HostEvent` stream frame, `PairingTicket` codec, `Transport` trait seam; no host/client wired to it yet |
 | `editor` | `oximux-editor` | `src/lib.rs` | gpui-component editor wrapper + LSP glue |
 | `storage` | `oximux-storage` | `src/lib.rs` | SQLite + migration ladder + CI guard |
 | `settings` | `oximux-settings` | `src/lib.rs` | theme tokens, density, typography, TOML config |
@@ -686,6 +690,8 @@ on_drop
 Separate from the raw-PTY terminal runtime above, the **chat** view runs a structured conversation model (`crates/agents/src/thread/`). Three provider adapters each decode their own wire protocol into one transport-agnostic vocabulary — `ThreadEvent` (`event.rs`) — which `ChatThread::apply` (`state.rs`) folds into a `Vec<ThreadEntry>` the view renders. Each adapter satisfies the `AgentConnection` trait (`connection.rs`); the factory in `connect.rs` picks one. The view never learns which backend produced an event.
 
 **Agent-core split (2026-07-18):** the pure fold + `ThreadEvent` vocabulary + stream-json decoder now live in `crates/agent-core` (`oximux-agent-core`) — serde/serde_json/tracing only, no pty/rusqlite/ACP/gpui/tokio — so the same fold can cross-compile for a mobile Rust core; `oximux-agents` re-exports the modules under their original `crate::thread::*` paths. Groundwork for this: `crates/agents/src/session_registry.rs` adds a process-wide, gpui-free `SessionRegistry` (event bus + off-thread command surface, keyed by `session_id`) that a future remote/network layer can subscribe to and command without a `gpui::Context`; it is built but not yet wired into the view. It required `AgentConnection` to gain a `Sync` supertrait, and the agent-chat view now holds its connection as `Arc<dyn AgentConnection>` (was `Box`) so the registry can share the same connection object the view drives — pure ownership change, no behavior change. This is Phase 1-2 groundwork for the Remote Control feature (control OxiMux from a phone over Iroh P2P; plan at `plans/260717-2037-oximux-remote-control/`) — no remote transport exists yet.
+
+**Wire vocabulary (`crates/remote-proto`, `oximux-remote-proto`, 2026-07-18):** the transport-free RPC surface shared by the future desktop host and the phone's Rust core — an append-only postcard `Request`/`Response` envelope (`PROTOCOL_VERSION = 1`, mirroring `relay-proto`'s versioning discipline), the `HostEvent` stream frame, a `PairingTicket` codec (`oximux://connect?ticket=` deep link, base64url-encoded postcard, `handshake_secret` redacted in `Debug`), and a transport-agnostic `Transport` trait (framed bidirectional seam; iroh will be one impl, an in-memory loopback drives tests today). `async-trait` is the crate's only async dependency — no tokio, no gpui — so it stays mobile-portable. postcard is non-self-describing and can't deserialize `serde_json::Value`, but `ThreadEvent` and `PermissionDecision` carry `Value` fields (and are already on the persisted-JSON path), so rather than fork a shadow event type those payloads ride the wire as a `serde_json` string nested inside the postcard envelope (`HostEvent.event_json`, `ResolvePermissionReq.decision_json`) — no on-disk format change. This required additive `Serialize`/`Deserialize` derives on the reachable agent-core event types (`ThreadEvent`, `TurnUsage`, `AuthMethodInfo`, `AuthMethodKind`, `PlanEntryLite`, `PermissionDecision`). No host, client, or transport impl consumes this crate yet.
 
 - **Claude** — hand-parsed `stream-json` (`stream_json.rs`); no official Rust SDK, so the taxonomy is tracked manually. Native surface (AskUserQuestion, effort/modes, background tasks) kept — not wrapped as ACP.
 - **Codex** — `codex app-server` JSON-RPC v2 (`codex/`); shapes verified via `generate-json-schema`.

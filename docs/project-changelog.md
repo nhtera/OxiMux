@@ -26,6 +26,34 @@ change.
 - **`990a84f`** — The agent-chat view now holds its connection as
   `Arc<dyn AgentConnection>` (was `Box`) so the registry can share it. Pure
   ownership change — same `&self` call surface, no behavior change.
+- **`e242b1e`** — Added `crates/remote-proto` (`oximux-remote-proto`): the
+  transport-free wire vocabulary for the future desktop host and the phone's
+  Rust core — postcard `Request`/`Response` envelope (`PROTOCOL_VERSION = 1`,
+  mirrors `relay-proto`'s versioning discipline), `HostEvent` stream frame,
+  and `PairingTicket` codec (`oximux://connect?ticket=` deep link, secret
+  redacted in `Debug`). `ThreadEvent`/`PermissionDecision` carry
+  `serde_json::Value`, which postcard can't deserialize, so they ride the
+  wire as a nested `serde_json` string instead of a shadow type — added
+  additive serde derives to the reachable agent-core event types.
+- **`7c6ac7d`** — Added the transport-agnostic `Transport` trait to
+  `remote-proto`: a framed, bidirectional seam (iroh will be one impl; an
+  in-memory loopback drives tests). `async-trait` is the only new dep — no
+  runtime — so the crate stays mobile-portable.
+- **`f41b894`** — Added `crates/remote-host` (`oximux-remote-host`): the
+  transport-agnostic core of the in-app remote server, driven over the
+  `Transport` seam. A per-connection RPC dispatcher wired to the Phase-2
+  `SessionRegistry`; the QR pairing / auth handshake (HMAC-SHA256 proof →
+  `session_token` | Ed25519 challenge); a two-level ACL (global authorized set +
+  per-device scope) re-checked on **every** RPC so revocation bites an open
+  connection; and host identity (Ed25519, `0600`, SHA-256(workdir)-keyed). Two
+  critical review findings fixed before landing (a revoked device re-registering
+  itself; `ListSessions` leaking sessions past a device's scope). The live iroh
+  endpoint, QR display, and enablement UI are later slices.
+- **`46ab53c`** — Added the `V019__remote_devices` migration + `RemoteDeviceRepo`
+  so paired devices, their scope, and revocations persist across restarts; a
+  `DeviceStore` seam in `remote-host` seeds the `AuthStore` at boot and writes
+  register/revoke through to it. Revoked devices stay recorded, so a re-pair can't
+  resurrect them even after a restart.
 
 ---
 
