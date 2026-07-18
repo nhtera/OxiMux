@@ -105,10 +105,26 @@ pub enum Response {
     SessionInfo(SessionInfoWire),
     /// Generic success for a command with no payload (prompt/steer/cancel/resolve).
     Ack,
-    /// Reply to [`Request::EventsSince`] — the replayed backlog.
+    /// Reply to [`Request::EventsSince`] — the replayed backlog. Also the immediate
+    /// reply to [`Request::Subscribe`]: the backlog after `after_seq`, before the
+    /// live [`Response::Event`] frames begin.
     Events(Vec<HostEvent>),
     /// The request failed at the protocol level.
     Error(RpcError),
+    /// A single live event **pushed** to a subscriber, unsolicited (no matching
+    /// request frame) — the live edge that follows the [`Response::Events`]
+    /// backlog once a [`Request::Subscribe`] is accepted. Appended last to keep
+    /// the enum's ordinal encoding append-only.
+    ///
+    /// **Gap contract:** live frames carry a monotonically increasing `seq` per
+    /// session, but the stream is *lossy under lag* — if the host's bounded live
+    /// ring laps before a slow subscriber reads it, the skipped span is dropped
+    /// silently (not re-sent here). A client detects this as a **jump in `seq`**
+    /// between consecutive `Event` frames for a session and resynchronizes with
+    /// [`Request::EventsSince`] `{ after_seq: last_seq_seen }`. `HostEvent.status`
+    /// is the session's status *at forward time*, not as of `seq`, so it can lead
+    /// `seq` even with no loss — it is a freshness hint, never the gap signal.
+    Event(HostEvent),
 }
 
 impl Request {
