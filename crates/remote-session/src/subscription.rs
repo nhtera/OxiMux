@@ -2,8 +2,9 @@
 //! a resume cursor.
 //!
 //! Feed it the backlog (from `subscribe`/`events_since`) and then the live
-//! [`HostEvent`] frames (`next_event`); it decodes each event and folds it into the
-//! thread with the same `agent-core` fold the desktop uses. It also enforces the
+//! [`HostEvent`] frames off the demux event stream (`RemoteSession::take_events`);
+//! it decodes each event and folds it into the thread with the same `agent-core`
+//! fold the desktop uses. It also enforces the
 //! wire's gap contract: a `seq` that skips ahead means the host's live ring lapped
 //! (or a frame was dropped), so rather than fold out of order it reports a
 //! [`FoldOutcome::Gap`] and the caller resyncs via `events_since(resume_from)`.

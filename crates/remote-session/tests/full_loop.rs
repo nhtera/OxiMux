@@ -4,8 +4,9 @@
 
 use std::sync::Arc;
 
+use futures::StreamExt;
 use futures::executor::block_on;
-use futures::future::join;
+use futures::future::join3;
 use oximux_agent_core::thread::{ChatThread, PermissionDecision, PermissionKind, ThreadEntry, ThreadEvent};
 use oximux_agents::session_registry::SessionRegistry;
 use oximux_agents::thread::{AgentCapabilities, StubConnection};
@@ -76,6 +77,7 @@ fn client_pairs_and_drives_a_session_over_the_loopback() {
 
     let (client_transport, server) = duplex_pair();
     let client = RemoteSession::new(Arc::new(client_transport), ClientSigner::from_seed(&CLIENT_SEED));
+    let pump = client.take_pump().expect("pump");
 
     let serve = dispatcher.serve(&server);
     let script = async move {
@@ -107,10 +109,11 @@ fn client_pairs_and_drives_a_session_over_the_loopback() {
             !client.resolve_permission("sess-1", "req-1", &allow).await.expect("re-resolve"),
             "already-decided is Ok(false), not an error"
         );
-        // client dropped here → serve loop ends
+        // client dropped here → its shutdown sender drops → pump stops → serve ends
     };
 
-    block_on(join(serve, script));
+    let (_, pump_res, ()) = block_on(join3(serve, pump.run(), script));
+    pump_res.expect("pump ran to a clean shutdown");
 }
 
 #[test]
@@ -125,6 +128,8 @@ fn client_subscribes_and_folds_backlog_then_live_events() {
 
     let (client_transport, server) = duplex_pair();
     let client = RemoteSession::new(Arc::new(client_transport), ClientSigner::from_seed(&CLIENT_SEED));
+    let pump = client.take_pump().expect("pump");
+    let mut events = client.take_events().expect("event stream");
 
     let serve = dispatcher.serve(&server);
     let script = async move {
@@ -138,17 +143,63 @@ fn client_subscribes_and_folds_backlog_then_live_events() {
         assert_eq!(sub.last_seq(), 2);
         assert_eq!(assistant_text(sub.thread()), "hi", "backlog folded into the thread");
 
-        // A live event ingested now arrives as a pushed frame and folds in order.
+        // A live event ingested now arrives on the demux event stream and folds in order.
         handle.ingest(ThreadEvent::AssistantText("there".into()));
-        let frame = client.next_event().await.expect("next_event").expect("a live frame");
+        let frame = events.next().await.expect("a live frame");
         assert_eq!(frame.seq, 3);
         assert_eq!(sub.apply(&frame).unwrap(), FoldOutcome::Applied { seq: 3 });
         assert_eq!(sub.last_seq(), 3);
         assert_eq!(assistant_text(sub.thread()), "hithere", "live event folded onto the backlog");
-        // client dropped here → serve loop ends
+        // client dropped here → its shutdown sender drops → pump stops → serve ends
     };
 
-    block_on(join(serve, script));
+    let (_, pump_res, ()) = block_on(join3(serve, pump.run(), script));
+    pump_res.expect("pump ran to a clean shutdown");
+}
+
+/// The demux-pump payoff: an RPC issued *while* a live subscription is streaming
+/// gets its reply routed correctly, and the interleaved live event is not lost —
+/// the pump keeps the reply and the pushed `Response::Event` from colliding on the
+/// one connection. End-to-end against the real host push path.
+#[test]
+fn client_issues_rpc_while_subscribed_without_collision() {
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let registry = seeded_registry();
+    let handle = registry.get("sess-1").expect("seeded session");
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock);
+
+    let (client_transport, server) = duplex_pair();
+    let client = RemoteSession::new(Arc::new(client_transport), ClientSigner::from_seed(&CLIENT_SEED));
+    let pump = client.take_pump().expect("pump");
+    let mut events = client.take_events().expect("event stream");
+
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        client.pair(&ticket(None), "phone", NOW).await.expect("pair");
+        let backlog = client.subscribe("sess-1", 0).await.expect("subscribe");
+        assert_eq!(backlog.len(), 2, "seq 1 + 2 replayed");
+
+        // Queue a live frame at the host, THEN fire an RPC. Its reply must be
+        // demuxed past the in-flight event rather than mis-read as one.
+        handle.ingest(ThreadEvent::AssistantText("mid-stream".into()));
+        let sessions = client.list_sessions().await.expect("list mid-subscription");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].last_seq, 3, "the RPC reply is intact, not an event frame");
+
+        // ...and the live event was delivered on the stream, not swallowed.
+        let frame = events.next().await.expect("the interleaved live frame");
+        assert_eq!(frame.seq, 3);
+        assert_eq!(
+            frame.event().unwrap(),
+            ThreadEvent::AssistantText("mid-stream".into()),
+            "the event survived the concurrent RPC"
+        );
+        // client dropped here → its shutdown sender drops → pump stops → serve ends
+    };
+
+    let (_, pump_res, ()) = block_on(join3(serve, pump.run(), script));
+    pump_res.expect("pump ran to a clean shutdown");
 }
 
 /// A `seq` jump is reported as a gap (not folded); after `events_since` backfills
@@ -216,27 +267,34 @@ fn client_reconnects_via_token_fast_path_and_challenge() {
     // Connection 1: pair, capture the reconnect token, then drop the connection.
     let (c1, s1) = duplex_pair();
     let client1 = RemoteSession::new(Arc::new(c1), ClientSigner::from_seed(&CLIENT_SEED));
-    let token = block_on(join(dispatcher.serve(&s1), async move {
+    let pump1 = client1.take_pump().expect("pump");
+    let token = block_on(join3(dispatcher.serve(&s1), pump1.run(), async move {
         client1.pair(&ticket(None), "phone", NOW).await.expect("pair");
         client1.session_token().expect("token issued")
     }))
-    .1;
+    .2;
 
     // Connection 2: same identity, seeded token → the fast path (no challenge).
     let (c2, s2) = duplex_pair();
     let client2 = RemoteSession::new(Arc::new(c2), ClientSigner::from_seed(&CLIENT_SEED));
     client2.set_session_token(Some(token));
-    block_on(join(dispatcher.serve(&s2), async move {
+    let pump2 = client2.take_pump().expect("pump");
+    block_on(join3(dispatcher.serve(&s2), pump2.run(), async move {
         client2.connect().await.expect("token reconnect");
         assert!(client2.list_sessions().await.is_ok(), "authenticated via token");
-    }));
+    }))
+    .1
+    .expect("pump ran to a clean shutdown");
 
     // Connection 3: same identity, NO token → the Ed25519 challenge path.
     let (c3, s3) = duplex_pair();
     let client3 = RemoteSession::new(Arc::new(c3), ClientSigner::from_seed(&CLIENT_SEED));
-    block_on(join(dispatcher.serve(&s3), async move {
+    let pump3 = client3.take_pump().expect("pump");
+    block_on(join3(dispatcher.serve(&s3), pump3.run(), async move {
         client3.connect().await.expect("challenge reconnect");
         assert!(client3.session_token().is_some(), "challenge issues a fresh token");
         assert!(client3.list_sessions().await.is_ok(), "authenticated via challenge");
-    }));
+    }))
+    .1
+    .expect("pump ran to a clean shutdown");
 }

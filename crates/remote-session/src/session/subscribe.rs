@@ -1,21 +1,22 @@
-//! The live-subscription primitives on [`RemoteSession`]: open a stream and read
-//! the pushed frames. The fold itself lives in [`crate::subscription`].
+//! Opening a session's live stream. The pushed frames are read off the demux
+//! event stream ([`RemoteSession::take_events`]); the fold lives in
+//! [`crate::subscription`].
 
-use oximux_remote_proto::proto::{Request, Response};
 use oximux_remote_proto::HostEvent;
+use oximux_remote_proto::proto::{Request, Response};
 
 use super::{RemoteSession, Result};
 use crate::error::SessionError;
 
 impl RemoteSession {
     /// Subscribe to a session's live stream. Returns the backlog after `after_seq`
-    /// (the immediate `Events` reply); each subsequent live frame is read with
-    /// [`Self::next_event`].
+    /// (the immediate `Events` reply); each subsequent live frame arrives on the
+    /// event stream taken with [`Self::take_events`].
     ///
-    /// **Once subscribed, this connection interleaves pushed `Response::Event`
-    /// frames with any RPC reply**, so do NOT issue other RPCs (via `call`) on it —
-    /// drive the stream with `next_event`. Concurrent RPC-while-subscribed needs a
-    /// demux pump, a later slice (see the note on `RemoteSession::call`).
+    /// The host awaits the backlog send before it forwards any live frame, so the
+    /// backlog is complete as of the subscribe. Because every RPC rides the demux
+    /// pump, other requests stay safe to issue on this connection while the stream
+    /// runs — the pump keeps pushed events and RPC replies from colliding.
     pub async fn subscribe(&self, session_id: &str, after_seq: u64) -> Result<Vec<HostEvent>> {
         let req =
             Request::Subscribe { session_id: session_id.to_string(), after_seq: Some(after_seq) };
@@ -23,21 +24,6 @@ impl RemoteSession {
             Response::Events(backlog) => Ok(backlog),
             Response::Error(e) => Err(SessionError::Rpc(e)),
             _ => Err(SessionError::Unexpected { expected: "Events" }),
-        }
-    }
-
-    /// Read the next pushed live event on a subscribed connection. `Ok(None)` when
-    /// the host closes the stream.
-    pub async fn next_event(&self) -> Result<Option<HostEvent>> {
-        let frame = match self.transport.recv().await {
-            Ok(Some(frame)) => frame,
-            Ok(None) => return Ok(None),
-            Err(e) => return Err(SessionError::Transport(e.to_string())),
-        };
-        match Response::from_bytes(&frame).map_err(|e| SessionError::Wire(e.to_string()))? {
-            Response::Event(event) => Ok(Some(event)),
-            Response::Error(e) => Err(SessionError::Rpc(e)),
-            _ => Err(SessionError::Unexpected { expected: "Event" }),
         }
     }
 }

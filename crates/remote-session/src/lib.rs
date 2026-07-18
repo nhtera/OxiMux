@@ -8,17 +8,19 @@
 //! to expose a typed API to React Native.
 //!
 //! Today: the [`ClientSigner`] app identity; [`RemoteSession`] — the
-//! Register/Connect/AuthProve handshake, one-shot RPCs, and `subscribe`/
-//! `next_event`; and [`SessionSubscription`] — the client-side fold of a session's
-//! `HostEvent` stream into a `ChatThread` with the gap→resync contract. Later
-//! slices layer the concurrent demux pump (RPC-while-subscribed) and the reconnect
-//! state machine on top.
+//! Register/Connect/AuthProve handshake, one-shot RPCs, and `subscribe` — driven
+//! over a concurrent [`demux`] pump so RPCs and a live event stream share one
+//! connection; and [`SessionSubscription`] — the client-side fold of a session's
+//! `HostEvent` stream into a `ChatThread` with the gap→resync contract. A later
+//! slice layers the reconnect state machine on top.
 
+mod demux;
 mod error;
 mod session;
 mod signer;
 mod subscription;
 
+pub use demux::{DemuxPump, EventStream};
 pub use error::SessionError;
 pub use session::RemoteSession;
 pub use signer::ClientSigner;

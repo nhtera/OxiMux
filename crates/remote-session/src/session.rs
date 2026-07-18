@@ -3,15 +3,17 @@
 //! transport is injected as one `Transport` impl, and the in-memory loopback
 //! drives the full-loop test against the real host dispatcher.
 //!
-//! Every call is strict request→response (`call`); the live subscription consumer
-//! (folding `HostEvent`s into a `ChatThread`) and the reconnect state machine are
-//! later slices layered on this.
+//! Every RPC rides the concurrent [`demux`](crate::demux) pump, so a client can
+//! issue requests *while* subscribed to a live session on the same connection: the
+//! pump routes pushed `HostEvent`s to the event stream ([`Self::take_events`]) and
+//! each reply to its waiting caller. The reconnect state machine is a later slice.
 
 mod handshake;
 mod subscribe;
 
 use std::sync::{Arc, Mutex};
 
+use futures::channel::oneshot;
 use oximux_agent_core::thread::{ChatImage, PermissionDecision};
 use oximux_remote_proto::messages::{
     ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionSummary,
@@ -19,25 +21,54 @@ use oximux_remote_proto::messages::{
 use oximux_remote_proto::proto::{Request, Response, RpcError};
 use oximux_remote_proto::{HostEvent, Transport};
 
+use crate::demux::{Demux, DemuxPump, EventStream, demux};
 use crate::error::SessionError;
 use crate::signer::ClientSigner;
 
 type Result<T> = std::result::Result<T, SessionError>;
 
 /// One client's connection to a host, over an abstract [`Transport`]. Owns the
-/// app-signing identity and caches the reconnect token.
+/// app-signing identity, the demux RPC handle, and caches the reconnect token.
 pub struct RemoteSession {
-    transport: Arc<dyn Transport>,
+    demux: Arc<Demux>,
     signer: ClientSigner,
     /// The reconnect credential the host issues on Register/Connect. Cached in
     /// memory only — `mobile-core` may persist it, but losing it just forces the
     /// slower Ed25519 challenge on the next `connect`.
     token: Mutex<Option<String>>,
+    /// The read-loop pump, taken once by the owner to drive (spawned in prod,
+    /// joined in tests). Every RPC is dead in the water until it runs.
+    pump: Mutex<Option<DemuxPump>>,
+    /// The live event stream, taken once by the owner to consume.
+    events: Mutex<Option<EventStream>>,
+    /// Dropping this stops the pump — so the connection tears down when the
+    /// session is dropped, no explicit close needed.
+    _shutdown: oneshot::Sender<()>,
 }
 
 impl RemoteSession {
     pub fn new(transport: Arc<dyn Transport>, signer: ClientSigner) -> Self {
-        Self { transport, signer, token: Mutex::new(None) }
+        let (handle, pump, events, shutdown) = demux(transport);
+        Self {
+            demux: handle,
+            signer,
+            token: Mutex::new(None),
+            pump: Mutex::new(Some(pump)),
+            events: Mutex::new(Some(events)),
+            _shutdown: shutdown,
+        }
+    }
+
+    /// Take the read-loop pump to drive it — once. Spawn `pump.run()` onto an
+    /// executor (prod) or join it (tests); RPCs only resolve while it runs.
+    pub fn take_pump(&self) -> Option<DemuxPump> {
+        self.pump.lock().unwrap().take()
+    }
+
+    /// Take the live event stream — once. Each pushed `HostEvent` is folded by a
+    /// [`SessionSubscription`](crate::SessionSubscription).
+    pub fn take_events(&self) -> Option<EventStream> {
+        self.events.lock().unwrap().take()
     }
 
     /// The app-signing public key the host records for this device.
@@ -150,24 +181,11 @@ impl RemoteSession {
         }
     }
 
-    /// Send one request frame and read exactly one response frame.
-    ///
-    /// Assumes strict one-request→one-response ordering on the transport. This
-    /// holds today because this crate never subscribes — but the host pushes
-    /// unsolicited [`Response::Event`] frames onto the *same* connection once a
-    /// `Subscribe` is active. The future live-subscription consumer must therefore
-    /// demux `Response::Event` off a single read loop (or a dedicated live
-    /// channel) BEFORE routing replies here; it must NOT reuse this `call` while
-    /// subscribed, or an `Event` frame would be mis-read as an RPC reply and shift
-    /// the request/response alignment permanently.
+    /// Send one request and await its reply. Rides the [`demux`](crate::demux)
+    /// pump, which routes pushed `Response::Event` frames off to the event stream
+    /// and this reply back here — so an RPC is safe to issue even while a live
+    /// subscription is streaming on the same connection.
     async fn call(&self, req: Request) -> Result<Response> {
-        let bytes = req.to_bytes().map_err(|e| SessionError::Wire(e.to_string()))?;
-        self.transport.send(bytes).await.map_err(|e| SessionError::Transport(e.to_string()))?;
-        match self.transport.recv().await.map_err(|e| SessionError::Transport(e.to_string()))? {
-            Some(frame) => {
-                Response::from_bytes(&frame).map_err(|e| SessionError::Wire(e.to_string()))
-            }
-            None => Err(SessionError::Closed),
-        }
+        self.demux.call(req).await
     }
 }

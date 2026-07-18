@@ -23,6 +23,13 @@ pub trait Transport: Send + Sync {
 
     /// Receive the next framed message, or `None` once the peer has closed the
     /// channel and no more frames will arrive.
+    ///
+    /// **Must be cancel-safe:** a caller may drop the returned future before it
+    /// resolves (e.g. a read loop that `select`s `recv` against a shutdown signal),
+    /// and doing so must not consume or lose a frame — the next `recv` must still
+    /// yield it. The in-memory loopback satisfies this (its receive is a single
+    /// channel poll); a stream-based impl (iroh) must buffer any partially-read
+    /// frame rather than discard bytes on drop.
     async fn recv(&self) -> Result<Option<Vec<u8>>, TransportError>;
 }
 

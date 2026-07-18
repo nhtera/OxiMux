@@ -5889,6 +5889,7 @@ name = "oximux-remote-session"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "ed25519-dalek",
  "futures",
  "oximux-agent-core",
