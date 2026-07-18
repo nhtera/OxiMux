@@ -18,6 +18,7 @@ members = [
     "crates/remote-proto",
     "crates/remote-host",
     "crates/remote-session",
+    "crates/remote-iroh",
     "crates/proc-cwd",
     "xtask",
 ]
@@ -49,6 +50,7 @@ oximux-relay-client = { path = "crates/relay-client" }
 oximux-remote-proto = { path = "crates/remote-proto" }
 oximux-remote-host = { path = "crates/remote-host" }
 oximux-remote-session = { path = "crates/remote-session" }
+oximux-remote-iroh = { path = "crates/remote-iroh" }
 oximux-proc-cwd = { path = "crates/proc-cwd" }
 
 # GPUI — see docs/gpui-pins.md. We deliberately do NOT pin `rev` here. The
@@ -90,6 +92,12 @@ bincode = { version = "2", features = ["serde"] }
 # cannot deserialize `Value` (it's non-self-describing; `deserialize_any` is
 # unsupported), and JSON is already those types' persisted representation.
 postcard = "1"
+# Remote-control P2P transport (crates/remote-iroh): iroh 1.0 (QUIC + hole-punch
+# + n0 relay/pkarr discovery) is the production `Transport`/`Connector` impl
+# beneath the pure-Rust remote-session client. The `Node*`→`Endpoint*` API rename
+# landed in 1.0 — write concrete calls against the 1.0 surface, not the 0.96
+# vendored reference.
+iroh = "1"
 # Remote-control host auth (crates/remote-host). Separate app-signing Ed25519
 # identity + a QR HMAC-SHA256 pairing proof, decoupled from the iroh transport
 # key. `rand` (OsRng) mints host keys, challenge nonces, and session tokens.

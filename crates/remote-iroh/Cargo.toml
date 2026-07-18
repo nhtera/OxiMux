@@ -1,0 +1,35 @@
+[package]
+name = "oximux-remote-iroh"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# The iroh P2P transport for remote control: the production `Transport` /
+# `Connector` impls that sit beneath the pure-Rust `remote-session` client and
+# the transport-agnostic `remote-host` dispatcher. A framed QUIC bi-stream
+# carries the postcard RPC envelope; iroh handles direct-first connectivity with
+# hole-punching and n0 relay/pkarr discovery. Kept in its own crate so
+# `remote-session` stays iroh-free (and unit-testable over the in-memory
+# loopback), and so both the host and the mobile core share one framing impl.
+[dependencies]
+oximux-remote-proto = { workspace = true }
+# For the `Connector`/`ConnectError` dial seam this crate implements.
+oximux-remote-session = { workspace = true }
+iroh = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The same-machine integration test drives the real host dispatcher + the real
+# client session over a real QUIC link between two endpoints on one machine.
+oximux-remote-host = { workspace = true }
+oximux-agents = { workspace = true }
+oximux-remote-proto = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
