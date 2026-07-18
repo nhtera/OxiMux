@@ -22,9 +22,18 @@ postcard = { workspace = true, features = ["use-std"] }
 base64 = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+# Only pulled in by the `testing` feature (the in-memory loopback transport);
+# a runtime-agnostic executor + channels, so no tokio in a shippable build.
+futures = { workspace = true, optional = true }
+
+[features]
+# Exposes `testing::DuplexTransport` — the in-process loopback that lets this
+# crate AND downstream crates (e.g. `remote-host` dispatcher tests) drive the RPC
+# layer with no network. Enabled automatically for this crate's own `cargo test`
+# (via `cfg(test)`); downstream crates opt in with `features = ["testing"]`.
+testing = ["dep:futures"]
 
 [dev-dependencies]
-# In-memory loopback `Transport` for the seam tests (a runtime-agnostic executor
-# + channels; keeps tokio out of the crate). When `remote-host`'s integration
-# test needs the same loopback cross-crate, promote it behind a `testing` feature.
+# The loopback module is `cfg(any(test, feature = "testing"))`, so this crate's
+# own tests need `futures` unconditionally available.
 futures = { workspace = true }

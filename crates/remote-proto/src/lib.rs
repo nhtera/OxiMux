@@ -27,6 +27,8 @@
 pub mod messages;
 pub mod pairing;
 pub mod proto;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod transport;
 
 pub use messages::{

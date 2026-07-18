@@ -43,36 +43,8 @@ pub enum TransportError {
 mod tests {
     use super::*;
     use crate::proto::{Request, Response};
-    use futures::channel::mpsc;
-    use futures::lock::Mutex;
-    use futures::{StreamExt, executor::block_on, future::join};
-
-    /// An in-process loopback: two endpoints whose send halves feed the other's
-    /// receive half. Enough to drive the dispatcher end-to-end without a network.
-    struct DuplexTransport {
-        tx: mpsc::UnboundedSender<Vec<u8>>,
-        rx: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
-    }
-
-    fn duplex_pair() -> (DuplexTransport, DuplexTransport) {
-        let (a_tx, b_rx) = mpsc::unbounded();
-        let (b_tx, a_rx) = mpsc::unbounded();
-        (
-            DuplexTransport { tx: a_tx, rx: Mutex::new(a_rx) },
-            DuplexTransport { tx: b_tx, rx: Mutex::new(b_rx) },
-        )
-    }
-
-    #[async_trait]
-    impl Transport for DuplexTransport {
-        async fn send(&self, frame: Vec<u8>) -> Result<(), TransportError> {
-            // `unbounded_send` fails only if every receiver was dropped.
-            self.tx.unbounded_send(frame).map_err(|_| TransportError::Closed)
-        }
-        async fn recv(&self) -> Result<Option<Vec<u8>>, TransportError> {
-            Ok(self.rx.lock().await.next().await)
-        }
-    }
+    use crate::testing::duplex_pair;
+    use futures::{executor::block_on, future::join};
 
     /// The seam proof: a real `Request` postcard-frame crosses an abstract
     /// `Transport` and comes back as a decoded `Response`, with the dispatch side
