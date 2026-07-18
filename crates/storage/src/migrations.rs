@@ -159,6 +159,14 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "agent_sessions_last_message",
         sql: include_str!("../migrations/V018__agent_sessions_last_message.sql"),
     },
+    // V019 adds `remote_devices` — one row per remote-control paired device
+    // (app-signing pubkey, name, per-device scope, revoked soft-delete) so the
+    // authorized set survives restart. Additive; never reorder/rewrite.
+    Migration {
+        version: 19,
+        name: "remote_devices",
+        sql: include_str!("../migrations/V019__remote_devices.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.
