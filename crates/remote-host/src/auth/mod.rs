@@ -23,11 +23,14 @@ mod reconnect;
 mod tests;
 
 pub use persistence::{DeviceStore, StorageDeviceStore, StoredDevice};
+// The registration proof is a wire invariant shared with the client, so it lives
+// in `remote-proto`; re-exported here for the host's callers + tests.
+pub use oximux_remote_proto::registration_proof;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use hmac::{Hmac, Mac};
+use hmac::Hmac;
 use rand::RngCore;
 use rand::rngs::OsRng;
 use sha2::Sha256;
@@ -39,16 +42,6 @@ pub type AppPubkey = [u8; 32];
 
 /// The maximum clock skew tolerated on a registration proof, each way.
 const REGISTRATION_WINDOW_SECS: u64 = 60;
-
-/// The canonical registration proof: `HMAC-SHA256(secret, app_pubkey || ts_le)`.
-/// Shared shape — the client (`remote-session`/`mobile-core`) computes the same;
-/// factor into a shared crate when that client lands.
-pub fn registration_proof(secret: &[u8; 16], app_pubkey: &AppPubkey, timestamp_secs: u64) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
-    mac.update(app_pubkey);
-    mac.update(&timestamp_secs.to_le_bytes());
-    mac.finalize().into_bytes().into()
-}
 
 /// A QR pairing secret the host is currently advertising.
 pub struct PairingSlot {

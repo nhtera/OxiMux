@@ -7,10 +7,35 @@
 //! HMAC. The secret IS the bearer credential, so it is never logged (see the
 //! host's redaction discipline).
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// The scheme + host a pairing URL always starts with.
 pub const CONNECT_URL_PREFIX: &str = "oximux://connect";
+
+/// The canonical registration proof: `HMAC-SHA256(secret, app_pubkey || ts_le)`.
+///
+/// A wire invariant, and this is its one shared definition. The client
+/// (`remote-session`) calls this to build `RegisterReq.proof`; the host verifies
+/// the *same construction* over the same inputs, but does so with a constant-time
+/// `Mac::verify_slice` (not by calling this fn and comparing — that would be a
+/// timing-leaky equality). So the byte formula lives here for both to agree on,
+/// while each side uses the primitive appropriate to its role. The
+/// `handshake_secret` never crosses the wire; only this proof does, inside the
+/// host's ±skew window.
+pub fn registration_proof(
+    secret: &[u8; 16],
+    app_pubkey: &[u8; 32],
+    timestamp_secs: u64,
+) -> [u8; 32] {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(app_pubkey);
+    mac.update(&timestamp_secs.to_le_bytes());
+    mac.finalize().into_bytes().into()
+}
 
 /// Everything a phone needs to open its first connection to a host.
 ///

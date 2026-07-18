@@ -22,6 +22,11 @@ postcard = { workspace = true, features = ["use-std"] }
 base64 = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+# The registration proof is a wire invariant — host and client MUST compute it
+# identically — so it lives here, computed with these pure-Rust (mobile-portable)
+# crypto crates rather than duplicated per side.
+hmac = { workspace = true }
+sha2 = { workspace = true }
 # Only pulled in by the `testing` feature (the in-memory loopback transport);
 # a runtime-agnostic executor + channels, so no tokio in a shippable build.
 futures = { workspace = true, optional = true }

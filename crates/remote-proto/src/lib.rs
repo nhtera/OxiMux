@@ -35,6 +35,6 @@ pub use messages::{
     AuthProveReq, ConnectReq, HostEvent, RegisterReq, ResolvePermissionReq, SendPromptReq,
     SessionInfoWire, SessionStatusWire, SessionSummary,
 };
-pub use pairing::{PairingError, PairingTicket};
+pub use pairing::{PairingError, PairingTicket, registration_proof};
 pub use proto::{PROTOCOL_VERSION, Request, Response, RpcError, WireError};
 pub use transport::{Transport, TransportError};
