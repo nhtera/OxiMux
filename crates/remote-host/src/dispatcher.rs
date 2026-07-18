@@ -5,20 +5,24 @@
 //! [`Transport`] seam, so the iroh endpoint is one driver and the in-memory
 //! loopback drives tests with no network.
 //!
-//! **Authorization is re-checked on every session RPC**, not just at connect: a
-//! device revoked mid-connection (Phase 7) must fail its next call even though
-//! its transport is still open. The authenticated handlers live in [`handlers`].
+//! The connection loop lives in [`serve`]: it multiplexes incoming client
+//! requests against the live events of any active `Subscribe`, so a live event is
+//! pushed the moment it is produced. The forwarding invariants live in [`stream`];
+//! the handshake in [`handshake`]; the authenticated session RPCs in [`handlers`].
+//!
+//! **Authorization is re-checked on every session RPC *and* every live frame**,
+//! not just at connect: a device revoked mid-connection (Phase 7) must stop being
+//! served even though its transport is still open.
 
 mod handlers;
+mod handshake;
+mod serve;
+mod stream;
 
 use std::sync::Arc;
 
 use oximux_agents::session_registry::SessionRegistry;
-use oximux_remote_proto::messages::{ConnectReq, RegisterReq};
 use oximux_remote_proto::proto::{Request, Response, RpcError};
-use oximux_remote_proto::Transport;
-use rand::RngCore;
-use rand::rngs::OsRng;
 
 use crate::auth::{AppPubkey, AuthStore};
 
@@ -51,30 +55,9 @@ impl Dispatcher {
         self
     }
 
-    /// Serve one connection until the peer closes or a send fails. Each request
-    /// yields exactly one response frame.
-    pub async fn serve(&self, transport: &dyn Transport) {
-        let mut state = ConnAuthn::Unauth;
-        loop {
-            let frame = match transport.recv().await {
-                Ok(Some(frame)) => frame,
-                Ok(None) | Err(_) => break,
-            };
-            let response = match Request::from_bytes(&frame) {
-                Ok(req) => self.dispatch(&mut state, req),
-                Err(_) => Response::Error(RpcError::BadRequest("undecodable request frame".into())),
-            };
-            // `Response` carries no `serde_json::Value`, so it always postcard-encodes.
-            let bytes = response.to_bytes().expect("response is always encodable");
-            if transport.send(bytes).await.is_err() {
-                break;
-            }
-        }
-    }
-
-    /// Route one request against the current connection state. Synchronous — the
-    /// registry commands are non-blocking; only the transport I/O in `serve` is
-    /// async.
+    /// Route one non-`Subscribe` request against the current connection state.
+    /// Synchronous — the registry commands are non-blocking; only the transport
+    /// I/O in [`serve`] is async.
     fn dispatch(&self, state: &mut ConnAuthn, req: Request) -> Response {
         match req {
             Request::Ping => Response::Pong,
@@ -89,45 +72,8 @@ impl Dispatcher {
         }
     }
 
-    fn handle_register(&self, state: &mut ConnAuthn, req: RegisterReq) -> Response {
-        match self.auth.register(&req, (self.now_secs)()) {
-            Ok(token) => {
-                *state = ConnAuthn::Authed { app_pubkey: req.app_pubkey };
-                Response::Registered { session_token: token }
-            }
-            Err(e) => Response::Error(e),
-        }
-    }
-
-    fn handle_connect(&self, state: &mut ConnAuthn, req: ConnectReq) -> Response {
-        if let Some(token) = req.session_token.as_deref()
-            && let Some(pubkey) = self.auth.authorize_token(token)
-        {
-            *state = ConnAuthn::Authed { app_pubkey: pubkey };
-            return Response::Connected { session_token: token.to_string() };
-        }
-        // No token / invalid token → challenge the app key.
-        let mut nonce = [0u8; 32];
-        OsRng.fill_bytes(&mut nonce);
-        *state = ConnAuthn::PendingChallenge { app_pubkey: req.app_pubkey, nonce };
-        Response::Challenge { nonce }
-    }
-
-    fn handle_auth_prove(&self, state: &mut ConnAuthn, signature: &[u8]) -> Response {
-        let ConnAuthn::PendingChallenge { app_pubkey, nonce } = state else {
-            return Response::Error(RpcError::BadRequest("no challenge outstanding".into()));
-        };
-        let (app_pubkey, nonce) = (*app_pubkey, *nonce);
-        match self.auth.verify_challenge(&app_pubkey, &nonce, signature) {
-            Ok(token) => {
-                *state = ConnAuthn::Authed { app_pubkey };
-                Response::Connected { session_token: token }
-            }
-            Err(e) => Response::Error(e),
-        }
-    }
-
-    /// Route an authenticated request to its handler (in [`handlers`]).
+    /// Route an authenticated request to its handler (in [`handlers`]). `Subscribe`
+    /// never reaches here — the serve loop intercepts it to open the live stream.
     fn handle_session_rpc(&self, pubkey: &AppPubkey, req: Request) -> Response {
         match req {
             Request::ListSessions => self.list_sessions(pubkey),
@@ -141,22 +87,16 @@ impl Dispatcher {
             Request::EventsSince { session_id, after_seq } => {
                 self.events_since(pubkey, &session_id, after_seq)
             }
-            // Live streaming keeps the connection open and pushes many frames — it
-            // needs the runtime transport layer (iroh slice). Until then, reply
-            // with the same backlog replay `EventsSince` gives, so a client can at
-            // least catch up.
-            Request::Subscribe { session_id, after_seq } => {
-                self.events_since(pubkey, &session_id, after_seq.unwrap_or(0))
-            }
-            // Handshake variants never reach here (handled before auth).
+            // Handshake variants (handled before auth) and `Subscribe` (intercepted
+            // in `serve`) never reach here.
             _ => Response::Error(RpcError::BadRequest("unexpected request".into())),
         }
     }
 }
 
 /// The device this connection is authenticated as, if it is still authorized.
-/// Returns `None` for an unauthenticated OR revoked connection — the per-RPC
-/// revocation gate.
+/// Returns `None` for an unauthenticated OR revoked connection — the per-RPC (and
+/// per-live-frame) revocation gate. `pub(super)` so the serve loop shares it.
 fn authorized_pubkey(state: &ConnAuthn, auth: &AuthStore) -> Option<AppPubkey> {
     match state {
         ConnAuthn::Authed { app_pubkey } if auth.is_authorized(app_pubkey) => Some(*app_pubkey),

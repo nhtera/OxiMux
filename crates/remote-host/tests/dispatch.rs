@@ -26,6 +26,12 @@ const SECRET: [u8; 16] = [0x22; 16];
 /// One request → one response over a client transport.
 async fn call(client: &dyn Transport, req: Request) -> Response {
     client.send(req.to_bytes().unwrap()).await.unwrap();
+    read_response(client).await
+}
+
+/// Read the next response frame with no preceding request — for the unsolicited
+/// live `Response::Event` frames a subscription pushes.
+async fn read_response(client: &dyn Transport) -> Response {
     let frame = client.recv().await.unwrap().expect("a response frame");
     Response::from_bytes(&frame).unwrap()
 }
@@ -169,6 +175,100 @@ fn full_pairing_and_session_control_over_the_loopback() {
         // client dropped here → serve loop ends
     };
 
+    block_on(join(serve, script));
+}
+
+#[test]
+fn subscribe_streams_live_events_and_revocation_silences_the_stream() {
+    let registry = seeded_registry();
+    // A handle clone the script can ingest into after subscribing, to drive the
+    // live edge (the registry itself is moved into the dispatcher).
+    let handle = registry.get("sess-1").expect("seeded session");
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false)); // static full-access ticket
+    let dispatcher = Dispatcher::new(registry, auth.clone()).with_clock(clock);
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        // Subscribe replies with the backlog (seq 1, 2) as `Events` first.
+        let Response::Events(backlog) =
+            call(&client, Request::Subscribe { session_id: "sess-1".into(), after_seq: Some(0) }).await
+        else {
+            panic!("expected the backlog Events reply");
+        };
+        let seqs: Vec<u64> = backlog.iter().map(|f| f.seq).collect();
+        assert_eq!(seqs, vec![1, 2], "backlog replayed before the live edge");
+
+        // A new event ingested now must arrive as a pushed live `Event`, not a
+        // re-sent backlog entry.
+        handle.ingest(ThreadEvent::AssistantText("live!".into()));
+        let Response::Event(frame) = read_response(&client).await else {
+            panic!("expected a pushed live Event");
+        };
+        assert_eq!(frame.seq, 3, "live seq follows the backlog");
+        assert_eq!(frame.event().unwrap(), ThreadEvent::AssistantText("live!".into()));
+        assert_eq!(frame.status.last_seq, 3, "status snapshot rides the live frame");
+
+        // Revoke mid-stream: the next ingest must be suppressed. Proven by a Ping
+        // whose Pong is the very next frame the client reads — had seq 4 been
+        // forwarded, it would arrive first.
+        auth.revoke(&pubkey);
+        handle.ingest(ThreadEvent::AssistantText("after-revoke".into()));
+        assert_eq!(
+            call(&client, Request::Ping).await,
+            Response::Pong,
+            "no live frame leaks past revocation ahead of the Pong"
+        );
+        // client dropped here → serve loop ends
+    };
+
+    block_on(join(serve, script));
+}
+
+#[test]
+fn repeat_subscribe_serves_backlog_without_a_second_live_stream() {
+    let registry = seeded_registry();
+    let handle = registry.get("sess-1").expect("seeded session");
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock);
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        // First subscribe opens the live stream + replays the backlog.
+        let sub = Request::Subscribe { session_id: "sess-1".into(), after_seq: Some(0) };
+        assert!(matches!(call(&client, sub.clone()).await, Response::Events(_)));
+        // Re-subscribing the same session on the same connection is idempotent: it
+        // serves the backlog again but must NOT open a second live stream.
+        assert!(matches!(call(&client, sub).await, Response::Events(_)));
+
+        // One ingest must yield exactly ONE live frame (not one per subscribe).
+        handle.ingest(ThreadEvent::AssistantText("once".into()));
+        let Response::Event(frame) = read_response(&client).await else {
+            panic!("expected a single live Event");
+        };
+        assert_eq!(frame.seq, 3);
+
+        // Had a second stream been registered, a duplicate seq-3 Event would sit
+        // ahead of the Pong; the Pong being next proves there was only one.
+        assert_eq!(call(&client, Request::Ping).await, Response::Pong, "no duplicate live frame");
+    };
     block_on(join(serve, script));
 }
 

@@ -32,7 +32,14 @@ ed25519-dalek = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
+# Live `Subscribe` streaming multiplexes the request loop with a merged set of
+# per-session broadcast streams (SelectAll + future::select) — runtime-agnostic,
+# so `serve` stays drivable by any executor (the loopback test's futures executor
+# and, in production, the iroh tokio runtime).
+futures = { workspace = true }
+# For the `broadcast::Receiver` the SessionRegistry hands out (sync primitives
+# only — no runtime pulled in; the broadcast wakers are runtime-agnostic).
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 oximux-remote-proto = { workspace = true, features = ["testing"] }
-futures = { workspace = true }
