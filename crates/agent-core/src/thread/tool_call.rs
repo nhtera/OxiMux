@@ -362,7 +362,7 @@ pub struct PermissionSuggestion {
 }
 
 /// The user's answer to a `PermissionRequest`, sent back to the agent.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PermissionDecision {
     /// Allow this one call. `updated_input` echoes (optionally edits) the
     /// tool input — REQUIRED by the CLI, an allow without it is malformed.

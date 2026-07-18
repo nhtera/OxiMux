@@ -1,0 +1,22 @@
+[package]
+name = "oximux-remote-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# The remote-control wire vocabulary: the append-only RPC envelope, the
+# `HostEvent` stream frame, and the `PairingTicket` codec. Deliberately
+# dependency-minimal and transport-free — no iroh, no irpc, no tokio, no gpui.
+# The host (`remote-host`) and the phone's Rust core (`mobile-core` via
+# `remote-session`) both speak this crate, so it must cross-compile to
+# aarch64-apple-ios / aarch64-linux-android with no desktop-only deps.
+[dependencies]
+oximux-agent-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true, features = ["use-std"] }
+base64 = { workspace = true }
+thiserror = { workspace = true }

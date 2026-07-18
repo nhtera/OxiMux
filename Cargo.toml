@@ -15,6 +15,7 @@ members = [
     "crates/relay-proto",
     "crates/relay",
     "crates/relay-client",
+    "crates/remote-proto",
     "crates/proc-cwd",
     "xtask",
 ]
@@ -43,6 +44,7 @@ oximux-settings = { path = "crates/settings" }
 oximux-relay-proto = { path = "crates/relay-proto" }
 oximux-relay    = { path = "crates/relay" }
 oximux-relay-client = { path = "crates/relay-client" }
+oximux-remote-proto = { path = "crates/remote-proto" }
 oximux-proc-cwd = { path = "crates/proc-cwd" }
 
 # GPUI — see docs/gpui-pins.md. We deliberately do NOT pin `rev` here. The
@@ -77,6 +79,13 @@ serde_json = "1"
 # byte layout is not ABI-stable across point releases — the workspace
 # pin is the authoritative version both app + daemon agree on.
 bincode = { version = "2", features = ["serde"] }
+# Remote-control wire codec (crates/remote-proto). Non-self-describing +
+# compact; the RPC envelope is postcard, append-only by ordinal (mirrors the
+# relay-proto PROTOCOL_VERSION discipline). Event/decision payloads that carry
+# `serde_json::Value` ride as a serde_json string INSIDE the envelope — postcard
+# cannot deserialize `Value` (it's non-self-describing; `deserialize_any` is
+# unsupported), and JSON is already those types' persisted representation.
+postcard = "1"
 # Phase 5 relay daemon: lock-free concurrent map for PtyRegistry. Used
 # only by the relay binary; declared centrally for future reuse.
 dashmap = "5"

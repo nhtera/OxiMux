@@ -15,7 +15,7 @@ use super::tool_call::{PermissionKind, PermissionSuggestion};
 /// Per-turn token/cost usage, decoded from the final `result` event. All counts
 /// are best-effort (0 when the field is absent); `cost_usd`/`context_window` are
 /// optional because not every turn reports them.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct TurnUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -29,7 +29,7 @@ pub struct TurnUsage {
 /// One authentication method an ACP agent advertises when it needs login, in a
 /// gpui-free shape mirroring ACP's `AuthMethod` union. Rendered by the auth card
 /// as a pill (Agent/Terminal) or an instructions block (EnvVar).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthMethodInfo {
     /// The method id echoed back in `authenticate` / used to route the click.
     pub id: String,
@@ -44,7 +44,7 @@ pub struct AuthMethodInfo {
 /// The authentication style of an [`AuthMethodInfo`], mirroring the ACP
 /// `AuthMethod` variants. Drives both the card rendering and the worker's
 /// per-kind flow.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AuthMethodKind {
     /// The agent handles login itself — clicking the pill runs `authenticate`.
     Agent,
@@ -68,7 +68,7 @@ pub enum AuthMethodKind {
 /// One entry of an agent execution plan, in a gpui-free shape mirroring ACP's
 /// `PlanEntry` (`content` + a three-state status + a priority). Rendered by the
 /// plan panel as a checklist row.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanEntryLite {
     pub content: String,
     /// Lifecycle: `"pending"`, `"in_progress"`, or `"completed"`. String-typed so
@@ -112,7 +112,7 @@ pub struct McpServerStatus {
     pub status: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ThreadEvent {
     /// Session bootstrap (`system/init`).
     SessionInit {
