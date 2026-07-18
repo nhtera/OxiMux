@@ -17,6 +17,7 @@ members = [
     "crates/relay-client",
     "crates/remote-proto",
     "crates/remote-host",
+    "crates/remote-session",
     "crates/proc-cwd",
     "xtask",
 ]
@@ -47,6 +48,7 @@ oximux-relay    = { path = "crates/relay" }
 oximux-relay-client = { path = "crates/relay-client" }
 oximux-remote-proto = { path = "crates/remote-proto" }
 oximux-remote-host = { path = "crates/remote-host" }
+oximux-remote-session = { path = "crates/remote-session" }
 oximux-proc-cwd = { path = "crates/proc-cwd" }
 
 # GPUI — see docs/gpui-pins.md. We deliberately do NOT pin `rev` here. The

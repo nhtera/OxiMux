@@ -5875,9 +5875,27 @@ dependencies = [
  "async-trait",
  "base64",
  "futures",
+ "hmac",
  "oximux-agent-core",
  "postcard",
  "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "oximux-remote-session"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ed25519-dalek",
+ "futures",
+ "oximux-agent-core",
+ "oximux-agents",
+ "oximux-remote-host",
+ "oximux-remote-proto",
+ "rand 0.8.6",
  "serde_json",
  "thiserror 1.0.69",
 ]

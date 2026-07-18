@@ -1,0 +1,32 @@
+[package]
+name = "oximux-remote-session"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# The client-side remote-control session — the phone's Rust core, pure Rust with
+# NO FFI so it is testable standalone (over the in-memory loopback, against the
+# real `remote-host` dispatcher). Holds the app-signing identity, drives the
+# Register/Connect/AuthProve handshake + one-shot RPCs over the `remote-proto`
+# `Transport` seam, and (later slices) folds the `HostEvent` stream into a
+# `ChatThread` + runs the reconnect state machine. `mobile-core` (uniffi) will
+# wrap this; iroh becomes one `Transport` impl underneath it.
+[dependencies]
+oximux-remote-proto = { workspace = true }
+oximux-agent-core = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The full-loop integration test drives this client against the real host
+# dispatcher over the in-memory loopback transport.
+oximux-remote-proto = { workspace = true, features = ["testing"] }
+oximux-remote-host = { workspace = true }
+oximux-agents = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
