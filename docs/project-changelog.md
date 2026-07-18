@@ -4,6 +4,31 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-18 — Remote Control groundwork: agent-core split + SessionRegistry (`feat/remote-control-headless-registry`, in progress)
+
+Phase 1-2 groundwork for controlling OxiMux from a phone over Iroh P2P (plan:
+`plans/260717-2037-oximux-remote-control/`). Not a shipped feature — no remote
+transport exists yet, nothing below is wired into the view except the ownership
+change.
+
+- **`23b9308`** — Extracted `crates/agent-core` (`oximux-agent-core`): the
+  pure `ChatThread` fold + `ThreadEvent` wire vocabulary + stream-json decoder,
+  split out of `oximux-agents`. Deps are serde/serde_json/tracing only — no
+  pty, rusqlite, ACP, gpui, or tokio — so it can cross-compile for a mobile
+  Rust core. `oximux-agents` re-exports the moved modules under their
+  original `crate::thread::*` paths; every downstream import site is
+  unchanged.
+- **`86ad9b6`** — Added `crates/agents/src/session_registry.rs`: a
+  process-wide, gpui-free `SessionRegistry` (event bus + off-thread command
+  surface) — seq-indexed replayable backlog, live broadcast fan-out, atomic
+  idempotent permission-resolve gate, status watch. `AgentConnection` gained
+  a `Sync` supertrait. Built behind the view first; nothing wired yet.
+- **`990a84f`** — The agent-chat view now holds its connection as
+  `Arc<dyn AgentConnection>` (was `Box`) so the registry can share it. Pure
+  ownership change — same `&self` call surface, no behavior change.
+
+---
+
 ### 2026-07-17 — Voice dictation: ampersand custom words + more filler languages (`feat/voice-dictation-vietnamese`)
 
 Second cross-check of the transcript pipeline against the open-source reference

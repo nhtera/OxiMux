@@ -36,8 +36,12 @@
 │  crates/pty    — TerminalBackend + PortablePtyBackend│
 │  crates/git    — Repository, StatusPoller, git ops, │
 │                  GhCmd (gh CLI wrapper)              │
+│  crates/agent-core — portable ThreadEvent vocabulary │
+│                  + stream-json decoder + ChatThread  │
+│                  fold (serde-only, mobile-portable)  │
 │  crates/agents — AgentRuntime trait + CliRuntime    │
 │                  CliAgentAdapter + StatusMachine     │
+│                  SessionRegistry (event bus, WIP)    │
 │  crates/settings — terminal.toml, commit_message_ai.toml,│
 │                    ProjectScripts (.oximux/scripts.toml)  │
 │  crates/core   — shared domain types (no deps)      │
@@ -63,7 +67,8 @@ backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
 | `pty` | `oximux-pty` | `src/lib.rs` | `TerminalBackend` + `PortablePtyBackend` |
 | `proc-cwd` | `oximux-proc-cwd` | `src/lib.rs` | resolve a process's working dir |
 | `git` | `oximux-git` | `src/lib.rs` | `Repository`, `StatusPoller`, git ops, `GhCmd` |
-| `agents` | `oximux-agents` | `src/lib.rs` | `AgentRuntime` trait, `CliRuntime`, `StatusMachine` |
+| `agent-core` | `oximux-agent-core` | `src/lib.rs` | portable `ThreadEvent` vocabulary + stream-json decoder + `ChatThread` fold (serde/serde_json/tracing only, no pty/rusqlite/ACP/gpui/tokio — mobile-portable); re-exported by `agents` under `crate::thread::*` |
+| `agents` | `oximux-agents` | `src/lib.rs` | `AgentRuntime` trait, `CliRuntime`, `StatusMachine`; `SessionRegistry` (gpui-free session event bus + command surface, built for Remote Control, not yet wired into the view) |
 | `editor` | `oximux-editor` | `src/lib.rs` | gpui-component editor wrapper + LSP glue |
 | `storage` | `oximux-storage` | `src/lib.rs` | SQLite + migration ladder + CI guard |
 | `settings` | `oximux-settings` | `src/lib.rs` | theme tokens, density, typography, TOML config |
@@ -679,6 +684,8 @@ on_drop
 ## Agent Chat adapters (structured chat view)
 
 Separate from the raw-PTY terminal runtime above, the **chat** view runs a structured conversation model (`crates/agents/src/thread/`). Three provider adapters each decode their own wire protocol into one transport-agnostic vocabulary — `ThreadEvent` (`event.rs`) — which `ChatThread::apply` (`state.rs`) folds into a `Vec<ThreadEntry>` the view renders. Each adapter satisfies the `AgentConnection` trait (`connection.rs`); the factory in `connect.rs` picks one. The view never learns which backend produced an event.
+
+**Agent-core split (2026-07-18):** the pure fold + `ThreadEvent` vocabulary + stream-json decoder now live in `crates/agent-core` (`oximux-agent-core`) — serde/serde_json/tracing only, no pty/rusqlite/ACP/gpui/tokio — so the same fold can cross-compile for a mobile Rust core; `oximux-agents` re-exports the modules under their original `crate::thread::*` paths. Groundwork for this: `crates/agents/src/session_registry.rs` adds a process-wide, gpui-free `SessionRegistry` (event bus + off-thread command surface, keyed by `session_id`) that a future remote/network layer can subscribe to and command without a `gpui::Context`; it is built but not yet wired into the view. It required `AgentConnection` to gain a `Sync` supertrait, and the agent-chat view now holds its connection as `Arc<dyn AgentConnection>` (was `Box`) so the registry can share the same connection object the view drives — pure ownership change, no behavior change. This is Phase 1-2 groundwork for the Remote Control feature (control OxiMux from a phone over Iroh P2P; plan at `plans/260717-2037-oximux-remote-control/`) — no remote transport exists yet.
 
 - **Claude** — hand-parsed `stream-json` (`stream_json.rs`); no official Rust SDK, so the taxonomy is tracked manually. Native surface (AskUserQuestion, effort/modes, background tasks) kept — not wrapped as ACP.
 - **Codex** — `codex app-server` JSON-RPC v2 (`codex/`); shapes verified via `generate-json-schema`.
