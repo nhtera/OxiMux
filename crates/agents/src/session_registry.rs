@@ -176,6 +176,12 @@ impl SessionHandle {
         self.status_tx.subscribe()
     }
 
+    /// The current status snapshot, cloned — for a one-shot read (e.g. building a
+    /// remote session-list row) without holding a `watch` receiver.
+    pub fn status_snapshot(&self) -> SessionStatus {
+        self.status_tx.borrow().clone()
+    }
+
     /// Refresh the coarse status snapshot. `ingested_seq` is `Some` only from the
     /// ingest path (which just appended that seq to the backlog); `last_seq` is
     /// advanced monotonically via `max` so a late status update from a slower
@@ -262,6 +268,18 @@ impl SessionRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.sessions.lock().unwrap().is_empty()
+    }
+
+    /// A snapshot of every live session's id + coarse status, for a remote
+    /// session-list bootstrap. Ascending by nothing in particular — the caller
+    /// orders as it likes.
+    pub fn statuses(&self) -> Vec<(SessionId, SessionStatus)> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, h)| (id.clone(), h.status_snapshot()))
+            .collect()
     }
 
     // ---- id-keyed convenience pass-throughs (return None/empty for unknown id) ----
