@@ -136,10 +136,10 @@ fn opencode_interactive_resume(session_id: &str) -> Vec<String> {
 /// The built-in ACP presets, surfaced one-click in the launcher.
 ///
 /// - **Cursor** — `cursor-agent acp` is native ACP (confirmed against the live
-///   ACP registry + Paseo's catalog).
-/// - **Amp** — Sourcegraph's ACP wrapper binary (`amp-acp`, the invocation Paseo
-///   uses). The `which amp-acp` detection greys it when absent; its exact
-///   invocation is pinned from research and should be re-confirmed live.
+///   ACP registry).
+/// - **Amp** — Sourcegraph's ACP wrapper binary (`amp-acp`). The `which amp-acp`
+///   detection greys it when absent; its exact invocation is pinned from research
+///   and should be re-confirmed live.
 /// - **OpenCode** — `opencode acp` is a built-in ACP server (verified live end
 ///   to end: handshake, streamed chunks, tool cards, usage, slash commands).
 ///   The `which opencode` detection greys it when absent. Its interactive

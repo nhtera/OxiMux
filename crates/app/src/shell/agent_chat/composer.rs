@@ -117,7 +117,7 @@ enum MentionMatch {
 
 /// The compact model label for the toolbar trigger: strip any `provider/`
 /// namespace so `openai/gpt-5.5` reads as `gpt-5.5`. The full label still shows
-/// in the dropdown menu. (Mirrors Paseo's `shortModelLabel`.)
+/// in the dropdown menu.
 fn short_model_label(label: &str) -> &str {
     match label.rfind('/') {
         Some(i) => &label[i + 1..],
@@ -152,7 +152,7 @@ impl SearchableListItem for ModelItem {
         )
     }
 
-    /// A two-line row (Paseo-style): the model name on top, its capability blurb
+    /// A two-line row: the model name on top, its capability blurb
     /// muted beneath. Rows without a blurb render the name alone. The blurb is
     /// clipped with an ellipsis so a long description never widens the menu.
     fn render(&self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
@@ -447,7 +447,7 @@ pub struct ComposerView {
     /// The placeholder string currently applied to the input, so `render` only
     /// re-pushes it (which needs a `Window`) when the derived value changes.
     applied_placeholder: Option<String>,
-    /// Persistent searchable model dropdown (Paseo-style filter-as-you-type),
+    /// Persistent searchable model dropdown (filter-as-you-type),
     /// held for the composer's life and re-seeded only when the advertised model
     /// set changes. A Confirm pick routes to `pick_model`. Rendered in place of a
     /// flat menu so long ACP model lists (OpenCode) stay navigable.
@@ -488,7 +488,7 @@ pub struct ComposerView {
     /// Id of the footer dropdown whose menu is currently open (e.g. `"chat-effort"`),
     /// or `None` when all are closed. Driven by each dropdown's `on_open_change`.
     /// Used to suppress a control's hover tooltip while its menu is open, so the
-    /// tooltip never paints over the options (matching Paseo/Radix).
+    /// tooltip never paints over the options.
     open_dropdown: Option<SharedString>,
     /// True while this is an unbound *New Agent* draft — the agent picker is
     /// shown so the user can choose the coding agent before the first send binds
@@ -1818,7 +1818,7 @@ impl ComposerView {
             .map(|(_, d)| d.clone())
             .unwrap_or_else(|| "Agent".to_string());
         // The picked agent's brand glyph (Claude/Codex marks; a generic sparkles
-        // for agents without one), mirroring Paseo's provider icon on the control.
+        // for agents without one), shown as the provider icon on the control.
         let trigger_icon = adapter_icon_path(&current_id);
         let trigger = Button::new("chat-agent-btn")
             .icon(Icon::default().path(trigger_icon))
@@ -1879,8 +1879,8 @@ impl ComposerView {
     /// routes through the Confirm subscription to `pick_model`.
     fn render_model_select(&self, _cx: &mut Context<Self>) -> impl IntoElement {
         // `flex_none` (no explicit width) lets the borderless Select hug its
-        // content — a compact "label ⌄" trigger like Paseo's model control and the
-        // sibling ghost pickers, rather than stretching across the toolbar. The
+        // content — a compact "label ⌄" trigger like the sibling ghost pickers,
+        // rather than stretching across the toolbar. The
         // dropdown itself stays a fixed, searchable width.
         div().flex_none().child(
             Select::new(&self.model_select)
@@ -1980,8 +1980,8 @@ impl ComposerView {
     /// The shared shell behind every footer dropdown (permission / effort /
     /// feature-select / agent picker): a ghost trigger button that opens a menu
     /// upward, plus a hover tooltip centered directly above the control and
-    /// SUPPRESSED while its own menu is open (matching Paseo/Radix, which hides a
-    /// trigger's tooltip when its dropdown opens). Callers pass the fully-built
+    /// SUPPRESSED while its own menu is open (a trigger's tooltip is hidden while
+    /// its dropdown is open). Callers pass the fully-built
     /// trigger and a `build_menu` closure so each control keeps its own row shape
     /// (plain checkmark rows for the labeled pickers, icon rows for the agent
     /// picker); this owns the `Popover` + open-state tracking + tooltip so the

@@ -348,8 +348,8 @@ impl AgentChatView {
         // Route up: the leaf carries no `WorkspaceRepo`, so ask the host to make
         // the worktree a first-class `Workspace` (DB row + git worktree). The
         // outcome returns via `on_worktree_create_outcome`, which resumes the
-        // send staged above. (The Orca thin-leaf shape — no workspace state on
-        // this view; the host owns the storage seam.)
+        // send staged above. (A thin-leaf shape — no workspace state on this
+        // view; the host owns the storage seam.)
         cx.emit(super::AgentChatEvent::WorktreeWorkspaceRequested { slug });
         cx.notify();
     }
