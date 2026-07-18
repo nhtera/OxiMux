@@ -9,6 +9,11 @@ use rand::rngs::OsRng;
 
 /// The app-signing keypair. Signs the reconnect challenge nonce; its public key
 /// is what the host records as the paired device.
+///
+/// `Clone` duplicates the same identity — the reconnect driver reuses one signer
+/// across the fresh sessions it builds per attempt. Deliberately **not** `Debug`,
+/// so the secret seed can't leak through formatting.
+#[derive(Clone)]
 pub struct ClientSigner {
     signing: SigningKey,
 }
