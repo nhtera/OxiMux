@@ -74,14 +74,21 @@ pub async fn maintain_connection(
                         // first, the link closed, but the reply may have been routed
                         // just before EOF; the pump's teardown resolves the
                         // handshake either way, so await it rather than assume it
-                        // failed. (The handshake is one bounded RPC, so `shutdown`
-                        // is honored at the hold below rather than racing it here.)
+                        // failed. Nothing bounds a silent host (the demux `call` has
+                        // no timeout), so race `shutdown` here too — otherwise a host
+                        // that accepts the dial then never replies would hang forever
+                        // with the stop signal unobserved. (On the pump-ended arm the
+                        // trailing `await` is bounded: the pump already finished, so
+                        // its teardown resolves the handshake at once.)
                         let handshake = Box::pin(session.connect());
-                        let (established, pump_ended) = match select(handshake, pump_fut.as_mut()).await
-                        {
-                            Either::Left((res, _)) => (res.is_ok(), false),
-                            Either::Right((_ended, handshake)) => (handshake.await.is_ok(), true),
-                        };
+                        let (established, pump_ended) =
+                            match select(select(handshake, pump_fut.as_mut()), &mut shutdown).await {
+                                Either::Left((Either::Left((res, _)), _)) => (res.is_ok(), false),
+                                Either::Left((Either::Right((_ended, handshake)), _)) => {
+                                    (handshake.await.is_ok(), true)
+                                }
+                                Either::Right(_) => return,
+                            };
                         // Refresh the reconnect token on every path: a successful
                         // handshake minted a fresh one; a failed one leaves it as-is.
                         token = session.session_token();
@@ -89,12 +96,17 @@ pub async fn maintain_connection(
                         if !established {
                             policy.on_dial_result(Err("handshake failed".into()))
                         } else if pump_ended {
-                            // Connected, but the link closed as the handshake
-                            // landed — the session never became usable. Count it
-                            // and reconnect; don't re-poll the finished pump.
-                            let _ = policy.on_dial_result(Ok(()));
-                            on_state(policy.state().clone());
-                            policy.on_lost()
+                            // The handshake landed but the link closed before the
+                            // session was ever handed off — it never became usable.
+                            // Count it as a FAILED attempt, not a lost-but-good one:
+                            // routing it through `on_dial_result(Ok)` + `on_lost`
+                            // would reset the retry counter every pass, so a host
+                            // that answers-then-drops (a restart racing reconnect,
+                            // load-shedding) would spin an unbounded zero-backoff
+                            // redial that never surfaces `Unreachable`. Treating it
+                            // as `Err` accrues backoff and honors the give-up budget.
+                            // Don't re-poll the finished pump.
+                            policy.on_dial_result(Err("link closed before the session became usable".into()))
                         } else {
                             let _ = policy.on_dial_result(Ok(()));
                             on_state(policy.state().clone());

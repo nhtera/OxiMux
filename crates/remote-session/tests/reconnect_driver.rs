@@ -14,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::channel::oneshot;
 use futures::executor::block_on;
-use futures::future::join;
+use futures::future::{Either, join, select};
 use oximux_remote_proto::Transport;
 use oximux_remote_proto::proto::Response;
 use oximux_remote_proto::testing::{DuplexTransport, duplex_pair};
@@ -201,6 +201,97 @@ fn driver_shutdown_cuts_a_backoff_short() {
         "stopped mid-backoff, not Unreachable, saw {:?}",
         states.borrow(),
     );
+}
+
+/// A host that completes the handshake then severs the link *before* the driver
+/// hands the session off — the "connected but never usable" path. Every attempt
+/// must count as a failure so backoff accrues and the give-up budget is honored;
+/// a regression would spin an unbounded zero-backoff redial that never settles.
+#[test]
+fn driver_gives_up_when_the_host_answers_then_drops_every_time() {
+    // 4 fresh transports (3 retries + the give-up dial); the host answers each
+    // handshake then drops at once, so the client's pump ends before hand-off.
+    let mut clients: Vec<Arc<dyn Transport>> = Vec::new();
+    let mut servers = Vec::new();
+    for _ in 0..4 {
+        let (c, s) = duplex_pair();
+        clients.push(Arc::new(c));
+        servers.push(s);
+    }
+    let delays = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let connector = Arc::new(QueueConnector {
+        queue: std::sync::Mutex::new(VecDeque::from(clients)),
+        dials: AtomicU32::new(0),
+    });
+    let sleeper = Arc::new(RecordingSleeper { delays: delays.clone() });
+
+    let states = Rc::new(RefCell::new(Vec::new()));
+    let states_seen = states.clone();
+    let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let host = async move {
+        for s in servers {
+            answer_connect(&s, "tok").await;
+            drop(s); // sever right after the reply → pump ends before hand-off
+        }
+    };
+    let driver = maintain_connection(
+        connector.clone(),
+        sleeper,
+        ClientSigner::from_seed(&SEED),
+        None,
+        shutdown_rx,
+        move |s| states_seen.borrow_mut().push(s),
+        |_session| unreachable!("the session never becomes usable"),
+    );
+    block_on(join(host, driver));
+
+    // Backoff accrued (not the pre-fix empty schedule), then settled Unreachable.
+    assert_eq!(*delays.lock().unwrap(), vec![secs(1), secs(2), secs(4)], "backoff accrues");
+    assert_eq!(connector.dials.load(Ordering::SeqCst), 4, "4 dials then give up");
+    assert!(
+        matches!(states.borrow().last(), Some(ConnState::Unreachable { .. })),
+        "settles Unreachable, saw {:?}",
+        states.borrow(),
+    );
+}
+
+/// A host that accepts the dial then goes silent mid-handshake — never replying,
+/// never closing. `shutdown` must still abort the driver promptly; nothing bounds
+/// the handshake RPC, so a regression would hang forever with the stop unobserved.
+#[test]
+fn driver_shutdown_aborts_a_stuck_handshake() {
+    let (c1, s1) = duplex_pair();
+    let connector = Arc::new(QueueConnector {
+        queue: std::sync::Mutex::new(VecDeque::from([Arc::new(c1) as Arc<dyn Transport>])),
+        dials: AtomicU32::new(0),
+    });
+    let sleeper = Arc::new(RecordingSleeper { delays: Arc::new(std::sync::Mutex::new(Vec::new())) });
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    // Accept the dial, read the client's Connect (handshake now outstanding), then
+    // fire shutdown and hold the link open forever without ever replying.
+    let host = async move {
+        s1.recv().await.expect("recv ok").expect("a Connect request");
+        let _ = shutdown_tx.send(());
+        futures::future::pending::<()>().await; // never reply, never close
+    };
+    let driver = maintain_connection(
+        connector.clone(),
+        sleeper,
+        ClientSigner::from_seed(&SEED),
+        None,
+        shutdown_rx,
+        |_state| {},
+        |_session| unreachable!("the handshake never completes"),
+    );
+
+    // The host is `pending` forever, so completion can only come from the driver
+    // returning on shutdown — a regression that ignores shutdown mid-handshake
+    // would leave both futures parked and hang the test.
+    let done = block_on(select(Box::pin(driver), Box::pin(host)));
+    assert!(matches!(done, Either::Left(_)), "driver returned on shutdown");
+    assert_eq!(connector.dials.load(Ordering::SeqCst), 1, "one dial, then aborted");
 }
 
 fn secs(n: u64) -> Duration {
