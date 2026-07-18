@@ -25,6 +25,8 @@ thiserror = { workspace = true }
 # async mutex to serialize RPCs, and `select`/`Either`. No tokio dependency — the
 # pump is drivable by any executor (a futures executor in tests, tokio in prod).
 futures = { workspace = true }
+# The `Connector` dial seam is an async trait (a proc-macro, no runtime).
+async-trait = { workspace = true }
 
 [dev-dependencies]
 # The full-loop integration test drives this client against the real host
@@ -34,5 +36,3 @@ oximux-remote-host = { workspace = true }
 oximux-agents = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
-# A mock `Transport` in the demux unit test (host-closed-mid-call regression).
-async-trait = { workspace = true }

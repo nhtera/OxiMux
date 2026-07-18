@@ -10,18 +10,25 @@
 //! Today: the [`ClientSigner`] app identity; [`RemoteSession`] — the
 //! Register/Connect/AuthProve handshake, one-shot RPCs, and `subscribe` — driven
 //! over a concurrent [`demux`] pump so RPCs and a live event stream share one
-//! connection; and [`SessionSubscription`] — the client-side fold of a session's
-//! `HostEvent` stream into a `ChatThread` with the gap→resync contract. A later
-//! slice layers the reconnect state machine on top.
+//! connection; [`SessionSubscription`] — the client-side fold of a session's
+//! `HostEvent` stream into a `ChatThread` with the gap→resync contract; and the
+//! reconnect policy — the [`Connector`] dial seam plus the pure [`Reconnect`] state
+//! machine (backoff + give-up). The async driver that ties the [`Connector`], the
+//! [`Reconnect`] policy, a sleeper, and the demux pump together lands with the
+//! tokio-hosted iroh transport, where the pump can be spawned alongside session use.
 
+mod connector;
 mod demux;
 mod error;
+mod reconnect;
 mod session;
 mod signer;
 mod subscription;
 
+pub use connector::{ConnectError, Connector};
 pub use demux::{DemuxPump, EventStream};
 pub use error::SessionError;
+pub use reconnect::{ConnAction, ConnState, Reconnect};
 pub use session::RemoteSession;
 pub use signer::ClientSigner;
 pub use subscription::{FoldOutcome, SessionSubscription};
