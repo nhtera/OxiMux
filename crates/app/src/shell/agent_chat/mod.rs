@@ -560,8 +560,9 @@ pub struct AgentChatView {
     /// is its sole mutator, on the foreground thread.
     thread: ChatThread,
     /// The live agent connection. `None` if the subprocess failed to spawn (a
-    /// read-only error state) or after teardown.
-    connection: Option<Box<dyn AgentConnection>>,
+    /// read-only error state) or after teardown. Shared as an `Arc` so the
+    /// session registry can hold the same connection and command it off-thread.
+    connection: Option<Arc<dyn AgentConnection>>,
     /// The bottom composer (status line + input + Send button), isolated into
     /// its own view so typing repaints only it, never the transcript. It reports
     /// submissions back via [`ComposerEvent`].
@@ -1145,7 +1146,7 @@ impl AgentChatView {
         // A resumed thread carries the prior session id; a fresh one is `None`
         // (spawn a new session). Either way the subprocess is spawned the same.
         let resume_session_id = thread.session_id.clone();
-        let mut connection: Option<Box<dyn AgentConnection>> = None;
+        let mut connection: Option<Arc<dyn AgentConnection>> = None;
         let mut disconnected = false;
         let mut drain_task = None;
         // A fresh/restored session always starts in the default permission mode
@@ -3178,7 +3179,7 @@ impl AgentChatView {
     /// `#[gpui::test]` can drive `on_event`/`on_disconnect` synchronously.
     #[cfg(test)]
     fn with_connection_for_test(
-        connection: Box<dyn AgentConnection>,
+        connection: Arc<dyn AgentConnection>,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -5972,7 +5973,7 @@ mod tests {
         let stub_probe = stub.clone();
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6029,7 +6030,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6063,7 +6064,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6118,7 +6119,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6159,7 +6160,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6224,7 +6225,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6289,7 +6290,7 @@ mod tests {
         let recorder = stub.clone();
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6340,7 +6341,7 @@ mod tests {
         let recorder = stub.clone();
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6378,7 +6379,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6437,7 +6438,7 @@ mod tests {
             }]);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6474,7 +6475,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6557,7 +6558,7 @@ mod tests {
         let stub_probe = stub.clone();
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6639,7 +6640,7 @@ mod tests {
         let stub_probe = stub.clone();
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6701,7 +6702,7 @@ mod tests {
         let stub_probe = stub.clone();
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6766,7 +6767,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6838,7 +6839,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6876,7 +6877,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6904,7 +6905,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6948,7 +6949,7 @@ mod tests {
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
                 // Regenerate is a rewind-gated (Claude) feature.
-                Box::new(StubConnection::default().with_capabilities(
+                Arc::new(StubConnection::default().with_capabilities(
                     oximux_agents::thread::AgentCapabilities { supports_rewind: true, ..Default::default() },
                 )),
                 Theme::default(),
@@ -7006,7 +7007,7 @@ mod tests {
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
                 // Edit-and-resend is a rewind-gated (Claude) feature.
-                Box::new(StubConnection::default().with_capabilities(
+                Arc::new(StubConnection::default().with_capabilities(
                     oximux_agents::thread::AgentCapabilities { supports_rewind: true, ..Default::default() },
                 )),
                 Theme::default(),
@@ -7079,7 +7080,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7162,7 +7163,7 @@ mod tests {
         let stub_probe = stub.clone();
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7230,7 +7231,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7287,7 +7288,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7365,7 +7366,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7463,7 +7464,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7524,7 +7525,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7578,7 +7579,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7640,7 +7641,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7712,7 +7713,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7752,7 +7753,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7792,7 +7793,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7833,7 +7834,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7897,7 +7898,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7966,7 +7967,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -8028,7 +8029,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),

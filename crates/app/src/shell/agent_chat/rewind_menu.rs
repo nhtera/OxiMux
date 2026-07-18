@@ -518,7 +518,7 @@ impl AgentChatView {
 /// Steps 1–3 of the flow, off the UI thread. Returns without mutating any view
 /// state — the caller owns the swap.
 async fn run_rewind_background(
-    conn: Option<Box<dyn oximux_agents::thread::AgentConnection>>,
+    conn: Option<std::sync::Arc<dyn oximux_agents::thread::AgentConnection>>,
     engine: Option<std::sync::Arc<CheckpointEngine>>,
     old_sid: String,
     ordinal: usize,
