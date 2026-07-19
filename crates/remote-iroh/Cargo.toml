@@ -18,18 +18,21 @@ rust-version.workspace = true
 oximux-remote-proto = { workspace = true }
 # For the `Connector`/`ConnectError` dial seam this crate implements.
 oximux-remote-session = { workspace = true }
+# The transport-agnostic `Dispatcher` the host accept loop (`serve_host`) drives
+# per connection. No cycle: `remote-host` never depends on `remote-iroh`.
+oximux-remote-host = { workspace = true }
 iroh = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+# iroh already runs on tokio; `serve_host` uses it directly to race accepts
+# against shutdown and serve each connection on its own task.
+tokio = { workspace = true }
 
 [dev-dependencies]
-# The same-machine integration test drives the real host dispatcher + the real
+# The same-machine integration tests drive the real host dispatcher + the real
 # client session over a real QUIC link between two endpoints on one machine.
-oximux-remote-host = { workspace = true }
+# (`oximux-remote-host`, `tokio`, and `futures` are already normal deps above.)
 oximux-agents = { workspace = true }
-oximux-remote-proto = { workspace = true }
-tokio = { workspace = true }
-futures = { workspace = true }
 serde_json = { workspace = true }

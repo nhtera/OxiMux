@@ -16,10 +16,12 @@
 
 mod connector;
 mod endpoint;
+mod host;
 mod transport;
 
 pub use connector::IrohConnector;
 pub use endpoint::{accept, bind_client, bind_host};
+pub use host::{HostHandle, serve_host, start_host};
 pub use transport::IrohTransport;
 
 /// The ALPN both sides negotiate. Bump the trailing version on any breaking wire
