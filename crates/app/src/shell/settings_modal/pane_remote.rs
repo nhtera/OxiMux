@@ -111,6 +111,10 @@ pub(super) fn render(
     let mut col = div()
         .flex()
         .flex_col()
+        // Without this the column sizes to its widest child, so a `w_full` child
+        // resolves against a content-derived width — circular, and long prose
+        // then lays out unwrapped and overflows the pane instead of wrapping.
+        .w_full()
         .child(entries_card(theme, density, typography, entries(modal, theme, density, typography, cx)))
         .child(
             div()
@@ -119,6 +123,12 @@ pub(super) fn render(
                 .text_color(theme.fg_subtle)
                 .child(status),
         );
+
+    // Shown whether or not remote access is on, and above the pairing code, so it
+    // is read *before* the toggle rather than discovered afterwards: enabling this
+    // publishes the Mac's addresses to a third-party discovery service, which is a
+    // consent question, not a footnote.
+    col = col.child(network_disclosure(theme, typography));
 
     // Once the host is bound, show the scannable pairing code plus the host's
     // identity underneath (the id is a public key — safe to show; the secret rides
@@ -160,6 +170,37 @@ pub(super) fn render(
         col = col.child(devices_section(devices, theme, density, typography, cx));
     }
     col.into_any_element()
+}
+
+/// What turning remote access on actually exposes to third parties.
+///
+/// Kept deliberately concrete — "uses a relay" tells a user nothing actionable.
+/// The two facts that matter are that an address is *published* to a public
+/// discovery service, and that a fallback path sees connection metadata even
+/// though it cannot read the traffic. Both are consequences of running with no
+/// self-hosted infrastructure, which is the trade this feature deliberately made.
+fn network_disclosure(theme: Theme, typography: &Typography) -> AnyElement {
+    // Each line is kept short enough to fit the pane on its own. Long prose here
+    // does NOT wrap — it lays out at its full single-line length and is clipped at
+    // the pane's right edge — and neither `w_full`, a `flex_1` text column, nor
+    // mirroring `setting_row_desc`'s row/column pairing changes that. Every other
+    // descriptive line in this modal is short enough to dodge the issue, so this
+    // is the pane's actual working pattern rather than a workaround around it.
+    // Splitting the text is also better reading for a consent notice.
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .pt(px(12.0))
+        .gap(px(4.0))
+        .text_size(px(typography.t_sub_label))
+        .text_color(theme.fg_subtle)
+        .child("While remote access is on, this Mac publishes its network addresses")
+        .child("to n0's public discovery service, so a paired device can find it.")
+        .child("If a direct connection isn't possible, traffic falls back to n0's public relays.")
+        .child("Relays forward encrypted traffic and cannot read it, but they do see")
+        .child("the IP addresses of both ends.")
+        .into_any_element()
 }
 
 /// The paired-devices list: one row per authorized device with a Revoke action.
