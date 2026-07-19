@@ -10,7 +10,9 @@
 //! enable rotates the pairing secret (durable paired-device persistence is later).
 //! The handshake secret is never displayed or logged.
 
-use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
+use std::sync::Arc;
+
+use gpui::{AnyElement, Image, ImageFormat, ImageSource, IntoElement, ParentElement, Styled, div, img, px};
 use oximux_remote_proto::PairingTicket;
 use oximux_settings::{Density, Theme, Typography};
 
@@ -57,6 +59,26 @@ fn status_text(enabled: bool, host_ready: bool, exposed: usize) -> String {
     format!("Ready to pair. Scan the code from the OxiMux mobile app. {exposure}")
 }
 
+/// On-screen edge of the pairing code, in logical pixels.
+const QR_SIZE: f32 = 180.0;
+
+/// The pairing code as a renderable image, cached on the modal by the deep link it
+/// encodes so a repaint neither re-encodes the PNG nor mints a new `Arc` (which
+/// would re-upload the texture every frame). `None` if the ticket can't be encoded.
+fn pairing_qr_image(modal: &SettingsModal, ticket: &PairingTicket) -> Option<Arc<Image>> {
+    let url = ticket.to_url().ok()?;
+    if let Some((cached_url, image)) = modal.qr_cache.borrow().as_ref()
+        && *cached_url == url
+    {
+        return Some(image.clone());
+    }
+    // Render at 2x the on-screen size so the code stays crisp on a Retina display.
+    let png = super::pairing_qr::qr_png(&url, 8)?;
+    let image = Arc::new(Image::from_bytes(ImageFormat::Png, png));
+    *modal.qr_cache.borrow_mut() = Some((url, image.clone()));
+    Some(image)
+}
+
 /// A short, human-scannable form of the host endpoint id (an Ed25519 public key —
 /// safe to show; it is not the secret). Confirms a real endpoint bound.
 fn short_endpoint_id(id: &[u8; 32]) -> String {
@@ -87,8 +109,26 @@ pub(super) fn render(
                 .child(status),
         );
 
-    // Once the host is bound, show its pairing identity (the QR image comes later).
+    // Once the host is bound, show the scannable pairing code plus the host's
+    // identity underneath (the id is a public key — safe to show; the secret rides
+    // inside the code and is never rendered as text).
     if let Some(ticket) = ticket {
+        if let Some(image) = pairing_qr_image(modal, &ticket) {
+            col = col.child(
+                // Row + `flex_none` so the white card hugs the code; a plain child
+                // of the column would stretch across the whole pane.
+                div().pt(px(12.0)).flex().flex_row().items_start().child(
+                    div()
+                        .flex_none()
+                        .p(px(8.0))
+                        .rounded(px(density.r_xs))
+                        // The code is painted black-on-white regardless of theme —
+                        // an inverted QR is unreadable to many scanners.
+                        .bg(gpui::white())
+                        .child(img(ImageSource::Image(image)).size(px(QR_SIZE))),
+                ),
+            );
+        }
         col = col.child(
             div()
                 .pt(px(8.0))

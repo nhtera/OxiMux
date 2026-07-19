@@ -31,6 +31,8 @@ oximux-settings = { workspace = true }
 oximux-storage = { workspace = true }
 oximux-ui = { workspace = true }
 
+qrcode = { workspace = true }
+
 gpui = { workspace = true }
 gpui_platform = { workspace = true }
 gpui-component = { workspace = true }
@@ -162,6 +164,10 @@ objc2-web-kit = { version = "0.3", features = [
 objc2-core-foundation = "0.3"
 
 [dev-dependencies]
+# Decodes the rendered pairing QR back to its payload, so the code is proven
+# *scannable* rather than merely well-shaped — the only way to verify that
+# without a phone.
+rqrr = "0.9"
 gpui = { workspace = true, features = ["test-support"] }
 gpui_macros = { workspace = true }
 tempfile = "3"

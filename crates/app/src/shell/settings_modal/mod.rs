@@ -18,6 +18,7 @@ mod pane_agents;
 mod pane_agents_launch;
 mod pane_keybindings;
 mod pane_notifications;
+mod pairing_qr;
 mod pane_remote;
 mod pane_terminal;
 mod pane_voice;
@@ -77,6 +78,11 @@ pub struct SettingsModal {
     /// toggles flip these atomics directly (interior mutability) so the
     /// change takes effect on the next dispatch without a reload.
     pub(crate) notify: Arc<AgentNotifySettings>,
+    /// Rendered pairing QR, cached by the deep link it encodes. `RefCell` because
+    /// the pane renders from `&self`. Without this the PNG would be re-encoded on
+    /// every repaint AND a fresh `Arc<Image>` each frame would defeat gpui's
+    /// texture cache, re-uploading the bitmap continuously.
+    pub(super) qr_cache: std::cell::RefCell<Option<(String, Arc<gpui::Image>)>>,
     /// Flat KV store the notification toggles persist into (keys in
     /// [`crate::notifier::keys`]), so prefs survive a restart.
     pub(crate) notify_repo: SettingsRepo,
@@ -147,6 +153,7 @@ impl SettingsModal {
         Self {
             open: false,
             selected: SettingsPane::Terminal,
+            qr_cache: std::cell::RefCell::new(None),
             focus_handle: cx.focus_handle(),
             theme,
             density,

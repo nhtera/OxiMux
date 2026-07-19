@@ -138,6 +138,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # to transcode clipboard/file formats Claude doesn't accept (tiff/bmp/…) to PNG.
 base64 = "0.22"
 image = "0.25"
+# QR encoding for the remote-control pairing code. `default-features = false`
+# keeps it to the pure-Rust bitmap encoder — no `image`/`svg` renderers, so it
+# can't drag in a second, conflicting `image` version.
+qrcode = { version = "0.14", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 # Phase 5 editor + LSP. Pinned to match gpui-component's transitive
