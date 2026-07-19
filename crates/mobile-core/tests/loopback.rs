@@ -4,9 +4,12 @@
 //! actual FFI-facing wrapper: pairing, `list_sessions`, and a folded event
 //! subscription pushed into a foreign `EventSink`. No network, no FFI codegen.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use futures::channel::oneshot;
+use futures::future::select;
 use oximux_agent_core::thread::{PermissionKind, ThreadEvent};
 use oximux_agents::session_registry::{SessionHandle, SessionRegistry};
 use oximux_agents::thread::{AgentCapabilities, StubConnection};
@@ -32,6 +35,22 @@ impl Connector for LoopbackConnector {
             .unwrap()
             .take()
             .ok_or_else(|| ConnectError::Unreachable("loopback already dialed".into()))
+    }
+}
+
+/// Hands out pre-made client transports in order — one per (re)dial — so the
+/// driver can reconnect after a link drop.
+struct QueueConnector {
+    queue: Mutex<VecDeque<Arc<dyn Transport>>>,
+}
+#[async_trait]
+impl Connector for QueueConnector {
+    async fn connect(&self) -> Result<Arc<dyn Transport>, ConnectError> {
+        self.queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or_else(|| ConnectError::Unreachable("no more loopback transports".into()))
     }
 }
 
@@ -130,6 +149,87 @@ async fn mobile_client_pairs_lists_and_subscribes_over_the_loopback() {
 
     client.disconnect().await;
     let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mobile_client_self_heals_and_restores_subscriptions_after_a_drop() {
+    let (registry, handle) = seeded_registry();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Arc::new(Dispatcher::new(registry, auth));
+
+    // Two loopback connections: the client pairs over the first, then reconnects
+    // (token fast-path) over the second after the first is severed.
+    let (client1, server1) = duplex_pair();
+    let (client2, server2) = duplex_pair();
+    let (drop1_tx, drop1_rx) = oneshot::channel::<()>();
+
+    let host = {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move {
+            // Serve conn 1 until told to sever it (simulating a network drop).
+            select(Box::pin(dispatcher.serve(&server1)), drop1_rx).await;
+            drop(server1); // link drops → the client's pump ends → the driver reconnects
+            // Serve conn 2 (the reconnect) until the client disconnects.
+            dispatcher.serve(&server2).await;
+        })
+    };
+
+    let ticket =
+        PairingTicket { endpoint_id: [0u8; 32], handshake_secret: SECRET, session_id: None };
+    let client = MobileClient::new(Some(CLIENT_SEED.to_vec()));
+    let listener = Arc::new(RecordingListener::default());
+    let connector = Arc::new(QueueConnector {
+        queue: Mutex::new(VecDeque::from([
+            Arc::new(client1) as Arc<dyn Transport>,
+            Arc::new(client2) as Arc<dyn Transport>,
+        ])),
+    });
+
+    client
+        .connect_with(connector, ticket, "phone".into(), listener.clone())
+        .await
+        .expect("connect_with");
+
+    // Subscribe over conn 1: 2 backlog events land in the sink.
+    let sink = Arc::new(RecordingSink::default());
+    client.subscribe("sess-1".into(), sink.clone()).await.expect("subscribe");
+    assert_eq!(sink.events.lock().unwrap().len(), 2, "conn-1 backlog");
+
+    // Sever conn 1 → the driver must reconnect over conn 2 on its own and restore
+    // the subscription — resuming from the fold cursor, so no backlog re-flood.
+    drop1_tx.send(()).expect("signal drop");
+    let reconnected = wait_until(|| connected_count(&listener) >= 2).await;
+    assert!(reconnected, "self-healed, saw {:?}", listener.states.lock().unwrap());
+    assert_eq!(
+        sink.events.lock().unwrap().len(),
+        2,
+        "reconnect resumed from the cursor — the 2 backlog events were not re-sent",
+    );
+
+    // The connection is live again: an RPC round-trips over the fresh link...
+    let sessions = client.list_sessions().await.expect("list after reconnect");
+    assert_eq!(sessions.len(), 1, "session list served over the reconnected link");
+
+    // ...and a NEW event pushed now streams over conn 2, folded onto the preserved
+    // cursor (seq 3), landing exactly once.
+    handle.ingest(ThreadEvent::AssistantText(" back".into()));
+    let got_live = wait_until(|| sink.events.lock().unwrap().len() == 3).await;
+    assert!(got_live, "live event resumed after reconnect, saw {}", sink.events.lock().unwrap().len());
+    assert!(
+        sink.events.lock().unwrap()[2].event_json.contains("back"),
+        "the resumed live event is the new one, saw {:?}",
+        sink.events.lock().unwrap()[2].event_json,
+    );
+
+    client.disconnect().await;
+    let _ = host.await;
+}
+
+/// How many times the listener has seen [`ConnState::Connected`] — the pair plus
+/// each self-healed reconnect.
+fn connected_count(listener: &RecordingListener) -> usize {
+    listener.states.lock().unwrap().iter().filter(|s| matches!(s, ConnState::Connected)).count()
 }
 
 /// Poll a condition for up to ~2s (the pump + dispatcher run on the core runtime).

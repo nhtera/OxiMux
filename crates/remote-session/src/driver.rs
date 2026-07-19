@@ -11,14 +11,18 @@
 //! RPCs are serviced because the pump keeps being polled inside this future until
 //! the link drops or `shutdown` fires.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::channel::oneshot;
 use futures::future::{Either, select};
+use oximux_remote_proto::PairingTicket;
 
 use crate::connector::Connector;
+use crate::error::SessionError;
 use crate::reconnect::{ConnAction, ConnState, Reconnect};
 use crate::session::RemoteSession;
 use crate::signer::ClientSigner;
@@ -30,6 +34,32 @@ pub trait Sleeper: Send + Sync {
     async fn sleep(&self, dur: Duration);
 }
 
+/// How the *first* dial authenticates. Only the very first attempt of a
+/// freshly-scanned pairing runs `Register`; once it lands (or on any resumed
+/// connection), every attempt is a token/challenge `Connect` reconnect — so a
+/// dropped link re-establishes without re-scanning the QR.
+pub enum Bootstrap {
+    /// Already paired: the host knows this app key (or its cached token), so every
+    /// attempt is a `Connect` reconnect.
+    Resume,
+    /// First-time pairing: the first attempt proves the QR `handshake_secret` via
+    /// `Register`; after it succeeds the driver falls back to `Resume`.
+    Pair { ticket: PairingTicket, device_name: String, at_secs: u64 },
+}
+
+/// The per-attempt handshake future selected by the current [`Bootstrap`] mode.
+fn handshake<'a>(
+    session: &'a RemoteSession,
+    bootstrap: &'a Bootstrap,
+) -> Pin<Box<dyn Future<Output = Result<(), SessionError>> + Send + 'a>> {
+    match bootstrap {
+        Bootstrap::Pair { ticket, device_name, at_secs } => {
+            Box::pin(session.pair(ticket, device_name, *at_secs))
+        }
+        Bootstrap::Resume => Box::pin(session.connect()),
+    }
+}
+
 /// Maintain a connection to the host until the reconnect budget is spent or
 /// `shutdown` fires.
 ///
@@ -37,11 +67,15 @@ pub trait Sleeper: Send + Sync {
 /// last `token`, hands the live session to `on_connected`, and reconnects on loss
 /// per the [`Reconnect`] policy — backing off through `sleeper`. `on_state`
 /// observes every transition for the UI.
+#[allow(clippy::too_many_arguments)] // a connection maintainer genuinely needs the
+// full set: transport dial + backoff + identity + token + bootstrap + stop + two
+// observers. Grouping them into a config struct would only relocate the surface.
 pub async fn maintain_connection(
     connector: Arc<dyn Connector>,
     sleeper: Arc<dyn Sleeper>,
     signer: ClientSigner,
     mut token: Option<String>,
+    mut bootstrap: Bootstrap,
     mut shutdown: oneshot::Receiver<()>,
     mut on_state: impl FnMut(ConnState),
     mut on_connected: impl FnMut(Arc<RemoteSession>),
@@ -80,7 +114,7 @@ pub async fn maintain_connection(
                         // with the stop signal unobserved. (On the pump-ended arm the
                         // trailing `await` is bounded: the pump already finished, so
                         // its teardown resolves the handshake at once.)
-                        let handshake = Box::pin(session.connect());
+                        let handshake = handshake(&session, &bootstrap);
                         let (established, pump_ended) =
                             match select(select(handshake, pump_fut.as_mut()), &mut shutdown).await {
                                 Either::Left((Either::Left((res, _)), _)) => (res.is_ok(), false),
@@ -92,6 +126,12 @@ pub async fn maintain_connection(
                         // Refresh the reconnect token on every path: a successful
                         // handshake minted a fresh one; a failed one leaves it as-is.
                         token = session.session_token();
+                        // Once paired, the device is registered on the host — every
+                        // later attempt reconnects via the token/challenge `Connect`
+                        // path, never re-consuming the one-time QR secret.
+                        if established {
+                            bootstrap = Bootstrap::Resume;
+                        }
 
                         if !established {
                             policy.on_dial_result(Err("handshake failed".into()))

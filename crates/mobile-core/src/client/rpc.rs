@@ -16,14 +16,14 @@ static CORR: AtomicU64 = AtomicU64::new(1);
 impl MobileClient {
     /// The host's current sessions, with live seq + awaiting-permission flags.
     pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>, MobileError> {
-        let session = self.shared.session().await?;
+        let session = self.shared.session()?;
         let rows = session.list_sessions().await.map_err(|e| MobileError::Rpc(e.to_string()))?;
         Ok(rows.into_iter().map(SessionSummary::from).collect())
     }
 
     /// Queue a prompt into a session's turn.
     pub async fn send_prompt(&self, session_id: String, text: String) -> Result<(), MobileError> {
-        let session = self.shared.session().await?;
+        let session = self.shared.session()?;
         let corr = CORR.fetch_add(1, Ordering::Relaxed);
         session
             .send_prompt(&session_id, &text, &[], corr)
@@ -39,7 +39,7 @@ impl MobileClient {
         request_id: String,
         reply: PermissionReply,
     ) -> Result<bool, MobileError> {
-        let session = self.shared.session().await?;
+        let session = self.shared.session()?;
         let decision = match reply {
             PermissionReply::Allow { updated_input_json } => {
                 // Allow MUST echo the tool input; refuse rather than send a
@@ -58,13 +58,13 @@ impl MobileClient {
 
     /// Steer an in-flight turn with extra guidance.
     pub async fn steer(&self, session_id: String, text: String) -> Result<(), MobileError> {
-        let session = self.shared.session().await?;
+        let session = self.shared.session()?;
         session.steer(&session_id, &text).await.map_err(|e| MobileError::Rpc(e.to_string()))
     }
 
     /// Cancel a session's current turn.
     pub async fn cancel(&self, session_id: String) -> Result<(), MobileError> {
-        let session = self.shared.session().await?;
+        let session = self.shared.session()?;
         session.cancel(&session_id).await.map_err(|e| MobileError::Rpc(e.to_string()))
     }
 }

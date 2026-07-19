@@ -15,11 +15,11 @@ use async_trait::async_trait;
 use futures::channel::oneshot;
 use futures::executor::block_on;
 use futures::future::{Either, join, select};
-use oximux_remote_proto::Transport;
 use oximux_remote_proto::proto::Response;
+use oximux_remote_proto::{PairingTicket, Transport};
 use oximux_remote_proto::testing::{DuplexTransport, duplex_pair};
 use oximux_remote_session::{
-    ClientSigner, ConnState, Connector, ConnectError, Sleeper, maintain_connection,
+    Bootstrap, ClientSigner, ConnState, Connector, ConnectError, Sleeper, maintain_connection,
 };
 
 const SEED: [u8; 32] = [7u8; 32];
@@ -61,6 +61,14 @@ async fn answer_connect(server: &DuplexTransport, token: &str) {
     server.send(reply).await.expect("send Connected");
 }
 
+/// Play the host side of a first-time pairing: read the client's `Register` and
+/// answer `Registered` with a fresh token.
+async fn answer_register(server: &DuplexTransport, token: &str) {
+    server.recv().await.expect("recv ok").expect("a Register request");
+    let reply = Response::Registered { session_token: token.into() }.to_bytes().unwrap();
+    server.send(reply).await.expect("send Registered");
+}
+
 #[test]
 fn driver_backs_off_then_gives_up_when_the_host_is_unreachable() {
     let delays = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -79,6 +87,7 @@ fn driver_backs_off_then_gives_up_when_the_host_is_unreachable() {
         sleeper,
         ClientSigner::from_seed(&SEED),
         None,
+        Bootstrap::Resume,
         shutdown_rx,
         move |s| states_seen.borrow_mut().push(s),
         |_session| unreachable!("never connects"),
@@ -129,6 +138,7 @@ fn driver_reconnects_after_the_link_drops() {
         sleeper,
         ClientSigner::from_seed(&SEED),
         None,
+        Bootstrap::Resume,
         shutdown_rx,
         |_state| {},
         move |_session| {
@@ -152,6 +162,70 @@ fn driver_reconnects_after_the_link_drops() {
 
     assert_eq!(*connected.borrow(), 2, "connected, lost the link, then reconnected");
     assert_eq!(connector.dials.load(Ordering::SeqCst), 2, "exactly two dials, no wasted retries");
+}
+
+/// The mobile bootstrap: the first dial pairs (`Register`); after the link drops
+/// the driver must reconnect via `Connect` (never re-consuming the QR secret). If
+/// the driver wrongly re-ran `Register`, `session.connect()`'s reply-shape check
+/// would reject the host's `Connected`, the reconnect would fail, and only one
+/// connect would land — so the two-connect assertion is the real proof.
+#[test]
+fn driver_pairs_on_the_first_dial_then_reconnects_via_connect() {
+    let (c1, s1) = duplex_pair();
+    let (c2, s2) = duplex_pair();
+    let connector = Arc::new(QueueConnector {
+        queue: std::sync::Mutex::new(VecDeque::from([
+            Arc::new(c1) as Arc<dyn Transport>,
+            Arc::new(c2) as Arc<dyn Transport>,
+        ])),
+        dials: AtomicU32::new(0),
+    });
+    let sleeper = Arc::new(RecordingSleeper { delays: Arc::new(std::sync::Mutex::new(Vec::new())) });
+
+    let connected = Rc::new(RefCell::new(0u32));
+    let connects_seen = connected.clone();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (drop1_tx, drop1_rx) = oneshot::channel();
+    let signals = Rc::new(RefCell::new((Some(drop1_tx), Some(shutdown_tx))));
+
+    // Host: pair (Register) conn 1, hold until connected, drop it; then answer the
+    // reconnect as a Connect on conn 2 — proving the driver switched off Register.
+    let host = async move {
+        answer_register(&s1, "tok-1").await;
+        drop1_rx.await.ok();
+        drop(s1);
+        answer_connect(&s2, "tok-2").await;
+        let _ = s2.recv().await;
+    };
+
+    let ticket =
+        PairingTicket { endpoint_id: [0u8; 32], handshake_secret: [1u8; 16], session_id: None };
+    let driver = maintain_connection(
+        connector.clone(),
+        sleeper,
+        ClientSigner::from_seed(&SEED),
+        None,
+        Bootstrap::Pair { ticket, device_name: "phone".into(), at_secs: 1000 },
+        shutdown_rx,
+        |_state| {},
+        move |_session| {
+            *connects_seen.borrow_mut() += 1;
+            let mut signals = signals.borrow_mut();
+            // 1st connect (paired): sever the link so we reconnect. 2nd (reconnected): stop.
+            let tx = match *connects_seen.borrow() {
+                1 => signals.0.take(),
+                2 => signals.1.take(),
+                _ => None,
+            };
+            if let Some(tx) = tx {
+                let _ = tx.send(());
+            }
+        },
+    );
+    block_on(join(host, driver));
+
+    assert_eq!(*connected.borrow(), 2, "paired, lost the link, then reconnected via Connect");
+    assert_eq!(connector.dials.load(Ordering::SeqCst), 2, "exactly two dials");
 }
 
 /// Fires a shutdown the first time it is asked to sleep, then never completes —
@@ -188,6 +262,7 @@ fn driver_shutdown_cuts_a_backoff_short() {
         sleeper,
         ClientSigner::from_seed(&SEED),
         None,
+        Bootstrap::Resume,
         shutdown_rx,
         move |s| states_seen.borrow_mut().push(s),
         |_session| unreachable!("never connects"),
@@ -240,6 +315,7 @@ fn driver_gives_up_when_the_host_answers_then_drops_every_time() {
         sleeper,
         ClientSigner::from_seed(&SEED),
         None,
+        Bootstrap::Resume,
         shutdown_rx,
         move |s| states_seen.borrow_mut().push(s),
         |_session| unreachable!("the session never becomes usable"),
@@ -281,6 +357,7 @@ fn driver_shutdown_aborts_a_stuck_handshake() {
         sleeper,
         ClientSigner::from_seed(&SEED),
         None,
+        Bootstrap::Resume,
         shutdown_rx,
         |_state| {},
         |_session| unreachable!("the handshake never completes"),

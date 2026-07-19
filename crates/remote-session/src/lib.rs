@@ -29,7 +29,7 @@ mod subscription;
 
 pub use connector::{ConnectError, Connector};
 pub use demux::{DemuxPump, EventStream};
-pub use driver::{Sleeper, maintain_connection};
+pub use driver::{Bootstrap, Sleeper, maintain_connection};
 pub use error::SessionError;
 pub use reconnect::{ConnAction, ConnState, Reconnect};
 pub use session::RemoteSession;

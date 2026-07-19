@@ -4,32 +4,53 @@
 //! [`subscription`](crate::subscription).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
+use futures::channel::oneshot;
 use oximux_remote_iroh::{IrohConnector, bind_client};
 use oximux_remote_proto::PairingTicket;
-use oximux_remote_proto::transport::Transport;
 use oximux_remote_session::{ClientSigner, Connector, RemoteSession};
 use tokio::sync::Mutex;
 
 use crate::callbacks::ConnStateListener;
-use crate::ffi_types::{ConnState, MobileError};
-use crate::runtime::{now_secs, rt};
-use crate::subscription::{Sub, run_dispatcher};
+use crate::ffi_types::MobileError;
+use crate::subscription::Sub;
 
+mod connect;
 mod rpc;
+
+use connect::spawn_maintainer;
 
 /// State shared between the client handle and its background tasks (the demux
 /// pump feeds events; the dispatcher folds them into the registered [`Sub`]s).
 pub(crate) struct Shared {
-    pub session: Mutex<Option<Arc<RemoteSession>>>,
+    /// The live session — swapped in by the reconnect driver on each (re)connect,
+    /// cleared while reconnecting. A plain (non-async) mutex so the sync driver
+    /// callbacks can update it; only ever held to clone the `Arc` out, never
+    /// across an `.await`.
+    pub session: StdMutex<Option<Arc<RemoteSession>>>,
     pub subs: Mutex<HashMap<String, Sub>>,
+    /// Monotonic connection epoch. Bumped on every (re)connect, and on
+    /// `connect_with`/`disconnect` (supersede). A backgrounded `activate` records
+    /// the epoch it was spawned for and refuses to publish its session if a newer
+    /// bump has since happened — so a slow/stale activation (reconnect flap, or a
+    /// disconnect racing an in-flight activate) can't resurrect a dead session.
+    pub epoch: AtomicU64,
+}
+
+impl Shared {
+    /// Supersede the current connection: any in-flight `activate` for an older
+    /// epoch will decline to publish. Returns the new current epoch.
+    pub(crate) fn bump_epoch(&self) -> u64 {
+        self.epoch.fetch_add(1, Ordering::AcqRel) + 1
+    }
 }
 
 impl Shared {
     /// The live session, or [`MobileError::NotConnected`].
-    pub(crate) async fn session(&self) -> Result<Arc<RemoteSession>, MobileError> {
-        self.session.lock().await.clone().ok_or(MobileError::NotConnected)
+    pub(crate) fn session(&self) -> Result<Arc<RemoteSession>, MobileError> {
+        self.session.lock().unwrap().clone().ok_or(MobileError::NotConnected)
     }
 }
 
@@ -39,6 +60,9 @@ impl Shared {
 pub struct MobileClient {
     signer: ClientSigner,
     pub(crate) shared: Arc<Shared>,
+    /// Stops the current reconnect driver when the app disconnects or supersedes
+    /// the connection. Taken + fired to signal the background loop to return.
+    shutdown: StdMutex<Option<oneshot::Sender<()>>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -58,15 +82,18 @@ impl MobileClient {
         Arc::new(Self {
             signer,
             shared: Arc::new(Shared {
-                session: Mutex::new(None),
+                session: StdMutex::new(None),
                 subs: Mutex::new(HashMap::new()),
+                epoch: AtomicU64::new(0),
             }),
+            shutdown: StdMutex::new(None),
         })
     }
 
     /// Pair with and connect to the host named by a scanned
     /// `oximux://connect?ticket=…` deep link, over iroh. On success the session is
-    /// live and `listener` has seen [`ConnState::Connected`].
+    /// live and `listener` has seen [`ConnState::Connected`](crate::ConnState); the
+    /// connection then self-heals across drops until [`disconnect`](Self::disconnect).
     pub async fn connect(
         &self,
         ticket_url: String,
@@ -81,18 +108,25 @@ impl MobileClient {
         self.connect_with(Arc::new(connector), ticket, device_name, listener).await
     }
 
-    /// Drop the connection; background tasks wind down as the session is released.
+    /// Drop the connection: stop the reconnect driver and release the session +
+    /// subscriptions so its pump + dispatcher wind down.
     pub async fn disconnect(&self) {
+        self.stop_current();
+        // Supersede first so any in-flight `activate` can't re-store a session
+        // after we clear it below.
+        self.shared.bump_epoch();
         self.shared.subs.lock().await.clear();
-        *self.shared.session.lock().await = None;
+        *self.shared.session.lock().unwrap() = None;
     }
 }
 
 impl MobileClient {
     /// The transport-agnostic connect path (production injects the iroh
-    /// [`Connector`]; a test or a future WebSocket transport injects its own).
-    /// Not part of the FFI surface — it takes an `Arc<dyn Connector>`. Dials, spins
-    /// up the demux pump + event dispatcher, then registers the device via `pair`.
+    /// [`Connector`]; a test or a future WebSocket transport injects its own). Not
+    /// part of the FFI surface — it takes an `Arc<dyn Connector>`. Hands the pieces
+    /// to the self-healing [`maintain_connection`](oximux_remote_session::maintain_connection)
+    /// driver and returns once the first pairing lands (or fails); the driver then
+    /// keeps the link alive across drops in the background.
     pub async fn connect_with(
         &self,
         connector: Arc<dyn Connector>,
@@ -100,34 +134,35 @@ impl MobileClient {
         device_name: String,
         listener: Arc<dyn ConnStateListener>,
     ) -> Result<(), MobileError> {
-        listener.on_state(ConnState::Connecting);
-        // Reset any prior connection first: dropping the old session ends its pump
-        // (via the demux shutdown), and clearing subs prevents a reentrant connect
-        // (e.g. a double-tapped reconnect) from leaving two pumps or stale sinks.
+        // Supersede any prior connection: stop its driver and clear subs + session
+        // so a reentrant connect (e.g. a double-tapped reconnect) never leaves two
+        // drivers or stale sinks behind. The epoch bump makes any in-flight
+        // `activate` from the old driver decline to publish.
+        self.stop_current();
+        self.shared.bump_epoch();
         self.shared.subs.lock().await.clear();
-        *self.shared.session.lock().await = None;
+        *self.shared.session.lock().unwrap() = None;
 
-        let transport: Arc<dyn Transport> =
-            connector.connect().await.map_err(|e| MobileError::Transport(e.to_string()))?;
-        let session = Arc::new(RemoteSession::new(transport, self.signer.clone()));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        *self.shutdown.lock().unwrap() = Some(shutdown_tx);
 
-        // Drive the demux + the event dispatcher on the core-owned runtime so they
-        // outlive this call. `take_*` are once-per-session; unwrap is sound here.
-        let pump = session.take_pump().expect("pump taken once");
-        let events = session.take_events().expect("events taken once");
-        rt().spawn(async move {
-            let _ = pump.run().await;
-        });
+        // Spawn the driver; it signals the first connection's outcome back here.
+        let first = spawn_maintainer(
+            self.shared.clone(),
+            self.signer.clone(),
+            connector,
+            ticket,
+            device_name,
+            listener,
+            shutdown_rx,
+        );
+        first.await.map_err(|_| MobileError::Transport("connection task ended".into()))?
+    }
 
-        // Register (or re-authorize) this device with the QR secret.
-        session
-            .pair(&ticket, &device_name, now_secs())
-            .await
-            .map_err(|e| MobileError::Pairing(e.to_string()))?;
-
-        *self.shared.session.lock().await = Some(session);
-        rt().spawn(run_dispatcher(self.shared.clone(), events));
-        listener.on_state(ConnState::Connected);
-        Ok(())
+    /// Stop the current reconnect driver, if one is running.
+    fn stop_current(&self) {
+        if let Some(tx) = self.shutdown.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
     }
 }
