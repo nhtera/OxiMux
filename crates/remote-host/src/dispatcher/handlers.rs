@@ -21,15 +21,22 @@ impl Dispatcher {
             // A session-scoped device must only learn about sessions it may act
             // on — never enumerate the full session set.
             .filter(|(session_id, _)| self.auth.is_allowed_for(pubkey, session_id))
-            .map(|(session_id, status)| SessionSummary {
-                // title/model aren't in the registry yet — they live on the
-                // desktop view's thread. Enriched when register-on-connect passes
-                // session meta in (a later slice); until then id stands in.
-                title: session_id.clone(),
-                model: None,
-                last_seq: status.last_seq,
-                awaiting_permission: status.awaiting_permission,
-                session_id,
+            .map(|(session_id, status)| {
+                // Title/model are published by the desktop view via the registry's
+                // session meta. A session that hasn't been titled yet (no
+                // `TitleUpdated` so far) falls back to its id so a row is never blank.
+                let meta = self
+                    .registry
+                    .get(&session_id)
+                    .map(|handle| handle.meta_snapshot())
+                    .unwrap_or_default();
+                SessionSummary {
+                    title: meta.title.unwrap_or_else(|| session_id.clone()),
+                    model: meta.model,
+                    last_seq: status.last_seq,
+                    awaiting_permission: status.awaiting_permission,
+                    session_id,
+                }
             })
             .collect();
         Response::Sessions(sessions)
@@ -43,11 +50,12 @@ impl Dispatcher {
             return Response::Error(RpcError::UnknownSession);
         };
         let status = handle.status_snapshot();
+        let meta = handle.meta_snapshot();
         Response::SessionInfo(SessionInfoWire {
             summary: SessionSummary {
                 session_id: session_id.to_string(),
-                title: session_id.to_string(),
-                model: None,
+                title: meta.title.unwrap_or_else(|| session_id.to_string()),
+                model: meta.model,
                 last_seq: status.last_seq,
                 awaiting_permission: status.awaiting_permission,
             },

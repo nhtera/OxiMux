@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gpui::Global;
-use oximux_agents::session_registry::{SessionHandle, SessionRegistry};
+use oximux_agents::session_registry::{SessionHandle, SessionMeta, SessionRegistry};
 use oximux_agents::thread::AgentConnection;
 use oximux_remote_host::{
     AppPubkey, AuthStore, DeviceStore, Dispatcher, PairingSlot, mint_pairing_secret,
@@ -48,6 +48,12 @@ impl RemoteBinding {
     /// Fan one backend event into the bound session (assign seq, store, broadcast).
     pub fn ingest(&self, event: oximux_agents::thread::ThreadEvent) {
         self.handle.ingest(event);
+    }
+
+    /// Publish the session's display metadata (title/model) so a remote client's
+    /// session list shows what the desktop shows instead of the raw session id.
+    pub fn set_meta(&self, meta: SessionMeta) {
+        self.handle.set_meta(meta);
     }
 
     /// Remove the session from the registry. The map holds its own `Arc`, so this

@@ -49,6 +49,19 @@ pub struct SessionStatus {
     pub awaiting_permission: bool,
 }
 
+/// How a session presents itself in a remote client's session list. Lives here
+/// (not in [`SessionStatus`]) because it is pushed by the desktop view rather than
+/// derived from the event stream, and it must not be clobbered by a status refresh
+/// on every ingest. Both fields are `None` until the view first publishes them —
+/// a freshly-registered session has no title until one is generated.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionMeta {
+    /// The session's display title (from the fold's `TitleUpdated`).
+    pub title: Option<String>,
+    /// The effective model id driving the session.
+    pub model: Option<String>,
+}
+
 /// Everything the registry knows about one live session. Held behind an `Arc` so
 /// the view and the network layer share one handle.
 pub struct SessionHandle {
@@ -69,6 +82,8 @@ pub struct SessionHandle {
     /// Request-ids currently awaiting a decision (drives `awaiting_permission`).
     pending: Mutex<HashSet<String>>,
     status_tx: watch::Sender<SessionStatus>,
+    /// Display metadata published by the desktop view (title/model).
+    meta: Mutex<SessionMeta>,
 }
 
 impl SessionHandle {
@@ -182,6 +197,23 @@ impl SessionHandle {
         self.status_tx.borrow().clone()
     }
 
+    /// The session's current display metadata (title/model).
+    pub fn meta_snapshot(&self) -> SessionMeta {
+        self.meta.lock().unwrap().clone()
+    }
+
+    /// Publish display metadata from the desktop view. Returns whether anything
+    /// changed, so a caller on a hot path (the per-event tee) can skip follow-up
+    /// work when the title and model are unchanged — which is the common case.
+    pub fn set_meta(&self, meta: SessionMeta) -> bool {
+        let mut current = self.meta.lock().unwrap();
+        if *current == meta {
+            return false;
+        }
+        *current = meta;
+        true
+    }
+
     /// Refresh the coarse status snapshot. `ingested_seq` is `Some` only from the
     /// ingest path (which just appended that seq to the backlog); `last_seq` is
     /// advanced monotonically via `max` so a late status update from a slower
@@ -245,6 +277,7 @@ impl SessionRegistry {
             decided: Mutex::new(HashSet::new()),
             pending: Mutex::new(HashSet::new()),
             status_tx,
+            meta: Mutex::new(SessionMeta::default()),
         });
         self.sessions.lock().unwrap().insert(id, handle.clone());
         handle
@@ -545,5 +578,24 @@ mod tests {
         let seqs: Vec<Seq> = reg.events_since("s1", 0).iter().map(|(s, _)| *s).collect();
         let expected: Vec<Seq> = (1..=total).collect();
         assert_eq!(seqs, expected, "seqs are 1..=N, ascending, gapless, no dupes");
+    }
+
+    /// Meta starts empty, round-trips, and reports whether it actually changed —
+    /// the per-event tee republishes on every batch and relies on that to no-op.
+    #[test]
+    fn session_meta_round_trips_and_reports_change() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        assert_eq!(handle.meta_snapshot(), SessionMeta::default(), "untitled until published");
+
+        let meta = SessionMeta { title: Some("Fix auth".into()), model: Some("opus".into()) };
+        assert!(handle.set_meta(meta.clone()), "first publish is a change");
+        assert_eq!(handle.meta_snapshot(), meta);
+
+        assert!(!handle.set_meta(meta), "republishing the same meta is not a change");
+        assert!(
+            handle.set_meta(SessionMeta { title: Some("Fix auth".into()), model: None }),
+            "dropping the model is a change",
+        );
     }
 }

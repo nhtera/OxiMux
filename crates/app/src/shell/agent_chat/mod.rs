@@ -517,6 +517,7 @@ use context_providers::{ContextRequest, ContextSource};
 use question_card::{QuestionCard, QuestionCardEvent};
 use tool_grouping::{plan_tool_grouping, summarize_tool_run, EntryDisplay, GroupSummary, GroupedTool};
 use crate::remote_control::{RemoteBinding, RemoteControl, next_remote_session_id};
+use oximux_agents::session_registry::SessionMeta;
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
@@ -3443,6 +3444,11 @@ impl AgentChatView {
             }
             self.apply_event(ev, cx);
         }
+        // Republish title/model after the fold has applied the batch, so a remote
+        // session list shows what this tab shows (a `TitleUpdated` or a model swap
+        // lands in the same batch). Done here, at the one place every event passes
+        // through, rather than at each site that can change them.
+        self.publish_remote_meta();
         if all_delta {
             self.notify_throttled(cx);
         } else {
@@ -3786,6 +3792,22 @@ impl AgentChatView {
         if let Some(binding) = self.remote.take() {
             binding.unregister(&self.remote_session_id);
         }
+    }
+
+    /// Push this tab's title + effective model into the registry so a remote
+    /// session list renders them instead of the raw `agent-N` id. No-op when remote
+    /// is disabled (`remote` is `None`); the registry skips unchanged values, which
+    /// is the common case on a per-batch call.
+    fn publish_remote_meta(&self) {
+        let Some(binding) = &self.remote else {
+            return;
+        };
+        binding.set_meta(SessionMeta {
+            title: self.thread.title.clone(),
+            // Mirrors the transcript's resolution: the thread's negotiated model
+            // wins, falling back to the tab's selection before one is negotiated.
+            model: self.thread.model.clone().or_else(|| self.model.clone()),
+        });
     }
 
     fn on_disconnect(&mut self, cx: &mut Context<Self>) {

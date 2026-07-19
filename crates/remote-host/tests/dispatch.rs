@@ -8,7 +8,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use futures::executor::block_on;
 use futures::future::join;
 use oximux_agent_core::thread::{PermissionDecision, PermissionKind, ThreadEvent};
-use oximux_agents::session_registry::SessionRegistry;
+use oximux_agents::session_registry::{SessionMeta, SessionRegistry};
 use oximux_agents::thread::{AgentCapabilities, StubConnection};
 use oximux_remote_host::{AuthStore, Dispatcher, PairingSlot, registration_proof};
 use oximux_remote_proto::messages::{ConnectReq, RegisterReq, SendPromptReq};
@@ -268,6 +268,55 @@ fn repeat_subscribe_serves_backlog_without_a_second_live_stream() {
         // Had a second stream been registered, a duplicate seq-3 Event would sit
         // ahead of the Pong; the Pong being next proves there was only one.
         assert_eq!(call(&client, Request::Ping).await, Response::Pong, "no duplicate live frame");
+    };
+    block_on(join(serve, script));
+}
+
+/// The desktop publishes a title/model per session; both must reach the client's
+/// list + detail views, and an untitled session must still render as something.
+#[test]
+fn session_meta_published_by_the_desktop_reaches_the_client() {
+    let registry = Arc::new(SessionRegistry::new());
+    let titled = registry.register("sess-1".into(), Arc::new(StubConnection::default()));
+    titled.set_meta(SessionMeta {
+        title: Some("Fix auth".into()),
+        model: Some("claude-opus-4-8".into()),
+    });
+    // Registered but never titled — the fallback path.
+    registry.register("sess-2".into(), Arc::new(StubConnection::default()));
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock);
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        let Response::Sessions(sessions) = call(&client, Request::ListSessions).await else {
+            panic!("expected Sessions");
+        };
+        let titled = sessions.iter().find(|s| s.session_id == "sess-1").expect("sess-1 listed");
+        assert_eq!(titled.title, "Fix auth", "the desktop's title, not the raw id");
+        assert_eq!(titled.model.as_deref(), Some("claude-opus-4-8"));
+
+        let untitled = sessions.iter().find(|s| s.session_id == "sess-2").expect("sess-2 listed");
+        assert_eq!(untitled.title, "sess-2", "an untitled session falls back to its id");
+        assert_eq!(untitled.model, None);
+
+        // The same meta rides the detail view.
+        let Response::SessionInfo(info) =
+            call(&client, Request::GetSessionInfo { session_id: "sess-1".into() }).await
+        else {
+            panic!("expected SessionInfo");
+        };
+        assert_eq!(info.summary.title, "Fix auth");
+        assert_eq!(info.summary.model.as_deref(), Some("claude-opus-4-8"));
     };
     block_on(join(serve, script));
 }
