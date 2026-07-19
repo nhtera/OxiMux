@@ -1,21 +1,26 @@
 //! The desktop's remote-control state: a process-wide [`SessionRegistry`] that the
-//! (future) in-app iroh host serves, plus an `enabled` flag that gates whether live
-//! agent sessions are fanned into it at all.
+//! in-app iroh host serves, plus an `enabled` flag that gates whether live agent
+//! sessions are fanned into it at all, and the running [`HostHandle`] itself.
 //!
 //! Held as a [`gpui::Global`] so any [`AgentChatView`] can bind its session into the
 //! registry on connect and tee its `ThreadEvent`s in — but only while remote control
 //! is enabled, so a disabled desktop pays **zero** per-event cost (no clone, no
 //! registration). The registry itself is `gpui`-free and lives behind an `Arc`, so
-//! the network layer subscribes and commands sessions off the UI thread.
+//! the network layer subscribes and commands sessions off the UI thread. The
+//! enablement toggle binds/stops the iroh host through the shared `&Global` (the
+//! async bind runs on the tokio runtime; the resulting handle folds back here).
 //!
 //! [`AgentChatView`]: crate::shell::agent_chat
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use gpui::Global;
 use oximux_agents::session_registry::{SessionHandle, SessionRegistry};
 use oximux_agents::thread::AgentConnection;
+use oximux_remote_host::{AuthStore, Dispatcher, PairingSlot, mint_pairing_secret};
+use oximux_remote_iroh::HostHandle;
+use oximux_remote_proto::PairingTicket;
 
 /// Monotonic source of stable per-view remote session ids. Decoupled from an
 /// agent's own (often not-yet-known-at-connect) session id: the phone only needs a
@@ -53,9 +58,14 @@ impl RemoteBinding {
 /// Process-wide remote-control state, installed once at boot as a `gpui::Global`.
 pub struct RemoteControl {
     registry: Arc<SessionRegistry>,
-    /// `AtomicBool` (not `bool`) so a future Settings toggle can flip it through the
+    /// `AtomicBool` (not `bool`) so the Settings toggle can flip it through the
     /// shared `&Global` reference without needing `&mut` access to the global.
     enabled: AtomicBool,
+    /// The running iroh host, once the endpoint has bound. A `Mutex` (not the
+    /// `enabled` atomic style) because a [`HostHandle`] isn't a primitive; guarded
+    /// behind the shared `&Global` so the toggle starts/stops it without `&mut`
+    /// global access. Dropping the handle stops the accept loop + closes the endpoint.
+    host: Mutex<Option<HostHandle>>,
 }
 
 impl Global for RemoteControl {}
@@ -67,10 +77,14 @@ impl Default for RemoteControl {
 }
 
 impl RemoteControl {
-    /// A fresh, **disabled** remote-control state — no sessions are fanned in until
-    /// something enables it (the enablement UI + host bind land in a later slice).
+    /// A fresh, **disabled** remote-control state — no sessions are fanned in and no
+    /// host is bound until the enablement toggle turns it on.
     pub fn new() -> Self {
-        Self { registry: Arc::new(SessionRegistry::new()), enabled: AtomicBool::new(false) }
+        Self {
+            registry: Arc::new(SessionRegistry::new()),
+            enabled: AtomicBool::new(false),
+            host: Mutex::new(None),
+        }
     }
 
     /// The shared session registry (the host serves from this same instance).
@@ -84,6 +98,37 @@ impl RemoteControl {
 
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Release);
+    }
+
+    /// Assemble a fresh dispatcher + one-time CSPRNG pairing secret for a host bind.
+    /// The secret seeds both the auth store's advertised pairing slot and the
+    /// `PairingTicket` that [`start_host`](oximux_remote_iroh::start_host) mints, so
+    /// the QR and the host agree. A fresh [`AuthStore`] per bind means toggling remote
+    /// off then on rotates the secret (the old QR stops working); durable
+    /// paired-device persistence is a later slice.
+    pub fn prepare_host(&self) -> (Arc<Dispatcher>, [u8; 16]) {
+        let secret = mint_pairing_secret();
+        let auth = Arc::new(AuthStore::new());
+        auth.set_pairing(PairingSlot::new(secret, None, false));
+        let dispatcher = Arc::new(Dispatcher::new(self.registry.clone(), auth));
+        (dispatcher, secret)
+    }
+
+    /// Store the freshly-bound host, stopping and replacing any prior one.
+    pub fn set_host(&self, host: HostHandle) {
+        *self.host.lock().unwrap() = Some(host);
+    }
+
+    /// Stop and forget the running host (dropping the handle signals its accept loop
+    /// to shut down and closes the endpoint). Idempotent.
+    pub fn stop_host(&self) {
+        self.host.lock().unwrap().take();
+    }
+
+    /// The pairing ticket to encode as the QR, once the host has bound. `None` while
+    /// disabled or during the brief async bind before the endpoint is ready.
+    pub fn pairing_ticket(&self) -> Option<PairingTicket> {
+        self.host.lock().unwrap().as_ref().map(|h| h.ticket().clone())
     }
 
     /// Register `id`→`conn` and return the binding **iff remote is enabled**;

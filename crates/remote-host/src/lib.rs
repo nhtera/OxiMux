@@ -19,7 +19,7 @@ pub mod identity;
 
 pub use auth::{
     AppPubkey, AuthStore, DeviceStore, PairingSlot, StorageDeviceStore, StoredDevice,
-    registration_proof,
+    mint_pairing_secret, registration_proof,
 };
 pub use dispatcher::Dispatcher;
 pub use identity::HostIdentity;

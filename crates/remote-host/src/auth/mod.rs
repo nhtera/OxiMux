@@ -110,6 +110,16 @@ impl AuthStore {
     }
 }
 
+/// Mint a fresh 16-byte pairing secret from the OS CSPRNG. The enablement flow
+/// hands this to both the advertised [`PairingSlot`] and the `PairingTicket` the
+/// QR encodes — it is a bearer credential (one scan = full access by default) and
+/// must never be logged.
+pub fn mint_pairing_secret() -> [u8; 16] {
+    let mut secret = [0u8; 16];
+    OsRng.fill_bytes(&mut secret);
+    secret
+}
+
 /// Mint a random reconnect token bound to `pubkey`.
 fn issue_token(st: &mut AuthState, pubkey: AppPubkey) -> String {
     let mut raw = [0u8; 32];

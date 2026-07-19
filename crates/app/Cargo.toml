@@ -21,6 +21,12 @@ oximux-proc-cwd = { workspace = true }
 oximux-pty = { workspace = true }
 oximux-relay-client = { workspace = true }
 oximux-relay-proto = { workspace = true }
+# Remote control: the in-app iroh host (bind + accept loop) that serves the
+# SessionRegistry to paired phones, its transport-agnostic dispatcher/auth, and
+# the shared wire types (PairingTicket).
+oximux-remote-host = { workspace = true }
+oximux-remote-iroh = { workspace = true }
+oximux-remote-proto = { workspace = true }
 oximux-settings = { workspace = true }
 oximux-storage = { workspace = true }
 oximux-ui = { workspace = true }

@@ -1,13 +1,17 @@
-//! Remote-control pane — one master switch that turns on exposing running agent
-//! sessions to the OxiMux mobile app. The toggle flips the shared
-//! [`RemoteControl`] global's `enabled` flag (effective immediately: gated
-//! registration + the per-event tee in the chat view start/stop from it).
+//! Remote-control pane — one master switch that exposes running agent sessions to
+//! the OxiMux mobile app and, while on, binds the in-app iroh host so a phone can
+//! pair. The toggle flips the shared [`RemoteControl`] global's `enabled` flag and
+//! starts/stops the host: enabling binds an endpoint off-thread (on the tokio
+//! runtime) and publishes a `PairingTicket` back here; disabling stops the host and
+//! stops advertising. The ticket is shown as the host's pairing identity for now —
+//! the scannable QR image lands in a later slice.
 //!
-//! Session-scoped for now — enabling is not persisted across restarts, and pairing
-//! a device (QR) + the live host bind land in a later step; until then this is the
-//! gate that makes running sessions register into the in-app registry.
+//! Session-scoped for now: enabling is not persisted across restarts, and each
+//! enable rotates the pairing secret (durable paired-device persistence is later).
+//! The handshake secret is never displayed or logged.
 
 use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
+use oximux_remote_proto::PairingTicket;
 use oximux_settings::{Density, Theme, Typography};
 
 use super::SettingsModal;
@@ -26,21 +30,39 @@ fn exposed_count(cx: &mut gpui::Context<SettingsModal>) -> usize {
     cx.try_global::<RemoteControl>().map(|rc| rc.registry().len()).unwrap_or(0)
 }
 
-/// The status line under the toggle: what enabling does (off), or how many
-/// sessions are exposed right now (on). Pure so it can be unit-tested.
-fn hint_text(enabled: bool, exposed: usize) -> String {
+/// The current pairing ticket, if the host has finished binding. `None` while off
+/// or during the brief async bind.
+fn pairing_ticket(cx: &mut gpui::Context<SettingsModal>) -> Option<PairingTicket> {
+    cx.try_global::<RemoteControl>().and_then(|rc| rc.pairing_ticket())
+}
+
+/// The status line under the toggle: what enabling does (off), that the host is
+/// still binding (on, no ticket yet), or how many sessions are exposed (on, ready).
+/// Pure so it can be unit-tested. Never mentions the handshake secret.
+fn status_text(enabled: bool, host_ready: bool, exposed: usize) -> String {
     if !enabled {
         return "Turn on to expose your running agent sessions to the OxiMux mobile app. \
                 Applies to sessions started after it's enabled."
             .to_string();
     }
-    match exposed {
-        0 => "Remote access is on. No agent sessions are running yet — start one and it will \
-              be exposed."
-            .to_string(),
-        1 => "Remote access is on. 1 running agent session is exposed.".to_string(),
-        n => format!("Remote access is on. {n} running agent sessions are exposed."),
+    if !host_ready {
+        return "Starting the pairing host — the pairing code will appear here in a moment."
+            .to_string();
     }
+    let exposure = match exposed {
+        0 => "No agent sessions are running yet — start one and it will be exposed.".to_string(),
+        1 => "1 running agent session is exposed.".to_string(),
+        n => format!("{n} running agent sessions are exposed."),
+    };
+    format!("Ready to pair. Scan the code from the OxiMux mobile app. {exposure}")
+}
+
+/// A short, human-scannable form of the host endpoint id (an Ed25519 public key —
+/// safe to show; it is not the secret). Confirms a real endpoint bound.
+fn short_endpoint_id(id: &[u8; 32]) -> String {
+    let head: String = id[..4].iter().map(|b| format!("{b:02x}")).collect();
+    let tail: String = id[28..].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{head}…{tail}")
 }
 
 pub(super) fn render(
@@ -50,9 +72,10 @@ pub(super) fn render(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
-    let hint = hint_text(enabled(cx), exposed_count(cx));
+    let ticket = pairing_ticket(cx);
+    let status = status_text(enabled(cx), ticket.is_some(), exposed_count(cx));
 
-    div()
+    let mut col = div()
         .flex()
         .flex_col()
         .child(entries_card(theme, density, typography, entries(modal, theme, density, typography, cx)))
@@ -61,9 +84,20 @@ pub(super) fn render(
                 .pt(px(12.0))
                 .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_subtle)
-                .child(hint),
-        )
-        .into_any_element()
+                .child(status),
+        );
+
+    // Once the host is bound, show its pairing identity (the QR image comes later).
+    if let Some(ticket) = ticket {
+        col = col.child(
+            div()
+                .pt(px(8.0))
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_muted)
+                .child(format!("Host {}", short_endpoint_id(&ticket.endpoint_id))),
+        );
+    }
+    col.into_any_element()
 }
 
 pub(super) fn entries(
@@ -80,36 +114,86 @@ pub(super) fn entries(
     )]
 }
 
-/// The master switch. Reads the live global flag; clicking flips it (effective
-/// immediately — new sessions register/tee from it) and repaints.
+/// The master switch. Reads the live global flag; clicking flips it and starts or
+/// stops the iroh host (see [`on_toggle`]), then repaints.
 fn remote_toggle(theme: Theme, cx: &mut gpui::Context<SettingsModal>) -> AnyElement {
-    toggle_switch(
-        "remote-enabled",
-        enabled(cx),
-        theme,
-        |_this, _window, cx| {
-            if let Some(rc) = cx.try_global::<RemoteControl>() {
-                rc.set_enabled(!rc.enabled());
+    toggle_switch("remote-enabled", enabled(cx), theme, on_toggle, cx)
+}
+
+/// Flip `RemoteControl.enabled` and start/stop the host. Turning on binds the iroh
+/// endpoint off-thread (on the tokio runtime) and folds the resulting handle +
+/// pairing ticket back in on the UI thread; turning off drops the handle, which
+/// stops the accept loop and closes the endpoint.
+fn on_toggle(
+    _this: &mut SettingsModal,
+    _window: &mut gpui::Window,
+    cx: &mut gpui::Context<SettingsModal>,
+) {
+    // Scope the global borrow so `cx` is free for the async bridge below. Returns
+    // the dispatcher + secret to bind with when turning on; `None` when turning off.
+    let prep = {
+        let Some(rc) = cx.try_global::<RemoteControl>() else {
+            return;
+        };
+        let turning_on = !rc.enabled();
+        rc.set_enabled(turning_on);
+        if turning_on {
+            Some(rc.prepare_host())
+        } else {
+            rc.stop_host();
+            None
+        }
+    };
+
+    if let Some((dispatcher, secret)) = prep
+        && let Ok(handle) = tokio::runtime::Handle::try_current()
+    {
+        // Bind on the tokio runtime (iroh needs it), then publish the handle back.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handle.spawn(async move {
+            let _ = tx.send(oximux_remote_iroh::start_host(dispatcher, secret).await);
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(host)) = rx.await {
+                let _ = this.update(cx, |_this, cx| {
+                    if let Some(rc) = cx.try_global::<RemoteControl>() {
+                        rc.set_host(host);
+                    }
+                    cx.notify();
+                });
             }
-            cx.notify();
-        },
-        cx,
-    )
+        })
+        .detach();
+    }
+    cx.notify();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::hint_text;
+    use super::{short_endpoint_id, status_text};
 
     #[test]
-    fn hint_reflects_enabled_state_and_count() {
-        assert!(hint_text(false, 3).starts_with("Turn on"), "disabled explains what enabling does");
-        assert!(hint_text(true, 0).contains("No agent sessions"), "on with none running");
-        assert_eq!(
-            hint_text(true, 1),
-            "Remote access is on. 1 running agent session is exposed.",
-            "singular",
+    fn status_reflects_enablement_host_readiness_and_count() {
+        assert!(status_text(false, false, 3).starts_with("Turn on"), "disabled explains enabling");
+        assert!(
+            status_text(true, false, 0).contains("Starting the pairing host"),
+            "on but host not yet bound",
         );
-        assert!(hint_text(true, 4).contains("4 running agent sessions"), "plural count");
+        assert!(status_text(true, true, 0).contains("No agent sessions"), "ready, none running");
+        assert!(status_text(true, true, 1).contains("1 running agent session"), "singular");
+        assert!(status_text(true, true, 4).contains("4 running agent sessions"), "plural");
+        assert!(status_text(true, true, 2).starts_with("Ready to pair"), "ready leads with pairing");
+    }
+
+    #[test]
+    fn short_endpoint_id_shows_head_and_tail_only() {
+        let mut id = [0u8; 32];
+        id[0] = 0xab;
+        id[1] = 0xcd;
+        id[31] = 0xef;
+        let short = short_endpoint_id(&id);
+        assert!(short.starts_with("abcd"), "leads with the first bytes");
+        assert!(short.ends_with("ef"), "ends with the last byte");
+        assert!(short.contains('…'), "elides the middle");
     }
 }
