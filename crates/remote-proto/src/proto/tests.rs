@@ -16,7 +16,7 @@ fn value_bearing_event() -> ThreadEvent {
 /// documented wire change, so an accidental edit fails here.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 3, "v3 = the appended version handshake");
+    assert_eq!(PROTOCOL_VERSION, 4, "v4 = the appended git write surface");
 }
 
 /// The floor moves only on a genuinely breaking change, never merely because

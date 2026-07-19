@@ -20,14 +20,15 @@ pub use crate::messages::*;
 /// Bumped whenever the wire schema changes. v1: initial remote-control surface
 /// (handshake + session list/info + prompt/resolve/steer/cancel + event
 /// subscription & gap-fill). v2: appended the git surface (`GitStatus`,
-/// `GitDiff`). v3: appended the version handshake (`Hello`/`HelloAck`).
+/// `GitDiff`). v3: appended the version handshake (`Hello`/`HelloAck`). v4:
+/// appended the git write surface (`GitStage`, `GitUnstage`, `GitCommit`).
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The oldest peer version this build still speaks. **Raise this only on a
 /// genuinely breaking change** — a reordered/removed variant or an altered
@@ -141,6 +142,16 @@ pub enum Request {
     /// read as [`ASSUMED_VERSION_WHEN_SILENT`]); appended last to keep the enum's
     /// ordinal encoding append-only.
     Hello(HelloReq),
+    /// Stage paths into the session repository's index. Paths are echoed from a
+    /// [`Response::GitStatus`] listing and each is **re-contained host-side**.
+    /// State-changing, so a read-only device is refused.
+    GitStage { session_id: String, paths: Vec<String> },
+    /// Remove paths from the index, leaving the worktree untouched.
+    GitUnstage { session_id: String, paths: Vec<String> },
+    /// Commit what is already staged. Deliberately carries no paths: the
+    /// path-taking git variant pre-stages, which would silently overwrite
+    /// hunk-level partial staging the remote client cannot see.
+    GitCommit { session_id: String, message: String },
 }
 
 /// Host → client.
@@ -191,6 +202,8 @@ pub enum Response {
     /// peer, so the client can refuse a host it cannot understand. Appended last
     /// to keep the enum's ordinal encoding append-only.
     HelloAck(HelloAckWire),
+    /// Reply to [`Request::GitCommit`] — the new HEAD sha.
+    GitCommitted { sha: String },
 }
 
 impl Request {

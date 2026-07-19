@@ -139,6 +139,30 @@ impl Dispatcher {
             let response = self.git_diff(&pubkey, &session_id, &path, staged, untracked).await;
             return self.send(transport, response).await;
         }
+        // The git writes are async for the same reason as the reads (they shell
+        // out), so they are awaited here too. Their own handlers apply the
+        // `may_write` gate on top of this authentication check.
+        if let Request::GitStage { session_id, paths } = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.git_stage(&pubkey, &session_id, &paths).await;
+            return self.send(transport, response).await;
+        }
+        if let Request::GitUnstage { session_id, paths } = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.git_unstage(&pubkey, &session_id, &paths).await;
+            return self.send(transport, response).await;
+        }
+        if let Request::GitCommit { session_id, message } = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.git_commit(&pubkey, &session_id, &message).await;
+            return self.send(transport, response).await;
+        }
         let response = self.dispatch(state, req);
         self.send(transport, response).await
     }

@@ -14,6 +14,7 @@
 //! not just at connect: a device revoked mid-connection (Phase 7) must stop being
 //! served even though its transport is still open.
 
+mod git;
 mod handlers;
 mod handshake;
 mod serve;

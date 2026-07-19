@@ -8,6 +8,7 @@
 //! pump routes pushed `HostEvent`s to the event stream ([`Self::take_events`]) and
 //! each reply to its waiting caller. The reconnect state machine is a later slice.
 
+mod git;
 mod handshake;
 mod subscribe;
 
