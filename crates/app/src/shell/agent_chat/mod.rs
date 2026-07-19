@@ -516,6 +516,7 @@ use composer::{ComposerEvent, ComposerView, ControlVocab};
 use context_providers::{ContextRequest, ContextSource};
 use question_card::{QuestionCard, QuestionCardEvent};
 use tool_grouping::{plan_tool_grouping, summarize_tool_run, EntryDisplay, GroupSummary, GroupedTool};
+use crate::remote_control::{RemoteBinding, RemoteControl, next_remote_session_id};
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
@@ -563,6 +564,16 @@ pub struct AgentChatView {
     /// read-only error state) or after teardown. Shared as an `Arc` so the
     /// session registry can hold the same connection and command it off-thread.
     connection: Option<Arc<dyn AgentConnection>>,
+    /// Stable id this session is exposed under to remote (phone) clients. Minted
+    /// once per view and kept across respawns, decoupled from the agent's own
+    /// (maybe-not-yet-known) session id — remote just needs a key stable for the
+    /// view's lifetime.
+    remote_session_id: String,
+    /// The live tie into the remote-control [`SessionRegistry`], or `None` when
+    /// remote control is disabled (the common case → zero per-event cost). `Some`
+    /// only while a connection is bound and remote is enabled; each `ThreadEvent`
+    /// is teed through it in [`Self::apply_batch`].
+    remote: Option<RemoteBinding>,
     /// The bottom composer (status line + input + Send button), isolated into
     /// its own view so typing repaints only it, never the transcript. It reports
     /// submissions back via [`ComposerEvent`].
@@ -1289,9 +1300,18 @@ impl AgentChatView {
             .to_string()
         });
 
+        let remote_session_id = next_remote_session_id();
+        // Bind this session into the remote-control registry now if remote control
+        // is enabled (else `None` — nothing registered, nothing teed).
+        let remote = connection.clone().and_then(|conn| {
+            cx.try_global::<RemoteControl>().and_then(|rc| rc.bind(&remote_session_id, conn))
+        });
+
         Self {
             thread,
             connection,
+            remote_session_id,
+            remote,
             backend,
             composer,
             session_detail_open: false,
@@ -2884,6 +2904,9 @@ impl AgentChatView {
         match connect(spec) {
             Ok((conn, rx)) => {
                 self.connection = Some(conn);
+                // Re-expose the respawned session to remote clients under the same
+                // stable id (drops the old binding, registers the fresh connection).
+                self.bind_remote(cx);
                 // Reassigning drops the old drain task, cancelling its foreground
                 // half; its forwarder thread then exits on the dead child's
                 // stdout EOF. We're single-threaded here, so no stale
@@ -2898,6 +2921,11 @@ impl AgentChatView {
                 push_slash_catalog(self.connection.as_deref(), &composer, &cwd, cx);
             }
             Err(e) => {
+                // The old connection was already shut down above and the respawn
+                // failed, so this session is dead — drop its remote binding rather
+                // than leave the registry advertising a session backed by a killed
+                // connection (`on_disconnect` isn't on this path).
+                self.unbind_remote();
                 self.thread.last_error = Some(format!("Failed to resume agent: {e}"));
                 self.disconnected = true;
                 self.interrupted = false;
@@ -3199,9 +3227,16 @@ impl AgentChatView {
         // Mirror `new`: seed the palette's command metadata from the backend, so
         // a test exercises the same path the real constructor takes.
         push_slash_catalog(Some(connection.as_ref()), &composer, std::path::Path::new(""), cx);
+        let remote_session_id = next_remote_session_id();
+        let remote = cx
+            .try_global::<RemoteControl>()
+            .and_then(|rc| rc.bind(&remote_session_id, connection.clone()));
+
         Self {
             thread: ChatThread::new(),
             connection: Some(connection),
+            remote_session_id,
+            remote,
             backend: ChatBackend::stream_json(),
             composer,
             session_detail_open: false,
@@ -3399,6 +3434,13 @@ impl AgentChatView {
     fn apply_batch(&mut self, batch: Vec<ThreadEvent>, cx: &mut Context<Self>) {
         let all_delta = batch.iter().all(ThreadEvent::is_delta);
         for ev in batch {
+            // Tee each event to any remote subscribers (gated: `remote` is `Some`
+            // only while remote control is enabled, so this clone never runs on a
+            // disabled desktop). The desktop UI keeps its own dedicated channel —
+            // this fan-out is parallel and never in the UI's path.
+            if let Some(binding) = &self.remote {
+                binding.ingest(ev.clone());
+            }
             self.apply_event(ev, cx);
         }
         if all_delta {
@@ -3724,7 +3766,32 @@ impl AgentChatView {
     /// tool never ran, since the process is gone). Best-effort deny in case
     /// stdin is briefly still writable, then mark the tool `Rejected` so the UI
     /// never shows a dangling approval prompt.
+    /// (Re)bind this session into the remote-control registry: drop any prior
+    /// binding, then register the current connection under [`Self::remote_session_id`]
+    /// — but only while remote control is enabled, so a disabled desktop registers
+    /// nothing and clones no events. Called on connect and on respawn.
+    fn bind_remote(&mut self, cx: &mut Context<Self>) {
+        self.unbind_remote();
+        if let Some(conn) = self.connection.clone()
+            && let Some(rc) = cx.try_global::<RemoteControl>()
+        {
+            self.remote = rc.bind(&self.remote_session_id, conn);
+        }
+    }
+
+    /// Drop this session's registry binding (on disconnect / teardown). No-op when
+    /// unbound. Explicit because the registry retains its own handle `Arc`, so
+    /// dropping the view's handle alone would not evict the session.
+    fn unbind_remote(&mut self) {
+        if let Some(binding) = self.remote.take() {
+            binding.unregister(&self.remote_session_id);
+        }
+    }
+
     fn on_disconnect(&mut self, cx: &mut Context<Self>) {
+        // The live process is gone: drop the remote binding so the phone's session
+        // list reflects only live sessions (a resume respawns + re-binds).
+        self.unbind_remote();
         let pending = self
             .thread
             .pending_permission()
@@ -5253,6 +5320,10 @@ impl AgentChatView {
 
 impl Drop for AgentChatView {
     fn drop(&mut self) {
+        // Evict this session from the remote registry so a closed tab doesn't leave
+        // a stale entry the phone would still list (the registry holds its own
+        // handle `Arc`, so this must be explicit — a `Drop` has no `cx`).
+        self.unbind_remote();
         // Kill + reap the `claude` child so closing the tab doesn't leak it.
         if let Some(conn) = &self.connection {
             conn.shutdown();
@@ -6935,6 +7006,68 @@ mod tests {
                     "no error banner for the rewind's own intentional kill"
                 );
                 assert!(view.interrupted, "stays resumable-idle for finish_rewind");
+            })
+            .expect("window update");
+    }
+
+    /// With remote control enabled, a chat view registers its session into the
+    /// shared registry, tees each applied event to a live subscriber in order, and
+    /// evicts the session on disconnect. (The disabled path — no global → no
+    /// binding → no clone — is what every other view test exercises implicitly.)
+    #[gpui::test]
+    async fn remote_enabled_registers_tees_and_unregisters(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            let rc = RemoteControl::new();
+            rc.set_enabled(true);
+            cx.set_global(rc);
+        });
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // The session registered under the view's stable remote id — subscribe.
+        let mut rx = window
+            .update(cx, |view, _window, cx| {
+                cx.global::<RemoteControl>()
+                    .registry()
+                    .subscribe(&view.remote_session_id)
+                    .expect("session registered while remote is enabled")
+            })
+            .expect("window update");
+
+        // An applied event is teed to the remote subscriber with its assigned seq.
+        window
+            .update(cx, |view, _window, cx| {
+                view.apply_batch(vec![ThreadEvent::AssistantText("hi".into())], cx);
+            })
+            .expect("window update");
+        let (seq, ev) = rx.try_recv().expect("event teed to the remote subscriber");
+        assert_eq!(seq, 1, "first teed event gets seq 1");
+        assert_eq!(ev, ThreadEvent::AssistantText("hi".into()));
+
+        // Disconnect evicts the session from the registry.
+        let id = window
+            .update(cx, |view, _window, cx| {
+                let id = view.remote_session_id.clone();
+                view.on_disconnect(cx);
+                id
+            })
+            .expect("window update");
+        window
+            .update(cx, |_view, _window, cx| {
+                assert!(
+                    cx.global::<RemoteControl>().registry().get(&id).is_none(),
+                    "session unregistered on disconnect",
+                );
             })
             .expect("window update");
     }

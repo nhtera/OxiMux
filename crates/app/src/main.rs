@@ -281,6 +281,10 @@ fn main() {
         cx.set_global(oximux_app::catalog_cache::CatalogCache::load_from(
             app_state.settings_repo(),
         ));
+        // Remote-control state (the session registry the future in-app iroh host
+        // serves). Installed disabled: until remote control is turned on, no live
+        // agent session is fanned into it, so the desktop pays zero per-event cost.
+        cx.set_global(oximux_app::remote_control::RemoteControl::new());
         // Install the full keymap (registry defaults ⊕ keybindings.toml
         // overrides) — this covers the menu-action chords too, and MUST run
         // before `set_menus`: GPUI reads the keymap when it builds the menu
