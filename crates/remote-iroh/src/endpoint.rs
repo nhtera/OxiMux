@@ -19,8 +19,18 @@ pub async fn bind_client() -> anyhow::Result<Endpoint> {
 }
 
 /// Bind a **host** endpoint advertising our ALPN so it can accept connections.
-pub async fn bind_host() -> anyhow::Result<Endpoint> {
-    Ok(Endpoint::builder(presets::N0).alpns(vec![OXIMUX_ALPN.to_vec()]).bind().await?)
+///
+/// `secret` fixes the endpoint's identity. Pass `Some` in production: iroh
+/// otherwise generates a fresh random key per bind, which changes the endpoint id
+/// — and a paired phone dials the host *by* that id, so a rotating one would force
+/// a re-scan of the pairing code on every restart. `None` (tests) keeps the
+/// throwaway-identity behavior.
+pub async fn bind_host(secret: Option<[u8; 32]>) -> anyhow::Result<Endpoint> {
+    let mut builder = Endpoint::builder(presets::N0).alpns(vec![OXIMUX_ALPN.to_vec()]);
+    if let Some(secret) = secret {
+        builder = builder.secret_key(iroh::SecretKey::from_bytes(&secret));
+    }
+    Ok(builder.bind().await?)
 }
 
 /// Await one inbound connection on `endpoint`, accept its bi-stream, and wrap it

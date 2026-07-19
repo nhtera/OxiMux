@@ -101,15 +101,18 @@ impl Drop for HostHandle {
 /// on it — returning a [`HostHandle`] whose [`ticket`](HostHandle::ticket) reaches
 /// this host. `secret` is the one-time handshake secret the ticket carries; it
 /// MUST match the [`PairingSlot`](oximux_remote_host::PairingSlot) the dispatcher's
-/// auth store was seeded with. Bind is deferred to call time (never at boot) so it
-/// only pays its cost when remote access is actually turned on.
+/// auth store was seeded with. `endpoint_secret` fixes the host's endpoint id so a
+/// paired device can reconnect after a restart (see [`bind_host`]). Bind is
+/// deferred to call time (never at boot) so it only pays its cost when remote
+/// access is actually turned on.
 ///
 /// [`PairingSlot`]: oximux_remote_host::PairingSlot
 pub async fn start_host(
     dispatcher: Arc<Dispatcher>,
     secret: [u8; 16],
+    endpoint_secret: Option<[u8; 32]>,
 ) -> anyhow::Result<HostHandle> {
-    let endpoint = bind_host().await?;
+    let endpoint = bind_host(endpoint_secret).await?;
     // Wait until direct addresses / relay home are known so the ticket is
     // reachable the moment it is shown.
     endpoint.online().await;

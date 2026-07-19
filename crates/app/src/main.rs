@@ -36,6 +36,10 @@ use tracing_subscriber::EnvFilter;
 /// `~/Library/Application Support`. Must stay in lockstep with
 /// `CFBundleIdentifier` in `assets/Info.plist`.
 const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
+/// Scope for the remote-control host key. The host is process-wide (it serves every
+/// workspace's sessions from one registry), so it uses ONE app-level identity rather
+/// than `HostIdentity`'s per-workspace keying.
+const HOST_IDENTITY_SCOPE: &str = "remote-control-host";
 const DB_FILE_NAME: &str = "oximux.db";
 
 fn main() {
@@ -286,9 +290,30 @@ fn main() {
         // session is fanned into it, so the desktop pays zero per-event cost — and
         // no endpoint is bound. Backed by the durable paired-device store so a phone
         // paired in an earlier run stays authorized across restarts.
-        cx.set_global(oximux_app::remote_control::RemoteControl::with_devices(std::sync::Arc::new(
-            oximux_remote_host::StorageDeviceStore::new(app_state.remote_device_repo()),
-        )));
+        let mut remote_control =
+            oximux_app::remote_control::RemoteControl::with_devices(std::sync::Arc::new(
+                oximux_remote_host::StorageDeviceStore::new(app_state.remote_device_repo()),
+            ));
+        // Pin the host's endpoint identity from the persistent host key. Without
+        // this iroh mints a fresh key per bind, so the endpoint id — the address a
+        // paired phone dials — would change on every restart and silently break
+        // every existing pairing. A key that can't be loaded degrades to an
+        // ephemeral identity rather than blocking boot.
+        if let Some(data_dir) = dirs::data_dir() {
+            let key_dir = data_dir.join(APP_DATA_SUBDIR);
+            match oximux_remote_host::HostIdentity::load_or_generate(&key_dir, HOST_IDENTITY_SCOPE)
+            {
+                Ok(identity) => {
+                    remote_control =
+                        remote_control.with_endpoint_secret(identity.transport_secret_bytes());
+                }
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "remote-control host identity unavailable; pairings will not survive a restart"
+                ),
+            }
+        }
+        cx.set_global(remote_control);
         // Install the full keymap (registry defaults ⊕ keybindings.toml
         // overrides) — this covers the menu-action chords too, and MUST run
         // before `set_menus`: GPUI reads the keymap when it builds the menu

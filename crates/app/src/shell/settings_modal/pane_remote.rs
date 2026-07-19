@@ -281,20 +281,22 @@ fn on_toggle(
         let turning_on = !rc.enabled();
         rc.set_enabled(turning_on);
         if turning_on {
-            Some(rc.prepare_host())
+            let (dispatcher, secret) = rc.prepare_host();
+            Some((dispatcher, secret, rc.endpoint_secret()))
         } else {
             rc.stop_host();
             None
         }
     };
 
-    if let Some((dispatcher, secret)) = prep
+    if let Some((dispatcher, secret, endpoint_secret)) = prep
         && let Ok(handle) = tokio::runtime::Handle::try_current()
     {
         // Bind on the tokio runtime (iroh needs it), then publish the handle back.
         let (tx, rx) = tokio::sync::oneshot::channel();
         handle.spawn(async move {
-            let _ = tx.send(oximux_remote_iroh::start_host(dispatcher, secret).await);
+            let _ = tx
+                .send(oximux_remote_iroh::start_host(dispatcher, secret, endpoint_secret).await);
         });
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(host)) = rx.await {

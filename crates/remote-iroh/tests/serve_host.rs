@@ -55,7 +55,7 @@ async fn dial_and_list(host_id: [u8; 32], direct: Vec<SocketAddr>, seed: [u8; 32
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn serve_host_serves_multiple_connections_then_shuts_down() {
-    let host_ep = bind_host().await.expect("bind host endpoint");
+    let host_ep = bind_host(None).await.expect("bind host endpoint");
     host_ep.online().await;
     let host_id = *host_ep.id().as_bytes();
     let direct: Vec<SocketAddr> = host_ep.addr().ip_addrs().copied().collect();
@@ -83,6 +83,37 @@ async fn serve_host_serves_multiple_connections_then_shuts_down() {
     host_task.await.expect("serve_host returns on shutdown");
 }
 
+/// The endpoint id must be pinned by the supplied secret, not regenerated per
+/// bind. A paired phone dials the host *by* that id, so a rotating identity would
+/// silently invalidate every stored pairing on each restart — the durable device
+/// table would survive while the address it points at did not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fixed_endpoint_secret_keeps_the_host_identity_across_binds() {
+    let secret = [0x5a; 32];
+
+    let first = bind_host(Some(secret)).await.expect("first bind");
+    let first_id = *first.id().as_bytes();
+    first.close().await;
+
+    let second = bind_host(Some(secret)).await.expect("second bind");
+    let second_id = *second.id().as_bytes();
+    second.close().await;
+
+    assert_eq!(first_id, second_id, "the same secret yields the same endpoint id");
+
+    // A different secret is a different host…
+    let other = bind_host(Some([0xa5; 32])).await.expect("other bind");
+    let other_id = *other.id().as_bytes();
+    other.close().await;
+    assert_ne!(first_id, other_id);
+
+    // …and no secret is the old throwaway-identity behavior.
+    let ephemeral = bind_host(None).await.expect("ephemeral bind");
+    let ephemeral_id = *ephemeral.id().as_bytes();
+    ephemeral.close().await;
+    assert_ne!(ephemeral_id, first_id, "an unseeded bind is a fresh identity");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_host_yields_a_ticket_and_stops_cleanly() {
     let auth = Arc::new(AuthStore::new());
@@ -91,7 +122,7 @@ async fn start_host_yields_a_ticket_and_stops_cleanly() {
 
     // `start_host` binds lazily (only here, never at boot), waits until dialable,
     // and hands back the ticket a phone would scan.
-    let handle = start_host(dispatcher, SECRET).await.expect("start host");
+    let handle = start_host(dispatcher, SECRET, None).await.expect("start host");
     assert_eq!(handle.ticket().handshake_secret, SECRET, "ticket carries the shared secret");
     assert_ne!(handle.ticket().endpoint_id, [0u8; 32], "ticket carries a real endpoint key");
     assert!(handle.ticket().session_id.is_none(), "a host ticket pins no single session");

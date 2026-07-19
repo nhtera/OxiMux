@@ -15,6 +15,11 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 
+/// Domain-separation label for the derived iroh transport key. Bump the version
+/// suffix only with intent: it changes the host's endpoint id, which invalidates
+/// every previously scanned pairing code.
+const TRANSPORT_KEY_DOMAIN: &[u8] = b"oximux/remote/iroh-transport/v1";
+
 /// A loaded host identity.
 pub struct HostIdentity {
     signing: SigningKey,
@@ -53,6 +58,21 @@ impl HostIdentity {
     /// The signing key (e.g. to seed the iroh transport key later).
     pub fn signing_key(&self) -> &SigningKey {
         &self.signing
+    }
+
+    /// The iroh transport secret, **derived** from the stored identity rather than
+    /// reusing the signing key verbatim.
+    ///
+    /// One secret on disk, but two distinct keys: the same private scalar is never
+    /// used for both app-level Ed25519 signatures and the transport's TLS identity,
+    /// so neither can stand in for the other. Deterministic, so the host keeps the
+    /// same endpoint id across restarts — which is what lets a paired phone
+    /// reconnect without re-scanning the QR.
+    pub fn transport_secret_bytes(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(TRANSPORT_KEY_DOMAIN);
+        hasher.update(self.signing.to_bytes());
+        hasher.finalize().into()
     }
 }
 
@@ -118,6 +138,36 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "key file is 0600");
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The transport key must be stable across reloads — an endpoint id that
+    /// changed per launch would invalidate every paired device's stored host
+    /// address — and must not simply be the signing key.
+    #[test]
+    fn transport_secret_is_stable_and_distinct_from_the_signing_key() {
+        let dir = std::env::temp_dir().join(format!("oximux-host-tk-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let first = HostIdentity::load_or_generate(&dir, "scope").expect("generate");
+        let reloaded = HostIdentity::load_or_generate(&dir, "scope").expect("reload");
+        assert_eq!(
+            first.transport_secret_bytes(),
+            reloaded.transport_secret_bytes(),
+            "the endpoint id survives a restart",
+        );
+
+        assert_ne!(
+            first.transport_secret_bytes(),
+            first.signing_key().to_bytes(),
+            "derived, not the signing key itself",
+        );
+        assert_ne!(first.transport_secret_bytes(), first.public_key_bytes());
+
+        // A different identity yields a different transport key.
+        let other = HostIdentity::load_or_generate(&dir, "other-scope").expect("other");
+        assert_ne!(first.transport_secret_bytes(), other.transport_secret_bytes());
 
         let _ = fs::remove_dir_all(&dir);
     }

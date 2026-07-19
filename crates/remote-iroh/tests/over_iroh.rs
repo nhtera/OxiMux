@@ -50,7 +50,7 @@ fn seeded_registry() -> Arc<SessionRegistry> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_pairs_and_drives_a_session_over_real_iroh_quic() {
     // ── Host: bind an iroh endpoint and learn its dialable direct addresses ──
-    let host_ep = bind_host().await.expect("bind host endpoint");
+    let host_ep = bind_host(None).await.expect("bind host endpoint");
     host_ep.online().await; // wait until direct addresses are known
     let host_id = *host_ep.id().as_bytes();
     let direct: Vec<SocketAddr> = host_ep.addr().ip_addrs().copied().collect();

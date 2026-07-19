@@ -83,6 +83,11 @@ pub struct RemoteControl {
     /// every RPC, so a revoke lands mid-session). Cleared on stop — with no host, the
     /// durable store is authoritative.
     auth: Mutex<Option<Arc<AuthStore>>>,
+    /// Seeds the iroh endpoint key so the host keeps ONE identity across binds and
+    /// restarts. Without it iroh mints a random key per bind, changing the endpoint
+    /// id — and since a paired phone dials by that id, every restart would silently
+    /// invalidate every pairing. `None` = ephemeral identity (tests).
+    endpoint_secret: Option<[u8; 32]>,
 }
 
 impl Global for RemoteControl {}
@@ -103,7 +108,15 @@ impl RemoteControl {
             host: Mutex::new(None),
             devices: None,
             auth: Mutex::new(None),
+            endpoint_secret: None,
         }
+    }
+
+    /// Pin the host's endpoint identity from the persistent host key, so a device
+    /// paired in an earlier run can still reach it.
+    pub fn with_endpoint_secret(mut self, secret: [u8; 32]) -> Self {
+        self.endpoint_secret = Some(secret);
+        self
     }
 
     /// The boot constructor: same as [`new`](Self::new) but backed by durable
@@ -191,6 +204,11 @@ impl RemoteControl {
         if let Some(store) = &self.devices {
             store.set_revoked(pubkey, true);
         }
+    }
+
+    /// The seed that pins the host's endpoint id, if one was installed at boot.
+    pub fn endpoint_secret(&self) -> Option<[u8; 32]> {
+        self.endpoint_secret
     }
 
     /// Store the freshly-bound host, stopping and replacing any prior one.
