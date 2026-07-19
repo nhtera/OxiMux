@@ -7075,6 +7075,8 @@ dependencies = [
  "hmac",
  "oximux-agent-core",
  "oximux-agents",
+ "oximux-core",
+ "oximux-git",
  "oximux-remote-proto",
  "oximux-storage",
  "rand 0.8.6",

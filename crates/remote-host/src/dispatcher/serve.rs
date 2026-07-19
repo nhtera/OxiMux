@@ -121,6 +121,17 @@ impl Dispatcher {
             }
             return self.send(transport, response).await;
         }
+        // `GitStatus` is the one authenticated request whose handler is async (it
+        // shells out to git), so it is awaited here rather than in the sync
+        // `dispatch`. Authorization is identical: an authenticated pubkey, then the
+        // handler's own per-session ACL recheck.
+        if let Request::GitStatus { session_id } = req {
+            let Some(pubkey) = authorized_pubkey(state, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.git_status(&pubkey, &session_id).await;
+            return self.send(transport, response).await;
+        }
         let response = self.dispatch(state, req);
         self.send(transport, response).await
     }

@@ -23,6 +23,10 @@ oximux-agents = { workspace = true }
 # Durable paired-device/ACL persistence (RemoteDeviceRepo). Desktop-only host,
 # so the rusqlite pull-in is fine — this crate never ships to mobile.
 oximux-storage = { workspace = true }
+# Git RPCs wrap the existing repository functions; path arguments are contained
+# via `oximux_git::path_guard` at this boundary before any disk access.
+oximux-git = { workspace = true }
+oximux-core = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

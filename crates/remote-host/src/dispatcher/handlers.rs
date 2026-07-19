@@ -4,7 +4,8 @@
 
 use oximux_agents::session_registry::SessionHandle;
 use oximux_remote_proto::messages::{
-    ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionStatusWire, SessionSummary,
+    GitFileWire, GitStatusWire, IndexStatusWire, ResolvePermissionReq, SendPromptReq,
+    SessionInfoWire, SessionStatusWire, SessionSummary, WorktreeStatusWire,
 };
 use oximux_remote_proto::proto::{Response, RpcError};
 use oximux_remote_proto::HostEvent;
@@ -135,5 +136,163 @@ impl Dispatcher {
                 Response::Error(RpcError::Internal("session command failed".into()))
             }
         }
+    }
+
+    /// Working-tree status of the repository the session lives in.
+    ///
+    /// Scoped by session, so remote git access inherits the device's existing
+    /// session ACL rather than introducing a second, wider authorization surface:
+    /// a session-scoped device can only see the repo of a session it may reach.
+    /// Async (unlike the other handlers) because opening the repo and running
+    /// status both shell out to git — the serve loop awaits this directly.
+    pub(super) async fn git_status(&self, pubkey: &AppPubkey, session_id: &str) -> Response {
+        if !self.auth.is_allowed_for(pubkey, session_id) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(handle) = self.registry.get(session_id) else {
+            return Response::Error(RpcError::UnknownSession);
+        };
+        let Some(cwd) = handle.meta_snapshot().cwd else {
+            return Response::Error(RpcError::BadRequest(
+                "session has no working directory".into(),
+            ));
+        };
+        // Git error text routinely embeds absolute paths ("fatal: not a git
+        // repository: /Users/…"), so it is logged host-side and never forwarded —
+        // the same rule the other handlers follow for backend errors.
+        let repo = match oximux_git::repository::Repository::open(&cwd).await {
+            Ok(repo) => repo,
+            Err(e) => {
+                tracing::warn!(error = %e, session = %session_id, "open repository failed");
+                return Response::Error(RpcError::Internal("git unavailable".into()));
+            }
+        };
+        match repo.status().await {
+            Ok(state) => Response::GitStatus(to_status_wire(state)),
+            Err(e) => {
+                tracing::warn!(error = %e, session = %session_id, "git status failed");
+                Response::Error(RpcError::Internal("git status failed".into()))
+            }
+        }
+    }
+}
+
+/// Map the desktop's `GitState` onto the dependency-minimal wire shape. Paths are
+/// emitted as the repository-relative strings git reported; a client echoes one
+/// back on a diff request and the host contains it again there — this direction
+/// never widens what the client may ask for.
+fn to_status_wire(state: oximux_core::GitState) -> GitStatusWire {
+    GitStatusWire {
+        branch: state.branch,
+        upstream: state.upstream,
+        ahead: state.ahead,
+        behind: state.behind,
+        files: state
+            .files
+            .into_iter()
+            .map(|f| GitFileWire {
+                path: f.path.to_string_lossy().into_owned(),
+                index: to_index_wire(f.index),
+                worktree: to_worktree_wire(f.worktree),
+                unstaged_lines: f.line_counts,
+                staged_lines: f.staged_line_counts,
+            })
+            .collect(),
+    }
+}
+
+fn to_index_wire(status: oximux_core::IndexStatus) -> IndexStatusWire {
+    use oximux_core::IndexStatus as S;
+    match status {
+        S::Unmodified => IndexStatusWire::Unmodified,
+        S::Modified => IndexStatusWire::Modified,
+        S::Added => IndexStatusWire::Added,
+        S::Deleted => IndexStatusWire::Deleted,
+        S::Renamed => IndexStatusWire::Renamed,
+        S::Copied => IndexStatusWire::Copied,
+        S::Untracked => IndexStatusWire::Untracked,
+        S::Ignored => IndexStatusWire::Ignored,
+        S::Unmerged => IndexStatusWire::Unmerged,
+    }
+}
+
+fn to_worktree_wire(status: oximux_core::WorktreeStatus) -> WorktreeStatusWire {
+    use oximux_core::WorktreeStatus as S;
+    match status {
+        S::Unmodified => WorktreeStatusWire::Unmodified,
+        S::Modified => WorktreeStatusWire::Modified,
+        S::Deleted => WorktreeStatusWire::Deleted,
+        S::Renamed => WorktreeStatusWire::Renamed,
+        S::Untracked => WorktreeStatusWire::Untracked,
+        S::Ignored => WorktreeStatusWire::Ignored,
+        S::Unmerged => WorktreeStatusWire::Unmerged,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use oximux_core::{FileStatus, GitState, IndexStatus, WorktreeStatus};
+
+    use super::{IndexStatusWire, WorktreeStatusWire, to_status_wire};
+
+    /// The desktop's status maps onto the wire shape without losing branch
+    /// context, per-file codes, or either line-count pair.
+    #[test]
+    fn git_state_maps_onto_the_wire_shape() {
+        let state = GitState {
+            branch: Some("main".into()),
+            upstream: Some("origin/main".into()),
+            ahead: 2,
+            behind: 1,
+            files: vec![FileStatus {
+                path: PathBuf::from("src/lib.rs"),
+                index: IndexStatus::Modified,
+                worktree: WorktreeStatus::Unmodified,
+                rename: None,
+                line_counts: Some((3, 1)),
+                staged_line_counts: Some((10, 2)),
+                conflict_kind: None,
+            }],
+            ..Default::default()
+        };
+
+        let wire = to_status_wire(state);
+
+        assert_eq!(wire.branch.as_deref(), Some("main"));
+        assert_eq!(wire.upstream.as_deref(), Some("origin/main"));
+        assert_eq!((wire.ahead, wire.behind), (2, 1));
+        assert_eq!(wire.files.len(), 1);
+        let f = &wire.files[0];
+        assert_eq!(f.path, "src/lib.rs", "paths cross as repo-relative strings");
+        assert_eq!(f.index, IndexStatusWire::Modified);
+        assert_eq!(f.worktree, WorktreeStatusWire::Unmodified);
+        assert_eq!(f.unstaged_lines, Some((3, 1)));
+        assert_eq!(f.staged_lines, Some((10, 2)), "staged counts are not confused with unstaged");
+    }
+
+    /// An untracked file keeps its code across the mapping (the pair that decides
+    /// which diff codepath a client asks for).
+    #[test]
+    fn untracked_status_survives_the_mapping() {
+        let state = GitState {
+            files: vec![FileStatus {
+                path: PathBuf::from("new.txt"),
+                index: IndexStatus::Untracked,
+                worktree: WorktreeStatus::Untracked,
+                rename: None,
+                line_counts: None,
+                staged_line_counts: None,
+                conflict_kind: None,
+            }],
+            ..Default::default()
+        };
+
+        let wire = to_status_wire(state);
+
+        assert_eq!(wire.files[0].index, IndexStatusWire::Untracked);
+        assert_eq!(wire.files[0].worktree, WorktreeStatusWire::Untracked);
+        assert_eq!(wire.branch, None, "a detached state has no branch");
     }
 }

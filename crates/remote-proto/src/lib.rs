@@ -32,8 +32,9 @@ pub mod testing;
 pub mod transport;
 
 pub use messages::{
-    AuthProveReq, ConnectReq, HostEvent, RegisterReq, ResolvePermissionReq, SendPromptReq,
-    SessionInfoWire, SessionStatusWire, SessionSummary,
+    AuthProveReq, ConnectReq, GitFileWire, GitStatusWire, HostEvent, IndexStatusWire, RegisterReq,
+    ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionStatusWire, SessionSummary,
+    WorktreeStatusWire,
 };
 pub use pairing::{PairingError, PairingTicket, registration_proof};
 pub use proto::{PROTOCOL_VERSION, Request, Response, RpcError, WireError};

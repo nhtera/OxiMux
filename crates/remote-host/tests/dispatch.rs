@@ -281,6 +281,7 @@ fn session_meta_published_by_the_desktop_reaches_the_client() {
     titled.set_meta(SessionMeta {
         title: Some("Fix auth".into()),
         model: Some("claude-opus-4-8".into()),
+        cwd: None,
     });
     // Registered but never titled — the fallback path.
     registry.register("sess-2".into(), Arc::new(StubConnection::default()));
@@ -317,6 +318,52 @@ fn session_meta_published_by_the_desktop_reaches_the_client() {
         };
         assert_eq!(info.summary.title, "Fix auth");
         assert_eq!(info.summary.model.as_deref(), Some("claude-opus-4-8"));
+    };
+    block_on(join(serve, script));
+}
+
+/// Git access rides the same session ACL as every other RPC (no second, wider
+/// authorization surface), and a session that never published a working directory
+/// is refused rather than the host guessing at a repository.
+#[test]
+fn git_status_is_acl_gated_and_requires_a_working_directory() {
+    let registry = Arc::new(SessionRegistry::new());
+    // Registered, but no cwd ever published by a desktop view.
+    registry.register("sess-1".into(), Arc::new(StubConnection::default()));
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock);
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        // Unauthenticated: git is refused like any other session RPC.
+        assert_eq!(
+            call(&client, Request::GitStatus { session_id: "sess-1".into() }).await,
+            Response::Error(RpcError::Unauthorized),
+            "no git access before pairing",
+        );
+
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        // An unknown session stays distinguishable from an unauthorized one.
+        assert_eq!(
+            call(&client, Request::GitStatus { session_id: "nope".into() }).await,
+            Response::Error(RpcError::UnknownSession),
+        );
+
+        // Known session, but no cwd → refused before any repository is opened.
+        assert!(
+            matches!(
+                call(&client, Request::GitStatus { session_id: "sess-1".into() }).await,
+                Response::Error(RpcError::BadRequest(_)),
+            ),
+            "a session with no working directory cannot resolve a repo",
+        );
     };
     block_on(join(serve, script));
 }

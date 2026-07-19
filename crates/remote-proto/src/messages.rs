@@ -154,3 +154,58 @@ impl HostEvent {
         Ok(serde_json::from_str(&self.event_json)?)
     }
 }
+
+/// Index-side (staged) status of a path, mirroring porcelain v2's X column.
+/// Re-declared here rather than reusing `oximux_core` so the wire crate stays
+/// dependency-minimal (the mobile core links it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IndexStatusWire {
+    Unmodified,
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Copied,
+    Untracked,
+    Ignored,
+    Unmerged,
+}
+
+/// Worktree-side (unstaged) status of a path — porcelain v2's Y column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorktreeStatusWire {
+    Unmodified,
+    Modified,
+    Deleted,
+    Renamed,
+    Untracked,
+    Ignored,
+    Unmerged,
+}
+
+/// One changed/untracked path in a [`GitStatusWire`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitFileWire {
+    /// Repository-relative path, as git reports it. Always relative — a client
+    /// echoes this back on a diff request, and the host contains it again there.
+    pub path: String,
+    pub index: IndexStatusWire,
+    pub worktree: WorktreeStatusWire,
+    /// Unstaged `(added, removed)` line counts, when git produced them.
+    pub unstaged_lines: Option<(u32, u32)>,
+    /// Staged `(added, removed)` line counts, when git produced them.
+    pub staged_lines: Option<(u32, u32)>,
+}
+
+/// [`Response::GitStatus`](crate::proto::Response::GitStatus) payload — the
+/// working-tree state of the repository a session lives in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitStatusWire {
+    /// Current branch; `None` when HEAD is detached.
+    pub branch: Option<String>,
+    /// Configured upstream tracking ref, e.g. `origin/main`.
+    pub upstream: Option<String>,
+    pub ahead: u32,
+    pub behind: u32,
+    pub files: Vec<GitFileWire>,
+}

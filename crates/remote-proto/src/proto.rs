@@ -84,6 +84,10 @@ pub enum Request {
     Subscribe { session_id: String, after_seq: Option<u64> },
     /// One-shot backlog replay (gap-fill) for events after `after_seq`.
     EventsSince { session_id: String, after_seq: u64 },
+    /// Working-tree status of the repository the session lives in. Scoped by
+    /// session so git access inherits the device's existing session ACL — a
+    /// session-scoped device cannot browse another project's repository.
+    GitStatus { session_id: String },
 }
 
 /// Host → client.
@@ -125,6 +129,9 @@ pub enum Response {
     /// is the session's status *at forward time*, not as of `seq`, so it can lead
     /// `seq` even with no loss — it is a freshness hint, never the gap signal.
     Event(HostEvent),
+    /// Reply to [`Request::GitStatus`]. Appended last to keep the enum's ordinal
+    /// encoding append-only.
+    GitStatus(GitStatusWire),
 }
 
 impl Request {

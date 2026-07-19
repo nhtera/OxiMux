@@ -3807,6 +3807,8 @@ impl AgentChatView {
             // Mirrors the transcript's resolution: the thread's negotiated model
             // wins, falling back to the tab's selection before one is negotiated.
             model: self.thread.model.clone().or_else(|| self.model.clone()),
+            // Git RPCs resolve their repository from this.
+            cwd: Some(self.cwd.clone()),
         });
     }
 

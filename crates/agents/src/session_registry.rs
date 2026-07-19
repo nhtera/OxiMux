@@ -22,6 +22,7 @@
 //!    `resolve_permission` are plain `&self` calls on the shared `Arc`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -60,6 +61,10 @@ pub struct SessionMeta {
     pub title: Option<String>,
     /// The effective model id driving the session.
     pub model: Option<String>,
+    /// The session's working directory. Git RPCs resolve their repository from
+    /// this, which scopes remote git access to the sessions a device may already
+    /// reach — a session-scoped device cannot browse another project's repo.
+    pub cwd: Option<PathBuf>,
 }
 
 /// Everything the registry knows about one live session. Held behind an `Arc` so
@@ -588,13 +593,18 @@ mod tests {
         let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
         assert_eq!(handle.meta_snapshot(), SessionMeta::default(), "untitled until published");
 
-        let meta = SessionMeta { title: Some("Fix auth".into()), model: Some("opus".into()) };
+        let meta =
+            SessionMeta { title: Some("Fix auth".into()), model: Some("opus".into()), cwd: None };
         assert!(handle.set_meta(meta.clone()), "first publish is a change");
         assert_eq!(handle.meta_snapshot(), meta);
 
         assert!(!handle.set_meta(meta), "republishing the same meta is not a change");
         assert!(
-            handle.set_meta(SessionMeta { title: Some("Fix auth".into()), model: None }),
+            handle.set_meta(SessionMeta {
+                title: Some("Fix auth".into()),
+                model: None,
+                cwd: None
+            }),
             "dropping the model is a change",
         );
     }
