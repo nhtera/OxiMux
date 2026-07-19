@@ -65,6 +65,9 @@ impl AuthStore {
                     // Pairing grants full access (the confirmed default);
                     // read-only is an explicit opt-down afterwards.
                     read_only: false,
+                    // A device that has just paired has, by definition, just
+                    // authenticated.
+                    last_seen: Some(now_secs),
                 },
             );
             let token = issue_token(&mut st, req.app_pubkey);
@@ -74,6 +77,7 @@ impl AuthStore {
                 sessions: bound.map(|s| vec![s]),
                 revoked: false,
                 read_only: false,
+                last_seen: Some(now_secs),
             };
             (token, stored)
         };

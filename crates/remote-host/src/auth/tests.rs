@@ -129,11 +129,11 @@ fn revoked_device_cannot_re_register_itself() {
 }
 
 #[test]
-fn cleared_pairing_rejects_registration() {
+fn registration_is_rejected_when_no_pairing_is_advertised() {
+    // No `set_pairing` at all — the state the host is in whenever remote access
+    // is off, and the one a `Register` must never get through.
     let store = AuthStore::new();
     let secret = [0x22; 16];
-    store.set_pairing(PairingSlot::new(secret, None, false));
-    store.clear_pairing();
     let pubkey = vk(0x33);
     let ts = 1_700_000_000;
     let req = RegisterReq {
@@ -192,14 +192,14 @@ fn read_only_device_may_read_but_not_write() {
 
     // Pairing grants full access, so a fresh device may write.
     assert!(store.may_write(&pubkey, "sess-1"), "pairing default is read-write");
-    assert!(!store.is_read_only(&pubkey));
+    assert!(store.devices().iter().all(|d| !d.read_only), "fresh device is not read-only");
 
     store.set_read_only(&pubkey, true);
 
     assert!(store.is_allowed_for(&pubkey, "sess-1"), "reads still served");
     assert!(store.is_authorized(&pubkey), "read-only is not revocation");
     assert!(!store.may_write(&pubkey, "sess-1"), "writes refused");
-    assert!(store.is_read_only(&pubkey));
+    assert!(store.devices().iter().any(|d| d.pubkey == pubkey && d.read_only), "the tier shows in the device list the UI reads");
 
     // The opt-down is reversible.
     store.set_read_only(&pubkey, false);

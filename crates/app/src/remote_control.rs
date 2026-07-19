@@ -177,7 +177,12 @@ impl RemoteControl {
                 .load()
                 .into_iter()
                 .filter(|d| !d.revoked)
-                .map(|d| DeviceInfo { pubkey: d.pubkey, name: d.name, read_only: d.read_only })
+                .map(|d| DeviceInfo {
+                    pubkey: d.pubkey,
+                    name: d.name,
+                    read_only: d.read_only,
+                    last_seen: d.last_seen,
+                })
                 .collect(),
             None => Vec::new(),
         }
@@ -297,6 +302,7 @@ mod tests {
         fn set_read_only(&self, pubkey: &AppPubkey, read_only: bool) {
             self.read_only.lock().unwrap().push((*pubkey, read_only));
         }
+        fn touch_last_seen(&self, _pubkey: &[u8; 32]) {}
     }
 
     fn a_device(byte: u8, name: &str, revoked: bool) -> StoredDevice {
@@ -306,6 +312,7 @@ mod tests {
             sessions: None,
             revoked,
             read_only: false,
+            last_seen: None,
         }
     }
 

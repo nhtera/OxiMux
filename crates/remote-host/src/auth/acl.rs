@@ -10,6 +10,11 @@ pub struct DeviceInfo {
     pub name: String,
     /// The opt-down tier: this device may read but not act.
     pub read_only: bool,
+    /// Unix seconds of the device's last successful authentication. `None` means
+    /// it paired but has never reconnected — worth surfacing, since an entry that
+    /// has never been used is a plausible sign of a pairing the user does not
+    /// recognize.
+    pub last_seen: Option<u64>,
 }
 
 impl AuthStore {
@@ -46,6 +51,7 @@ impl AuthStore {
                 pubkey: *pubkey,
                 name: d.name.clone(),
                 read_only: d.read_only,
+                last_seen: d.last_seen,
             })
             .collect()
     }
@@ -61,12 +67,6 @@ impl AuthStore {
             return false;
         }
         !self.inner.lock().unwrap().devices.get(pubkey).is_some_and(|d| d.read_only)
-    }
-
-    /// Is this device marked read-only (the opt-down tier)? For the paired-device
-    /// UI; authorization decisions use [`may_write`](Self::may_write).
-    pub fn is_read_only(&self, pubkey: &AppPubkey) -> bool {
-        self.inner.lock().unwrap().devices.get(pubkey).is_some_and(|d| d.read_only)
     }
 
     /// Move a device between the read-write and read-only tiers. Takes effect on

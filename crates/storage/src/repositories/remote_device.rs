@@ -29,6 +29,9 @@ pub struct RemoteDeviceRow {
     /// The opt-down tier: the device may read (transcripts, status, diffs) but
     /// every state-changing RPC is refused. Orthogonal to `scope`.
     pub read_only: bool,
+    /// Unix seconds of the device's last successful authentication; `None` if it
+    /// paired but has never reconnected.
+    pub last_seen: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -46,7 +49,7 @@ impl RemoteDeviceRepo {
     pub fn list_all(&self) -> Result<Vec<RemoteDeviceRow>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT pubkey, name, scope, scope_sessions, revoked, read_only \
+                "SELECT pubkey, name, scope, scope_sessions, revoked, read_only, last_seen \
                  FROM remote_devices",
             )?;
             let mapped = stmt.query_map([], |row| {
@@ -57,18 +60,22 @@ impl RemoteDeviceRepo {
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, i64>(4)? != 0,
                     row.get::<_, i64>(5)? != 0,
+                    row.get::<_, Option<i64>>(6)?,
                 ))
             })?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()
         })?;
         Ok(rows
             .into_iter()
-            .map(|(pubkey, name, scope, sessions, revoked, read_only)| RemoteDeviceRow {
-                pubkey,
-                name,
-                scope: decode_scope(&scope, sessions.as_deref()),
-                revoked,
-                read_only,
+            .map(|(pubkey, name, scope, sessions, revoked, read_only, last_seen)| {
+                RemoteDeviceRow {
+                    pubkey,
+                    name,
+                    scope: decode_scope(&scope, sessions.as_deref()),
+                    revoked,
+                    read_only,
+                    last_seen,
+                }
             })
             .collect())
     }
@@ -202,6 +209,9 @@ mod tests {
             revoked: false,
             // A freshly paired device is read-write; read-only is an opt-down.
             read_only: false,
+            // Upsert records the pairing, not a connection — `last_seen` stays
+            // unset until the device actually authenticates.
+            last_seen: None,
         });
         assert_eq!(
             all[1].scope,

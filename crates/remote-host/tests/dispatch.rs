@@ -636,3 +636,64 @@ fn a_client_below_the_floor_is_refused_before_offering_a_credential() {
     };
     block_on(join(dispatcher.serve(&server), script));
 }
+
+/// Reconnecting records `last_seen`, so the paired-device list can show whether a
+/// device is still in use. The column existed and the repo method existed, but
+/// nothing ever called it — the list would have shown "never connected" forever.
+#[test]
+fn authenticating_records_the_device_last_seen() {
+    let (client, server) = duplex_pair();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(seeded_registry(), Arc::clone(&auth)).with_clock(clock);
+
+    let script = async {
+        let key = SigningKey::from_bytes(&[21u8; 32]);
+        let pubkey = key.verifying_key().to_bytes();
+
+        // Pairing itself counts as an authentication.
+        let Response::Registered { session_token } =
+            call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+        let paired_at = auth
+            .devices()
+            .into_iter()
+            .find(|d| d.pubkey == pubkey)
+            .expect("device listed")
+            .last_seen;
+        assert_eq!(paired_at, Some(NOW), "pairing stamps last_seen");
+
+        // Reset the stamp first. Under a fixed test clock both stamps would read
+        // NOW, so asserting "still NOW" after a reconnect could not tell a real
+        // stamp from the pairing one never being overwritten.
+        auth.touch_last_seen(&pubkey, 0);
+        assert_eq!(
+            auth.devices().into_iter().find(|d| d.pubkey == pubkey).unwrap().last_seen,
+            Some(0),
+            "stamp reset, so the next assertion means something"
+        );
+
+        // A later reconnect stamps it again.
+        let reconnect = call(
+            &client,
+            Request::Connect(ConnectReq {
+                app_pubkey: pubkey,
+                session_token: Some(session_token),
+            }),
+        )
+        .await;
+        assert!(matches!(reconnect, Response::Connected { .. }), "token fast path");
+        let seen = auth
+            .devices()
+            .into_iter()
+            .find(|d| d.pubkey == pubkey)
+            .expect("device listed")
+            .last_seen;
+        assert_eq!(seen, Some(NOW), "reconnect stamps last_seen too");
+
+        drop(client);
+    };
+    block_on(join(dispatcher.serve(&server), script));
+}

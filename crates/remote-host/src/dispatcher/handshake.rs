@@ -49,6 +49,7 @@ impl Dispatcher {
             && let Some(pubkey) = self.auth.authorize_token(token)
         {
             *state = ConnAuthn::Authed { app_pubkey: pubkey };
+            self.auth.touch_last_seen(&pubkey, (self.now_secs)());
             return Response::Connected { session_token: token.to_string() };
         }
         // No token / invalid token → challenge the app key.
@@ -66,6 +67,7 @@ impl Dispatcher {
         match self.auth.verify_challenge(&app_pubkey, &nonce, signature) {
             Ok(token) => {
                 *state = ConnAuthn::Authed { app_pubkey };
+                self.auth.touch_last_seen(&app_pubkey, (self.now_secs)());
                 Response::Connected { session_token: token }
             }
             Err(e) => Response::Error(e),

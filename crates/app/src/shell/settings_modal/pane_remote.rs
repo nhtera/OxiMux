@@ -203,6 +203,30 @@ fn network_disclosure(theme: Theme, typography: &Typography) -> AnyElement {
         .into_any_element()
 }
 
+/// How long ago a device last authenticated, in the coarsest useful unit.
+///
+/// "Never" is the notable case, not an empty state: a device that paired but has
+/// never come back is worth a second look — it is what a pairing the user does
+/// not recognize would look like. Rounded to whole units because the exact minute
+/// carries no decision value here; the question this answers is "is this device
+/// still in use?".
+fn last_seen_label(last_seen: Option<u64>) -> String {
+    let Some(seen) = last_seen else { return "never connected".into() };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // A clock that moved backwards (NTP correction, timezone-adjacent skew) would
+    // otherwise underflow into an absurd "584942417355 days ago".
+    let ago = now.saturating_sub(seen);
+    match ago {
+        0..=59 => "last seen just now".into(),
+        60..=3599 => format!("last seen {}m ago", ago / 60),
+        3600..=86_399 => format!("last seen {}h ago", ago / 3600),
+        _ => format!("last seen {}d ago", ago / 86_400),
+    }
+}
+
 /// The paired-devices list: one row per authorized device with a Revoke action.
 /// Revoking takes effect on a running host immediately (per-RPC recheck) and is
 /// persisted, so it survives a restart.
@@ -227,7 +251,7 @@ fn devices_section(
         );
 
     for (idx, device) in devices.into_iter().enumerate() {
-        let oximux_remote_host::DeviceInfo { pubkey, name, read_only } = device;
+        let oximux_remote_host::DeviceInfo { pubkey, name, read_only, last_seen } = device;
         // One pubkey per closure below; each needs its own copy.
         let revoke_key = pubkey;
         section = section.child(
@@ -251,7 +275,11 @@ fn devices_section(
                             div()
                                 .text_size(px(typography.t_sub_label))
                                 .text_color(theme.fg_subtle)
-                                .child(short_endpoint_id(&pubkey)),
+                                .child(format!(
+                                    "{} · {}",
+                                    short_endpoint_id(&pubkey),
+                                    last_seen_label(last_seen)
+                                )),
                         ),
                 )
                 .child(
@@ -398,7 +426,7 @@ fn on_toggle(
 
 #[cfg(test)]
 mod tests {
-    use super::{short_endpoint_id, status_text};
+    use super::{last_seen_label, short_endpoint_id, status_text};
 
     #[test]
     fn status_reflects_enablement_host_readiness_and_count() {
@@ -443,5 +471,37 @@ mod tests {
         assert!(short.starts_with("abcd"), "leads with the first bytes");
         assert!(short.ends_with("ef"), "ends with the last byte");
         assert!(short.contains('…'), "elides the middle");
+    }
+
+    /// A device that paired but never came back is the case worth surfacing — it
+    /// is what an unrecognized pairing looks like — so it gets its own wording
+    /// rather than a blank.
+    #[test]
+    fn a_device_that_never_connected_says_so() {
+        assert_eq!(last_seen_label(None), "never connected");
+    }
+
+    #[test]
+    fn elapsed_time_is_reported_in_the_coarsest_useful_unit() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(last_seen_label(Some(now)), "last seen just now");
+        assert_eq!(last_seen_label(Some(now - 120)), "last seen 2m ago");
+        assert_eq!(last_seen_label(Some(now - 3 * 3600)), "last seen 3h ago");
+        assert_eq!(last_seen_label(Some(now - 5 * 86_400)), "last seen 5d ago");
+    }
+
+    /// A timestamp in the future (a clock correction, or a row written by a
+    /// machine whose clock ran ahead) must not underflow into an absurd
+    /// "584942417355 days ago".
+    #[test]
+    fn a_future_timestamp_does_not_underflow() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert_eq!(last_seen_label(Some(now + 10_000)), "last seen just now");
     }
 }

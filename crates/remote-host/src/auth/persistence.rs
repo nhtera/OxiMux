@@ -26,6 +26,9 @@ pub struct StoredDevice {
     pub revoked: bool,
     /// The opt-down tier: reads served, state-changing RPCs refused.
     pub read_only: bool,
+    /// Unix seconds of the device's last successful authentication, if it has
+    /// ever connected. `None` for a device that paired but never came back.
+    pub last_seen: Option<u64>,
 }
 
 /// A durable sink for the authorized-device set. Methods are best-effort
@@ -40,6 +43,10 @@ pub trait DeviceStore: Send + Sync {
     fn set_revoked(&self, pubkey: &AppPubkey, revoked: bool);
     /// Persist a read-only-tier change.
     fn set_read_only(&self, pubkey: &AppPubkey, read_only: bool);
+    /// Record that a device just authenticated. Called once per connection, not
+    /// per RPC — the per-RPC recheck runs on the hot path and must not touch the
+    /// database.
+    fn touch_last_seen(&self, pubkey: &AppPubkey);
 }
 
 impl AuthStore {
@@ -61,6 +68,7 @@ impl AuthStore {
                         revoked: d.revoked,
                         scope,
                         read_only: d.read_only,
+                        last_seen: d.last_seen,
                     },
                 );
         }
@@ -86,6 +94,23 @@ impl AuthStore {
     pub(super) fn persist_read_only(&self, pubkey: &AppPubkey, read_only: bool) {
         if let Some(store) = &self.store {
             store.set_read_only(pubkey, read_only);
+        }
+    }
+
+    /// Record a successful authentication, in memory and durably.
+    ///
+    /// Called once per connection from the handshake, never from the per-RPC
+    /// recheck — that runs on every request and a database write there would put
+    /// disk I/O on the hot path.
+    pub fn touch_last_seen(&self, pubkey: &AppPubkey, now_secs: u64) {
+        {
+            let mut st = self.inner.lock().unwrap();
+            if let Some(d) = st.devices.get_mut(pubkey) {
+                d.last_seen = Some(now_secs);
+            }
+        }
+        if let Some(store) = &self.store {
+            store.touch_last_seen(pubkey);
         }
     }
 }
@@ -117,6 +142,7 @@ impl DeviceStore for StorageDeviceStore {
                         },
                         revoked: row.revoked,
                         read_only: row.read_only,
+                        last_seen: row.last_seen.map(|t| t as u64),
                     })
                 })
                 .collect(),
@@ -148,6 +174,12 @@ impl DeviceStore for StorageDeviceStore {
     fn set_read_only(&self, pubkey: &AppPubkey, read_only: bool) {
         if let Err(e) = self.repo.set_read_only(&pubkey_to_hex(pubkey), read_only) {
             tracing::warn!(error = %e, "persisting device read-only tier failed");
+        }
+    }
+
+    fn touch_last_seen(&self, pubkey: &AppPubkey) {
+        if let Err(e) = self.repo.touch_last_seen(&pubkey_to_hex(pubkey)) {
+            tracing::warn!(error = %e, "persisting device last-seen failed");
         }
     }
 }
@@ -199,6 +231,7 @@ mod tests {
         saved: Mutex<Vec<StoredDevice>>,
         revoked: Mutex<Vec<(AppPubkey, bool)>>,
         read_only: Mutex<Vec<(AppPubkey, bool)>>,
+        seen: Mutex<Vec<AppPubkey>>,
         seed: Vec<StoredDevice>,
     }
     impl DeviceStore for RecordingStore {
@@ -213,6 +246,9 @@ mod tests {
         }
         fn set_read_only(&self, pubkey: &AppPubkey, read_only: bool) {
             self.read_only.lock().unwrap().push((*pubkey, read_only));
+        }
+        fn touch_last_seen(&self, pubkey: &AppPubkey) {
+            self.seen.lock().unwrap().push(*pubkey);
         }
     }
 
@@ -241,6 +277,7 @@ mod tests {
                 sessions: Some(vec!["sess-1".into()]),
                 revoked: false,
                 read_only: false,
+                last_seen: None,
             }],
             ..Default::default()
         });

@@ -79,6 +79,8 @@ struct DeviceRecord {
     /// The opt-down tier: reads are served, every state-changing RPC is refused.
     /// Orthogonal to `scope` — a device can be session-scoped AND read-only.
     read_only: bool,
+    /// Unix seconds of the last successful authentication.
+    last_seen: Option<u64>,
 }
 
 /// A device that just completed pairing. Published so the desktop can confirm it
@@ -153,12 +155,6 @@ impl AuthStore {
         self.inner.lock().unwrap().pairing = Some(slot);
     }
 
-    /// Stop advertising any pairing secret. The enablement UI calls this once
-    /// pairing is done (or the Allow-connections toggle goes off) so a static
-    /// secret can't be used to `Register` indefinitely.
-    pub fn clear_pairing(&self) {
-        self.inner.lock().unwrap().pairing = None;
-    }
 }
 
 /// Mint a fresh 16-byte pairing secret from the OS CSPRNG. The enablement flow
