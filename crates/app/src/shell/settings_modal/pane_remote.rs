@@ -15,7 +15,7 @@ use oximux_remote_proto::PairingTicket;
 use oximux_settings::{Density, Theme, Typography};
 
 use super::SettingsModal;
-use super::controls::toggle_switch;
+use super::controls::{toggle_switch, value_chip};
 use super::layout::{SettingEntry, entries_card, entry};
 use crate::remote_control::RemoteControl;
 
@@ -97,7 +97,81 @@ pub(super) fn render(
                 .child(format!("Host {}", short_endpoint_id(&ticket.endpoint_id))),
         );
     }
+
+    // Paired devices + one-tap revoke. Listed whether or not remote is on, so a
+    // device can be cut off without first turning remote access back on.
+    let devices = cx.try_global::<RemoteControl>().map(|rc| rc.paired_devices()).unwrap_or_default();
+    if !devices.is_empty() {
+        col = col.child(devices_section(devices, theme, density, typography, cx));
+    }
     col.into_any_element()
+}
+
+/// The paired-devices list: one row per authorized device with a Revoke action.
+/// Revoking takes effect on a running host immediately (per-RPC recheck) and is
+/// persisted, so it survives a restart.
+fn devices_section(
+    devices: Vec<(oximux_remote_host::AppPubkey, String)>,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    let mut section = div()
+        .flex()
+        .flex_col()
+        .pt(px(16.0))
+        .child(
+            div()
+                .pb(px(6.0))
+                .text_size(px(typography.t_sub_label))
+                .font_weight(typography.w_medium)
+                .text_color(theme.fg_base)
+                .child("Paired devices"),
+        );
+
+    for (idx, (pubkey, name)) in devices.into_iter().enumerate() {
+        section = section.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(density.gap_inline))
+                .h(px(density.h_action_row))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(px(typography.t_body_sm))
+                                .text_color(theme.fg_base)
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(typography.t_sub_label))
+                                .text_color(theme.fg_subtle)
+                                .child(short_endpoint_id(&pubkey)),
+                        ),
+                )
+                .child(value_chip(
+                    ("remote-revoke", idx),
+                    "Revoke",
+                    theme,
+                    density,
+                    typography,
+                    move |_this, _window, cx| {
+                        if let Some(rc) = cx.try_global::<RemoteControl>() {
+                            rc.revoke_device(&pubkey);
+                        }
+                        cx.notify();
+                    },
+                    cx,
+                )),
+        );
+    }
+    section.into_any_element()
 }
 
 pub(super) fn entries(

@@ -18,7 +18,9 @@ use std::sync::{Arc, Mutex};
 use gpui::Global;
 use oximux_agents::session_registry::{SessionHandle, SessionRegistry};
 use oximux_agents::thread::AgentConnection;
-use oximux_remote_host::{AuthStore, DeviceStore, Dispatcher, PairingSlot, mint_pairing_secret};
+use oximux_remote_host::{
+    AppPubkey, AuthStore, DeviceStore, Dispatcher, PairingSlot, mint_pairing_secret,
+};
 use oximux_remote_iroh::HostHandle;
 use oximux_remote_proto::PairingTicket;
 
@@ -70,6 +72,11 @@ pub struct RemoteControl {
     /// fresh [`AuthStore`] from it, so devices paired in an earlier run (or before the
     /// last toggle-off) stay authorized. `None` = in-memory only (tests).
     devices: Option<Arc<dyn DeviceStore>>,
+    /// The live host's auth store while one is bound, so the paired-devices UI can
+    /// revoke against the *running* host (the dispatcher rechecks authorization on
+    /// every RPC, so a revoke lands mid-session). Cleared on stop — with no host, the
+    /// durable store is authoritative.
+    auth: Mutex<Option<Arc<AuthStore>>>,
 }
 
 impl Global for RemoteControl {}
@@ -89,6 +96,7 @@ impl RemoteControl {
             enabled: AtomicBool::new(false),
             host: Mutex::new(None),
             devices: None,
+            auth: Mutex::new(None),
         }
     }
 
@@ -126,8 +134,43 @@ impl RemoteControl {
             None => AuthStore::new(),
         });
         auth.set_pairing(PairingSlot::new(secret, None, false));
+        // Keep a handle so the paired-devices UI can revoke against the live host.
+        *self.auth.lock().unwrap() = Some(auth.clone());
         let dispatcher = Arc::new(Dispatcher::new(self.registry.clone(), auth));
         (dispatcher, secret)
+    }
+
+    /// Paired devices to list in the UI as `(pubkey, name)`, revoked ones excluded.
+    /// Reads the live auth store while a host is bound (so the list matches exactly
+    /// what that host will accept) and falls back to durable storage when remote is
+    /// off — you can review and revoke a device without turning remote access on.
+    pub fn paired_devices(&self) -> Vec<(AppPubkey, String)> {
+        if let Some(auth) = self.auth.lock().unwrap().as_ref() {
+            return auth.devices();
+        }
+        match &self.devices {
+            Some(store) => store
+                .load()
+                .into_iter()
+                .filter(|d| !d.revoked)
+                .map(|d| (d.pubkey, d.name))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Revoke a paired device. Against a live host this drops its tokens and fails
+    /// its next per-RPC authorization recheck (so an in-flight session dies), and
+    /// write-through keeps it revoked across restarts. With no host bound, the
+    /// revocation goes straight to durable storage.
+    pub fn revoke_device(&self, pubkey: &AppPubkey) {
+        if let Some(auth) = self.auth.lock().unwrap().as_ref() {
+            auth.revoke(pubkey);
+            return;
+        }
+        if let Some(store) = &self.devices {
+            store.set_revoked(pubkey, true);
+        }
     }
 
     /// Store the freshly-bound host, stopping and replacing any prior one.
@@ -139,6 +182,8 @@ impl RemoteControl {
     /// to shut down and closes the endpoint). Idempotent.
     pub fn stop_host(&self) {
         self.host.lock().unwrap().take();
+        // With no host, the durable store is authoritative for the devices UI.
+        self.auth.lock().unwrap().take();
     }
 
     /// The pairing ticket to encode as the QR, once the host has bound. `None` while
@@ -173,19 +218,30 @@ mod tests {
 
     /// Counts `load` calls so the *wiring* is covered, not just `remote-host`'s
     /// adapter: if `prepare_host` ever stops seeding from the durable store, a phone
-    /// paired in an earlier run would silently lose authorization.
+    /// paired in an earlier run would silently lose authorization. Also records
+    /// revocations so the no-host revoke path is checked.
     #[derive(Default)]
     struct RecordingStore {
         loads: AtomicUsize,
+        devices: Mutex<Vec<StoredDevice>>,
+        revoked: Mutex<Vec<AppPubkey>>,
     }
 
     impl DeviceStore for RecordingStore {
         fn load(&self) -> Vec<StoredDevice> {
             self.loads.fetch_add(1, Ordering::Relaxed);
-            Vec::new()
+            self.devices.lock().unwrap().clone()
         }
         fn save(&self, _device: &StoredDevice) {}
-        fn set_revoked(&self, _pubkey: &AppPubkey, _revoked: bool) {}
+        fn set_revoked(&self, pubkey: &AppPubkey, revoked: bool) {
+            if revoked {
+                self.revoked.lock().unwrap().push(*pubkey);
+            }
+        }
+    }
+
+    fn a_device(byte: u8, name: &str, revoked: bool) -> StoredDevice {
+        StoredDevice { pubkey: [byte; 32], name: name.into(), sessions: None, revoked }
     }
 
     /// Every bind seeds its auth store from durable device persistence.
@@ -197,6 +253,35 @@ mod tests {
         let _ = rc.prepare_host();
 
         assert_eq!(store.loads.load(Ordering::Relaxed), 1, "seeded from the durable devices");
+    }
+
+    /// With no host bound, the devices list still reads durable storage (so a device
+    /// can be reviewed/cut off without turning remote access on) and hides revoked ones.
+    #[test]
+    fn paired_devices_reads_durable_storage_when_no_host_is_bound() {
+        let store = Arc::new(RecordingStore::default());
+        store.devices.lock().unwrap().extend([
+            a_device(0x11, "phone", false),
+            a_device(0x22, "old-tablet", true),
+        ]);
+        let rc = RemoteControl::with_devices(store);
+
+        let listed = rc.paired_devices();
+
+        assert_eq!(listed.len(), 1, "revoked devices are not offered");
+        assert_eq!(listed[0].1, "phone");
+    }
+
+    /// Revoking with no host bound still persists, so it survives into the next bind.
+    #[test]
+    fn revoke_without_a_host_writes_through_to_storage() {
+        let store = Arc::new(RecordingStore::default());
+        store.devices.lock().unwrap().push(a_device(0x11, "phone", false));
+        let rc = RemoteControl::with_devices(store.clone());
+
+        rc.revoke_device(&[0x11; 32]);
+
+        assert_eq!(store.revoked.lock().unwrap().as_slice(), &[[0x11; 32]], "revocation persisted");
     }
 
     /// Re-enabling rotates the pairing secret, so a QR captured earlier stops working.
