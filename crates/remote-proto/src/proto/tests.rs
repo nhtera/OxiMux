@@ -12,9 +12,11 @@ fn value_bearing_event() -> ThreadEvent {
     }
 }
 
+/// A deliberate tripwire: the version is only allowed to move together with a
+/// documented wire change, so an accidental edit fails here.
 #[test]
-fn protocol_version_is_one() {
-    assert_eq!(PROTOCOL_VERSION, 1);
+fn protocol_version_is_pinned() {
+    assert_eq!(PROTOCOL_VERSION, 2, "v2 = the appended git surface");
 }
 
 /// The evidence behind the JSON-in-envelope design: postcard is

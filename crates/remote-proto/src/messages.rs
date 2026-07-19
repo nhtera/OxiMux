@@ -209,3 +209,57 @@ pub struct GitStatusWire {
     pub behind: u32,
     pub files: Vec<GitFileWire>,
 }
+
+/// How a path changed, mirroring the desktop's `DiffStatus`. Rename/copy origins
+/// cross as strings (the wire crate stays `PathBuf`-free).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiffStatusWire {
+    Added,
+    Modified,
+    Deleted,
+    Renamed { from: String, similarity: u8 },
+    Copied { from: String, similarity: u8 },
+    ModeChanged { old_mode: u32, new_mode: u32 },
+    Binary,
+}
+
+/// One line inside a hunk body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiffLineKindWire {
+    Context,
+    Added,
+    Removed,
+    /// The `\ No newline at end of file` marker, kept inline next to the line it
+    /// qualifies so a renderer can show the hint where it belongs.
+    NoNewlineHint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffLineWire {
+    pub kind: DiffLineKindWire,
+    /// Body text minus the leading `+`/`-`/space marker.
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiffHunkWire {
+    pub old_start: u32,
+    pub old_lines: u32,
+    pub new_start: u32,
+    pub new_lines: u32,
+    /// Free text after the second `@@` (function name etc.), verbatim.
+    pub header_suffix: String,
+    pub lines: Vec<DiffLineWire>,
+}
+
+/// One file's diff — the [`Response::GitDiff`](crate::proto::Response::GitDiff)
+/// payload is a list of these (a rename can yield more than one).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileDiffWire {
+    pub path: String,
+    pub status: DiffStatusWire,
+    pub hunks: Vec<DiffHunkWire>,
+    /// The rendered line count exceeded the desktop's large-diff threshold, so a
+    /// client may want to collapse it. Hunks are still complete — never truncated.
+    pub large: bool,
+}

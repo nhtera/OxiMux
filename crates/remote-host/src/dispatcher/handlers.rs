@@ -4,8 +4,9 @@
 
 use oximux_agents::session_registry::SessionHandle;
 use oximux_remote_proto::messages::{
-    GitFileWire, GitStatusWire, IndexStatusWire, ResolvePermissionReq, SendPromptReq,
-    SessionInfoWire, SessionStatusWire, SessionSummary, WorktreeStatusWire,
+    DiffHunkWire, DiffLineKindWire, DiffLineWire, DiffStatusWire, FileDiffWire, GitFileWire,
+    GitStatusWire, IndexStatusWire, ResolvePermissionReq, SendPromptReq, SessionInfoWire,
+    SessionStatusWire, SessionSummary, WorktreeStatusWire,
 };
 use oximux_remote_proto::proto::{Response, RpcError};
 use oximux_remote_proto::HostEvent;
@@ -174,6 +175,128 @@ impl Dispatcher {
                 Response::Error(RpcError::Internal("git status failed".into()))
             }
         }
+    }
+
+    /// Diff one path in the session's repository.
+    ///
+    /// The path arrives from the client, so it is **contained against the repo
+    /// workdir here, at the RPC boundary** — not left to git. Only the tracked
+    /// paths shell out; `diff_for_untracked` reads the file directly, so nothing
+    /// downstream would catch a traversal on that branch.
+    pub(super) async fn git_diff(
+        &self,
+        pubkey: &AppPubkey,
+        session_id: &str,
+        path: &str,
+        staged: bool,
+        untracked: bool,
+    ) -> Response {
+        if !self.auth.is_allowed_for(pubkey, session_id) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(handle) = self.registry.get(session_id) else {
+            return Response::Error(RpcError::UnknownSession);
+        };
+        let Some(cwd) = handle.meta_snapshot().cwd else {
+            return Response::Error(RpcError::BadRequest(
+                "session has no working directory".into(),
+            ));
+        };
+        let repo = match oximux_git::repository::Repository::open(&cwd).await {
+            Ok(repo) => repo,
+            Err(e) => {
+                tracing::warn!(error = %e, session = %session_id, "open repository failed");
+                return Response::Error(RpcError::Internal("git unavailable".into()));
+            }
+        };
+
+        // Containment gate. The rejection message deliberately says nothing about
+        // what does or does not exist on disk — it must not become a probe.
+        let contained =
+            match oximux_git::path_guard::contained_path(repo.workdir(), std::path::Path::new(path))
+            {
+                Ok(p) => p,
+                Err(_) => {
+                    tracing::warn!(session = %session_id, "rejected out-of-repository diff path");
+                    return Response::Error(RpcError::BadRequest("path is outside the repository".into()));
+                }
+            };
+
+        let diffs = if untracked {
+            repo.diff_for_untracked(&contained).await
+        } else {
+            repo.diff_for_path(&contained, staged).await
+        };
+        // Paths go back out repository-relative. The untracked codepath echoes the
+        // absolute path it was handed, and shipping that would disclose the host's
+        // directory layout (home dir, usernames) to the client — and break the
+        // contract that a listed path can be echoed straight back on a diff request.
+        let root = repo
+            .workdir()
+            .canonicalize()
+            .unwrap_or_else(|_| repo.workdir().to_path_buf());
+        match diffs {
+            Ok(files) => Response::GitDiff(
+                files.into_iter().map(|d| to_file_diff_wire(d, &root)).collect(),
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, session = %session_id, "git diff failed");
+                Response::Error(RpcError::Internal("git diff failed".into()))
+            }
+        }
+    }
+}
+
+/// Map one file's diff onto the wire shape. Paths cross as repository-relative
+/// strings (never host-absolute); rename/copy origins come along so a client can
+/// render "was X".
+fn to_file_diff_wire(d: oximux_core::FileDiff, root: &std::path::Path) -> FileDiffWire {
+    use oximux_core::DiffStatus as S;
+    let status = match d.status {
+        S::Added => DiffStatusWire::Added,
+        S::Modified => DiffStatusWire::Modified,
+        S::Deleted => DiffStatusWire::Deleted,
+        S::Renamed { from, similarity } => {
+            DiffStatusWire::Renamed { from: from.to_string_lossy().into_owned(), similarity }
+        }
+        S::Copied { from, similarity } => {
+            DiffStatusWire::Copied { from: from.to_string_lossy().into_owned(), similarity }
+        }
+        S::ModeChanged { old_mode, new_mode } => {
+            DiffStatusWire::ModeChanged { old_mode, new_mode }
+        }
+        S::Binary => DiffStatusWire::Binary,
+    };
+    FileDiffWire {
+        path: d.path.strip_prefix(root).unwrap_or(&d.path).to_string_lossy().into_owned(),
+        status,
+        large: d.large,
+        hunks: d
+            .hunks
+            .into_iter()
+            .map(|h| DiffHunkWire {
+                old_start: h.old_start,
+                old_lines: h.old_lines,
+                new_start: h.new_start,
+                new_lines: h.new_lines,
+                header_suffix: h.header_suffix,
+                lines: h
+                    .lines
+                    .into_iter()
+                    .map(|l| DiffLineWire {
+                        kind: match l.kind {
+                            oximux_core::DiffLineKind::Context => DiffLineKindWire::Context,
+                            oximux_core::DiffLineKind::Added => DiffLineKindWire::Added,
+                            oximux_core::DiffLineKind::Removed => DiffLineKindWire::Removed,
+                            oximux_core::DiffLineKind::NoNewlineHint => {
+                                DiffLineKindWire::NoNewlineHint
+                            }
+                        },
+                        content: l.content,
+                    })
+                    .collect(),
+            })
+            .collect(),
     }
 }
 

@@ -47,3 +47,7 @@ tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 oximux-remote-proto = { workspace = true, features = ["testing"] }
+# The git-RPC test drives the real handlers against a real repository, so it
+# needs a runtime (git shells out) and a scratch directory.
+tokio = { workspace = true }
+tempfile = "3"

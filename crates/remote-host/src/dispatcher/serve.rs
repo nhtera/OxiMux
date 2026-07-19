@@ -132,6 +132,13 @@ impl Dispatcher {
             let response = self.git_status(&pubkey, &session_id).await;
             return self.send(transport, response).await;
         }
+        if let Request::GitDiff { session_id, path, staged, untracked } = req {
+            let Some(pubkey) = authorized_pubkey(state, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.git_diff(&pubkey, &session_id, &path, staged, untracked).await;
+            return self.send(transport, response).await;
+        }
         let response = self.dispatch(state, req);
         self.send(transport, response).await
     }

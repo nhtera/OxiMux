@@ -32,7 +32,8 @@ pub mod testing;
 pub mod transport;
 
 pub use messages::{
-    AuthProveReq, ConnectReq, GitFileWire, GitStatusWire, HostEvent, IndexStatusWire, RegisterReq,
+    AuthProveReq, ConnectReq, DiffHunkWire, DiffLineKindWire, DiffLineWire, DiffStatusWire,
+    FileDiffWire, GitFileWire, GitStatusWire, HostEvent, IndexStatusWire, RegisterReq,
     ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionStatusWire, SessionSummary,
     WorktreeStatusWire,
 };

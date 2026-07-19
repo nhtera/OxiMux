@@ -19,8 +19,15 @@ pub use crate::messages::*;
 
 /// Bumped whenever the wire schema changes. v1: initial remote-control surface
 /// (handshake + session list/info + prompt/resolve/steer/cancel + event
-/// subscription & gap-fill).
-pub const PROTOCOL_VERSION: u32 = 1;
+/// subscription & gap-fill). v2: appended the git surface (`GitStatus`,
+/// `GitDiff`).
+///
+/// Appending variants is *not* a breaking change — postcard ordinals of the
+/// existing ones are untouched, and an older peer simply never sends or receives
+/// the new calls. So this bumps while the transport ALPN
+/// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
+/// changes only, and bumping it would refuse otherwise-compatible peers.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// A local codec failure (encode/decode), never sent on the wire. Protocol-level
 /// failures the host reports to a client are [`RpcError`], carried in
@@ -88,6 +95,11 @@ pub enum Request {
     /// session so git access inherits the device's existing session ACL — a
     /// session-scoped device cannot browse another project's repository.
     GitStatus { session_id: String },
+    /// Diff for one path in the session's repository. `path` is echoed back from
+    /// a [`Response::GitStatus`] listing and is **re-contained host-side** — a
+    /// client cannot reach outside the repository with it. `untracked` selects the
+    /// read-off-disk codepath git itself won't diff; `staged` picks index-vs-HEAD.
+    GitDiff { session_id: String, path: String, staged: bool, untracked: bool },
 }
 
 /// Host → client.
@@ -132,6 +144,8 @@ pub enum Response {
     /// Reply to [`Request::GitStatus`]. Appended last to keep the enum's ordinal
     /// encoding append-only.
     GitStatus(GitStatusWire),
+    /// Reply to [`Request::GitDiff`] — one entry per file the diff covers.
+    GitDiff(Vec<FileDiffWire>),
 }
 
 impl Request {
