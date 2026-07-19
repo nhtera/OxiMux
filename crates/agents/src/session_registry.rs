@@ -71,8 +71,12 @@ pub struct SessionMeta {
 /// the view and the network layer share one handle.
 pub struct SessionHandle {
     /// Shared connection — the view borrows the same `Arc`, so commands issued
-    /// remotely and locally hit one transport.
-    conn: Arc<dyn AgentConnection>,
+    /// remotely and locally hit one transport. Swappable ([`swap_connection`]) so a
+    /// desktop respawn can re-point the session at its new backend **without**
+    /// re-registering it, which would reset `seq` and strand every subscriber.
+    ///
+    /// [`swap_connection`]: SessionHandle::swap_connection
+    conn: Mutex<Arc<dyn AgentConnection>>,
     /// Next `seq` to assign; `fetch_add` makes ingestion lock-free on the counter.
     next_seq: AtomicU64,
     /// Bounded replay store for gap-fill. Oldest entries drop past `backlog_cap`.
@@ -158,7 +162,7 @@ impl SessionHandle {
         if !newly_decided {
             return Ok(false);
         }
-        if let Err(err) = self.conn.resolve_permission(request_id, decision) {
+        if let Err(err) = self.conn().resolve_permission(request_id, decision) {
             // Undo the gate so the request isn't permanently locked as "decided"
             // by a transient transport failure.
             self.decided.lock().unwrap().remove(request_id);
@@ -177,18 +181,36 @@ impl SessionHandle {
     /// optimistic-echo correlation the view/phone use to dedup the arriving stream
     /// copy against their local echo (threaded through once the surfaces echo).
     pub fn send_prompt(&self, text: &str, images: &[ChatImage]) -> Result<()> {
-        self.conn.send_user_message_with_images(text, images)
+        self.conn().send_user_message_with_images(text, images)
     }
 
     /// Redirect the agent mid-turn (backends that support it); no-op default
     /// otherwise. Same transport as the desktop composer's steer.
     pub fn steer(&self, text: &str) -> Result<()> {
-        self.conn.steer(text)
+        self.conn().steer(text)
     }
 
     /// Interrupt the current turn.
     pub fn cancel(&self) -> Result<()> {
-        self.conn.cancel()
+        self.conn().cancel()
+    }
+
+    /// The current connection, cloned out so no lock is held across a backend call
+    /// (those can block, and a swap must never wait behind one).
+    fn conn(&self) -> Arc<dyn AgentConnection> {
+        self.conn.lock().unwrap().clone()
+    }
+
+    /// Re-point this session at a new backend, keeping its `seq`, backlog, live
+    /// subscribers, and permission gates intact.
+    ///
+    /// The desktop respawns a session on a model/effort/permission change or
+    /// `/clear`. Re-registering for that would mint a fresh handle whose `seq`
+    /// restarts at 1 — and a subscriber sitting at a higher cursor treats every
+    /// such frame as an already-seen duplicate and silently drops it, with no gap
+    /// to trigger a resync. Swapping keeps the stream monotonic instead.
+    pub fn swap_connection(&self, conn: Arc<dyn AgentConnection>) {
+        *self.conn.lock().unwrap() = conn;
     }
 
     /// A `watch` receiver over the coarse status snapshot for list views.
@@ -271,10 +293,19 @@ impl SessionRegistry {
         backlog_cap: usize,
         broadcast_cap: usize,
     ) -> Arc<SessionHandle> {
+        // Re-registering a live id is a respawn, not a new session: swap the
+        // backend in place so `seq`, the backlog, and live subscribers survive.
+        // Minting a fresh handle here would reset `seq` to 1 and strand every
+        // subscriber (their cursor is already higher, so the frames read as
+        // duplicates and are dropped without any gap to resync from).
+        if let Some(existing) = self.sessions.lock().unwrap().get(&id) {
+            existing.swap_connection(conn);
+            return existing.clone();
+        }
         let (live, _) = broadcast::channel(broadcast_cap.max(1));
         let (status_tx, _) = watch::channel(SessionStatus::default());
         let handle = Arc::new(SessionHandle {
-            conn,
+            conn: Mutex::new(conn),
             next_seq: AtomicU64::new(1),
             backlog: Mutex::new(VecDeque::new()),
             backlog_cap: backlog_cap.max(1),
@@ -583,6 +614,45 @@ mod tests {
         let seqs: Vec<Seq> = reg.events_since("s1", 0).iter().map(|(s, _)| *s).collect();
         let expected: Vec<Seq> = (1..=total).collect();
         assert_eq!(seqs, expected, "seqs are 1..=N, ascending, gapless, no dupes");
+    }
+
+    /// A respawn re-registers the same id. `seq` must keep climbing and live
+    /// subscribers must survive — otherwise a phone sitting at a higher cursor
+    /// silently discards everything after the respawn as a duplicate, with no gap
+    /// to trigger a resync.
+    #[test]
+    fn re_registering_a_live_id_swaps_the_backend_and_keeps_the_stream() {
+        let reg = SessionRegistry::new();
+        let first = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        first.ingest(ThreadEvent::AssistantText("before".into()));
+        first.ingest(ThreadEvent::AssistantText("respawn imminent".into()));
+        assert_eq!(first.status_snapshot().last_seq, 2);
+
+        let mut live = reg.subscribe("s1").expect("subscribed before the respawn");
+
+        // The respawn: same id, brand-new backend.
+        let replacement = Arc::new(RecordingConn::default());
+        let after = reg.register("s1".into(), replacement.clone());
+
+        assert_eq!(after.status_snapshot().last_seq, 2, "seq is not reset by a respawn");
+        after.ingest(ThreadEvent::AssistantText("after".into()));
+        assert_eq!(after.status_snapshot().last_seq, 3, "seq keeps climbing across the respawn");
+
+        // The subscriber was created BEFORE the respawn and still receives after
+        // it. (`subscribe` is the live edge only — it never replays, so the first
+        // frame here is the post-respawn one, at a seq above the pre-respawn
+        // cursor. That ordering is the whole point: a client would have discarded
+        // it as a duplicate had the respawn reset seq to 1.)
+        let (seq, ev) = live.try_recv().expect("subscription survived the respawn");
+        assert_eq!(seq, 3, "the post-respawn event continues the sequence");
+        assert_eq!(ev, ThreadEvent::AssistantText("after".into()));
+
+        // The backlog spans the respawn, so a reconnecting client can resume.
+        assert_eq!(reg.events_since("s1", 0).len(), 3, "backlog is continuous");
+
+        // Commands now reach the NEW backend.
+        after.send_prompt("go", &[]).expect("send");
+        assert_eq!(replacement.prompts.lock().unwrap().as_slice(), ["go"], "swapped backend used");
     }
 
     /// Meta starts empty, round-trips, and reports whether it actually changed —

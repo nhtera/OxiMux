@@ -3777,11 +3777,21 @@ impl AgentChatView {
     /// — but only while remote control is enabled, so a disabled desktop registers
     /// nothing and clones no events. Called on connect and on respawn.
     fn bind_remote(&mut self, cx: &mut Context<Self>) {
-        self.unbind_remote();
-        if let Some(conn) = self.connection.clone()
-            && let Some(rc) = cx.try_global::<RemoteControl>()
-        {
-            self.remote = rc.bind(&self.remote_session_id, conn);
+        // Deliberately does NOT unregister first. On a respawn this runs again for
+        // the same session id, and `register` swaps the backend in place — keeping
+        // `seq` monotonic so a subscribed phone keeps receiving. Unregistering here
+        // would mint a fresh handle at seq 1, which every subscriber would silently
+        // discard as already-seen. Teardown paths still call `unbind_remote`.
+        let bound = self
+            .connection
+            .clone()
+            .and_then(|conn| {
+                cx.try_global::<RemoteControl>().and_then(|rc| rc.bind(&self.remote_session_id, conn))
+            });
+        match bound {
+            Some(binding) => self.remote = Some(binding),
+            // No connection, or remote is disabled — drop any prior binding.
+            None => self.unbind_remote(),
         }
     }
 
@@ -7077,6 +7087,20 @@ mod tests {
         let (seq, ev) = rx.try_recv().expect("event teed to the remote subscriber");
         assert_eq!(seq, 1, "first teed event gets seq 1");
         assert_eq!(ev, ThreadEvent::AssistantText("hi".into()));
+
+        // A respawn re-binds the SAME id. `seq` must keep climbing and the
+        // subscriber must survive — a reset to 1 would look like duplicates to a
+        // phone already past that cursor, and it would silently show nothing more.
+        window
+            .update(cx, |view, _window, cx| {
+                view.connection = Some(Arc::new(StubConnection::default()));
+                view.bind_remote(cx);
+                view.apply_batch(vec![ThreadEvent::AssistantText("after".into())], cx);
+            })
+            .expect("window update");
+        let (seq, ev) = rx.try_recv().expect("the subscription survived the respawn");
+        assert_eq!(seq, 2, "seq continues across a respawn instead of resetting");
+        assert_eq!(ev, ThreadEvent::AssistantText("after".into()));
 
         // Disconnect evicts the session from the registry.
         let id = window
