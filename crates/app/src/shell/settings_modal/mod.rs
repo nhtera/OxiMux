@@ -18,6 +18,7 @@ mod pane_agents;
 mod pane_agents_launch;
 mod pane_keybindings;
 mod pane_notifications;
+mod pane_remote;
 mod pane_terminal;
 mod pane_voice;
 mod view;
