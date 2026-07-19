@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use oximux_core::{AgentSession, AgentStatus, Project, Workspace};
 use oximux_storage::{
     AgentSessionRepo, Db, DiffReviewNoteRepo, PaneBufferRepo, PaneRelayIdRepo, PaneSessionRepo,
-    ProjectRepo, SettingsRepo, StorageError, WorkspaceRepo, WorktreeSettingsRepo,
+    ProjectRepo, RemoteDeviceRepo, SettingsRepo, StorageError, WorkspaceRepo, WorktreeSettingsRepo,
 };
 
 /// Recent-projects fetch limit. The project picker (step 5) paginates if a
@@ -80,6 +80,13 @@ impl AppState {
     /// Internal callers use the field directly.
     pub fn settings_repo(&self) -> &SettingsRepo {
         &self.settings_repo
+    }
+
+    /// The paired-remote-device repo, built on demand for the boot path that
+    /// backs remote control's auth store with durable persistence. Not a stored
+    /// field: it is read once at startup, and a repo is just a `Db` handle.
+    pub fn remote_device_repo(&self) -> RemoteDeviceRepo {
+        RemoteDeviceRepo::new(self.db.clone())
     }
 }
 

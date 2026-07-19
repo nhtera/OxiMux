@@ -281,10 +281,14 @@ fn main() {
         cx.set_global(oximux_app::catalog_cache::CatalogCache::load_from(
             app_state.settings_repo(),
         ));
-        // Remote-control state (the session registry the future in-app iroh host
-        // serves). Installed disabled: until remote control is turned on, no live
-        // agent session is fanned into it, so the desktop pays zero per-event cost.
-        cx.set_global(oximux_app::remote_control::RemoteControl::new());
+        // Remote-control state (the session registry the in-app iroh host serves).
+        // Installed disabled: until remote control is turned on, no live agent
+        // session is fanned into it, so the desktop pays zero per-event cost — and
+        // no endpoint is bound. Backed by the durable paired-device store so a phone
+        // paired in an earlier run stays authorized across restarts.
+        cx.set_global(oximux_app::remote_control::RemoteControl::with_devices(std::sync::Arc::new(
+            oximux_remote_host::StorageDeviceStore::new(app_state.remote_device_repo()),
+        )));
         // Install the full keymap (registry defaults ⊕ keybindings.toml
         // overrides) — this covers the menu-action chords too, and MUST run
         // before `set_menus`: GPUI reads the keymap when it builds the menu

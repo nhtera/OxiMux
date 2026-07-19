@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use gpui::Global;
 use oximux_agents::session_registry::{SessionHandle, SessionRegistry};
 use oximux_agents::thread::AgentConnection;
-use oximux_remote_host::{AuthStore, Dispatcher, PairingSlot, mint_pairing_secret};
+use oximux_remote_host::{AuthStore, DeviceStore, Dispatcher, PairingSlot, mint_pairing_secret};
 use oximux_remote_iroh::HostHandle;
 use oximux_remote_proto::PairingTicket;
 
@@ -66,6 +66,10 @@ pub struct RemoteControl {
     /// behind the shared `&Global` so the toggle starts/stops it without `&mut`
     /// global access. Dropping the handle stops the accept loop + closes the endpoint.
     host: Mutex<Option<HostHandle>>,
+    /// Durable paired-device persistence, installed at boot. Every host bind seeds a
+    /// fresh [`AuthStore`] from it, so devices paired in an earlier run (or before the
+    /// last toggle-off) stay authorized. `None` = in-memory only (tests).
+    devices: Option<Arc<dyn DeviceStore>>,
 }
 
 impl Global for RemoteControl {}
@@ -84,7 +88,15 @@ impl RemoteControl {
             registry: Arc::new(SessionRegistry::new()),
             enabled: AtomicBool::new(false),
             host: Mutex::new(None),
+            devices: None,
         }
+    }
+
+    /// The boot constructor: same as [`new`](Self::new) but backed by durable
+    /// paired-device storage, so a phone paired in an earlier run stays authorized
+    /// across restarts and toggle cycles.
+    pub fn with_devices(devices: Arc<dyn DeviceStore>) -> Self {
+        Self { devices: Some(devices), ..Self::new() }
     }
 
     /// The shared session registry (the host serves from this same instance).
@@ -104,11 +116,15 @@ impl RemoteControl {
     /// The secret seeds both the auth store's advertised pairing slot and the
     /// `PairingTicket` that [`start_host`](oximux_remote_iroh::start_host) mints, so
     /// the QR and the host agree. A fresh [`AuthStore`] per bind means toggling remote
-    /// off then on rotates the secret (the old QR stops working); durable
-    /// paired-device persistence is a later slice.
+    /// off then on rotates the **pairing secret** (the old QR stops working) — but the
+    /// store it is seeded from is durable, so already-paired devices stay authorized
+    /// and reconnect without re-scanning.
     pub fn prepare_host(&self) -> (Arc<Dispatcher>, [u8; 16]) {
         let secret = mint_pairing_secret();
-        let auth = Arc::new(AuthStore::new());
+        let auth = Arc::new(match &self.devices {
+            Some(devices) => AuthStore::with_store(devices.clone()),
+            None => AuthStore::new(),
+        });
         auth.set_pairing(PairingSlot::new(secret, None, false));
         let dispatcher = Arc::new(Dispatcher::new(self.registry.clone(), auth));
         (dispatcher, secret)
@@ -144,11 +160,54 @@ impl RemoteControl {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
     use oximux_agents::thread::{StubConnection, ThreadEvent};
+    use oximux_remote_host::{AppPubkey, StoredDevice};
+
+    use super::*;
 
     fn a_conn() -> Arc<dyn AgentConnection> {
         Arc::new(StubConnection::default())
+    }
+
+    /// Counts `load` calls so the *wiring* is covered, not just `remote-host`'s
+    /// adapter: if `prepare_host` ever stops seeding from the durable store, a phone
+    /// paired in an earlier run would silently lose authorization.
+    #[derive(Default)]
+    struct RecordingStore {
+        loads: AtomicUsize,
+    }
+
+    impl DeviceStore for RecordingStore {
+        fn load(&self) -> Vec<StoredDevice> {
+            self.loads.fetch_add(1, Ordering::Relaxed);
+            Vec::new()
+        }
+        fn save(&self, _device: &StoredDevice) {}
+        fn set_revoked(&self, _pubkey: &AppPubkey, _revoked: bool) {}
+    }
+
+    /// Every bind seeds its auth store from durable device persistence.
+    #[test]
+    fn prepare_host_seeds_auth_from_the_durable_device_store() {
+        let store = Arc::new(RecordingStore::default());
+        let rc = RemoteControl::with_devices(store.clone());
+
+        let _ = rc.prepare_host();
+
+        assert_eq!(store.loads.load(Ordering::Relaxed), 1, "seeded from the durable devices");
+    }
+
+    /// Re-enabling rotates the pairing secret, so a QR captured earlier stops working.
+    #[test]
+    fn each_prepare_mints_a_fresh_pairing_secret() {
+        let rc = RemoteControl::new();
+
+        let (_, first) = rc.prepare_host();
+        let (_, second) = rc.prepare_host();
+
+        assert_ne!(first, second, "a stale pairing code must not stay valid across enables");
     }
 
     /// Disabled is the default and binds nothing — the per-event path stays free.
