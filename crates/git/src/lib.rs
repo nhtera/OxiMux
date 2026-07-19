@@ -21,6 +21,7 @@ pub mod log;
 pub mod merge;
 pub mod numstat;
 pub mod operation;
+pub mod path_guard;
 pub mod poller;
 pub mod pr_context;
 pub mod process;

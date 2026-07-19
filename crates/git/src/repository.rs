@@ -432,11 +432,11 @@ impl Repository {
             DiffHunk, DiffLine, DiffLineKind, DiffStatus, LARGE_DIFF_LINE_THRESHOLD,
         };
 
-        let abs = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.workdir.join(path)
-        };
+        // This is the one diff path that reads the file directly instead of
+        // shelling out to git, so nothing else would catch a traversal. Contain it
+        // here as well as at any RPC boundary — a remote caller must not be able to
+        // turn "show me an untracked file" into "read any file on this machine".
+        let abs = crate::path_guard::contained_path(&self.workdir, path)?;
         let bytes = match tokio::fs::read(&abs).await {
             Ok(b) => b,
             Err(e) => return Err(GitError::parse(format!("read {}: {e}", abs.display()))),
