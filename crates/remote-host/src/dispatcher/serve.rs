@@ -11,7 +11,7 @@ use oximux_remote_proto::Transport;
 use oximux_remote_proto::proto::{Request, Response, RpcError};
 
 use super::stream::LiveFrame;
-use super::{ConnAuthn, Dispatcher, authorized_pubkey};
+use super::{ConnState, Dispatcher, authorized_pubkey};
 
 /// What this turn of the serve loop picked to process. `Live` is boxed — a
 /// [`LiveFrame`] is far larger than a request frame. A `Request(None)` means the
@@ -27,7 +27,7 @@ impl Dispatcher {
     /// yields exactly one response frame; a live subscription pushes many
     /// [`Response::Event`] frames unsolicited between requests.
     pub async fn serve(&self, transport: &dyn Transport) {
-        let mut state = ConnAuthn::Unauth;
+        let mut state = ConnState::default();
         // Active live subscriptions, merged so any one that produces an event wakes
         // the loop. Empty until the first accepted `Subscribe`.
         let mut streams: SelectAll<BoxStream<'static, LiveFrame>> = SelectAll::new();
@@ -75,7 +75,7 @@ impl Dispatcher {
                 Picked::Live(Some(frame)) => {
                     // Re-derive the still-authorized pubkey per frame; a revoked
                     // connection forwards nothing.
-                    match authorized_pubkey(&state, &self.auth) {
+                    match authorized_pubkey(&state.authn, &self.auth) {
                         Some(pubkey) => {
                             if !self.forward_live(&pubkey, &mut cursors, transport, *frame).await {
                                 break;
@@ -95,7 +95,7 @@ impl Dispatcher {
     /// Returns whether the transport is still writable.
     async fn on_request(
         &self,
-        state: &mut ConnAuthn,
+        state: &mut ConnState,
         streams: &mut SelectAll<BoxStream<'static, LiveFrame>>,
         cursors: &mut HashMap<SessionId, Seq>,
         transport: &dyn Transport,
@@ -111,7 +111,7 @@ impl Dispatcher {
         // `Subscribe` is the one request that also opens a live stream, so it is
         // handled in the serve loop rather than the sync `dispatch`.
         if let Request::Subscribe { session_id, after_seq } = req {
-            let Some(pubkey) = authorized_pubkey(state, &self.auth) else {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
             let (response, stream) =
@@ -126,14 +126,14 @@ impl Dispatcher {
         // `dispatch`. Authorization is identical: an authenticated pubkey, then the
         // handler's own per-session ACL recheck.
         if let Request::GitStatus { session_id } = req {
-            let Some(pubkey) = authorized_pubkey(state, &self.auth) else {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
             let response = self.git_status(&pubkey, &session_id).await;
             return self.send(transport, response).await;
         }
         if let Request::GitDiff { session_id, path, staged, untracked } = req {
-            let Some(pubkey) = authorized_pubkey(state, &self.auth) else {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
             let response = self.git_diff(&pubkey, &session_id, &path, staged, untracked).await;

@@ -22,4 +22,11 @@ pub enum SessionError {
     /// desync, so the field names which reply was expected.
     #[error("unexpected response (expected {expected})")]
     Unexpected { expected: &'static str },
+    /// The two ends cannot understand each other. Distinct from
+    /// [`Self::Rpc`]`(RpcError::IncompatibleVersion)`, which is the host
+    /// refusing *us*; this is the client refusing the *host*. Both numbers are
+    /// carried so the UI can say which side needs updating rather than showing a
+    /// generic connection failure — the actionable difference for the user.
+    #[error("incompatible protocol (this build speaks {ours}, host speaks {theirs})")]
+    IncompatibleVersion { ours: u32, theirs: u32 },
 }

@@ -22,9 +22,30 @@ mod stream;
 use std::sync::Arc;
 
 use oximux_agents::session_registry::SessionRegistry;
-use oximux_remote_proto::proto::{Request, Response, RpcError};
+use oximux_remote_proto::proto::{
+    ASSUMED_VERSION_WHEN_SILENT, MIN_COMPATIBLE_VERSION, PROTOCOL_VERSION, Request, Response,
+    RpcError, is_compatible,
+};
 
 use crate::auth::{AppPubkey, AuthStore};
+
+/// One connection's mutable state: what it has proven, and which protocol
+/// version it speaks.
+///
+/// The version lives here rather than being checked once and discarded because
+/// the gate must also catch a peer that never sent `Hello` at all — silence is
+/// itself a version claim (see [`ASSUMED_VERSION_WHEN_SILENT`]), and it can only
+/// be acted on when a later request arrives.
+struct ConnState {
+    authn: ConnAuthn,
+    peer_version: u32,
+}
+
+impl Default for ConnState {
+    fn default() -> Self {
+        Self { authn: ConnAuthn::Unauth, peer_version: ASSUMED_VERSION_WHEN_SILENT }
+    }
+}
 
 /// One connection's authentication state.
 enum ConnAuthn {
@@ -58,14 +79,24 @@ impl Dispatcher {
     /// Route one non-`Subscribe` request against the current connection state.
     /// Synchronous — the registry commands are non-blocking; only the transport
     /// I/O in [`serve`] is async.
-    fn dispatch(&self, state: &mut ConnAuthn, req: Request) -> Response {
+    fn dispatch(&self, state: &mut ConnState, req: Request) -> Response {
+        // The version gate precedes everything, including the handshake: an
+        // incompatible peer must be turned away before it offers a credential,
+        // not after.
+        if !is_compatible(state.peer_version) {
+            return Response::Error(RpcError::IncompatibleVersion {
+                host_version: PROTOCOL_VERSION,
+                host_min_compatible: MIN_COMPATIBLE_VERSION,
+            });
+        }
         match req {
+            Request::Hello(h) => self.handle_hello(state, h),
             Request::Ping => Response::Pong,
-            Request::Register(r) => self.handle_register(state, r),
-            Request::Connect(c) => self.handle_connect(state, c),
-            Request::AuthProve(a) => self.handle_auth_prove(state, &a.signature),
+            Request::Register(r) => self.handle_register(&mut state.authn, r),
+            Request::Connect(c) => self.handle_connect(&mut state.authn, c),
+            Request::AuthProve(a) => self.handle_auth_prove(&mut state.authn, &a.signature),
             // Everything below requires an authenticated, still-authorized device.
-            other => match authorized_pubkey(state, &self.auth) {
+            other => match authorized_pubkey(&state.authn, &self.auth) {
                 Some(pubkey) => self.handle_session_rpc(&pubkey, other),
                 None => Response::Error(RpcError::Unauthorized),
             },

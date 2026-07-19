@@ -298,3 +298,45 @@ fn client_reconnects_via_token_fast_path_and_challenge() {
     .1
     .expect("pump ran to a clean shutdown");
 }
+
+/// A host that predates the version handshake cannot decode `Hello` at all — it
+/// answers `BadRequest`. The client must read that as "old host" and pair
+/// anyway; if it bailed, the compatibility feature would itself be the thing
+/// that broke compatibility. Driven by a hand-rolled host that rejects the
+/// unknown variant exactly as a v1/v2 dispatcher would.
+#[test]
+fn client_pairs_with_a_host_too_old_to_know_the_version_handshake() {
+    use oximux_remote_proto::Transport;
+    use oximux_remote_proto::proto::{Request, Response, RpcError};
+
+    let (client_t, server_t) = duplex_pair();
+    let client = RemoteSession::new(Arc::new(client_t), ClientSigner::from_seed(&[3u8; 32]));
+    let pump = client.take_pump().expect("pump");
+
+    // A host frozen at the pre-handshake wire: anything it cannot decode as one
+    // of its known variants comes back as BadRequest.
+    let legacy_host = async {
+        loop {
+            let Ok(Some(frame)) = server_t.recv().await else { break };
+            let reply = match Request::from_bytes(&frame) {
+                Ok(Request::Hello(_)) | Err(_) => {
+                    Response::Error(RpcError::BadRequest("undecodable request frame".into()))
+                }
+                Ok(Request::Register(_)) => {
+                    Response::Registered { session_token: "tok".into() }
+                }
+                Ok(_) => Response::Error(RpcError::BadRequest("unexpected".into())),
+            };
+            if server_t.send(reply.to_bytes().unwrap()).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    let script = async move {
+        client.pair(&ticket(None), "phone", NOW).await.expect("pairing must survive an old host");
+        // `client` drops here, ending the pump and the scripted host.
+    };
+    let (_, pump_res, ()) = block_on(join3(legacy_host, pump.run(), script));
+    pump_res.expect("pump ran to a clean shutdown");
+}

@@ -11,8 +11,10 @@ use oximux_agent_core::thread::{PermissionDecision, PermissionKind, ThreadEvent}
 use oximux_agents::session_registry::{SessionMeta, SessionRegistry};
 use oximux_agents::thread::{AgentCapabilities, StubConnection};
 use oximux_remote_host::{AuthStore, Dispatcher, PairingSlot, registration_proof};
-use oximux_remote_proto::messages::{ConnectReq, RegisterReq, SendPromptReq};
-use oximux_remote_proto::proto::{Request, Response, RpcError};
+use oximux_remote_proto::messages::{ConnectReq, HelloReq, RegisterReq, SendPromptReq};
+use oximux_remote_proto::proto::{
+    MIN_COMPATIBLE_VERSION, PROTOCOL_VERSION, Request, Response, RpcError,
+};
 use oximux_remote_proto::testing::duplex_pair;
 use oximux_remote_proto::{AuthProveReq, ResolvePermissionReq, Transport};
 use serde_json::json;
@@ -536,4 +538,101 @@ fn reconnect_via_challenge_and_token() {
     };
 
     block_on(join(serve, script));
+}
+
+/// A real Ed25519 public key. Arbitrary byte arrays will not do — `register`
+/// runs `VerifyingKey::from_bytes`, which rejects anything that is not a valid
+/// curve point with `Unauthorized`, indistinguishable from a bad proof.
+fn real_pubkey(seed: u8) -> [u8; 32] {
+    SigningKey::from_bytes(&[seed; 32]).verifying_key().to_bytes()
+}
+
+/// The version handshake answers with the host's range, and — critically — an
+/// **older** client is still served. An equality check here would mean every
+/// appended RPC on the desktop disconnected every already-paired phone.
+#[test]
+fn hello_reports_the_host_range_and_serves_an_older_client() {
+    let (client, server) = duplex_pair();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(seeded_registry(), auth).with_clock(clock);
+
+    let script = async {
+        // A client one version behind the host.
+        let older = PROTOCOL_VERSION - 1;
+        let ack = call(&client, Request::Hello(HelloReq { protocol_version: older })).await;
+        match ack {
+            Response::HelloAck(ack) => {
+                assert_eq!(ack.protocol_version, PROTOCOL_VERSION);
+                assert_eq!(ack.min_compatible, MIN_COMPATIBLE_VERSION);
+            }
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+        // …and it can still complete a real pairing afterwards.
+        let pubkey = real_pubkey(41);
+        match call(&client, Request::Register(register_req(pubkey))).await {
+            Response::Registered { .. } => {}
+            other => panic!("an older-but-compatible client must still pair, got {other:?}"),
+        }
+        drop(client);
+    };
+    block_on(join(dispatcher.serve(&server), script));
+}
+
+/// A client that never sends `Hello` is read as v1 and served normally — the
+/// handshake must not become the thing that breaks pre-handshake clients.
+#[test]
+fn a_client_that_never_says_hello_is_still_served() {
+    let (client, server) = duplex_pair();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(seeded_registry(), auth).with_clock(clock);
+
+    let script = async {
+        let pubkey = real_pubkey(42);
+        match call(&client, Request::Register(register_req(pubkey))).await {
+            Response::Registered { .. } => {}
+            other => panic!("a silent (v1) client must still pair, got {other:?}"),
+        }
+        drop(client);
+    };
+    block_on(join(dispatcher.serve(&server), script));
+}
+
+/// The refusal path carries both host numbers, so the client can tell the user
+/// which side is behind instead of surfacing a bare connection failure. Driven
+/// through a version below the floor rather than by mutating the constant.
+#[test]
+fn a_client_below_the_floor_is_refused_before_offering_a_credential() {
+    let (client, server) = duplex_pair();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(seeded_registry(), auth).with_clock(clock);
+
+    let script = async {
+        // Version 0 is below `MIN_COMPATIBLE_VERSION` (1) for every build.
+        let resp = call(&client, Request::Hello(HelloReq { protocol_version: 0 })).await;
+        match resp {
+            Response::Error(RpcError::IncompatibleVersion {
+                host_version,
+                host_min_compatible,
+            }) => {
+                assert_eq!(host_version, PROTOCOL_VERSION);
+                assert_eq!(
+                    host_min_compatible,
+                    MIN_COMPATIBLE_VERSION
+                );
+            }
+            other => panic!("expected IncompatibleVersion, got {other:?}"),
+        }
+        // And the refusal sticks: a subsequent pairing attempt on the same
+        // connection is refused too, so a rejected peer cannot simply carry on.
+        let pubkey = real_pubkey(43);
+        match call(&client, Request::Register(register_req(pubkey))).await {
+            Response::Error(RpcError::IncompatibleVersion { .. }) => {}
+            other => panic!("a refused client must stay refused, got {other:?}"),
+        }
+        drop(client);
+    };
+    block_on(join(dispatcher.serve(&server), script));
 }

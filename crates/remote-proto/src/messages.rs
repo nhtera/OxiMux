@@ -12,6 +12,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::proto::WireError;
 
+/// [`Request::Hello`](crate::proto::Request::Hello) payload — the version
+/// declaration a client opens with, before any credential is offered.
+///
+/// Deliberately a **new variant** rather than a field on [`RegisterReq`] /
+/// [`ConnectReq`]: postcard encodes struct fields positionally, so adding a field
+/// to an existing payload would silently change how every older peer decodes it —
+/// the exact class of breakage this handshake exists to catch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HelloReq {
+    /// The version the client was built against
+    /// ([`PROTOCOL_VERSION`](crate::proto::PROTOCOL_VERSION)).
+    pub protocol_version: u32,
+}
+
+/// [`Response::HelloAck`](crate::proto::Response::HelloAck) payload — the host's
+/// half of the version exchange, so *each* side can refuse a peer it cannot
+/// understand rather than only the host policing the client.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HelloAckWire {
+    /// The host's own [`PROTOCOL_VERSION`](crate::proto::PROTOCOL_VERSION).
+    pub protocol_version: u32,
+    /// The oldest peer version this host still speaks
+    /// ([`MIN_COMPATIBLE_VERSION`](crate::proto::MIN_COMPATIBLE_VERSION)).
+    pub min_compatible: u32,
+}
+
 /// [`Request::Register`](crate::proto::Request::Register) payload — the QR-pairing proof.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RegisterReq {

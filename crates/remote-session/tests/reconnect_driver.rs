@@ -15,7 +15,8 @@ use async_trait::async_trait;
 use futures::channel::oneshot;
 use futures::executor::block_on;
 use futures::future::{Either, join, select};
-use oximux_remote_proto::proto::Response;
+use oximux_remote_proto::messages::HelloAckWire;
+use oximux_remote_proto::proto::{MIN_COMPATIBLE_VERSION, PROTOCOL_VERSION, Response};
 use oximux_remote_proto::{PairingTicket, Transport};
 use oximux_remote_proto::testing::{DuplexTransport, duplex_pair};
 use oximux_remote_session::{
@@ -53,9 +54,25 @@ impl Connector for QueueConnector {
     }
 }
 
+/// Play the host side of the version handshake, which the client now opens every
+/// connection with. A scripted host that skipped this would answer the `Hello`
+/// with the *next* reply in its script and leave the real request unanswered —
+/// so this must mirror a real host, not be stubbed out.
+async fn answer_hello(server: &DuplexTransport) {
+    server.recv().await.expect("recv ok").expect("a Hello request");
+    let ack = Response::HelloAck(HelloAckWire {
+        protocol_version: PROTOCOL_VERSION,
+        min_compatible: MIN_COMPATIBLE_VERSION,
+    })
+    .to_bytes()
+    .unwrap();
+    server.send(ack).await.expect("send HelloAck");
+}
+
 /// Play the host side of one reconnect handshake: read the client's `Connect` and
 /// answer `Connected` with a fresh token (the fast-path branch the driver takes).
 async fn answer_connect(server: &DuplexTransport, token: &str) {
+    answer_hello(server).await;
     server.recv().await.expect("recv ok").expect("a Connect request");
     let reply = Response::Connected { session_token: token.into() }.to_bytes().unwrap();
     server.send(reply).await.expect("send Connected");
@@ -64,6 +81,7 @@ async fn answer_connect(server: &DuplexTransport, token: &str) {
 /// Play the host side of a first-time pairing: read the client's `Register` and
 /// answer `Registered` with a fresh token.
 async fn answer_register(server: &DuplexTransport, token: &str) {
+    answer_hello(server).await;
     server.recv().await.expect("recv ok").expect("a Register request");
     let reply = Response::Registered { session_token: token.into() }.to_bytes().unwrap();
     server.send(reply).await.expect("send Registered");

@@ -16,7 +16,58 @@ fn value_bearing_event() -> ThreadEvent {
 /// documented wire change, so an accidental edit fails here.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 2, "v2 = the appended git surface");
+    assert_eq!(PROTOCOL_VERSION, 3, "v3 = the appended version handshake");
+}
+
+/// The floor moves only on a genuinely breaking change, never merely because
+/// [`PROTOCOL_VERSION`] moved. Raising it strands every peer below it, so this
+/// tripwire forces that to be a deliberate edit rather than a reflex bump
+/// alongside an append.
+#[test]
+fn min_compatible_version_is_pinned() {
+    assert_eq!(
+        MIN_COMPATIBLE_VERSION, 1,
+        "every version so far is append-only, so v1 peers are still understood"
+    );
+}
+
+/// The core policy: an append-only wire means *older is fine*. If this ever
+/// flips to equality-matching, shipping one appended RPC on the desktop would
+/// disconnect every already-paired phone until each one updated.
+#[test]
+fn an_older_peer_is_still_compatible() {
+    assert!(is_compatible(1), "a v1 peer never sends the appended calls — it is serviceable");
+    assert!(is_compatible(PROTOCOL_VERSION));
+}
+
+/// A newer peer is accepted too: it knows we are older and is responsible for
+/// confining itself to what we understand. Refusing it would force both ends to
+/// upgrade in lock-step — the coupling this handshake exists to remove.
+#[test]
+fn a_newer_peer_is_compatible() {
+    assert!(is_compatible(PROTOCOL_VERSION + 10));
+}
+
+/// Silence is a version claim, not a missing one: a peer predating the handshake
+/// *is* a v1 peer, so the gate still applies to it.
+#[test]
+fn a_silent_peer_is_read_as_v1() {
+    assert_eq!(ASSUMED_VERSION_WHEN_SILENT, 1);
+    assert_eq!(is_compatible(ASSUMED_VERSION_WHEN_SILENT), is_compatible(1));
+}
+
+/// `Hello`/`HelloAck` were appended, so every pre-existing variant must keep its
+/// ordinal — the whole basis for old peers still working. Encoding a v1-era
+/// request and decoding it back proves the ordinals did not shift.
+#[test]
+fn appending_the_handshake_kept_earlier_variants_stable() {
+    let ping = Request::Ping;
+    let bytes = ping.to_bytes().expect("encode");
+    assert_eq!(Request::from_bytes(&bytes).expect("decode"), ping);
+
+    let hello = Request::Hello(HelloReq { protocol_version: PROTOCOL_VERSION });
+    let bytes = hello.to_bytes().expect("encode");
+    assert_eq!(Request::from_bytes(&bytes).expect("decode"), hello);
 }
 
 /// The evidence behind the JSON-in-envelope design: postcard is

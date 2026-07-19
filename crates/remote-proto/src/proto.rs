@@ -20,14 +20,44 @@ pub use crate::messages::*;
 /// Bumped whenever the wire schema changes. v1: initial remote-control surface
 /// (handshake + session list/info + prompt/resolve/steer/cancel + event
 /// subscription & gap-fill). v2: appended the git surface (`GitStatus`,
-/// `GitDiff`).
+/// `GitDiff`). v3: appended the version handshake (`Hello`/`HelloAck`).
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// The oldest peer version this build still speaks. **Raise this only on a
+/// genuinely breaking change** — a reordered/removed variant or an altered
+/// payload shape — never merely because [`PROTOCOL_VERSION`] moved.
+///
+/// The two constants exist separately because equality is the *wrong* test for
+/// an append-only wire: a v1 client and a v3 host understand each other
+/// perfectly, since the client simply never sends the appended calls. Rejecting
+/// on `!=` (as the unrelated relay protocol does, where it is correct) would
+/// break every already-paired phone the moment the desktop shipped an appended
+/// RPC — turning a compatible upgrade into a fleet-wide outage.
+pub const MIN_COMPATIBLE_VERSION: u32 = 1;
+
+/// The version assumed for a peer that never sent [`Request::Hello`]. Clients
+/// predating the version handshake are exactly the v1 clients, so treating
+/// silence as v1 is not a fallback — it is the correct reading, and it keeps the
+/// compatibility gate meaningful for peers that cannot declare themselves.
+pub const ASSUMED_VERSION_WHEN_SILENT: u32 = 1;
+
+/// Whether this build can serve a peer that speaks `peer_version`.
+///
+/// Asymmetric by design: a peer **older** than [`MIN_COMPATIBLE_VERSION`] is
+/// refused, while a **newer** peer is accepted — it knows this version is older
+/// and is responsible for confining itself to the calls this build understands.
+/// Refusing the newer side too would make every upgrade require both ends to
+/// move in lock-step, which is precisely what a negotiated handshake is meant to
+/// avoid.
+pub fn is_compatible(peer_version: u32) -> bool {
+    peer_version >= MIN_COMPATIBLE_VERSION
+}
 
 /// A local codec failure (encode/decode), never sent on the wire. Protocol-level
 /// failures the host reports to a client are [`RpcError`], carried in
@@ -58,6 +88,11 @@ pub enum RpcError {
     BadRequest(String),
     /// The host hit an internal error handling an otherwise-valid request.
     Internal(String),
+    /// The peer's protocol version is too old for this build to serve. Carries
+    /// both ends of the host's range so the client can tell the user *what* to
+    /// do (upgrade the phone) instead of reporting a bare connection failure.
+    /// Appended last to keep the enum's ordinal encoding append-only.
+    IncompatibleVersion { host_version: u32, host_min_compatible: u32 },
 }
 
 /// Client → host. Append-only; see the module note.
@@ -100,6 +135,12 @@ pub enum Request {
     /// client cannot reach outside the repository with it. `untracked` selects the
     /// read-off-disk codepath git itself won't diff; `staged` picks index-vs-HEAD.
     GitDiff { session_id: String, path: String, staged: bool, untracked: bool },
+    /// Declare the client's protocol version. Sent first, **before** any
+    /// credential, so an incompatible peer is turned away without a secret ever
+    /// crossing the wire. Optional on the wire (a v1 client never sends it and is
+    /// read as [`ASSUMED_VERSION_WHEN_SILENT`]); appended last to keep the enum's
+    /// ordinal encoding append-only.
+    Hello(HelloReq),
 }
 
 /// Host → client.
@@ -146,6 +187,10 @@ pub enum Response {
     GitStatus(GitStatusWire),
     /// Reply to [`Request::GitDiff`] — one entry per file the diff covers.
     GitDiff(Vec<FileDiffWire>),
+    /// Reply to [`Request::Hello`] — the host's version and its oldest supported
+    /// peer, so the client can refuse a host it cannot understand. Appended last
+    /// to keep the enum's ordinal encoding append-only.
+    HelloAck(HelloAckWire),
 }
 
 impl Request {
