@@ -129,3 +129,63 @@ fn read_err(e: iroh::endpoint::ReadError) -> TransportError {
         other => TransportError::Io(other.to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a wire frame: `[len BE][body]`.
+    fn framed(body: &[u8]) -> Vec<u8> {
+        let mut v = (body.len() as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// The carry-reassembly core `recv` relies on: fewer than a whole frame's bytes
+    /// yields nothing and leaves the carry untouched, so the next read completes it.
+    /// This is the deterministic half of the cancel-safety property (the live
+    /// dropped-poll path is covered by the over-iroh integration test): partial
+    /// bytes staged in `carry` are never lost between reads.
+    #[test]
+    fn a_partial_frame_is_buffered_until_complete() {
+        let full = framed(b"hello"); // [0,0,0,5][h,e,l,l,o] = 9 bytes
+        let mut carry: Vec<u8> = full[..6].to_vec(); // len prefix + 2 body bytes
+
+        // Header known but body short → nothing yet, and the bytes are kept.
+        assert_eq!(take_frame(&mut carry).unwrap(), None);
+        assert_eq!(carry.len(), 6, "the partial frame stays staged");
+
+        // The rest arrives → the whole frame comes out, carry drained.
+        carry.extend_from_slice(&full[6..]);
+        assert_eq!(take_frame(&mut carry).unwrap(), Some(b"hello".to_vec()));
+        assert!(carry.is_empty());
+    }
+
+    /// A read that delivers more than one frame yields them one at a time, leaving
+    /// the trailing frame's bytes in the carry for the next call.
+    #[test]
+    fn extra_bytes_after_a_frame_stay_for_the_next() {
+        let mut carry = framed(b"ab");
+        carry.extend_from_slice(&framed(b"cde"));
+
+        assert_eq!(take_frame(&mut carry).unwrap(), Some(b"ab".to_vec()));
+        assert_eq!(take_frame(&mut carry).unwrap(), Some(b"cde".to_vec()));
+        assert_eq!(take_frame(&mut carry).unwrap(), None);
+    }
+
+    /// Fewer than the 4 header bytes can't even name a length → buffer and wait.
+    #[test]
+    fn a_truncated_header_waits_for_more() {
+        let mut carry = vec![0u8, 0, 0]; // 3 of the 4 length bytes
+        assert_eq!(take_frame(&mut carry).unwrap(), None);
+        assert_eq!(carry.len(), 3);
+    }
+
+    /// A hostile/corrupt length prefix above the cap is rejected rather than driving
+    /// an unbounded allocation.
+    #[test]
+    fn an_oversize_length_prefix_is_rejected() {
+        let mut carry = ((MAX_FRAME + 1) as u32).to_be_bytes().to_vec();
+        assert!(matches!(take_frame(&mut carry), Err(TransportError::Io(_))));
+    }
+}

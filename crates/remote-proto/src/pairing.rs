@@ -44,9 +44,10 @@ pub fn registration_proof(
 /// would print the secret bytes through any `{:?}`.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairingTicket {
-    /// The host's iroh node id — a 32-byte Ed25519 public key. Kept as raw bytes
-    /// so this crate stays iroh-free; the host converts to `iroh::NodeId`.
-    /// Routing is via pkarr/relays from this id alone, so no address is exposed.
+    /// The host's iroh endpoint id — a 32-byte Ed25519 public key. Kept as raw
+    /// bytes so this crate stays iroh-free; the transport converts to
+    /// `iroh::EndpointId`. Routing is via pkarr/relays from this id alone, so no
+    /// address is exposed.
     pub endpoint_id: [u8; 32],
     /// One-time HMAC secret, pinned at **16 bytes (128-bit)** — adequate for a
     /// short-lived pairing proof (ignore any 256-bit references in upstream docs;
