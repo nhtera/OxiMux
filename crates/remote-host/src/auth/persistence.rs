@@ -24,6 +24,8 @@ pub struct StoredDevice {
     /// `None` = full access; `Some(list)` = restricted to those sessions.
     pub sessions: Option<Vec<String>>,
     pub revoked: bool,
+    /// The opt-down tier: reads served, state-changing RPCs refused.
+    pub read_only: bool,
 }
 
 /// A durable sink for the authorized-device set. Methods are best-effort
@@ -36,6 +38,8 @@ pub trait DeviceStore: Send + Sync {
     fn save(&self, device: &StoredDevice);
     /// Persist a revoked-flag change.
     fn set_revoked(&self, pubkey: &AppPubkey, revoked: bool);
+    /// Persist a read-only-tier change.
+    fn set_read_only(&self, pubkey: &AppPubkey, read_only: bool);
 }
 
 impl AuthStore {
@@ -50,7 +54,15 @@ impl AuthStore {
             };
             state
                 .devices
-                .insert(d.pubkey, DeviceRecord { name: d.name, revoked: d.revoked, scope });
+                .insert(
+                    d.pubkey,
+                    DeviceRecord {
+                        name: d.name,
+                        revoked: d.revoked,
+                        scope,
+                        read_only: d.read_only,
+                    },
+                );
         }
         Self { inner: std::sync::Mutex::new(state), store: Some(store) }
     }
@@ -67,6 +79,13 @@ impl AuthStore {
     pub(super) fn persist_revoked(&self, pubkey: &AppPubkey, revoked: bool) {
         if let Some(store) = &self.store {
             store.set_revoked(pubkey, revoked);
+        }
+    }
+
+    /// Write a read-only-tier change through to durable storage (if any).
+    pub(super) fn persist_read_only(&self, pubkey: &AppPubkey, read_only: bool) {
+        if let Some(store) = &self.store {
+            store.set_read_only(pubkey, read_only);
         }
     }
 }
@@ -97,6 +116,7 @@ impl DeviceStore for StorageDeviceStore {
                             RemoteScope::Sessions(s) => Some(s),
                         },
                         revoked: row.revoked,
+                        read_only: row.read_only,
                     })
                 })
                 .collect(),
@@ -122,6 +142,12 @@ impl DeviceStore for StorageDeviceStore {
     fn set_revoked(&self, pubkey: &AppPubkey, revoked: bool) {
         if let Err(e) = self.repo.set_revoked(&pubkey_to_hex(pubkey), revoked) {
             tracing::warn!(error = %e, "persisting device revocation failed");
+        }
+    }
+
+    fn set_read_only(&self, pubkey: &AppPubkey, read_only: bool) {
+        if let Err(e) = self.repo.set_read_only(&pubkey_to_hex(pubkey), read_only) {
+            tracing::warn!(error = %e, "persisting device read-only tier failed");
         }
     }
 }
@@ -172,6 +198,7 @@ mod tests {
     struct RecordingStore {
         saved: Mutex<Vec<StoredDevice>>,
         revoked: Mutex<Vec<(AppPubkey, bool)>>,
+        read_only: Mutex<Vec<(AppPubkey, bool)>>,
         seed: Vec<StoredDevice>,
     }
     impl DeviceStore for RecordingStore {
@@ -183,6 +210,9 @@ mod tests {
         }
         fn set_revoked(&self, pubkey: &AppPubkey, revoked: bool) {
             self.revoked.lock().unwrap().push((*pubkey, revoked));
+        }
+        fn set_read_only(&self, pubkey: &AppPubkey, read_only: bool) {
+            self.read_only.lock().unwrap().push((*pubkey, read_only));
         }
     }
 
@@ -210,6 +240,7 @@ mod tests {
                 name: "seeded".into(),
                 sessions: Some(vec!["sess-1".into()]),
                 revoked: false,
+                read_only: false,
             }],
             ..Default::default()
         });

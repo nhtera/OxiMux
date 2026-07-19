@@ -73,6 +73,9 @@ struct DeviceRecord {
     name: String,
     revoked: bool,
     scope: DeviceScope,
+    /// The opt-down tier: reads are served, every state-changing RPC is refused.
+    /// Orthogonal to `scope` — a device can be session-scoped AND read-only.
+    read_only: bool,
 }
 
 #[derive(Default)]

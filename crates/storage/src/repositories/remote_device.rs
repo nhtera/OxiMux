@@ -26,6 +26,9 @@ pub struct RemoteDeviceRow {
     pub name: String,
     pub scope: RemoteScope,
     pub revoked: bool,
+    /// The opt-down tier: the device may read (transcripts, status, diffs) but
+    /// every state-changing RPC is refused. Orthogonal to `scope`.
+    pub read_only: bool,
 }
 
 #[derive(Clone)]
@@ -43,7 +46,8 @@ impl RemoteDeviceRepo {
     pub fn list_all(&self) -> Result<Vec<RemoteDeviceRow>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT pubkey, name, scope, scope_sessions, revoked FROM remote_devices",
+                "SELECT pubkey, name, scope, scope_sessions, revoked, read_only \
+                 FROM remote_devices",
             )?;
             let mapped = stmt.query_map([], |row| {
                 Ok((
@@ -52,17 +56,19 @@ impl RemoteDeviceRepo {
                     row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, i64>(4)? != 0,
+                    row.get::<_, i64>(5)? != 0,
                 ))
             })?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()
         })?;
         Ok(rows
             .into_iter()
-            .map(|(pubkey, name, scope, sessions, revoked)| RemoteDeviceRow {
+            .map(|(pubkey, name, scope, sessions, revoked, read_only)| RemoteDeviceRow {
                 pubkey,
                 name,
                 scope: decode_scope(&scope, sessions.as_deref()),
                 revoked,
+                read_only,
             })
             .collect())
     }
@@ -89,6 +95,18 @@ impl RemoteDeviceRepo {
                      scope_sessions = excluded.scope_sessions, \
                      revoked = excluded.revoked",
                 params![pubkey, name, scope_kind, scope_sessions, revoked as i64, ts],
+            )
+            .map(|_| ())
+        })?;
+        Ok(())
+    }
+
+    /// Set a device's read-only tier. No-op for an unknown pubkey.
+    pub fn set_read_only(&self, pubkey: &str, read_only: bool) -> Result<(), StorageError> {
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE remote_devices SET read_only = ?2 WHERE pubkey = ?1",
+                params![pubkey, read_only as i64],
             )
             .map(|_| ())
         })?;
@@ -182,11 +200,30 @@ mod tests {
             name: "Phone".into(),
             scope: RemoteScope::Full,
             revoked: false,
+            // A freshly paired device is read-write; read-only is an opt-down.
+            read_only: false,
         });
         assert_eq!(
             all[1].scope,
             RemoteScope::Sessions(vec!["sess-1".into(), "sess-2".into()])
         );
+    }
+
+    /// The opt-down persists and is independent of the revoked flag.
+    #[test]
+    fn read_only_round_trips_and_defaults_off() {
+        let db = open_memory().expect("open_memory");
+        let repo = RemoteDeviceRepo::new(db);
+        repo.upsert("aa", "Phone", &RemoteScope::Full, false).expect("insert");
+        assert!(!repo.list_all().unwrap()[0].read_only, "pairing grants read-write");
+
+        repo.set_read_only("aa", true).expect("set read-only");
+        let row = repo.list_all().unwrap().into_iter().next().unwrap();
+        assert!(row.read_only, "the opt-down persists");
+        assert!(!row.revoked, "read-only is not revocation");
+
+        repo.set_read_only("aa", false).expect("restore");
+        assert!(!repo.list_all().unwrap()[0].read_only, "and can be lifted again");
     }
 
     #[test]

@@ -164,3 +164,65 @@ fn session_bound_ticket_restricts_the_acl() {
     assert!(store.is_allowed_for(&pubkey, "sess-1"), "allowed on its bound session");
     assert!(!store.is_allowed_for(&pubkey, "sess-2"), "denied on other sessions");
 }
+
+/// Register `pubkey` against a fresh store, optionally session-bound.
+fn registered(session: Option<&str>) -> (AuthStore, AppPubkey) {
+    let store = AuthStore::new();
+    let secret = [0x22; 16];
+    store.set_pairing(PairingSlot::new(secret, session.map(Into::into), false));
+    let pubkey = vk(0x33);
+    let ts = 1_700_000_000;
+    let req = RegisterReq {
+        app_pubkey: pubkey,
+        device_name: "phone".into(),
+        proof: registration_proof(&secret, &pubkey, ts),
+        timestamp_secs: ts,
+        session_id: session.map(Into::into),
+    };
+    store.register(&req, ts).expect("register");
+    (store, pubkey)
+}
+
+/// The read-only opt-down: reads stay allowed, every write is refused. This is the
+/// tier that makes terminal attach and git writes safe to grant to a device the
+/// user doesn't fully trust.
+#[test]
+fn read_only_device_may_read_but_not_write() {
+    let (store, pubkey) = registered(None);
+
+    // Pairing grants full access, so a fresh device may write.
+    assert!(store.may_write(&pubkey, "sess-1"), "pairing default is read-write");
+    assert!(!store.is_read_only(&pubkey));
+
+    store.set_read_only(&pubkey, true);
+
+    assert!(store.is_allowed_for(&pubkey, "sess-1"), "reads still served");
+    assert!(store.is_authorized(&pubkey), "read-only is not revocation");
+    assert!(!store.may_write(&pubkey, "sess-1"), "writes refused");
+    assert!(store.is_read_only(&pubkey));
+
+    // The opt-down is reversible.
+    store.set_read_only(&pubkey, false);
+    assert!(store.may_write(&pubkey, "sess-1"), "restored to read-write");
+}
+
+/// Read-only and session-scoping are independent dimensions.
+#[test]
+fn read_only_composes_with_session_scope() {
+    let (store, pubkey) = registered(Some("sess-1"));
+    store.set_read_only(&pubkey, true);
+
+    assert!(store.is_allowed_for(&pubkey, "sess-1"), "in-scope read allowed");
+    assert!(!store.may_write(&pubkey, "sess-1"), "in-scope write refused when read-only");
+    assert!(!store.may_write(&pubkey, "sess-2"), "out-of-scope write refused");
+    assert!(!store.is_allowed_for(&pubkey, "sess-2"), "out-of-scope read still refused");
+}
+
+/// Revocation outranks the tier — a revoked device writes nothing.
+#[test]
+fn revoked_device_may_not_write() {
+    let (store, pubkey) = registered(None);
+    store.revoke(&pubkey);
+
+    assert!(!store.may_write(&pubkey, "sess-1"));
+}

@@ -58,7 +58,14 @@ impl AuthStore {
             }
             st.devices.insert(
                 req.app_pubkey,
-                DeviceRecord { name: req.device_name.clone(), revoked: false, scope },
+                DeviceRecord {
+                    name: req.device_name.clone(),
+                    revoked: false,
+                    scope,
+                    // Pairing grants full access (the confirmed default);
+                    // read-only is an explicit opt-down afterwards.
+                    read_only: false,
+                },
             );
             let token = issue_token(&mut st, req.app_pubkey);
             let stored = StoredDevice {
@@ -66,6 +73,7 @@ impl AuthStore {
                 name: req.device_name.clone(),
                 sessions: bound.map(|s| vec![s]),
                 revoked: false,
+                read_only: false,
             };
             (token, stored)
         };

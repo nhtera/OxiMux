@@ -72,7 +72,8 @@ impl Dispatcher {
     }
 
     pub(super) fn resolve_permission(&self, pubkey: &AppPubkey, req: ResolvePermissionReq) -> Response {
-        if !self.auth.is_allowed_for(pubkey, &req.session_id) {
+        // Deciding a permission lets an agent act, so it is a write.
+        if !self.auth.may_write(pubkey, &req.session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         let decision = match req.decision() {
@@ -118,13 +119,17 @@ impl Dispatcher {
         Response::Events(frames)
     }
 
-    /// Run a session command behind the per-RPC ACL/authz recheck. `pub(super)`
+    /// Run a session **command** behind the per-RPC ACL/authz recheck. `pub(super)`
     /// so the dispatcher's router can use it for the trivial Steer/Cancel arms.
+    ///
+    /// Every caller of this is state-changing (prompt/steer/cancel), so the gate is
+    /// `may_write` — a read-only device is refused here even though it may read the
+    /// same session.
     pub(super) fn scoped<F>(&self, pubkey: &AppPubkey, session_id: &str, f: F) -> Response
     where
         F: FnOnce(&SessionHandle) -> anyhow::Result<()>,
     {
-        if !self.auth.is_allowed_for(pubkey, session_id) {
+        if !self.auth.may_write(pubkey, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(handle) = self.registry.get(session_id) else {

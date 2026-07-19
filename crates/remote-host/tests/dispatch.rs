@@ -368,6 +368,71 @@ fn git_status_is_acl_gated_and_requires_a_working_directory() {
     block_on(join(serve, script));
 }
 
+/// The read-only tier over the wire: the device keeps reading its sessions but
+/// every state-changing RPC is refused, and the downgrade bites an ALREADY-OPEN
+/// connection (the dispatcher rechecks per call, like revocation).
+#[test]
+fn read_only_device_is_refused_writes_mid_connection() {
+    let registry = seeded_registry();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth.clone()).with_clock(clock);
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        // Read-write to start: a prompt is accepted.
+        assert_eq!(
+            call(
+                &client,
+                Request::SendPrompt(SendPromptReq {
+                    session_id: "sess-1".into(),
+                    text: "go".into(),
+                    images: vec![],
+                    corr_id: 1,
+                })
+            )
+            .await,
+            Response::Ack,
+        );
+
+        // Downgrade the live device.
+        auth.set_read_only(&pubkey, true);
+
+        // Reads keep working…
+        assert!(matches!(call(&client, Request::ListSessions).await, Response::Sessions(_)));
+        assert!(matches!(
+            call(&client, Request::GetSessionInfo { session_id: "sess-1".into() }).await,
+            Response::SessionInfo(_),
+        ));
+
+        // …while every write is refused on the same open connection.
+        for write in [
+            Request::SendPrompt(SendPromptReq {
+                session_id: "sess-1".into(),
+                text: "again".into(),
+                images: vec![],
+                corr_id: 2,
+            }),
+            Request::Steer { session_id: "sess-1".into(), text: "focus".into() },
+            Request::Cancel { session_id: "sess-1".into() },
+        ] {
+            assert_eq!(
+                call(&client, write).await,
+                Response::Error(RpcError::Unauthorized),
+                "a read-only device must not drive the agent",
+            );
+        }
+    };
+    block_on(join(serve, script));
+}
+
 #[test]
 fn list_sessions_respects_device_scope() {
     let registry = Arc::new(SessionRegistry::new());

@@ -37,6 +37,39 @@ impl AuthStore {
             .collect()
     }
 
+    /// May this device perform a **state-changing** RPC on `session_id`?
+    ///
+    /// Strictly narrower than [`is_allowed_for`](Self::is_allowed_for): the device
+    /// must be authorized and in scope AND not marked read-only. Every RPC that
+    /// drives an agent, decides a permission, writes the repository, or types into
+    /// a terminal goes through this — a read-only device can watch, never act.
+    pub fn may_write(&self, pubkey: &AppPubkey, session_id: &str) -> bool {
+        if !self.is_allowed_for(pubkey, session_id) {
+            return false;
+        }
+        !self.inner.lock().unwrap().devices.get(pubkey).is_some_and(|d| d.read_only)
+    }
+
+    /// Is this device marked read-only (the opt-down tier)? For the paired-device
+    /// UI; authorization decisions use [`may_write`](Self::may_write).
+    pub fn is_read_only(&self, pubkey: &AppPubkey) -> bool {
+        self.inner.lock().unwrap().devices.get(pubkey).is_some_and(|d| d.read_only)
+    }
+
+    /// Move a device between the read-write and read-only tiers. Takes effect on
+    /// the next RPC (the dispatcher rechecks per call, so an open connection is
+    /// downgraded mid-session) and is written through to durable storage.
+    pub fn set_read_only(&self, pubkey: &AppPubkey, read_only: bool) {
+        {
+            let mut st = self.inner.lock().unwrap();
+            if let Some(d) = st.devices.get_mut(pubkey) {
+                d.read_only = read_only;
+            }
+        }
+        // Write through outside the lock (the store may block on I/O).
+        self.persist_read_only(pubkey, read_only);
+    }
+
     /// Revoke a device: it fails the next per-RPC recheck and its tokens die.
     pub fn revoke(&self, pubkey: &AppPubkey) {
         {

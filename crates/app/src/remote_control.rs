@@ -244,10 +244,17 @@ mod tests {
                 self.revoked.lock().unwrap().push(*pubkey);
             }
         }
+        fn set_read_only(&self, _pubkey: &AppPubkey, _read_only: bool) {}
     }
 
     fn a_device(byte: u8, name: &str, revoked: bool) -> StoredDevice {
-        StoredDevice { pubkey: [byte; 32], name: name.into(), sessions: None, revoked }
+        StoredDevice {
+            pubkey: [byte; 32],
+            name: name.into(),
+            sessions: None,
+            revoked,
+            read_only: false,
+        }
     }
 
     /// Every bind seeds its auth store from durable device persistence.
