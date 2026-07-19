@@ -19,8 +19,10 @@ use gpui::Global;
 use oximux_agents::session_registry::{SessionHandle, SessionMeta, SessionRegistry};
 use oximux_agents::thread::AgentConnection;
 use oximux_remote_host::{
-    AppPubkey, AuthStore, DeviceInfo, DeviceStore, Dispatcher, PairingSlot, mint_pairing_secret,
+    AppPubkey, AuthStore, DeviceInfo, DeviceStore, Dispatcher, PairedDevice, PairingSlot,
+    mint_pairing_secret,
 };
+use tokio::sync::broadcast;
 use oximux_remote_iroh::HostHandle;
 use oximux_remote_proto::PairingTicket;
 
@@ -152,7 +154,10 @@ impl RemoteControl {
             Some(devices) => AuthStore::with_store(devices.clone()),
             None => AuthStore::new(),
         });
-        auth.set_pairing(PairingSlot::new(secret, None, false));
+        // ONE-TIME: the code dies the moment a device uses it, so a photographed
+        // QR can't be redeemed later while remote access happens to stay on.
+        // Pairing another device means toggling off/on, which mints a fresh code.
+        auth.set_pairing(PairingSlot::new(secret, None, true));
         // Keep a handle so the paired-devices UI can revoke against the live host.
         *self.auth.lock().unwrap() = Some(auth.clone());
         let dispatcher = Arc::new(Dispatcher::new(self.registry.clone(), auth));
@@ -204,6 +209,18 @@ impl RemoteControl {
         if let Some(store) = &self.devices {
             store.set_revoked(pubkey, true);
         }
+    }
+
+    /// Is the displayed pairing code still redeemable? `false` once a device has
+    /// used it, so the UI can stop showing a dead code.
+    pub fn pairing_open(&self) -> bool {
+        self.auth.lock().unwrap().as_ref().is_some_and(|auth| auth.pairing_open())
+    }
+
+    /// Watch for devices completing pairing, so the desktop can confirm each one.
+    /// `None` when no host has been prepared yet.
+    pub fn subscribe_pairings(&self) -> Option<broadcast::Receiver<PairedDevice>> {
+        self.auth.lock().unwrap().as_ref().map(|auth| auth.subscribe_pairings())
     }
 
     /// The seed that pins the host's endpoint id, if one was installed at boot.

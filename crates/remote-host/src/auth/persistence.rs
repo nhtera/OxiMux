@@ -64,7 +64,7 @@ impl AuthStore {
                     },
                 );
         }
-        Self { inner: std::sync::Mutex::new(state), store: Some(store) }
+        Self { store: Some(store), inner: std::sync::Mutex::new(state), ..Default::default() }
     }
 
     /// Write a newly-registered device through to durable storage (if any). Call

@@ -31,6 +31,8 @@ pub use oximux_remote_proto::registration_proof;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::broadcast;
+
 use hmac::Hmac;
 use rand::RngCore;
 use rand::rngs::OsRng;
@@ -79,6 +81,15 @@ struct DeviceRecord {
     read_only: bool,
 }
 
+/// A device that just completed pairing. Published so the desktop can confirm it
+/// to the user — pairing grants full access by default, so a silent one is exactly
+/// the "race-won silent pairing" the red team flagged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedDevice {
+    pub pubkey: AppPubkey,
+    pub name: String,
+}
+
 #[derive(Default)]
 struct AuthState {
     pairing: Option<PairingSlot>,
@@ -88,17 +99,53 @@ struct AuthState {
 
 /// The host's authorization state, shared behind a `Mutex` across connections.
 /// The pairing / reconnect / ACL method sets live in the sibling submodules.
-#[derive(Default)]
 pub struct AuthStore {
     inner: Mutex<AuthState>,
     /// Optional durable sink: seeds the authorized set at construction and
     /// receives register/revoke write-throughs. `None` = in-memory only.
     store: Option<Arc<dyn DeviceStore>>,
+    /// Announces completed pairings. Bounded and lossy by design — a missed
+    /// notification must never stall `register`, which holds the auth path.
+    paired_tx: broadcast::Sender<PairedDevice>,
 }
+
+impl Default for AuthStore {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(AuthState::default()),
+            store: None,
+            paired_tx: broadcast::channel(PAIRED_EVENT_CAPACITY).0,
+        }
+    }
+}
+
+/// Pairings are rare (a human scanning a code), so a small ring is ample.
+const PAIRED_EVENT_CAPACITY: usize = 8;
 
 impl AuthStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Watch for devices completing pairing.
+    pub fn subscribe_pairings(&self) -> broadcast::Receiver<PairedDevice> {
+        self.paired_tx.subscribe()
+    }
+
+    /// Announce a completed pairing. Send errors (no listeners) are ignored.
+    pub(super) fn announce_paired(&self, device: PairedDevice) {
+        let _ = self.paired_tx.send(device);
+    }
+
+    /// Is a pairing code currently usable? `false` once a one-time slot has been
+    /// consumed, so the UI can stop showing a code that no longer works.
+    pub fn pairing_open(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .pairing
+            .as_ref()
+            .is_some_and(|slot| !(slot.one_time && slot.used))
     }
 
     /// Install (replace) the pairing secret the host is advertising via QR.

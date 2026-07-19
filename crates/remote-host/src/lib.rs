@@ -18,7 +18,8 @@ pub mod dispatcher;
 pub mod identity;
 
 pub use auth::{
-    AppPubkey, AuthStore, DeviceInfo, DeviceStore, PairingSlot, StorageDeviceStore, StoredDevice,
+    AppPubkey, AuthStore, DeviceInfo, DeviceStore, PairedDevice, PairingSlot, StorageDeviceStore,
+    StoredDevice,
     mint_pairing_secret, registration_proof,
 };
 pub use dispatcher::Dispatcher;

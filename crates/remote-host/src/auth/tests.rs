@@ -226,3 +226,86 @@ fn revoked_device_may_not_write() {
 
     assert!(!store.may_write(&pubkey, "sess-1"));
 }
+
+/// A one-time code is spent by the first device: a second scan of the SAME code
+/// is refused, and `pairing_open` reports it so the UI stops showing a dead code.
+/// This is what stops a photographed QR being redeemed later while remote access
+/// happens to still be on.
+#[test]
+fn a_one_time_code_is_spent_by_the_first_device() {
+    let store = AuthStore::new();
+    let secret = [0x22; 16];
+    store.set_pairing(PairingSlot::new(secret, None, true));
+    assert!(store.pairing_open(), "a fresh code is redeemable");
+
+    let ts = 1_700_000_000;
+    let first = vk(0x33);
+    let req = RegisterReq {
+        app_pubkey: first,
+        device_name: "phone".into(),
+        proof: registration_proof(&secret, &first, ts),
+        timestamp_secs: ts,
+        session_id: None,
+    };
+    store.register(&req, ts).expect("first device pairs");
+    assert!(!store.pairing_open(), "the code is spent");
+
+    // A different device presenting the same (valid) proof is refused.
+    let second = vk(0x44);
+    let replay = RegisterReq {
+        app_pubkey: second,
+        device_name: "attacker".into(),
+        proof: registration_proof(&secret, &second, ts),
+        timestamp_secs: ts,
+        session_id: None,
+    };
+    assert_eq!(store.register(&replay, ts), Err(RpcError::Unauthorized), "code cannot be reused");
+    assert!(!store.is_authorized(&second), "the second device never gains access");
+    assert!(store.is_authorized(&first), "the first device keeps its access");
+}
+
+/// Pairing is announced, so the desktop can confirm it rather than a device
+/// silently gaining full access.
+#[test]
+fn pairing_is_announced_to_subscribers() {
+    let store = AuthStore::new();
+    let secret = [0x22; 16];
+    store.set_pairing(PairingSlot::new(secret, None, true));
+    let mut events = store.subscribe_pairings();
+
+    let ts = 1_700_000_000;
+    let pubkey = vk(0x33);
+    let req = RegisterReq {
+        app_pubkey: pubkey,
+        device_name: "Tien's phone".into(),
+        proof: registration_proof(&secret, &pubkey, ts),
+        timestamp_secs: ts,
+        session_id: None,
+    };
+    store.register(&req, ts).expect("register");
+
+    let announced = events.try_recv().expect("a pairing was announced");
+    assert_eq!(announced.pubkey, pubkey);
+    assert_eq!(announced.name, "Tien's phone", "the name the user will see");
+}
+
+/// A failed registration announces nothing — no false confirmation.
+#[test]
+fn a_rejected_registration_is_not_announced() {
+    let store = AuthStore::new();
+    store.set_pairing(PairingSlot::new([0x01; 16], None, true));
+    let mut events = store.subscribe_pairings();
+
+    let ts = 1_700_000_000;
+    let pubkey = vk(0x33);
+    let wrong = RegisterReq {
+        app_pubkey: pubkey,
+        device_name: "attacker".into(),
+        // Proof computed against a different secret.
+        proof: registration_proof(&[0x02; 16], &pubkey, ts),
+        timestamp_secs: ts,
+        session_id: None,
+    };
+    assert!(store.register(&wrong, ts).is_err(), "wrong secret is refused");
+    assert!(events.try_recv().is_err(), "nothing announced for a refused pairing");
+}

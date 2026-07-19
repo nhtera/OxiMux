@@ -78,6 +78,12 @@ impl AuthStore {
             (token, stored)
         };
         self.persist_saved(&stored);
+        // Announce AFTER the durable write, so a listener that reacts by reading
+        // the device list can't observe a device the store doesn't have yet.
+        self.announce_paired(super::PairedDevice {
+            pubkey: req.app_pubkey,
+            name: req.device_name.clone(),
+        });
         Ok(token)
     }
 }

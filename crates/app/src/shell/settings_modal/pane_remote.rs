@@ -16,8 +16,11 @@ use gpui::{AnyElement, Image, ImageFormat, ImageSource, IntoElement, ParentEleme
 use oximux_remote_proto::PairingTicket;
 use oximux_settings::{Density, Theme, Typography};
 
+use tokio::sync::broadcast;
+
 use super::SettingsModal;
 use super::controls::{toggle_switch, value_chip};
+use crate::shell::toast::{ToastKind, toast};
 use super::layout::{SettingEntry, entries_card, entry};
 use crate::remote_control::RemoteControl;
 
@@ -41,7 +44,7 @@ fn pairing_ticket(cx: &mut gpui::Context<SettingsModal>) -> Option<PairingTicket
 /// The status line under the toggle: what enabling does (off), that the host is
 /// still binding (on, no ticket yet), or how many sessions are exposed (on, ready).
 /// Pure so it can be unit-tested. Never mentions the handshake secret.
-fn status_text(enabled: bool, host_ready: bool, exposed: usize) -> String {
+fn status_text(enabled: bool, host_ready: bool, pairing_open: bool, exposed: usize) -> String {
     if !enabled {
         return "Turn on to expose your running agent sessions to the OxiMux mobile app. \
                 Applies to sessions started after it's enabled."
@@ -56,6 +59,13 @@ fn status_text(enabled: bool, host_ready: bool, exposed: usize) -> String {
         1 => "1 running agent session is exposed.".to_string(),
         n => format!("{n} running agent sessions are exposed."),
     };
+    if !pairing_open {
+        // The code is single-use, so once redeemed it is gone rather than left on
+        // screen looking valid.
+        return format!(
+            "Paired. Turn remote access off and on to pair another device. {exposure}"
+        );
+    }
     format!("Ready to pair. Scan the code from the OxiMux mobile app. {exposure}")
 }
 
@@ -95,7 +105,8 @@ pub(super) fn render(
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
     let ticket = pairing_ticket(cx);
-    let status = status_text(enabled(cx), ticket.is_some(), exposed_count(cx));
+    let pairing_open = cx.try_global::<RemoteControl>().is_some_and(|rc| rc.pairing_open());
+    let status = status_text(enabled(cx), ticket.is_some(), pairing_open, exposed_count(cx));
 
     let mut col = div()
         .flex()
@@ -113,7 +124,11 @@ pub(super) fn render(
     // identity underneath (the id is a public key — safe to show; the secret rides
     // inside the code and is never rendered as text).
     if let Some(ticket) = ticket {
-        if let Some(image) = pairing_qr_image(modal, &ticket) {
+        // Only while the code is still redeemable — a spent code on screen invites
+        // a scan that would just fail.
+        if pairing_open
+            && let Some(image) = pairing_qr_image(modal, &ticket)
+        {
             col = col.child(
                 // Row + `flex_none` so the white card hugs the code; a plain child
                 // of the column would stretch across the whole pane.
@@ -282,14 +297,16 @@ fn on_toggle(
         rc.set_enabled(turning_on);
         if turning_on {
             let (dispatcher, secret) = rc.prepare_host();
-            Some((dispatcher, secret, rc.endpoint_secret()))
+            // Subscribe before the host starts serving, so a fast scan can't pair
+            // in the window between bind and subscribe and go unannounced.
+            Some((dispatcher, secret, rc.endpoint_secret(), rc.subscribe_pairings()))
         } else {
             rc.stop_host();
             None
         }
     };
 
-    if let Some((dispatcher, secret, endpoint_secret)) = prep
+    if let Some((dispatcher, secret, endpoint_secret, pairings)) = prep
         && let Ok(handle) = tokio::runtime::Handle::try_current()
     {
         // Bind on the tokio runtime (iroh needs it), then publish the handle back.
@@ -307,6 +324,31 @@ fn on_toggle(
                     cx.notify();
                 });
             }
+            // Confirm each pairing to the user: with full access granted on the
+            // first scan, a silent pairing is the failure mode to avoid. Ends on
+            // its own when the host stops and the sender drops.
+            let Some(mut pairings) = pairings else {
+                return;
+            };
+            loop {
+                match pairings.recv().await {
+                    Ok(device) => {
+                        let _ = this.update(cx, |_this, cx| {
+                            toast(
+                                cx,
+                                ToastKind::Success,
+                                format!("Paired \u{201c}{}\u{201d} — it has full access", device.name),
+                            );
+                            // Repaint: the code is spent and the device joins the list.
+                            cx.notify();
+                        });
+                    }
+                    // Fell behind the ring; the pairings are still in the device
+                    // list, so keep listening rather than giving up.
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
         })
         .detach();
     }
@@ -319,15 +361,35 @@ mod tests {
 
     #[test]
     fn status_reflects_enablement_host_readiness_and_count() {
-        assert!(status_text(false, false, 3).starts_with("Turn on"), "disabled explains enabling");
         assert!(
-            status_text(true, false, 0).contains("Starting the pairing host"),
+            status_text(false, false, true, 3).starts_with("Turn on"),
+            "disabled explains enabling",
+        );
+        assert!(
+            status_text(true, false, true, 0).contains("Starting the pairing host"),
             "on but host not yet bound",
         );
-        assert!(status_text(true, true, 0).contains("No agent sessions"), "ready, none running");
-        assert!(status_text(true, true, 1).contains("1 running agent session"), "singular");
-        assert!(status_text(true, true, 4).contains("4 running agent sessions"), "plural");
-        assert!(status_text(true, true, 2).starts_with("Ready to pair"), "ready leads with pairing");
+        assert!(
+            status_text(true, true, true, 0).contains("No agent sessions"),
+            "ready, none running",
+        );
+        assert!(status_text(true, true, true, 1).contains("1 running agent session"), "singular");
+        assert!(status_text(true, true, true, 4).contains("4 running agent sessions"), "plural");
+        assert!(
+            status_text(true, true, true, 2).starts_with("Ready to pair"),
+            "ready leads with pairing",
+        );
+    }
+
+    /// Once the single-use code is spent the pane stops inviting a scan and says
+    /// how to pair another device.
+    #[test]
+    fn status_reports_a_spent_pairing_code() {
+        let spent = status_text(true, true, false, 2);
+        assert!(spent.starts_with("Paired"), "leads with the outcome: {spent}");
+        assert!(!spent.contains("Scan the code"), "no longer invites a scan");
+        assert!(spent.contains("off and on"), "says how to pair another device");
+        assert!(spent.contains("2 running agent sessions"), "still reports exposure");
     }
 
     #[test]
