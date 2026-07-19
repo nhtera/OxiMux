@@ -111,7 +111,7 @@ pub(super) fn render(
 /// Revoking takes effect on a running host immediately (per-RPC recheck) and is
 /// persisted, so it survives a restart.
 fn devices_section(
-    devices: Vec<(oximux_remote_host::AppPubkey, String)>,
+    devices: Vec<oximux_remote_host::DeviceInfo>,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -130,7 +130,10 @@ fn devices_section(
                 .child("Paired devices"),
         );
 
-    for (idx, (pubkey, name)) in devices.into_iter().enumerate() {
+    for (idx, device) in devices.into_iter().enumerate() {
+        let oximux_remote_host::DeviceInfo { pubkey, name, read_only } = device;
+        // One pubkey per closure below; each needs its own copy.
+        let revoke_key = pubkey;
         section = section.child(
             div()
                 .flex()
@@ -155,20 +158,46 @@ fn devices_section(
                                 .child(short_endpoint_id(&pubkey)),
                         ),
                 )
-                .child(value_chip(
-                    ("remote-revoke", idx),
-                    "Revoke",
-                    theme,
-                    density,
-                    typography,
-                    move |_this, _window, cx| {
-                        if let Some(rc) = cx.try_global::<RemoteControl>() {
-                            rc.revoke_device(&pubkey);
-                        }
-                        cx.notify();
-                    },
-                    cx,
-                )),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(density.gap_inline))
+                        // The opt-down: pairing grants full access, so this is how a
+                        // device gets narrowed to view-only without cutting it off.
+                        .child(
+                            div()
+                                .text_size(px(typography.t_sub_label))
+                                .text_color(theme.fg_subtle)
+                                .child("Read-only"),
+                        )
+                        .child(toggle_switch(
+                            ("remote-device-read-only", idx),
+                            read_only,
+                            theme,
+                            move |_this, _window, cx| {
+                                if let Some(rc) = cx.try_global::<RemoteControl>() {
+                                    rc.set_device_read_only(&pubkey, !read_only);
+                                }
+                                cx.notify();
+                            },
+                            cx,
+                        ))
+                        .child(value_chip(
+                            ("remote-revoke", idx),
+                            "Revoke",
+                            theme,
+                            density,
+                            typography,
+                            move |_this, _window, cx| {
+                                if let Some(rc) = cx.try_global::<RemoteControl>() {
+                                    rc.revoke_device(&revoke_key);
+                                }
+                                cx.notify();
+                            },
+                            cx,
+                        )),
+                ),
         );
     }
     section.into_any_element()

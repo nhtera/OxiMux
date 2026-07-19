@@ -19,7 +19,7 @@ use gpui::Global;
 use oximux_agents::session_registry::{SessionHandle, SessionMeta, SessionRegistry};
 use oximux_agents::thread::AgentConnection;
 use oximux_remote_host::{
-    AppPubkey, AuthStore, DeviceStore, Dispatcher, PairingSlot, mint_pairing_secret,
+    AppPubkey, AuthStore, DeviceInfo, DeviceStore, Dispatcher, PairingSlot, mint_pairing_secret,
 };
 use oximux_remote_iroh::HostHandle;
 use oximux_remote_proto::PairingTicket;
@@ -146,11 +146,11 @@ impl RemoteControl {
         (dispatcher, secret)
     }
 
-    /// Paired devices to list in the UI as `(pubkey, name)`, revoked ones excluded.
-    /// Reads the live auth store while a host is bound (so the list matches exactly
-    /// what that host will accept) and falls back to durable storage when remote is
-    /// off — you can review and revoke a device without turning remote access on.
-    pub fn paired_devices(&self) -> Vec<(AppPubkey, String)> {
+    /// Paired devices to list in the UI, revoked ones excluded. Reads the live auth
+    /// store while a host is bound (so the list matches exactly what that host will
+    /// accept) and falls back to durable storage when remote is off — you can review,
+    /// revoke, and re-tier a device without turning remote access on.
+    pub fn paired_devices(&self) -> Vec<DeviceInfo> {
         if let Some(auth) = self.auth.lock().unwrap().as_ref() {
             return auth.devices();
         }
@@ -159,9 +159,23 @@ impl RemoteControl {
                 .load()
                 .into_iter()
                 .filter(|d| !d.revoked)
-                .map(|d| (d.pubkey, d.name))
+                .map(|d| DeviceInfo { pubkey: d.pubkey, name: d.name, read_only: d.read_only })
                 .collect(),
             None => Vec::new(),
+        }
+    }
+
+    /// Move a device between the read-write and read-only tiers. Against a live host
+    /// this takes effect on its next RPC (the dispatcher rechecks per call, so an
+    /// open connection is downgraded mid-session); with no host bound it goes
+    /// straight to durable storage so the next bind seeds it.
+    pub fn set_device_read_only(&self, pubkey: &AppPubkey, read_only: bool) {
+        if let Some(auth) = self.auth.lock().unwrap().as_ref() {
+            auth.set_read_only(pubkey, read_only);
+            return;
+        }
+        if let Some(store) = &self.devices {
+            store.set_read_only(pubkey, read_only);
         }
     }
 
@@ -231,6 +245,7 @@ mod tests {
         loads: AtomicUsize,
         devices: Mutex<Vec<StoredDevice>>,
         revoked: Mutex<Vec<AppPubkey>>,
+        read_only: Mutex<Vec<(AppPubkey, bool)>>,
     }
 
     impl DeviceStore for RecordingStore {
@@ -244,7 +259,9 @@ mod tests {
                 self.revoked.lock().unwrap().push(*pubkey);
             }
         }
-        fn set_read_only(&self, _pubkey: &AppPubkey, _read_only: bool) {}
+        fn set_read_only(&self, pubkey: &AppPubkey, read_only: bool) {
+            self.read_only.lock().unwrap().push((*pubkey, read_only));
+        }
     }
 
     fn a_device(byte: u8, name: &str, revoked: bool) -> StoredDevice {
@@ -282,7 +299,8 @@ mod tests {
         let listed = rc.paired_devices();
 
         assert_eq!(listed.len(), 1, "revoked devices are not offered");
-        assert_eq!(listed[0].1, "phone");
+        assert_eq!(listed[0].name, "phone");
+        assert!(!listed[0].read_only, "a paired device starts read-write");
     }
 
     /// Revoking with no host bound still persists, so it survives into the next bind.
@@ -295,6 +313,22 @@ mod tests {
         rc.revoke_device(&[0x11; 32]);
 
         assert_eq!(store.revoked.lock().unwrap().as_slice(), &[[0x11; 32]], "revocation persisted");
+    }
+
+    /// Re-tiering with no host bound still persists, so the next bind seeds it.
+    #[test]
+    fn set_device_read_only_without_a_host_writes_through_to_storage() {
+        let store = Arc::new(RecordingStore::default());
+        store.devices.lock().unwrap().push(a_device(0x11, "phone", false));
+        let rc = RemoteControl::with_devices(store.clone());
+
+        rc.set_device_read_only(&[0x11; 32], true);
+
+        assert_eq!(
+            store.read_only.lock().unwrap().as_slice(),
+            &[([0x11; 32], true)],
+            "the opt-down is persisted even with remote off",
+        );
     }
 
     /// Re-enabling rotates the pairing secret, so a QR captured earlier stops working.

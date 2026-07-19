@@ -22,6 +22,7 @@ mod reconnect;
 #[cfg(test)]
 mod tests;
 
+pub use acl::DeviceInfo;
 pub use persistence::{DeviceStore, StorageDeviceStore, StoredDevice};
 // The registration proof is a wire invariant shared with the client, so it lives
 // in `remote-proto`; re-exported here for the host's callers + tests.

@@ -3,6 +3,15 @@
 
 use super::{AppPubkey, AuthStore, DeviceScope};
 
+/// One paired device as the desktop UI shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub pubkey: AppPubkey,
+    pub name: String,
+    /// The opt-down tier: this device may read but not act.
+    pub read_only: bool,
+}
+
 impl AuthStore {
     /// Is this device still globally authorized (i.e. not revoked)? The per-RPC
     /// revocation gate.
@@ -24,16 +33,20 @@ impl AuthStore {
         }
     }
 
-    /// The currently-authorized (non-revoked) devices as `(pubkey, name)` — the
-    /// data behind the paired-devices list + revoke UI.
-    pub fn devices(&self) -> Vec<(AppPubkey, String)> {
+    /// The currently-authorized (non-revoked) devices — the data behind the
+    /// paired-devices list, its revoke action, and its read-only toggle.
+    pub fn devices(&self) -> Vec<DeviceInfo> {
         self.inner
             .lock()
             .unwrap()
             .devices
             .iter()
             .filter(|(_, d)| !d.revoked)
-            .map(|(pubkey, d)| (*pubkey, d.name.clone()))
+            .map(|(pubkey, d)| DeviceInfo {
+                pubkey: *pubkey,
+                name: d.name.clone(),
+                read_only: d.read_only,
+            })
             .collect()
     }
 
