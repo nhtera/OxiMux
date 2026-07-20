@@ -374,3 +374,82 @@ async fn a_relaunched_client_resumes_the_pairing_without_a_ticket() {
     assert_eq!(sessions[0].session_id, "sess-1");
     serve_2.abort();
 }
+
+/// The recovery path a phone takes when it forgot its host but the desktop still
+/// knows it: `Register` is refused (a known key must reconnect, not re-pair), the
+/// app falls back to a resume on the *same* client, and that resume has to leave a
+/// usable session behind.
+///
+/// Covers the sequence end to end: a refused re-pair must not leave the client in
+/// a state where the following resume reports success but serves nothing. Asserts
+/// the session is *usable*, not merely that the resume resolved — "connected but
+/// every RPC returns `NotConnected`" is the failure worth catching here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_after_a_refused_re_pair_leaves_a_usable_session() {
+    let (registry, _handle) = seeded_registry();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Arc::new(Dispatcher::new(registry, auth.clone()));
+    let ticket =
+        PairingTicket { endpoint_id: [0u8; 32], handshake_secret: SECRET, session_id: None };
+
+    // Pair once, then drop the client's side of the pairing the way the phone's
+    // "forget this desktop" does — the desktop's record survives.
+    let (client_t, server_t) = duplex_pair();
+    let serve_1 = {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move { dispatcher.serve(&server_t).await })
+    };
+    let client = MobileClient::new(Some(CLIENT_SEED.to_vec()));
+    client
+        .connect_with(
+            Arc::new(LoopbackConnector { transport: Mutex::new(Some(Arc::new(client_t))) }),
+            ticket.clone(),
+            "phone".into(),
+            Arc::new(RecordingListener::default()),
+        )
+        .await
+        .expect("initial pairing");
+    client.disconnect().await;
+    serve_1.abort();
+
+    // A fresh code is offered (remote toggled off and on), but this key is already
+    // known, so pairing again must fail.
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let (client_t2, server_t2) = duplex_pair();
+    let serve_2 = {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move { dispatcher.serve(&server_t2).await })
+    };
+    client
+        .connect_with(
+            Arc::new(LoopbackConnector { transport: Mutex::new(Some(Arc::new(client_t2))) }),
+            ticket,
+            "phone".into(),
+            Arc::new(RecordingListener::default()),
+        )
+        .await
+        .expect_err("a device the host already knows cannot re-register");
+    serve_2.abort();
+
+    // The fallback: resume on the same client, by identity.
+    let (client_t3, server_t3) = duplex_pair();
+    let serve_3 = {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move { dispatcher.serve(&server_t3).await })
+    };
+    let listener = Arc::new(RecordingListener::default());
+    client
+        .resume_with(
+            Arc::new(LoopbackConnector { transport: Mutex::new(Some(Arc::new(client_t3))) }),
+            listener.clone(),
+        )
+        .await
+        .expect("resume recovers the pairing");
+
+    // The assertion that matters: connected *and* usable. Reporting success while
+    // the session is gone is the failure this guards.
+    let sessions = client.list_sessions().await.expect("the resumed session must serve RPCs");
+    assert_eq!(sessions.len(), 1, "sees the host's sessions after recovery");
+    serve_3.abort();
+}
