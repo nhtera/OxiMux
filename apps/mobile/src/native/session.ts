@@ -3,7 +3,13 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { useClient } from './client';
 import { describeError } from './errors';
-import { EMPTY_THREAD, parseThread, type Thread } from './thread';
+import {
+  EMPTY_THREAD,
+  parseThread,
+  type AskQuestion,
+  type QuestionAnswers,
+  type Thread,
+} from './thread';
 
 export type SessionView = {
   thread: Thread;
@@ -19,6 +25,11 @@ export type SessionView = {
   cancel: () => Promise<boolean>;
   allow: (requestId: string, toolInput: unknown) => Promise<boolean>;
   deny: (requestId: string, message: string) => Promise<boolean>;
+  answer: (
+    requestId: string,
+    questions: AskQuestion[],
+    answers: QuestionAnswers
+  ) => Promise<boolean>;
   dismissError: () => void;
 };
 
@@ -142,7 +153,23 @@ export function useSession(sessionId: string): SessionView {
     [run, sessionId]
   );
 
+  const answer = useCallback(
+    (requestId: string, questions: AskQuestion[], answers: QuestionAnswers) =>
+      run((c) =>
+        // Both payloads cross as JSON: the questions are quoted straight back
+        // from the snapshot that produced this card, so the core sees the exact
+        // shapes the fold emitted rather than a re-derived approximation.
+        c.answerQuestion(
+          sessionId,
+          requestId,
+          JSON.stringify(questions),
+          JSON.stringify(answers)
+        )
+      ),
+    [run, sessionId]
+  );
+
   const dismissError = useCallback(() => setError(undefined), []);
 
-  return { thread, loading, error, send, steer, cancel, allow, deny, dismissError };
+  return { thread, loading, error, send, steer, cancel, allow, deny, answer, dismissError };
 }

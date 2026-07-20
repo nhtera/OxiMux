@@ -8,7 +8,8 @@ import {
   TurnDiffCard,
   UserBubble,
 } from '@/components/chat/entries';
-import { PermissionCard, QuestionCard } from '@/components/chat/permission-card';
+import { PermissionCard } from '@/components/chat/permission-card';
+import { QuestionCard } from '@/components/chat/question-card';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import {
@@ -19,6 +20,8 @@ import {
   isUser,
   pendingPermission,
   pendingQuestion,
+  type AskQuestion,
+  type QuestionAnswers,
   type Thread,
   type ThreadEntry,
 } from '@/native/thread';
@@ -27,9 +30,14 @@ type Props = {
   thread: Thread;
   onAllow: (requestId: string, toolInput: unknown) => Promise<unknown>;
   onDeny: (requestId: string, message: string) => Promise<unknown>;
+  onAnswer: (
+    requestId: string,
+    questions: AskQuestion[],
+    answers: QuestionAnswers
+  ) => Promise<unknown>;
 };
 
-export function Transcript({ thread, onAllow, onDeny }: Props) {
+export function Transcript({ thread, onAllow, onDeny, onAnswer }: Props) {
   const listRef = useRef<FlatList<ThreadEntry>>(null);
   const count = thread.entries.length;
   // The last entry also *grows* while a reply streams, so the length alone is
@@ -45,8 +53,10 @@ export function Transcript({ thread, onAllow, onDeny }: Props) {
   }, [count, tailLength]);
 
   const renderItem = useCallback(
-    ({ item }: { item: ThreadEntry }) => <Entry entry={item} onAllow={onAllow} onDeny={onDeny} />,
-    [onAllow, onDeny]
+    ({ item }: { item: ThreadEntry }) => (
+      <Entry entry={item} onAllow={onAllow} onDeny={onDeny} onAnswer={onAnswer} />
+    ),
+    [onAllow, onDeny, onAnswer]
   );
 
   return (
@@ -67,7 +77,12 @@ export function Transcript({ thread, onAllow, onDeny }: Props) {
   );
 }
 
-function Entry({ entry, onAllow, onDeny }: { entry: ThreadEntry } & Omit<Props, 'thread'>) {
+function Entry({
+  entry,
+  onAllow,
+  onDeny,
+  onAnswer,
+}: { entry: ThreadEntry } & Omit<Props, 'thread'>) {
   if (isUser(entry)) {
     return <UserBubble text={entry.User.text} images={entry.User.images} />;
   }
@@ -89,7 +104,9 @@ function Entry({ entry, onAllow, onDeny }: { entry: ThreadEntry } & Omit<Props, 
         {permission ? (
           <PermissionCard call={call} request={permission} onAllow={onAllow} onDeny={onDeny} />
         ) : null}
-        {question ? <QuestionCard call={call} request={question} /> : null}
+        {question ? (
+          <QuestionCard call={call} request={question} onAnswer={onAnswer} />
+        ) : null}
       </ToolCallCard>
     );
   }

@@ -2,11 +2,10 @@ import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
+import { QUESTION_ACCENT as ACCENT } from '@/constants/chat';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
-import type { PermissionRequest, QuestionRequest, ToolCall } from '@/native/thread';
-
-const ACCENT = '#F5A623';
+import type { PermissionRequest, ToolCall } from '@/native/thread';
 
 type Props = {
   call: ToolCall;
@@ -103,27 +102,6 @@ export function PermissionCard({ call, request, onAllow, onDeny }: Props) {
           offered on the desktop for this request.
         </ThemedText>
       ) : null}
-    </View>
-  );
-}
-
-/**
- * Questions block a turn exactly as permissions do, but answering one needs a
- * selection payload the FFI does not carry yet, so this states plainly where it
- * can be answered rather than rendering dead option rows.
- */
-export function QuestionCard({ call, request }: { call: ToolCall; request: QuestionRequest }) {
-  const theme = useTheme();
-  const first = request.questions[0];
-  return (
-    <View style={[styles.card, { borderColor: ACCENT, backgroundColor: theme.backgroundElement }]}>
-      <ThemedText type="small" style={styles.kicker}>
-        Question · {call.name}
-      </ThemedText>
-      {first ? <ThemedText style={styles.body}>{first.question}</ThemedText> : null}
-      <ThemedText type="small" style={styles.note}>
-        Answer this on the desktop — the turn stays paused until you do.
-      </ThemedText>
     </View>
   );
 }

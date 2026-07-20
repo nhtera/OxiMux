@@ -18,7 +18,7 @@ import { useSession } from '@/native/session';
 export default function SessionScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const sessionId = String(id);
-  const { thread, loading, error, send, steer, cancel, allow, deny, dismissError } =
+  const { thread, loading, error, send, steer, cancel, allow, deny, answer, dismissError } =
     useSession(sessionId);
   const insets = useSafeAreaInsets();
   // The stack header sits above this view, so the keyboard has to be offset past
@@ -61,7 +61,7 @@ export default function SessionScreen() {
               <ActivityIndicator />
             </View>
           ) : (
-            <Transcript thread={thread} onAllow={allow} onDeny={deny} />
+            <Transcript thread={thread} onAllow={allow} onDeny={deny} onAnswer={answer} />
           )}
 
           <Composer

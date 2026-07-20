@@ -55,6 +55,35 @@ export type AskQuestion = {
 
 export type QuestionRequest = { request_id: string; questions: AskQuestion[] };
 
+/**
+ * One question's draft answer. `selected` holds option **labels** (not ids or
+ * indices) and `custom` supersedes it when non-empty, matching how the tool
+ * itself resolves the pair.
+ */
+export type QuestionAnswer = { selected: string[]; custom: string | null };
+
+/** The answer set for a request, keyed by question **id** — not question text.
+ * The host remaps ids to text when it builds the backend payload, so getting
+ * this key wrong drops the answer silently rather than erroring. */
+export type QuestionAnswers = {
+  by_question: Record<string, QuestionAnswer>;
+  response: string | null;
+};
+
+/** The resolved value for one question, or undefined when unanswered. Mirrors
+ * the Rust `QuestionAnswer::resolved`, which decides what actually gets sent. */
+export function resolvedAnswer(answer: QuestionAnswer | undefined): string | undefined {
+  const custom = answer?.custom?.trim();
+  if (custom) return custom;
+  const labels = (answer?.selected ?? []).map((s) => s.trim()).filter(Boolean);
+  return labels.length > 0 ? labels.join(', ') : undefined;
+}
+
+/** True when every question has a resolved answer — the submit gate. */
+export function allAnswered(questions: AskQuestion[], answers: QuestionAnswers): boolean {
+  return questions.every((q) => resolvedAnswer(answers.by_question[q.id]) !== undefined);
+}
+
 export type ToolCallStatus =
   | 'Pending'
   | 'InProgress'
