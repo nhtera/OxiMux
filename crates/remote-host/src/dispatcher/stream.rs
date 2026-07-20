@@ -12,7 +12,7 @@
 //!   stream; a per-session cursor then drops any live `seq` already covered by the
 //!   backlog batch, so the client never sees a `seq` twice.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use futures::stream::{self, BoxStream, StreamExt};
 use oximux_agent_core::thread::ThreadEvent;
@@ -211,7 +211,7 @@ impl Dispatcher {
         &self,
         pubkey: &AppPubkey,
         pty_id: &str,
-        attached: &mut HashSet<String>,
+        attached: &mut HashMap<String, tokio::sync::oneshot::Sender<()>>,
     ) -> (Response, Option<BoxStream<'static, Live>>) {
         if !self.auth.may_use_terminals(pubkey) {
             return (Response::Error(RpcError::Unauthorized), None);
@@ -234,12 +234,14 @@ impl Dispatcher {
             cols: attach.cols,
             rows: attach.rows,
         };
-        if !attached.insert(pty_id.to_owned()) {
+        if attached.contains_key(pty_id) {
             // Already streaming: `rx` drops here, which detaches the duplicate
             // attachment rather than leaving it fanning into nothing.
             return (response, None);
         }
-        (response, Some(term_stream(pty_id.to_owned(), rx)))
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        attached.insert(pty_id.to_owned(), cancel_tx);
+        (response, Some(term_stream(pty_id.to_owned(), rx, cancel_rx)))
     }
 
     /// Type into a terminal. The gate here is the write tier, not merely
@@ -298,14 +300,32 @@ impl Dispatcher {
 }
 
 /// Turn an attached terminal's frame receiver into a `'static` merged stream.
-/// Ends when the source drops the sender (the terminal is gone).
+///
+/// Ends when the source drops the sender (the terminal is gone) **or** when
+/// `cancel` fires. The cancel half is not optional bookkeeping: `SelectAll` has
+/// no way to remove one stream, so without it a detach could only forget the
+/// entry while the stream kept forwarding — and the next attach would add a
+/// second one beside it. Duplicated output accumulates per attach/detach cycle,
+/// which is a screen full of doubled characters rather than a leak anyone would
+/// notice as one.
 fn term_stream(
     pty_id: String,
     rx: tokio::sync::mpsc::Receiver<crate::terminals::TerminalFrame>,
+    cancel: tokio::sync::oneshot::Receiver<()>,
 ) -> BoxStream<'static, Live> {
-    stream::unfold((pty_id, rx), |(pty_id, mut rx)| async move {
-        let frame = rx.recv().await?;
-        Some((Live::Terminal { pty_id: pty_id.clone(), frame }, (pty_id, rx)))
+    stream::unfold((pty_id, rx, cancel), |(pty_id, mut rx, mut cancel)| async move {
+        tokio::select! {
+            // Biased so a pending cancel wins over a frame that is already
+            // queued: after a detach the client is no longer rendering this
+            // terminal, and delivering one more frame would reach a screen that
+            // has moved on.
+            biased;
+            _ = &mut cancel => None,
+            frame = rx.recv() => {
+                let frame = frame?;
+                Some((Live::Terminal { pty_id: pty_id.clone(), frame }, (pty_id, rx, cancel)))
+            }
+        }
     })
     .boxed()
 }

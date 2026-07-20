@@ -30,6 +30,7 @@ export function TerminalView({ frames, onInput, onResize }: Props) {
 
   const flush = useCallback(() => {
     if (!ready.current || !webRef.current) return;
+    if (frames.length > written.current) console.log('[probe] flush', written.current, '->', frames.length);
     for (let i = written.current; i < frames.length; i++) {
       const frame = frames[i];
       const message =
@@ -75,8 +76,11 @@ export function TerminalView({ frames, onInput, onResize }: Props) {
         onMessage={onMessage}
         // The page is a fixed local string with no navigation of its own; a
         // terminal must never follow a link that output happened to contain.
+        // The inline document itself loads as `about:blank`, so a blanket
+        // `false` here blocks the page from ever appearing — allow that one and
+        // refuse everything else.
         originWhitelist={['about:']}
-        onShouldStartLoadWithRequest={() => false}
+        onShouldStartLoadWithRequest={(req) => req.url.startsWith('about:')}
         javaScriptEnabled
         // Without this the soft keyboard shoves the whole page up and the grid
         // is measured against a viewport that no longer matches what is drawn.

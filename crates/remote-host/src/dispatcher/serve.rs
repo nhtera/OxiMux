@@ -2,7 +2,7 @@
 //! live events of any active `Subscribe`, so a live event is pushed the moment it
 //! is produced without waiting on the next request.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use futures::future::{Either, select};
 use futures::stream::{BoxStream, SelectAll, StreamExt};
@@ -32,10 +32,13 @@ impl Dispatcher {
         // the loop. Empty until the first accepted `Subscribe`.
         let mut streams: SelectAll<BoxStream<'static, Live>> = SelectAll::new();
         let mut cursors: HashMap<SessionId, Seq> = HashMap::new();
-        // Terminals this connection already streams, so a repeat attach serves
-        // the replay again without opening a second stream. Re-attaching IS the
-        // documented gap recovery, so it has to stay cheap and repeatable.
-        let mut attached: HashSet<String> = HashSet::new();
+        // Terminals this connection already streams, each with the handle that
+        // ends its stream. A repeat attach serves the replay again without
+        // opening a second stream — re-attaching IS the documented gap
+        // recovery, so it has to stay cheap and repeatable — and a detach must
+        // actually stop the old one, or the next attach stacks a second stream
+        // beside it and every byte arrives twice.
+        let mut attached: HashMap<String, tokio::sync::oneshot::Sender<()>> = HashMap::new();
         // `futures::future::select` is left-biased (always polls its first arg
         // first). Alternating which side leads each turn keeps neither the request
         // stream nor live delivery able to starve the other: a flood of pipelined
@@ -120,7 +123,7 @@ impl Dispatcher {
         state: &mut ConnState,
         streams: &mut SelectAll<BoxStream<'static, Live>>,
         cursors: &mut HashMap<SessionId, Seq>,
-        attached: &mut HashSet<String>,
+        attached: &mut HashMap<String, tokio::sync::oneshot::Sender<()>>,
         transport: &dyn Transport,
         frame: Vec<u8>,
     ) -> bool {
@@ -178,9 +181,10 @@ impl Dispatcher {
             return self.send(transport, response).await;
         }
         if let Request::TermDetach { pty_id } = req {
-            // Idempotent and unauthenticated-safe: forgetting a stream this
-            // connection holds is never a privilege. The stream itself ends when
-            // its receiver drops, which happens as the merged set is rebuilt.
+            // Idempotent and unauthenticated-safe: ending a stream this
+            // connection holds is never a privilege. Dropping the cancel sender
+            // is what actually stops it — `SelectAll` cannot remove a stream, so
+            // merely forgetting the entry would leave it forwarding forever.
             attached.remove(&pty_id);
             return self.send(transport, Response::Ack).await;
         }

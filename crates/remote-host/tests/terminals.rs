@@ -34,6 +34,9 @@ fn clock() -> u64 {
 struct FakeTerminals {
     frames: Mutex<Option<mpsc::Receiver<TerminalFrame>>>,
     typed: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// Frames handed to a *second* attach, so a detach/re-attach cycle can be
+    /// driven without the fake running out of receivers.
+    reattached: Mutex<Option<mpsc::Receiver<TerminalFrame>>>,
 }
 
 #[async_trait::async_trait]
@@ -54,7 +57,12 @@ impl TerminalSource for FakeTerminals {
         if pty_id != "pty-1" {
             return Err(TerminalError::NotFound);
         }
-        let rx = self.frames.lock().await.take().ok_or(TerminalError::Unavailable)?;
+        // Second attach draws from its own receiver, mirroring a real source
+        // handing out a fresh subscription per attach.
+        let rx = match self.frames.lock().await.take() {
+            Some(rx) => rx,
+            None => self.reattached.lock().await.take().ok_or(TerminalError::Unavailable)?,
+        };
         Ok((
             TerminalAttach { replay: b"$ echo hi\r\nhi\r\n".to_vec(), cols: 80, rows: 24 },
             rx,
@@ -103,6 +111,7 @@ fn harness(pairing_session: Option<&str>) -> Harness {
     let terminals = Arc::new(FakeTerminals {
         frames: Mutex::new(Some(rx)),
         typed: Arc::clone(&typed),
+        reattached: Mutex::new(None),
     });
     let auth = Arc::new(AuthStore::new());
     auth.set_pairing(PairingSlot::new(SECRET, pairing_session.map(Into::into), false));
@@ -292,6 +301,90 @@ async fn a_dropped_frame_reaches_the_client_as_a_gap() {
             Response::from_bytes(&frame).unwrap(),
             Response::TermGapped { pty_id: "pty-1".into() },
             "the host's own data loss is reported, not hidden behind a continuous stream",
+        );
+    };
+
+    futures::future::join(serve, script).await;
+}
+
+/// A detach must actually STOP the stream, not merely forget it.
+///
+/// `SelectAll` cannot remove one of its streams, so a detach that only dropped
+/// the bookkeeping entry would leave the old stream forwarding while the next
+/// attach stacked a second one beside it. Every byte would then arrive twice —
+/// and three times after the next cycle — which on screen is doubled characters
+/// rather than anything that reads as a leak.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn re_attaching_after_a_detach_does_not_double_the_output() {
+    let (tx_a, rx_a) = mpsc::channel(8);
+    let (tx_b, rx_b) = mpsc::channel(8);
+    let typed = Arc::new(Mutex::new(Vec::new()));
+    let terminals = Arc::new(FakeTerminals {
+        frames: Mutex::new(Some(rx_a)),
+        typed: Arc::clone(&typed),
+        reattached: Mutex::new(Some(rx_b)),
+    });
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), Arc::clone(&auth))
+        .with_clock(clock)
+        .with_terminals(terminals);
+
+    let pubkey = [0x33; 32];
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req(pubkey, None))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        let Response::TermAttached { .. } =
+            call(&client, Request::TermAttach { pty_id: "pty-1".into() }).await
+        else {
+            panic!("expected TermAttached");
+        };
+
+        // Detach, then attach again — the mount/unmount/remount a client does
+        // when the user leaves a terminal screen and comes back.
+        assert_eq!(
+            call(&client, Request::TermDetach { pty_id: "pty-1".into() }).await,
+            Response::Ack,
+        );
+        let Response::TermAttached { .. } =
+            call(&client, Request::TermAttach { pty_id: "pty-1".into() }).await
+        else {
+            panic!("expected a second TermAttached");
+        };
+
+        // The detached stream must be GONE, not merely forgotten. Cancelling it
+        // drops its receiver, so the source's next send fails — which is also
+        // what tells a real source to release its upstream subscription. If the
+        // stream were only forgotten this send would succeed and STALE would
+        // arrive below, ahead of the live stream's frames.
+        assert!(
+            tx_a.send(TerminalFrame::Output(b"STALE".to_vec())).await.is_err(),
+            "the detached stream's receiver is gone, so its source stops feeding it",
+        );
+
+        tx_b.send(TerminalFrame::Output(b"once".to_vec())).await.unwrap();
+        let frame = client.recv().await.unwrap().expect("a pushed frame");
+        assert_eq!(
+            Response::from_bytes(&frame).unwrap(),
+            Response::TermOutput { pty_id: "pty-1".into(), bytes: b"once".to_vec() },
+        );
+
+        // The next frame must be the live stream's, never the detached one's —
+        // that ordering is the assertion. A detached stream that still forwards
+        // would have delivered STALE ahead of this.
+        tx_b.send(TerminalFrame::Output(b"twice".to_vec())).await.unwrap();
+        let frame = client.recv().await.unwrap().expect("a second pushed frame");
+        assert_eq!(
+            Response::from_bytes(&frame).unwrap(),
+            Response::TermOutput { pty_id: "pty-1".into(), bytes: b"twice".to_vec() },
+            "the detached stream is silent — it was stopped, not merely forgotten",
         );
     };
 
