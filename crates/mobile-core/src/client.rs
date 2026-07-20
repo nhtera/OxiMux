@@ -10,14 +10,16 @@ use std::sync::{Arc, Mutex as StdMutex};
 use futures::channel::oneshot;
 use oximux_remote_iroh::{IrohConnector, bind_client};
 use oximux_remote_proto::PairingTicket;
-use oximux_remote_session::{ClientSigner, Connector, RemoteSession};
+use oximux_remote_session::{Bootstrap, ClientSigner, Connector, RemoteSession};
 use tokio::sync::Mutex;
 
 use crate::callbacks::ConnStateListener;
 use crate::ffi_types::MobileError;
+use crate::runtime::now_secs;
 use crate::subscription::Sub;
 
 mod connect;
+mod git;
 mod rpc;
 
 use connect::spawn_maintainer;
@@ -63,6 +65,11 @@ pub struct MobileClient {
     /// Stops the current reconnect driver when the app disconnects or supersedes
     /// the connection. Taken + fired to signal the background loop to return.
     shutdown: StdMutex<Option<oneshot::Sender<()>>>,
+    /// The endpoint id of the host this client last dialled. Exposed so the app
+    /// can persist it and [`reconnect`](MobileClient::reconnect) later — the
+    /// pairing ticket itself must NOT be stored for that, since its
+    /// `handshake_secret` is single-use and the host rotates it.
+    host_endpoint: StdMutex<Option<[u8; 32]>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -87,7 +94,35 @@ impl MobileClient {
                 epoch: AtomicU64::new(0),
             }),
             shutdown: StdMutex::new(None),
+            host_endpoint: StdMutex::new(None),
         })
+    }
+
+    /// The endpoint id of the host this client is paired with, once a
+    /// [`connect`](Self::connect) has been attempted. Persist these 32 bytes to
+    /// reconnect after a restart — they are the host's public key, not a secret.
+    pub fn host_endpoint_id(&self) -> Option<Vec<u8>> {
+        self.host_endpoint.lock().unwrap().map(|id| id.to_vec())
+    }
+
+    /// Reconnect to an already-paired host by its stored endpoint id.
+    ///
+    /// This does **not** re-pair: the driver runs [`Bootstrap::Resume`], so the
+    /// host authenticates this device by challenging its Ed25519 app key (or by
+    /// its cached token). That is why the pairing ticket is not needed — and must
+    /// not be stored, since its one-time secret would be stale anyway.
+    pub async fn reconnect(
+        &self,
+        endpoint_id: Vec<u8>,
+        listener: Arc<dyn ConnStateListener>,
+    ) -> Result<(), MobileError> {
+        let id: [u8; 32] = endpoint_id.try_into().map_err(|v: Vec<u8>| {
+            MobileError::BadTicket(format!("endpoint id must be 32 bytes, got {}", v.len()))
+        })?;
+        let endpoint = bind_client().await.map_err(|e| MobileError::Transport(e.to_string()))?;
+        let connector =
+            IrohConnector::new(endpoint, id).map_err(|e| MobileError::Transport(e.to_string()))?;
+        self.start(Arc::new(connector), Some(id), Bootstrap::Resume, listener).await
     }
 
     /// Pair with and connect to the host named by a scanned
@@ -134,6 +169,30 @@ impl MobileClient {
         device_name: String,
         listener: Arc<dyn ConnStateListener>,
     ) -> Result<(), MobileError> {
+        let endpoint_id = ticket.endpoint_id;
+        let bootstrap = Bootstrap::Pair { ticket, device_name, at_secs: now_secs() };
+        self.start(connector, Some(endpoint_id), bootstrap, listener).await
+    }
+
+    /// The transport-agnostic resume path — the [`connect_with`](Self::connect_with)
+    /// counterpart for an already-paired host, so the `Bootstrap::Resume` handshake
+    /// can be driven over an injected transport instead of a real iroh dial.
+    pub async fn resume_with(
+        &self,
+        connector: Arc<dyn Connector>,
+        listener: Arc<dyn ConnStateListener>,
+    ) -> Result<(), MobileError> {
+        self.start(connector, None, Bootstrap::Resume, listener).await
+    }
+
+    /// Supersede any current connection and drive a fresh one under `bootstrap`.
+    async fn start(
+        &self,
+        connector: Arc<dyn Connector>,
+        endpoint_id: Option<[u8; 32]>,
+        bootstrap: Bootstrap,
+        listener: Arc<dyn ConnStateListener>,
+    ) -> Result<(), MobileError> {
         // Supersede any prior connection: stop its driver and clear subs + session
         // so a reentrant connect (e.g. a double-tapped reconnect) never leaves two
         // drivers or stale sinks behind. The epoch bump makes any in-flight
@@ -143,6 +202,10 @@ impl MobileClient {
         self.shared.subs.lock().await.clear();
         *self.shared.session.lock().unwrap() = None;
 
+        if let Some(id) = endpoint_id {
+            *self.host_endpoint.lock().unwrap() = Some(id);
+        }
+
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         *self.shutdown.lock().unwrap() = Some(shutdown_tx);
 
@@ -151,8 +214,7 @@ impl MobileClient {
             self.shared.clone(),
             self.signer.clone(),
             connector,
-            ticket,
-            device_name,
+            bootstrap,
             listener,
             shutdown_rx,
         );

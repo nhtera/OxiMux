@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::channel::oneshot;
-use oximux_remote_proto::PairingTicket;
 use oximux_remote_session::{
     Bootstrap, ClientSigner, ConnState as RsConnState, Connector, RemoteSession, Sleeper,
     maintain_connection,
@@ -18,7 +17,7 @@ use oximux_remote_session::{
 use super::Shared;
 use crate::callbacks::ConnStateListener;
 use crate::ffi_types::{ConnState, MobileError};
-use crate::runtime::{now_secs, rt};
+use crate::runtime::rt;
 use crate::subscription::{FirstResult, activate};
 
 /// Backs the driver's reconnect backoff with real wall-clock sleeps.
@@ -37,8 +36,7 @@ pub(crate) fn spawn_maintainer(
     shared: Arc<Shared>,
     signer: ClientSigner,
     connector: Arc<dyn Connector>,
-    ticket: PairingTicket,
-    device_name: String,
+    bootstrap: Bootstrap,
     listener: Arc<dyn ConnStateListener>,
     shutdown_rx: oneshot::Receiver<()>,
 ) -> oneshot::Receiver<Result<(), MobileError>> {
@@ -76,7 +74,6 @@ pub(crate) fn spawn_maintainer(
         rt().spawn(activate(shared.clone(), session, first.clone(), epoch));
     };
 
-    let bootstrap = Bootstrap::Pair { ticket, device_name, at_secs: now_secs() };
     rt().spawn(maintain_connection(
         connector,
         Arc::new(TokioSleeper),

@@ -242,3 +242,70 @@ async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
     }
     cond()
 }
+
+/// A relaunched app resumes its pairing without a ticket.
+///
+/// This is the path every app launch takes after the first, and it is the reason
+/// the ticket must NOT be persisted: its `handshake_secret` is one-time, so a
+/// stored ticket would be stale. The device is recognised instead by its Ed25519
+/// identity — modelled here by building the second client from the same seed,
+/// exactly as the app rebuilds it from the OS keystore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relaunched_client_resumes_the_pairing_without_a_ticket() {
+    let (registry, _handle) = seeded_registry();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    // One dispatcher, so the AuthStore carries the pairing across both connections
+    // just as the desktop's durable device record does across an app restart.
+    let dispatcher = Arc::new(Dispatcher::new(registry, auth));
+
+    // First launch: pair over the first loopback.
+    let (client_t, server_t) = duplex_pair();
+    let serve_1 = {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move { dispatcher.serve(&server_t).await })
+    };
+    let ticket =
+        PairingTicket { endpoint_id: [0u8; 32], handshake_secret: SECRET, session_id: None };
+    let first = MobileClient::new(Some(CLIENT_SEED.to_vec()));
+    first
+        .connect_with(
+            Arc::new(LoopbackConnector { transport: Mutex::new(Some(Arc::new(client_t))) }),
+            ticket,
+            "phone".into(),
+            Arc::new(RecordingListener::default()),
+        )
+        .await
+        .expect("initial pairing");
+    // The host id is what the app persists; the ticket is deliberately not stored.
+    assert_eq!(first.host_endpoint_id(), Some(vec![0u8; 32]), "exposes the host id to persist");
+    first.disconnect().await;
+    serve_1.abort();
+
+    // Relaunch: a brand-new client from the same stored seed, resuming with no ticket.
+    let (client_t2, server_t2) = duplex_pair();
+    let serve_2 = {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move { dispatcher.serve(&server_t2).await })
+    };
+    let relaunched = MobileClient::new(Some(CLIENT_SEED.to_vec()));
+    let listener = Arc::new(RecordingListener::default());
+    relaunched
+        .resume_with(
+            Arc::new(LoopbackConnector { transport: Mutex::new(Some(Arc::new(client_t2))) }),
+            listener.clone(),
+        )
+        .await
+        .expect("resume without a ticket");
+    assert!(
+        matches!(listener.states.lock().unwrap().last(), Some(ConnState::Connected)),
+        "resumes to Connected, saw {:?}",
+        listener.states.lock().unwrap(),
+    );
+
+    // And the resumed session is usable, not merely connected.
+    let sessions = relaunched.list_sessions().await.expect("list_sessions after resume");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, "sess-1");
+    serve_2.abort();
+}
