@@ -177,6 +177,41 @@ async fn mobile_client_pairs_lists_and_subscribes_over_the_loopback() {
          saw {text:?}",
     );
 
+    // Answering crosses the FFI as JSON and comes back idempotent, same contract
+    // as resolving a permission.
+    let questions = r#"[{"id":"q1","header":"Pick","question":"Which one?",
+        "options":[{"label":"A","description":"first"}],
+        "kind":"SingleSelect","other_allowed":false,"is_secret":false}]"#;
+    let answers = r#"{"by_question":{"q1":{"selected":["A"],"custom":null}},"response":null}"#;
+    assert!(
+        client
+            .answer_question("sess-1".into(), "req-q".into(), questions.into(), answers.into())
+            .await
+            .expect("answer_question"),
+        "the first answer decides the request",
+    );
+    assert!(
+        !client
+            .answer_question("sess-1".into(), "req-q".into(), questions.into(), answers.into())
+            .await
+            .expect("re-answer"),
+        "a second answer is already-decided, not an error",
+    );
+
+    // A secret question is refused before anything leaves the phone: the desktop
+    // redacts a secret answer by flagging its own thread as the answer is sent,
+    // and this path has no thread to flag, so a remote answer would land in the
+    // persisted transcript in plain text.
+    let secret = questions.replace("\"is_secret\":false", "\"is_secret\":true");
+    let err = client
+        .answer_question("sess-1".into(), "req-s".into(), secret, answers.into())
+        .await
+        .expect_err("a secret question is refused");
+    assert!(
+        format!("{err:?}").contains("desktop"),
+        "the refusal says where it CAN be answered, saw {err:?}",
+    );
+
     client.disconnect().await;
     let _ = server.await;
 }

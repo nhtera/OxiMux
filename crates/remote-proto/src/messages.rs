@@ -7,7 +7,9 @@
 //! both private so a payload can only be built through the encoding constructor
 //! — see the crate-level note for why they are not native postcard.
 
-use oximux_agent_core::thread::{ChatImage, PermissionDecision, SessionMeta, ThreadEvent};
+use oximux_agent_core::thread::{
+    AskQuestion, ChatImage, PermissionDecision, QuestionAnswers, SessionMeta, ThreadEvent,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::proto::WireError;
@@ -119,6 +121,29 @@ impl ResolvePermissionReq {
     pub fn decision(&self) -> Result<PermissionDecision, WireError> {
         Ok(serde_json::from_str(&self.decision_json)?)
     }
+}
+
+/// [`Request::AnswerQuestion`](crate::proto::Request::AnswerQuestion) payload —
+/// the answer to an outstanding `AskUserQuestion`.
+///
+/// Unlike [`ResolvePermissionReq`] these ride as native postcard rather than a
+/// JSON string: every field of `AskQuestion` / `QuestionAnswers` is a plain
+/// `String`, `Vec`, `bool` or map, with no `serde_json::Value` anywhere, so the
+/// encapsulation that decision payloads need does not apply here.
+///
+/// `questions` is echoed back by the client rather than looked up host-side, and
+/// that is forced rather than chosen: building the backend payload needs the
+/// question text (answers are keyed by it), but the questions live in the
+/// desktop's `ChatThread`, which the session registry cannot reach. The client
+/// is quoting the host's own `QuestionAsked` event back at it, and it is an
+/// authenticated paired device that could already send prompts and approve
+/// tools, so this widens no boundary that matters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AnswerQuestionReq {
+    pub session_id: String,
+    pub request_id: String,
+    pub questions: Vec<AskQuestion>,
+    pub answers: QuestionAnswers,
 }
 
 /// Coarse per-session status, piggybacked on every [`HostEvent`] so a client can

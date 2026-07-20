@@ -7,7 +7,10 @@ use std::sync::Arc;
 use futures::StreamExt;
 use futures::executor::block_on;
 use futures::future::join3;
-use oximux_agent_core::thread::{ChatThread, PermissionDecision, PermissionKind, ThreadEntry, ThreadEvent};
+use oximux_agent_core::thread::{
+    AskQuestion, ChatThread, PermissionDecision, PermissionKind, QuestionAnswer, QuestionAnswers,
+    QuestionKind, QuestionOption, ThreadEntry, ThreadEvent,
+};
 use oximux_agents::session_registry::SessionRegistry;
 use oximux_agents::thread::{AgentCapabilities, StubConnection};
 use oximux_remote_host::{AuthStore, Dispatcher, PairingSlot};
@@ -108,6 +111,36 @@ fn client_pairs_and_drives_a_session_over_the_loopback() {
         assert!(
             !client.resolve_permission("sess-1", "req-1", &allow).await.expect("re-resolve"),
             "already-decided is Ok(false), not an error"
+        );
+
+        // Answering shares that gate, so it carries the same contract.
+        let questions = vec![AskQuestion {
+            id: "q1".into(),
+            header: "Pick".into(),
+            question: "Which one?".into(),
+            options: vec![QuestionOption { label: "A".into(), description: "first".into() }],
+            kind: QuestionKind::SingleSelect,
+            other_allowed: false,
+            is_secret: false,
+        }];
+        let answers = QuestionAnswers {
+            by_question: [("q1".to_string(), QuestionAnswer {
+                selected: vec!["A".into()],
+                custom: None,
+            })]
+            .into_iter()
+            .collect(),
+            response: None,
+        };
+        assert!(
+            client.answer_question("sess-1", "req-q", &questions, &answers).await.expect("answer")
+        );
+        assert!(
+            !client
+                .answer_question("sess-1", "req-q", &questions, &answers)
+                .await
+                .expect("re-answer"),
+            "a second answer to the same request is already-decided, not an error"
         );
         // client dropped here → its shutdown sender drops → pump stops → serve ends
     };

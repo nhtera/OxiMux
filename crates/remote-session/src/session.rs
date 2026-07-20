@@ -15,9 +15,9 @@ mod subscribe;
 use std::sync::{Arc, Mutex};
 
 use futures::channel::oneshot;
-use oximux_agent_core::thread::{ChatImage, PermissionDecision};
+use oximux_agent_core::thread::{AskQuestion, ChatImage, PermissionDecision, QuestionAnswers};
 use oximux_remote_proto::messages::{
-    ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionSummary,
+    AnswerQuestionReq, ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionSummary,
 };
 use oximux_remote_proto::proto::{Request, Response, RpcError};
 use oximux_remote_proto::{HostEvent, Transport};
@@ -138,6 +138,29 @@ impl RemoteSession {
         let payload = ResolvePermissionReq::new(session_id, request_id, decision)
             .map_err(|e| SessionError::Wire(e.to_string()))?;
         match self.call(Request::ResolvePermission(payload)).await? {
+            Response::Ack => Ok(true),
+            Response::Error(RpcError::AlreadyDecided) => Ok(false),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Ack" }),
+        }
+    }
+
+    /// Answer an outstanding `AskUserQuestion`. Same idempotency contract as
+    /// [`Self::resolve_permission`]: `Ok(false)` means someone answered first.
+    pub async fn answer_question(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        questions: &[AskQuestion],
+        answers: &QuestionAnswers,
+    ) -> Result<bool> {
+        let payload = AnswerQuestionReq {
+            session_id: session_id.to_string(),
+            request_id: request_id.to_string(),
+            questions: questions.to_vec(),
+            answers: answers.clone(),
+        };
+        match self.call(Request::AnswerQuestion(payload)).await? {
             Response::Ack => Ok(true),
             Response::Error(RpcError::AlreadyDecided) => Ok(false),
             Response::Error(e) => Err(SessionError::Rpc(e)),

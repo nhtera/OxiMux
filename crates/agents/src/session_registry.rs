@@ -29,7 +29,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use tokio::sync::{broadcast, watch};
 
-use crate::thread::{AgentConnection, ChatImage, PermissionDecision, ThreadEvent};
+use crate::thread::{
+    AgentConnection, AskQuestion, ChatImage, PermissionDecision, QuestionAnswers, ThreadEvent,
+};
 
 /// Session identity — the same `session_id` the transcript persists under.
 pub type SessionId = String;
@@ -173,6 +175,38 @@ impl SessionHandle {
         // from `next_seq` here can read a counter already bumped by a concurrent
         // ingest whose event isn't in the backlog yet, publishing a resume cursor
         // ahead of the durable store). Refresh only the awaiting flag.
+        self.update_status(None);
+        Ok(true)
+    }
+
+    /// Answer an outstanding `AskUserQuestion`, sharing the permission gate so a
+    /// question and a permission can never both claim the same `request_id` and
+    /// so a racing second answer is refused rather than double-sent.
+    ///
+    /// `questions` comes from the caller because the backend payload keys answers
+    /// by question text, and that text lives in the `ChatThread` this registry
+    /// deliberately does not hold.
+    ///
+    /// Note this does **not** carry the desktop's secret-answer redaction: that
+    /// sets `redact_result` on the thread, which is out of reach here. Callers
+    /// exposing this to a remote surface must keep `is_secret` questions off it.
+    pub fn answer_question(
+        &self,
+        request_id: &str,
+        questions: &[AskQuestion],
+        answers: &QuestionAnswers,
+    ) -> Result<bool> {
+        let newly_decided = self.decided.lock().unwrap().insert(request_id.to_string());
+        if !newly_decided {
+            return Ok(false);
+        }
+        if let Err(err) = self.conn().answer_question(request_id, questions, answers) {
+            // Roll the gate back so a transient transport failure doesn't lock the
+            // question as answered forever.
+            self.decided.lock().unwrap().remove(request_id);
+            return Err(err);
+        }
+        self.pending.lock().unwrap().remove(request_id);
         self.update_status(None);
         Ok(true)
     }

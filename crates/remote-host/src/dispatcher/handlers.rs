@@ -4,7 +4,8 @@
 
 use oximux_agents::session_registry::SessionHandle;
 use oximux_remote_proto::messages::{
-    ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionStatusWire, SessionSummary,
+    AnswerQuestionReq, ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionStatusWire,
+    SessionSummary,
 };
 use oximux_remote_proto::proto::{Response, RpcError};
 use oximux_remote_proto::HostEvent;
@@ -91,6 +92,26 @@ impl Dispatcher {
                 // to the client (it can carry paths / internal shapes).
                 tracing::warn!(error = %e, session = %req.session_id, "resolve_permission failed");
                 Response::Error(RpcError::Internal("permission resolve failed".into()))
+            }
+        }
+    }
+
+    pub(super) fn answer_question(&self, pubkey: &AppPubkey, req: AnswerQuestionReq) -> Response {
+        // Answering releases a blocked turn, so it is a write.
+        if !self.auth.may_write(pubkey, &req.session_id) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(handle) = self.registry.get(&req.session_id) else {
+            return Response::Error(RpcError::UnknownSession);
+        };
+        match handle.answer_question(&req.request_id, &req.questions, &req.answers) {
+            Ok(true) => Response::Ack,
+            Ok(false) => Response::Error(RpcError::AlreadyDecided),
+            Err(e) => {
+                // Backend error text can carry paths and internal shapes — log it
+                // here, hand the client only the category.
+                tracing::warn!(error = %e, session = %req.session_id, "answer_question failed");
+                Response::Error(RpcError::Internal("question answer failed".into()))
             }
         }
     }

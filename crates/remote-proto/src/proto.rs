@@ -21,14 +21,15 @@ pub use crate::messages::*;
 /// (handshake + session list/info + prompt/resolve/steer/cancel + event
 /// subscription & gap-fill). v2: appended the git surface (`GitStatus`,
 /// `GitDiff`). v3: appended the version handshake (`Hello`/`HelloAck`). v4:
-/// appended the git write surface (`GitStage`, `GitUnstage`, `GitCommit`).
+/// appended the git write surface (`GitStage`, `GitUnstage`, `GitCommit`). v5:
+/// appended `AnswerQuestion`.
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The oldest peer version this build still speaks. **Raise this only on a
 /// genuinely breaking change** — a reordered/removed variant or an altered
@@ -152,6 +153,10 @@ pub enum Request {
     /// path-taking git variant pre-stages, which would silently overwrite
     /// hunk-level partial staging the remote client cannot see.
     GitCommit { session_id: String, message: String },
+    /// Answer an outstanding `AskUserQuestion`. Idempotent host-side, sharing the
+    /// same decided-once gate as [`Request::ResolvePermission`]. State-changing —
+    /// answering releases a blocked turn — so a read-only device is refused.
+    AnswerQuestion(AnswerQuestionReq),
 }
 
 /// Host → client.

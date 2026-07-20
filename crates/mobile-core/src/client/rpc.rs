@@ -4,7 +4,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use oximux_agent_core::thread::PermissionDecision;
+use oximux_agent_core::thread::{AskQuestion, PermissionDecision, QuestionAnswers};
 
 use crate::client::MobileClient;
 use crate::ffi_types::{MobileError, PermissionReply, SessionSummary};
@@ -52,6 +52,45 @@ impl MobileClient {
         };
         session
             .resolve_permission(&session_id, &request_id, &decision)
+            .await
+            .map_err(|e| MobileError::Rpc(e.to_string()))
+    }
+
+    /// Answer a pending `AskUserQuestion`. Returns `true` if this call answered it,
+    /// `false` if it was already answered (idempotent, not an error).
+    ///
+    /// Both payloads cross as JSON rather than as generated records: the phone
+    /// already holds the questions verbatim inside `ThreadSnapshot.thread_json`,
+    /// so it quotes them straight back instead of round-tripping a hand-maintained
+    /// record shape that could drift from the fold's.
+    ///
+    /// A question marked `is_secret` is **refused here**. The desktop redacts a
+    /// secret answer by setting `redact_result` on its `ChatThread` at the moment
+    /// of answering — the last point the secret-ness is knowable — and the session
+    /// registry this path runs through holds no thread to mark. Answering one
+    /// remotely would leave the echoed credential in the persisted transcript in
+    /// plain text. This is a guard against the accidental case, not a security
+    /// boundary: `is_secret` arrives from the client, so it protects an honest
+    /// caller, and a paired device could already send prompts and approve tools.
+    pub async fn answer_question(
+        &self,
+        session_id: String,
+        request_id: String,
+        questions_json: String,
+        answers_json: String,
+    ) -> Result<bool, MobileError> {
+        let session = self.shared.session()?;
+        let questions: Vec<AskQuestion> = serde_json::from_str(&questions_json)
+            .map_err(|e| MobileError::Rpc(format!("questions are not valid JSON: {e}")))?;
+        let answers: QuestionAnswers = serde_json::from_str(&answers_json)
+            .map_err(|e| MobileError::Rpc(format!("answers are not valid JSON: {e}")))?;
+        if questions.iter().any(|q| q.is_secret) {
+            return Err(MobileError::Rpc(
+                "this question asks for a secret and can only be answered on the desktop".into(),
+            ));
+        }
+        session
+            .answer_question(&session_id, &request_id, &questions, &answers)
             .await
             .map_err(|e| MobileError::Rpc(e.to_string()))
     }

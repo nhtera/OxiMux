@@ -112,6 +112,7 @@ impl Dispatcher {
             Request::GetSessionInfo { session_id } => self.session_info(pubkey, &session_id),
             Request::SendPrompt(r) => self.send_prompt(pubkey, r),
             Request::ResolvePermission(r) => self.resolve_permission(pubkey, r),
+            Request::AnswerQuestion(r) => self.answer_question(pubkey, r),
             Request::Steer { session_id, text } => {
                 self.scoped(pubkey, &session_id, |h| h.steer(&text))
             }
