@@ -87,6 +87,19 @@ impl AuthStore {
     pub(super) fn persist_saved(&self, device: &StoredDevice) {
         if let Some(store) = &self.store {
             store.save(device);
+            // Pairing is itself a sighting, and the in-memory record says so — but
+            // `save` writes the pairing, not a connection, so the timestamp was
+            // dropped on the way to disk. Every restart and every remote off/on
+            // reseeds from disk, so the device came back reading "never connected":
+            // the label the paired-devices list reserves for a pairing nobody
+            // recognizes, worn by one that had just been made.
+            //
+            // Stamped here rather than inside a store implementation so it holds
+            // for every backend, instead of depending on each one remembering that
+            // `StoredDevice.last_seen` is meaningful.
+            if device.last_seen.is_some() {
+                store.touch_last_seen(&device.pubkey);
+            }
         }
     }
 
@@ -302,6 +315,34 @@ mod tests {
         );
         auth.register(&reg(pubkey, None), NOW)
             .expect("a forgotten device is no longer known, so it may pair again");
+    }
+
+    /// Pairing is a sighting, and it has to reach disk as one.
+    ///
+    /// The in-memory record has always carried it; the durable write dropped it,
+    /// because `upsert` deliberately does not touch `last_seen`. Every restart and
+    /// every remote off/on reseeds this store from disk, so the device came back
+    /// as "never connected" — the label the paired-devices list reserves for a
+    /// pairing the user does not recognize.
+    #[test]
+    fn a_fresh_pairing_reaches_storage_as_a_sighting() {
+        let store = Arc::new(RecordingStore::default());
+        let auth = AuthStore::with_store(store.clone());
+        auth.set_pairing(super::super::PairingSlot::new(SECRET, None, false));
+        let pubkey = vk(0x66);
+
+        auth.register(&reg(pubkey, None), NOW).expect("pair");
+
+        assert_eq!(
+            auth.devices().into_iter().find(|d| d.pubkey == pubkey).unwrap().last_seen,
+            Some(NOW),
+            "in memory, as before",
+        );
+        assert_eq!(
+            store.seen.lock().unwrap().as_slice(),
+            &[pubkey],
+            "and on disk, so a reseed does not read it back as never-connected",
+        );
     }
 
     /// Forgetting must cut a *live* device off as hard as revoking does — its

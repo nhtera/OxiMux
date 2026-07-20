@@ -697,3 +697,86 @@ fn authenticating_records_the_device_last_seen() {
     };
     block_on(join(dispatcher.serve(&server), script));
 }
+
+/// Forgetting a device must cut an already-open connection off exactly as hard as
+/// revoking it does.
+///
+/// The two differ only in what they leave behind — a revoked key stays known so it
+/// can never re-pair, a forgotten one does not — and that difference is about
+/// *future* pairings. If erasing the record let a live connection keep working
+/// (its token still cached, its per-RPC recheck passing), forget would be the
+/// strictly weaker action while reading like the more final one.
+#[test]
+fn forgetting_a_device_bites_an_already_open_connection() {
+    let registry = seeded_registry();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth.clone()).with_clock(clock);
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let pubkey = SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes();
+
+    let script = async move {
+        assert!(matches!(
+            call(&client, Request::Hello(HelloReq { protocol_version: PROTOCOL_VERSION })).await,
+            Response::HelloAck(_)
+        ));
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+        // Authenticated and working before the forget, so the assertion after it
+        // cannot pass for the trivial reason that nothing worked to begin with.
+        let Response::Sessions(sessions) = call(&client, Request::ListSessions).await else {
+            panic!("expected Sessions");
+        };
+        assert_eq!(sessions.len(), 1, "the live connection serves session RPCs");
+
+        auth.forget(&pubkey);
+
+        assert_eq!(call(&client, Request::Ping).await, Response::Pong, "the link stays up");
+        assert_eq!(
+            call(&client, Request::ListSessions).await,
+            Response::Error(RpcError::Unauthorized),
+            "but the erased device is no longer authorized for session RPCs",
+        );
+    };
+
+    block_on(join(serve, script));
+}
+
+/// Pairing counts as a sighting. The device list treats "never connected" as the
+/// suspicious case — a pairing nobody recognizes — so a device that just paired
+/// must not wear the same label at the exact moment the user reads the list.
+#[test]
+fn pairing_records_the_devices_first_sighting() {
+    let registry = seeded_registry();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth.clone()).with_clock(clock);
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let pubkey = SigningKey::from_bytes(&[8u8; 32]).verifying_key().to_bytes();
+
+    let script = async move {
+        assert!(matches!(
+            call(&client, Request::Hello(HelloReq { protocol_version: PROTOCOL_VERSION })).await,
+            Response::HelloAck(_)
+        ));
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        let device = auth
+            .devices()
+            .into_iter()
+            .find(|d| d.pubkey == pubkey)
+            .expect("the paired device is listed");
+        assert_eq!(device.last_seen, Some(NOW), "pairing stamps the first sighting");
+    };
+
+    block_on(join(serve, script));
+}

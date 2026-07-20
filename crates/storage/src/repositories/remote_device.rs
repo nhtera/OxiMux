@@ -303,6 +303,24 @@ mod tests {
         assert!(all[0].last_seen.is_some(), "the timestamp reads back as Unix seconds");
     }
 
+    /// `upsert` must not disturb an existing sighting. A device's name or scope
+    /// can be rewritten long after it last connected, and folding `last_seen`
+    /// into that write would reset it to "never connected" on every edit.
+    #[test]
+    fn upsert_leaves_an_existing_last_seen_alone() {
+        let db = open_memory().expect("open_memory");
+        let repo = RemoteDeviceRepo::new(db);
+        repo.upsert("aa", "Phone", &RemoteScope::Full, false).expect("insert");
+        repo.touch_last_seen("aa").expect("connect");
+        let seen = repo.list_all().expect("list")[0].last_seen.expect("stamped");
+
+        repo.upsert("aa", "Renamed Phone", &RemoteScope::Full, false).expect("rename");
+
+        let row = repo.list_all().expect("list").remove(0);
+        assert_eq!(row.name, "Renamed Phone", "the edit landed");
+        assert_eq!(row.last_seen, Some(seen), "and the sighting survived it");
+    }
+
     /// A timestamp that isn't RFC-3339 (hand-edited, or written by an older
     /// build) must cost only the label, never the device's authorization.
     #[test]
