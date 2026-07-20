@@ -14,21 +14,31 @@ rust-version.workspace = true
 # hole-punching and n0 relay/pkarr discovery. Kept in its own crate so
 # `remote-session` stays iroh-free (and unit-testable over the in-memory
 # loopback), and so both the host and the mobile core share one framing impl.
+[features]
+default = ["host"]
+# The desktop's accept loop and its `Dispatcher` wiring. The mobile client turns
+# this OFF: linking the host half would drag `remote-host` → `agents` → `pty` →
+# `portable-pty` onto the phone, whose `termios`/`ioctl-rs` dependencies do not
+# compile for iOS or Android. The build break is the visible symptom; the real
+# point is that a phone must never carry the code that spawns local PTYs.
+host = ["dep:oximux-remote-host", "dep:tokio"]
+
 [dependencies]
 oximux-remote-proto = { workspace = true }
 # For the `Connector`/`ConnectError` dial seam this crate implements.
 oximux-remote-session = { workspace = true }
 # The transport-agnostic `Dispatcher` the host accept loop (`serve_host`) drives
 # per connection. No cycle: `remote-host` never depends on `remote-iroh`.
-oximux-remote-host = { workspace = true }
+oximux-remote-host = { workspace = true, optional = true }
 iroh = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 # iroh already runs on tokio; `serve_host` uses it directly to race accepts
-# against shutdown and serve each connection on its own task.
-tokio = { workspace = true }
+# against shutdown and serve each connection on its own task. Only the host half
+# needs it directly, so it rides the `host` feature.
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The same-machine integration tests drive the real host dispatcher + the real

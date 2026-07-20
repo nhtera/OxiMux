@@ -20,6 +20,7 @@ crate-type = ["cdylib", "staticlib", "lib"]
 [dependencies]
 oximux-remote-proto = { workspace = true }
 oximux-remote-session = { workspace = true }
+# Client half only — deliberately without the `host` feature the desktop enables.
 oximux-remote-iroh = { workspace = true }
 oximux-agent-core = { workspace = true }
 uniffi = { workspace = true }

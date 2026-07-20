@@ -51,7 +51,10 @@ oximux-relay-client = { path = "crates/relay-client" }
 oximux-remote-proto = { path = "crates/remote-proto" }
 oximux-remote-host = { path = "crates/remote-host" }
 oximux-remote-session = { path = "crates/remote-session" }
-oximux-remote-iroh = { path = "crates/remote-iroh" }
+# `host` is opt-in rather than default so the mobile core cannot inherit the
+# desktop accept loop (and, through it, the PTY stack) by omission. Desktop
+# consumers ask for it explicitly with `features = ["host"]`.
+oximux-remote-iroh = { path = "crates/remote-iroh", default-features = false }
 oximux-mobile-core = { path = "crates/mobile-core" }
 oximux-proc-cwd = { path = "crates/proc-cwd" }
 

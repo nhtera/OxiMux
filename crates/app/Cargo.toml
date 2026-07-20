@@ -25,7 +25,7 @@ oximux-relay-proto = { workspace = true }
 # SessionRegistry to paired phones, its transport-agnostic dispatcher/auth, and
 # the shared wire types (PairingTicket).
 oximux-remote-host = { workspace = true }
-oximux-remote-iroh = { workspace = true }
+oximux-remote-iroh = { workspace = true, features = ["host"] }
 oximux-remote-proto = { workspace = true }
 oximux-settings = { workspace = true }
 oximux-storage = { workspace = true }

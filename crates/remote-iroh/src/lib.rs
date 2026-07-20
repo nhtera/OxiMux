@@ -16,11 +16,13 @@
 
 mod connector;
 mod endpoint;
+#[cfg(feature = "host")]
 mod host;
 mod transport;
 
 pub use connector::IrohConnector;
 pub use endpoint::{accept, bind_client, bind_host};
+#[cfg(feature = "host")]
 pub use host::{HostHandle, serve_host, start_host};
 pub use transport::IrohTransport;
 
