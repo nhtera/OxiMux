@@ -24,7 +24,7 @@ pub use connector::IrohConnector;
 pub use endpoint::{accept, bind_client, bind_host};
 #[cfg(feature = "host")]
 pub use host::{HostHandle, serve_host, start_host};
-pub use transport::IrohTransport;
+pub use transport::{IrohTransport, MAX_FRAME};
 
 /// The ALPN both sides negotiate. Bump the trailing version on any breaking wire
 /// change (kept in lock-step with `remote_proto::PROTOCOL_VERSION`).

@@ -7,10 +7,37 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use oximux_agent_core::thread::{AskQuestion, PermissionDecision, QuestionAnswers};
 
 use crate::client::MobileClient;
-use crate::ffi_types::{MobileError, PermissionReply, SessionSummary};
+use crate::ffi_types::{ChatImage, MobileError, PermissionReply, SessionSummary};
 
 /// Correlates a queued prompt with its ack; unique per process is enough.
 static CORR: AtomicU64 = AtomicU64::new(1);
+
+/// Headroom left below the transport's frame cap for everything else the request
+/// carries — session id, prompt text, and the postcard envelope. Generous,
+/// because the cost of guessing low is a refused attachment the user can retry
+/// smaller, while guessing high is a dropped frame they cannot diagnose.
+const FRAME_HEADROOM: usize = 1024 * 1024;
+
+/// Refuse a prompt whose attachments cannot fit in one frame.
+///
+/// The transport rejects an oversize frame as an IO error, which reaches the app
+/// as a bare transport failure some distance from the photo that caused it. A
+/// phone camera roll makes this reachable without doing anything unusual: base64
+/// inflates by ~4/3, so a handful of full-resolution shots clears the cap.
+fn check_prompt_size(text: &str, images: &[ChatImage]) -> Result<(), MobileError> {
+    let budget = oximux_remote_iroh::MAX_FRAME.saturating_sub(FRAME_HEADROOM);
+    let total: usize = images.iter().map(|i| i.data.len() + i.media_type.len()).sum::<usize>()
+        + text.len();
+    if total > budget {
+        let mb = |n: usize| n as f64 / (1024.0 * 1024.0);
+        return Err(MobileError::Rpc(format!(
+            "attachments total {:.1} MB, over the {:.0} MB a single message can carry \u{2014} send fewer or smaller images",
+            mb(total),
+            mb(budget),
+        )));
+    }
+    Ok(())
+}
 
 #[uniffi::export(async_runtime = "tokio")]
 impl MobileClient {
@@ -22,11 +49,19 @@ impl MobileClient {
     }
 
     /// Queue a prompt into a session's turn.
-    pub async fn send_prompt(&self, session_id: String, text: String) -> Result<(), MobileError> {
+    pub async fn send_prompt(
+        &self,
+        session_id: String,
+        text: String,
+        images: Vec<ChatImage>,
+    ) -> Result<(), MobileError> {
         let session = self.shared.session()?;
+        check_prompt_size(&text, &images)?;
+        let images: Vec<oximux_agent_core::thread::ChatImage> =
+            images.into_iter().map(Into::into).collect();
         let corr = CORR.fetch_add(1, Ordering::Relaxed);
         session
-            .send_prompt(&session_id, &text, &[], corr)
+            .send_prompt(&session_id, &text, &images, corr)
             .await
             .map_err(|e| MobileError::Rpc(e.to_string()))
     }

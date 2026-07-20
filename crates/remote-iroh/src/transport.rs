@@ -19,7 +19,11 @@ use oximux_remote_proto::transport::{Transport, TransportError};
 
 /// A hard cap on a single frame so a hostile or corrupt length prefix can't drive
 /// an unbounded allocation. Comfortably above any real RPC/event payload.
-const MAX_FRAME: usize = 16 * 1024 * 1024;
+///
+/// Public because a caller assembling a large request (a prompt carrying images)
+/// has to know the ceiling to refuse politely rather than let the send fail as an
+/// opaque transport error.
+pub const MAX_FRAME: usize = 16 * 1024 * 1024;
 
 /// The receive half plus its carry buffer (see the module docs on cancel-safety).
 struct RecvHalf {

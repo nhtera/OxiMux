@@ -14,7 +14,7 @@ use oximux_agent_core::thread::{PermissionKind, ThreadEvent};
 use oximux_agents::session_registry::{SessionHandle, SessionRegistry};
 use oximux_agents::thread::{AgentCapabilities, StubConnection};
 use oximux_mobile_core::{
-    ConnState, ConnStateListener, MobileClient, ThreadSink, ThreadSnapshot,
+    ChatImage, ConnState, ConnStateListener, MobileClient, ThreadSink, ThreadSnapshot,
 };
 use oximux_remote_host::{AuthStore, Dispatcher, PairingSlot};
 use oximux_remote_proto::transport::Transport;
@@ -452,4 +452,109 @@ async fn a_resume_after_a_refused_re_pair_leaves_a_usable_session() {
     let sessions = client.list_sessions().await.expect("the resumed session must serve RPCs");
     assert_eq!(sessions.len(), 1, "sees the host's sessions after recovery");
     serve_3.abort();
+}
+
+/// An attached image has to survive the whole chain — FFI record, postcard
+/// envelope, host handler, registry — and land in the folded transcript the app
+/// renders.
+///
+/// The fold is where it has to arrive, not the backend: `AgentConnection`'s
+/// default `send_user_message_with_images` drops images on the floor for a
+/// backend that cannot take them, so proving the stub saw it would prove nothing
+/// about what the user sees. The user's own bubble is published by the registry
+/// regardless, which is what makes the attachment visible remotely at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attached_image_reaches_the_folded_transcript() {
+    let (registry, _handle) = seeded_registry();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Arc::new(Dispatcher::new(registry, auth));
+
+    let (client_t, server_t) = duplex_pair();
+    let serve = {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move { dispatcher.serve(&server_t).await })
+    };
+
+    let ticket =
+        PairingTicket { endpoint_id: [0u8; 32], handshake_secret: SECRET, session_id: None };
+    let client = MobileClient::new(Some(CLIENT_SEED.to_vec()));
+    client
+        .connect_with(
+            Arc::new(LoopbackConnector { transport: Mutex::new(Some(Arc::new(client_t))) }),
+            ticket,
+            "phone".into(),
+            Arc::new(RecordingListener::default()),
+        )
+        .await
+        .expect("connect");
+
+    let sink = Arc::new(RecordingSink::default());
+    client.subscribe("sess-1".into(), sink.clone()).await.expect("subscribe");
+    let before = sink.count();
+
+    client
+        .send_prompt("sess-1".into(), "what is this?".into(), vec![ChatImage {
+            media_type: "image/png".into(),
+            data: "aGVsbG8=".into(),
+        }])
+        .await
+        .expect("send a prompt carrying an image");
+
+    assert!(wait_until(|| sink.count() > before).await, "the prompt pushed a snapshot");
+    let json = sink.latest_json();
+    assert!(json.contains("what is this?"), "the prompt text is in the transcript: {json}");
+    assert!(json.contains("aGVsbG8="), "and so is the image payload: {json}");
+    assert!(json.contains("image/png"), "with its media type: {json}");
+
+    serve.abort();
+}
+
+/// A prompt too large for one frame is refused here, with a message naming the
+/// cause. The transport would otherwise reject the frame as a bare IO error, some
+/// distance from the photo that caused it — and a camera roll makes that
+/// reachable without doing anything unusual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oversize_attachment_is_refused_with_a_useful_message() {
+    let (registry, _handle) = seeded_registry();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Arc::new(Dispatcher::new(registry, auth));
+
+    let (client_t, server_t) = duplex_pair();
+    let serve = {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move { dispatcher.serve(&server_t).await })
+    };
+
+    let ticket =
+        PairingTicket { endpoint_id: [0u8; 32], handshake_secret: SECRET, session_id: None };
+    let client = MobileClient::new(Some(CLIENT_SEED.to_vec()));
+    client
+        .connect_with(
+            Arc::new(LoopbackConnector { transport: Mutex::new(Some(Arc::new(client_t))) }),
+            ticket,
+            "phone".into(),
+            Arc::new(RecordingListener::default()),
+        )
+        .await
+        .expect("connect");
+
+    let huge = "A".repeat(oximux_remote_iroh::MAX_FRAME);
+    let err = client
+        .send_prompt("sess-1".into(), "look".into(), vec![ChatImage {
+            media_type: "image/png".into(),
+            data: huge,
+        }])
+        .await
+        .expect_err("an attachment over the frame cap must not be sent");
+
+    let msg = err.to_string();
+    assert!(msg.contains("MB"), "the message is in the units a user thinks in: {msg}");
+    assert!(
+        msg.contains("fewer or smaller"),
+        "and says what to do about it rather than just failing: {msg}",
+    );
+
+    serve.abort();
 }

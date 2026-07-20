@@ -26,6 +26,27 @@ impl From<WireSummary> for SessionSummary {
     }
 }
 
+/// An image attached to a prompt.
+///
+/// A typed record rather than a JSON string (the shape `answer_question` uses):
+/// there are only two fields and neither is dynamic, so the app gets real types
+/// and a malformed attachment becomes impossible instead of a parse error.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatImage {
+    /// An image MIME type, e.g. `image/jpeg`. Passed through to the agent, which
+    /// decides what it accepts.
+    pub media_type: String,
+    /// The image bytes, base64. Note this inflates the payload by ~4/3, which is
+    /// what the send-size ceiling is measured against.
+    pub data: String,
+}
+
+impl From<ChatImage> for oximux_agent_core::thread::ChatImage {
+    fn from(i: ChatImage) -> Self {
+        Self { media_type: i.media_type, data: i.data }
+    }
+}
+
 /// The connection state the UI reflects, mirroring `remote_session::ConnState`.
 #[derive(Debug, Clone, uniffi::Enum)]
 pub enum ConnState {
