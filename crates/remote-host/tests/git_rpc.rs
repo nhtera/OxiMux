@@ -387,3 +387,93 @@ async fn a_read_only_device_can_read_git_but_not_write_it() {
     };
     futures::future::join(serve, script).await;
 }
+
+/// Revoking a device cuts off its **already-open, already-authenticated**
+/// connection, not merely its next handshake.
+///
+/// The check that matters is on disk, not on the wire. A refusal that still let
+/// the commit land would look identical from the client's side — it would read
+/// the `Unauthorized` and assume nothing happened — so this asserts the git log
+/// is unchanged rather than trusting the response code.
+///
+/// The connection here is deliberately left open across the revoke: authenticating
+/// once and then trusting that connection for its lifetime is the natural way to
+/// write this dispatcher, and it is exactly what revocation has to defeat. A
+/// device is revoked *because* it is no longer trusted, and waiting for it to
+/// reconnect before enforcing that would be waiting for the one thing a
+/// compromised device has no reason to do.
+///
+/// Two independent gates enforce this — the serve loop's per-request
+/// `authorized_pubkey`, and the git handlers' own `session_repo` check — and
+/// disabling either one alone leaves this test passing. That redundancy is the
+/// point, so the assertion is written against the observable property (no commit
+/// lands) rather than against whichever gate happens to fire first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoking_mid_connection_stops_a_commit_from_landing() {
+    let (_dir, root) = repo_with_history_and_untracked_file();
+
+    let registry = Arc::new(SessionRegistry::new());
+    let handle = registry.register("sess-1".into(), Arc::new(StubConnection::default()));
+    handle.set_meta(SessionMeta { title: None, model: None, cwd: Some(root.clone()) });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, Arc::clone(&auth)).with_clock(clock);
+    let pubkey = [0x33; 32];
+
+    let head_before = head_sha(&root);
+    let (client, server) = duplex_pair();
+    let root_for_check = root.clone();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        // Stage while still trusted, so the index genuinely holds something to
+        // commit. Without this the commit would fail for having nothing staged
+        // and the test would pass without proving anything about revocation.
+        let staged = call(
+            &client,
+            Request::GitStage { session_id: "sess-1".into(), paths: vec!["new.txt".into()] },
+        )
+        .await;
+        assert_eq!(staged, Response::Ack, "staging works before the revoke");
+
+        auth.revoke(&pubkey);
+
+        let commit = call(
+            &client,
+            Request::GitCommit { session_id: "sess-1".into(), message: "after revoke".into() },
+        )
+        .await;
+        assert_eq!(commit, Response::Error(RpcError::Unauthorized), "commit refused after revoke");
+
+        // A read on the same open connection is refused too — revocation is not
+        // limited to the write gate.
+        let status = call(&client, Request::GitStatus { session_id: "sess-1".into() }).await;
+        assert_eq!(status, Response::Error(RpcError::Unauthorized), "reads refused after revoke");
+
+        assert_eq!(
+            head_sha(&root_for_check),
+            head_before,
+            "HEAD is untouched: the refusal stopped the commit rather than merely reporting it",
+        );
+
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+}
+
+/// The current HEAD sha, for asserting a write did or did not land.
+fn head_sha(dir: &Path) -> String {
+    let out = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .expect("git rev-parse");
+    assert!(out.status.success(), "git rev-parse HEAD failed in {dir:?}");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
