@@ -34,6 +34,17 @@ pub struct RemoteDeviceRow {
     pub last_seen: Option<i64>,
 }
 
+/// An RFC-3339 `last_seen` as Unix seconds, or `None` if it can't be read.
+///
+/// Deliberately lenient: this column is display-only ("last seen 3h ago"), while
+/// the row it belongs to carries the device's *authorization*. Refusing the row
+/// over an unreadable timestamp would drop a paired device from the authorized
+/// set and lock the user's phone out — a far worse outcome than a missing
+/// relative-time label.
+fn parse_last_seen(stored: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(stored).ok().map(|dt| dt.timestamp())
+}
+
 #[derive(Clone)]
 pub struct RemoteDeviceRepo {
     db: Db,
@@ -60,7 +71,12 @@ impl RemoteDeviceRepo {
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, i64>(4)? != 0,
                     row.get::<_, i64>(5)? != 0,
-                    row.get::<_, Option<i64>>(6)?,
+                    // Stored as RFC-3339 TEXT (see `touch_last_seen`), exposed as
+                    // Unix seconds. Reading it straight as `i64` fails the row —
+                    // and because the rows are collected into a single Result,
+                    // one such row used to fail the WHOLE query, emptying the
+                    // authorized set on the next launch.
+                    row.get::<_, Option<String>>(6)?,
                 ))
             })?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()
@@ -74,7 +90,7 @@ impl RemoteDeviceRepo {
                     scope: decode_scope(&scope, sessions.as_deref()),
                     revoked,
                     read_only,
-                    last_seen,
+                    last_seen: last_seen.as_deref().and_then(parse_last_seen),
                 }
             })
             .collect())
@@ -267,6 +283,41 @@ mod tests {
         repo.upsert("aa", "Phone", &RemoteScope::Full, false).expect("insert");
         repo.remove("aa").expect("remove");
         assert!(repo.list_all().expect("list").is_empty());
+    }
+
+    /// The regression that made pairing last exactly one app run: `last_seen` is
+    /// written as RFC-3339 text but was read back as an integer, so the first
+    /// device to connect made `list_all` fail outright. The authorized set is
+    /// seeded from this call at boot, so the failure logged out every paired
+    /// device and emptied the paired-devices list — with "handshake failed" on
+    /// the phone as the only symptom.
+    #[test]
+    fn a_device_that_has_connected_still_lists_after_a_reload() {
+        let db = open_memory().expect("open_memory");
+        let repo = RemoteDeviceRepo::new(db);
+        repo.upsert("aa", "Phone", &RemoteScope::Full, false).expect("insert");
+        repo.touch_last_seen("aa").expect("touch");
+
+        let all = repo.list_all().expect("a connected device must not fail the listing");
+        assert_eq!(all.len(), 1, "the device survives having connected");
+        assert!(all[0].last_seen.is_some(), "the timestamp reads back as Unix seconds");
+    }
+
+    /// A timestamp that isn't RFC-3339 (hand-edited, or written by an older
+    /// build) must cost only the label, never the device's authorization.
+    #[test]
+    fn an_unreadable_timestamp_keeps_the_device() {
+        let db = open_memory().expect("open_memory");
+        let repo = RemoteDeviceRepo::new(db.clone());
+        repo.upsert("aa", "Phone", &RemoteScope::Full, false).expect("insert");
+        db.with_conn(|c| {
+            c.execute("UPDATE remote_devices SET last_seen = 'not-a-timestamp'", [])
+        })
+        .expect("write a junk timestamp");
+
+        let all = repo.list_all().expect("junk in a display column is not fatal");
+        assert_eq!(all.len(), 1, "the device is still authorized");
+        assert_eq!(all[0].last_seen, None, "only the label is lost");
     }
 
     #[test]
