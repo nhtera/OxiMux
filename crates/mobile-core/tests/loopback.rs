@@ -1,8 +1,8 @@
 //! The end-to-end proof: the real `MobileClient` (the phone's Rust core) pairs
 //! with and drives the real `remote-host` `Dispatcher` over the in-memory
 //! loopback — a test `Connector` stands in for iroh. Everything crosses our
-//! actual FFI-facing wrapper: pairing, `list_sessions`, and a folded event
-//! subscription pushed into a foreign `EventSink`. No network, no FFI codegen.
+//! actual FFI-facing wrapper: pairing, `list_sessions`, and a folded transcript
+//! pushed into a foreign `ThreadSink`. No network, no FFI codegen.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -13,7 +13,9 @@ use futures::future::select;
 use oximux_agent_core::thread::{PermissionKind, ThreadEvent};
 use oximux_agents::session_registry::{SessionHandle, SessionRegistry};
 use oximux_agents::thread::{AgentCapabilities, StubConnection};
-use oximux_mobile_core::{ConnState, ConnStateListener, EventSink, MobileClient, RemoteEvent};
+use oximux_mobile_core::{
+    ConnState, ConnStateListener, MobileClient, ThreadSink, ThreadSnapshot,
+};
 use oximux_remote_host::{AuthStore, Dispatcher, PairingSlot};
 use oximux_remote_proto::transport::Transport;
 use oximux_remote_proto::{PairingTicket, testing::duplex_pair};
@@ -66,11 +68,22 @@ impl ConnStateListener for RecordingListener {
 
 #[derive(Default)]
 struct RecordingSink {
-    events: Mutex<Vec<RemoteEvent>>,
+    snapshots: Mutex<Vec<ThreadSnapshot>>,
 }
-impl EventSink for RecordingSink {
-    fn on_event(&self, event: RemoteEvent) {
-        self.events.lock().unwrap().push(event);
+impl ThreadSink for RecordingSink {
+    fn on_thread(&self, snapshot: ThreadSnapshot) {
+        self.snapshots.lock().unwrap().push(snapshot);
+    }
+}
+
+impl RecordingSink {
+    fn count(&self) -> usize {
+        self.snapshots.lock().unwrap().len()
+    }
+
+    /// The most recent transcript pushed — what the app would be rendering.
+    fn latest_json(&self) -> String {
+        self.snapshots.lock().unwrap().last().expect("a snapshot was pushed").thread_json.clone()
     }
 }
 
@@ -132,20 +145,37 @@ async fn mobile_client_pairs_lists_and_subscribes_over_the_loopback() {
     assert_eq!(sessions[0].last_seq, 2);
     assert!(sessions[0].awaiting_permission);
 
-    // Subscribe: the backlog is folded and pushed into the foreign sink.
+    // Subscribe: the whole backlog folds into ONE snapshot — the cold-open
+    // bootstrap. Two events, one push: the app renders a transcript, not a
+    // replay.
     let sink = Arc::new(RecordingSink::default());
     client.subscribe("sess-1".into(), sink.clone()).await.expect("subscribe");
-    assert_eq!(sink.events.lock().unwrap().len(), 2, "backlog: text + permission");
+    assert_eq!(sink.count(), 1, "the backlog folds into a single snapshot");
+    let bootstrap = sink.snapshots.lock().unwrap()[0].clone();
+    assert!(bootstrap.thread_json.contains("hi"), "carries the folded assistant text");
     assert!(
-        sink.events.lock().unwrap()[0].event_json.contains("hi"),
-        "first folded event is the assistant text, saw {:?}",
-        sink.events.lock().unwrap()[0].event_json,
+        bootstrap.awaiting_permission,
+        "the seeded permission blocks the session, so the snapshot says so",
+    );
+    assert!(
+        bootstrap.thread_json.contains("req-1"),
+        "the pending request rides the transcript, so the card can answer it: {}",
+        bootstrap.thread_json,
     );
 
-    // A live event pushed on the host now streams through the dispatcher to the sink.
+    // A live event pushed on the host streams through the dispatcher and folds
+    // onto the SAME thread — the text accumulates rather than arriving loose.
     handle.ingest(ThreadEvent::AssistantText(" there".into()));
-    let got_live = wait_until(|| sink.events.lock().unwrap().len() >= 3).await;
-    assert!(got_live, "live event forwarded, saw {} total", sink.events.lock().unwrap().len());
+    let got_live = wait_until(|| sink.count() >= 2).await;
+    assert!(got_live, "live event pushed a fresh snapshot, saw {} total", sink.count());
+    let latest: serde_json::Value =
+        serde_json::from_str(&sink.latest_json()).expect("snapshot is valid json");
+    let text = latest["entries"][0]["Assistant"]["text"].as_str().expect("assistant text");
+    assert!(
+        text.contains("hi") && text.contains("there"),
+        "the live text folded into the SAME assistant entry rather than a loose second one, \
+         saw {text:?}",
+    );
 
     client.disconnect().await;
     let _ = server.await;
@@ -191,10 +221,10 @@ async fn mobile_client_self_heals_and_restores_subscriptions_after_a_drop() {
         .await
         .expect("connect_with");
 
-    // Subscribe over conn 1: 2 backlog events land in the sink.
+    // Subscribe over conn 1: the backlog bootstraps as one snapshot.
     let sink = Arc::new(RecordingSink::default());
     client.subscribe("sess-1".into(), sink.clone()).await.expect("subscribe");
-    assert_eq!(sink.events.lock().unwrap().len(), 2, "conn-1 backlog");
+    assert_eq!(sink.count(), 1, "conn-1 backlog bootstrap");
 
     // Sever conn 1 → the driver must reconnect over conn 2 on its own and restore
     // the subscription — resuming from the fold cursor, so no backlog re-flood.
@@ -202,9 +232,9 @@ async fn mobile_client_self_heals_and_restores_subscriptions_after_a_drop() {
     let reconnected = wait_until(|| connected_count(&listener) >= 2).await;
     assert!(reconnected, "self-healed, saw {:?}", listener.states.lock().unwrap());
     assert_eq!(
-        sink.events.lock().unwrap().len(),
-        2,
-        "reconnect resumed from the cursor — the 2 backlog events were not re-sent",
+        sink.count(),
+        1,
+        "reconnect resumed from the cursor — the backlog was not re-folded, so no new push",
     );
 
     // The connection is live again: an RPC round-trips over the fresh link...
@@ -214,12 +244,12 @@ async fn mobile_client_self_heals_and_restores_subscriptions_after_a_drop() {
     // ...and a NEW event pushed now streams over conn 2, folded onto the preserved
     // cursor (seq 3), landing exactly once.
     handle.ingest(ThreadEvent::AssistantText(" back".into()));
-    let got_live = wait_until(|| sink.events.lock().unwrap().len() == 3).await;
-    assert!(got_live, "live event resumed after reconnect, saw {}", sink.events.lock().unwrap().len());
+    let got_live = wait_until(|| sink.count() == 2).await;
+    assert!(got_live, "live event resumed after reconnect, saw {} pushes", sink.count());
     assert!(
-        sink.events.lock().unwrap()[2].event_json.contains("back"),
-        "the resumed live event is the new one, saw {:?}",
-        sink.events.lock().unwrap()[2].event_json,
+        sink.latest_json().contains("back"),
+        "the resumed live event folded into the transcript, saw {}",
+        sink.latest_json(),
     );
 
     client.disconnect().await;

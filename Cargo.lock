@@ -7034,6 +7034,7 @@ dependencies = [
  "oximux-remote-iroh",
  "oximux-remote-proto",
  "oximux-remote-session",
+ "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tokio",

@@ -29,6 +29,9 @@ uniffi = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
 futures = { workspace = true }
 async-trait = { workspace = true }
+# The thread snapshot is a borrowed projection of the `agent-core` read model, so
+# it needs `derive` to serialize by reference rather than cloning the transcript.
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

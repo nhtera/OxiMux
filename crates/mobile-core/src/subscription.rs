@@ -1,7 +1,14 @@
-//! Live subscription: fold a session's `HostEvent` stream and push each applied
-//! event to the foreign [`EventSink`]. The demux pump feeds one connection-wide
-//! event stream; [`run_dispatcher`] routes each frame to the matching registered
-//! session and heals seq gaps via `events_since`.
+//! Live subscription: fold a session's `HostEvent` stream and push the folded
+//! transcript to the foreign [`ThreadSink`]. The demux pump feeds one
+//! connection-wide event stream; [`run_dispatcher`] routes each frame to the
+//! matching registered session and heals seq gaps via `events_since`.
+//!
+//! **Pushes are batched, not per-event.** A snapshot costs one serialization of
+//! the whole transcript, so pushing per streaming text delta would re-serialize
+//! the entire thread per token. The dispatcher instead drains every frame already
+//! queued, folds them all, and pushes once — so a burst coalesces into a single
+//! push while a quiet stream still pushes immediately. That needs no timer and
+//! adds no latency: batching only happens when frames are genuinely waiting.
 //!
 //! Known limitations (deferred robustness, acceptable for this slice):
 //! - **Decode-`Err` wedge:** if a frame's `ThreadEvent` fails to decode (only
@@ -13,18 +20,19 @@
 //!   and the `Sub` being registered is dropped; the seq-gap logic recovers all
 //!   but a literal end-of-turn last event. A seed-buffer would close the window.
 
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use futures::StreamExt;
 use futures::channel::oneshot;
-use oximux_remote_proto::HostEvent;
 use oximux_remote_session::{EventStream, FoldOutcome, RemoteSession, SessionSubscription};
 
-use crate::callbacks::EventSink;
+use crate::callbacks::ThreadSink;
 use crate::client::{MobileClient, Shared};
-use crate::ffi_types::{MobileError, RemoteEvent};
+use crate::ffi_types::MobileError;
 use crate::runtime::rt;
+use crate::snapshot::ThreadSnapshot;
 
 /// The first-connection outcome channel `connect_with` awaits: `Ok` once the
 /// session is live and wired up, `Err` if the host is unreachable before it ever
@@ -34,54 +42,112 @@ pub(crate) type FirstResult = Arc<StdMutex<Option<oneshot::Sender<Result<(), Mob
 /// A registered subscription: the fold cursor + the foreign sink to push into.
 pub(crate) struct Sub {
     pub subscription: SessionSubscription,
-    pub sink: Arc<dyn EventSink>,
+    pub sink: Arc<dyn ThreadSink>,
 }
 
-/// Project + push one wire frame to the sink (best-effort; a malformed frame is
-/// skipped rather than tearing down the stream).
-fn forward(sink: &Arc<dyn EventSink>, frame: &HostEvent) {
-    if let Ok(ev) = RemoteEvent::from_host_event(frame) {
-        sink.on_event(ev);
+/// One pending push: the foreign sink and the snapshot to hand it.
+type Push = (Arc<dyn ThreadSink>, ThreadSnapshot);
+
+/// Build a subscription's snapshot, ready to push *after* the subs lock is
+/// released. A thread that will not serialize yields `None` and is skipped
+/// rather than tearing down the stream — see [`ThreadSnapshot::build`].
+fn snapshot_of(sub: &Sub) -> Option<Push> {
+    let snapshot = ThreadSnapshot::build(
+        sub.subscription.session_id(),
+        sub.subscription.last_seq(),
+        sub.subscription.thread(),
+    )?;
+    Some((sub.sink.clone(), snapshot))
+}
+
+/// Hand each snapshot to its sink.
+///
+/// Deliberately called with **no lock held**: `on_thread` crosses into the
+/// foreign runtime (JS), so its duration is not ours to bound — a slow render
+/// would otherwise hold the subs lock and stall every concurrent RPC handler
+/// that needs it.
+fn deliver(pushes: Vec<Push>) {
+    for (sink, snapshot) in pushes {
+        sink.on_thread(snapshot);
     }
 }
 
-/// The connection-wide event loop: fold each frame into its session's cursor and
-/// forward it; on a seq gap, backfill from the host and forward the recovered
-/// span. Ends when the pump closes the stream (link lost / disconnect).
+/// The connection-wide event loop: fold each frame into its session's cursor,
+/// then push the sessions it touched; on a seq gap, backfill from the host and
+/// push the recovered state. Ends when the pump closes the stream (link lost /
+/// disconnect).
 pub(crate) async fn run_dispatcher(shared: Arc<Shared>, mut events: EventStream) {
     while let Some(frame) = events.next().await {
-        let outcome = {
+        // Fold this frame plus every frame already queued behind it, so a burst
+        // of deltas costs one snapshot rather than one per delta. `try_next`
+        // never waits, so a quiet stream takes this loop exactly once.
+        let mut batch = vec![frame];
+        while let Ok(more) = events.try_recv() {
+            batch.push(more);
+        }
+
+        let mut gaps = Vec::new();
+        let pushes = {
             let mut subs = shared.subs.lock().await;
-            match subs.get_mut(&frame.session_id) {
-                None => continue, // no subscriber for this session
-                Some(sub) => match sub.subscription.apply(&frame) {
+            // A set, not a list: a batch usually carries several frames for the
+            // same session, and each session is pushed once at the end.
+            let mut touched: HashSet<String> = HashSet::new();
+            // Sessions that have gapped in this batch. Once a session gaps, its
+            // remaining frames are skipped — they would each gap in turn, and the
+            // backfill replays the whole span in order anyway. Tracked per
+            // session rather than by breaking out of the batch, so one session's
+            // gap does not discard another session's frames: those would fold
+            // fine, and dropping them would stall that session until its next
+            // frame happened to trigger a gap of its own.
+            let mut gapped: HashSet<&str> = HashSet::new();
+            for frame in &batch {
+                if gapped.contains(frame.session_id.as_str()) {
+                    continue;
+                }
+                let Some(sub) = subs.get_mut(&frame.session_id) else { continue };
+                match sub.subscription.apply(frame) {
                     Ok(FoldOutcome::Applied { .. }) => {
-                        forward(&sub.sink, &frame);
-                        continue;
+                        touched.insert(frame.session_id.clone());
                     }
-                    Ok(FoldOutcome::Gap { resume_from }) => Some(resume_from),
-                    _ => continue, // dedup / already-seen
-                },
+                    Ok(FoldOutcome::Gap { resume_from }) => {
+                        gaps.push((frame.session_id.clone(), resume_from));
+                        gapped.insert(frame.session_id.as_str());
+                    }
+                    // A decode failure — and ONLY that. A duplicate folds as
+                    // `Applied` (at the unchanged cursor), so this arm is not the
+                    // dedup path it might look like. Skipping leaves the cursor
+                    // put, which is the wedge documented at the top of this file.
+                    Err(_) => {}
+                }
             }
+            touched.iter().filter_map(|id| subs.get(id)).filter_map(snapshot_of).collect()
         };
-        // Gap: fetch the missed span WITHOUT holding the subs lock across the RPC.
-        if let Some(resume_from) = outcome {
-            backfill_gap(&shared, &frame.session_id, resume_from).await;
+        deliver(pushes);
+
+        // Gaps: fetch the missed span WITHOUT holding the subs lock across the RPC.
+        for (session_id, resume_from) in gaps {
+            backfill_gap(&shared, &session_id, resume_from).await;
         }
     }
 }
 
-/// Re-fetch `events_since(resume_from)` and fold+forward the recovered frames.
+/// Re-fetch `events_since(resume_from)`, fold the recovered frames, and push the
+/// healed transcript once.
 async fn backfill_gap(shared: &Arc<Shared>, session_id: &str, resume_from: u64) {
     let Ok(session) = shared.session() else { return };
     let Ok(backlog) = session.events_since(session_id, resume_from).await else { return };
-    let mut subs = shared.subs.lock().await;
-    let Some(sub) = subs.get_mut(session_id) else { return };
-    for ev in &backlog {
-        if matches!(sub.subscription.apply(ev), Ok(FoldOutcome::Applied { .. })) {
-            forward(&sub.sink, ev);
+    let pending = {
+        let mut subs = shared.subs.lock().await;
+        let Some(sub) = subs.get_mut(session_id) else { return };
+        let mut applied = false;
+        for ev in &backlog {
+            if matches!(sub.subscription.apply(ev), Ok(FoldOutcome::Applied { .. })) {
+                applied = true;
+            }
         }
-    }
+        applied.then(|| snapshot_of(sub)).flatten()
+    };
+    deliver(pending.into_iter().collect());
 }
 
 /// Wire a freshly-(re)connected session into the shared state: restore any
@@ -129,30 +195,38 @@ async fn resubscribe_all(shared: &Arc<Shared>, session: &Arc<RemoteSession>) {
             None => continue,
         };
         let Ok(backlog) = session.subscribe(&id, after).await else { continue };
-        let mut subs = shared.subs.lock().await;
-        let Some(sub) = subs.get_mut(&id) else { continue };
-        for ev in &backlog {
-            let before = sub.subscription.last_seq();
-            // Forward only frames that actually advanced the cursor (skip any the
-            // cursor already covers), so a racing activation can't double-deliver.
-            if matches!(sub.subscription.apply(ev), Ok(FoldOutcome::Applied { .. }))
-                && sub.subscription.last_seq() > before
-            {
-                forward(&sub.sink, ev);
+        let pending = {
+            let mut subs = shared.subs.lock().await;
+            let Some(sub) = subs.get_mut(&id) else { continue };
+            let mut advanced = false;
+            for ev in &backlog {
+                let before = sub.subscription.last_seq();
+                // Count only frames that actually advanced the cursor (skip any
+                // the cursor already covers), so a racing activation can't
+                // double-apply.
+                if matches!(sub.subscription.apply(ev), Ok(FoldOutcome::Applied { .. }))
+                    && sub.subscription.last_seq() > before
+                {
+                    advanced = true;
+                }
             }
-        }
+            // Push once the whole missed span is folded, so a reconnect repaints
+            // the healed transcript in one step rather than frame by frame.
+            advanced.then(|| snapshot_of(sub)).flatten()
+        };
+        deliver(pending.into_iter().collect());
     }
 }
 
 #[uniffi::export(async_runtime = "tokio")]
 impl MobileClient {
-    /// Subscribe to a session's live events. Seeds the backlog (folded + pushed to
-    /// `sink`), then live frames flow through the dispatcher. Re-subscribing
-    /// replaces the prior sink for that session.
+    /// Subscribe to a session's transcript. Folds the whole backlog and pushes it
+    /// as one snapshot — the cold-open bootstrap — after which live frames flow
+    /// through the dispatcher. Re-subscribing replaces the prior sink.
     pub async fn subscribe(
         &self,
         session_id: String,
-        sink: Arc<dyn EventSink>,
+        sink: Arc<dyn ThreadSink>,
     ) -> Result<(), MobileError> {
         let session = self.shared.session()?;
         let backlog = session
@@ -161,10 +235,12 @@ impl MobileClient {
             .map_err(|e| MobileError::Rpc(e.to_string()))?;
         let mut sub = Sub { subscription: SessionSubscription::new(session_id.clone()), sink };
         for ev in &backlog {
-            if matches!(sub.subscription.apply(ev), Ok(FoldOutcome::Applied { .. })) {
-                forward(&sub.sink, ev);
-            }
+            let _ = sub.subscription.apply(ev);
         }
+        // Push unconditionally, even for an empty backlog: the app is waiting for
+        // a first snapshot to replace its loading state, and a session with no
+        // history yet would otherwise sit on a spinner until the first event.
+        deliver(snapshot_of(&sub).into_iter().collect());
         self.shared.subs.lock().await.insert(session_id, sub);
         Ok(())
     }

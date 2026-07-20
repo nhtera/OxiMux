@@ -2,7 +2,6 @@
 //! the wire types. Kept a thin, stable projection of `remote-proto` so the RN app
 //! never sees the postcard/JSON envelope details.
 
-use oximux_remote_proto::HostEvent;
 use oximux_remote_proto::messages::SessionSummary as WireSummary;
 
 /// One agent session the phone lists.
@@ -24,34 +23,6 @@ impl From<WireSummary> for SessionSummary {
             last_seq: w.last_seq,
             awaiting_permission: w.awaiting_permission,
         }
-    }
-}
-
-/// A folded live event pushed to a subscribed session. `event_json` is the
-/// `ThreadEvent` in its canonical JSON form (the RN app renders it — the same
-/// representation the desktop persists), so the FFI stays stable as the event
-/// taxonomy grows.
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct RemoteEvent {
-    pub session_id: String,
-    pub seq: u64,
-    pub event_json: String,
-    pub awaiting_permission: bool,
-}
-
-impl RemoteEvent {
-    /// Project a wire `HostEvent` into the FFI event, re-serializing the decoded
-    /// `ThreadEvent` to its canonical JSON.
-    pub(crate) fn from_host_event(ev: &HostEvent) -> Result<Self, MobileError> {
-        let thread_event = ev.event().map_err(|e| MobileError::Rpc(e.to_string()))?;
-        let event_json =
-            serde_json::to_string(&thread_event).map_err(|e| MobileError::Rpc(e.to_string()))?;
-        Ok(Self {
-            session_id: ev.session_id.clone(),
-            seq: ev.seq,
-            event_json,
-            awaiting_permission: ev.status.awaiting_permission,
-        })
     }
 }
 
