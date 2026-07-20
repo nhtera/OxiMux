@@ -2196,10 +2196,23 @@ impl AgentChatView {
             self.title_generated = true; // guard a fast double-send from re-firing
             self.spawn_title_generation(text.clone(), cx);
         }
-        if let Some(conn) = &self.connection
-            && let Err(e) = conn.send_user_message_with_images(&text, &images)
-        {
-            self.thread.last_error = Some(format!("Send failed: {e}"));
+        if let Some(conn) = &self.connection {
+            match conn.send_user_message_with_images(&text, &images) {
+                // Tee the prompt to remote subscribers only. No backend echoes the
+                // user's own message, so without this a phone renders replies to
+                // prompts it never showed. It is NOT applied to `self.thread` —
+                // the optimistic push above already put the bubble there, and
+                // folding it again here would duplicate it.
+                Ok(()) => {
+                    if let Some(binding) = &self.remote {
+                        binding.ingest(ThreadEvent::UserMessage {
+                            text: text.clone(),
+                            images: images.clone(),
+                        });
+                    }
+                }
+                Err(e) => self.thread.last_error = Some(format!("Send failed: {e}")),
+            }
         }
         // Jump to (and re-arm following of) the bottom for the new turn.
         self.stick_to_bottom = true;

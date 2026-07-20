@@ -130,6 +130,17 @@ pub enum ThreadEvent {
         /// renders by omitting those rows rather than showing blanks.
         meta: SessionMeta,
     },
+    /// The user sent a prompt.
+    ///
+    /// Unlike every other variant this does **not** originate from a backend —
+    /// no agent protocol echoes the user's own message back. It is synthesized at
+    /// the send sites purely so a *remote* subscriber can fold a transcript that
+    /// includes the user's half. The desktop pushes its own entry directly and
+    /// must not also apply this, or the bubble would appear twice.
+    UserMessage {
+        text: String,
+        images: Vec<ChatImage>,
+    },
     /// A live streaming text delta (from `content_block_delta` text_delta).
     /// The UI may render these for smooth typing; the authoritative text
     /// arrives in the finalized `AssistantText`.

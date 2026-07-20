@@ -215,7 +215,16 @@ impl SessionHandle {
     /// optimistic-echo correlation the view/phone use to dedup the arriving stream
     /// copy against their local echo (threaded through once the surfaces echo).
     pub fn send_prompt(&self, text: &str, images: &[ChatImage]) -> Result<()> {
-        self.conn().send_user_message_with_images(text, images)
+        self.conn().send_user_message_with_images(text, images)?;
+        // No backend echoes the user's own message back, so without this the
+        // remote transcript would show replies to prompts it never displayed.
+        // Ingested only after the send succeeds — a failed send must not leave a
+        // bubble implying the agent received something it never did.
+        self.ingest(ThreadEvent::UserMessage {
+            text: text.to_string(),
+            images: images.to_vec(),
+        });
+        Ok(())
     }
 
     /// Redirect the agent mid-turn (backends that support it); no-op default
@@ -454,6 +463,47 @@ mod tests {
 
     fn allow() -> PermissionDecision {
         PermissionDecision::Allow { updated_input: serde_json::Value::Null }
+    }
+
+    /// A remote subscriber learns the user's own prompt ONLY from the synthetic
+    /// event `send_prompt` ingests — no backend echoes it back — so without this
+    /// the phone would render replies to prompts it never displayed.
+    #[test]
+    fn send_prompt_ingests_the_user_message_for_subscribers() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        let mut rx = reg.subscribe("s1").unwrap();
+
+        handle.send_prompt("hello", &[]).unwrap();
+
+        let (_, ev) = rx.try_recv().expect("the prompt reached subscribers");
+        assert!(
+            matches!(&ev, ThreadEvent::UserMessage { text, .. } if text == "hello"),
+            "saw {ev:?}",
+        );
+    }
+
+    /// A send that never reached the agent must not leave a bubble implying it
+    /// did — the gate is the transport result, not the attempt.
+    #[test]
+    fn a_failed_send_ingests_nothing() {
+        struct DeadConn;
+        impl AgentConnection for DeadConn {
+            fn send_user_message(&self, _text: &str) -> Result<()> {
+                anyhow::bail!("transport down")
+            }
+            fn resolve_permission(&self, _id: &str, _d: PermissionDecision) -> Result<()> {
+                Ok(())
+            }
+            fn shutdown(&self) {}
+        }
+
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(DeadConn));
+        let mut rx = reg.subscribe("s1").unwrap();
+
+        assert!(handle.send_prompt("hello", &[]).is_err());
+        assert!(rx.try_recv().is_err(), "a failed send publishes no bubble");
     }
 
     /// A non-gpui subscriber observes events and drives commands with no

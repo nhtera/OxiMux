@@ -225,6 +225,11 @@ impl ChatThread {
                     self.session_meta = meta.clone();
                 }
             }
+            // Reuses the same push the desktop calls directly, so a remote fold
+            // and a local one produce an identical entry (and the same turn reset).
+            ThreadEvent::UserMessage { text, images } => {
+                self.push_user_message_with_images(text.clone(), images.clone());
+            }
             ThreadEvent::AssistantTextDelta(t) => {
                 self.assistant_mut().text.push_str(t);
                 self.text_streaming = true;
@@ -885,6 +890,32 @@ mod tests {
             ThreadEntry::Assistant(m) => &m.text,
             _ => panic!("not an assistant entry"),
         }
+    }
+
+    /// A remote fold sees the user's half only through this event — no backend
+    /// echoes the prompt back — so it must land as a real `User` entry, not be
+    /// dropped as an unknown variant.
+    #[test]
+    fn user_message_event_folds_into_a_user_entry() {
+        let mut t = ChatThread::new();
+        t.apply(&ThreadEvent::UserMessage { text: "hi".into(), images: vec![] });
+        t.apply(&ThreadEvent::AssistantText("hello".into()));
+        assert!(
+            matches!(&t.entries[0], ThreadEntry::User { text, .. } if text == "hi"),
+            "the prompt folds into a User entry, saw {:?}",
+            t.entries[0],
+        );
+        assert_eq!(t.entries.len(), 2, "one user entry + one assistant entry");
+    }
+
+    /// The event and the desktop's direct push must agree, or a phone and the
+    /// desktop would render the same prompt differently.
+    #[test]
+    fn user_message_event_matches_a_direct_push() {
+        let (mut evented, mut pushed) = (ChatThread::new(), ChatThread::new());
+        evented.apply(&ThreadEvent::UserMessage { text: "hi".into(), images: vec![] });
+        pushed.push_user_message_with_images("hi", vec![]);
+        assert_eq!(evented.entries, pushed.entries);
     }
 
     #[test]
