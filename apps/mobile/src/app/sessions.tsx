@@ -82,7 +82,11 @@ function SessionRow({ session }: { session: SessionSummary }) {
 const styles = StyleSheet.create({
   fill: { flex: 1 },
   header: { paddingHorizontal: Spacing.four, paddingVertical: Spacing.three },
-  list: { paddingHorizontal: Spacing.four, gap: Spacing.three },
+  // `flexGrow` is load-bearing, not cosmetic: without it the content container
+  // collapses to the height of the empty-state text, leaving nothing tall enough
+  // to drag — so pull-to-refresh silently does nothing in exactly the state where
+  // it is needed most, and an empty list looks like a host exposing no sessions.
+  list: { flexGrow: 1, paddingHorizontal: Spacing.four, gap: Spacing.three },
   row: { flexDirection: 'row', alignItems: 'center', gap: Spacing.three, paddingVertical: Spacing.two },
   rowText: { flex: 1, gap: Spacing.half },
   attention: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#F5A623' },
