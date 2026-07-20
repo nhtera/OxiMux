@@ -1,4 +1,4 @@
-import { router } from 'expo-router';
+import { Link, router } from 'expo-router';
 import type { SessionSummary } from 'oximux-core';
 import { useCallback, useEffect, useState } from 'react';
 import { FlatList, Pressable, RefreshControl, StyleSheet, View } from 'react-native';
@@ -36,6 +36,11 @@ export default function SessionsScreen() {
       <SafeAreaView style={styles.fill} edges={['bottom']}>
         <View style={styles.header}>
           <ConnectionBadge />
+          {/* The only route off this screen that isn't a session. Without it a
+              paired device has no way back to pairing — see settings.tsx. */}
+          <Link href="/settings">
+            <ThemedText type="code">Settings</ThemedText>
+          </Link>
         </View>
         <FlatList
           data={sessions}
@@ -81,7 +86,14 @@ function SessionRow({ session }: { session: SessionSummary }) {
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  header: { paddingHorizontal: Spacing.four, paddingVertical: Spacing.three },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.three,
+    paddingHorizontal: Spacing.four,
+    paddingVertical: Spacing.three,
+  },
   // `flexGrow` is load-bearing, not cosmetic: without it the content container
   // collapses to the height of the empty-state text, leaving nothing tall enough
   // to drag — so pull-to-refresh silently does nothing in exactly the state where
