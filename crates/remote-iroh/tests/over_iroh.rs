@@ -107,3 +107,78 @@ async fn client_pairs_and_drives_a_session_over_real_iroh_quic() {
     pump_res.expect("pump ran to a clean shutdown");
     host_task.await.expect("host task joined");
 }
+
+/// The same round trip, but dialed **by endpoint id alone** — no direct addresses
+/// injected — so the pkarr publish/resolve path a real phone depends on actually
+/// runs.
+///
+/// This is the plan's largest untested assumption. Every other integration test
+/// here calls `.with_direct_addrs(..)` "so the dial doesn't depend on public
+/// discovery", which is reasonable for a hermetic test and also means the route a
+/// scanned QR code actually takes has never executed. A pairing ticket carries an
+/// endpoint id and nothing else: if publish or resolve is misconfigured, pairing
+/// fails in the user's hands and passes in CI.
+///
+/// **`#[ignore]` on purpose — this test talks to the public internet.** It waits
+/// on n0's pkarr/DNS infrastructure to publish and resolve, so it is neither
+/// hermetic nor fast, and a network-dependent test in the default run would fail
+/// for reasons that have nothing to do with the change under review. Run it
+/// deliberately:
+///
+/// ```text
+/// cargo test -p oximux-remote-iroh --test over_iroh -- --ignored --nocapture
+/// ```
+///
+/// Note what this does and does not prove. It exercises **discovery** — publish,
+/// resolve, and connect without a pre-shared address. It does **not** prove
+/// **cross-NAT** reachability: both endpoints sit on one machine behind one NAT,
+/// so hole-punching is not exercised. That gap needs two machines on different
+/// networks and stays open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires internet: resolves the host through n0's public pkarr/DNS"]
+async fn client_dials_by_endpoint_id_alone_through_public_discovery() {
+    let host_ep = bind_host(None).await.expect("bind host endpoint");
+    // `online` waits until the endpoint has addresses AND has published them, which
+    // is the state a client's resolve depends on. Dialing before this is what a
+    // race here would look like.
+    host_ep.online().await;
+    let host_id = *host_ep.id().as_bytes();
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Arc::new(Dispatcher::new(seeded_registry(), auth).with_clock(clock));
+
+    let host_task = {
+        let dispatcher = dispatcher.clone();
+        let host_ep = host_ep.clone();
+        tokio::spawn(async move {
+            let transport = accept(&host_ep).await.expect("accept").expect("one connection");
+            dispatcher.serve(&transport).await;
+        })
+    };
+
+    // The whole point: no `.with_direct_addrs(..)`. The connector is handed the
+    // endpoint id a `PairingTicket` carries and must find the host from that.
+    let client_ep = bind_client().await.expect("bind client endpoint");
+    let connector = IrohConnector::new(client_ep, host_id).expect("connector");
+    let transport = connector.connect().await.expect("dial host by endpoint id alone");
+
+    let client = RemoteSession::new(transport, ClientSigner::from_seed(&CLIENT_SEED));
+    let pump = client.take_pump().expect("pump");
+
+    let ticket =
+        PairingTicket { endpoint_id: host_id, handshake_secret: SECRET, session_id: None };
+    let script = async move {
+        client.pair(&ticket, "phone", NOW).await.expect("pair over a discovered link");
+        // One real RPC, so the assertion is "a usable session", not merely "a
+        // socket opened" — discovery that connects but cannot carry traffic would
+        // otherwise read as success.
+        let sessions = client.list_sessions().await.expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "sess-1");
+    };
+
+    let (pump_res, ()) = join(pump.run(), script).await;
+    pump_res.expect("pump ran to a clean shutdown");
+    host_task.await.expect("host task joined");
+}
