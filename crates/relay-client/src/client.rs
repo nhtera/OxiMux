@@ -298,7 +298,8 @@ fn fan_to_subscriber(subscribers: &PtySubscribers, notif: Notification) {
     let pty_id = match &notif {
         Notification::Output { pty_id, .. }
         | Notification::Exit { pty_id, .. }
-        | Notification::Attention { pty_id, .. } => pty_id.clone(),
+        | Notification::Attention { pty_id, .. }
+        | Notification::Gapped { pty_id } => pty_id.clone(),
     };
     let had_entry = if let Some(mut subs) = subscribers.get_mut(&pty_id) {
         // Deliver to EVERY attachment on this PTY, dropping any whose

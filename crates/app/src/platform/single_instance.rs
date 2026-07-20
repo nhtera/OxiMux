@@ -24,7 +24,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// Lock file name under the app data directory. Sits alongside the relay
-/// `relay-v6.{sock,pid,token}` files — same placement convention.
+/// `relay-v7.{sock,pid,token}` files — same placement convention.
 pub const LOCK_FILENAME: &str = "oximux-gui.lock";
 
 /// Resolve the GUI lock path inside a given data directory.

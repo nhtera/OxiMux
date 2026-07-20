@@ -357,6 +357,26 @@ fn apply_relay_notification(
             push_event(queues, id, TerminalEvent::Bell { id });
             ControlFlow::Continue(())
         }
+        // The daemon discarded output for this subscriber because our queue was
+        // full. The bytes survive in the session's replay ring, so recovery is a
+        // re-attach — which this pump cannot perform: it holds no client handle,
+        // and a fresh `Attach` would register a *second* attachment in the
+        // daemon's smallest-screen-wins size calculation unless the old one is
+        // released in the same step.
+        //
+        // So this arm is deliberately inert for now, and deliberately explicit
+        // rather than a catch-all: the grid is known-stale from here, and that
+        // fact should force a decision at this site rather than be swallowed by
+        // a `_ =>`. Continue rather than Break — a terminal with a hole in it is
+        // still more useful than one that abruptly dies.
+        Notification::Gapped { .. } => {
+            tracing::warn!(
+                ?id,
+                "daemon dropped output for this subscriber; terminal contents are stale \
+                 until the session is re-attached"
+            );
+            ControlFlow::Continue(())
+        }
     }
 }
 

@@ -28,7 +28,15 @@ use crate::error::ErrCode;
 // with no new app-side plumbing — and an agent hook can report status
 // without a controlling terminal (hooks run detached, with no `/dev/tty`).
 // New variant ⇒ wire break ⇒ socket bumps to `relay-v6.sock`.
-pub const PROTOCOL_VERSION: u32 = 6;
+//
+// v7: `Notification::Gapped` tells a subscriber the daemon discarded output
+// for it, so it knows to re-attach and resync from the replay ring. The
+// version bump is load-bearing rather than ceremonial: the handshake compares
+// versions for EQUALITY, so without it a v7 daemon and a v6 client would
+// connect happily and then break the moment a gap occurred — the v6 client
+// cannot decode variant 3, and postcard enums are positional. Bumping turns
+// that into a clean refusal at connect. Socket bumps to `relay-v7.sock`.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
@@ -195,5 +203,18 @@ pub enum Notification {
         pty_id: String,
         title: String,
         body: String,
+    },
+    /// This subscriber fell behind and the daemon discarded output for it.
+    ///
+    /// The bytes are not lost — the session's replay ring still holds them —
+    /// but they will never arrive on the live stream, so a client that keeps
+    /// rendering from here on is drawing a terminal with a hole in it. The
+    /// recovery is to re-`Attach`, which replays the ring from scratch.
+    ///
+    /// Sent once per gap rather than per dropped message: a subscriber that is
+    /// behind is behind, and repeating the signal would compete for the very
+    /// queue space that is already exhausted.
+    Gapped {
+        pty_id: String,
     },
 }
