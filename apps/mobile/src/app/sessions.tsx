@@ -1,6 +1,7 @@
+import { router } from 'expo-router';
 import type { SessionSummary } from 'oximux-core';
 import { useCallback, useEffect, useState } from 'react';
-import { FlatList, RefreshControl, StyleSheet, View } from 'react-native';
+import { FlatList, Pressable, RefreshControl, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ConnectionBadge } from '@/components/connection-badge';
@@ -57,7 +58,12 @@ export default function SessionsScreen() {
 
 function SessionRow({ session }: { session: SessionSummary }) {
   return (
-    <View style={styles.row}>
+    <Pressable
+      onPress={() =>
+        router.push({ pathname: '/session/[id]', params: { id: session.sessionId } })
+      }
+      style={styles.row}
+    >
       <View style={styles.rowText}>
         <ThemedText numberOfLines={1}>{session.title}</ThemedText>
         {session.model ? (
@@ -69,7 +75,7 @@ function SessionRow({ session }: { session: SessionSummary }) {
       {/* A session blocked on a permission is the one thing worth crossing the
           room for, so it gets the only accent in the row. */}
       {session.awaitingPermission ? <View style={styles.attention} /> : null}
-    </View>
+    </Pressable>
   );
 }
 
