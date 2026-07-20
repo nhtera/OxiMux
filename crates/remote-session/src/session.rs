@@ -11,6 +11,7 @@
 mod git;
 mod handshake;
 mod subscribe;
+mod terminals;
 
 use std::sync::{Arc, Mutex};
 
@@ -22,7 +23,7 @@ use oximux_remote_proto::messages::{
 use oximux_remote_proto::proto::{Request, Response, RpcError};
 use oximux_remote_proto::{HostEvent, Transport};
 
-use crate::demux::{Demux, DemuxPump, EventStream, demux};
+use crate::demux::{Demux, DemuxPump, EventStream, TerminalStream, demux};
 use crate::error::SessionError;
 use crate::signer::ClientSigner;
 
@@ -42,6 +43,10 @@ pub struct RemoteSession {
     pump: Mutex<Option<DemuxPump>>,
     /// The live event stream, taken once by the owner to consume.
     events: Mutex<Option<EventStream>>,
+    /// The live terminal stream, taken once by the owner to consume. Separate
+    /// from `events` because a client can watch a terminal without subscribing
+    /// to any agent session, and vice versa.
+    terminals: Mutex<Option<TerminalStream>>,
     /// Dropping this stops the pump — so the connection tears down when the
     /// session is dropped, no explicit close needed.
     _shutdown: oneshot::Sender<()>,
@@ -49,13 +54,14 @@ pub struct RemoteSession {
 
 impl RemoteSession {
     pub fn new(transport: Arc<dyn Transport>, signer: ClientSigner) -> Self {
-        let (handle, pump, events, shutdown) = demux(transport);
+        let (handle, pump, events, terminals, shutdown) = demux(transport);
         Self {
             demux: handle,
             signer,
             token: Mutex::new(None),
             pump: Mutex::new(Some(pump)),
             events: Mutex::new(Some(events)),
+            terminals: Mutex::new(Some(terminals)),
             _shutdown: shutdown,
         }
     }
@@ -64,6 +70,12 @@ impl RemoteSession {
     /// executor (prod) or join it (tests); RPCs only resolve while it runs.
     pub fn take_pump(&self) -> Option<DemuxPump> {
         self.pump.lock().unwrap().take()
+    }
+
+    /// Take the live event stream — once. Each pushed `HostEvent` is folded by a
+    /// [`SessionSubscription`](crate::SessionSubscription).
+    pub fn take_terminals(&self) -> Option<TerminalStream> {
+        self.terminals.lock().unwrap().take()
     }
 
     /// Take the live event stream — once. Each pushed `HostEvent` is folded by a

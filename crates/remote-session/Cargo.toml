@@ -36,3 +36,7 @@ oximux-remote-host = { workspace = true }
 oximux-agents = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
+# The terminal seam hands back a tokio mpsc receiver, so the fake source in the
+# terminal loop test needs one to feed it.
+tokio = { workspace = true, features = ["sync", "rt"] }
+async-trait = { workspace = true }

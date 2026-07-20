@@ -27,6 +27,23 @@ type Result<T> = std::result::Result<T, SessionError>;
 /// dropped.
 pub type EventStream = mpsc::UnboundedReceiver<HostEvent>;
 
+/// One unsolicited terminal frame from the host.
+///
+/// Terminal pushes ride their own channel rather than sharing the session-event
+/// stream: the two have different consumers with different lifetimes (a phone
+/// can watch a terminal without subscribing to any agent session), and merging
+/// them would make either consumer's backpressure the other's problem.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TerminalPush {
+    Output { pty_id: String, bytes: Vec<u8> },
+    /// The host dropped output for us; re-attach to resync.
+    Gapped { pty_id: String },
+    Exited { pty_id: String, code: Option<i32> },
+}
+
+/// The receiver end of the live terminal stream the pump feeds.
+pub type TerminalStream = mpsc::UnboundedReceiver<TerminalPush>;
+
 /// The shared reply slot. Each [`Demux::call`] registers a one-shot sender here
 /// before sending its request; the pump moves the matching reply into it.
 ///
@@ -54,6 +71,7 @@ pub struct DemuxPump {
     transport: Arc<dyn Transport>,
     pending: Arc<Pending>,
     events: mpsc::UnboundedSender<HostEvent>,
+    terminals: mpsc::UnboundedSender<TerminalPush>,
     shutdown: oneshot::Receiver<()>,
 }
 
@@ -63,17 +81,24 @@ pub struct DemuxPump {
 /// it on teardown (no explicit close call needed).
 pub fn demux(
     transport: Arc<dyn Transport>,
-) -> (Arc<Demux>, DemuxPump, EventStream, oneshot::Sender<()>) {
+) -> (Arc<Demux>, DemuxPump, EventStream, TerminalStream, oneshot::Sender<()>) {
     let pending = Arc::new(Pending { slot: Mutex::new(None), alive: AtomicBool::new(true) });
     let (events_tx, events_rx) = mpsc::unbounded();
+    let (terminals_tx, terminals_rx) = mpsc::unbounded();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let handle = Arc::new(Demux {
         transport: transport.clone(),
         pending: pending.clone(),
         rpc_lock: AsyncMutex::new(()),
     });
-    let pump = DemuxPump { transport, pending, events: events_tx, shutdown: shutdown_rx };
-    (handle, pump, events_rx, shutdown_tx)
+    let pump = DemuxPump {
+        transport,
+        pending,
+        events: events_tx,
+        terminals: terminals_tx,
+        shutdown: shutdown_rx,
+    };
+    (handle, pump, events_rx, terminals_rx, shutdown_tx)
 }
 
 impl Demux {
@@ -132,6 +157,21 @@ impl DemuxPump {
                     // events; keep pumping so in-flight RPC replies still route.
                     let _ = self.events.unbounded_send(event);
                 }
+                // Terminal frames are pushed, exactly like `Event`, and MUST be
+                // routed away from the reply slot. Falling through to the
+                // catch-all below would hand terminal output to whatever RPC
+                // happened to be outstanding and desync the connection for the
+                // rest of its life — the wire has no correlation id, so a single
+                // misrouted frame is unrecoverable.
+                Response::TermOutput { pty_id, bytes } => {
+                    let _ = self.terminals.unbounded_send(TerminalPush::Output { pty_id, bytes });
+                }
+                Response::TermGapped { pty_id } => {
+                    let _ = self.terminals.unbounded_send(TerminalPush::Gapped { pty_id });
+                }
+                Response::TermExited { pty_id, code } => {
+                    let _ = self.terminals.unbounded_send(TerminalPush::Exited { pty_id, code });
+                }
                 reply => {
                     if let Some(tx) = self.pending.slot.lock().unwrap().take() {
                         let _ = tx.send(reply);
@@ -172,7 +212,7 @@ mod tests {
     /// a reply that can no longer arrive.
     #[test]
     fn call_errors_instead_of_hanging_when_the_pump_stops() {
-        let (handle, pump, _events, _shutdown) = demux(Arc::new(HostClosedTransport));
+        let (handle, pump, _events, _terminals, _shutdown) = demux(Arc::new(HostClosedTransport));
         let (pump_res, call_res) = block_on(join(pump.run(), handle.call(Request::Ping)));
         assert!(pump_res.is_ok(), "clean stop on host close");
         assert!(
