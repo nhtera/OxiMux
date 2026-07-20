@@ -201,15 +201,18 @@ impl RemoteControl {
             return auth.devices();
         }
         match &self.devices {
+            // Revoked devices are listed here too, matching the live store: the
+            // record is what a forget acts on, so hiding it would put the device
+            // beyond reach of the only action that can undo the revocation.
             Some(store) => store
                 .load()
                 .into_iter()
-                .filter(|d| !d.revoked)
                 .map(|d| DeviceInfo {
                     pubkey: d.pubkey,
                     name: d.name,
                     read_only: d.read_only,
                     last_seen: d.last_seen,
+                    revoked: d.revoked,
                 })
                 .collect(),
             None => Vec::new(),
@@ -241,6 +244,23 @@ impl RemoteControl {
         }
         if let Some(store) = &self.devices {
             store.set_revoked(pubkey, true);
+        }
+    }
+
+    /// Erase a device's record, cutting it off now and letting it pair again.
+    ///
+    /// The host refuses to `Register` a key it already knows — including a revoked
+    /// one — so without this a device could never be re-paired: revoking a phone
+    /// and then wanting it back was a dead end, and so was a phone that dropped
+    /// its own side of the pairing. Erasing the record is the deliberate host-side
+    /// undo that check is written to require.
+    pub fn forget_device(&self, pubkey: &AppPubkey) {
+        if let Some(auth) = self.auth.lock().unwrap().as_ref() {
+            auth.forget(pubkey);
+            return;
+        }
+        if let Some(store) = &self.devices {
+            store.remove(pubkey);
         }
     }
 
@@ -356,6 +376,7 @@ mod tests {
         devices: Mutex<Vec<StoredDevice>>,
         revoked: Mutex<Vec<AppPubkey>>,
         read_only: Mutex<Vec<(AppPubkey, bool)>>,
+        removed: Mutex<Vec<AppPubkey>>,
     }
 
     impl DeviceStore for RecordingStore {
@@ -371,6 +392,9 @@ mod tests {
         }
         fn set_read_only(&self, pubkey: &AppPubkey, read_only: bool) {
             self.read_only.lock().unwrap().push((*pubkey, read_only));
+        }
+        fn remove(&self, pubkey: &AppPubkey) {
+            self.removed.lock().unwrap().push(*pubkey);
         }
         fn touch_last_seen(&self, _pubkey: &[u8; 32]) {}
     }
@@ -418,8 +442,14 @@ mod tests {
         );
     }
 
-    /// With no host bound, the devices list still reads durable storage (so a device
-    /// can be reviewed/cut off without turning remote access on) and hides revoked ones.
+    /// With no host bound, the devices list still reads durable storage — so a
+    /// device can be reviewed and cut off without turning remote access on.
+    ///
+    /// Revoked devices are listed, flagged rather than hidden. This deliberately
+    /// reverses the earlier "revoked devices are not offered": the host refuses to
+    /// register a key it already knows, revoked included, so hiding the row put
+    /// the device beyond reach of the only action that can undo the revocation and
+    /// made revoking silently permanent.
     #[test]
     fn paired_devices_reads_durable_storage_when_no_host_is_bound() {
         let store = Arc::new(RecordingStore::default());
@@ -431,9 +461,30 @@ mod tests {
 
         let listed = rc.paired_devices();
 
-        assert_eq!(listed.len(), 1, "revoked devices are not offered");
-        assert_eq!(listed[0].name, "phone");
-        assert!(!listed[0].read_only, "a paired device starts read-write");
+        assert_eq!(listed.len(), 2, "revoked devices stay listed so they can be forgotten");
+        let phone = listed.iter().find(|d| d.name == "phone").expect("active device listed");
+        assert!(!phone.revoked, "the active device is not flagged");
+        assert!(!phone.read_only, "a paired device starts read-write");
+        let tablet =
+            listed.iter().find(|d| d.name == "old-tablet").expect("revoked device listed");
+        assert!(tablet.revoked, "and the revoked one is flagged, not omitted");
+    }
+
+    /// Forgetting with no host bound erases the record durably, which is what lets
+    /// that device pair again — a revocation alone leaves the key known forever.
+    #[test]
+    fn forget_without_a_host_erases_the_record() {
+        let store = Arc::new(RecordingStore::default());
+        store.devices.lock().unwrap().push(a_device(0x11, "phone", false));
+        let rc = RemoteControl::with_devices(store.clone());
+
+        rc.forget_device(&[0x11; 32]);
+
+        assert_eq!(
+            store.removed.lock().unwrap().as_slice(),
+            &[[0x11; 32]],
+            "the erasure reaches storage, so it survives into the next bind",
+        );
     }
 
     /// Revoking with no host bound still persists, so it survives into the next bind.

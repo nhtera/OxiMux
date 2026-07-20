@@ -43,6 +43,13 @@ pub trait DeviceStore: Send + Sync {
     fn set_revoked(&self, pubkey: &AppPubkey, revoked: bool);
     /// Persist a read-only-tier change.
     fn set_read_only(&self, pubkey: &AppPubkey, read_only: bool);
+    /// Erase a device's record entirely, so its key is no longer *known*.
+    ///
+    /// Distinct from [`set_revoked`](Self::set_revoked): a revoked device stays
+    /// recorded on purpose, so proof of a pairing secret can never resurrect it.
+    /// Erasing is the deliberate host-side undo of that, and is the only way a
+    /// device that has already paired can pair again.
+    fn remove(&self, pubkey: &AppPubkey);
     /// Record that a device just authenticated. Called once per connection, not
     /// per RPC — the per-RPC recheck runs on the hot path and must not touch the
     /// database.
@@ -87,6 +94,13 @@ impl AuthStore {
     pub(super) fn persist_revoked(&self, pubkey: &AppPubkey, revoked: bool) {
         if let Some(store) = &self.store {
             store.set_revoked(pubkey, revoked);
+        }
+    }
+
+    /// Erase a device from durable storage (if any). Call outside the lock.
+    pub(super) fn persist_removed(&self, pubkey: &AppPubkey) {
+        if let Some(store) = &self.store {
+            store.remove(pubkey);
         }
     }
 
@@ -177,6 +191,12 @@ impl DeviceStore for StorageDeviceStore {
         }
     }
 
+    fn remove(&self, pubkey: &AppPubkey) {
+        if let Err(e) = self.repo.remove(&pubkey_to_hex(pubkey)) {
+            tracing::warn!(error = %e, "erasing paired device failed");
+        }
+    }
+
     fn touch_last_seen(&self, pubkey: &AppPubkey) {
         if let Err(e) = self.repo.touch_last_seen(&pubkey_to_hex(pubkey)) {
             tracing::warn!(error = %e, "persisting device last-seen failed");
@@ -232,6 +252,7 @@ mod tests {
         revoked: Mutex<Vec<(AppPubkey, bool)>>,
         read_only: Mutex<Vec<(AppPubkey, bool)>>,
         seen: Mutex<Vec<AppPubkey>>,
+        removed: Mutex<Vec<AppPubkey>>,
         seed: Vec<StoredDevice>,
     }
     impl DeviceStore for RecordingStore {
@@ -247,9 +268,58 @@ mod tests {
         fn set_read_only(&self, pubkey: &AppPubkey, read_only: bool) {
             self.read_only.lock().unwrap().push((*pubkey, read_only));
         }
+        fn remove(&self, pubkey: &AppPubkey) {
+            self.removed.lock().unwrap().push(*pubkey);
+        }
         fn touch_last_seen(&self, pubkey: &AppPubkey) {
             self.seen.lock().unwrap().push(*pubkey);
         }
+    }
+
+    /// The pair of properties that make revoke and forget different actions
+    /// rather than two names for one: a revoked key stays known (so proof of a
+    /// pairing secret can never resurrect a lost phone over the wire), and a
+    /// forgotten one does not (so the user can deliberately let a device back
+    /// in). Collapsing either direction reintroduces a real bug.
+    #[test]
+    fn revoking_blocks_re_registration_but_forgetting_allows_it() {
+        let store = Arc::new(RecordingStore::default());
+        let auth = AuthStore::with_store(store.clone());
+        let pubkey = vk(0x44);
+
+        auth.set_pairing(super::super::PairingSlot::new(SECRET, None, false));
+        auth.register(&reg(pubkey, None), NOW).expect("first pairing");
+
+        auth.revoke(&pubkey);
+        auth.register(&reg(pubkey, None), NOW)
+            .expect_err("a revoked device must not re-pair with only the secret");
+
+        auth.forget(&pubkey);
+        assert_eq!(
+            store.removed.lock().unwrap().as_slice(),
+            &[pubkey],
+            "the erasure is written through, so it survives a restart",
+        );
+        auth.register(&reg(pubkey, None), NOW)
+            .expect("a forgotten device is no longer known, so it may pair again");
+    }
+
+    /// Forgetting must cut a *live* device off as hard as revoking does — its
+    /// cached token is what would otherwise keep an open connection working
+    /// against a record that no longer exists.
+    #[test]
+    fn forgetting_drops_the_devices_live_tokens() {
+        let store = Arc::new(RecordingStore::default());
+        let auth = AuthStore::with_store(store.clone());
+        let pubkey = vk(0x55);
+
+        auth.set_pairing(super::super::PairingSlot::new(SECRET, None, false));
+        let token = auth.register(&reg(pubkey, None), NOW).expect("pair");
+        assert_eq!(auth.authorize_token(&token), Some(pubkey), "token works while paired");
+
+        auth.forget(&pubkey);
+        assert_eq!(auth.authorize_token(&token), None, "the token dies with the record");
+        assert!(!auth.is_authorized(&pubkey), "and the device is no longer authorized");
     }
 
     #[test]

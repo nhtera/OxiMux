@@ -15,6 +15,10 @@ pub struct DeviceInfo {
     /// has never been used is a plausible sign of a pairing the user does not
     /// recognize.
     pub last_seen: Option<u64>,
+    /// Cut off, but still recorded — the tombstone that stops a pairing code
+    /// from resurrecting it. Listed rather than hidden so the record remains
+    /// reachable: erasing it is the only way that device can ever pair again.
+    pub revoked: bool,
 }
 
 impl AuthStore {
@@ -38,20 +42,25 @@ impl AuthStore {
         }
     }
 
-    /// The currently-authorized (non-revoked) devices — the data behind the
-    /// paired-devices list, its revoke action, and its read-only toggle.
+    /// Every recorded device — the data behind the paired-devices list, its
+    /// revoke/forget actions, and its read-only toggle.
+    ///
+    /// Revoked devices are **included**, flagged rather than filtered. Hiding
+    /// them made the record unreachable from the UI while `register` still
+    /// refused the key, so revoking a phone quietly became permanent: nothing
+    /// on screen could undo it.
     pub fn devices(&self) -> Vec<DeviceInfo> {
         self.inner
             .lock()
             .unwrap()
             .devices
             .iter()
-            .filter(|(_, d)| !d.revoked)
             .map(|(pubkey, d)| DeviceInfo {
                 pubkey: *pubkey,
                 name: d.name.clone(),
                 read_only: d.read_only,
                 last_seen: d.last_seen,
+                revoked: d.revoked,
             })
             .collect()
     }
@@ -81,6 +90,28 @@ impl AuthStore {
         }
         // Write through outside the lock (the store may block on I/O).
         self.persist_read_only(pubkey, read_only);
+    }
+
+    /// Forget a device entirely: same immediate cut-off as [`revoke`](Self::revoke),
+    /// but the record is erased rather than tombstoned, so the key stops being
+    /// *known* and the device may pair again with a fresh code.
+    ///
+    /// This is the explicit host-side undo that [`register`](Self::register)'s
+    /// already-known check requires. Keeping it separate from `revoke` is the
+    /// point: revoking a lost phone must stay permanent, because otherwise anyone
+    /// holding a pairing code could undo it over the wire. Forgetting is only
+    /// reachable from the desktop, by someone already at the machine.
+    pub fn forget(&self, pubkey: &AppPubkey) {
+        {
+            let mut st = self.inner.lock().unwrap();
+            st.devices.remove(pubkey);
+            // Drop live tokens in the same critical section as the record, or an
+            // in-flight connection would keep passing the per-RPC recheck against
+            // a device that no longer exists.
+            st.tokens.retain(|_, owner| owner != pubkey);
+        }
+        // Write through outside the lock (the store may block on I/O).
+        self.persist_removed(pubkey);
     }
 
     /// Revoke a device: it fails the next per-RPC recheck and its tokens die.
