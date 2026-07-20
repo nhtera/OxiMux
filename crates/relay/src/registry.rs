@@ -285,6 +285,29 @@ impl PtyRegistry {
         Ok(pty_id)
     }
 
+    /// Snapshot the replay ring and current dims WITHOUT touching subscribers
+    /// or attachments — the resync path for a client told it `Gapped`.
+    ///
+    /// Deliberately not `attach`: that client is already attached and already
+    /// holds an `attachment_id`. Attaching again would add a second entry to
+    /// the smallest-screen-wins `min`, so recovering from a dropped frame
+    /// would resize the live process. This answers only "what is on screen
+    /// now?".
+    pub fn replay(&self, pty_id: &str) -> Result<(Vec<u8>, u16, u16), RegistryError> {
+        let entry = self
+            .entries
+            .get(pty_id)
+            .ok_or_else(|| RegistryError::NotFound(pty_id.into()))?;
+        // Ring first, matching the lock order `attach` and `fan_out` use, so a
+        // snapshot taken here can never interleave with a push mid-write.
+        let ring = entry.ring.lock().expect("ring poisoned");
+        let replay = ring.snapshot();
+        drop(ring);
+        let cols = *entry.cols.lock().expect("cols poisoned");
+        let rows = *entry.rows.lock().expect("rows poisoned");
+        Ok((replay, cols, rows))
+    }
+
     /// Attach a subscriber and return `(replay, cols, rows, attachment_id)`
     /// — the buffered raw output, the PTY's CURRENT (effective) grid
     /// dimensions, and a fresh per-attachment handle. The client must
