@@ -422,11 +422,36 @@ pub(super) fn entries(
     _typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> Vec<SettingEntry> {
-    vec![entry(
-        "Allow remote access",
-        "Expose running agent sessions so the OxiMux mobile app can view and drive them.",
-        remote_toggle(theme, cx),
-    )]
+    vec![
+        entry(
+            "Allow remote access",
+            "Expose running agent sessions so the OxiMux mobile app can view and drive them.",
+            remote_toggle(theme, cx),
+        ),
+        entry(
+            "Keep this Mac awake while on",
+            "Stop it idle-sleeping, so a paired device can still reach it. Sleeping with the lid closed is unaffected.",
+            keep_awake_toggle(theme, cx),
+        ),
+    ]
+}
+
+/// The keep-awake companion. Reads the live flag on the shared assertion rather
+/// than a copy on the modal, so it reflects what is actually in force.
+fn keep_awake_toggle(theme: Theme, cx: &mut gpui::Context<SettingsModal>) -> AnyElement {
+    let current = crate::agent_awake::global().remote_enabled();
+    toggle_switch(
+        "remote-keep-awake",
+        current,
+        theme,
+        move |this, _window, cx| {
+            let next = !current;
+            crate::agent_awake::global().set_remote_enabled(next);
+            this.persist_flag(crate::remote_control::KEEP_AWAKE_SETTING, next, cx);
+            cx.notify();
+        },
+        cx,
+    )
 }
 
 /// The master switch. Reads the live global flag; clicking flips it and starts or

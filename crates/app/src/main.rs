@@ -326,6 +326,15 @@ fn main() {
             .ok()
             .flatten()
             .is_some_and(|v| v == "true");
+        // Hydrate the keep-awake preference BEFORE resuming, so the hold the
+        // resume takes is evaluated against the user's actual choice rather than
+        // the default — otherwise a user who turned it off would get an assertion
+        // for the moment between bind and hydration.
+        if let Ok(Some(v)) =
+            app_state.settings_repo().get(oximux_app::remote_control::KEEP_AWAKE_SETTING)
+        {
+            oximux_app::agent_awake::global().set_remote_enabled(v == "true");
+        }
         if remote_was_on {
             oximux_app::remote_control::RemoteControl::resume_at_launch(cx);
         }

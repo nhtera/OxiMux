@@ -21,6 +21,12 @@ use gpui::Global;
 /// relaunch — without it a paired phone silently cannot reach a restarted
 /// desktop until someone opens Settings and flips the toggle by hand.
 pub const ENABLED_SETTING: &str = "remote.enabled";
+
+/// Settings key for the keep-awake companion. Separate from the agents-running
+/// preference on purpose: they answer different questions, and one silently
+/// governing the other would make turning off a notification setting stop a
+/// paired phone from reaching this Mac.
+pub const KEEP_AWAKE_SETTING: &str = "remote.keep_awake";
 use oximux_agents::session_registry::{SessionHandle, SessionMeta, SessionRegistry};
 use oximux_agents::thread::AgentConnection;
 use oximux_remote_host::{
@@ -90,6 +96,12 @@ pub struct RemoteControl {
     /// every RPC, so a revoke lands mid-session). Cleared on stop — with no host, the
     /// durable store is authoritative.
     auth: Mutex<Option<Arc<AuthStore>>>,
+    /// Prevents idle sleep while the host is bound — a phone can only reach a Mac
+    /// that is awake, so without this the feature simply stops working a few
+    /// minutes after the user walks away. Held for the host's lifetime and
+    /// released with it; gated by its own setting, so it does not disturb (or get
+    /// disturbed by) the keep-awake-while-agents-run preference.
+    awake: Mutex<Option<crate::agent_awake::AwakeHold>>,
     /// Seeds the iroh endpoint key so the host keeps ONE identity across binds and
     /// restarts. Without it iroh mints a random key per bind, changing the endpoint
     /// id — and since a paired phone dials by that id, every restart would silently
@@ -115,6 +127,7 @@ impl RemoteControl {
             host: Mutex::new(None),
             devices: None,
             auth: Mutex::new(None),
+            awake: Mutex::new(None),
             endpoint_secret: None,
         }
     }
@@ -282,8 +295,13 @@ impl RemoteControl {
     }
 
     /// Store the freshly-bound host, stopping and replacing any prior one.
+    ///
+    /// Taking the keep-awake hold here rather than at the toggle ties it to the
+    /// host actually being bound: a bind that fails leaves no hold to leak, and
+    /// the assertion never outlives the thing it exists to keep reachable.
     pub fn set_host(&self, host: HostHandle) {
         *self.host.lock().unwrap() = Some(host);
+        *self.awake.lock().unwrap() = Some(crate::agent_awake::global().acquire_remote());
     }
 
     /// Stop and forget the running host (dropping the handle signals its accept loop
@@ -292,6 +310,8 @@ impl RemoteControl {
         self.host.lock().unwrap().take();
         // With no host, the durable store is authoritative for the devices UI.
         self.auth.lock().unwrap().take();
+        // Nothing left to stay awake for; the guard releases on drop.
+        self.awake.lock().unwrap().take();
     }
 
     /// The pairing ticket to encode as the QR, once the host has bound. `None` while
