@@ -16,6 +16,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gpui::Global;
+
+/// Settings key for the master switch. Persisted so remote access survives a
+/// relaunch — without it a paired phone silently cannot reach a restarted
+/// desktop until someone opens Settings and flips the toggle by hand.
+pub const ENABLED_SETTING: &str = "remote.enabled";
 use oximux_agents::session_registry::{SessionHandle, SessionMeta, SessionRegistry};
 use oximux_agents::thread::AgentConnection;
 use oximux_remote_host::{
@@ -150,18 +155,41 @@ impl RemoteControl {
     /// and reconnect without re-scanning.
     pub fn prepare_host(&self) -> (Arc<Dispatcher>, [u8; 16]) {
         let secret = mint_pairing_secret();
-        let auth = Arc::new(match &self.devices {
-            Some(devices) => AuthStore::with_store(devices.clone()),
-            None => AuthStore::new(),
-        });
+        let auth = self.seeded_auth();
         // ONE-TIME: the code dies the moment a device uses it, so a photographed
         // QR can't be redeemed later while remote access happens to stay on.
         // Pairing another device means toggling off/on, which mints a fresh code.
         auth.set_pairing(PairingSlot::new(secret, None, true));
-        // Keep a handle so the paired-devices UI can revoke against the live host.
+        (Arc::new(Dispatcher::new(self.registry.clone(), auth)), secret)
+    }
+
+    /// Prepare a host that serves **already-paired** devices but opens no pairing
+    /// window — for restoring remote access at launch.
+    ///
+    /// The distinction is the point: the user turned remote access on once, and
+    /// that should survive a relaunch. But re-opening a pairing slot on every
+    /// launch would silently leave the desktop claimable by anyone who can reach
+    /// the code, without the user ever asking to pair. Existing devices
+    /// authenticate against the durable store by pubkey and never need the
+    /// pairing secret, so they reconnect while the window stays shut.
+    ///
+    /// The secret still returned is what `start_host` mints its ticket from; with
+    /// no slot seeded it redeems to nothing, and the pane hides the QR because
+    /// `pairing_open()` is false.
+    pub fn prepare_host_resumed(&self) -> (Arc<Dispatcher>, [u8; 16]) {
+        let auth = self.seeded_auth();
+        (Arc::new(Dispatcher::new(self.registry.clone(), auth)), mint_pairing_secret())
+    }
+
+    /// A fresh auth store seeded from the durable device list, retained so the
+    /// paired-devices UI can revoke against the live host.
+    fn seeded_auth(&self) -> Arc<AuthStore> {
+        let auth = Arc::new(match &self.devices {
+            Some(devices) => AuthStore::with_store(devices.clone()),
+            None => AuthStore::new(),
+        });
         *self.auth.lock().unwrap() = Some(auth.clone());
-        let dispatcher = Arc::new(Dispatcher::new(self.registry.clone(), auth));
-        (dispatcher, secret)
+        auth
     }
 
     /// Paired devices to list in the UI, revoked ones excluded. Reads the live auth
@@ -252,6 +280,48 @@ impl RemoteControl {
         self.host.lock().unwrap().as_ref().map(|h| h.ticket().clone())
     }
 
+    /// Restore remote access at launch: flip the flag on and bind the iroh
+    /// endpoint off-thread, so already-paired phones can dial a freshly-started
+    /// desktop.
+    ///
+    /// Flag and bind travel together deliberately. Setting the flag alone would
+    /// leave the UI showing remote as on while nothing was listening; binding
+    /// alone would listen while [`Self::bind`] refused to register a single
+    /// session. Either half on its own is the bug this exists to prevent.
+    ///
+    /// A missing tokio runtime is a no-op rather than a panic: iroh needs one to
+    /// bind, and the app is still perfectly usable without remote access.
+    pub fn resume_at_launch(cx: &mut gpui::App) {
+        let Some(rc) = cx.try_global::<RemoteControl>() else {
+            return;
+        };
+        rc.set_enabled(true);
+        let (dispatcher, secret) = rc.prepare_host_resumed();
+        let endpoint_secret = rc.endpoint_secret();
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("no tokio runtime; remote host not bound");
+            return;
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        rt.spawn(async move {
+            let _ = tx.send(oximux_remote_iroh::start_host(dispatcher, secret, endpoint_secret).await);
+        });
+        cx.spawn(async move |cx| {
+            match rx.await {
+                Ok(Ok(host)) => cx.update(|cx| {
+                    if let Some(rc) = cx.try_global::<RemoteControl>() {
+                        rc.set_host(host);
+                    }
+                }),
+                // Say why rather than leaving the pane spinning on
+                // "Starting the pairing host…" forever.
+                Ok(Err(err)) => tracing::warn!(%err, "remote host failed to bind"),
+                Err(_) => tracing::warn!("remote host bind task dropped"),
+            }
+        })
+        .detach();
+    }
+
     /// Register `id`→`conn` and return the binding **iff remote is enabled**;
     /// `None` when disabled, so the caller does no work and holds no binding.
     pub fn bind(&self, id: &str, conn: Arc<dyn AgentConnection>) -> Option<RemoteBinding> {
@@ -325,6 +395,27 @@ mod tests {
         let _ = rc.prepare_host();
 
         assert_eq!(store.loads.load(Ordering::Relaxed), 1, "seeded from the durable devices");
+        assert!(rc.pairing_open(), "a deliberate toggle opens the pairing window");
+    }
+
+    /// Restoring remote access at launch must serve already-paired devices without
+    /// re-opening a pairing window — otherwise every relaunch would silently leave
+    /// the desktop claimable by anyone who can reach the code.
+    #[test]
+    fn a_resumed_host_serves_paired_devices_but_opens_no_pairing_window() {
+        let store = Arc::new(RecordingStore::default());
+        store.devices.lock().unwrap().push(a_device(0x11, "phone", false));
+        let rc = RemoteControl::with_devices(store.clone());
+
+        let _ = rc.prepare_host_resumed();
+
+        assert!(!rc.pairing_open(), "no pairing window on a launch restore");
+        assert_eq!(store.loads.load(Ordering::Relaxed), 1, "still seeded from durable devices");
+        assert_eq!(
+            rc.paired_devices().len(),
+            1,
+            "the already-paired phone is still authorized and can reconnect",
+        );
     }
 
     /// With no host bound, the devices list still reads durable storage (so a device

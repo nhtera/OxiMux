@@ -314,6 +314,21 @@ fn main() {
             }
         }
         cx.set_global(remote_control);
+        // Restore the master switch. Installed disabled above, so without this a
+        // desktop that had remote access on comes back with it off — and an
+        // already-paired phone simply cannot reach it until someone opens Settings
+        // and flips the toggle by hand, which defeats the point of checking on
+        // agents from a phone. Resuming binds for existing devices only; pairing a
+        // NEW device still takes a deliberate toggle.
+        let remote_was_on = app_state
+            .settings_repo()
+            .get(oximux_app::remote_control::ENABLED_SETTING)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v == "true");
+        if remote_was_on {
+            oximux_app::remote_control::RemoteControl::resume_at_launch(cx);
+        }
         // Install the full keymap (registry defaults ⊕ keybindings.toml
         // overrides) — this covers the menu-action chords too, and MUST run
         // before `set_menus`: GPUI reads the keymap when it builds the menu

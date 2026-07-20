@@ -352,19 +352,20 @@ fn remote_toggle(theme: Theme, cx: &mut gpui::Context<SettingsModal>) -> AnyElem
 /// pairing ticket back in on the UI thread; turning off drops the handle, which
 /// stops the accept loop and closes the endpoint.
 fn on_toggle(
-    _this: &mut SettingsModal,
+    this: &mut SettingsModal,
     _window: &mut gpui::Window,
     cx: &mut gpui::Context<SettingsModal>,
 ) {
     // Scope the global borrow so `cx` is free for the async bridge below. Returns
-    // the dispatcher + secret to bind with when turning on; `None` when turning off.
-    let prep = {
+    // the dispatcher + secret to bind with when turning on; `None` when turning off,
+    // plus the new state to persist once the borrow is released.
+    let (prep, turning_on) = {
         let Some(rc) = cx.try_global::<RemoteControl>() else {
             return;
         };
         let turning_on = !rc.enabled();
         rc.set_enabled(turning_on);
-        if turning_on {
+        let prep = if turning_on {
             let (dispatcher, secret) = rc.prepare_host();
             // Subscribe before the host starts serving, so a fast scan can't pair
             // in the window between bind and subscribe and go unannounced.
@@ -372,8 +373,12 @@ fn on_toggle(
         } else {
             rc.stop_host();
             None
-        }
+        };
+        (prep, turning_on)
     };
+
+    // Persist the choice so it survives a relaunch rather than silently reverting.
+    this.persist_flag(crate::remote_control::ENABLED_SETTING, turning_on, cx);
 
     if let Some((dispatcher, secret, endpoint_secret, pairings)) = prep
         && let Ok(handle) = tokio::runtime::Handle::try_current()

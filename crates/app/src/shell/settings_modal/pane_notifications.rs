@@ -169,7 +169,7 @@ fn notify_toggle(
             if key == keys::AGENT_AWAKE {
                 crate::agent_awake::global().set_enabled(next);
             }
-            this.persist_notify(key, next, cx);
+            this.persist_flag(key, next, cx);
         },
         cx,
     )

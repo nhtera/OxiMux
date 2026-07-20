@@ -359,10 +359,12 @@ impl SettingsModal {
     /// Persist one notification pref to the flat settings store as
     /// `"true"`/`"false"`. The live atomic is flipped by the caller before
     /// this runs; persistence only makes the choice survive a restart.
-    pub(super) fn persist_notify(&mut self, key: &str, value: bool, cx: &mut Context<Self>) {
+    /// Persist a boolean pref to the flat settings store. Not notification-specific
+    /// despite the repo's name — the remote master switch rides the same table.
+    pub(super) fn persist_flag(&mut self, key: &str, value: bool, cx: &mut Context<Self>) {
         let v = if value { "true" } else { "false" };
         if let Err(err) = self.notify_repo.set(key, v) {
-            tracing::warn!(%err, key, "settings modal: failed to persist notification pref");
+            tracing::warn!(%err, key, "settings modal: failed to persist pref");
         }
         cx.notify();
     }
