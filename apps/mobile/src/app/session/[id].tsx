@@ -18,8 +18,19 @@ import { useSession } from '@/native/session';
 export default function SessionScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const sessionId = String(id);
-  const { thread, loading, error, send, steer, cancel, allow, deny, answer, dismissError } =
-    useSession(sessionId);
+  const {
+    thread,
+    loading,
+    error,
+    send,
+    steer,
+    cancel,
+    allow,
+    deny,
+    answer,
+    dismissError,
+    reportError,
+  } = useSession(sessionId);
   const insets = useSafeAreaInsets();
   // The stack header sits above this view, so the keyboard has to be offset past
   // it or it pushes the composer up behind the transcript. Derived from the top
@@ -69,6 +80,7 @@ export default function SessionScreen() {
             onSend={send}
             onSteer={steer}
             onCancel={cancel}
+            onError={reportError}
           />
         </SafeAreaView>
       </KeyboardAvoidingView>

@@ -31,6 +31,12 @@
           "cameraPermission": "OxiMux uses the camera only to scan the pairing QR code shown by your desktop."
         }
       ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "OxiMux uses your photo library only to attach images to a prompt you send to your desktop."
+        }
+      ],
       "./plugins/with-system-configuration",
       [
         "expo-splash-screen",

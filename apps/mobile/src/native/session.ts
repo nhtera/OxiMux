@@ -1,6 +1,7 @@
 import { PermissionReply, type ThreadSnapshot } from 'oximux-core';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+import { toChatImage, type Attachment } from './attachments';
 import { useClient } from './client';
 import { describeError } from './errors';
 import {
@@ -19,7 +20,7 @@ export type SessionView = {
   /** A failed action (send/resolve/cancel), shown inline and dismissible. */
   error?: string;
   /** Resolves `false` if the send failed, so the composer can keep the text. */
-  send: (text: string) => Promise<boolean>;
+  send: (text: string, images?: Attachment[]) => Promise<boolean>;
   /** Guide a turn that is already running, instead of queueing a new prompt. */
   steer: (text: string) => Promise<boolean>;
   cancel: () => Promise<boolean>;
@@ -31,6 +32,9 @@ export type SessionView = {
     answers: QuestionAnswers
   ) => Promise<boolean>;
   dismissError: () => void;
+  /** Surface a failure that happened outside an RPC (picking an image, say)
+   * through the same inline banner, so the screen has one error channel. */
+  reportError: (message: string) => void;
 };
 
 /**
@@ -121,7 +125,8 @@ export function useSession(sessionId: string): SessionView {
   );
 
   const send = useCallback(
-    (text: string) => run((c) => c.sendPrompt(sessionId, text)),
+    (text: string, images: Attachment[] = []) =>
+      run((c) => c.sendPrompt(sessionId, text, images.map(toChatImage))),
     [run, sessionId]
   );
 
@@ -170,6 +175,19 @@ export function useSession(sessionId: string): SessionView {
   );
 
   const dismissError = useCallback(() => setError(undefined), []);
+  const reportError = useCallback((message: string) => setError(message), []);
 
-  return { thread, loading, error, send, steer, cancel, allow, deny, answer, dismissError };
+  return {
+    thread,
+    loading,
+    error,
+    send,
+    steer,
+    cancel,
+    allow,
+    deny,
+    answer,
+    dismissError,
+    reportError,
+  };
 }

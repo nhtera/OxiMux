@@ -1,17 +1,21 @@
 import { useState } from 'react';
 import { Pressable, StyleSheet, TextInput, View } from 'react-native';
 
+import { AttachmentStrip } from '@/components/chat/attachment-strip';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import { MAX_ATTACHMENTS, pickImages, type Attachment } from '@/native/attachments';
 
 type Props = {
   /** True while a turn is running — swaps Send for Steer and offers Stop. */
   turnActive: boolean;
   /** Resolves `false` when the prompt did not reach the desktop. */
-  onSend: (text: string) => Promise<boolean>;
+  onSend: (text: string, images: Attachment[]) => Promise<boolean>;
   onSteer: (text: string) => Promise<boolean>;
   onCancel: () => Promise<unknown>;
+  /** Surfaced by the screen alongside its other action failures. */
+  onError: (message: string) => void;
 };
 
 /**
@@ -19,26 +23,53 @@ type Props = {
  * rather than Send: typing mid-turn almost always means "also do this", and
  * sending would queue a whole new prompt to run after the current one instead of
  * guiding it. Stop sits next to it for the other intent.
+ *
+ * Attachments override that: steering carries text only on the wire, so a turn
+ * running with images queued still sends. Silently dropping photos the user
+ * deliberately attached would be the worse surprise of the two.
  */
-export function Composer({ turnActive, onSend, onSteer, onCancel }: Props) {
+export function Composer({ turnActive, onSend, onSteer, onCancel, onError }: Props) {
   const theme = useTheme();
   const [text, setText] = useState('');
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [busy, setBusy] = useState(false);
   const trimmed = text.trim();
-  const canSubmit = trimmed.length > 0 && !busy;
+  const steering = turnActive && attachments.length === 0;
+  const canSubmit = (trimmed.length > 0 || attachments.length > 0) && !busy;
+  const room = MAX_ATTACHMENTS - attachments.length;
+  // Picking during an in-flight send would race the restore-on-failure path:
+  // the newly picked images would be the ones kept, and the ones that failed to
+  // send would be the ones dropped — the opposite of what the restore is for.
+  const canAttach = room > 0 && !busy;
+
+  const attach = async () => {
+    try {
+      const picked = await pickImages(room);
+      if (picked.length > 0) setAttachments((current) => [...current, ...picked]);
+    } catch (e) {
+      onError(e instanceof Error ? e.message : 'Could not open the photo library.');
+    }
+  };
 
   const submit = async () => {
     if (!canSubmit) return;
     setBusy(true);
     // Clear optimistically: the desktop echoes the prompt back as a real entry,
     // so leaving it in the box would read as "not sent" once it appears above.
+    const queued = attachments;
     setText('');
+    setAttachments([]);
     try {
-      const sent = await (turnActive ? onSteer(trimmed) : onSend(trimmed));
+      const sent = await (steering ? onSteer(trimmed) : onSend(trimmed, queued));
       // ...but put it back if it never landed. On a phone the link drops
       // routinely, and silently eating a typed prompt is worse than the error
       // alone: the user would have to retype it with nothing to copy from.
-      if (!sent) setText((current) => (current.length > 0 ? current : trimmed));
+      // The images come back for the same reason — re-picking them from the
+      // library is a longer detour than retyping a sentence.
+      if (!sent) {
+        setText((current) => (current.length > 0 ? current : trimmed));
+        setAttachments((current) => (current.length > 0 ? current : queued));
+      }
     } finally {
       setBusy(false);
     }
@@ -46,10 +77,15 @@ export function Composer({ turnActive, onSend, onSteer, onCancel }: Props) {
 
   return (
     <View style={[styles.bar, { borderTopColor: theme.backgroundSelected }]}>
+      <AttachmentStrip
+        attachments={attachments}
+        onRemove={(id) => setAttachments((current) => current.filter((a) => a.id !== id))}
+      />
+
       <TextInput
         value={text}
         onChangeText={setText}
-        placeholder={turnActive ? 'Steer this turn…' : 'Send a prompt…'}
+        placeholder={steering ? 'Steer this turn…' : 'Send a prompt…'}
         placeholderTextColor={theme.textSecondary}
         autoCapitalize="sentences"
         multiline
@@ -60,6 +96,19 @@ export function Composer({ turnActive, onSend, onSteer, onCancel }: Props) {
       />
 
       <View style={styles.actions}>
+        <Pressable
+          onPress={attach}
+          disabled={!canAttach}
+          accessibilityLabel="Attach an image"
+          style={[styles.button, styles.attach, !canAttach && styles.disabled]}
+        >
+          <ThemedText type="code">
+            {room === 0 ? `${MAX_ATTACHMENTS} max` : 'Attach'}
+          </ThemedText>
+        </Pressable>
+
+        <View style={styles.spacer} />
+
         {turnActive ? (
           <Pressable onPress={onCancel} style={[styles.button, styles.stop]}>
             <ThemedText type="code">Stop</ThemedText>
@@ -75,7 +124,7 @@ export function Composer({ turnActive, onSend, onSteer, onCancel }: Props) {
             !canSubmit && styles.disabled,
           ]}
         >
-          <ThemedText type="code">{turnActive ? 'Steer' : 'Send'}</ThemedText>
+          <ThemedText type="code">{steering ? 'Steer' : 'Send'}</ThemedText>
         </Pressable>
       </View>
     </View>
@@ -96,7 +145,9 @@ const styles = StyleSheet.create({
     paddingVertical: Spacing.two,
     fontSize: 16,
   },
-  actions: { flexDirection: 'row', justifyContent: 'flex-end', gap: Spacing.two },
+  actions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two },
+  spacer: { flex: 1 },
+  attach: { borderWidth: StyleSheet.hairlineWidth, borderColor: '#8B949E' },
   button: {
     paddingVertical: Spacing.two,
     paddingHorizontal: Spacing.four,
