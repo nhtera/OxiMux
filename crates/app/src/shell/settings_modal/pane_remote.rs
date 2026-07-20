@@ -136,23 +136,24 @@ pub(super) fn render(
     if let Some(ticket) = ticket {
         // Only while the code is still redeemable — a spent code on screen invites
         // a scan that would just fail.
-        if pairing_open
-            && let Some(image) = pairing_qr_image(modal, &ticket)
-        {
-            col = col.child(
-                // Row + `flex_none` so the white card hugs the code; a plain child
-                // of the column would stretch across the whole pane.
-                div().pt(px(12.0)).flex().flex_row().items_start().child(
-                    div()
-                        .flex_none()
-                        .p(px(8.0))
-                        .rounded(px(density.r_xs))
-                        // The code is painted black-on-white regardless of theme —
-                        // an inverted QR is unreadable to many scanners.
-                        .bg(gpui::white())
-                        .child(img(ImageSource::Image(image)).size(px(QR_SIZE))),
-                ),
-            );
+        if pairing_open {
+            if let Some(image) = pairing_qr_image(modal, &ticket) {
+                col = col.child(
+                    // Row + `flex_none` so the white card hugs the code; a plain child
+                    // of the column would stretch across the whole pane.
+                    div().pt(px(12.0)).flex().flex_row().items_start().child(
+                        div()
+                            .flex_none()
+                            .p(px(8.0))
+                            .rounded(px(density.r_xs))
+                            // The code is painted black-on-white regardless of theme —
+                            // an inverted QR is unreadable to many scanners.
+                            .bg(gpui::white())
+                            .child(img(ImageSource::Image(image)).size(px(QR_SIZE))),
+                    ),
+                );
+            }
+            col = col.child(copy_link_row(&ticket, theme, density, typography, cx));
         }
         col = col.child(
             div()
@@ -170,6 +171,57 @@ pub(super) fn render(
         col = col.child(devices_section(devices, theme, density, typography, cx));
     }
     col.into_any_element()
+}
+
+/// A second way to hand the pairing ticket to a phone: copy the deep link.
+///
+/// The QR alone is a dead end whenever a camera can't be pointed at the screen —
+/// a simulator, a phone with a broken camera, or a Mac being driven remotely. The
+/// mobile app already accepts a pasted `oximux://connect?ticket=…` (its manual
+/// path), so the link was expected on this end and simply had no affordance.
+///
+/// The link carries the same one-time secret the QR encodes, so this widens where
+/// that secret can land — the clipboard is readable by any running app — without
+/// changing what it grants. It stays single-use and dies on redemption, and the
+/// row is gated on `pairing_open` so a spent link is never offered. The secret is
+/// still never rendered as text or logged.
+fn copy_link_row(
+    ticket: &PairingTicket,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    // Encode once here rather than inside the click handler: a ticket that can't
+    // be encoded should not offer a button that silently does nothing.
+    let Ok(url) = ticket.to_url() else {
+        return div().into_any_element();
+    };
+    div()
+        .pt(px(8.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(density.gap_inline))
+        .child(value_chip(
+            "remote-copy-link",
+            "Copy pairing link",
+            theme,
+            density,
+            typography,
+            move |_this, _window, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(url.clone()));
+                toast(cx, ToastKind::Success, "Pairing link copied — paste it in the mobile app");
+            },
+            cx,
+        ))
+        .child(
+            div()
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_subtle)
+                .child("Can't scan? Paste the link in the app instead."),
+        )
+        .into_any_element()
 }
 
 /// What turning remote access on actually exposes to third parties.
