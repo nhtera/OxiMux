@@ -12,6 +12,8 @@
 //!
 //! [`AgentChatView`]: crate::shell::agent_chat
 
+pub mod relay_terminals;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -29,6 +31,7 @@ pub const ENABLED_SETTING: &str = "remote.enabled";
 pub const KEEP_AWAKE_SETTING: &str = "remote.keep_awake";
 use oximux_agents::session_registry::{SessionHandle, SessionMeta, SessionRegistry};
 use oximux_agents::thread::AgentConnection;
+use oximux_remote_host::TerminalSource;
 use oximux_remote_host::{
     AppPubkey, AuthStore, DeviceInfo, DeviceStore, Dispatcher, PairedDevice, PairingSlot,
     mint_pairing_secret,
@@ -91,6 +94,13 @@ pub struct RemoteControl {
     /// fresh [`AuthStore`] from it, so devices paired in an earlier run (or before the
     /// last toggle-off) stay authorized. `None` = in-memory only (tests).
     devices: Option<Arc<dyn DeviceStore>>,
+    /// The desktop's terminals, when a relay client is available to serve them.
+    ///
+    /// `None` leaves every terminal RPC answering `Unauthorized`, which is the
+    /// correct degradation: a desktop running without the PTY daemon has no
+    /// terminals to expose, and saying so distinctly would let an unauthorized
+    /// client probe the host's configuration.
+    terminals: Option<Arc<dyn TerminalSource>>,
     /// The live host's auth store while one is bound, so the paired-devices UI can
     /// revoke against the *running* host (the dispatcher rechecks authorization on
     /// every RPC, so a revoke lands mid-session). Cleared on stop — with no host, the
@@ -126,6 +136,7 @@ impl RemoteControl {
             enabled: AtomicBool::new(false),
             host: Mutex::new(None),
             devices: None,
+            terminals: None,
             auth: Mutex::new(None),
             awake: Mutex::new(None),
             endpoint_secret: None,
@@ -144,6 +155,12 @@ impl RemoteControl {
     /// across restarts and toggle cycles.
     pub fn with_devices(devices: Arc<dyn DeviceStore>) -> Self {
         Self { devices: Some(devices), ..Self::new() }
+    }
+
+    /// Install the terminal source the host serves. Called once at boot, after
+    /// the relay client comes up.
+    pub fn set_terminals(&mut self, terminals: Arc<dyn TerminalSource>) {
+        self.terminals = Some(terminals);
     }
 
     /// The shared session registry (the host serves from this same instance).
@@ -173,7 +190,7 @@ impl RemoteControl {
         // QR can't be redeemed later while remote access happens to stay on.
         // Pairing another device means toggling off/on, which mints a fresh code.
         auth.set_pairing(PairingSlot::new(secret, None, true));
-        (Arc::new(Dispatcher::new(self.registry.clone(), auth)), secret)
+        (Arc::new(self.dispatcher(auth)), secret)
     }
 
     /// Prepare a host that serves **already-paired** devices but opens no pairing
@@ -191,7 +208,18 @@ impl RemoteControl {
     /// `pairing_open()` is false.
     pub fn prepare_host_resumed(&self) -> (Arc<Dispatcher>, [u8; 16]) {
         let auth = self.seeded_auth();
-        (Arc::new(Dispatcher::new(self.registry.clone(), auth)), mint_pairing_secret())
+        (Arc::new(self.dispatcher(auth)), mint_pairing_secret())
+    }
+
+    /// Build a dispatcher over the shared registry, exposing terminals when a
+    /// source is installed. Both host-preparation paths go through here so a
+    /// resumed host cannot quietly serve a different surface than a fresh one.
+    fn dispatcher(&self, auth: Arc<AuthStore>) -> Dispatcher {
+        let dispatcher = Dispatcher::new(self.registry.clone(), auth);
+        match &self.terminals {
+            Some(terminals) => dispatcher.with_terminals(Arc::clone(terminals)),
+            None => dispatcher,
+        }
     }
 
     /// A fresh auth store seeded from the durable device list, retained so the

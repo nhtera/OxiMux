@@ -313,6 +313,11 @@ fn main() {
                 ),
             }
         }
+        // Serve terminals when the relay came up. Absent (in-process PTY
+        // fallback), every terminal RPC keeps answering `Unauthorized`.
+        if let Some(terminals) = oximux_app::remote_control::relay_terminals::installed() {
+            remote_control.set_terminals(terminals);
+        }
         cx.set_global(remote_control);
         // Restore the master switch. Installed disabled above, so without this a
         // desktop that had remote access on comes back with it off — and an
@@ -1088,6 +1093,14 @@ fn boot_relay_supervisor(
         tracing::warn!("relay PID file missing; crash heartbeat disabled");
     }
 
+    // Publish the relay-backed terminal source so the remote host can serve
+    // terminals. Installed here rather than returned because the relay boots
+    // before the `RemoteControl` global exists.
+    oximux_app::remote_control::relay_terminals::install(std::sync::Arc::new(
+        oximux_app::remote_control::relay_terminals::RelayTerminals::new(std::sync::Arc::clone(
+            &client_arc,
+        )),
+    ));
     let backend = RelayBackend::new(client_arc, relay_rt.handle().clone());
     let boxed: Box<dyn TerminalBackend> = Box::new(backend);
     let shared = std::sync::Arc::new(std::sync::Mutex::new(boxed));
