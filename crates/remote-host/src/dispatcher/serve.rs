@@ -2,7 +2,7 @@
 //! live events of any active `Subscribe`, so a live event is pushed the moment it
 //! is produced without waiting on the next request.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use futures::future::{Either, select};
 use futures::stream::{BoxStream, SelectAll, StreamExt};
@@ -10,7 +10,7 @@ use oximux_agents::session_registry::{Seq, SessionId};
 use oximux_remote_proto::Transport;
 use oximux_remote_proto::proto::{Request, Response, RpcError};
 
-use super::stream::LiveFrame;
+use super::stream::{Live, forward_terminal};
 use super::{ConnState, Dispatcher, authorized_pubkey};
 
 /// What this turn of the serve loop picked to process. `Live` is boxed — a
@@ -19,7 +19,7 @@ use super::{ConnState, Dispatcher, authorized_pubkey};
 /// (loop back to the plain-recv path).
 enum Picked {
     Request(Option<Vec<u8>>),
-    Live(Option<Box<LiveFrame>>),
+    Live(Option<Box<Live>>),
 }
 
 impl Dispatcher {
@@ -30,8 +30,12 @@ impl Dispatcher {
         let mut state = ConnState::default();
         // Active live subscriptions, merged so any one that produces an event wakes
         // the loop. Empty until the first accepted `Subscribe`.
-        let mut streams: SelectAll<BoxStream<'static, LiveFrame>> = SelectAll::new();
+        let mut streams: SelectAll<BoxStream<'static, Live>> = SelectAll::new();
         let mut cursors: HashMap<SessionId, Seq> = HashMap::new();
+        // Terminals this connection already streams, so a repeat attach serves
+        // the replay again without opening a second stream. Re-attaching IS the
+        // documented gap recovery, so it has to stay cheap and repeatable.
+        let mut attached: HashSet<String> = HashSet::new();
         // `futures::future::select` is left-biased (always polls its first arg
         // first). Alternating which side leads each turn keeps neither the request
         // stream nor live delivery able to starve the other: a flood of pipelined
@@ -65,7 +69,16 @@ impl Dispatcher {
 
             match picked {
                 Picked::Request(Some(frame)) => {
-                    if !self.on_request(&mut state, &mut streams, &mut cursors, transport, frame).await
+                    if !self
+                        .on_request(
+                            &mut state,
+                            &mut streams,
+                            &mut cursors,
+                            &mut attached,
+                            transport,
+                            frame,
+                        )
+                        .await
                     {
                         break;
                     }
@@ -77,7 +90,16 @@ impl Dispatcher {
                     // connection forwards nothing.
                     match authorized_pubkey(&state.authn, &self.auth) {
                         Some(pubkey) => {
-                            if !self.forward_live(&pubkey, &mut cursors, transport, *frame).await {
+                            let alive = match *frame {
+                                Live::Session(f) => {
+                                    self.forward_live(&pubkey, &mut cursors, transport, f).await
+                                }
+                                Live::Terminal { pty_id, frame } => {
+                                    forward_terminal(&self.auth, &pubkey, transport, pty_id, frame)
+                                        .await
+                                }
+                            };
+                            if !alive {
                                 break;
                             }
                         }
@@ -96,8 +118,9 @@ impl Dispatcher {
     async fn on_request(
         &self,
         state: &mut ConnState,
-        streams: &mut SelectAll<BoxStream<'static, LiveFrame>>,
+        streams: &mut SelectAll<BoxStream<'static, Live>>,
         cursors: &mut HashMap<SessionId, Seq>,
+        attached: &mut HashSet<String>,
         transport: &dyn Transport,
         frame: Vec<u8>,
     ) -> bool {
@@ -117,9 +140,49 @@ impl Dispatcher {
             let (response, stream) =
                 self.begin_subscribe(&pubkey, &session_id, after_seq.unwrap_or(0), cursors);
             if let Some(stream) = stream {
+                streams.push(stream.map(Live::Session).boxed());
+            }
+            return self.send(transport, response).await;
+        }
+        // The terminal RPCs are async (the PTY layer is), so they are awaited
+        // here rather than in the sync `dispatch`, exactly as the git ones are.
+        if let Request::ListTerminals = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.list_terminals(&pubkey).await;
+            return self.send(transport, response).await;
+        }
+        if let Request::TermAttach { pty_id } = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let (response, stream) = self.begin_term_attach(&pubkey, &pty_id, attached).await;
+            if let Some(stream) = stream {
                 streams.push(stream);
             }
             return self.send(transport, response).await;
+        }
+        if let Request::TermInput { pty_id, bytes } = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.term_input(&pubkey, &pty_id, &bytes).await;
+            return self.send(transport, response).await;
+        }
+        if let Request::TermResize { pty_id, cols, rows } = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.term_resize(&pubkey, &pty_id, cols, rows).await;
+            return self.send(transport, response).await;
+        }
+        if let Request::TermDetach { pty_id } = req {
+            // Idempotent and unauthenticated-safe: forgetting a stream this
+            // connection holds is never a privilege. The stream itself ends when
+            // its receiver drops, which happens as the merged set is rebuilt.
+            attached.remove(&pty_id);
+            return self.send(transport, Response::Ack).await;
         }
         // `GitStatus` is the one authenticated request whose handler is async (it
         // shells out to git), so it is awaited here rather than in the sync

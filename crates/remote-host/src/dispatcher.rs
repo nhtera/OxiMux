@@ -62,13 +62,27 @@ enum ConnAuthn {
 pub struct Dispatcher {
     registry: Arc<SessionRegistry>,
     auth: Arc<AuthStore>,
+    /// The desktop's terminals, when the host exposes them.
+    ///
+    /// `None` is a real configuration, not merely an untouched default: a host
+    /// built without a PTY layer answers every terminal RPC with
+    /// `Unauthorized`. That is the same answer a device lacking the scope gets,
+    /// deliberately — "this host has no terminals" and "you may not see them"
+    /// are not distinctions worth leaking to a client.
+    terminals: Option<Arc<dyn crate::terminals::TerminalSource>>,
     /// Wall clock (Unix seconds), injectable so tests are deterministic.
     now_secs: fn() -> u64,
 }
 
 impl Dispatcher {
     pub fn new(registry: Arc<SessionRegistry>, auth: Arc<AuthStore>) -> Self {
-        Self { registry, auth, now_secs: system_now_secs }
+        Self { registry, auth, terminals: None, now_secs: system_now_secs }
+    }
+
+    /// Expose the desktop's terminals over this dispatcher.
+    pub fn with_terminals(mut self, terminals: Arc<dyn crate::terminals::TerminalSource>) -> Self {
+        self.terminals = Some(terminals);
+        self
     }
 
     /// Override the clock (tests).

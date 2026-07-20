@@ -12,7 +12,7 @@
 //!   stream; a per-session cursor then drops any live `seq` already covered by the
 //!   backlog batch, so the client never sees a `seq` twice.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use futures::stream::{self, BoxStream, StreamExt};
 use oximux_agent_core::thread::ThreadEvent;
@@ -31,6 +31,18 @@ pub(super) struct LiveFrame {
     pub session_id: SessionId,
     pub seq: Seq,
     pub event: ThreadEvent,
+}
+
+/// Anything the serve loop can push to the client unsolicited.
+///
+/// Session events and terminal output share **one** merged stream rather than
+/// getting a select arm each. The loop alternates which side leads so neither
+/// requests nor live frames can starve the other; adding a third arm would make
+/// that rotation a three-way fairness problem, and a terminal repainting a
+/// full-screen TUI is exactly the flood that would win it.
+pub(super) enum Live {
+    Session(LiveFrame),
+    Terminal { pty_id: String, frame: crate::terminals::TerminalFrame },
 }
 
 /// Turn a session's broadcast receiver into a `'static` stream of [`LiveFrame`]s.
@@ -167,4 +179,158 @@ impl Dispatcher {
             .await
             .is_ok()
     }
+}
+
+impl Dispatcher {
+    /// List the terminals this device may see.
+    pub(super) async fn list_terminals(&self, pubkey: &AppPubkey) -> Response {
+        if !self.auth.may_use_terminals(pubkey) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(source) = &self.terminals else {
+            return Response::Error(RpcError::Unauthorized);
+        };
+        match source.list().await {
+            Ok(rows) => Response::Terminals(rows),
+            Err(e) => {
+                tracing::warn!(error = %e, "list terminals failed");
+                Response::Error(RpcError::Internal("terminals unavailable".into()))
+            }
+        }
+    }
+
+    /// Attach to a terminal: immediate replay, plus a live stream to register.
+    ///
+    /// A repeat attach to a terminal this connection already streams serves the
+    /// replay again WITHOUT opening a second stream — the same rule `Subscribe`
+    /// follows, and for the same reason: a second stream would leak a receiver
+    /// for the life of the connection and double every subsequent frame.
+    /// Re-attaching is also the documented gap recovery, so it must be cheap and
+    /// repeatable rather than something a client is punished for.
+    pub(super) async fn begin_term_attach(
+        &self,
+        pubkey: &AppPubkey,
+        pty_id: &str,
+        attached: &mut HashSet<String>,
+    ) -> (Response, Option<BoxStream<'static, Live>>) {
+        if !self.auth.may_use_terminals(pubkey) {
+            return (Response::Error(RpcError::Unauthorized), None);
+        }
+        let Some(source) = &self.terminals else {
+            return (Response::Error(RpcError::Unauthorized), None);
+        };
+        let (attach, rx) = match source.attach(pty_id).await {
+            Ok(v) => v,
+            Err(crate::terminals::TerminalError::NotFound) => {
+                return (Response::Error(RpcError::UnknownSession), None);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "terminal attach failed");
+                return (Response::Error(RpcError::Internal("terminals unavailable".into())), None);
+            }
+        };
+        let response = Response::TermAttached {
+            replay: attach.replay,
+            cols: attach.cols,
+            rows: attach.rows,
+        };
+        if !attached.insert(pty_id.to_owned()) {
+            // Already streaming: `rx` drops here, which detaches the duplicate
+            // attachment rather than leaving it fanning into nothing.
+            return (response, None);
+        }
+        (response, Some(term_stream(pty_id.to_owned(), rx)))
+    }
+
+    /// Type into a terminal. The gate here is the write tier, not merely
+    /// terminal visibility — this is arbitrary code execution on the desktop.
+    pub(super) async fn term_input(&self, pubkey: &AppPubkey, pty_id: &str, bytes: &[u8]) -> Response {
+        if !self.auth.may_drive_terminals(pubkey) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(source) = &self.terminals else {
+            return Response::Error(RpcError::Unauthorized);
+        };
+        match source.input(pty_id, bytes).await {
+            Ok(()) => Response::Ack,
+            Err(crate::terminals::TerminalError::NotFound) => {
+                Response::Error(RpcError::UnknownSession)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "terminal input failed");
+                Response::Error(RpcError::Internal("terminals unavailable".into()))
+            }
+        }
+    }
+
+    /// Resize a terminal — write-gated, because the size is shared with every
+    /// other attachment including the desktop's own window.
+    pub(super) async fn term_resize(
+        &self,
+        pubkey: &AppPubkey,
+        pty_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Response {
+        if !self.auth.may_drive_terminals(pubkey) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(source) = &self.terminals else {
+            return Response::Error(RpcError::Unauthorized);
+        };
+        // A zero dimension is nonsense a PTY layer may accept and then divide by.
+        // Rejected here rather than clamped: a client asking for a 0-column grid
+        // has a bug, and silently serving it something else hides that.
+        if cols == 0 || rows == 0 {
+            return Response::Error(RpcError::BadRequest("terminal size must be non-zero".into()));
+        }
+        match source.resize(pty_id, cols, rows).await {
+            Ok(()) => Response::Ack,
+            Err(crate::terminals::TerminalError::NotFound) => {
+                Response::Error(RpcError::UnknownSession)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "terminal resize failed");
+                Response::Error(RpcError::Internal("terminals unavailable".into()))
+            }
+        }
+    }
+}
+
+/// Turn an attached terminal's frame receiver into a `'static` merged stream.
+/// Ends when the source drops the sender (the terminal is gone).
+fn term_stream(
+    pty_id: String,
+    rx: tokio::sync::mpsc::Receiver<crate::terminals::TerminalFrame>,
+) -> BoxStream<'static, Live> {
+    stream::unfold((pty_id, rx), |(pty_id, mut rx)| async move {
+        let frame = rx.recv().await?;
+        Some((Live::Terminal { pty_id: pty_id.clone(), frame }, (pty_id, rx)))
+    })
+    .boxed()
+}
+
+/// Forward one terminal frame. Returns whether the transport is still writable.
+pub(super) async fn forward_terminal(
+    auth: &crate::auth::AuthStore,
+    pubkey: &AppPubkey,
+    transport: &dyn Transport,
+    pty_id: String,
+    frame: crate::terminals::TerminalFrame,
+) -> bool {
+    // Per-frame recheck, matching the session path: a device revoked or
+    // downgraded mid-stream stops seeing a terminal it was already watching.
+    // Read access is the right gate here — this direction never types.
+    if !auth.may_use_terminals(pubkey) {
+        return true;
+    }
+    let response = match frame {
+        crate::terminals::TerminalFrame::Output(bytes) => Response::TermOutput { pty_id, bytes },
+        crate::terminals::TerminalFrame::Gapped => Response::TermGapped { pty_id },
+        crate::terminals::TerminalFrame::Exited(code) => Response::TermExited { pty_id, code },
+    };
+    transport
+        .send(response.to_bytes().expect("response is always encodable"))
+        .await
+        .is_ok()
 }
