@@ -42,6 +42,41 @@ impl AuthStore {
         }
     }
 
+    /// May this device see and attach to terminals?
+    ///
+    /// Requires [`DeviceScope::Full`], not merely "authorized". A terminal has
+    /// no owning agent session, so a session-scoped device has no defensible
+    /// mapping onto one — and inventing a mapping ("the terminal whose cwd
+    /// matches") would silently widen the scope the desktop user chose, on the
+    /// single highest-risk surface in this protocol. A narrowed device is
+    /// therefore refused outright rather than shown a filtered list.
+    ///
+    /// This is read access: it shows the screen, it does not type. Typing is
+    /// [`may_drive_terminals`](Self::may_drive_terminals).
+    pub fn may_use_terminals(&self, pubkey: &AppPubkey) -> bool {
+        let st = self.inner.lock().unwrap();
+        matches!(
+            st.devices.get(pubkey),
+            Some(d) if !d.revoked && matches!(d.scope, DeviceScope::Full)
+        )
+    }
+
+    /// May this device type into a terminal, or resize one?
+    ///
+    /// The most consequential permission the protocol grants: bytes into a live
+    /// shell is arbitrary code execution on the desktop. Read-only is the
+    /// opt-down that separates watching a terminal from driving it.
+    ///
+    /// Resize rides the same gate despite being harmless in isolation, because
+    /// it is *shared* — the daemon runs the PTY at the smallest size any
+    /// attachment asks for, so a phone can reflow the desktop user's window.
+    pub fn may_drive_terminals(&self, pubkey: &AppPubkey) -> bool {
+        if !self.may_use_terminals(pubkey) {
+            return false;
+        }
+        !self.inner.lock().unwrap().devices.get(pubkey).is_some_and(|d| d.read_only)
+    }
+
     /// Every recorded device — the data behind the paired-devices list, its
     /// revoke/forget actions, and its read-only toggle.
     ///

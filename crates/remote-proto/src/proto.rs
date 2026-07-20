@@ -22,14 +22,16 @@ pub use crate::messages::*;
 /// subscription & gap-fill). v2: appended the git surface (`GitStatus`,
 /// `GitDiff`). v3: appended the version handshake (`Hello`/`HelloAck`). v4:
 /// appended the git write surface (`GitStage`, `GitUnstage`, `GitCommit`). v5:
-/// appended `AnswerQuestion`.
+/// appended `AnswerQuestion`. v6: appended the terminal surface
+/// (`ListTerminals`, `TermAttach`/`TermInput`/`TermResize`/`TermDetach`, and the
+/// pushed `TermOutput`/`TermGapped`/`TermExited` frames).
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// The oldest peer version this build still speaks. **Raise this only on a
 /// genuinely breaking change** — a reordered/removed variant or an altered
@@ -157,6 +159,36 @@ pub enum Request {
     /// same decided-once gate as [`Request::ResolvePermission`]. State-changing —
     /// answering releases a blocked turn — so a read-only device is refused.
     AnswerQuestion(AnswerQuestionReq),
+    /// Every terminal the host is willing to expose.
+    ///
+    /// Not session-scoped, unlike the git RPCs: a terminal is not owned by an
+    /// agent session, so there is no `cwd` to inherit an ACL from. A
+    /// session-scoped device is therefore refused outright rather than shown a
+    /// filtered list — narrowing "this one session" to "these terminals" has no
+    /// defensible mapping, and guessing one would silently widen the scope the
+    /// desktop user chose.
+    ListTerminals,
+    /// Attach to a terminal: replies with the replay ring and the dims it was
+    /// drawn at, then streams [`Response::TermOutput`] frames live.
+    ///
+    /// **Read access, not write.** Attaching shows the screen; it cannot type.
+    TermAttach { pty_id: String },
+    /// Send keystrokes to a terminal.
+    ///
+    /// **The most dangerous RPC on this protocol**: bytes into a live shell is
+    /// arbitrary code execution on the desktop. Gated on full write scope, so a
+    /// device downgraded to read-only can watch a terminal it cannot drive.
+    TermInput { pty_id: String, bytes: Vec<u8> },
+    /// Resize a terminal's grid.
+    ///
+    /// State-changing and *shared*: the daemon drives the PTY at the smallest
+    /// requested size across all attachments, so a phone resizing can reflow
+    /// the desktop user's own window. Write-gated for that reason, not because
+    /// resizing is dangerous on its own.
+    TermResize { pty_id: String, cols: u16, rows: u16 },
+    /// Stop streaming a terminal to this connection. Idempotent: detaching one
+    /// that was never attached is not an error.
+    TermDetach { pty_id: String },
 }
 
 /// Host → client.
@@ -209,6 +241,34 @@ pub enum Response {
     HelloAck(HelloAckWire),
     /// Reply to [`Request::GitCommit`] — the new HEAD sha.
     GitCommitted { sha: String },
+    /// Reply to [`Request::ListTerminals`].
+    Terminals(Vec<TerminalSummary>),
+    /// Reply to [`Request::TermAttach`]: the replay ring plus the dims it was
+    /// drawn at.
+    ///
+    /// A client MUST build its emulator at exactly these dims before feeding it
+    /// `replay` — the bytes were produced by a process drawing into a grid of
+    /// this size, and absolute-position sequences land in the wrong cells in any
+    /// other. This mirrors the desktop's own attach contract rather than
+    /// inventing a second one.
+    TermAttached { replay: Vec<u8>, cols: u16, rows: u16 },
+    /// Terminal bytes **pushed** to an attached client, unsolicited.
+    ///
+    /// **Lossy under lag, and deliberately not sequenced.** The relay drops
+    /// output for a subscriber that falls behind and tells it so; this bridge
+    /// forwards that signal as [`Response::TermGapped`] rather than papering
+    /// over it. Do not read a continuous `TermOutput` stream as a guarantee that
+    /// no bytes were skipped — the gap notice is the signal, not the byte count.
+    TermOutput { pty_id: String, bytes: Vec<u8> },
+    /// The host dropped terminal output destined for this client.
+    ///
+    /// Recovery is to re-issue [`Request::TermAttach`], which returns a fresh
+    /// replay snapshot. Forwarded rather than swallowed because a client that
+    /// keeps rendering after a gap is drawing a screen with a hole in it, and
+    /// nothing downstream can detect that on its own.
+    TermGapped { pty_id: String },
+    /// A terminal ended. The client should stop rendering it as live.
+    TermExited { pty_id: String, code: Option<i32> },
 }
 
 impl Request {

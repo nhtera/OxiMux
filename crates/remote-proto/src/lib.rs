@@ -35,7 +35,7 @@ pub use messages::{
     AuthProveReq, ConnectReq, DiffHunkWire, DiffLineKindWire, DiffLineWire, DiffStatusWire,
     FileDiffWire, GitFileWire, GitStatusWire, HostEvent, IndexStatusWire, RegisterReq,
     ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionStatusWire, SessionSummary,
-    WorktreeStatusWire,
+    TerminalSummary, WorktreeStatusWire,
 };
 pub use pairing::{PairingError, PairingTicket, registration_proof};
 pub use proto::{PROTOCOL_VERSION, Request, Response, RpcError, WireError};

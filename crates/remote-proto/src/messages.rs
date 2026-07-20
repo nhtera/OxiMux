@@ -164,6 +164,19 @@ pub struct SessionSummary {
     pub awaiting_permission: bool,
 }
 
+/// One terminal the phone can list and attach to.
+///
+/// `cwd` is the terminal's working directory as a display string, not a path to
+/// act on: nothing in the terminal RPCs takes a path, so this never becomes a
+/// filesystem-probe surface the way the git `path` argument does.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TerminalSummary {
+    pub pty_id: String,
+    pub cwd: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
 /// [`Response::SessionInfo`](crate::proto::Response::SessionInfo) payload — a
 /// summary plus the session's advertised inventory ([`SessionMeta`] is already
 /// serde + postcard-safe: all `String`).

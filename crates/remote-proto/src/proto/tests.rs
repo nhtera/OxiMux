@@ -16,7 +16,7 @@ fn value_bearing_event() -> ThreadEvent {
 /// documented wire change, so an accidental edit fails here.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 5, "v5 = the appended AnswerQuestion call");
+    assert_eq!(PROTOCOL_VERSION, 6, "v6 = the appended terminal surface");
 }
 
 /// The floor moves only on a genuinely breaking change, never merely because

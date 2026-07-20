@@ -16,6 +16,7 @@
 pub mod auth;
 pub mod dispatcher;
 pub mod identity;
+pub mod terminals;
 
 pub use auth::{
     AppPubkey, AuthStore, DeviceInfo, DeviceStore, PairedDevice, PairingSlot, StorageDeviceStore,
@@ -24,3 +25,4 @@ pub use auth::{
 };
 pub use dispatcher::Dispatcher;
 pub use identity::HostIdentity;
+pub use terminals::{TerminalAttach, TerminalError, TerminalFrame, TerminalSource};

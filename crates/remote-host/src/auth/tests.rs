@@ -309,3 +309,50 @@ fn a_rejected_registration_is_not_announced() {
     assert!(store.register(&wrong, ts).is_err(), "wrong secret is refused");
     assert!(events.try_recv().is_err(), "nothing announced for a refused pairing");
 }
+
+/// A session-scoped device gets **no** terminal access at all — not a filtered
+/// list, not read-only, none.
+///
+/// Terminals have no owning agent session, so there is nothing for a narrowed
+/// scope to be narrowed *to*. The tempting alternative — matching a terminal's
+/// cwd against the scoped session's — would hand a device the desktop user
+/// deliberately confined to one conversation a shell on the machine, which is
+/// the single widest privilege this protocol can grant. Refusing outright is the
+/// conservative reading of a scope the user chose.
+#[test]
+fn a_session_scoped_device_gets_no_terminal_access() {
+    let (store, pubkey) = registered(Some("sess-1"));
+
+    assert!(store.is_allowed_for(&pubkey, "sess-1"), "its own session still works");
+    assert!(!store.may_use_terminals(&pubkey), "terminals are not in a narrowed scope");
+    assert!(!store.may_drive_terminals(&pubkey), "and certainly not writable");
+}
+
+/// A full-scope device can watch terminals; read-only stops it typing.
+///
+/// This is the tier that makes terminal attach survivable: typing into a live
+/// shell is arbitrary code execution on the desktop, so "can see it" and "can
+/// drive it" must be separable.
+#[test]
+fn read_only_lets_a_device_watch_a_terminal_but_not_type() {
+    let (store, pubkey) = registered(None);
+    assert!(store.may_drive_terminals(&pubkey), "full access types by default");
+
+    store.set_read_only(&pubkey, true);
+
+    assert!(store.may_use_terminals(&pubkey), "still allowed to watch");
+    assert!(!store.may_drive_terminals(&pubkey), "but not to type or resize");
+
+    store.set_read_only(&pubkey, false);
+    assert!(store.may_drive_terminals(&pubkey), "the opt-down is reversible");
+}
+
+/// Revocation outranks everything, including terminal read access.
+#[test]
+fn a_revoked_device_loses_terminals_entirely() {
+    let (store, pubkey) = registered(None);
+    store.revoke(&pubkey);
+
+    assert!(!store.may_use_terminals(&pubkey));
+    assert!(!store.may_drive_terminals(&pubkey));
+}
