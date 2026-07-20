@@ -38,9 +38,14 @@ export default function SessionsScreen() {
           <ConnectionBadge />
           {/* The only route off this screen that isn't a session. Without it a
               paired device has no way back to pairing — see settings.tsx. */}
-          <Link href="/settings">
-            <ThemedText type="code">Settings</ThemedText>
-          </Link>
+          <View style={styles.headerActions}>
+            <Link href="/terminals">
+              <ThemedText type="code">Terminals</ThemedText>
+            </Link>
+            <Link href="/settings">
+              <ThemedText type="code">Settings</ThemedText>
+            </Link>
+          </View>
         </View>
         <FlatList
           data={sessions}
@@ -86,6 +91,7 @@ function SessionRow({ session }: { session: SessionSummary }) {
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
+  headerActions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.three },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
