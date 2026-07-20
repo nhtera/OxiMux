@@ -19,10 +19,14 @@ mod ffi_types;
 mod runtime;
 mod snapshot;
 mod subscription;
+mod terminals;
 
 uniffi::setup_scaffolding!();
 
-pub use callbacks::{ConnStateListener, ThreadSink};
+pub use callbacks::{ConnStateListener, TerminalSink, ThreadSink};
 pub use client::MobileClient;
-pub use ffi_types::{ChatImage, ConnState, MobileError, PermissionReply, SessionSummary};
+pub use ffi_types::{
+    ChatImage, ConnState, MobileError, PermissionReply, SessionSummary, TerminalInfo,
+    TerminalScreen,
+};
 pub use snapshot::ThreadSnapshot;

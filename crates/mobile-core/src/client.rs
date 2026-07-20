@@ -39,6 +39,13 @@ pub(crate) struct Shared {
     /// bump has since happened — so a slow/stale activation (reconnect flap, or a
     /// disconnect racing an in-flight activate) can't resurrect a dead session.
     pub epoch: AtomicU64,
+    /// The app's terminal sink, if it registered one.
+    ///
+    /// Connection-wide rather than per-terminal because the wire has a single
+    /// push stream: every attached terminal's frames arrive interleaved and are
+    /// told apart by `pty_id`, so one sink is the shape the transport already
+    /// has.
+    pub terminal_sink: StdMutex<Option<Arc<dyn crate::callbacks::TerminalSink>>>,
 }
 
 impl Shared {
@@ -92,6 +99,7 @@ impl MobileClient {
                 session: StdMutex::new(None),
                 subs: Mutex::new(HashMap::new()),
                 epoch: AtomicU64::new(0),
+                terminal_sink: StdMutex::new(None),
             }),
             shutdown: StdMutex::new(None),
             host_endpoint: StdMutex::new(None),

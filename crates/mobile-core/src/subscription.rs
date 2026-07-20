@@ -163,6 +163,11 @@ pub(crate) async fn activate(
     epoch: u64,
 ) {
     let events = session.take_events().expect("events taken once per session");
+    // Taken here, beside the event stream, because both are per-session: a new
+    // session after a reconnect brings a fresh pair. Draining it is not optional
+    // — it is an unbounded channel the pump keeps filling, so leaving it untaken
+    // would grow without limit for any client the host pushes terminal frames to.
+    let terminal_pushes = session.take_terminals().expect("terminals taken once per session");
     resubscribe_all(&shared, &session).await;
     {
         // Publish the session — but only if a newer (re)connect or a `disconnect`
@@ -175,6 +180,7 @@ pub(crate) async fn activate(
         *live = Some(session);
     }
     rt().spawn(run_dispatcher(shared.clone(), events));
+    rt().spawn(crate::terminals::run_terminal_pump(shared.clone(), terminal_pushes));
     if let Some(tx) = first.lock().unwrap().take() {
         let _ = tx.send(Ok(()));
     }
@@ -263,6 +269,7 @@ mod tests {
             session: StdMutex::new(None),
             subs: TokioMutex::new(HashMap::new()),
             epoch: AtomicU64::new(epoch),
+            terminal_sink: StdMutex::new(None),
         })
     }
 

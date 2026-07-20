@@ -83,3 +83,31 @@ pub enum MobileError {
     #[error("the request failed: {0}")]
     Rpc(String),
 }
+
+/// One terminal the phone can list and attach to.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TerminalInfo {
+    pub pty_id: String,
+    pub cwd: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl From<oximux_remote_proto::messages::TerminalSummary> for TerminalInfo {
+    fn from(t: oximux_remote_proto::messages::TerminalSummary) -> Self {
+        Self { pty_id: t.pty_id, cwd: t.cwd, cols: t.cols, rows: t.rows }
+    }
+}
+
+/// A terminal's replay snapshot and the grid it was drawn at.
+///
+/// The dims are not advisory. The replay bytes carry absolute-position escape
+/// sequences produced by a process drawing into a grid of exactly this size, so
+/// an emulator built at any other size renders them into the wrong cells. The
+/// app MUST size its emulator from these before feeding it `replay`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TerminalScreen {
+    pub replay: Vec<u8>,
+    pub cols: u16,
+    pub rows: u16,
+}

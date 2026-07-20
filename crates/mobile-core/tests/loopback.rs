@@ -558,3 +558,166 @@ async fn an_oversize_attachment_is_refused_with_a_useful_message() {
 
     serve.abort();
 }
+
+/// A terminal's replay and live frames reach the app through the FFI sink.
+///
+/// This is the one path where the core is a pure conduit — it forwards raw bytes
+/// and never parses a screen — so the assertion is that nothing is lost or
+/// reshaped between the host's push and the sink's callback, including the gap
+/// notice, which is the only way the app can learn its screen went stale.
+#[derive(Default)]
+struct RecordingTerminalSink {
+    output: Mutex<Vec<(String, Vec<u8>)>>,
+    gaps: Mutex<Vec<String>>,
+    exits: Mutex<Vec<(String, Option<i32>)>>,
+}
+
+impl oximux_mobile_core::TerminalSink for RecordingTerminalSink {
+    fn on_output(&self, pty_id: String, bytes: Vec<u8>) {
+        self.output.lock().unwrap().push((pty_id, bytes));
+    }
+    fn on_gap(&self, pty_id: String) {
+        self.gaps.lock().unwrap().push(pty_id);
+    }
+    fn on_exit(&self, pty_id: String, code: Option<i32>) {
+        self.exits.lock().unwrap().push((pty_id, code));
+    }
+}
+
+/// A terminal source whose live frames this test drives by hand.
+struct ScriptedTerminals {
+    frames: Mutex<Option<tokio::sync::mpsc::Receiver<oximux_remote_host::TerminalFrame>>>,
+}
+
+#[async_trait]
+impl oximux_remote_host::TerminalSource for ScriptedTerminals {
+    async fn list(
+        &self,
+    ) -> Result<Vec<oximux_remote_proto::messages::TerminalSummary>, oximux_remote_host::TerminalError>
+    {
+        Ok(vec![oximux_remote_proto::messages::TerminalSummary {
+            pty_id: "pty-1".into(),
+            cwd: "/work".into(),
+            cols: 80,
+            rows: 24,
+        }])
+    }
+
+    async fn attach(
+        &self,
+        pty_id: &str,
+    ) -> Result<
+        (
+            oximux_remote_host::TerminalAttach,
+            tokio::sync::mpsc::Receiver<oximux_remote_host::TerminalFrame>,
+        ),
+        oximux_remote_host::TerminalError,
+    > {
+        if pty_id != "pty-1" {
+            return Err(oximux_remote_host::TerminalError::NotFound);
+        }
+        let rx = self
+            .frames
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or(oximux_remote_host::TerminalError::Unavailable)?;
+        Ok((
+            oximux_remote_host::TerminalAttach {
+                replay: b"prompt$ ".to_vec(),
+                cols: 80,
+                rows: 24,
+            },
+            rx,
+        ))
+    }
+
+    async fn input(
+        &self,
+        _pty_id: &str,
+        _bytes: &[u8],
+    ) -> Result<(), oximux_remote_host::TerminalError> {
+        Ok(())
+    }
+
+    async fn resize(
+        &self,
+        _pty_id: &str,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<(), oximux_remote_host::TerminalError> {
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_frames_reach_the_app_sink() {
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let terminals = Arc::new(ScriptedTerminals { frames: Mutex::new(Some(rx)) });
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Arc::new(
+        Dispatcher::new(Arc::new(SessionRegistry::new()), auth).with_terminals(terminals),
+    );
+
+    let (client_t, server_t) = duplex_pair();
+    let server = {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move { dispatcher.serve(&server_t).await })
+    };
+
+    let ticket =
+        PairingTicket { endpoint_id: [0u8; 32], handshake_secret: SECRET, session_id: None };
+    let client = MobileClient::new(Some(CLIENT_SEED.to_vec()));
+    let listener = Arc::new(RecordingListener::default());
+    let connector = Arc::new(LoopbackConnector { transport: Mutex::new(Some(Arc::new(client_t))) });
+    client
+        .connect_with(connector, ticket, "phone".into(), listener)
+        .await
+        .expect("connect_with");
+
+    let sink = Arc::new(RecordingTerminalSink::default());
+    // Registered BEFORE attaching, so no frame arrives unheard.
+    client.set_terminal_sink(sink.clone());
+
+    let listed = client.list_terminals().await.expect("list_terminals");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].pty_id, "pty-1");
+    assert_eq!((listed[0].cols, listed[0].rows), (80, 24));
+
+    let screen = client.attach_terminal("pty-1".into()).await.expect("attach");
+    assert_eq!(screen.replay, b"prompt$ ");
+    assert_eq!(
+        (screen.cols, screen.rows),
+        (80, 24),
+        "the dims cross the FFI — the app sizes its emulator from these before replaying",
+    );
+
+    tx.send(oximux_remote_host::TerminalFrame::Output(b"ls\r\n".to_vec())).await.unwrap();
+    tx.send(oximux_remote_host::TerminalFrame::Gapped).await.unwrap();
+    tx.send(oximux_remote_host::TerminalFrame::Exited(Some(0))).await.unwrap();
+
+    // Poll rather than sleep: the frames cross a host task, the wire, the demux
+    // pump, and the terminal pump before reaching the sink.
+    for _ in 0..200 {
+        if !sink.exits.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        sink.output.lock().unwrap().as_slice(),
+        &[("pty-1".to_string(), b"ls\r\n".to_vec())],
+        "raw bytes arrive unreshaped — the core never parses a screen",
+    );
+    assert_eq!(
+        sink.gaps.lock().unwrap().as_slice(),
+        &["pty-1".to_string()],
+        "the gap is surfaced, so the app knows to re-attach rather than render a hole",
+    );
+    assert_eq!(sink.exits.lock().unwrap().as_slice(), &[("pty-1".to_string(), Some(0))]);
+
+    drop(client);
+    let _ = server.await;
+}
