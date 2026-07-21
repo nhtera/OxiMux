@@ -24,14 +24,16 @@ pub use crate::messages::*;
 /// appended the git write surface (`GitStage`, `GitUnstage`, `GitCommit`). v5:
 /// appended `AnswerQuestion`. v6: appended the terminal surface
 /// (`ListTerminals`, `TermAttach`/`TermInput`/`TermResize`/`TermDetach`, and the
-/// pushed `TermOutput`/`TermGapped`/`TermExited` frames).
+/// pushed `TermOutput`/`TermGapped`/`TermExited` frames). v7: appended the
+/// session-control surface (`ListChoices` + `SetModel`/`SetPermissionMode`, and
+/// the `Choices` reply).
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// The oldest peer version this build still speaks. **Raise this only on a
 /// genuinely breaking change** — a reordered/removed variant or an altered
@@ -189,6 +191,24 @@ pub enum Request {
     /// Stop streaming a terminal to this connection. Idempotent: detaching one
     /// that was never attached is not an error.
     TermDetach { pty_id: String },
+    /// The models and permission modes this session's backend offers, for the
+    /// phone's pickers.
+    ///
+    /// Session-scoped rather than global because the answer depends on which
+    /// backend is bound: two open sessions can be running different agents with
+    /// different catalogs. Read-only — listing what is available changes nothing.
+    ListChoices { session_id: String },
+    /// Switch the session's model.
+    ///
+    /// **Not guaranteed to succeed.** Some backends fix the model at spawn time
+    /// and the desktop falls back to respawning the child; that fallback is not
+    /// reachable from here yet, so those backends answer with an error rather
+    /// than appearing to work. Failing loudly beats a control that silently
+    /// does nothing.
+    SetModel { session_id: String, model: String },
+    /// Switch the session's permission mode. Same fix-at-spawn caveat as
+    /// [`Request::SetModel`].
+    SetPermissionMode { session_id: String, mode: String },
 }
 
 /// Host → client.
@@ -269,6 +289,36 @@ pub enum Response {
     TermGapped { pty_id: String },
     /// A terminal ended. The client should stop rendering it as live.
     TermExited { pty_id: String, code: Option<i32> },
+    /// Reply to [`Request::ListChoices`].
+    Choices(SessionChoices),
+}
+
+/// What a session's backend offers for its model and permission-mode pickers.
+///
+/// Both lists can legitimately be **empty**: a dynamic-catalog backend reports
+/// nothing until its handshake completes, and an agent may expose no mode
+/// choices at all. An empty list means "no choice to offer", never an error —
+/// the phone hides the picker rather than showing a broken one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionChoices {
+    pub models: Vec<Choice>,
+    pub modes: Vec<Choice>,
+    /// What is active now, so the picker can mark it without a second round trip.
+    pub current_model: Option<String>,
+    pub current_mode: Option<String>,
+}
+
+/// One selectable option.
+///
+/// `id` is what goes back over the wire; `label` is what a person reads. They
+/// are kept separate because a backend's identifier is often not presentable
+/// (`claude-opus-4-8` against "Opus 4.8"), and `description` carries the
+/// second line the desktop's own picker shows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Choice {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
 }
 
 impl Request {

@@ -7,7 +7,7 @@ use oximux_remote_proto::messages::{
     AnswerQuestionReq, ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionStatusWire,
     SessionSummary,
 };
-use oximux_remote_proto::proto::{Response, RpcError};
+use oximux_remote_proto::proto::{Choice, Response, RpcError, SessionChoices};
 use oximux_remote_proto::HostEvent;
 
 use super::Dispatcher;
@@ -136,6 +136,80 @@ impl Dispatcher {
             }
         }
         Response::Events(frames)
+    }
+
+    /// The model and permission-mode options this session's backend offers.
+    ///
+    /// A **read**, so it gates on `is_allowed_for` rather than `may_write`: a
+    /// read-only device should see which model is running, it simply cannot
+    /// change it.
+    ///
+    /// Empty lists are a legitimate answer, not an error — a dynamic-catalog
+    /// backend advertises nothing until its handshake completes, and some agents
+    /// offer no mode choices at all. The phone hides a picker with no options
+    /// rather than showing an empty one.
+    pub(super) fn list_choices(&self, pubkey: &AppPubkey, session_id: &str) -> Response {
+        if !self.auth.is_allowed_for(pubkey, session_id) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(handle) = self.registry.get(session_id) else {
+            return Response::Error(RpcError::UnknownSession);
+        };
+        let meta = handle.meta_snapshot();
+        Response::Choices(SessionChoices {
+            models: handle
+                .models()
+                .into_iter()
+                .map(|m| Choice { id: m.wire, label: m.label, description: m.description })
+                .collect(),
+            modes: handle
+                .permission_modes()
+                .into_iter()
+                .map(|m| Choice { id: m.wire, label: m.label, description: None })
+                .collect(),
+            current_model: meta.model,
+            current_mode: None,
+        })
+    }
+
+    /// Switch the session's model or permission mode in place.
+    ///
+    /// Separate from [`Self::scoped`] purely for the error message. `scoped`
+    /// answers any failure with a generic "session command failed", which is
+    /// right when the cause is genuinely internal — but the overwhelmingly
+    /// common failure here is a backend that fixes its model at spawn, and
+    /// telling the user that is the difference between a control that looks
+    /// broken and one that explains itself.
+    ///
+    /// The real error is logged host-side and a **fixed** string is returned.
+    /// Forwarding the underlying text would repeat the leak the git handlers
+    /// already had to fix, where raw tool output carried host paths to the
+    /// client.
+    pub(super) fn set_choice<F>(
+        &self,
+        pubkey: &AppPubkey,
+        session_id: &str,
+        what: &'static str,
+        f: F,
+    ) -> Response
+    where
+        F: FnOnce(&SessionHandle) -> anyhow::Result<()>,
+    {
+        if !self.auth.may_write(pubkey, session_id) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(handle) = self.registry.get(session_id) else {
+            return Response::Error(RpcError::UnknownSession);
+        };
+        match f(&handle) {
+            Ok(()) => Response::Ack,
+            Err(e) => {
+                tracing::warn!(error = %e, session = %session_id, "remote {what} change refused");
+                Response::Error(RpcError::BadRequest(format!(
+                    "this agent cannot change {what} while it is running"
+                )))
+            }
+        }
     }
 
     /// Run a session **command** behind the per-RPC ACL/authz recheck. `pub(super)`

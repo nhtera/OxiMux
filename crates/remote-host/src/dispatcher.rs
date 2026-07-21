@@ -131,6 +131,15 @@ impl Dispatcher {
                 self.scoped(pubkey, &session_id, |h| h.steer(&text))
             }
             Request::Cancel { session_id } => self.scoped(pubkey, &session_id, |h| h.cancel()),
+            Request::ListChoices { session_id } => self.list_choices(pubkey, &session_id),
+            Request::SetModel { session_id, model } => {
+                self.set_choice(pubkey, &session_id, "model", |h| h.set_model(&model))
+            }
+            Request::SetPermissionMode { session_id, mode } => {
+                self.set_choice(pubkey, &session_id, "permission mode", |h| {
+                    h.set_permission_mode(&mode)
+                })
+            }
             Request::EventsSince { session_id, after_seq } => {
                 self.events_since(pubkey, &session_id, after_seq)
             }

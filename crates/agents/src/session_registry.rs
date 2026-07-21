@@ -30,7 +30,8 @@ use anyhow::Result;
 use tokio::sync::{broadcast, watch};
 
 use crate::thread::{
-    AgentConnection, AskQuestion, ChatImage, PermissionDecision, QuestionAnswers, ThreadEvent,
+    AgentConnection, AskQuestion, ChatImage, ModeChoice, ModelChoice, PermissionDecision,
+    QuestionAnswers, ThreadEvent,
 };
 
 /// Session identity — the same `session_id` the transcript persists under.
@@ -254,6 +255,44 @@ impl SessionHandle {
     /// to trigger a resync. Swapping keeps the stream monotonic instead.
     pub fn swap_connection(&self, conn: Arc<dyn AgentConnection>) {
         *self.conn.lock().unwrap() = conn;
+    }
+
+    /// The models this session's backend offers, for a remote picker.
+    ///
+    /// Read straight off the live connection rather than from any cache: for a
+    /// bound session `models()` is authoritative, and the desktop's own
+    /// `CatalogCache` is a `gpui::Global` in the `app` crate that this crate is
+    /// deliberately unable to reach.
+    ///
+    /// An empty list is a legitimate answer — a dynamic-catalog backend reports
+    /// nothing until its handshake completes — and means "no choice to offer",
+    /// not a failure.
+    pub fn models(&self) -> Vec<ModelChoice> {
+        self.conn().models()
+    }
+
+    /// The permission modes this session's backend offers. Empty is legitimate,
+    /// as for [`Self::models`].
+    pub fn permission_modes(&self) -> Vec<ModeChoice> {
+        self.conn().permission_modes()
+    }
+
+    /// Switch the backend's model in place.
+    ///
+    /// Mirrors what the desktop tries first. **Some backends fix the model at
+    /// spawn** and answer with an error here; the desktop recovers by respawning
+    /// the child, which is a view-level operation this crate cannot perform (it
+    /// owns no process spawning, by design). So the error propagates to the
+    /// caller instead of being swallowed — a remote picker that silently did
+    /// nothing would be worse than one that says it could not.
+    pub fn set_model(&self, model: &str) -> anyhow::Result<()> {
+        self.conn().set_model(model)
+    }
+
+    /// Switch the backend's permission mode in place. Same fix-at-spawn caveat
+    /// as [`Self::set_model`].
+    pub fn set_permission_mode(&self, mode: &str) -> anyhow::Result<()> {
+        self.conn().set_mode(mode)
     }
 
     /// A `watch` receiver over the coarse status snapshot for list views.

@@ -20,7 +20,7 @@ use oximux_agent_core::thread::{AskQuestion, ChatImage, PermissionDecision, Ques
 use oximux_remote_proto::messages::{
     AnswerQuestionReq, ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionSummary,
 };
-use oximux_remote_proto::proto::{Request, Response, RpcError};
+use oximux_remote_proto::proto::{Request, Response, RpcError, SessionChoices};
 use oximux_remote_proto::{HostEvent, Transport};
 
 use crate::demux::{Demux, DemuxPump, EventStream, TerminalStream, demux};
@@ -189,6 +189,43 @@ impl RemoteSession {
     /// Cancel the session's in-flight turn.
     pub async fn cancel(&self, session_id: &str) -> Result<()> {
         self.expect_ack(Request::Cancel { session_id: session_id.to_string() }).await
+    }
+
+    /// The models and permission modes this session's backend offers.
+    ///
+    /// Empty lists mean "nothing to choose from" — a dynamic-catalog backend
+    /// before its handshake completes, or an agent with no mode options — not a
+    /// failure.
+    pub async fn list_choices(&self, session_id: &str) -> Result<SessionChoices> {
+        let req = Request::ListChoices { session_id: session_id.to_string() };
+        match self.call(req).await? {
+            Response::Choices(choices) => Ok(choices),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Choices" }),
+        }
+    }
+
+    /// Switch the session's model.
+    ///
+    /// Errors when the backend fixes its model at spawn time; the host answers
+    /// with a message saying so rather than accepting silently, so this is worth
+    /// surfacing to the user instead of swallowing.
+    pub async fn set_model(&self, session_id: &str, model: &str) -> Result<()> {
+        let req = Request::SetModel {
+            session_id: session_id.to_string(),
+            model: model.to_string(),
+        };
+        self.expect_ack(req).await
+    }
+
+    /// Switch the session's permission mode. Same fix-at-spawn caveat as
+    /// [`Self::set_model`].
+    pub async fn set_permission_mode(&self, session_id: &str, mode: &str) -> Result<()> {
+        let req = Request::SetPermissionMode {
+            session_id: session_id.to_string(),
+            mode: mode.to_string(),
+        };
+        self.expect_ack(req).await
     }
 
     /// Gap-fill: replay retained events after `after_seq` (the resync path when the

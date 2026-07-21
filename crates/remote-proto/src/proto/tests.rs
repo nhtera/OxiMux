@@ -16,7 +16,7 @@ fn value_bearing_event() -> ThreadEvent {
 /// documented wire change, so an accidental edit fails here.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 6, "v6 = the appended terminal surface");
+    assert_eq!(PROTOCOL_VERSION, 7, "v7 = the appended session-control surface");
 }
 
 /// The floor moves only on a genuinely breaking change, never merely because
@@ -122,6 +122,9 @@ fn requests_round_trip_via_postcard() {
         Request::Cancel { session_id: "s1".into() },
         Request::Subscribe { session_id: "s1".into(), after_seq: Some(10) },
         Request::EventsSince { session_id: "s1".into(), after_seq: 10 },
+        Request::ListChoices { session_id: "s1".into() },
+        Request::SetModel { session_id: "s1".into(), model: "opus-4.8".into() },
+        Request::SetPermissionMode { session_id: "s1".into(), mode: "plan".into() },
     ];
     for req in requests {
         let bytes = req.to_bytes().expect("encode");
@@ -157,6 +160,24 @@ fn send_prompt_and_responses_round_trip() {
         Response::Ack,
         Response::Error(RpcError::AlreadyDecided),
         Response::Error(RpcError::BadRequest("no challenge outstanding".into())),
+        // Empty lists are a legitimate answer (a backend with no catalog), so the
+        // populated and empty shapes both have to survive the wire.
+        Response::Choices(SessionChoices {
+            models: vec![Choice {
+                id: "opus-4.8".into(),
+                label: "Opus 4.8".into(),
+                description: Some("most capable".into()),
+            }],
+            modes: vec![],
+            current_model: Some("opus-4.8".into()),
+            current_mode: None,
+        }),
+        Response::Choices(SessionChoices {
+            models: vec![],
+            modes: vec![],
+            current_model: None,
+            current_mode: None,
+        }),
     ];
     for resp in responses {
         let bytes = resp.to_bytes().expect("encode");
@@ -212,4 +233,23 @@ impl HostEvent {
             _ => panic!("expected Events"),
         }
     }
+}
+
+/// The append-only guarantee, asserted on **bytes** rather than a round trip.
+///
+/// Encoding and decoding with the same binary agree no matter where the ordinals
+/// sit, so `appending_..._kept_earlier_variants_stable` above cannot actually
+/// catch an inserted variant — it would pass while every already-paired phone
+/// silently misread every call. Postcard writes an enum as its variant index, so
+/// pinning the literal byte is what makes an insertion fail here instead of in
+/// the field.
+///
+/// `Ping` is the 4th variant, so it encodes as a single `3`. If this fails,
+/// someone inserted a variant above it rather than appending — that is a
+/// breaking change and needs `MIN_COMPATIBLE_VERSION` raised, not just a
+/// `PROTOCOL_VERSION` bump.
+#[test]
+fn early_variants_keep_their_literal_ordinals() {
+    assert_eq!(Request::Ping.to_bytes().expect("encode"), vec![3]);
+    assert_eq!(Request::ListSessions.to_bytes().expect("encode"), vec![4]);
 }
