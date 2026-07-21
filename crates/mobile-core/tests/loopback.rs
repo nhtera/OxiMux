@@ -721,3 +721,233 @@ async fn terminal_frames_reach_the_app_sink() {
     drop(client);
     let _ = server.await;
 }
+
+/// A terminal source that can be attached more than once — needed because a
+/// reconnect re-attaches, and [`ScriptedTerminals`] hands out its receiver once.
+/// Keeps the sender for each attach so the test can push to the current one.
+#[derive(Default)]
+struct ReattachableTerminals {
+    senders: Mutex<Vec<tokio::sync::mpsc::Sender<oximux_remote_host::TerminalFrame>>>,
+}
+
+#[async_trait]
+impl oximux_remote_host::TerminalSource for ReattachableTerminals {
+    async fn list(
+        &self,
+    ) -> Result<Vec<oximux_remote_proto::messages::TerminalSummary>, oximux_remote_host::TerminalError>
+    {
+        Ok(vec![oximux_remote_proto::messages::TerminalSummary {
+            pty_id: "pty-1".into(),
+            cwd: "/work".into(),
+            cols: 80,
+            rows: 24,
+        }])
+    }
+
+    async fn attach(
+        &self,
+        pty_id: &str,
+    ) -> Result<
+        (
+            oximux_remote_host::TerminalAttach,
+            tokio::sync::mpsc::Receiver<oximux_remote_host::TerminalFrame>,
+        ),
+        oximux_remote_host::TerminalError,
+    > {
+        if pty_id != "pty-1" {
+            return Err(oximux_remote_host::TerminalError::NotFound);
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        self.senders.lock().unwrap().push(tx);
+        Ok((
+            oximux_remote_host::TerminalAttach {
+                replay: b"prompt$ ".to_vec(),
+                cols: 80,
+                rows: 24,
+            },
+            rx,
+        ))
+    }
+
+    async fn input(
+        &self,
+        _pty_id: &str,
+        _bytes: &[u8],
+    ) -> Result<(), oximux_remote_host::TerminalError> {
+        Ok(())
+    }
+
+    async fn resize(
+        &self,
+        _pty_id: &str,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<(), oximux_remote_host::TerminalError> {
+        Ok(())
+    }
+}
+
+/// A reconnect must restore an attached terminal, not silently strand it.
+///
+/// Host-side attachment state is per-connection — `serve` rebuilds it empty on
+/// every accept — so after a redial the host streams nothing while the app still
+/// shows an open terminal. That failure is invisible from the app: the screen
+/// looks fine, it has simply stopped updating.
+///
+/// Asserted on **output flowing again**, not merely on the gap signal being
+/// raised. A signal the app cannot act on would satisfy the weaker assertion
+/// while leaving the user looking at a dead screen, which is the whole bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_restores_an_attached_terminal() {
+    let terminals = Arc::new(ReattachableTerminals::default());
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Arc::new(
+        Dispatcher::new(Arc::new(SessionRegistry::new()), auth).with_terminals(terminals.clone()),
+    );
+
+    let (client1, server1) = duplex_pair();
+    let (client2, server2) = duplex_pair();
+    let (drop1_tx, drop1_rx) = oneshot::channel::<()>();
+
+    let host = {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move {
+            select(Box::pin(dispatcher.serve(&server1)), drop1_rx).await;
+            drop(server1); // the link drops → the client's pump ends → it redials
+            dispatcher.serve(&server2).await;
+        })
+    };
+
+    let ticket =
+        PairingTicket { endpoint_id: [0u8; 32], handshake_secret: SECRET, session_id: None };
+    let client = MobileClient::new(Some(CLIENT_SEED.to_vec()));
+    let listener = Arc::new(RecordingListener::default());
+    let connector = Arc::new(QueueConnector {
+        queue: Mutex::new(VecDeque::from([
+            Arc::new(client1) as Arc<dyn Transport>,
+            Arc::new(client2) as Arc<dyn Transport>,
+        ])),
+    });
+    client
+        .connect_with(connector, ticket, "phone".into(), listener.clone())
+        .await
+        .expect("connect_with");
+
+    let sink = Arc::new(RecordingTerminalSink::default());
+    client.set_terminal_sink(sink.clone());
+    client.attach_terminal("pty-1".into()).await.expect("attach over conn 1");
+
+    // Live output flows over conn 1. The sender is cloned out of the lock first —
+    // holding a std guard across an await is a deadlock waiting to happen.
+    let conn1_tx = terminals.senders.lock().unwrap()[0].clone();
+    conn1_tx.send(oximux_remote_host::TerminalFrame::Output(b"before".to_vec())).await.unwrap();
+    assert!(
+        wait_until(|| !sink.output.lock().unwrap().is_empty()).await,
+        "output flows before the drop",
+    );
+
+    // Sever conn 1. The driver redials on its own; the core must then tell the app
+    // to re-attach, since nothing on the new connection knows about the old one.
+    drop1_tx.send(()).expect("signal drop");
+    assert!(
+        wait_until(|| connected_count(&listener) >= 2).await,
+        "self-healed, saw {:?}",
+        listener.states.lock().unwrap(),
+    );
+    assert!(
+        wait_until(|| !sink.gaps.lock().unwrap().is_empty()).await,
+        "the reconnect raised a gap for the attached terminal — without it the app \
+         never learns to re-attach and the screen silently stops updating",
+    );
+
+    // Stand in for the app's `onGap` handler, which answers a gap by re-attaching.
+    client.attach_terminal("pty-1".into()).await.expect("re-attach over conn 2");
+    assert_eq!(
+        terminals.senders.lock().unwrap().len(),
+        2,
+        "the re-attach reached the host and opened a fresh stream",
+    );
+
+    // The real property: output reaches the app again over the new connection.
+    let conn2_tx = terminals.senders.lock().unwrap()[1].clone();
+    conn2_tx.send(oximux_remote_host::TerminalFrame::Output(b"after".to_vec())).await.unwrap();
+    assert!(
+        wait_until(|| sink
+            .output
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, bytes)| bytes == b"after"))
+        .await,
+        "live output resumed after the reconnect, saw {:?}",
+        sink.output.lock().unwrap(),
+    );
+
+    client.disconnect().await;
+    let _ = host.await;
+}
+
+/// A terminal the app detached must not come back on the next reconnect — the
+/// app has said it is done with it, and a resurrected screen would stream bytes
+/// nothing is rendering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_detached_terminal_is_not_restored_by_a_reconnect() {
+    let terminals = Arc::new(ReattachableTerminals::default());
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Arc::new(
+        Dispatcher::new(Arc::new(SessionRegistry::new()), auth).with_terminals(terminals.clone()),
+    );
+
+    let (client1, server1) = duplex_pair();
+    let (client2, server2) = duplex_pair();
+    let (drop1_tx, drop1_rx) = oneshot::channel::<()>();
+
+    let host = {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move {
+            select(Box::pin(dispatcher.serve(&server1)), drop1_rx).await;
+            drop(server1);
+            dispatcher.serve(&server2).await;
+        })
+    };
+
+    let ticket =
+        PairingTicket { endpoint_id: [0u8; 32], handshake_secret: SECRET, session_id: None };
+    let client = MobileClient::new(Some(CLIENT_SEED.to_vec()));
+    let listener = Arc::new(RecordingListener::default());
+    let connector = Arc::new(QueueConnector {
+        queue: Mutex::new(VecDeque::from([
+            Arc::new(client1) as Arc<dyn Transport>,
+            Arc::new(client2) as Arc<dyn Transport>,
+        ])),
+    });
+    client
+        .connect_with(connector, ticket, "phone".into(), listener.clone())
+        .await
+        .expect("connect_with");
+
+    let sink = Arc::new(RecordingTerminalSink::default());
+    client.set_terminal_sink(sink.clone());
+    client.attach_terminal("pty-1".into()).await.expect("attach");
+    client.detach_terminal("pty-1".into()).await.expect("detach");
+
+    drop1_tx.send(()).expect("signal drop");
+    assert!(
+        wait_until(|| connected_count(&listener) >= 2).await,
+        "self-healed, saw {:?}",
+        listener.states.lock().unwrap(),
+    );
+
+    // Give any erroneous resync a chance to fire before asserting its absence.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        sink.gaps.lock().unwrap().is_empty(),
+        "a detached terminal raised no gap on reconnect, saw {:?}",
+        sink.gaps.lock().unwrap(),
+    );
+
+    client.disconnect().await;
+    let _ = host.await;
+}

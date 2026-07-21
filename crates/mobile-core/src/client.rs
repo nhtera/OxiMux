@@ -3,7 +3,7 @@
 //! async RPCs live in [`rpc`](crate::client::rpc) and subscription in
 //! [`subscription`](crate::subscription).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -46,6 +46,15 @@ pub(crate) struct Shared {
     /// told apart by `pty_id`, so one sink is the shape the transport already
     /// has.
     pub terminal_sink: StdMutex<Option<Arc<dyn crate::callbacks::TerminalSink>>>,
+    /// Terminals the app is currently attached to, so a reconnect can restore
+    /// them.
+    ///
+    /// Needed because host-side attachment state is per-connection: `serve`
+    /// rebuilds its `attached` map empty on every accept, so a redial leaves the
+    /// host streaming nothing while the app still shows an open terminal. Unlike
+    /// [`subs`](Self::subs), there is no cursor to resume from — a terminal has
+    /// no seq — so recovery is a re-attach, not a replay-since.
+    pub attached: StdMutex<HashSet<String>>,
 }
 
 impl Shared {
@@ -100,6 +109,7 @@ impl MobileClient {
                 subs: Mutex::new(HashMap::new()),
                 epoch: AtomicU64::new(0),
                 terminal_sink: StdMutex::new(None),
+                attached: StdMutex::new(HashSet::new()),
             }),
             shutdown: StdMutex::new(None),
             host_endpoint: StdMutex::new(None),

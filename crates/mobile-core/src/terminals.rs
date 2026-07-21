@@ -29,8 +29,42 @@ pub(crate) async fn run_terminal_pump(shared: Arc<Shared>, mut pushes: TerminalS
         match push {
             TerminalPush::Output { pty_id, bytes } => sink.on_output(pty_id, bytes),
             TerminalPush::Gapped { pty_id } => sink.on_gap(pty_id),
-            TerminalPush::Exited { pty_id, code } => sink.on_exit(pty_id, code),
+            TerminalPush::Exited { pty_id, code } => {
+                // The terminal is gone, so nothing is left to restore on a
+                // reconnect. Forgetting it here keeps a dead pty from being
+                // re-attached on every redial for the life of the connection.
+                shared.attached.lock().unwrap().remove(&pty_id);
+                sink.on_exit(pty_id, code);
+            }
         }
+    }
+}
+
+/// Tell the app to re-attach every terminal it was watching before a reconnect.
+///
+/// Sessions resume from a fold cursor; terminals cannot — there is no seq to
+/// resume from, and the host rebuilt its attachment map empty when it accepted
+/// the new connection. So recovery reuses the gap path, which already exists and
+/// is already exercised: the app answers `on_gap` by re-attaching and replacing
+/// the screen, which is exactly the right response here too. A reconnect *is* a
+/// gap — bytes were missed — so this reports what happened rather than
+/// impersonating an unrelated signal.
+///
+/// The core deliberately does not re-attach on the app's behalf. It would have to
+/// deliver the fresh screen through a sink that only carries appendable output,
+/// and appending a replay to a screen the WebView still holds would duplicate it
+/// rather than replace it.
+///
+/// Called after the new session is published, since the `on_gap` handler dials
+/// straight back in with an `attach` RPC.
+pub(crate) fn resync_attached(shared: &Arc<Shared>) {
+    let sink = shared.terminal_sink.lock().unwrap().clone();
+    let Some(sink) = sink else { return };
+    // Snapshot before notifying: the callback re-enters the core to attach, which
+    // takes this same lock.
+    let ptys: Vec<String> = shared.attached.lock().unwrap().iter().cloned().collect();
+    for pty_id in ptys {
+        sink.on_gap(pty_id);
     }
 }
 
@@ -62,6 +96,9 @@ impl MobileClient {
         let session = self.shared.session()?;
         let attached =
             session.term_attach(&pty_id).await.map_err(|e| MobileError::Rpc(e.to_string()))?;
+        // Recorded only on success, so a refused attach (a read-only device, a
+        // pty that has since exited) is not resurrected on every later reconnect.
+        self.shared.attached.lock().unwrap().insert(pty_id);
         Ok(TerminalScreen {
             replay: attached.replay,
             cols: attached.cols,
@@ -100,6 +137,11 @@ impl MobileClient {
 
     /// Stop streaming a terminal. Idempotent.
     pub async fn detach_terminal(&self, pty_id: String) -> Result<(), MobileError> {
+        // Forgotten before the RPC, and regardless of how it lands: the app has
+        // said it is done with this terminal, so a reconnect must not restore it
+        // even if the detach itself fails on a connection that is already going
+        // away — which is exactly when a failure here is likely.
+        self.shared.attached.lock().unwrap().remove(&pty_id);
         let session = self.shared.session()?;
         session.term_detach(&pty_id).await.map_err(|e| MobileError::Rpc(e.to_string()))
     }

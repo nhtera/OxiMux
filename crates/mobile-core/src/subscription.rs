@@ -181,6 +181,10 @@ pub(crate) async fn activate(
     }
     rt().spawn(run_dispatcher(shared.clone(), events));
     rt().spawn(crate::terminals::run_terminal_pump(shared.clone(), terminal_pushes));
+    // After the session is published and the pump is running: the app answers this
+    // by re-attaching, which needs a live session to issue the RPC against and a
+    // running pump for the resulting frames to arrive through.
+    crate::terminals::resync_attached(&shared);
     if let Some(tx) = first.lock().unwrap().take() {
         let _ = tx.send(Ok(()));
     }
@@ -270,6 +274,7 @@ mod tests {
             subs: TokioMutex::new(HashMap::new()),
             epoch: AtomicU64::new(epoch),
             terminal_sink: StdMutex::new(None),
+            attached: StdMutex::new(std::collections::HashSet::new()),
         })
     }
 
