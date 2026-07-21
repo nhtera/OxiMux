@@ -19,7 +19,10 @@ import { useSession } from '@/native/session';
  * events.
  */
 export default function SessionScreen() {
-  const { id } = useLocalSearchParams<{ id: string }>();
+  // `draft` arrives when the forge screen attaches a PR/issue: it routes back
+  // here with the composed text as a param rather than through shared state, so
+  // the attachment is carried by the navigation that caused it.
+  const { id, draft } = useLocalSearchParams<{ id: string; draft?: string }>();
   const sessionId = String(id);
   const {
     thread,
@@ -68,6 +71,9 @@ export default function SessionScreen() {
               <Pressable onPress={() => setRewindOpen(true)} hitSlop={Spacing.two}>
                 <ThemedText type="code">Rewind</ThemedText>
               </Pressable>
+              <Link href={{ pathname: '/forge/[id]', params: { id: sessionId } }}>
+                <ThemedText type="code">PRs</ThemedText>
+              </Link>
               <Link href={{ pathname: '/git/[id]', params: { id: sessionId } }}>
                 <ThemedText type="code">Git</ThemedText>
               </Link>
@@ -110,6 +116,7 @@ export default function SessionScreen() {
             turnActive={thread.turn_active}
             slashCommands={thread.slash_commands}
             controls={<SessionControls sessionId={id} />}
+            draft={draft}
             onSend={send}
             onSteer={steer}
             onCancel={cancel}

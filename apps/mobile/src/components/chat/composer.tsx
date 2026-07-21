@@ -18,6 +18,15 @@ type Props = {
    * that offers no choices, or before the catalog has been fetched.
    */
   controls?: React.ReactNode;
+  /**
+   * Text to prefill the input with — how an attached PR/issue reaches the
+   * composer.
+   *
+   * Applied when its **value changes**, not on every render, so it seeds the
+   * input once and then leaves the user's edits alone. A prefill that reasserted
+   * itself would fight anyone typing after it.
+   */
+  draft?: string;
   /** Resolves `false` when the prompt did not reach the desktop. */
   onSend: (text: string, images: Attachment[]) => Promise<boolean>;
   onSteer: (text: string) => Promise<boolean>;
@@ -40,6 +49,7 @@ export function Composer({
   turnActive,
   slashCommands = [],
   controls,
+  draft,
   onSend,
   onSteer,
   onCancel,
@@ -47,7 +57,22 @@ export function Composer({
 }: Props) {
   const theme = useTheme();
   const inputRef = useRef<TextInput>(null);
-  const [text, setText] = useState('');
+  // Seeded from `draft` at mount, which is the common case for an attachment:
+  // the forge screen navigates here with the text already composed, so the
+  // composer is constructed holding it rather than receiving it as a change.
+  const [text, setText] = useState(draft ?? '');
+  // Seed from `draft` only when it actually changes — React's adjust-state-
+  // during-render pattern, which needs state rather than a ref (a ref written
+  // during render is not safe under concurrent rendering).
+  //
+  // Comparing against the last *applied* draft rather than against `text` is
+  // what lets the user edit or clear a prefilled draft without it snapping back
+  // on the next render.
+  const [lastDraft, setLastDraft] = useState(draft);
+  if (draft !== undefined && draft !== lastDraft) {
+    setLastDraft(draft);
+    setText(draft);
+  }
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [busy, setBusy] = useState(false);
   const trimmed = text.trim();
