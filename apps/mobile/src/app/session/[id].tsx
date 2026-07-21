@@ -26,6 +26,7 @@ export default function SessionScreen() {
     steer,
     cancel,
     allow,
+    allowWith,
     deny,
     answer,
     dismissError,
@@ -72,7 +73,13 @@ export default function SessionScreen() {
               <ActivityIndicator />
             </View>
           ) : (
-            <Transcript thread={thread} onAllow={allow} onDeny={deny} onAnswer={answer} />
+            <Transcript
+              thread={thread}
+              onAllow={allow}
+              onAllowWith={allowWith}
+              onDeny={deny}
+              onAnswer={answer}
+            />
           )}
 
           <Composer

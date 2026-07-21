@@ -83,6 +83,18 @@ impl MobileClient {
                     .map_err(|e| MobileError::Rpc(format!("updated_input is not valid JSON: {e}")))?;
                 PermissionDecision::Allow { updated_input }
             }
+            PermissionReply::AllowWithSuggestion { updated_input_json, suggestion_json } => {
+                let updated_input = serde_json::from_str(&updated_input_json)
+                    .map_err(|e| MobileError::Rpc(format!("updated_input is not valid JSON: {e}")))?;
+                // Parsed rather than forwarded as a string because the wire type
+                // is a typed `PermissionSuggestion`. A malformed one is refused
+                // here rather than sent: applying a suggestion changes what the
+                // agent is allowed to do for the rest of the session, so a
+                // half-understood payload is the wrong thing to guess at.
+                let suggestion = serde_json::from_str(&suggestion_json)
+                    .map_err(|e| MobileError::Rpc(format!("suggestion is not valid JSON: {e}")))?;
+                PermissionDecision::AllowWithSuggestion { updated_input, suggestion }
+            }
             PermissionReply::Deny { message } => PermissionDecision::Deny { message },
         };
         session

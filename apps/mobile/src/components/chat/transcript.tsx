@@ -21,6 +21,7 @@ import {
   pendingPermission,
   pendingQuestion,
   type AskQuestion,
+  type PermissionSuggestion,
   type QuestionAnswers,
   type Thread,
   type ThreadEntry,
@@ -29,6 +30,11 @@ import {
 type Props = {
   thread: Thread;
   onAllow: (requestId: string, toolInput: unknown) => Promise<unknown>;
+  onAllowWith: (
+    requestId: string,
+    toolInput: unknown,
+    suggestion: PermissionSuggestion
+  ) => Promise<unknown>;
   onDeny: (requestId: string, message: string) => Promise<unknown>;
   onAnswer: (
     requestId: string,
@@ -37,7 +43,7 @@ type Props = {
   ) => Promise<unknown>;
 };
 
-export function Transcript({ thread, onAllow, onDeny, onAnswer }: Props) {
+export function Transcript({ thread, onAllow, onAllowWith, onDeny, onAnswer }: Props) {
   const listRef = useRef<FlatList<ThreadEntry>>(null);
   const count = thread.entries.length;
   // The last entry also *grows* while a reply streams, so the length alone is
@@ -54,9 +60,15 @@ export function Transcript({ thread, onAllow, onDeny, onAnswer }: Props) {
 
   const renderItem = useCallback(
     ({ item }: { item: ThreadEntry }) => (
-      <Entry entry={item} onAllow={onAllow} onDeny={onDeny} onAnswer={onAnswer} />
+      <Entry
+        entry={item}
+        onAllow={onAllow}
+        onAllowWith={onAllowWith}
+        onDeny={onDeny}
+        onAnswer={onAnswer}
+      />
     ),
-    [onAllow, onDeny, onAnswer]
+    [onAllow, onAllowWith, onDeny, onAnswer]
   );
 
   return (
@@ -80,6 +92,7 @@ export function Transcript({ thread, onAllow, onDeny, onAnswer }: Props) {
 function Entry({
   entry,
   onAllow,
+  onAllowWith,
   onDeny,
   onAnswer,
 }: { entry: ThreadEntry } & Omit<Props, 'thread'>) {
@@ -102,7 +115,13 @@ function Entry({
     return (
       <ToolCallCard call={call}>
         {permission ? (
-          <PermissionCard call={call} request={permission} onAllow={onAllow} onDeny={onDeny} />
+          <PermissionCard
+            call={call}
+            request={permission}
+            onAllow={onAllow}
+            onAllowWith={onAllowWith}
+            onDeny={onDeny}
+          />
         ) : null}
         {question ? (
           <QuestionCard call={call} request={question} onAnswer={onAnswer} />

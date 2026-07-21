@@ -65,6 +65,16 @@ pub enum PermissionReply {
     /// event, optionally edited) — the CLI treats an allow without it as
     /// malformed and denies the tool, so this is required, not optional.
     Allow { updated_input_json: String },
+    /// Allow *and* apply the shortcut the agent offered alongside the request —
+    /// the "always allow edits this session" class of button.
+    ///
+    /// `suggestion_json` is one of the `suggestions` the app received on the
+    /// `PermissionRequested` event, quoted back **verbatim**. Its `raw` payload
+    /// is opaque to both the phone and the host; only the agent that offered it
+    /// interprets it. Echoing rather than reconstructing means the phone cannot
+    /// invent a suggestion the agent never made, so this adds no trust boundary
+    /// beyond the existing resolve path.
+    AllowWithSuggestion { updated_input_json: String, suggestion_json: String },
     /// Deny; `message` is shown to the model.
     Deny { message: String },
 }

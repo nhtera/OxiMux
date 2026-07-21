@@ -5,7 +5,7 @@ import { ThemedText } from '@/components/themed-text';
 import { QUESTION_ACCENT as ACCENT } from '@/constants/chat';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
-import type { PermissionRequest, ToolCall } from '@/native/thread';
+import type { PermissionRequest, PermissionSuggestion, ToolCall } from '@/native/thread';
 
 type Props = {
   call: ToolCall;
@@ -14,6 +14,16 @@ type Props = {
   // to report an outcome — a failure already surfaces on the screen's error row.
   onAllow: (requestId: string, toolInput: unknown) => Promise<unknown>;
   onDeny: (requestId: string, message: string) => Promise<unknown>;
+  /**
+   * Allow *and* apply one of the agent's own offered shortcuts. The suggestion
+   * is passed back exactly as it arrived — its `raw` payload is opaque to the
+   * phone and only the agent that offered it knows what it means.
+   */
+  onAllowWith?: (
+    requestId: string,
+    toolInput: unknown,
+    suggestion: PermissionSuggestion
+  ) => Promise<unknown>;
 };
 
 /**
@@ -25,7 +35,7 @@ type Props = {
  * A `plan` request carries the plan markdown in `description` rather than a file
  * name, so it gets the full body instead of a one-line summary.
  */
-export function PermissionCard({ call, request, onAllow, onDeny }: Props) {
+export function PermissionCard({ call, request, onAllow, onDeny, onAllowWith }: Props) {
   const theme = useTheme();
   const [busy, setBusy] = useState(false);
   /**
@@ -91,12 +101,31 @@ export function PermissionCard({ call, request, onAllow, onDeny }: Props) {
         {busy ? <ActivityIndicator /> : null}
       </View>
 
-      {/* Agent-offered shortcuts ("always allow this pattern") are shown so the
-          user knows the desktop can widen the grant, but they are not actionable
-          here: applying one needs the suggestion's opaque payload echoed back on
-          a decision variant this FFI does not expose yet. Listing them without
-          wiring them would promise a button that does nothing. */}
-      {request.suggestions.length > 0 ? (
+      {/* The agent's own shortcuts — "always allow edits this session" and the
+          like. These were listed but inert until the FFI gained a decision
+          variant that echoes the suggestion back; they now apply for real.
+          Rendered below the plain Allow so the narrower choice stays the
+          default: these widen what the agent may do for the rest of the
+          session, which is not what an accidental tap should buy. */}
+      {onAllowWith && request.suggestions.length > 0
+        ? request.suggestions.map((suggestion, i) => (
+            <Pressable
+              key={`${suggestion.kind}-${i}`}
+              disabled={busy}
+              onPress={() =>
+                decide(() => onAllowWith(request.request_id, call.input, suggestion))
+              }
+              style={[styles.suggestion, busy && styles.busy]}
+            >
+              <ThemedText type="code" numberOfLines={2}>
+                {suggestion.label}
+              </ThemedText>
+            </Pressable>
+          ))
+        : null}
+
+      {/* No handler wired: say what exists rather than showing a dead button. */}
+      {!onAllowWith && request.suggestions.length > 0 ? (
         <ThemedText type="small" style={styles.note}>
           {request.suggestions.length === 1 ? 'A shortcut is' : `${request.suggestions.length} shortcuts are`}{' '}
           offered on the desktop for this request.
@@ -140,4 +169,11 @@ const styles = StyleSheet.create({
   allowLabel: { color: '#000000' },
   busy: { opacity: 0.5 },
   note: { opacity: 0.8 },
+  suggestion: {
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: ACCENT,
+    borderRadius: Spacing.two,
+    paddingVertical: Spacing.two,
+    paddingHorizontal: Spacing.three,
+  },
 });

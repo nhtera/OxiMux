@@ -951,3 +951,137 @@ async fn a_detached_terminal_is_not_restored_by_a_reconnect() {
     client.disconnect().await;
     let _ = host.await;
 }
+
+/// A permission suggestion — the agent's own "always allow edits this session"
+/// shortcut — applies when the phone chooses it.
+///
+/// Before this, the phone could only allow-once or deny: the suggestion pills
+/// were displayed but inert, so a remote user had to re-approve every single
+/// call the desktop user could have waved through once.
+///
+/// Asserted on what reached the **backend**, not on the RPC returning true. The
+/// suggestion's `raw` is opaque to both phone and host and only the agent
+/// interprets it, so the property that matters is that it arrived byte-for-byte
+/// in `updatedPermissions` — an allow that quietly dropped it would satisfy any
+/// wire-level check while leaving the user re-approving forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_permission_suggestion_reaches_the_agent_verbatim() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = Arc::new(StubConnection::default());
+    let handle = registry.register("sess-1".into(), conn.clone());
+    handle.ingest(ThreadEvent::PermissionRequested {
+        request_id: "req-1".into(),
+        tool_use_id: None,
+        tool_name: "Edit".into(),
+        input: json!({ "path": "a.rs" }),
+        description: "edit a.rs".into(),
+        suggestions: vec![],
+        kind: PermissionKind::Tool,
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Arc::new(Dispatcher::new(registry, auth));
+
+    let (client_t, server_t) = duplex_pair();
+    let server = {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move { dispatcher.serve(&server_t).await })
+    };
+
+    let ticket =
+        PairingTicket { endpoint_id: [0u8; 32], handshake_secret: SECRET, session_id: None };
+    let client = MobileClient::new(Some(CLIENT_SEED.to_vec()));
+    let connector = Arc::new(LoopbackConnector { transport: Mutex::new(Some(Arc::new(client_t))) });
+    client
+        .connect_with(connector, ticket, "phone".into(), Arc::new(RecordingListener::default()))
+        .await
+        .expect("connect_with");
+
+    let decided = client
+        .resolve_permission(
+            "sess-1".into(),
+            "req-1".into(),
+            oximux_mobile_core::PermissionReply::AllowWithSuggestion {
+                updated_input_json: r#"{"path":"a.rs"}"#.into(),
+                suggestion_json: r#"{"kind":"setMode","label":"Always allow edits",
+                                     "raw":{"mode":"acceptEdits"}}"#
+                    .into(),
+            },
+        )
+        .await
+        .expect("resolve");
+    assert!(decided, "this call decided the request");
+
+    let sent = conn.sent();
+    let response = sent
+        .iter()
+        .find(|v| v["type"] == "control_response")
+        .expect("the decision reached the backend");
+    let inner = &response["response"]["response"];
+    assert_eq!(inner["behavior"], "allow");
+    assert_eq!(
+        inner["updatedPermissions"],
+        json!([{ "mode": "acceptEdits" }]),
+        "the agent's own opaque payload rode through untouched, saw {inner}",
+    );
+
+    client.disconnect().await;
+    let _ = server.await;
+}
+
+/// A malformed suggestion is refused before it is sent.
+///
+/// Applying one changes what the agent may do for the rest of the session, so a
+/// half-understood payload is the wrong thing to guess at — better to fail the
+/// call than to send an allow whose shortcut means something unintended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_suggestion_is_refused_rather_than_sent() {
+    let registry = Arc::new(SessionRegistry::new());
+    let conn = Arc::new(StubConnection::default());
+    let handle = registry.register("sess-1".into(), conn.clone());
+    handle.ingest(ThreadEvent::PermissionRequested {
+        request_id: "req-1".into(),
+        tool_use_id: None,
+        tool_name: "Edit".into(),
+        input: json!({}),
+        description: "edit".into(),
+        suggestions: vec![],
+        kind: PermissionKind::Tool,
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Arc::new(Dispatcher::new(registry, auth));
+
+    let (client_t, server_t) = duplex_pair();
+    let server = {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move { dispatcher.serve(&server_t).await })
+    };
+
+    let ticket =
+        PairingTicket { endpoint_id: [0u8; 32], handshake_secret: SECRET, session_id: None };
+    let client = MobileClient::new(Some(CLIENT_SEED.to_vec()));
+    let connector = Arc::new(LoopbackConnector { transport: Mutex::new(Some(Arc::new(client_t))) });
+    client
+        .connect_with(connector, ticket, "phone".into(), Arc::new(RecordingListener::default()))
+        .await
+        .expect("connect_with");
+
+    let result = client
+        .resolve_permission(
+            "sess-1".into(),
+            "req-1".into(),
+            oximux_mobile_core::PermissionReply::AllowWithSuggestion {
+                updated_input_json: "{}".into(),
+                suggestion_json: "not json at all".into(),
+            },
+        )
+        .await;
+    assert!(result.is_err(), "a malformed suggestion fails the call");
+    assert!(conn.sent().is_empty(), "nothing reached the backend, saw {:?}", conn.sent());
+
+    client.disconnect().await;
+    let _ = server.await;
+}

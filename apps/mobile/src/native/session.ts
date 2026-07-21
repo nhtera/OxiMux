@@ -8,6 +8,7 @@ import {
   EMPTY_THREAD,
   parseThread,
   type AskQuestion,
+  type PermissionSuggestion,
   type QuestionAnswers,
   type Thread,
 } from './thread';
@@ -25,6 +26,11 @@ export type SessionView = {
   steer: (text: string) => Promise<boolean>;
   cancel: () => Promise<boolean>;
   allow: (requestId: string, toolInput: unknown) => Promise<boolean>;
+  allowWith: (
+    requestId: string,
+    toolInput: unknown,
+    suggestion: PermissionSuggestion
+  ) => Promise<boolean>;
   deny: (requestId: string, message: string) => Promise<boolean>;
   answer: (
     requestId: string,
@@ -152,6 +158,25 @@ export function useSession(sessionId: string): SessionView {
     [run, sessionId]
   );
 
+  const allowWith = useCallback(
+    (requestId: string, toolInput: unknown, suggestion: PermissionSuggestion) =>
+      run((c) =>
+        c.resolvePermission(
+          sessionId,
+          requestId,
+          // The suggestion is quoted straight back from the card that displayed
+          // it. Its `raw` is opaque here — only the agent that offered it knows
+          // what it means — so echoing rather than rebuilding is what keeps the
+          // phone from inventing a grant the agent never proposed.
+          new PermissionReply.AllowWithSuggestion({
+            updatedInputJson: JSON.stringify(toolInput ?? null),
+            suggestionJson: JSON.stringify(suggestion),
+          })
+        )
+      ),
+    [run, sessionId]
+  );
+
   const deny = useCallback(
     (requestId: string, message: string) =>
       run((c) => c.resolvePermission(sessionId, requestId, new PermissionReply.Deny({ message }))),
@@ -185,6 +210,7 @@ export function useSession(sessionId: string): SessionView {
     steer,
     cancel,
     allow,
+    allowWith,
     deny,
     answer,
     dismissError,
