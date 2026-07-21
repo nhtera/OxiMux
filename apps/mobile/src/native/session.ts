@@ -37,6 +37,15 @@ export type SessionView = {
     questions: AskQuestion[],
     answers: QuestionAnswers
   ) => Promise<boolean>;
+  /**
+   * Rewind to a user turn: drop it and everything after it.
+   *
+   * `ordinal` counts **user** entries only, matching the wire. Nothing is
+   * applied locally — the truncation arrives as a `Rewound` event that folds
+   * through the same subscription, so the phone and the desktop agree by
+   * construction rather than by two implementations happening to match.
+   */
+  rewind: (ordinal: number) => Promise<boolean>;
   dismissError: () => void;
   /** Surface a failure that happened outside an RPC (picking an image, say)
    * through the same inline banner, so the screen has one error channel. */
@@ -143,6 +152,14 @@ export function useSession(sessionId: string): SessionView {
 
   const cancel = useCallback(() => run((c) => c.cancel(sessionId)), [run, sessionId]);
 
+  const rewind = useCallback(
+    // `includeFiles: false` — the phone never restores the working tree. That
+    // discards uncommitted work belonging to whoever is at the desktop, which
+    // is not a thing to trigger from a pocket.
+    (ordinal: number) => run((c) => c.rewindSession(sessionId, ordinal, false)),
+    [run, sessionId]
+  );
+
   const allow = useCallback(
     (requestId: string, toolInput: unknown) =>
       run((c) =>
@@ -213,6 +230,7 @@ export function useSession(sessionId: string): SessionView {
     allowWith,
     deny,
     answer,
+    rewind,
     dismissError,
     reportError,
   };

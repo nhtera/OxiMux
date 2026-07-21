@@ -1,8 +1,10 @@
 import { Link, Stack, useLocalSearchParams } from 'expo-router';
+import { useState } from 'react';
 import { ActivityIndicator, KeyboardAvoidingView, Platform, Pressable, StyleSheet, View } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Composer } from '@/components/chat/composer';
+import { RewindSheet } from '@/components/chat/rewind-sheet';
 import { SessionControls } from '@/components/chat/session-controls';
 import { StatusStrip } from '@/components/chat/status-strip';
 import { Transcript } from '@/components/chat/transcript';
@@ -30,10 +32,26 @@ export default function SessionScreen() {
     allowWith,
     deny,
     answer,
+    rewind,
     dismissError,
     reportError,
   } = useSession(sessionId);
+  const [rewindOpen, setRewindOpen] = useState(false);
+  const [rewinding, setRewinding] = useState(false);
+  const [rewindError, setRewindError] = useState<string>();
   const insets = useSafeAreaInsets();
+
+  const onRewind = async (ordinal: number) => {
+    setRewinding(true);
+    setRewindError(undefined);
+    const ok = await rewind(ordinal);
+    setRewinding(false);
+    // Closed only on success. A failure leaves the sheet open holding its
+    // error, because the alternative — dismissing and showing the message
+    // somewhere else — reads as though the rewind went through.
+    if (ok) setRewindOpen(false);
+    else setRewindError('The rewind did not go through. The transcript is unchanged.');
+  };
   // The stack header sits above this view, so the keyboard has to be offset past
   // it or it pushes the composer up behind the transcript. Derived from the top
   // inset plus the standard iOS nav-bar height rather than hardcoded, so a
@@ -46,9 +64,14 @@ export default function SessionScreen() {
         options={{
           title: thread.title ?? 'Session',
           headerRight: () => (
-            <Link href={{ pathname: '/git/[id]', params: { id: sessionId } }}>
-              <ThemedText type="code">Git</ThemedText>
-            </Link>
+            <View style={styles.headerActions}>
+              <Pressable onPress={() => setRewindOpen(true)} hitSlop={Spacing.two}>
+                <ThemedText type="code">Rewind</ThemedText>
+              </Pressable>
+              <Link href={{ pathname: '/git/[id]', params: { id: sessionId } }}>
+                <ThemedText type="code">Git</ThemedText>
+              </Link>
+            </View>
           ),
         }}
       />
@@ -94,6 +117,18 @@ export default function SessionScreen() {
           />
         </SafeAreaView>
       </KeyboardAvoidingView>
+
+      <RewindSheet
+        visible={rewindOpen}
+        entries={thread.entries}
+        busy={rewinding}
+        error={rewindError}
+        onRewind={onRewind}
+        onClose={() => {
+          setRewindOpen(false);
+          setRewindError(undefined);
+        }}
+      />
     </ThemedView>
   );
 }
@@ -103,4 +138,5 @@ const styles = StyleSheet.create({
   centre: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   error: { paddingHorizontal: Spacing.three, paddingVertical: Spacing.two },
   errorText: { color: '#F85149' },
+  headerActions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.three },
 });
