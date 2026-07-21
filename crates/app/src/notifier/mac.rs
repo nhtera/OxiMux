@@ -407,10 +407,10 @@ impl Notifier for MacNotifier {
         ATTENTION_BADGE.store(0, Ordering::Relaxed);
         set_dock_badge(0);
         // Reopen the per-tab attention gate so the next edge after refocus fires.
-        if let Ok(mut slot) = OUTSTANDING.lock() {
-            if let Some(set) = slot.as_mut() {
-                set.clear();
-            }
+        if let Ok(mut slot) = OUTSTANDING.lock()
+            && let Some(set) = slot.as_mut()
+        {
+            set.clear();
         }
     }
 
@@ -459,10 +459,10 @@ mod tests {
         bell.coalesce_until_focus = false;
         assert!(coalesce_allows(&bell));
         // Clearing the set reopens the gate.
-        if let Ok(mut s) = OUTSTANDING.lock() {
-            if let Some(set) = s.as_mut() {
-                set.clear();
-            }
+        if let Ok(mut s) = OUTSTANDING.lock()
+            && let Some(set) = s.as_mut()
+        {
+            set.clear();
         }
         assert!(coalesce_allows(&chat_req(1)));
         // Clean up so ordering with other tests doesn't leak.

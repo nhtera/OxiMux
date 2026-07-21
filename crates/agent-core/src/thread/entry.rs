@@ -10,6 +10,15 @@ use super::tool_call::ToolCall;
 use super::turn_diff::TurnFileChange;
 
 /// One rendered item in the conversation, in arrival order.
+///
+/// `ToolCall` is much larger than the other variants, so every entry costs its
+/// size (~424 bytes). Boxing it would reclaim the difference on the
+/// non-tool entries, at the price of an indirection on the enum this app matches
+/// on more than any other, and edits at ~78 construction and match sites across
+/// twelve files. The transcript is bounded by what one conversation holds — a few
+/// thousand entries, so under a megabyte of slack — which does not buy that.
+/// Revisit if transcripts ever grow unbounded.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ThreadEntry {
     /// A user prompt: the typed text plus any attached images.

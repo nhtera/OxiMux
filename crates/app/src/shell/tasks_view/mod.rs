@@ -198,10 +198,10 @@ impl TasksView {
             .map(|p| &p.id)
             .ne(projects.iter().map(|p| &p.id));
         self.projects = projects;
-        if let TaskScope::One(id) = &self.scope {
-            if !self.projects.iter().any(|p| &p.id == id) {
-                self.scope = TaskScope::All;
-            }
+        if let TaskScope::One(id) = &self.scope
+            && !self.projects.iter().any(|p| &p.id == id)
+        {
+            self.scope = TaskScope::All;
         }
         if changed {
             self.loaded_key = None;

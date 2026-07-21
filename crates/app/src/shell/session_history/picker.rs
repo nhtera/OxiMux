@@ -119,7 +119,7 @@ fn provider_tag(entry: &SessionEntry) -> &str {
     entry
         .preset_id
         .as_deref()
-        .unwrap_or_else(|| match entry.adapter {
+        .unwrap_or(match entry.adapter {
             AgentAdapter::ClaudeCode => "claude",
             AgentAdapter::Codex => "codex",
             AgentAdapter::Pi => "pi",

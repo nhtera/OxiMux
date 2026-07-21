@@ -60,10 +60,10 @@ fn main() {
                         conn.cancel().expect("cancel");
                     }
                     // The agent reports the outcome it received back on the wire.
-                    ThreadEvent::AssistantTextDelta(t) => {
-                        if t.contains("PERMISSION_OUTCOME: cancelled") {
-                            saw_cancelled_outcome = true;
-                        }
+                    ThreadEvent::AssistantTextDelta(t)
+                        if t.contains("PERMISSION_OUTCOME: cancelled") =>
+                    {
+                        saw_cancelled_outcome = true;
                     }
                     ThreadEvent::TurnEnded { .. } => break,
                     ThreadEvent::Error(e) => {

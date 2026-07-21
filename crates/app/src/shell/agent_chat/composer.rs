@@ -435,6 +435,13 @@ impl PartialEq for WorktreeDraft {
 /// Desktop's feel: generous but bounded.
 const MAX_COMPOSER_ROWS: usize = 10;
 
+/// What a footer dropdown does when a row is picked, given the row's wire value.
+///
+/// Named because the permission / effort / feature-select controls all share the
+/// shape: `render_labeled_dropdown` takes one and each caller builds one, so the
+/// two spellings have to stay in step.
+type DropdownPick = std::rc::Rc<dyn Fn(&mut ComposerView, String, &mut Context<ComposerView>)>;
+
 pub struct ComposerView {
     input: Entity<InputState>,
     theme: Theme,
@@ -2110,6 +2117,7 @@ impl ComposerView {
     /// checkmarked menu upward. Builds the trigger and the plain (checkmark +
     /// label) rows, then delegates the Popover + tooltip behavior to
     /// [`Self::render_dropdown_shell`].
+    #[allow(clippy::too_many_arguments)]
     fn render_labeled_dropdown(
         &self,
         ctrl_id: SharedString,
@@ -2118,7 +2126,7 @@ impl ComposerView {
         current_label: String,
         current_wire: String,
         items: Vec<(String, String)>,
-        on_pick: std::rc::Rc<dyn Fn(&mut ComposerView, String, &mut Context<ComposerView>)>,
+        on_pick: DropdownPick,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let view = cx.entity();
@@ -2293,11 +2301,10 @@ impl ComposerView {
                         .map(|(_, l)| l.clone())
                         .unwrap_or_else(|| feature.label.clone());
                     let fid = feature.id.clone();
-                    let on_pick: std::rc::Rc<
-                        dyn Fn(&mut ComposerView, String, &mut Context<ComposerView>),
-                    > = std::rc::Rc::new(move |view: &mut ComposerView, wire, cx| {
-                        view.pick_feature(fid.clone(), FeatureValue::Choice(wire), cx);
-                    });
+                    let on_pick: DropdownPick =
+                        std::rc::Rc::new(move |view: &mut ComposerView, wire, cx| {
+                            view.pick_feature(fid.clone(), FeatureValue::Choice(wire), cx);
+                        });
                     row = row.child(self.render_labeled_dropdown(
                         btn_id,
                         Self::feature_icon_path(feature.icon.as_deref()),
@@ -2558,9 +2565,10 @@ impl ComposerView {
 
     /// The active recording bar — a ChatGPT-style row that OVERLAYS the input
     /// field (absolute, opaque): a filled stop square (■ = stop + insert), a live
-    /// scrolling waveform filling the width, the mm:ss timer, and cancel (✕ / Esc)
-    /// + send (↑ / Enter) controls. Mounted as an absolute child of the input pill
-    /// (which stays mounted underneath so focus + Escape/Enter keep working).
+    /// scrolling waveform filling the width, the mm:ss timer, and cancel
+    /// (✕ / Esc) + send (↑ / Enter) controls. Mounted as an absolute child of the
+    /// input pill (which stays mounted underneath so focus + Escape/Enter keep
+    /// working).
     fn render_recording_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
         let density = self.density;

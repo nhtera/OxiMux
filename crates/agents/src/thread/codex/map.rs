@@ -1382,7 +1382,7 @@ mod tests {
         assert!(matches!(&spawn[0], ThreadEvent::ToolCallStarted { id, .. } if id == "collab_2"));
         assert!(spawn.contains(&ThreadEvent::SubagentAction {
             parent_tool_call_id: "collab_2".into(), line: "Bash rustc --version".into() }));
-        assert!(s.subagent_buffer.get("child-B").is_none(), "buffer drained on register");
+        assert!(!s.subagent_buffer.contains_key("child-B"), "buffer drained on register");
     }
 
     #[test]

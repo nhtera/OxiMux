@@ -1337,10 +1337,10 @@ mod tests {
         assert!(matches!(decode_line(&real).as_slice(), [ThreadEvent::TurnEnded { .. }]));
     }
 
-    /// End-to-end against the captured spike fixture (one turn spawning a subagent
-    /// + a background bash): the subagent's own tool calls stay out of the main
-    /// stream, and exactly one — the primary — `TurnEnded` is emitted with the
-    /// real turn's usage (not a continuation's tiny total).
+    /// End-to-end against the captured spike fixture (one turn spawning a
+    /// subagent + a background bash): the subagent's own tool calls stay out of
+    /// the main stream, and exactly one — the primary — `TurnEnded` is emitted
+    /// with the real turn's usage (not a continuation's tiny total).
     #[test]
     fn spike_fixture_keeps_main_stream_clean() {
         let fixture = include_str!("testdata/stream_json_subagent.jsonl");

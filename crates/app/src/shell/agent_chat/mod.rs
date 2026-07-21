@@ -2494,11 +2494,10 @@ impl AgentChatView {
         }
         if let Some(conn) = self.connection.as_ref()
             && let Err(e) = conn.authenticate(&method_id)
+            && let Some(auth) = self.auth.as_mut()
         {
-            if let Some(auth) = self.auth.as_mut() {
-                auth.pending = None;
-                auth.error = Some(e.to_string());
-            }
+            auth.pending = None;
+            auth.error = Some(e.to_string());
         }
         cx.notify();
     }
@@ -5888,6 +5887,40 @@ fn thinking_block(
     block.into_any_element()
 }
 
+/// A hover-revealed icon action on a user message (Copy / Edit / Rewind).
+/// Minimal ghost button — just the glyph with a soft hover wash and a tooltip
+/// naming the action — matching the restrained affordances of a native chat
+/// client. `icon_color` lets the caller tint it (e.g. green ✓ right after Copy).
+fn message_action_icon(
+    id: SharedString,
+    icon_path: &'static str,
+    tooltip: &'static str,
+    icon_color: gpui::Hsla,
+    theme: Theme,
+    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let tip = SharedString::from(tooltip);
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(24.0))
+        .rounded(px(6.0))
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.hover_overlay))
+        .tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+        })
+        .child(
+            Icon::default()
+                .path(icon_path)
+                .size(px(14.0))
+                .text_color(icon_color),
+        )
+        .on_mouse_down(MouseButton::Left, on_click)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8296,38 +8329,4 @@ mod tests {
             })
             .expect("window update");
     }
-}
-
-/// A hover-revealed icon action on a user message (Copy / Edit / Rewind).
-/// Minimal ghost button — just the glyph with a soft hover wash and a tooltip
-/// naming the action — matching the restrained affordances of a native chat
-/// client. `icon_color` lets the caller tint it (e.g. green ✓ right after Copy).
-fn message_action_icon(
-    id: SharedString,
-    icon_path: &'static str,
-    tooltip: &'static str,
-    icon_color: gpui::Hsla,
-    theme: Theme,
-    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    let tip = SharedString::from(tooltip);
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .justify_center()
-        .size(px(24.0))
-        .rounded(px(6.0))
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.hover_overlay))
-        .tooltip(move |window, cx| {
-            gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-        })
-        .child(
-            Icon::default()
-                .path(icon_path)
-                .size(px(14.0))
-                .text_color(icon_color),
-        )
-        .on_mouse_down(MouseButton::Left, on_click)
 }

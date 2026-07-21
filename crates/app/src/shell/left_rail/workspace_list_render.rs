@@ -158,7 +158,7 @@ pub fn sort_workspaces(
         // Case-insensitive alphabetical by display name. `Project` collapses to
         // the same within-group order because every row here shares one project.
         WorkspaceSortMode::Name | WorkspaceSortMode::Project => {
-            list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            list.sort_by_key(|a| a.name.to_lowercase())
         }
     };
     order_group(&mut pinned);

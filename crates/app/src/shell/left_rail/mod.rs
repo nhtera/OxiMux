@@ -1268,7 +1268,7 @@ fn render_workspace_list(
         }
         match sort_mode {
             WorkspaceSortMode::Name => {
-                flat.sort_by(|a, b| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()));
+                flat.sort_by_key(|a| a.1.name.to_lowercase());
             }
             WorkspaceSortMode::Project => flat.sort_by(|a, b| {
                 a.0.name

@@ -579,6 +579,7 @@ impl AgentChatView {
 
 /// Steps 1–3 of the flow, off the UI thread. Returns without mutating any view
 /// state — the caller owns the swap.
+#[allow(clippy::too_many_arguments)]
 async fn run_rewind_background(
     conn: Option<std::sync::Arc<dyn oximux_agents::thread::AgentConnection>>,
     engine: Option<std::sync::Arc<CheckpointEngine>>,
