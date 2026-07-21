@@ -732,11 +732,23 @@ impl PaneGroup {
     /// `claude` subprocess (separate PID). Not a singleton — each chat is its
     /// own session, so a second call opens a second chat. The label is a
     /// running `Chat N` count over the group's existing chat tabs.
+    /// `initial_prompt` sends a first message the moment the tab exists, for a
+    /// caller that already knows what the session is for (a scheduled run). It
+    /// travels `AgentChatView::send_text` — the same path a typed prompt takes —
+    /// so it is subject to the same guards and lands in history identically.
+    ///
+    /// Sending here rather than parking the text on the view is deliberate: the
+    /// bound constructor connects **synchronously**, so by this line the session
+    /// is live and there is nothing to wait for. A stored "send once connected"
+    /// field would additionally have to defend against re-sending on every
+    /// respawn — re-running the prompt, which for a scheduled run may well mutate
+    /// a repository.
     pub fn open_agent_chat_tab(
         &mut self,
         cwd: PathBuf,
         model: Option<String>,
         backend: oximux_agents::thread::ChatBackend,
+        initial_prompt: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -757,7 +769,13 @@ impl PaneGroup {
                 cx,
             )
         });
-        self.push_agent_chat_view(view, cwd, model, window, cx)
+        // Pushed before sending so the tab is in the tree when the first turn
+        // starts streaming into it.
+        let idx = self.push_agent_chat_view(view.clone(), cwd, model, window, cx);
+        if let Some(prompt) = initial_prompt {
+            view.update(cx, |view, cx| view.send_text(prompt, Vec::new(), cx));
+        }
+        idx
     }
 
     /// Open an **unbound** *New Agent* draft chat: no subprocess spawns until the

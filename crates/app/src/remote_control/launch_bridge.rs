@@ -174,7 +174,7 @@ fn open_session(
     window
         .update(cx, |_, window, cx| {
             panes.update(cx, |panes, cx| {
-                panes.open_agent_chat_tab_in_active_group(cwd, None, backend, window, cx)
+                panes.open_agent_chat_tab_in_active_group(cwd, None, backend, None, window, cx)
             })
         })
         .map_err(|_| LaunchError::Unavailable)?

@@ -80,11 +80,15 @@ impl ProjectPanes {
     /// in a list that reorders, whereas the session id is stable for the view's
     /// lifetime and is what a remote caller actually asked for. Existing callers
     /// ignore it.
+    ///
+    /// `initial_prompt` is sent as the session's first message — see
+    /// [`PaneGroup::open_agent_chat_tab`].
     pub fn open_agent_chat_tab_in_active_group(
         &mut self,
         cwd: PathBuf,
         model: Option<String>,
         backend: oximux_agents::thread::ChatBackend,
+        initial_prompt: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
@@ -97,7 +101,7 @@ impl ProjectPanes {
         self.set_active_group(target_id, window, cx);
         let target = self.groups.get(&target_id).cloned()?;
         target.update(cx, |g, cx| {
-            let ix = g.open_agent_chat_tab(cwd, model, backend, window, cx);
+            let ix = g.open_agent_chat_tab(cwd, model, backend, initial_prompt, window, cx);
             g.chat_session_id_at(ix, cx)
         })
     }

@@ -2119,7 +2119,17 @@ impl AgentChatView {
 
     /// Record + transmit a submitted prompt (from the composer's Submit event).
     /// The composer has already cleared its own input.
-    fn send_text(&mut self, text: String, images: Vec<ChatImage>, cx: &mut Context<Self>) {
+    ///
+    /// `pub(crate)` so a tab opened with an initial prompt (a scheduled run) sends
+    /// it down exactly this path rather than a parallel one — the guards, the
+    /// deferred bind, the optimistic thread push and the remote tee all have to
+    /// apply equally to a prompt nobody typed.
+    pub(crate) fn send_text(
+        &mut self,
+        text: String,
+        images: Vec<ChatImage>,
+        cx: &mut Context<Self>,
+    ) {
         // An import bridge has no live backend — its composer is swapped for
         // Resume-in-terminal, so no send path should ever construct here. Guard
         // defensively in case a stray Submit event slips through.

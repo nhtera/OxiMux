@@ -735,7 +735,7 @@ impl WorkspaceRoot {
                             .unwrap_or_default();
                         if let Some(panes) = this.active_project_panes() {
                             panes.update(cx, |p, cx| {
-                                p.open_agent_chat_tab_in_active_group(cwd, None, backend, window, cx);
+                                p.open_agent_chat_tab_in_active_group(cwd, None, backend, None, window, cx);
                             });
                         }
                     } else {
@@ -781,7 +781,7 @@ impl WorkspaceRoot {
                         });
                     if let Some(panes) = this.active_project_panes() {
                         panes.update(cx, |p, cx| {
-                            p.open_agent_chat_tab_in_active_group(cwd, None, backend, window, cx);
+                            p.open_agent_chat_tab_in_active_group(cwd, None, backend, None, window, cx);
                         });
                     }
                 }
