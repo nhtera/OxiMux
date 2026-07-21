@@ -26,14 +26,15 @@ pub use crate::messages::*;
 /// (`ListTerminals`, `TermAttach`/`TermInput`/`TermResize`/`TermDetach`, and the
 /// pushed `TermOutput`/`TermGapped`/`TermExited` frames). v7: appended the
 /// session-control surface (`ListChoices` + `SetModel`/`SetPermissionMode`, and
-/// the `Choices` reply, plus `CreateSession`/`SessionCreated`).
+/// the `Choices` reply, plus `CreateSession`/`SessionCreated`). v8: appended
+/// `RewindSession`.
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 7;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// The oldest peer version this build still speaks. **Raise this only on a
 /// genuinely breaking change** — a reordered/removed variant or an altered
@@ -226,6 +227,28 @@ pub enum Request {
     /// defaulted: starting a *different* agent than the one asked for is worse
     /// than starting none.
     CreateSession { cwd: String, agent_id: Option<String> },
+    /// Rewind a session to an earlier turn: drop the user message at `ordinal`
+    /// (0-based, counting only user entries) and everything after it.
+    ///
+    /// **Destructive and not undoable from the client.** The host forks the
+    /// conversation to a new backing session rather than editing the original,
+    /// so the desktop retains a recovery path — but nothing on this protocol
+    /// exposes it. Write-gated.
+    ///
+    /// `ordinal` rather than an entry index because ordinals count only user
+    /// entries, so client and host agree even when their folds disagree about
+    /// how many rows a turn produced. The host re-validates it against its own
+    /// transcript and refuses a mismatch rather than truncating at the wrong
+    /// point.
+    ///
+    /// `include_files` additionally restores the working tree to the turn's
+    /// checkpoint. That is a **destructive filesystem write** — it discards
+    /// uncommitted work, including edits made outside this session and by the
+    /// person sitting at the desktop. It is accepted on the wire from this
+    /// version so enabling it later needs no new variant, but the host may
+    /// refuse it; a client must treat refusal as normal, not as an error to
+    /// retry.
+    RewindSession { session_id: String, ordinal: u32, include_files: bool },
 }
 
 /// Host → client.

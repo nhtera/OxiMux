@@ -13,6 +13,7 @@
 //! [`AgentChatView`]: crate::shell::agent_chat
 
 pub mod launch_bridge;
+pub mod rewind_bridge;
 pub mod relay_terminals;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,6 +34,7 @@ pub const KEEP_AWAKE_SETTING: &str = "remote.keep_awake";
 use oximux_agents::session_registry::{SessionHandle, SessionMeta, SessionRegistry};
 use oximux_agents::thread::AgentConnection;
 use oximux_remote_host::TerminalSource;
+use oximux_remote_host::RewindService;
 use oximux_remote_host::{SessionLauncher, 
     AppPubkey, AuthStore, DeviceInfo, DeviceStore, Dispatcher, PairedDevice, PairingSlot,
     mint_pairing_secret,
@@ -107,6 +109,9 @@ pub struct RemoteControl {
     /// whether this desktop can start sessions is not a fact an unauthorized
     /// client should be able to establish.
     launcher: Option<Arc<dyn SessionLauncher>>,
+    /// The desktop's rewind path, when one is installed. `None` answers
+    /// `RewindSession` with `Unauthorized`, as `launcher` does.
+    rewinder: Option<Arc<dyn RewindService>>,
     /// The live host's auth store while one is bound, so the paired-devices UI can
     /// revoke against the *running* host (the dispatcher rechecks authorization on
     /// every RPC, so a revoke lands mid-session). Cleared on stop — with no host, the
@@ -144,6 +149,7 @@ impl RemoteControl {
             devices: None,
             terminals: None,
             launcher: None,
+            rewinder: None,
             auth: Mutex::new(None),
             awake: Mutex::new(None),
             endpoint_secret: None,
@@ -168,6 +174,11 @@ impl RemoteControl {
     /// the relay client comes up.
     pub fn set_launcher(&mut self, launcher: Arc<dyn SessionLauncher>) {
         self.launcher = Some(launcher);
+    }
+
+    /// Install the rewind service the host serves. Called once at boot.
+    pub fn set_rewinder(&mut self, rewinder: Arc<dyn RewindService>) {
+        self.rewinder = Some(rewinder);
     }
 
     pub fn set_terminals(&mut self, terminals: Arc<dyn TerminalSource>) {
@@ -233,6 +244,9 @@ impl RemoteControl {
         }
         if let Some(launcher) = &self.launcher {
             dispatcher = dispatcher.with_launcher(Arc::clone(launcher));
+        }
+        if let Some(rewinder) = &self.rewinder {
+            dispatcher = dispatcher.with_rewinder(Arc::clone(rewinder));
         }
         dispatcher
     }

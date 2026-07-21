@@ -177,6 +177,45 @@ impl Dispatcher {
         }
     }
 
+    /// Rewind a session to an earlier turn.
+    ///
+    /// Gated on `may_write` like every state-changing RPC — and unlike
+    /// `create_session`, plain `may_write` is the right gate here: this names a
+    /// session, so a session-scoped device is already narrowed to the
+    /// conversations it may touch and needs no extra scope check.
+    ///
+    /// The client's `ordinal` is **not** trusted. It is validated against the
+    /// host's own transcript inside the service, because the phone's fold can
+    /// legitimately be behind — and truncating at the wrong point on a stale
+    /// ordinal would silently destroy turns the user meant to keep.
+    pub(super) async fn rewind_session(
+        &self,
+        pubkey: &AppPubkey,
+        session_id: &str,
+        ordinal: usize,
+        include_files: bool,
+    ) -> Response {
+        if !self.auth.may_write(pubkey, session_id) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(rewinder) = self.rewinder.as_ref() else {
+            return Response::Error(RpcError::Unauthorized);
+        };
+        match rewinder.rewind(session_id, ordinal, include_files).await {
+            // The truncation itself reaches the client as a `Rewound` event on
+            // the session stream — the same path a desktop-initiated rewind
+            // takes — so this only acknowledges that the rewind was accepted.
+            Ok(()) => Response::Ack,
+            Err(e) => {
+                // `RewindError`'s messages are curated to carry no host paths,
+                // unlike the underlying fork/checkpoint failures they stand for,
+                // which name session files and git objects.
+                tracing::warn!(error = %e, "remote rewind failed");
+                Response::Error(RpcError::BadRequest(e.to_string()))
+            }
+        }
+    }
+
     /// The model and permission-mode options this session's backend offers.
     ///
     /// A **read**, so it gates on `is_allowed_for` rather than `may_write`: a

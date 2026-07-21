@@ -1085,3 +1085,103 @@ async fn a_malformed_suggestion_is_refused_rather_than_sent() {
     client.disconnect().await;
     let _ = server.await;
 }
+
+/// A rewind driven from the phone, all the way through: the RPC crosses the
+/// wire, the host's service accepts it, and the resulting `Rewound` event folds
+/// onto the phone's *existing* subscription so the transcript truncates with no
+/// re-subscribe.
+///
+/// That last part is the property worth proving. A rewind swaps the desktop's
+/// underlying session file id, and if the registry key moved with it the phone's
+/// subscription would be pointing at a session that no longer exists — it would
+/// sit on a stale transcript with no error to show for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_phone_rewinds_a_session_and_its_transcript_truncates() {
+    let registry = Arc::new(SessionRegistry::new());
+    let handle = registry.register("sess-1".into(), Arc::new(StubConnection::default()));
+    handle.ingest(ThreadEvent::UserMessage { text: "first".into(), images: vec![] });
+    handle.ingest(ThreadEvent::AssistantText("reply one".into()));
+    handle.ingest(ThreadEvent::UserMessage { text: "second".into(), images: vec![] });
+    handle.ingest(ThreadEvent::AssistantText("reply two".into()));
+
+    // A rewind service standing in for the desktop: it records the request and
+    // emits the same `Rewound` event the real view emits once its fork lands.
+    struct EmittingRewinder {
+        handle: Arc<SessionHandle>,
+        calls: Mutex<Vec<(String, usize, bool)>>,
+    }
+    #[async_trait]
+    impl oximux_remote_host::RewindService for EmittingRewinder {
+        async fn rewind(
+            &self,
+            session_id: &str,
+            ordinal: usize,
+            include_files: bool,
+        ) -> Result<(), oximux_remote_host::RewindError> {
+            self.calls.lock().unwrap().push((session_id.to_string(), ordinal, include_files));
+            if include_files {
+                return Err(oximux_remote_host::RewindError::FilesUnsupported);
+            }
+            self.handle.ingest(ThreadEvent::Rewound { ordinal });
+            Ok(())
+        }
+    }
+
+    let rewinder =
+        Arc::new(EmittingRewinder { handle: handle.clone(), calls: Mutex::new(Vec::new()) });
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher =
+        Arc::new(Dispatcher::new(registry, auth).with_rewinder(rewinder.clone()));
+
+    let (client_t, server_t) = duplex_pair();
+    let server = {
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move { dispatcher.serve(&server_t).await })
+    };
+
+    let ticket =
+        PairingTicket { endpoint_id: [0u8; 32], handshake_secret: SECRET, session_id: None };
+    let client = MobileClient::new(Some(CLIENT_SEED.to_vec()));
+    let connector = Arc::new(LoopbackConnector { transport: Mutex::new(Some(Arc::new(client_t))) });
+    client
+        .connect_with(connector, ticket, "phone".into(), Arc::new(RecordingListener::default()))
+        .await
+        .expect("connect_with");
+
+    let sink = Arc::new(RecordingSink::default());
+    client.subscribe("sess-1".into(), sink.clone()).await.expect("subscribe");
+    let bootstrap = sink.latest_json();
+    assert!(
+        bootstrap.contains("second") && bootstrap.contains("reply two"),
+        "the phone starts holding both turns: {bootstrap}",
+    );
+
+    // Rewind to the second user message (ordinal 1) — it and its reply go.
+    client.rewind_session("sess-1".into(), 1, false).await.expect("rewind accepted");
+
+    let truncated = wait_until(|| !sink.latest_json().contains("reply two")).await;
+    assert!(truncated, "the transcript truncated, saw {}", sink.latest_json());
+    let latest = sink.latest_json();
+    assert!(
+        !latest.contains("second"),
+        "the rewound user turn is gone too, not just its reply: {latest}",
+    );
+    assert!(
+        latest.contains("first") && latest.contains("reply one"),
+        "everything before the rewind point survived: {latest}",
+    );
+    assert_eq!(
+        rewinder.calls.lock().unwrap().as_slice(),
+        &[("sess-1".to_string(), 1, false)],
+        "the ordinal crossed the wire unchanged",
+    );
+
+    // The files axis is refused, and the refusal surfaces as an error rather
+    // than a silent conversation-only rewind the caller would read as success.
+    let refused = client.rewind_session("sess-1".into(), 0, true).await;
+    assert!(refused.is_err(), "a refused files-axis rewind is an error, not a quiet success");
+
+    client.disconnect().await;
+    let _ = server.await;
+}

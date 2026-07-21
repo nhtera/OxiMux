@@ -75,13 +75,23 @@ pub struct Dispatcher {
     /// host can start sessions is not something an unauthorized client should be
     /// able to probe.
     launcher: Option<Arc<dyn crate::launcher::SessionLauncher>>,
+    /// The desktop's rewind path, when the host exposes it. `None` answers
+    /// `Unauthorized`, as `terminals` and `launcher` do.
+    rewinder: Option<Arc<dyn crate::rewind::RewindService>>,
     /// Wall clock (Unix seconds), injectable so tests are deterministic.
     now_secs: fn() -> u64,
 }
 
 impl Dispatcher {
     pub fn new(registry: Arc<SessionRegistry>, auth: Arc<AuthStore>) -> Self {
-        Self { registry, auth, terminals: None, launcher: None, now_secs: system_now_secs }
+        Self {
+            registry,
+            auth,
+            terminals: None,
+            launcher: None,
+            rewinder: None,
+            now_secs: system_now_secs,
+        }
     }
 
     /// Expose the desktop's terminals over this dispatcher.
@@ -93,6 +103,12 @@ impl Dispatcher {
     /// Let this dispatcher start new sessions on the desktop.
     pub fn with_launcher(mut self, launcher: Arc<dyn crate::launcher::SessionLauncher>) -> Self {
         self.launcher = Some(launcher);
+        self
+    }
+
+    /// Let this dispatcher rewind sessions on the desktop.
+    pub fn with_rewinder(mut self, rewinder: Arc<dyn crate::rewind::RewindService>) -> Self {
+        self.rewinder = Some(rewinder);
         self
     }
 

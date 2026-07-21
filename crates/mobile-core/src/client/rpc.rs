@@ -172,6 +172,30 @@ impl MobileClient {
             .map_err(|e| MobileError::Rpc(e.to_string()))
     }
 
+    /// Rewind a session to an earlier turn.
+    ///
+    /// **Destructive**: the turn at `ordinal` and everything after it are
+    /// dropped. Returns once the desktop accepts the rewind; the transcript
+    /// updates when the resulting `Rewound` event folds through the existing
+    /// subscription, so the caller does not apply anything itself.
+    ///
+    /// `include_files` also restores the working tree to that turn's snapshot,
+    /// discarding uncommitted work — including edits the person at the desktop
+    /// made outside this session. The desktop may refuse it and still perform
+    /// the conversation rewind.
+    pub async fn rewind_session(
+        &self,
+        session_id: String,
+        ordinal: u32,
+        include_files: bool,
+    ) -> Result<(), MobileError> {
+        let session = self.shared.session()?;
+        session
+            .rewind_session(&session_id, ordinal, include_files)
+            .await
+            .map_err(|e| MobileError::Rpc(e.to_string()))
+    }
+
     /// The models and permission modes this session's backend offers.
     ///
     /// Empty lists mean there is nothing to choose between — a dynamic-catalog

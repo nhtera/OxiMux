@@ -317,6 +317,27 @@ impl PaneGroup {
         }
     }
 
+    /// The chat view bound to `remote_session_id`, wherever it sits in this
+    /// group — active tab or not.
+    ///
+    /// Unlike [`Self::active_agent_chat_view`], a remote caller has no notion of
+    /// which tab happens to be focused: the phone addresses a session by id and
+    /// that session is usually in a background tab.
+    pub fn agent_chat_view_by_remote_id(
+        &self,
+        remote_session_id: &str,
+        cx: &gpui::App,
+    ) -> Option<Entity<crate::shell::agent_chat::AgentChatView>> {
+        self.tabs.iter().find_map(|tab| match &tab.content {
+            PaneContent::AgentChat(view)
+                if view.read(cx).remote_session_id() == remote_session_id =>
+            {
+                Some(view.clone())
+            }
+            _ => None,
+        })
+    }
+
     /// The active tab's agent session id, if the active tab is an agent.
     /// Used by "send to active agent" actions to route directly to the
     /// agent in the focused tab — the most common layout has terminal +

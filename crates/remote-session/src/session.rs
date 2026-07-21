@@ -245,6 +245,33 @@ impl RemoteSession {
         }
     }
 
+    /// Rewind a session to an earlier turn, dropping that turn and everything
+    /// after it.
+    ///
+    /// **Destructive and not undoable from here.** Returns once the host has
+    /// accepted the rewind, not once it has finished: the truncation arrives on
+    /// the event stream as `ThreadEvent::Rewound`, which is also how a
+    /// desktop-initiated rewind reaches this client, so there is one code path
+    /// applying it rather than two.
+    ///
+    /// `include_files` additionally restores the working tree to the turn's
+    /// checkpoint, discarding uncommitted work. The host may refuse it while
+    /// still performing the conversation rewind's validation; a caller should
+    /// treat that refusal as normal rather than retrying.
+    pub async fn rewind_session(
+        &self,
+        session_id: &str,
+        ordinal: u32,
+        include_files: bool,
+    ) -> Result<()> {
+        let req = Request::RewindSession {
+            session_id: session_id.to_string(),
+            ordinal,
+            include_files,
+        };
+        self.expect_ack(req).await
+    }
+
     /// Gap-fill: replay retained events after `after_seq` (the resync path when the
     /// live stream reports a `seq` jump).
     pub async fn events_since(&self, session_id: &str, after_seq: u64) -> Result<Vec<HostEvent>> {

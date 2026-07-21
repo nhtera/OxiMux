@@ -421,6 +421,24 @@ pub enum ThreadEvent {
     Notice(String),
     /// A protocol/parse/transport error to surface in the thread.
     Error(String),
+    /// A rewind landed: drop the user entry at `ordinal` and everything after.
+    ///
+    /// The only event that *removes* transcript rather than extending it, and
+    /// the reason it has to exist: a rewind truncates the desktop's in-memory
+    /// thread directly, which a remote subscriber folding this stream can never
+    /// observe. Without it a phone keeps the stale tail and then appends the
+    /// replacement turns after it, silently showing a conversation that never
+    /// happened.
+    ///
+    /// Carries the ordinal rather than an entry index because ordinals count
+    /// only user entries, so the two sides agree even if their folds disagree
+    /// about how many rows a turn produced — which they legitimately can, since
+    /// a subscriber that joined mid-session has a shorter entry list.
+    ///
+    /// Ingested only *after* the rewind has actually succeeded on disk. An
+    /// attempt that fails leaves the transcript alone, matching what the desktop
+    /// shows itself.
+    Rewound { ordinal: usize },
 }
 
 impl ThreadEvent {

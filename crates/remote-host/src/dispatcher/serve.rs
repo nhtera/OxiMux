@@ -239,6 +239,15 @@ impl Dispatcher {
             let response = self.create_session(&pubkey, &cwd, agent_id.as_deref()).await;
             return self.send(transport, response).await;
         }
+        // Rewinding round-trips to the desktop's UI thread like launching does.
+        if let Request::RewindSession { session_id, ordinal, include_files } = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response =
+                self.rewind_session(&pubkey, &session_id, ordinal as usize, include_files).await;
+            return self.send(transport, response).await;
+        }
         let response = self.dispatch(state, req);
         self.send(transport, response).await
     }

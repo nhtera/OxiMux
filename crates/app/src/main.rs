@@ -328,6 +328,14 @@ fn main() {
             remote_control.set_launcher(std::sync::Arc::new(launcher));
             oximux_app::remote_control::launch_bridge::serve_launches(requests, cx);
         }
+        // The same inbound shape for rewinds: the request crosses to this loop,
+        // which finds the tab holding that session and starts its rewind.
+        // Installed unconditionally, for the same reason as the launcher.
+        {
+            let (rewinder, requests) = oximux_app::remote_control::rewind_bridge::rewind_bridge();
+            remote_control.set_rewinder(std::sync::Arc::new(rewinder));
+            oximux_app::remote_control::rewind_bridge::serve_rewinds(requests, cx);
+        }
         cx.set_global(remote_control);
         // Restore the master switch. Installed disabled above, so without this a
         // desktop that had remote access on comes back with it off — and an

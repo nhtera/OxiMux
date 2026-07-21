@@ -651,6 +651,13 @@ impl ChatThread {
                 self.turn_active = false;
                 self.compacting = false;
             }
+            // The producer already performed the rewind; this replays the same
+            // truncation onto a subscriber's fold. `truncate_to_user` no-ops on
+            // an ordinal it cannot resolve, which is the right answer for a
+            // subscriber that joined after the target turn and never held it.
+            ThreadEvent::Rewound { ordinal } => {
+                self.truncate_to_user(*ordinal);
+            }
         }
     }
 
@@ -1490,6 +1497,45 @@ mod tests {
         let json = serde_json::to_string(&src.entries).expect("serialize entries");
         let back: Vec<ThreadEntry> = serde_json::from_str(&json).expect("deserialize entries");
         assert_eq!(back, src.entries);
+    }
+
+    /// A remote subscriber folds `Rewound` into the same truncation the desktop
+    /// performed directly. Without this the phone keeps the dropped tail and
+    /// then appends the replacement turns after it.
+    #[test]
+    fn rewound_truncates_a_subscribers_fold() {
+        let mut t = ChatThread::new();
+        t.apply(&ThreadEvent::UserMessage { text: "one".into(), images: vec![] });
+        t.apply(&ThreadEvent::AssistantText("A1".into()));
+        t.apply(&ThreadEvent::UserMessage { text: "two".into(), images: vec![] });
+        t.apply(&ThreadEvent::AssistantText("A2".into()));
+        assert_eq!(t.entries.len(), 4);
+
+        t.apply(&ThreadEvent::Rewound { ordinal: 1 });
+
+        assert_eq!(t.entries.len(), 2, "'two' and its reply are gone");
+        assert!(
+            !t.entries.iter().any(|e| matches!(e, ThreadEntry::User { text, .. } if text == "two")),
+            "the rewound turn is not still in the transcript",
+        );
+        // The replacement turn appends onto the truncated thread, not after a
+        // stale tail — the whole point of propagating the truncation.
+        t.apply(&ThreadEvent::UserMessage { text: "two-redo".into(), images: vec![] });
+        assert_eq!(t.entries.len(), 3);
+    }
+
+    /// A subscriber that joined mid-session never held the target turn. The
+    /// ordinal cannot resolve against its shorter fold, and dropping rows it
+    /// *did* legitimately receive would be worse than ignoring the event.
+    #[test]
+    fn rewound_past_a_late_subscribers_history_changes_nothing() {
+        let mut t = ChatThread::new();
+        t.apply(&ThreadEvent::UserMessage { text: "only".into(), images: vec![] });
+        t.apply(&ThreadEvent::AssistantText("A".into()));
+
+        t.apply(&ThreadEvent::Rewound { ordinal: 7 });
+
+        assert_eq!(t.entries.len(), 2, "an unresolvable ordinal truncates nothing");
     }
 
     #[test]
