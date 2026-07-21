@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { Pressable, StyleSheet, View } from 'react-native';
 
+import { MarkdownBody } from '@/components/chat/markdown-body';
+import { SubagentLogPanel } from '@/components/chat/subagent-log-panel';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
@@ -50,7 +52,7 @@ export function AssistantBubble({ message }: { message: AssistantMessage }) {
           {message.thinking}
         </ThemedText>
       ) : null}
-      {message.text ? <ThemedText style={styles.body}>{message.text}</ThemedText> : null}
+      {message.text ? <MarkdownBody text={message.text} /> : null}
     </View>
   );
 }
@@ -107,6 +109,8 @@ export function ToolCallCard({ call, children }: { call: ToolCall; children?: Re
         </ThemedText>
       ) : null}
 
+      <SubagentLogPanel lines={call.subagent_log} />
+
       {/* The approval card, when this call is blocked on one. */}
       {children}
     </View>
@@ -123,35 +127,9 @@ export function CompactionDivider({ summary }: { summary: string }) {
   );
 }
 
-export function TurnDiffCard({ files }: { files: TurnFileChange[] }) {
-  const theme = useTheme();
-  const added = files.reduce((n, f) => n + f.added, 0);
-  const removed = files.reduce((n, f) => n + f.removed, 0);
-  return (
-    <View style={[styles.tool, { backgroundColor: theme.backgroundElement }]}>
-      <ThemedText type="small">
-        {files.length === 1 ? '1 file changed' : `${files.length} files changed`}
-        {'  '}
-        <ThemedText type="small" style={styles.added}>
-          +{added}
-        </ThemedText>{' '}
-        <ThemedText type="small" style={styles.removed}>
-          −{removed}
-        </ThemedText>
-      </ThemedText>
-      {files.slice(0, 8).map((f) => (
-        <ThemedText key={f.path} type="code" numberOfLines={1} style={styles.muted}>
-          {f.path}
-        </ThemedText>
-      ))}
-      {files.length > 8 ? (
-        <ThemedText type="small" style={styles.muted}>
-          …and {files.length - 8} more
-        </ThemedText>
-      ) : null}
-    </View>
-  );
-}
+// `TurnDiffCard` moved to ./turn-diff-card.tsx when it gained an expandable
+// hunk view — re-exported so the transcript's import does not have to care.
+export { TurnDiffCard } from '@/components/chat/turn-diff-card';
 
 const styles = StyleSheet.create({
   body: { lineHeight: 22 },

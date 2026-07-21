@@ -93,7 +93,7 @@ function Entry({
     return <CompactionDivider summary={entry.ContextCompaction.summary} />;
   }
   if (isTurnDiff(entry)) {
-    return <TurnDiffCard files={entry.TurnDiff.files} />;
+    return <TurnDiffCard files={entry.TurnDiff.files} diff={entry.TurnDiff.diff} />;
   }
   if (isToolCall(entry)) {
     const call = entry.ToolCall;
