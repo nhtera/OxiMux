@@ -154,20 +154,21 @@ impl Forge {
     /// Pick the provider for the repo at `cwd` from its `origin` URL, or
     /// `None` when `origin` is neither a GitHub nor a GitLab host (or absent).
     ///
-    /// GitHub is tested **first**: a `github.com` URL can carry `gitlab` in its
-    /// path (e.g. `github.com/gitlab-tools/x`), which the GitLab substring
-    /// match would otherwise mis-claim. Returning `None` for an unsupported
-    /// remote lets callers skip the forge CLI entirely instead of firing `gh`
-    /// against, say, a Bitbucket repo. This single classification also replaces
-    /// the old `detect` + `supports_repo` pair (two identical `git remote`
-    /// shell-outs) — `detect().is_some()` is the gate.
+    /// Returning `None` for an unsupported remote lets callers skip the forge
+    /// CLI entirely instead of firing `gh` against, say, a Bitbucket repo. This
+    /// single classification also replaces the old `detect` + `supports_repo`
+    /// pair (two identical `git remote` shell-outs) — `detect().is_some()` is
+    /// the gate.
+    ///
+    /// The classification itself lives in [`oximux_git::forge::detect`], not
+    /// here: the remote surface needs the same answer and cannot reach this
+    /// crate. Its GitHub-first ordering is load-bearing (a `github.com` URL can
+    /// carry `gitlab` in its path), which is exactly the kind of detail two
+    /// copies would eventually disagree about.
     pub async fn detect(cwd: &Path) -> Option<Self> {
-        if oximux_git::gh::is_github_remote(cwd).await {
-            Some(Forge::Github(GithubForge))
-        } else if oximux_git::glab::is_gitlab_remote(cwd).await {
-            Some(Forge::Gitlab(GitlabForge))
-        } else {
-            None
+        match oximux_git::forge::detect(cwd).await? {
+            oximux_git::forge::ForgeHost::Github => Some(Forge::Github(GithubForge)),
+            oximux_git::forge::ForgeHost::Gitlab => Some(Forge::Gitlab(GitlabForge)),
         }
     }
 }

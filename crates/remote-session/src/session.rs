@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex};
 use futures::channel::oneshot;
 use oximux_agent_core::thread::{AskQuestion, ChatImage, PermissionDecision, QuestionAnswers};
 use oximux_remote_proto::messages::{
-    AnswerQuestionReq, ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionSummary,
+    AnswerQuestionReq, CheckRunWire, ForgeItemDetailWire, ForgeItemKindWire, ForgeItemWire,
+    ForgeStateWire, ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionSummary,
 };
 use oximux_remote_proto::proto::{Request, Response, RpcError, SessionChoices};
 use oximux_remote_proto::{HostEvent, Transport};
@@ -270,6 +271,63 @@ impl RemoteSession {
             include_files,
         };
         self.expect_ack(req).await
+    }
+
+    /// Issues or pull requests for the session's repository.
+    ///
+    /// **An empty list is a normal answer**, not a failure: a repo hosted
+    /// nowhere relevant, a forge CLI that is absent or signed out, or simply no
+    /// matching items all resolve to empty. The host cannot tell those apart, so
+    /// a caller must render "nothing here" rather than inventing a reason.
+    pub async fn list_forge_items(
+        &self,
+        session_id: &str,
+        kind: ForgeItemKindWire,
+        state: ForgeStateWire,
+        mine: bool,
+    ) -> Result<Vec<ForgeItemWire>> {
+        let req = Request::ListForgeItems {
+            session_id: session_id.to_string(),
+            kind,
+            state,
+            mine,
+        };
+        match self.call(req).await? {
+            Response::ForgeItems(items) => Ok(items),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "ForgeItems" }),
+        }
+    }
+
+    /// Body + author of one issue/PR. `None` when the forge CLI could not supply
+    /// it — distinct from an item whose body is genuinely empty.
+    pub async fn forge_item_detail(
+        &self,
+        session_id: &str,
+        kind: ForgeItemKindWire,
+        number: u64,
+    ) -> Result<Option<ForgeItemDetailWire>> {
+        let req = Request::GetForgeItemDetail {
+            session_id: session_id.to_string(),
+            kind,
+            number,
+        };
+        match self.call(req).await? {
+            Response::ForgeItemDetail(detail) => Ok(detail),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "ForgeItemDetail" }),
+        }
+    }
+
+    /// CI check runs for the current branch's pull request. Empty is normal —
+    /// no PR, no checks, or a forge with no pipeline mapping.
+    pub async fn list_forge_checks(&self, session_id: &str) -> Result<Vec<CheckRunWire>> {
+        let req = Request::ListForgeChecks { session_id: session_id.to_string() };
+        match self.call(req).await? {
+            Response::ForgeChecks(checks) => Ok(checks),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "ForgeChecks" }),
+        }
     }
 
     /// Gap-fill: replay retained events after `after_seq` (the resync path when the

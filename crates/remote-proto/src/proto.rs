@@ -27,14 +27,15 @@ pub use crate::messages::*;
 /// pushed `TermOutput`/`TermGapped`/`TermExited` frames). v7: appended the
 /// session-control surface (`ListChoices` + `SetModel`/`SetPermissionMode`, and
 /// the `Choices` reply, plus `CreateSession`/`SessionCreated`). v8: appended
-/// `RewindSession`.
+/// `RewindSession`. v9: appended the read-only forge surface
+/// (`ListForgeItems`, `GetForgeItemDetail`, `ListForgeChecks`).
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// The oldest peer version this build still speaks. **Raise this only on a
 /// genuinely breaking change** — a reordered/removed variant or an altered
@@ -249,6 +250,32 @@ pub enum Request {
     /// refuse it; a client must treat refusal as normal, not as an error to
     /// retry.
     RewindSession { session_id: String, ordinal: u32, include_files: bool },
+    /// Issues or pull requests for the session's repository.
+    ///
+    /// A **read** — gated on `is_allowed_for`, not `may_write`. The repository
+    /// is resolved from the session's own `cwd`, exactly as the git RPCs do, so
+    /// a session-scoped device can only ever reach the project it was scoped
+    /// to.
+    ///
+    /// No credential crosses this wire in either direction. The desktop runs
+    /// the forge CLI that is already signed in there; the phone never holds a
+    /// token.
+    ///
+    /// **An empty list is a normal answer, not a failure**: a repo hosted
+    /// nowhere relevant, a CLI that is absent or signed out, or simply no
+    /// matching items all resolve to empty. A client must render "nothing
+    /// here", never an error — the host cannot distinguish these cases and does
+    /// not pretend to.
+    ListForgeItems { session_id: String, kind: ForgeItemKindWire, state: ForgeStateWire, mine: bool },
+    /// Body + author of one issue/PR — the lazy companion to
+    /// [`Request::ListForgeItems`], whose rows omit the body so a 50-item list
+    /// stays small.
+    GetForgeItemDetail { session_id: String, kind: ForgeItemKindWire, number: u64 },
+    /// CI check runs for the current branch's pull request.
+    ///
+    /// Empty when there is no PR, no checks, or the forge does not report any —
+    /// including every GitLab repo, which has no pipeline mapping wired.
+    ListForgeChecks { session_id: String },
 }
 
 /// Host → client.
@@ -335,6 +362,14 @@ pub enum Response {
     /// registered under, so the client can subscribe to it directly rather than
     /// re-listing and guessing which row is new.
     SessionCreated { session_id: String },
+    /// Reply to [`Request::ListForgeItems`]. Empty is a normal answer.
+    ForgeItems(Vec<ForgeItemWire>),
+    /// Reply to [`Request::GetForgeItemDetail`]. `None` when the forge CLI
+    /// could not supply it — a distinct answer from an empty body, which is a
+    /// real item that simply has no description.
+    ForgeItemDetail(Option<ForgeItemDetailWire>),
+    /// Reply to [`Request::ListForgeChecks`]. Empty is a normal answer.
+    ForgeChecks(Vec<CheckRunWire>),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

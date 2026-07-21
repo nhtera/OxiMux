@@ -327,3 +327,72 @@ pub struct FileDiffWire {
     /// client may want to collapse it. Hunks are still complete — never truncated.
     pub large: bool,
 }
+
+/// One issue or pull request, mirroring `oximux_git::gh::ForgeItem`.
+///
+/// Re-declared here rather than reusing the git crate's type, for the same
+/// reason [`IndexStatusWire`] is: this crate is linked into the mobile core, and
+/// depending on `oximux-git` would drag the whole git layer — and its CLI
+/// shell-outs — into a phone build that can never use them.
+///
+/// The source type is `Deserialize`-only (it parses forge-CLI JSON), so it could
+/// not cross this wire even if the dependency were acceptable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeItemWire {
+    pub number: u64,
+    pub title: String,
+    /// `OPEN` / `CLOSED` / `MERGED`, forwarded verbatim.
+    ///
+    /// Not narrowed to an enum: the per-provider strings vary more than a fixed
+    /// set can absorb, and an unrecognised value would have to become a lossy
+    /// "other" — the same reasoning `CheckRun.bucket` follows upstream.
+    pub state: String,
+    pub url: String,
+    pub labels: Vec<String>,
+    pub assignees: Vec<String>,
+    /// Login of whoever opened it. Empty when the source omits it (a deleted
+    /// account), which renders as no attribution rather than a blank name.
+    pub author: String,
+    /// RFC-3339 last-update timestamp, or empty when the source omitted it.
+    /// Formatted client-side — the host does not know the reader's locale.
+    pub updated_at: String,
+}
+
+/// One CI check run, mirroring `oximux_git::gh::CheckRun`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckRunWire {
+    pub name: String,
+    /// `pass` / `fail` / `pending` / `skipping` / `cancel`, forwarded verbatim
+    /// from the forge CLI's own bucketing rather than re-derived here.
+    pub bucket: String,
+    pub link: String,
+    /// Short human blurb (e.g. "Successful in 2m"). Empty when absent.
+    pub description: String,
+}
+
+/// Body + author of one issue/PR, mirroring `oximux_git::gh::ItemDetail`.
+///
+/// Fetched separately from the listing because the body is markdown that can run
+/// to kilobytes; sending it for every row would make a 50-item list far more
+/// expensive than the list a phone actually renders.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ForgeItemDetailWire {
+    pub body: String,
+    pub author: String,
+}
+
+/// Whether to list issues or pull requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForgeItemKindWire {
+    Issue,
+    /// A GitHub pull request or GitLab merge request.
+    Pull,
+}
+
+/// Which items to list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForgeStateWire {
+    Open,
+    Closed,
+    All,
+}

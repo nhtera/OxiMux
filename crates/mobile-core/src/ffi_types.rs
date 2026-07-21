@@ -164,3 +164,111 @@ pub struct TerminalScreen {
     pub cols: u16,
     pub rows: u16,
 }
+
+/// One issue or pull request.
+///
+/// A flat projection of the wire row — labels and assignees arrive as plain
+/// strings rather than single-field records, because a record wrapping one
+/// string costs an FFI type for no added meaning.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ForgeItem {
+    pub number: u64,
+    pub title: String,
+    /// `OPEN` / `CLOSED` / `MERGED`, forwarded verbatim from the forge.
+    ///
+    /// Left as a string rather than narrowed to an enum: the per-provider values
+    /// vary more than a fixed set absorbs, and an unrecognised one would have to
+    /// collapse into a lossy "other" the app could not render meaningfully.
+    pub state: String,
+    pub url: String,
+    pub labels: Vec<String>,
+    pub assignees: Vec<String>,
+    /// Empty when the source omits it (a deleted account) — renders as no
+    /// attribution, not a blank name.
+    pub author: String,
+    /// RFC-3339, or empty when the source omitted it. Formatted app-side; the
+    /// desktop does not know the reader's locale.
+    pub updated_at: String,
+}
+
+impl From<oximux_remote_proto::messages::ForgeItemWire> for ForgeItem {
+    fn from(w: oximux_remote_proto::messages::ForgeItemWire) -> Self {
+        Self {
+            number: w.number,
+            title: w.title,
+            state: w.state,
+            url: w.url,
+            labels: w.labels,
+            assignees: w.assignees,
+            author: w.author,
+            updated_at: w.updated_at,
+        }
+    }
+}
+
+/// One CI check run.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CheckRun {
+    pub name: String,
+    /// `pass` / `fail` / `pending` / `skipping` / `cancel`, as the forge CLI
+    /// bucketed it. Not re-derived here — the CLI already normalises across
+    /// wildly varying per-provider status strings, and a second classification
+    /// would be a second thing to get wrong.
+    pub bucket: String,
+    pub link: String,
+    pub description: String,
+}
+
+impl From<oximux_remote_proto::messages::CheckRunWire> for CheckRun {
+    fn from(w: oximux_remote_proto::messages::CheckRunWire) -> Self {
+        Self { name: w.name, bucket: w.bucket, link: w.link, description: w.description }
+    }
+}
+
+/// Body + author of one issue/PR, fetched on demand.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ForgeItemDetail {
+    pub body: String,
+    pub author: String,
+}
+
+impl From<oximux_remote_proto::messages::ForgeItemDetailWire> for ForgeItemDetail {
+    fn from(w: oximux_remote_proto::messages::ForgeItemDetailWire) -> Self {
+        Self { body: w.body, author: w.author }
+    }
+}
+
+/// Whether to list issues or pull requests.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum ForgeItemKind {
+    Issue,
+    /// A GitHub pull request or GitLab merge request.
+    Pull,
+}
+
+impl From<ForgeItemKind> for oximux_remote_proto::messages::ForgeItemKindWire {
+    fn from(k: ForgeItemKind) -> Self {
+        match k {
+            ForgeItemKind::Issue => Self::Issue,
+            ForgeItemKind::Pull => Self::Pull,
+        }
+    }
+}
+
+/// Which items to list.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum ForgeState {
+    Open,
+    Closed,
+    All,
+}
+
+impl From<ForgeState> for oximux_remote_proto::messages::ForgeStateWire {
+    fn from(s: ForgeState) -> Self {
+        match s {
+            ForgeState::Open => Self::Open,
+            ForgeState::Closed => Self::Closed,
+            ForgeState::All => Self::All,
+        }
+    }
+}

@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use oximux_agent_core::thread::{AskQuestion, PermissionDecision, QuestionAnswers};
 
 use crate::client::MobileClient;
-use crate::ffi_types::{ChatImage, MobileError, PermissionReply, SessionChoices, SessionSummary};
+use crate::ffi_types::{
+    ChatImage, CheckRun, ForgeItem, ForgeItemDetail, ForgeItemKind, ForgeState, MobileError,
+    PermissionReply, SessionChoices, SessionSummary,
+};
 
 /// Correlates a queued prompt with its ack; unique per process is enough.
 static CORR: AtomicU64 = AtomicU64::new(1);
@@ -194,6 +197,63 @@ impl MobileClient {
             .rewind_session(&session_id, ordinal, include_files)
             .await
             .map_err(|e| MobileError::Rpc(e.to_string()))
+    }
+
+    /// Issues or pull requests for the session's repository.
+    ///
+    /// **Empty is a normal answer.** A repo hosted nowhere relevant, a forge CLI
+    /// that is absent or signed out on the desktop, or simply no matching items
+    /// all come back empty — the desktop cannot tell them apart, so the app must
+    /// show "nothing here" rather than guessing at a reason.
+    ///
+    /// No credential is involved on this device: the desktop runs the CLI that
+    /// is already signed in there.
+    pub async fn list_forge_items(
+        &self,
+        session_id: String,
+        kind: ForgeItemKind,
+        state: ForgeState,
+        mine: bool,
+    ) -> Result<Vec<ForgeItem>, MobileError> {
+        let session = self.shared.session()?;
+        let items = session
+            .list_forge_items(&session_id, kind.into(), state.into(), mine)
+            .await
+            .map_err(|e| MobileError::Rpc(e.to_string()))?;
+        Ok(items.into_iter().map(ForgeItem::from).collect())
+    }
+
+    /// Body + author of one issue/PR, fetched when it is opened.
+    ///
+    /// `None` means the desktop's forge CLI could not supply it — a different
+    /// answer from an item whose body is genuinely empty, which arrives as
+    /// `Some` with an empty string.
+    pub async fn forge_item_detail(
+        &self,
+        session_id: String,
+        kind: ForgeItemKind,
+        number: u64,
+    ) -> Result<Option<ForgeItemDetail>, MobileError> {
+        let session = self.shared.session()?;
+        let detail = session
+            .forge_item_detail(&session_id, kind.into(), number)
+            .await
+            .map_err(|e| MobileError::Rpc(e.to_string()))?;
+        Ok(detail.map(ForgeItemDetail::from))
+    }
+
+    /// CI check runs for the current branch's pull request. Empty when there is
+    /// no PR, no checks, or the forge reports none.
+    pub async fn list_forge_checks(
+        &self,
+        session_id: String,
+    ) -> Result<Vec<CheckRun>, MobileError> {
+        let session = self.shared.session()?;
+        let checks = session
+            .list_forge_checks(&session_id)
+            .await
+            .map_err(|e| MobileError::Rpc(e.to_string()))?;
+        Ok(checks.into_iter().map(CheckRun::from).collect())
     }
 
     /// The models and permission modes this session's backend offers.

@@ -239,6 +239,34 @@ impl Dispatcher {
             let response = self.create_session(&pubkey, &cwd, agent_id.as_deref()).await;
             return self.send(transport, response).await;
         }
+        // The forge RPCs shell out to `gh`/`glab`, so they are awaited here for
+        // the same reason the git reads are: a network-bound CLI call must not
+        // block the synchronous dispatch path.
+        // `item_state` rather than `state`: the connection's own `state` is in
+        // scope here, and shadowing it inside this arm would be a trap for the
+        // next edit.
+        if let Request::ListForgeItems { session_id, kind, state: item_state, mine } = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response =
+                self.list_forge_items(&pubkey, &session_id, kind, item_state, mine).await;
+            return self.send(transport, response).await;
+        }
+        if let Request::GetForgeItemDetail { session_id, kind, number } = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.forge_item_detail(&pubkey, &session_id, kind, number).await;
+            return self.send(transport, response).await;
+        }
+        if let Request::ListForgeChecks { session_id } = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.list_forge_checks(&pubkey, &session_id).await;
+            return self.send(transport, response).await;
+        }
         // Rewinding round-trips to the desktop's UI thread like launching does.
         if let Request::RewindSession { session_id, ordinal, include_files } = req {
             let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {

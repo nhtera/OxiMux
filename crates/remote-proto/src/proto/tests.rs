@@ -16,7 +16,7 @@ fn value_bearing_event() -> ThreadEvent {
 /// documented wire change, so an accidental edit fails here.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 8, "v8 = the appended rewind surface");
+    assert_eq!(PROTOCOL_VERSION, 9, "v9 = the appended read-only forge surface");
 }
 
 /// The floor moves only on a genuinely breaking change, never merely because
