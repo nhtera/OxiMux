@@ -174,6 +174,11 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "remote_devices_read_only",
         sql: include_str!("../migrations/V020__remote_devices_read_only.sql"),
     },
+    Migration {
+        version: 21,
+        name: "schedules",
+        sql: include_str!("../migrations/V021__schedules.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.
