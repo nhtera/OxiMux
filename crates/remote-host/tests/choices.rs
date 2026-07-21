@@ -237,3 +237,198 @@ async fn an_unknown_session_is_reported_as_such() {
     };
     futures::future::join(serve, script).await;
 }
+
+/// A launcher whose behaviour the test scripts, recording what it was asked for.
+struct ScriptedLauncher {
+    calls: std::sync::Mutex<Vec<(String, Option<String>)>>,
+    result: Result<String, ()>,
+}
+
+#[async_trait::async_trait]
+impl oximux_remote_host::SessionLauncher for ScriptedLauncher {
+    async fn create(
+        &self,
+        cwd: &str,
+        agent_id: Option<&str>,
+    ) -> Result<String, oximux_remote_host::LaunchError> {
+        self.calls.lock().unwrap().push((cwd.to_string(), agent_id.map(str::to_string)));
+        self.result
+            .clone()
+            .map_err(|_| oximux_remote_host::LaunchError::BadWorkingDirectory)
+    }
+}
+
+fn launcher(result: Result<String, ()>) -> Arc<ScriptedLauncher> {
+    Arc::new(ScriptedLauncher { calls: std::sync::Mutex::new(Vec::new()), result })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_access_device_starts_a_session_and_gets_its_id() {
+    let launcher = launcher(Ok("sess-new".into()));
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), auth)
+        .with_clock(clock)
+        .with_launcher(launcher.clone());
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32]))).await
+        else {
+            panic!("expected Registered");
+        };
+        let created = call(
+            &client,
+            Request::CreateSession { cwd: "/work/proj".into(), agent_id: Some("claude".into()) },
+        )
+        .await;
+        // The id comes back so the client can subscribe immediately, rather than
+        // re-listing and guessing which row is new.
+        assert_eq!(created, Response::SessionCreated { session_id: "sess-new".into() });
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+
+    assert_eq!(
+        launcher.calls.lock().unwrap().as_slice(),
+        &[("/work/proj".to_string(), Some("claude".to_string()))],
+        "cwd and agent reached the launcher unchanged",
+    );
+}
+
+/// A session-scoped device must not be able to create its way out of its scope.
+///
+/// This is the gate that does not follow from `may_write`: creating a session has
+/// no session id to narrow against, so the ordinary write check would wave a
+/// narrowed device straight through — and the session it created would be
+/// outside the confinement the desktop user chose, making the narrowing
+/// decorative.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_scoped_device_cannot_create_a_session() {
+    let launcher = launcher(Ok("sess-new".into()));
+    let auth = Arc::new(AuthStore::new());
+    // Paired against one session only — the narrowed tier.
+    auth.set_pairing(PairingSlot::new(SECRET, Some("sess-1".into()), false));
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), auth)
+        .with_clock(clock)
+        .with_launcher(launcher.clone());
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let mut req = register_req([0x33; 32]);
+        req.session_id = Some("sess-1".into());
+        let Response::Registered { .. } = call(&client, Request::Register(req)).await else {
+            panic!("expected Registered");
+        };
+        let created = call(
+            &client,
+            Request::CreateSession { cwd: "/work".into(), agent_id: None },
+        )
+        .await;
+        assert_eq!(created, Response::Error(RpcError::Unauthorized));
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+
+    // Checked at the launcher, not on the wire: an Unauthorized reply that still
+    // spawned a process would look identical from the client's side.
+    assert!(
+        launcher.calls.lock().unwrap().is_empty(),
+        "nothing reached the launcher, saw {:?}",
+        launcher.calls.lock().unwrap(),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_device_cannot_create_a_session() {
+    let launcher = launcher(Ok("sess-new".into()));
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let pubkey = [0x33; 32];
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), Arc::clone(&auth))
+        .with_clock(clock)
+        .with_launcher(launcher.clone());
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+        auth.set_read_only(&pubkey, true);
+        let created =
+            call(&client, Request::CreateSession { cwd: "/work".into(), agent_id: None }).await;
+        assert_eq!(created, Response::Error(RpcError::Unauthorized));
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+    assert!(launcher.calls.lock().unwrap().is_empty(), "nothing spawned");
+}
+
+/// A host with no launcher answers `Unauthorized`, not a distinct "unsupported".
+///
+/// Whether this desktop can start sessions is not something an unauthorized
+/// client should be able to probe — the same reasoning the terminal RPCs use for
+/// a missing `TerminalSource`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_without_a_launcher_is_indistinguishable_from_one_that_refuses() {
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), auth).with_clock(clock); // no launcher
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32]))).await
+        else {
+            panic!("expected Registered");
+        };
+        let created =
+            call(&client, Request::CreateSession { cwd: "/work".into(), agent_id: None }).await;
+        assert_eq!(created, Response::Error(RpcError::Unauthorized));
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+}
+
+/// A launch failure reports a category, never the desktop's own error text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_launch_reports_a_category_not_host_detail() {
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), auth)
+        .with_clock(clock)
+        .with_launcher(launcher(Err(())));
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32]))).await
+        else {
+            panic!("expected Registered");
+        };
+        let created = call(
+            &client,
+            Request::CreateSession { cwd: "/nope/missing".into(), agent_id: None },
+        )
+        .await;
+        match created {
+            Response::Error(RpcError::BadRequest(msg)) => {
+                // A launch failure routinely embeds absolute host paths (a
+                // missing directory, a binary off PATH). The category crosses;
+                // the detail is logged host-side.
+                assert!(!msg.contains("/nope/missing"), "no host path leaked: {msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+}

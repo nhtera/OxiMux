@@ -228,6 +228,23 @@ impl RemoteSession {
         self.expect_ack(req).await
     }
 
+    /// Start a new agent session on the desktop, returning its id.
+    ///
+    /// The id comes back rather than being discovered by re-listing, so the
+    /// caller can subscribe to the new session immediately instead of polling
+    /// and guessing which row appeared.
+    pub async fn create_session(&self, cwd: &str, agent_id: Option<&str>) -> Result<String> {
+        let req = Request::CreateSession {
+            cwd: cwd.to_string(),
+            agent_id: agent_id.map(str::to_string),
+        };
+        match self.call(req).await? {
+            Response::SessionCreated { session_id } => Ok(session_id),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "SessionCreated" }),
+        }
+    }
+
     /// Gap-fill: replay retained events after `after_seq` (the resync path when the
     /// live stream reports a `seq` jump).
     pub async fn events_since(&self, session_id: &str, after_seq: u64) -> Result<Vec<HostEvent>> {

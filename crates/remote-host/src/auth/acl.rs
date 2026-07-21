@@ -77,6 +77,31 @@ impl AuthStore {
         !self.inner.lock().unwrap().devices.get(pubkey).is_some_and(|d| d.read_only)
     }
 
+    /// May this device start a **new** agent session?
+    ///
+    /// Two gates in one, because creating a session is the only RPC with no
+    /// session id to scope against:
+    ///
+    /// - **Full scope required.** A session-scoped device confined to one
+    ///   conversation could otherwise create a second one and simply walk out of
+    ///   its own scope, which would make the narrowing decorative. So it is
+    ///   refused outright, the same reasoning as
+    ///   [`may_use_terminals`](Self::may_use_terminals).
+    /// - **Not read-only.** Spawning a process is as state-changing as it gets.
+    ///
+    /// Written as its own check rather than `may_write(pubkey, "")`. That
+    /// expression happens to behave identically today — an empty id matches no
+    /// scoped device — but only by accident of the sentinel, and a reader cannot
+    /// tell whether the empty string is load-bearing or a placeholder. This says
+    /// what it means.
+    pub fn may_create_sessions(&self, pubkey: &AppPubkey) -> bool {
+        let st = self.inner.lock().unwrap();
+        matches!(
+            st.devices.get(pubkey),
+            Some(d) if !d.revoked && !d.read_only && matches!(d.scope, DeviceScope::Full)
+        )
+    }
+
     /// Every recorded device — the data behind the paired-devices list, its
     /// revoke/forget actions, and its read-only toggle.
     ///

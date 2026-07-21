@@ -16,6 +16,7 @@
 pub mod auth;
 pub mod dispatcher;
 pub mod identity;
+pub mod launcher;
 pub mod terminals;
 
 pub use auth::{
@@ -25,4 +26,5 @@ pub use auth::{
 };
 pub use dispatcher::Dispatcher;
 pub use identity::HostIdentity;
+pub use launcher::{LaunchError, SessionLauncher};
 pub use terminals::{TerminalAttach, TerminalError, TerminalFrame, TerminalSource};

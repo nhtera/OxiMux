@@ -70,18 +70,29 @@ pub struct Dispatcher {
     /// deliberately — "this host has no terminals" and "you may not see them"
     /// are not distinctions worth leaking to a client.
     terminals: Option<Arc<dyn crate::terminals::TerminalSource>>,
+    /// The desktop's session-launch path, when the host exposes it. `None`
+    /// answers `Unauthorized` for the same reason `terminals` does — whether a
+    /// host can start sessions is not something an unauthorized client should be
+    /// able to probe.
+    launcher: Option<Arc<dyn crate::launcher::SessionLauncher>>,
     /// Wall clock (Unix seconds), injectable so tests are deterministic.
     now_secs: fn() -> u64,
 }
 
 impl Dispatcher {
     pub fn new(registry: Arc<SessionRegistry>, auth: Arc<AuthStore>) -> Self {
-        Self { registry, auth, terminals: None, now_secs: system_now_secs }
+        Self { registry, auth, terminals: None, launcher: None, now_secs: system_now_secs }
     }
 
     /// Expose the desktop's terminals over this dispatcher.
     pub fn with_terminals(mut self, terminals: Arc<dyn crate::terminals::TerminalSource>) -> Self {
         self.terminals = Some(terminals);
+        self
+    }
+
+    /// Let this dispatcher start new sessions on the desktop.
+    pub fn with_launcher(mut self, launcher: Arc<dyn crate::launcher::SessionLauncher>) -> Self {
+        self.launcher = Some(launcher);
         self
     }
 

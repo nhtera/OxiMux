@@ -138,6 +138,45 @@ impl Dispatcher {
         Response::Events(frames)
     }
 
+    /// Start a new agent session on the desktop.
+    ///
+    /// **The only RPC that creates rather than drives**, so the authorization is
+    /// worth stating plainly: it gates on `may_write` with **no session id**,
+    /// because there is no session yet to scope against. That has a consequence
+    /// the other write gates do not have — a device the desktop narrowed to a
+    /// single session must not be able to create a second one and escape its own
+    /// scope, so a session-scoped device is refused outright here.
+    ///
+    /// A host with no launcher configured answers `Unauthorized` rather than a
+    /// distinct "not supported": whether this desktop can start sessions is not
+    /// something an unauthorized client should be able to probe, matching how
+    /// the terminal RPCs treat a missing `TerminalSource`.
+    pub(super) async fn create_session(
+        &self,
+        pubkey: &AppPubkey,
+        cwd: &str,
+        agent_id: Option<&str>,
+    ) -> Response {
+        // Refuse a session-scoped device before anything else: `may_write` alone
+        // would let one through, since it has no session to narrow against.
+        if !self.auth.may_create_sessions(pubkey) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(launcher) = self.launcher.as_ref() else {
+            return Response::Error(RpcError::Unauthorized);
+        };
+        match launcher.create(cwd, agent_id).await {
+            Ok(session_id) => Response::SessionCreated { session_id },
+            Err(e) => {
+                // The launcher's own error text routinely embeds absolute host
+                // paths (a missing directory, a binary off `PATH`), so it is
+                // logged here and only the category crosses the wire.
+                tracing::warn!(error = %e, "remote session launch failed");
+                Response::Error(RpcError::BadRequest(e.to_string()))
+            }
+        }
+    }
+
     /// The model and permission-mode options this session's backend offers.
     ///
     /// A **read**, so it gates on `is_allowed_for` rather than `may_write`: a

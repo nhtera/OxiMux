@@ -230,6 +230,15 @@ impl Dispatcher {
             let response = self.git_commit(&pubkey, &session_id, &message).await;
             return self.send(transport, response).await;
         }
+        // Launching is async (it round-trips to the desktop's UI thread), so it
+        // is awaited here rather than in the sync `dispatch`, like the git RPCs.
+        if let Request::CreateSession { cwd, agent_id } = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.create_session(&pubkey, &cwd, agent_id.as_deref()).await;
+            return self.send(transport, response).await;
+        }
         let response = self.dispatch(state, req);
         self.send(transport, response).await
     }

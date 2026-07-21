@@ -26,7 +26,7 @@ pub use crate::messages::*;
 /// (`ListTerminals`, `TermAttach`/`TermInput`/`TermResize`/`TermDetach`, and the
 /// pushed `TermOutput`/`TermGapped`/`TermExited` frames). v7: appended the
 /// session-control surface (`ListChoices` + `SetModel`/`SetPermissionMode`, and
-/// the `Choices` reply).
+/// the `Choices` reply, plus `CreateSession`/`SessionCreated`).
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
@@ -209,6 +209,23 @@ pub enum Request {
     /// Switch the session's permission mode. Same fix-at-spawn caveat as
     /// [`Request::SetModel`].
     SetPermissionMode { session_id: String, mode: String },
+    /// Start a new agent session on the desktop.
+    ///
+    /// **The only RPC that creates rather than drives**, and so the
+    /// highest-privilege one here: it spawns a process on the developer's
+    /// machine. Write-gated, so a read-only device is refused.
+    ///
+    /// `cwd` is whatever the client sends, by an explicit product decision. That
+    /// is not a new capability — a paired device already has shell access via
+    /// [`Request::TermInput`] and could `cd` anywhere and launch an agent itself
+    /// — but the host still validates the path is a real directory rather than
+    /// trusting it.
+    ///
+    /// `agent_id` picks which configured agent to start; `None` takes the
+    /// desktop's default. An unknown id is refused rather than silently
+    /// defaulted: starting a *different* agent than the one asked for is worse
+    /// than starting none.
+    CreateSession { cwd: String, agent_id: Option<String> },
 }
 
 /// Host → client.
@@ -291,6 +308,10 @@ pub enum Response {
     TermExited { pty_id: String, code: Option<i32> },
     /// Reply to [`Request::ListChoices`].
     Choices(SessionChoices),
+    /// Reply to [`Request::CreateSession`] — the id the new session is
+    /// registered under, so the client can subscribe to it directly rather than
+    /// re-listing and guessing which row is new.
+    SessionCreated { session_id: String },
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.
