@@ -154,6 +154,24 @@ impl MobileClient {
         session.cancel(&session_id).await.map_err(|e| MobileError::Rpc(e.to_string()))
     }
 
+    /// Start a new agent session on the desktop, returning its id so the caller
+    /// can open it immediately rather than re-listing and guessing which row is
+    /// new.
+    ///
+    /// `cwd` must be a path that exists on the **desktop**, not the phone. A
+    /// desktop with no window open, or one that cannot start sessions, refuses.
+    pub async fn create_session(
+        &self,
+        cwd: String,
+        agent_id: Option<String>,
+    ) -> Result<String, MobileError> {
+        let session = self.shared.session()?;
+        session
+            .create_session(&cwd, agent_id.as_deref())
+            .await
+            .map_err(|e| MobileError::Rpc(e.to_string()))
+    }
+
     /// The models and permission modes this session's backend offers.
     ///
     /// Empty lists mean there is nothing to choose between — a dynamic-catalog

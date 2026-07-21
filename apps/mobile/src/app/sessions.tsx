@@ -5,11 +5,13 @@ import { FlatList, Pressable, RefreshControl, StyleSheet, TextInput, View } from
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ConnectionBadge } from '@/components/connection-badge';
+import { NewSessionSheet } from '@/components/new-session-sheet';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { useClient } from '@/native/client';
+import { describeError } from '@/native/errors';
 import { filterSessions } from '@/native/session-filter';
 
 export default function SessionsScreen() {
@@ -19,6 +21,32 @@ export default function SessionsScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [query, setQuery] = useState('');
   const theme = useTheme();
+  const client = useClient((s) => s.client);
+  const [creating, setCreating] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [createError, setCreateError] = useState<string>();
+
+  const create = useCallback(
+    async (cwd: string) => {
+      if (!client) return;
+      setBusy(true);
+      setCreateError(undefined);
+      try {
+        const sessionId = await client.createSession(cwd, undefined);
+        setCreating(false);
+        // Straight into the new session rather than back to a list the user then
+        // has to find it in — the id comes back from the host precisely so this
+        // does not need a refresh-and-guess.
+        router.push({ pathname: '/session/[id]', params: { id: sessionId } });
+        void refreshSessions();
+      } catch (e) {
+        setCreateError(describeError(e));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [client, refreshSessions]
+  );
 
   const visible = filterSessions(sessions, query);
   const filtering = query.trim().length > 0;
@@ -46,6 +74,9 @@ export default function SessionsScreen() {
           {/* The only route off this screen that isn't a session. Without it a
               paired device has no way back to pairing — see settings.tsx. */}
           <View style={styles.headerActions}>
+            <Pressable onPress={() => setCreating(true)} accessibilityLabel="New session">
+              <ThemedText type="code">New</ThemedText>
+            </Pressable>
             <Link href="/terminals">
               <ThemedText type="code">Terminals</ThemedText>
             </Link>
@@ -91,6 +122,16 @@ export default function SessionsScreen() {
                   : 'Waiting for the host…'}
             </ThemedText>
           }
+        />
+        <NewSessionSheet
+          visible={creating}
+          busy={busy}
+          error={createError}
+          onCreate={create}
+          onClose={() => {
+            setCreating(false);
+            setCreateError(undefined);
+          }}
         />
       </SafeAreaView>
     </ThemedView>
