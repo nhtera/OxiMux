@@ -1,4 +1,4 @@
-//! Ref-counted prevent-idle-sleep assertion, held for two independent reasons.
+//! Ref-counted prevent-idle-sleep assertion, held for three independent reasons.
 //!
 //! **Agents:** each agent-tab status watcher acquires an [`AwakeHold`] when its
 //! agent enters `Running` and drops it on the way out (or when the tab closes —
@@ -9,6 +9,11 @@
 //! only reach a Mac that is awake, so without it remote control quietly stops
 //! working a few minutes after the user walks away — the failure it exists to
 //! prevent looks exactly like the feature being broken.
+//!
+//! **Scheduling:** a schedule armed to fire later holds one until it does. Note
+//! this only prevents *idle sleep while the app is running* — it cannot wake a
+//! sleeping Mac or relaunch a quit app, so an overnight schedule still needs the
+//! app left open.
 //!
 //! Each reason has its own user toggle (Notifications → "Keep Mac awake while
 //! agents run", Remote → "Keep this Mac awake while on"), and they are tracked
@@ -37,10 +42,10 @@ pub trait SleepAssertionBackend: Send + Sync {
 /// One independent justification for staying awake: how many things currently
 /// want it, and whether the user has allowed this particular reason.
 ///
-/// Two of these share a single OS assertion. They are kept separate rather than
-/// summed into one count and one flag because the flags are different user
-/// settings — turning off "keep awake while agents run" must not also let the
-/// machine sleep on a paired phone, and vice versa.
+/// These share a single OS assertion. They are kept separate rather than summed
+/// into one count and one flag because the flags are different user settings —
+/// turning off "keep awake while agents run" must not also let the machine sleep
+/// on a paired phone, or decide that scheduled runs may be missed.
 #[derive(Default)]
 struct Reason {
     holds: usize,
@@ -56,6 +61,7 @@ impl Reason {
 struct State {
     agent: Reason,
     remote: Reason,
+    scheduling: Reason,
     assertion: Option<u32>,
 }
 
@@ -71,6 +77,7 @@ impl AgentAwake {
             state: Mutex::new(State {
                 agent: Reason { holds: 0, enabled },
                 remote: Reason { holds: 0, enabled },
+                scheduling: Reason { holds: 0, enabled },
                 assertion: None,
             }),
         }
@@ -86,6 +93,25 @@ impl AgentAwake {
     /// being up is its own justification independent of any agent running.
     pub fn acquire_remote(self: &Arc<Self>) -> AwakeHold {
         self.acquire_for(Source::Remote)
+    }
+
+    /// Keep the machine awake while a schedule is armed to fire.
+    ///
+    /// Its own reason for the same purpose the other two are separate: a user
+    /// who turned off "keep awake while agents run" has not thereby said their
+    /// scheduled runs should be missed.
+    ///
+    /// This only prevents **idle sleep while the app is running**. It cannot
+    /// wake a Mac that is already asleep, and it cannot relaunch a quit app —
+    /// so an overnight schedule still needs the app left open. Every surface
+    /// that creates a schedule is expected to say so.
+    pub fn acquire_scheduling(self: &Arc<Self>) -> AwakeHold {
+        self.acquire_for(Source::Scheduling)
+    }
+
+    /// The scheduling counterpart of [`set_enabled`](Self::set_enabled).
+    pub fn set_scheduling_enabled(&self, enabled: bool) {
+        self.set_enabled_for(Source::Scheduling, enabled);
     }
 
     fn acquire_for(self: &Arc<Self>, source: Source) -> AwakeHold {
@@ -140,7 +166,7 @@ impl AgentAwake {
     /// `pmset -g assertions`); churning the assertion to keep the label current
     /// would trade a real resource for a cosmetic one.
     fn reevaluate(&self, state: &mut State) {
-        let want = state.agent.wants() || state.remote.wants();
+        let want = state.agent.wants() || state.remote.wants() || state.scheduling.wants();
         match (want, state.assertion) {
             (true, None) => {
                 state.assertion = self.backend.create(assertion_name(state));
@@ -166,8 +192,10 @@ impl AgentAwake {
         (s.agent.holds, s.assertion.is_some())
     }
 
+    /// Whether the OS assertion is currently held. Test-only, and `pub(crate)` so
+    /// sibling modules that take holds (the scheduler) can assert on the effect.
     #[cfg(test)]
-    fn asserted(&self) -> bool {
+    pub(crate) fn asserted(&self) -> bool {
         self.lock_state().assertion.is_some()
     }
 }
@@ -178,6 +206,7 @@ impl AgentAwake {
 enum Source {
     Agent,
     Remote,
+    Scheduling,
 }
 
 impl Source {
@@ -185,6 +214,7 @@ impl Source {
         match self {
             Source::Agent => &mut state.agent,
             Source::Remote => &mut state.remote,
+            Source::Scheduling => &mut state.scheduling,
         }
     }
 }
@@ -193,9 +223,13 @@ impl Source {
 /// the actual cause so someone hunting a machine that won't sleep is not sent
 /// looking for an agent that isn't running.
 fn assertion_name(state: &State) -> &'static str {
-    match (state.agent.wants(), state.remote.wants()) {
-        (true, true) => "OxiMux agent running, remote access on",
-        (false, true) => "OxiMux remote access on",
+    match (state.agent.wants(), state.remote.wants(), state.scheduling.wants()) {
+        (true, true, _) => "OxiMux agent running, remote access on",
+        (false, true, _) => "OxiMux remote access on",
+        // Named last so an agent actually running still reads as the cause; a
+        // schedule merely armed is the weakest of the three explanations for a
+        // machine that will not sleep.
+        (false, false, true) => "OxiMux schedule armed",
         _ => "OxiMux agent running",
     }
 }
@@ -436,5 +470,53 @@ mod tests {
         let awake = Arc::new(AgentAwake::with_backend(Arc::new(FailBackend), true));
         let _h = awake.acquire();
         assert_eq!(awake.snapshot(), (1, false));
+    }
+
+    /// An armed schedule holds the assertion on its own — with no agent running
+    /// and remote off. Without this a scheduled run set for later would sit
+    /// behind an idle-sleeping Mac and silently never fire.
+    #[test]
+    fn a_scheduling_hold_asserts_by_itself() {
+        let backend = Arc::new(MockBackend::default());
+        let awake = Arc::new(AgentAwake::with_backend(backend.clone(), true));
+        assert!(!awake.asserted(), "nothing wants it yet");
+
+        let hold = awake.acquire_scheduling();
+        assert!(awake.asserted(), "an armed schedule is its own reason to stay awake");
+        assert_eq!(*backend.last_name.lock().unwrap(), "OxiMux schedule armed");
+
+        drop(hold);
+        assert!(!awake.asserted(), "released when no schedule is armed");
+    }
+
+    /// The three reasons are refcounted independently: releasing one must not
+    /// drop an assertion another still wants.
+    #[test]
+    fn scheduling_and_agent_holds_do_not_release_each_other() {
+        let awake = Arc::new(AgentAwake::with_backend(Arc::new(MockBackend::default()), true));
+        let agent = awake.acquire();
+        let scheduling = awake.acquire_scheduling();
+        assert!(awake.asserted());
+
+        drop(agent);
+        assert!(awake.asserted(), "the schedule still wants it");
+
+        drop(scheduling);
+        assert!(!awake.asserted(), "now nothing does");
+    }
+
+    /// Each reason has its own user toggle. Turning off "keep awake while agents
+    /// run" must not also decide that scheduled runs may be missed.
+    #[test]
+    fn disabling_the_agent_reason_leaves_scheduling_holding() {
+        let awake = Arc::new(AgentAwake::with_backend(Arc::new(MockBackend::default()), true));
+        let _agent = awake.acquire();
+        let _scheduling = awake.acquire_scheduling();
+
+        awake.set_enabled(false);
+        assert!(awake.asserted(), "scheduling is a separate preference");
+
+        awake.set_scheduling_enabled(false);
+        assert!(!awake.asserted(), "both off, nothing holds");
     }
 }

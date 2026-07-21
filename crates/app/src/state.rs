@@ -88,6 +88,17 @@ impl AppState {
     pub fn remote_device_repo(&self) -> RemoteDeviceRepo {
         RemoteDeviceRepo::new(self.db.clone())
     }
+
+    /// The scheduled-run store, built on demand for the same reason as
+    /// [`Self::remote_device_repo`]: it is taken once at startup and is just a
+    /// handle on the shared connection.
+    ///
+    /// Shares the app's `Db` rather than opening its own connection — SQLite
+    /// serializes writers, so a second connection would turn lock contention
+    /// between the scheduler and the rest of the app into `SQLITE_BUSY`.
+    pub fn schedule_store(&self) -> oximux_agents::schedule::ScheduleStore {
+        oximux_agents::schedule::ScheduleStore::new(self.db.conn())
+    }
 }
 
 /// Load recent projects + their workspaces, then mark every alive-at-

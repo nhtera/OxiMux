@@ -361,6 +361,11 @@ fn main() {
         if remote_was_on {
             oximux_app::remote_control::RemoteControl::resume_at_launch(cx);
         }
+        // Start the scheduled-run ticker. Installed unconditionally: with no
+        // schedules it costs one indexed read every tick and takes no keep-awake
+        // hold, and gating it on "are there any schedules" would mean the first
+        // one created never fires until the next launch.
+        oximux_app::scheduler::Scheduler::install(app_state.schedule_store(), cx);
         // Install the full keymap (registry defaults ⊕ keybindings.toml
         // overrides) — this covers the menu-action chords too, and MUST run
         // before `set_menus`: GPUI reads the keymap when it builds the menu

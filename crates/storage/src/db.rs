@@ -43,6 +43,22 @@ impl Db {
         let guard = self.conn.lock().expect("Db mutex poisoned");
         f(&guard).map_err(StorageError::Query)
     }
+
+    /// The shared connection handle, for a store that owns its own statements
+    /// and needs transactions.
+    ///
+    /// [`Self::with_conn`] hands out a `&Connection`, which cannot begin a
+    /// transaction (that needs `&mut`). A store doing multi-statement writes —
+    /// where a crash between statements would leave inconsistent rows — needs
+    /// the handle itself.
+    ///
+    /// Sharing the same `Arc` rather than opening a second connection is the
+    /// point: SQLite serializes writers, and a second connection would turn a
+    /// lock contention into `SQLITE_BUSY` errors between two halves of the same
+    /// application.
+    pub fn conn(&self) -> Arc<Mutex<Connection>> {
+        self.conn.clone()
+    }
 }
 
 /// Open a SQLite database at `path`, applying WAL + FK + busy-timeout

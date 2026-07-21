@@ -11,6 +11,7 @@ pub mod left_rail_layout;
 pub mod notifier;
 pub mod project_panes_factory;
 pub mod remote_control;
+pub mod scheduler;
 pub mod shell;
 pub mod state;
 pub mod workspace_root;
