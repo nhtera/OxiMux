@@ -7,9 +7,11 @@ import { ConnectionBadge } from '@/components/connection-badge';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
+import { useTheme } from '@/hooks/use-theme';
 import { useClient } from '@/native/client';
 import { fromBase64 } from '@/native/base64';
 import { loadHost, type PairedHost } from '@/native/hosts';
+import { useThemePreference, type ThemePreference } from '@/stores/theme-preference';
 
 /**
  * Connection details and the way out of a pairing.
@@ -62,6 +64,11 @@ export default function SettingsScreen() {
           </View>
 
           <View style={styles.section}>
+            <ThemedText type="smallBold">Appearance</ThemedText>
+            <ThemePicker />
+          </View>
+
+          <View style={styles.section}>
             <ThemedText type="smallBold">Paired desktop</ThemedText>
             {host ? (
               <>
@@ -107,6 +114,47 @@ export default function SettingsScreen() {
   );
 }
 
+const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
+  { value: 'system', label: 'System' },
+  { value: 'light', label: 'Light' },
+  { value: 'dark', label: 'Dark' },
+];
+
+/**
+ * Three-way theme choice. `System` is listed first because it is the default and
+ * the one most people keep.
+ */
+function ThemePicker() {
+  const theme = useTheme();
+  const preference = useThemePreference((s) => s.preference);
+  const setPreference = useThemePreference((s) => s.setPreference);
+
+  return (
+    <View style={styles.segments}>
+      {THEME_OPTIONS.map((option) => {
+        const selected = option.value === preference;
+        return (
+          <Pressable
+            key={option.value}
+            onPress={() => setPreference(option.value)}
+            accessibilityRole="radio"
+            accessibilityState={{ selected }}
+            style={[
+              styles.segment,
+              { borderColor: theme.backgroundSelected },
+              selected && { backgroundColor: theme.backgroundSelected },
+            ]}
+          >
+            <ThemedText type="code" style={!selected && styles.muted}>
+              {option.label}
+            </ThemedText>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
 /**
  * The endpoint id as the desktop prints it: first four and last four bytes in
  * hex, middle elided.
@@ -132,4 +180,12 @@ const styles = StyleSheet.create({
   danger: { paddingVertical: Spacing.three },
   dangerText: { color: '#F85149' },
   hint: { opacity: 0.7 },
+  segments: { flexDirection: 'row', gap: Spacing.two },
+  segment: {
+    flex: 1,
+    alignItems: 'center',
+    paddingVertical: Spacing.two,
+    borderRadius: Spacing.two,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
 });

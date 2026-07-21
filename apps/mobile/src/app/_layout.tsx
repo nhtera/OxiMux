@@ -1,8 +1,21 @@
 import { DarkTheme, DefaultTheme, Stack, ThemeProvider } from 'expo-router';
-import { useColorScheme } from 'react-native';
+import { useEffect } from 'react';
+
+import { useColorScheme } from '@/hooks/use-color-scheme';
+import { useThemePreference } from '@/stores/theme-preference';
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
+  const load = useThemePreference((s) => s.load);
+
+  // Read the stored override once at startup. Until it resolves the app renders
+  // the OS scheme, which is the right default to flash: someone who never set a
+  // preference sees no change at all, and someone who did sees at most one frame
+  // of the system theme rather than a spinner.
+  useEffect(() => {
+    void load();
+  }, [load]);
+
   return (
     <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
       <Stack>

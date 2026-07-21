@@ -77,6 +77,7 @@ export default function SessionScreen() {
 
           <Composer
             turnActive={thread.turn_active}
+            slashCommands={thread.slash_commands}
             onSend={send}
             onSteer={steer}
             onCancel={cancel}

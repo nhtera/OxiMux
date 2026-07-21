@@ -1,20 +1,27 @@
 import { Link, router } from 'expo-router';
 import type { SessionSummary } from 'oximux-core';
 import { useCallback, useEffect, useState } from 'react';
-import { FlatList, Pressable, RefreshControl, StyleSheet, View } from 'react-native';
+import { FlatList, Pressable, RefreshControl, StyleSheet, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ConnectionBadge } from '@/components/connection-badge';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
+import { useTheme } from '@/hooks/use-theme';
 import { useClient } from '@/native/client';
+import { filterSessions } from '@/native/session-filter';
 
 export default function SessionsScreen() {
   const sessions = useClient((s) => s.sessions);
   const phase = useClient((s) => s.phase);
   const refreshSessions = useClient((s) => s.refreshSessions);
   const [refreshing, setRefreshing] = useState(false);
+  const [query, setQuery] = useState('');
+  const theme = useTheme();
+
+  const visible = filterSessions(sessions, query);
+  const filtering = query.trim().length > 0;
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -47,17 +54,41 @@ export default function SessionsScreen() {
             </Link>
           </View>
         </View>
+        {/* Hidden until there is enough to search: a lone session does not need
+            a filter, and the box would just be one more thing between the user
+            and the list. */}
+        {sessions.length > 1 ? (
+          <TextInput
+            value={query}
+            onChangeText={setQuery}
+            placeholder="Filter sessions…"
+            placeholderTextColor={theme.textSecondary}
+            autoCapitalize="none"
+            autoCorrect={false}
+            clearButtonMode="while-editing"
+            style={[
+              styles.search,
+              { backgroundColor: theme.backgroundElement, color: theme.text },
+            ]}
+          />
+        ) : null}
+
         <FlatList
-          data={sessions}
+          data={visible}
           keyExtractor={(s) => s.sessionId}
           renderItem={({ item }) => <SessionRow session={item} />}
           contentContainerStyle={styles.list}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} />}
           ListEmptyComponent={
             <ThemedText type="small" style={styles.empty}>
-              {phase === 'connected'
-                ? 'No agent sessions open on the desktop.'
-                : 'Waiting for the host…'}
+              {/* Kept distinct from the no-sessions state on purpose: telling a
+                  user whose filter matched nothing that the desktop has no
+                  sessions open would be a lie about the desktop. */}
+              {filtering
+                ? `No sessions match “${query.trim()}”.`
+                : phase === 'connected'
+                  ? 'No agent sessions open on the desktop.'
+                  : 'Waiting for the host…'}
             </ThemedText>
           }
         />
@@ -109,4 +140,12 @@ const styles = StyleSheet.create({
   rowText: { flex: 1, gap: Spacing.half },
   attention: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#F5A623' },
   empty: { textAlign: 'center', paddingTop: Spacing.five },
+  search: {
+    marginHorizontal: Spacing.four,
+    marginBottom: Spacing.three,
+    borderRadius: Spacing.two,
+    paddingHorizontal: Spacing.three,
+    paddingVertical: Spacing.two,
+    fontSize: 16,
+  },
 });

@@ -1,7 +1,8 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Pressable, StyleSheet, TextInput, View } from 'react-native';
 
 import { AttachmentStrip } from '@/components/chat/attachment-strip';
+import { filterCommands, SlashPalette, slashQuery } from '@/components/chat/slash-palette';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
@@ -10,6 +11,8 @@ import { MAX_ATTACHMENTS, pickImages, type Attachment } from '@/native/attachmen
 type Props = {
   /** True while a turn is running — swaps Send for Steer and offers Stop. */
   turnActive: boolean;
+  /** The agent's slash commands, for the composer palette. Names only. */
+  slashCommands?: string[];
   /** Resolves `false` when the prompt did not reach the desktop. */
   onSend: (text: string, images: Attachment[]) => Promise<boolean>;
   onSteer: (text: string) => Promise<boolean>;
@@ -28,12 +31,30 @@ type Props = {
  * running with images queued still sends. Silently dropping photos the user
  * deliberately attached would be the worse surprise of the two.
  */
-export function Composer({ turnActive, onSend, onSteer, onCancel, onError }: Props) {
+export function Composer({
+  turnActive,
+  slashCommands = [],
+  onSend,
+  onSteer,
+  onCancel,
+  onError,
+}: Props) {
   const theme = useTheme();
+  const inputRef = useRef<TextInput>(null);
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [busy, setBusy] = useState(false);
   const trimmed = text.trim();
+
+  const query = slashQuery(text);
+  const matches = query === undefined ? [] : filterCommands(slashCommands, query);
+
+  const chooseCommand = (command: string) => {
+    // Trailing space both dismisses the palette (a space ends the command name)
+    // and puts the cursor where arguments go, so the next keystroke is useful.
+    setText(`/${command} `);
+    inputRef.current?.focus();
+  };
   const steering = turnActive && attachments.length === 0;
   const canSubmit = (trimmed.length > 0 || attachments.length > 0) && !busy;
   const room = MAX_ATTACHMENTS - attachments.length;
@@ -82,7 +103,12 @@ export function Composer({ turnActive, onSend, onSteer, onCancel, onError }: Pro
         onRemove={(id) => setAttachments((current) => current.filter((a) => a.id !== id))}
       />
 
+      {matches.length > 0 ? (
+        <SlashPalette commands={matches} onSelect={chooseCommand} />
+      ) : null}
+
       <TextInput
+        ref={inputRef}
         value={text}
         onChangeText={setText}
         placeholder={steering ? 'Steer this turn…' : 'Send a prompt…'}
