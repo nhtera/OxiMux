@@ -920,6 +920,18 @@ fn entry_child_indices(
 }
 
 impl AgentChatView {
+    /// The key this view is registered under in the remote-control
+    /// [`SessionRegistry`].
+    ///
+    /// Exposed for the remote *launch* path, which has to answer a phone with
+    /// the id of the session it just asked for. It is available the instant the
+    /// view exists — the id is a process-local counter minted in
+    /// [`Self::new`], not something the backend hands back — so a caller can
+    /// read it without waiting for a connection.
+    pub fn remote_session_id(&self) -> &str {
+        &self.remote_session_id
+    }
+
     /// Construct a chat view and spawn its headless `claude` subprocess in
     /// `cwd`. A spawn failure degrades to a read-only error state rather than
     /// panicking, so the tab still opens and explains what went wrong.

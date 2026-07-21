@@ -12,6 +12,7 @@
 //!
 //! [`AgentChatView`]: crate::shell::agent_chat
 
+pub mod launch_bridge;
 pub mod relay_terminals;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -32,7 +33,7 @@ pub const KEEP_AWAKE_SETTING: &str = "remote.keep_awake";
 use oximux_agents::session_registry::{SessionHandle, SessionMeta, SessionRegistry};
 use oximux_agents::thread::AgentConnection;
 use oximux_remote_host::TerminalSource;
-use oximux_remote_host::{
+use oximux_remote_host::{SessionLauncher, 
     AppPubkey, AuthStore, DeviceInfo, DeviceStore, Dispatcher, PairedDevice, PairingSlot,
     mint_pairing_secret,
 };
@@ -101,6 +102,11 @@ pub struct RemoteControl {
     /// terminals to expose, and saying so distinctly would let an unauthorized
     /// client probe the host's configuration.
     terminals: Option<Arc<dyn TerminalSource>>,
+    /// The desktop's session-launch path, when one is installed. `None` answers
+    /// `CreateSession` with `Unauthorized` for the same reason `terminals` does:
+    /// whether this desktop can start sessions is not a fact an unauthorized
+    /// client should be able to establish.
+    launcher: Option<Arc<dyn SessionLauncher>>,
     /// The live host's auth store while one is bound, so the paired-devices UI can
     /// revoke against the *running* host (the dispatcher rechecks authorization on
     /// every RPC, so a revoke lands mid-session). Cleared on stop — with no host, the
@@ -137,6 +143,7 @@ impl RemoteControl {
             host: Mutex::new(None),
             devices: None,
             terminals: None,
+            launcher: None,
             auth: Mutex::new(None),
             awake: Mutex::new(None),
             endpoint_secret: None,
@@ -159,6 +166,10 @@ impl RemoteControl {
 
     /// Install the terminal source the host serves. Called once at boot, after
     /// the relay client comes up.
+    pub fn set_launcher(&mut self, launcher: Arc<dyn SessionLauncher>) {
+        self.launcher = Some(launcher);
+    }
+
     pub fn set_terminals(&mut self, terminals: Arc<dyn TerminalSource>) {
         self.terminals = Some(terminals);
     }
@@ -211,15 +222,19 @@ impl RemoteControl {
         (Arc::new(self.dispatcher(auth)), mint_pairing_secret())
     }
 
-    /// Build a dispatcher over the shared registry, exposing terminals when a
-    /// source is installed. Both host-preparation paths go through here so a
-    /// resumed host cannot quietly serve a different surface than a fresh one.
+    /// Build a dispatcher over the shared registry, exposing terminals and the
+    /// session launcher when they are installed. Both host-preparation paths go
+    /// through here so a resumed host cannot quietly serve a different surface
+    /// than a fresh one.
     fn dispatcher(&self, auth: Arc<AuthStore>) -> Dispatcher {
-        let dispatcher = Dispatcher::new(self.registry.clone(), auth);
-        match &self.terminals {
-            Some(terminals) => dispatcher.with_terminals(Arc::clone(terminals)),
-            None => dispatcher,
+        let mut dispatcher = Dispatcher::new(self.registry.clone(), auth);
+        if let Some(terminals) = &self.terminals {
+            dispatcher = dispatcher.with_terminals(Arc::clone(terminals));
         }
+        if let Some(launcher) = &self.launcher {
+            dispatcher = dispatcher.with_launcher(Arc::clone(launcher));
+        }
+        dispatcher
     }
 
     /// A fresh auth store seeded from the durable device list, retained so the

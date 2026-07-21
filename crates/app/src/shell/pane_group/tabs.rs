@@ -1167,6 +1167,20 @@ impl PaneGroup {
         self.toggle_terminal_for_chat(view, window, cx);
     }
 
+    /// The remote-control session id of the agent chat at `ix`, if that tab is
+    /// one.
+    ///
+    /// Exists for the remote launch path, which opens a tab and must answer the
+    /// phone with the id of the session it created. Reads it off the view rather
+    /// than tracking it separately, so there is no second copy to drift.
+    pub fn chat_session_id_at(&self, ix: usize, cx: &App) -> Option<String> {
+        let tab = self.tabs.get(ix)?;
+        let PaneContent::AgentChat(view) = &tab.content else {
+            return None;
+        };
+        Some(view.read(cx).remote_session_id().to_string())
+    }
+
     /// Toggle the ACTIVE tab between chat and its companion terminal view — the
     /// ⌃⇧V action, routed here by the workspace root. No-op unless the active tab
     /// is an agent chat.

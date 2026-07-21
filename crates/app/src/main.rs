@@ -318,6 +318,16 @@ fn main() {
         if let Some(terminals) = oximux_app::remote_control::relay_terminals::installed() {
             remote_control.set_terminals(terminals);
         }
+        // The inbound half: a phone asking for a new session hands the request
+        // to this loop, which opens the tab on the UI thread and answers with
+        // its id. Installed unconditionally — a host that never enables remote
+        // access simply never receives a request, and wiring it later would mean
+        // remote could be switched on before the launcher existed.
+        {
+            let (launcher, requests) = oximux_app::remote_control::launch_bridge::launch_bridge();
+            remote_control.set_launcher(std::sync::Arc::new(launcher));
+            oximux_app::remote_control::launch_bridge::serve_launches(requests, cx);
+        }
         cx.set_global(remote_control);
         // Restore the master switch. Installed disabled above, so without this a
         // desktop that had remote access on comes back with it off — and an
