@@ -13,6 +13,11 @@ type Props = {
   turnActive: boolean;
   /** The agent's slash commands, for the composer palette. Names only. */
   slashCommands?: string[];
+  /**
+   * The model/mode chips. Optional so the composer still renders for a backend
+   * that offers no choices, or before the catalog has been fetched.
+   */
+  controls?: React.ReactNode;
   /** Resolves `false` when the prompt did not reach the desktop. */
   onSend: (text: string, images: Attachment[]) => Promise<boolean>;
   onSteer: (text: string) => Promise<boolean>;
@@ -34,6 +39,7 @@ type Props = {
 export function Composer({
   turnActive,
   slashCommands = [],
+  controls,
   onSend,
   onSteer,
   onCancel,
@@ -120,6 +126,10 @@ export function Composer({
           { backgroundColor: theme.backgroundElement, color: theme.text },
         ]}
       />
+
+      {/* Behaviour controls sit below the input, matching where the desktop
+          composer puts them — context above the input, behaviour below. */}
+      {controls}
 
       <View style={styles.actions}>
         <Pressable

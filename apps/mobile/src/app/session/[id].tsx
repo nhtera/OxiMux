@@ -3,6 +3,7 @@ import { ActivityIndicator, KeyboardAvoidingView, Platform, Pressable, StyleShee
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Composer } from '@/components/chat/composer';
+import { SessionControls } from '@/components/chat/session-controls';
 import { StatusStrip } from '@/components/chat/status-strip';
 import { Transcript } from '@/components/chat/transcript';
 import { ThemedText } from '@/components/themed-text';
@@ -85,6 +86,7 @@ export default function SessionScreen() {
           <Composer
             turnActive={thread.turn_active}
             slashCommands={thread.slash_commands}
+            controls={<SessionControls sessionId={id} />}
             onSend={send}
             onSteer={steer}
             onCancel={cancel}

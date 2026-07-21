@@ -3,6 +3,49 @@
 //! never sees the postcard/JSON envelope details.
 
 use oximux_remote_proto::messages::SessionSummary as WireSummary;
+use oximux_remote_proto::proto::{Choice as WireChoice, SessionChoices as WireChoices};
+
+/// One selectable model or permission mode.
+///
+/// `id` is what goes back over the wire; `label` is what a person reads. They
+/// stay separate because a backend's identifier is usually not presentable
+/// (`claude-opus-4-8` against "Opus 4.8").
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Choice {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+}
+
+impl From<WireChoice> for Choice {
+    fn from(w: WireChoice) -> Self {
+        Self { id: w.id, label: w.label, description: w.description }
+    }
+}
+
+/// What a session's backend offers its pickers, plus what is active now so the
+/// app can mark the current entry without a second round trip.
+///
+/// Both lists may legitimately be empty — that means "nothing to choose
+/// between", not a failure.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SessionChoices {
+    pub models: Vec<Choice>,
+    pub modes: Vec<Choice>,
+    pub current_model: Option<String>,
+    pub current_mode: Option<String>,
+}
+
+impl From<WireChoices> for SessionChoices {
+    fn from(w: WireChoices) -> Self {
+        Self {
+            models: w.models.into_iter().map(Choice::from).collect(),
+            modes: w.modes.into_iter().map(Choice::from).collect(),
+            current_model: w.current_model,
+            current_mode: w.current_mode,
+        }
+    }
+}
 
 /// One agent session the phone lists.
 #[derive(Debug, Clone, uniffi::Record)]

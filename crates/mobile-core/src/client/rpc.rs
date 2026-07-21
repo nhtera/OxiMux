@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use oximux_agent_core::thread::{AskQuestion, PermissionDecision, QuestionAnswers};
 
 use crate::client::MobileClient;
-use crate::ffi_types::{ChatImage, MobileError, PermissionReply, SessionSummary};
+use crate::ffi_types::{ChatImage, MobileError, PermissionReply, SessionChoices, SessionSummary};
 
 /// Correlates a queued prompt with its ack; unique per process is enough.
 static CORR: AtomicU64 = AtomicU64::new(1);
@@ -152,5 +152,44 @@ impl MobileClient {
     pub async fn cancel(&self, session_id: String) -> Result<(), MobileError> {
         let session = self.shared.session()?;
         session.cancel(&session_id).await.map_err(|e| MobileError::Rpc(e.to_string()))
+    }
+
+    /// The models and permission modes this session's backend offers.
+    ///
+    /// Empty lists mean there is nothing to choose between — a dynamic-catalog
+    /// backend before its handshake completes, or an agent with no mode options.
+    /// The app hides the picker rather than showing an empty one.
+    pub async fn list_choices(&self, session_id: String) -> Result<SessionChoices, MobileError> {
+        let session = self.shared.session()?;
+        let choices = session
+            .list_choices(&session_id)
+            .await
+            .map_err(|e| MobileError::Rpc(e.to_string()))?;
+        Ok(choices.into())
+    }
+
+    /// Switch the session's model.
+    ///
+    /// Fails on a backend that fixes its model at spawn (Claude, Codex): the
+    /// desktop recovers those by respawning the child, which the remote path
+    /// cannot do. The error carries the host's explanation so the app can show
+    /// it rather than leaving a control that appears to do nothing.
+    pub async fn set_model(&self, session_id: String, model: String) -> Result<(), MobileError> {
+        let session = self.shared.session()?;
+        session.set_model(&session_id, &model).await.map_err(|e| MobileError::Rpc(e.to_string()))
+    }
+
+    /// Switch the session's permission mode. Same fix-at-spawn caveat as
+    /// [`Self::set_model`].
+    pub async fn set_permission_mode(
+        &self,
+        session_id: String,
+        mode: String,
+    ) -> Result<(), MobileError> {
+        let session = self.shared.session()?;
+        session
+            .set_permission_mode(&session_id, &mode)
+            .await
+            .map_err(|e| MobileError::Rpc(e.to_string()))
     }
 }
