@@ -117,7 +117,9 @@ pub fn serve_launches(rx: tokio::sync::mpsc::Receiver<LaunchRequest>, cx: &mut g
             // Split before sending: `send` consumes the reply channel, so the
             // request cannot still be borrowed by the closure at that point.
             let LaunchRequest { cwd, agent_id, reply } = request;
-            let opened = cx.update(|cx| open_session(&cwd, agent_id.as_deref(), cx));
+            // Remote launches open an empty session; only the scheduler seeds a
+            // first prompt.
+            let opened = cx.update(|cx| open_session(&cwd, agent_id.as_deref(), None, cx));
             let _ = reply.send(opened);
         }
     })
@@ -125,9 +127,14 @@ pub fn serve_launches(rx: tokio::sync::mpsc::Receiver<LaunchRequest>, cx: &mut g
 }
 
 /// Open one session, returning the id the phone should subscribe to.
-fn open_session(
+///
+/// `initial_prompt`, when present, is sent as the session's first message. Remote
+/// launches pass `None` (they open an empty session for the phone to type into);
+/// the scheduler passes the schedule's prompt.
+pub(crate) fn open_session(
     cwd: &str,
     agent_id: Option<&str>,
+    initial_prompt: Option<String>,
     cx: &mut gpui::App,
 ) -> Result<String, LaunchError> {
     let cwd = usable_working_directory(cwd)?;
@@ -174,7 +181,14 @@ fn open_session(
     window
         .update(cx, |_, window, cx| {
             panes.update(cx, |panes, cx| {
-                panes.open_agent_chat_tab_in_active_group(cwd, None, backend, None, window, cx)
+                panes.open_agent_chat_tab_in_active_group(
+                    cwd,
+                    None,
+                    backend,
+                    initial_prompt,
+                    window,
+                    cx,
+                )
             })
         })
         .map_err(|_| LaunchError::Unavailable)?
