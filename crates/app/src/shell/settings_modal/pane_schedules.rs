@@ -15,22 +15,29 @@
 //! selection is a later addition. The `session_id` a run records is shown as text
 //! only, never a jump link: the id is minted from a per-launch counter that
 //! resets on restart, so a link could send someone to an unrelated session.
+//!
+//! **Layout.** The create form sits in one grouped card; time-of-day is picked
+//! with two `HH`/`MM` dropdowns rather than paired steppers, which read as a
+//! stray `+ : −` expression. The working directory has a native folder picker so
+//! a path cannot be fat-fingered.
 
 use chrono::{DateTime, Local};
 use gpui::{
-    AnyElement, Context, Entity, Hsla, IntoElement, ParentElement, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    Anchor, AnyElement, ClickEvent, Context, Entity, Hsla, IntoElement, ParentElement, SharedString,
+    Styled, Window, div, prelude::FluentBuilder, px,
 };
-use gpui_component::{Sizable as _, input::Input, input::InputState};
-use oximux_agents::schedule::recurrence::MIN_INTERVAL_MINUTES;
+use gpui_component::button::{Button, DropdownButton};
+use gpui_component::input::{Input, InputState};
+use gpui_component::menu::PopupMenuItem;
+use gpui_component::{Icon, Sizable as _};
 use oximux_agents::schedule::{
     NewSchedule, Recurrence, RecurrenceError, RunOutcome, Schedule, ScheduleRun, describe,
 };
 use oximux_settings::{Density, Theme, Typography};
 
 use super::SettingsModal;
-use super::controls::{stepper, toggle_switch, value_chip};
-use super::layout::{section_title, setting_row_desc};
+use super::controls::{toggle_switch, value_chip};
+use super::layout::{card_surface, section_title, setting_row_desc};
 use super::segmented::{Segment, segmented};
 
 /// How many recent runs to show under each schedule.
@@ -39,8 +46,9 @@ const RUNS_SHOWN: u32 = 3;
 /// Weekday labels, Monday-first to match [`Recurrence::WeeklyAt`]'s `0 = Monday`.
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
-/// Step size for the interval + minute steppers, in minutes.
-const MINUTE_STEP: u32 = 5;
+/// Interval presets for the "Every N minutes" dropdown. All are at or above the
+/// recurrence floor, so the picker cannot express a runaway schedule.
+const INTERVAL_CHOICES: [u32; 8] = [5, 10, 15, 30, 60, 120, 240, 480];
 
 /// Which kind of recurrence the create form is building. Mirrors [`Recurrence`]'s
 /// three cases without their values, which live in [`ScheduleDraft`].
@@ -149,6 +157,28 @@ impl SettingsModal {
         cx.notify();
     }
 
+    /// Open a native folder picker and drop the chosen path into the working-
+    /// directory field. Mirrors the project picker's `pick_folder` flow: the
+    /// panel resolves outside the GPUI window, so the result is applied back on
+    /// the UI thread via `update_in`.
+    pub(super) fn browse_schedule_cwd(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let folder = rfd::AsyncFileDialog::new().pick_folder().await;
+            let Some(path) = folder.map(|h| h.path().to_path_buf()) else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(input) = this.sched_cwd_input.clone() {
+                    input.update(cx, |s, cx| {
+                        s.set_value(path.to_string_lossy().to_string(), window, cx)
+                    });
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn toggle_schedule(&mut self, id: String, enabled: bool, cx: &mut Context<Self>) {
         if let Err(err) = self.schedule_store.set_enabled(&id, enabled, Local::now()) {
             tracing::warn!(%err, "settings: could not toggle schedule");
@@ -180,6 +210,16 @@ fn clear_input(
     }
 }
 
+fn set_hour(m: &mut SettingsModal, v: u32) {
+    m.schedule_draft.hour = v as u8;
+}
+fn set_minute(m: &mut SettingsModal, v: u32) {
+    m.schedule_draft.minute = v as u8;
+}
+fn set_interval(m: &mut SettingsModal, v: u32) {
+    m.schedule_draft.interval_minutes = v;
+}
+
 pub(super) fn render(
     modal: &SettingsModal,
     theme: Theme,
@@ -187,14 +227,21 @@ pub(super) fn render(
     typography: &Typography,
     cx: &mut Context<SettingsModal>,
 ) -> AnyElement {
+    let entity = cx.entity();
     div()
         .flex()
         .flex_col()
         .w_full()
         .gap(px(16.0))
         .child(constraint_banner(theme, typography))
-        .child(create_form(modal, theme, density, typography, cx))
-        .child(schedule_list(modal, theme, density, typography, cx))
+        .child(section_title("New schedule", "", theme, typography))
+        .child(card_surface(
+            theme,
+            density,
+            create_form_body(modal, &entity, theme, density, typography, cx),
+        ))
+        .child(section_title("Your schedules", "", theme, typography))
+        .child(schedule_list_body(modal, theme, density, typography, cx))
         .into_any_element()
 }
 
@@ -215,30 +262,31 @@ fn constraint_banner(theme: Theme, typography: &Typography) -> AnyElement {
         .into_any_element()
 }
 
-fn create_form(
+fn create_form_body(
     modal: &SettingsModal,
+    entity: &Entity<SettingsModal>,
     theme: Theme,
     density: Density,
     typography: &Typography,
     cx: &mut Context<SettingsModal>,
 ) -> AnyElement {
+    let draft = modal.schedule_draft;
     let mut col = div()
         .flex()
         .flex_col()
         .w_full()
-        .gap(px(6.0))
-        .child(section_title("New schedule", "", theme, typography))
+        .py(px(4.0))
         .child(text_field("Name", &modal.sched_name_input, theme, typography))
-        .child(text_field("Working directory", &modal.sched_cwd_input, theme, typography))
+        .child(cwd_field(&modal.sched_cwd_input, theme, density, typography, cx))
         .child(text_field("Prompt", &modal.sched_prompt_input, theme, typography))
         .child(setting_row_desc(
             "Repeats",
             "How often the run fires.",
-            recurrence_kind_picker(modal.schedule_draft.kind, theme, density, typography, cx),
+            recurrence_kind_picker(draft.kind, theme, density, typography, cx),
             theme,
             typography,
         ))
-        .child(recurrence_editor(modal.schedule_draft, theme, density, typography, cx));
+        .child(recurrence_editor(draft, entity, theme, density, typography, cx));
 
     if let Some(err) = &modal.schedule_form_error {
         col = col.child(
@@ -251,7 +299,7 @@ fn create_form(
     }
 
     col.child(
-        div().pt(px(8.0)).child(value_chip(
+        div().pt(px(10.0)).child(value_chip(
             "sched-create",
             "Create schedule",
             theme,
@@ -271,27 +319,68 @@ fn text_field(
     theme: Theme,
     typography: &Typography,
 ) -> AnyElement {
-    let control = match input {
-        Some(state) => Input::new(state)
-            .small()
-            .text_size(px(typography.t_body_sm))
-            .into_any_element(),
-        None => div().into_any_element(),
-    };
     div()
         .flex()
         .flex_col()
         .w_full()
         .gap(px(4.0))
         .py(px(6.0))
+        .child(field_label(label, theme, typography))
+        .child(input_or_blank(input, typography))
+        .into_any_element()
+}
+
+/// The working-directory field: label, input, and a native folder picker so a
+/// path can be chosen rather than typed.
+fn cwd_field(
+    input: &Option<Entity<InputState>>,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut Context<SettingsModal>,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .gap(px(4.0))
+        .py(px(6.0))
+        .child(field_label("Working directory", theme, typography))
         .child(
             div()
-                .text_size(px(typography.t_sub_label))
-                .text_color(theme.fg_muted)
-                .child(label),
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(div().flex_1().child(input_or_blank(input, typography)))
+                .child(value_chip(
+                    "sched-browse",
+                    "Browse…",
+                    theme,
+                    density,
+                    typography,
+                    |this, _window, cx| this.browse_schedule_cwd(cx),
+                    cx,
+                )),
         )
-        .child(control)
         .into_any_element()
+}
+
+fn field_label(label: &'static str, theme: Theme, typography: &Typography) -> AnyElement {
+    div()
+        .text_size(px(typography.t_sub_label))
+        .text_color(theme.fg_muted)
+        .child(label)
+        .into_any_element()
+}
+
+fn input_or_blank(input: &Option<Entity<InputState>>, typography: &Typography) -> AnyElement {
+    match input {
+        Some(state) => {
+            Input::new(state).small().text_size(px(typography.t_body_sm)).into_any_element()
+        }
+        None => div().into_any_element(),
+    }
 }
 
 /// The Every-N / Daily / Weekly selector.
@@ -326,9 +415,10 @@ fn recurrence_kind_picker(
 }
 
 /// The value editors for whichever recurrence kind is selected: an interval
-/// stepper, a time-of-day pair, or a weekday picker plus a time-of-day pair.
+/// dropdown, a time-of-day pair, or a weekday picker plus a time-of-day pair.
 fn recurrence_editor(
     draft: ScheduleDraft,
+    entity: &Entity<SettingsModal>,
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -338,23 +428,13 @@ fn recurrence_editor(
         DraftKind::Interval => setting_row_desc(
             "Interval",
             "At least five minutes — each fire starts a full agent turn.",
-            stepper(
+            number_dropdown(
                 "sched-interval",
-                format!("{} min", draft.interval_minutes),
-                theme,
-                density,
-                typography,
-                |this, _w, cx| {
-                    let m = this.schedule_draft.interval_minutes;
-                    this.schedule_draft.interval_minutes =
-                        m.saturating_sub(MINUTE_STEP).max(MIN_INTERVAL_MINUTES);
-                    cx.notify();
-                },
-                |this, _w, cx| {
-                    this.schedule_draft.interval_minutes += MINUTE_STEP;
-                    cx.notify();
-                },
-                cx,
+                interval_label(draft.interval_minutes),
+                interval_options(),
+                draft.interval_minutes,
+                entity.clone(),
+                set_interval,
             ),
             theme,
             typography,
@@ -362,7 +442,7 @@ fn recurrence_editor(
         DraftKind::Daily => setting_row_desc(
             "Time of day",
             "Local time.",
-            time_of_day(draft, theme, density, typography, cx),
+            time_of_day(draft, entity, theme),
             theme,
             typography,
         ),
@@ -380,7 +460,7 @@ fn recurrence_editor(
             .child(setting_row_desc(
                 "Time of day",
                 "Local time.",
-                time_of_day(draft, theme, density, typography, cx),
+                time_of_day(draft, entity, theme),
                 theme,
                 typography,
             ))
@@ -388,56 +468,107 @@ fn recurrence_editor(
     }
 }
 
-/// An `HH : MM` pair of steppers. Hour wraps 0–23; minute steps by five and
-/// wraps 0–55.
-fn time_of_day(
-    draft: ScheduleDraft,
-    theme: Theme,
-    density: Density,
-    typography: &Typography,
-    cx: &mut Context<SettingsModal>,
-) -> AnyElement {
-    let hour = stepper(
-        "sched-hour",
-        format!("{:02}", draft.hour),
-        theme,
-        density,
-        typography,
-        |this, _w, cx| {
-            this.schedule_draft.hour = (this.schedule_draft.hour + 23) % 24;
-            cx.notify();
-        },
-        |this, _w, cx| {
-            this.schedule_draft.hour = (this.schedule_draft.hour + 1) % 24;
-            cx.notify();
-        },
-        cx,
-    );
-    let minute = stepper(
-        "sched-minute",
-        format!("{:02}", draft.minute),
-        theme,
-        density,
-        typography,
-        |this, _w, cx| {
-            this.schedule_draft.minute = (this.schedule_draft.minute + 60 - MINUTE_STEP as u8) % 60;
-            cx.notify();
-        },
-        |this, _w, cx| {
-            this.schedule_draft.minute = (this.schedule_draft.minute + MINUTE_STEP as u8) % 60;
-            cx.notify();
-        },
-        cx,
-    );
+/// An `HH : MM` pair of dropdowns — a clock, not two flanked steppers.
+fn time_of_day(draft: ScheduleDraft, entity: &Entity<SettingsModal>, theme: Theme) -> AnyElement {
     div()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(8.0))
-        .child(hour)
-        .child(div().text_color(theme.fg_muted).child(":"))
-        .child(minute)
+        .gap(px(6.0))
+        .child(number_dropdown(
+            "sched-hour",
+            format!("{:02}", draft.hour),
+            hour_options(),
+            draft.hour as u32,
+            entity.clone(),
+            set_hour,
+        ))
+        .child(div().px(px(2.0)).text_color(theme.fg_muted).child(":"))
+        .child(number_dropdown(
+            "sched-minute",
+            format!("{:02}", draft.minute),
+            minute_options(),
+            draft.minute as u32,
+            entity.clone(),
+            set_minute,
+        ))
         .into_any_element()
+}
+
+/// A labelled dropdown that writes a numeric draft field. The trigger shows the
+/// current value; the menu lists `options`, the active one trailing a check.
+fn number_dropdown(
+    id: &'static str,
+    current_label: String,
+    options: Vec<(String, u32)>,
+    selected_value: u32,
+    entity: Entity<SettingsModal>,
+    set: fn(&mut SettingsModal, u32),
+) -> AnyElement {
+    DropdownButton::new(id)
+        .button(
+            Button::new(SharedString::from(format!("{id}-btn")))
+                .label(current_label)
+                .small()
+                .outline(),
+        )
+        .small()
+        .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, window, _cx| {
+            for (label, value) in options.clone() {
+                let selected = value == selected_value;
+                let entity = entity.clone();
+                menu = menu.item(
+                    PopupMenuItem::element(move |_w, _cx| menu_row(label.clone(), selected)).on_click(
+                        window.listener_for(
+                            &entity,
+                            move |m: &mut SettingsModal, _ev: &ClickEvent, _w, cx| {
+                                set(m, value);
+                                cx.notify();
+                            },
+                        ),
+                    ),
+                );
+            }
+            menu
+        })
+        .into_any_element()
+}
+
+/// One dropdown menu row: the label, and a right-aligned check on the active one.
+fn menu_row(label: String, selected: bool) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(28.0))
+        .min_w(px(96.0))
+        .child(div().child(label))
+        .child(div().w(px(16.0)).flex_none().flex().justify_center().when(selected, |d| {
+            d.child(Icon::default().path("icons/check.svg").size(px(14.0)))
+        }))
+}
+
+fn hour_options() -> Vec<(String, u32)> {
+    (0u32..24).map(|h| (format!("{h:02}"), h)).collect()
+}
+
+fn minute_options() -> Vec<(String, u32)> {
+    (0u32..60).step_by(5).map(|m| (format!("{m:02}"), m)).collect()
+}
+
+fn interval_options() -> Vec<(String, u32)> {
+    INTERVAL_CHOICES.iter().map(|&m| (interval_label(m), m)).collect()
+}
+
+/// A human interval, e.g. `30 min`, `1 hour`, `2 hours`.
+fn interval_label(m: u32) -> String {
+    if m >= 60 && m.is_multiple_of(60) {
+        let hours = m / 60;
+        if hours == 1 { "1 hour".into() } else { format!("{hours} hours") }
+    } else {
+        format!("{m} min")
+    }
 }
 
 /// A seven-segment weekday selector, Monday-first.
@@ -462,36 +593,27 @@ fn weekday_picker(
     segmented("sched-weekday", segments, theme, density, typography, cx)
 }
 
-fn schedule_list(
+fn schedule_list_body(
     modal: &SettingsModal,
     theme: Theme,
     density: Density,
     typography: &Typography,
     cx: &mut Context<SettingsModal>,
 ) -> AnyElement {
-    let mut col = div()
-        .flex()
-        .flex_col()
-        .w_full()
-        .gap(px(6.0))
-        .child(section_title("Schedules", "", theme, typography));
-
     if modal.schedule_rows.is_empty() {
-        return col
-            .child(
-                div()
-                    .py(px(8.0))
-                    .text_size(px(typography.t_body_sm))
-                    .text_color(theme.fg_subtle)
-                    .child("No schedules yet. Create one above."),
-            )
+        return div()
+            .py(px(4.0))
+            .text_size(px(typography.t_body_sm))
+            .text_color(theme.fg_subtle)
+            .child("No schedules yet. Create one above.")
             .into_any_element();
     }
 
+    let mut col = div().flex().flex_col().w_full().py(px(2.0));
     for (idx, row) in modal.schedule_rows.iter().enumerate() {
         col = col.child(schedule_row(idx, row, theme, density, typography, cx));
     }
-    col.into_any_element()
+    card_surface(theme, density, col.into_any_element())
 }
 
 fn schedule_row(
@@ -639,6 +761,22 @@ mod tests {
     fn an_interval_draft_under_the_floor_is_refused() {
         let draft = ScheduleDraft { kind: DraftKind::Interval, interval_minutes: 1, ..Default::default() };
         assert!(draft.to_recurrence().is_err());
+    }
+
+    #[test]
+    fn interval_labels_read_naturally() {
+        assert_eq!(interval_label(30), "30 min");
+        assert_eq!(interval_label(60), "1 hour");
+        assert_eq!(interval_label(120), "2 hours");
+    }
+
+    /// Every interval preset is at or above the floor, so the picker cannot
+    /// express a schedule the store would reject.
+    #[test]
+    fn interval_presets_all_clear_the_floor() {
+        for m in INTERVAL_CHOICES {
+            assert!(Recurrence::every_minutes(m).is_ok(), "{m} is below the floor");
+        }
     }
 
     #[test]
