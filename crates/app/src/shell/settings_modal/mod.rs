@@ -20,6 +20,7 @@ mod pane_keybindings;
 mod pane_notifications;
 mod pairing_qr;
 mod pane_remote;
+mod pane_schedules;
 mod pane_terminal;
 mod pane_voice;
 mod view;
@@ -123,6 +124,23 @@ pub struct SettingsModal {
     pub(crate) recording_action: Option<&'static str>,
     /// The interceptor subscription — alive exactly while recording.
     pub(super) recording_sub: Option<Subscription>,
+    /// Shared schedule store — the same connection the scheduler ticker reads,
+    /// so a schedule created or removed here is visible to it within one tick.
+    pub(super) schedule_store: oximux_agents::schedule::ScheduleStore,
+    /// Schedules + their recent run history, reloaded from the store at each
+    /// `open()` and after every create/delete/toggle so the pane never reads
+    /// SQLite mid-paint.
+    pub(super) schedule_rows: Vec<pane_schedules::ScheduleRow>,
+    /// The in-progress "new schedule" recurrence choice; the text fields live in
+    /// the three inputs below. Reset to defaults on each `open()`.
+    pub(super) schedule_draft: pane_schedules::ScheduleDraft,
+    /// Create-form text inputs, lazily built on `open()` (they need a `Window`).
+    /// `None` before first open.
+    pub(super) sched_name_input: Option<Entity<InputState>>,
+    pub(super) sched_cwd_input: Option<Entity<InputState>>,
+    pub(super) sched_prompt_input: Option<Entity<InputState>>,
+    /// Validation message shown under the create form, or `None` when clean.
+    pub(super) schedule_form_error: Option<String>,
 }
 
 /// Parse the custom-words editor field into a de-duplicated dictionary. Splits
@@ -141,6 +159,7 @@ pub(super) fn parse_custom_words(raw: &str) -> Vec<String> {
 }
 
 impl SettingsModal {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         theme: Theme,
         density: Density,
@@ -148,6 +167,7 @@ impl SettingsModal {
         notify: Arc<AgentNotifySettings>,
         notify_repo: SettingsRepo,
         notifier: Arc<dyn Notifier>,
+        schedule_store: oximux_agents::schedule::ScheduleStore,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
@@ -175,6 +195,13 @@ impl SettingsModal {
             keybind_overrides: BTreeMap::new(),
             recording_action: None,
             recording_sub: None,
+            schedule_store,
+            schedule_rows: Vec::new(),
+            schedule_draft: pane_schedules::ScheduleDraft::default(),
+            sched_name_input: None,
+            sched_cwd_input: None,
+            sched_prompt_input: None,
+            schedule_form_error: None,
         }
     }
 
@@ -256,6 +283,19 @@ impl SettingsModal {
             );
         self.custom_words_input = Some(cw_input);
 
+        // Schedules pane: reload the list + run history from the shared store,
+        // and build a fresh empty create form (reset draft, clear any error).
+        self.reload_schedules();
+        self.schedule_draft = pane_schedules::ScheduleDraft::default();
+        self.schedule_form_error = None;
+        self.sched_name_input =
+            Some(cx.new(|cx| InputState::new(window, cx).placeholder("Nightly test run")));
+        self.sched_cwd_input =
+            Some(cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/project")));
+        self.sched_prompt_input = Some(cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Run the test suite and summarize failures")
+        }));
+
         self.open = true;
         self.pos = None;
         self.drag_grab = None;
@@ -306,6 +346,11 @@ impl SettingsModal {
         self._search_sub = None;
         self.custom_words_input = None;
         self._custom_words_sub = None;
+        // Drop the schedule create-form inputs so their focus handles can't keep
+        // window focus orphaned after the modal is hidden.
+        self.sched_name_input = None;
+        self.sched_cwd_input = None;
+        self.sched_prompt_input = None;
         // A close mid-recording must release the keystroke interceptor or
         // every subsequent key press in the app would be swallowed.
         self.recording_action = None;

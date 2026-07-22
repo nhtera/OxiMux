@@ -77,7 +77,12 @@ impl AgentAwake {
             state: Mutex::new(State {
                 agent: Reason { holds: 0, enabled },
                 remote: Reason { holds: 0, enabled },
-                scheduling: Reason { holds: 0, enabled },
+                // Always enabled: scheduling keep-awake is not a user preference.
+                // Creating a schedule already expresses the intent, and a
+                // separate switch that silently caused scheduled runs to be
+                // missed would be a footgun. So an armed schedule holds the
+                // machine awake unconditionally — there is no toggle to gate it.
+                scheduling: Reason { holds: 0, enabled: true },
                 assertion: None,
             }),
         }
@@ -107,11 +112,6 @@ impl AgentAwake {
     /// that creates a schedule is expected to say so.
     pub fn acquire_scheduling(self: &Arc<Self>) -> AwakeHold {
         self.acquire_for(Source::Scheduling)
-    }
-
-    /// The scheduling counterpart of [`set_enabled`](Self::set_enabled).
-    pub fn set_scheduling_enabled(&self, enabled: bool) {
-        self.set_enabled_for(Source::Scheduling, enabled);
     }
 
     fn acquire_for(self: &Arc<Self>, source: Source) -> AwakeHold {
@@ -505,18 +505,30 @@ mod tests {
         assert!(!awake.asserted(), "now nothing does");
     }
 
-    /// Each reason has its own user toggle. Turning off "keep awake while agents
-    /// run" must not also decide that scheduled runs may be missed.
+    /// Scheduling is not gated on the agent preference. Turning off "keep awake
+    /// while agents run" must not also decide that scheduled runs may be missed —
+    /// so a scheduling hold keeps asserting after the agent reason is disabled,
+    /// and only releasing the hold (no schedule armed) drops it.
     #[test]
     fn disabling_the_agent_reason_leaves_scheduling_holding() {
         let awake = Arc::new(AgentAwake::with_backend(Arc::new(MockBackend::default()), true));
         let _agent = awake.acquire();
-        let _scheduling = awake.acquire_scheduling();
+        let scheduling = awake.acquire_scheduling();
 
         awake.set_enabled(false);
-        assert!(awake.asserted(), "scheduling is a separate preference");
+        assert!(awake.asserted(), "scheduling is not gated on the agent preference");
 
-        awake.set_scheduling_enabled(false);
-        assert!(!awake.asserted(), "both off, nothing holds");
+        drop(scheduling);
+        assert!(!awake.asserted(), "nothing armed, nothing holds");
+    }
+
+    /// Scheduling keep-awake has no user toggle and defaults on regardless of the
+    /// agent preference passed at construction — an armed schedule holds the
+    /// machine awake even when the app was built with keep-awake off.
+    #[test]
+    fn scheduling_holds_even_when_constructed_disabled() {
+        let awake = Arc::new(AgentAwake::with_backend(Arc::new(MockBackend::default()), false));
+        let _scheduling = awake.acquire_scheduling();
+        assert!(awake.asserted(), "scheduling is always enabled, not gated on the seed");
     }
 }

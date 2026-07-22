@@ -827,6 +827,7 @@ impl WorkspaceRoot {
                 agent_notify_settings.clone(),
                 app_state.settings_repo.clone(),
                 notifier.clone(),
+                app_state.schedule_store(),
                 cx,
             )
         });
