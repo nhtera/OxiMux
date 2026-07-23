@@ -16,7 +16,7 @@ fn value_bearing_event() -> ThreadEvent {
 /// documented wire change, so an accidental edit fails here.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 9, "v9 = the appended read-only forge surface");
+    assert_eq!(PROTOCOL_VERSION, 10, "v10 = the appended schedule surface");
 }
 
 /// The floor moves only on a genuinely breaking change, never merely because
@@ -252,4 +252,8 @@ impl HostEvent {
 fn early_variants_keep_their_literal_ordinals() {
     assert_eq!(Request::Ping.to_bytes().expect("encode"), vec![3]);
     assert_eq!(Request::ListSessions.to_bytes().expect("encode"), vec![4]);
+    // The v10 schedule surface appended after the v9 forge tail: `ListSchedules`
+    // is the 33rd variant (index 32). Pinning it catches an insertion anywhere in
+    // the 32 variants before it, which would shift every paired phone's decode.
+    assert_eq!(Request::ListSchedules.to_bytes().expect("encode"), vec![32]);
 }

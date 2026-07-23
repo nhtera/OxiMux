@@ -28,14 +28,17 @@ pub use crate::messages::*;
 /// session-control surface (`ListChoices` + `SetModel`/`SetPermissionMode`, and
 /// the `Choices` reply, plus `CreateSession`/`SessionCreated`). v8: appended
 /// `RewindSession`. v9: appended the read-only forge surface
-/// (`ListForgeItems`, `GetForgeItemDetail`, `ListForgeChecks`).
+/// (`ListForgeItems`, `GetForgeItemDetail`, `ListForgeChecks`). v10: appended the
+/// schedule surface (`ListSchedules`, `CreateSchedule`, `DeleteSchedule`,
+/// `SetScheduleEnabled`, `GetScheduleRuns`, and the `Schedules`/`ScheduleCreated`/
+/// `ScheduleRuns` replies).
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// The oldest peer version this build still speaks. **Raise this only on a
 /// genuinely breaking change** — a reordered/removed variant or an altered
@@ -276,6 +279,47 @@ pub enum Request {
     /// Empty when there is no PR, no checks, or the forge does not report any —
     /// including every GitLab repo, which has no pipeline mapping wired.
     ListForgeChecks { session_id: String },
+    /// Every schedule the desktop holds, with its next fire and human summary.
+    ///
+    /// A **global read** — it names no session, so there is nothing for a
+    /// session-scoped device to be narrowed to. It is therefore gated on full
+    /// scope, not `is_allowed_for`: a schedule can target any project, and its
+    /// prompt and cwd would leak work outside a confined device's one
+    /// conversation. A read-only full device may still list — seeing standing
+    /// schedules changes nothing.
+    ListSchedules,
+    /// Create a schedule that fires a canned prompt on a recurrence.
+    ///
+    /// **A standing grant to run an agent unattended**, so it is the
+    /// highest-privilege schedule RPC: gated exactly as [`Request::CreateSession`]
+    /// is (full scope **and** not read-only), because a schedule is a deferred
+    /// session spawn and a session-scoped device could otherwise plant one that
+    /// runs outside its own confinement.
+    ///
+    /// `recurrence` is validated host-side through the same constructors the
+    /// desktop uses — an interval under the floor, or an impossible time, is
+    /// refused rather than stored, so the phone cannot smuggle in a recurrence the
+    /// desktop's own UI could never produce.
+    CreateSchedule {
+        name: String,
+        cwd: String,
+        prompt: String,
+        agent_id: Option<String>,
+        recurrence: RecurrenceWire,
+    },
+    /// Delete a schedule by id. Idempotent: deleting one already gone is not an
+    /// error. Write-gated like [`Request::CreateSchedule`]. In-flight runs are
+    /// unaffected — this stops *future* fires, it does not reach into a run
+    /// already started.
+    DeleteSchedule { id: String },
+    /// Enable or disable a schedule without deleting it. Same write gate as
+    /// creating one — a disabled schedule that a lost phone re-enables is the same
+    /// standing grant as a freshly created one.
+    SetScheduleEnabled { id: String, enabled: bool },
+    /// The recent run history for one schedule (most recent first, capped at
+    /// `limit`). A **read**, gated like [`Request::ListSchedules`]: run rows carry
+    /// the same cross-project detail a schedule row does.
+    GetScheduleRuns { schedule_id: String, limit: u32 },
 }
 
 /// Host → client.
@@ -370,6 +414,16 @@ pub enum Response {
     ForgeItemDetail(Option<ForgeItemDetailWire>),
     /// Reply to [`Request::ListForgeChecks`]. Empty is a normal answer.
     ForgeChecks(Vec<CheckRunWire>),
+    /// Reply to [`Request::ListSchedules`]. Empty is a normal answer — a desktop
+    /// with no schedules is the common case, not a failure.
+    Schedules(Vec<ScheduleWire>),
+    /// Reply to [`Request::CreateSchedule`] — the stored row, so the client can
+    /// insert it without re-listing. Carries the derived id and first `next_fire`,
+    /// which the client could not have computed itself.
+    ScheduleCreated(ScheduleWire),
+    /// Reply to [`Request::GetScheduleRuns`]. Empty means the schedule has never
+    /// fired yet, a normal state for a freshly created one.
+    ScheduleRuns(Vec<ScheduleRunWire>),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

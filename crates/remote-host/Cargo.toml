@@ -27,6 +27,9 @@ oximux-storage = { workspace = true }
 # via `oximux_git::path_guard` at this boundary before any disk access.
 oximux-git = { workspace = true }
 oximux-core = { workspace = true }
+# Schedule rows carry `DateTime<Local>` fires; this boundary formats them to
+# RFC-3339 for the wire and derives the tick clock from the injected `now_secs`.
+chrono = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

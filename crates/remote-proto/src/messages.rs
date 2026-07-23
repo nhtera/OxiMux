@@ -396,3 +396,69 @@ pub enum ForgeStateWire {
     Closed,
     All,
 }
+
+/// How often a schedule repeats, mirroring `oximux_agents::schedule::Recurrence`.
+///
+/// Re-declared here rather than reused for the same reason [`ForgeItemWire`] is:
+/// this crate links into the mobile core, and depending on `oximux-agents` would
+/// pull the session registry and its process-spawn machinery into a phone build
+/// that only needs the three shapes.
+///
+/// **Not cron.** The desktop deliberately models recurrence as a closed set of
+/// three cases so a phone can drive it with pickers that cannot produce an
+/// invalid value; this wire type carries that same closed set. The host still
+/// re-validates on receipt (an interval under the floor, an impossible time)
+/// through the desktop's own constructors — the enum shape prevents *most*
+/// nonsense, the constructor prevents the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecurrenceWire {
+    /// Every N minutes, measured from the previous fire.
+    EveryMinutes { minutes: u32 },
+    /// Every day at a wall-clock time.
+    DailyAt { hour: u8, minute: u8 },
+    /// Every week on one weekday at a wall-clock time. `weekday` is 0=Monday.
+    WeeklyAt { weekday: u8, hour: u8, minute: u8 },
+}
+
+/// A stored schedule, mirroring `oximux_agents::schedule::Schedule`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleWire {
+    pub id: String,
+    pub name: String,
+    /// Working directory the run's session opens in — a project the desktop
+    /// already has, the same containment `CreateSession`'s cwd follows.
+    pub cwd: String,
+    pub prompt: String,
+    pub agent_id: Option<String>,
+    pub recurrence: RecurrenceWire,
+    pub enabled: bool,
+    /// RFC-3339 next-fire instant in the **desktop's** local zone. Formatted
+    /// client-side against the reader's own clock — the host does not know the
+    /// phone's locale.
+    pub next_fire_at: String,
+    /// The desktop's own human phrasing of the recurrence (e.g. "Weekdays at
+    /// 09:00"). Carried rather than re-derived on the phone so both surfaces read
+    /// identically — the same reason the fold runs once, on the desktop.
+    pub summary: String,
+}
+
+/// One recorded fire, mirroring `oximux_agents::schedule::ScheduleRun`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleRunWire {
+    pub schedule_id: String,
+    /// RFC-3339 **scheduled** instant, not when the tick noticed it.
+    pub fired_at: String,
+    pub outcome: RunOutcomeWire,
+    /// The session the fire opened, when it opened one. `None` on a failure that
+    /// never got that far.
+    pub session_id: Option<String>,
+    /// A short human note on a failure, absent on success.
+    pub detail: Option<String>,
+}
+
+/// How one fire turned out, mirroring `oximux_agents::schedule::RunOutcome`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RunOutcomeWire {
+    Ok,
+    Failed,
+}

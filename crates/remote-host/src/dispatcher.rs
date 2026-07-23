@@ -18,6 +18,7 @@ mod forge;
 mod git;
 mod handlers;
 mod handshake;
+mod schedules;
 mod serve;
 mod stream;
 
@@ -79,6 +80,14 @@ pub struct Dispatcher {
     /// The desktop's rewind path, when the host exposes it. `None` answers
     /// `Unauthorized`, as `terminals` and `launcher` do.
     rewinder: Option<Arc<dyn crate::rewind::RewindService>>,
+    /// The desktop's schedule store, when the host exposes it. `None` answers
+    /// `Unauthorized` for the same reason the other optional surfaces do —
+    /// whether this desktop keeps schedules is not something an unauthorized
+    /// client should be able to probe. Held as the concrete store rather than a
+    /// trait because it is already gpui-free and process-spawn-free (it only
+    /// reads and writes SQLite rows), so no view-layer seam is needed the way
+    /// `launcher` and `rewinder` needed one.
+    schedules: Option<Arc<oximux_agents::schedule::ScheduleStore>>,
     /// Wall clock (Unix seconds), injectable so tests are deterministic.
     now_secs: fn() -> u64,
 }
@@ -91,6 +100,7 @@ impl Dispatcher {
             terminals: None,
             launcher: None,
             rewinder: None,
+            schedules: None,
             now_secs: system_now_secs,
         }
     }
@@ -110,6 +120,15 @@ impl Dispatcher {
     /// Let this dispatcher rewind sessions on the desktop.
     pub fn with_rewinder(mut self, rewinder: Arc<dyn crate::rewind::RewindService>) -> Self {
         self.rewinder = Some(rewinder);
+        self
+    }
+
+    /// Expose the desktop's schedules over this dispatcher.
+    pub fn with_schedule_store(
+        mut self,
+        schedules: Arc<oximux_agents::schedule::ScheduleStore>,
+    ) -> Self {
+        self.schedules = Some(schedules);
         self
     }
 
@@ -170,6 +189,17 @@ impl Dispatcher {
             }
             Request::EventsSince { session_id, after_seq } => {
                 self.events_since(pubkey, &session_id, after_seq)
+            }
+            Request::ListSchedules => self.list_schedules(pubkey),
+            Request::CreateSchedule { name, cwd, prompt, agent_id, recurrence } => {
+                self.create_schedule(pubkey, name, cwd, prompt, agent_id, recurrence)
+            }
+            Request::DeleteSchedule { id } => self.delete_schedule(pubkey, &id),
+            Request::SetScheduleEnabled { id, enabled } => {
+                self.set_schedule_enabled(pubkey, &id, enabled)
+            }
+            Request::GetScheduleRuns { schedule_id, limit } => {
+                self.schedule_runs(pubkey, &schedule_id, limit)
             }
             // Handshake variants (handled before auth) and `Subscribe` (intercepted
             // in `serve`) never reach here.

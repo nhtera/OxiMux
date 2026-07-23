@@ -102,6 +102,37 @@ impl AuthStore {
         )
     }
 
+    /// May this device read the desktop's schedules and their run history?
+    ///
+    /// Full scope, for the same reason [`may_use_terminals`](Self::may_use_terminals)
+    /// requires it: a schedule names no session, so a session-scoped device has
+    /// nothing to be narrowed against, and a schedule's cwd and prompt describe
+    /// work that may lie entirely outside the one conversation such a device was
+    /// confined to. Reading changes nothing, so a read-only full device is
+    /// admitted — it can watch the schedule list it cannot edit.
+    pub fn may_read_schedules(&self, pubkey: &AppPubkey) -> bool {
+        let st = self.inner.lock().unwrap();
+        matches!(
+            st.devices.get(pubkey),
+            Some(d) if !d.revoked && matches!(d.scope, DeviceScope::Full)
+        )
+    }
+
+    /// May this device create, delete, or toggle a schedule?
+    ///
+    /// The same two gates as [`may_create_sessions`](Self::may_create_sessions),
+    /// and for the same reason: a schedule is a *deferred* session spawn, so
+    /// planting one is at least as privileged as starting a session now. Full
+    /// scope stops a session-scoped device from planting a run outside its
+    /// confinement; not-read-only stops a watcher from arming one at all.
+    pub fn may_manage_schedules(&self, pubkey: &AppPubkey) -> bool {
+        let st = self.inner.lock().unwrap();
+        matches!(
+            st.devices.get(pubkey),
+            Some(d) if !d.revoked && !d.read_only && matches!(d.scope, DeviceScope::Full)
+        )
+    }
+
     /// Every recorded device — the data behind the paired-devices list, its
     /// revoke/forget actions, and its read-only toggle.
     ///
