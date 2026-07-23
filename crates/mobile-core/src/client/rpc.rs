@@ -9,7 +9,7 @@ use oximux_agent_core::thread::{AskQuestion, PermissionDecision, QuestionAnswers
 use crate::client::MobileClient;
 use crate::ffi_types::{
     ChatImage, CheckRun, ForgeItem, ForgeItemDetail, ForgeItemKind, ForgeState, MobileError,
-    PermissionReply, SessionChoices, SessionSummary,
+    PermissionReply, Recurrence, Schedule, ScheduleRun, SessionChoices, SessionSummary,
 };
 
 /// Correlates a queued prompt with its ack; unique per process is enough.
@@ -293,5 +293,74 @@ impl MobileClient {
             .set_permission_mode(&session_id, &mode)
             .await
             .map_err(|e| MobileError::Rpc(e.to_string()))
+    }
+
+    /// Every schedule the desktop holds.
+    ///
+    /// **Empty is a normal answer** — a desktop with no schedules is the common
+    /// case, not a failure. A session-scoped device is refused entirely, since a
+    /// schedule names no session for it to be narrowed to.
+    pub async fn list_schedules(&self) -> Result<Vec<Schedule>, MobileError> {
+        let session = self.shared.session()?;
+        let rows = session.list_schedules().await.map_err(|e| MobileError::Rpc(e.to_string()))?;
+        Ok(rows.into_iter().map(Schedule::from).collect())
+    }
+
+    /// Create a schedule, returning the stored row so the caller can show it
+    /// without re-listing.
+    ///
+    /// `cwd` is a path on the **desktop**, not the phone — the project the run
+    /// opens in. The desktop refuses a recurrence its own pickers could not
+    /// produce (an interval under the floor, an impossible time).
+    pub async fn create_schedule(
+        &self,
+        name: String,
+        cwd: String,
+        prompt: String,
+        agent_id: Option<String>,
+        recurrence: Recurrence,
+    ) -> Result<Schedule, MobileError> {
+        let session = self.shared.session()?;
+        let sched = session
+            .create_schedule(&name, &cwd, &prompt, agent_id.as_deref(), recurrence.into())
+            .await
+            .map_err(|e| MobileError::Rpc(e.to_string()))?;
+        Ok(sched.into())
+    }
+
+    /// Delete a schedule. Idempotent — deleting one already gone is success. Stops
+    /// future fires; a run already in flight is unaffected.
+    pub async fn delete_schedule(&self, id: String) -> Result<(), MobileError> {
+        let session = self.shared.session()?;
+        session.delete_schedule(&id).await.map_err(|e| MobileError::Rpc(e.to_string()))
+    }
+
+    /// Enable or disable a schedule without deleting it. Re-enabling recomputes
+    /// the next fire from now.
+    pub async fn set_schedule_enabled(
+        &self,
+        id: String,
+        enabled: bool,
+    ) -> Result<(), MobileError> {
+        let session = self.shared.session()?;
+        session
+            .set_schedule_enabled(&id, enabled)
+            .await
+            .map_err(|e| MobileError::Rpc(e.to_string()))
+    }
+
+    /// A schedule's recent run history, most recent first, capped at `limit`.
+    /// **Empty means it has never fired** — normal for a fresh schedule.
+    pub async fn get_schedule_runs(
+        &self,
+        schedule_id: String,
+        limit: u32,
+    ) -> Result<Vec<ScheduleRun>, MobileError> {
+        let session = self.shared.session()?;
+        let rows = session
+            .get_schedule_runs(&schedule_id, limit)
+            .await
+            .map_err(|e| MobileError::Rpc(e.to_string()))?;
+        Ok(rows.into_iter().map(ScheduleRun::from).collect())
     }
 }

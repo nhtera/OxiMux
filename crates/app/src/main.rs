@@ -336,6 +336,12 @@ fn main() {
             remote_control.set_rewinder(std::sync::Arc::new(rewinder));
             oximux_app::remote_control::rewind_bridge::serve_rewinds(requests, cx);
         }
+        // Schedules the phone can list and manage: the same store the desktop's
+        // ticker fires and its Settings pane edits, so all three surfaces share one
+        // set of rows. Reads and writes only, no process spawn — the store is
+        // handed over directly rather than through a bridge, unlike the launcher
+        // and rewinder above.
+        remote_control.set_schedule_store(std::sync::Arc::new(app_state.schedule_store()));
         cx.set_global(remote_control);
         // Restore the master switch. Installed disabled above, so without this a
         // desktop that had remote access on comes back with it off — and an

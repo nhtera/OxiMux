@@ -272,3 +272,116 @@ impl From<ForgeState> for oximux_remote_proto::messages::ForgeStateWire {
         }
     }
 }
+
+/// How often a schedule repeats — a closed set of three cases, so the app drives
+/// it with pickers that cannot produce an invalid value. The host re-validates on
+/// create (an interval under the floor, an impossible time) regardless.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum Recurrence {
+    /// Every N minutes, measured from the previous fire.
+    EveryMinutes { minutes: u32 },
+    /// Every day at a wall-clock time.
+    DailyAt { hour: u8, minute: u8 },
+    /// Every week on one weekday at a wall-clock time. `weekday` is 0=Monday.
+    WeeklyAt { weekday: u8, hour: u8, minute: u8 },
+}
+
+impl From<oximux_remote_proto::messages::RecurrenceWire> for Recurrence {
+    fn from(w: oximux_remote_proto::messages::RecurrenceWire) -> Self {
+        use oximux_remote_proto::messages::RecurrenceWire as W;
+        match w {
+            W::EveryMinutes { minutes } => Self::EveryMinutes { minutes },
+            W::DailyAt { hour, minute } => Self::DailyAt { hour, minute },
+            W::WeeklyAt { weekday, hour, minute } => Self::WeeklyAt { weekday, hour, minute },
+        }
+    }
+}
+
+impl From<Recurrence> for oximux_remote_proto::messages::RecurrenceWire {
+    fn from(r: Recurrence) -> Self {
+        match r {
+            Recurrence::EveryMinutes { minutes } => Self::EveryMinutes { minutes },
+            Recurrence::DailyAt { hour, minute } => Self::DailyAt { hour, minute },
+            Recurrence::WeeklyAt { weekday, hour, minute } => {
+                Self::WeeklyAt { weekday, hour, minute }
+            }
+        }
+    }
+}
+
+/// A stored schedule, as the app renders it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Schedule {
+    pub id: String,
+    pub name: String,
+    /// The **desktop's** working directory the run opens in.
+    pub cwd: String,
+    pub prompt: String,
+    pub agent_id: Option<String>,
+    pub recurrence: Recurrence,
+    pub enabled: bool,
+    /// RFC-3339 next fire in the desktop's zone. Formatted app-side against the
+    /// reader's own clock — the desktop does not know the phone's locale.
+    pub next_fire_at: String,
+    /// The desktop's own phrasing of the recurrence, carried so both surfaces
+    /// read identically rather than the phone re-deriving it.
+    pub summary: String,
+}
+
+impl From<oximux_remote_proto::messages::ScheduleWire> for Schedule {
+    fn from(w: oximux_remote_proto::messages::ScheduleWire) -> Self {
+        Self {
+            id: w.id,
+            name: w.name,
+            cwd: w.cwd,
+            prompt: w.prompt,
+            agent_id: w.agent_id,
+            recurrence: w.recurrence.into(),
+            enabled: w.enabled,
+            next_fire_at: w.next_fire_at,
+            summary: w.summary,
+        }
+    }
+}
+
+/// How one recorded fire turned out.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum RunOutcome {
+    Ok,
+    Failed,
+}
+
+impl From<oximux_remote_proto::messages::RunOutcomeWire> for RunOutcome {
+    fn from(w: oximux_remote_proto::messages::RunOutcomeWire) -> Self {
+        use oximux_remote_proto::messages::RunOutcomeWire as W;
+        match w {
+            W::Ok => Self::Ok,
+            W::Failed => Self::Failed,
+        }
+    }
+}
+
+/// One recorded fire of a schedule.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ScheduleRun {
+    pub schedule_id: String,
+    /// RFC-3339 **scheduled** instant, not when the tick noticed it.
+    pub fired_at: String,
+    pub outcome: RunOutcome,
+    /// The session the fire opened, when it opened one.
+    pub session_id: Option<String>,
+    /// A short human note on a failure, absent on success.
+    pub detail: Option<String>,
+}
+
+impl From<oximux_remote_proto::messages::ScheduleRunWire> for ScheduleRun {
+    fn from(w: oximux_remote_proto::messages::ScheduleRunWire) -> Self {
+        Self {
+            schedule_id: w.schedule_id,
+            fired_at: w.fired_at,
+            outcome: w.outcome.into(),
+            session_id: w.session_id,
+            detail: w.detail,
+        }
+    }
+}

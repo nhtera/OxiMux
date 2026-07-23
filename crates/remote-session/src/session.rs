@@ -19,7 +19,8 @@ use futures::channel::oneshot;
 use oximux_agent_core::thread::{AskQuestion, ChatImage, PermissionDecision, QuestionAnswers};
 use oximux_remote_proto::messages::{
     AnswerQuestionReq, CheckRunWire, ForgeItemDetailWire, ForgeItemKindWire, ForgeItemWire,
-    ForgeStateWire, ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionSummary,
+    ForgeStateWire, RecurrenceWire, ResolvePermissionReq, ScheduleRunWire, ScheduleWire,
+    SendPromptReq, SessionInfoWire, SessionSummary,
 };
 use oximux_remote_proto::proto::{Request, Response, RpcError, SessionChoices};
 use oximux_remote_proto::{HostEvent, Transport};
@@ -327,6 +328,73 @@ impl RemoteSession {
             Response::ForgeChecks(checks) => Ok(checks),
             Response::Error(e) => Err(SessionError::Rpc(e)),
             _ => Err(SessionError::Unexpected { expected: "ForgeChecks" }),
+        }
+    }
+
+    /// Every schedule the desktop holds. **Empty is a normal answer** — a desktop
+    /// with no schedules is the common case. Refused for a session-scoped device,
+    /// which has no session to be narrowed to.
+    pub async fn list_schedules(&self) -> Result<Vec<ScheduleWire>> {
+        match self.call(Request::ListSchedules).await? {
+            Response::Schedules(rows) => Ok(rows),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Schedules" }),
+        }
+    }
+
+    /// Create a schedule, returning the stored row — its derived id and first
+    /// next-fire come back so the caller can show it without re-listing.
+    ///
+    /// An invalid recurrence (an interval under the desktop's floor, an
+    /// impossible time) is refused by the host rather than stored; the phone's
+    /// pickers cannot express those, so this only bites a malformed caller.
+    pub async fn create_schedule(
+        &self,
+        name: &str,
+        cwd: &str,
+        prompt: &str,
+        agent_id: Option<&str>,
+        recurrence: RecurrenceWire,
+    ) -> Result<ScheduleWire> {
+        let req = Request::CreateSchedule {
+            name: name.to_string(),
+            cwd: cwd.to_string(),
+            prompt: prompt.to_string(),
+            agent_id: agent_id.map(str::to_string),
+            recurrence,
+        };
+        match self.call(req).await? {
+            Response::ScheduleCreated(sched) => Ok(sched),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "ScheduleCreated" }),
+        }
+    }
+
+    /// Delete a schedule. Idempotent — deleting one already gone is success.
+    /// In-flight runs are unaffected; this stops future fires.
+    pub async fn delete_schedule(&self, id: &str) -> Result<()> {
+        self.expect_ack(Request::DeleteSchedule { id: id.to_string() }).await
+    }
+
+    /// Enable or disable a schedule without deleting it. Re-enabling recomputes
+    /// the next fire from now — a schedule paused for a week does not wake owing a
+    /// week of missed runs.
+    pub async fn set_schedule_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        self.expect_ack(Request::SetScheduleEnabled { id: id.to_string(), enabled }).await
+    }
+
+    /// A schedule's recent run history, most recent first, capped at `limit`.
+    /// **Empty means it has never fired**, normal for a fresh schedule.
+    pub async fn get_schedule_runs(
+        &self,
+        schedule_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ScheduleRunWire>> {
+        let req = Request::GetScheduleRuns { schedule_id: schedule_id.to_string(), limit };
+        match self.call(req).await? {
+            Response::ScheduleRuns(rows) => Ok(rows),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "ScheduleRuns" }),
         }
     }
 

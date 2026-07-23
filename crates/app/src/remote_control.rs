@@ -112,6 +112,13 @@ pub struct RemoteControl {
     /// The desktop's rewind path, when one is installed. `None` answers
     /// `RewindSession` with `Unauthorized`, as `launcher` does.
     rewinder: Option<Arc<dyn RewindService>>,
+    /// The desktop's schedule store, when one is installed. `None` answers the
+    /// schedule RPCs with `Unauthorized`, as `launcher` does — whether this
+    /// desktop keeps schedules is not a fact an unauthorized client should be able
+    /// to establish. Shares the app's one SQLite connection, so a schedule the
+    /// phone creates is the same row the desktop's ticker fires and its Settings
+    /// pane lists.
+    schedules: Option<Arc<oximux_agents::schedule::ScheduleStore>>,
     /// The live host's auth store while one is bound, so the paired-devices UI can
     /// revoke against the *running* host (the dispatcher rechecks authorization on
     /// every RPC, so a revoke lands mid-session). Cleared on stop — with no host, the
@@ -150,6 +157,7 @@ impl RemoteControl {
             terminals: None,
             launcher: None,
             rewinder: None,
+            schedules: None,
             auth: Mutex::new(None),
             awake: Mutex::new(None),
             endpoint_secret: None,
@@ -179,6 +187,13 @@ impl RemoteControl {
     /// Install the rewind service the host serves. Called once at boot.
     pub fn set_rewinder(&mut self, rewinder: Arc<dyn RewindService>) {
         self.rewinder = Some(rewinder);
+    }
+
+    /// Install the schedule store the host serves. Called once at boot with the
+    /// same store the desktop's scheduler ticks, so both surfaces read and write
+    /// the same rows.
+    pub fn set_schedule_store(&mut self, schedules: Arc<oximux_agents::schedule::ScheduleStore>) {
+        self.schedules = Some(schedules);
     }
 
     pub fn set_terminals(&mut self, terminals: Arc<dyn TerminalSource>) {
@@ -247,6 +262,9 @@ impl RemoteControl {
         }
         if let Some(rewinder) = &self.rewinder {
             dispatcher = dispatcher.with_rewinder(Arc::clone(rewinder));
+        }
+        if let Some(schedules) = &self.schedules {
+            dispatcher = dispatcher.with_schedule_store(Arc::clone(schedules));
         }
         dispatcher
     }

@@ -23,10 +23,13 @@ export default function RootLayout() {
         <Stack.Screen name="pair-scan" options={{ title: 'Scan pairing code' }} />
         <Stack.Screen name="sessions" options={{ title: 'Sessions' }} />
         <Stack.Screen name="settings" options={{ title: 'Settings' }} />
+        <Stack.Screen name="schedules" options={{ title: 'Schedules' }} />
         {/* Titles come from the screens themselves: a session is named by the
-            agent, and the git screen by the branch it is on. */}
+            agent, the git screen by the branch it is on, and a schedule's run
+            history by the schedule's own name. */}
         <Stack.Screen name="session/[id]" />
         <Stack.Screen name="git/[id]" />
+        <Stack.Screen name="schedules/[id]" />
       </Stack>
     </ThemeProvider>
   );

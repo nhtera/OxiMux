@@ -80,6 +80,9 @@ export default function SessionsScreen() {
             <Link href="/terminals">
               <ThemedText type="code">Terminals</ThemedText>
             </Link>
+            <Link href="/schedules">
+              <ThemedText type="code">Schedules</ThemedText>
+            </Link>
             <Link href="/settings">
               <ThemedText type="code">Settings</ThemedText>
             </Link>
