@@ -14,13 +14,19 @@ const GLYPH: Record<CheckStatus, string> = {
   unknown: '?',
 };
 
-const COLOR: Record<CheckStatus, string> = {
-  pass: '#3FB950',
-  fail: '#F85149',
-  pending: '#D29922',
-  skipped: '#8B949E',
-  unknown: '#8B949E',
-};
+function colorFor(status: CheckStatus, theme: ReturnType<typeof useTheme>): string {
+  switch (status) {
+    case 'pass':
+      return theme.success;
+    case 'fail':
+      return theme.danger;
+    case 'pending':
+      return theme.info;
+    case 'skipped':
+    case 'unknown':
+      return theme.textMuted;
+  }
+}
 
 /**
  * CI checks for the current branch's PR.
@@ -44,7 +50,7 @@ export function CheckList({ checks }: { checks: CheckRun[] }) {
         const status = checkStatus(check);
         return (
           <View key={`${check.name}-${check.link}`} style={styles.row}>
-            <ThemedText type="code" style={{ color: COLOR[status] }}>
+            <ThemedText type="code" style={{ color: colorFor(status, theme) }}>
               {GLYPH[status]}
             </ThemedText>
             <ThemedText type="small" numberOfLines={1} style={styles.name}>

@@ -5,9 +5,11 @@ import { AttachmentStrip } from '@/components/chat/attachment-strip';
 import { MicButton } from '@/components/chat/mic-button';
 import { filterCommands, SlashPalette, slashQuery } from '@/components/chat/slash-palette';
 import { ThemedText } from '@/components/themed-text';
+import { Button } from '@/components/ui/button';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { MAX_ATTACHMENTS, pickImages, type Attachment } from '@/native/attachments';
+import { impact } from '@/native/haptics';
 import { useDictation } from '@/native/use-dictation';
 
 type Props = {
@@ -119,6 +121,7 @@ export function Composer({
 
   const submit = async () => {
     if (!canSubmit) return;
+    impact();
     setBusy(true);
     // Clear optimistically: the desktop echoes the prompt back as a real entry,
     // so leaving it in the box would read as "not sent" once it appears above.
@@ -175,7 +178,12 @@ export function Composer({
           onPress={attach}
           disabled={!canAttach}
           accessibilityLabel="Attach an image"
-          style={[styles.button, styles.attach, !canAttach && styles.disabled]}
+          style={[
+            styles.button,
+            styles.attach,
+            { borderColor: theme.borderStrong },
+            !canAttach && styles.disabled,
+          ]}
         >
           <ThemedText type="code">
             {room === 0 ? `${MAX_ATTACHMENTS} max` : 'Attach'}
@@ -195,11 +203,7 @@ export function Composer({
 
         <View style={styles.spacer} />
 
-        {turnActive ? (
-          <Pressable onPress={onCancel} style={[styles.button, styles.stop]}>
-            <ThemedText type="code">Stop</ThemedText>
-          </Pressable>
-        ) : null}
+        {turnActive ? <Button label="Stop" variant="danger" onPress={onCancel} /> : null}
 
         <Pressable
           onPress={submit}
@@ -233,12 +237,11 @@ const styles = StyleSheet.create({
   },
   actions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two },
   spacer: { flex: 1 },
-  attach: { borderWidth: StyleSheet.hairlineWidth, borderColor: '#8B949E' },
+  attach: { borderWidth: StyleSheet.hairlineWidth },
   button: {
     paddingVertical: Spacing.two,
     paddingHorizontal: Spacing.four,
     borderRadius: Spacing.two,
   },
-  stop: { borderWidth: 1, borderColor: '#F85149' },
   disabled: { opacity: 0.4 },
 });

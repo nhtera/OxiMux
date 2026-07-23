@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Pressable, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
+import { ErrorBanner } from '@/components/ui/error-banner';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import type { PlanEntryLite, Thread } from '@/native/thread';
@@ -24,11 +25,7 @@ export function StatusStrip({ thread }: { thread: Thread }) {
 
   return (
     <View style={[styles.strip, { borderBottomColor: theme.backgroundSelected }]}>
-      {thread.last_error ? (
-        <ThemedText type="small" style={styles.error} numberOfLines={2}>
-          {thread.last_error}
-        </ThemedText>
-      ) : null}
+      {thread.last_error ? <ErrorBanner message={thread.last_error} /> : null}
 
       {thread.compacting ? (
         <ThemedText type="small" style={styles.muted}>
@@ -92,5 +89,4 @@ const styles = StyleSheet.create({
   },
   planRow: { paddingLeft: Spacing.two },
   muted: { opacity: 0.7 },
-  error: { color: '#F85149' },
 });

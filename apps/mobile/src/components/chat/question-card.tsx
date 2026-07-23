@@ -1,8 +1,10 @@
+import { Check, X } from 'lucide-react-native';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, View } from 'react-native';
 
 import { QuestionBlock } from '@/components/chat/question-block';
 import { ThemedText } from '@/components/themed-text';
+import { Button } from '@/components/ui/button';
 import { QUESTION_ACCENT as ACCENT } from '@/constants/chat';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
@@ -107,26 +109,26 @@ export function QuestionCard({ call, request, onAnswer }: Props) {
       ))}
 
       <View style={styles.actions}>
-        <Pressable
+        <Button
+          label="Submit"
+          variant="primary"
+          size="compact"
+          leftIcon={Check}
           disabled={!ready || busy}
           onPress={() => submit(answers)}
-          style={[styles.button, { backgroundColor: ACCENT }, (!ready || busy) && styles.dim]}
-        >
-          <ThemedText type="code" style={styles.submitLabel}>
-            Submit
-          </ThemedText>
-        </Pressable>
+        />
 
         {/* Skip sends an empty answer set, which the tool reads as "did not
             answer" — the same thing the desktop's Skip does. It releases the
             turn rather than leaving the agent blocked. */}
-        <Pressable
+        <Button
+          label="Skip"
+          variant="outline"
+          size="compact"
+          leftIcon={X}
           disabled={busy}
           onPress={() => submit({ by_question: {}, response: null })}
-          style={[styles.button, styles.skip, busy && styles.dim]}
-        >
-          <ThemedText type="code">Skip</ThemedText>
-        </Pressable>
+        />
 
         {busy ? <ActivityIndicator /> : null}
       </View>
@@ -144,13 +146,5 @@ const styles = StyleSheet.create({
   kicker: { color: ACCENT },
   body: { lineHeight: 20 },
   actions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, paddingTop: Spacing.one },
-  button: {
-    paddingVertical: Spacing.two,
-    paddingHorizontal: Spacing.three,
-    borderRadius: Spacing.two,
-  },
-  skip: { borderWidth: 1, borderColor: '#8A8F98' },
-  submitLabel: { color: '#000000' },
-  dim: { opacity: 0.4 },
   note: { opacity: 0.8 },
 });

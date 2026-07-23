@@ -43,10 +43,10 @@ export function TurnDiffCard({ files, diff }: { files: TurnFileChange[]; diff: s
           {expanded ? '▾' : '▸'}{' '}
           {files.length === 1 ? '1 file changed' : `${files.length} files changed`}
           {'  '}
-          <ThemedText type="small" style={styles.added}>
+          <ThemedText type="small" themeColor="diffAdd">
             +{added}
           </ThemedText>{' '}
-          <ThemedText type="small" style={styles.removed}>
+          <ThemedText type="small" themeColor="diffRemove">
             −{removed}
           </ThemedText>
         </ThemedText>
@@ -99,10 +99,10 @@ function ExpandedBody({
         <ThemedText key={f.path} type="code" numberOfLines={1} style={styles.fileRow}>
           {f.path}
           {'  '}
-          <ThemedText type="code" style={styles.added}>
+          <ThemedText type="code" themeColor="diffAdd">
             +{f.added}
           </ThemedText>{' '}
-          <ThemedText type="code" style={styles.removed}>
+          <ThemedText type="code" themeColor="diffRemove">
             −{f.removed}
           </ThemedText>
         </ThemedText>
@@ -126,6 +126,4 @@ const styles = StyleSheet.create({
   diffs: { gap: Spacing.three },
   fileRow: { opacity: 0.9 },
   muted: { opacity: 0.7 },
-  added: { color: '#3FB950' },
-  removed: { color: '#F85149' },
 });

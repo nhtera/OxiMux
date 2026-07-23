@@ -1,11 +1,16 @@
 import { Stack, useLocalSearchParams } from 'expo-router';
+import { Check, Minus, Plus } from 'lucide-react-native';
 import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, Pressable, RefreshControl, ScrollView, StyleSheet, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { ConnectionBanner } from '@/components/connection-banner';
 import { DiffView } from '@/components/git/diff-view';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
+import { Button } from '@/components/ui/button';
+import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorBanner } from '@/components/ui/error-banner';
 import { Spacing } from '@/constants/theme';
 import { useClient } from '@/native/client';
 import { describeError } from '@/native/errors';
@@ -120,6 +125,7 @@ export default function GitScreen() {
     <ThemedView style={styles.fill}>
       <Stack.Screen options={{ title: status?.branch ?? 'Git' }} />
       <SafeAreaView style={styles.fill} edges={['bottom']}>
+        <ConnectionBanner />
         <ScrollView
           contentContainerStyle={styles.list}
           refreshControl={<RefreshControl refreshing={false} onRefresh={refresh} />}
@@ -138,17 +144,9 @@ export default function GitScreen() {
             <ActivityIndicator />
           )}
 
-          {error ? (
-            <ThemedText type="small" style={styles.error}>
-              {error}
-            </ThemedText>
-          ) : null}
+          {error ? <ErrorBanner message={error} /> : null}
 
-          {status?.files.length === 0 ? (
-            <ThemedText type="small" style={styles.muted}>
-              Working tree clean.
-            </ThemedText>
-          ) : null}
+          {status?.files.length === 0 ? <EmptyState title="Working tree clean." /> : null}
 
           {status?.files.map((file) => (
             <View key={file.path} style={styles.fileBlock}>
@@ -219,10 +217,10 @@ function FileRow({
           {added || removed ? (
             <>
               {'  '}
-              <ThemedText type="small" style={styles.added}>
+              <ThemedText type="small" themeColor="diffAdd">
                 +{added}
               </ThemedText>{' '}
-              <ThemedText type="small" style={styles.removed}>
+              <ThemedText type="small" themeColor="diffRemove">
                 −{removed}
               </ThemedText>
             </>
@@ -230,9 +228,14 @@ function FileRow({
         </ThemedText>
       </Pressable>
 
-      <Pressable disabled={busy} onPress={onToggleStage} style={[styles.stage, busy && styles.dim]}>
-        <ThemedText type="small">{isStaged(file) ? 'Unstage' : 'Stage'}</ThemedText>
-      </Pressable>
+      <Button
+        label={isStaged(file) ? 'Unstage' : 'Stage'}
+        variant="outline"
+        size="compact"
+        leftIcon={isStaged(file) ? Minus : Plus}
+        disabled={busy}
+        onPress={onToggleStage}
+      />
     </View>
   );
 }
@@ -266,19 +269,14 @@ function CommitBar({
         style={[styles.input, { backgroundColor: theme.backgroundElement, color: theme.text }]}
         multiline
       />
-      <Pressable
-        onPress={onCommit}
+      <Button
+        label={`Commit${stagedCount > 0 ? ` ${stagedCount}` : ''}`}
+        variant="primary"
+        leftIcon={Check}
         disabled={!canCommit}
-        style={[
-          styles.commitButton,
-          { backgroundColor: theme.backgroundSelected },
-          !canCommit && styles.dim,
-        ]}
-      >
-        <ThemedText type="code">
-          Commit{stagedCount > 0 ? ` ${stagedCount}` : ''}
-        </ThemedText>
-      </Pressable>
+        onPress={onCommit}
+        style={styles.commitButton}
+      />
     </View>
   );
 }
@@ -289,13 +287,6 @@ const styles = StyleSheet.create({
   fileBlock: { gap: Spacing.two },
   row: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two },
   rowMain: { flex: 1, gap: Spacing.half },
-  stage: {
-    paddingVertical: Spacing.one,
-    paddingHorizontal: Spacing.two,
-    borderWidth: 1,
-    borderColor: '#8A8F98',
-    borderRadius: Spacing.one,
-  },
   commitBar: {
     borderTopWidth: StyleSheet.hairlineWidth,
     padding: Spacing.three,
@@ -309,15 +300,6 @@ const styles = StyleSheet.create({
     paddingVertical: Spacing.two,
     fontSize: 16,
   },
-  commitButton: {
-    alignSelf: 'flex-end',
-    paddingVertical: Spacing.two,
-    paddingHorizontal: Spacing.four,
-    borderRadius: Spacing.two,
-  },
+  commitButton: { alignSelf: 'flex-end' },
   muted: { opacity: 0.7 },
-  dim: { opacity: 0.4 },
-  added: { color: '#3FB950' },
-  removed: { color: '#F85149' },
-  error: { color: '#F85149' },
 });

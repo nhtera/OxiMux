@@ -1,8 +1,12 @@
 import { useMemo, useState } from 'react';
-import { ActivityIndicator, Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
+import { Button } from '@/components/ui/button';
+import { ErrorBanner } from '@/components/ui/error-banner';
+import { Sheet } from '@/components/ui/sheet';
 import { Spacing } from '@/constants/theme';
+import { impact } from '@/native/haptics';
 import { useTheme } from '@/hooks/use-theme';
 import { rewindTargets, targetLabel, type RewindTarget } from '@/native/rewind';
 import type { ThreadEntry } from '@/native/thread';
@@ -40,56 +44,50 @@ export function RewindSheet({
   };
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={close}>
-      <Pressable style={styles.backdrop} onPress={close}>
-        <Pressable style={[styles.sheet, { backgroundColor: theme.background }]} onPress={() => {}}>
-          {confirming ? (
-            <Confirm
-              target={confirming}
-              busy={busy}
-              error={error}
-              onBack={() => setConfirming(null)}
-              onGo={() => onRewind(confirming.ordinal)}
-            />
+    <Sheet visible={visible} onClose={close}>
+      {confirming ? (
+        <Confirm
+          target={confirming}
+          busy={busy}
+          error={error}
+          onBack={() => setConfirming(null)}
+          onGo={() => {
+            impact();
+            onRewind(confirming.ordinal);
+          }}
+        />
+      ) : (
+        <>
+          <ThemedText type="smallBold">Rewind to a message</ThemedText>
+          <ThemedText type="small" style={styles.hint}>
+            The chosen message and everything after it are removed.
+          </ThemedText>
+          {targets.length === 0 ? (
+            <ThemedText type="small" style={styles.hint}>
+              Nothing to rewind to yet.
+            </ThemedText>
           ) : (
-            <>
-              <ThemedText type="smallBold">Rewind to a message</ThemedText>
-              <ThemedText type="small" style={styles.hint}>
-                The chosen message and everything after it are removed.
-              </ThemedText>
-              {targets.length === 0 ? (
-                <ThemedText type="small" style={styles.hint}>
-                  Nothing to rewind to yet.
+            // Newest first: the turn someone wants to undo is almost always a
+            // recent one, and a long conversation would otherwise bury it.
+            [...targets].reverse().map((target) => (
+              <Pressable
+                key={target.ordinal}
+                onPress={() => setConfirming(target)}
+                style={[styles.row, { borderBottomColor: theme.backgroundElement }]}
+              >
+                <ThemedText numberOfLines={1} style={styles.rowText}>
+                  {targetLabel(target)}
                 </ThemedText>
-              ) : (
-                <ScrollView style={styles.list}>
-                  {/* Newest first: the turn someone wants to undo is almost
-                      always a recent one, and a long conversation would
-                      otherwise bury it under scroll. */}
-                  {[...targets].reverse().map((target) => (
-                    <Pressable
-                      key={target.ordinal}
-                      onPress={() => setConfirming(target)}
-                      style={[styles.row, { borderBottomColor: theme.backgroundElement }]}
-                    >
-                      <ThemedText numberOfLines={1} style={styles.rowText}>
-                        {targetLabel(target)}
-                      </ThemedText>
-                      <ThemedText type="small" style={styles.hint}>
-                        −{target.messagesRemoved}
-                      </ThemedText>
-                    </Pressable>
-                  ))}
-                </ScrollView>
-              )}
-              <Pressable onPress={close} style={styles.button}>
-                <ThemedText type="code">Cancel</ThemedText>
+                <ThemedText type="small" style={styles.hint}>
+                  −{target.messagesRemoved}
+                </ThemedText>
               </Pressable>
-            </>
+            ))
           )}
-        </Pressable>
-      </Pressable>
-    </Modal>
+          <Button label="Cancel" variant="secondary" onPress={close} />
+        </>
+      )}
+    </Sheet>
   );
 }
 
@@ -106,7 +104,6 @@ function Confirm({
   onBack: () => void;
   onGo: () => void;
 }) {
-  const theme = useTheme();
   const count = target.messagesRemoved;
 
   return (
@@ -127,42 +124,19 @@ function Confirm({
         available on the desktop.
       </ThemedText>
 
-      {error ? (
-        <ThemedText type="small" style={styles.error} numberOfLines={3}>
-          {error}
-        </ThemedText>
-      ) : null}
+      {error ? <ErrorBanner message={error} /> : null}
 
       <View style={styles.actions}>
         {busy ? <ActivityIndicator /> : null}
         <View style={styles.spacer} />
-        <Pressable onPress={onBack} disabled={busy} style={styles.button}>
-          <ThemedText type="code">Back</ThemedText>
-        </Pressable>
-        <Pressable
-          onPress={onGo}
-          disabled={busy}
-          style={[styles.button, styles.danger, busy && styles.disabled]}
-        >
-          <ThemedText type="code" style={{ color: theme.text }}>
-            Rewind
-          </ThemedText>
-        </Pressable>
+        <Button label="Back" variant="secondary" disabled={busy} onPress={onBack} />
+        <Button label="Rewind" variant="danger" disabled={busy} onPress={onGo} />
       </View>
     </>
   );
 }
 
 const styles = StyleSheet.create({
-  backdrop: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.4)' },
-  sheet: {
-    borderTopLeftRadius: Spacing.three,
-    borderTopRightRadius: Spacing.three,
-    padding: Spacing.four,
-    gap: Spacing.two,
-    maxHeight: '70%',
-  },
-  list: { maxHeight: 280 },
   row: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -172,14 +146,6 @@ const styles = StyleSheet.create({
   },
   rowText: { flex: 1 },
   hint: { opacity: 0.7 },
-  error: { color: '#F85149' },
   actions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, paddingTop: Spacing.two },
   spacer: { flex: 1 },
-  button: {
-    paddingVertical: Spacing.two,
-    paddingHorizontal: Spacing.three,
-    borderRadius: Spacing.two,
-  },
-  danger: { backgroundColor: 'rgba(248,81,73,0.22)' },
-  disabled: { opacity: 0.4 },
 });

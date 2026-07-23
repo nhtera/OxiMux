@@ -1,8 +1,11 @@
 import { useState } from 'react';
-import { ActivityIndicator, Modal, Pressable, StyleSheet, TextInput, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
-import { Spacing } from '@/constants/theme';
+import { Button } from '@/components/ui/button';
+import { ErrorBanner } from '@/components/ui/error-banner';
+import { BottomSheetTextInput, Sheet } from '@/components/ui/sheet';
+import { Radius, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 
 /**
@@ -37,82 +40,50 @@ export function NewSessionSheet({
   const trimmed = cwd.trim();
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <Pressable style={styles.backdrop} onPress={onClose}>
-        <Pressable style={[styles.sheet, { backgroundColor: theme.background }]} onPress={() => {}}>
-          <ThemedText type="smallBold">New session</ThemedText>
+    <Sheet visible={visible} onClose={onClose}>
+      <ThemedText type="smallBold">New session</ThemedText>
 
-          <TextInput
-            value={cwd}
-            onChangeText={setCwd}
-            placeholder="/path/on/the/desktop"
-            placeholderTextColor={theme.textSecondary}
-            autoCapitalize="none"
-            autoCorrect={false}
-            // Paths are not sentences; the default keyboard's capitalisation and
-            // autocorrect actively fight them.
-            keyboardType="default"
-            style={[
-              styles.input,
-              { backgroundColor: theme.backgroundElement, color: theme.text },
-            ]}
-          />
-          <ThemedText type="small" style={styles.hint}>
-            A folder on the desktop running OxiMux — not on this phone.
-          </ThemedText>
+      <BottomSheetTextInput
+        value={cwd}
+        onChangeText={setCwd}
+        placeholder="/path/on/the/desktop"
+        placeholderTextColor={theme.textSecondary}
+        autoCapitalize="none"
+        autoCorrect={false}
+        // Paths are not sentences; the default keyboard's capitalisation and
+        // autocorrect actively fight them.
+        keyboardType="default"
+        style={[styles.input, { backgroundColor: theme.backgroundElement, color: theme.text }]}
+      />
+      <ThemedText type="small" style={styles.hint}>
+        A folder on the desktop running OxiMux — not on this phone.
+      </ThemedText>
 
-          {error ? (
-            <ThemedText type="small" style={styles.error} numberOfLines={3}>
-              {error}
-            </ThemedText>
-          ) : null}
+      {error ? <ErrorBanner message={error} /> : null}
 
-          <View style={styles.actions}>
-            {busy ? <ActivityIndicator /> : null}
-            <View style={styles.spacer} />
-            <Pressable onPress={onClose} disabled={busy} style={styles.button}>
-              <ThemedText type="code">Cancel</ThemedText>
-            </Pressable>
-            <Pressable
-              onPress={() => onCreate(trimmed)}
-              disabled={busy || trimmed.length === 0}
-              style={[
-                styles.button,
-                { backgroundColor: theme.backgroundSelected },
-                (busy || trimmed.length === 0) && styles.disabled,
-              ]}
-            >
-              <ThemedText type="code">Start</ThemedText>
-            </Pressable>
-          </View>
-        </Pressable>
-      </Pressable>
-    </Modal>
+      <View style={styles.actions}>
+        {busy ? <ActivityIndicator /> : null}
+        <View style={styles.spacer} />
+        <Button label="Cancel" variant="secondary" disabled={busy} onPress={onClose} />
+        <Button
+          label="Start"
+          variant="primary"
+          disabled={busy || trimmed.length === 0}
+          onPress={() => onCreate(trimmed)}
+        />
+      </View>
+    </Sheet>
   );
 }
 
 const styles = StyleSheet.create({
-  backdrop: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.4)' },
-  sheet: {
-    borderTopLeftRadius: Spacing.three,
-    borderTopRightRadius: Spacing.three,
-    padding: Spacing.four,
-    gap: Spacing.two,
-  },
   input: {
-    borderRadius: Spacing.two,
+    borderRadius: Radius.md,
     paddingHorizontal: Spacing.three,
     paddingVertical: Spacing.two,
     fontSize: 16,
   },
   hint: { opacity: 0.7 },
-  error: { color: '#F85149' },
   actions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, paddingTop: Spacing.two },
   spacer: { flex: 1 },
-  button: {
-    paddingVertical: Spacing.two,
-    paddingHorizontal: Spacing.three,
-    borderRadius: Spacing.two,
-  },
-  disabled: { opacity: 0.4 },
 });

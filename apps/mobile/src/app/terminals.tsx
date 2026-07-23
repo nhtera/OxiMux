@@ -3,8 +3,11 @@ import type { TerminalInfo } from 'oximux-core';
 import { ActivityIndicator, FlatList, Pressable, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { ConnectionBanner } from '@/components/connection-banner';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
+import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorBanner } from '@/components/ui/error-banner';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { useTerminalList } from '@/native/terminal';
@@ -25,17 +28,19 @@ export default function TerminalsScreen() {
   return (
     <ThemedView style={styles.fill}>
       <SafeAreaView style={styles.fill} edges={['bottom']}>
+        <ConnectionBanner />
         {error ? (
-          <Pressable onPress={reload} style={styles.notice}>
-            <ThemedText type="small" style={styles.errorText}>
-              {error}
-            </ThemedText>
+          <View style={styles.notice}>
+            {/* Tap retries the list rather than merely clearing the message —
+                the affordance the ad-hoc version had — so `onDismiss` is wired
+                to `reload`, not a plain dismiss. */}
+            <ErrorBanner message={error} onDismiss={reload} />
             <ThemedText type="small" style={{ color: theme.textSecondary }}>
               {error.includes('not authorized') || error.includes('Unauthorized')
                 ? 'This device is limited to one agent session, so terminals are not shared with it. Change its access on the desktop, in Settings → Remote.'
                 : 'Tap to try again.'}
             </ThemedText>
-          </Pressable>
+          </View>
         ) : null}
 
         {loading ? (
@@ -49,13 +54,7 @@ export default function TerminalsScreen() {
             renderItem={({ item }) => <TerminalRow terminal={item} />}
             contentContainerStyle={styles.list}
             ListEmptyComponent={
-              error ? null : (
-                <View style={styles.centre}>
-                  <ThemedText style={{ color: theme.textSecondary }}>
-                    No terminals open on the desktop.
-                  </ThemedText>
-                </View>
-              )
+              error ? null : <EmptyState title="No terminals open on the desktop." />
             }
           />
         )}
@@ -95,5 +94,4 @@ const styles = StyleSheet.create({
   row: { gap: Spacing.one },
   centre: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: Spacing.four },
   notice: { paddingHorizontal: Spacing.three, paddingVertical: Spacing.two, gap: Spacing.one },
-  errorText: { color: '#F85149' },
 });

@@ -3,6 +3,7 @@ import { Pressable, StyleSheet, View } from 'react-native';
 
 import { MarkdownBody } from '@/components/chat/markdown-body';
 import { SubagentLogPanel } from '@/components/chat/subagent-log-panel';
+import { ThinkingShimmer } from '@/components/chat/thinking-shimmer';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
@@ -69,6 +70,7 @@ export function ToolCallCard({ call, children }: { call: ToolCall; children?: Re
   const theme = useTheme();
   const [expanded, setExpanded] = useState(false);
   const failed = failure(call);
+  const running = call.status === 'InProgress';
   const result = call.redact_result ? '[redacted]' : (call.result ?? '');
   const preview = result.split('\n').slice(0, RESULT_PREVIEW_LINES).join('\n');
   const truncated = preview.length < result.length;
@@ -79,13 +81,21 @@ export function ToolCallCard({ call, children }: { call: ToolCall; children?: Re
         <ThemedText type="code" numberOfLines={1} style={styles.toolName}>
           {call.name}
         </ThemedText>
-        <ThemedText type="small" style={failed ? styles.failed : styles.muted}>
-          {statusLabel(call.status)}
-        </ThemedText>
+        {running ? (
+          <ThinkingShimmer label="Working" />
+        ) : (
+          <ThemedText
+            type="small"
+            themeColor={failed ? 'danger' : undefined}
+            style={!failed ? styles.muted : undefined}
+          >
+            {statusLabel(call.status)}
+          </ThemedText>
+        )}
       </Pressable>
 
       {failed ? (
-        <ThemedText type="small" style={styles.failed}>
+        <ThemedText type="small" themeColor="danger">
           {failed}
         </ThemedText>
       ) : null}
@@ -148,8 +158,5 @@ const styles = StyleSheet.create({
   toolHeader: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two },
   toolName: { flex: 1 },
   result: { opacity: 0.85, lineHeight: 16 },
-  failed: { color: '#F85149' },
-  added: { color: '#3FB950' },
-  removed: { color: '#F85149' },
   divider: { alignItems: 'center', paddingVertical: Spacing.two },
 });

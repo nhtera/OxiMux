@@ -2,6 +2,7 @@ import { Recurrence, Recurrence_Tags } from 'oximux-core';
 import { Pressable, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
+import { Chip } from '@/components/ui/badge';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { INTERVAL_CHOICES, WEEKDAYS, intervalLabel } from '@/native/recurrence';
@@ -205,29 +206,6 @@ function Segmented<T extends string | number>({
   );
 }
 
-function Chip({
-  label,
-  selected,
-  onPress,
-}: {
-  label: string;
-  selected: boolean;
-  onPress: () => void;
-}) {
-  const theme = useTheme();
-  return (
-    <Pressable
-      onPress={onPress}
-      style={[
-        styles.chip,
-        { backgroundColor: selected ? theme.backgroundSelected : theme.backgroundElement },
-      ]}
-    >
-      <ThemedText type="code">{label}</ThemedText>
-    </Pressable>
-  );
-}
-
 function Stepper({
   label,
   value,
@@ -284,11 +262,6 @@ const styles = StyleSheet.create({
     borderRadius: Spacing.two,
   },
   chips: { flexDirection: 'row', flexWrap: 'wrap', gap: Spacing.two },
-  chip: {
-    paddingVertical: Spacing.two,
-    paddingHorizontal: Spacing.three,
-    borderRadius: Spacing.two,
-  },
   time: { flexDirection: 'row', alignItems: 'flex-end', gap: Spacing.three },
   colon: { paddingBottom: Spacing.two },
   stepper: { gap: Spacing.one },

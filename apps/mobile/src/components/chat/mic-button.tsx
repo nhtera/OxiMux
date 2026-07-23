@@ -55,7 +55,7 @@ export function MicButton({ phase, level, onStart, onStop }: Props) {
       style={[
         styles.button,
         {
-          borderColor: recording ? '#F85149' : theme.textSecondary,
+          borderColor: recording ? theme.danger : theme.textSecondary,
           opacity: transcribing ? 0.5 : 1,
         },
       ]}
@@ -65,12 +65,12 @@ export function MicButton({ phase, level, onStart, onStop }: Props) {
           <View
             style={[
               styles.meterFill,
-              { width: `${Math.round(Math.min(1, level) * 100)}%` },
+              { width: `${Math.round(Math.min(1, level) * 100)}%`, backgroundColor: theme.danger },
             ]}
           />
         </View>
       ) : null}
-      <ThemedText type="code" style={recording ? { color: '#F85149' } : undefined}>
+      <ThemedText type="code" style={recording ? { color: theme.danger } : undefined}>
         {label}
       </ThemedText>
     </View>
@@ -97,6 +97,5 @@ const styles = StyleSheet.create({
   meterFill: {
     height: 4,
     borderRadius: 2,
-    backgroundColor: '#F85149',
   },
 });

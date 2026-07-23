@@ -1,20 +1,17 @@
 import { Stack, router, useLocalSearchParams } from 'expo-router';
 import { ForgeItemKind, type ForgeItem } from 'oximux-core';
 import { useState } from 'react';
-import {
-  ActivityIndicator,
-  FlatList,
-  Pressable,
-  RefreshControl,
-  StyleSheet,
-  View,
-} from 'react-native';
+import { FlatList, Pressable, RefreshControl, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { CheckList } from '@/components/forge/check-list';
 import { ForgeItemRow } from '@/components/forge/item-row';
+import { ConnectionBanner } from '@/components/connection-banner';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
+import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorBanner } from '@/components/ui/error-banner';
+import { SkeletonList } from '@/components/ui/skeleton';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { attachPromptText } from '@/native/forge';
@@ -56,18 +53,13 @@ export default function ForgeScreen() {
     <ThemedView style={styles.fill}>
       <Stack.Screen options={{ title: 'Pull requests & issues' }} />
       <SafeAreaView style={styles.fill} edges={['bottom']}>
+        <ConnectionBanner />
         <KindToggle kind={kind} onChange={setKind} />
 
-        {error ? (
-          <ThemedText type="small" style={styles.error} numberOfLines={3}>
-            {error}
-          </ThemedText>
-        ) : null}
+        {error ? <ErrorBanner message={error} /> : null}
 
         {loading && items.length === 0 ? (
-          <View style={styles.centre}>
-            <ActivityIndicator />
-          </View>
+          <SkeletonList />
         ) : (
           <FlatList
             data={items}
@@ -82,16 +74,14 @@ export default function ForgeScreen() {
             )}
             refreshControl={<RefreshControl refreshing={loading} onRefresh={refresh} />}
             ListEmptyComponent={
-              <View style={styles.centre}>
-                <ThemedText type="small" style={styles.empty}>
-                  {/* Deliberately vague about the cause. The desktop cannot tell
-                      "no open items" from "no gh installed", "gh signed out" or
-                      "not a GitHub/GitLab repo" — so naming one would be a
-                      guess presented as fact. */}
-                  Nothing to show. This repository may not be hosted on GitHub or
-                  GitLab, or its CLI may not be set up on the desktop.
-                </ThemedText>
-              </View>
+              // Deliberately vague about the cause. The desktop cannot tell
+              // "no open items" from "no gh installed", "gh signed out" or
+              // "not a GitHub/GitLab repo" — so naming one would be a guess
+              // presented as fact.
+              <EmptyState
+                title="Nothing to show."
+                message="This repository may not be hosted on GitHub or GitLab, or its CLI may not be set up on the desktop."
+              />
             }
           />
         )}
@@ -133,13 +123,10 @@ function KindToggle({
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  centre: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: Spacing.four },
   toggle: { flexDirection: 'row', gap: Spacing.two, padding: Spacing.three },
   tab: {
     paddingVertical: Spacing.two,
     paddingHorizontal: Spacing.three,
     borderRadius: Spacing.two,
   },
-  empty: { opacity: 0.7, textAlign: 'center' },
-  error: { color: '#F85149', paddingHorizontal: Spacing.three, paddingVertical: Spacing.two },
 });

@@ -1,11 +1,12 @@
 import { Stack, useLocalSearchParams } from 'expo-router';
-import { ActivityIndicator, KeyboardAvoidingView, Platform, Pressable, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, StyleSheet, View } from 'react-native';
+import { KeyboardAvoidingView } from 'react-native-keyboard-controller';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { ConnectionBanner } from '@/components/connection-banner';
 import { TerminalView } from '@/components/terminal/terminal-view';
-import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { Spacing } from '@/constants/theme';
+import { ErrorBanner } from '@/components/ui/error-banner';
 import { useTerminal } from '@/native/terminal';
 
 /**
@@ -27,19 +28,10 @@ export default function TerminalScreen() {
   return (
     <ThemedView style={styles.fill}>
       <Stack.Screen options={{ title: 'Terminal' }} />
-      <KeyboardAvoidingView
-        style={styles.fill}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        keyboardVerticalOffset={Platform.OS === 'ios' ? keyboardOffset : 0}
-      >
+      <KeyboardAvoidingView style={styles.fill} behavior="padding" keyboardVerticalOffset={keyboardOffset}>
         <SafeAreaView style={styles.fill} edges={['bottom']}>
-          {error ? (
-            <Pressable onPress={dismissError} style={styles.error}>
-              <ThemedText type="small" style={styles.errorText}>
-                {error} — tap to dismiss
-              </ThemedText>
-            </Pressable>
-          ) : null}
+          <ConnectionBanner />
+          {error ? <ErrorBanner message={error} onDismiss={dismissError} /> : null}
 
           {loading ? (
             <View style={styles.centre}>
@@ -57,6 +49,4 @@ export default function TerminalScreen() {
 const styles = StyleSheet.create({
   fill: { flex: 1 },
   centre: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  error: { paddingHorizontal: Spacing.three, paddingVertical: Spacing.two },
-  errorText: { color: '#F85149' },
 });

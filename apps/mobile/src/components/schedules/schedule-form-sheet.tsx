@@ -1,17 +1,12 @@
 import type { Recurrence } from 'oximux-core';
 import { useState } from 'react';
-import {
-  ActivityIndicator,
-  Modal,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  TextInput,
-  View,
-} from 'react-native';
+import { ActivityIndicator, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
-import { Spacing } from '@/constants/theme';
+import { Button } from '@/components/ui/button';
+import { ErrorBanner } from '@/components/ui/error-banner';
+import { BottomSheetTextInput, Sheet } from '@/components/ui/sheet';
+import { Radius, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import type { ScheduleDraft } from '@/native/use-schedules';
 
@@ -64,101 +59,66 @@ export function ScheduleFormSheet({
   const field = [styles.input, { backgroundColor: theme.backgroundElement, color: theme.text }];
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      <Pressable style={styles.backdrop} onPress={onClose}>
-        <Pressable style={[styles.sheet, { backgroundColor: theme.background }]} onPress={() => {}}>
-          <ScrollView
-            contentContainerStyle={styles.body}
-            keyboardShouldPersistTaps="handled"
-            showsVerticalScrollIndicator={false}
-          >
-            <ThemedText type="smallBold">New schedule</ThemedText>
+    <Sheet visible={visible} onClose={onClose}>
+      <ThemedText type="smallBold">New schedule</ThemedText>
 
-            <TextInput
-              value={name}
-              onChangeText={setName}
-              placeholder="Name (e.g. Nightly report)"
-              placeholderTextColor={theme.textSecondary}
-              style={field}
-            />
+      <BottomSheetTextInput
+        value={name}
+        onChangeText={setName}
+        placeholder="Name (e.g. Nightly report)"
+        placeholderTextColor={theme.textSecondary}
+        style={field}
+      />
 
-            <TextInput
-              value={cwd}
-              onChangeText={setCwd}
-              placeholder="/path/on/the/desktop"
-              placeholderTextColor={theme.textSecondary}
-              autoCapitalize="none"
-              autoCorrect={false}
-              style={field}
-            />
-            <ThemedText type="small" style={styles.hint}>
-              A folder on the desktop running OxiMux — not on this phone.
-            </ThemedText>
+      <BottomSheetTextInput
+        value={cwd}
+        onChangeText={setCwd}
+        placeholder="/path/on/the/desktop"
+        placeholderTextColor={theme.textSecondary}
+        autoCapitalize="none"
+        autoCorrect={false}
+        style={field}
+      />
+      <ThemedText type="small" style={styles.hint}>
+        A folder on the desktop running OxiMux — not on this phone.
+      </ThemedText>
 
-            <TextInput
-              value={prompt}
-              onChangeText={setPrompt}
-              placeholder="What should the agent do?"
-              placeholderTextColor={theme.textSecondary}
-              multiline
-              style={[...field, styles.prompt]}
-            />
+      <BottomSheetTextInput
+        value={prompt}
+        onChangeText={setPrompt}
+        placeholder="What should the agent do?"
+        placeholderTextColor={theme.textSecondary}
+        multiline
+        style={[...field, styles.prompt]}
+      />
 
-            <ThemedText type="small" style={styles.label}>
-              Repeats
-            </ThemedText>
-            <RecurrencePicker value={recurrence} onChange={setRecurrence} />
+      <ThemedText type="small" style={styles.label}>
+        Repeats
+      </ThemedText>
+      <RecurrencePicker value={recurrence} onChange={setRecurrence} />
 
-            {/* The load-bearing disclaimer — see the component doc. */}
-            <ThemedText type="small" style={styles.warning}>
-              Runs only while the desktop app is open. OxiMux can keep the Mac
-              awake, but it cannot wake a sleeping Mac or reopen a quit app, so a
-              run scheduled for a time the app was closed will not happen.
-            </ThemedText>
+      {/* The load-bearing disclaimer — see the component doc. */}
+      <ThemedText type="small" style={styles.warning}>
+        Runs only while the desktop app is open. OxiMux can keep the Mac awake,
+        but it cannot wake a sleeping Mac or reopen a quit app, so a run scheduled
+        for a time the app was closed will not happen.
+      </ThemedText>
 
-            {error ? (
-              <ThemedText type="small" style={styles.error} numberOfLines={4}>
-                {error}
-              </ThemedText>
-            ) : null}
+      {error ? <ErrorBanner message={error} /> : null}
 
-            <View style={styles.actions}>
-              {busy ? <ActivityIndicator /> : null}
-              <View style={styles.spacer} />
-              <Pressable onPress={onClose} disabled={busy} style={styles.button}>
-                <ThemedText type="code">Cancel</ThemedText>
-              </Pressable>
-              <Pressable
-                onPress={submit}
-                disabled={busy || !ready}
-                style={[
-                  styles.button,
-                  { backgroundColor: theme.backgroundSelected },
-                  (busy || !ready) && styles.disabled,
-                ]}
-              >
-                <ThemedText type="code">Create</ThemedText>
-              </Pressable>
-            </View>
-          </ScrollView>
-        </Pressable>
-      </Pressable>
-    </Modal>
+      <View style={styles.actions}>
+        {busy ? <ActivityIndicator /> : null}
+        <View style={styles.spacer} />
+        <Button label="Cancel" variant="secondary" disabled={busy} onPress={onClose} />
+        <Button label="Create" variant="primary" disabled={busy || !ready} onPress={submit} />
+      </View>
+    </Sheet>
   );
 }
 
 const styles = StyleSheet.create({
-  backdrop: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.4)' },
-  sheet: {
-    borderTopLeftRadius: Spacing.three,
-    borderTopRightRadius: Spacing.three,
-    // Capped so a tall keyboard plus the recurrence controls still leaves the
-    // backdrop tappable to dismiss.
-    maxHeight: '90%',
-  },
-  body: { padding: Spacing.four, gap: Spacing.two },
   input: {
-    borderRadius: Spacing.two,
+    borderRadius: Radius.md,
     paddingHorizontal: Spacing.three,
     paddingVertical: Spacing.two,
     fontSize: 16,
@@ -167,7 +127,6 @@ const styles = StyleSheet.create({
   hint: { opacity: 0.7 },
   label: { opacity: 0.7, paddingTop: Spacing.two },
   warning: { opacity: 0.85, paddingTop: Spacing.two, lineHeight: 18 },
-  error: { color: '#F85149' },
   actions: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -175,10 +134,4 @@ const styles = StyleSheet.create({
     paddingTop: Spacing.three,
   },
   spacer: { flex: 1 },
-  button: {
-    paddingVertical: Spacing.two,
-    paddingHorizontal: Spacing.three,
-    borderRadius: Spacing.two,
-  },
-  disabled: { opacity: 0.4 },
 });

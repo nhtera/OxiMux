@@ -1,5 +1,13 @@
-import { useCallback, useEffect, useRef } from 'react';
-import { FlatList, StyleSheet, View } from 'react-native';
+import { ChevronDown } from 'lucide-react-native';
+import { useCallback, useRef, useState } from 'react';
+import {
+  FlatList,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
+  StyleSheet,
+  View,
+} from 'react-native';
+import Animated, { FadeIn, FadeOut } from 'react-native-reanimated';
 
 import {
   AssistantBubble,
@@ -11,7 +19,9 @@ import {
 import { PermissionCard } from '@/components/chat/permission-card';
 import { QuestionCard } from '@/components/chat/question-card';
 import { ThemedText } from '@/components/themed-text';
-import { Spacing } from '@/constants/theme';
+import { IconButton } from '@/components/ui/icon-button';
+import { Radius, Spacing } from '@/constants/theme';
+import { useTheme } from '@/hooks/use-theme';
 import {
   isAssistant,
   isCompaction,
@@ -43,20 +53,39 @@ type Props = {
   ) => Promise<unknown>;
 };
 
-export function Transcript({ thread, onAllow, onAllowWith, onDeny, onAnswer }: Props) {
-  const listRef = useRef<FlatList<ThreadEntry>>(null);
-  const count = thread.entries.length;
-  // The last entry also *grows* while a reply streams, so the length alone is
-  // not enough to know something changed — the streamed text is what moves the
-  // bottom of the list.
-  const tailLength = lastEntryLength(thread.entries);
+/** How close to the bottom still counts as "following the conversation". */
+const NEAR_BOTTOM_PX = 80;
 
-  useEffect(() => {
-    if (count === 0) return;
-    // `scrollToEnd` on an offscreen list is a no-op, so it is deferred a frame.
-    const id = setTimeout(() => listRef.current?.scrollToEnd({ animated: true }), 50);
-    return () => clearTimeout(id);
-  }, [count, tailLength]);
+export function Transcript({ thread, onAllow, onAllowWith, onDeny, onAnswer }: Props) {
+  const theme = useTheme();
+  const listRef = useRef<FlatList<ThreadEntry>>(null);
+  // Whether the user is pinned to the bottom. A ref, not state, so a streaming
+  // reply firing `onContentSizeChange` many times a second never re-renders the
+  // whole transcript — only the pill's visibility (below) is React state.
+  const atBottom = useRef(true);
+  const [showPill, setShowPill] = useState(false);
+
+  const toEnd = useCallback((animated: boolean) => {
+    listRef.current?.scrollToEnd({ animated });
+    atBottom.current = true;
+    setShowPill(false);
+  }, []);
+
+  const onScroll = useCallback((e: NativeSyntheticEvent<NativeScrollEvent>) => {
+    const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
+    const distance = contentSize.height - (contentOffset.y + layoutMeasurement.height);
+    const near = distance < NEAR_BOTTOM_PX;
+    atBottom.current = near;
+    // Only flip React state on an actual change — not on every scroll frame.
+    setShowPill((shown) => (shown === near ? !near : shown));
+  }, []);
+
+  // Stick to the bottom as content grows (new entry or a streaming reply) only
+  // when the user was already there. Someone reading history stays put — the
+  // old unconditional `scrollToEnd` yanked them down on every token.
+  const onContentSizeChange = useCallback(() => {
+    if (atBottom.current) listRef.current?.scrollToEnd({ animated: true });
+  }, []);
 
   const renderItem = useCallback(
     ({ item }: { item: ThreadEntry }) => (
@@ -72,20 +101,36 @@ export function Transcript({ thread, onAllow, onAllowWith, onDeny, onAnswer }: P
   );
 
   return (
-    <FlatList
-      ref={listRef}
-      data={thread.entries}
-      // Entries have no stable id of their own; index is correct here because
-      // the fold only ever appends or mutates in place — it never reorders.
-      keyExtractor={(_, index) => String(index)}
-      renderItem={renderItem}
-      contentContainerStyle={styles.list}
-      ListEmptyComponent={
-        <ThemedText type="small" style={styles.empty}>
-          No messages yet. Send one below.
-        </ThemedText>
-      }
-    />
+    <View style={styles.fill}>
+      <FlatList
+        ref={listRef}
+        data={thread.entries}
+        // Entries have no stable id of their own; index is correct here because
+        // the fold only ever appends or mutates in place — it never reorders.
+        keyExtractor={(_, index) => String(index)}
+        renderItem={renderItem}
+        contentContainerStyle={styles.list}
+        onScroll={onScroll}
+        scrollEventThrottle={32}
+        onContentSizeChange={onContentSizeChange}
+        ListEmptyComponent={
+          <ThemedText type="small" style={styles.empty}>
+            No messages yet. Send one below.
+          </ThemedText>
+        }
+      />
+      {showPill ? (
+        <Animated.View entering={FadeIn.duration(150)} exiting={FadeOut.duration(150)} style={styles.pillWrap}>
+          <IconButton
+            icon={ChevronDown}
+            accessibilityLabel="Scroll to latest message"
+            onPress={() => toEnd(true)}
+            color={theme.text}
+            style={[styles.pill, { backgroundColor: theme.surface2, borderColor: theme.border }]}
+          />
+        </Animated.View>
+      ) : null}
+    </View>
   );
 }
 
@@ -138,21 +183,16 @@ function Entry({
   );
 }
 
-/**
- * The length of whatever text the last entry carries, so a streaming reply
- * re-triggers the scroll effect as it grows.
- */
-function lastEntryLength(entries: ThreadEntry[]): number {
-  const last = entries[entries.length - 1];
-  if (!last) return 0;
-  if (isAssistant(last)) return last.Assistant.text.length + last.Assistant.thinking.length;
-  if (isToolCall(last)) return (last.ToolCall.result ?? '').length;
-  if (isUser(last)) return last.User.text.length;
-  return 0;
-}
-
 const styles = StyleSheet.create({
+  fill: { flex: 1 },
   list: { padding: Spacing.three, gap: Spacing.three },
   empty: { textAlign: 'center', paddingTop: Spacing.five, opacity: 0.7 },
   unknown: { opacity: 0.6 },
+  pillWrap: { position: 'absolute', right: Spacing.three, bottom: Spacing.three },
+  pill: {
+    width: 40,
+    height: 40,
+    borderRadius: Radius.full,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
 });

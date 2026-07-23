@@ -1,6 +1,9 @@
 import { Link, Stack, useLocalSearchParams } from 'expo-router';
+import { GitBranch, GitPullRequest, History, PanelLeft } from 'lucide-react-native';
 import { useState } from 'react';
-import { ActivityIndicator, KeyboardAvoidingView, Platform, Pressable, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
+import { GestureDetector } from 'react-native-gesture-handler';
+import { KeyboardAvoidingView } from 'react-native-keyboard-controller';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { Composer } from '@/components/chat/composer';
@@ -8,8 +11,13 @@ import { RewindSheet } from '@/components/chat/rewind-sheet';
 import { SessionControls } from '@/components/chat/session-controls';
 import { StatusStrip } from '@/components/chat/status-strip';
 import { Transcript } from '@/components/chat/transcript';
+import { ConnectionBanner } from '@/components/connection-banner';
+import { SessionsDrawer, useSessionsDrawer } from '@/components/deck/sessions-drawer';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
+import { ErrorBanner } from '@/components/ui/error-banner';
+import { Icon } from '@/components/ui/icon';
+import { IconButton } from '@/components/ui/icon-button';
 import { Spacing } from '@/constants/theme';
 import { useSession } from '@/native/session';
 
@@ -43,6 +51,7 @@ export default function SessionScreen() {
   const [rewinding, setRewinding] = useState(false);
   const [rewindError, setRewindError] = useState<string>();
   const insets = useSafeAreaInsets();
+  const drawer = useSessionsDrawer();
 
   const onRewind = async (ordinal: number) => {
     setRewinding(true);
@@ -66,37 +75,44 @@ export default function SessionScreen() {
       <Stack.Screen
         options={{
           title: thread.title ?? 'Session',
+          // The left edge belongs to the sessions drawer, so the stack's own
+          // iOS swipe-back is disabled here; the header back button still returns.
+          gestureEnabled: false,
           headerRight: () => (
             <View style={styles.headerActions}>
-              <Pressable onPress={() => setRewindOpen(true)} hitSlop={Spacing.two}>
+              <IconButton icon={PanelLeft} accessibilityLabel="Switch session" onPress={drawer.open} />
+              <Pressable
+                onPress={() => setRewindOpen(true)}
+                hitSlop={Spacing.two}
+                style={styles.headerAction}
+              >
+                <Icon icon={History} size="sm" />
                 <ThemedText type="code">Rewind</ThemedText>
               </Pressable>
-              <Link href={{ pathname: '/forge/[id]', params: { id: sessionId } }}>
-                <ThemedText type="code">PRs</ThemedText>
+              <Link href={{ pathname: '/forge/[id]', params: { id: sessionId } }} asChild>
+                <Pressable style={styles.headerAction}>
+                  <Icon icon={GitPullRequest} size="sm" />
+                  <ThemedText type="code">PRs</ThemedText>
+                </Pressable>
               </Link>
-              <Link href={{ pathname: '/git/[id]', params: { id: sessionId } }}>
-                <ThemedText type="code">Git</ThemedText>
+              <Link href={{ pathname: '/git/[id]', params: { id: sessionId } }} asChild>
+                <Pressable style={styles.headerAction}>
+                  <Icon icon={GitBranch} size="sm" />
+                  <ThemedText type="code">Git</ThemedText>
+                </Pressable>
               </Link>
             </View>
           ),
         }}
       />
 
-      <KeyboardAvoidingView
-        style={styles.fill}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        keyboardVerticalOffset={Platform.OS === 'ios' ? keyboardOffset : 0}
-      >
+      <GestureDetector gesture={drawer.edgePan}>
+        <KeyboardAvoidingView style={styles.fill} behavior="padding" keyboardVerticalOffset={keyboardOffset}>
         <SafeAreaView style={styles.fill} edges={['bottom']}>
+          <ConnectionBanner />
           <StatusStrip thread={thread} />
 
-          {error ? (
-            <Pressable onPress={dismissError} style={styles.error}>
-              <ThemedText type="small" style={styles.errorText}>
-                {error} — tap to dismiss
-              </ThemedText>
-            </Pressable>
-          ) : null}
+          {error ? <ErrorBanner message={error} onDismiss={dismissError} /> : null}
 
           {loading ? (
             <View style={styles.centre}>
@@ -123,7 +139,8 @@ export default function SessionScreen() {
             onError={reportError}
           />
         </SafeAreaView>
-      </KeyboardAvoidingView>
+        </KeyboardAvoidingView>
+      </GestureDetector>
 
       <RewindSheet
         visible={rewindOpen}
@@ -136,6 +153,13 @@ export default function SessionScreen() {
           setRewindError(undefined);
         }}
       />
+
+      <SessionsDrawer
+        progress={drawer.progress}
+        isOpen={drawer.isOpen}
+        close={drawer.close}
+        activeId={sessionId}
+      />
     </ThemedView>
   );
 }
@@ -143,7 +167,6 @@ export default function SessionScreen() {
 const styles = StyleSheet.create({
   fill: { flex: 1 },
   centre: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  error: { paddingHorizontal: Spacing.three, paddingVertical: Spacing.two },
-  errorText: { color: '#F85149' },
   headerActions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.three },
+  headerAction: { flexDirection: 'row', alignItems: 'center', gap: Spacing.one },
 });

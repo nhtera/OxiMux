@@ -8,6 +8,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Spacing } from '@/constants/theme';
+import { useTheme } from '@/hooks/use-theme';
 import { useClient } from '@/native/client';
 import { describeError } from '@/native/errors';
 
@@ -19,6 +20,7 @@ import { describeError } from '@/native/errors';
 const TICKET_PREFIX = 'oximux://connect?ticket=';
 
 export default function PairScanScreen() {
+  const theme = useTheme();
   const [permission, requestPermission] = useCameraPermissions();
   const [error, setError] = useState<string>();
   // Simulators have no camera, so scanning can never succeed there. Start such
@@ -76,7 +78,10 @@ export default function PairScanScreen() {
             autoCapitalize="none"
             autoCorrect={false}
             multiline
-            style={styles.input}
+            style={[
+              styles.input,
+              { borderColor: theme.borderStrong, color: theme.textMuted },
+            ]}
           />
           <Pressable onPress={() => submit(typed)} style={styles.button}>
             <ThemedText type="code">Pair</ThemedText>
@@ -160,9 +165,7 @@ const styles = StyleSheet.create({
     alignSelf: 'stretch',
     minHeight: 72,
     borderWidth: 1,
-    borderColor: '#8A8F98',
     borderRadius: Spacing.two,
     padding: Spacing.three,
-    color: '#8A8F98',
   },
 });

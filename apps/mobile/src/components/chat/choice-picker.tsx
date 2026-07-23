@@ -1,8 +1,11 @@
+import { Check } from 'lucide-react-native';
 import type { Choice } from 'oximux-core';
-import { Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { StyleSheet } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
-import { Spacing } from '@/constants/theme';
+import { ListRow } from '@/components/ui/list-row';
+import { Sheet } from '@/components/ui/sheet';
+import { Radius, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 
 /**
@@ -36,74 +39,50 @@ export function ChoicePicker({
   const theme = useTheme();
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onClose}>
-      {/* Tapping the backdrop dismisses — the sheet is a choice, not a decision
-          the user must make before doing anything else. */}
-      <Pressable style={styles.backdrop} onPress={onClose}>
-        {/* Swallows the press so a tap inside the sheet does not close it. */}
-        <Pressable
-          style={[styles.sheet, { backgroundColor: theme.background }]}
-          onPress={() => {}}
-        >
-          <ThemedText type="smallBold" style={styles.title}>
-            {title}
-          </ThemedText>
+    <Sheet visible={visible} onClose={onClose}>
+      <ThemedText type="smallBold" style={styles.title}>
+        {title}
+      </ThemedText>
 
-          <ScrollView style={styles.list}>
-            {choices.map((choice) => {
-              const selected = choice.id === current;
-              return (
-                <Pressable
-                  key={choice.id}
-                  disabled={busy || selected}
-                  onPress={() => onPick(choice.id)}
-                  accessibilityRole="radio"
-                  accessibilityState={{ selected, disabled: busy }}
-                  style={[
-                    styles.row,
-                    selected && { backgroundColor: theme.backgroundSelected },
-                    busy && styles.busy,
-                  ]}
-                >
-                  <View style={styles.rowText}>
-                    <ThemedText numberOfLines={1}>{choice.label}</ThemedText>
-                    {choice.description ? (
-                      <ThemedText type="small" numberOfLines={2} style={styles.muted}>
-                        {choice.description}
-                      </ThemedText>
-                    ) : null}
-                  </View>
-                  {selected ? <ThemedText type="code">✓</ThemedText> : null}
-                </Pressable>
-              );
-            })}
-          </ScrollView>
-        </Pressable>
-      </Pressable>
-    </Modal>
+      {choices.map((choice) => {
+        const selected = choice.id === current;
+        return (
+          <ListRow
+            key={choice.id}
+            // Switching costs a round trip and can be refused outright, so the row
+            // already showing what is current, or one tapped while a switch is in
+            // flight, takes no press at all.
+            onPress={selected || busy ? undefined : () => onPick(choice.id)}
+            accessoryIcon={selected ? Check : undefined}
+            style={[
+              styles.row,
+              selected && { backgroundColor: theme.backgroundSelected },
+              busy && styles.busy,
+            ]}
+          >
+            <ThemedText numberOfLines={1}>{choice.label}</ThemedText>
+            {choice.description ? (
+              <ThemedText type="small" numberOfLines={2} style={styles.muted}>
+                {choice.description}
+              </ThemedText>
+            ) : null}
+          </ListRow>
+        );
+      })}
+    </Sheet>
   );
 }
 
 const styles = StyleSheet.create({
-  backdrop: { flex: 1, justifyContent: 'flex-end', backgroundColor: 'rgba(0,0,0,0.4)' },
-  sheet: {
-    maxHeight: '70%',
-    borderTopLeftRadius: Spacing.three,
-    borderTopRightRadius: Spacing.three,
-    padding: Spacing.four,
-    gap: Spacing.two,
-  },
   title: { paddingBottom: Spacing.one },
-  list: { flexGrow: 0 },
   row: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: Spacing.three,
     paddingVertical: Spacing.three,
     paddingHorizontal: Spacing.two,
-    borderRadius: Spacing.two,
+    borderRadius: Radius.md,
   },
-  rowText: { flex: 1, gap: Spacing.half },
   muted: { opacity: 0.7 },
   busy: { opacity: 0.5 },
 });

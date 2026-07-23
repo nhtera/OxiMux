@@ -1,20 +1,22 @@
+import { Paperclip } from 'lucide-react-native';
 import { Pressable, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
+import { Button } from '@/components/ui/button';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { relativeAge } from '@/native/forge';
 import type { ForgeItem } from 'oximux-core';
 
 /** Colour for an item's lifecycle state, mirroring forge conventions. */
-function stateColor(state: string): string {
+function stateColor(state: string, theme: ReturnType<typeof useTheme>): string {
   switch (state.toUpperCase()) {
     case 'MERGED':
-      return '#A371F7';
+      return theme.merged;
     case 'CLOSED':
-      return '#F85149';
+      return theme.danger;
     default:
-      return '#3FB950';
+      return theme.success;
   }
 }
 
@@ -41,7 +43,7 @@ export function ForgeItemRow({
     <View style={[styles.row, { borderBottomColor: theme.backgroundElement }]}>
       <Pressable style={styles.main} onPress={onPress}>
         <View style={styles.titleLine}>
-          <View style={[styles.stateDot, { backgroundColor: stateColor(item.state) }]} />
+          <View style={[styles.stateDot, { backgroundColor: stateColor(item.state, theme) }]} />
           <ThemedText numberOfLines={2} style={styles.title}>
             {item.title}
           </ThemedText>
@@ -60,9 +62,7 @@ export function ForgeItemRow({
           </ThemedText>
         ) : null}
       </Pressable>
-      <Pressable onPress={onAttach} hitSlop={Spacing.two} style={styles.attach}>
-        <ThemedText type="code">Attach</ThemedText>
-      </Pressable>
+      <Button label="Attach" variant="ghost" size="compact" leftIcon={Paperclip} onPress={onAttach} />
     </View>
   );
 }
@@ -81,5 +81,4 @@ const styles = StyleSheet.create({
   stateDot: { width: 8, height: 8, borderRadius: 4, marginTop: 6 },
   title: { flex: 1 },
   meta: { opacity: 0.7 },
-  attach: { paddingVertical: Spacing.two, paddingHorizontal: Spacing.two },
 });

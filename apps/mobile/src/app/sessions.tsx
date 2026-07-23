@@ -1,4 +1,5 @@
 import { Link, router } from 'expo-router';
+import { CalendarClock, Plus, Settings as SettingsIcon, SquareTerminal } from 'lucide-react-native';
 import type { SessionSummary } from 'oximux-core';
 import { useCallback, useEffect, useState } from 'react';
 import { FlatList, Pressable, RefreshControl, StyleSheet, TextInput, View } from 'react-native';
@@ -8,6 +9,8 @@ import { ConnectionBadge } from '@/components/connection-badge';
 import { NewSessionSheet } from '@/components/new-session-sheet';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
+import { EmptyState } from '@/components/ui/empty-state';
+import { Icon } from '@/components/ui/icon';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { useClient } from '@/native/client';
@@ -74,17 +77,31 @@ export default function SessionsScreen() {
           {/* The only route off this screen that isn't a session. Without it a
               paired device has no way back to pairing — see settings.tsx. */}
           <View style={styles.headerActions}>
-            <Pressable onPress={() => setCreating(true)} accessibilityLabel="New session">
+            <Pressable
+              onPress={() => setCreating(true)}
+              accessibilityLabel="New session"
+              style={styles.headerAction}
+            >
+              <Icon icon={Plus} size="sm" />
               <ThemedText type="code">New</ThemedText>
             </Pressable>
-            <Link href="/terminals">
-              <ThemedText type="code">Terminals</ThemedText>
+            <Link href="/terminals" asChild>
+              <Pressable style={styles.headerAction}>
+                <Icon icon={SquareTerminal} size="sm" />
+                <ThemedText type="code">Terminals</ThemedText>
+              </Pressable>
             </Link>
-            <Link href="/schedules">
-              <ThemedText type="code">Schedules</ThemedText>
+            <Link href="/schedules" asChild>
+              <Pressable style={styles.headerAction}>
+                <Icon icon={CalendarClock} size="sm" />
+                <ThemedText type="code">Schedules</ThemedText>
+              </Pressable>
             </Link>
-            <Link href="/settings">
-              <ThemedText type="code">Settings</ThemedText>
+            <Link href="/settings" asChild>
+              <Pressable style={styles.headerAction}>
+                <Icon icon={SettingsIcon} size="sm" />
+                <ThemedText type="code">Settings</ThemedText>
+              </Pressable>
             </Link>
           </View>
         </View>
@@ -114,16 +131,19 @@ export default function SessionsScreen() {
           contentContainerStyle={styles.list}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} />}
           ListEmptyComponent={
-            <ThemedText type="small" style={styles.empty}>
-              {/* Kept distinct from the no-sessions state on purpose: telling a
-                  user whose filter matched nothing that the desktop has no
-                  sessions open would be a lie about the desktop. */}
-              {filtering
-                ? `No sessions match “${query.trim()}”.`
-                : phase === 'connected'
-                  ? 'No agent sessions open on the desktop.'
-                  : 'Waiting for the host…'}
-            </ThemedText>
+            // Kept distinct from the no-sessions state on purpose: telling a
+            // user whose filter matched nothing that the desktop has no
+            // sessions open would be a lie about the desktop.
+            <EmptyState
+              title={
+                filtering
+                  ? 'No matches'
+                  : phase === 'connected'
+                    ? 'No agent sessions open on the desktop.'
+                    : 'Waiting for the host…'
+              }
+              message={filtering ? `No sessions match “${query.trim()}”.` : undefined}
+            />
           }
         />
         <NewSessionSheet
@@ -142,6 +162,7 @@ export default function SessionsScreen() {
 }
 
 function SessionRow({ session }: { session: SessionSummary }) {
+  const theme = useTheme();
   return (
     <Pressable
       onPress={() =>
@@ -159,7 +180,9 @@ function SessionRow({ session }: { session: SessionSummary }) {
       </View>
       {/* A session blocked on a permission is the one thing worth crossing the
           room for, so it gets the only accent in the row. */}
-      {session.awaitingPermission ? <View style={styles.attention} /> : null}
+      {session.awaitingPermission ? (
+        <View style={[styles.attention, { backgroundColor: theme.warning }]} />
+      ) : null}
     </Pressable>
   );
 }
@@ -167,6 +190,7 @@ function SessionRow({ session }: { session: SessionSummary }) {
 const styles = StyleSheet.create({
   fill: { flex: 1 },
   headerActions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.three },
+  headerAction: { flexDirection: 'row', alignItems: 'center', gap: Spacing.one },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -182,8 +206,7 @@ const styles = StyleSheet.create({
   list: { flexGrow: 1, paddingHorizontal: Spacing.four, gap: Spacing.three },
   row: { flexDirection: 'row', alignItems: 'center', gap: Spacing.three, paddingVertical: Spacing.two },
   rowText: { flex: 1, gap: Spacing.half },
-  attention: { width: 8, height: 8, borderRadius: 4, backgroundColor: '#F5A623' },
-  empty: { textAlign: 'center', paddingTop: Spacing.five },
+  attention: { width: 8, height: 8, borderRadius: 4 },
   search: {
     marginHorizontal: Spacing.four,
     marginBottom: Spacing.three,

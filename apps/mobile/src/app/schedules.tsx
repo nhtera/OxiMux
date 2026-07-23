@@ -1,20 +1,19 @@
 import { Stack, router } from 'expo-router';
+import { Plus } from 'lucide-react-native';
 import { useCallback, useState } from 'react';
-import {
-  ActivityIndicator,
-  Alert,
-  FlatList,
-  Pressable,
-  RefreshControl,
-  StyleSheet,
-  View,
-} from 'react-native';
+import { Alert, FlatList, Pressable, RefreshControl, StyleSheet } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { ConnectionBanner } from '@/components/connection-banner';
 import { ScheduleFormSheet } from '@/components/schedules/schedule-form-sheet';
 import { ScheduleRow } from '@/components/schedules/schedule-row';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
+import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorBanner } from '@/components/ui/error-banner';
+import { SkeletonList } from '@/components/ui/skeleton';
+import { impact, tick } from '@/native/haptics';
+import { Icon } from '@/components/ui/icon';
 import { Spacing } from '@/constants/theme';
 import { describeError } from '@/native/errors';
 import { useSchedules, type ScheduleDraft } from '@/native/use-schedules';
@@ -40,7 +39,14 @@ export default function SchedulesScreen() {
     (id: string, name: string) => {
       Alert.alert('Delete schedule?', `“${name}” will stop running. This cannot be undone.`, [
         { text: 'Cancel', style: 'cancel' },
-        { text: 'Delete', style: 'destructive', onPress: () => void remove(id) },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => {
+            impact();
+            void remove(id);
+          },
+        },
       ]);
     },
     [remove],
@@ -70,23 +76,23 @@ export default function SchedulesScreen() {
         options={{
           title: 'Schedules',
           headerRight: () => (
-            <Pressable onPress={() => setCreating(true)} accessibilityLabel="New schedule">
+            <Pressable
+              onPress={() => setCreating(true)}
+              accessibilityLabel="New schedule"
+              style={styles.headerAction}
+            >
+              <Icon icon={Plus} size="sm" />
               <ThemedText type="code">New</ThemedText>
             </Pressable>
           ),
         }}
       />
       <SafeAreaView style={styles.fill} edges={['bottom']}>
-        {error ? (
-          <ThemedText type="small" style={styles.error} numberOfLines={3}>
-            {error}
-          </ThemedText>
-        ) : null}
+        <ConnectionBanner />
+        {error ? <ErrorBanner message={error} /> : null}
 
         {loading && schedules.length === 0 ? (
-          <View style={styles.centre}>
-            <ActivityIndicator />
-          </View>
+          <SkeletonList />
         ) : (
           <FlatList
             data={schedules}
@@ -98,18 +104,19 @@ export default function SchedulesScreen() {
                 onOpen={() =>
                   router.push({ pathname: '/schedules/[id]', params: { id: item.id, name: item.name } })
                 }
-                onToggle={(enabled) => void toggle(item.id, enabled)}
+                onToggle={(enabled) => {
+                  tick();
+                  void toggle(item.id, enabled);
+                }}
                 onDelete={() => confirmDelete(item.id, item.name)}
               />
             )}
             refreshControl={<RefreshControl refreshing={loading} onRefresh={refresh} />}
             ListEmptyComponent={
-              <View style={styles.centre}>
-                <ThemedText type="small" style={styles.empty}>
-                  No schedules yet. Tap New to have the desktop run an agent on a
-                  recurring time.
-                </ThemedText>
-              </View>
+              <EmptyState
+                title="No schedules yet."
+                message="Tap New to have the desktop run an agent on a recurring time."
+              />
             }
           />
         )}
@@ -131,8 +138,6 @@ export default function SchedulesScreen() {
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  centre: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: Spacing.four },
   list: { flexGrow: 1, paddingHorizontal: Spacing.four, paddingVertical: Spacing.three, gap: Spacing.two },
-  empty: { opacity: 0.7, textAlign: 'center' },
-  error: { color: '#F85149', paddingHorizontal: Spacing.three, paddingVertical: Spacing.two },
+  headerAction: { flexDirection: 'row', alignItems: 'center', gap: Spacing.one },
 });

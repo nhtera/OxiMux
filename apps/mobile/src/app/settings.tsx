@@ -6,6 +6,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { ConnectionBadge } from '@/components/connection-badge';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
+import { Button } from '@/components/ui/button';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { useClient } from '@/native/client';
@@ -91,15 +92,13 @@ export default function SettingsScreen() {
           </View>
 
           {host ? (
-            <Pressable onPress={confirmUnpair} style={styles.danger}>
-              <ThemedText type="code" style={styles.dangerText}>
-                Forget this desktop
-              </ThemedText>
-            </Pressable>
+            <Button label="Forget this desktop" variant="danger" onPress={confirmUnpair} />
           ) : (
-            <Pressable onPress={() => router.push('/pair-scan')} style={styles.action}>
-              <ThemedText type="code">Pair with a desktop</ThemedText>
-            </Pressable>
+            <Button
+              label="Pair with a desktop"
+              variant="primary"
+              onPress={() => router.push('/pair-scan')}
+            />
           )}
 
           {phase === 'unreachable' ? (
@@ -176,9 +175,6 @@ const styles = StyleSheet.create({
   body: { padding: Spacing.four, gap: Spacing.five },
   section: { gap: Spacing.two },
   muted: { opacity: 0.7 },
-  action: { paddingVertical: Spacing.three },
-  danger: { paddingVertical: Spacing.three },
-  dangerText: { color: '#F85149' },
   hint: { opacity: 0.7 },
   segments: { flexDirection: 'row', gap: Spacing.two },
   segment: {

@@ -1,9 +1,12 @@
+import { Check, X } from 'lucide-react-native';
 import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
+import { Button } from '@/components/ui/button';
 import { QUESTION_ACCENT as ACCENT } from '@/constants/chat';
 import { Spacing } from '@/constants/theme';
+import { impact, tick } from '@/native/haptics';
 import { useTheme } from '@/hooks/use-theme';
 import type { PermissionRequest, PermissionSuggestion, ToolCall } from '@/native/thread';
 
@@ -78,25 +81,29 @@ export function PermissionCard({ call, request, onAllow, onDeny, onAllowWith }: 
       </ThemedText>
 
       <View style={styles.actions}>
-        <Pressable
+        <Button
+          label={isPlan ? 'Approve plan' : 'Allow'}
+          variant="primary"
+          size="compact"
+          leftIcon={Check}
           disabled={busy}
-          onPress={() => decide(() => onAllow(request.request_id, call.input))}
-          style={[styles.button, { backgroundColor: ACCENT }, busy && styles.busy]}
-        >
-          <ThemedText type="code" style={styles.allowLabel}>
-            {isPlan ? 'Approve plan' : 'Allow'}
-          </ThemedText>
-        </Pressable>
+          onPress={() => {
+            impact();
+            decide(() => onAllow(request.request_id, call.input));
+          }}
+        />
 
-        <Pressable
+        <Button
+          label="Deny"
+          variant="outline"
+          size="compact"
+          leftIcon={X}
           disabled={busy}
-          onPress={() =>
-            decide(() => onDeny(request.request_id, 'Denied from the OxiMux mobile app.'))
-          }
-          style={[styles.button, styles.deny, busy && styles.busy]}
-        >
-          <ThemedText type="code">Deny</ThemedText>
-        </Pressable>
+          onPress={() => {
+            tick();
+            decide(() => onDeny(request.request_id, 'Denied from the OxiMux mobile app.'));
+          }}
+        />
 
         {busy ? <ActivityIndicator /> : null}
       </View>
@@ -112,9 +119,10 @@ export function PermissionCard({ call, request, onAllow, onDeny, onAllowWith }: 
             <Pressable
               key={`${suggestion.kind}-${i}`}
               disabled={busy}
-              onPress={() =>
-                decide(() => onAllowWith(request.request_id, call.input, suggestion))
-              }
+              onPress={() => {
+                impact();
+                decide(() => onAllowWith(request.request_id, call.input, suggestion));
+              }}
               style={[styles.suggestion, busy && styles.busy]}
             >
               <ThemedText type="code" numberOfLines={2}>
@@ -160,13 +168,6 @@ const styles = StyleSheet.create({
   kicker: { color: ACCENT },
   body: { lineHeight: 20 },
   actions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two, paddingTop: Spacing.one },
-  button: {
-    paddingVertical: Spacing.two,
-    paddingHorizontal: Spacing.three,
-    borderRadius: Spacing.two,
-  },
-  deny: { borderWidth: 1, borderColor: '#8A8F98' },
-  allowLabel: { color: '#000000' },
   busy: { opacity: 0.5 },
   note: { opacity: 0.8 },
   suggestion: {

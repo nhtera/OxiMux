@@ -1,9 +1,10 @@
 import type { Choice } from 'oximux-core';
 import { useState } from 'react';
-import { Pressable, StyleSheet, View } from 'react-native';
+import { StyleSheet, View } from 'react-native';
 
 import { ChoicePicker } from '@/components/chat/choice-picker';
-import { ThemedText } from '@/components/themed-text';
+import { Chip } from '@/components/ui/badge';
+import { ErrorBanner } from '@/components/ui/error-banner';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { useChoices } from '@/native/choices';
@@ -47,13 +48,7 @@ export function SessionControls({ sessionId }: { sessionId: string }) {
       {/* Surfaced rather than swallowed: the user tapped something and is owed
           an answer. A fix-at-spawn backend refuses here, and the host's message
           explains why rather than leaving a control that seems broken. */}
-      {error ? (
-        <Pressable onPress={dismissError}>
-          <ThemedText type="small" style={styles.error} numberOfLines={2}>
-            {error}
-          </ThemedText>
-        </Pressable>
-      ) : null}
+      {error ? <ErrorBanner message={error} onDismiss={dismissError} /> : null}
 
       <ChoicePicker
         title="Model"
@@ -86,29 +81,6 @@ export function SessionControls({ sessionId }: { sessionId: string }) {
   );
 }
 
-function Chip({
-  label,
-  busy,
-  onPress,
-}: {
-  label: string;
-  busy: boolean;
-  onPress: () => void;
-}) {
-  const theme = useTheme();
-  return (
-    <Pressable
-      onPress={onPress}
-      disabled={busy}
-      style={[styles.chip, { borderColor: theme.backgroundSelected }, busy && styles.busy]}
-    >
-      <ThemedText type="small" numberOfLines={1}>
-        {label}
-      </ThemedText>
-    </Pressable>
-  );
-}
-
 /**
  * The human label for whatever is current.
  *
@@ -125,14 +97,5 @@ function labelFor(choices: Choice[], current?: string): string | undefined {
 const styles = StyleSheet.create({
   wrap: { gap: Spacing.one },
   row: { flexDirection: 'row', gap: Spacing.two, flexWrap: 'wrap' },
-  chip: {
-    borderWidth: StyleSheet.hairlineWidth,
-    borderRadius: Spacing.three,
-    paddingVertical: Spacing.half,
-    paddingHorizontal: Spacing.two,
-    maxWidth: 180,
-  },
-  busy: { opacity: 0.5 },
-  error: { color: '#F85149' },
   hairline: { height: 0 },
 });

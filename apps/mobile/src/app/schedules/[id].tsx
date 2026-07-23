@@ -5,7 +5,10 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
+import { EmptyState } from '@/components/ui/empty-state';
+import { ErrorBanner } from '@/components/ui/error-banner';
 import { Spacing } from '@/constants/theme';
+import { useTheme } from '@/hooks/use-theme';
 import { useScheduleRuns } from '@/native/use-schedules';
 
 /**
@@ -29,11 +32,7 @@ export default function ScheduleRunsScreen() {
     <ThemedView style={styles.fill}>
       <Stack.Screen options={{ title: name ? String(name) : 'Run history' }} />
       <SafeAreaView style={styles.fill} edges={['bottom']}>
-        {error ? (
-          <ThemedText type="small" style={styles.error} numberOfLines={3}>
-            {error}
-          </ThemedText>
-        ) : null}
+        {error ? <ErrorBanner message={error} /> : null}
 
         {loading && runs.length === 0 ? (
           <View style={styles.centre}>
@@ -47,12 +46,10 @@ export default function ScheduleRunsScreen() {
             renderItem={({ item }) => <RunRow run={item} />}
             refreshControl={<RefreshControl refreshing={loading} onRefresh={refresh} />}
             ListEmptyComponent={
-              <View style={styles.centre}>
-                <ThemedText type="small" style={styles.empty}>
-                  No runs yet. This schedule has not fired — it will appear here
-                  once it does, provided the desktop app is running at the time.
-                </ThemedText>
-              </View>
+              <EmptyState
+                title="No runs yet."
+                message="This schedule has not fired — it will appear here once it does, provided the desktop app is running at the time."
+              />
             }
           />
         )}
@@ -65,10 +62,12 @@ export default function ScheduleRunsScreen() {
 }
 
 function RunRow({ run }: { run: ScheduleRun }) {
+  const theme = useTheme();
   const ok = run.outcome === RunOutcome.Ok;
+  const statusColor = ok ? theme.success : theme.danger;
   return (
     <View style={styles.row}>
-      <View style={[styles.dot, { backgroundColor: ok ? '#3FB950' : '#F85149' }]} />
+      <View style={[styles.dot, { backgroundColor: statusColor }]} />
       <View style={styles.rowText}>
         <ThemedText numberOfLines={1}>{formatFired(run.firedAt)}</ThemedText>
         {/* On success the session id is the only extra detail; on failure the
@@ -83,7 +82,7 @@ function RunRow({ run }: { run: ScheduleRun }) {
           </ThemedText>
         ) : null}
       </View>
-      <ThemedText type="small" style={[styles.badge, { color: ok ? '#3FB950' : '#F85149' }]}>
+      <ThemedText type="small" style={[styles.badge, { color: statusColor }]}>
         {ok ? 'Ran' : 'Failed'}
       </ThemedText>
     </View>
@@ -111,7 +110,5 @@ const styles = StyleSheet.create({
   rowText: { flex: 1, gap: Spacing.half },
   muted: { opacity: 0.7 },
   badge: { fontVariant: ['tabular-nums'] },
-  empty: { opacity: 0.7, textAlign: 'center' },
-  error: { color: '#F85149', paddingHorizontal: Spacing.three, paddingVertical: Spacing.two },
   back: { alignSelf: 'center', paddingVertical: Spacing.three },
 });
