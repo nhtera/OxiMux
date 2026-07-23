@@ -45,6 +45,12 @@
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 76
         }
+      ],
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "OxiMux uses the microphone only to dictate a prompt, which your desktop transcribes."
+        }
       ]
     ],
     "experiments": {

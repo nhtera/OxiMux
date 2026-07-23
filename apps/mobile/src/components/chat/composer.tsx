@@ -2,11 +2,13 @@ import { useRef, useState } from 'react';
 import { Pressable, StyleSheet, TextInput, View } from 'react-native';
 
 import { AttachmentStrip } from '@/components/chat/attachment-strip';
+import { MicButton } from '@/components/chat/mic-button';
 import { filterCommands, SlashPalette, slashQuery } from '@/components/chat/slash-palette';
 import { ThemedText } from '@/components/themed-text';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { MAX_ATTACHMENTS, pickImages, type Attachment } from '@/native/attachments';
+import { useDictation } from '@/native/use-dictation';
 
 type Props = {
   /** True while a turn is running — swaps Send for Steer and offers Stop. */
@@ -103,6 +105,18 @@ export function Composer({
     }
   };
 
+  // A dictated transcript is inserted like typed text — it never auto-sends, so a
+  // misheard word can be fixed before the prompt goes out. A separator is added
+  // only when the box already has text not ending in whitespace, so back-to-back
+  // dictations read as separate words rather than running together.
+  const insertDictated = (dictated: string) => {
+    setText((current) => {
+      const needsSpace = current.length > 0 && !/\s$/.test(current);
+      return `${current}${needsSpace ? ' ' : ''}${dictated}`;
+    });
+  };
+  const dictation = useDictation({ onText: insertDictated, onError });
+
   const submit = async () => {
     if (!canSubmit) return;
     setBusy(true);
@@ -167,6 +181,17 @@ export function Composer({
             {room === 0 ? `${MAX_ATTACHMENTS} max` : 'Attach'}
           </ThemedText>
         </Pressable>
+
+        {/* Dictation only appears while connected — the desktop is what
+            transcribes, so a disconnected phone has nothing to offer here. */}
+        {dictation.available ? (
+          <MicButton
+            phase={dictation.phase}
+            level={dictation.level}
+            onStart={dictation.start}
+            onStop={dictation.stop}
+          />
+        ) : null}
 
         <View style={styles.spacer} />
 
