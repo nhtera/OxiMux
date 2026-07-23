@@ -276,6 +276,17 @@ impl Dispatcher {
                 self.rewind_session(&pubkey, &session_id, ordinal as usize, include_files).await;
             return self.send(transport, response).await;
         }
+        // Transcription runs a CPU-heavy ONNX decode, so its handler is async (it
+        // `spawn_blocking`s the decode) and is awaited here rather than in the
+        // sync `dispatch`. Gated on the authenticated connection alone — it names
+        // no session and mutates nothing.
+        if let Request::TranscribeAudio { audio_base64, sample_rate } = req {
+            if authorized_pubkey(&state.authn, &self.auth).is_none() {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            }
+            let response = self.transcribe_audio(&audio_base64, sample_rate).await;
+            return self.send(transport, response).await;
+        }
         let response = self.dispatch(state, req);
         self.send(transport, response).await
     }

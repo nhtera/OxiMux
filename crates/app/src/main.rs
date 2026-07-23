@@ -342,6 +342,16 @@ fn main() {
         // handed over directly rather than through a bridge, unlike the launcher
         // and rewinder above.
         remote_control.set_schedule_store(std::sync::Arc::new(app_state.schedule_store()));
+        // Voice dictation the phone can drive: the desktop decodes clips with the
+        // same speech engine and model manager its own composer uses, so a phone
+        // dictation and a desktop one run through identical code. The service was
+        // installed above, so its model manager is shared here rather than a
+        // second one being built.
+        if let Some(transcriber) =
+            oximux_app::shell::agent_chat::build_remote_transcriber(cx)
+        {
+            remote_control.set_transcriber(transcriber);
+        }
         cx.set_global(remote_control);
         // Restore the master switch. Installed disabled above, so without this a
         // desktop that had remote access on comes back with it off — and an

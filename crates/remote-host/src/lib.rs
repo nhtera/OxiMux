@@ -19,6 +19,7 @@ pub mod identity;
 pub mod launcher;
 pub mod rewind;
 pub mod terminals;
+pub mod transcribe;
 
 pub use auth::{
     AppPubkey, AuthStore, DeviceInfo, DeviceStore, PairedDevice, PairingSlot, StorageDeviceStore,
@@ -30,3 +31,4 @@ pub use identity::HostIdentity;
 pub use launcher::{LaunchError, SessionLauncher};
 pub use rewind::{RewindError, RewindService};
 pub use terminals::{TerminalAttach, TerminalError, TerminalFrame, TerminalSource};
+pub use transcribe::{AudioTranscriber, TranscribeError};

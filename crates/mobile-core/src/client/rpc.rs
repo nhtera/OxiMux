@@ -363,4 +363,22 @@ impl MobileClient {
             .map_err(|e| MobileError::Rpc(e.to_string()))?;
         Ok(rows.into_iter().map(ScheduleRun::from).collect())
     }
+
+    /// Transcribe a recorded voice clip with the desktop's speech engine.
+    ///
+    /// `audio_base64` is a standard-base64 WAV (the phone records 16 kHz mono
+    /// PCM16). **An empty string is a normal answer** — a silent clip — not an
+    /// error; the caller inserts it into the composer as-is. The heavy decode
+    /// runs desktop-side, so this is a single round trip, not a stream.
+    pub async fn transcribe_audio(
+        &self,
+        audio_base64: String,
+        sample_rate: u32,
+    ) -> Result<String, MobileError> {
+        let session = self.shared.session()?;
+        session
+            .transcribe_audio(&audio_base64, sample_rate)
+            .await
+            .map_err(|e| MobileError::Rpc(e.to_string()))
+    }
 }

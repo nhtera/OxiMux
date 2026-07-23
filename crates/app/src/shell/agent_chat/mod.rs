@@ -23,6 +23,7 @@ mod dictation_history;
 mod dictation_hud;
 mod dictation_service;
 mod dictation_ui;
+mod remote_dictation;
 mod dictation_waveform;
 mod context_providers;
 mod diff_card;
@@ -54,6 +55,7 @@ pub use acp_terminal_host::install as install_acp_terminal_host;
 /// Install the process-wide voice-dictation service (controller + model
 /// manager) at app boot — re-exported for `main` to call once.
 pub use dictation_service::install as install_dictation_service;
+pub use dictation_service::build_remote_transcriber;
 
 /// Model-management entry points the Voice settings pane drives (the recorder
 /// `start`/`stop` stay internal — they carry a `ComposerView` handle). Re-exported

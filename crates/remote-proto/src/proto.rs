@@ -31,14 +31,16 @@ pub use crate::messages::*;
 /// (`ListForgeItems`, `GetForgeItemDetail`, `ListForgeChecks`). v10: appended the
 /// schedule surface (`ListSchedules`, `CreateSchedule`, `DeleteSchedule`,
 /// `SetScheduleEnabled`, `GetScheduleRuns`, and the `Schedules`/`ScheduleCreated`/
-/// `ScheduleRuns` replies).
+/// `ScheduleRuns` replies). v11: appended the voice-dictation surface
+/// (`TranscribeAudio` and its `Transcript` reply) — the phone records a clip and
+/// the desktop's existing speech engine decodes it.
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// The oldest peer version this build still speaks. **Raise this only on a
 /// genuinely breaking change** — a reordered/removed variant or an altered
@@ -320,6 +322,18 @@ pub enum Request {
     /// `limit`). A **read**, gated like [`Request::ListSchedules`]: run rows carry
     /// the same cross-project detail a schedule row does.
     GetScheduleRuns { schedule_id: String, limit: u32 },
+    /// Decode one voice clip to text with the desktop's speech engine.
+    ///
+    /// `audio_base64` is a standard-base64 WAV (16 kHz mono PCM16 is the
+    /// phone's contract; the host reads the real rate from the header and
+    /// resamples when it differs). `sample_rate` is the phone's declared capture
+    /// rate, used only as a fallback for a headerless raw-PCM payload.
+    ///
+    /// **Mutates nothing** — a composer utility, not a session command — so it is
+    /// gated on the authenticated-connection requirement alone, not on write
+    /// scope: any paired device may dictate, exactly as any of them may type. No
+    /// audio is retained past the decode call.
+    TranscribeAudio { audio_base64: String, sample_rate: u32 },
 }
 
 /// Host → client.
@@ -424,6 +438,10 @@ pub enum Response {
     /// Reply to [`Request::GetScheduleRuns`]. Empty means the schedule has never
     /// fired yet, a normal state for a freshly created one.
     ScheduleRuns(Vec<ScheduleRunWire>),
+    /// Reply to [`Request::TranscribeAudio`] — the decoded transcript. An empty
+    /// string is a normal answer (the clip was silence, or only filler the engine
+    /// dropped), not a failure: the client inserts it as-is, which is a no-op.
+    Transcript(String),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

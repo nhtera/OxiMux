@@ -21,6 +21,7 @@ mod handshake;
 mod schedules;
 mod serve;
 mod stream;
+mod transcribe;
 
 use std::sync::Arc;
 
@@ -88,6 +89,14 @@ pub struct Dispatcher {
     /// reads and writes SQLite rows), so no view-layer seam is needed the way
     /// `launcher` and `rewinder` needed one.
     schedules: Option<Arc<oximux_agents::schedule::ScheduleStore>>,
+    /// The desktop's speech-to-text engine, when the host exposes it. `None`
+    /// answers `Unauthorized` for the same reason the other optional surfaces do
+    /// — whether this desktop can transcribe is not something an unauthorized
+    /// client should probe. A trait rather than a concrete type because the
+    /// decode loads an ONNX graph and runs on the desktop's own model manager,
+    /// which lives above this crate (the same reason `launcher`/`rewinder` are
+    /// seams and `schedules` is not).
+    transcriber: Option<Arc<dyn crate::transcribe::AudioTranscriber>>,
     /// Wall clock (Unix seconds), injectable so tests are deterministic.
     now_secs: fn() -> u64,
 }
@@ -101,6 +110,7 @@ impl Dispatcher {
             launcher: None,
             rewinder: None,
             schedules: None,
+            transcriber: None,
             now_secs: system_now_secs,
         }
     }
@@ -129,6 +139,15 @@ impl Dispatcher {
         schedules: Arc<oximux_agents::schedule::ScheduleStore>,
     ) -> Self {
         self.schedules = Some(schedules);
+        self
+    }
+
+    /// Let this dispatcher transcribe voice clips with the desktop's engine.
+    pub fn with_transcriber(
+        mut self,
+        transcriber: Arc<dyn crate::transcribe::AudioTranscriber>,
+    ) -> Self {
+        self.transcriber = Some(transcriber);
         self
     }
 

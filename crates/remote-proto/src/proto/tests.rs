@@ -16,7 +16,7 @@ fn value_bearing_event() -> ThreadEvent {
 /// documented wire change, so an accidental edit fails here.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 10, "v10 = the appended schedule surface");
+    assert_eq!(PROTOCOL_VERSION, 11, "v11 = the appended voice-dictation surface");
 }
 
 /// The floor moves only on a genuinely breaking change, never merely because
@@ -256,4 +256,9 @@ fn early_variants_keep_their_literal_ordinals() {
     // is the 33rd variant (index 32). Pinning it catches an insertion anywhere in
     // the 32 variants before it, which would shift every paired phone's decode.
     assert_eq!(Request::ListSchedules.to_bytes().expect("encode"), vec![32]);
+    // The v11 voice surface appended after the schedule tail: `TranscribeAudio`
+    // is the 38th variant (index 37). Its first encoded byte is that ordinal;
+    // the string + varint payload follows, so pin only the discriminant.
+    let transcribe = Request::TranscribeAudio { audio_base64: String::new(), sample_rate: 0 };
+    assert_eq!(transcribe.to_bytes().expect("encode")[0], 37);
 }

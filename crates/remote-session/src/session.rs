@@ -398,6 +398,20 @@ impl RemoteSession {
         }
     }
 
+    /// Transcribe a recorded voice clip with the desktop's speech engine.
+    ///
+    /// `audio_base64` is a standard-base64 WAV (16 kHz mono PCM16 is the phone's
+    /// contract). An **empty transcript is a normal answer** — a silent clip, or
+    /// one that held only filler — not an error; the caller inserts it as-is.
+    pub async fn transcribe_audio(&self, audio_base64: &str, sample_rate: u32) -> Result<String> {
+        let req = Request::TranscribeAudio { audio_base64: audio_base64.to_string(), sample_rate };
+        match self.call(req).await? {
+            Response::Transcript(text) => Ok(text),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Transcript" }),
+        }
+    }
+
     /// Gap-fill: replay retained events after `after_seq` (the resync path when the
     /// live stream reports a `seq` jump).
     pub async fn events_since(&self, session_id: &str, after_seq: u64) -> Result<Vec<HostEvent>> {

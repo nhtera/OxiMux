@@ -7114,6 +7114,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "chrono",
  "ed25519-dalek 2.2.0",
  "futures",

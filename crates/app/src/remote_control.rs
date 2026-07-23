@@ -33,6 +33,7 @@ pub const ENABLED_SETTING: &str = "remote.enabled";
 pub const KEEP_AWAKE_SETTING: &str = "remote.keep_awake";
 use oximux_agents::session_registry::{SessionHandle, SessionMeta, SessionRegistry};
 use oximux_agents::thread::AgentConnection;
+use oximux_remote_host::AudioTranscriber;
 use oximux_remote_host::TerminalSource;
 use oximux_remote_host::RewindService;
 use oximux_remote_host::{SessionLauncher, 
@@ -119,6 +120,12 @@ pub struct RemoteControl {
     /// phone creates is the same row the desktop's ticker fires and its Settings
     /// pane lists.
     schedules: Option<Arc<oximux_agents::schedule::ScheduleStore>>,
+    /// The desktop's speech-to-text engine, when one is installed. `None` answers
+    /// `TranscribeAudio` with `Unauthorized`, as `launcher` does. Shares the
+    /// composer's own model manager, so a model downloaded in Settings › Voice is
+    /// immediately usable from the phone, and a phone dictation runs through the
+    /// exact engine a desktop one does.
+    transcriber: Option<Arc<dyn AudioTranscriber>>,
     /// The live host's auth store while one is bound, so the paired-devices UI can
     /// revoke against the *running* host (the dispatcher rechecks authorization on
     /// every RPC, so a revoke lands mid-session). Cleared on stop — with no host, the
@@ -158,6 +165,7 @@ impl RemoteControl {
             launcher: None,
             rewinder: None,
             schedules: None,
+            transcriber: None,
             auth: Mutex::new(None),
             awake: Mutex::new(None),
             endpoint_secret: None,
@@ -194,6 +202,13 @@ impl RemoteControl {
     /// the same rows.
     pub fn set_schedule_store(&mut self, schedules: Arc<oximux_agents::schedule::ScheduleStore>) {
         self.schedules = Some(schedules);
+    }
+
+    /// Install the transcriber the host serves. Called once at boot with a
+    /// transcriber that shares the composer's model manager, so both dictation
+    /// surfaces decode with the same model.
+    pub fn set_transcriber(&mut self, transcriber: Arc<dyn AudioTranscriber>) {
+        self.transcriber = Some(transcriber);
     }
 
     pub fn set_terminals(&mut self, terminals: Arc<dyn TerminalSource>) {
@@ -265,6 +280,9 @@ impl RemoteControl {
         }
         if let Some(schedules) = &self.schedules {
             dispatcher = dispatcher.with_schedule_store(Arc::clone(schedules));
+        }
+        if let Some(transcriber) = &self.transcriber {
+            dispatcher = dispatcher.with_transcriber(Arc::clone(transcriber));
         }
         dispatcher
     }
