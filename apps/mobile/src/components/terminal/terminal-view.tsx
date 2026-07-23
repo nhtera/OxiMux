@@ -30,7 +30,6 @@ export function TerminalView({ frames, onInput, onResize }: Props) {
 
   const flush = useCallback(() => {
     if (!ready.current || !webRef.current) return;
-    if (frames.length > written.current) console.log('[probe] flush', written.current, '->', frames.length);
     for (let i = written.current; i < frames.length; i++) {
       const frame = frames[i];
       const message =

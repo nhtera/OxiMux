@@ -50,6 +50,13 @@ module.exports = {
   ],
   moduleNameMapper: {
     '^@/(.*)$': '<rootDir>/src/$1',
+    // Its package.json `react-native`/`module` export condition points at an
+    // untranspiled `.mjs` build, which the `\.[jt]sx?$` transform below never
+    // matches — every icon import (not just the `type` ones) would otherwise
+    // reach the runtime as a raw `export` statement. The `main` condition is
+    // plain CommonJS, so redirecting here sidesteps the transform gap entirely
+    // rather than teaching Jest a new extension to parse.
+    '^lucide-react-native$': '<rootDir>/node_modules/lucide-react-native/dist/cjs/lucide-react-native.js',
   },
   testMatch: ['**/*.test.ts', '**/*.test.tsx'],
 };
