@@ -15,11 +15,11 @@ import Animated, {
   runOnJS,
   useAnimatedStyle,
   useSharedValue,
-  withSpring,
   withTiming,
 } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { MOTION_TIMING } from '@/constants/motion';
 import { Radius, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 
@@ -35,7 +35,6 @@ type Props = {
   contentStyle?: StyleProp<ViewStyle>;
 };
 
-const OPEN_SPRING = { damping: 22, stiffness: 240 } as const;
 const CLOSE_MS = 200;
 /** Commit dismiss past a third of the sheet's height, or on a fast downward flick. */
 const DISMISS_VELOCITY = 600;
@@ -90,7 +89,7 @@ export function Sheet({ visible, onClose, children, contentStyle }: Props) {
       if (visible && !opened.current) {
         opened.current = true;
         // eslint-disable-next-line react-hooks/immutability
-        progress.value = withSpring(1, OPEN_SPRING);
+        progress.value = withTiming(1, MOTION_TIMING);
       }
     },
     [visible, progress, sheetH]
@@ -113,7 +112,7 @@ export function Sheet({ visible, onClose, children, contentStyle }: Props) {
         runOnJS(onClose)();
       } else {
         // eslint-disable-next-line react-hooks/immutability
-        progress.value = withSpring(1, OPEN_SPRING);
+        progress.value = withTiming(1, MOTION_TIMING);
       }
     });
 

@@ -14,11 +14,12 @@ import { createContext, useCallback, useContext, useMemo, useState } from 'react
 import { Dimensions, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { Gesture } from 'react-native-gesture-handler';
 import Animated, {
+  Extrapolation,
   interpolate,
   runOnJS,
   useAnimatedStyle,
   useSharedValue,
-  withSpring,
+  withTiming,
   type SharedValue,
 } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -27,6 +28,7 @@ import { ThemedText } from '@/components/themed-text';
 import { Icon } from '@/components/ui/icon';
 import { IconButton } from '@/components/ui/icon-button';
 import { ListDivider } from '@/components/ui/list-row';
+import { MOTION_TIMING } from '@/constants/motion';
 import { Radius, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { useClient } from '@/native/client';
@@ -40,7 +42,6 @@ const COMMIT_FRACTION = DRAWER_WIDTH / 3;
 const COMMIT_VELOCITY = 500;
 /** Left-edge grab zone for opening the drawer from a screen. */
 const EDGE_ZONE = 28;
-const SPRING = { damping: 20, stiffness: 220 } as const;
 
 /** The four flat, always-relevant destinations. Detail routes are pushed on top
  *  of whichever of these is active and are not listed here. */
@@ -93,7 +94,7 @@ export function AppDrawerProvider({ children }: { children: React.ReactNode }) {
       // Mutating a reanimated shared value is the intended API; the compiler's
       // immutability rule does not model shared values.
       // eslint-disable-next-line react-hooks/immutability
-      progress.value = withSpring(toOpen ? 1 : 0, SPRING);
+      progress.value = withTiming(toOpen ? 1 : 0, MOTION_TIMING);
     },
     [progress]
   );
@@ -163,9 +164,13 @@ function DrawerPanel({
     [close]
   );
 
-  const backdropStyle = useAnimatedStyle(() => ({ opacity: interpolate(progress.value, [0, 1], [0, 0.5]) }));
+  const backdropStyle = useAnimatedStyle(() => ({
+    opacity: interpolate(progress.value, [0, 1], [0, 0.5], Extrapolation.CLAMP),
+  }));
   const panelStyle = useAnimatedStyle(() => ({
-    transform: [{ translateX: interpolate(progress.value, [0, 1], [-DRAWER_WIDTH, 0]) }],
+    // Clamped so a drag or timing tail can never carry the panel past its open
+    // position (the overshoot that read as a jump).
+    transform: [{ translateX: interpolate(progress.value, [0, 1], [-DRAWER_WIDTH, 0], Extrapolation.CLAMP) }],
   }));
 
   return (

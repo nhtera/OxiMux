@@ -47,12 +47,14 @@ export default function RootLayout() {
               <Stack screenOptions={{ contentStyle: { backgroundColor: theme.background } }}>
                 <Stack.Screen name="index" options={{ title: 'OxiMux' }} />
                 <Stack.Screen name="pair-scan" options={{ title: 'Scan pairing code' }} />
-                {/* The four primary destinations carry the hamburger; detail routes
-                    below keep their back button instead. */}
-                <Stack.Screen name="sessions" options={{ title: 'Sessions', headerLeft: menuButton }} />
-                <Stack.Screen name="terminals" options={{ title: 'Terminals', headerLeft: menuButton }} />
-                <Stack.Screen name="settings" options={{ title: 'Settings', headerLeft: menuButton }} />
-                <Stack.Screen name="schedules" options={{ title: 'Schedules', headerLeft: menuButton }} />
+                {/* The four primary destinations carry the hamburger and switch with
+                    no slide — they are drawer siblings, not a push stack, so the new
+                    screen just appears while the drawer closes (the reference does the
+                    same). Detail routes below keep their back button and push slide. */}
+                <Stack.Screen name="sessions" options={{ title: 'Sessions', headerLeft: menuButton, animation: 'none' }} />
+                <Stack.Screen name="terminals" options={{ title: 'Terminals', headerLeft: menuButton, animation: 'none' }} />
+                <Stack.Screen name="settings" options={{ title: 'Settings', headerLeft: menuButton, animation: 'none' }} />
+                <Stack.Screen name="schedules" options={{ title: 'Schedules', headerLeft: menuButton, animation: 'none' }} />
                 {/* Titles come from the screens themselves: a session is named by the
                     agent, the git screen by the branch it is on, and a schedule's run
                     history by the schedule's own name. */}

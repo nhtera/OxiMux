@@ -1,14 +1,13 @@
 import { useEffect, useState } from 'react';
 import { Pressable, StyleSheet, View, type LayoutChangeEvent } from 'react-native';
-import Animated, { useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
+import Animated, { useAnimatedStyle, useSharedValue, withTiming } from 'react-native-reanimated';
 
 import { ThemedText } from '@/components/themed-text';
+import { MOTION_TIMING } from '@/constants/motion';
 import { Radius, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { tick } from '@/native/haptics';
 
-/** Matches the sheet's open feel so motion reads as one system, not per-component. */
-const SPRING = { damping: 22, stiffness: 240 } as const;
 const PAD = 3;
 
 export type Segment<T extends string> = { value: T; label: string };
@@ -43,7 +42,7 @@ export function SegmentedControl<T extends string>({
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/immutability
-    pos.value = withSpring(selectedIndex, SPRING);
+    pos.value = withTiming(selectedIndex, MOTION_TIMING);
   }, [selectedIndex, pos]);
 
   const segWidth = width > 0 ? (width - PAD * 2) / segments.length : 0;

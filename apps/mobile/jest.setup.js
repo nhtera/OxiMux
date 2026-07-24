@@ -110,7 +110,19 @@ jest.mock('react-native-reanimated', () => {
         fn(...args),
     interpolate: (_x, _inRange, outRange) => outRange[0],
     interpolateColor: (_x, _inRange, outRange) => outRange[0],
-    Easing: {},
+    Extrapolation: { CLAMP: 'clamp', EXTEND: 'extend', IDENTITY: 'identity' },
+    // `bezier`/`out`/… are *called* at module load (constants/motion.ts), so they
+    // must be real functions, not the bare `{}` a passed-but-never-invoked easing
+    // could get away with. They return an identity curve — jest never animates.
+    Easing: {
+      bezier: () => (t) => t,
+      linear: (t) => t,
+      ease: (t) => t,
+      in: (fn) => fn,
+      out: (fn) => fn,
+      inOut: (fn) => fn,
+      cubic: (t) => t,
+    },
   };
 });
 
