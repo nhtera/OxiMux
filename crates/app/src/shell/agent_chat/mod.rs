@@ -842,6 +842,13 @@ pub struct AgentChatView {
     /// group already owns this view's `Entity`). `None` in tests / standalone use,
     /// which simply omits the terminal sources.
     pane_group: Option<WeakEntity<PaneGroup>>,
+    /// The visible tab title the desktop shows for this chat — a user's manual
+    /// rename, else the running `Chat N` / agent label — mirrored here by the
+    /// owning pane group so the remote session list renders the same name rather
+    /// than the raw `agent-N` id. `None` until the pane group first syncs it (or
+    /// in standalone use), where [`Self::publish_remote_meta`] falls back to the
+    /// thread's provider-native title.
+    remote_tab_title: Option<String>,
     /// True when `cwd` sits inside a git repo, checked once at construction via
     /// a cheap `.git` stat (the same heuristic `workspaces_with_primary_for`
     /// uses for the synthesized primary-row check). Gates the *New Agent*
@@ -1415,6 +1422,7 @@ impl AgentChatView {
             rewind_then_send: None,
             pending_edit: None,
             pane_group: None,
+            remote_tab_title: None,
             show_background_tasks: false,
             flash_entry: None,
             flash_frames: 0,
@@ -3363,6 +3371,7 @@ impl AgentChatView {
             rewind_then_send: None,
             pending_edit: None,
             pane_group: None,
+            remote_tab_title: None,
             show_background_tasks: false,
             flash_entry: None,
             flash_frames: 0,
@@ -3927,13 +3936,29 @@ impl AgentChatView {
             return;
         };
         binding.set_meta(SessionMeta {
-            title: self.thread.title.clone(),
+            // The tab's visible title (a manual rename, else the running label) is
+            // what the desktop shows, so it wins; fall back to the thread's
+            // provider-native title until the pane group has synced one.
+            title: self.remote_tab_title.clone().or_else(|| self.thread.title.clone()),
             // Mirrors the transcript's resolution: the thread's negotiated model
             // wins, falling back to the tab's selection before one is negotiated.
             model: self.thread.model.clone().or_else(|| self.model.clone()),
             // Git RPCs resolve their repository from this.
             cwd: Some(self.cwd.clone()),
         });
+    }
+
+    /// Record the visible tab title (a manual rename, else the running `Chat N` /
+    /// agent label) the desktop shows for this chat, so a remote session list
+    /// renders the same name instead of the raw `agent-N` id. Pushed by the owning
+    /// pane group on tab create, rename, and ambient title change; re-publishes the
+    /// registry meta only when the title actually changed.
+    pub fn set_remote_tab_title(&mut self, title: Option<String>) {
+        if self.remote_tab_title == title {
+            return;
+        }
+        self.remote_tab_title = title;
+        self.publish_remote_meta();
     }
 
     /// Publish the folded transcript to the registry so a remote client opening this

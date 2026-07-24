@@ -163,6 +163,9 @@ impl PaneGroup {
             tab.color = meta.color;
             tab.custom_title = meta.custom_title;
         }
+        // A restored custom title must reach the remote session list too — the tab
+        // was created (and synced) with its default label before this override.
+        self.sync_remote_tab_title(idx, cx);
         self.tab_order.sort_by_key(|&i| {
             self.tabs
                 .get(i)
