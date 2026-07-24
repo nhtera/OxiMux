@@ -4,6 +4,7 @@ import { Alert, Pressable, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ConnectionBadge } from '@/components/connection-badge';
+import { ChatSettings } from '@/components/settings/chat-settings';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Button } from '@/components/ui/button';
@@ -68,6 +69,8 @@ export default function SettingsScreen() {
             <ThemedText type="smallBold">Appearance</ThemedText>
             <ThemePicker />
           </View>
+
+          <ChatSettings />
 
           <View style={styles.section}>
             <ThemedText type="smallBold">Paired desktop</ThemedText>

@@ -1,16 +1,18 @@
 import { Link, router } from 'expo-router';
-import { CalendarClock, Plus, Settings as SettingsIcon, SquareTerminal } from 'lucide-react-native';
+import { CalendarClock, Plus, Search, Settings as SettingsIcon, SquareTerminal } from 'lucide-react-native';
 import type { SessionSummary } from 'oximux-core';
 import { useCallback, useEffect, useState } from 'react';
 import { FlatList, Pressable, RefreshControl, StyleSheet, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { CommandPalette } from '@/components/command-palette';
 import { ConnectionBadge } from '@/components/connection-badge';
 import { NewSessionSheet } from '@/components/new-session-sheet';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { EmptyState } from '@/components/ui/empty-state';
 import { Icon } from '@/components/ui/icon';
+import { IconButton } from '@/components/ui/icon-button';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { useClient } from '@/native/client';
@@ -28,6 +30,7 @@ export default function SessionsScreen() {
   const [creating, setCreating] = useState(false);
   const [busy, setBusy] = useState(false);
   const [createError, setCreateError] = useState<string>();
+  const [paletteOpen, setPaletteOpen] = useState(false);
 
   const create = useCallback(
     async (cwd: string) => {
@@ -77,6 +80,12 @@ export default function SessionsScreen() {
           {/* The only route off this screen that isn't a session. Without it a
               paired device has no way back to pairing — see settings.tsx. */}
           <View style={styles.headerActions}>
+            <IconButton
+              icon={Search}
+              size="sm"
+              accessibilityLabel="Search and jump"
+              onPress={() => setPaletteOpen(true)}
+            />
             <Pressable
               onPress={() => setCreating(true)}
               accessibilityLabel="New session"
@@ -155,6 +164,11 @@ export default function SessionsScreen() {
             setCreating(false);
             setCreateError(undefined);
           }}
+        />
+        <CommandPalette
+          visible={paletteOpen}
+          onClose={() => setPaletteOpen(false)}
+          onNewSession={() => setCreating(true)}
         />
       </SafeAreaView>
     </ThemedView>

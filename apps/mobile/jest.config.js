@@ -29,6 +29,9 @@ module.exports = {
         '@sentry/react-native',
         'native-base',
         'react-native-svg',
+        // Overrides the jest-expo preset's own allowlist, so this must be re-listed:
+        // its `/jest` stand-in (wired in jest.setup.js) ships as untranspiled ESM.
+        'react-native-keyboard-controller',
         'react-native-marked',
         'react-native-code-highlighter',
         'react-syntax-highlighter',

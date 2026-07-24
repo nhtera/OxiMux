@@ -1,4 +1,3 @@
-import { BottomSheetModalProvider } from '@gorhom/bottom-sheet';
 import { DarkTheme, DefaultTheme, Stack, ThemeProvider } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { useEffect } from 'react';
@@ -8,29 +7,32 @@ import { KeyboardProvider } from 'react-native-keyboard-controller';
 
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { useTheme } from '@/hooks/use-theme';
+import { useChatPreferences } from '@/stores/chat-preferences';
 import { useThemePreference } from '@/stores/theme-preference';
 
 export default function RootLayout() {
   const colorScheme = useColorScheme();
   const theme = useTheme();
   const load = useThemePreference((s) => s.load);
+  const loadChatPrefs = useChatPreferences((s) => s.load);
 
   // Read the stored override once at startup. Until it resolves the app renders
   // the OS scheme, which is the right default to flash: someone who never set a
   // preference sees no change at all, and someone who did sees at most one frame
-  // of the system theme rather than a spinner.
+  // of the system theme rather than a spinner. Chat preferences load alongside;
+  // their default (overview, thinking collapsed) is also the safe pre-load render.
   useEffect(() => {
     void load();
-  }, [load]);
+    void loadChatPrefs();
+  }, [load, loadChatPrefs]);
 
   return (
-    // GestureHandlerRootView must be the outermost wrapper for gorhom's sheet
-    // pan gestures to reach the touch system; BottomSheetModalProvider is the
-    // portal host every `Sheet` presents into.
+    // GestureHandlerRootView must be the outermost wrapper so the sheet + drawer
+    // pan gestures reach the touch system; the in-house `Sheet` renders inline
+    // under it (no portal provider) and rises with the keyboard via KeyboardProvider.
     <GestureHandlerRootView style={styles.root}>
       <KeyboardProvider>
         <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-          <BottomSheetModalProvider>
           <StatusBar style={colorScheme === 'dark' ? 'light' : 'dark'} />
           <Stack screenOptions={{ contentStyle: { backgroundColor: theme.background } }}>
             <Stack.Screen name="index" options={{ title: 'OxiMux' }} />
@@ -45,7 +47,6 @@ export default function RootLayout() {
             <Stack.Screen name="git/[id]" />
             <Stack.Screen name="schedules/[id]" />
           </Stack>
-          </BottomSheetModalProvider>
         </ThemeProvider>
       </KeyboardProvider>
     </GestureHandlerRootView>

@@ -1,6 +1,6 @@
 import { router } from 'expo-router';
 import type { TerminalInfo } from 'oximux-core';
-import { ActivityIndicator, FlatList, Pressable, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, FlatList, Pressable, RefreshControl, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ConnectionBanner } from '@/components/connection-banner';
@@ -53,6 +53,11 @@ export default function TerminalsScreen() {
             keyExtractor={(t) => t.ptyId}
             renderItem={({ item }) => <TerminalRow terminal={item} />}
             contentContainerStyle={styles.list}
+            // The desktop can open or close terminals while the phone is away and
+            // nothing pushes that; a pull re-lists on demand. `reload` flips the
+            // hook's loading state, which drives the spinner, so this control is
+            // left un-refreshing and the tap-to-retry banner covers failures.
+            refreshControl={<RefreshControl refreshing={false} onRefresh={reload} />}
             ListEmptyComponent={
               error ? null : <EmptyState title="No terminals open on the desktop." />
             }

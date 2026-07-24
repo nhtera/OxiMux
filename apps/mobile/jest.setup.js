@@ -47,29 +47,68 @@ jest.mock('react-native-safe-area-context', () => {
 });
 
 /**
- * The bottom-sheet library leans on reanimated + gesture-handler native pieces
- * that do not exist under Node. Any sheet a test renders (the choice picker, the
- * rewind sheet) would otherwise die on a missing native module. The mock renders
- * children directly and stubs the imperative present/dismiss, so a test that
- * mounts a sheet `visible` sees its content exactly as on device — which is what
- * every sheet test asserts against.
+ * The in-house `Sheet` (and the swipe-deck drawer) drive gesture-handler +
+ * reanimated + keyboard-controller directly. Under Node those reach for native
+ * pieces that do not exist, so any sheet a test renders (the choice picker, the
+ * rewind sheet) would die on a missing native module.
+ *
+ * keyboard-controller ships a jest stand-in that tracks the real API — its `/jest`
+ * entry returns a zero-height keyboard, the right value for a headless render.
+ * reanimated v4's shipped mock, though, pulls its real native initializers and
+ * cannot load under Node, and its `GestureDetector` in turn drives reanimated
+ * internals — so both get small hand-written stubs covering exactly the surface
+ * these components use. Animated hosts pass children through, shared values are
+ * plain boxes, the timing/spring helpers resolve instantly (firing their completion
+ * callback), and gestures are inert chainable builders — so a `visible` sheet
+ * renders its content exactly as on device, which is what every sheet test asserts.
  */
-jest.mock('@gorhom/bottom-sheet', () => {
-  const React = require('react');
-  const { View, ScrollView, TextInput } = require('react-native');
-  const Modal = React.forwardRef((props, ref) => {
-    React.useImperativeHandle(ref, () => ({ present: () => {}, dismiss: () => {} }));
-    return React.createElement(React.Fragment, null, props.children);
-  });
+jest.mock('react-native-keyboard-controller', () =>
+  require('react-native-keyboard-controller/jest')
+);
+jest.mock('react-native-gesture-handler', () => {
+  const { View } = require('react-native');
+  // Every builder method returns the builder, so any `.onEnd().onUpdate()` chain
+  // resolves to an inert object; a detector just renders its child.
+  const builder = () => {
+    const g = new Proxy(() => g, { get: () => (() => g) });
+    return g;
+  };
   return {
     __esModule: true,
-    default: View,
-    BottomSheetModal: Modal,
-    BottomSheetModalProvider: ({ children }) => children,
-    BottomSheetScrollView: ScrollView,
-    BottomSheetView: View,
-    BottomSheetTextInput: TextInput,
-    BottomSheetBackdrop: () => null,
+    GestureHandlerRootView: View,
+    GestureDetector: ({ children }) => children ?? null,
+    GestureBuilder: builder,
+    Gesture: new Proxy({}, { get: () => builder }),
+    Directions: {},
+    State: {},
+  };
+});
+jest.mock('react-native-reanimated', () => {
+  const { View, ScrollView, Text, Image } = require('react-native');
+  const box = (init) => ({ value: init });
+  const Animated = { View, ScrollView, Text, Image, createAnimatedComponent: (c) => c };
+  return {
+    __esModule: true,
+    default: Animated,
+    useSharedValue: box,
+    useAnimatedStyle: (fn) => {
+      try {
+        return fn();
+      } catch {
+        return {};
+      }
+    },
+    withSpring: (v) => v,
+    withTiming: (v, _cfg, cb) => {
+      if (cb) cb(true);
+      return v;
+    },
+    runOnJS:
+      (fn) =>
+      (...args) =>
+        fn(...args),
+    interpolate: (_x, _inRange, outRange) => outRange[0],
+    Easing: {},
   };
 });
 

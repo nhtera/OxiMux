@@ -1,7 +1,7 @@
 import { Stack, useLocalSearchParams } from 'expo-router';
 import { Check, Minus, Plus } from 'lucide-react-native';
 import { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Pressable, RefreshControl, ScrollView, StyleSheet, TextInput, View } from 'react-native';
+import { ActivityIndicator, FlatList, Pressable, RefreshControl, StyleSheet, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ConnectionBanner } from '@/components/connection-banner';
@@ -126,30 +126,43 @@ export default function GitScreen() {
       <Stack.Screen options={{ title: status?.branch ?? 'Git' }} />
       <SafeAreaView style={styles.fill} edges={['bottom']}>
         <ConnectionBanner />
-        <ScrollView
+        {/* A virtualized file list rather than a ScrollView of every row: a repo
+            with many changed files windows its rows, and each file's diff mounts
+            only while that file is open — so a large working tree no longer pays
+            to lay out diffs the user has not looked at. */}
+        <FlatList
+          data={status?.files ?? []}
+          keyExtractor={(file) => file.path}
           contentContainerStyle={styles.list}
           refreshControl={<RefreshControl refreshing={false} onRefresh={refresh} />}
-        >
-          {status ? (
-            <ThemedText type="small" style={styles.muted}>
-              {status.branch ?? 'detached HEAD'}
-              {status.upstream ? ` → ${status.upstream}` : ''}
-              {status.ahead > 0 ? ` · ${status.ahead} ahead` : ''}
-              {status.behind > 0 ? ` · ${status.behind} behind` : ''}
-            </ThemedText>
-          ) : error ? null : (
-            // Only spin while the status is genuinely still in flight — a failed
-            // load leaves `status` undefined too, and a spinner above an error
-            // message reads as "still trying" when nothing is.
-            <ActivityIndicator />
-          )}
-
-          {error ? <ErrorBanner message={error} /> : null}
-
-          {status?.files.length === 0 ? <EmptyState title="Working tree clean." /> : null}
-
-          {status?.files.map((file) => (
-            <View key={file.path} style={styles.fileBlock}>
+          // Re-render rows when what a row depends on beyond its own file changes:
+          // which file is open, its loaded diff, and whether a write is in flight.
+          extraData={`${openPath}|${diff ? 'd' : ''}|${busy}`}
+          ListHeaderComponent={
+            <View style={styles.header}>
+              {status ? (
+                <ThemedText type="small" style={styles.muted}>
+                  {status.branch ?? 'detached HEAD'}
+                  {status.upstream ? ` → ${status.upstream}` : ''}
+                  {status.ahead > 0 ? ` · ${status.ahead} ahead` : ''}
+                  {status.behind > 0 ? ` · ${status.behind} behind` : ''}
+                </ThemedText>
+              ) : error ? null : (
+                // Only spin while the status is genuinely still in flight — a
+                // failed load leaves `status` undefined too, and a spinner above
+                // an error message reads as "still trying" when nothing is.
+                <ActivityIndicator />
+              )}
+              {error ? <ErrorBanner message={error} /> : null}
+            </View>
+          }
+          ListEmptyComponent={
+            // Only the loaded-and-clean case is a real empty state; while status
+            // is still undefined the header carries the spinner instead.
+            status?.files.length === 0 ? <EmptyState title="Working tree clean." /> : null
+          }
+          renderItem={({ item: file }) => (
+            <View style={styles.fileBlock}>
               <FileRow
                 file={file}
                 busy={busy}
@@ -171,8 +184,8 @@ export default function GitScreen() {
                 )
               ) : null}
             </View>
-          ))}
-        </ScrollView>
+          )}
+        />
 
         <CommitBar
           stagedCount={staged.length}
@@ -284,6 +297,7 @@ function CommitBar({
 const styles = StyleSheet.create({
   fill: { flex: 1 },
   list: { padding: Spacing.three, gap: Spacing.three },
+  header: { gap: Spacing.three },
   fileBlock: { gap: Spacing.two },
   row: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two },
   rowMain: { flex: 1, gap: Spacing.half },
