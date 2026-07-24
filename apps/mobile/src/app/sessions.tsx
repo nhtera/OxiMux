@@ -1,8 +1,8 @@
-import { Stack, router, useFocusEffect } from 'expo-router';
+import { Stack, router } from 'expo-router';
 import { Plus, Search } from 'lucide-react-native';
 import type { SessionSummary } from 'oximux-core';
 import { useCallback, useState } from 'react';
-import { AppState, FlatList, Pressable, RefreshControl, StyleSheet, TextInput, View } from 'react-native';
+import { FlatList, Pressable, RefreshControl, StyleSheet, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { CommandPalette } from '@/components/command-palette';
@@ -20,10 +20,7 @@ import { useClient } from '@/native/client';
 import { describeError } from '@/native/errors';
 import { tick } from '@/native/haptics';
 import { filterSessions } from '@/native/session-filter';
-
-/** How often to re-list while the Sessions screen is focused and connected —
- *  frequent enough to feel live, cheap enough for a list RPC. */
-const SESSION_POLL_MS = 5000;
+import { parseSessionTitle } from '@/native/session-title';
 
 export default function SessionsScreen() {
   const sessions = useClient((s) => s.sessions);
@@ -72,26 +69,9 @@ export default function SessionsScreen() {
     }
   }, [refreshSessions]);
 
-  // The host never pushes session open/close/rename, so the list would otherwise
-  // drift the whole time the phone stays connected. Keep it live while this screen
-  // is on top: re-list on focus, poll on a short interval, and re-list whenever the
-  // app returns to the foreground. The interval is torn down when the screen blurs
-  // (a session is opened on top) so a backgrounded list isn't polling. Pull-to-
-  // refresh stays for an explicit nudge.
-  useFocusEffect(
-    useCallback(() => {
-      if (phase !== 'connected') return;
-      void refreshSessions();
-      const id = setInterval(() => void refreshSessions(), SESSION_POLL_MS);
-      const sub = AppState.addEventListener('change', (next) => {
-        if (next === 'active') void refreshSessions();
-      });
-      return () => {
-        clearInterval(id);
-        sub.remove();
-      };
-    }, [phase, refreshSessions])
-  );
+  // The session list is kept live by a host push subscription registered in the
+  // client store (the desktop streams open/close/rename/permission changes), so
+  // there is nothing to poll here. Pull-to-refresh remains as a manual nudge.
 
   return (
     <ThemedView style={styles.fill}>
@@ -182,6 +162,9 @@ export default function SessionsScreen() {
 
 function SessionRow({ session }: { session: SessionSummary }) {
   const theme = useTheme();
+  // The host folds the project into the title so a row is attributable to its
+  // project without a wire-schema change; render it as a muted line above.
+  const { project, label } = parseSessionTitle(session.title);
   return (
     <Pressable
       onPress={() => {
@@ -191,7 +174,12 @@ function SessionRow({ session }: { session: SessionSummary }) {
       style={({ pressed }) => [styles.row, pressed && { backgroundColor: theme.surface2 }]}
     >
       <View style={styles.rowText}>
-        <ThemedText numberOfLines={1}>{session.title}</ThemedText>
+        {project ? (
+          <ThemedText type="small" numberOfLines={1} style={{ color: theme.textSecondary }}>
+            {project}
+          </ThemedText>
+        ) : null}
+        <ThemedText numberOfLines={1}>{label}</ThemedText>
         {session.model ? (
           <ThemedText type="small" numberOfLines={1}>
             {session.model}
@@ -226,6 +214,9 @@ const styles = StyleSheet.create({
   attention: { width: 8, height: 8, borderRadius: 4 },
   search: {
     marginHorizontal: Spacing.four,
+    // Symmetric top gap: the connection banner above is absent while connected,
+    // so without this the field butts straight against the header.
+    marginTop: Spacing.three,
     marginBottom: Spacing.three,
     borderRadius: Spacing.two,
     paddingHorizontal: Spacing.three,

@@ -88,6 +88,10 @@ export const useClient = create<ClientState & ClientActions>((set, get) => ({
    */
   async pair(ticketUrl: string) {
     const client = await newClient();
+    // Register the session-list sink before connecting so the host's initial
+    // snapshot and every subsequent change land in the store — the list is
+    // push-driven, not polled (the Rust core re-subscribes on each reconnect).
+    client.setSessionsSink({ onSessions: (sessions) => set({ sessions }) });
     set({ client, phase: 'connecting', cause: undefined });
     const onState = { onState: (state: ConnState) => set(phaseOf(state)) };
 
@@ -128,6 +132,8 @@ export const useClient = create<ClientState & ClientActions>((set, get) => ({
     const host = await loadHost();
     if (!host) return false;
     const client = await newClient();
+    // See `pair`: the list is kept live by this push sink, not a poll.
+    client.setSessionsSink({ onSessions: (sessions) => set({ sessions }) });
     set({ client, phase: 'connecting', cause: undefined });
     await client.reconnect(toArrayBuffer(endpointIdBytes(host)), {
       onState: (state: ConnState) => set(phaseOf(state)),
