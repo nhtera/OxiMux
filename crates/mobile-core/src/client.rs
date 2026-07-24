@@ -55,6 +55,10 @@ pub(crate) struct Shared {
     /// [`subs`](Self::subs), there is no cursor to resume from — a terminal has
     /// no seq — so recovery is a re-attach, not a replay-since.
     pub attached: StdMutex<HashSet<String>>,
+    /// The app's session-list sink, if it registered one. Connection-wide, like
+    /// [`terminal_sink`](Self::terminal_sink): the wire has a single session-list
+    /// push stream, re-subscribed on every (re)connect.
+    pub sessions_sink: StdMutex<Option<Arc<dyn crate::callbacks::SessionsSink>>>,
 }
 
 impl Shared {
@@ -110,6 +114,7 @@ impl MobileClient {
                 epoch: AtomicU64::new(0),
                 terminal_sink: StdMutex::new(None),
                 attached: StdMutex::new(HashSet::new()),
+                sessions_sink: StdMutex::new(None),
             }),
             shutdown: StdMutex::new(None),
             host_endpoint: StdMutex::new(None),

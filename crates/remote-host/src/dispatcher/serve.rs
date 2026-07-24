@@ -39,6 +39,9 @@ impl Dispatcher {
         // actually stop the old one, or the next attach stacks a second stream
         // beside it and every byte arrives twice.
         let mut attached: HashMap<String, tokio::sync::oneshot::Sender<()>> = HashMap::new();
+        // Whether this connection holds a session-list subscription. A repeat
+        // `SubscribeSessions` re-snapshots without opening a second stream.
+        let mut sessions_subscribed = false;
         // `futures::future::select` is left-biased (always polls its first arg
         // first). Alternating which side leads each turn keeps neither the request
         // stream nor live delivery able to starve the other: a flood of pipelined
@@ -78,6 +81,7 @@ impl Dispatcher {
                             &mut streams,
                             &mut cursors,
                             &mut attached,
+                            &mut sessions_subscribed,
                             transport,
                             frame,
                         )
@@ -100,6 +104,9 @@ impl Dispatcher {
                                 Live::Terminal { pty_id, frame } => {
                                     forward_terminal(&self.auth, &pubkey, transport, pty_id, frame)
                                         .await
+                                }
+                                Live::SessionList => {
+                                    self.forward_sessions(&pubkey, transport).await
                                 }
                             };
                             if !alive {
@@ -124,6 +131,7 @@ impl Dispatcher {
         streams: &mut SelectAll<BoxStream<'static, Live>>,
         cursors: &mut HashMap<SessionId, Seq>,
         attached: &mut HashMap<String, tokio::sync::oneshot::Sender<()>>,
+        sessions_subscribed: &mut bool,
         transport: &dyn Transport,
         frame: Vec<u8>,
     ) -> bool {
@@ -144,6 +152,18 @@ impl Dispatcher {
                 self.begin_subscribe(&pubkey, &session_id, after_seq.unwrap_or(0), cursors);
             if let Some(stream) = stream {
                 streams.push(stream.map(Live::Session).boxed());
+            }
+            return self.send(transport, response).await;
+        }
+        // `SubscribeSessions`, like `Subscribe`, also opens a live stream, so it is
+        // handled here rather than in the sync `dispatch`.
+        if let Request::SubscribeSessions = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let (response, stream) = self.begin_subscribe_sessions(&pubkey, sessions_subscribed);
+            if let Some(stream) = stream {
+                streams.push(stream);
             }
             return self.send(transport, response).await;
         }

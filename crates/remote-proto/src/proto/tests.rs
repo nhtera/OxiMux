@@ -16,7 +16,7 @@ fn value_bearing_event() -> ThreadEvent {
 /// documented wire change, so an accidental edit fails here.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 11, "v11 = the appended voice-dictation surface");
+    assert_eq!(PROTOCOL_VERSION, 13, "v13 = the appended transcript-snapshot fetch");
 }
 
 /// The floor moves only on a genuinely breaking change, never merely because
@@ -125,6 +125,7 @@ fn requests_round_trip_via_postcard() {
         Request::ListChoices { session_id: "s1".into() },
         Request::SetModel { session_id: "s1".into(), model: "opus-4.8".into() },
         Request::SetPermissionMode { session_id: "s1".into(), mode: "plan".into() },
+        Request::FetchTranscript { session_id: "s1".into() },
     ];
     for req in requests {
         let bytes = req.to_bytes().expect("encode");
@@ -177,6 +178,12 @@ fn send_prompt_and_responses_round_trip() {
             modes: vec![],
             current_model: None,
             current_mode: None,
+        }),
+        Response::SessionTranscript(SessionTranscriptWire {
+            session_id: "s1".into(),
+            seq: 7,
+            entries_json: "[]".into(),
+            model: Some("claude".into()),
         }),
     ];
     for resp in responses {
@@ -261,4 +268,26 @@ fn early_variants_keep_their_literal_ordinals() {
     // the string + varint payload follows, so pin only the discriminant.
     let transcribe = Request::TranscribeAudio { audio_base64: String::new(), sample_rate: 0 };
     assert_eq!(transcribe.to_bytes().expect("encode")[0], 37);
+    // The v12 session-list subscription appended after the voice tail:
+    // `SubscribeSessions` is the 39th Request variant (index 38, a unit variant, so
+    // its whole encoding is that single ordinal byte).
+    assert_eq!(Request::SubscribeSessions.to_bytes().expect("encode"), vec![38]);
+    // The v13 transcript-snapshot fetch appended after the subscription tail:
+    // `FetchTranscript` is the 40th Request variant (index 39). Pin the discriminant;
+    // the `session_id` string payload follows.
+    let fetch = Request::FetchTranscript { session_id: String::new() };
+    assert_eq!(fetch.to_bytes().expect("encode")[0], 39);
+    // `SessionsChanged` is the 29th Response variant (index 28); pin the
+    // discriminant, the `Vec` payload follows.
+    let changed = Response::SessionsChanged(vec![]);
+    assert_eq!(changed.to_bytes().expect("encode")[0], 28);
+    // `SessionTranscript` is the 30th Response variant (index 29), appended after
+    // `SessionsChanged`.
+    let transcript = Response::SessionTranscript(SessionTranscriptWire {
+        session_id: String::new(),
+        seq: 0,
+        entries_json: "[]".into(),
+        model: None,
+    });
+    assert_eq!(transcript.to_bytes().expect("encode")[0], 29);
 }

@@ -190,6 +190,7 @@ impl Dispatcher {
         match req {
             Request::ListSessions => self.list_sessions(pubkey),
             Request::GetSessionInfo { session_id } => self.session_info(pubkey, &session_id),
+            Request::FetchTranscript { session_id } => self.fetch_transcript(pubkey, &session_id),
             Request::SendPrompt(r) => self.send_prompt(pubkey, r),
             Request::ResolvePermission(r) => self.resolve_permission(pubkey, r),
             Request::AnswerQuestion(r) => self.answer_question(pubkey, r),

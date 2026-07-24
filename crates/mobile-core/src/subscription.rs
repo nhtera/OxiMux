@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use futures::StreamExt;
 use futures::channel::oneshot;
+use oximux_agent_core::thread::ThreadEntry;
 use oximux_remote_session::{EventStream, FoldOutcome, RemoteSession, SessionSubscription};
 
 use crate::callbacks::ThreadSink;
@@ -168,7 +169,14 @@ pub(crate) async fn activate(
     // — it is an unbounded channel the pump keeps filling, so leaving it untaken
     // would grow without limit for any client the host pushes terminal frames to.
     let terminal_pushes = session.take_terminals().expect("terminals taken once per session");
+    // Also per-session: a fresh (re)connect brings a new push stream, and the host
+    // rebuilds its subscriber set on accept, so this must be taken + re-subscribed
+    // every activation, like the terminal stream above.
+    let session_pushes = session.take_sessions().expect("sessions taken once per session");
     resubscribe_all(&shared, &session).await;
+    // Subscribe to the live session list on this connection; the RPC returns the
+    // initial snapshot, delivered to the sink inside.
+    crate::sessions::resubscribe_sessions(&shared, &session).await;
     {
         // Publish the session — but only if a newer (re)connect or a `disconnect`
         // hasn't superseded us while we were wiring up. Checked under the same lock
@@ -181,6 +189,7 @@ pub(crate) async fn activate(
     }
     rt().spawn(run_dispatcher(shared.clone(), events));
     rt().spawn(crate::terminals::run_terminal_pump(shared.clone(), terminal_pushes));
+    rt().spawn(crate::sessions::run_sessions_pump(shared.clone(), session_pushes));
     // After the session is published and the pump is running: the app answers this
     // by re-attaching, which needs a live session to issue the RPC against and a
     // running pump for the resulting frames to arrive through.
@@ -239,14 +248,29 @@ impl MobileClient {
         sink: Arc<dyn ThreadSink>,
     ) -> Result<(), MobileError> {
         let session = self.shared.session()?;
+        // Fetch the authoritative transcript snapshot first, so the session opens
+        // with its full history — including one restored from disk after a host
+        // restart, which lives only in the desktop view's fold and never entered
+        // the live event ring. Rehydrate from it and resume the live stream from its
+        // cursor. An older host without `FetchTranscript` (or an empty base) falls
+        // back to a fresh, backlog-only fold — exactly the prior cold-open behavior.
+        let (mut subscription, after) = match session.fetch_transcript(&session_id).await {
+            Ok(t) => {
+                let entries: Vec<ThreadEntry> =
+                    serde_json::from_str(&t.entries_json).unwrap_or_default();
+                let sub = SessionSubscription::rehydrated(session_id.clone(), entries, t.model, t.seq);
+                (sub, t.seq)
+            }
+            Err(_) => (SessionSubscription::new(session_id.clone()), 0),
+        };
         let backlog = session
-            .subscribe(&session_id, 0)
+            .subscribe(&session_id, after)
             .await
             .map_err(|e| MobileError::Rpc(e.to_string()))?;
-        let mut sub = Sub { subscription: SessionSubscription::new(session_id.clone()), sink };
         for ev in &backlog {
-            let _ = sub.subscription.apply(ev);
+            let _ = subscription.apply(ev);
         }
+        let sub = Sub { subscription, sink };
         // Push unconditionally, even for an empty backlog: the app is waiting for
         // a first snapshot to replace its loading state, and a session with no
         // history yet would otherwise sit on a spinner until the first event.
@@ -275,6 +299,7 @@ mod tests {
             epoch: AtomicU64::new(epoch),
             terminal_sink: StdMutex::new(None),
             attached: StdMutex::new(std::collections::HashSet::new()),
+            sessions_sink: StdMutex::new(None),
         })
     }
 

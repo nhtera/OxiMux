@@ -31,7 +31,10 @@ pub const ENABLED_SETTING: &str = "remote.enabled";
 /// governing the other would make turning off a notification setting stop a
 /// paired phone from reaching this Mac.
 pub const KEEP_AWAKE_SETTING: &str = "remote.keep_awake";
-use oximux_agents::session_registry::{SessionHandle, SessionMeta, SessionRegistry};
+use futures::channel::mpsc;
+use oximux_agents::session_registry::{
+    RemotePrompt, SessionHandle, SessionMeta, SessionRegistry,
+};
 use oximux_agents::thread::AgentConnection;
 use oximux_remote_host::AudioTranscriber;
 use oximux_remote_host::TerminalSource;
@@ -74,6 +77,21 @@ impl RemoteBinding {
     /// session list shows what the desktop shows instead of the raw session id.
     pub fn set_meta(&self, meta: SessionMeta) {
         self.handle.set_meta(meta);
+    }
+
+    /// Publish the folded transcript so a remote client opening this session sees
+    /// its full history — including one restored from disk after a restart, which
+    /// never entered the event ring. `entries_json` is the folded `Vec<ThreadEntry>`
+    /// as JSON; the registry pairs it with the current seq for the client's resume.
+    pub fn publish_transcript(&self, entries_json: String, model: Option<String>) {
+        self.handle.publish_transcript(entries_json, model);
+    }
+
+    /// Register the sink that relays remotely-injected prompts (phone sends) back to
+    /// the view, so the desktop renders the user's own bubble instead of a reply to
+    /// a prompt it never showed.
+    pub fn set_prompt_sink(&self, tx: mpsc::UnboundedSender<RemotePrompt>) {
+        self.handle.set_remote_prompt_sink(tx);
     }
 
     /// Remove the session from the registry. The map holds its own `Arc`, so this

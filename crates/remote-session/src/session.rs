@@ -20,12 +20,12 @@ use oximux_agent_core::thread::{AskQuestion, ChatImage, PermissionDecision, Ques
 use oximux_remote_proto::messages::{
     AnswerQuestionReq, CheckRunWire, ForgeItemDetailWire, ForgeItemKindWire, ForgeItemWire,
     ForgeStateWire, RecurrenceWire, ResolvePermissionReq, ScheduleRunWire, ScheduleWire,
-    SendPromptReq, SessionInfoWire, SessionSummary,
+    SendPromptReq, SessionInfoWire, SessionSummary, SessionTranscriptWire,
 };
 use oximux_remote_proto::proto::{Request, Response, RpcError, SessionChoices};
 use oximux_remote_proto::{HostEvent, Transport};
 
-use crate::demux::{Demux, DemuxPump, EventStream, TerminalStream, demux};
+use crate::demux::{Demux, DemuxPump, EventStream, SessionsStream, TerminalStream, demux};
 use crate::error::SessionError;
 use crate::signer::ClientSigner;
 
@@ -49,6 +49,9 @@ pub struct RemoteSession {
     /// from `events` because a client can watch a terminal without subscribing
     /// to any agent session, and vice versa.
     terminals: Mutex<Option<TerminalStream>>,
+    /// The pushed session-list stream, taken once by the owner. Each item is a full
+    /// per-device snapshot that replaces the client's session list wholesale.
+    sessions: Mutex<Option<SessionsStream>>,
     /// Dropping this stops the pump — so the connection tears down when the
     /// session is dropped, no explicit close needed.
     _shutdown: oneshot::Sender<()>,
@@ -56,7 +59,7 @@ pub struct RemoteSession {
 
 impl RemoteSession {
     pub fn new(transport: Arc<dyn Transport>, signer: ClientSigner) -> Self {
-        let (handle, pump, events, terminals, shutdown) = demux(transport);
+        let (handle, pump, events, terminals, sessions, shutdown) = demux(transport);
         Self {
             demux: handle,
             signer,
@@ -64,7 +67,28 @@ impl RemoteSession {
             pump: Mutex::new(Some(pump)),
             events: Mutex::new(Some(events)),
             terminals: Mutex::new(Some(terminals)),
+            sessions: Mutex::new(Some(sessions)),
             _shutdown: shutdown,
+        }
+    }
+
+    /// Take the pushed session-list stream — once. Each item is a full snapshot the
+    /// owner uses to replace its session list.
+    pub fn take_sessions(&self) -> Option<SessionsStream> {
+        self.sessions.lock().unwrap().take()
+    }
+
+    /// Subscribe to the live session list. Returns the current snapshot immediately;
+    /// thereafter the host pushes a fresh snapshot on every change onto the stream
+    /// from [`Self::take_sessions`]. Idempotent — a repeat subscribe re-snapshots.
+    pub async fn subscribe_sessions(&self) -> Result<Vec<SessionSummary>> {
+        // The immediate reply is a plain `Sessions` snapshot (routed to the RPC
+        // slot); subsequent changes arrive as pushed `SessionsChanged` frames on the
+        // stream from `take_sessions`.
+        match self.call(Request::SubscribeSessions).await? {
+            Response::Sessions(rows) => Ok(rows),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Sessions" }),
         }
     }
 
@@ -120,6 +144,19 @@ impl RemoteSession {
             Response::SessionInfo(info) => Ok(info),
             Response::Error(e) => Err(SessionError::Rpc(e)),
             _ => Err(SessionError::Unexpected { expected: "SessionInfo" }),
+        }
+    }
+
+    /// The session's authoritative folded-transcript snapshot — full history plus
+    /// the `seq` it reflects. Fetched when opening a session so it renders its
+    /// history immediately (including a restart-restored transcript that never
+    /// entered the live ring); the caller then subscribes from `seq` to extend it.
+    pub async fn fetch_transcript(&self, session_id: &str) -> Result<SessionTranscriptWire> {
+        let req = Request::FetchTranscript { session_id: session_id.to_string() };
+        match self.call(req).await? {
+            Response::SessionTranscript(t) => Ok(t),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "SessionTranscript" }),
         }
     }
 

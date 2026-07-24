@@ -9,7 +9,7 @@
 //! (or a frame was dropped), so rather than fold out of order it reports a
 //! [`FoldOutcome::Gap`] and the caller resyncs via `events_since(resume_from)`.
 
-use oximux_agent_core::thread::ChatThread;
+use oximux_agent_core::thread::{ChatThread, ThreadEntry};
 use oximux_remote_proto::HostEvent;
 
 use crate::error::SessionError;
@@ -50,6 +50,22 @@ impl SessionSubscription {
     /// backlog) or seed the cursor by folding a known-contiguous backlog first.
     pub fn new(session_id: impl Into<String>) -> Self {
         Self { session_id: session_id.into(), thread: ChatThread::new(), last_seq: 0 }
+    }
+
+    /// A subscription seeded from a fetched transcript snapshot: rehydrate the fold
+    /// from `entries` and set the cursor to `seq`. The caller then subscribes from
+    /// `seq` so live frames extend the snapshot with neither a gap nor a duplicate.
+    /// The counterpart to [`Self::new`] for opening a session that already has
+    /// history — restored after a host restart, or older than the live event ring.
+    pub fn rehydrated(
+        session_id: impl Into<String>,
+        entries: Vec<ThreadEntry>,
+        model: Option<String>,
+        seq: u64,
+    ) -> Self {
+        let session_id = session_id.into();
+        let thread = ChatThread::rehydrated(Some(session_id.clone()), model, entries, Vec::new());
+        Self { session_id, thread, last_seq: seq }
     }
 
     /// The session this subscription tracks.
@@ -105,5 +121,54 @@ impl SessionSubscription {
             }
         }
         Ok(last)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use oximux_agent_core::thread::ThreadEvent;
+    use oximux_remote_proto::messages::SessionStatusWire;
+
+    use super::*;
+
+    fn status(seq: u64) -> SessionStatusWire {
+        SessionStatusWire { last_seq: seq, awaiting_permission: false }
+    }
+
+    /// The restart scenario: a subscription rehydrated from a restored transcript
+    /// (seq 0 — the fold never entered the event ring) shows that history at once
+    /// AND folds the first live event on top of it. This is the exact fix for a
+    /// phone opening a session whose desktop tab was restored after a host restart.
+    #[test]
+    fn rehydrated_shows_history_and_extends_with_live_events() {
+        let entries = vec![
+            ThreadEntry::User { text: "restored question".into(), images: vec![], checkpoint: None },
+            ThreadEntry::ContextCompaction { summary: "earlier history".into() },
+        ];
+        let mut sub = SessionSubscription::rehydrated("sess-1", entries, Some("claude".into()), 0);
+
+        // History is present immediately, before any live frame arrives.
+        assert_eq!(sub.thread().entries.len(), 2, "restored history should seed the fold");
+        assert_eq!(sub.last_seq(), 0, "cursor resumes from the snapshot seq");
+
+        // The first live event (seq 1 == snapshot seq + 1) folds onto the history.
+        let frame =
+            HostEvent::new("sess-1", 1, &ThreadEvent::AssistantText("live reply".into()), status(1))
+                .expect("encode frame");
+        assert_eq!(sub.apply(&frame).expect("apply"), FoldOutcome::Applied { seq: 1 });
+        assert_eq!(sub.last_seq(), 1);
+        assert!(
+            sub.thread().entries.len() > 2,
+            "the live event extends the restored history rather than replacing it",
+        );
+    }
+
+    /// The fallback path: a fresh (non-rehydrated) subscription still starts empty
+    /// at cursor 0, so an older host without `FetchTranscript` degrades cleanly.
+    #[test]
+    fn fresh_subscription_starts_empty() {
+        let sub = SessionSubscription::new("sess-2");
+        assert_eq!(sub.thread().entries.len(), 0);
+        assert_eq!(sub.last_seq(), 0);
     }
 }

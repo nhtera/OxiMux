@@ -5,7 +5,7 @@
 use oximux_agents::session_registry::SessionHandle;
 use oximux_remote_proto::messages::{
     AnswerQuestionReq, ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionStatusWire,
-    SessionSummary,
+    SessionSummary, SessionTranscriptWire,
 };
 use oximux_remote_proto::proto::{Choice, Response, RpcError, SessionChoices};
 use oximux_remote_proto::HostEvent;
@@ -13,34 +13,92 @@ use oximux_remote_proto::HostEvent;
 use super::Dispatcher;
 use crate::auth::AppPubkey;
 
+/// The project label a phone session row shows for attribution — the final path
+/// component of the session's working directory (its workspace root). `None` when
+/// no cwd has been published yet (a freshly-registered session), so the row simply
+/// omits the context line rather than showing a placeholder.
+fn project_label(cwd: Option<&std::path::Path>) -> Option<String> {
+    cwd.and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// Compose the phone-facing session title. The wire summary carries a single
+/// `title`, so the project is folded into it as `"<project> · <title>"`; the phone
+/// splits on the separator to render the project as a muted context label. This
+/// keeps a remote session row attributable to its project without adding a
+/// `SessionSummary` field — which the append-only wire forbids. Falls back to the
+/// bare title (or the id, so a row is never blank) when no cwd is known, which is
+/// also what an older host sends, so the phone degrades to the un-prefixed row.
+fn remote_title(title: Option<String>, cwd: Option<&std::path::Path>, session_id: &str) -> String {
+    let base = title.unwrap_or_else(|| session_id.to_string());
+    match project_label(cwd) {
+        Some(project) => format!("{project} · {base}"),
+        None => base,
+    }
+}
+
 impl Dispatcher {
-    pub(super) fn list_sessions(&self, pubkey: &AppPubkey) -> Response {
-        let sessions = self
-            .registry
+    /// The per-device-filtered session list — the shared body behind both the
+    /// [`Request::ListSessions`](oximux_remote_proto::proto::Request::ListSessions)
+    /// reply and every pushed
+    /// [`SessionsChanged`](oximux_remote_proto::proto::Response::SessionsChanged)
+    /// snapshot, so both honour the same scope filter and meta lookup.
+    pub(super) fn snapshot_sessions(&self, pubkey: &AppPubkey) -> Vec<SessionSummary> {
+        self.registry
             .statuses()
             .into_iter()
             // A session-scoped device must only learn about sessions it may act
             // on — never enumerate the full session set.
             .filter(|(session_id, _)| self.auth.is_allowed_for(pubkey, session_id))
             .map(|(session_id, status)| {
-                // Title/model are published by the desktop view via the registry's
-                // session meta. A session that hasn't been titled yet (no
-                // `TitleUpdated` so far) falls back to its id so a row is never blank.
+                // Title/model/cwd are published by the desktop view via the
+                // registry's session meta. The title is project-qualified for the
+                // remote row; a session not yet titled falls back to its id (never
+                // blank), and one with no published cwd gets no project prefix.
                 let meta = self
                     .registry
                     .get(&session_id)
                     .map(|handle| handle.meta_snapshot())
                     .unwrap_or_default();
                 SessionSummary {
-                    title: meta.title.unwrap_or_else(|| session_id.clone()),
+                    title: remote_title(meta.title, meta.cwd.as_deref(), &session_id),
                     model: meta.model,
                     last_seq: status.last_seq,
                     awaiting_permission: status.awaiting_permission,
                     session_id,
                 }
             })
-            .collect();
-        Response::Sessions(sessions)
+            .collect()
+    }
+
+    pub(super) fn list_sessions(&self, pubkey: &AppPubkey) -> Response {
+        Response::Sessions(self.snapshot_sessions(pubkey))
+    }
+
+    /// Serve a session's authoritative folded-transcript snapshot so a client opens
+    /// it with full history — including a transcript restored from disk after a host
+    /// restart, which lives only in the view's fold and never entered the event ring.
+    /// An empty base (`"[]"`, seq 0) is returned when the view has not published yet,
+    /// so the client opens cleanly and the live stream fills it rather than erroring.
+    pub(super) fn fetch_transcript(&self, pubkey: &AppPubkey, session_id: &str) -> Response {
+        if !self.auth.is_allowed_for(pubkey, session_id) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(handle) = self.registry.get(session_id) else {
+            return Response::Error(RpcError::UnknownSession);
+        };
+        let snap = handle.transcript_snapshot().unwrap_or_default();
+        Response::SessionTranscript(SessionTranscriptWire {
+            session_id: session_id.to_string(),
+            seq: snap.seq,
+            entries_json: if snap.entries_json.is_empty() {
+                "[]".to_string()
+            } else {
+                snap.entries_json
+            },
+            model: snap.model,
+        })
     }
 
     pub(super) fn session_info(&self, pubkey: &AppPubkey, session_id: &str) -> Response {
@@ -55,7 +113,7 @@ impl Dispatcher {
         Response::SessionInfo(SessionInfoWire {
             summary: SessionSummary {
                 session_id: session_id.to_string(),
-                title: meta.title.unwrap_or_else(|| session_id.to_string()),
+                title: remote_title(meta.title, meta.cwd.as_deref(), session_id),
                 model: meta.model,
                 last_seq: status.last_seq,
                 awaiting_permission: status.awaiting_permission,

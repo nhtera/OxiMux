@@ -36,3 +36,10 @@ docs/journals
 
 # repomix scratch dumps (regeneratable; not source-of-truth)
 repomix-output.xml
+
+spikes/iroh-ping/target/
+spikes/mobile-core-uniffi/target
+spikes/mobile-core-uniffi/node_modules
+
+# Third-party reference checkouts (not part of the project)
+References/

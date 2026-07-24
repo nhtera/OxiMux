@@ -164,6 +164,24 @@ pub struct SessionSummary {
     pub awaiting_permission: bool,
 }
 
+/// A session's folded-transcript snapshot — the
+/// [`Response::SessionTranscript`](crate::proto::Response::SessionTranscript)
+/// payload.
+///
+/// `entries_json` is the folded `Vec<ThreadEntry>` as JSON (same reasoning as
+/// [`HostEvent`]: the entry tree is deep and evolving, so it crosses as a string
+/// rather than a mirrored postcard record). `seq` is the fold cursor the entries
+/// reflect — the client resumes the live stream from it so subsequent events
+/// extend the snapshot with neither a gap nor a duplicate. An empty transcript is
+/// `entries_json: "[]"`, `seq: 0`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionTranscriptWire {
+    pub session_id: String,
+    pub seq: u64,
+    pub entries_json: String,
+    pub model: Option<String>,
+}
+
 /// One terminal the phone can list and attach to.
 ///
 /// `cwd` is the terminal's working directory as a display string, not a path to

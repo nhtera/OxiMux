@@ -519,7 +519,7 @@ use context_providers::{ContextRequest, ContextSource};
 use question_card::{QuestionCard, QuestionCardEvent};
 use tool_grouping::{plan_tool_grouping, summarize_tool_run, EntryDisplay, GroupSummary, GroupedTool};
 use crate::remote_control::{RemoteBinding, RemoteControl, next_remote_session_id};
-use oximux_agents::session_registry::SessionMeta;
+use oximux_agents::session_registry::{RemotePrompt, SessionMeta};
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
@@ -741,6 +741,10 @@ pub struct AgentChatView {
     /// `Drop::shutdown()` (which kills the child → stdout EOF → both threads
     /// unwind). Keep that the single cleanup owner across future refactors.
     _drain_task: Option<Task<()>>,
+    /// Relays remotely-injected prompts (phone sends) into this tab's transcript so
+    /// the desktop shows the user's own bubble. Re-created on each (re)bind; dropping
+    /// it ends the relay.
+    _remote_prompt_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     /// Interactive AskUserQuestion cards for tool calls awaiting answers, keyed
     /// by tool-call id. Each is its own entity so its text inputs repaint without
@@ -1321,6 +1325,30 @@ impl AgentChatView {
         let remote = connection.clone().and_then(|conn| {
             cx.try_global::<RemoteControl>().and_then(|rc| rc.bind(&remote_session_id, conn))
         });
+        // A restored transcript loads at construction (never through the live event
+        // drain that publishes for a running session), so publish its meta + folded
+        // history now. Without this a remote client opening an idle restored session
+        // sees it unlabelled and empty until the next live event — the exact gap on a
+        // host restart. `bind_remote` covers the later respawn/reconnect path; this
+        // covers cold restore, where `self` does not exist yet so the binding is
+        // driven directly from the locals that seed the struct below.
+        let mut remote_prompt_task = None;
+        if let Some(binding) = &remote {
+            let model = thread.model.clone().or_else(|| model.clone());
+            binding.set_meta(SessionMeta {
+                title: thread.title.clone(),
+                model: model.clone(),
+                cwd: Some(cwd.clone()),
+            });
+            if let Ok(entries_json) = serde_json::to_string(&thread.entries) {
+                binding.publish_transcript(entries_json, model);
+            }
+            // Relay remotely-injected prompts (phone sends) into this tab so the
+            // desktop shows the user's own bubble, not just the reply.
+            let (tx, rx) = futures::channel::mpsc::unbounded();
+            binding.set_prompt_sink(tx);
+            remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, cx));
+        }
 
         Self {
             thread,
@@ -1371,6 +1399,7 @@ impl AgentChatView {
             sheet_copied: false,
             _sheet_copy_task: None,
             _drain_task: drain_task,
+            _remote_prompt_task: remote_prompt_task,
             _subscriptions: subscriptions,
             question_cards: HashMap::new(),
             question_card_subs: HashMap::new(),
@@ -3318,6 +3347,7 @@ impl AgentChatView {
             sheet_copied: false,
             _sheet_copy_task: None,
             _drain_task: None,
+            _remote_prompt_task: None,
             _subscriptions: Vec::new(),
             question_cards: HashMap::new(),
             question_card_subs: HashMap::new(),
@@ -3460,6 +3490,35 @@ impl AgentChatView {
         })
     }
 
+    /// Drain relayed remote prompts (phone sends) and fold each as a user bubble.
+    /// Mirrors [`Self::spawn_drain`] but for the prompt-echo channel the registry
+    /// feeds on a remote `send_prompt`. Ends when the sender drops (rebind/teardown).
+    fn spawn_remote_prompt_relay(
+        mut rx: futures::channel::mpsc::UnboundedReceiver<RemotePrompt>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            while let Some(prompt) = rx.next().await {
+                if this.update(cx, |view, cx| view.push_remote_user_bubble(prompt, cx)).is_err() {
+                    return; // view dropped
+                }
+            }
+        })
+    }
+
+    /// Fold a prompt that arrived over remote control into this tab's transcript.
+    /// The host already forwarded it to the backend and ingested a synthetic copy
+    /// for other subscribers, so this only pushes the bubble locally — it must NOT
+    /// re-tee (that would double the prompt on the phone), mirroring how a
+    /// desktop-typed prompt bubbles optimistically without folding the echo again.
+    fn push_remote_user_bubble(&mut self, prompt: RemotePrompt, cx: &mut Context<Self>) {
+        self.thread.push_user_message_with_images(prompt.text, prompt.images);
+        // Pin to the bottom so the new turn is in view, like a local send.
+        self.stick_to_bottom = true;
+        self.follow_frames = FOLLOW_FRAMES;
+        cx.notify();
+    }
+
     /// Fold a drained batch into the thread, then repaint once for the whole
     /// batch instead of once per event.
     ///
@@ -3488,6 +3547,11 @@ impl AgentChatView {
         if all_delta {
             self.notify_throttled(cx);
         } else {
+            // A settled event landed (message, tool result, turn end): refresh the
+            // published transcript so a newly-opening remote client's authoritative
+            // history is current. Gated with the non-delta repaint so it never runs
+            // on the per-token hot path.
+            self.publish_remote_transcript();
             self.notify_now(cx);
         }
     }
@@ -3825,7 +3889,21 @@ impl AgentChatView {
                 cx.try_global::<RemoteControl>().and_then(|rc| rc.bind(&self.remote_session_id, conn))
             });
         match bound {
-            Some(binding) => self.remote = Some(binding),
+            Some(binding) => {
+                self.remote = Some(binding);
+                // Expose the current transcript at once — on a restart this fold was
+                // restored from disk and never entered the event ring, so a phone
+                // opening the session before the next event would otherwise see it
+                // empty. Meta too, so the row is labelled from the first list.
+                self.publish_remote_meta();
+                self.publish_remote_transcript();
+                // Re-arm the remote-prompt echo relay against the new binding.
+                let (tx, rx) = futures::channel::mpsc::unbounded();
+                if let Some(binding) = &self.remote {
+                    binding.set_prompt_sink(tx);
+                }
+                self._remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, cx));
+            }
             // No connection, or remote is disabled — drop any prior binding.
             None => self.unbind_remote(),
         }
@@ -3856,6 +3934,25 @@ impl AgentChatView {
             // Git RPCs resolve their repository from this.
             cwd: Some(self.cwd.clone()),
         });
+    }
+
+    /// Publish the folded transcript to the registry so a remote client opening this
+    /// session renders full history. Called on bind (to expose a restart-restored
+    /// fold that never entered the event ring) and after each settled batch (to keep
+    /// the snapshot current). Deliberately NOT on per-token delta batches — a whole-
+    /// transcript reserialization per token would be wasteful, and a client opening
+    /// mid-stream folds those deltas from the live backlog on top of the last settled
+    /// snapshot anyway. No-op when remote is disabled or the transcript won't
+    /// serialize (a half-serialized snapshot is worse than keeping the prior one).
+    fn publish_remote_transcript(&self) {
+        let Some(binding) = &self.remote else {
+            return;
+        };
+        let Ok(entries_json) = serde_json::to_string(&self.thread.entries) else {
+            return;
+        };
+        let model = self.thread.model.clone().or_else(|| self.model.clone());
+        binding.publish_transcript(entries_json, model);
     }
 
     fn on_disconnect(&mut self, cx: &mut Context<Self>) {

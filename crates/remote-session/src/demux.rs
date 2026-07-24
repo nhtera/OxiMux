@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use futures::channel::{mpsc, oneshot};
 use futures::future::{Either, select};
 use futures::lock::Mutex as AsyncMutex;
+use oximux_remote_proto::messages::SessionSummary;
 use oximux_remote_proto::proto::{Request, Response};
 use oximux_remote_proto::{HostEvent, Transport};
 
@@ -44,6 +45,13 @@ pub enum TerminalPush {
 /// The receiver end of the live terminal stream the pump feeds.
 pub type TerminalStream = mpsc::UnboundedReceiver<TerminalPush>;
 
+/// The receiver end of the pushed session-list stream. Each item is a fresh, full,
+/// per-device-filtered snapshot (not a delta): the host recomputes and pushes the
+/// whole list on every change, so the client replaces its list wholesale. Rides its
+/// own channel for the same reason terminal pushes do — a different consumer with a
+/// different lifetime, and its own backpressure.
+pub type SessionsStream = mpsc::UnboundedReceiver<Vec<SessionSummary>>;
+
 /// The shared reply slot. Each [`Demux::call`] registers a one-shot sender here
 /// before sending its request; the pump moves the matching reply into it.
 ///
@@ -72,6 +80,7 @@ pub struct DemuxPump {
     pending: Arc<Pending>,
     events: mpsc::UnboundedSender<HostEvent>,
     terminals: mpsc::UnboundedSender<TerminalPush>,
+    sessions: mpsc::UnboundedSender<Vec<SessionSummary>>,
     shutdown: oneshot::Receiver<()>,
 }
 
@@ -81,10 +90,11 @@ pub struct DemuxPump {
 /// it on teardown (no explicit close call needed).
 pub fn demux(
     transport: Arc<dyn Transport>,
-) -> (Arc<Demux>, DemuxPump, EventStream, TerminalStream, oneshot::Sender<()>) {
+) -> (Arc<Demux>, DemuxPump, EventStream, TerminalStream, SessionsStream, oneshot::Sender<()>) {
     let pending = Arc::new(Pending { slot: Mutex::new(None), alive: AtomicBool::new(true) });
     let (events_tx, events_rx) = mpsc::unbounded();
     let (terminals_tx, terminals_rx) = mpsc::unbounded();
+    let (sessions_tx, sessions_rx) = mpsc::unbounded();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let handle = Arc::new(Demux {
         transport: transport.clone(),
@@ -96,9 +106,10 @@ pub fn demux(
         pending,
         events: events_tx,
         terminals: terminals_tx,
+        sessions: sessions_tx,
         shutdown: shutdown_rx,
     };
-    (handle, pump, events_rx, terminals_rx, shutdown_tx)
+    (handle, pump, events_rx, terminals_rx, sessions_rx, shutdown_tx)
 }
 
 impl Demux {
@@ -172,6 +183,12 @@ impl DemuxPump {
                 Response::TermExited { pty_id, code } => {
                     let _ = self.terminals.unbounded_send(TerminalPush::Exited { pty_id, code });
                 }
+                // The pushed session list is unsolicited like `Event`/`Term*` and
+                // MUST route away from the reply slot — the catch-all below would
+                // hand it to whatever RPC is outstanding and desync the connection.
+                Response::SessionsChanged(rows) => {
+                    let _ = self.sessions.unbounded_send(rows);
+                }
                 reply => {
                     if let Some(tx) = self.pending.slot.lock().unwrap().take() {
                         let _ = tx.send(reply);
@@ -212,7 +229,8 @@ mod tests {
     /// a reply that can no longer arrive.
     #[test]
     fn call_errors_instead_of_hanging_when_the_pump_stops() {
-        let (handle, pump, _events, _terminals, _shutdown) = demux(Arc::new(HostClosedTransport));
+        let (handle, pump, _events, _terminals, _sessions, _shutdown) =
+            demux(Arc::new(HostClosedTransport));
         let (pump_res, call_res) = block_on(join(pump.run(), handle.call(Request::Ping)));
         assert!(pump_res.is_ok(), "clean stop on host close");
         assert!(

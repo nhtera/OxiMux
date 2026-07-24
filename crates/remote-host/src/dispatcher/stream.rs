@@ -20,7 +20,7 @@ use oximux_agents::session_registry::{Seq, SessionHandle, SessionId};
 use oximux_remote_proto::messages::SessionStatusWire;
 use oximux_remote_proto::proto::{Response, RpcError};
 use oximux_remote_proto::{HostEvent, Transport};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use super::Dispatcher;
 use crate::auth::AppPubkey;
@@ -43,6 +43,13 @@ pub(super) struct LiveFrame {
 pub(super) enum Live {
     Session(LiveFrame),
     Terminal { pty_id: String, frame: crate::terminals::TerminalFrame },
+    /// The live session list changed (a session opened, closed, was renamed/
+    /// remodeled, or flipped its permission flag). Carries no payload: the serve
+    /// loop recomputes the per-device-filtered snapshot on receipt, so the scope
+    /// filter is applied at forward time exactly like the per-frame recheck on
+    /// events. Low-frequency and coalesced by the registry's generation counter, so
+    /// it never floods the merge the way a full-screen terminal repaint would.
+    SessionList,
 }
 
 /// Turn a session's broadcast receiver into a `'static` stream of [`LiveFrame`]s.
@@ -63,6 +70,20 @@ fn live_stream(
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
+        }
+    })
+    .boxed()
+}
+
+/// Turn the registry's change receiver into a `'static` stream that yields a
+/// [`Live::SessionList`] tick on every session-list change. The generation counter
+/// coalesces, so a burst of changes wakes the serve loop once; the stream ends when
+/// the registry (the sender) is dropped.
+fn sessions_stream(rx: watch::Receiver<u64>) -> BoxStream<'static, Live> {
+    stream::unfold(rx, |mut rx| async move {
+        match rx.changed().await {
+            Ok(()) => Some((Live::SessionList, rx)),
+            Err(_) => None,
         }
     })
     .boxed()
@@ -176,6 +197,44 @@ impl Dispatcher {
         };
         transport
             .send(Response::Event(host_event).to_bytes().expect("response is always encodable"))
+            .await
+            .is_ok()
+    }
+
+    /// Set up a session-list subscription: reply with the current per-device
+    /// snapshot, then — on the first subscribe for this connection — a stream that
+    /// pushes a fresh snapshot on every registry change. A repeat subscribe serves
+    /// the snapshot only: a second change-receiver would leak for the connection's
+    /// life and double every push.
+    pub(super) fn begin_subscribe_sessions(
+        &self,
+        pubkey: &AppPubkey,
+        already: &mut bool,
+    ) -> (Response, Option<BoxStream<'static, Live>>) {
+        if *already {
+            return (Response::Sessions(self.snapshot_sessions(pubkey)), None);
+        }
+        // Receiver before snapshot so a change landing in the gap fires a tick
+        // rather than being missed — an extra identical push is harmless. The
+        // immediate reply is a plain `Sessions` (routed to the client's RPC slot);
+        // only the later change pushes are `SessionsChanged`.
+        let rx = self.registry.subscribe_changes();
+        let snapshot = self.snapshot_sessions(pubkey);
+        *already = true;
+        (Response::Sessions(snapshot), Some(sessions_stream(rx)))
+    }
+
+    /// Push the current session list, recomputed per change so the per-device scope
+    /// filter is honoured on every push — mirroring `forward_live`'s per-frame
+    /// recheck. Returns whether the transport is still writable.
+    pub(super) async fn forward_sessions(&self, pubkey: &AppPubkey, transport: &dyn Transport) -> bool {
+        let snapshot = self.snapshot_sessions(pubkey);
+        transport
+            .send(
+                Response::SessionsChanged(snapshot)
+                    .to_bytes()
+                    .expect("response is always encodable"),
+            )
             .await
             .is_ok()
     }

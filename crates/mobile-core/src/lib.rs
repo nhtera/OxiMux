@@ -17,6 +17,7 @@ mod callbacks;
 mod client;
 mod ffi_types;
 mod runtime;
+mod sessions;
 mod snapshot;
 mod subscription;
 mod terminals;

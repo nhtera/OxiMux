@@ -28,7 +28,7 @@ mod signer;
 mod subscription;
 
 pub use connector::{ConnectError, Connector};
-pub use demux::{DemuxPump, EventStream, TerminalPush, TerminalStream};
+pub use demux::{DemuxPump, EventStream, SessionsStream, TerminalPush, TerminalStream};
 pub use driver::{Bootstrap, Sleeper, maintain_connection};
 pub use error::SessionError;
 pub use reconnect::{ConnAction, ConnState, Reconnect};

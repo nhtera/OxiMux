@@ -3,7 +3,7 @@
 //! `with_foreign` makes each implementable on the foreign side; the core holds an
 //! `Arc<dyn …>` and invokes it from its runtime tasks.
 
-use crate::ffi_types::ConnState;
+use crate::ffi_types::{ConnState, SessionSummary};
 use crate::snapshot::ThreadSnapshot;
 
 /// Receives the folded transcript for a subscribed session.
@@ -33,6 +33,17 @@ pub trait TerminalSink: Send + Sync {
     fn on_gap(&self, pty_id: String);
     /// The terminal's process ended.
     fn on_exit(&self, pty_id: String, code: Option<i32>);
+}
+
+/// Receives the live session list for the whole client.
+///
+/// The core pushes the *whole* per-device-filtered list on every change (a session
+/// opened/closed/renamed/remodeled, or a permission flag flipped), not a delta, so
+/// the app replaces its list wholesale — the same shape `list_sessions` returns. One
+/// sink per client: the wire has a single session-list stream.
+#[uniffi::export(with_foreign)]
+pub trait SessionsSink: Send + Sync {
+    fn on_sessions(&self, sessions: Vec<SessionSummary>);
 }
 
 /// Receives connection-state transitions for the whole client.

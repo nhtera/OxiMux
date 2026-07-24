@@ -33,14 +33,20 @@ pub use crate::messages::*;
 /// `SetScheduleEnabled`, `GetScheduleRuns`, and the `Schedules`/`ScheduleCreated`/
 /// `ScheduleRuns` replies). v11: appended the voice-dictation surface
 /// (`TranscribeAudio` and its `Transcript` reply) — the phone records a clip and
-/// the desktop's existing speech engine decodes it.
+/// the desktop's existing speech engine decodes it. v12: appended the pushed
+/// session-list subscription (`SubscribeSessions` and its `SessionsChanged`
+/// frame) — the host streams the session list so the phone need not poll it.
+/// v13: appended `FetchTranscript` and its `SessionTranscript` reply — an
+/// authoritative folded-transcript snapshot so a client opens a session with its
+/// full history even after a host restart (the restored transcript never enters
+/// the live event ring).
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// The oldest peer version this build still speaks. **Raise this only on a
 /// genuinely breaking change** — a reordered/removed variant or an altered
@@ -334,6 +340,24 @@ pub enum Request {
     /// scope: any paired device may dictate, exactly as any of them may type. No
     /// audio is retained past the decode call.
     TranscribeAudio { audio_base64: String, sample_rate: u32 },
+    /// Subscribe to the live session list. The immediate reply is a plain
+    /// [`Response::Sessions`] snapshot — the same per-device-filtered list
+    /// [`Request::ListSessions`] returns — after which the host **pushes** a fresh
+    /// [`Response::SessionsChanged`] whenever a session opens, closes, or its title/
+    /// model/status changes, so a subscribed client never polls. The immediate reply
+    /// and the pushes use different variants for the same reason `Subscribe` replies
+    /// with `Events` but pushes `Event`: the client demux tells a solicited reply
+    /// from an unsolicited push by variant. Read-only: gated on the authenticated-
+    /// connection requirement, like `ListSessions`.
+    SubscribeSessions,
+    /// Fetch a session's folded transcript as an authoritative snapshot, so a
+    /// client opening a session sees its full history — including a transcript
+    /// restored from disk after a host restart, which never entered the live event
+    /// ring. The reply ([`Response::SessionTranscript`]) carries the folded entries
+    /// plus the `seq` they reflect; the client rehydrates its fold from them and
+    /// then subscribes from that `seq` so live events extend the snapshot without a
+    /// gap or a duplicate. Read-only; scope-checked like the other session RPCs.
+    FetchTranscript { session_id: String },
 }
 
 /// Host → client.
@@ -442,6 +466,20 @@ pub enum Response {
     /// string is a normal answer (the clip was silence, or only filler the engine
     /// dropped), not a failure: the client inserts it as-is, which is a no-op.
     Transcript(String),
+    /// The session list, **pushed** on every change to a
+    /// [`Request::SubscribeSessions`] subscriber (open/close/rename/permission). A
+    /// distinct variant from [`Response::Sessions`] — which is both the
+    /// `ListSessions` reply and `SubscribeSessions`'s immediate snapshot reply — so
+    /// the client demux routes these unsolicited pushes to the subscription stream
+    /// rather than an RPC reply slot, exactly as `Event` is distinct from the
+    /// `Events` reply. Appended last to keep the ordinal encoding append-only.
+    SessionsChanged(Vec<SessionSummary>),
+    /// A session's folded transcript snapshot — the reply to
+    /// [`Request::FetchTranscript`]. Carries the folded entries (as JSON, mirroring
+    /// [`HostEvent`]'s reason for not being native postcard: the entry tree is deep
+    /// and still evolving) plus the `seq` they reflect, so the client rehydrates its
+    /// fold and resumes the live stream from that cursor.
+    SessionTranscript(SessionTranscriptWire),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

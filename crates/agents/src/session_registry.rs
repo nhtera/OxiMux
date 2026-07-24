@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
+use futures::channel::mpsc;
 use tokio::sync::{broadcast, watch};
 
 use crate::thread::{
@@ -70,6 +71,38 @@ pub struct SessionMeta {
     pub cwd: Option<PathBuf>,
 }
 
+/// A folded-transcript snapshot the desktop view publishes for remote clients.
+///
+/// Stored per session so a client opening it gets the full history plus a resume
+/// cursor — critically, a transcript restored from disk after a host restart lives
+/// only in the view's fold and never enters the event ring, so the bounded backlog
+/// alone cannot supply it. Opaque to the registry: `entries_json` is the folded
+/// `Vec<ThreadEntry>` as JSON, so the registry stays free of `agent-core`'s entry
+/// taxonomy (the same reason the wire carries it as a string).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TranscriptSnapshot {
+    /// The fold cursor the entries reflect — the registry's last-assigned `seq` at
+    /// publish time (0 before any event, e.g. a freshly restored transcript). A
+    /// subscriber resumes the live stream strictly after this.
+    pub seq: Seq,
+    /// The folded `Vec<ThreadEntry>` serialized as JSON.
+    pub entries_json: String,
+    /// The effective model, mirrored so a rehydrating client seeds its fold with it.
+    pub model: Option<String>,
+}
+
+/// A prompt that arrived over remote control (a phone send), relayed to the bound
+/// desktop view so it can show the user's own bubble. The host already forwarded
+/// the prompt to the backend and ingested a synthetic copy for other subscribers;
+/// the view needs this only to render the bubble locally (no backend echoes the
+/// user's own message, and a desktop-typed prompt bubbles optimistically in the
+/// composer — a remote one has no such local surface without this relay).
+#[derive(Clone, Debug)]
+pub struct RemotePrompt {
+    pub text: String,
+    pub images: Vec<ChatImage>,
+}
+
 /// Everything the registry knows about one live session. Held behind an `Arc` so
 /// the view and the network layer share one handle.
 pub struct SessionHandle {
@@ -96,6 +129,19 @@ pub struct SessionHandle {
     status_tx: watch::Sender<SessionStatus>,
     /// Display metadata published by the desktop view (title/model).
     meta: Mutex<SessionMeta>,
+    /// The latest folded-transcript snapshot the desktop view published, served to a
+    /// remote client on `FetchTranscript`. `None` until the view first publishes —
+    /// a client then opens with an empty base and the live stream fills it.
+    transcript: Mutex<Option<TranscriptSnapshot>>,
+    /// Relays a remotely-injected prompt back to the bound desktop view so it shows
+    /// the user's own bubble. `None` when no view is bound (remote disabled, or a
+    /// headless host); the prompt still reaches the backend and other subscribers.
+    remote_prompt_tx: Mutex<Option<mpsc::UnboundedSender<RemotePrompt>>>,
+    /// The registry-wide session-list generation, shared with the registry and
+    /// every sibling handle. Bumped when this session's list-visible state changes
+    /// (title/model or the awaiting-permission flag) so a session-list subscriber
+    /// re-snapshots. Coalescing, so a burst wakes the subscriber once.
+    changed: watch::Sender<u64>,
 }
 
 impl SessionHandle {
@@ -225,6 +271,16 @@ impl SessionHandle {
             text: text.to_string(),
             images: images.to_vec(),
         });
+        // Relay to the bound desktop view so it renders the user's own bubble too —
+        // the synthetic ingest above only reaches remote subscribers, and no backend
+        // echoes the prompt, so without this the desktop shows the reply to a prompt
+        // it never displayed. Best-effort: a dropped receiver (no view) is fine.
+        if let Some(tx) = self.remote_prompt_tx.lock().unwrap().as_ref() {
+            let _ = tx.unbounded_send(RemotePrompt {
+                text: text.to_string(),
+                images: images.to_vec(),
+            });
+        }
         Ok(())
     }
 
@@ -311,6 +367,27 @@ impl SessionHandle {
         self.meta.lock().unwrap().clone()
     }
 
+    /// The transcript snapshot the desktop view last published, if any.
+    pub fn transcript_snapshot(&self) -> Option<TranscriptSnapshot> {
+        self.transcript.lock().unwrap().clone()
+    }
+
+    /// Register the sink that relays remotely-injected prompts to the desktop view.
+    /// Replaces any prior sink (a rebind re-points it); the old receiver then ends.
+    pub fn set_remote_prompt_sink(&self, tx: mpsc::UnboundedSender<RemotePrompt>) {
+        *self.remote_prompt_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Publish the folded transcript for remote clients. Pairs the entries with the
+    /// registry's current last-assigned `seq` (0 before any event) so a subscriber
+    /// resumes the live stream from exactly the point the snapshot already covers —
+    /// no gap, no duplicate. Cheap enough for the desktop view to call whenever a
+    /// settled turn lands; it is not on the per-token delta path.
+    pub fn publish_transcript(&self, entries_json: String, model: Option<String>) {
+        let seq = self.next_seq.load(Ordering::SeqCst).saturating_sub(1);
+        *self.transcript.lock().unwrap() = Some(TranscriptSnapshot { seq, entries_json, model });
+    }
+
     /// Publish display metadata from the desktop view. Returns whether anything
     /// changed, so a caller on a hot path (the per-event tee) can skip follow-up
     /// work when the title and model are unchanged — which is the common case.
@@ -320,7 +397,15 @@ impl SessionHandle {
             return false;
         }
         *current = meta;
+        drop(current);
+        // A title/model change is visible in the session-list row.
+        self.bump_changed();
         true
+    }
+
+    /// Nudge the registry-wide session-list generation so a subscriber re-snapshots.
+    fn bump_changed(&self) {
+        self.changed.send_modify(|g| *g = g.wrapping_add(1));
     }
 
     /// Refresh the coarse status snapshot. `ingested_seq` is `Some` only from the
@@ -331,12 +416,20 @@ impl SessionHandle {
     /// resume cursor.
     fn update_status(&self, ingested_seq: Option<Seq>) {
         let awaiting = !self.pending.lock().unwrap().is_empty();
+        let mut awaiting_flipped = false;
         self.status_tx.send_modify(|status| {
             if let Some(seq) = ingested_seq {
                 status.last_seq = status.last_seq.max(seq);
             }
+            awaiting_flipped = status.awaiting_permission != awaiting;
             status.awaiting_permission = awaiting;
         });
+        // Only the awaiting flag shows in a session-list row; a pure `last_seq` tick
+        // (every event/token) would re-push an identical list, so bump only on a
+        // flip — the coalescing generation keeps even that cheap.
+        if awaiting_flipped {
+            self.bump_changed();
+        }
     }
 }
 
@@ -350,14 +443,32 @@ pub const DEFAULT_BROADCAST_CAP: usize = 256;
 
 /// The process-wide map of live sessions. Cloneable handles are h-shared out;
 /// the registry itself is held behind an `Arc` (and, in the app, a `gpui::Global`).
-#[derive(Default)]
 pub struct SessionRegistry {
     sessions: Mutex<HashMap<SessionId, Arc<SessionHandle>>>,
+    /// Coalescing generation, bumped whenever the session set or any session's
+    /// list-visible state changes. A session-list subscriber awaits this and
+    /// re-snapshots, so the phone is pushed the list rather than polling it.
+    changed: watch::Sender<u64>,
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        let (changed, _) = watch::channel(0);
+        Self { sessions: Mutex::new(HashMap::new()), changed }
+    }
 }
 
 impl SessionRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A receiver that ticks whenever the live session list changes — a session
+    /// opened, closed, renamed, remodeled, or its permission flag flipped. The host
+    /// awaits this and re-snapshots the list for each subscriber; the counter
+    /// coalesces so a burst of changes wakes it once.
+    pub fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
     }
 
     /// Register a session and return its handle (also retained in the map). Call on
@@ -396,15 +507,25 @@ impl SessionRegistry {
             pending: Mutex::new(HashSet::new()),
             status_tx,
             meta: Mutex::new(SessionMeta::default()),
+            transcript: Mutex::new(None),
+            remote_prompt_tx: Mutex::new(None),
+            changed: self.changed.clone(),
         });
         self.sessions.lock().unwrap().insert(id, handle.clone());
+        // A newly registered session changes the list.
+        self.changed.send_modify(|g| *g = g.wrapping_add(1));
         handle
     }
 
     /// Remove a session from the map, returning its handle if present. Any live
     /// subscribers see the broadcast close when the last handle is dropped.
     pub fn unregister(&self, id: &str) -> Option<Arc<SessionHandle>> {
-        self.sessions.lock().unwrap().remove(id)
+        let removed = self.sessions.lock().unwrap().remove(id);
+        if removed.is_some() {
+            // A closed session changes the list.
+            self.changed.send_modify(|g| *g = g.wrapping_add(1));
+        }
+        removed
     }
 
     /// Look up a live session handle.
@@ -520,6 +641,21 @@ mod tests {
             matches!(&ev, ThreadEvent::UserMessage { text, .. } if text == "hello"),
             "saw {ev:?}",
         );
+    }
+
+    /// A remotely-injected prompt is relayed to the bound view sink so the desktop
+    /// renders the user's own bubble (the synthetic ingest only reaches the phone).
+    #[test]
+    fn send_prompt_relays_to_the_bound_view_sink() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        let (tx, mut rx) = mpsc::unbounded();
+        handle.set_remote_prompt_sink(tx);
+
+        handle.send_prompt("hi from phone", &[]).unwrap();
+
+        let prompt = rx.try_recv().expect("relay sent a prompt");
+        assert_eq!(prompt.text, "hi from phone");
     }
 
     /// A send that never reached the agent must not leave a bubble implying it
