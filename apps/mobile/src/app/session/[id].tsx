@@ -11,6 +11,7 @@ import { RewindSheet } from '@/components/chat/rewind-sheet';
 import { SessionControls } from '@/components/chat/session-controls';
 import { StatusStrip } from '@/components/chat/status-strip';
 import { Transcript } from '@/components/chat/transcript';
+import { TurnTimer } from '@/components/chat/turn-timer';
 import { ConnectionBanner } from '@/components/connection-banner';
 import { useAppDrawer } from '@/components/deck/app-drawer';
 import { ThemedText } from '@/components/themed-text';
@@ -111,6 +112,7 @@ export default function SessionScreen() {
         <SafeAreaView style={styles.fill} edges={['bottom']}>
           <ConnectionBanner />
           <StatusStrip thread={thread} />
+          <TurnTimer active={thread.turn_active} />
 
           {error ? <ErrorBanner message={error} onDismiss={dismissError} /> : null}
 
