@@ -1,8 +1,8 @@
-import { Stack, router } from 'expo-router';
+import { Stack, router, useFocusEffect } from 'expo-router';
 import { Plus, Search } from 'lucide-react-native';
 import type { SessionSummary } from 'oximux-core';
-import { useCallback, useEffect, useState } from 'react';
-import { FlatList, Pressable, RefreshControl, StyleSheet, TextInput, View } from 'react-native';
+import { useCallback, useState } from 'react';
+import { AppState, FlatList, Pressable, RefreshControl, StyleSheet, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { CommandPalette } from '@/components/command-palette';
@@ -20,6 +20,10 @@ import { useClient } from '@/native/client';
 import { describeError } from '@/native/errors';
 import { tick } from '@/native/haptics';
 import { filterSessions } from '@/native/session-filter';
+
+/** How often to re-list while the Sessions screen is focused and connected —
+ *  frequent enough to feel live, cheap enough for a list RPC. */
+const SESSION_POLL_MS = 5000;
 
 export default function SessionsScreen() {
   const sessions = useClient((s) => s.sessions);
@@ -68,11 +72,26 @@ export default function SessionsScreen() {
     }
   }, [refreshSessions]);
 
-  // Re-list whenever the link comes back: the desktop may have opened or closed
-  // sessions while the phone was away, and nothing pushes that as an event.
-  useEffect(() => {
-    if (phase === 'connected') void refreshSessions();
-  }, [phase, refreshSessions]);
+  // The host never pushes session open/close/rename, so the list would otherwise
+  // drift the whole time the phone stays connected. Keep it live while this screen
+  // is on top: re-list on focus, poll on a short interval, and re-list whenever the
+  // app returns to the foreground. The interval is torn down when the screen blurs
+  // (a session is opened on top) so a backgrounded list isn't polling. Pull-to-
+  // refresh stays for an explicit nudge.
+  useFocusEffect(
+    useCallback(() => {
+      if (phase !== 'connected') return;
+      void refreshSessions();
+      const id = setInterval(() => void refreshSessions(), SESSION_POLL_MS);
+      const sub = AppState.addEventListener('change', (next) => {
+        if (next === 'active') void refreshSessions();
+      });
+      return () => {
+        clearInterval(id);
+        sub.remove();
+      };
+    }, [phase, refreshSessions])
+  );
 
   return (
     <ThemedView style={styles.fill}>
