@@ -342,6 +342,12 @@ fn main() {
         // handed over directly rather than through a bridge, unlike the launcher
         // and rewinder above.
         remote_control.set_schedule_store(std::sync::Arc::new(app_state.schedule_store()));
+        // Projects the phone can start a session in without typing a path: the same
+        // recent-projects store the desktop sidebar lists, read directly (no UI hop)
+        // since it is durable data, not live view state.
+        remote_control.set_project_provider(std::sync::Arc::new(
+            oximux_app::remote_control::project_provider::RepoProjects::new(app_state.project_repo()),
+        ));
         // Voice dictation the phone can drive: the desktop decodes clips with the
         // same speech engine and model manager its own composer uses, so a phone
         // dictation and a desktop one run through identical code. The service was

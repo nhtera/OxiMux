@@ -39,14 +39,16 @@ pub use crate::messages::*;
 /// v13: appended `FetchTranscript` and its `SessionTranscript` reply — an
 /// authoritative folded-transcript snapshot so a client opens a session with its
 /// full history even after a host restart (the restored transcript never enters
-/// the live event ring).
+/// the live event ring). v14: appended `ListProjects` and its `Projects` reply —
+/// the host's projects (name + path) so a client can start a session in one
+/// without typing its path.
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// The oldest peer version this build still speaks. **Raise this only on a
 /// genuinely breaking change** — a reordered/removed variant or an altered
@@ -358,6 +360,13 @@ pub enum Request {
     /// then subscribes from that `seq` so live events extend the snapshot without a
     /// gap or a duplicate. Read-only; scope-checked like the other session RPCs.
     FetchTranscript { session_id: String },
+    /// List the projects (workspaces) the host knows, so a client can start a new
+    /// session in one without typing its path. The reply ([`Response::Projects`])
+    /// carries each project's display name and absolute host path; the client hands
+    /// the chosen path straight to [`Request::CreateSession`]. Scope-checked like
+    /// `CreateSession` — the list is only useful for creating, and it exposes host
+    /// paths, so a device that may not create sessions may not enumerate them.
+    ListProjects,
 }
 
 /// Host → client.
@@ -480,6 +489,11 @@ pub enum Response {
     /// and still evolving) plus the `seq` they reflect, so the client rehydrates its
     /// fold and resumes the live stream from that cursor.
     SessionTranscript(SessionTranscriptWire),
+    /// The host's known projects — the reply to [`Request::ListProjects`]. Each
+    /// carries a display name and the absolute host path a client passes to
+    /// [`Request::CreateSession`]. May be empty (no projects, or the host exposes
+    /// none).
+    Projects(Vec<ProjectSummaryWire>),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

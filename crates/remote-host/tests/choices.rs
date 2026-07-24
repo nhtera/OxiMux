@@ -370,6 +370,106 @@ async fn a_read_only_device_cannot_create_a_session() {
     assert!(launcher.calls.lock().unwrap().is_empty(), "nothing spawned");
 }
 
+/// A project provider whose list the test controls.
+struct ScriptedProjects(Vec<oximux_remote_proto::ProjectSummaryWire>);
+
+#[async_trait::async_trait]
+impl oximux_remote_host::ProjectProvider for ScriptedProjects {
+    async fn projects(&self) -> Vec<oximux_remote_proto::ProjectSummaryWire> {
+        self.0.clone()
+    }
+}
+
+fn projects(
+    rows: Vec<oximux_remote_proto::ProjectSummaryWire>,
+) -> Arc<ScriptedProjects> {
+    Arc::new(ScriptedProjects(rows))
+}
+
+/// A device that may create sessions gets the provider's project list verbatim —
+/// the quick-start targets the phone offers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_access_device_lists_the_projects() {
+    let rows = vec![
+        oximux_remote_proto::ProjectSummaryWire {
+            name: "OxiMux".into(),
+            path: "/Users/me/Code/OxiMux".into(),
+        },
+        oximux_remote_proto::ProjectSummaryWire { name: "work".into(), path: "/Users/me/work".into() },
+    ];
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), auth)
+        .with_clock(clock)
+        .with_projects(projects(rows.clone()));
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32]))).await
+        else {
+            panic!("expected Registered");
+        };
+        assert_eq!(call(&client, Request::ListProjects).await, Response::Projects(rows));
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+}
+
+/// The project list is gated exactly like creating: a session-scoped device may
+/// not enumerate the host's projects (it would leak paths it cannot use).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_scoped_device_cannot_list_projects() {
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, Some("sess-1".into()), false));
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), auth)
+        .with_clock(clock)
+        .with_projects(projects(vec![oximux_remote_proto::ProjectSummaryWire {
+            name: "OxiMux".into(),
+            path: "/secret".into(),
+        }]));
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let mut req = register_req([0x33; 32]);
+        req.session_id = Some("sess-1".into());
+        let Response::Registered { .. } = call(&client, Request::Register(req)).await else {
+            panic!("expected Registered");
+        };
+        assert_eq!(
+            call(&client, Request::ListProjects).await,
+            Response::Error(RpcError::Unauthorized),
+        );
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+}
+
+/// A host with no project provider answers an empty list — an authorized client
+/// sees no quick-start projects rather than an error, since "this desktop exposes
+/// none" is not worth hiding (the create path stays gated regardless).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_without_a_project_provider_lists_nothing() {
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), auth).with_clock(clock); // no provider
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32]))).await
+        else {
+            panic!("expected Registered");
+        };
+        assert_eq!(call(&client, Request::ListProjects).await, Response::Projects(vec![]));
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+}
+
 /// A host with no launcher answers `Unauthorized`, not a distinct "unsupported".
 ///
 /// Whether this desktop can start sessions is not something an unauthorized

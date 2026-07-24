@@ -259,6 +259,15 @@ impl Dispatcher {
             let response = self.create_session(&pubkey, &cwd, agent_id.as_deref()).await;
             return self.send(transport, response).await;
         }
+        // Listing projects reads the desktop's recent-projects snapshot off its UI
+        // thread, so it is async and awaited here beside its create-session sibling.
+        if let Request::ListProjects = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.list_projects(&pubkey).await;
+            return self.send(transport, response).await;
+        }
         // The forge RPCs shell out to `gh`/`glab`, so they are awaited here for
         // the same reason the git reads are: a network-bound CLI call must not
         // block the synchronous dispatch path.

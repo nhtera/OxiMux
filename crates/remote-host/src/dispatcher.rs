@@ -78,6 +78,11 @@ pub struct Dispatcher {
     /// host can start sessions is not something an unauthorized client should be
     /// able to probe.
     launcher: Option<Arc<dyn crate::launcher::SessionLauncher>>,
+    /// The desktop's project list, when the host exposes it. `None` answers with
+    /// an empty list rather than `Unauthorized`: unlike `launcher`, an authorized
+    /// client asking for projects on a host that simply has none should see "no
+    /// projects", not a capability probe — the create path is still gated.
+    projects: Option<Arc<dyn crate::projects::ProjectProvider>>,
     /// The desktop's rewind path, when the host exposes it. `None` answers
     /// `Unauthorized`, as `terminals` and `launcher` do.
     rewinder: Option<Arc<dyn crate::rewind::RewindService>>,
@@ -108,6 +113,7 @@ impl Dispatcher {
             auth,
             terminals: None,
             launcher: None,
+            projects: None,
             rewinder: None,
             schedules: None,
             transcriber: None,
@@ -124,6 +130,12 @@ impl Dispatcher {
     /// Let this dispatcher start new sessions on the desktop.
     pub fn with_launcher(mut self, launcher: Arc<dyn crate::launcher::SessionLauncher>) -> Self {
         self.launcher = Some(launcher);
+        self
+    }
+
+    /// Let this dispatcher list the desktop's projects as new-session targets.
+    pub fn with_projects(mut self, projects: Arc<dyn crate::projects::ProjectProvider>) -> Self {
+        self.projects = Some(projects);
         self
     }
 

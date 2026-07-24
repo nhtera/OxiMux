@@ -9,7 +9,8 @@ use oximux_agent_core::thread::{AskQuestion, PermissionDecision, QuestionAnswers
 use crate::client::MobileClient;
 use crate::ffi_types::{
     ChatImage, CheckRun, ForgeItem, ForgeItemDetail, ForgeItemKind, ForgeState, MobileError,
-    PermissionReply, Recurrence, Schedule, ScheduleRun, SessionChoices, SessionSummary,
+    PermissionReply, ProjectSummary, Recurrence, Schedule, ScheduleRun, SessionChoices,
+    SessionSummary,
 };
 
 /// Correlates a queued prompt with its ack; unique per process is enough.
@@ -49,6 +50,14 @@ impl MobileClient {
         let session = self.shared.session()?;
         let rows = session.list_sessions().await.map_err(|e| MobileError::Rpc(e.to_string()))?;
         Ok(rows.into_iter().map(SessionSummary::from).collect())
+    }
+
+    /// The host's projects, offered as new-session targets so the phone can start a
+    /// session in one by its path instead of typing it. May be empty.
+    pub async fn list_projects(&self) -> Result<Vec<ProjectSummary>, MobileError> {
+        let session = self.shared.session()?;
+        let rows = session.list_projects().await.map_err(|e| MobileError::Rpc(e.to_string()))?;
+        Ok(rows.into_iter().map(ProjectSummary::from).collect())
     }
 
     /// Queue a prompt into a session's turn.

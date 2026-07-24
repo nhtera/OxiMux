@@ -16,7 +16,7 @@ fn value_bearing_event() -> ThreadEvent {
 /// documented wire change, so an accidental edit fails here.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 13, "v13 = the appended transcript-snapshot fetch");
+    assert_eq!(PROTOCOL_VERSION, 14, "v14 = the appended project list");
 }
 
 /// The floor moves only on a genuinely breaking change, never merely because
@@ -126,6 +126,7 @@ fn requests_round_trip_via_postcard() {
         Request::SetModel { session_id: "s1".into(), model: "opus-4.8".into() },
         Request::SetPermissionMode { session_id: "s1".into(), mode: "plan".into() },
         Request::FetchTranscript { session_id: "s1".into() },
+        Request::ListProjects,
     ];
     for req in requests {
         let bytes = req.to_bytes().expect("encode");
@@ -185,6 +186,10 @@ fn send_prompt_and_responses_round_trip() {
             entries_json: "[]".into(),
             model: Some("claude".into()),
         }),
+        Response::Projects(vec![ProjectSummaryWire {
+            name: "OxiMux".into(),
+            path: "/Users/me/Code/OxiMux".into(),
+        }]),
     ];
     for resp in responses {
         let bytes = resp.to_bytes().expect("encode");
@@ -277,6 +282,10 @@ fn early_variants_keep_their_literal_ordinals() {
     // the `session_id` string payload follows.
     let fetch = Request::FetchTranscript { session_id: String::new() };
     assert_eq!(fetch.to_bytes().expect("encode")[0], 39);
+    // The v14 project list appended after the transcript-fetch tail: `ListProjects`
+    // is the 41st Request variant (index 40, a unit variant, so its whole encoding
+    // is that single ordinal byte).
+    assert_eq!(Request::ListProjects.to_bytes().expect("encode"), vec![40]);
     // `SessionsChanged` is the 29th Response variant (index 28); pin the
     // discriminant, the `Vec` payload follows.
     let changed = Response::SessionsChanged(vec![]);
@@ -290,4 +299,8 @@ fn early_variants_keep_their_literal_ordinals() {
         model: None,
     });
     assert_eq!(transcript.to_bytes().expect("encode")[0], 29);
+    // `Projects` is the 31st Response variant (index 30), appended after
+    // `SessionTranscript`.
+    let projects = Response::Projects(vec![]);
+    assert_eq!(projects.to_bytes().expect("encode")[0], 30);
 }

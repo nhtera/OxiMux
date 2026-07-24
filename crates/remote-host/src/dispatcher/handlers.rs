@@ -235,6 +235,23 @@ impl Dispatcher {
         }
     }
 
+    /// List the desktop's projects as new-session targets.
+    ///
+    /// Gated exactly like [`create_session`](Self::create_session) — a client that
+    /// may not create a session has no use for the paths and must not be handed
+    /// them. A session-scoped device is refused outright; a host with no project
+    /// provider answers an empty list, since "this desktop exposes no projects" is
+    /// not a capability worth hiding (the create path stays gated regardless).
+    pub(super) async fn list_projects(&self, pubkey: &AppPubkey) -> Response {
+        if !self.auth.may_create_sessions(pubkey) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        match self.projects.as_ref() {
+            Some(provider) => Response::Projects(provider.projects().await),
+            None => Response::Projects(Vec::new()),
+        }
+    }
+
     /// Rewind a session to an earlier turn.
     ///
     /// Gated on `may_write` like every state-changing RPC — and unlike

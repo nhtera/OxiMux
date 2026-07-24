@@ -17,6 +17,7 @@ pub mod auth;
 pub mod dispatcher;
 pub mod identity;
 pub mod launcher;
+pub mod projects;
 pub mod rewind;
 pub mod terminals;
 pub mod transcribe;
@@ -29,6 +30,7 @@ pub use auth::{
 pub use dispatcher::Dispatcher;
 pub use identity::HostIdentity;
 pub use launcher::{LaunchError, SessionLauncher};
+pub use projects::ProjectProvider;
 pub use rewind::{RewindError, RewindService};
 pub use terminals::{TerminalAttach, TerminalError, TerminalFrame, TerminalSource};
 pub use transcribe::{AudioTranscriber, TranscribeError};

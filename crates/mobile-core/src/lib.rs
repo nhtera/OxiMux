@@ -27,7 +27,7 @@ uniffi::setup_scaffolding!();
 pub use callbacks::{ConnStateListener, TerminalSink, ThreadSink};
 pub use client::MobileClient;
 pub use ffi_types::{
-    ChatImage, Choice, ConnState, MobileError, PermissionReply, SessionChoices, SessionSummary,
-    TerminalInfo, TerminalScreen,
+    ChatImage, Choice, ConnState, MobileError, PermissionReply, ProjectSummary, SessionChoices,
+    SessionSummary, TerminalInfo, TerminalScreen,
 };
 pub use snapshot::ThreadSnapshot;

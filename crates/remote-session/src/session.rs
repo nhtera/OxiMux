@@ -19,8 +19,8 @@ use futures::channel::oneshot;
 use oximux_agent_core::thread::{AskQuestion, ChatImage, PermissionDecision, QuestionAnswers};
 use oximux_remote_proto::messages::{
     AnswerQuestionReq, CheckRunWire, ForgeItemDetailWire, ForgeItemKindWire, ForgeItemWire,
-    ForgeStateWire, RecurrenceWire, ResolvePermissionReq, ScheduleRunWire, ScheduleWire,
-    SendPromptReq, SessionInfoWire, SessionSummary, SessionTranscriptWire,
+    ForgeStateWire, ProjectSummaryWire, RecurrenceWire, ResolvePermissionReq, ScheduleRunWire,
+    ScheduleWire, SendPromptReq, SessionInfoWire, SessionSummary, SessionTranscriptWire,
 };
 use oximux_remote_proto::proto::{Request, Response, RpcError, SessionChoices};
 use oximux_remote_proto::{HostEvent, Transport};
@@ -157,6 +157,16 @@ impl RemoteSession {
             Response::SessionTranscript(t) => Ok(t),
             Response::Error(e) => Err(SessionError::Rpc(e)),
             _ => Err(SessionError::Unexpected { expected: "SessionTranscript" }),
+        }
+    }
+
+    /// The desktop's projects, offered as new-session targets so the phone can
+    /// start a session in one by its path instead of typing it. May be empty.
+    pub async fn list_projects(&self) -> Result<Vec<ProjectSummaryWire>> {
+        match self.call(Request::ListProjects).await? {
+            Response::Projects(rows) => Ok(rows),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Projects" }),
         }
     }
 

@@ -164,6 +164,17 @@ pub struct SessionSummary {
     pub awaiting_permission: bool,
 }
 
+/// One row of [`Response::Projects`](crate::proto::Response::Projects): a project
+/// the host knows, offered as a quick-start target for a new session. `path` is
+/// the absolute host path a client passes back to
+/// [`Request::CreateSession`](crate::proto::Request::CreateSession); `name` is the
+/// display label (typically the folder's final component).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectSummaryWire {
+    pub name: String,
+    pub path: String,
+}
+
 /// A session's folded-transcript snapshot — the
 /// [`Response::SessionTranscript`](crate::proto::Response::SessionTranscript)
 /// payload.

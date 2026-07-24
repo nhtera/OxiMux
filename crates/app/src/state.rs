@@ -99,6 +99,13 @@ impl AppState {
     pub fn schedule_store(&self) -> oximux_agents::schedule::ScheduleStore {
         oximux_agents::schedule::ScheduleStore::new(self.db.conn())
     }
+
+    /// The project repository, shared for the remote-control project provider so a
+    /// paired phone lists the same projects the desktop does. Clones the handle
+    /// (shared `Db`), not a second connection — SQLite serializes writers.
+    pub fn project_repo(&self) -> ProjectRepo {
+        self.project_repo.clone()
+    }
 }
 
 /// Load recent projects + their workspaces, then mark every alive-at-

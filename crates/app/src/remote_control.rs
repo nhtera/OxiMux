@@ -13,6 +13,7 @@
 //! [`AgentChatView`]: crate::shell::agent_chat
 
 pub mod launch_bridge;
+pub mod project_provider;
 pub mod rewind_bridge;
 pub mod relay_terminals;
 
@@ -37,6 +38,7 @@ use oximux_agents::session_registry::{
 };
 use oximux_agents::thread::AgentConnection;
 use oximux_remote_host::AudioTranscriber;
+use oximux_remote_host::ProjectProvider;
 use oximux_remote_host::TerminalSource;
 use oximux_remote_host::RewindService;
 use oximux_remote_host::{SessionLauncher, 
@@ -144,6 +146,10 @@ pub struct RemoteControl {
     /// immediately usable from the phone, and a phone dictation runs through the
     /// exact engine a desktop one does.
     transcriber: Option<Arc<dyn AudioTranscriber>>,
+    /// The desktop's project list, when the host exposes it. `None` serves an empty
+    /// list — an authorized client simply sees no quick-start projects, which is
+    /// honest for a desktop with none; the create path stays gated regardless.
+    projects: Option<Arc<dyn ProjectProvider>>,
     /// The live host's auth store while one is bound, so the paired-devices UI can
     /// revoke against the *running* host (the dispatcher rechecks authorization on
     /// every RPC, so a revoke lands mid-session). Cleared on stop — with no host, the
@@ -184,6 +190,7 @@ impl RemoteControl {
             rewinder: None,
             schedules: None,
             transcriber: None,
+            projects: None,
             auth: Mutex::new(None),
             awake: Mutex::new(None),
             endpoint_secret: None,
@@ -231,6 +238,13 @@ impl RemoteControl {
 
     pub fn set_terminals(&mut self, terminals: Arc<dyn TerminalSource>) {
         self.terminals = Some(terminals);
+    }
+
+    /// Install the project provider the host serves. Called once at boot, backed
+    /// by the same project store the desktop sidebar lists — so the phone's
+    /// quick-start projects match what the desktop shows.
+    pub fn set_project_provider(&mut self, projects: Arc<dyn ProjectProvider>) {
+        self.projects = Some(projects);
     }
 
     /// The shared session registry (the host serves from this same instance).
@@ -301,6 +315,9 @@ impl RemoteControl {
         }
         if let Some(transcriber) = &self.transcriber {
             dispatcher = dispatcher.with_transcriber(Arc::clone(transcriber));
+        }
+        if let Some(projects) = &self.projects {
+            dispatcher = dispatcher.with_projects(Arc::clone(projects));
         }
         dispatcher
     }

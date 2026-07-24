@@ -2,6 +2,7 @@
 //! the wire types. Kept a thin, stable projection of `remote-proto` so the RN app
 //! never sees the postcard/JSON envelope details.
 
+use oximux_remote_proto::messages::ProjectSummaryWire as WireProject;
 use oximux_remote_proto::messages::SessionSummary as WireSummary;
 use oximux_remote_proto::proto::{Choice as WireChoice, SessionChoices as WireChoices};
 
@@ -66,6 +67,20 @@ impl From<WireSummary> for SessionSummary {
             last_seq: w.last_seq,
             awaiting_permission: w.awaiting_permission,
         }
+    }
+}
+
+/// One project the phone offers as a new-session target. `path` is the absolute
+/// host path handed back to `create_session`; `name` is the display label.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ProjectSummary {
+    pub name: String,
+    pub path: String,
+}
+
+impl From<WireProject> for ProjectSummary {
+    fn from(w: WireProject) -> Self {
+        Self { name: w.name, path: w.path }
     }
 }
 
