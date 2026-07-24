@@ -123,6 +123,19 @@ export const Colors = {
 
 export type ThemeColor = keyof SchemeColors;
 
+/**
+ * `#rrggbb` → `rgba(r,g,b,a)`, so a semantic colour can be used as a low-alpha
+ * tint (a danger-tinted fill, an accent glow) without adding a second token for
+ * every shade. Lives beside the palette because the input is always a token.
+ */
+export function withAlpha(hex: string, alpha: number): string {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
 export const Fonts = Platform.select({
   ios: {
     /** iOS `UIFontDescriptorSystemDesignDefault` */

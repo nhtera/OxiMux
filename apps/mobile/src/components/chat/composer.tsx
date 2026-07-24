@@ -1,14 +1,13 @@
-import { ArrowUp, CornerDownRight, ImagePlus } from 'lucide-react-native';
+import { ArrowUp, CornerDownRight, ImagePlus, Square } from 'lucide-react-native';
 import { useRef, useState } from 'react';
 import { Pressable, StyleSheet, TextInput, View } from 'react-native';
 
 import { AttachmentStrip } from '@/components/chat/attachment-strip';
 import { MicButton } from '@/components/chat/mic-button';
 import { filterCommands, SlashPalette, slashQuery } from '@/components/chat/slash-palette';
-import { Button } from '@/components/ui/button';
+import { ControlHeight, IconHitSlop } from '@/components/ui/control-geometry';
 import { Icon } from '@/components/ui/icon';
-import { IconButton } from '@/components/ui/icon-button';
-import { Radius, Spacing } from '@/constants/theme';
+import { Radius, Spacing, withAlpha } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { MAX_ATTACHMENTS, pickImages, type Attachment } from '@/native/attachments';
 import { impact } from '@/native/haptics';
@@ -20,8 +19,9 @@ type Props = {
   /** The agent's slash commands, for the composer palette. Names only. */
   slashCommands?: string[];
   /**
-   * The model/mode chips. Optional so the composer still renders for a backend
-   * that offers no choices, or before the catalog has been fetched.
+   * The model/mode chips, rendered inline on the control row. Optional so the
+   * composer still renders for a backend that offers no choices, or before the
+   * catalog has been fetched.
    */
   controls?: React.ReactNode;
   /**
@@ -42,10 +42,23 @@ type Props = {
 };
 
 /**
- * The composer. While a turn is in flight the primary action becomes **Steer**
- * rather than Send: typing mid-turn almost always means "also do this", and
- * sending would queue a whole new prompt to run after the current one instead of
- * guiding it. Stop sits next to it for the other intent.
+ * The composer.
+ *
+ * One rounded dock holds everything that composes a prompt — queued images, the
+ * text, and a single row of controls — so the whole thing reads as one object
+ * rising out of the transcript. It replaced three stacked bands (input, then a
+ * chip row, then a button row) that each drew their own box and left the bar
+ * tall and unsettled with nothing in it.
+ *
+ * The row's order is by frequency, left to right: attach, what the turn will run
+ * as (model, mode), then the two ways to finish — dictate and send. Everything in
+ * it is a glyph on the same circular step, so the eye lands on the one filled
+ * button and the rest recede.
+ *
+ * While a turn is in flight the primary action becomes **Steer** rather than
+ * Send: typing mid-turn almost always means "also do this", and sending would
+ * queue a whole new prompt to run after the current one instead of guiding it.
+ * Stop sits next to it for the other intent.
  *
  * Attachments override that: steering carries text only on the wire, so a turn
  * running with images queued still sends. Silently dropping photos the user
@@ -147,73 +160,108 @@ export function Composer({
   };
 
   return (
-    <View style={[styles.bar, { borderTopColor: theme.backgroundSelected }]}>
-      <AttachmentStrip
-        attachments={attachments}
-        onRemove={(id) => setAttachments((current) => current.filter((a) => a.id !== id))}
-      />
-
+    <View style={styles.bar}>
+      {/* The palette floats above the dock rather than inside it: it is a list of
+          candidates for what is being typed, not part of the prompt. */}
       {matches.length > 0 ? (
         <SlashPalette commands={matches} onSelect={chooseCommand} />
       ) : null}
 
-      <TextInput
-        ref={inputRef}
-        value={text}
-        onChangeText={setText}
-        placeholder={steering ? 'Steer this turn…' : 'Send a prompt…'}
-        placeholderTextColor={theme.textSecondary}
-        autoCapitalize="sentences"
-        multiline
-        style={[
-          styles.input,
-          { backgroundColor: theme.backgroundElement, color: theme.text },
-        ]}
-      />
-
-      {/* Behaviour controls sit below the input, matching where the desktop
-          composer puts them — context above the input, behaviour below. */}
-      {controls}
-
-      <View style={styles.actions}>
-        <IconButton
-          icon={ImagePlus}
-          onPress={attach}
-          disabled={!canAttach}
-          accessibilityLabel={room === 0 ? `Attachment limit reached (${MAX_ATTACHMENTS} max)` : 'Attach an image'}
+      <View style={[styles.dock, { backgroundColor: theme.surface1, borderColor: theme.border }]}>
+        <AttachmentStrip
+          attachments={attachments}
+          onRemove={(id) => setAttachments((current) => current.filter((a) => a.id !== id))}
         />
 
-        {/* Dictation only appears while connected — the desktop is what
-            transcribes, so a disconnected phone has nothing to offer here. */}
-        {dictation.available ? (
-          <MicButton
-            phase={dictation.phase}
-            level={dictation.level}
-            onStart={dictation.start}
-            onStop={dictation.stop}
-          />
-        ) : null}
+        <TextInput
+          ref={inputRef}
+          value={text}
+          onChangeText={setText}
+          placeholder={steering ? 'Steer this turn…' : 'Send a prompt…'}
+          placeholderTextColor={theme.textMuted}
+          autoCapitalize="sentences"
+          multiline
+          // No fill of its own — the dock is the surface, and a second box inside
+          // it was what made the old bar read as two unrelated fields.
+          style={[styles.input, { color: theme.text }]}
+        />
 
-        <View style={styles.spacer} />
+        <View style={styles.row}>
+          <Pressable
+            onPress={attach}
+            disabled={!canAttach}
+            hitSlop={IconHitSlop}
+            accessibilityRole="button"
+            accessibilityLabel={
+              room === 0 ? `Attachment limit reached (${MAX_ATTACHMENTS} max)` : 'Attach an image'
+            }
+            style={({ pressed }) => [
+              styles.circle,
+              { backgroundColor: theme.surface2 },
+              pressed && styles.pressed,
+              !canAttach && styles.disabled,
+            ]}
+          >
+            <Icon icon={ImagePlus} size="lg" color={theme.textSecondary} />
+          </Pressable>
 
-        {turnActive ? <Button label="Stop" variant="danger" onPress={onCancel} /> : null}
+          {/* Behaviour controls sit with the send button rather than on a band of
+              their own — they describe the turn that button will start. Given the
+              leftover width so a long model name truncates instead of crowding
+              out the actions. */}
+          <View style={styles.controls}>{controls}</View>
 
-        {/* Icon-first send: a filled circle that lights to the accent once there is
-            something to send. Mid-turn the intent is Steer, not Send, so the glyph
-            swaps to make that unmistakable. */}
-        <Pressable
-          onPress={submit}
-          disabled={!canSubmit}
-          accessibilityRole="button"
-          accessibilityLabel={steering ? 'Steer this turn' : 'Send'}
-          style={[styles.send, { backgroundColor: canSubmit ? theme.accent : theme.surface3 }]}
-        >
-          <Icon
-            icon={steering ? CornerDownRight : ArrowUp}
-            size="md"
-            color={canSubmit ? theme.accentText : theme.textMuted}
-          />
-        </Pressable>
+          {/* Dictation only appears while connected — the desktop is what
+              transcribes, so a disconnected phone has nothing to offer here. */}
+          {dictation.available ? (
+            <MicButton
+              phase={dictation.phase}
+              level={dictation.level}
+              onStart={dictation.start}
+              onStop={dictation.stop}
+            />
+          ) : null}
+
+          {/* Stop is a peer of send, not a red text button: mid-turn the two are
+              the same kind of decision, and the label was the widest thing in the
+              row for the one state where room is tightest. */}
+          {turnActive ? (
+            <Pressable
+              onPress={onCancel}
+              hitSlop={IconHitSlop}
+              accessibilityRole="button"
+              accessibilityLabel="Stop this turn"
+              style={({ pressed }) => [
+                styles.circle,
+                { backgroundColor: withAlpha(theme.danger, 0.16) },
+                pressed && styles.pressed,
+              ]}
+            >
+              <Icon icon={Square} size="md" color={theme.danger} />
+            </Pressable>
+          ) : null}
+
+          {/* Icon-first send: a filled circle that lights to the accent once there is
+              something to send. Mid-turn the intent is Steer, not Send, so the glyph
+              swaps to make that unmistakable. */}
+          <Pressable
+            onPress={submit}
+            disabled={!canSubmit}
+            accessibilityRole="button"
+            accessibilityLabel={steering ? 'Steer this turn' : 'Send'}
+            style={({ pressed }) => [
+              styles.circle,
+              { backgroundColor: canSubmit ? theme.accent : theme.surface3 },
+              pressed && styles.pressed,
+            ]}
+          >
+            <Icon
+              icon={steering ? CornerDownRight : ArrowUp}
+              size="lg"
+              color={canSubmit ? theme.accentText : theme.textMuted}
+            />
+          </Pressable>
+        </View>
       </View>
     </View>
   );
@@ -221,25 +269,42 @@ export function Composer({
 
 const styles = StyleSheet.create({
   bar: {
-    borderTopWidth: StyleSheet.hairlineWidth,
-    padding: Spacing.three,
+    paddingHorizontal: Spacing.two,
+    paddingTop: Spacing.two,
+    paddingBottom: Spacing.one,
+    gap: Spacing.two,
+  },
+  dock: {
+    borderWidth: StyleSheet.hairlineWidth,
+    // Large enough to read as a capsule when the input is one line, and still
+    // sane once it has grown to its cap.
+    borderRadius: Radius.xl + Spacing.two,
+    padding: Spacing.two,
     gap: Spacing.two,
   },
   input: {
-    minHeight: 44,
+    // One comfortable line at rest; grows to roughly six before it scrolls, which
+    // is as much of the screen as the keyboard leaves.
+    minHeight: ControlHeight.compact,
     maxHeight: 140,
-    borderRadius: Spacing.two,
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.two,
+    paddingHorizontal: Spacing.two,
+    // iOS multiline inputs sit flush to the top without this and read as
+    // mis-aligned against the placeholder.
+    paddingTop: Spacing.one,
+    paddingBottom: 0,
     fontSize: 16,
   },
-  actions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two },
-  spacer: { flex: 1 },
-  send: {
-    width: 40,
-    height: 40,
+  row: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two },
+  // `flex: 1` doubles as the spacer that pushes mic/send to the right edge, so
+  // an agent offering no chips still lays out correctly.
+  controls: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: Spacing.one },
+  circle: {
+    width: ControlHeight.compact,
+    height: ControlHeight.compact,
     borderRadius: Radius.full,
     alignItems: 'center',
     justifyContent: 'center',
   },
+  pressed: { opacity: 0.6 },
+  disabled: { opacity: 0.4 },
 });

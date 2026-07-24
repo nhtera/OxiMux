@@ -8,7 +8,7 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 
 import { Composer } from '@/components/chat/composer';
 import { RewindSheet } from '@/components/chat/rewind-sheet';
-import { SessionControls } from '@/components/chat/session-controls';
+import { useSessionControls } from '@/components/chat/session-controls';
 import { StatusStrip } from '@/components/chat/status-strip';
 import { Transcript } from '@/components/chat/transcript';
 import { TurnTimer } from '@/components/chat/turn-timer';
@@ -48,6 +48,10 @@ export default function SessionScreen() {
     dismissError,
     reportError,
   } = useSession(sessionId);
+  // Chips render inside the composer's control row; the pickers they open are
+  // full-width sheets and are rendered at the screen root, beside the rewind
+  // sheet, so they anchor to the window rather than to that row.
+  const sessionControls = useSessionControls(sessionId, reportError);
   const [rewindOpen, setRewindOpen] = useState(false);
   const [rewinding, setRewinding] = useState(false);
   const [rewindError, setRewindError] = useState<string>();
@@ -133,7 +137,7 @@ export default function SessionScreen() {
           <Composer
             turnActive={thread.turn_active}
             slashCommands={thread.slash_commands}
-            controls={<SessionControls sessionId={id} />}
+            controls={sessionControls.chips}
             draft={draft}
             onSend={send}
             onSteer={steer}
@@ -143,6 +147,8 @@ export default function SessionScreen() {
         </SafeAreaView>
         </KeyboardAvoidingView>
       </GestureDetector>
+
+      {sessionControls.pickers}
 
       <RewindSheet
         visible={rewindOpen}
