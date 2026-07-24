@@ -103,11 +103,13 @@ jest.mock('react-native-reanimated', () => {
       if (cb) cb(true);
       return v;
     },
+    withRepeat: (v) => v,
     runOnJS:
       (fn) =>
       (...args) =>
         fn(...args),
     interpolate: (_x, _inRange, outRange) => outRange[0],
+    interpolateColor: (_x, _inRange, outRange) => outRange[0],
     Easing: {},
   };
 });

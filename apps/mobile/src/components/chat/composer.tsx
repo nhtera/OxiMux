@@ -1,12 +1,14 @@
+import { ArrowUp, CornerDownRight, ImagePlus } from 'lucide-react-native';
 import { useRef, useState } from 'react';
 import { Pressable, StyleSheet, TextInput, View } from 'react-native';
 
 import { AttachmentStrip } from '@/components/chat/attachment-strip';
 import { MicButton } from '@/components/chat/mic-button';
 import { filterCommands, SlashPalette, slashQuery } from '@/components/chat/slash-palette';
-import { ThemedText } from '@/components/themed-text';
 import { Button } from '@/components/ui/button';
-import { Spacing } from '@/constants/theme';
+import { Icon } from '@/components/ui/icon';
+import { IconButton } from '@/components/ui/icon-button';
+import { Radius, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { MAX_ATTACHMENTS, pickImages, type Attachment } from '@/native/attachments';
 import { impact } from '@/native/haptics';
@@ -174,21 +176,12 @@ export function Composer({
       {controls}
 
       <View style={styles.actions}>
-        <Pressable
+        <IconButton
+          icon={ImagePlus}
           onPress={attach}
           disabled={!canAttach}
-          accessibilityLabel="Attach an image"
-          style={[
-            styles.button,
-            styles.attach,
-            { borderColor: theme.borderStrong },
-            !canAttach && styles.disabled,
-          ]}
-        >
-          <ThemedText type="code">
-            {room === 0 ? `${MAX_ATTACHMENTS} max` : 'Attach'}
-          </ThemedText>
-        </Pressable>
+          accessibilityLabel={room === 0 ? `Attachment limit reached (${MAX_ATTACHMENTS} max)` : 'Attach an image'}
+        />
 
         {/* Dictation only appears while connected — the desktop is what
             transcribes, so a disconnected phone has nothing to offer here. */}
@@ -205,16 +198,21 @@ export function Composer({
 
         {turnActive ? <Button label="Stop" variant="danger" onPress={onCancel} /> : null}
 
+        {/* Icon-first send: a filled circle that lights to the accent once there is
+            something to send. Mid-turn the intent is Steer, not Send, so the glyph
+            swaps to make that unmistakable. */}
         <Pressable
           onPress={submit}
           disabled={!canSubmit}
-          style={[
-            styles.button,
-            { backgroundColor: theme.backgroundSelected },
-            !canSubmit && styles.disabled,
-          ]}
+          accessibilityRole="button"
+          accessibilityLabel={steering ? 'Steer this turn' : 'Send'}
+          style={[styles.send, { backgroundColor: canSubmit ? theme.accent : theme.surface3 }]}
         >
-          <ThemedText type="code">{steering ? 'Steer' : 'Send'}</ThemedText>
+          <Icon
+            icon={steering ? CornerDownRight : ArrowUp}
+            size="md"
+            color={canSubmit ? theme.accentText : theme.textMuted}
+          />
         </Pressable>
       </View>
     </View>
@@ -237,11 +235,11 @@ const styles = StyleSheet.create({
   },
   actions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two },
   spacer: { flex: 1 },
-  attach: { borderWidth: StyleSheet.hairlineWidth },
-  button: {
-    paddingVertical: Spacing.two,
-    paddingHorizontal: Spacing.four,
-    borderRadius: Spacing.two,
+  send: {
+    width: 40,
+    height: 40,
+    borderRadius: Radius.full,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  disabled: { opacity: 0.4 },
 });

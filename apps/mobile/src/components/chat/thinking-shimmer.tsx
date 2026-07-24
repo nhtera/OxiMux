@@ -11,15 +11,26 @@ import Animated, {
 } from 'react-native-reanimated';
 import Svg, { Defs, LinearGradient, Rect, Stop } from 'react-native-svg';
 
-import { ThemedText } from '@/components/themed-text';
+import { ThemedText, type ThemedTextProps } from '@/components/themed-text';
 import { useTheme } from '@/hooks/use-theme';
 
 /**
  * A highlight band sweeping across a label, masked to the glyph shapes — reads as
  * "working" far better than a spinner or a static word. The animation is torn
  * down on unmount (`cancelAnimation`), so a card that scrolls off burns nothing.
+ *
+ * `type`/`numberOfLines` let a caller sweep text in its own style (e.g. a mono
+ * tool name that shimmers in place while the call runs) rather than a fixed size.
  */
-export function ThinkingShimmer({ label }: { label: string }) {
+export function ThinkingShimmer({
+  label,
+  type = 'small',
+  numberOfLines,
+}: {
+  label: string;
+  type?: ThemedTextProps['type'];
+  numberOfLines?: number;
+}) {
   const theme = useTheme();
   const [size, setSize] = useState({ width: 0, height: 0 });
   const shift = useSharedValue(0);
@@ -42,13 +53,13 @@ export function ThinkingShimmer({ label }: { label: string }) {
     <MaskedView
       style={size.height ? { height: size.height } : undefined}
       maskElement={
-        <ThemedText type="small" onLayout={onLayout}>
+        <ThemedText type={type} numberOfLines={numberOfLines} onLayout={onLayout}>
           {label}
         </ThemedText>
       }
     >
       {/* Dim base under the glyphs, so the label stays legible between sweeps. */}
-      <ThemedText type="small" style={{ color: theme.textMuted }}>
+      <ThemedText type={type} numberOfLines={numberOfLines} style={{ color: theme.textMuted }}>
         {label}
       </ThemedText>
       {size.width > 0 ? (

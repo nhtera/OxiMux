@@ -5,6 +5,16 @@ import { Icon } from '@/components/ui/icon';
 import { IconSize, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 
+/**
+ * A hairline rule between rows. Insetting it (default: a row's horizontal padding)
+ * makes a scrolling list read as one grouped surface — the reference's mobile
+ * lists lean on dividers, not whitespace, to separate rows.
+ */
+export function ListDivider({ inset = Spacing.four }: { inset?: number }) {
+  const theme = useTheme();
+  return <View style={{ height: StyleSheet.hairlineWidth, marginLeft: inset, backgroundColor: theme.border }} />;
+}
+
 type Props = {
   children: React.ReactNode;
   onPress?: () => void;
@@ -26,7 +36,11 @@ export function ListRow({ children, onPress, accessoryIcon, accessibilityLabel, 
       disabled={!onPress}
       accessibilityRole={onPress ? 'button' : undefined}
       accessibilityLabel={accessibilityLabel}
-      style={({ pressed }) => [styles.row, pressed && onPress ? styles.pressed : null, style]}
+      style={({ pressed }) => [
+        styles.row,
+        pressed && onPress ? { backgroundColor: theme.surface2 } : null,
+        style,
+      ]}
     >
       <View style={styles.content}>{children}</View>
       {accessoryIcon ? <Icon icon={accessoryIcon} size="sm" color={theme.textMuted} /> : null}
@@ -43,5 +57,4 @@ const styles = StyleSheet.create({
     minHeight: IconSize.xl + Spacing.three,
   },
   content: { flex: 1, gap: Spacing.half },
-  pressed: { opacity: 0.6 },
 });

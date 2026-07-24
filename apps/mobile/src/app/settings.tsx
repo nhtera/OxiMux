@@ -1,6 +1,7 @@
+import Constants from 'expo-constants';
 import { router } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
-import { Alert, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { Alert, ScrollView, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ConnectionBadge } from '@/components/connection-badge';
@@ -8,8 +9,8 @@ import { ChatSettings } from '@/components/settings/chat-settings';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { Button } from '@/components/ui/button';
+import { SegmentedControl } from '@/components/ui/segmented-control';
 import { Spacing } from '@/constants/theme';
-import { useTheme } from '@/hooks/use-theme';
 import { useClient } from '@/native/client';
 import { fromBase64 } from '@/native/base64';
 import { loadHost, type PairedHost } from '@/native/hosts';
@@ -80,15 +81,15 @@ export default function SettingsScreen() {
                     and it is the one value that identifies *which* desktop this is
                     when more than one is in play. Elided in the middle: the ends
                     are what a user compares against the desktop's own display. */}
-                <ThemedText type="code" style={styles.muted}>
+                <ThemedText type="code" themeColor="textMuted">
                   {shortId(host.endpointId)}
                 </ThemedText>
-                <ThemedText type="small" style={styles.muted}>
+                <ThemedText type="small" themeColor="textMuted">
                   Paired {new Date(host.pairedAt).toLocaleDateString()}
                 </ThemedText>
               </>
             ) : (
-              <ThemedText type="small" style={styles.muted}>
+              <ThemedText type="small" themeColor="textMuted">
                 No desktop paired.
               </ThemedText>
             )}
@@ -105,9 +106,15 @@ export default function SettingsScreen() {
           )}
 
           {phase === 'unreachable' ? (
-            <ThemedText type="small" style={styles.hint}>
+            <ThemedText type="small" themeColor="textMuted">
               The desktop is not answering. Check that OxiMux is running and that
               Remote access is on in its settings.
+            </ThemedText>
+          ) : null}
+
+          {Constants.expoConfig?.version ? (
+            <ThemedText type="small" themeColor="textMuted" style={styles.version}>
+              OxiMux {Constants.expoConfig.version}
             </ThemedText>
           ) : null}
         </ScrollView>
@@ -127,33 +134,16 @@ const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
  * the one most people keep.
  */
 function ThemePicker() {
-  const theme = useTheme();
   const preference = useThemePreference((s) => s.preference);
   const setPreference = useThemePreference((s) => s.setPreference);
 
   return (
-    <View style={styles.segments}>
-      {THEME_OPTIONS.map((option) => {
-        const selected = option.value === preference;
-        return (
-          <Pressable
-            key={option.value}
-            onPress={() => setPreference(option.value)}
-            accessibilityRole="radio"
-            accessibilityState={{ selected }}
-            style={[
-              styles.segment,
-              { borderColor: theme.backgroundSelected },
-              selected && { backgroundColor: theme.backgroundSelected },
-            ]}
-          >
-            <ThemedText type="code" style={!selected && styles.muted}>
-              {option.label}
-            </ThemedText>
-          </Pressable>
-        );
-      })}
-    </View>
+    <SegmentedControl
+      segments={THEME_OPTIONS}
+      value={preference}
+      onChange={setPreference}
+      accessibilityLabel="Theme"
+    />
   );
 }
 
@@ -177,14 +167,5 @@ const styles = StyleSheet.create({
   fill: { flex: 1 },
   body: { padding: Spacing.four, gap: Spacing.five },
   section: { gap: Spacing.two },
-  muted: { opacity: 0.7 },
-  hint: { opacity: 0.7 },
-  segments: { flexDirection: 'row', gap: Spacing.two },
-  segment: {
-    flex: 1,
-    alignItems: 'center',
-    paddingVertical: Spacing.two,
-    borderRadius: Spacing.two,
-    borderWidth: StyleSheet.hairlineWidth,
-  },
+  version: { textAlign: 'center' },
 });

@@ -1,8 +1,10 @@
 import type { Schedule } from 'oximux-core';
-import { Pressable, StyleSheet, Switch, View } from 'react-native';
+import { Pressable, StyleSheet, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
+import { Switch } from '@/components/ui/switch';
 import { Spacing } from '@/constants/theme';
+import { useTheme } from '@/hooks/use-theme';
 
 /**
  * One schedule: its name, the desktop's own phrasing of when it repeats, and the
@@ -26,18 +28,27 @@ export function ScheduleRow({
   /** Long-press to delete — confirmed by the caller, since it is irreversible. */
   onDelete: () => void;
 }) {
+  const theme = useTheme();
   return (
-    <Pressable onPress={onOpen} onLongPress={onDelete} style={styles.row}>
+    <Pressable
+      onPress={onOpen}
+      onLongPress={onDelete}
+      style={({ pressed }) => [styles.row, pressed && { backgroundColor: theme.surface2 }]}
+    >
       <View style={[styles.text, !schedule.enabled && styles.dim]}>
         <ThemedText numberOfLines={1}>{schedule.name}</ThemedText>
-        <ThemedText type="small" style={styles.muted} numberOfLines={1}>
+        <ThemedText type="small" themeColor="textMuted" numberOfLines={1}>
           {schedule.summary}
         </ThemedText>
-        <ThemedText type="small" style={styles.muted} numberOfLines={1}>
+        <ThemedText type="small" themeColor="textMuted" numberOfLines={1}>
           {schedule.enabled ? `Next ${formatNextFire(schedule.nextFireAt)}` : 'Paused'}
         </ThemedText>
       </View>
-      <Switch value={schedule.enabled} onValueChange={onToggle} />
+      <Switch
+        value={schedule.enabled}
+        onValueChange={onToggle}
+        accessibilityLabel={`${schedule.enabled ? 'Disable' : 'Enable'} ${schedule.name}`}
+      />
     </Pressable>
   );
 }
@@ -65,9 +76,9 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: Spacing.three,
-    paddingVertical: Spacing.two,
+    paddingVertical: Spacing.three,
+    paddingHorizontal: Spacing.four,
   },
   text: { flex: 1, gap: Spacing.half },
   dim: { opacity: 0.5 },
-  muted: { opacity: 0.7 },
 });

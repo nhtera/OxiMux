@@ -1,6 +1,6 @@
 import { router } from 'expo-router';
 import type { TerminalInfo } from 'oximux-core';
-import { ActivityIndicator, FlatList, Pressable, RefreshControl, StyleSheet, View } from 'react-native';
+import { FlatList, Pressable, RefreshControl, StyleSheet, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ConnectionBanner } from '@/components/connection-banner';
@@ -8,8 +8,11 @@ import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { EmptyState } from '@/components/ui/empty-state';
 import { ErrorBanner } from '@/components/ui/error-banner';
+import { ListDivider } from '@/components/ui/list-row';
+import { SkeletonList } from '@/components/ui/skeleton';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
+import { tick } from '@/native/haptics';
 import { useTerminalList } from '@/native/terminal';
 
 /**
@@ -44,14 +47,13 @@ export default function TerminalsScreen() {
         ) : null}
 
         {loading ? (
-          <View style={styles.centre}>
-            <ActivityIndicator />
-          </View>
+          <SkeletonList />
         ) : (
           <FlatList
             data={terminals}
             keyExtractor={(t) => t.ptyId}
             renderItem={({ item }) => <TerminalRow terminal={item} />}
+            ItemSeparatorComponent={ListDivider}
             contentContainerStyle={styles.list}
             // The desktop can open or close terminals while the phone is away and
             // nothing pushes that; a pull re-lists on demand. `reload` flips the
@@ -72,8 +74,11 @@ function TerminalRow({ terminal }: { terminal: TerminalInfo }) {
   const theme = useTheme();
   return (
     <Pressable
-      onPress={() => router.push({ pathname: '/terminal/[id]', params: { id: terminal.ptyId } })}
-      style={styles.row}
+      onPress={() => {
+        tick();
+        router.push({ pathname: '/terminal/[id]', params: { id: terminal.ptyId } });
+      }}
+      style={({ pressed }) => [styles.row, pressed && { backgroundColor: theme.surface2 }]}
     >
       <ThemedText type="smallBold">{shortCwd(terminal.cwd)}</ThemedText>
       <ThemedText type="small" style={{ color: theme.textSecondary }}>
@@ -95,8 +100,7 @@ function shortCwd(cwd: string): string {
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  list: { padding: Spacing.three, gap: Spacing.three },
-  row: { gap: Spacing.one },
-  centre: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: Spacing.four },
+  list: { flexGrow: 1, paddingVertical: Spacing.two },
+  row: { gap: Spacing.one, paddingVertical: Spacing.three, paddingHorizontal: Spacing.four },
   notice: { paddingHorizontal: Spacing.three, paddingVertical: Spacing.two, gap: Spacing.one },
 });

@@ -11,6 +11,7 @@ import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { EmptyState } from '@/components/ui/empty-state';
 import { ErrorBanner } from '@/components/ui/error-banner';
+import { ListDivider } from '@/components/ui/list-row';
 import { SkeletonList } from '@/components/ui/skeleton';
 import { impact, tick } from '@/native/haptics';
 import { Icon } from '@/components/ui/icon';
@@ -97,6 +98,7 @@ export default function SchedulesScreen() {
           <FlatList
             data={schedules}
             keyExtractor={(s) => s.id}
+            ItemSeparatorComponent={ListDivider}
             contentContainerStyle={styles.list}
             renderItem={({ item }) => (
               <ScheduleRow
@@ -138,6 +140,6 @@ export default function SchedulesScreen() {
 
 const styles = StyleSheet.create({
   fill: { flex: 1 },
-  list: { flexGrow: 1, paddingHorizontal: Spacing.four, paddingVertical: Spacing.three, gap: Spacing.two },
+  list: { flexGrow: 1, paddingVertical: Spacing.two },
   headerAction: { flexDirection: 'row', alignItems: 'center', gap: Spacing.one },
 });

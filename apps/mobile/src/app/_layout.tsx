@@ -4,7 +4,9 @@ import { useEffect } from 'react';
 import { StyleSheet } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { KeyboardProvider } from 'react-native-keyboard-controller';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
 
+import { AppDrawerProvider, DrawerMenuButton } from '@/components/deck/app-drawer';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { useTheme } from '@/hooks/use-theme';
 import { useChatPreferences } from '@/stores/chat-preferences';
@@ -26,29 +28,42 @@ export default function RootLayout() {
     void loadChatPrefs();
   }, [load, loadChatPrefs]);
 
+  const menuButton = () => <DrawerMenuButton />;
+
   return (
     // GestureHandlerRootView must be the outermost wrapper so the sheet + drawer
     // pan gestures reach the touch system; the in-house `Sheet` renders inline
     // under it (no portal provider) and rises with the keyboard via KeyboardProvider.
+    // SafeAreaProvider sits above the drawer overlay (a sibling of the navigator)
+    // so its panel reads real insets rather than the zero fallback.
     <GestureHandlerRootView style={styles.root}>
-      <KeyboardProvider>
-        <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
-          <StatusBar style={colorScheme === 'dark' ? 'light' : 'dark'} />
-          <Stack screenOptions={{ contentStyle: { backgroundColor: theme.background } }}>
-            <Stack.Screen name="index" options={{ title: 'OxiMux' }} />
-            <Stack.Screen name="pair-scan" options={{ title: 'Scan pairing code' }} />
-            <Stack.Screen name="sessions" options={{ title: 'Sessions' }} />
-            <Stack.Screen name="settings" options={{ title: 'Settings' }} />
-            <Stack.Screen name="schedules" options={{ title: 'Schedules' }} />
-            {/* Titles come from the screens themselves: a session is named by the
-                agent, the git screen by the branch it is on, and a schedule's run
-                history by the schedule's own name. */}
-            <Stack.Screen name="session/[id]" />
-            <Stack.Screen name="git/[id]" />
-            <Stack.Screen name="schedules/[id]" />
-          </Stack>
-        </ThemeProvider>
-      </KeyboardProvider>
+      <SafeAreaProvider>
+        <KeyboardProvider>
+          <ThemeProvider value={colorScheme === 'dark' ? DarkTheme : DefaultTheme}>
+            <StatusBar style={colorScheme === 'dark' ? 'light' : 'dark'} />
+            {/* The nav drawer wraps the whole navigator: a single overlay reachable
+                from every primary screen's header, matching the desktop's sidebar. */}
+            <AppDrawerProvider>
+              <Stack screenOptions={{ contentStyle: { backgroundColor: theme.background } }}>
+                <Stack.Screen name="index" options={{ title: 'OxiMux' }} />
+                <Stack.Screen name="pair-scan" options={{ title: 'Scan pairing code' }} />
+                {/* The four primary destinations carry the hamburger; detail routes
+                    below keep their back button instead. */}
+                <Stack.Screen name="sessions" options={{ title: 'Sessions', headerLeft: menuButton }} />
+                <Stack.Screen name="terminals" options={{ title: 'Terminals', headerLeft: menuButton }} />
+                <Stack.Screen name="settings" options={{ title: 'Settings', headerLeft: menuButton }} />
+                <Stack.Screen name="schedules" options={{ title: 'Schedules', headerLeft: menuButton }} />
+                {/* Titles come from the screens themselves: a session is named by the
+                    agent, the git screen by the branch it is on, and a schedule's run
+                    history by the schedule's own name. */}
+                <Stack.Screen name="session/[id]" />
+                <Stack.Screen name="git/[id]" />
+                <Stack.Screen name="schedules/[id]" />
+              </Stack>
+            </AppDrawerProvider>
+          </ThemeProvider>
+        </KeyboardProvider>
+      </SafeAreaProvider>
     </GestureHandlerRootView>
   );
 }

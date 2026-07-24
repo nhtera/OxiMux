@@ -40,15 +40,18 @@ export function ForgeItemRow({
   const age = relativeAge(item.updatedAt);
 
   return (
-    <View style={[styles.row, { borderBottomColor: theme.backgroundElement }]}>
-      <Pressable style={styles.main} onPress={onPress}>
+    <View style={[styles.row, { borderBottomColor: theme.border }]}>
+      <Pressable
+        style={({ pressed }) => [styles.main, pressed && { backgroundColor: theme.surface2 }]}
+        onPress={onPress}
+      >
         <View style={styles.titleLine}>
           <View style={[styles.stateDot, { backgroundColor: stateColor(item.state, theme) }]} />
           <ThemedText numberOfLines={2} style={styles.title}>
             {item.title}
           </ThemedText>
         </View>
-        <ThemedText type="small" style={styles.meta} numberOfLines={1}>
+        <ThemedText type="small" themeColor="textMuted" numberOfLines={1}>
           {/* Assembled from what is actually present: the forge omits an author
               for deleted accounts and a timestamp on older CLIs, and rendering
               "by  ·  ·" around the gaps looks broken. */}
@@ -57,7 +60,7 @@ export function ForgeItemRow({
             .join(' · ')}
         </ThemedText>
         {item.labels.length > 0 ? (
-          <ThemedText type="small" style={styles.meta} numberOfLines={1}>
+          <ThemedText type="small" themeColor="textMuted" numberOfLines={1}>
             {item.labels.join(', ')}
           </ThemedText>
         ) : null}
@@ -80,5 +83,4 @@ const styles = StyleSheet.create({
   titleLine: { flexDirection: 'row', alignItems: 'flex-start', gap: Spacing.two },
   stateDot: { width: 8, height: 8, borderRadius: 4, marginTop: 6 },
   title: { flex: 1 },
-  meta: { opacity: 0.7 },
 });

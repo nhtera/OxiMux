@@ -12,7 +12,7 @@ import { SessionControls } from '@/components/chat/session-controls';
 import { StatusStrip } from '@/components/chat/status-strip';
 import { Transcript } from '@/components/chat/transcript';
 import { ConnectionBanner } from '@/components/connection-banner';
-import { SessionsDrawer, useSessionsDrawer } from '@/components/deck/sessions-drawer';
+import { useAppDrawer } from '@/components/deck/app-drawer';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { ErrorBanner } from '@/components/ui/error-banner';
@@ -51,7 +51,7 @@ export default function SessionScreen() {
   const [rewinding, setRewinding] = useState(false);
   const [rewindError, setRewindError] = useState<string>();
   const insets = useSafeAreaInsets();
-  const drawer = useSessionsDrawer();
+  const drawer = useAppDrawer();
 
   const onRewind = async (ordinal: number) => {
     setRewinding(true);
@@ -152,13 +152,6 @@ export default function SessionScreen() {
           setRewindOpen(false);
           setRewindError(undefined);
         }}
-      />
-
-      <SessionsDrawer
-        progress={drawer.progress}
-        isOpen={drawer.isOpen}
-        close={drawer.close}
-        activeId={sessionId}
       />
     </ThemedView>
   );

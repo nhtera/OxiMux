@@ -1,8 +1,10 @@
+import { Check } from 'lucide-react-native';
 import { Pressable, StyleSheet, TextInput, View } from 'react-native';
 
 import { ThemedText } from '@/components/themed-text';
+import { Icon } from '@/components/ui/icon';
 import { QUESTION_ACCENT } from '@/constants/chat';
-import { Spacing } from '@/constants/theme';
+import { Radius, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import type { AskQuestion, QuestionAnswer } from '@/native/thread';
 
@@ -60,13 +62,30 @@ export function QuestionBlock({
             onPress={() => toggle(option.label)}
             style={[
               styles.option,
-              { borderColor: on ? QUESTION_ACCENT : theme.backgroundSelected },
+              {
+                borderColor: on ? QUESTION_ACCENT : theme.backgroundSelected,
+                backgroundColor: on ? theme.surface2 : 'transparent',
+              },
               disabled && styles.dim,
             ]}
           >
-            <ThemedText type="code" style={styles.marker}>
-              {on ? (multi ? '☑' : '◉') : multi ? '☐' : '○'}
-            </ThemedText>
+            {/* A drawn control, not a font glyph: a checkbox for multi-select, a
+                radio for single, filled with the accent when chosen — renders the
+                same on every platform where ☑/◉ did not. */}
+            {multi ? (
+              <View
+                style={[
+                  styles.checkbox,
+                  { borderColor: on ? QUESTION_ACCENT : theme.borderStrong, backgroundColor: on ? QUESTION_ACCENT : 'transparent' },
+                ]}
+              >
+                {on ? <Icon icon={Check} size="xs" color="#ffffff" /> : null}
+              </View>
+            ) : (
+              <View style={[styles.radio, { borderColor: on ? QUESTION_ACCENT : theme.borderStrong }]}>
+                {on ? <View style={styles.radioDot} /> : null}
+              </View>
+            )}
             <View style={styles.optionText}>
               <ThemedText>{option.label}</ThemedText>
               {option.description ? (
@@ -106,7 +125,27 @@ const styles = StyleSheet.create({
     borderRadius: Spacing.two,
     padding: Spacing.two,
   },
-  marker: { color: QUESTION_ACCENT },
+  // 18px controls, nudged down 2px to sit on the label's cap height rather than
+  // its line box.
+  checkbox: {
+    width: 18,
+    height: 18,
+    borderRadius: Radius.sm,
+    borderWidth: 2,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 2,
+  },
+  radio: {
+    width: 18,
+    height: 18,
+    borderRadius: Radius.full,
+    borderWidth: 2,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 2,
+  },
+  radioDot: { width: 8, height: 8, borderRadius: Radius.full, backgroundColor: QUESTION_ACCENT },
   optionText: { flex: 1, gap: Spacing.half },
   input: {
     minHeight: 44,

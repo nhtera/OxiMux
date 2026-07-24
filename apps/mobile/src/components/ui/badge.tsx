@@ -23,12 +23,34 @@ function toneColor(tone: BadgeTone, theme: ReturnType<typeof useTheme>): string 
   }
 }
 
-/** A static status pill: coloured label + a matching dot. Not interactive. */
+/** `#rrggbb` → `rgba(r,g,b,a)` so a tone colour can tint at low alpha. */
+function withAlpha(hex: string, alpha: number): string {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+/**
+ * A static status pill: a tone-tinted fill + matching dot + coloured label, so
+ * severity reads from the whole pill at a glance, not just a 6px dot. Neutral has
+ * no colour to tint, so it keeps the plain surface background.
+ */
 export function Badge({ label, tone = 'neutral' }: { label: string; tone?: BadgeTone }) {
   const theme = useTheme();
   const color = toneColor(tone, theme);
+  const tinted = tone !== 'neutral';
   return (
-    <View style={[styles.badge, { borderColor: theme.border, backgroundColor: theme.surface2 }]}>
+    <View
+      style={[
+        styles.badge,
+        {
+          borderColor: tinted ? withAlpha(color, 0.24) : theme.border,
+          backgroundColor: tinted ? withAlpha(color, 0.14) : theme.surface2,
+        },
+      ]}
+    >
       <View style={[styles.dot, { backgroundColor: color }]} />
       <ThemedText type="small" style={{ color }}>
         {label}
