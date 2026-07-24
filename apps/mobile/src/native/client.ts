@@ -3,6 +3,7 @@ import {
   ConnState_Tags,
   MobileClient,
   type ConnState,
+  type ProjectSummary,
   type SessionSummary,
 } from 'oximux-core';
 import { create } from 'zustand';
@@ -30,6 +31,12 @@ type ClientState = {
   /** Populated only in the `unreachable` phase — the last dial's failure. */
   cause?: string;
   sessions: SessionSummary[];
+  /**
+   * The host's projects, as quick-start targets for the grouped session list.
+   * Fetched once per connect (they change rarely — a project is added/removed on
+   * the desktop, not mid-session), so unlike `sessions` there is no push channel.
+   */
+  projects: ProjectSummary[];
   /** Non-null once a pairing has been attempted; the Rust core owns the connection. */
   client?: MobileClient;
 };
@@ -47,6 +54,8 @@ type ClientActions = {
    */
   ensureConnected: () => Promise<void>;
   refreshSessions: () => Promise<void>;
+  /** Re-fetch the host's projects. Best-effort — a failure leaves the list as-is. */
+  refreshProjects: () => Promise<void>;
   disconnect: () => Promise<void>;
   unpair: () => Promise<void>;
 };
@@ -98,6 +107,7 @@ let dialing: Promise<boolean> | null = null;
 export const useClient = create<ClientState & ClientActions>((set, get) => ({
   phase: 'idle',
   sessions: [],
+  projects: [],
 
   /**
    * Consume a scanned pairing ticket. The seed comes from the keystore so a
@@ -137,8 +147,9 @@ export const useClient = create<ClientState & ClientActions>((set, get) => ({
     if (endpointId) await saveHost(new Uint8Array(endpointId));
 
     // `connect` resolves once the first handshake lands; the driver then keeps
-    // the link alive on its own. Seed the list so the first render is populated.
+    // the link alive on its own. Seed the lists so the first render is populated.
     await get().refreshSessions();
+    await get().refreshProjects();
   },
 
   /**
@@ -161,6 +172,7 @@ export const useClient = create<ClientState & ClientActions>((set, get) => ({
         onState: (state: ConnState) => set(phaseOf(state)),
       });
       await get().refreshSessions();
+      await get().refreshProjects();
       return true;
     })();
     try {
@@ -191,9 +203,20 @@ export const useClient = create<ClientState & ClientActions>((set, get) => ({
     set({ sessions: await client.listSessions() });
   },
 
+  async refreshProjects() {
+    const client = get().client;
+    if (!client) return;
+    try {
+      set({ projects: await client.listProjects() });
+    } catch {
+      // A host that predates the project RPC (or refuses it) simply leaves the
+      // grouped list falling back to a flat one — not worth surfacing.
+    }
+  },
+
   async disconnect() {
     await get().client?.disconnect();
-    set({ phase: 'idle', sessions: [], client: undefined, cause: undefined });
+    set({ phase: 'idle', sessions: [], projects: [], client: undefined, cause: undefined });
   },
 
   /** Drop the connection and forget the host, sending the app back to pairing. */

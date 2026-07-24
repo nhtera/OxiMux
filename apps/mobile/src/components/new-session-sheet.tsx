@@ -26,17 +26,32 @@ export function NewSessionSheet({
   visible,
   busy,
   error,
+  initialCwd,
   onCreate,
   onClose,
 }: {
   visible: boolean;
   busy: boolean;
   error?: string;
+  /** Pre-fills the path when opened from a project's compose "+" (else blank). */
+  initialCwd?: string;
   onCreate: (cwd: string) => void;
   onClose: () => void;
 }) {
   const theme = useTheme();
-  const [cwd, setCwd] = useState('');
+  const [cwd, setCwd] = useState(initialCwd ?? '');
+  // Re-seed the field each time the sheet opens: a per-project compose pre-fills
+  // its path, a plain "New session" opens blank. This is the "adjust state on a
+  // prop/visibility edge during render" pattern — no effect, so no cascading
+  // render, and it beats keying the whole sheet (which would fight its animation).
+  const [seeded, setSeeded] = useState(false);
+  if (visible && !seeded) {
+    setSeeded(true);
+    setCwd(initialCwd ?? '');
+  }
+  if (!visible && seeded) {
+    setSeeded(false);
+  }
   const trimmed = cwd.trim();
 
   return (

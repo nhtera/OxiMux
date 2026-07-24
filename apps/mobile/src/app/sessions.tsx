@@ -1,8 +1,8 @@
 import { Stack, router } from 'expo-router';
-import { Plus, Search } from 'lucide-react-native';
+import { Plus, Search, SquarePen } from 'lucide-react-native';
 import type { SessionSummary } from 'oximux-core';
-import { useCallback, useEffect, useState } from 'react';
-import { FlatList, Pressable, RefreshControl, StyleSheet, TextInput, View } from 'react-native';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Pressable, RefreshControl, SectionList, StyleSheet, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { CommandPalette } from '@/components/command-palette';
@@ -11,6 +11,7 @@ import { NewSessionSheet } from '@/components/new-session-sheet';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { EmptyState } from '@/components/ui/empty-state';
+import { Icon } from '@/components/ui/icon';
 import { IconButton } from '@/components/ui/icon-button';
 import { ListDivider } from '@/components/ui/list-row';
 import { SkeletonList } from '@/components/ui/skeleton';
@@ -20,11 +21,13 @@ import { useClient } from '@/native/client';
 import { describeError } from '@/native/errors';
 import { tick } from '@/native/haptics';
 import { filterSessions } from '@/native/session-filter';
+import { groupSessionsByProject } from '@/native/session-grouping';
 import { parseSessionTitle } from '@/native/session-title';
 import { useNewSessionIntent } from '@/stores/new-session-intent';
 
 export default function SessionsScreen() {
   const sessions = useClient((s) => s.sessions);
+  const projects = useClient((s) => s.projects);
   const phase = useClient((s) => s.phase);
   const refreshSessions = useClient((s) => s.refreshSessions);
   const ensureConnected = useClient((s) => s.ensureConnected);
@@ -39,7 +42,16 @@ export default function SessionsScreen() {
   const [creating, setCreating] = useState(() => useNewSessionIntent.getState().requested);
   const [busy, setBusy] = useState(false);
   const [createError, setCreateError] = useState<string>();
+  // Set when the sheet is opened from a project's compose "+": it pre-fills the
+  // project's path so the user confirms (and sees any error) rather than typing —
+  // undefined for a plain "New session", which opens blank.
+  const [prefillCwd, setPrefillCwd] = useState<string>();
   const [paletteOpen, setPaletteOpen] = useState(false);
+
+  const openNewSession = useCallback((cwd?: string) => {
+    setPrefillCwd(cwd);
+    setCreating(true);
+  }, []);
 
   // Consume the intent honored by the initial state above, and open the sheet for
   // an intent raised while this screen is already mounted. Subscribing keeps the
@@ -49,6 +61,7 @@ export default function SessionsScreen() {
     if (intent.requested) intent.consume();
     return useNewSessionIntent.subscribe((s) => {
       if (s.requested) {
+        setPrefillCwd(undefined);
         setCreating(true);
         useNewSessionIntent.getState().consume();
       }
@@ -79,6 +92,19 @@ export default function SessionsScreen() {
 
   const visible = filterSessions(sessions, query);
   const filtering = query.trim().length > 0;
+
+  // Group by project for the sectioned list — but while filtering, drop the
+  // project headers and show a flat list of matches (an empty project header
+  // amid search results is noise). `groupSessionsByProject([], …)` yields one
+  // pathless group, which renders headerless.
+  const groups = useMemo(
+    () => groupSessionsByProject(filtering ? [] : projects, visible),
+    [filtering, projects, visible]
+  );
+  // Nothing to list when there are no matches and no project headers to offer —
+  // that is when the skeleton / empty / down message takes over. A connected host
+  // with projects but no sessions still lists (the per-project "+" starts one).
+  const nothingToList = visible.length === 0 && (filtering || projects.length === 0);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
@@ -122,7 +148,7 @@ export default function SessionsScreen() {
           headerRight: () => (
             <View style={styles.headerActions}>
               <IconButton icon={Search} accessibilityLabel="Search and jump" onPress={() => setPaletteOpen(true)} />
-              <IconButton icon={Plus} accessibilityLabel="New session" onPress={() => setCreating(true)} />
+              <IconButton icon={Plus} accessibilityLabel="New session" onPress={() => openNewSession()} />
             </View>
           ),
         }}
@@ -148,65 +174,96 @@ export default function SessionsScreen() {
           />
         ) : null}
 
-        <FlatList
-          data={visible}
-          keyExtractor={(s) => s.sessionId}
-          renderItem={({ item }) => <SessionRow session={item} />}
-          ItemSeparatorComponent={ListDivider}
-          contentContainerStyle={styles.list}
-          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} />}
-          ListEmptyComponent={
-            // While the first link is still coming up there is nothing to say yet,
-            // so a skeleton reads as "content arriving" rather than a false "no
-            // sessions". Once connected (or failed), fall back to the real message.
-            // Kept distinct from the no-sessions state on purpose: telling a user
-            // whose filter matched nothing that the desktop has no sessions open
-            // would be a lie about the desktop.
-            !filtering && (phase === 'connecting' || phase === 'reconnecting') ? (
-              <SkeletonList />
-            ) : (
-              <EmptyState
-                title={
-                  filtering
-                    ? 'No matches'
-                    : phase === 'connected'
-                      ? 'No agent sessions open on the desktop.'
-                      : 'Waiting for the host…'
-                }
-                message={filtering ? `No sessions match “${query.trim()}”.` : undefined}
-                action={
-                  !filtering && down
-                    ? { label: 'Retry', onPress: retry, loading: retrying }
-                    : undefined
-                }
-              />
-            )
-          }
-        />
+        {nothingToList ? (
+          // While the first link is still coming up there is nothing to say yet,
+          // so a skeleton reads as "content arriving" rather than a false "no
+          // sessions". Once connected (or failed), fall back to the real message.
+          // Kept distinct from the no-sessions state on purpose: telling a user
+          // whose filter matched nothing that the desktop has no sessions open
+          // would be a lie about the desktop.
+          !filtering && (phase === 'connecting' || phase === 'reconnecting') ? (
+            <SkeletonList />
+          ) : (
+            <EmptyState
+              title={
+                filtering
+                  ? 'No matches'
+                  : phase === 'connected'
+                    ? 'No agent sessions open on the desktop.'
+                    : 'Waiting for the host…'
+              }
+              message={filtering ? `No sessions match “${query.trim()}”.` : undefined}
+              action={
+                !filtering && down ? { label: 'Retry', onPress: retry, loading: retrying } : undefined
+              }
+            />
+          )
+        ) : (
+          <SectionList
+            sections={groups}
+            keyExtractor={(s) => s.sessionId}
+            renderItem={({ item, section }) => (
+              // The project sits in the section header, so hide the per-row project
+              // label there; a pathless group (flat / "Other") has no header, so it
+              // keeps rendering the project inline.
+              <SessionRow session={item} showProject={!section.path} />
+            )}
+            renderSectionHeader={({ section }) =>
+              section.name === '' ? null : (
+                <View style={[styles.sectionHeader, { backgroundColor: theme.background }]}>
+                  <ThemedText type="small" themeColor="textMuted" numberOfLines={1} style={styles.sectionName}>
+                    {section.name}
+                  </ThemedText>
+                  {/* Only a real project (with a path) can host a new session; the
+                      "Other" bucket has none, so it gets no compose affordance. */}
+                  {section.path ? (
+                    <Pressable
+                      onPress={() => {
+                        tick();
+                        openNewSession(section.path as string);
+                      }}
+                      accessibilityLabel={`New session in ${section.name}`}
+                      hitSlop={Spacing.two}
+                    >
+                      <Icon icon={SquarePen} size="sm" color={theme.textSecondary} />
+                    </Pressable>
+                  ) : null}
+                </View>
+              )
+            }
+            ItemSeparatorComponent={ListDivider}
+            stickySectionHeadersEnabled={false}
+            contentContainerStyle={styles.list}
+            refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} />}
+          />
+        )}
         <NewSessionSheet
           visible={creating}
           busy={busy}
           error={createError}
+          initialCwd={prefillCwd}
           onCreate={create}
           onClose={() => {
             setCreating(false);
             setCreateError(undefined);
+            setPrefillCwd(undefined);
           }}
         />
         <CommandPalette
           visible={paletteOpen}
           onClose={() => setPaletteOpen(false)}
-          onNewSession={() => setCreating(true)}
+          onNewSession={() => openNewSession()}
         />
       </SafeAreaView>
     </ThemedView>
   );
 }
 
-function SessionRow({ session }: { session: SessionSummary }) {
+function SessionRow({ session, showProject }: { session: SessionSummary; showProject: boolean }) {
   const theme = useTheme();
   // The host folds the project into the title so a row is attributable to its
-  // project without a wire-schema change; render it as a muted line above.
+  // project without a wire-schema change; render it as a muted line above — but
+  // only when the row is not already under a project section header.
   const { project, label } = parseSessionTitle(session.title);
   return (
     <Pressable
@@ -217,7 +274,7 @@ function SessionRow({ session }: { session: SessionSummary }) {
       style={({ pressed }) => [styles.row, pressed && { backgroundColor: theme.surface2 }]}
     >
       <View style={styles.rowText}>
-        {project ? (
+        {showProject && project ? (
           <ThemedText type="small" numberOfLines={1} style={{ color: theme.textSecondary }}>
             {project}
           </ThemedText>
@@ -255,6 +312,16 @@ const styles = StyleSheet.create({
   },
   rowText: { flex: 1, gap: Spacing.half },
   attention: { width: 8, height: 8, borderRadius: 4 },
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: Spacing.three,
+    paddingHorizontal: Spacing.four,
+    paddingTop: Spacing.four,
+    paddingBottom: Spacing.two,
+  },
+  sectionName: { flex: 1, textTransform: 'uppercase', letterSpacing: 0.5 },
   search: {
     marginHorizontal: Spacing.four,
     // Symmetric top gap: the connection banner above is absent while connected,
