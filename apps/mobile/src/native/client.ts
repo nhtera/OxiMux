@@ -38,6 +38,14 @@ type ClientActions = {
   pair: (ticketUrl: string) => Promise<void>;
   /** Reconnect to the stored host. Resolves `false` when none is paired. */
   resume: () => Promise<boolean>;
+  /**
+   * Stand the host link back up if it is not already live. Idempotent: a no-op
+   * while `connected`/`connecting`/`reconnecting`, and a fresh `resume` otherwise
+   * (`idle`/`disconnected`/`unreachable` — the reconnect driver has stopped and
+   * nothing else will redial). Safe to call on every app foreground and on
+   * pull-to-refresh.
+   */
+  ensureConnected: () => Promise<void>;
   refreshSessions: () => Promise<void>;
   disconnect: () => Promise<void>;
   unpair: () => Promise<void>;
@@ -76,6 +84,16 @@ function deviceName(): string {
 async function newClient(): Promise<MobileClient> {
   return new MobileClient(toArrayBuffer(await getOrCreateSeed()));
 }
+
+/**
+ * The in-flight `resume`, so a cold-boot resume and a foreground `ensureConnected`
+ * that race at startup share one dial rather than each minting a client (the later
+ * one would supersede the earlier, tearing down a connection that was about to
+ * land). Cleared when the dial settles — success or failure — so a later
+ * reconnect starts fresh. Module-scoped rather than in the store because it is
+ * plumbing, not rendered state.
+ */
+let dialing: Promise<boolean> | null = null;
 
 export const useClient = create<ClientState & ClientActions>((set, get) => ({
   phase: 'idle',
@@ -129,17 +147,42 @@ export const useClient = create<ClientState & ClientActions>((set, get) => ({
    * why storing one would not have helped: its secret is single-use).
    */
   async resume() {
-    const host = await loadHost();
-    if (!host) return false;
-    const client = await newClient();
-    // See `pair`: the list is kept live by this push sink, not a poll.
-    client.setSessionsSink({ onSessions: (sessions) => set({ sessions }) });
-    set({ client, phase: 'connecting', cause: undefined });
-    await client.reconnect(toArrayBuffer(endpointIdBytes(host)), {
-      onState: (state: ConnState) => set(phaseOf(state)),
-    });
-    await get().refreshSessions();
-    return true;
+    // Coalesce concurrent calls (cold-boot boot effect + foreground reconnect)
+    // onto one dial; whoever loses the race awaits the same outcome.
+    if (dialing) return dialing;
+    dialing = (async () => {
+      const host = await loadHost();
+      if (!host) return false;
+      const client = await newClient();
+      // See `pair`: the list is kept live by this push sink, not a poll.
+      client.setSessionsSink({ onSessions: (sessions) => set({ sessions }) });
+      set({ client, phase: 'connecting', cause: undefined });
+      await client.reconnect(toArrayBuffer(endpointIdBytes(host)), {
+        onState: (state: ConnState) => set(phaseOf(state)),
+      });
+      await get().refreshSessions();
+      return true;
+    })();
+    try {
+      return await dialing;
+    } finally {
+      dialing = null;
+    }
+  },
+
+  async ensureConnected() {
+    const phase = get().phase;
+    // Already live, or a dial is already in flight — leave it be.
+    if (phase === 'connected' || phase === 'connecting' || phase === 'reconnecting') return;
+    // idle / disconnected / unreachable: the reconnect driver has given up (or
+    // never started — a JS reload can restore a screen with the store reset), so
+    // stand a fresh one up. A dial failure re-surfaces through `phase`, so there
+    // is nothing to propagate to a foreground tick or a pull-to-refresh.
+    try {
+      await get().resume();
+    } catch {
+      // phase already carries the failure (unreachable)
+    }
   },
 
   async refreshSessions() {

@@ -26,7 +26,9 @@ export default function SessionsScreen() {
   const sessions = useClient((s) => s.sessions);
   const phase = useClient((s) => s.phase);
   const refreshSessions = useClient((s) => s.refreshSessions);
+  const ensureConnected = useClient((s) => s.ensureConnected);
   const [refreshing, setRefreshing] = useState(false);
+  const [retrying, setRetrying] = useState(false);
   const [query, setQuery] = useState('');
   const theme = useTheme();
   const client = useClient((s) => s.client);
@@ -63,15 +65,33 @@ export default function SessionsScreen() {
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
+      // Reconnect first if the link is down — pull-to-refresh is the gesture a
+      // user reaches for when a screen looks stale, so it must recover the
+      // connection, not just re-list against a dead one. A no-op when live.
+      await ensureConnected();
       await refreshSessions();
     } finally {
       setRefreshing(false);
     }
-  }, [refreshSessions]);
+  }, [ensureConnected, refreshSessions]);
+
+  const retry = useCallback(async () => {
+    setRetrying(true);
+    try {
+      await ensureConnected();
+    } finally {
+      setRetrying(false);
+    }
+  }, [ensureConnected]);
+
+  // Down states (no live link, no dial in flight): the reconnect driver has
+  // given up, so offer an explicit retry alongside the foreground auto-reconnect.
+  const down = phase === 'idle' || phase === 'disconnected' || phase === 'unreachable';
 
   // The session list is kept live by a host push subscription registered in the
   // client store (the desktop streams open/close/rename/permission changes), so
-  // there is nothing to poll here. Pull-to-refresh remains as a manual nudge.
+  // there is nothing to poll here. Pull-to-refresh remains as a manual nudge, and
+  // a foreground reconnect (wired at the app root) revives a link the OS dropped.
 
   return (
     <ThemedView style={styles.fill}>
@@ -136,6 +156,11 @@ export default function SessionsScreen() {
                       : 'Waiting for the host…'
                 }
                 message={filtering ? `No sessions match “${query.trim()}”.` : undefined}
+                action={
+                  !filtering && down
+                    ? { label: 'Retry', onPress: retry, loading: retrying }
+                    : undefined
+                }
               />
             )
           }
