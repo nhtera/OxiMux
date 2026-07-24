@@ -1,7 +1,7 @@
 import { Stack, router } from 'expo-router';
 import { Plus, Search } from 'lucide-react-native';
 import type { SessionSummary } from 'oximux-core';
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { FlatList, Pressable, RefreshControl, StyleSheet, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -21,6 +21,7 @@ import { describeError } from '@/native/errors';
 import { tick } from '@/native/haptics';
 import { filterSessions } from '@/native/session-filter';
 import { parseSessionTitle } from '@/native/session-title';
+import { useNewSessionIntent } from '@/stores/new-session-intent';
 
 export default function SessionsScreen() {
   const sessions = useClient((s) => s.sessions);
@@ -32,10 +33,27 @@ export default function SessionsScreen() {
   const [query, setQuery] = useState('');
   const theme = useTheme();
   const client = useClient((s) => s.client);
-  const [creating, setCreating] = useState(false);
+  // The drawer's Sessions "+" raises a one-shot intent rather than opening the
+  // sheet itself (the sheet lives here). If it was raised before this screen
+  // mounted (drawer tapped from another screen), open with the sheet already up.
+  const [creating, setCreating] = useState(() => useNewSessionIntent.getState().requested);
   const [busy, setBusy] = useState(false);
   const [createError, setCreateError] = useState<string>();
   const [paletteOpen, setPaletteOpen] = useState(false);
+
+  // Consume the intent honored by the initial state above, and open the sheet for
+  // an intent raised while this screen is already mounted. Subscribing keeps the
+  // setState out of the effect body (the create is an external-event callback).
+  useEffect(() => {
+    const intent = useNewSessionIntent.getState();
+    if (intent.requested) intent.consume();
+    return useNewSessionIntent.subscribe((s) => {
+      if (s.requested) {
+        setCreating(true);
+        useNewSessionIntent.getState().consume();
+      }
+    });
+  }, []);
 
   const create = useCallback(
     async (cwd: string) => {

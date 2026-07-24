@@ -33,6 +33,7 @@ import { Radius, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { useClient } from '@/native/client';
 import { tick } from '@/native/haptics';
+import { useNewSessionIntent } from '@/stores/new-session-intent';
 
 const SCREEN = Dimensions.get('window').width;
 /** Panel width — most of the screen, but never full-bleed so the screen peeks. */
@@ -211,6 +212,10 @@ function DrawerPanel({
             <Pressable
               onPress={() => {
                 tick();
+                // Actually start a new session — the "+" is a create affordance,
+                // not a shortcut to the list. Raise the intent, then route to the
+                // Sessions screen that owns the create sheet.
+                useNewSessionIntent.getState().request();
                 goto('/sessions');
               }}
               accessibilityLabel="New session"
