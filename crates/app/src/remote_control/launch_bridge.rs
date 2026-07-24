@@ -146,13 +146,13 @@ pub(crate) fn open_session(
         .try_global::<oximux_settings::AgentLaunchSettings>()
         .cloned()
         .unwrap_or_default();
-    // `default_agent` is legitimately empty on a fresh install — nobody has
-    // picked one — so an unnamed request has nothing to fall back to and is
-    // refused rather than guessing at an adapter.
+    // A request that names no agent (a remote quick-add — the local launcher
+    // always names one via its picker) uses the configured default, or falls back
+    // to a chat-capable agent so it still starts before the user has picked a
+    // default. `None` only when the host has no chat-capable agent at all.
     let adapter_id = match agent_id {
         Some(id) => id.to_string(),
-        None if !settings.default_agent.is_empty() => settings.default_agent.clone(),
-        None => return Err(LaunchError::Failed),
+        None => settings.default_chat_agent().ok_or(LaunchError::Failed)?,
     };
     // Refused rather than silently defaulted: starting a *different* agent than
     // the one asked for is a worse outcome than starting none, and the phone

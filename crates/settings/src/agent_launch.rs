@@ -338,6 +338,33 @@ impl AgentLaunchSettings {
         self.agents.get(adapter_id)
     }
 
+    /// The adapter a launch that names **no** agent should use: the configured
+    /// [`default_agent`](Self::default_agent) when it is set and chat-capable, else
+    /// the first chat-capable, non-disabled agent — built-in chat agents first,
+    /// then any configured ACP one. `None` only when the host has no chat-capable
+    /// agent at all.
+    ///
+    /// Exists so a remote quick-add (which names no agent, unlike the local picker
+    /// where the user chooses one) can still start a session before the user has
+    /// picked a default — rather than failing with a bare "could not start".
+    pub fn default_chat_agent(&self) -> Option<String> {
+        let configured = self.default_agent.trim();
+        if !configured.is_empty() && self.chat_capable(configured) {
+            return Some(configured.to_string());
+        }
+        const BUILTINS: [&str; 3] = ["claude-code", "codex", "pi"];
+        BUILTINS
+            .into_iter()
+            .find(|id| self.chat_capable(id) && !self.is_disabled(id))
+            .map(str::to_string)
+            .or_else(|| {
+                self.agents
+                    .iter()
+                    .find(|(id, a)| !a.disabled && self.chat_capable(id))
+                    .map(|(id, _)| id.clone())
+            })
+    }
+
     /// Mutable launch entry for `adapter_id`, inserting a default if absent.
     /// Used by the settings UI to flip toggles.
     pub fn entry_mut(&mut self, adapter_id: &str) -> &mut PerAgentLaunch {
@@ -608,6 +635,30 @@ acp_args = "--experimental-acp --foo"
         s.entry_mut("gemini").acp_command = "gemini".into();
         assert!(s.chat_capable("gemini"));
         assert_eq!(s.transport_for("gemini"), Transport::Acp);
+    }
+
+    #[test]
+    fn default_chat_agent_falls_back_when_no_default_is_set() {
+        // Empty default (the fresh-install state): a remote quick-add still
+        // resolves to a built-in chat agent rather than failing.
+        let s = AgentLaunchSettings::default();
+        assert!(s.default_agent.is_empty());
+        assert_eq!(s.default_chat_agent().as_deref(), Some("claude-code"));
+    }
+
+    #[test]
+    fn default_chat_agent_prefers_the_configured_default() {
+        let mut s = AgentLaunchSettings::default();
+        s.default_agent = "codex".into();
+        assert_eq!(s.default_chat_agent().as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn default_chat_agent_skips_a_disabled_builtin() {
+        // claude-code hidden from the picker → fall through to the next chat agent.
+        let mut s = AgentLaunchSettings::default();
+        s.entry_mut("claude-code").disabled = true;
+        assert_eq!(s.default_chat_agent().as_deref(), Some("codex"));
     }
 
     #[test]
