@@ -236,8 +236,21 @@ export const useClient = create<ClientState & ClientActions>((set, get) => ({
     set({ phase: 'idle', sessions: [], projects: [], client: undefined, cause: undefined });
   },
 
-  /** Drop the connection and forget the host, sending the app back to pairing. */
+  /**
+   * Drop the connection and forget the host, sending the app back to pairing.
+   *
+   * Tells the desktop first, so its paired-devices list loses this phone instead
+   * of keeping a row for a device that has gone. Best-effort on purpose: a
+   * desktop that is asleep, unreachable, or too old to know the call must not be
+   * able to keep this phone enrolled, so the local forget happens either way and
+   * the failure costs only a stale row the desktop's own Forget clears.
+   */
   async unpair() {
+    try {
+      await get().client?.unpair();
+    } catch {
+      // Left enrolled on the desktop; the phone still forgets it here.
+    }
     await get().disconnect();
     await clearHost();
   },

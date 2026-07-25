@@ -115,7 +115,8 @@ pub struct PairedDevice {
     pub name: String,
 }
 
-/// What came of a scan, so the desktop can say which it was.
+/// A change in who is paired, so the desktop can say what happened: what came of
+/// a scan, or a device leaving of its own accord.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PairingEvent {
     /// A new device registered and now has full access.
@@ -130,6 +131,14 @@ pub enum PairingEvent {
     /// open — this path does not spend the code — so the desktop can say what
     /// happened without withdrawing it.
     AlreadyPaired(PairedDevice),
+    /// A device dropped its own enrollment (the phone's "Forget this desktop"),
+    /// so it is gone from the device list and must pair afresh to return.
+    ///
+    /// Unlike the other two this is not the outcome of a scan — nothing on the
+    /// desktop prompted it — which is exactly why it is announced: the paired-
+    /// devices list is rendered from a snapshot, so without a nudge it would go on
+    /// showing a device that had already left.
+    Unpaired(PairedDevice),
 }
 
 #[derive(Default)]
@@ -169,7 +178,8 @@ impl AuthStore {
         Self::default()
     }
 
-    /// Watch what becomes of scans against the advertised code.
+    /// Watch the pairing set change — what becomes of scans against the
+    /// advertised code, and devices that un-enrol themselves.
     pub fn subscribe_pairings(&self) -> broadcast::Receiver<PairingEvent> {
         self.paired_tx.subscribe()
     }

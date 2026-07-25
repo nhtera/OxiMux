@@ -60,6 +60,19 @@ impl MobileClient {
         Ok(rows.into_iter().map(ProjectSummary::from).collect())
     }
 
+    /// Tell the host to forget this device, so the desktop's paired-devices list
+    /// loses the row for a phone the user has just unpaired.
+    ///
+    /// The caller is expected to drop its stored host afterwards **whether or not
+    /// this succeeds**: unpairing is a local decision, and a desktop that is
+    /// asleep or unreachable must not be able to keep a phone enrolled. The cost
+    /// of the failure case is a stale row the user can clear with the desktop's
+    /// own Forget, which is strictly better than a phone that cannot leave.
+    pub async fn unpair(&self) -> Result<(), MobileError> {
+        let session = self.shared.session()?;
+        session.unpair().await.map_err(|e| MobileError::Rpc(e.to_string()))
+    }
+
     /// Queue a prompt into a session's turn.
     pub async fn send_prompt(
         &self,

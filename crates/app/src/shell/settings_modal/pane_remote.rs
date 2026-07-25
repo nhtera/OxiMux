@@ -107,6 +107,64 @@ fn open_window(modal: &mut SettingsModal, cx: &mut gpui::Context<SettingsModal>)
     watch_for_pairing(cx, epoch);
 }
 
+/// Report devices that un-enrol themselves, for as long as the modal lives.
+///
+/// Separate from [`watch_for_pairing`] because it answers a different question.
+/// That one is scoped to a pairing window and dies with it; this one has to
+/// outlive every window, since a phone's "Forget this desktop" is not an answer
+/// to anything the desktop is doing — it can land with no code on screen and the
+/// Remote pane nowhere in sight.
+///
+/// The repaint is the point: the paired-devices list renders from a snapshot
+/// taken per frame, so an open pane would otherwise keep listing a phone that had
+/// already left. The toast covers the other case, where the pane is closed and
+/// the repaint alone would tell the user nothing.
+pub(super) fn watch_for_unpair(modal: &mut SettingsModal, cx: &mut gpui::Context<SettingsModal>) {
+    if modal.remote_unpair_watch {
+        return;
+    }
+    let Some(mut pairings) = cx.try_global::<RemoteControl>().and_then(|rc| rc.subscribe_pairings())
+    else {
+        return;
+    };
+    modal.remote_unpair_watch = true;
+    cx.spawn(async move |this, cx| {
+        loop {
+            match pairings.recv().await {
+                Ok(PairingEvent::Unpaired(device)) => {
+                    let updated = this.update(cx, |_this, cx| {
+                        toast(
+                            cx,
+                            ToastKind::Info,
+                            format!(
+                                "\u{201c}{}\u{201d} unpaired itself \u{2014} it needs a new code to return",
+                                device.name
+                            ),
+                        );
+                        cx.notify();
+                    });
+                    // The modal is gone, so nothing is left to repaint or toast.
+                    if updated.is_err() {
+                        break;
+                    }
+                }
+                // Pairing outcomes belong to the window that opened the code.
+                Ok(_) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // The store this listened to is gone — turning remote access off
+                // and on again builds a new one. Clear the flag on the way out so
+                // the next open subscribes to the replacement instead of trusting
+                // a watcher that has nothing left to hear.
+                Err(broadcast::error::RecvError::Closed) => {
+                    let _ = this.update(cx, |this, _cx| this.remote_unpair_watch = false);
+                    break;
+                }
+            }
+        }
+    })
+    .detach();
+}
+
 /// Wait for a device to redeem the window opened as `epoch`, then show it.
 ///
 /// Scoped to the window rather than to the host, because a window is the only
@@ -190,6 +248,10 @@ fn watch_for_pairing(cx: &mut gpui::Context<SettingsModal>, epoch: u64) {
                     // later one superseded it. `Pair another` spawns a fresh watcher.
                     break;
                 }
+                // A device leaving says nothing about the window this watcher
+                // guards — the code is untouched and still waiting on a scan.
+                // Reported by the pane's own long-lived watcher instead.
+                Ok(PairingEvent::Unpaired(_)) => continue,
                 // Fell behind the ring; the pairing is still in the device list,
                 // so keep listening rather than giving up.
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,

@@ -190,8 +190,12 @@ impl AuthStore {
     /// This is the explicit host-side undo that [`register`](Self::register)'s
     /// already-known check requires. Keeping it separate from `revoke` is the
     /// point: revoking a lost phone must stay permanent, because otherwise anyone
-    /// holding a pairing code could undo it over the wire. Forgetting is only
-    /// reachable from the desktop, by someone already at the machine.
+    /// holding a pairing code could undo it over the wire.
+    ///
+    /// Reachable two ways, and only two: from the desktop, by someone already at
+    /// the machine, and from a device dropping *itself*
+    /// ([`forget_self`](Self::forget_self)). No path lets one device forget
+    /// another.
     pub fn forget(&self, pubkey: &AppPubkey) {
         {
             let mut st = self.inner.lock().unwrap();
@@ -203,6 +207,34 @@ impl AuthStore {
         }
         // Write through outside the lock (the store may block on I/O).
         self.persist_removed(pubkey);
+    }
+
+    /// [`forget`](Self::forget) a device at its own request, announcing it so the
+    /// desktop's list stops showing a device that has walked away.
+    ///
+    /// Announced where the desktop-initiated `forget` is not: that one is already
+    /// a direct response to a click, and the list it refreshes is the one the
+    /// clicker is looking at. This one arrives with nothing on screen having
+    /// caused it, so the pane would otherwise keep listing a phone that had
+    /// dropped the pairing — precisely the stale row that made the phone's
+    /// "Forget this desktop" look like it had done nothing.
+    ///
+    /// The name is read before the record goes, since afterwards there is nothing
+    /// left to name it with.
+    pub fn forget_self(&self, pubkey: &AppPubkey) {
+        let name = self
+            .inner
+            .lock()
+            .unwrap()
+            .devices
+            .get(pubkey)
+            .map(|d| d.name.clone())
+            .unwrap_or_default();
+        self.forget(pubkey);
+        self.announce_paired(super::PairingEvent::Unpaired(super::PairedDevice {
+            pubkey: *pubkey,
+            name,
+        }));
     }
 
     /// Revoke a device: it fails the next per-RPC recheck and its tokens die.

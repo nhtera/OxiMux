@@ -41,14 +41,16 @@ pub use crate::messages::*;
 /// full history even after a host restart (the restored transcript never enters
 /// the live event ring). v14: appended `ListProjects` and its `Projects` reply —
 /// the host's projects (name + path) so a client can start a session in one
-/// without typing its path.
+/// without typing its path. v15: appended `Unpair` — a device drops its own
+/// enrollment, so forgetting a desktop on the phone also clears the phone from
+/// the desktop's paired-devices list.
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// The oldest peer version this build still speaks. **Raise this only on a
 /// genuinely breaking change** — a reordered/removed variant or an altered
@@ -367,6 +369,20 @@ pub enum Request {
     /// `CreateSession` — the list is only useful for creating, and it exposes host
     /// paths, so a device that may not create sessions may not enumerate them.
     ListProjects,
+    /// Drop **this** device's enrollment, so a user who forgets the desktop on
+    /// their phone also disappears from the desktop's paired-devices list. Replies
+    /// [`Response::Ack`]; the connection is unauthorized from the next RPC on.
+    ///
+    /// Carries no pubkey: it acts on the calling connection's own identity, which
+    /// the host already authenticated. A device that could name its subject would
+    /// be a remote un-enrollment of *other* devices, which is a desktop-only act.
+    ///
+    /// Erases the record rather than tombstoning it, so the phone may pair again
+    /// with a fresh code — the same asymmetry the desktop's own Forget has against
+    /// Revoke. Revocation stays out of reach here because a revoked device fails
+    /// the authorization gate before this handler runs, so it cannot clear its own
+    /// tombstone and re-pair.
+    Unpair,
 }
 
 /// Host → client.

@@ -459,6 +459,30 @@ fn a_rejected_registration_is_not_announced() {
     assert!(events.try_recv().is_err(), "nothing announced for a refused pairing");
 }
 
+/// A device dropping itself is announced under the name the host holds for it,
+/// which is the only name still available once the record is gone.
+#[test]
+fn a_device_forgetting_itself_is_announced_before_the_name_is_lost() {
+    let store = AuthStore::new();
+    let secret = [0xa1; 16];
+    store.set_pairing(slot(secret));
+    let ts = 1_700_000_000;
+    let pubkey = vk(0x77);
+    store.register(&a_register(pubkey, "Tien's phone", &secret, ts), ts).expect("pairing");
+
+    let mut events = store.subscribe_pairings();
+    store.forget_self(&pubkey);
+
+    let PairingEvent::Unpaired(announced) = events.try_recv().expect("the departure was announced")
+    else {
+        panic!("a device dropping itself announces Unpaired");
+    };
+    assert_eq!(announced.name, "Tien's phone");
+    assert_eq!(announced.pubkey, pubkey);
+    assert!(!store.is_authorized(&pubkey), "and it is gone");
+    assert!(store.devices().is_empty(), "erased, not tombstoned");
+}
+
 /// A session-scoped device gets **no** terminal access at all — not a filtered
 /// list, not read-only, none.
 ///

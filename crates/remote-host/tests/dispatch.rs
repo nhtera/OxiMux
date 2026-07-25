@@ -780,3 +780,89 @@ fn pairing_records_the_devices_first_sighting() {
 
     block_on(join(serve, script));
 }
+
+/// The phone's "Forget this desktop", end to end: the device drops its own
+/// enrollment over the wire, and the desktop's list loses the row instead of
+/// keeping a phone that has already gone.
+#[test]
+fn a_device_unpairs_itself_and_may_pair_again() {
+    let registry = seeded_registry();
+    let auth = Arc::new(AuthStore::new());
+    // Static (not one-time), so re-pairing afterwards exercises the erased record
+    // rather than a spent code.
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth.clone()).with_clock(clock);
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let pubkey = SigningKey::from_bytes(&[9u8; 32]).verifying_key().to_bytes();
+
+    let script = async move {
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+        assert_eq!(auth.devices().len(), 1, "paired");
+
+        assert_eq!(call(&client, Request::Unpair).await, Response::Ack);
+        assert!(auth.devices().is_empty(), "the desktop's list loses the device");
+
+        // Same cut-off as a desktop-side forget: the link is up, the device is not.
+        assert_eq!(call(&client, Request::Ping).await, Response::Pong);
+        assert_eq!(
+            call(&client, Request::ListSessions).await,
+            Response::Error(RpcError::Unauthorized),
+            "an unpaired device is no longer authorized",
+        );
+
+        // Erased, not tombstoned — scanning a fresh code works, which is what
+        // separates unpairing from being revoked.
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("a device that unpaired itself can pair again");
+        };
+        assert_eq!(auth.devices().len(), 1);
+    };
+
+    block_on(join(serve, script));
+}
+
+/// Unpairing cannot launder a revocation. A revoked device fails the
+/// authorization gate before the handler runs, so it can neither erase its own
+/// tombstone nor pair back in behind it.
+#[test]
+fn a_revoked_device_cannot_unpair_away_its_tombstone() {
+    let registry = seeded_registry();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth.clone()).with_clock(clock);
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let pubkey = SigningKey::from_bytes(&[10u8; 32]).verifying_key().to_bytes();
+
+    let script = async move {
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+        auth.revoke(&pubkey);
+
+        assert_eq!(
+            call(&client, Request::Unpair).await,
+            Response::Error(RpcError::Unauthorized),
+            "a revoked device may not un-enrol itself",
+        );
+        assert!(
+            auth.devices().iter().any(|d| d.pubkey == pubkey && d.revoked),
+            "the tombstone survives",
+        );
+        assert_eq!(
+            call(&client, Request::Register(register_req(pubkey))).await,
+            Response::Error(RpcError::Unauthorized),
+            "and it still cannot pair back in",
+        );
+    };
+
+    block_on(join(serve, script));
+}

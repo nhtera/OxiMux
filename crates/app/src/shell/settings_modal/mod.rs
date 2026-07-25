@@ -98,6 +98,14 @@ pub struct SettingsModal {
     /// device to actually pair woke all of them at once: one toast per window
     /// ever opened.
     pub(super) remote_pairing_epoch: u64,
+    /// Whether the watcher that reports devices leaving is running. One per modal,
+    /// not per pairing window: a device un-enrols on its own schedule, with no
+    /// code on screen and often no Remote pane open.
+    ///
+    /// Set only once the subscription actually succeeds, so opening settings
+    /// before remote access is on doesn't consume the single attempt — the next
+    /// open tries again, by which time the host may have bound.
+    pub(super) remote_unpair_watch: bool,
     /// Flat KV store the notification toggles persist into (keys in
     /// [`crate::notifier::keys`]), so prefs survive a restart.
     pub(crate) notify_repo: SettingsRepo,
@@ -190,6 +198,7 @@ impl SettingsModal {
             qr_cache: std::cell::RefCell::new(None),
             remote_pairing: None,
             remote_pairing_epoch: 0,
+            remote_unpair_watch: false,
             focus_handle: cx.focus_handle(),
             theme,
             density,
@@ -252,6 +261,10 @@ impl SettingsModal {
             .try_global::<DictationSettings>()
             .cloned()
             .unwrap_or_default();
+        // Start reporting devices that drop themselves, if the host is up. Not in
+        // the constructor: the remote host binds later than the shell is built, so
+        // subscribing there would find nothing to subscribe to.
+        pane_remote::watch_for_unpair(self, cx);
         // Reseed the keybinding overrides from disk (hand edits since boot
         // show up here; load problems were already toasted at boot).
         self.keybind_overrides = crate::keybindings_settings::load_overrides().0;

@@ -170,6 +170,15 @@ impl RemoteSession {
         }
     }
 
+    /// Drop this device's enrollment on the host, so forgetting the desktop here
+    /// also clears this device from the desktop's paired-devices list.
+    ///
+    /// One-way and immediate: every later RPC on this connection is refused, so
+    /// callers unpair as the last thing they do before tearing the link down.
+    pub async fn unpair(&self) -> Result<()> {
+        self.expect_ack(Request::Unpair).await
+    }
+
     /// Send a user prompt into a session, starting a turn. `corr_id` lets the
     /// caller match the eventual echoed turn in the event stream.
     pub async fn send_prompt(

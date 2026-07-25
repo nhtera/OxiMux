@@ -225,6 +225,14 @@ impl Dispatcher {
             Request::GetScheduleRuns { schedule_id, limit } => {
                 self.schedule_runs(pubkey, &schedule_id, limit)
             }
+            // Un-enrolling itself. Gated on the authenticated connection alone: it
+            // only ever narrows the caller's own access, so neither full scope nor
+            // write access is the right thing to ask for — a session-scoped,
+            // read-only device may still stop being paired.
+            Request::Unpair => {
+                self.auth.forget_self(pubkey);
+                Response::Ack
+            }
             // Handshake variants (handled before auth) and `Subscribe` (intercepted
             // in `serve`) never reach here.
             _ => Response::Error(RpcError::BadRequest("unexpected request".into())),

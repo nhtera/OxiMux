@@ -16,7 +16,7 @@ fn value_bearing_event() -> ThreadEvent {
 /// documented wire change, so an accidental edit fails here.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 14, "v14 = the appended project list");
+    assert_eq!(PROTOCOL_VERSION, 15, "v15 = the appended self-unpair");
 }
 
 /// The floor moves only on a genuinely breaking change, never merely because
