@@ -1,7 +1,8 @@
 //! xtask — repo-level lint orchestrator. CI calls these subcommands.
 //!
 //! Subcommands:
-//!   xtask file-size-lint   Walk crates/*/src and warn > 1500 LOC, fail > 3000.
+//!   xtask file-size-lint   Walk the Rust source roots and warn > 1500 LOC,
+//!                          fail > 3000.
 //!   xtask ci-check         Run all xtask checks back-to-back.
 //!
 //! Thresholds match GPUI reality (large render/impl files are idiomatic). A
@@ -17,6 +18,14 @@ use std::process::ExitCode;
 const WARN_LOC: usize = 1500;
 const FAIL_LOC: usize = 3000;
 const ALLOW_FILE: &str = "xtask/file-size-allow.txt";
+
+/// Repo-relative directories the lint walks, enumerated rather than globbed.
+///
+/// `apps/` is NOT walked wholesale on purpose: `apps/mobile` is a React Native
+/// tree (~1.2 GB, thousands of directories under `ios/`) with no Rust in it, so
+/// scanning it would cost far more than the lint itself. A new Rust app is one
+/// row here.
+const SOURCE_ROOTS: &[&str] = &["crates", "apps/desktop"];
 
 fn main() -> ExitCode {
     let cmd = std::env::args().nth(1).unwrap_or_else(|| "help".into());
@@ -40,13 +49,18 @@ fn main() -> ExitCode {
 }
 
 fn print_help() {
+    let roots = SOURCE_ROOTS
+        .iter()
+        .map(|r| format!("{r}/**/*.rs"))
+        .collect::<Vec<_>>()
+        .join(", ");
     println!(
         "xtask — OxiMux repo checks\n\
          \n\
          USAGE:\n  xtask <command>\n\
          \n\
          COMMANDS:\n\
-           file-size-lint   Enforce {WARN_LOC} warn / {FAIL_LOC} fail LOC caps in crates/*/src/**/*.rs\n\
+           file-size-lint   Enforce {WARN_LOC} warn / {FAIL_LOC} fail LOC caps across {roots}\n\
            ci-check         Run all checks (currently: file-size-lint)\n\
            help             Print this message"
     );
@@ -54,14 +68,20 @@ fn print_help() {
 
 fn file_size_lint() -> Result<(), Box<dyn std::error::Error>> {
     let root = workspace_root()?;
-    let crates_dir = root.join("crates");
     let allow = load_allowlist(&root)?;
     // Track which allowlist rows we actually saw over-cap, to flag stale rows.
     let mut seen_over_cap: HashMap<String, bool> = allow.keys().map(|k| (k.clone(), false)).collect();
     let mut warn = 0usize;
     let mut fail = 0usize;
 
-    for rs in collect_rs_files(&crates_dir.join(""))? {
+    let mut sources = Vec::new();
+    for source_root in SOURCE_ROOTS {
+        sources.extend(collect_rs_files(&root.join(source_root))?);
+    }
+    // Stable order regardless of read_dir(), so output diffs cleanly run to run.
+    sources.sort();
+
+    for rs in sources {
         let loc = count_loc(&rs)?;
         let rel_path = rs.strip_prefix(&root).unwrap_or(&rs);
         let rel = rel_path.to_string_lossy().replace('\\', "/");
