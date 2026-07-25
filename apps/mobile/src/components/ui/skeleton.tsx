@@ -1,6 +1,12 @@
 import { useEffect } from 'react';
 import { StyleSheet, type StyleProp, View, type ViewStyle } from 'react-native';
-import Animated, { useAnimatedStyle, useSharedValue, withRepeat, withTiming } from 'react-native-reanimated';
+import Animated, {
+  cancelAnimation,
+  useAnimatedStyle,
+  useSharedValue,
+  withRepeat,
+  withTiming,
+} from 'react-native-reanimated';
 
 import { Radius } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
@@ -26,7 +32,12 @@ export function Skeleton({
 
   useEffect(() => {
     pulse.value = withRepeat(withTiming(0.8, { duration: 900 }), -1, true);
-    return () => {};
+    // A `-1` repeat never ends on its own, so an unmounted skeleton would keep
+    // its animation — and the shadow node it drives — alive for the life of the
+    // process. Placeholders mount on every load, refresh and reconnect, so the
+    // leak compounds: the UI thread ends up committing props for hundreds of
+    // rows nobody can see. Cancelling on unmount is what bounds it.
+    return () => cancelAnimation(pulse);
   }, [pulse]);
 
   const animatedStyle = useAnimatedStyle(() => ({ opacity: pulse.value }));
