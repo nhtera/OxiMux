@@ -6,7 +6,6 @@
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": true,
     "scheme": "oximux",
     "ios": {
       "icon": "./assets/expo.icon",
@@ -58,7 +57,8 @@
         {
           "microphonePermission": "OxiMux uses the microphone only to dictate a prompt, which your desktop transcribes."
         }
-      ]
+      ],
+      "expo-asset"
     ],
     "experiments": {
       "typedRoutes": true,

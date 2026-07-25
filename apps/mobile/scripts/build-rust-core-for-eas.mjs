@@ -23,7 +23,7 @@
 // present and `ubrn.config.yaml`'s relative `rust.directory` resolves normally.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -96,5 +96,13 @@ const buildArgs =
     : ['ubrn', 'build', 'android', '--release', '--and-generate'];
 run('npx', buildArgs, coreModule);
 run('npx', ['bob', 'build'], coreModule);
+
+// The bootstrap tree has served its purpose, and leaving it behind would put a
+// second copy of react and react-native next to the app's — a native build may
+// only contain one of each, so the duplicates are a real hazard rather than
+// wasted disk. Everything generated above lives outside node_modules, and the
+// app's own install hoists ubrn and bob, so the `prepare` script npm runs on
+// this module during that install still resolves.
+rmSync(join(coreModule, 'node_modules'), { recursive: true, force: true });
 
 console.log('\n✓ native core ready — the app install can now resolve oximux-core');
