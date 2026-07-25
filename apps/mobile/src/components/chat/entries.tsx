@@ -1,6 +1,8 @@
+import { Image } from 'expo-image';
 import { useState } from 'react';
 import { Pressable, StyleSheet, View } from 'react-native';
 
+import { ImageLightbox, dataUri } from '@/components/chat/image-lightbox';
 import { MarkdownBody } from '@/components/chat/markdown-body';
 import { MessageActions } from '@/components/chat/message-actions';
 import { ThemedText } from '@/components/themed-text';
@@ -11,18 +13,40 @@ import { type AssistantMessage, type ChatImage } from '@/native/thread';
 
 export function UserBubble({ text, images }: { text: string; images: ChatImage[] }) {
   const theme = useTheme();
+  const [zoom, setZoom] = useState<ChatImage | null>(null);
   return (
     <View style={styles.userRow}>
       <View style={styles.userCol}>
-        <View style={[styles.userBubble, { backgroundColor: theme.backgroundSelected }]}>
-          {text ? <ThemedText style={styles.body}>{text}</ThemedText> : null}
-          {images.length > 0 ? (
-            <ThemedText type="small" themeColor="textMuted">
-              {images.length === 1 ? '1 image attached' : `${images.length} images attached`}
-            </ThemedText>
-          ) : null}
-        </View>
-        <MessageActions text={text} />
+        {/* Above the bubble rather than inside it, matching the desktop: an
+            attachment is its own thing, and nesting it would make the bubble
+            stretch to the image's width and swallow the tail corner. */}
+        {images.length > 0 ? (
+          <View style={styles.thumbs}>
+            {images.map((image, i) => (
+              <Pressable
+                key={i}
+                onPress={() => setZoom(image)}
+                accessibilityRole="imagebutton"
+                accessibilityLabel="View attached image"
+              >
+                <Image
+                  source={{ uri: dataUri(image) }}
+                  style={[styles.thumb, { backgroundColor: theme.surface2 }]}
+                  contentFit="cover"
+                />
+              </Pressable>
+            ))}
+          </View>
+        ) : null}
+        {/* An image-only prompt renders no bubble at all — an empty rounded box
+            beneath the thumbnail reads as a rendering fault. */}
+        {text ? (
+          <View style={[styles.userBubble, { backgroundColor: theme.backgroundSelected }]}>
+            <ThemedText style={styles.body}>{text}</ThemedText>
+          </View>
+        ) : null}
+        {text ? <MessageActions text={text} /> : null}
+        <ImageLightbox image={zoom} onClose={() => setZoom(null)} />
       </View>
     </View>
   );
@@ -82,6 +106,11 @@ const styles = StyleSheet.create({
     paddingVertical: Spacing.two,
     gap: Spacing.one,
   },
+  // Larger than the tool-call card's thumbnail: that one is an incidental
+  // result among many rows, while this is the thing the user chose to send and
+  // wants to recognise at a glance without opening the viewer.
+  thumbs: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'flex-end', gap: Spacing.one },
+  thumb: { width: 128, height: 128, borderRadius: Radius.md },
   assistant: { gap: Spacing.one },
   thinking: { fontStyle: 'italic' },
   divider: { alignItems: 'center', paddingVertical: Spacing.two },
