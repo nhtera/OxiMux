@@ -1,28 +1,25 @@
 import { Stack, router } from 'expo-router';
-import { Plus, Search, SquarePen } from 'lucide-react-native';
-import type { SessionSummary } from 'oximux-core';
+import { Plus, Search } from 'lucide-react-native';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { Pressable, RefreshControl, SectionList, StyleSheet, TextInput, View } from 'react-native';
+import { RefreshControl, SectionList, StyleSheet, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { CommandPalette } from '@/components/command-palette';
 import { ConnectionBanner } from '@/components/connection-banner';
 import { NewSessionSheet } from '@/components/new-session-sheet';
+import { ProjectGroupHeader, PROJECT_INDENT } from '@/components/sessions/project-group-header';
+import { SessionListRow } from '@/components/sessions/session-list-row';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
 import { EmptyState } from '@/components/ui/empty-state';
-import { Icon } from '@/components/ui/icon';
 import { IconButton } from '@/components/ui/icon-button';
-import { ListDivider } from '@/components/ui/list-row';
 import { SkeletonList } from '@/components/ui/skeleton';
 import { Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { useClient } from '@/native/client';
 import { describeError } from '@/native/errors';
-import { tick } from '@/native/haptics';
 import { filterSessions } from '@/native/session-filter';
 import { groupSessionsByProject } from '@/native/session-grouping';
-import { parseSessionTitle } from '@/native/session-title';
 import { useNewSessionIntent } from '@/stores/new-session-intent';
 
 export default function SessionsScreen() {
@@ -101,6 +98,32 @@ export default function SessionsScreen() {
   const groups = useMemo(
     () => groupSessionsByProject(filtering ? [] : projects, visible),
     [filtering, projects, visible]
+  );
+
+  // Which projects the user has folded open or shut, by key. Absent means "not
+  // touched", which is why the default is computed rather than seeded: a project
+  // that gains its first session should open on its own, and one that arrives
+  // later must not inherit a neighbour's state.
+  const [toggled, setToggled] = useState<Record<string, boolean>>({});
+  // The rows animate themselves in and out (see `SessionListRow`) rather than
+  // this configuring `LayoutAnimation` here: frame-by-frame capture of a toggle
+  // showed that API changing nothing at all under the New Architecture — the
+  // rows appeared between two frames — while the row-level transition measures
+  // as a six-frame fade in both directions.
+  const toggle = useCallback(
+    (key: string, expanded: boolean) => setToggled((t) => ({ ...t, [key]: !expanded })),
+    []
+  );
+  // `data` is what collapsing acts on — an empty section still renders its
+  // header, so the list keeps every project reachable while hiding its rows.
+  // `count` survives that emptying, since the header reports it while shut.
+  const sections = useMemo(
+    () =>
+      groups.map((g) => {
+        const expanded = toggled[g.key] ?? g.data.length > 0;
+        return { ...g, expanded, count: g.data.length, data: expanded ? g.data : [] };
+      }),
+    [groups, toggled]
   );
   // Nothing to list when there are no matches and no project headers to offer —
   // that is when the skeleton / empty / down message takes over. A connected host
@@ -206,38 +229,40 @@ export default function SessionsScreen() {
           )
         ) : (
           <SectionList
-            sections={groups}
+            sections={sections}
             keyExtractor={(s) => s.sessionId}
             renderItem={({ item, section }) => (
               // The project sits in the section header, so hide the per-row project
               // label there; a pathless group (flat / "Other") has no header, so it
               // keeps rendering the project inline.
-              <SessionRow session={item} showProject={!section.path} />
+              <SessionListRow session={item} showProject={!section.path} />
             )}
             renderSectionHeader={({ section }) =>
               section.name === '' ? null : (
-                <View style={[styles.sectionHeader, { backgroundColor: theme.background }]}>
-                  <ThemedText type="small" themeColor="textMuted" numberOfLines={1} style={styles.sectionName}>
-                    {section.name}
-                  </ThemedText>
-                  {/* Only a real project (with a path) can host a new session; the
-                      "Other" bucket has none, so it gets no compose affordance. */}
-                  {section.path ? (
-                    <Pressable
-                      onPress={() => {
-                        tick();
-                        openNewSession(section.path as string);
-                      }}
-                      accessibilityLabel={`New session in ${section.name}`}
-                      hitSlop={Spacing.two}
-                    >
-                      <Icon icon={SquarePen} size="sm" color={theme.textSecondary} />
-                    </Pressable>
-                  ) : null}
-                </View>
+                <ProjectGroupHeader
+                  name={section.name}
+                  count={section.count}
+                  expanded={section.expanded}
+                  onToggle={() => toggle(section.key, section.expanded)}
+                  // Only a real project (with a path) can host a new session; the
+                  // "Other" bucket has none, so it gets no compose affordance.
+                  onCompose={section.path ? () => openNewSession(section.path as string) : undefined}
+                />
               )
             }
-            ItemSeparatorComponent={ListDivider}
+            // An open project with nothing in it says so, rather than showing a
+            // name with a gap under it — the state that used to look like a list
+            // that had failed to load.
+            renderSectionFooter={({ section }) =>
+              section.expanded && section.count === 0 && section.name !== '' ? (
+                <ThemedText type="small" themeColor="textMuted" style={styles.emptyProject}>
+                  No sessions yet
+                </ThemedText>
+              ) : null
+            }
+            // No `ItemSeparatorComponent`: indentation groups the rows now, and
+            // the rule it drew was inset on the left but ran to the screen edge
+            // on the right.
             stickySectionHeadersEnabled={false}
             contentContainerStyle={styles.list}
             refreshControl={<RefreshControl refreshing={refreshing} onRefresh={refresh} />}
@@ -265,42 +290,6 @@ export default function SessionsScreen() {
   );
 }
 
-function SessionRow({ session, showProject }: { session: SessionSummary; showProject: boolean }) {
-  const theme = useTheme();
-  // The host folds the project into the title so a row is attributable to its
-  // project without a wire-schema change; render it as a muted line above — but
-  // only when the row is not already under a project section header.
-  const { project, label } = parseSessionTitle(session.title);
-  return (
-    <Pressable
-      onPress={() => {
-        tick();
-        router.push({ pathname: '/session/[id]', params: { id: session.sessionId } });
-      }}
-      style={({ pressed }) => [styles.row, pressed && { backgroundColor: theme.surface2 }]}
-    >
-      <View style={styles.rowText}>
-        {showProject && project ? (
-          <ThemedText type="small" numberOfLines={1} style={{ color: theme.textSecondary }}>
-            {project}
-          </ThemedText>
-        ) : null}
-        <ThemedText numberOfLines={1}>{label}</ThemedText>
-        {session.model ? (
-          <ThemedText type="small" numberOfLines={1}>
-            {session.model}
-          </ThemedText>
-        ) : null}
-      </View>
-      {/* A session blocked on a permission is the one thing worth crossing the
-          room for, so it gets the only accent in the row. */}
-      {session.awaitingPermission ? (
-        <View style={[styles.attention, { backgroundColor: theme.warning }]} />
-      ) : null}
-    </Pressable>
-  );
-}
-
 const styles = StyleSheet.create({
   fill: { flex: 1 },
   headerActions: { flexDirection: 'row', alignItems: 'center', gap: Spacing.two },
@@ -308,26 +297,14 @@ const styles = StyleSheet.create({
   // collapses to the height of the empty-state text, leaving nothing tall enough
   // to drag — so pull-to-refresh silently does nothing in exactly the state where
   // it is needed most, and an empty list looks like a host exposing no sessions.
-  list: { flexGrow: 1, paddingVertical: Spacing.two },
-  row: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Spacing.three,
-    paddingVertical: Spacing.three,
-    paddingHorizontal: Spacing.four,
+  list: { flexGrow: 1, paddingBottom: Spacing.four },
+  // Aligned with the session rows it stands in for, so an empty project reads as
+  // the same column of content rather than a stray caption.
+  emptyProject: {
+    paddingLeft: Spacing.four + PROJECT_INDENT,
+    paddingRight: Spacing.four,
+    paddingVertical: Spacing.two,
   },
-  rowText: { flex: 1, gap: Spacing.half },
-  attention: { width: 8, height: 8, borderRadius: 4 },
-  sectionHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: Spacing.three,
-    paddingHorizontal: Spacing.four,
-    paddingTop: Spacing.four,
-    paddingBottom: Spacing.two,
-  },
-  sectionName: { flex: 1, textTransform: 'uppercase', letterSpacing: 0.5 },
   search: {
     marginHorizontal: Spacing.four,
     // Symmetric top gap: the connection banner above is absent while connected,
