@@ -32,6 +32,20 @@ pub const ENABLED_SETTING: &str = "remote.enabled";
 /// governing the other would make turning off a notification setting stop a
 /// paired phone from reaching this Mac.
 pub const KEEP_AWAKE_SETTING: &str = "remote.keep_awake";
+
+/// How long an opened pairing window stays redeemable.
+///
+/// Long enough to walk to the phone, unlock it, and open the app; short enough
+/// that a code left on an unattended screen stops working before the desk does.
+pub const PAIRING_WINDOW_SECS: u64 = 5 * 60;
+
+/// Wall clock in unix seconds, saturating at the epoch on a clock set before it.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 use futures::channel::mpsc;
 use oximux_agents::session_registry::{
     RemoteChoice, RemotePrompt, SessionHandle, SessionMeta, SessionRegistry,
@@ -269,39 +283,53 @@ impl RemoteControl {
         self.enabled.store(on, Ordering::Release);
     }
 
-    /// Assemble a fresh dispatcher + one-time CSPRNG pairing secret for a host bind.
-    /// The secret seeds both the auth store's advertised pairing slot and the
-    /// `PairingTicket` that [`start_host`](oximux_remote_iroh::start_host) mints, so
-    /// the QR and the host agree. A fresh [`AuthStore`] per bind means toggling remote
-    /// off then on rotates the **pairing secret** (the old QR stops working) — but the
-    /// store it is seeded from is durable, so already-paired devices stay authorized
-    /// and reconnect without re-scanning.
+    /// Assemble a fresh dispatcher + CSPRNG seed for a host bind. Serves
+    /// **already-paired** devices and opens no pairing window.
+    ///
+    /// Binding never admits a new device on its own, whether the user just flipped
+    /// the toggle or the app restored remote access at launch. Opening a window
+    /// implicitly would leave the desktop claimable by anyone who can reach the
+    /// code without the user ever asking to pair — and it is why adding a second
+    /// device used to mean toggling off and on, which tears the endpoint down
+    /// under the devices already connected through it. Pairing is its own explicit
+    /// act: see [`open_pairing`](Self::open_pairing).
+    ///
+    /// Existing devices authenticate against the durable store by pubkey and never
+    /// need the pairing secret, so they reconnect while the window stays shut. A
+    /// fresh [`AuthStore`] per bind is still seeded from that durable store, so
+    /// they survive toggle cycles and restarts.
+    ///
+    /// The secret returned is what `start_host` mints its ticket from; with no slot
+    /// seeded it redeems to nothing, and `open_pairing` supplies the live one.
     pub fn prepare_host(&self) -> (Arc<Dispatcher>, [u8; 16]) {
-        let secret = mint_pairing_secret();
-        let auth = self.seeded_auth();
-        // ONE-TIME: the code dies the moment a device uses it, so a photographed
-        // QR can't be redeemed later while remote access happens to stay on.
-        // Pairing another device means toggling off/on, which mints a fresh code.
-        auth.set_pairing(PairingSlot::new(secret, None, true));
-        (Arc::new(self.dispatcher(auth)), secret)
-    }
-
-    /// Prepare a host that serves **already-paired** devices but opens no pairing
-    /// window — for restoring remote access at launch.
-    ///
-    /// The distinction is the point: the user turned remote access on once, and
-    /// that should survive a relaunch. But re-opening a pairing slot on every
-    /// launch would silently leave the desktop claimable by anyone who can reach
-    /// the code, without the user ever asking to pair. Existing devices
-    /// authenticate against the durable store by pubkey and never need the
-    /// pairing secret, so they reconnect while the window stays shut.
-    ///
-    /// The secret still returned is what `start_host` mints its ticket from; with
-    /// no slot seeded it redeems to nothing, and the pane hides the QR because
-    /// `pairing_open()` is false.
-    pub fn prepare_host_resumed(&self) -> (Arc<Dispatcher>, [u8; 16]) {
         let auth = self.seeded_auth();
         (Arc::new(self.dispatcher(auth)), mint_pairing_secret())
+    }
+
+    /// Open a pairing window on the **running** host and return the ticket to show.
+    /// `None` if no host is bound yet.
+    ///
+    /// Deliberately does not touch the endpoint. The endpoint id is pinned to the
+    /// durable host identity and the secret is just a value in the live
+    /// [`AuthStore`], so a new code costs a mutex rather than a rebind — devices
+    /// already connected keep their sessions while a new one is admitted.
+    pub fn open_pairing(&self) -> Option<PairingTicket> {
+        // Both locks are taken and released one at a time; holding either across
+        // the other would pair this path with `set_host`/`stop_host` for no reason.
+        let auth = self.auth.lock().unwrap().as_ref().cloned()?;
+        let endpoint_id = self.host.lock().unwrap().as_ref()?.ticket().endpoint_id;
+        let secret = mint_pairing_secret();
+        // ONE-TIME and short-lived: the code dies on the first scan, and expires
+        // unscanned so a QR left on screen stops being an open invitation.
+        auth.set_pairing(PairingSlot::expiring(secret, None, true, now_secs() + PAIRING_WINDOW_SECS));
+        Some(PairingTicket { endpoint_id, handshake_secret: secret, session_id: None })
+    }
+
+    /// Withdraw the pairing window. Idempotent, and a no-op with no host bound.
+    pub fn close_pairing(&self) {
+        if let Some(auth) = self.auth.lock().unwrap().as_ref() {
+            auth.close_pairing();
+        }
     }
 
     /// Build a dispatcher over the shared registry, exposing terminals and the
@@ -473,7 +501,7 @@ impl RemoteControl {
             return;
         };
         rc.set_enabled(true);
-        let (dispatcher, secret) = rc.prepare_host_resumed();
+        let (dispatcher, secret) = rc.prepare_host();
         let endpoint_secret = rc.endpoint_secret();
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             tracing::warn!("no tokio runtime; remote host not bound");
@@ -576,21 +604,33 @@ mod tests {
         let _ = rc.prepare_host();
 
         assert_eq!(store.loads.load(Ordering::Relaxed), 1, "seeded from the durable devices");
-        assert!(rc.pairing_open(), "a deliberate toggle opens the pairing window");
+        assert!(!rc.pairing_open(), "binding alone never admits a new device");
     }
 
-    /// Restoring remote access at launch must serve already-paired devices without
-    /// re-opening a pairing window — otherwise every relaunch would silently leave
-    /// the desktop claimable by anyone who can reach the code.
+    /// Asking to pair with no host bound must open nothing. The pane shows a
+    /// "starting" state and re-asks once the endpoint is up; a window minted here
+    /// would be a live code with no endpoint able to serve it.
     #[test]
-    fn a_resumed_host_serves_paired_devices_but_opens_no_pairing_window() {
+    fn opening_a_pairing_window_needs_a_bound_host() {
+        let rc = RemoteControl::with_devices(Arc::new(RecordingStore::default()));
+        let _ = rc.prepare_host();
+
+        assert!(rc.open_pairing().is_none(), "no host, no ticket");
+        assert!(!rc.pairing_open(), "and no window was left open behind it");
+    }
+
+    /// Binding a host must serve already-paired devices without opening a pairing
+    /// window — otherwise merely turning remote access on (or relaunching) would
+    /// silently leave the desktop claimable by anyone who can reach the code.
+    #[test]
+    fn a_bound_host_serves_paired_devices_but_opens_no_pairing_window() {
         let store = Arc::new(RecordingStore::default());
         store.devices.lock().unwrap().push(a_device(0x11, "phone", false));
         let rc = RemoteControl::with_devices(store.clone());
 
-        let _ = rc.prepare_host_resumed();
+        let _ = rc.prepare_host();
 
-        assert!(!rc.pairing_open(), "no pairing window on a launch restore");
+        assert!(!rc.pairing_open(), "no pairing window from a bind");
         assert_eq!(store.loads.load(Ordering::Relaxed), 1, "still seeded from durable devices");
         assert_eq!(
             rc.paired_devices().len(),

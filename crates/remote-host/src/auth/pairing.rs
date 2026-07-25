@@ -21,7 +21,10 @@ impl AuthStore {
         let (token, stored) = {
             let mut st = self.inner.lock().unwrap();
             let slot = st.pairing.as_ref().ok_or(RpcError::Unauthorized)?;
-            if slot.one_time && slot.used {
+            // Redeemed, or past the window the desktop advertised. Both are
+            // `Unauthorized` rather than a distinct "expired" — a caller holding a
+            // dead secret learns only that it does not work.
+            if slot.dead_at(now_secs) {
                 return Err(RpcError::Unauthorized);
             }
             if now_secs.abs_diff(req.timestamp_secs) > REGISTRATION_WINDOW_SECS {

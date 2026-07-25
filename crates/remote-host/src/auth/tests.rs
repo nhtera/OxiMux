@@ -264,6 +264,104 @@ fn a_one_time_code_is_spent_by_the_first_device() {
     assert!(store.is_authorized(&first), "the first device keeps its access");
 }
 
+/// The behaviour the pairing row exists to provide: a second device pairs through
+/// a freshly-opened window while the first keeps everything it had.
+///
+/// This used to require toggling remote access off and on, which rebuilds the auth
+/// store and closes the iroh endpoint under whoever is already connected. Opening a
+/// window on the live store is the whole difference, so it is worth pinning that
+/// the first device survives it — authorization, and not merely presence in the
+/// list.
+#[test]
+fn a_second_device_pairs_through_a_new_window_without_disturbing_the_first() {
+    let store = AuthStore::new();
+    let ts = 1_700_000_000;
+
+    let first_secret = [0x11; 16];
+    store.set_pairing(slot(first_secret));
+    let first = vk(0x33);
+    let first_token = store
+        .register(&a_register(first, "first phone", &first_secret, ts), ts)
+        .expect("first device pairs");
+    assert!(!store.pairing_open(), "the one-time code is spent");
+
+    // What "Pair a device" does: a new secret on the SAME store, no rebind.
+    let second_secret = [0x22; 16];
+    store.set_pairing(slot(second_secret));
+    assert!(store.pairing_open(), "a fresh window is open again");
+
+    let second = vk(0x44);
+    store
+        .register(&a_register(second, "second phone", &second_secret, ts), ts)
+        .expect("second device pairs through the new window");
+
+    assert!(store.is_authorized(&second), "the second device gained access");
+    assert!(store.is_authorized(&first), "the first device kept its access");
+    assert_eq!(
+        store.authorize_token(&first_token),
+        Some(first),
+        "and its reconnect token still resolves — the session was never torn down",
+    );
+    assert_eq!(store.devices().len(), 2, "both are listed");
+}
+
+/// A code that outlived its window is refused even though it was never redeemed.
+/// Without this the countdown would be theatre: the desktop would say a code had
+/// lapsed while the host went on accepting it.
+#[test]
+fn an_expired_window_stops_redeeming() {
+    let store = AuthStore::new();
+    let secret = [0x55; 16];
+    let opened = 1_700_000_000;
+    store.set_pairing(PairingSlot::expiring(secret, None, true, opened + 300));
+
+    assert!(store.pairing_open_at(opened + 299), "still open a second before");
+    assert!(!store.pairing_open_at(opened + 300), "closed on the boundary");
+
+    let pubkey = vk(0x66);
+    // Registered at a timestamp the skew window accepts, so expiry is the only
+    // thing that can refuse it.
+    let late = opened + 300;
+    assert_eq!(
+        store.register(&a_register(pubkey, "late phone", &secret, late), late),
+        Err(RpcError::Unauthorized),
+        "the secret is correct but the window has closed",
+    );
+    assert!(!store.is_authorized(&pubkey), "no access was granted");
+}
+
+/// Leaving the pairing view retires the code immediately, rather than leaving a
+/// window nobody is watching open until it times out.
+#[test]
+fn closing_the_window_revokes_an_unused_code() {
+    let store = AuthStore::new();
+    let secret = [0x77; 16];
+    store.set_pairing(slot(secret));
+    assert!(store.pairing_open(), "open to begin with");
+
+    store.close_pairing();
+
+    assert!(!store.pairing_open(), "closed on request");
+    let ts = 1_700_000_000;
+    let pubkey = vk(0x88);
+    assert_eq!(
+        store.register(&a_register(pubkey, "phone", &secret, ts), ts),
+        Err(RpcError::Unauthorized),
+        "a code from the closed window no longer redeems",
+    );
+}
+
+/// A well-formed registration for `pubkey`, proved against `secret`.
+fn a_register(pubkey: AppPubkey, name: &str, secret: &[u8; 16], ts: u64) -> RegisterReq {
+    RegisterReq {
+        app_pubkey: pubkey,
+        device_name: name.into(),
+        proof: registration_proof(secret, &pubkey, ts),
+        timestamp_secs: ts,
+        session_id: None,
+    }
+}
+
 /// Pairing is announced, so the desktop can confirm it rather than a device
 /// silently gaining full access.
 #[test]

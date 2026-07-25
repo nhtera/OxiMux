@@ -84,6 +84,20 @@ pub struct SettingsModal {
     /// every repaint AND a fresh `Arc<Image>` each frame would defeat gpui's
     /// texture cache, re-uploading the bitmap continuously.
     pub(super) qr_cache: std::cell::RefCell<Option<(String, Arc<gpui::Image>)>>,
+    /// The Remote pane's pairing sub-view, when the user has opened it. `None` is
+    /// the pane's normal state — a live pairing code exists only while this is
+    /// `Some`, which is what makes opening the view the act that mints one.
+    pub(super) remote_pairing: Option<pane_remote::PairingState>,
+    /// Which pairing window is current. Bumped every time one opens or closes, so
+    /// a watcher spawned for an earlier window recognises itself as superseded
+    /// and exits instead of acting.
+    ///
+    /// Needed because a watcher parks on `recv()` for a pairing that its own
+    /// window may never see — closing the view does not wake it. Without this,
+    /// every window opened during a session left a listener alive, and the first
+    /// device to actually pair woke all of them at once: one toast per window
+    /// ever opened.
+    pub(super) remote_pairing_epoch: u64,
     /// Flat KV store the notification toggles persist into (keys in
     /// [`crate::notifier::keys`]), so prefs survive a restart.
     pub(crate) notify_repo: SettingsRepo,
@@ -174,6 +188,8 @@ impl SettingsModal {
             open: false,
             selected: SettingsPane::Terminal,
             qr_cache: std::cell::RefCell::new(None),
+            remote_pairing: None,
+            remote_pairing_epoch: 0,
             focus_handle: cx.focus_handle(),
             theme,
             density,
@@ -355,6 +371,10 @@ impl SettingsModal {
         // every subsequent key press in the app would be swallowed.
         self.recording_action = None;
         self.recording_sub = None;
+        // Closing the modal is leaving the pairing view: retire the live code with
+        // it rather than letting a window the user can no longer see stay
+        // redeemable until it times out.
+        pane_remote::close_pairing(self, cx);
         if was_open {
             cx.emit(SettingsModalEvent::Closed);
         }

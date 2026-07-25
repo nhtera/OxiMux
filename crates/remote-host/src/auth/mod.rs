@@ -55,11 +55,34 @@ pub struct PairingSlot {
     /// One-time tickets self-invalidate after a successful `Register`.
     pub one_time: bool,
     used: bool,
+    /// Unix seconds after which the secret stops being redeemable, if the opener
+    /// bounded it. `None` leaves it live until used or replaced.
+    ///
+    /// This is the *host's* copy of the window, not a display hint: a countdown
+    /// that only ran in the UI would let a code keep working after the desktop
+    /// said it had lapsed, which is precisely backwards for a bearer credential
+    /// whose whole protection is being short-lived.
+    expires_at: Option<u64>,
 }
 
 impl PairingSlot {
     pub fn new(secret: [u8; 16], session_id: Option<String>, one_time: bool) -> Self {
-        Self { secret, session_id, one_time, used: false }
+        Self { secret, session_id, one_time, used: false, expires_at: None }
+    }
+
+    /// A slot that stops being redeemable at `expires_at` (unix seconds).
+    pub fn expiring(
+        secret: [u8; 16],
+        session_id: Option<String>,
+        one_time: bool,
+        expires_at: u64,
+    ) -> Self {
+        Self { expires_at: Some(expires_at), ..Self::new(secret, session_id, one_time) }
+    }
+
+    /// Spent — either redeemed (one-time) or past its window.
+    fn dead_at(&self, now_secs: u64) -> bool {
+        (self.one_time && self.used) || self.expires_at.is_some_and(|at| now_secs >= at)
     }
 }
 
@@ -140,14 +163,16 @@ impl AuthStore {
     }
 
     /// Is a pairing code currently usable? `false` once a one-time slot has been
-    /// consumed, so the UI can stop showing a code that no longer works.
+    /// consumed or its window has lapsed, so the UI can stop showing a code that
+    /// no longer works.
     pub fn pairing_open(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .pairing
-            .as_ref()
-            .is_some_and(|slot| !(slot.one_time && slot.used))
+        self.pairing_open_at(now_secs())
+    }
+
+    /// [`pairing_open`](Self::pairing_open) against an explicit clock, so expiry
+    /// is testable without sleeping.
+    pub fn pairing_open_at(&self, now_secs: u64) -> bool {
+        self.inner.lock().unwrap().pairing.as_ref().is_some_and(|slot| !slot.dead_at(now_secs))
     }
 
     /// Install (replace) the pairing secret the host is advertising via QR.
@@ -155,6 +180,22 @@ impl AuthStore {
         self.inner.lock().unwrap().pairing = Some(slot);
     }
 
+    /// Withdraw the advertised pairing secret, closing the window immediately.
+    ///
+    /// Leaving the view that opened a window is a statement that the user is done
+    /// pairing, and honouring it beats waiting out the expiry: the shortest-lived
+    /// credential is the one retired the moment nobody is looking at it.
+    pub fn close_pairing(&self) {
+        self.inner.lock().unwrap().pairing = None;
+    }
+}
+
+/// Wall clock in unix seconds, saturating at the epoch on a clock set before it.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Mint a fresh 16-byte pairing secret from the OS CSPRNG. The enablement flow
