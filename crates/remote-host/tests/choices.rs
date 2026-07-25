@@ -41,15 +41,15 @@ fn model(wire: &str, label: &str) -> ModelChoice {
 /// A switchable (ACP-like) backend: offers a catalog and accepts changes live.
 fn switchable_registry() -> (Arc<SessionRegistry>, Arc<StubConnection>) {
     let conn = Arc::new(StubConnection::default().with_switchable(
-        vec![model("opus-4.8", "Opus 4.8"), model("sonnet-5", "Sonnet 5")],
+        vec![model("opus-5", "Opus 5"), model("sonnet-5", "Sonnet 5")],
         vec![ModeChoice { wire: "plan".into(), label: "Plan".into() }],
     ));
     let registry = Arc::new(SessionRegistry::new());
     let handle = registry.register("sess-1".into(), conn.clone());
     handle.set_meta(SessionMeta {
-        title: None,
-        model: Some("opus-4.8".into()),
-        cwd: None,
+        model: Some("opus-5".into()),
+        permission_mode: Some("plan".into()),
+        ..Default::default()
     });
     (registry, conn)
 }
@@ -76,14 +76,19 @@ async fn a_device_lists_the_catalog_and_switches_model() {
         };
         assert_eq!(
             choices.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            ["opus-4.8", "sonnet-5"],
+            ["opus-5", "sonnet-5"],
         );
-        assert_eq!(choices.models[0].label, "Opus 4.8", "the label is what a person reads");
+        assert_eq!(choices.models[0].label, "Opus 5", "the label is what a person reads");
         assert_eq!(choices.modes.len(), 1);
         assert_eq!(
             choices.current_model.as_deref(),
-            Some("opus-4.8"),
+            Some("opus-5"),
             "the picker marks the active model without a second round trip",
+        );
+        assert_eq!(
+            choices.current_mode.as_deref(),
+            Some("plan"),
+            "and the mode it is running, or its chip can only ever read 'Mode'",
         );
 
         let set = call(
@@ -210,6 +215,60 @@ async fn a_fix_at_spawn_backend_switches_through_the_desktop_view() {
     };
     futures::future::join(serve, script).await;
     view.await.expect("the view task saw the change");
+}
+
+/// A mode change goes through the view even on a backend that could take it
+/// directly.
+///
+/// Claude switches permission mode in place, so setting the connection here would
+/// "work" — the agent would obey — while the desktop tab went on holding the old
+/// mode: the value it shows in its own picker, and the one it would respawn with.
+/// The phone would then re-read that stale mode and redraw the chip it started
+/// with, which reads as a control that does nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_switchable_backend_still_changes_mode_through_the_desktop_view() {
+    let (registry, conn) = switchable_registry();
+    let handle = registry.get("sess-1").expect("the session is registered");
+
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+    handle.set_remote_choice_sink(tx);
+    let view = tokio::spawn(async move {
+        let change = rx.next().await.expect("the change reaches the view");
+        assert_eq!(change.kind, ChoiceKind::PermissionMode);
+        assert_eq!(change.value, "plan");
+        let _ = change.reply.send(true);
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock);
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32]))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        let set = call(
+            &client,
+            Request::SetPermissionMode { session_id: "sess-1".into(), mode: "plan".into() },
+        )
+        .await;
+        assert_eq!(set, Response::Ack);
+
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+    view.await.expect("the view task saw the change");
+
+    assert!(
+        conn.sent().is_empty(),
+        "the view owns the switch; setting the backend behind it desyncs the two, saw {:?}",
+        conn.sent(),
+    );
 }
 
 /// The view being attached is not the same as the change landing.

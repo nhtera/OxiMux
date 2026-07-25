@@ -57,7 +57,7 @@ pub struct SessionStatus {
 /// How a session presents itself in a remote client's session list. Lives here
 /// (not in [`SessionStatus`]) because it is pushed by the desktop view rather than
 /// derived from the event stream, and it must not be clobbered by a status refresh
-/// on every ingest. Both fields are `None` until the view first publishes them —
+/// on every ingest. Every field is `None` until the view first publishes them —
 /// a freshly-registered session has no title until one is generated.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionMeta {
@@ -65,6 +65,11 @@ pub struct SessionMeta {
     pub title: Option<String>,
     /// The effective model id driving the session.
     pub model: Option<String>,
+    /// The effective permission mode, including the backend's baseline when the
+    /// user has picked nothing — a remote picker has no way to derive that
+    /// baseline itself, and a mode chip that reads "Mode" for a session plainly
+    /// running one is the same as having no chip.
+    pub permission_mode: Option<String>,
     /// The session's working directory. Git RPCs resolve their repository from
     /// this, which scopes remote git access to the sessions a device may already
     /// reach — a session-scoped device cannot browse another project's repo.
@@ -121,16 +126,17 @@ impl ChoiceKind {
     }
 }
 
-/// A model or permission-mode change the backend would not make in place,
-/// handed to the bound desktop view to complete.
+/// A model or permission-mode change handed to the bound desktop view to apply,
+/// so a remote pick and a local one are the same act.
 ///
-/// **Some backends fix these at spawn** — Claude and Codex take `--model` as a
-/// launch flag — and answer their in-session setter with an error. The desktop's
-/// own picker recovers by respawning the child resumed on the new pick, so the
-/// conversation continues on the new model. That respawn is a view-level
-/// operation this crate deliberately cannot perform: it owns no process
-/// spawning. Without this relay a remote picker could only ever fail against the
-/// two most common backends, while the desktop's identical picker worked.
+/// The view is the right place for it on both counts. **Some backends fix these
+/// at spawn** — Claude and Codex take `--model` as a launch flag — and answer
+/// their in-session setter with an error; the desktop's picker recovers by
+/// respawning the child resumed on the new pick, a view-level operation this
+/// crate deliberately cannot perform, owning no process spawning. And a backend
+/// that *does* switch in place still leaves the view holding the old value
+/// unless it is the one making the change — the state it would spawn with, and
+/// the metadata a remote picker reads back.
 ///
 /// The reply rides along so the caller learns whether the change landed instead
 /// of guessing from a later state read.
@@ -376,50 +382,67 @@ impl SessionHandle {
         self.conn().permission_modes()
     }
 
-    /// Switch the backend's model, in place if it can and through the bound
-    /// desktop view if it cannot.
-    ///
-    /// The same two-step the desktop's own picker performs: try the in-session
-    /// setter (an ACP agent maps a model pick to a config option), and on refusal
-    /// hand the change to the view, which respawns the child resumed on the new
-    /// model. See [`RemoteChoice`] for why the second step cannot live here.
+    /// Switch the backend's model. Applied by the bound desktop view when there
+    /// is one; see [`Self::change_choice`].
     pub async fn set_model(&self, model: &str) -> anyhow::Result<()> {
-        if self.conn().set_model(model).is_ok() {
-            return Ok(());
-        }
-        self.delegate_choice(ChoiceKind::Model, model).await
+        self.change_choice(ChoiceKind::Model, model).await
     }
 
-    /// Switch the backend's permission mode. Same two-step as [`Self::set_model`]
-    /// — Claude switches mode in place, so this usually resolves on the first
-    /// step and never reaches the view.
+    /// Switch the backend's permission mode. Same routing as [`Self::set_model`].
     pub async fn set_permission_mode(&self, mode: &str) -> anyhow::Result<()> {
-        if self.conn().set_mode(mode).is_ok() {
-            return Ok(());
-        }
-        self.delegate_choice(ChoiceKind::PermissionMode, mode).await
+        self.change_choice(ChoiceKind::PermissionMode, mode).await
     }
 
-    /// Hand a refused change to the bound desktop view and wait for its answer.
-    async fn delegate_choice(&self, kind: ChoiceKind, value: &str) -> anyhow::Result<()> {
+    /// Apply a model or permission-mode pick, **through the bound desktop view**
+    /// when one exists.
+    ///
+    /// The view is asked first rather than as a fallback. It runs the same
+    /// two-step a local pick does — try the in-session setter, else respawn the
+    /// child resumed on the new value — but it also records the pick in its own
+    /// state and republishes the session's metadata. Setting the connection
+    /// behind the view's back succeeds on a backend that switches in place
+    /// (Claude does exactly this for permission mode) and then leaves the
+    /// desktop's own picker, the respawn flags, and the metadata a remote client
+    /// reads all describing the value the session used to be running.
+    ///
+    /// Only a session no view is showing falls back to the connection, which is
+    /// then the sole authority left. See [`RemoteChoice`] for why the respawn
+    /// cannot live in this crate.
+    async fn change_choice(&self, kind: ChoiceKind, value: &str) -> anyhow::Result<()> {
         // Cloned out of the lock rather than held across the await: the guard is
         // not `Send`, and holding it would block every sibling caller for as long
         // as a respawn takes.
-        let tx = self
-            .remote_choice_tx
-            .lock()
-            .unwrap()
-            .clone()
-            .with_context(|| format!("no desktop view can change this session's {}", kind.noun()))?;
+        let sink = self.remote_choice_tx.lock().unwrap().clone();
         let (reply, answer) = futures::channel::oneshot::channel();
-        tx.unbounded_send(RemoteChoice { kind, value: value.to_string(), reply })
-            .map_err(|_| anyhow::anyhow!("the desktop view is gone"))?;
+        let change = RemoteChoice { kind, value: value.to_string(), reply };
+        // A send that fails means the relay ended without its sink being cleared,
+        // which leaves the session in the same position as one that never had a
+        // view: nothing will carry the change. Try the backend rather than report
+        // a failure a live in-place setter could have avoided.
+        let Some(tx) = sink else {
+            return self.set_on_connection(kind, value);
+        };
+        if tx.unbounded_send(change).is_err() {
+            return self.set_on_connection(kind, value);
+        }
         // A dropped sender means the view went away mid-change (the tab closed,
         // the app quit) — a failure, not something to wait on forever.
         match answer.await {
             Ok(true) => Ok(()),
             _ => anyhow::bail!("the desktop could not change the {}", kind.noun()),
         }
+    }
+
+    /// Set a choice straight on the backend, for a session with no view bound.
+    /// A backend that fixes the value at spawn refuses here, and there is no
+    /// respawn to fall back on — which is what the caller reports.
+    fn set_on_connection(&self, kind: ChoiceKind, value: &str) -> anyhow::Result<()> {
+        let conn = self.conn();
+        match kind {
+            ChoiceKind::Model => conn.set_model(value),
+            ChoiceKind::PermissionMode => conn.set_mode(value),
+        }
+        .with_context(|| format!("no desktop view can change this session's {}", kind.noun()))
     }
 
     /// Register the sink that carries refused model/mode changes to the desktop
@@ -1000,8 +1023,11 @@ mod tests {
         let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
         assert_eq!(handle.meta_snapshot(), SessionMeta::default(), "untitled until published");
 
-        let meta =
-            SessionMeta { title: Some("Fix auth".into()), model: Some("opus".into()), cwd: None };
+        let meta = SessionMeta {
+            title: Some("Fix auth".into()),
+            model: Some("opus".into()),
+            ..Default::default()
+        };
         assert!(handle.set_meta(meta.clone()), "first publish is a change");
         assert_eq!(handle.meta_snapshot(), meta);
 
@@ -1009,8 +1035,7 @@ mod tests {
         assert!(
             handle.set_meta(SessionMeta {
                 title: Some("Fix auth".into()),
-                model: None,
-                cwd: None
+                ..Default::default()
             }),
             "dropping the model is a change",
         );

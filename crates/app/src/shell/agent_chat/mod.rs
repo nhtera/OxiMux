@@ -1354,6 +1354,9 @@ impl AgentChatView {
             binding.set_meta(SessionMeta {
                 title: thread.title.clone(),
                 model: model.clone(),
+                // The backend's baseline: the tab seeds `permission_mode: None`
+                // below, and a restored pick republishes when it is applied.
+                permission_mode: connection.as_ref().and_then(|c| c.default_mode()),
                 cwd: Some(cwd.clone()),
             });
             if let Ok(entries_json) = serde_json::to_string(&thread.entries) {
@@ -3073,6 +3076,9 @@ impl AgentChatView {
         if !switched_live {
             cx.emit(AgentChatEvent::ModelChanged(model));
         }
+        // Same reason as the mode path: a remote picker re-reads immediately, and
+        // an in-place switch produces no event to carry the new value out.
+        self.publish_remote_meta();
         cx.notify();
     }
 
@@ -3112,6 +3118,11 @@ impl AgentChatView {
             self.respawn(cx);
         }
         self.sync_composer(cx); // reflect the new mode in the toolbar label
+        // Push it out now rather than waiting for the next event batch: a remote
+        // picker re-reads the session's choices the moment its change is
+        // acknowledged, and an in-place switch produces no event to ride on — so
+        // without this the phone re-reads the mode it just left.
+        self.publish_remote_meta();
         cx.notify();
     }
 
@@ -4022,9 +4033,22 @@ impl AgentChatView {
             // Mirrors the transcript's resolution: the thread's negotiated model
             // wins, falling back to the tab's selection before one is negotiated.
             model: self.thread.model.clone().or_else(|| self.model.clone()),
+            permission_mode: self.effective_permission_mode(),
             // Git RPCs resolve their repository from this.
             cwd: Some(self.cwd.clone()),
         });
+    }
+
+    /// The permission mode this tab is actually running under.
+    ///
+    /// `permission_mode` is `None` for the backend's baseline — that is what makes
+    /// `respawn` omit the flag — so the field alone cannot say what is in force.
+    /// A remote picker needs the resolved answer: it holds no connection of its
+    /// own to ask for the baseline.
+    fn effective_permission_mode(&self) -> Option<String> {
+        self.permission_mode
+            .clone()
+            .or_else(|| self.connection.as_ref().and_then(|c| c.default_mode()))
     }
 
     /// Record the visible tab title (a manual rename, else the running `Chat N` /
@@ -4382,6 +4406,8 @@ impl AgentChatView {
             .unwrap_or_default();
         self.permission_mode = (mode != default_mode).then(|| mode.to_string());
         self.sync_composer(cx);
+        // A backend-driven flip is still a mode change a remote picker must see.
+        self.publish_remote_meta();
         cx.notify();
     }
 

@@ -282,8 +282,8 @@ fn session_meta_published_by_the_desktop_reaches_the_client() {
     let titled = registry.register("sess-1".into(), Arc::new(StubConnection::default()));
     titled.set_meta(SessionMeta {
         title: Some("Fix auth".into()),
-        model: Some("claude-opus-4-8".into()),
-        cwd: None,
+        model: Some("claude-opus-5".into()),
+        ..Default::default()
     });
     // Registered but never titled — the fallback path.
     registry.register("sess-2".into(), Arc::new(StubConnection::default()));
@@ -306,7 +306,7 @@ fn session_meta_published_by_the_desktop_reaches_the_client() {
         };
         let titled = sessions.iter().find(|s| s.session_id == "sess-1").expect("sess-1 listed");
         assert_eq!(titled.title, "Fix auth", "the desktop's title, not the raw id");
-        assert_eq!(titled.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(titled.model.as_deref(), Some("claude-opus-5"));
 
         let untitled = sessions.iter().find(|s| s.session_id == "sess-2").expect("sess-2 listed");
         assert_eq!(untitled.title, "sess-2", "an untitled session falls back to its id");
@@ -319,7 +319,7 @@ fn session_meta_published_by_the_desktop_reaches_the_client() {
             panic!("expected SessionInfo");
         };
         assert_eq!(info.summary.title, "Fix auth");
-        assert_eq!(info.summary.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(info.summary.model.as_deref(), Some("claude-opus-5"));
     };
     block_on(join(serve, script));
 }

@@ -46,7 +46,7 @@ fn register_req(pubkey: [u8; 32]) -> RegisterReq {
 fn registry_with_cwd(cwd: std::path::PathBuf) -> Arc<SessionRegistry> {
     let registry = Arc::new(SessionRegistry::new());
     let handle = registry.register("sess-1".into(), Arc::new(StubConnection::default()));
-    handle.set_meta(SessionMeta { title: None, model: None, cwd: Some(cwd) });
+    handle.set_meta(SessionMeta { cwd: Some(cwd), ..Default::default() });
     registry
 }
 

@@ -321,7 +321,11 @@ impl Dispatcher {
                 .map(|m| Choice { id: m.wire, label: m.label, description: None })
                 .collect(),
             current_model: meta.model,
-            current_mode: None,
+            // From the desktop view's published metadata, like the model: the
+            // connection knows which modes exist but not which one this session
+            // is sitting in — the view owns that, because it is the thing that
+            // spawned the child with it.
+            current_mode: meta.permission_mode,
         })
     }
 

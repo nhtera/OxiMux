@@ -68,7 +68,7 @@ async fn git_diff_serves_repo_files_and_refuses_to_escape() {
 
     let registry = Arc::new(SessionRegistry::new());
     let handle = registry.register("sess-1".into(), Arc::new(StubConnection::default()));
-    handle.set_meta(SessionMeta { title: None, model: None, cwd: Some(root.clone()) });
+    handle.set_meta(SessionMeta { cwd: Some(root.clone()), ..Default::default() });
 
     let auth = Arc::new(AuthStore::new());
     auth.set_pairing(PairingSlot::new(SECRET, None, false));
@@ -179,7 +179,7 @@ async fn git_writes_stage_and_commit_against_a_real_repo() {
 
     let registry = Arc::new(SessionRegistry::new());
     let handle = registry.register("sess-1".into(), Arc::new(StubConnection::default()));
-    handle.set_meta(SessionMeta { title: None, model: None, cwd: Some(root.clone()) });
+    handle.set_meta(SessionMeta { cwd: Some(root.clone()), ..Default::default() });
 
     let auth = Arc::new(AuthStore::new());
     auth.set_pairing(PairingSlot::new(SECRET, None, false));
@@ -268,7 +268,7 @@ async fn git_writes_refuse_paths_outside_the_repository() {
 
     let registry = Arc::new(SessionRegistry::new());
     let handle = registry.register("sess-1".into(), Arc::new(StubConnection::default()));
-    handle.set_meta(SessionMeta { title: None, model: None, cwd: Some(root) });
+    handle.set_meta(SessionMeta { cwd: Some(root), ..Default::default() });
 
     let auth = Arc::new(AuthStore::new());
     auth.set_pairing(PairingSlot::new(SECRET, None, false));
@@ -340,7 +340,7 @@ async fn a_read_only_device_can_read_git_but_not_write_it() {
 
     let registry = Arc::new(SessionRegistry::new());
     let handle = registry.register("sess-1".into(), Arc::new(StubConnection::default()));
-    handle.set_meta(SessionMeta { title: None, model: None, cwd: Some(root) });
+    handle.set_meta(SessionMeta { cwd: Some(root), ..Default::default() });
 
     let auth = Arc::new(AuthStore::new());
     auth.set_pairing(PairingSlot::new(SECRET, None, false));
@@ -414,7 +414,7 @@ async fn revoking_mid_connection_stops_a_commit_from_landing() {
 
     let registry = Arc::new(SessionRegistry::new());
     let handle = registry.register("sess-1".into(), Arc::new(StubConnection::default()));
-    handle.set_meta(SessionMeta { title: None, model: None, cwd: Some(root.clone()) });
+    handle.set_meta(SessionMeta { cwd: Some(root.clone()), ..Default::default() });
 
     let auth = Arc::new(AuthStore::new());
     auth.set_pairing(PairingSlot::new(SECRET, None, false));
