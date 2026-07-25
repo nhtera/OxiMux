@@ -81,7 +81,7 @@ pub(super) fn render_toolbar(
     .child(ctrl_chip("Mine", mine, theme, density, typography, cx, |tv, cx| {
         tv.toggle_mine(cx)
     }))
-    .child(div().w(px(density.gap_inline as f32 * 2.0)))
+    .child(div().w(px(density.gap_inline * 2.0)))
     .child(ctrl_chip("Refresh", false, theme, density, typography, cx, |tv, cx| {
         tv.refresh(cx)
     }))

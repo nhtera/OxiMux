@@ -193,6 +193,8 @@ fn wrapped(text: String, theme: oximux_settings::Theme) -> AnyElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use gpui::TestAppContext;
     use oximux_agents::thread::{McpServerStatus, StubConnection};
     use oximux_settings::{Density, Theme, Typography};
@@ -205,7 +207,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),

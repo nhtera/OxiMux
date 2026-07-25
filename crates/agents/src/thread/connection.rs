@@ -153,7 +153,12 @@ pub enum FeatureValue {
 /// existing impls (and the test stub) compile unchanged; a backend overrides
 /// only what it supports. The trait is deliberately grown once, provider-
 /// agnostically, so the future ACP backend satisfies the same seam.
-pub trait AgentConnection: Send {
+// `Sync` (not just `Send`) so the session registry can hold the connection as a
+// shared `Arc<dyn AgentConnection>` and call it from an off-thread task while the
+// desktop view holds the same `Arc` — `Arc<T>` is only `Send`/shareable when
+// `T: Send + Sync`. All impls hold channel senders / handles (no `Rc`/`RefCell`),
+// so they already satisfy `Sync`.
+pub trait AgentConnection: Send + Sync {
     /// Send a user prompt, starting a new turn. (The transport also accepts a
     /// message mid-turn, but the chat UI currently gates sending behind Stop
     /// while a turn is streaming, so a live steer isn't issued from the UI.)
@@ -473,6 +478,16 @@ pub struct StubConnection {
     /// Self-described slash commands, for tests that exercise the palette's
     /// backend-metadata path. Empty by default (like a names-only backend).
     commands: Vec<SlashCommandInfo>,
+    /// Models this stub offers. Empty by default, matching the trait default and
+    /// a dynamic-catalog backend before its handshake completes.
+    models: Vec<ModelChoice>,
+    /// Permission modes this stub offers. Empty by default.
+    modes: Vec<ModeChoice>,
+    /// Whether `set_model`/`set_mode` succeed. False by default, matching the
+    /// trait default and the real fix-at-spawn backends (Claude, Codex), so an
+    /// unconfigured stub exercises the refusal path rather than a success that
+    /// no real backend would give.
+    switchable: bool,
 }
 
 impl StubConnection {
@@ -494,6 +509,15 @@ impl StubConnection {
     /// command catalog of its own does (pi's `get_commands`).
     pub fn with_slash_commands(mut self, commands: Vec<SlashCommandInfo>) -> Self {
         self.commands = commands;
+        self
+    }
+
+    /// Make the stub offer models and modes, and accept switching between them —
+    /// an ACP-like backend that can change without a respawn.
+    pub fn with_switchable(mut self, models: Vec<ModelChoice>, modes: Vec<ModeChoice>) -> Self {
+        self.models = models;
+        self.modes = modes;
+        self.switchable = true;
         self
     }
 
@@ -542,6 +566,29 @@ impl AgentConnection for StubConnection {
     }
     fn slash_commands(&self) -> Vec<SlashCommandInfo> {
         self.commands.clone()
+    }
+    fn models(&self) -> Vec<ModelChoice> {
+        self.models.clone()
+    }
+    fn permission_modes(&self) -> Vec<ModeChoice> {
+        self.modes.clone()
+    }
+    /// Recorded so a test can assert the switch reached the backend, not merely
+    /// that the wire said Ack — a reply that acknowledged while dropping the
+    /// change would look identical to the client.
+    fn set_model(&self, model: &str) -> Result<()> {
+        if !self.switchable {
+            anyhow::bail!("this agent does not support changing model at runtime")
+        }
+        self.record(json!({"type": "set_model", "model": model}));
+        Ok(())
+    }
+    fn set_mode(&self, mode: &str) -> Result<()> {
+        if !self.switchable {
+            anyhow::bail!("this agent does not support changing mode at runtime")
+        }
+        self.record(json!({"type": "set_mode", "mode": mode}));
+        Ok(())
     }
     fn shutdown(&self) {}
 }

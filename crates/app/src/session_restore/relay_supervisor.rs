@@ -43,9 +43,9 @@ pub enum SupervisorError {
 // reuse an older daemon that can't decode the new shapes. A new socket name
 // guarantees the new client spawns a new daemon; any stale older daemon
 // idles out on its own socket.
-const SOCKET_FILENAME: &str = "relay-v6.sock";
-const TOKEN_FILENAME: &str = "relay-v6.token";
-const PID_FILENAME: &str = "relay-v6.pid";
+const SOCKET_FILENAME: &str = "relay-v7.sock";
+const TOKEN_FILENAME: &str = "relay-v7.token";
+const PID_FILENAME: &str = "relay-v7.pid";
 
 const HANDSHAKE_QUICK_TIMEOUT: Duration = Duration::from_millis(500);
 const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -455,9 +455,9 @@ mod tests {
     #[test]
     fn supervisor_paths_under_runtime_dir() {
         let s = RelaySupervisor::new(PathBuf::from("/tmp/runtime"), PathBuf::from("/tmp/logs"));
-        assert_eq!(s.socket_path(), PathBuf::from("/tmp/runtime/relay-v6.sock"));
-        assert_eq!(s.token_path(), PathBuf::from("/tmp/runtime/relay-v6.token"));
-        assert_eq!(s.pid_path(), PathBuf::from("/tmp/runtime/relay-v6.pid"));
+        assert_eq!(s.socket_path(), PathBuf::from("/tmp/runtime/relay-v7.sock"));
+        assert_eq!(s.token_path(), PathBuf::from("/tmp/runtime/relay-v7.token"));
+        assert_eq!(s.pid_path(), PathBuf::from("/tmp/runtime/relay-v7.pid"));
         assert_eq!(s.log_path(), PathBuf::from("/tmp/logs/relay.log"));
     }
 

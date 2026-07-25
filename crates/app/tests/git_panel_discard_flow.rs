@@ -2,8 +2,8 @@
 //!
 //! Covers the seams that matter for safety:
 //! - `GitPanel::discard_path` populates `pending_discard` with the
-//!   right `(kind, copy, expected)` for the file's status — never
-//!   mutates the working tree.
+//!   right `(kind, copy)` for the file's status — never mutates the
+//!   working tree.
 //! - `GitPanel::confirmed_discard_path` clears the pending request,
 //!   marks the path as in-flight, fires the actual `git restore --`,
 //!   and clears the in-flight marker once the op returns. The on-disk
@@ -112,7 +112,7 @@ async fn discard_path_sets_pending_with_modified_copy(cx: &mut TestAppContext) {
         assert_eq!(kind, DiscardKind::Discard);
         assert!(req.copy.title.starts_with("Discard changes to"));
         assert_eq!(req.copy.confirm_label.as_ref(), "Discard");
-        assert_eq!(req.expected.as_ref(), "src.rs");
+        assert!(req.copy.title.contains("\"src.rs\""));
         assert!(
             panel.in_flight_discards().is_empty(),
             "no git op should run before confirmation"
@@ -227,17 +227,18 @@ async fn discard_path_is_a_noop_while_request_is_pending(cx: &mut TestAppContext
     window
         .update(cx, |panel, _win, cx| {
             panel.discard_path(PathBuf::from("src.rs"), cx);
-            // Capture the first request's expected string; second call
-            // must NOT overwrite it.
-            let first_expected = panel
+            // Capture the first request's copy; second call must NOT
+            // overwrite it.
+            let first_title = panel
                 .pending_discard()
                 .expect("first call sets pending")
-                .expected
+                .copy
+                .title
                 .clone();
             // Second call while pending is active: silently dropped.
             panel.discard_path(PathBuf::from("src.rs"), cx);
             let after = panel.pending_discard().expect("still pending");
-            assert_eq!(after.expected, first_expected);
+            assert_eq!(after.copy.title, first_title);
         })
         .expect("panel update");
 }

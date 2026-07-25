@@ -28,7 +28,20 @@ use crate::error::ErrCode;
 // with no new app-side plumbing — and an agent hook can report status
 // without a controlling terminal (hooks run detached, with no `/dev/tty`).
 // New variant ⇒ wire break ⇒ socket bumps to `relay-v6.sock`.
-pub const PROTOCOL_VERSION: u32 = 6;
+//
+// v7: `Notification::Gapped` tells a subscriber the daemon discarded output
+// for it, so it knows to re-attach and resync from the replay ring. The
+// version bump is load-bearing rather than ceremonial: the handshake compares
+// versions for EQUALITY, so without it a v7 daemon and a v6 client would
+// connect happily and then break the moment a gap occurred — the v6 client
+// cannot decode variant 3, and postcard enums are positional. Bumping turns
+// that into a clean refusal at connect. Socket bumps to `relay-v7.sock`.
+//
+// Also v7 (same unreleased break): `Request::Replay` / `Response::ReplayOk`
+// re-fetch the ring WITHOUT minting an attachment, so recovering from a gap
+// does not add a second attachment whose stale size would keep voting in the
+// daemon's smallest-screen-wins `min`.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
@@ -139,6 +152,20 @@ pub enum Request {
         pty_id: String,
         payload: String,
     },
+    /// Re-fetch a PTY's replay ring WITHOUT registering an attachment — the
+    /// recovery path for a subscriber that received `Notification::Gapped`.
+    ///
+    /// Distinct from `Attach` on purpose. A re-`Attach` mints a second
+    /// `attachment_id` for a client that already holds one, and the daemon
+    /// drives the PTY at the element-wise `min` across attachments, so the
+    /// stale entry would keep voting on the size until it was released —
+    /// visibly resizing the live process to recover from a dropped frame.
+    /// This asks only the question the caller actually has ("what is on the
+    /// screen now?") and leaves attachment bookkeeping alone.
+    /// Appended last to keep existing variant indices stable.
+    Replay {
+        pty_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +198,15 @@ pub enum Response {
     Pty(PtyDescriptor),
     PtyList(Vec<PtyDescriptor>),
     StatsOk(Vec<PtyStats>),
+    /// Answer to `Request::Replay`: the ring snapshot plus the dims it was
+    /// drawn at. The caller MUST rebuild its emulator at these dims before
+    /// replaying, for the same reason `AttachOk` carries them — absolute-
+    /// position sequences only land correctly in a grid of the right size.
+    ReplayOk {
+        replay: Vec<u8>,
+        cols: u16,
+        rows: u16,
+    },
     Err {
         code: ErrCode,
         message: String,
@@ -195,5 +231,18 @@ pub enum Notification {
         pty_id: String,
         title: String,
         body: String,
+    },
+    /// This subscriber fell behind and the daemon discarded output for it.
+    ///
+    /// The bytes are not lost — the session's replay ring still holds them —
+    /// but they will never arrive on the live stream, so a client that keeps
+    /// rendering from here on is drawing a terminal with a hole in it. The
+    /// recovery is to re-`Attach`, which replays the ring from scratch.
+    ///
+    /// Sent once per gap rather than per dropped message: a subscriber that is
+    /// behind is behind, and repeating the signal would compete for the very
+    /// queue space that is already exhausted.
+    Gapped {
+        pty_id: String,
     },
 }

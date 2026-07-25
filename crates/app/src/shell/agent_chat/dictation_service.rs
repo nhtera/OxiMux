@@ -22,6 +22,7 @@ use oximux_dictation::feedback::Cue;
 use oximux_dictation::{
     DictationController, DictationEvent, ModelManager, ModelPaths, ModelStatus, Readiness,
 };
+use oximux_remote_host::AudioTranscriber;
 use oximux_settings::{DictationSettings, ModelUnloadTimeout};
 
 use super::composer::ComposerView;
@@ -401,6 +402,20 @@ pub fn cancel_download(cx: &App, id: &str) {
     {
         flag.store(true, Ordering::SeqCst);
     }
+}
+
+/// Build the host-side transcriber for the remote-control dispatcher, sharing
+/// this service's [`ModelManager`] so a model downloaded in Settings › Voice is
+/// usable from a paired phone the moment it lands. `None` when the service isn't
+/// installed (unit tests / a build without dictation) — the dispatcher then
+/// answers `TranscribeAudio` with `Unauthorized`, as it does for any absent
+/// surface.
+pub fn build_remote_transcriber(cx: &App) -> Option<Arc<dyn AudioTranscriber>> {
+    let svc = cx.try_global::<DictationService>()?;
+    Some(Arc::new(super::remote_dictation::HostTranscriber::new(
+        Arc::clone(&svc.manager),
+        models_dir(),
+    )))
 }
 
 /// Delete a downloaded model's files.

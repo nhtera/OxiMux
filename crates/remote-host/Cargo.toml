@@ -1,0 +1,60 @@
+[package]
+name = "oximux-remote-host"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# The in-app remote-control host: the transport-agnostic RPC dispatcher, the
+# two-key pairing/auth handshake + ACL, and the host identity. Consumes the
+# Phase-2 `SessionRegistry` (in `oximux-agents`) to serve session list/subscribe/
+# command RPCs. Desktop-only (runs in-process in OxiMux), so depending on the
+# heavier `oximux-agents` is fine — this crate never ships to mobile.
+#
+# The live iroh `Endpoint` binding + QR display live in later slices; everything
+# here is driven over the `remote-proto` `Transport` seam and is unit-testable
+# with the in-memory loopback (no network).
+[dependencies]
+oximux-remote-proto = { workspace = true }
+oximux-agent-core = { workspace = true }
+oximux-agents = { workspace = true }
+# Durable paired-device/ACL persistence (RemoteDeviceRepo). Desktop-only host,
+# so the rusqlite pull-in is fine — this crate never ships to mobile.
+oximux-storage = { workspace = true }
+# Git RPCs wrap the existing repository functions; path arguments are contained
+# via `oximux_git::path_guard` at this boundary before any disk access.
+oximux-git = { workspace = true }
+oximux-core = { workspace = true }
+# Schedule rows carry `DateTime<Local>` fires; this boundary formats them to
+# RFC-3339 for the wire and derives the tick clock from the injected `now_secs`.
+chrono = { workspace = true }
+# Voice-dictation clips cross the wire base64-encoded (the same encoding the
+# composer's image attachments use); this boundary decodes them before handing
+# raw bytes to the transcription seam.
+base64 = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+ed25519-dalek = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+# Live `Subscribe` streaming multiplexes the request loop with a merged set of
+# per-session broadcast streams (SelectAll + future::select) — runtime-agnostic,
+# so `serve` stays drivable by any executor (the loopback test's futures executor
+# and, in production, the iroh tokio runtime).
+futures = { workspace = true }
+# For the `broadcast::Receiver` the SessionRegistry hands out (sync primitives
+# only — no runtime pulled in; the broadcast wakers are runtime-agnostic).
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+oximux-remote-proto = { workspace = true, features = ["testing"] }
+# The git-RPC test drives the real handlers against a real repository, so it
+# needs a runtime (git shells out) and a scratch directory.
+tokio = { workspace = true }
+tempfile = "3"

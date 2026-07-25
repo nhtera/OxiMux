@@ -199,6 +199,56 @@ impl AgentChatView {
         .detach();
     }
 
+    /// Start a rewind on behalf of a remote client.
+    ///
+    /// Every check here exists because the caller is not the desktop user: the
+    /// phone folded its own transcript from an event stream and can be behind,
+    /// so its `ordinal` is a *claim* about a conversation, validated against
+    /// this view's actual thread before anything destructive happens. The
+    /// desktop's own path skips this — it derives the ordinal from the entry
+    /// the user clicked, which cannot be stale.
+    ///
+    /// Returns once the rewind is accepted, not once it completes; the
+    /// truncation reaches subscribers as a `Rewound` event either way, so
+    /// there is nothing for the caller to learn by waiting.
+    pub fn remote_rewind(
+        &mut self,
+        ordinal: usize,
+        include_files: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<(), oximux_remote_host::RewindError> {
+        use oximux_remote_host::RewindError;
+
+        // The files axis is refused rather than silently downgraded to a
+        // conversation-only rewind: it overwrites the working tree, discarding
+        // uncommitted work belonging to whoever is sitting at the desktop. A
+        // client that asked for it and got a quiet partial result would report
+        // success for something that did not happen.
+        if include_files {
+            return Err(RewindError::FilesUnsupported);
+        }
+        if self.rewinding {
+            return Err(RewindError::Busy);
+        }
+        if self.thread.session_id.is_none() || !self.backend_supports_rewind() {
+            return Err(RewindError::Unsupported);
+        }
+        // The ordinal must name a user message *in this thread*. A stale phone
+        // asking to rewind to a turn that no longer exists must be refused, not
+        // clamped to the nearest one — truncating at a point the user did not
+        // choose destroys turns they meant to keep.
+        let entry_index = self
+            .thread
+            .user_entry_index(ordinal)
+            .ok_or(RewindError::OrdinalMismatch)?;
+
+        // Any open confirm card is for a different target and would be stale
+        // once this lands.
+        self.rewind_confirm = None;
+        self.perform_rewind(ordinal, entry_index, None, cx);
+        Ok(())
+    }
+
     pub(super) fn cancel_rewind_confirm(&mut self, cx: &mut Context<Self>) {
         if self.rewind_confirm.take().is_some() {
             cx.notify();
@@ -334,6 +384,18 @@ impl AgentChatView {
         match outcome {
             RewindOutcome::Done { new_sid, files_degraded } => {
                 self.thread.truncate_to_user(ordinal);
+                // Tell remote subscribers to truncate too. A rewind mutates the
+                // thread directly rather than through the event stream, so
+                // without this a subscribed phone keeps the dropped tail and
+                // then appends the replacement turns after it — a transcript
+                // showing a conversation that never happened.
+                //
+                // Ingested here, after the fork succeeded, so a failed rewind
+                // (the `Failed` arm below) leaves every subscriber's transcript
+                // exactly as the desktop's own.
+                if let Some(binding) = &self.remote {
+                    binding.ingest(oximux_agents::thread::ThreadEvent::Rewound { ordinal });
+                }
                 // Entry indices shift when the tail is dropped — clear the jump
                 // highlight so it can't tint the wrong bubble. The rail/list read
                 // live entries each render, so their hover state needs no reset.
@@ -517,8 +579,9 @@ impl AgentChatView {
 
 /// Steps 1–3 of the flow, off the UI thread. Returns without mutating any view
 /// state — the caller owns the swap.
+#[allow(clippy::too_many_arguments)]
 async fn run_rewind_background(
-    conn: Option<Box<dyn oximux_agents::thread::AgentConnection>>,
+    conn: Option<std::sync::Arc<dyn oximux_agents::thread::AgentConnection>>,
     engine: Option<std::sync::Arc<CheckpointEngine>>,
     old_sid: String,
     ordinal: usize,

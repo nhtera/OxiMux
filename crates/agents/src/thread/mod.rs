@@ -13,25 +13,24 @@
 //! the same `ChatThread` without changing the state machine or the view.
 
 pub mod acp;
-pub mod background_task;
 pub mod claude_stream_json;
 pub mod codex;
 pub mod codex_session_import;
 pub mod connect;
 pub mod connection;
-pub mod context_chip;
-pub mod entry;
-pub mod event;
 pub mod pi;
-pub mod question;
 pub mod session_file_fork;
 pub mod session_import;
-pub mod state;
-pub mod stream_json;
-pub mod tool_call;
-pub mod tool_detail;
 pub mod transport;
-pub mod turn_diff;
+
+// The pure fold + wire vocabulary + stream-json decoder now live in the
+// dependency-minimal, mobile-portable `oximux-agent-core` crate. Re-export the
+// modules under their original `crate::thread::*` paths so every downstream
+// import site (and this file's own type re-exports below) resolves unchanged.
+pub use oximux_agent_core::thread::{
+    background_task, context_chip, entry, event, question, state, stream_json, tool_call,
+    tool_detail, turn_diff,
+};
 
 pub use acp::AcpConnection;
 pub use claude_stream_json::{build_args, claude_model_choices, ClaudeStreamJsonConnection};

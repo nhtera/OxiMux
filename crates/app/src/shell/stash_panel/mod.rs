@@ -1,9 +1,9 @@
 //! StashPanel — list git stash entries with per-row Apply / Pop / Drop.
 //!
 //! Drop is destructive, so the panel only sets a `pending_drop` flag; the
-//! shell host (step 14) observes the entity, opens a `ConfirmDialog` with
-//! expected = "drop", and calls `drop_pending()` on confirm. Apply and Pop
-//! fire directly (Pop is reversible via reflog).
+//! shell host (step 14) observes the entity, opens a `ConfirmDialog`, and
+//! calls `drop_pending()` on confirm. Apply and Pop fire directly (Pop is
+//! reversible via reflog).
 //!
 //! Layout:
 //!   - Always-rendered header: chevron + "STASHES (N)" + "+" push button.

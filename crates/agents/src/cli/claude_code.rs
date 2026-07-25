@@ -211,11 +211,11 @@ mod tests {
     #[test]
     fn build_command_includes_model_when_set() {
         let mut c = cfg();
-        c.model = Some("claude-opus-4-7".into());
+        c.model = Some("claude-opus-5".into());
         let spec = ClaudeCodeAdapter.build_command(&c).unwrap();
         assert_eq!(
             spec.args,
-            vec!["--model".to_string(), "claude-opus-4-7".into()]
+            vec!["--model".to_string(), "claude-opus-5".into()]
         );
     }
 
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn build_command_full_house() {
         let mut c = cfg();
-        c.model = Some("claude-opus-4-7".into());
+        c.model = Some("claude-opus-5".into());
         c.effort = Some("high".into());
         c.prompt = Some("refactor this".into());
         let spec = ClaudeCodeAdapter.build_command(&c).unwrap();
@@ -274,7 +274,7 @@ mod tests {
             spec.args,
             vec![
                 "--model".to_string(),
-                "claude-opus-4-7".into(),
+                "claude-opus-5".into(),
                 "--effort".into(),
                 "high".into(),
                 "--prefill".into(),

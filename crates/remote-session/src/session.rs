@@ -1,0 +1,504 @@
+//! The client session: the Register/Connect/AuthProve handshake and the one-shot
+//! RPCs, driven over the `remote-proto` [`Transport`] seam. Pure Rust — the iroh
+//! transport is injected as one `Transport` impl, and the in-memory loopback
+//! drives the full-loop test against the real host dispatcher.
+//!
+//! Every RPC rides the concurrent [`demux`](crate::demux) pump, so a client can
+//! issue requests *while* subscribed to a live session on the same connection: the
+//! pump routes pushed `HostEvent`s to the event stream ([`Self::take_events`]) and
+//! each reply to its waiting caller. The reconnect state machine is a later slice.
+
+mod git;
+mod handshake;
+mod subscribe;
+mod terminals;
+
+use std::sync::{Arc, Mutex};
+
+use futures::channel::oneshot;
+use oximux_agent_core::thread::{AskQuestion, ChatImage, PermissionDecision, QuestionAnswers};
+use oximux_remote_proto::messages::{
+    AnswerQuestionReq, CheckRunWire, ForgeItemDetailWire, ForgeItemKindWire, ForgeItemWire,
+    ForgeStateWire, ProjectSummaryWire, RecurrenceWire, ResolvePermissionReq, ScheduleRunWire,
+    ScheduleWire, SendPromptReq, SessionInfoWire, SessionSummary, SessionTranscriptWire,
+};
+use oximux_remote_proto::proto::{Request, Response, RpcError, SessionChoices};
+use oximux_remote_proto::{HostEvent, Transport};
+
+use crate::demux::{Demux, DemuxPump, EventStream, SessionsStream, TerminalStream, demux};
+use crate::error::SessionError;
+use crate::signer::ClientSigner;
+
+type Result<T> = std::result::Result<T, SessionError>;
+
+/// One client's connection to a host, over an abstract [`Transport`]. Owns the
+/// app-signing identity, the demux RPC handle, and caches the reconnect token.
+pub struct RemoteSession {
+    demux: Arc<Demux>,
+    signer: ClientSigner,
+    /// The reconnect credential the host issues on Register/Connect. Cached in
+    /// memory only — `mobile-core` may persist it, but losing it just forces the
+    /// slower Ed25519 challenge on the next `connect`.
+    token: Mutex<Option<String>>,
+    /// The read-loop pump, taken once by the owner to drive (spawned in prod,
+    /// joined in tests). Every RPC is dead in the water until it runs.
+    pump: Mutex<Option<DemuxPump>>,
+    /// The live event stream, taken once by the owner to consume.
+    events: Mutex<Option<EventStream>>,
+    /// The live terminal stream, taken once by the owner to consume. Separate
+    /// from `events` because a client can watch a terminal without subscribing
+    /// to any agent session, and vice versa.
+    terminals: Mutex<Option<TerminalStream>>,
+    /// The pushed session-list stream, taken once by the owner. Each item is a full
+    /// per-device snapshot that replaces the client's session list wholesale.
+    sessions: Mutex<Option<SessionsStream>>,
+    /// Dropping this stops the pump — so the connection tears down when the
+    /// session is dropped, no explicit close needed.
+    _shutdown: oneshot::Sender<()>,
+}
+
+impl RemoteSession {
+    pub fn new(transport: Arc<dyn Transport>, signer: ClientSigner) -> Self {
+        let (handle, pump, events, terminals, sessions, shutdown) = demux(transport);
+        Self {
+            demux: handle,
+            signer,
+            token: Mutex::new(None),
+            pump: Mutex::new(Some(pump)),
+            events: Mutex::new(Some(events)),
+            terminals: Mutex::new(Some(terminals)),
+            sessions: Mutex::new(Some(sessions)),
+            _shutdown: shutdown,
+        }
+    }
+
+    /// Take the pushed session-list stream — once. Each item is a full snapshot the
+    /// owner uses to replace its session list.
+    pub fn take_sessions(&self) -> Option<SessionsStream> {
+        self.sessions.lock().unwrap().take()
+    }
+
+    /// Subscribe to the live session list. Returns the current snapshot immediately;
+    /// thereafter the host pushes a fresh snapshot on every change onto the stream
+    /// from [`Self::take_sessions`]. Idempotent — a repeat subscribe re-snapshots.
+    pub async fn subscribe_sessions(&self) -> Result<Vec<SessionSummary>> {
+        // The immediate reply is a plain `Sessions` snapshot (routed to the RPC
+        // slot); subsequent changes arrive as pushed `SessionsChanged` frames on the
+        // stream from `take_sessions`.
+        match self.call(Request::SubscribeSessions).await? {
+            Response::Sessions(rows) => Ok(rows),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Sessions" }),
+        }
+    }
+
+    /// Take the read-loop pump to drive it — once. Spawn `pump.run()` onto an
+    /// executor (prod) or join it (tests); RPCs only resolve while it runs.
+    pub fn take_pump(&self) -> Option<DemuxPump> {
+        self.pump.lock().unwrap().take()
+    }
+
+    /// Take the live event stream — once. Each pushed `HostEvent` is folded by a
+    /// [`SessionSubscription`](crate::SessionSubscription).
+    pub fn take_terminals(&self) -> Option<TerminalStream> {
+        self.terminals.lock().unwrap().take()
+    }
+
+    /// Take the live event stream — once. Each pushed `HostEvent` is folded by a
+    /// [`SessionSubscription`](crate::SessionSubscription).
+    pub fn take_events(&self) -> Option<EventStream> {
+        self.events.lock().unwrap().take()
+    }
+
+    /// The app-signing public key the host records for this device.
+    pub fn public_key(&self) -> [u8; 32] {
+        self.signer.public_key()
+    }
+
+    /// The cached reconnect token, if any (for the caller to persist).
+    pub fn session_token(&self) -> Option<String> {
+        self.token.lock().unwrap().clone()
+    }
+
+    /// Seed a persisted reconnect token so the next [`Self::connect`] can take the
+    /// fast path.
+    pub fn set_session_token(&self, token: Option<String>) {
+        *self.token.lock().unwrap() = token;
+    }
+
+    // ---- one-shot session RPCs (the handshake lives in `handshake.rs`) ----
+
+    /// Every session the host exposes to this device.
+    pub async fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
+        match self.call(Request::ListSessions).await? {
+            Response::Sessions(sessions) => Ok(sessions),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Sessions" }),
+        }
+    }
+
+    /// One session's detail + resume cursor.
+    pub async fn session_info(&self, session_id: &str) -> Result<SessionInfoWire> {
+        let req = Request::GetSessionInfo { session_id: session_id.to_string() };
+        match self.call(req).await? {
+            Response::SessionInfo(info) => Ok(info),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "SessionInfo" }),
+        }
+    }
+
+    /// The session's authoritative folded-transcript snapshot — full history plus
+    /// the `seq` it reflects. Fetched when opening a session so it renders its
+    /// history immediately (including a restart-restored transcript that never
+    /// entered the live ring); the caller then subscribes from `seq` to extend it.
+    pub async fn fetch_transcript(&self, session_id: &str) -> Result<SessionTranscriptWire> {
+        let req = Request::FetchTranscript { session_id: session_id.to_string() };
+        match self.call(req).await? {
+            Response::SessionTranscript(t) => Ok(t),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "SessionTranscript" }),
+        }
+    }
+
+    /// The desktop's projects, offered as new-session targets so the phone can
+    /// start a session in one by its path instead of typing it. May be empty.
+    pub async fn list_projects(&self) -> Result<Vec<ProjectSummaryWire>> {
+        match self.call(Request::ListProjects).await? {
+            Response::Projects(rows) => Ok(rows),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Projects" }),
+        }
+    }
+
+    /// Drop this device's enrollment on the host, so forgetting the desktop here
+    /// also clears this device from the desktop's paired-devices list.
+    ///
+    /// One-way and immediate: every later RPC on this connection is refused, so
+    /// callers unpair as the last thing they do before tearing the link down.
+    pub async fn unpair(&self) -> Result<()> {
+        self.expect_ack(Request::Unpair).await
+    }
+
+    /// Send a user prompt into a session, starting a turn. `corr_id` lets the
+    /// caller match the eventual echoed turn in the event stream.
+    pub async fn send_prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+        images: &[ChatImage],
+        corr_id: u64,
+    ) -> Result<()> {
+        let req = Request::SendPrompt(SendPromptReq {
+            session_id: session_id.to_string(),
+            text: text.to_string(),
+            images: images.to_vec(),
+            corr_id,
+        });
+        self.expect_ack(req).await
+    }
+
+    /// Answer an outstanding permission request. `Ok(true)` = this call decided it;
+    /// `Ok(false)` = it was already decided (idempotent — still a success).
+    pub async fn resolve_permission(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        decision: &PermissionDecision,
+    ) -> Result<bool> {
+        let payload = ResolvePermissionReq::new(session_id, request_id, decision)
+            .map_err(|e| SessionError::Wire(e.to_string()))?;
+        match self.call(Request::ResolvePermission(payload)).await? {
+            Response::Ack => Ok(true),
+            Response::Error(RpcError::AlreadyDecided) => Ok(false),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Ack" }),
+        }
+    }
+
+    /// Answer an outstanding `AskUserQuestion`. Same idempotency contract as
+    /// [`Self::resolve_permission`]: `Ok(false)` means someone answered first.
+    pub async fn answer_question(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        questions: &[AskQuestion],
+        answers: &QuestionAnswers,
+    ) -> Result<bool> {
+        let payload = AnswerQuestionReq {
+            session_id: session_id.to_string(),
+            request_id: request_id.to_string(),
+            questions: questions.to_vec(),
+            answers: answers.clone(),
+        };
+        match self.call(Request::AnswerQuestion(payload)).await? {
+            Response::Ack => Ok(true),
+            Response::Error(RpcError::AlreadyDecided) => Ok(false),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Ack" }),
+        }
+    }
+
+    /// Steer a mid-turn agent with extra guidance.
+    pub async fn steer(&self, session_id: &str, text: &str) -> Result<()> {
+        let req = Request::Steer { session_id: session_id.to_string(), text: text.to_string() };
+        self.expect_ack(req).await
+    }
+
+    /// Cancel the session's in-flight turn.
+    pub async fn cancel(&self, session_id: &str) -> Result<()> {
+        self.expect_ack(Request::Cancel { session_id: session_id.to_string() }).await
+    }
+
+    /// The models and permission modes this session's backend offers.
+    ///
+    /// Empty lists mean "nothing to choose from" — a dynamic-catalog backend
+    /// before its handshake completes, or an agent with no mode options — not a
+    /// failure.
+    pub async fn list_choices(&self, session_id: &str) -> Result<SessionChoices> {
+        let req = Request::ListChoices { session_id: session_id.to_string() };
+        match self.call(req).await? {
+            Response::Choices(choices) => Ok(choices),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Choices" }),
+        }
+    }
+
+    /// Switch the session's model.
+    ///
+    /// Errors when the backend fixes its model at spawn time; the host answers
+    /// with a message saying so rather than accepting silently, so this is worth
+    /// surfacing to the user instead of swallowing.
+    pub async fn set_model(&self, session_id: &str, model: &str) -> Result<()> {
+        let req = Request::SetModel {
+            session_id: session_id.to_string(),
+            model: model.to_string(),
+        };
+        self.expect_ack(req).await
+    }
+
+    /// Switch the session's permission mode. Same fix-at-spawn caveat as
+    /// [`Self::set_model`].
+    pub async fn set_permission_mode(&self, session_id: &str, mode: &str) -> Result<()> {
+        let req = Request::SetPermissionMode {
+            session_id: session_id.to_string(),
+            mode: mode.to_string(),
+        };
+        self.expect_ack(req).await
+    }
+
+    /// Start a new agent session on the desktop, returning its id.
+    ///
+    /// The id comes back rather than being discovered by re-listing, so the
+    /// caller can subscribe to the new session immediately instead of polling
+    /// and guessing which row appeared.
+    pub async fn create_session(&self, cwd: &str, agent_id: Option<&str>) -> Result<String> {
+        let req = Request::CreateSession {
+            cwd: cwd.to_string(),
+            agent_id: agent_id.map(str::to_string),
+        };
+        match self.call(req).await? {
+            Response::SessionCreated { session_id } => Ok(session_id),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "SessionCreated" }),
+        }
+    }
+
+    /// Rewind a session to an earlier turn, dropping that turn and everything
+    /// after it.
+    ///
+    /// **Destructive and not undoable from here.** Returns once the host has
+    /// accepted the rewind, not once it has finished: the truncation arrives on
+    /// the event stream as `ThreadEvent::Rewound`, which is also how a
+    /// desktop-initiated rewind reaches this client, so there is one code path
+    /// applying it rather than two.
+    ///
+    /// `include_files` additionally restores the working tree to the turn's
+    /// checkpoint, discarding uncommitted work. The host may refuse it while
+    /// still performing the conversation rewind's validation; a caller should
+    /// treat that refusal as normal rather than retrying.
+    pub async fn rewind_session(
+        &self,
+        session_id: &str,
+        ordinal: u32,
+        include_files: bool,
+    ) -> Result<()> {
+        let req = Request::RewindSession {
+            session_id: session_id.to_string(),
+            ordinal,
+            include_files,
+        };
+        self.expect_ack(req).await
+    }
+
+    /// Issues or pull requests for the session's repository.
+    ///
+    /// **An empty list is a normal answer**, not a failure: a repo hosted
+    /// nowhere relevant, a forge CLI that is absent or signed out, or simply no
+    /// matching items all resolve to empty. The host cannot tell those apart, so
+    /// a caller must render "nothing here" rather than inventing a reason.
+    pub async fn list_forge_items(
+        &self,
+        session_id: &str,
+        kind: ForgeItemKindWire,
+        state: ForgeStateWire,
+        mine: bool,
+    ) -> Result<Vec<ForgeItemWire>> {
+        let req = Request::ListForgeItems {
+            session_id: session_id.to_string(),
+            kind,
+            state,
+            mine,
+        };
+        match self.call(req).await? {
+            Response::ForgeItems(items) => Ok(items),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "ForgeItems" }),
+        }
+    }
+
+    /// Body + author of one issue/PR. `None` when the forge CLI could not supply
+    /// it — distinct from an item whose body is genuinely empty.
+    pub async fn forge_item_detail(
+        &self,
+        session_id: &str,
+        kind: ForgeItemKindWire,
+        number: u64,
+    ) -> Result<Option<ForgeItemDetailWire>> {
+        let req = Request::GetForgeItemDetail {
+            session_id: session_id.to_string(),
+            kind,
+            number,
+        };
+        match self.call(req).await? {
+            Response::ForgeItemDetail(detail) => Ok(detail),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "ForgeItemDetail" }),
+        }
+    }
+
+    /// CI check runs for the current branch's pull request. Empty is normal —
+    /// no PR, no checks, or a forge with no pipeline mapping.
+    pub async fn list_forge_checks(&self, session_id: &str) -> Result<Vec<CheckRunWire>> {
+        let req = Request::ListForgeChecks { session_id: session_id.to_string() };
+        match self.call(req).await? {
+            Response::ForgeChecks(checks) => Ok(checks),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "ForgeChecks" }),
+        }
+    }
+
+    /// Every schedule the desktop holds. **Empty is a normal answer** — a desktop
+    /// with no schedules is the common case. Refused for a session-scoped device,
+    /// which has no session to be narrowed to.
+    pub async fn list_schedules(&self) -> Result<Vec<ScheduleWire>> {
+        match self.call(Request::ListSchedules).await? {
+            Response::Schedules(rows) => Ok(rows),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Schedules" }),
+        }
+    }
+
+    /// Create a schedule, returning the stored row — its derived id and first
+    /// next-fire come back so the caller can show it without re-listing.
+    ///
+    /// An invalid recurrence (an interval under the desktop's floor, an
+    /// impossible time) is refused by the host rather than stored; the phone's
+    /// pickers cannot express those, so this only bites a malformed caller.
+    pub async fn create_schedule(
+        &self,
+        name: &str,
+        cwd: &str,
+        prompt: &str,
+        agent_id: Option<&str>,
+        recurrence: RecurrenceWire,
+    ) -> Result<ScheduleWire> {
+        let req = Request::CreateSchedule {
+            name: name.to_string(),
+            cwd: cwd.to_string(),
+            prompt: prompt.to_string(),
+            agent_id: agent_id.map(str::to_string),
+            recurrence,
+        };
+        match self.call(req).await? {
+            Response::ScheduleCreated(sched) => Ok(sched),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "ScheduleCreated" }),
+        }
+    }
+
+    /// Delete a schedule. Idempotent — deleting one already gone is success.
+    /// In-flight runs are unaffected; this stops future fires.
+    pub async fn delete_schedule(&self, id: &str) -> Result<()> {
+        self.expect_ack(Request::DeleteSchedule { id: id.to_string() }).await
+    }
+
+    /// Enable or disable a schedule without deleting it. Re-enabling recomputes
+    /// the next fire from now — a schedule paused for a week does not wake owing a
+    /// week of missed runs.
+    pub async fn set_schedule_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        self.expect_ack(Request::SetScheduleEnabled { id: id.to_string(), enabled }).await
+    }
+
+    /// A schedule's recent run history, most recent first, capped at `limit`.
+    /// **Empty means it has never fired**, normal for a fresh schedule.
+    pub async fn get_schedule_runs(
+        &self,
+        schedule_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ScheduleRunWire>> {
+        let req = Request::GetScheduleRuns { schedule_id: schedule_id.to_string(), limit };
+        match self.call(req).await? {
+            Response::ScheduleRuns(rows) => Ok(rows),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "ScheduleRuns" }),
+        }
+    }
+
+    /// Transcribe a recorded voice clip with the desktop's speech engine.
+    ///
+    /// `audio_base64` is a standard-base64 WAV (16 kHz mono PCM16 is the phone's
+    /// contract). An **empty transcript is a normal answer** — a silent clip, or
+    /// one that held only filler — not an error; the caller inserts it as-is.
+    pub async fn transcribe_audio(&self, audio_base64: &str, sample_rate: u32) -> Result<String> {
+        let req = Request::TranscribeAudio { audio_base64: audio_base64.to_string(), sample_rate };
+        match self.call(req).await? {
+            Response::Transcript(text) => Ok(text),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Transcript" }),
+        }
+    }
+
+    /// Gap-fill: replay retained events after `after_seq` (the resync path when the
+    /// live stream reports a `seq` jump).
+    pub async fn events_since(&self, session_id: &str, after_seq: u64) -> Result<Vec<HostEvent>> {
+        let req = Request::EventsSince { session_id: session_id.to_string(), after_seq };
+        match self.call(req).await? {
+            Response::Events(events) => Ok(events),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Events" }),
+        }
+    }
+
+    // ---- plumbing ----
+
+    fn cache(&self, token: String) {
+        *self.token.lock().unwrap() = Some(token);
+    }
+
+    /// A command whose only successful reply is `Ack`.
+    async fn expect_ack(&self, req: Request) -> Result<()> {
+        match self.call(req).await? {
+            Response::Ack => Ok(()),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "Ack" }),
+        }
+    }
+
+    /// Send one request and await its reply. Rides the [`demux`](crate::demux)
+    /// pump, which routes pushed `Response::Event` frames off to the event stream
+    /// and this reply back here — so an RPC is safe to issue even while a live
+    /// subscription is streaming on the same connection.
+    async fn call(&self, req: Request) -> Result<Response> {
+        self.demux.call(req).await
+    }
+}

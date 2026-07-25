@@ -19,11 +19,20 @@ oximux-editor = { workspace = true }
 oximux-git = { workspace = true }
 oximux-proc-cwd = { workspace = true }
 oximux-pty = { workspace = true }
+async-trait = { workspace = true }
 oximux-relay-client = { workspace = true }
 oximux-relay-proto = { workspace = true }
+# Remote control: the in-app iroh host (bind + accept loop) that serves the
+# SessionRegistry to paired phones, its transport-agnostic dispatcher/auth, and
+# the shared wire types (PairingTicket).
+oximux-remote-host = { workspace = true }
+oximux-remote-iroh = { workspace = true, features = ["host"] }
+oximux-remote-proto = { workspace = true }
 oximux-settings = { workspace = true }
 oximux-storage = { workspace = true }
 oximux-ui = { workspace = true }
+
+qrcode = { workspace = true }
 
 gpui = { workspace = true }
 gpui_platform = { workspace = true }
@@ -156,6 +165,10 @@ objc2-web-kit = { version = "0.3", features = [
 objc2-core-foundation = "0.3"
 
 [dev-dependencies]
+# Decodes the rendered pairing QR back to its payload, so the code is proven
+# *scannable* rather than merely well-shaped — the only way to verify that
+# without a phone.
+rqrr = "0.9"
 gpui = { workspace = true, features = ["test-support"] }
 gpui_macros = { workspace = true }
 tempfile = "3"

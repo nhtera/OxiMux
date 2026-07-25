@@ -1,0 +1,415 @@
+//! Live event forwarding for `Subscribe`.
+//!
+//! A subscription turns a session's registry broadcast into a `'static` stream of
+//! tagged [`LiveFrame`]s that the serve loop merges (`SelectAll`) and pushes to the
+//! client as [`Response::Event`] frames. Two invariants ride here:
+//!
+//! - **Per-frame authorization recheck.** Revocation and per-device scope must bite
+//!   the live stream too, not only request RPCs — so a device revoked mid-stream
+//!   stops receiving events even though its broadcast receiver is still open.
+//! - **Backlog dedup cursor.** Subscribing snapshots the backlog *after* taking the
+//!   broadcast receiver, so an event landing in that gap is caught by the live
+//!   stream; a per-session cursor then drops any live `seq` already covered by the
+//!   backlog batch, so the client never sees a `seq` twice.
+
+use std::collections::HashMap;
+
+use futures::stream::{self, BoxStream, StreamExt};
+use oximux_agent_core::thread::ThreadEvent;
+use oximux_agents::session_registry::{Seq, SessionHandle, SessionId};
+use oximux_remote_proto::messages::SessionStatusWire;
+use oximux_remote_proto::proto::{Response, RpcError};
+use oximux_remote_proto::{HostEvent, Transport};
+use tokio::sync::{broadcast, watch};
+
+use super::Dispatcher;
+use crate::auth::AppPubkey;
+
+/// One live event as it leaves the merged subscription stream, tagged with the
+/// session it belongs to (the merge erases which stream produced it).
+pub(super) struct LiveFrame {
+    pub session_id: SessionId,
+    pub seq: Seq,
+    pub event: ThreadEvent,
+}
+
+/// Anything the serve loop can push to the client unsolicited.
+///
+/// Session events and terminal output share **one** merged stream rather than
+/// getting a select arm each. The loop alternates which side leads so neither
+/// requests nor live frames can starve the other; adding a third arm would make
+/// that rotation a three-way fairness problem, and a terminal repainting a
+/// full-screen TUI is exactly the flood that would win it.
+pub(super) enum Live {
+    Session(LiveFrame),
+    Terminal { pty_id: String, frame: crate::terminals::TerminalFrame },
+    /// The live session list changed (a session opened, closed, was renamed/
+    /// remodeled, or flipped its permission flag). Carries no payload: the serve
+    /// loop recomputes the per-device-filtered snapshot on receipt, so the scope
+    /// filter is applied at forward time exactly like the per-frame recheck on
+    /// events. Low-frequency and coalesced by the registry's generation counter, so
+    /// it never floods the merge the way a full-screen terminal repaint would.
+    SessionList,
+}
+
+/// Turn a session's broadcast receiver into a `'static` stream of [`LiveFrame`]s.
+/// A lagged receiver (a slow client outran the ring) **skips** the dropped span
+/// rather than ending — the client resynchronizes via `EventsSince`. The stream
+/// ends when the session's last handle drops (broadcast closed).
+fn live_stream(
+    session_id: SessionId,
+    rx: broadcast::Receiver<(Seq, ThreadEvent)>,
+) -> BoxStream<'static, LiveFrame> {
+    stream::unfold((session_id, rx), |(session_id, mut rx)| async move {
+        loop {
+            match rx.recv().await {
+                Ok((seq, event)) => {
+                    let frame = LiveFrame { session_id: session_id.clone(), seq, event };
+                    return Some((frame, (session_id, rx)));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
+    .boxed()
+}
+
+/// Turn the registry's change receiver into a `'static` stream that yields a
+/// [`Live::SessionList`] tick on every session-list change. The generation counter
+/// coalesces, so a burst of changes wakes the serve loop once; the stream ends when
+/// the registry (the sender) is dropped.
+fn sessions_stream(rx: watch::Receiver<u64>) -> BoxStream<'static, Live> {
+    stream::unfold(rx, |mut rx| async move {
+        match rx.changed().await {
+            Ok(()) => Some((Live::SessionList, rx)),
+            Err(_) => None,
+        }
+    })
+    .boxed()
+}
+
+/// Encode the retained backlog after `after_seq` into wire frames, returning the
+/// frames and the highest `seq` seen (the initial dedup cursor). `Err(())` on an
+/// encode failure. Each frame carries the session's current coarse status.
+fn backlog_frames(
+    handle: &SessionHandle,
+    session_id: &str,
+    after_seq: u64,
+) -> Result<(Vec<HostEvent>, Seq), ()> {
+    let status = handle.status_snapshot();
+    let wire = SessionStatusWire {
+        last_seq: status.last_seq,
+        awaiting_permission: status.awaiting_permission,
+    };
+    let mut frames = Vec::new();
+    let mut cursor = after_seq;
+    for (seq, event) in handle.events_since(after_seq) {
+        let frame = HostEvent::new(session_id, seq, &event, wire.clone()).map_err(|_| ())?;
+        cursor = cursor.max(seq);
+        frames.push(frame);
+    }
+    Ok((frames, cursor))
+}
+
+impl Dispatcher {
+    /// Set up a live subscription. Authorizes + scope-checks, then:
+    /// - **First subscribe on this connection** for the session: takes the
+    ///   broadcast receiver **before** snapshotting the backlog (so no event slips
+    ///   through the gap), seeds the dedup cursor, and returns the immediate
+    ///   [`Response::Events`] backlog plus the live stream to register.
+    /// - **Repeat subscribe** (already streaming this session on this connection):
+    ///   serves the requested backlog only — no second live stream is opened (that
+    ///   would leak a receiver for the life of the connection) and the live cursor
+    ///   is left untouched so dedup keeps holding.
+    ///
+    /// Returns the immediate response and, only on the first subscribe, the stream.
+    pub(super) fn begin_subscribe(
+        &self,
+        pubkey: &AppPubkey,
+        session_id: &str,
+        after_seq: u64,
+        cursors: &mut HashMap<SessionId, Seq>,
+    ) -> (Response, Option<BoxStream<'static, LiveFrame>>) {
+        if !self.auth.is_allowed_for(pubkey, session_id) {
+            return (Response::Error(RpcError::Unauthorized), None);
+        }
+        let Some(handle) = self.registry.get(session_id) else {
+            return (Response::Error(RpcError::UnknownSession), None);
+        };
+
+        // Already streaming this session on this connection → backlog only,
+        // idempotent, cursor preserved.
+        if cursors.contains_key(session_id) {
+            return match backlog_frames(&handle, session_id, after_seq) {
+                Ok((frames, _)) => (Response::Events(frames), None),
+                Err(()) => (Response::Error(RpcError::Internal("event encode failed".into())), None),
+            };
+        }
+
+        // First subscribe: receiver before snapshot so an event landing in the gap
+        // is caught live and deduped by the cursor, never dropped.
+        let rx = handle.subscribe();
+        match backlog_frames(&handle, session_id, after_seq) {
+            Ok((frames, cursor)) => {
+                cursors.insert(session_id.to_string(), cursor);
+                (Response::Events(frames), Some(live_stream(session_id.to_string(), rx)))
+            }
+            Err(()) => (Response::Error(RpcError::Internal("event encode failed".into())), None),
+        }
+    }
+
+    /// Forward one live frame to the client, honoring the per-frame authorization
+    /// recheck (revocation/scope) and the backlog dedup cursor. Returns whether the
+    /// transport is still writable (`false` → the serve loop should stop).
+    pub(super) async fn forward_live(
+        &self,
+        pubkey: &AppPubkey,
+        cursors: &mut HashMap<SessionId, Seq>,
+        transport: &dyn Transport,
+        frame: LiveFrame,
+    ) -> bool {
+        // Revocation / scope bites the live stream too: suppress silently but keep
+        // the connection open (other sessions may still be permitted).
+        if !self.auth.is_allowed_for(pubkey, &frame.session_id) {
+            return true;
+        }
+        // Never re-send a `seq` already covered by the backlog batch (or an
+        // out-of-order late duplicate).
+        let cursor = cursors.entry(frame.session_id.clone()).or_insert(0);
+        if frame.seq <= *cursor {
+            return true;
+        }
+        *cursor = frame.seq;
+
+        let status = self
+            .registry
+            .get(&frame.session_id)
+            .map(|h| h.status_snapshot())
+            .unwrap_or_default();
+        let wire = SessionStatusWire {
+            last_seq: status.last_seq,
+            awaiting_permission: status.awaiting_permission,
+        };
+        let host_event = match HostEvent::new(&frame.session_id, frame.seq, &frame.event, wire) {
+            Ok(e) => e,
+            Err(_) => return true, // can't encode this one; keep the stream alive
+        };
+        transport
+            .send(Response::Event(host_event).to_bytes().expect("response is always encodable"))
+            .await
+            .is_ok()
+    }
+
+    /// Set up a session-list subscription: reply with the current per-device
+    /// snapshot, then — on the first subscribe for this connection — a stream that
+    /// pushes a fresh snapshot on every registry change. A repeat subscribe serves
+    /// the snapshot only: a second change-receiver would leak for the connection's
+    /// life and double every push.
+    pub(super) fn begin_subscribe_sessions(
+        &self,
+        pubkey: &AppPubkey,
+        already: &mut bool,
+    ) -> (Response, Option<BoxStream<'static, Live>>) {
+        if *already {
+            return (Response::Sessions(self.snapshot_sessions(pubkey)), None);
+        }
+        // Receiver before snapshot so a change landing in the gap fires a tick
+        // rather than being missed — an extra identical push is harmless. The
+        // immediate reply is a plain `Sessions` (routed to the client's RPC slot);
+        // only the later change pushes are `SessionsChanged`.
+        let rx = self.registry.subscribe_changes();
+        let snapshot = self.snapshot_sessions(pubkey);
+        *already = true;
+        (Response::Sessions(snapshot), Some(sessions_stream(rx)))
+    }
+
+    /// Push the current session list, recomputed per change so the per-device scope
+    /// filter is honoured on every push — mirroring `forward_live`'s per-frame
+    /// recheck. Returns whether the transport is still writable.
+    pub(super) async fn forward_sessions(&self, pubkey: &AppPubkey, transport: &dyn Transport) -> bool {
+        let snapshot = self.snapshot_sessions(pubkey);
+        transport
+            .send(
+                Response::SessionsChanged(snapshot)
+                    .to_bytes()
+                    .expect("response is always encodable"),
+            )
+            .await
+            .is_ok()
+    }
+}
+
+impl Dispatcher {
+    /// List the terminals this device may see.
+    pub(super) async fn list_terminals(&self, pubkey: &AppPubkey) -> Response {
+        if !self.auth.may_use_terminals(pubkey) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(source) = &self.terminals else {
+            return Response::Error(RpcError::Unauthorized);
+        };
+        match source.list().await {
+            Ok(rows) => Response::Terminals(rows),
+            Err(e) => {
+                tracing::warn!(error = %e, "list terminals failed");
+                Response::Error(RpcError::Internal("terminals unavailable".into()))
+            }
+        }
+    }
+
+    /// Attach to a terminal: immediate replay, plus a live stream to register.
+    ///
+    /// A repeat attach to a terminal this connection already streams serves the
+    /// replay again WITHOUT opening a second stream — the same rule `Subscribe`
+    /// follows, and for the same reason: a second stream would leak a receiver
+    /// for the life of the connection and double every subsequent frame.
+    /// Re-attaching is also the documented gap recovery, so it must be cheap and
+    /// repeatable rather than something a client is punished for.
+    pub(super) async fn begin_term_attach(
+        &self,
+        pubkey: &AppPubkey,
+        pty_id: &str,
+        attached: &mut HashMap<String, tokio::sync::oneshot::Sender<()>>,
+    ) -> (Response, Option<BoxStream<'static, Live>>) {
+        if !self.auth.may_use_terminals(pubkey) {
+            return (Response::Error(RpcError::Unauthorized), None);
+        }
+        let Some(source) = &self.terminals else {
+            return (Response::Error(RpcError::Unauthorized), None);
+        };
+        let (attach, rx) = match source.attach(pty_id).await {
+            Ok(v) => v,
+            Err(crate::terminals::TerminalError::NotFound) => {
+                return (Response::Error(RpcError::UnknownSession), None);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "terminal attach failed");
+                return (Response::Error(RpcError::Internal("terminals unavailable".into())), None);
+            }
+        };
+        let response = Response::TermAttached {
+            replay: attach.replay,
+            cols: attach.cols,
+            rows: attach.rows,
+        };
+        if attached.contains_key(pty_id) {
+            // Already streaming: `rx` drops here, which detaches the duplicate
+            // attachment rather than leaving it fanning into nothing.
+            return (response, None);
+        }
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        attached.insert(pty_id.to_owned(), cancel_tx);
+        (response, Some(term_stream(pty_id.to_owned(), rx, cancel_rx)))
+    }
+
+    /// Type into a terminal. The gate here is the write tier, not merely
+    /// terminal visibility — this is arbitrary code execution on the desktop.
+    pub(super) async fn term_input(&self, pubkey: &AppPubkey, pty_id: &str, bytes: &[u8]) -> Response {
+        if !self.auth.may_drive_terminals(pubkey) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(source) = &self.terminals else {
+            return Response::Error(RpcError::Unauthorized);
+        };
+        match source.input(pty_id, bytes).await {
+            Ok(()) => Response::Ack,
+            Err(crate::terminals::TerminalError::NotFound) => {
+                Response::Error(RpcError::UnknownSession)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "terminal input failed");
+                Response::Error(RpcError::Internal("terminals unavailable".into()))
+            }
+        }
+    }
+
+    /// Resize a terminal — write-gated, because the size is shared with every
+    /// other attachment including the desktop's own window.
+    pub(super) async fn term_resize(
+        &self,
+        pubkey: &AppPubkey,
+        pty_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Response {
+        if !self.auth.may_drive_terminals(pubkey) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(source) = &self.terminals else {
+            return Response::Error(RpcError::Unauthorized);
+        };
+        // A zero dimension is nonsense a PTY layer may accept and then divide by.
+        // Rejected here rather than clamped: a client asking for a 0-column grid
+        // has a bug, and silently serving it something else hides that.
+        if cols == 0 || rows == 0 {
+            return Response::Error(RpcError::BadRequest("terminal size must be non-zero".into()));
+        }
+        match source.resize(pty_id, cols, rows).await {
+            Ok(()) => Response::Ack,
+            Err(crate::terminals::TerminalError::NotFound) => {
+                Response::Error(RpcError::UnknownSession)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "terminal resize failed");
+                Response::Error(RpcError::Internal("terminals unavailable".into()))
+            }
+        }
+    }
+}
+
+/// Turn an attached terminal's frame receiver into a `'static` merged stream.
+///
+/// Ends when the source drops the sender (the terminal is gone) **or** when
+/// `cancel` fires. The cancel half is not optional bookkeeping: `SelectAll` has
+/// no way to remove one stream, so without it a detach could only forget the
+/// entry while the stream kept forwarding — and the next attach would add a
+/// second one beside it. Duplicated output accumulates per attach/detach cycle,
+/// which is a screen full of doubled characters rather than a leak anyone would
+/// notice as one.
+fn term_stream(
+    pty_id: String,
+    rx: tokio::sync::mpsc::Receiver<crate::terminals::TerminalFrame>,
+    cancel: tokio::sync::oneshot::Receiver<()>,
+) -> BoxStream<'static, Live> {
+    stream::unfold((pty_id, rx, cancel), |(pty_id, mut rx, mut cancel)| async move {
+        tokio::select! {
+            // Biased so a pending cancel wins over a frame that is already
+            // queued: after a detach the client is no longer rendering this
+            // terminal, and delivering one more frame would reach a screen that
+            // has moved on.
+            biased;
+            _ = &mut cancel => None,
+            frame = rx.recv() => {
+                let frame = frame?;
+                Some((Live::Terminal { pty_id: pty_id.clone(), frame }, (pty_id, rx, cancel)))
+            }
+        }
+    })
+    .boxed()
+}
+
+/// Forward one terminal frame. Returns whether the transport is still writable.
+pub(super) async fn forward_terminal(
+    auth: &crate::auth::AuthStore,
+    pubkey: &AppPubkey,
+    transport: &dyn Transport,
+    pty_id: String,
+    frame: crate::terminals::TerminalFrame,
+) -> bool {
+    // Per-frame recheck, matching the session path: a device revoked or
+    // downgraded mid-stream stops seeing a terminal it was already watching.
+    // Read access is the right gate here — this direction never types.
+    if !auth.may_use_terminals(pubkey) {
+        return true;
+    }
+    let response = match frame {
+        crate::terminals::TerminalFrame::Output(bytes) => Response::TermOutput { pty_id, bytes },
+        crate::terminals::TerminalFrame::Gapped => Response::TermGapped { pty_id },
+        crate::terminals::TerminalFrame::Exited(code) => Response::TermExited { pty_id, code },
+    };
+    transport
+        .send(response.to_bytes().expect("response is always encodable"))
+        .await
+        .is_ok()
+}

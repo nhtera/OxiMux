@@ -732,11 +732,23 @@ impl PaneGroup {
     /// `claude` subprocess (separate PID). Not a singleton — each chat is its
     /// own session, so a second call opens a second chat. The label is a
     /// running `Chat N` count over the group's existing chat tabs.
+    /// `initial_prompt` sends a first message the moment the tab exists, for a
+    /// caller that already knows what the session is for (a scheduled run). It
+    /// travels `AgentChatView::send_text` — the same path a typed prompt takes —
+    /// so it is subject to the same guards and lands in history identically.
+    ///
+    /// Sending here rather than parking the text on the view is deliberate: the
+    /// bound constructor connects **synchronously**, so by this line the session
+    /// is live and there is nothing to wait for. A stored "send once connected"
+    /// field would additionally have to defend against re-sending on every
+    /// respawn — re-running the prompt, which for a scheduled run may well mutate
+    /// a repository.
     pub fn open_agent_chat_tab(
         &mut self,
         cwd: PathBuf,
         model: Option<String>,
         backend: oximux_agents::thread::ChatBackend,
+        initial_prompt: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -757,7 +769,13 @@ impl PaneGroup {
                 cx,
             )
         });
-        self.push_agent_chat_view(view, cwd, model, window, cx)
+        // Pushed before sending so the tab is in the tree when the first turn
+        // starts streaming into it.
+        let idx = self.push_agent_chat_view(view.clone(), cwd, model, window, cx);
+        if let Some(prompt) = initial_prompt {
+            view.update(cx, |view, cx| view.send_text(prompt, Vec::new(), cx));
+        }
+        idx
     }
 
     /// Open an **unbound** *New Agent* draft chat: no subprocess spawns until the
@@ -937,6 +955,9 @@ impl PaneGroup {
         self.bump_mru(new_idx);
         self.focus_active(window, cx);
         self.pin_tab_strip_to_end();
+        // Seed the remote registry with the tab's starting label so a paired
+        // device shows "Chat N" (or a restored custom title) rather than agent-N.
+        self.sync_remote_tab_title(new_idx, cx);
         cx.notify();
         new_idx
     }
@@ -1000,12 +1021,19 @@ impl PaneGroup {
             crate::shell::agent_chat::AgentChatEvent::TitleChanged(title) => {
                 // Update the tab's fallback label (a user's manual `custom_title`
                 // rename still wins over it in the header render).
-                for tab in &mut self.tabs {
+                let mut changed = None;
+                for (i, tab) in self.tabs.iter_mut().enumerate() {
                     if let PaneContent::AgentChat(v) = &tab.content
                         && v.entity_id() == view.entity_id()
                     {
                         tab.label = SharedString::from(title.clone());
+                        changed = Some(i);
                     }
+                }
+                // Carry the new label to the remote session list (custom rename
+                // still wins inside the sync).
+                if let Some(idx) = changed {
+                    self.sync_remote_tab_title(idx, cx);
                 }
                 cx.notify();
             }
@@ -1165,6 +1193,20 @@ impl PaneGroup {
         };
         let view = view.clone();
         self.toggle_terminal_for_chat(view, window, cx);
+    }
+
+    /// The remote-control session id of the agent chat at `ix`, if that tab is
+    /// one.
+    ///
+    /// Exists for the remote launch path, which opens a tab and must answer the
+    /// phone with the id of the session it created. Reads it off the view rather
+    /// than tracking it separately, so there is no second copy to drift.
+    pub fn chat_session_id_at(&self, ix: usize, cx: &App) -> Option<String> {
+        let tab = self.tabs.get(ix)?;
+        let PaneContent::AgentChat(view) = &tab.content else {
+            return None;
+        };
+        Some(view.read(cx).remote_session_id().to_string())
     }
 
     /// Toggle the ACTIVE tab between chat and its companion terminal view — the
@@ -2161,9 +2203,6 @@ impl PaneGroup {
         let prompt = ConfirmPrompt {
             title: "Unsaved changes".into(),
             body: format!("{file_name} has unsaved changes. Save before closing?").into(),
-            // Plain confirm — no type-to-confirm; closing one tab isn't worth
-            // a typed gate.
-            expected: "".into(),
             on_confirm,
             confirm_label: Some("Save".into()),
             on_cancel: None,
@@ -2179,9 +2218,8 @@ impl PaneGroup {
         let dialog =
             cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
 
-        // Focus the dialog so Enter (Save) / Escape (Cancel) work without a
-        // click — the prompt has no inner Input to grab focus on its own.
-        dialog.read(cx).focus_handle(cx).focus(window, cx);
+        // `ConfirmDialog::new` takes focus itself, so Enter (Save) / Escape
+        // (Cancel) work without a click.
 
         // Drop the dialog the moment the user resolves it. Replacing the
         // observer cancels any stale one.
@@ -2326,7 +2364,27 @@ impl PaneGroup {
             tab.custom_title = title;
             cx.notify();
         }
+        // A rename must reach the remote session list too, so a paired phone shows
+        // the same name the desktop tab now does.
+        self.sync_remote_tab_title(idx, cx);
         self.schedule_repin_if_was_pinned(was_pinned, cx);
+    }
+
+    /// Mirror an AgentChat tab's visible title (a manual rename, else the running
+    /// label) into its chat view, which publishes it to the remote registry so a
+    /// paired device's session list shows the same name as the desktop tab rather
+    /// than the raw `agent-N` id. No-op for a non-agent tab or a bad index.
+    pub(super) fn sync_remote_tab_title(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some((view, title)) = self.tabs.get(idx).and_then(|tab| {
+            let PaneContent::AgentChat(view) = &tab.content else {
+                return None;
+            };
+            let title = tab.custom_title.clone().unwrap_or_else(|| tab.label.clone());
+            Some((view.clone(), title.to_string()))
+        }) else {
+            return;
+        };
+        view.update(cx, |v, _cx| v.set_remote_tab_title(Some(title)));
     }
 
     /// Resolve the tab's visible title — custom override if set, else

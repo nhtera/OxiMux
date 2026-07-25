@@ -74,28 +74,36 @@ impl ProjectPanes {
     /// active id is stale). Not a singleton — each call opens a fresh chat
     /// session with its own headless subprocess. Routed to by the launch picker
     /// when `default_open_mode` is `Chat` and the picked adapter is chat-capable.
+    ///
+    /// Returns the new tab's remote-control session id. The tab index the pane
+    /// group hands back is deliberately *not* the return value: it is a position
+    /// in a list that reorders, whereas the session id is stable for the view's
+    /// lifetime and is what a remote caller actually asked for. Existing callers
+    /// ignore it.
+    ///
+    /// `initial_prompt` is sent as the session's first message — see
+    /// [`PaneGroup::open_agent_chat_tab`].
     pub fn open_agent_chat_tab_in_active_group(
         &mut self,
         cwd: PathBuf,
         model: Option<String>,
         backend: oximux_agents::thread::ChatBackend,
+        initial_prompt: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<String> {
         let target_id = self
             .groups
             .contains_key(&self.manager.active_group_id())
             .then(|| self.manager.active_group_id())
             .or_else(|| self.manager.in_order_groups().first().copied());
-        let Some(target_id) = target_id else {
-            return;
-        };
+        let target_id = target_id?;
         self.set_active_group(target_id, window, cx);
-        if let Some(target) = self.groups.get(&target_id).cloned() {
-            target.update(cx, |g, cx| {
-                g.open_agent_chat_tab(cwd, model, backend, window, cx);
-            });
-        }
+        let target = self.groups.get(&target_id).cloned()?;
+        target.update(cx, |g, cx| {
+            let ix = g.open_agent_chat_tab(cwd, model, backend, initial_prompt, window, cx);
+            g.chat_session_id_at(ix, cx)
+        })
     }
 
     /// Open an unbound *New Agent* draft chat in the active group (deferred

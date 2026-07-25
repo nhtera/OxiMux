@@ -1,0 +1,44 @@
+[package]
+name = "oximux-remote-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# The remote-control wire vocabulary: the append-only RPC envelope, the
+# `HostEvent` stream frame, the `PairingTicket` codec, and the transport-agnostic
+# `Transport` seam. Deliberately dependency-minimal — no iroh, no irpc, no tokio
+# runtime, no gpui. `async-trait` is the sole async dep (a proc-macro, no
+# runtime), so the crate still cross-compiles to aarch64-apple-ios /
+# aarch64-linux-android with no desktop-only deps. The host (`remote-host`) and
+# the phone's Rust core (`mobile-core` via `remote-session`) both speak it.
+[dependencies]
+oximux-agent-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true, features = ["use-std"] }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+# The registration proof is a wire invariant — host and client MUST compute it
+# identically — so it lives here, computed with these pure-Rust (mobile-portable)
+# crypto crates rather than duplicated per side.
+hmac = { workspace = true }
+sha2 = { workspace = true }
+# Only pulled in by the `testing` feature (the in-memory loopback transport);
+# a runtime-agnostic executor + channels, so no tokio in a shippable build.
+futures = { workspace = true, optional = true }
+
+[features]
+# Exposes `testing::DuplexTransport` — the in-process loopback that lets this
+# crate AND downstream crates (e.g. `remote-host` dispatcher tests) drive the RPC
+# layer with no network. Enabled automatically for this crate's own `cargo test`
+# (via `cfg(test)`); downstream crates opt in with `features = ["testing"]`.
+testing = ["dep:futures"]
+
+[dev-dependencies]
+# The loopback module is `cfg(any(test, feature = "testing"))`, so this crate's
+# own tests need `futures` unconditionally available.
+futures = { workspace = true }

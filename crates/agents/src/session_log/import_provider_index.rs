@@ -377,7 +377,7 @@ fn pi_user_text(v: &Value) -> Option<String> {
             .find_map(|b| b.get("text").and_then(Value::as_str))?
             .to_string()
     };
-    (!text.trim().is_empty()).then(|| text)
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// Last `session_info.name` in the tail (a rename lands late in the file).
@@ -618,14 +618,13 @@ fn pi_preview_message(v: &Value) -> Option<PreviewMessage> {
     let text = if let Some(s) = content.as_str() {
         s.to_string()
     } else {
-        let joined = content
+        content
             .as_array()?
             .iter()
             .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
             .filter_map(|b| b.get("text").and_then(Value::as_str))
             .collect::<Vec<_>>()
-            .join("\n");
-        joined
+            .join("\n")
     };
     if text.trim().is_empty() {
         return None;

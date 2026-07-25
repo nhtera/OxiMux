@@ -1,0 +1,51 @@
+[package]
+name = "oximux-mobile-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# The phone's Rust core: a uniffi binding that wraps the pure-Rust
+# `remote-session` client + the `remote-iroh` transport into a typed async +
+# streamed-callback surface for the React Native app (Swift / Kotlin / JSI). It
+# owns the iroh connection, the RPC client, reconnect, and the `HostEvent` fold;
+# React Native calls it over generated bindings. Builds as a `cdylib` (Android) /
+# `staticlib` (iOS) alongside the normal `lib` for in-workspace tests + bindgen.
+[lib]
+name = "oximux_mobile_core"
+crate-type = ["cdylib", "staticlib", "lib"]
+
+[dependencies]
+oximux-remote-proto = { workspace = true }
+oximux-remote-session = { workspace = true }
+# Client half only — deliberately without the `host` feature the desktop enables.
+oximux-remote-iroh = { workspace = true }
+oximux-agent-core = { workspace = true }
+uniffi = { workspace = true }
+# Owns a runtime for the long-lived connection/pump tasks; async FFI methods run
+# under uniffi's tokio bridge.
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+# The thread snapshot is a borrowed projection of the `agent-core` read model, so
+# it needs `derive` to serialize by reference rather than cloning the transcript.
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Tests drive the real client core against the real `remote-host` dispatcher over
+# the in-memory loopback (a test `Connector`), no iroh/network needed.
+oximux-remote-proto = { workspace = true, features = ["testing"] }
+oximux-remote-host = { workspace = true }
+oximux-agents = { workspace = true }
+async-trait = { workspace = true }
+
+[[bin]]
+# `cargo run --bin uniffi-bindgen -- generate --library <dylib> --language swift …`
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = []

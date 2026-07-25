@@ -348,8 +348,8 @@ impl AgentChatView {
         // Route up: the leaf carries no `WorkspaceRepo`, so ask the host to make
         // the worktree a first-class `Workspace` (DB row + git worktree). The
         // outcome returns via `on_worktree_create_outcome`, which resumes the
-        // send staged above. (The Orca thin-leaf shape — no workspace state on
-        // this view; the host owns the storage seam.)
+        // send staged above. (A thin-leaf shape — no workspace state on this
+        // view; the host owns the storage seam.)
         cx.emit(super::AgentChatEvent::WorktreeWorkspaceRequested { slug });
         cx.notify();
     }
@@ -804,9 +804,14 @@ mod tests {
         // Claude's pre-bind vocab is the rich shared list: pretty labels + blurbs,
         // not the bare registry wires.
         let claude_wires: Vec<&str> = claude.models.iter().map(|m| m.wire.as_str()).collect();
-        assert_eq!(claude_wires, ["opus", "sonnet", "haiku"]);
+        assert_eq!(claude_wires, ["opus", "fable", "sonnet", "haiku"]);
         assert_eq!(claude.models[0].label, "Opus");
-        assert!(claude.models[0].description.is_some(), "Claude models carry a blurb pre-bind");
+        // The blurb is where the version shows, so the pre-bind draft names the
+        // same model the bound session will report.
+        assert_eq!(
+            claude.models[0].description.as_deref(),
+            Some("Opus 5 · Best for everyday, complex tasks"),
+        );
         assert_eq!(claude.efforts, ["high", "medium", "low"]);
         assert_eq!(claude.default_model(), Some("opus"));
         // Codex offers no pre-bind models: its stale terminal-launcher list would

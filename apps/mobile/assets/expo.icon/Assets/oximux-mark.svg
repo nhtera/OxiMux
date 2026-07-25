@@ -1,0 +1,20 @@
+<!--
+  The prompt mark: a chevron and a cursor rule.
+
+  The chevron is two separate two-point segments rather than one three-point
+  polyline, and that is load-bearing. Icon Composer closes a multi-point element
+  as if it were a polygon, which drew a hairline straight down the mark between
+  the chevron's two open ends — visible on the home screen, though every correct
+  SVG renderer showed the shape fine. A two-point segment closes onto itself, so
+  the same behaviour is degenerate and cannot draw anything.
+
+  The two segments meet at 526,513, where their round caps produce exactly the
+  disc a round join would, so the rendered shape is unchanged.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <g fill="none" stroke="#E6E8EC" stroke-width="60" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M351 370 L526 513"/>
+    <path d="M526 513 L351 655"/>
+    <path d="M566 655 L744 655"/>
+  </g>
+</svg>

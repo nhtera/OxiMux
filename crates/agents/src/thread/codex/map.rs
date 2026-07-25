@@ -1,9 +1,9 @@
 //! Codex app-server (v2) notification → [`ThreadEvent`] mapping.
 //!
 //! codex 0.144.1's v2 protocol has a **single** event channel (item lifecycle +
-//! turn/thread events) — the legacy `codex/event/<snake>` mirror the older Paseo
-//! reference warns about does NOT exist here, so there is no dual-channel dedup
-//! to do. `item/started` carries the `ThreadItem` at the start of a tool/message,
+//! turn/thread events) — the legacy `codex/event/<snake>` mirror that older
+//! protocol versions emitted does NOT exist here, so there is no dual-channel
+//! dedup to do. `item/started` carries the `ThreadItem` at the start of a tool/message,
 //! `item/completed` carries the authoritative final item (so text/reasoning are
 //! finalized from it, not from a delta buffer). Verified via
 //! `codex app-server generate-json-schema`.
@@ -1382,7 +1382,7 @@ mod tests {
         assert!(matches!(&spawn[0], ThreadEvent::ToolCallStarted { id, .. } if id == "collab_2"));
         assert!(spawn.contains(&ThreadEvent::SubagentAction {
             parent_tool_call_id: "collab_2".into(), line: "Bash rustc --version".into() }));
-        assert!(s.subagent_buffer.get("child-B").is_none(), "buffer drained on register");
+        assert!(!s.subagent_buffer.contains_key("child-B"), "buffer drained on register");
     }
 
     #[test]

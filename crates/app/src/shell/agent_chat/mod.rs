@@ -23,6 +23,7 @@ mod dictation_history;
 mod dictation_hud;
 mod dictation_service;
 mod dictation_ui;
+mod remote_dictation;
 mod dictation_waveform;
 mod context_providers;
 mod diff_card;
@@ -54,6 +55,7 @@ pub use acp_terminal_host::install as install_acp_terminal_host;
 /// Install the process-wide voice-dictation service (controller + model
 /// manager) at app boot — re-exported for `main` to call once.
 pub use dictation_service::install as install_dictation_service;
+pub use dictation_service::build_remote_transcriber;
 
 /// Model-management entry points the Voice settings pane drives (the recorder
 /// `start`/`stop` stay internal — they carry a `ComposerView` handle). Re-exported
@@ -516,6 +518,8 @@ use composer::{ComposerEvent, ComposerView, ControlVocab};
 use context_providers::{ContextRequest, ContextSource};
 use question_card::{QuestionCard, QuestionCardEvent};
 use tool_grouping::{plan_tool_grouping, summarize_tool_run, EntryDisplay, GroupSummary, GroupedTool};
+use crate::remote_control::{RemoteBinding, RemoteControl, next_remote_session_id};
+use oximux_agents::session_registry::{ChoiceKind, RemoteChoice, RemotePrompt, SessionMeta};
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
@@ -560,8 +564,19 @@ pub struct AgentChatView {
     /// is its sole mutator, on the foreground thread.
     thread: ChatThread,
     /// The live agent connection. `None` if the subprocess failed to spawn (a
-    /// read-only error state) or after teardown.
-    connection: Option<Box<dyn AgentConnection>>,
+    /// read-only error state) or after teardown. Shared as an `Arc` so the
+    /// session registry can hold the same connection and command it off-thread.
+    connection: Option<Arc<dyn AgentConnection>>,
+    /// Stable id this session is exposed under to remote (phone) clients. Minted
+    /// once per view and kept across respawns, decoupled from the agent's own
+    /// (maybe-not-yet-known) session id — remote just needs a key stable for the
+    /// view's lifetime.
+    remote_session_id: String,
+    /// The live tie into the remote-control [`SessionRegistry`], or `None` when
+    /// remote control is disabled (the common case → zero per-event cost). `Some`
+    /// only while a connection is bound and remote is enabled; each `ThreadEvent`
+    /// is teed through it in [`Self::apply_batch`].
+    remote: Option<RemoteBinding>,
     /// The bottom composer (status line + input + Send button), isolated into
     /// its own view so typing repaints only it, never the transcript. It reports
     /// submissions back via [`ComposerEvent`].
@@ -726,6 +741,17 @@ pub struct AgentChatView {
     /// `Drop::shutdown()` (which kills the child → stdout EOF → both threads
     /// unwind). Keep that the single cleanup owner across future refactors.
     _drain_task: Option<Task<()>>,
+    /// Relays remotely-injected prompts (phone sends) into this tab's transcript so
+    /// the desktop shows the user's own bubble. Re-created on each (re)bind; dropping
+    /// it ends the relay.
+    _remote_prompt_task: Option<Task<()>>,
+    /// Drains model/mode changes relayed from a remote picker. Held for its
+    /// lifetime like the prompt relay — dropping it ends the drain. Started once
+    /// and never replaced (see [`AgentChatView::choice_relay_sender`]).
+    _remote_choice_task: Option<Task<()>>,
+    /// The live end of that relay, handed to each binding. Kept so a rebind can
+    /// re-register it without disturbing the task.
+    remote_choice_tx: Option<futures::channel::mpsc::UnboundedSender<RemoteChoice>>,
     _subscriptions: Vec<Subscription>,
     /// Interactive AskUserQuestion cards for tool calls awaiting answers, keyed
     /// by tool-call id. Each is its own entity so its text inputs repaint without
@@ -823,6 +849,13 @@ pub struct AgentChatView {
     /// group already owns this view's `Entity`). `None` in tests / standalone use,
     /// which simply omits the terminal sources.
     pane_group: Option<WeakEntity<PaneGroup>>,
+    /// The visible tab title the desktop shows for this chat — a user's manual
+    /// rename, else the running `Chat N` / agent label — mirrored here by the
+    /// owning pane group so the remote session list renders the same name rather
+    /// than the raw `agent-N` id. `None` until the pane group first syncs it (or
+    /// in standalone use), where [`Self::publish_remote_meta`] falls back to the
+    /// thread's provider-native title.
+    remote_tab_title: Option<String>,
     /// True when `cwd` sits inside a git repo, checked once at construction via
     /// a cheap `.git` stat (the same heuristic `workspaces_with_primary_for`
     /// uses for the synthesized primary-row check). Gates the *New Agent*
@@ -907,6 +940,18 @@ fn entry_child_indices(
 }
 
 impl AgentChatView {
+    /// The key this view is registered under in the remote-control
+    /// [`SessionRegistry`].
+    ///
+    /// Exposed for the remote *launch* path, which has to answer a phone with
+    /// the id of the session it just asked for. It is available the instant the
+    /// view exists — the id is a process-local counter minted in
+    /// [`Self::new`], not something the backend hands back — so a caller can
+    /// read it without waiting for a connection.
+    pub fn remote_session_id(&self) -> &str {
+        &self.remote_session_id
+    }
+
     /// Construct a chat view and spawn its headless `claude` subprocess in
     /// `cwd`. A spawn failure degrades to a read-only error state rather than
     /// panicking, so the tab still opens and explains what went wrong.
@@ -1145,7 +1190,7 @@ impl AgentChatView {
         // A resumed thread carries the prior session id; a fresh one is `None`
         // (spawn a new session). Either way the subprocess is spawned the same.
         let resume_session_id = thread.session_id.clone();
-        let mut connection: Option<Box<dyn AgentConnection>> = None;
+        let mut connection: Option<Arc<dyn AgentConnection>> = None;
         let mut disconnected = false;
         let mut drain_task = None;
         // A fresh/restored session always starts in the default permission mode
@@ -1288,9 +1333,60 @@ impl AgentChatView {
             .to_string()
         });
 
+        let remote_session_id = next_remote_session_id();
+        // Bind this session into the remote-control registry now if remote control
+        // is enabled (else `None` — nothing registered, nothing teed).
+        let remote = connection.clone().and_then(|conn| {
+            cx.try_global::<RemoteControl>().and_then(|rc| rc.bind(&remote_session_id, conn))
+        });
+        // A restored transcript loads at construction (never through the live event
+        // drain that publishes for a running session), so publish its meta + folded
+        // history now. Without this a remote client opening an idle restored session
+        // sees it unlabelled and empty until the next live event — the exact gap on a
+        // host restart. `bind_remote` covers the later respawn/reconnect path; this
+        // covers cold restore, where `self` does not exist yet so the binding is
+        // driven directly from the locals that seed the struct below.
+        let mut remote_prompt_task = None;
+        let mut remote_choice_task = None;
+        let mut remote_choice_sender = None;
+        if let Some(binding) = &remote {
+            let model = thread.model.clone().or_else(|| model.clone());
+            binding.set_meta(SessionMeta {
+                title: thread.title.clone(),
+                // The backend's baseline again, for the same reason as the mode
+                // below: a session opened remotely carries no pick of its own, so
+                // without this its picker would show nothing selected until the
+                // user changed something. Mirrors `Self::effective_model`, which
+                // takes over from the first live republish.
+                model: model
+                    .clone()
+                    .or_else(|| connection.as_ref().and_then(|c| c.default_model())),
+                // The backend's baseline: the tab seeds `permission_mode: None`
+                // below, and a restored pick republishes when it is applied.
+                permission_mode: connection.as_ref().and_then(|c| c.default_mode()),
+                cwd: Some(cwd.clone()),
+            });
+            if let Ok(entries_json) = serde_json::to_string(&thread.entries) {
+                binding.publish_transcript(entries_json, model);
+            }
+            // Relay remotely-injected prompts (phone sends) into this tab so the
+            // desktop shows the user's own bubble, not just the reply.
+            let (tx, rx) = futures::channel::mpsc::unbounded();
+            binding.set_prompt_sink(tx);
+            remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, cx));
+            // Complete model/mode picks the backend fixes at spawn, which only
+            // this view can carry out (it owns the respawn).
+            let (choice_tx, choice_rx) = futures::channel::mpsc::unbounded();
+            binding.set_choice_sink(choice_tx.clone());
+            remote_choice_sender = Some(choice_tx);
+            remote_choice_task = Some(Self::spawn_remote_choice_relay(choice_rx, cx));
+        }
+
         Self {
             thread,
             connection,
+            remote_session_id,
+            remote,
             backend,
             composer,
             session_detail_open: false,
@@ -1335,6 +1431,9 @@ impl AgentChatView {
             sheet_copied: false,
             _sheet_copy_task: None,
             _drain_task: drain_task,
+            _remote_prompt_task: remote_prompt_task,
+            _remote_choice_task: remote_choice_task,
+            remote_choice_tx: remote_choice_sender,
             _subscriptions: subscriptions,
             question_cards: HashMap::new(),
             question_card_subs: HashMap::new(),
@@ -1350,6 +1449,7 @@ impl AgentChatView {
             rewind_then_send: None,
             pending_edit: None,
             pane_group: None,
+            remote_tab_title: None,
             show_background_tasks: false,
             flash_entry: None,
             flash_frames: 0,
@@ -2085,7 +2185,17 @@ impl AgentChatView {
 
     /// Record + transmit a submitted prompt (from the composer's Submit event).
     /// The composer has already cleared its own input.
-    fn send_text(&mut self, text: String, images: Vec<ChatImage>, cx: &mut Context<Self>) {
+    ///
+    /// `pub(crate)` so a tab opened with an initial prompt (a scheduled run) sends
+    /// it down exactly this path rather than a parallel one — the guards, the
+    /// deferred bind, the optimistic thread push and the remote tee all have to
+    /// apply equally to a prompt nobody typed.
+    pub(crate) fn send_text(
+        &mut self,
+        text: String,
+        images: Vec<ChatImage>,
+        cx: &mut Context<Self>,
+    ) {
         // An import bridge has no live backend — its composer is swapped for
         // Resume-in-terminal, so no send path should ever construct here. Guard
         // defensively in case a stray Submit event slips through.
@@ -2174,10 +2284,23 @@ impl AgentChatView {
             self.title_generated = true; // guard a fast double-send from re-firing
             self.spawn_title_generation(text.clone(), cx);
         }
-        if let Some(conn) = &self.connection
-            && let Err(e) = conn.send_user_message_with_images(&text, &images)
-        {
-            self.thread.last_error = Some(format!("Send failed: {e}"));
+        if let Some(conn) = &self.connection {
+            match conn.send_user_message_with_images(&text, &images) {
+                // Tee the prompt to remote subscribers only. No backend echoes the
+                // user's own message, so without this a phone renders replies to
+                // prompts it never showed. It is NOT applied to `self.thread` —
+                // the optimistic push above already put the bubble there, and
+                // folding it again here would duplicate it.
+                Ok(()) => {
+                    if let Some(binding) = &self.remote {
+                        binding.ingest(ThreadEvent::UserMessage {
+                            text: text.clone(),
+                            images: images.clone(),
+                        });
+                    }
+                }
+                Err(e) => self.thread.last_error = Some(format!("Send failed: {e}")),
+            }
         }
         // Jump to (and re-arm following of) the bottom for the new turn.
         self.stick_to_bottom = true;
@@ -2437,11 +2560,10 @@ impl AgentChatView {
         }
         if let Some(conn) = self.connection.as_ref()
             && let Err(e) = conn.authenticate(&method_id)
+            && let Some(auth) = self.auth.as_mut()
         {
-            if let Some(auth) = self.auth.as_mut() {
-                auth.pending = None;
-                auth.error = Some(e.to_string());
-            }
+            auth.pending = None;
+            auth.error = Some(e.to_string());
         }
         cx.notify();
     }
@@ -2883,6 +3005,9 @@ impl AgentChatView {
         match connect(spec) {
             Ok((conn, rx)) => {
                 self.connection = Some(conn);
+                // Re-expose the respawned session to remote clients under the same
+                // stable id (drops the old binding, registers the fresh connection).
+                self.bind_remote(cx);
                 // Reassigning drops the old drain task, cancelling its foreground
                 // half; its forwarder thread then exits on the dead child's
                 // stdout EOF. We're single-threaded here, so no stale
@@ -2897,6 +3022,11 @@ impl AgentChatView {
                 push_slash_catalog(self.connection.as_deref(), &composer, &cwd, cx);
             }
             Err(e) => {
+                // The old connection was already shut down above and the respawn
+                // failed, so this session is dead — drop its remote binding rather
+                // than leave the registry advertising a session backed by a killed
+                // connection (`on_disconnect` isn't on this path).
+                self.unbind_remote();
                 self.thread.last_error = Some(format!("Failed to resume agent: {e}"));
                 self.disconnected = true;
                 self.interrupted = false;
@@ -2953,6 +3083,9 @@ impl AgentChatView {
         if !switched_live {
             cx.emit(AgentChatEvent::ModelChanged(model));
         }
+        // Same reason as the mode path: a remote picker re-reads immediately, and
+        // an in-place switch produces no event to carry the new value out.
+        self.publish_remote_meta();
         cx.notify();
     }
 
@@ -2992,6 +3125,11 @@ impl AgentChatView {
             self.respawn(cx);
         }
         self.sync_composer(cx); // reflect the new mode in the toolbar label
+        // Push it out now rather than waiting for the next event batch: a remote
+        // picker re-reads the session's choices the moment its change is
+        // acknowledged, and an in-place switch produces no event to ride on — so
+        // without this the phone re-reads the mode it just left.
+        self.publish_remote_meta();
         cx.notify();
     }
 
@@ -3178,7 +3316,7 @@ impl AgentChatView {
     /// `#[gpui::test]` can drive `on_event`/`on_disconnect` synchronously.
     #[cfg(test)]
     fn with_connection_for_test(
-        connection: Box<dyn AgentConnection>,
+        connection: Arc<dyn AgentConnection>,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -3198,9 +3336,16 @@ impl AgentChatView {
         // Mirror `new`: seed the palette's command metadata from the backend, so
         // a test exercises the same path the real constructor takes.
         push_slash_catalog(Some(connection.as_ref()), &composer, std::path::Path::new(""), cx);
+        let remote_session_id = next_remote_session_id();
+        let remote = cx
+            .try_global::<RemoteControl>()
+            .and_then(|rc| rc.bind(&remote_session_id, connection.clone()));
+
         Self {
             thread: ChatThread::new(),
             connection: Some(connection),
+            remote_session_id,
+            remote,
             backend: ChatBackend::stream_json(),
             composer,
             session_detail_open: false,
@@ -3245,6 +3390,9 @@ impl AgentChatView {
             sheet_copied: false,
             _sheet_copy_task: None,
             _drain_task: None,
+            _remote_prompt_task: None,
+            _remote_choice_task: None,
+            remote_choice_tx: None,
             _subscriptions: Vec::new(),
             question_cards: HashMap::new(),
             question_card_subs: HashMap::new(),
@@ -3260,6 +3408,7 @@ impl AgentChatView {
             rewind_then_send: None,
             pending_edit: None,
             pane_group: None,
+            remote_tab_title: None,
             show_background_tasks: false,
             flash_entry: None,
             flash_frames: 0,
@@ -3387,6 +3536,84 @@ impl AgentChatView {
         })
     }
 
+    /// Drain relayed remote prompts (phone sends) and fold each as a user bubble.
+    /// Mirrors [`Self::spawn_drain`] but for the prompt-echo channel the registry
+    /// feeds on a remote `send_prompt`. Ends when the sender drops (rebind/teardown).
+    fn spawn_remote_prompt_relay(
+        mut rx: futures::channel::mpsc::UnboundedReceiver<RemotePrompt>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            while let Some(prompt) = rx.next().await {
+                if this.update(cx, |view, cx| view.push_remote_user_bubble(prompt, cx)).is_err() {
+                    return; // view dropped
+                }
+            }
+        })
+    }
+
+    /// The sender for this tab's choice relay, starting the relay on first use.
+    ///
+    /// One relay per view for its whole life, rather than one per binding: a
+    /// respawn rebinds while the relay is mid-change, and a relay that were
+    /// replaced there would lose the reply for the pick that triggered it.
+    fn choice_relay_sender(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> futures::channel::mpsc::UnboundedSender<RemoteChoice> {
+        if let Some(tx) = &self.remote_choice_tx {
+            return tx.clone();
+        }
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        self._remote_choice_task = Some(Self::spawn_remote_choice_relay(rx, cx));
+        self.remote_choice_tx = Some(tx.clone());
+        tx
+    }
+
+    /// Drain model/permission-mode changes the backend refused in-session and
+    /// apply each through this tab's own picker path, which respawns the child
+    /// resumed on the new pick when the backend fixes the value at spawn.
+    ///
+    /// Routing through `change_model`/`change_permission_mode` rather than
+    /// reimplementing the respawn is the point: a remote pick and a local one then
+    /// cannot drift, and everything those paths already handle — persisting the
+    /// choice, moving the context-window denominator, re-seeding the composer —
+    /// happens either way.
+    fn spawn_remote_choice_relay(
+        mut rx: futures::channel::mpsc::UnboundedReceiver<RemoteChoice>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            while let Some(RemoteChoice { kind, value, reply }) = rx.next().await {
+                // `is_ok` is the honest answer this channel can give: the pick
+                // reached a live view and was applied. A respawn that then fails
+                // to start surfaces in the transcript as an agent error, which the
+                // phone is already subscribed to — it is not something to report
+                // here as a refused pick.
+                let applied = this
+                    .update(cx, |view, cx| match kind {
+                        ChoiceKind::Model => view.change_model(value, cx),
+                        ChoiceKind::PermissionMode => view.change_permission_mode(value, cx),
+                    })
+                    .is_ok();
+                let _ = reply.send(applied);
+            }
+        })
+    }
+
+    /// Fold a prompt that arrived over remote control into this tab's transcript.
+    /// The host already forwarded it to the backend and ingested a synthetic copy
+    /// for other subscribers, so this only pushes the bubble locally — it must NOT
+    /// re-tee (that would double the prompt on the phone), mirroring how a
+    /// desktop-typed prompt bubbles optimistically without folding the echo again.
+    fn push_remote_user_bubble(&mut self, prompt: RemotePrompt, cx: &mut Context<Self>) {
+        self.thread.push_user_message_with_images(prompt.text, prompt.images);
+        // Pin to the bottom so the new turn is in view, like a local send.
+        self.stick_to_bottom = true;
+        self.follow_frames = FOLLOW_FRAMES;
+        cx.notify();
+    }
+
     /// Fold a drained batch into the thread, then repaint once for the whole
     /// batch instead of once per event.
     ///
@@ -3398,11 +3625,28 @@ impl AgentChatView {
     fn apply_batch(&mut self, batch: Vec<ThreadEvent>, cx: &mut Context<Self>) {
         let all_delta = batch.iter().all(ThreadEvent::is_delta);
         for ev in batch {
+            // Tee each event to any remote subscribers (gated: `remote` is `Some`
+            // only while remote control is enabled, so this clone never runs on a
+            // disabled desktop). The desktop UI keeps its own dedicated channel —
+            // this fan-out is parallel and never in the UI's path.
+            if let Some(binding) = &self.remote {
+                binding.ingest(ev.clone());
+            }
             self.apply_event(ev, cx);
         }
+        // Republish title/model after the fold has applied the batch, so a remote
+        // session list shows what this tab shows (a `TitleUpdated` or a model swap
+        // lands in the same batch). Done here, at the one place every event passes
+        // through, rather than at each site that can change them.
+        self.publish_remote_meta();
         if all_delta {
             self.notify_throttled(cx);
         } else {
+            // A settled event landed (message, tool result, turn end): refresh the
+            // published transcript so a newly-opening remote client's authoritative
+            // history is current. Gated with the non-delta repaint so it never runs
+            // on the per-token hot path.
+            self.publish_remote_transcript();
             self.notify_now(cx);
         }
     }
@@ -3723,7 +3967,151 @@ impl AgentChatView {
     /// tool never ran, since the process is gone). Best-effort deny in case
     /// stdin is briefly still writable, then mark the tool `Rejected` so the UI
     /// never shows a dangling approval prompt.
+    /// (Re)bind this session into the remote-control registry: drop any prior
+    /// binding, then register the current connection under [`Self::remote_session_id`]
+    /// — but only while remote control is enabled, so a disabled desktop registers
+    /// nothing and clones no events. Called on connect and on respawn.
+    fn bind_remote(&mut self, cx: &mut Context<Self>) {
+        // Deliberately does NOT unregister first. On a respawn this runs again for
+        // the same session id, and `register` swaps the backend in place — keeping
+        // `seq` monotonic so a subscribed phone keeps receiving. Unregistering here
+        // would mint a fresh handle at seq 1, which every subscriber would silently
+        // discard as already-seen. Teardown paths still call `unbind_remote`.
+        let bound = self
+            .connection
+            .clone()
+            .and_then(|conn| {
+                cx.try_global::<RemoteControl>().and_then(|rc| rc.bind(&self.remote_session_id, conn))
+            });
+        match bound {
+            Some(binding) => {
+                self.remote = Some(binding);
+                // Expose the current transcript at once — on a restart this fold was
+                // restored from disk and never entered the event ring, so a phone
+                // opening the session before the next event would otherwise see it
+                // empty. Meta too, so the row is labelled from the first list.
+                self.publish_remote_meta();
+                self.publish_remote_transcript();
+                // Re-arm the remote-prompt echo relay against the new binding.
+                let (tx, rx) = futures::channel::mpsc::unbounded();
+                if let Some(binding) = &self.remote {
+                    binding.set_prompt_sink(tx);
+                }
+                self._remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, cx));
+                // Point the *existing* choice relay at the new binding rather than
+                // starting a fresh one. This path runs inside `change_model` →
+                // `respawn`, so the relay is mid-flight on the very pick that
+                // caused it: replacing the task here would drop that future and
+                // cancel its reply, telling the phone a change it just made had
+                // failed. Re-registering the same sender is enough — a rebind may
+                // mint a new handle (after an unbind), and this points it back.
+                let choice_tx = self.choice_relay_sender(cx);
+                if let Some(binding) = &self.remote {
+                    binding.set_choice_sink(choice_tx);
+                }
+            }
+            // No connection, or remote is disabled — drop any prior binding.
+            None => self.unbind_remote(),
+        }
+    }
+
+    /// Drop this session's registry binding (on disconnect / teardown). No-op when
+    /// unbound. Explicit because the registry retains its own handle `Arc`, so
+    /// dropping the view's handle alone would not evict the session.
+    fn unbind_remote(&mut self) {
+        if let Some(binding) = self.remote.take() {
+            binding.unregister(&self.remote_session_id);
+        }
+    }
+
+    /// Push this tab's title + effective model into the registry so a remote
+    /// session list renders them instead of the raw `agent-N` id. No-op when remote
+    /// is disabled (`remote` is `None`); the registry skips unchanged values, which
+    /// is the common case on a per-batch call.
+    fn publish_remote_meta(&self) {
+        let Some(binding) = &self.remote else {
+            return;
+        };
+        binding.set_meta(SessionMeta {
+            // The tab's visible title (a manual rename, else the running label) is
+            // what the desktop shows, so it wins; fall back to the thread's
+            // provider-native title until the pane group has synced one.
+            title: self.remote_tab_title.clone().or_else(|| self.thread.title.clone()),
+            model: self.effective_model(),
+            permission_mode: self.effective_permission_mode(),
+            // Git RPCs resolve their repository from this.
+            cwd: Some(self.cwd.clone()),
+        });
+    }
+
+    /// The model this tab is actually running under.
+    ///
+    /// The same shape as [`Self::effective_permission_mode`], and for the same
+    /// reason: `model` is `None` until the user picks one, so a session that has
+    /// never had a pick would otherwise publish nothing and a remote picker would
+    /// render every model unselected — as if the session were running on no model
+    /// at all. The desktop's own composer resolves it exactly this way, falling
+    /// back to the connection's default when the tab holds no pick.
+    ///
+    /// The thread's negotiated model still wins: once the backend reports what it
+    /// actually loaded, that is the truth, and it can differ from the default the
+    /// child was launched with.
+    fn effective_model(&self) -> Option<String> {
+        self.thread
+            .model
+            .clone()
+            .or_else(|| self.model.clone())
+            .or_else(|| self.connection.as_ref().and_then(|c| c.default_model()))
+    }
+
+    /// The permission mode this tab is actually running under.
+    ///
+    /// `permission_mode` is `None` for the backend's baseline — that is what makes
+    /// `respawn` omit the flag — so the field alone cannot say what is in force.
+    /// A remote picker needs the resolved answer: it holds no connection of its
+    /// own to ask for the baseline.
+    fn effective_permission_mode(&self) -> Option<String> {
+        self.permission_mode
+            .clone()
+            .or_else(|| self.connection.as_ref().and_then(|c| c.default_mode()))
+    }
+
+    /// Record the visible tab title (a manual rename, else the running `Chat N` /
+    /// agent label) the desktop shows for this chat, so a remote session list
+    /// renders the same name instead of the raw `agent-N` id. Pushed by the owning
+    /// pane group on tab create, rename, and ambient title change; re-publishes the
+    /// registry meta only when the title actually changed.
+    pub fn set_remote_tab_title(&mut self, title: Option<String>) {
+        if self.remote_tab_title == title {
+            return;
+        }
+        self.remote_tab_title = title;
+        self.publish_remote_meta();
+    }
+
+    /// Publish the folded transcript to the registry so a remote client opening this
+    /// session renders full history. Called on bind (to expose a restart-restored
+    /// fold that never entered the event ring) and after each settled batch (to keep
+    /// the snapshot current). Deliberately NOT on per-token delta batches — a whole-
+    /// transcript reserialization per token would be wasteful, and a client opening
+    /// mid-stream folds those deltas from the live backlog on top of the last settled
+    /// snapshot anyway. No-op when remote is disabled or the transcript won't
+    /// serialize (a half-serialized snapshot is worse than keeping the prior one).
+    fn publish_remote_transcript(&self) {
+        let Some(binding) = &self.remote else {
+            return;
+        };
+        let Ok(entries_json) = serde_json::to_string(&self.thread.entries) else {
+            return;
+        };
+        let model = self.thread.model.clone().or_else(|| self.model.clone());
+        binding.publish_transcript(entries_json, model);
+    }
+
     fn on_disconnect(&mut self, cx: &mut Context<Self>) {
+        // The live process is gone: drop the remote binding so the phone's session
+        // list reflects only live sessions (a resume respawns + re-binds).
+        self.unbind_remote();
         let pending = self
             .thread
             .pending_permission()
@@ -4043,6 +4431,8 @@ impl AgentChatView {
             .unwrap_or_default();
         self.permission_mode = (mode != default_mode).then(|| mode.to_string());
         self.sync_composer(cx);
+        // A backend-driven flip is still a mode change a remote picker must see.
+        self.publish_remote_meta();
         cx.notify();
     }
 
@@ -5252,6 +5642,10 @@ impl AgentChatView {
 
 impl Drop for AgentChatView {
     fn drop(&mut self) {
+        // Evict this session from the remote registry so a closed tab doesn't leave
+        // a stale entry the phone would still list (the registry holds its own
+        // handle `Arc`, so this must be explicit — a `Drop` has no `cx`).
+        self.unbind_remote();
         // Kill + reap the `claude` child so closing the tab doesn't leak it.
         if let Some(conn) = &self.connection {
             conn.shutdown();
@@ -5747,6 +6141,40 @@ fn thinking_block(
     block.into_any_element()
 }
 
+/// A hover-revealed icon action on a user message (Copy / Edit / Rewind).
+/// Minimal ghost button — just the glyph with a soft hover wash and a tooltip
+/// naming the action — matching the restrained affordances of a native chat
+/// client. `icon_color` lets the caller tint it (e.g. green ✓ right after Copy).
+fn message_action_icon(
+    id: SharedString,
+    icon_path: &'static str,
+    tooltip: &'static str,
+    icon_color: gpui::Hsla,
+    theme: Theme,
+    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let tip = SharedString::from(tooltip);
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(24.0))
+        .rounded(px(6.0))
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.hover_overlay))
+        .tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+        })
+        .child(
+            Icon::default()
+                .path(icon_path)
+                .size(px(14.0))
+                .text_color(icon_color),
+        )
+        .on_mouse_down(MouseButton::Left, on_click)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5972,7 +6400,7 @@ mod tests {
         let stub_probe = stub.clone();
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6029,7 +6457,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6063,7 +6491,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6118,7 +6546,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6159,7 +6587,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6224,7 +6652,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6289,7 +6717,7 @@ mod tests {
         let recorder = stub.clone();
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6340,7 +6768,7 @@ mod tests {
         let recorder = stub.clone();
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6378,7 +6806,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6437,7 +6865,7 @@ mod tests {
             }]);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6474,7 +6902,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6557,7 +6985,7 @@ mod tests {
         let stub_probe = stub.clone();
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6639,7 +7067,7 @@ mod tests {
         let stub_probe = stub.clone();
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6701,7 +7129,7 @@ mod tests {
         let stub_probe = stub.clone();
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6766,7 +7194,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6838,7 +7266,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6876,7 +7304,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6904,7 +7332,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -6938,6 +7366,82 @@ mod tests {
             .expect("window update");
     }
 
+    /// With remote control enabled, a chat view registers its session into the
+    /// shared registry, tees each applied event to a live subscriber in order, and
+    /// evicts the session on disconnect. (The disabled path — no global → no
+    /// binding → no clone — is what every other view test exercises implicitly.)
+    #[gpui::test]
+    async fn remote_enabled_registers_tees_and_unregisters(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            let rc = RemoteControl::new();
+            rc.set_enabled(true);
+            cx.set_global(rc);
+        });
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        // The session registered under the view's stable remote id — subscribe.
+        let mut rx = window
+            .update(cx, |view, _window, cx| {
+                cx.global::<RemoteControl>()
+                    .registry()
+                    .subscribe(&view.remote_session_id)
+                    .expect("session registered while remote is enabled")
+            })
+            .expect("window update");
+
+        // An applied event is teed to the remote subscriber with its assigned seq.
+        window
+            .update(cx, |view, _window, cx| {
+                view.apply_batch(vec![ThreadEvent::AssistantText("hi".into())], cx);
+            })
+            .expect("window update");
+        let (seq, ev) = rx.try_recv().expect("event teed to the remote subscriber");
+        assert_eq!(seq, 1, "first teed event gets seq 1");
+        assert_eq!(ev, ThreadEvent::AssistantText("hi".into()));
+
+        // A respawn re-binds the SAME id. `seq` must keep climbing and the
+        // subscriber must survive — a reset to 1 would look like duplicates to a
+        // phone already past that cursor, and it would silently show nothing more.
+        window
+            .update(cx, |view, _window, cx| {
+                view.connection = Some(Arc::new(StubConnection::default()));
+                view.bind_remote(cx);
+                view.apply_batch(vec![ThreadEvent::AssistantText("after".into())], cx);
+            })
+            .expect("window update");
+        let (seq, ev) = rx.try_recv().expect("the subscription survived the respawn");
+        assert_eq!(seq, 2, "seq continues across a respawn instead of resetting");
+        assert_eq!(ev, ThreadEvent::AssistantText("after".into()));
+
+        // Disconnect evicts the session from the registry.
+        let id = window
+            .update(cx, |view, _window, cx| {
+                let id = view.remote_session_id.clone();
+                view.on_disconnect(cx);
+                id
+            })
+            .expect("window update");
+        window
+            .update(cx, |_view, _window, cx| {
+                assert!(
+                    cx.global::<RemoteControl>().registry().get(&id).is_none(),
+                    "session unregistered on disconnect",
+                );
+            })
+            .expect("window update");
+    }
+
     /// Regenerate stages the PRECEDING user prompt (unchanged) for re-send via
     /// the rewind machinery — the selection logic that decides *what* re-rolls.
     /// The fork/respawn half is the shared rewind path (covered elsewhere); here
@@ -6948,7 +7452,7 @@ mod tests {
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
                 // Regenerate is a rewind-gated (Claude) feature.
-                Box::new(StubConnection::default().with_capabilities(
+                Arc::new(StubConnection::default().with_capabilities(
                     oximux_agents::thread::AgentCapabilities { supports_rewind: true, ..Default::default() },
                 )),
                 Theme::default(),
@@ -7006,7 +7510,7 @@ mod tests {
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
                 // Edit-and-resend is a rewind-gated (Claude) feature.
-                Box::new(StubConnection::default().with_capabilities(
+                Arc::new(StubConnection::default().with_capabilities(
                     oximux_agents::thread::AgentCapabilities { supports_rewind: true, ..Default::default() },
                 )),
                 Theme::default(),
@@ -7079,7 +7583,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7162,7 +7666,7 @@ mod tests {
         let stub_probe = stub.clone();
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(stub),
+                Arc::new(stub),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7230,7 +7734,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7287,7 +7791,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7365,7 +7869,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7463,7 +7967,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7524,7 +8028,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7578,7 +8082,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7640,7 +8144,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7712,7 +8216,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7752,7 +8256,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7792,7 +8296,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7833,7 +8337,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7897,7 +8401,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -7966,7 +8470,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -8028,7 +8532,7 @@ mod tests {
         cx.update(gpui_component::init);
         let window = cx.add_window(|window, cx| {
             AgentChatView::with_connection_for_test(
-                Box::new(StubConnection::default()),
+                Arc::new(StubConnection::default()),
                 Theme::default(),
                 Density::default(),
                 Typography::default(),
@@ -8079,38 +8583,4 @@ mod tests {
             })
             .expect("window update");
     }
-}
-
-/// A hover-revealed icon action on a user message (Copy / Edit / Rewind).
-/// Minimal ghost button — just the glyph with a soft hover wash and a tooltip
-/// naming the action — matching the restrained affordances of a native chat
-/// client. `icon_color` lets the caller tint it (e.g. green ✓ right after Copy).
-fn message_action_icon(
-    id: SharedString,
-    icon_path: &'static str,
-    tooltip: &'static str,
-    icon_color: gpui::Hsla,
-    theme: Theme,
-    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    let tip = SharedString::from(tooltip);
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .justify_center()
-        .size(px(24.0))
-        .rounded(px(6.0))
-        .cursor_pointer()
-        .hover(|s| s.bg(theme.hover_overlay))
-        .tooltip(move |window, cx| {
-            gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-        })
-        .child(
-            Icon::default()
-                .path(icon_path)
-                .size(px(14.0))
-                .text_color(icon_color),
-        )
-        .on_mouse_down(MouseButton::Left, on_click)
 }

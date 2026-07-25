@@ -5,6 +5,7 @@
 //!   1. advertised `terminal:true` (else the agent's `terminal/create` would be
 //!      rejected and no terminal would appear), and
 //!   2. emitted a `ToolTerminal` event binding the fake terminal id to the card.
+//!
 //! Exits non-zero if the flow doesn't complete — a real regression guard for the
 //! agents-side wiring (the app's real host + inline render is verified in-GUI).
 //!

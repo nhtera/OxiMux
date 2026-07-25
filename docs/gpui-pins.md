@@ -24,7 +24,7 @@ The correct cargo idiom for git deps shared with an unpinned transitive crate is
 
 | Crate | Rev | Date | Source |
 |---|---|---|---|
-| `gpui` / `gpui_platform` / `gpui_macros` | `4e06b33eb9f292507c98e4a143438c1c3d8a2b5b` | 2026-05-15 | zed-industries/zed main |
+| `gpui` / `gpui_platform` / `gpui_macros` | `3bd9d13b63fc5a5ffa39326597bc4fd91adc82d1` | 2026-05-16 | zed-industries/zed main |
 | `gpui-component` | `ccc1e7689203d09bfc88a0aae29473d1c289fa0c` | 2026-05-15 | longbridge/gpui-component main |
 | Rust toolchain | `1.95.0` | 2026-05-15 | matches `zed-industries/zed` rust-toolchain.toml upstream |
 
@@ -33,6 +33,7 @@ The correct cargo idiom for git deps shared with an unpinned transitive crate is
 | Date | Old → New | Why | What broke |
 |---|---|---|---|
 | 2026-05-15 | — | Initial pin (Phase 0) | n/a |
+| 2026-07-17 | `4e06b33e…` → `3bd9d13b…` (doc-only) | Reconcile stale doc rev with `Cargo.lock` (authoritative). No dependency change — the lockfile already resolved `3bd9d13b…`; only this table was out of date. | n/a |
 
 ## Bump procedure
 

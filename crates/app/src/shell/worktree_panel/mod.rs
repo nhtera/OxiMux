@@ -8,8 +8,8 @@
 //! the rule list here. KISS — the source of truth stays in `oximux-git`.
 //!
 //! Remove: per-row button sets `pending_remove`; the shell host (step 14)
-//! observes and mounts a ConfirmDialog with expected = worktree path basename
-//! before calling `remove_pending()`.
+//! observes and mounts a ConfirmDialog naming the worktree before calling
+//! `remove_pending()`.
 
 pub mod list_render;
 

@@ -18,6 +18,9 @@ mod pane_agents;
 mod pane_agents_launch;
 mod pane_keybindings;
 mod pane_notifications;
+mod pairing_qr;
+mod pane_remote;
+mod pane_schedules;
 mod pane_terminal;
 mod pane_voice;
 mod view;
@@ -76,6 +79,33 @@ pub struct SettingsModal {
     /// toggles flip these atomics directly (interior mutability) so the
     /// change takes effect on the next dispatch without a reload.
     pub(crate) notify: Arc<AgentNotifySettings>,
+    /// Rendered pairing QR, cached by the deep link it encodes. `RefCell` because
+    /// the pane renders from `&self`. Without this the PNG would be re-encoded on
+    /// every repaint AND a fresh `Arc<Image>` each frame would defeat gpui's
+    /// texture cache, re-uploading the bitmap continuously.
+    pub(super) qr_cache: std::cell::RefCell<Option<(String, Arc<gpui::Image>)>>,
+    /// The Remote pane's pairing sub-view, when the user has opened it. `None` is
+    /// the pane's normal state — a live pairing code exists only while this is
+    /// `Some`, which is what makes opening the view the act that mints one.
+    pub(super) remote_pairing: Option<pane_remote::PairingState>,
+    /// Which pairing window is current. Bumped every time one opens or closes, so
+    /// a watcher spawned for an earlier window recognises itself as superseded
+    /// and exits instead of acting.
+    ///
+    /// Needed because a watcher parks on `recv()` for a pairing that its own
+    /// window may never see — closing the view does not wake it. Without this,
+    /// every window opened during a session left a listener alive, and the first
+    /// device to actually pair woke all of them at once: one toast per window
+    /// ever opened.
+    pub(super) remote_pairing_epoch: u64,
+    /// Whether the watcher that reports devices leaving is running. One per modal,
+    /// not per pairing window: a device un-enrols on its own schedule, with no
+    /// code on screen and often no Remote pane open.
+    ///
+    /// Set only once the subscription actually succeeds, so opening settings
+    /// before remote access is on doesn't consume the single attempt — the next
+    /// open tries again, by which time the host may have bound.
+    pub(super) remote_unpair_watch: bool,
     /// Flat KV store the notification toggles persist into (keys in
     /// [`crate::notifier::keys`]), so prefs survive a restart.
     pub(crate) notify_repo: SettingsRepo,
@@ -116,6 +146,23 @@ pub struct SettingsModal {
     pub(crate) recording_action: Option<&'static str>,
     /// The interceptor subscription — alive exactly while recording.
     pub(super) recording_sub: Option<Subscription>,
+    /// Shared schedule store — the same connection the scheduler ticker reads,
+    /// so a schedule created or removed here is visible to it within one tick.
+    pub(super) schedule_store: oximux_agents::schedule::ScheduleStore,
+    /// Schedules + their recent run history, reloaded from the store at each
+    /// `open()` and after every create/delete/toggle so the pane never reads
+    /// SQLite mid-paint.
+    pub(super) schedule_rows: Vec<pane_schedules::ScheduleRow>,
+    /// The in-progress "new schedule" recurrence choice; the text fields live in
+    /// the three inputs below. Reset to defaults on each `open()`.
+    pub(super) schedule_draft: pane_schedules::ScheduleDraft,
+    /// Create-form text inputs, lazily built on `open()` (they need a `Window`).
+    /// `None` before first open.
+    pub(super) sched_name_input: Option<Entity<InputState>>,
+    pub(super) sched_cwd_input: Option<Entity<InputState>>,
+    pub(super) sched_prompt_input: Option<Entity<InputState>>,
+    /// Validation message shown under the create form, or `None` when clean.
+    pub(super) schedule_form_error: Option<String>,
 }
 
 /// Parse the custom-words editor field into a de-duplicated dictionary. Splits
@@ -134,6 +181,7 @@ pub(super) fn parse_custom_words(raw: &str) -> Vec<String> {
 }
 
 impl SettingsModal {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         theme: Theme,
         density: Density,
@@ -141,11 +189,16 @@ impl SettingsModal {
         notify: Arc<AgentNotifySettings>,
         notify_repo: SettingsRepo,
         notifier: Arc<dyn Notifier>,
+        schedule_store: oximux_agents::schedule::ScheduleStore,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
             open: false,
             selected: SettingsPane::Terminal,
+            qr_cache: std::cell::RefCell::new(None),
+            remote_pairing: None,
+            remote_pairing_epoch: 0,
+            remote_unpair_watch: false,
             focus_handle: cx.focus_handle(),
             theme,
             density,
@@ -167,6 +220,13 @@ impl SettingsModal {
             keybind_overrides: BTreeMap::new(),
             recording_action: None,
             recording_sub: None,
+            schedule_store,
+            schedule_rows: Vec::new(),
+            schedule_draft: pane_schedules::ScheduleDraft::default(),
+            sched_name_input: None,
+            sched_cwd_input: None,
+            sched_prompt_input: None,
+            schedule_form_error: None,
         }
     }
 
@@ -201,6 +261,10 @@ impl SettingsModal {
             .try_global::<DictationSettings>()
             .cloned()
             .unwrap_or_default();
+        // Start reporting devices that drop themselves, if the host is up. Not in
+        // the constructor: the remote host binds later than the shell is built, so
+        // subscribing there would find nothing to subscribe to.
+        pane_remote::watch_for_unpair(self, cx);
         // Reseed the keybinding overrides from disk (hand edits since boot
         // show up here; load problems were already toasted at boot).
         self.keybind_overrides = crate::keybindings_settings::load_overrides().0;
@@ -247,6 +311,19 @@ impl SettingsModal {
                 }),
             );
         self.custom_words_input = Some(cw_input);
+
+        // Schedules pane: reload the list + run history from the shared store,
+        // and build a fresh empty create form (reset draft, clear any error).
+        self.reload_schedules();
+        self.schedule_draft = pane_schedules::ScheduleDraft::default();
+        self.schedule_form_error = None;
+        self.sched_name_input =
+            Some(cx.new(|cx| InputState::new(window, cx).placeholder("Nightly test run")));
+        self.sched_cwd_input =
+            Some(cx.new(|cx| InputState::new(window, cx).placeholder("/path/to/project")));
+        self.sched_prompt_input = Some(cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Run the test suite and summarize failures")
+        }));
 
         self.open = true;
         self.pos = None;
@@ -298,10 +375,19 @@ impl SettingsModal {
         self._search_sub = None;
         self.custom_words_input = None;
         self._custom_words_sub = None;
+        // Drop the schedule create-form inputs so their focus handles can't keep
+        // window focus orphaned after the modal is hidden.
+        self.sched_name_input = None;
+        self.sched_cwd_input = None;
+        self.sched_prompt_input = None;
         // A close mid-recording must release the keystroke interceptor or
         // every subsequent key press in the app would be swallowed.
         self.recording_action = None;
         self.recording_sub = None;
+        // Closing the modal is leaving the pairing view: retire the live code with
+        // it rather than letting a window the user can no longer see stay
+        // redeemable until it times out.
+        pane_remote::close_pairing(self, cx);
         if was_open {
             cx.emit(SettingsModalEvent::Closed);
         }
@@ -351,10 +437,12 @@ impl SettingsModal {
     /// Persist one notification pref to the flat settings store as
     /// `"true"`/`"false"`. The live atomic is flipped by the caller before
     /// this runs; persistence only makes the choice survive a restart.
-    pub(super) fn persist_notify(&mut self, key: &str, value: bool, cx: &mut Context<Self>) {
+    /// Persist a boolean pref to the flat settings store. Not notification-specific
+    /// despite the repo's name — the remote master switch rides the same table.
+    pub(super) fn persist_flag(&mut self, key: &str, value: bool, cx: &mut Context<Self>) {
         let v = if value { "true" } else { "false" };
         if let Err(err) = self.notify_repo.set(key, v) {
-            tracing::warn!(%err, key, "settings modal: failed to persist notification pref");
+            tracing::warn!(%err, key, "settings modal: failed to persist pref");
         }
         cx.notify();
     }

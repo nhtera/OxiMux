@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for the hardened-runtime (notarizable) build.
+
+  Deliberately minimal. Every entitlement here is a restriction lifted off the
+  hardened runtime, so each one has to earn its place — and Apple asks about
+  the broad ones. This is NOT an App Sandbox build, so the sandbox-only keys
+  (network client/server, file access) do not apply and must not be added
+  "just in case": they would be inert here and misleading to read.
+
+  Not present, and why:
+  - Library validation stays ON. The bundled onnxruntime/sherpa dylibs are
+    signed with the same Team ID as the app, so they load without needing
+    `disable-library-validation` — which would otherwise let any
+    same-architecture dylib into the process.
+  - No JIT / unsigned-executable-memory. WebKit runs JavaScript in its own
+    process, so the host app never needs them.
+  - No DYLD environment variables. The bundle resolves its dylibs through an
+    `@executable_path` rpath, not DYLD_FALLBACK_LIBRARY_PATH (that is only how
+    `cargo run` finds them during development).
+-->
+<plist version="1.0">
+<dict>
+    <!--
+      Voice dictation records audio through cpal (crates/dictation).
+
+      Under the hardened runtime the `NSMicrophoneUsageDescription` string in
+      Info.plist is necessary but NOT sufficient: without this entitlement the
+      permission prompt still appears and the user can still grant it, and the
+      capture silently returns nothing. The failure looks like a broken feature
+      rather than a missing permission, which is what makes it worth stating.
+    -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>

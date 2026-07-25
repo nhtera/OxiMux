@@ -145,6 +145,7 @@ pub(super) fn render_tool_card(
 
 /// Status glyph + tool label; the whole row toggles the disclosure when there's
 /// expandable content.
+#[allow(clippy::too_many_arguments)]
 fn header_row(
     tc: &ToolCall,
     expanded: bool,

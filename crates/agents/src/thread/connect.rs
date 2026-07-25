@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -140,7 +141,7 @@ impl ConnectSpec {
 /// and the `ThreadEvent` receiver the app drains. Semantics of the StreamJson
 /// arm are identical to constructing `ClaudeStreamJsonConnection::spawn_resumed`
 /// directly (the app's prior call).
-pub fn connect(spec: ConnectSpec) -> Result<(Box<dyn AgentConnection>, Receiver<ThreadEvent>)> {
+pub fn connect(spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<ThreadEvent>)> {
     match spec.transport {
         Transport::StreamJson => {
             let (conn, rx) = ClaudeStreamJsonConnection::spawn_resumed(
@@ -150,7 +151,7 @@ pub fn connect(spec: ConnectSpec) -> Result<(Box<dyn AgentConnection>, Receiver<
                 spec.permission_mode.as_deref(),
                 spec.effort.as_deref(),
             )?;
-            Ok((Box::new(conn), rx))
+            Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
         Transport::AppServer => {
             let posture = spec
@@ -164,7 +165,7 @@ pub fn connect(spec: ConnectSpec) -> Result<(Box<dyn AgentConnection>, Receiver<
                 spec.effort.as_deref(),
                 posture,
             )?;
-            Ok((Box::new(conn), rx))
+            Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
         Transport::Acp => {
             let command = spec
@@ -180,7 +181,7 @@ pub fn connect(spec: ConnectSpec) -> Result<(Box<dyn AgentConnection>, Receiver<
                 spec.env.clone(),
                 spec.auth_method.clone(),
             )?;
-            Ok((Box::new(conn), rx))
+            Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
         Transport::Rpc => {
             // `None` → the deliberate default, never an accidental "no flags".
@@ -196,7 +197,7 @@ pub fn connect(spec: ConnectSpec) -> Result<(Box<dyn AgentConnection>, Receiver<
                 posture,
                 spec.resume_session_id.as_deref(),
             )?;
-            Ok((Box::new(conn), rx))
+            Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
     }
 }

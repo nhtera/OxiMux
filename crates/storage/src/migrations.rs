@@ -159,6 +159,26 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "agent_sessions_last_message",
         sql: include_str!("../migrations/V018__agent_sessions_last_message.sql"),
     },
+    // V019 adds `remote_devices` — one row per remote-control paired device
+    // (app-signing pubkey, name, per-device scope, revoked soft-delete) so the
+    // authorized set survives restart. Additive; never reorder/rewrite.
+    Migration {
+        version: 19,
+        name: "remote_devices",
+        sql: include_str!("../migrations/V019__remote_devices.sql"),
+    },
+    // V020 adds the per-device read-only opt-down. Additive with DEFAULT 0, so
+    // devices paired before it keep their existing read-write access.
+    Migration {
+        version: 20,
+        name: "remote_devices_read_only",
+        sql: include_str!("../migrations/V020__remote_devices_read_only.sql"),
+    },
+    Migration {
+        version: 21,
+        name: "schedules",
+        sql: include_str!("../migrations/V021__schedules.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.

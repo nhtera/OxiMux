@@ -17,11 +17,21 @@ use crate::checkpoint::CheckpointStore;
 use crate::ring_buffer::RingBuffer;
 
 // Bounded per-subscriber channel. The session writer task drains it;
-// if it falls behind, fan_out drops notifications (with a tracing warn)
-// rather than growing memory unboundedly. The replay buffer is the
-// source of truth — a slow client gets the missed bytes on its next
-// Attach, and the live stream gaps until it catches up.
+// if it falls behind, fan_out drops notifications rather than growing
+// memory unboundedly. The replay buffer is the source of truth — a slow
+// client gets the missed bytes on its next Attach, and the live stream
+// gaps until it catches up. The client is TOLD it gapped
+// (`Notification::Gapped`) so that next Attach actually happens.
 pub const SUBSCRIBER_QUEUE: usize = 1024;
+
+/// One attached client's outbound queue, plus whether it has an unannounced
+/// gap. The flag lives beside the sender rather than inside the channel
+/// because a full queue — the only way a gap occurs — has no room to carry
+/// the notice at the moment it is needed.
+struct Subscriber {
+    tx: Sender<Notification>,
+    gapped: bool,
+}
 
 // 1 MiB per PTY — the plan's "Locked decisions" section, larger than
 // the ~100 KiB common in lighter multiplexers because TUIs (`cc`, `vim`,
@@ -94,7 +104,7 @@ struct Entry {
     writer: Mutex<Box<dyn Write + Send>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     ring: Arc<Mutex<RingBuffer>>,
-    subscribers: Arc<Mutex<Vec<Sender<Notification>>>>,
+    subscribers: Arc<Mutex<Vec<Subscriber>>>,
     // Flipped by `reader_loop` immediately before the Exit fan-out.
     // The `close` grace poll watches this to skip the full SIGKILL
     // wait when the child has already reaped naturally.
@@ -205,7 +215,7 @@ impl PtyRegistry {
         let writer = pair.master.take_writer().context("take writer")?;
 
         let ring = Arc::new(Mutex::new(RingBuffer::new(REPLAY_BUFFER_BYTES)));
-        let subscribers: Arc<Mutex<Vec<Sender<Notification>>>> = Arc::new(Mutex::new(Vec::new()));
+        let subscribers: Arc<Mutex<Vec<Subscriber>>> = Arc::new(Mutex::new(Vec::new()));
         let child_exited = Arc::new(AtomicBool::new(false));
         let exit_code = Arc::new(AtomicI32::new(EXIT_CODE_NONE));
 
@@ -275,6 +285,29 @@ impl PtyRegistry {
         Ok(pty_id)
     }
 
+    /// Snapshot the replay ring and current dims WITHOUT touching subscribers
+    /// or attachments — the resync path for a client told it `Gapped`.
+    ///
+    /// Deliberately not `attach`: that client is already attached and already
+    /// holds an `attachment_id`. Attaching again would add a second entry to
+    /// the smallest-screen-wins `min`, so recovering from a dropped frame
+    /// would resize the live process. This answers only "what is on screen
+    /// now?".
+    pub fn replay(&self, pty_id: &str) -> Result<(Vec<u8>, u16, u16), RegistryError> {
+        let entry = self
+            .entries
+            .get(pty_id)
+            .ok_or_else(|| RegistryError::NotFound(pty_id.into()))?;
+        // Ring first, matching the lock order `attach` and `fan_out` use, so a
+        // snapshot taken here can never interleave with a push mid-write.
+        let ring = entry.ring.lock().expect("ring poisoned");
+        let replay = ring.snapshot();
+        drop(ring);
+        let cols = *entry.cols.lock().expect("cols poisoned");
+        let rows = *entry.rows.lock().expect("rows poisoned");
+        Ok((replay, cols, rows))
+    }
+
     /// Attach a subscriber and return `(replay, cols, rows, attachment_id)`
     /// — the buffered raw output, the PTY's CURRENT (effective) grid
     /// dimensions, and a fresh per-attachment handle. The client must
@@ -322,7 +355,7 @@ impl PtyRegistry {
                 code,
             });
         }
-        subs.push(sub);
+        subs.push(Subscriber { tx: sub, gapped: false });
         drop(subs);
         drop(ring);
         let cols = *entry.cols.lock().expect("cols poisoned");
@@ -671,7 +704,7 @@ fn reader_loop(
     mut reader: Box<dyn Read + Send>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     ring: Arc<Mutex<RingBuffer>>,
-    subscribers: Arc<Mutex<Vec<Sender<Notification>>>>,
+    subscribers: Arc<Mutex<Vec<Subscriber>>>,
     child_exited: Arc<AtomicBool>,
     exit_code: Arc<AtomicI32>,
     bytes_out: Arc<AtomicU64>,
@@ -725,20 +758,51 @@ fn reader_loop(
     );
 }
 
-fn fan_out(subscribers: &Arc<Mutex<Vec<Sender<Notification>>>>, notif: Notification) {
+fn fan_out(subscribers: &Arc<Mutex<Vec<Subscriber>>>, notif: Notification) {
     let mut subs = subscribers.lock().expect("subs poisoned");
-    // Drop subscribers whose receiver has been dropped. For "full"
-    // we keep the subscriber but discard the message — back-pressure
-    // policy from the plan: the replay buffer is the source of truth
-    // for slow clients.
-    subs.retain(|tx| match tx.try_send(notif.clone()) {
-        Ok(()) => true,
-        Err(TrySendError::Full(_)) => {
-            tracing::warn!("subscriber queue full; dropping notification");
-            true
+    // Drop subscribers whose receiver has been dropped. For "full" we keep the
+    // subscriber but discard the message — the replay ring is the source of
+    // truth for a slow client. Discarding *silently* is what this used to do,
+    // and it made that recovery unreachable: the client had no way to learn it
+    // had missed anything, so it never re-attached and kept rendering a
+    // terminal with a hole in it.
+    subs.retain_mut(|sub| {
+        // A pending gap is announced before any further output, so the client
+        // re-attaches rather than compositing new bytes onto a stale grid.
+        // This cannot be sent at the moment the gap opens: the queue being
+        // full is precisely what caused it, so the signal waits for room.
+        if sub.gapped {
+            match sub.tx.try_send(Notification::Gapped {
+                pty_id: pty_id_of(&notif).to_owned(),
+            }) {
+                Ok(()) => sub.gapped = false,
+                // Still backed up. Keep the flag and try again next time
+                // rather than dropping the notice along with the bytes.
+                Err(TrySendError::Full(_)) => return true,
+                Err(TrySendError::Closed(_)) => return false,
+            }
         }
-        Err(TrySendError::Closed(_)) => false,
+        match sub.tx.try_send(notif.clone()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!("subscriber queue full; dropping notification");
+                sub.gapped = true;
+                true
+            }
+            Err(TrySendError::Closed(_)) => false,
+        }
     });
+}
+
+/// The session a notification belongs to. Every variant carries one, so a gap
+/// notice can be addressed to the same session as the output it displaced.
+fn pty_id_of(notif: &Notification) -> &str {
+    match notif {
+        Notification::Output { pty_id, .. }
+        | Notification::Exit { pty_id, .. }
+        | Notification::Attention { pty_id, .. }
+        | Notification::Gapped { pty_id } => pty_id,
+    }
 }
 
 /// Seed a UTF-8 locale on a spawned shell when the environment supplies none.
@@ -756,5 +820,140 @@ fn seed_utf8_locale(command: &mut CommandBuilder) {
         && std::env::var_os("LANG").is_none()
     {
         command.env("LANG", "en_US.UTF-8");
+    }
+}
+
+#[cfg(test)]
+mod fan_out_tests {
+    use super::*;
+
+    fn output(n: u8) -> Notification {
+        Notification::Output {
+            pty_id: "pty-1".into(),
+            bytes: vec![n],
+        }
+    }
+
+    fn gapped() -> Notification {
+        Notification::Gapped {
+            pty_id: "pty-1".into(),
+        }
+    }
+
+    type Subs = Arc<Mutex<Vec<Subscriber>>>;
+
+    fn subscribers(cap: usize) -> (Subs, tokio::sync::mpsc::Receiver<Notification>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(cap);
+        (
+            Arc::new(Mutex::new(vec![Subscriber { tx, gapped: false }])),
+            rx,
+        )
+    }
+
+    fn drain(rx: &mut tokio::sync::mpsc::Receiver<Notification>) -> Vec<Notification> {
+        let mut out = Vec::new();
+        while let Ok(n) = rx.try_recv() {
+            out.push(n);
+        }
+        out
+    }
+
+    /// A subscriber that falls behind is TOLD, once room frees up.
+    ///
+    /// This is the whole point of the flag: the queue being full is what causes
+    /// the gap, so the notice cannot be delivered at the moment it happens. If
+    /// it were simply dropped along with the bytes — which is what this used to
+    /// do — the client would never learn to re-attach, and the replay ring that
+    /// holds the missed output would be unreachable in practice.
+    #[tokio::test]
+    async fn a_subscriber_that_missed_output_is_told_once_there_is_room() {
+        let (subs, mut rx) = subscribers(2);
+
+        fan_out(&subs, output(1));
+        fan_out(&subs, output(2)); // queue now full
+        fan_out(&subs, output(3)); // dropped — the gap opens
+
+        assert_eq!(drain(&mut rx), vec![output(1), output(2)]);
+
+        fan_out(&subs, output(4));
+        assert_eq!(
+            drain(&mut rx),
+            vec![gapped(), output(4)],
+            "the gap is announced BEFORE the next output, so the client re-attaches \
+             rather than compositing fresh bytes onto a stale grid",
+        );
+    }
+
+    /// The notice is sent once per gap, not once per dropped message: a
+    /// subscriber that is behind is behind, and repeating it would compete for
+    /// the very queue space that is already exhausted.
+    #[tokio::test]
+    async fn the_gap_notice_is_not_repeated_once_the_subscriber_catches_up() {
+        let (subs, mut rx) = subscribers(2);
+
+        fan_out(&subs, output(1));
+        fan_out(&subs, output(2));
+        fan_out(&subs, output(3)); // dropped
+        drain(&mut rx);
+
+        // Asserted, not merely drained: without this the test would pass
+        // vacuously if no notice were ever sent — the exact regression the
+        // sibling test guards against.
+        fan_out(&subs, output(4));
+        assert_eq!(drain(&mut rx), vec![gapped(), output(4)], "the gap is announced once");
+
+        fan_out(&subs, output(5));
+        assert_eq!(
+            drain(&mut rx),
+            vec![output(5)],
+            "a caught-up subscriber gets plain output, not a second gap notice",
+        );
+    }
+
+    /// A subscriber still congested when the notice goes out gaps again — the
+    /// notice occupies queue space like any other message, so the output it was
+    /// announcing can itself be dropped.
+    ///
+    /// That is correct rather than unfortunate: a second gap really did occur,
+    /// and the client is told about it. Pinned here because the alternative
+    /// reading ("one gap notice per congestion episode") is the intuitive one
+    /// and would make a future refactor suppress a notice that is real.
+    #[tokio::test]
+    async fn a_still_congested_subscriber_gaps_again() {
+        let (subs, mut rx) = subscribers(1);
+
+        fan_out(&subs, output(1)); // fills the single slot
+        fan_out(&subs, output(2)); // dropped — gap opens
+        assert_eq!(drain(&mut rx), vec![output(1)]);
+
+        // One slot free: the notice takes it, so output(3) has nowhere to go.
+        fan_out(&subs, output(3));
+        assert_eq!(drain(&mut rx), vec![gapped()]);
+
+        fan_out(&subs, output(4));
+        assert_eq!(
+            drain(&mut rx),
+            vec![gapped()],
+            "the dropped output(3) opened a fresh gap, which is announced in turn",
+        );
+    }
+
+    /// A subscriber whose receiver is gone is dropped rather than retained
+    /// forever — including while a gap is pending, which is its own early-return
+    /// branch in the retain and would otherwise leak the entry.
+    #[tokio::test]
+    async fn a_closed_subscriber_is_dropped_even_with_a_gap_pending() {
+        let (subs, mut rx) = subscribers(1);
+
+        fan_out(&subs, output(1));
+        fan_out(&subs, output(2)); // gap opens
+        rx.close();
+        drop(rx);
+
+        fan_out(&subs, output(3));
+        assert!(
+            subs.lock().unwrap().is_empty(),
+            "the dead subscriber is reaped on the gap-notice path too",
+        );
     }
 }

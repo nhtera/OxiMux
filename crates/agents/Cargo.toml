@@ -9,6 +9,10 @@ rust-version.workspace = true
 
 [dependencies]
 oximux-core = { workspace = true }
+# Portable fold + wire vocabulary + stream-json decoder, re-exported under the
+# original `crate::thread::*` paths (see src/thread/mod.rs). Split out so the
+# phone's Rust core can reuse the fold without pty/sqlite/ACP deps.
+oximux-agent-core = { workspace = true }
 oximux-pty = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -45,6 +49,10 @@ libc = "0.2"
 
 [dev-dependencies]
 oximux-git = { workspace = true }
+# Only the schedule-store tests need this, to apply the real migrations against
+# an in-memory database. The store itself takes a Connection, so the shipping
+# build keeps no dependency on the storage crate.
+oximux-storage = { workspace = true }
 tempfile = "3"
 toml = { workspace = true }
 

@@ -29,7 +29,7 @@ use crate::shell::git_panel::GitPanel;
 use crate::shell::git_panel::discard_confirm::{
     self, DiscardAllArea, DiscardCopy, DiscardKind,
 };
-use gpui::{Context, EventEmitter, SharedString};
+use gpui::{Context, EventEmitter};
 use oximux_git::Repository;
 use std::path::{Path, PathBuf};
 use tokio::sync::oneshot;
@@ -56,8 +56,8 @@ pub enum DiscardScope {
 /// Information the shell host needs to render a discard confirm dialog.
 ///
 /// Built by `discard_path` (single) or `discard_area` (per-section).
-/// The host passes `copy` + `expected` straight into a `ConfirmPrompt`,
-/// and dispatches `on_confirm` on `scope`.
+/// The host passes `copy` straight into a `ConfirmPrompt`, and
+/// dispatches `on_confirm` on `scope`.
 ///
 /// `paths` is always non-empty: one entry for `Single`, the full
 /// section list for `Area`.
@@ -66,7 +66,6 @@ pub struct DiscardRequest {
     pub paths: Vec<PathBuf>,
     pub scope: DiscardScope,
     pub copy: DiscardCopy,
-    pub expected: SharedString,
 }
 
 /// Event emitted whenever `discard_path` / `discard_area` accepts a
@@ -119,12 +118,10 @@ impl GitPanel {
         match file_status {
             Some(f) => {
                 let (kind, copy) = discard_confirm::copy_for(&f);
-                let expected = discard_confirm::expected_for(&f);
                 DiscardRequest {
                     paths: vec![path],
                     scope: DiscardScope::Single { kind },
                     copy,
-                    expected,
                 }
             }
             None => {
@@ -146,21 +143,20 @@ impl GitPanel {
                             .into(),
                         confirm_label: "Discard".into(),
                     },
-                    expected: display.into(),
                 }
             }
         }
     }
 
-    /// Open the type-to-confirm dialog for "Discard all" / "Delete all"
-    /// on a section. `paths` is the full list of paths in `area` at
-    /// the moment the user clicked. No-op when `paths` is empty (the
+    /// Open the confirm dialog for "Discard all" / "Delete all" on a
+    /// section. `paths` is the full list of paths in `area` at the
+    /// moment the user clicked. No-op when `paths` is empty (the
     /// section button should already be hidden in that case).
     ///
     /// Like [`discard_path`](Self::discard_path), this only sets
     /// `pending_discard` — the actual mutation runs in
-    /// [`confirmed_discard_area`](Self::confirmed_discard_area) after
-    /// the user types the expected string and clicks Discard / Delete.
+    /// [`confirmed_discard_area`](Self::confirmed_discard_area) once
+    /// the user clicks Discard / Delete.
     pub fn discard_area(
         &mut self,
         area: DiscardAllArea,
@@ -171,12 +167,10 @@ impl GitPanel {
             return;
         }
         let copy = discard_confirm::copy_for_area(area, paths.len());
-        let expected = discard_confirm::expected_for_area(area, paths.len());
         self.pending_discard = Some(DiscardRequest {
             paths,
             scope: DiscardScope::Area { area },
             copy,
-            expected,
         });
         cx.emit(DiscardRequested);
         cx.notify();

@@ -1,0 +1,402 @@
+//! The FFI value types crossing to Swift/Kotlin/JS, and their conversions from
+//! the wire types. Kept a thin, stable projection of `remote-proto` so the RN app
+//! never sees the postcard/JSON envelope details.
+
+use oximux_remote_proto::messages::ProjectSummaryWire as WireProject;
+use oximux_remote_proto::messages::SessionSummary as WireSummary;
+use oximux_remote_proto::proto::{Choice as WireChoice, SessionChoices as WireChoices};
+
+/// One selectable model or permission mode.
+///
+/// `id` is what goes back over the wire; `label` is what a person reads. They
+/// stay separate because a backend's identifier is usually not presentable
+/// (`claude-opus-5` against "Opus 5").
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Choice {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+}
+
+impl From<WireChoice> for Choice {
+    fn from(w: WireChoice) -> Self {
+        Self { id: w.id, label: w.label, description: w.description }
+    }
+}
+
+/// What a session's backend offers its pickers, plus what is active now so the
+/// app can mark the current entry without a second round trip.
+///
+/// Both lists may legitimately be empty — that means "nothing to choose
+/// between", not a failure.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SessionChoices {
+    pub models: Vec<Choice>,
+    pub modes: Vec<Choice>,
+    pub current_model: Option<String>,
+    pub current_mode: Option<String>,
+}
+
+impl From<WireChoices> for SessionChoices {
+    fn from(w: WireChoices) -> Self {
+        Self {
+            models: w.models.into_iter().map(Choice::from).collect(),
+            modes: w.modes.into_iter().map(Choice::from).collect(),
+            current_model: w.current_model,
+            current_mode: w.current_mode,
+        }
+    }
+}
+
+/// One agent session the phone lists.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub title: String,
+    pub model: Option<String>,
+    pub last_seq: u64,
+    pub awaiting_permission: bool,
+}
+
+impl From<WireSummary> for SessionSummary {
+    fn from(w: WireSummary) -> Self {
+        Self {
+            session_id: w.session_id,
+            title: w.title,
+            model: w.model,
+            last_seq: w.last_seq,
+            awaiting_permission: w.awaiting_permission,
+        }
+    }
+}
+
+/// One project the phone offers as a new-session target. `path` is the absolute
+/// host path handed back to `create_session`; `name` is the display label.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ProjectSummary {
+    pub name: String,
+    pub path: String,
+}
+
+impl From<WireProject> for ProjectSummary {
+    fn from(w: WireProject) -> Self {
+        Self { name: w.name, path: w.path }
+    }
+}
+
+/// An image attached to a prompt.
+///
+/// A typed record rather than a JSON string (the shape `answer_question` uses):
+/// there are only two fields and neither is dynamic, so the app gets real types
+/// and a malformed attachment becomes impossible instead of a parse error.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatImage {
+    /// An image MIME type, e.g. `image/jpeg`. Passed through to the agent, which
+    /// decides what it accepts.
+    pub media_type: String,
+    /// The image bytes, base64. Note this inflates the payload by ~4/3, which is
+    /// what the send-size ceiling is measured against.
+    pub data: String,
+}
+
+impl From<ChatImage> for oximux_agent_core::thread::ChatImage {
+    fn from(i: ChatImage) -> Self {
+        Self { media_type: i.media_type, data: i.data }
+    }
+}
+
+/// The connection state the UI reflects, mirroring `remote_session::ConnState`.
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum ConnState {
+    Connecting,
+    Connected,
+    Reconnecting,
+    Disconnected,
+    Unreachable { cause: String },
+}
+
+/// The user's answer to a permission request (the FFI-simplified decision).
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum PermissionReply {
+    /// Allow this one call. `updated_input_json` MUST echo the tool's input (the
+    /// app passes back the `input` it received on the `PermissionRequested`
+    /// event, optionally edited) — the CLI treats an allow without it as
+    /// malformed and denies the tool, so this is required, not optional.
+    Allow { updated_input_json: String },
+    /// Allow *and* apply the shortcut the agent offered alongside the request —
+    /// the "always allow edits this session" class of button.
+    ///
+    /// `suggestion_json` is one of the `suggestions` the app received on the
+    /// `PermissionRequested` event, quoted back **verbatim**. Its `raw` payload
+    /// is opaque to both the phone and the host; only the agent that offered it
+    /// interprets it. Echoing rather than reconstructing means the phone cannot
+    /// invent a suggestion the agent never made, so this adds no trust boundary
+    /// beyond the existing resolve path.
+    AllowWithSuggestion { updated_input_json: String, suggestion_json: String },
+    /// Deny; `message` is shown to the model.
+    Deny { message: String },
+}
+
+/// Every fallible FFI method surfaces one of these.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum MobileError {
+    #[error("not connected to a host")]
+    NotConnected,
+    #[error("the pairing ticket is invalid: {0}")]
+    BadTicket(String),
+    #[error("pairing failed: {0}")]
+    Pairing(String),
+    #[error("the transport could not be established: {0}")]
+    Transport(String),
+    #[error("the request failed: {0}")]
+    Rpc(String),
+}
+
+/// One terminal the phone can list and attach to.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TerminalInfo {
+    pub pty_id: String,
+    pub cwd: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl From<oximux_remote_proto::messages::TerminalSummary> for TerminalInfo {
+    fn from(t: oximux_remote_proto::messages::TerminalSummary) -> Self {
+        Self { pty_id: t.pty_id, cwd: t.cwd, cols: t.cols, rows: t.rows }
+    }
+}
+
+/// A terminal's replay snapshot and the grid it was drawn at.
+///
+/// The dims are not advisory. The replay bytes carry absolute-position escape
+/// sequences produced by a process drawing into a grid of exactly this size, so
+/// an emulator built at any other size renders them into the wrong cells. The
+/// app MUST size its emulator from these before feeding it `replay`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TerminalScreen {
+    pub replay: Vec<u8>,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// One issue or pull request.
+///
+/// A flat projection of the wire row — labels and assignees arrive as plain
+/// strings rather than single-field records, because a record wrapping one
+/// string costs an FFI type for no added meaning.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ForgeItem {
+    pub number: u64,
+    pub title: String,
+    /// `OPEN` / `CLOSED` / `MERGED`, forwarded verbatim from the forge.
+    ///
+    /// Left as a string rather than narrowed to an enum: the per-provider values
+    /// vary more than a fixed set absorbs, and an unrecognised one would have to
+    /// collapse into a lossy "other" the app could not render meaningfully.
+    pub state: String,
+    pub url: String,
+    pub labels: Vec<String>,
+    pub assignees: Vec<String>,
+    /// Empty when the source omits it (a deleted account) — renders as no
+    /// attribution, not a blank name.
+    pub author: String,
+    /// RFC-3339, or empty when the source omitted it. Formatted app-side; the
+    /// desktop does not know the reader's locale.
+    pub updated_at: String,
+}
+
+impl From<oximux_remote_proto::messages::ForgeItemWire> for ForgeItem {
+    fn from(w: oximux_remote_proto::messages::ForgeItemWire) -> Self {
+        Self {
+            number: w.number,
+            title: w.title,
+            state: w.state,
+            url: w.url,
+            labels: w.labels,
+            assignees: w.assignees,
+            author: w.author,
+            updated_at: w.updated_at,
+        }
+    }
+}
+
+/// One CI check run.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CheckRun {
+    pub name: String,
+    /// `pass` / `fail` / `pending` / `skipping` / `cancel`, as the forge CLI
+    /// bucketed it. Not re-derived here — the CLI already normalises across
+    /// wildly varying per-provider status strings, and a second classification
+    /// would be a second thing to get wrong.
+    pub bucket: String,
+    pub link: String,
+    pub description: String,
+}
+
+impl From<oximux_remote_proto::messages::CheckRunWire> for CheckRun {
+    fn from(w: oximux_remote_proto::messages::CheckRunWire) -> Self {
+        Self { name: w.name, bucket: w.bucket, link: w.link, description: w.description }
+    }
+}
+
+/// Body + author of one issue/PR, fetched on demand.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ForgeItemDetail {
+    pub body: String,
+    pub author: String,
+}
+
+impl From<oximux_remote_proto::messages::ForgeItemDetailWire> for ForgeItemDetail {
+    fn from(w: oximux_remote_proto::messages::ForgeItemDetailWire) -> Self {
+        Self { body: w.body, author: w.author }
+    }
+}
+
+/// Whether to list issues or pull requests.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum ForgeItemKind {
+    Issue,
+    /// A GitHub pull request or GitLab merge request.
+    Pull,
+}
+
+impl From<ForgeItemKind> for oximux_remote_proto::messages::ForgeItemKindWire {
+    fn from(k: ForgeItemKind) -> Self {
+        match k {
+            ForgeItemKind::Issue => Self::Issue,
+            ForgeItemKind::Pull => Self::Pull,
+        }
+    }
+}
+
+/// Which items to list.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum ForgeState {
+    Open,
+    Closed,
+    All,
+}
+
+impl From<ForgeState> for oximux_remote_proto::messages::ForgeStateWire {
+    fn from(s: ForgeState) -> Self {
+        match s {
+            ForgeState::Open => Self::Open,
+            ForgeState::Closed => Self::Closed,
+            ForgeState::All => Self::All,
+        }
+    }
+}
+
+/// How often a schedule repeats — a closed set of three cases, so the app drives
+/// it with pickers that cannot produce an invalid value. The host re-validates on
+/// create (an interval under the floor, an impossible time) regardless.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum Recurrence {
+    /// Every N minutes, measured from the previous fire.
+    EveryMinutes { minutes: u32 },
+    /// Every day at a wall-clock time.
+    DailyAt { hour: u8, minute: u8 },
+    /// Every week on one weekday at a wall-clock time. `weekday` is 0=Monday.
+    WeeklyAt { weekday: u8, hour: u8, minute: u8 },
+}
+
+impl From<oximux_remote_proto::messages::RecurrenceWire> for Recurrence {
+    fn from(w: oximux_remote_proto::messages::RecurrenceWire) -> Self {
+        use oximux_remote_proto::messages::RecurrenceWire as W;
+        match w {
+            W::EveryMinutes { minutes } => Self::EveryMinutes { minutes },
+            W::DailyAt { hour, minute } => Self::DailyAt { hour, minute },
+            W::WeeklyAt { weekday, hour, minute } => Self::WeeklyAt { weekday, hour, minute },
+        }
+    }
+}
+
+impl From<Recurrence> for oximux_remote_proto::messages::RecurrenceWire {
+    fn from(r: Recurrence) -> Self {
+        match r {
+            Recurrence::EveryMinutes { minutes } => Self::EveryMinutes { minutes },
+            Recurrence::DailyAt { hour, minute } => Self::DailyAt { hour, minute },
+            Recurrence::WeeklyAt { weekday, hour, minute } => {
+                Self::WeeklyAt { weekday, hour, minute }
+            }
+        }
+    }
+}
+
+/// A stored schedule, as the app renders it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Schedule {
+    pub id: String,
+    pub name: String,
+    /// The **desktop's** working directory the run opens in.
+    pub cwd: String,
+    pub prompt: String,
+    pub agent_id: Option<String>,
+    pub recurrence: Recurrence,
+    pub enabled: bool,
+    /// RFC-3339 next fire in the desktop's zone. Formatted app-side against the
+    /// reader's own clock — the desktop does not know the phone's locale.
+    pub next_fire_at: String,
+    /// The desktop's own phrasing of the recurrence, carried so both surfaces
+    /// read identically rather than the phone re-deriving it.
+    pub summary: String,
+}
+
+impl From<oximux_remote_proto::messages::ScheduleWire> for Schedule {
+    fn from(w: oximux_remote_proto::messages::ScheduleWire) -> Self {
+        Self {
+            id: w.id,
+            name: w.name,
+            cwd: w.cwd,
+            prompt: w.prompt,
+            agent_id: w.agent_id,
+            recurrence: w.recurrence.into(),
+            enabled: w.enabled,
+            next_fire_at: w.next_fire_at,
+            summary: w.summary,
+        }
+    }
+}
+
+/// How one recorded fire turned out.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum RunOutcome {
+    Ok,
+    Failed,
+}
+
+impl From<oximux_remote_proto::messages::RunOutcomeWire> for RunOutcome {
+    fn from(w: oximux_remote_proto::messages::RunOutcomeWire) -> Self {
+        use oximux_remote_proto::messages::RunOutcomeWire as W;
+        match w {
+            W::Ok => Self::Ok,
+            W::Failed => Self::Failed,
+        }
+    }
+}
+
+/// One recorded fire of a schedule.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ScheduleRun {
+    pub schedule_id: String,
+    /// RFC-3339 **scheduled** instant, not when the tick noticed it.
+    pub fired_at: String,
+    pub outcome: RunOutcome,
+    /// The session the fire opened, when it opened one.
+    pub session_id: Option<String>,
+    /// A short human note on a failure, absent on success.
+    pub detail: Option<String>,
+}
+
+impl From<oximux_remote_proto::messages::ScheduleRunWire> for ScheduleRun {
+    fn from(w: oximux_remote_proto::messages::ScheduleRunWire) -> Self {
+        Self {
+            schedule_id: w.schedule_id,
+            fired_at: w.fired_at,
+            outcome: w.outcome.into(),
+            session_id: w.session_id,
+            detail: w.detail,
+        }
+    }
+}

@@ -7,6 +7,7 @@ members = [
     "crates/dictation",
     "crates/pty",
     "crates/git",
+    "crates/agent-core",
     "crates/agents",
     "crates/editor",
     "crates/storage",
@@ -14,6 +15,11 @@ members = [
     "crates/relay-proto",
     "crates/relay",
     "crates/relay-client",
+    "crates/remote-proto",
+    "crates/remote-host",
+    "crates/remote-session",
+    "crates/remote-iroh",
+    "crates/mobile-core",
     "crates/proc-cwd",
     "xtask",
 ]
@@ -34,6 +40,7 @@ oximux-core     = { path = "crates/core" }
 oximux-dictation = { path = "crates/dictation" }
 oximux-pty      = { path = "crates/pty" }
 oximux-git      = { path = "crates/git" }
+oximux-agent-core = { path = "crates/agent-core" }
 oximux-agents   = { path = "crates/agents" }
 oximux-editor   = { path = "crates/editor" }
 oximux-storage  = { path = "crates/storage" }
@@ -41,6 +48,14 @@ oximux-settings = { path = "crates/settings" }
 oximux-relay-proto = { path = "crates/relay-proto" }
 oximux-relay    = { path = "crates/relay" }
 oximux-relay-client = { path = "crates/relay-client" }
+oximux-remote-proto = { path = "crates/remote-proto" }
+oximux-remote-host = { path = "crates/remote-host" }
+oximux-remote-session = { path = "crates/remote-session" }
+# `host` is opt-in rather than default so the mobile core cannot inherit the
+# desktop accept loop (and, through it, the PTY stack) by omission. Desktop
+# consumers ask for it explicitly with `features = ["host"]`.
+oximux-remote-iroh = { path = "crates/remote-iroh", default-features = false }
+oximux-mobile-core = { path = "crates/mobile-core" }
 oximux-proc-cwd = { path = "crates/proc-cwd" }
 
 # GPUI — see docs/gpui-pins.md. We deliberately do NOT pin `rev` here. The
@@ -75,6 +90,29 @@ serde_json = "1"
 # byte layout is not ABI-stable across point releases — the workspace
 # pin is the authoritative version both app + daemon agree on.
 bincode = { version = "2", features = ["serde"] }
+# Remote-control wire codec (crates/remote-proto). Non-self-describing +
+# compact; the RPC envelope is postcard, append-only by ordinal (mirrors the
+# relay-proto PROTOCOL_VERSION discipline). Event/decision payloads that carry
+# `serde_json::Value` ride as a serde_json string INSIDE the envelope — postcard
+# cannot deserialize `Value` (it's non-self-describing; `deserialize_any` is
+# unsupported), and JSON is already those types' persisted representation.
+postcard = "1"
+# Remote-control P2P transport (crates/remote-iroh): iroh 1.0 (QUIC + hole-punch
+# + n0 relay/pkarr discovery) is the production `Transport`/`Connector` impl
+# beneath the pure-Rust remote-session client. The `Node*`→`Endpoint*` API rename
+# landed in 1.0 — write concrete calls against the 1.0 surface, not the 0.96
+# vendored reference.
+iroh = "1"
+# Mobile FFI (crates/mobile-core): uniffi 0.31 wraps remote-session + iroh into a
+# Swift/Kotlin/JSI surface for the React Native app. 0.31 is the version
+# uniffi-bindgen-react-native and n0's iroh-ffi both track.
+uniffi = { version = "0.31", features = ["cli", "tokio"] }
+# Remote-control host auth (crates/remote-host). Separate app-signing Ed25519
+# identity + a QR HMAC-SHA256 pairing proof, decoupled from the iroh transport
+# key. `rand` (OsRng) mints host keys, challenge nonces, and session tokens.
+ed25519-dalek = "2"
+hmac = "0.12"
+rand = "0.8"
 # Phase 5 relay daemon: lock-free concurrent map for PtyRegistry. Used
 # only by the relay binary; declared centrally for future reuse.
 dashmap = "5"
@@ -103,6 +141,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # to transcode clipboard/file formats Claude doesn't accept (tiff/bmp/…) to PNG.
 base64 = "0.22"
 image = "0.25"
+# QR encoding for the remote-control pairing code. `default-features = false`
+# keeps it to the pure-Rust bitmap encoder — no `image`/`svg` renderers, so it
+# can't drag in a second, conflicting `image` version.
+qrcode = { version = "0.14", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 # Phase 5 editor + LSP. Pinned to match gpui-component's transitive

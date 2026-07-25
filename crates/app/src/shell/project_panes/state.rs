@@ -106,6 +106,19 @@ impl ProjectPanes {
         self.active_group()?.read(cx).active_agent_chat_view()
     }
 
+    /// The chat view bound to `remote_session_id` across every group in this
+    /// project. Used by the remote rewind path, which addresses a session by id
+    /// with no idea which group or tab holds it.
+    pub fn agent_chat_view_by_remote_id(
+        &self,
+        remote_session_id: &str,
+        cx: &App,
+    ) -> Option<Entity<crate::shell::agent_chat::AgentChatView>> {
+        self.groups
+            .values()
+            .find_map(|g| g.read(cx).agent_chat_view_by_remote_id(remote_session_id, cx))
+    }
+
     pub fn group(&self, id: PaneGroupId) -> Option<Entity<PaneGroup>> {
         self.groups.get(&id).cloned()
     }

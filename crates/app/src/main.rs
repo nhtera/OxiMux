@@ -36,6 +36,10 @@ use tracing_subscriber::EnvFilter;
 /// `~/Library/Application Support`. Must stay in lockstep with
 /// `CFBundleIdentifier` in `assets/Info.plist`.
 const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
+/// Scope for the remote-control host key. The host is process-wide (it serves every
+/// workspace's sessions from one registry), so it uses ONE app-level identity rather
+/// than `HostIdentity`'s per-workspace keying.
+const HOST_IDENTITY_SCOPE: &str = "remote-control-host";
 const DB_FILE_NAME: &str = "oximux.db";
 
 fn main() {
@@ -281,6 +285,109 @@ fn main() {
         cx.set_global(oximux_app::catalog_cache::CatalogCache::load_from(
             app_state.settings_repo(),
         ));
+        // Remote-control state (the session registry the in-app iroh host serves).
+        // Installed disabled: until remote control is turned on, no live agent
+        // session is fanned into it, so the desktop pays zero per-event cost — and
+        // no endpoint is bound. Backed by the durable paired-device store so a phone
+        // paired in an earlier run stays authorized across restarts.
+        let mut remote_control =
+            oximux_app::remote_control::RemoteControl::with_devices(std::sync::Arc::new(
+                oximux_remote_host::StorageDeviceStore::new(app_state.remote_device_repo()),
+            ));
+        // Pin the host's endpoint identity from the persistent host key. Without
+        // this iroh mints a fresh key per bind, so the endpoint id — the address a
+        // paired phone dials — would change on every restart and silently break
+        // every existing pairing. A key that can't be loaded degrades to an
+        // ephemeral identity rather than blocking boot.
+        if let Some(data_dir) = dirs::data_dir() {
+            let key_dir = data_dir.join(APP_DATA_SUBDIR);
+            match oximux_remote_host::HostIdentity::load_or_generate(&key_dir, HOST_IDENTITY_SCOPE)
+            {
+                Ok(identity) => {
+                    remote_control =
+                        remote_control.with_endpoint_secret(identity.transport_secret_bytes());
+                }
+                Err(err) => tracing::warn!(
+                    error = %err,
+                    "remote-control host identity unavailable; pairings will not survive a restart"
+                ),
+            }
+        }
+        // Serve terminals when the relay came up. Absent (in-process PTY
+        // fallback), every terminal RPC keeps answering `Unauthorized`.
+        if let Some(terminals) = oximux_app::remote_control::relay_terminals::installed() {
+            remote_control.set_terminals(terminals);
+        }
+        // The inbound half: a phone asking for a new session hands the request
+        // to this loop, which opens the tab on the UI thread and answers with
+        // its id. Installed unconditionally — a host that never enables remote
+        // access simply never receives a request, and wiring it later would mean
+        // remote could be switched on before the launcher existed.
+        {
+            let (launcher, requests) = oximux_app::remote_control::launch_bridge::launch_bridge();
+            remote_control.set_launcher(std::sync::Arc::new(launcher));
+            oximux_app::remote_control::launch_bridge::serve_launches(requests, cx);
+        }
+        // The same inbound shape for rewinds: the request crosses to this loop,
+        // which finds the tab holding that session and starts its rewind.
+        // Installed unconditionally, for the same reason as the launcher.
+        {
+            let (rewinder, requests) = oximux_app::remote_control::rewind_bridge::rewind_bridge();
+            remote_control.set_rewinder(std::sync::Arc::new(rewinder));
+            oximux_app::remote_control::rewind_bridge::serve_rewinds(requests, cx);
+        }
+        // Schedules the phone can list and manage: the same store the desktop's
+        // ticker fires and its Settings pane edits, so all three surfaces share one
+        // set of rows. Reads and writes only, no process spawn — the store is
+        // handed over directly rather than through a bridge, unlike the launcher
+        // and rewinder above.
+        remote_control.set_schedule_store(std::sync::Arc::new(app_state.schedule_store()));
+        // Projects the phone can start a session in without typing a path: the same
+        // recent-projects store the desktop sidebar lists, read directly (no UI hop)
+        // since it is durable data, not live view state.
+        remote_control.set_project_provider(std::sync::Arc::new(
+            oximux_app::remote_control::project_provider::RepoProjects::new(app_state.project_repo()),
+        ));
+        // Voice dictation the phone can drive: the desktop decodes clips with the
+        // same speech engine and model manager its own composer uses, so a phone
+        // dictation and a desktop one run through identical code. The service was
+        // installed above, so its model manager is shared here rather than a
+        // second one being built.
+        if let Some(transcriber) =
+            oximux_app::shell::agent_chat::build_remote_transcriber(cx)
+        {
+            remote_control.set_transcriber(transcriber);
+        }
+        cx.set_global(remote_control);
+        // Restore the master switch. Installed disabled above, so without this a
+        // desktop that had remote access on comes back with it off — and an
+        // already-paired phone simply cannot reach it until someone opens Settings
+        // and flips the toggle by hand, which defeats the point of checking on
+        // agents from a phone. Resuming binds for existing devices only; pairing a
+        // NEW device still takes a deliberate toggle.
+        let remote_was_on = app_state
+            .settings_repo()
+            .get(oximux_app::remote_control::ENABLED_SETTING)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v == "true");
+        // Hydrate the keep-awake preference BEFORE resuming, so the hold the
+        // resume takes is evaluated against the user's actual choice rather than
+        // the default — otherwise a user who turned it off would get an assertion
+        // for the moment between bind and hydration.
+        if let Ok(Some(v)) =
+            app_state.settings_repo().get(oximux_app::remote_control::KEEP_AWAKE_SETTING)
+        {
+            oximux_app::agent_awake::global().set_remote_enabled(v == "true");
+        }
+        if remote_was_on {
+            oximux_app::remote_control::RemoteControl::resume_at_launch(cx);
+        }
+        // Start the scheduled-run ticker. Installed unconditionally: with no
+        // schedules it costs one indexed read every tick and takes no keep-awake
+        // hold, and gating it on "are there any schedules" would mean the first
+        // one created never fires until the next launch.
+        oximux_app::scheduler::Scheduler::install(app_state.schedule_store(), cx);
         // Install the full keymap (registry defaults ⊕ keybindings.toml
         // overrides) — this covers the menu-action chords too, and MUST run
         // before `set_menus`: GPUI reads the keymap when it builds the menu
@@ -1031,6 +1138,14 @@ fn boot_relay_supervisor(
         tracing::warn!("relay PID file missing; crash heartbeat disabled");
     }
 
+    // Publish the relay-backed terminal source so the remote host can serve
+    // terminals. Installed here rather than returned because the relay boots
+    // before the `RemoteControl` global exists.
+    oximux_app::remote_control::relay_terminals::install(std::sync::Arc::new(
+        oximux_app::remote_control::relay_terminals::RelayTerminals::new(std::sync::Arc::clone(
+            &client_arc,
+        )),
+    ));
     let backend = RelayBackend::new(client_arc, relay_rt.handle().clone());
     let boxed: Box<dyn TerminalBackend> = Box::new(backend);
     let shared = std::sync::Arc::new(std::sync::Mutex::new(boxed));

@@ -547,7 +547,7 @@ mod tests {
                     adapter: AgentAdapter::ClaudeCode,
                     adapter_id: "claude-code".into(),
                     worktree_path: "/tmp/proj".into(),
-                    model: Some("claude-opus-4-7".into()),
+                    model: Some("claude-opus-5".into()),
                     effort: Some("high".into()),
                     relay_external_id: None,
                     relay_session: None,
@@ -566,7 +566,7 @@ mod tests {
         assert_eq!(agent.adapter, AgentAdapter::ClaudeCode);
         assert_eq!(agent.adapter_id, "claude-code");
         assert_eq!(agent.worktree_path, "/tmp/proj");
-        assert_eq!(agent.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(agent.model.as_deref(), Some("claude-opus-5"));
         assert_eq!(agent.effort.as_deref(), Some("high"));
     }
 

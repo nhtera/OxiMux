@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use oximux_core::{AgentSession, AgentStatus, Project, Workspace};
 use oximux_storage::{
     AgentSessionRepo, Db, DiffReviewNoteRepo, PaneBufferRepo, PaneRelayIdRepo, PaneSessionRepo,
-    ProjectRepo, SettingsRepo, StorageError, WorkspaceRepo, WorktreeSettingsRepo,
+    ProjectRepo, RemoteDeviceRepo, SettingsRepo, StorageError, WorkspaceRepo, WorktreeSettingsRepo,
 };
 
 /// Recent-projects fetch limit. The project picker (step 5) paginates if a
@@ -80,6 +80,31 @@ impl AppState {
     /// Internal callers use the field directly.
     pub fn settings_repo(&self) -> &SettingsRepo {
         &self.settings_repo
+    }
+
+    /// The paired-remote-device repo, built on demand for the boot path that
+    /// backs remote control's auth store with durable persistence. Not a stored
+    /// field: it is read once at startup, and a repo is just a `Db` handle.
+    pub fn remote_device_repo(&self) -> RemoteDeviceRepo {
+        RemoteDeviceRepo::new(self.db.clone())
+    }
+
+    /// The scheduled-run store, built on demand for the same reason as
+    /// [`Self::remote_device_repo`]: it is taken once at startup and is just a
+    /// handle on the shared connection.
+    ///
+    /// Shares the app's `Db` rather than opening its own connection — SQLite
+    /// serializes writers, so a second connection would turn lock contention
+    /// between the scheduler and the rest of the app into `SQLITE_BUSY`.
+    pub fn schedule_store(&self) -> oximux_agents::schedule::ScheduleStore {
+        oximux_agents::schedule::ScheduleStore::new(self.db.conn())
+    }
+
+    /// The project repository, shared for the remote-control project provider so a
+    /// paired phone lists the same projects the desktop does. Clones the handle
+    /// (shared `Db`), not a second connection — SQLite serializes writers.
+    pub fn project_repo(&self) -> ProjectRepo {
+        self.project_repo.clone()
     }
 }
 

@@ -42,6 +42,7 @@ use crate::thread::tool_call::PermissionDecision;
 /// Run the whole ACP session to completion (blocks the worker thread). A spawn
 /// or protocol failure is surfaced as a [`ThreadEvent::Error`] so the app's
 /// disconnect path fires (the same degradation as a Claude spawn failure).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     command: String,
     args: Vec<String>,
@@ -134,10 +135,10 @@ async fn session(
                         // `models()`/`current_model()` read the live vocabulary, then
                         // fall through: the mapper emits `ControlsUpdated` so the
                         // composer re-pulls its pickers.
-                        if let SessionUpdate::ConfigOptionUpdate(u) = &n.update {
-                            if let Ok(mut s) = st.lock() {
-                                s.config_options = u.config_options.clone();
-                            }
+                        if let SessionUpdate::ConfigOptionUpdate(u) = &n.update
+                            && let Ok(mut s) = st.lock()
+                        {
+                            s.config_options = u.config_options.clone();
                         }
                         // During a `session/load` replay, drop transcript-bearing
                         // updates: OxiMux repaints from its own persisted blob, so
@@ -460,13 +461,13 @@ async fn session(
                             // and signal the composer to re-pull its pickers so the
                             // effort/other controls track the new model. Guard the
                             // empty case so a terse agent reply can't wipe the vocab.
-                            if let Ok(resp) = resp {
-                                if !resp.config_options.is_empty() {
-                                    if let Ok(mut s) = state.lock() {
-                                        s.config_options = resp.config_options;
-                                    }
-                                    let _ = event_tx.send(ThreadEvent::ControlsUpdated);
+                            if let Ok(resp) = resp
+                                && !resp.config_options.is_empty()
+                            {
+                                if let Ok(mut s) = state.lock() {
+                                    s.config_options = resp.config_options;
                                 }
+                                let _ = event_tx.send(ThreadEvent::ControlsUpdated);
                             }
                         }
                     }

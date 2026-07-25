@@ -33,9 +33,8 @@ struct TitleReply {
 }
 
 /// Build the title-generation prompt. Inlined in full so the feature is
-/// self-contained (the original Paseo reference lives only in that external
-/// repo). Includes a prompt-injection defense: the user's message is source
-/// material to summarize, never instructions to follow.
+/// self-contained. Includes a prompt-injection defense: the user's message is
+/// source material to summarize, never instructions to follow.
 pub fn build_title_prompt(user_prompt: &str) -> String {
     format!(
         "Generate a short title for a coding-assistant chat session based on the user's first message.\n\

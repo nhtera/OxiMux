@@ -396,6 +396,7 @@ pub(super) fn open_action(
 /// with the URL drafted for review, ready to work the issue — the Tasks
 /// equivalent of "start"). `pub(super)` so the detail view reuses the same
 /// chip; stops propagation so the row's open-detail click doesn't also fire.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn create_action(
     name: String,
     linked_issue: String,

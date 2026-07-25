@@ -1,41 +1,32 @@
-//! ConfirmDialog — reusable confirm modal with two intensities.
+//! ConfirmDialog — reusable confirm modal.
 //!
-//! - **Type-to-confirm** (`expected` non-empty): the destructive button is
-//!   enabled only once the user types `expected` exactly. Used for
-//!   irreversible, on-disk operations (revert file, drop stash, remove
-//!   worktree) where a reflex click would lose data.
-//! - **Plain confirm** (`expected` empty): no text field; the destructive
-//!   button is enabled immediately. Used for reversible / non-destructive
-//!   operations (e.g. removing a project from the cockpit — files on disk
-//!   are untouched).
+//! One shape: title, body, a Cancel button and a destructive Confirm button
+//! that fires on the first click. Destructive weight is carried by the copy
+//! and the danger-styled button, not by a typing gate — a modal the user has
+//! to transcribe a filename into costs every discard a detour while stopping
+//! nothing a second look wouldn't.
 //!
-//! Either way a Cancel button and Escape dismiss the dialog. The callback
-//! runs on confirm; the dialog flips `confirmed = true` so the host can
-//! drop it from the modal stack.
-//!
-//! Pure match predicate lives at `logic::is_match` so tests run without
-//! GPUI.
+//! An optional middle action turns it into a three-way prompt (Save /
+//! Discard / Cancel). Escape and the Cancel button dismiss; Enter confirms.
+//! The dialog flips `confirmed` / `cancelled` so the host can drop it from
+//! the modal stack.
 
-pub mod logic;
-
-use crate::confirm_dialog::logic::is_match;
 use gpui::{
-    App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, ParentElement, Render, SharedString, Styled, Window, div, px,
+    App, ClickEvent, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyDownEvent, ParentElement, Render, SharedString, Styled, Window, div, px,
     prelude::FluentBuilder,
 };
 use gpui_component::{
     Disableable, Sizable,
     button::{Button, ButtonVariants},
-    input::{Input, InputState},
 };
 use oximux_settings::{Density, Theme, Typography};
 use std::rc::Rc;
 
-/// Boxed callback fired when the user clicks Confirm with a matching typed
-/// string. `Rc` (not `Arc`) because GPUI views are single-threaded on the
-/// foreground executor; `Rc<dyn Fn>` avoids the `Send` bound that the
-/// closure would otherwise need.
+/// Boxed callback fired when the user resolves the dialog — confirm, the
+/// secondary action, or cancel. `Rc` (not `Arc`) because GPUI views are
+/// single-threaded on the foreground executor; `Rc<dyn Fn>` avoids the
+/// `Send` bound that the closure would otherwise need.
 pub type ConfirmCallback = Rc<dyn Fn(&mut Window, &mut App) + 'static>;
 
 /// Bundle of message + intent fields. Keeps the constructor under clippy's
@@ -43,7 +34,6 @@ pub type ConfirmCallback = Rc<dyn Fn(&mut Window, &mut App) + 'static>;
 pub struct ConfirmPrompt {
     pub title: SharedString,
     pub body: SharedString,
-    pub expected: SharedString,
     pub on_confirm: ConfirmCallback,
     /// Optional override for the destructive button label. Defaults to
     /// `"Confirm"` for back-compat with stash / workspace callers; SCM
@@ -74,9 +64,7 @@ pub struct ConfirmSecondary {
 pub struct ConfirmDialog {
     title: SharedString,
     body: SharedString,
-    expected: SharedString,
     confirm_label: SharedString,
-    input_state: Entity<InputState>,
     on_confirm: Option<ConfirmCallback>,
     on_cancel: Option<ConfirmCallback>,
     /// Label + callback for the optional destructive middle action. `None`
@@ -103,7 +91,6 @@ impl ConfirmDialog {
         let ConfirmPrompt {
             title,
             body,
-            expected,
             on_confirm,
             confirm_label,
             on_cancel,
@@ -113,21 +100,26 @@ impl ConfirmDialog {
             Some(ConfirmSecondary { label, on_click }) => (Some(label), Some(on_click)),
             None => (None, None),
         };
-        let placeholder = format!("Type {expected} to confirm");
-        let input_state = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        let focus_handle = cx.focus_handle();
+        // Land focus on the card so Enter / Escape work without a click.
+        // Deferred: these dialogs open from a click handler, and GPUI's
+        // post-click focus dispatch runs after it and would clobber a
+        // synchronous focus here.
+        {
+            let handle = focus_handle.clone();
+            window.defer(cx, move |window, cx| window.focus(&handle, cx));
+        }
         Self {
             title,
             body,
-            expected,
             confirm_label: confirm_label.unwrap_or_else(|| "Confirm".into()),
-            input_state,
             on_confirm: Some(on_confirm),
             on_cancel,
             secondary_label,
             on_secondary,
             confirmed: false,
             cancelled: false,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             theme,
             density,
             typography,
@@ -145,24 +137,14 @@ impl ConfirmDialog {
         self.cancelled
     }
 
-    /// `true` when this dialog gates confirmation behind typing `expected`.
-    /// Empty `expected` → plain confirm (button enabled immediately).
-    fn requires_typing(&self) -> bool {
-        !self.expected.is_empty()
-    }
-
-    pub fn typed_matches(&self, cx: &App) -> bool {
-        let typed = self.input_state.read(cx).value().to_string();
-        is_match(&typed, &self.expected)
-    }
-
-    /// Whether the destructive button may fire right now.
-    fn can_confirm(&self, cx: &App) -> bool {
-        (!self.requires_typing() || self.typed_matches(cx)) && !self.confirmed
+    /// Whether the destructive button may fire right now — i.e. the dialog
+    /// hasn't already been resolved.
+    fn can_confirm(&self) -> bool {
+        !self.confirmed && !self.cancelled
     }
 
     fn try_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.can_confirm(cx) {
+        if !self.can_confirm() {
             return;
         }
         if let Some(cb) = self.on_confirm.take() {
@@ -211,10 +193,7 @@ impl Render for ConfirmDialog {
         let theme = self.theme;
         let density = self.density;
         let typography = &self.typography;
-        let can_confirm = self.can_confirm(cx);
-        let requires_typing = self.requires_typing();
-        let prompt = format!("Type {} to confirm:", self.expected);
-
+        let can_confirm = self.can_confirm();
         let confirm_label = self.confirm_label.clone();
         let secondary_label = self.secondary_label.clone();
         let has_secondary = secondary_label.is_some();
@@ -222,8 +201,8 @@ impl Render for ConfirmDialog {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(
                 |dlg, event: &KeyDownEvent, window, cx| {
-                    // Bubble-phase: only act on the keys we care about so
-                    // text input inside the Input widget keeps working.
+                    // Enter fires the primary action, Escape dismisses;
+                    // everything else falls through untouched.
                     match event.keystroke.key.as_str() {
                         "enter" => dlg.try_confirm(window, cx),
                         "escape" => dlg.cancel(window, cx),
@@ -254,17 +233,6 @@ impl Render for ConfirmDialog {
                     .line_height(px(typography.t_body_sm * 1.45))
                     .child(self.body.clone()),
             )
-            // Type-to-confirm field — shown only when a match string is
-            // required. Plain-confirm dialogs (empty `expected`) skip it.
-            .when(requires_typing, |this| {
-                this.child(
-                    div()
-                        .text_size(px(typography.t_label_caps))
-                        .text_color(theme.fg_subtle)
-                        .child(prompt),
-                )
-                .child(Input::new(&self.input_state))
-            })
             .child(
                 div()
                     .flex()

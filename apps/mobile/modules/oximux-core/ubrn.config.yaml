@@ -1,0 +1,26 @@
+---
+# Binds the in-repo `crates/mobile-core` uniffi surface into this turbo-module.
+#
+# `directory` is the OxiMux cargo workspace root, relative to this library; the
+# crate is built in place rather than checked out, so the bindings can never lag
+# the Rust they describe — a wire change and its TypeScript land in one commit.
+rust:
+  directory: ../../../..
+  manifestPath: crates/mobile-core/Cargo.toml
+
+bindings:
+  cpp: cpp/generated
+  ts: src/generated
+
+android:
+  # arm64 covers every current physical device; x86_64 keeps the emulator usable.
+  # armeabi-v7a and x86 are omitted deliberately — they triple build time for
+  # hardware we do not target.
+  targets:
+    - arm64-v8a
+    - x86_64
+
+ios:
+  targets:
+    - aarch64-apple-ios
+    - aarch64-apple-ios-sim

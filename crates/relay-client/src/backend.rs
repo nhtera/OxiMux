@@ -228,7 +228,14 @@ impl RelayBackend {
         let id = self.mint_id();
         let generation = Arc::new(AtomicU64::new(1));
         let (sub_id, notif_rx) = self.client.subscribe_pty(relay_pty_id);
-        let pump = self.spawn_pump(id, Arc::clone(&state), Arc::clone(&generation), 1, notif_rx);
+        let pump = self.spawn_pump(
+            id,
+            relay_pty_id.to_owned(),
+            Arc::clone(&state),
+            Arc::clone(&generation),
+            1,
+            notif_rx,
+        );
         lock_recover(&self.sessions, "sessions").insert(
             id,
             Session {
@@ -248,6 +255,7 @@ impl RelayBackend {
     fn spawn_pump(
         &self,
         id: TerminalSessionId,
+        relay_pty_id: String,
         state: Arc<Mutex<TerminalState>>,
         generation: Arc<AtomicU64>,
         my_generation: u64,
@@ -255,8 +263,26 @@ impl RelayBackend {
     ) -> JoinHandle<()> {
         let queues = Arc::clone(&self.event_queues);
         let wakers = Arc::clone(&self.output_wakers);
+        let client = Arc::clone(&self.client);
         self.handle.spawn(async move {
             while let Some(n) = notif_rx.recv().await {
+                // A gap is handled here rather than in `apply_relay_notification`
+                // because recovery needs an await on the daemon, and that
+                // function is deliberately synchronous so the generation guard
+                // stays unit-testable without a runtime.
+                if matches!(n, Notification::Gapped { .. }) {
+                    // Same guard the apply path opens with: a superseded pump
+                    // must not touch the shared state, and a resync writes the
+                    // whole grid.
+                    if generation.load(Ordering::Acquire) != my_generation {
+                        return;
+                    }
+                    resync_after_gap(&client, &relay_pty_id, &state).await;
+                    if let Some(waker) = lock_recover(&wakers, "output wakers").get(&id) {
+                        waker();
+                    }
+                    continue;
+                }
                 let flow =
                     apply_relay_notification(&state, &queues, id, &generation, my_generation, n);
                 // Event-driven drain: nudge the UI the instant output is queued
@@ -272,6 +298,49 @@ impl RelayBackend {
             }
         })
     }
+}
+
+/// Rebuild the local grid from the daemon's replay ring after a dropped frame.
+///
+/// Uses `Replay` rather than a second `Attach`: this session already holds an
+/// attachment, and attaching again would add a stale entry to the daemon's
+/// smallest-screen-wins size calculation — so recovering from a dropped frame
+/// would resize the live process.
+///
+/// The state is replaced wholesale rather than patched. There is no way to know
+/// which bytes were missed, so the grid is rebuilt at the daemon's current dims
+/// exactly as `attach` builds it; anything less would leave the hole in place.
+/// A failure here is logged and left alone: a stale grid is worse than a correct
+/// one but far better than tearing down a live session over one dropped frame,
+/// and the next gap retries.
+async fn resync_after_gap(
+    client: &RelayClient,
+    relay_pty_id: &str,
+    state: &Arc<Mutex<TerminalState>>,
+) {
+    let resp = client
+        .request(Request::Replay {
+            pty_id: relay_pty_id.to_owned(),
+        })
+        .await;
+    let (replay, cols, rows) = match resp {
+        Ok(Response::ReplayOk { replay, cols, rows }) => (replay, cols.max(1), rows.max(1)),
+        Ok(other) => {
+            tracing::warn!(?relay_pty_id, ?other, "gap resync: unexpected response");
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(?relay_pty_id, ?err, "gap resync: request failed");
+            return;
+        }
+    };
+    let mut s = lock_recover(state, "terminal state");
+    *s = TerminalState::new(cols, rows, SCROLLBACK_ROWS);
+    s.advance(&replay);
+    // Replay is historical: drop the title/clipboard/bell/colour events it
+    // fired so a resync does not re-ring the bell for output the user already
+    // saw before the gap.
+    s.clear_collected();
 }
 
 /// Apply one relay notification to the local terminal state + event
@@ -357,6 +426,26 @@ fn apply_relay_notification(
             push_event(queues, id, TerminalEvent::Bell { id });
             ControlFlow::Continue(())
         }
+        // The daemon discarded output for this subscriber because our queue was
+        // full. The bytes survive in the session's replay ring, so recovery is a
+        // re-attach — which this pump cannot perform: it holds no client handle,
+        // and a fresh `Attach` would register a *second* attachment in the
+        // daemon's smallest-screen-wins size calculation unless the old one is
+        // released in the same step.
+        //
+        // So this arm is deliberately inert for now, and deliberately explicit
+        // rather than a catch-all: the grid is known-stale from here, and that
+        // fact should force a decision at this site rather than be swallowed by
+        // a `_ =>`. Continue rather than Break — a terminal with a hole in it is
+        // still more useful than one that abruptly dies.
+        Notification::Gapped { .. } => {
+            tracing::warn!(
+                ?id,
+                "daemon dropped output for this subscriber; terminal contents are stale \
+                 until the session is re-attached"
+            );
+            ControlFlow::Continue(())
+        }
     }
 }
 
@@ -423,7 +512,14 @@ impl TerminalBackend for RelayBackend {
         }
         let generation = Arc::new(AtomicU64::new(1));
         let (sub_id, notif_rx) = self.client.subscribe_pty(&relay_pty_id);
-        let pump = self.spawn_pump(id, Arc::clone(&state), Arc::clone(&generation), 1, notif_rx);
+        let pump = self.spawn_pump(
+            id,
+            relay_pty_id.to_owned(),
+            Arc::clone(&state),
+            Arc::clone(&generation),
+            1,
+            notif_rx,
+        );
         lock_recover(&self.sessions, "sessions").insert(
             id,
             Session {

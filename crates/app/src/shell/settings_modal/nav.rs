@@ -24,17 +24,21 @@ pub enum SettingsPane {
     Agents,
     Voice,
     Notifications,
+    Schedules,
+    Remote,
     Keybindings,
     Appearance,
     About,
 }
 
 impl SettingsPane {
-    pub(super) const ALL: [SettingsPane; 7] = [
+    pub(super) const ALL: [SettingsPane; 9] = [
         SettingsPane::Terminal,
         SettingsPane::Agents,
         SettingsPane::Voice,
         SettingsPane::Notifications,
+        SettingsPane::Schedules,
+        SettingsPane::Remote,
         SettingsPane::Keybindings,
         SettingsPane::Appearance,
         SettingsPane::About,
@@ -46,6 +50,8 @@ impl SettingsPane {
             SettingsPane::Agents => "Agents / AI",
             SettingsPane::Voice => "Voice",
             SettingsPane::Notifications => "Notifications",
+            SettingsPane::Schedules => "Schedules",
+            SettingsPane::Remote => "Remote",
             SettingsPane::Keybindings => "Keybindings",
             SettingsPane::Appearance => "Appearance",
             SettingsPane::About => "About",
@@ -61,6 +67,8 @@ impl SettingsPane {
             SettingsPane::Agents => "icons/sparkles.svg",
             SettingsPane::Voice => "icons/mic.svg",
             SettingsPane::Notifications => "icons/bell.svg",
+            SettingsPane::Schedules => "icons/history.svg",
+            SettingsPane::Remote => "icons/globe.svg",
             SettingsPane::Keybindings => "icons/keyboard.svg",
             SettingsPane::Appearance => "icons/palette.svg",
             SettingsPane::About => "icons/info.svg",

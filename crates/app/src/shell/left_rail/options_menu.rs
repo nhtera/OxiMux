@@ -35,6 +35,9 @@ struct MenuState {
     compact: bool,
 }
 
+/// What a check-marked radio row does when clicked (sort order, card layout).
+type RadioClick = Box<dyn Fn(&mut WorkspaceOptionsMenu, &mut Context<WorkspaceOptionsMenu>)>;
+
 pub struct WorkspaceOptionsMenu {
     /// `None` when closed; `Some` carries the live snapshot plus the
     /// screen-pixel anchor for the popover.
@@ -161,7 +164,7 @@ impl Render for WorkspaceOptionsMenu {
         let radio_row = |id: &'static str,
                          label: &str,
                          is_active: bool,
-                         on_click: Box<dyn Fn(&mut Self, &mut Context<Self>)>,
+                         on_click: RadioClick,
                          cx: &mut Context<Self>| {
             div()
                 .id(id)

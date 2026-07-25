@@ -192,6 +192,16 @@ impl WorkspaceRoot {
         self.project_panes_by_project.get(id).cloned()
     }
 
+    /// Every project's panes in this window, active or not.
+    ///
+    /// The remote surface addresses sessions by id, and a session keeps running
+    /// in a project the user has since switched away from — so a lookup
+    /// restricted to [`Self::active_project_panes`] would report a live session
+    /// as missing purely because of which project happens to be on screen.
+    pub(crate) fn all_project_panes(&self) -> Vec<Entity<ProjectPanes>> {
+        self.project_panes_by_project.values().cloned().collect()
+    }
+
     /// ⌘E over a non-composer pane (a focused chat composer consumes it first).
     /// Stops a live session if one is running, else resolves a text sink for the
     /// active pane and hands it to the dictation HUD. Panes that can't take text
@@ -656,7 +666,6 @@ impl WorkspaceRoot {
         let prompt = ConfirmPrompt {
             title: "Move to Trash".into(),
             body: body.into(),
-            expected: "".into(),
             on_confirm,
             confirm_label: Some("Move to Trash".into()),
             on_cancel: None,
@@ -741,7 +750,6 @@ impl WorkspaceRoot {
         let prompt = ConfirmPrompt {
             title: request.copy.title,
             body: request.copy.body,
-            expected: request.expected,
             on_confirm,
             confirm_label: Some(request.copy.confirm_label),
             on_cancel: Some(on_cancel),

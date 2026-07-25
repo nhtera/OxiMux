@@ -1,10 +1,9 @@
 //! PushStashDialog — small form modal for `git stash push`.
 //!
 //! Two body fields: a single-line message input and an
-//! "Include untracked files" checkbox. NOT a type-to-confirm dialog —
-//! `ConfirmDialog` only supports the destructive type-gated flow,
-//! which is the wrong UX for a creation form. Built as a separate
-//! primitive so the four existing destructive callers stay unchanged.
+//! "Include untracked files" checkbox. Not a `ConfirmDialog` — that
+//! primitive is title + body + buttons, with no room for form fields,
+//! so this is its own thing and the destructive callers stay unchanged.
 //!
 //! Lifecycle mirrors `ConfirmDialog`: caller mounts on demand,
 //! observes `is_confirmed()` / `is_cancelled()` to drop the slot.

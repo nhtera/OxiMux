@@ -1203,3 +1203,140 @@ async fn spawn_args_reach_child_process() {
     );
     assert!(exit.is_some(), "expected Exit notification after echo");
 }
+
+/// `Replay` returns the ring WITHOUT registering an attachment.
+///
+/// The no-attachment half is the whole reason this request exists rather than
+/// a second `Attach`. The daemon drives the PTY at the element-wise `min`
+/// across attachments, so a resync that quietly added one would pin the live
+/// process to whatever size that phantom attachment claimed — a dropped frame
+/// would visibly resize the user's terminal. Asserted by resizing after the
+/// replay and checking the PTY still follows the one real attachment.
+#[tokio::test]
+async fn replay_returns_the_ring_without_adding_an_attachment() {
+    let relay = boot_relay().await;
+    let (mut c, mut buf) = connect_and_hello(&relay).await;
+
+    let (pty_id, attachment_id) = match req(
+        &mut c,
+        &mut buf,
+        2,
+        Request::Spawn {
+            cwd: "/tmp".into(),
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".into()),
+            args: Vec::new(),
+            env: vec![],
+        },
+    )
+    .await
+    {
+        Response::SpawnOk {
+            pty_id,
+            attachment_id,
+        } => (pty_id, attachment_id),
+        other => panic!("spawn failed: {other:?}"),
+    };
+
+    req(
+        &mut c,
+        &mut buf,
+        3,
+        Request::Write {
+            pty_id: pty_id.clone(),
+            bytes: b"echo marker\n".to_vec(),
+        },
+    )
+    .await;
+
+    // Let the echo land in the ring before snapshotting it.
+    let mut replay = Vec::new();
+    for _ in 0..100 {
+        match req(
+            &mut c,
+            &mut buf,
+            4,
+            Request::Replay {
+                pty_id: pty_id.clone(),
+            },
+        )
+        .await
+        {
+            Response::ReplayOk { replay: r, .. } if String::from_utf8_lossy(&r).contains("marker") => {
+                replay = r;
+                break;
+            }
+            Response::ReplayOk { .. } => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => panic!("replay failed: {other:?}"),
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&replay).contains("marker"),
+        "replay carries the buffered output; got {:?}",
+        String::from_utf8_lossy(&replay),
+    );
+
+    // The real attachment GROWS the PTY. Growing is the detector, not shrinking:
+    // a phantom attachment is registered at the current effective size, and the
+    // daemon takes the element-wise `min`, so a phantom would cap any growth at
+    // 80x24 while a shrink would sail past it unnoticed.
+    req(
+        &mut c,
+        &mut buf,
+        5,
+        Request::Resize {
+            pty_id: pty_id.clone(),
+            attachment_id,
+            cols: 120,
+            rows: 40,
+        },
+    )
+    .await;
+
+    let listed = match req(&mut c, &mut buf, 6, Request::ListPtys).await {
+        Response::PtyList(list) => list,
+        other => panic!("list failed: {other:?}"),
+    };
+    let pty = listed
+        .iter()
+        .find(|p| p.pty_id == pty_id)
+        .expect("the pty is listed");
+    assert_eq!(
+        (pty.cols, pty.rows),
+        (120, 40),
+        "the PTY follows the one real attachment — Replay added no phantom voter \
+         capping the size at the pre-replay 80x24",
+    );
+}
+
+/// A `Replay` for an unknown PTY is a clean error, not a panic. The resync path
+/// races session teardown by construction: a gap notice can arrive for a PTY
+/// that is closed before the client gets around to asking about it.
+#[tokio::test]
+async fn replay_of_an_unknown_pty_is_an_error() {
+    let relay = boot_relay().await;
+    let (mut c, mut buf) = connect_and_hello(&relay).await;
+
+    let resp = req(
+        &mut c,
+        &mut buf,
+        2,
+        Request::Replay {
+            pty_id: "no-such-pty".into(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            resp,
+            Response::Err {
+                code: oximux_relay_proto::ErrCode::PtyNotFound,
+                ..
+            }
+        ),
+        "expected PtyNotFound, got {resp:?}",
+    );
+}
