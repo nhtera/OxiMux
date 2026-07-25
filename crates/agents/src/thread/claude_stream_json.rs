@@ -38,10 +38,23 @@ use super::tool_call::PermissionDecision;
 /// The CLI accepts the `wire` alias directly as `--model`; the `label` is the
 /// capitalized name shown in the picker; the `blurb` is a one-line capability
 /// hint rendered muted beneath the name (and matched by the model search).
+///
+/// **The alias is the wire value, and the version lives in the blurb** — the
+/// shape the CLI's own `/model` picker uses ("Opus" → "Opus 5 · Best for
+/// everyday, complex tasks"). An alias means "the latest of this family", so
+/// pinning a full id (`claude-opus-5`) instead would quietly keep running last
+/// year's model after the CLI moved on. The cost is that a new release dates the
+/// blurb until this list is refreshed — a stale *description*, never a stale
+/// pick, which is the right way round.
+///
+/// Wording and versions are taken from the installed CLI's own picker rather
+/// than written here, so the two agree on which model is "most capable" — a
+/// judgement that moves with each release, and did: Fable, not Opus, holds it now.
 const CLAUDE_MODELS: &[(&str, &str, &str)] = &[
-    ("opus", "Opus", "Most capable — deep reasoning & hard tasks"),
-    ("sonnet", "Sonnet", "Balanced speed and quality for everyday work"),
-    ("haiku", "Haiku", "Fastest — quick edits and lightweight tasks"),
+    ("opus", "Opus", "Opus 5 · Best for everyday, complex tasks"),
+    ("fable", "Fable", "Fable 5 · Most capable for your hardest and longest-running tasks"),
+    ("sonnet", "Sonnet", "Sonnet 5 · Efficient for routine tasks"),
+    ("haiku", "Haiku", "Haiku 4.5 · Fastest for quick answers"),
 ];
 
 /// The static Claude chat-model vocabulary as [`ModelChoice`]s (pretty label +
@@ -587,7 +600,22 @@ mod tests {
         let (conn, _rx) =
             ClaudeStreamJsonConnection::spawn_command(Command::new("true")).expect("spawn");
         let models: Vec<String> = conn.models().into_iter().map(|m| m.wire).collect();
-        assert_eq!(models, vec!["opus", "sonnet", "haiku"]);
+        assert_eq!(models, vec!["opus", "fable", "sonnet", "haiku"]);
+        // Every blurb leads with the versioned name, which is the only place the
+        // picker can show *which* Opus an alias resolves to.
+        for choice in conn.models() {
+            let blurb = choice.description.expect("every model carries a blurb");
+            assert!(
+                blurb.starts_with(&choice.label),
+                "{} leads its blurb with the versioned name, got {blurb:?}",
+                choice.label,
+            );
+            assert!(
+                blurb.contains(" · "),
+                "{} separates version from capability, got {blurb:?}",
+                choice.label,
+            );
+        }
         assert_eq!(conn.default_model().as_deref(), Some("sonnet"));
         let modes: Vec<(String, String)> =
             conn.permission_modes().into_iter().map(|m| (m.wire, m.label)).collect();
