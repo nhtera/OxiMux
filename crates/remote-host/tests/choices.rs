@@ -3,7 +3,8 @@
 
 use std::sync::Arc;
 
-use oximux_agents::session_registry::{SessionMeta, SessionRegistry};
+use futures::StreamExt;
+use oximux_agents::session_registry::{ChoiceKind, SessionMeta, SessionRegistry};
 use oximux_agents::thread::{ModeChoice, ModelChoice, StubConnection};
 use oximux_remote_host::{AuthStore, Dispatcher, PairingSlot, registration_proof};
 use oximux_remote_proto::messages::RegisterReq;
@@ -105,13 +106,14 @@ async fn a_device_lists_the_catalog_and_switches_model() {
     );
 }
 
-/// A backend that fixes its model at spawn (Claude, Codex) must fail loudly.
+/// A fix-at-spawn backend with no desktop view attached must fail loudly.
 ///
-/// The desktop recovers by respawning the child, which is a view-level operation
-/// the registry cannot perform. Rather than pretend, the host says so — a picker
-/// that silently did nothing would be worse than one that explains itself.
+/// The recovery for such a backend is a respawn, which only a bound view can
+/// perform. With none attached there is nothing that could carry the change out,
+/// so the host says so — a picker that silently did nothing would be worse than
+/// one that explains itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fix_at_spawn_backend_refuses_with_an_explanation() {
+async fn a_fix_at_spawn_backend_with_no_view_refuses_with_an_explanation() {
     let registry = Arc::new(SessionRegistry::new());
     // A default stub is deliberately NOT switchable — it matches the trait
     // default and the real fix-at-spawn backends.
@@ -159,6 +161,103 @@ async fn a_fix_at_spawn_backend_refuses_with_an_explanation() {
         drop(client);
     };
     futures::future::join(serve, script).await;
+}
+
+/// A fix-at-spawn backend switches anyway when a desktop view is attached.
+///
+/// This is the case that matters: Claude and Codex take `--model` at spawn and
+/// refuse the in-session setter, and the desktop's own picker has always
+/// recovered by respawning the child resumed on the new pick. Without this the
+/// phone offered a catalog it could never apply against the two most common
+/// backends, while the identical desktop control worked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fix_at_spawn_backend_switches_through_the_desktop_view() {
+    let registry = Arc::new(SessionRegistry::new());
+    // Not switchable — the in-session setter fails, as on the real backends.
+    let handle = registry.register("sess-1".into(), Arc::new(StubConnection::default()));
+
+    // Stand in for the bound desktop view: take the relayed change and confirm it.
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+    handle.set_remote_choice_sink(tx);
+    let view = tokio::spawn(async move {
+        let change = rx.next().await.expect("the change reaches the view");
+        assert_eq!(change.kind, ChoiceKind::Model);
+        assert_eq!(change.value, "sonnet-5", "the view is told which model to respawn on");
+        let _ = change.reply.send(true);
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock);
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32]))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        let set = call(
+            &client,
+            Request::SetModel { session_id: "sess-1".into(), model: "sonnet-5".into() },
+        )
+        .await;
+        assert_eq!(set, Response::Ack, "the view completed the change, so it succeeded");
+
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+    view.await.expect("the view task saw the change");
+}
+
+/// The view being attached is not the same as the change landing.
+///
+/// A respawn can fail (the tab closed mid-change, the agent would not start).
+/// Reporting success then would leave the phone showing a model the session is
+/// not running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_view_that_cannot_apply_the_change_is_reported_as_a_failure() {
+    let registry = Arc::new(SessionRegistry::new());
+    let handle = registry.register("sess-1".into(), Arc::new(StubConnection::default()));
+
+    let (tx, mut rx) = futures::channel::mpsc::unbounded();
+    handle.set_remote_choice_sink(tx);
+    let view = tokio::spawn(async move {
+        let change = rx.next().await.expect("the change reaches the view");
+        // Dropped rather than answered — the view went away mid-change. This must
+        // resolve as a failure rather than hanging the RPC forever.
+        drop(change.reply);
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock);
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32]))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        let set = call(
+            &client,
+            Request::SetModel { session_id: "sess-1".into(), model: "sonnet-5".into() },
+        )
+        .await;
+        assert!(
+            matches!(set, Response::Error(RpcError::BadRequest(_))),
+            "an unapplied change is a failure, got {set:?}",
+        );
+
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+    view.await.expect("the view task saw the change");
 }
 
 /// Reading the catalog is a read; changing it is a write.

@@ -34,7 +34,7 @@ pub const ENABLED_SETTING: &str = "remote.enabled";
 pub const KEEP_AWAKE_SETTING: &str = "remote.keep_awake";
 use futures::channel::mpsc;
 use oximux_agents::session_registry::{
-    RemotePrompt, SessionHandle, SessionMeta, SessionRegistry,
+    RemoteChoice, RemotePrompt, SessionHandle, SessionMeta, SessionRegistry,
 };
 use oximux_agents::thread::AgentConnection;
 use oximux_remote_host::AudioTranscriber;
@@ -94,6 +94,15 @@ impl RemoteBinding {
     /// a prompt it never showed.
     pub fn set_prompt_sink(&self, tx: mpsc::UnboundedSender<RemotePrompt>) {
         self.handle.set_remote_prompt_sink(tx);
+    }
+
+    /// Register the sink that carries a model/permission-mode change the backend
+    /// refused in-session to the view, which completes it by respawning the child
+    /// resumed on the new pick — the same recovery the desktop's own picker does.
+    /// Without this a remote picker could not switch the model of a Claude or
+    /// Codex session at all, since both fix it at spawn.
+    pub fn set_choice_sink(&self, tx: mpsc::UnboundedSender<RemoteChoice>) {
+        self.handle.set_remote_choice_sink(tx);
     }
 
     /// Remove the session from the registry. The map holds its own `Arc`, so this

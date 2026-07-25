@@ -519,7 +519,7 @@ use context_providers::{ContextRequest, ContextSource};
 use question_card::{QuestionCard, QuestionCardEvent};
 use tool_grouping::{plan_tool_grouping, summarize_tool_run, EntryDisplay, GroupSummary, GroupedTool};
 use crate::remote_control::{RemoteBinding, RemoteControl, next_remote_session_id};
-use oximux_agents::session_registry::{RemotePrompt, SessionMeta};
+use oximux_agents::session_registry::{ChoiceKind, RemoteChoice, RemotePrompt, SessionMeta};
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
@@ -745,6 +745,13 @@ pub struct AgentChatView {
     /// the desktop shows the user's own bubble. Re-created on each (re)bind; dropping
     /// it ends the relay.
     _remote_prompt_task: Option<Task<()>>,
+    /// Drains model/mode changes relayed from a remote picker. Held for its
+    /// lifetime like the prompt relay — dropping it ends the drain. Started once
+    /// and never replaced (see [`AgentChatView::choice_relay_sender`]).
+    _remote_choice_task: Option<Task<()>>,
+    /// The live end of that relay, handed to each binding. Kept so a rebind can
+    /// re-register it without disturbing the task.
+    remote_choice_tx: Option<futures::channel::mpsc::UnboundedSender<RemoteChoice>>,
     _subscriptions: Vec<Subscription>,
     /// Interactive AskUserQuestion cards for tool calls awaiting answers, keyed
     /// by tool-call id. Each is its own entity so its text inputs repaint without
@@ -1340,6 +1347,8 @@ impl AgentChatView {
         // covers cold restore, where `self` does not exist yet so the binding is
         // driven directly from the locals that seed the struct below.
         let mut remote_prompt_task = None;
+        let mut remote_choice_task = None;
+        let mut remote_choice_sender = None;
         if let Some(binding) = &remote {
             let model = thread.model.clone().or_else(|| model.clone());
             binding.set_meta(SessionMeta {
@@ -1355,6 +1364,12 @@ impl AgentChatView {
             let (tx, rx) = futures::channel::mpsc::unbounded();
             binding.set_prompt_sink(tx);
             remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, cx));
+            // Complete model/mode picks the backend fixes at spawn, which only
+            // this view can carry out (it owns the respawn).
+            let (choice_tx, choice_rx) = futures::channel::mpsc::unbounded();
+            binding.set_choice_sink(choice_tx.clone());
+            remote_choice_sender = Some(choice_tx);
+            remote_choice_task = Some(Self::spawn_remote_choice_relay(choice_rx, cx));
         }
 
         Self {
@@ -1407,6 +1422,8 @@ impl AgentChatView {
             _sheet_copy_task: None,
             _drain_task: drain_task,
             _remote_prompt_task: remote_prompt_task,
+            _remote_choice_task: remote_choice_task,
+            remote_choice_tx: remote_choice_sender,
             _subscriptions: subscriptions,
             question_cards: HashMap::new(),
             question_card_subs: HashMap::new(),
@@ -3356,6 +3373,8 @@ impl AgentChatView {
             _sheet_copy_task: None,
             _drain_task: None,
             _remote_prompt_task: None,
+            _remote_choice_task: None,
+            remote_choice_tx: None,
             _subscriptions: Vec::new(),
             question_cards: HashMap::new(),
             question_card_subs: HashMap::new(),
@@ -3511,6 +3530,55 @@ impl AgentChatView {
                 if this.update(cx, |view, cx| view.push_remote_user_bubble(prompt, cx)).is_err() {
                     return; // view dropped
                 }
+            }
+        })
+    }
+
+    /// The sender for this tab's choice relay, starting the relay on first use.
+    ///
+    /// One relay per view for its whole life, rather than one per binding: a
+    /// respawn rebinds while the relay is mid-change, and a relay that were
+    /// replaced there would lose the reply for the pick that triggered it.
+    fn choice_relay_sender(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> futures::channel::mpsc::UnboundedSender<RemoteChoice> {
+        if let Some(tx) = &self.remote_choice_tx {
+            return tx.clone();
+        }
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        self._remote_choice_task = Some(Self::spawn_remote_choice_relay(rx, cx));
+        self.remote_choice_tx = Some(tx.clone());
+        tx
+    }
+
+    /// Drain model/permission-mode changes the backend refused in-session and
+    /// apply each through this tab's own picker path, which respawns the child
+    /// resumed on the new pick when the backend fixes the value at spawn.
+    ///
+    /// Routing through `change_model`/`change_permission_mode` rather than
+    /// reimplementing the respawn is the point: a remote pick and a local one then
+    /// cannot drift, and everything those paths already handle — persisting the
+    /// choice, moving the context-window denominator, re-seeding the composer —
+    /// happens either way.
+    fn spawn_remote_choice_relay(
+        mut rx: futures::channel::mpsc::UnboundedReceiver<RemoteChoice>,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn(async move |this: WeakEntity<Self>, cx| {
+            while let Some(RemoteChoice { kind, value, reply }) = rx.next().await {
+                // `is_ok` is the honest answer this channel can give: the pick
+                // reached a live view and was applied. A respawn that then fails
+                // to start surfaces in the transcript as an agent error, which the
+                // phone is already subscribed to — it is not something to report
+                // here as a refused pick.
+                let applied = this
+                    .update(cx, |view, cx| match kind {
+                        ChoiceKind::Model => view.change_model(value, cx),
+                        ChoiceKind::PermissionMode => view.change_permission_mode(value, cx),
+                    })
+                    .is_ok();
+                let _ = reply.send(applied);
             }
         })
     }
@@ -3912,6 +3980,17 @@ impl AgentChatView {
                     binding.set_prompt_sink(tx);
                 }
                 self._remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, cx));
+                // Point the *existing* choice relay at the new binding rather than
+                // starting a fresh one. This path runs inside `change_model` →
+                // `respawn`, so the relay is mid-flight on the very pick that
+                // caused it: replacing the task here would drop that future and
+                // cancel its reply, telling the phone a change it just made had
+                // failed. Re-registering the same sender is enough — a rebind may
+                // mint a new handle (after an unbind), and this points it back.
+                let choice_tx = self.choice_relay_sender(cx);
+                if let Some(binding) = &self.remote {
+                    binding.set_choice_sink(choice_tx);
+                }
             }
             // No connection, or remote is disabled — drop any prior binding.
             None => self.unbind_remote(),

@@ -2,7 +2,7 @@
 //! (`is_allowed_for`) before touching the [`SessionRegistry`], so revocation and
 //! per-device scoping bite on every call.
 
-use oximux_agents::session_registry::SessionHandle;
+use oximux_agents::session_registry::{ChoiceKind, SessionHandle};
 use oximux_remote_proto::messages::{
     AnswerQuestionReq, ResolvePermissionReq, SendPromptReq, SessionInfoWire, SessionStatusWire,
     SessionSummary, SessionTranscriptWire,
@@ -325,41 +325,50 @@ impl Dispatcher {
         })
     }
 
-    /// Switch the session's model or permission mode in place.
+    /// Switch the session's model or permission mode.
+    ///
+    /// Async because the handle's setter is: a backend that fixes the value at
+    /// spawn (Claude, Codex) cannot switch in place, and the change is completed
+    /// by the desktop respawning the child resumed on the new pick — a round trip
+    /// to the UI thread, like launching a session.
     ///
     /// Separate from [`Self::scoped`] purely for the error message. `scoped`
     /// answers any failure with a generic "session command failed", which is
-    /// right when the cause is genuinely internal — but the overwhelmingly
-    /// common failure here is a backend that fixes its model at spawn, and
-    /// telling the user that is the difference between a control that looks
-    /// broken and one that explains itself.
+    /// right when the cause is genuinely internal — but a picker the user just
+    /// tapped is owed something better than that.
     ///
     /// The real error is logged host-side and a **fixed** string is returned.
     /// Forwarding the underlying text would repeat the leak the git handlers
     /// already had to fix, where raw tool output carried host paths to the
     /// client.
-    pub(super) fn set_choice<F>(
+    pub(super) async fn set_choice(
         &self,
         pubkey: &AppPubkey,
         session_id: &str,
-        what: &'static str,
-        f: F,
-    ) -> Response
-    where
-        F: FnOnce(&SessionHandle) -> anyhow::Result<()>,
-    {
+        kind: ChoiceKind,
+        value: &str,
+    ) -> Response {
         if !self.auth.may_write(pubkey, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(handle) = self.registry.get(session_id) else {
             return Response::Error(RpcError::UnknownSession);
         };
-        match f(&handle) {
+        let what = kind.noun();
+        let outcome = match kind {
+            ChoiceKind::Model => handle.set_model(value).await,
+            ChoiceKind::PermissionMode => handle.set_permission_mode(value).await,
+        };
+        match outcome {
             Ok(()) => Response::Ack,
             Err(e) => {
                 tracing::warn!(error = %e, session = %session_id, "remote {what} change refused");
+                // Says what is true of every remaining failure here: the backend
+                // would not switch in place and no desktop view completed it. The
+                // old text blamed a running turn, which is usually not the cause
+                // and is never something the user can act on.
                 Response::Error(RpcError::BadRequest(format!(
-                    "this agent cannot change {what} while it is running"
+                    "the desktop could not change this session's {what}"
                 )))
             }
         }

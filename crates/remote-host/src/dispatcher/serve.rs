@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use futures::future::{Either, select};
 use futures::stream::{BoxStream, SelectAll, StreamExt};
-use oximux_agents::session_registry::{Seq, SessionId};
+use oximux_agents::session_registry::{ChoiceKind, Seq, SessionId};
 use oximux_remote_proto::Transport;
 use oximux_remote_proto::proto::{Request, Response, RpcError};
 
@@ -257,6 +257,25 @@ impl Dispatcher {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
             let response = self.create_session(&pubkey, &cwd, agent_id.as_deref()).await;
+            return self.send(transport, response).await;
+        }
+        // Switching a model or permission mode is async for the same reason: a
+        // backend that fixes the value at spawn can only change it by respawning,
+        // which the desktop view performs on its own thread.
+        if let Request::SetModel { session_id, model } = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response =
+                self.set_choice(&pubkey, &session_id, ChoiceKind::Model, &model).await;
+            return self.send(transport, response).await;
+        }
+        if let Request::SetPermissionMode { session_id, mode } = req {
+            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response =
+                self.set_choice(&pubkey, &session_id, ChoiceKind::PermissionMode, &mode).await;
             return self.send(transport, response).await;
         }
         // Listing projects reads the desktop's recent-projects snapshot off its UI

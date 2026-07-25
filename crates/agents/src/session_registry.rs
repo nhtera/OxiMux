@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use futures::channel::mpsc;
 use tokio::sync::{broadcast, watch};
 
@@ -103,6 +103,44 @@ pub struct RemotePrompt {
     pub images: Vec<ChatImage>,
 }
 
+/// Which picker a [`RemoteChoice`] carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChoiceKind {
+    Model,
+    PermissionMode,
+}
+
+impl ChoiceKind {
+    /// The noun for an error message. `&'static str` so a caller can format it
+    /// without allocating on a path that is already failing.
+    pub fn noun(self) -> &'static str {
+        match self {
+            ChoiceKind::Model => "model",
+            ChoiceKind::PermissionMode => "permission mode",
+        }
+    }
+}
+
+/// A model or permission-mode change the backend would not make in place,
+/// handed to the bound desktop view to complete.
+///
+/// **Some backends fix these at spawn** — Claude and Codex take `--model` as a
+/// launch flag — and answer their in-session setter with an error. The desktop's
+/// own picker recovers by respawning the child resumed on the new pick, so the
+/// conversation continues on the new model. That respawn is a view-level
+/// operation this crate deliberately cannot perform: it owns no process
+/// spawning. Without this relay a remote picker could only ever fail against the
+/// two most common backends, while the desktop's identical picker worked.
+///
+/// The reply rides along so the caller learns whether the change landed instead
+/// of guessing from a later state read.
+pub struct RemoteChoice {
+    pub kind: ChoiceKind,
+    pub value: String,
+    /// `true` once the view has applied the change.
+    pub reply: futures::channel::oneshot::Sender<bool>,
+}
+
 /// Everything the registry knows about one live session. Held behind an `Arc` so
 /// the view and the network layer share one handle.
 pub struct SessionHandle {
@@ -137,6 +175,11 @@ pub struct SessionHandle {
     /// the user's own bubble. `None` when no view is bound (remote disabled, or a
     /// headless host); the prompt still reaches the backend and other subscribers.
     remote_prompt_tx: Mutex<Option<mpsc::UnboundedSender<RemotePrompt>>>,
+    /// Relays a model/permission-mode change the backend refused in-session to the
+    /// bound desktop view, which completes it by respawning. `None` when no view is
+    /// bound, and then a refused change stays refused — there is nothing that could
+    /// carry it out.
+    remote_choice_tx: Mutex<Option<mpsc::UnboundedSender<RemoteChoice>>>,
     /// The registry-wide session-list generation, shared with the registry and
     /// every sibling handle. Bumped when this session's list-visible state changes
     /// (title/model or the awaiting-permission flag) so a session-list subscriber
@@ -333,22 +376,56 @@ impl SessionHandle {
         self.conn().permission_modes()
     }
 
-    /// Switch the backend's model in place.
+    /// Switch the backend's model, in place if it can and through the bound
+    /// desktop view if it cannot.
     ///
-    /// Mirrors what the desktop tries first. **Some backends fix the model at
-    /// spawn** and answer with an error here; the desktop recovers by respawning
-    /// the child, which is a view-level operation this crate cannot perform (it
-    /// owns no process spawning, by design). So the error propagates to the
-    /// caller instead of being swallowed — a remote picker that silently did
-    /// nothing would be worse than one that says it could not.
-    pub fn set_model(&self, model: &str) -> anyhow::Result<()> {
-        self.conn().set_model(model)
+    /// The same two-step the desktop's own picker performs: try the in-session
+    /// setter (an ACP agent maps a model pick to a config option), and on refusal
+    /// hand the change to the view, which respawns the child resumed on the new
+    /// model. See [`RemoteChoice`] for why the second step cannot live here.
+    pub async fn set_model(&self, model: &str) -> anyhow::Result<()> {
+        if self.conn().set_model(model).is_ok() {
+            return Ok(());
+        }
+        self.delegate_choice(ChoiceKind::Model, model).await
     }
 
-    /// Switch the backend's permission mode in place. Same fix-at-spawn caveat
-    /// as [`Self::set_model`].
-    pub fn set_permission_mode(&self, mode: &str) -> anyhow::Result<()> {
-        self.conn().set_mode(mode)
+    /// Switch the backend's permission mode. Same two-step as [`Self::set_model`]
+    /// — Claude switches mode in place, so this usually resolves on the first
+    /// step and never reaches the view.
+    pub async fn set_permission_mode(&self, mode: &str) -> anyhow::Result<()> {
+        if self.conn().set_mode(mode).is_ok() {
+            return Ok(());
+        }
+        self.delegate_choice(ChoiceKind::PermissionMode, mode).await
+    }
+
+    /// Hand a refused change to the bound desktop view and wait for its answer.
+    async fn delegate_choice(&self, kind: ChoiceKind, value: &str) -> anyhow::Result<()> {
+        // Cloned out of the lock rather than held across the await: the guard is
+        // not `Send`, and holding it would block every sibling caller for as long
+        // as a respawn takes.
+        let tx = self
+            .remote_choice_tx
+            .lock()
+            .unwrap()
+            .clone()
+            .with_context(|| format!("no desktop view can change this session's {}", kind.noun()))?;
+        let (reply, answer) = futures::channel::oneshot::channel();
+        tx.unbounded_send(RemoteChoice { kind, value: value.to_string(), reply })
+            .map_err(|_| anyhow::anyhow!("the desktop view is gone"))?;
+        // A dropped sender means the view went away mid-change (the tab closed,
+        // the app quit) — a failure, not something to wait on forever.
+        match answer.await {
+            Ok(true) => Ok(()),
+            _ => anyhow::bail!("the desktop could not change the {}", kind.noun()),
+        }
+    }
+
+    /// Register the sink that carries refused model/mode changes to the desktop
+    /// view. Replaces any prior sink (a rebind re-points it), like the prompt sink.
+    pub fn set_remote_choice_sink(&self, tx: mpsc::UnboundedSender<RemoteChoice>) {
+        *self.remote_choice_tx.lock().unwrap() = Some(tx);
     }
 
     /// A `watch` receiver over the coarse status snapshot for list views.
@@ -509,6 +586,7 @@ impl SessionRegistry {
             meta: Mutex::new(SessionMeta::default()),
             transcript: Mutex::new(None),
             remote_prompt_tx: Mutex::new(None),
+            remote_choice_tx: Mutex::new(None),
             changed: self.changed.clone(),
         });
         self.sessions.lock().unwrap().insert(id, handle.clone());
