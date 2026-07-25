@@ -15,7 +15,7 @@ const session = (over: Partial<SessionSummary>): SessionSummary => ({
 });
 
 const SESSIONS = [
-  session({ sessionId: '1', title: 'Fix the parser', model: 'opus-4.8' }),
+  session({ sessionId: '1', title: 'Fix the parser', model: 'opus-5' }),
   session({ sessionId: '2', title: 'Write docs', model: 'sonnet-5' }),
   // No model at all — the field is optional on the wire.
   session({ sessionId: '3', title: 'Refactor auth' }),

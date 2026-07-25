@@ -123,7 +123,7 @@ fn requests_round_trip_via_postcard() {
         Request::Subscribe { session_id: "s1".into(), after_seq: Some(10) },
         Request::EventsSince { session_id: "s1".into(), after_seq: 10 },
         Request::ListChoices { session_id: "s1".into() },
-        Request::SetModel { session_id: "s1".into(), model: "opus-4.8".into() },
+        Request::SetModel { session_id: "s1".into(), model: "opus-5".into() },
         Request::SetPermissionMode { session_id: "s1".into(), mode: "plan".into() },
         Request::FetchTranscript { session_id: "s1".into() },
         Request::ListProjects,
@@ -166,12 +166,12 @@ fn send_prompt_and_responses_round_trip() {
         // populated and empty shapes both have to survive the wire.
         Response::Choices(SessionChoices {
             models: vec![Choice {
-                id: "opus-4.8".into(),
-                label: "Opus 4.8".into(),
+                id: "opus-5".into(),
+                label: "Opus 5".into(),
                 description: Some("most capable".into()),
             }],
             modes: vec![],
-            current_model: Some("opus-4.8".into()),
+            current_model: Some("opus-5".into()),
             current_mode: None,
         }),
         Response::Choices(SessionChoices {

@@ -23,7 +23,7 @@ pub struct AgentSessionConfig {
     pub adapter: AgentAdapter,
     pub worktree_path: PathBuf,
     pub prompt: Option<String>,
-    /// Optional model selector (e.g. `claude-opus-4-7`). Adapter ignores
+    /// Optional model selector (e.g. `claude-opus-5`). Adapter ignores
     /// when the CLI has no `--model` flag.
     pub model: Option<String>,
     /// Optional reasoning effort hint (e.g. `high`). Adapter ignores when

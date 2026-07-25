@@ -4,7 +4,7 @@ import type { Choice } from 'oximux-core';
 import { ChoicePicker } from '@/components/chat/choice-picker';
 
 const CHOICES: Choice[] = [
-  { id: 'opus-4.8', label: 'Opus 4.8', description: 'most capable' },
+  { id: 'claude-opus-5', label: 'Opus 5', description: 'most capable' },
   { id: 'sonnet-5', label: 'Sonnet 5', description: undefined },
 ];
 
@@ -14,7 +14,7 @@ describe('ChoicePicker', () => {
       <ChoicePicker
         title="Model"
         choices={CHOICES}
-        current="opus-4.8"
+        current="claude-opus-5"
         visible
         busy={false}
         onPick={() => {}}
@@ -22,10 +22,10 @@ describe('ChoicePicker', () => {
       />
     );
     // The id is what crosses the wire; the label is what a person reads. A
-    // picker listing `claude-opus-4-8` would be technically correct and unusable.
-    expect(screen.getByText('Opus 4.8')).toBeTruthy();
+    // picker listing `claude-opus-5` would be technically correct and unusable.
+    expect(screen.getByText('Opus 5')).toBeTruthy();
     expect(screen.getByText('most capable')).toBeTruthy();
-    expect(screen.queryByText('opus-4.8')).toBeNull();
+    expect(screen.queryByText('claude-opus-5')).toBeNull();
   });
 
   it('reports the picked id', () => {
@@ -34,7 +34,7 @@ describe('ChoicePicker', () => {
       <ChoicePicker
         title="Model"
         choices={CHOICES}
-        current="opus-4.8"
+        current="claude-opus-5"
         visible
         busy={false}
         onPick={onPick}
@@ -53,14 +53,14 @@ describe('ChoicePicker', () => {
       <ChoicePicker
         title="Model"
         choices={CHOICES}
-        current="opus-4.8"
+        current="claude-opus-5"
         visible
         busy={false}
         onPick={onPick}
         onClose={() => {}}
       />
     );
-    fireEvent.press(screen.getByText('Opus 4.8'));
+    fireEvent.press(screen.getByText('Opus 5'));
     expect(onPick).not.toHaveBeenCalled();
   });
 
@@ -70,7 +70,7 @@ describe('ChoicePicker', () => {
       <ChoicePicker
         title="Model"
         choices={CHOICES}
-        current="opus-4.8"
+        current="claude-opus-5"
         visible
         busy
         onPick={onPick}

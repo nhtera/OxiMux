@@ -958,7 +958,7 @@ mod tests {
             "result":"Done.","total_cost_usd":0.33,
             "usage":{"input_tokens":714,"output_tokens":7,
                 "cache_read_input_tokens":16681,"cache_creation_input_tokens":5571},
-            "modelUsage":{"claude-opus-4-8":{"contextWindow":200000}}}).to_string();
+            "modelUsage":{"claude-opus-5":{"contextWindow":200000}}}).to_string();
         match &decode_line(&ok)[0] {
             ThreadEvent::TurnEnded { result, usage, is_error, .. } => {
                 assert_eq!(result.as_deref(), Some("Done."));

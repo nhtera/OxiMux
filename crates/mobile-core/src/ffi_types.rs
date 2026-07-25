@@ -10,7 +10,7 @@ use oximux_remote_proto::proto::{Choice as WireChoice, SessionChoices as WireCho
 ///
 /// `id` is what goes back over the wire; `label` is what a person reads. They
 /// stay separate because a backend's identifier is usually not presentable
-/// (`claude-opus-4-8` against "Opus 4.8").
+/// (`claude-opus-5` against "Opus 5").
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct Choice {
     pub id: String,

@@ -531,7 +531,7 @@ pub struct SessionChoices {
 ///
 /// `id` is what goes back over the wire; `label` is what a person reads. They
 /// are kept separate because a backend's identifier is often not presentable
-/// (`claude-opus-4-8` against "Opus 4.8"), and `description` carries the
+/// (`claude-opus-5` against "Opus 5"), and `description` carries the
 /// second line the desktop's own picker shows.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Choice {
