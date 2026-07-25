@@ -23,7 +23,8 @@ pub mod terminals;
 pub mod transcribe;
 
 pub use auth::{
-    AppPubkey, AuthStore, DeviceInfo, DeviceStore, PairedDevice, PairingSlot, StorageDeviceStore,
+    AppPubkey, AuthStore, DeviceInfo, DeviceStore, PairedDevice, PairingEvent, PairingSlot,
+    StorageDeviceStore,
     StoredDevice,
     mint_pairing_secret, registration_proof,
 };

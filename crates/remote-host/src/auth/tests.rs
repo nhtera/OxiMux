@@ -2,7 +2,7 @@ use ed25519_dalek::SigningKey;
 use oximux_remote_proto::RpcError;
 use oximux_remote_proto::messages::RegisterReq;
 
-use super::{AppPubkey, AuthStore, PairingSlot, registration_proof};
+use super::{AppPubkey, AuthStore, PairingEvent, PairingSlot, registration_proof};
 
 fn slot(secret: [u8; 16]) -> PairingSlot {
     PairingSlot::new(secret, None, true)
@@ -382,9 +382,60 @@ fn pairing_is_announced_to_subscribers() {
     };
     store.register(&req, ts).expect("register");
 
-    let announced = events.try_recv().expect("a pairing was announced");
+    let PairingEvent::Paired(announced) = events.try_recv().expect("a pairing was announced") else {
+        panic!("a first-time registration announces Paired");
+    };
     assert_eq!(announced.pubkey, pubkey);
     assert_eq!(announced.name, "Tien's phone", "the name the user will see");
+}
+
+/// A device the host already knows re-scans — the case a user hits by pointing an
+/// already-paired phone at a fresh code.
+///
+/// It is refused (`Register` never re-admits a known key) and the client falls
+/// back to a reconnect, so from the desktop's side nothing was admitted. Silence
+/// there is what made the pane look ignored: the phone connected while the QR sat
+/// untouched. Two things are asserted because both matter to what the pane may
+/// then say — the refusal is announced, and the code survives it.
+#[test]
+fn an_already_paired_device_rescanning_is_announced_without_spending_the_code() {
+    let store = AuthStore::new();
+    let secret = [0x99; 16];
+    store.set_pairing(slot(secret));
+    let ts = 1_700_000_000;
+    let pubkey = vk(0x55);
+    store.register(&a_register(pubkey, "Tien's phone", &secret, ts), ts).expect("first pairing");
+
+    let mut events = store.subscribe_pairings();
+    // The same key again — against a fresh window, since the first spent that one.
+    store.set_pairing(slot(secret));
+    assert_eq!(
+        store.register(&a_register(pubkey, "renamed by the caller", &secret, ts), ts),
+        Err(RpcError::Unauthorized),
+        "a known key is still refused",
+    );
+
+    let PairingEvent::AlreadyPaired(announced) =
+        events.try_recv().expect("the refusal was announced")
+    else {
+        panic!("a known device re-scanning announces AlreadyPaired");
+    };
+    assert_eq!(
+        announced.name, "Tien's phone",
+        "named from the stored record, not the request — reaching this path proves \
+         possession of the code but not of the key, so the claimed name is not trusted",
+    );
+    assert!(store.pairing_open(), "the code is untouched");
+
+    // The claim the pane makes — "this code is still good for a new device" —
+    // proved by a new device actually redeeming it, rather than inferred from
+    // `pairing_open`. A refusal that quietly burned the slot would still leave
+    // that flag true right up until someone tried to use it.
+    let newcomer = vk(0x66);
+    store
+        .register(&a_register(newcomer, "a different phone", &secret, ts), ts)
+        .expect("the same code still admits a genuinely new device");
+    assert!(store.is_authorized(&newcomer));
 }
 
 /// A failed registration announces nothing — no false confirmation.

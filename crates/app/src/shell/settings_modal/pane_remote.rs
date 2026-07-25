@@ -29,6 +29,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, Image, ImageFormat, ImageSource, InteractiveElement, IntoElement, MouseButton,
     ParentElement, Styled, div, img, px, svg,
@@ -45,6 +46,7 @@ use super::layout::{
     SettingEntry, card_surface, entries_card, entry, section_card, section_title,
 };
 use crate::remote_control::{PAIRING_WINDOW_SECS, RemoteControl};
+use oximux_remote_host::PairingEvent;
 
 /// The pairing sub-view's state. Held on the modal; `None` means the pane is at
 /// rest and, by construction, that no pairing code is live.
@@ -54,7 +56,12 @@ pub(crate) enum PairingState {
     Starting,
     /// A live code. `expires_at` is unix seconds, mirroring the host's own copy of
     /// the window so the countdown can't disagree with what the host will accept.
-    Waiting { ticket: PairingTicket, expires_at: u64 },
+    ///
+    /// `note` reports something that happened without ending the wait — currently
+    /// an already-paired device re-scanning. That case leaves the code unspent, so
+    /// it belongs *beside* the still-valid QR rather than replacing it: another
+    /// device can still use this same code.
+    Waiting { ticket: PairingTicket, expires_at: u64, note: Option<String> },
     /// A device redeemed the code. Held until dismissed rather than auto-closing:
     /// during the scan the user is looking at the phone, and this is what they
     /// look back to the Mac to read.
@@ -89,8 +96,11 @@ fn open_window(modal: &mut SettingsModal, cx: &mut gpui::Context<SettingsModal>)
     let Some(ticket) = cx.try_global::<RemoteControl>().and_then(|rc| rc.open_pairing()) else {
         return;
     };
-    modal.remote_pairing =
-        Some(PairingState::Waiting { ticket, expires_at: now_secs() + PAIRING_WINDOW_SECS });
+    modal.remote_pairing = Some(PairingState::Waiting {
+        ticket,
+        expires_at: now_secs() + PAIRING_WINDOW_SECS,
+        note: None,
+    });
     modal.remote_pairing_epoch += 1;
     let epoch = modal.remote_pairing_epoch;
     start_countdown(cx, epoch);
@@ -118,7 +128,36 @@ fn watch_for_pairing(cx: &mut gpui::Context<SettingsModal>, epoch: u64) {
     cx.spawn(async move |this, cx| {
         loop {
             match pairings.recv().await {
-                Ok(device) => {
+                // A known device re-scanned. It is refused and reconnects by key
+                // instead, so nothing was admitted and the code is still good —
+                // the wait continues, annotated. Without this the desktop sat on
+                // an untouched-looking QR while the phone happily connected.
+                Ok(PairingEvent::AlreadyPaired(device)) => {
+                    let _ = this.update(cx, |this, cx| {
+                        if this.remote_pairing_epoch != epoch {
+                            return;
+                        }
+                        toast(
+                            cx,
+                            ToastKind::Info,
+                            format!(
+                                "\u{201c}{}\u{201d} is already paired — it reconnected instead",
+                                device.name
+                            ),
+                        );
+                        if let Some(PairingState::Waiting { note, .. }) = &mut this.remote_pairing {
+                            *note = Some(format!(
+                                "{} is already paired, so it reconnected instead. \
+                                 This code is still good for a new device.",
+                                device.name
+                            ));
+                        }
+                        cx.notify();
+                    });
+                    // Deliberately no `break`: this window never admitted anyone.
+                    continue;
+                }
+                Ok(PairingEvent::Paired(device)) => {
                     let _ = this.update(cx, |this, cx| {
                         // A later window owns this outcome; stay silent and let
                         // its own watcher report it.
@@ -527,7 +566,7 @@ fn pairing_view(
                     .child("Starting the host — the code will appear here in a moment."),
             );
         }
-        Some(PairingState::Waiting { ticket, expires_at }) => {
+        Some(PairingState::Waiting { ticket, expires_at, note }) => {
             // Centred as a column: the code is the one thing on this screen, and
             // the instruction and countdown belong under it rather than beside a
             // left-aligned block of white.
@@ -557,6 +596,14 @@ fn pairing_view(
                         .text_color(theme.fg_muted)
                         .child(countdown_label(expires_at.saturating_sub(now_secs()))),
                 )
+                .when_some(note.clone(), |c, note| {
+                    c.child(
+                        div()
+                            .text_size(px(typography.t_sub_label))
+                            .text_color(theme.status_info)
+                            .child(note),
+                    )
+                })
                 .child(copy_link_row(ticket, theme, density, typography, cx)),
             );
         }

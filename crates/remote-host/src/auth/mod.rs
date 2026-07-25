@@ -115,6 +115,23 @@ pub struct PairedDevice {
     pub name: String,
 }
 
+/// What came of a scan, so the desktop can say which it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairingEvent {
+    /// A new device registered and now has full access.
+    Paired(PairedDevice),
+    /// A device the host already knows scanned the code. It is refused —
+    /// `Register` never re-admits a known key — and reconnects by key instead,
+    /// so it ends up connected without ever having paired.
+    ///
+    /// Announced because from the outside that looks like nothing happening: the
+    /// phone connects, and a desktop watching only for successes leaves its code
+    /// on screen with no idea a scan occurred. The window is genuinely still
+    /// open — this path does not spend the code — so the desktop can say what
+    /// happened without withdrawing it.
+    AlreadyPaired(PairedDevice),
+}
+
 #[derive(Default)]
 struct AuthState {
     pairing: Option<PairingSlot>,
@@ -131,7 +148,7 @@ pub struct AuthStore {
     store: Option<Arc<dyn DeviceStore>>,
     /// Announces completed pairings. Bounded and lossy by design — a missed
     /// notification must never stall `register`, which holds the auth path.
-    paired_tx: broadcast::Sender<PairedDevice>,
+    paired_tx: broadcast::Sender<PairingEvent>,
 }
 
 impl Default for AuthStore {
@@ -152,14 +169,14 @@ impl AuthStore {
         Self::default()
     }
 
-    /// Watch for devices completing pairing.
-    pub fn subscribe_pairings(&self) -> broadcast::Receiver<PairedDevice> {
+    /// Watch what becomes of scans against the advertised code.
+    pub fn subscribe_pairings(&self) -> broadcast::Receiver<PairingEvent> {
         self.paired_tx.subscribe()
     }
 
-    /// Announce a completed pairing. Send errors (no listeners) are ignored.
-    pub(super) fn announce_paired(&self, device: PairedDevice) {
-        let _ = self.paired_tx.send(device);
+    /// Announce a scan's outcome. Send errors (no listeners) are ignored.
+    pub(super) fn announce_paired(&self, event: PairingEvent) {
+        let _ = self.paired_tx.send(event);
     }
 
     /// Is a pairing code currently usable? `false` once a one-time slot has been

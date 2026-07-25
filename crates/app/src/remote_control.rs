@@ -56,7 +56,7 @@ use oximux_remote_host::ProjectProvider;
 use oximux_remote_host::TerminalSource;
 use oximux_remote_host::RewindService;
 use oximux_remote_host::{SessionLauncher, 
-    AppPubkey, AuthStore, DeviceInfo, DeviceStore, Dispatcher, PairedDevice, PairingSlot,
+    AppPubkey, AuthStore, DeviceInfo, DeviceStore, Dispatcher, PairingEvent, PairingSlot,
     mint_pairing_secret,
 };
 use tokio::sync::broadcast;
@@ -450,7 +450,7 @@ impl RemoteControl {
 
     /// Watch for devices completing pairing, so the desktop can confirm each one.
     /// `None` when no host has been prepared yet.
-    pub fn subscribe_pairings(&self) -> Option<broadcast::Receiver<PairedDevice>> {
+    pub fn subscribe_pairings(&self) -> Option<broadcast::Receiver<PairingEvent>> {
         self.auth.lock().unwrap().as_ref().map(|auth| auth.subscribe_pairings())
     }
 

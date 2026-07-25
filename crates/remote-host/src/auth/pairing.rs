@@ -45,7 +45,21 @@ impl AuthStore {
             // requires an explicit host-side un-revoke), nor silently rewrite an
             // active device's scope/name. An already-paired device reconnects via
             // `Connect`, not `Register`.
-            if st.devices.contains_key(&req.app_pubkey) {
+            //
+            // Refused, but not silently: it is the most likely outcome of a user
+            // re-scanning with a phone they already paired, and a desktop that
+            // says nothing leaves its code on screen looking ignored. The name
+            // comes from the stored record rather than the request — reaching
+            // here proves possession of the code, but the pubkey is only claimed,
+            // so the trustworthy name is the one already held for that key.
+            if let Some(known) = st.devices.get(&req.app_pubkey) {
+                let name = known.name.clone();
+                // Announced after the lock is dropped, as the success path is.
+                drop(st);
+                self.announce_paired(super::PairingEvent::AlreadyPaired(super::PairedDevice {
+                    pubkey: req.app_pubkey,
+                    name,
+                }));
                 return Err(RpcError::Unauthorized);
             }
 
@@ -87,10 +101,10 @@ impl AuthStore {
         self.persist_saved(&stored);
         // Announce AFTER the durable write, so a listener that reacts by reading
         // the device list can't observe a device the store doesn't have yet.
-        self.announce_paired(super::PairedDevice {
+        self.announce_paired(super::PairingEvent::Paired(super::PairedDevice {
             pubkey: req.app_pubkey,
             name: req.device_name.clone(),
-        });
+        }));
         Ok(token)
     }
 }
