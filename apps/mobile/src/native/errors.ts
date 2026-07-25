@@ -15,3 +15,35 @@ export function describeError(error: unknown): string {
   }
   return error instanceof Error ? error.message : String(error);
 }
+
+/**
+ * A pairing failure as a sentence with a next step, rather than the raw tag.
+ *
+ * Matched on substrings of the rendered error, not on the enum: the refusal
+ * reaches here as `Transport(cause)` carrying the reconnect driver's message, so
+ * the tag alone can't tell a refused code from an unreachable Mac. That makes
+ * this best-effort by construction — anything unrecognised keeps the technical
+ * text, which is more use than a wrong guess dressed up as a diagnosis.
+ *
+ * The refusal case deliberately does not claim *which* refusal it was. The host
+ * answers expired, already-used, revoked, and already-known identically (it
+ * declines to tell an unauthorized caller which), so naming one would be a
+ * guess. Listing the two the user can act on is honest and still actionable.
+ */
+export function describePairingError(error: unknown): string {
+  const raw = describeError(error).toLowerCase();
+
+  if (raw.includes('unauthorized') || raw.includes('pairing failed')) {
+    return 'Your desktop refused this code. It may have expired or already been used — open Settings → Remote there and tap "Pair a device" for a fresh one.';
+  }
+  if (raw.includes('badticket') || raw.includes('invalid') || raw.includes('not an oximux')) {
+    return "That isn't a valid OxiMux pairing link.";
+  }
+  if (raw.includes('timed out') || raw.includes('timeout')) {
+    return "Couldn't reach your Mac in time. Check it's awake and on a network, then try again.";
+  }
+  if (raw.includes('unreachable') || raw.includes('transport') || raw.includes('connection')) {
+    return "Couldn't reach your Mac. Check that it's awake and that remote access is still on.";
+  }
+  return describeError(error);
+}

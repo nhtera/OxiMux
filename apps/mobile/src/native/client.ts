@@ -41,8 +41,20 @@ type ClientState = {
   client?: MobileClient;
 };
 
+/**
+ * What `pair` is doing right now, for a screen that would otherwise show nothing
+ * between the scan and the result.
+ *
+ * These are steps in one user-visible act, not transport states — `connecting`
+ * covers dialling *and* registering, because a phone owner has no use for the
+ * distinction. `resuming` is the one branch worth naming: it means the host knew
+ * this device already, so the attempt became a reconnect and pays a second dial.
+ * Without it that doubled wait is indistinguishable from a hang.
+ */
+export type PairStep = 'connecting' | 'resuming';
+
 type ClientActions = {
-  pair: (ticketUrl: string) => Promise<void>;
+  pair: (ticketUrl: string, onStep?: (step: PairStep) => void) => Promise<void>;
   /** Reconnect to the stored host. Resolves `false` when none is paired. */
   resume: () => Promise<boolean>;
   /**
@@ -114,7 +126,8 @@ export const useClient = create<ClientState & ClientActions>((set, get) => ({
    * re-pair against the same desktop reuses this device's existing identity
    * rather than orphaning the record the desktop already holds.
    */
-  async pair(ticketUrl: string) {
+  async pair(ticketUrl: string, onStep?: (step: PairStep) => void) {
+    onStep?.('connecting');
     const client = await newClient();
     // Register the session-list sink before connecting so the host's initial
     // snapshot and every subsequent change land in the store — the list is
@@ -137,6 +150,10 @@ export const useClient = create<ClientState & ClientActions>((set, get) => ({
       // the actionable one — is what surfaces.
       const endpointId = client.hostEndpointId();
       if (!endpointId) throw e;
+      // Say so rather than silently paying a second dial: from the outside this
+      // is the slowest path pairing has, and an unexplained double wait is what
+      // a hang looks like.
+      onStep?.('resuming');
       await client.reconnect(endpointId, onState);
     }
 
