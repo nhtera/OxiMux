@@ -1,5 +1,5 @@
-import { Link, Stack, useLocalSearchParams } from 'expo-router';
-import { GitBranch, GitPullRequest, History, PanelLeft } from 'lucide-react-native';
+import { Link, Stack, router, useLocalSearchParams } from 'expo-router';
+import { Archive, GitBranch, GitPullRequest, History, PanelLeft } from 'lucide-react-native';
 import { useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, View } from 'react-native';
 import { GestureDetector } from 'react-native-gesture-handler';
@@ -8,6 +8,7 @@ import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context'
 
 import { Composer } from '@/components/chat/composer';
 import { RewindSheet } from '@/components/chat/rewind-sheet';
+import { SessionClosedNotice } from '@/components/chat/session-closed-notice';
 import { useSessionControls } from '@/components/chat/session-controls';
 import { StatusStrip } from '@/components/chat/status-strip';
 import { Transcript } from '@/components/chat/transcript';
@@ -16,6 +17,7 @@ import { ConnectionBanner } from '@/components/connection-banner';
 import { useAppDrawer } from '@/components/deck/app-drawer';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
+import { EmptyState } from '@/components/ui/empty-state';
 import { ErrorBanner } from '@/components/ui/error-banner';
 import { Icon } from '@/components/ui/icon';
 import { IconButton } from '@/components/ui/icon-button';
@@ -37,6 +39,7 @@ export default function SessionScreen() {
     thread,
     loading,
     error,
+    closed,
     send,
     steer,
     cancel,
@@ -57,6 +60,9 @@ export default function SessionScreen() {
   const [rewindError, setRewindError] = useState<string>();
   const insets = useSafeAreaInsets();
   const drawer = useAppDrawer();
+  // `replace`, not `back`: a session that no longer exists should not stay on the
+  // stack for a swipe or a second Back to land on again.
+  const toSessions = () => router.replace('/sessions');
 
   const onRewind = async (ordinal: number) => {
     setRewinding(true);
@@ -86,26 +92,33 @@ export default function SessionScreen() {
           headerRight: () => (
             <View style={styles.headerActions}>
               <IconButton icon={PanelLeft} accessibilityLabel="Switch session" onPress={drawer.open} />
-              <Pressable
-                onPress={() => setRewindOpen(true)}
-                hitSlop={Spacing.two}
-                style={styles.headerAction}
-              >
-                <Icon icon={History} size="sm" />
-                <ThemedText type="code">Rewind</ThemedText>
-              </Pressable>
-              <Link href={{ pathname: '/forge/[id]', params: { id: sessionId } }} asChild>
-                <Pressable style={styles.headerAction}>
-                  <Icon icon={GitPullRequest} size="sm" />
-                  <ThemedText type="code">PRs</ThemedText>
-                </Pressable>
-              </Link>
-              <Link href={{ pathname: '/git/[id]', params: { id: sessionId } }} asChild>
-                <Pressable style={styles.headerAction}>
-                  <Icon icon={GitBranch} size="sm" />
-                  <ThemedText type="code">Git</ThemedText>
-                </Pressable>
-              </Link>
+              {/* Rewind, PRs and Git all address this session on the host, so a
+                  closed one leaves them as buttons that can only fail. Switching
+                  session is the one action that still means something. */}
+              {closed ? null : (
+                <>
+                  <Pressable
+                    onPress={() => setRewindOpen(true)}
+                    hitSlop={Spacing.two}
+                    style={styles.headerAction}
+                  >
+                    <Icon icon={History} size="sm" />
+                    <ThemedText type="code">Rewind</ThemedText>
+                  </Pressable>
+                  <Link href={{ pathname: '/forge/[id]', params: { id: sessionId } }} asChild>
+                    <Pressable style={styles.headerAction}>
+                      <Icon icon={GitPullRequest} size="sm" />
+                      <ThemedText type="code">PRs</ThemedText>
+                    </Pressable>
+                  </Link>
+                  <Link href={{ pathname: '/git/[id]', params: { id: sessionId } }} asChild>
+                    <Pressable style={styles.headerAction}>
+                      <Icon icon={GitBranch} size="sm" />
+                      <ThemedText type="code">Git</ThemedText>
+                    </Pressable>
+                  </Link>
+                </>
+              )}
             </View>
           ),
         }}
@@ -118,13 +131,31 @@ export default function SessionScreen() {
           <StatusStrip thread={thread} />
           <TurnTimer active={thread.turn_active} />
 
-          {error ? <ErrorBanner message={error} onDismiss={dismissError} /> : null}
+          {/* A closed session's own state says everything the banner would, and
+              says it without the red — an action that failed because the tab is
+              gone is not a failure the user needs to read twice. */}
+          {error && !closed ? <ErrorBanner message={error} onDismiss={dismissError} /> : null}
 
           {loading ? (
             <View style={styles.centre}>
               <ActivityIndicator />
             </View>
+          ) : closed && thread.entries.length === 0 ? (
+            // Nothing was ever loaded — the session was already gone when this
+            // screen opened, so there is no transcript to leave on screen. This
+            // state carries the whole message, which is why the notice below
+            // stands down: one screen, one explanation.
+            <View style={styles.fill}>
+              <EmptyState
+                icon={Archive}
+                title="This session is no longer open"
+                message="It was closed on the desktop."
+                action={{ label: 'Back to sessions', onPress: toSessions }}
+              />
+            </View>
           ) : (
+            // A transcript that did load stays readable: closing the tab ends the
+            // session, it does not make what was said unreadable.
             <Transcript
               thread={thread}
               onAllow={allow}
@@ -134,16 +165,22 @@ export default function SessionScreen() {
             />
           )}
 
-          <Composer
-            turnActive={thread.turn_active}
-            slashCommands={thread.slash_commands}
-            controls={sessionControls.chips}
-            draft={draft}
-            onSend={send}
-            onSteer={steer}
-            onCancel={cancel}
-            onError={reportError}
-          />
+          {closed ? (
+            // Only where a transcript is on screen — otherwise the empty state
+            // above has already said it, and said it with room to breathe.
+            thread.entries.length > 0 ? <SessionClosedNotice onBack={toSessions} /> : null
+          ) : (
+            <Composer
+              turnActive={thread.turn_active}
+              slashCommands={thread.slash_commands}
+              controls={sessionControls.chips}
+              draft={draft}
+              onSend={send}
+              onSteer={steer}
+              onCancel={cancel}
+              onError={reportError}
+            />
+          )}
         </SafeAreaView>
         </KeyboardAvoidingView>
       </GestureDetector>

@@ -3,7 +3,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { toChatImage, type Attachment } from './attachments';
 import { useClient } from './client';
-import { describeError } from './errors';
+import { describeError, isUnknownSession } from './errors';
+import { useSessionGone } from './session-presence';
 import {
   EMPTY_THREAD,
   parseThread,
@@ -20,6 +21,12 @@ export type SessionView = {
   loading: boolean;
   /** A failed action (send/resolve/cancel), shown inline and dismissible. */
   error?: string;
+  /**
+   * The desktop has closed this session. Terminal — nothing will arrive and no
+   * action will succeed — so the screen stops offering to drive it rather than
+   * letting every control fail one by one.
+   */
+  closed: boolean;
   /** Resolves `false` if the send failed, so the composer can keep the text. */
   send: (text: string, images?: Attachment[]) => Promise<boolean>;
   /** Guide a turn that is already running, instead of queueing a new prompt. */
@@ -73,6 +80,11 @@ export function useSession(sessionId: string): SessionView {
   const [thread, setThread] = useState<Thread>(EMPTY_THREAD);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
+  // The two liveness signals `useSessionGone` weighs. Kept apart from `error`:
+  // a session the desktop has closed is a state the screen renders, not a
+  // failure the user can dismiss and retry past.
+  const [unknownSession, setUnknownSession] = useState(false);
+  const [subscribed, setSubscribed] = useState(false);
   // Actions read the client through a ref so a reconnect (which swaps the client)
   // does not have to re-create every callback the composer holds.
   const clientRef = useRef(client);
@@ -87,6 +99,11 @@ export function useSession(sessionId: string): SessionView {
     // high-water mark makes the rendered thread monotonic.
     let renderedSeq = -1;
     setLoading(true);
+    // A reconnect re-runs this against a fresh client; neither the previous
+    // attempt's verdict nor its confirmation may outlive it — the desktop may
+    // have closed the session in between, or reopened one it had closed.
+    setUnknownSession(false);
+    setSubscribed(false);
 
     const sink = {
       onThread: (snapshot: ThreadSnapshot) => {
@@ -105,11 +122,21 @@ export function useSession(sessionId: string): SessionView {
       },
     };
 
-    client.subscribe(sessionId, sink).catch((e: unknown) => {
-      if (!live) return;
-      setError(describeError(e));
-      setLoading(false);
-    });
+    client
+      .subscribe(sessionId, sink)
+      .then(() => {
+        // The host answered about this session, so it had it. That is what
+        // later lets its absence from the session list be read as a close.
+        if (live) setSubscribed(true);
+      })
+      .catch((e: unknown) => {
+        if (!live) return;
+        setLoading(false);
+        // "No such session" is not an error to show: the desktop closed the tab,
+        // so the screen says that instead of quoting the wire back at the user.
+        if (isUnknownSession(e)) setUnknownSession(true);
+        else setError(describeError(e));
+      });
 
     return () => {
       live = false;
@@ -219,10 +246,13 @@ export function useSession(sessionId: string): SessionView {
   const dismissError = useCallback(() => setError(undefined), []);
   const reportError = useCallback((message: string) => setError(message), []);
 
+  const closed = useSessionGone(sessionId, { subscribed, unknownSession });
+
   return {
     thread,
     loading,
     error,
+    closed,
     send,
     steer,
     cancel,

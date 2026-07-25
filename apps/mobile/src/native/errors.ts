@@ -17,6 +17,19 @@ export function describeError(error: unknown): string {
 }
 
 /**
+ * Whether a failure means the host has no such session — the desktop closed the
+ * tab, so nothing about this session id will work again.
+ *
+ * Matched on the rendered text rather than a variant, because the wire's
+ * `RpcError` is flattened to a string well before it reaches here: the core
+ * carries it as `Rpc(String)`, so the discriminated shape is already gone. The
+ * needle is the wire enum's own variant name, which is as stable as the protocol.
+ */
+export function isUnknownSession(error: unknown): boolean {
+  return describeError(error).includes('UnknownSession');
+}
+
+/**
  * A pairing failure as a sentence with a next step, rather than the raw tag.
  *
  * Matched on substrings of the rendered error, not on the enum: the refusal
