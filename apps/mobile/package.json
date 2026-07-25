@@ -5,9 +5,9 @@
   "private": true,
   "scripts": {
     "start": "expo start --dev-client",
-    "android": "expo run:android",
-    "ios": "expo run:ios",
-    "prebuild": "expo prebuild --clean",
+    "android": "LANG=${LANG:-en_US.UTF-8} expo run:android",
+    "ios": "LANG=${LANG:-en_US.UTF-8} expo run:ios",
+    "prebuild": "LANG=${LANG:-en_US.UTF-8} expo prebuild --clean",
     "lint": "expo lint",
     "typecheck": "tsc --noEmit",
     "bindings": "npm run ubrn:ios --prefix modules/oximux-core",
