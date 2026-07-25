@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/app",
+    "apps/desktop",
     "crates/ui",
     "crates/core",
     "crates/dictation",
@@ -34,7 +34,7 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 # Internal crates
-oximux-app      = { path = "crates/app" }
+oximux-app      = { path = "apps/desktop" }
 oximux-ui       = { path = "crates/ui" }
 oximux-core     = { path = "crates/core" }
 oximux-dictation = { path = "crates/dictation" }
