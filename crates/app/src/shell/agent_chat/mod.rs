@@ -1353,7 +1353,14 @@ impl AgentChatView {
             let model = thread.model.clone().or_else(|| model.clone());
             binding.set_meta(SessionMeta {
                 title: thread.title.clone(),
-                model: model.clone(),
+                // The backend's baseline again, for the same reason as the mode
+                // below: a session opened remotely carries no pick of its own, so
+                // without this its picker would show nothing selected until the
+                // user changed something. Mirrors `Self::effective_model`, which
+                // takes over from the first live republish.
+                model: model
+                    .clone()
+                    .or_else(|| connection.as_ref().and_then(|c| c.default_model())),
                 // The backend's baseline: the tab seeds `permission_mode: None`
                 // below, and a restored pick republishes when it is applied.
                 permission_mode: connection.as_ref().and_then(|c| c.default_mode()),
@@ -4030,13 +4037,31 @@ impl AgentChatView {
             // what the desktop shows, so it wins; fall back to the thread's
             // provider-native title until the pane group has synced one.
             title: self.remote_tab_title.clone().or_else(|| self.thread.title.clone()),
-            // Mirrors the transcript's resolution: the thread's negotiated model
-            // wins, falling back to the tab's selection before one is negotiated.
-            model: self.thread.model.clone().or_else(|| self.model.clone()),
+            model: self.effective_model(),
             permission_mode: self.effective_permission_mode(),
             // Git RPCs resolve their repository from this.
             cwd: Some(self.cwd.clone()),
         });
+    }
+
+    /// The model this tab is actually running under.
+    ///
+    /// The same shape as [`Self::effective_permission_mode`], and for the same
+    /// reason: `model` is `None` until the user picks one, so a session that has
+    /// never had a pick would otherwise publish nothing and a remote picker would
+    /// render every model unselected — as if the session were running on no model
+    /// at all. The desktop's own composer resolves it exactly this way, falling
+    /// back to the connection's default when the tab holds no pick.
+    ///
+    /// The thread's negotiated model still wins: once the backend reports what it
+    /// actually loaded, that is the truth, and it can differ from the default the
+    /// child was launched with.
+    fn effective_model(&self) -> Option<String> {
+        self.thread
+            .model
+            .clone()
+            .or_else(|| self.model.clone())
+            .or_else(|| self.connection.as_ref().and_then(|c| c.default_model()))
     }
 
     /// The permission mode this tab is actually running under.
