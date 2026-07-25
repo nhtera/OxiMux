@@ -29,6 +29,7 @@ export default function SessionsScreen() {
   const sessions = useClient((s) => s.sessions);
   const projects = useClient((s) => s.projects);
   const phase = useClient((s) => s.phase);
+  const cause = useClient((s) => s.cause);
   const refreshSessions = useClient((s) => s.refreshSessions);
   const ensureConnected = useClient((s) => s.ensureConnected);
   const [refreshing, setRefreshing] = useState(false);
@@ -192,7 +193,12 @@ export default function SessionsScreen() {
                     ? 'No agent sessions open on the desktop.'
                     : 'Waiting for the host…'
               }
-              message={filtering ? `No sessions match “${query.trim()}”.` : undefined}
+              // While down, the core's failure reason is the only thing that
+              // separates "the desktop is off" from "this network cannot reach
+              // it" — the difference between waiting and moving networks.
+              message={
+                filtering ? `No sessions match “${query.trim()}”.` : down ? cause : undefined
+              }
               action={
                 !filtering && down ? { label: 'Retry', onPress: retry, loading: retrying } : undefined
               }

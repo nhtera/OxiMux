@@ -23,13 +23,20 @@ const MESSAGE: Partial<Record<ConnectionPhase, string>> = {
 export function ConnectionBanner() {
   const theme = useTheme();
   const phase = useClient((s) => s.phase);
+  // The core's reason for giving up — "the desktop is asleep or remote is off"
+  // and "this network cannot reach it" are the same red bar without it, and they
+  // want opposite responses from the user. Matches `ConnectionBadge`'s format.
+  const cause = useClient((s) => s.cause);
   const message = MESSAGE[phase];
   if (!message) return null;
   const tone = phase === 'disconnected' || phase === 'unreachable' ? theme.danger : theme.warning;
   return (
     <View style={[styles.bar, { backgroundColor: tone }]}>
-      <ThemedText type="small" numberOfLines={1} style={{ color: theme.accentText }}>
+      {/* Two lines: a transport failure is a sentence, not a word, and clipping it
+          to one line usually cuts off the part that says what went wrong. */}
+      <ThemedText type="small" numberOfLines={2} style={{ color: theme.accentText }}>
         {message}
+        {cause ? ` — ${cause}` : ''}
       </ThemedText>
     </View>
   );

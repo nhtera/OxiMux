@@ -8,7 +8,7 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { AppDrawerProvider, DrawerMenuButton } from '@/components/deck/app-drawer';
 import { useColorScheme } from '@/hooks/use-color-scheme';
-import { useForegroundReconnect } from '@/hooks/use-foreground-reconnect';
+import { useConnectionRecovery } from '@/hooks/use-connection-recovery';
 import { useTheme } from '@/hooks/use-theme';
 import { useChatPreferences } from '@/stores/chat-preferences';
 import { useThemePreference } from '@/stores/theme-preference';
@@ -20,8 +20,9 @@ export default function RootLayout() {
   const loadChatPrefs = useChatPreferences((s) => s.load);
 
   // Reconnect to the paired host on every foreground (and on this root's mount),
-  // so a link the OS tore down while suspended comes back without a force-quit.
-  useForegroundReconnect();
+  // and keep retrying on a widening delay while the link is down — a suspended
+  // app and a change of network both leave it dead otherwise.
+  useConnectionRecovery();
 
   // Read the stored override once at startup. Until it resolves the app renders
   // the OS scheme, which is the right default to flash: someone who never set a

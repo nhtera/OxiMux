@@ -3,12 +3,16 @@
 //! pair. The toggle flips the shared [`RemoteControl`] global's `enabled` flag and
 //! starts/stops the host: enabling binds an endpoint off-thread (on the tokio
 //! runtime) and publishes a `PairingTicket` back here; disabling stops the host and
-//! stops advertising. The ticket is shown as the host's pairing identity for now —
-//! the scannable QR image lands in a later slice.
+//! stops advertising. The ticket is rendered as a scannable QR (see
+//! [`pairing_qr`](super::pairing_qr)) for the phone's camera.
 //!
-//! Session-scoped for now: enabling is not persisted across restarts, and each
-//! enable rotates the pairing secret (durable paired-device persistence is later).
-//! The handshake secret is never displayed or logged.
+//! The switch itself is persisted (`ENABLED_SETTING`), so a desktop that had
+//! remote access on comes back up serving it — otherwise a paired phone would
+//! silently fail to reach a restarted Mac. What is *not* persisted is the pairing
+//! window: each enable mints a fresh one-time secret, and a relaunch resumes the
+//! host with no slot open at all, so already-paired devices reconnect (they
+//! authenticate by key against the durable device store) while no new device can
+//! claim this Mac unasked. The handshake secret is never displayed or logged.
 
 use std::sync::Arc;
 
