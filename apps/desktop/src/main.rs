@@ -66,7 +66,7 @@ fn main() {
 
     // Phase 5 step 1 spike: `--editor-spike` short-circuits the normal
     // workspace boot and opens a single editor window on this file
-    // (`crates/app/src/main.rs`). The spike validates that
+    // (`apps/desktop/src/main.rs`). The spike validates that
     // gpui-component's `code_editor()` + tree-sitter highlight works
     // before days 2-3 wire rust-analyzer into the LSP provider traits.
     // The flag is intentionally undocumented in `--help` — it ships
@@ -627,7 +627,7 @@ fn install_signal_watchdog(cx: &mut gpui::App) {
 }
 
 /// Phase 5 step 1 spike entry point. Opens a single window mounting
-/// `EditorView` on `crates/app/src/main.rs`. The DB / repo / relay /
+/// `EditorView` on `apps/desktop/src/main.rs`. The DB / repo / relay /
 /// workspace shell are all skipped so the spike isolates the editor +
 /// (days 2-3) LSP surface.
 ///
@@ -655,7 +655,7 @@ fn run_editor_spike() {
 
     let file_path = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
-        .join("crates/app/src/main.rs");
+        .join("apps/desktop/src/main.rs");
     tracing::info!(file = %file_path.display(), "editor-spike: opening file");
 
     let app = gpui_platform::application().with_assets(CompositeAssets);

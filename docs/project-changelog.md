@@ -4,6 +4,33 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-26 — Desktop app relocated to `apps/desktop` (`refactor/apps-desktop`)
+
+Pure refactor, zero behavior change. ADR: `docs/adr/007-apps-desktop-relocation.md`.
+
+- **`c981a9a`** — `git mv crates/app apps/desktop`, so `apps/` now holds both
+  product surfaces (`desktop`, `mobile`) and `crates/` holds libraries and
+  sidecars. 426 renames plus the two `Cargo.toml` lines (`members`, the
+  `oximux-app` path dep) needed to keep the workspace building —
+  `cargo check --workspace --all-targets` passed with no other edit, proving the
+  crate was never coupled to its location. Package name (`oximux-app`) and
+  binary name (`oximux`) are unchanged, so `README`, `.claude/launch.json`, and
+  `scripts/bundle-macos.sh` keep working as-is.
+- **`39f39d4`** — `xtask file-size-lint` walked a hardcoded `crates/` root and
+  would have kept exiting green while silently skipping ~73% of the source.
+  Source roots are now an explicit list; `apps/` is not globbed because
+  `apps/mobile` is a ~1.2 GB RN tree with no Rust in it. Verified by diffing the
+  lint output against the pre-move baseline.
+- Fixed the one genuine runtime path the move broke: `run_editor_spike()` in
+  `main.rs` joined `cwd + "crates/app/src/main.rs"` to choose the file the
+  editor spike opens.
+
+**Touches**: `apps/desktop/**` (moved), `Cargo.toml`, `xtask/src/main.rs`,
+`docs/{system-architecture,codebase-summary,design-guidelines,gpui-pins,development-roadmap,brief}.md`,
+`docs/adr/007-apps-desktop-relocation.md` (new)
+
+---
+
 ### 2026-07-18 — Remote Control groundwork: agent-core split + SessionRegistry (`feat/remote-control-headless-registry`, in progress)
 
 Phase 1-2 groundwork for controlling OxiMux from a phone over Iroh P2P (plan:

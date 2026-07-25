@@ -39,7 +39,7 @@ use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
 
 /// macOS Application Support sub-directory anchor. Must mirror the same
-/// constant in `crates/app/src/main.rs` — kept duplicated rather than
+/// constant in `apps/desktop/src/main.rs` — kept duplicated rather than
 /// re-exported because `main.rs` is a binary and `workspace_root.rs` is
 /// the library, and the two share no module today.
 pub(crate) const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";

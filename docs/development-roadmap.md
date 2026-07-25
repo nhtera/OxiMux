@@ -33,7 +33,7 @@ All 14 implementation steps shipped. Step 15 is the dogfood usage gate.
 - Commit, stash push/list/apply/pop/drop, branch list/create/switch
 - Worktree add/list/remove, merge with auto-stash recovery
 
-**UI (crates/app)**
+**UI (apps/desktop)**
 - `GitPanel`: staged / unstaged / untracked sections
 - `DiffView`: loads diff per file; large-diff cap + expand()
 - `CommitDialog`: conventional-commit prefix cycle + submit

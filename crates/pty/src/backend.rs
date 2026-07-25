@@ -1,7 +1,7 @@
 //! The `TerminalBackend` contract.
 //!
 //! One trait object per concrete source (real PTY, fixture replay, ACP).
-//! The UI layer in `crates/app` owns a `Box<dyn TerminalBackend>` and
+//! The UI layer in `apps/desktop` owns a `Box<dyn TerminalBackend>` and
 //! polls it via `drain_events` once per frame.
 
 use anyhow::Result;

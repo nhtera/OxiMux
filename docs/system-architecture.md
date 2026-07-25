@@ -9,7 +9,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  GPUI UI layer  (crates/app)                        │
+│  GPUI UI layer  (apps/desktop)                        │
 │  WindowRegistry (global) — one WorkspaceRoot / window│
 │  WorkspaceRoot → MainPane (grid of pane leaves)     │
 │                   each leaf: LeafTabs (per-pane tabs)│
@@ -60,7 +60,7 @@
 
 Folder-level index (coarse by design — it rots slowly). Logic lives in the
 backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
-`crates/app/src/shell/<domain>/`. To find a feature, grep the domain column.
+`apps/desktop/src/shell/<domain>/`. To find a feature, grep the domain column.
 
 ### Crates (`crates/<dir>/` → package → entry)
 
@@ -83,7 +83,7 @@ backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
 | `app` | `oximux-app` | `src/lib.rs` + `src/main.rs` | GPUI cockpit; all views (the 73%-LOC crate) |
 | `xtask/` | `xtask` | `src/main.rs` | repo lint orchestrator (`file-size-lint` etc.) |
 
-### `crates/app/src/` — top-level (non-view)
+### `apps/desktop/src/` — top-level (non-view)
 
 | File / folder | Holds |
 |---|---|
@@ -98,7 +98,7 @@ backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
 | `platform/` | macOS-specific glue (App Nap, single-instance) |
 | `session_restore/` | cold/warm session restore orchestration |
 
-### `crates/app/src/shell/<domain>/` — GPUI views
+### `apps/desktop/src/shell/<domain>/` — GPUI views
 
 One folder per cockpit zone: `agent_ui`, `agents_dashboard`, `browser_view`,
 `chrome`, `command_palette`, `commit_dialog`, `compose_bar`, `diff_view`,
@@ -294,7 +294,7 @@ launchd / manual spawn
                     Server awaits Notify; drops guards → socket + pid cleaned up
 ```
 
-**App-side supervisor** (`crates/app/src/relay_supervisor.rs`):
+**App-side supervisor** (`apps/desktop/src/relay_supervisor.rs`):
 
 ```
 boot_relay_supervisor(PaneRelayIdRepo)
@@ -319,7 +319,7 @@ boot_relay_supervisor(PaneRelayIdRepo)
 > Cook report: `plans/reports/cook-260522-0240-phase-05-step01-editor-lsp-spike.md`
 
 ```
-crates/app/src/main.rs
+apps/desktop/src/main.rs
   --editor-spike flag
     └── run_editor_spike()
           tokio Handle check (self-aborts with clear message if no reactor in scope)
@@ -371,7 +371,7 @@ render_preview()
     blockquotes / links / fenced code blocks / images
 ```
 
-**FileHttpClient** (`crates/app/src/file_http_client.rs`):
+**FileHttpClient** (`apps/desktop/src/file_http_client.rs`):
 
 gpui defaults to `NullHttpClient` — its image element loads image URLs through the http client, never the filesystem. `FileHttpClient` is a `file://`-only `gpui::HttpClient` impl installed at app startup via `cx.set_http_client(Arc::new(FileHttpClient))`. It overrides `get()` because `http::Uri` rejects `file:///path` (empty authority) in the default path. HTTP/HTTPS requests are not forwarded (rejected).
 

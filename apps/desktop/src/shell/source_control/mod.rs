@@ -44,8 +44,8 @@ pub mod toolbar;
 pub mod tree;
 
 // Re-export so external callers (notably the integration tests at
-// `crates/app/tests/sc_base_ref_persistence.rs` and
-// `crates/app/tests/sc_commit_draft_persistence.rs`) keep resolving
+// `apps/desktop/tests/sc_base_ref_persistence.rs` and
+// `apps/desktop/tests/sc_commit_draft_persistence.rs`) keep resolving
 // against `oximux_app::shell::source_control::{symbol}` rather than
 // reaching into the deeper `settings_persistence` path.
 pub use settings_persistence::{load_initial_commit_draft, merge_base_ref_into_settings};
@@ -523,7 +523,7 @@ impl SourceControlPanel {
     /// is entered.
     ///
     /// `pub` (not `pub(super)`) so integration tests at
-    /// `crates/app/tests/sc_open_all_conflicts.rs` can drive the
+    /// `apps/desktop/tests/sc_open_all_conflicts.rs` can drive the
     /// method directly without going through a Button click event.
     pub fn open_all_conflicts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(on_open) = self.on_open_file.clone() else {
@@ -1292,7 +1292,7 @@ impl Render for SourceControlPanel {
         );
 
         // Filter wiring: helper `filter_files` is unit-tested in
-        // `crates/app/tests/sc_filter.rs`; the changed-files list itself does
+        // `apps/desktop/tests/sc_filter.rs`; the changed-files list itself does
         // not consume the query yet — that wires through `GitPanel` in a
         // follow-up. Holding the input value here keeps the field interactive
         // and ready to plug into the panel filter slot when it lands.

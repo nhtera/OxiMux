@@ -1,5 +1,5 @@
 //! Pure-data tests for the SCM branch-picker primitive. Source lives at
-//! `crates/app/src/shell/source_control/branch_picker.rs`; tests
+//! `apps/desktop/src/shell/source_control/branch_picker.rs`; tests
 //! extracted here so the production module stays under the file-size
 //! warn cap (matching the `sc_dropdown_items.rs` extraction precedent).
 //!

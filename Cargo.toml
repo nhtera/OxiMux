@@ -159,7 +159,7 @@ lsp-types = { version = "0.97", features = ["proposed"] }
 # editor crate's `path_to_file_uri`; paths with spaces / unicode /
 # reserved chars round-trip cleanly only with proper encoding.
 url = "2"
-# macOS Application Support directory resolution (see crates/app/src/main.rs).
+# macOS Application Support directory resolution (see apps/desktop/src/main.rs).
 # default-features off: we only need `data_dir()` on macOS; the default
 # features pull in Windows/X11 helpers we never call.
 dirs = { version = "5", default-features = false }

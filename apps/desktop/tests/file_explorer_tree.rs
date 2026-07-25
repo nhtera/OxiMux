@@ -1,6 +1,6 @@
 //! Unit tests for `tree_state` — `should_include` and `flatten`.
 //! These duplicate the in-module tests from tree_state.rs to satisfy the
-//! "tests under crates/app/tests/" requirement and add additional cases.
+//! "tests under apps/desktop/tests/" requirement and add additional cases.
 
 use oximux_app::shell::file_explorer::tree_state::{DirCache, TreeNode, flatten, should_include};
 use std::collections::{HashMap, HashSet};

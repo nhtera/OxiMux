@@ -1,6 +1,6 @@
 //! GPUI headless E2E tests for per-pane tab strip and Cmd+W cascade.
 //!
-//! These live inside the crate (not in `crates/app/tests/`) so they can
+//! These live inside the crate (not in `apps/desktop/tests/`) so they can
 //! reach `pub(crate)` handlers on `PaneGroup` — specifically
 //! `on_close_tab` and `on_split_sub_pane_right`.
 //!
