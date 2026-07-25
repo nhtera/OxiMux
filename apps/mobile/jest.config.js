@@ -16,7 +16,11 @@ module.exports = {
     'node_modules/(?!(' +
       [
         '(jest-)?react-native',
-        '@react-native(-community)?',
+        // `[\\w-]*` for the same reason as `expo` below: the bare
+        // `@react-native(-community)?` form only matches when a `/` follows, so
+        // it misses every hyphenated package in the org — `@react-native-masked-
+        // view` above all, which the composer pulls in through its shimmer.
+        '@react-native(-community)?[\\w-]*',
         // `[\\w-]*` matters: the bare `expo(nent)?` form used by most published
         // configs requires a `/` straight after "expo", so it silently misses
         // every hyphenated package — `expo-modules-core` above all, which the
