@@ -37,7 +37,7 @@ All 14 implementation steps shipped. Step 15 is the dogfood usage gate.
 - `GitPanel`: staged / unstaged / untracked sections
 - `DiffView`: loads diff per file; large-diff cap + expand()
 - `CommitDialog`: conventional-commit prefix cycle + submit
-- `ConfirmDialog`: type-to-confirm gate for destructive ops
+- `ConfirmDialog`: confirm/cancel gate for destructive ops
 - `StashPanel`: list + apply/pop/drop with confirm gate
 - `WorktreePanel`: list + create + remove with confirm gate
 - `StatusBar` center zone: branch + ↑ahead ↓behind + dirty count

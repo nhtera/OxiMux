@@ -208,8 +208,8 @@ CommitDialog (GPUI entity)
   ← submit() → Repository::commit (tokio)
 
 ConfirmDialog (GPUI entity)
-  ← type-to-confirm gate for destructive ops (revert, stash drop, worktree remove)
-  ← typed_matches() calls pure logic::is_match
+  ← one-click confirm/cancel gate for destructive ops (revert, stash drop, worktree remove)
+  ← optional secondary action for three-way prompts (Save / Discard / Cancel)
 
 StashPanel (GPUI entity)
   ← refresh() → git stash list

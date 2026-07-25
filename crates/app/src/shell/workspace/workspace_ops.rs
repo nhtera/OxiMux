@@ -2003,10 +2003,9 @@ impl WorkspaceRoot {
         cx.notify();
     }
 
-    /// Open the type-to-confirm dialog for workspace deletion. Reuses
-    /// `ConfirmDialog`; expected string is the slug. On confirm: removes
-    /// worktree + branch + DB row (FK cascade clears pane/agent
-    /// sessions).
+    /// Open the confirm dialog for workspace deletion. On confirm:
+    /// removes worktree + branch + DB row (FK cascade clears
+    /// pane/agent sessions).
     ///
     /// When the previous delete of THIS workspace failed at worktree
     /// removal, the dialog becomes the Force Delete variant. The armed
@@ -2136,6 +2135,9 @@ impl WorkspaceRoot {
             })
             .detach();
         });
+        // Force delete `-D`'s the branch (real data loss), so it says so in
+        // the body and on the button — the danger-styled button plus that
+        // warning carries the weight.
         let prompt = if force {
             ConfirmPrompt {
                 title: "Force delete workspace".into(),
@@ -2144,10 +2146,6 @@ impl WorkspaceRoot {
                     workspace.worktree_path, workspace.branch
                 )
                 .into(),
-                // Force delete `-D`'s the branch (real data loss), so keep a
-                // deliberate type-gate — but a short fixed word, not the slug,
-                // which can be sentence-length for an issue-derived workspace.
-                expected: "delete".into(),
                 on_confirm,
                 confirm_label: Some("Force Delete".into()),
                 on_cancel: None,
@@ -2161,12 +2159,6 @@ impl WorkspaceRoot {
                     workspace.worktree_path, workspace.branch
                 )
                 .into(),
-                // Plain confirm (no type-to-confirm): a normal delete only
-                // removes the branch when git considers it safe (merged) — it
-                // refuses an unmerged branch without force — so a danger-styled
-                // button + the warning above is proportionate, and it spares the
-                // user typing an issue-derived slug that can be sentence-length.
-                expected: "".into(),
                 on_confirm,
                 confirm_label: None,
                 on_cancel: None,
@@ -2222,9 +2214,9 @@ impl WorkspaceRoot {
         );
     }
 
-    /// Open the plain confirm dialog for removing a project from the
-    /// cockpit. No type-to-confirm — removal is reversible (re-open the
-    /// folder) and leaves every file on disk in place. On confirm: deletes
+    /// Open the confirm dialog for removing a project from the
+    /// cockpit. Removal is reversible (re-open the folder) and leaves
+    /// every file on disk in place. On confirm: deletes
     /// the `projects` row — the `ON DELETE CASCADE` FK then drops the
     /// project's workspaces, pane buffers, and relay-id rows. If the removed
     /// project was active, the active selection is cleared.
@@ -2270,8 +2262,6 @@ impl WorkspaceRoot {
                 project.name
             )
             .into(),
-            // Empty `expected` → plain confirm (no type-to-confirm field).
-            expected: "".into(),
             on_confirm,
             confirm_label: Some("Remove".into()),
             on_cancel: None,

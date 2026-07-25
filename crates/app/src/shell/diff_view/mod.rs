@@ -1482,13 +1482,13 @@ impl DiffView {
         });
     }
 
-    /// Open the type-to-confirm modal for "Discard this hunk?". On
-    /// confirm, runs `discard_hunks` and reloads. No-op when the view
-    /// isn't Ready, the file is untracked, the staged side is on
-    /// screen (discard is worktree-only — user must unstage first), or
-    /// the index is out of range. First-open-wins: a re-fire while a
+    /// Open the confirm modal for "Discard this hunk?". On confirm,
+    /// runs `discard_hunks` and reloads. No-op when the view isn't
+    /// Ready, the file is untracked, the staged side is on screen
+    /// (discard is worktree-only — user must unstage first), or the
+    /// index is out of range. First-open-wins: a re-fire while a
     /// dialog is already mounted is ignored so a rapid double-click
-    /// doesn't replace a half-typed confirm string.
+    /// doesn't swap the modal out from under the user's cursor.
     pub fn request_discard_hunk(
         &mut self,
         file_idx: usize,
@@ -1524,7 +1524,6 @@ impl DiffView {
             body: "This will revert this hunk in the worktree. The index is \
                    untouched. This cannot be undone."
                 .into(),
-            expected: "Discard".into(),
             on_confirm,
             confirm_label: Some("Discard".into()),
             on_cancel: Some(on_cancel),

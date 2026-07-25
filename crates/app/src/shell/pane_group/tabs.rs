@@ -2203,9 +2203,6 @@ impl PaneGroup {
         let prompt = ConfirmPrompt {
             title: "Unsaved changes".into(),
             body: format!("{file_name} has unsaved changes. Save before closing?").into(),
-            // Plain confirm — no type-to-confirm; closing one tab isn't worth
-            // a typed gate.
-            expected: "".into(),
             on_confirm,
             confirm_label: Some("Save".into()),
             on_cancel: None,
@@ -2221,9 +2218,8 @@ impl PaneGroup {
         let dialog =
             cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
 
-        // Focus the dialog so Enter (Save) / Escape (Cancel) work without a
-        // click — the prompt has no inner Input to grab focus on its own.
-        dialog.read(cx).focus_handle(cx).focus(window, cx);
+        // `ConfirmDialog::new` takes focus itself, so Enter (Save) / Escape
+        // (Cancel) work without a click.
 
         // Drop the dialog the moment the user resolves it. Replacing the
         // observer cancels any stale one.

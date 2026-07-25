@@ -489,8 +489,8 @@ actions!(
         StageFile,
         /// Unstage the file currently selected in the git panel.
         UnstageFile,
-        /// Revert (discard) worktree changes for the selected file. Step 8 is
-        /// a no-op stub; step 11 wires the type-to-confirm modal.
+        /// Revert (discard) worktree changes for the selected file. Routes
+        /// through the discard confirm modal.
         RevertFile,
         /// Trigger the diff view to load the currently selected file in the
         /// git panel. Dispatched up the element tree from GitPanel row

@@ -14,8 +14,8 @@
 //! section the user clicked "Discard all" / "Delete all" on. The copy
 //! is plural-aware so N=1 reads naturally.
 //!
-//! Both code paths produce a [`DiscardCopy`] the host pairs with a
-//! type-to-confirm string to drive [`ConfirmPrompt`].
+//! Both code paths produce a [`DiscardCopy`] the host feeds straight
+//! into [`ConfirmPrompt`].
 
 use gpui::SharedString;
 use oximux_core::{FileStatus, IndexStatus, WorktreeStatus};
@@ -54,8 +54,8 @@ pub enum DiscardAllArea {
     Untracked,
 }
 
-/// Resolved copy for a single discard request. The host pairs this
-/// with `expected = file_name` to drive the type-to-confirm gate.
+/// Resolved copy for a single discard request — everything the modal
+/// needs to state what it is about to do.
 #[derive(Debug, Clone)]
 pub struct DiscardCopy {
     pub title: SharedString,
@@ -97,13 +97,6 @@ pub fn copy_for(file: &FileStatus) -> (DiscardKind, DiscardCopy) {
             confirm_label: "Discard".into(),
         },
     )
-}
-
-/// Short string the user types to confirm: the basename, falling back
-/// to the full path string for path-segment-only entries (rare but
-/// well-defined).
-pub fn expected_for(file: &FileStatus) -> SharedString {
-    display_name(file).into()
 }
 
 /// Copy for the "Discard all" / "Delete all" section-header action.
@@ -170,19 +163,6 @@ pub fn copy_for_area(area: DiscardAllArea, n: usize) -> DiscardCopy {
                 confirm_label: if n == 1 { "Discard" } else { "Discard all" }.into(),
             }
         }
-    }
-}
-
-/// Type-to-confirm string for an area discard. Short and area-specific
-/// so the user can type it without scanning paths — `"Discard all"`
-/// for Staged + Unstaged, `"Delete all"` for Untracked. Singular cases
-/// drop the "all" to read naturally.
-pub fn expected_for_area(area: DiscardAllArea, n: usize) -> SharedString {
-    match (area, n) {
-        (DiscardAllArea::Untracked, 1) => "Delete".into(),
-        (DiscardAllArea::Untracked, _) => "Delete all".into(),
-        (_, 1) => "Discard".into(),
-        (_, _) => "Discard all".into(),
     }
 }
 
@@ -308,30 +288,26 @@ mod tests {
     }
 
     #[test]
-    fn expected_uses_basename() {
+    fn title_uses_basename() {
         let f = fs("nested/deep/file.rs", IndexStatus::Modified, WorktreeStatus::Modified);
-        assert_eq!(expected_for(&f).as_ref(), "file.rs");
+        assert!(copy_for(&f).1.title.contains("\"file.rs\""));
     }
 
     #[test]
-    fn expected_falls_back_to_full_path_when_no_basename() {
+    fn title_falls_back_to_full_path_when_no_basename() {
         // A path that's just "." has no file_name; fallback is the
         // path's own string form.
         let f = fs(".", IndexStatus::Modified, WorktreeStatus::Modified);
-        assert_eq!(expected_for(&f).as_ref(), ".");
+        assert!(copy_for(&f).1.title.contains("\".\""));
     }
 
-    // ---------- copy_for_area / expected_for_area (Slice C) ----------
+    // ---------- copy_for_area (Slice C) ----------
 
     #[test]
     fn untracked_area_singular_uses_delete_label() {
         let c = copy_for_area(DiscardAllArea::Untracked, 1);
         assert!(c.title.starts_with("Delete this untracked file"));
         assert_eq!(c.confirm_label.as_ref(), "Delete");
-        assert_eq!(
-            expected_for_area(DiscardAllArea::Untracked, 1).as_ref(),
-            "Delete"
-        );
     }
 
     #[test]
@@ -339,10 +315,6 @@ mod tests {
         let c = copy_for_area(DiscardAllArea::Untracked, 5);
         assert!(c.title.contains("Delete 5 untracked files"));
         assert_eq!(c.confirm_label.as_ref(), "Delete all");
-        assert_eq!(
-            expected_for_area(DiscardAllArea::Untracked, 5).as_ref(),
-            "Delete all"
-        );
     }
 
     #[test]
@@ -350,10 +322,6 @@ mod tests {
         let c = copy_for_area(DiscardAllArea::Staged, 1);
         assert!(c.title.starts_with("Discard this staged change"));
         assert_eq!(c.confirm_label.as_ref(), "Discard");
-        assert_eq!(
-            expected_for_area(DiscardAllArea::Staged, 1).as_ref(),
-            "Discard"
-        );
     }
 
     #[test]
@@ -361,10 +329,6 @@ mod tests {
         let c = copy_for_area(DiscardAllArea::Staged, 3);
         assert!(c.title.contains("Discard all 3 staged changes"));
         assert_eq!(c.confirm_label.as_ref(), "Discard all");
-        assert_eq!(
-            expected_for_area(DiscardAllArea::Staged, 3).as_ref(),
-            "Discard all"
-        );
     }
 
     #[test]
@@ -372,10 +336,6 @@ mod tests {
         let c = copy_for_area(DiscardAllArea::Unstaged, 1);
         assert!(c.title.starts_with("Discard this unstaged change"));
         assert_eq!(c.confirm_label.as_ref(), "Discard");
-        assert_eq!(
-            expected_for_area(DiscardAllArea::Unstaged, 1).as_ref(),
-            "Discard"
-        );
     }
 
     #[test]

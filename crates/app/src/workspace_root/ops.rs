@@ -666,7 +666,6 @@ impl WorkspaceRoot {
         let prompt = ConfirmPrompt {
             title: "Move to Trash".into(),
             body: body.into(),
-            expected: "".into(),
             on_confirm,
             confirm_label: Some("Move to Trash".into()),
             on_cancel: None,
@@ -751,7 +750,6 @@ impl WorkspaceRoot {
         let prompt = ConfirmPrompt {
             title: request.copy.title,
             body: request.copy.body,
-            expected: request.expected,
             on_confirm,
             confirm_label: Some(request.copy.confirm_label),
             on_cancel: Some(on_cancel),
