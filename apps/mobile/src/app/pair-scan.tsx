@@ -2,12 +2,14 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Device from 'expo-device';
 import { router } from 'expo-router';
 import { useCallback, useRef, useState } from 'react';
-import { Pressable, StyleSheet, TextInput } from 'react-native';
+import { StyleSheet, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import { Spacing } from '@/constants/theme';
+import { Button } from '@/components/ui/button';
+import { ErrorBanner } from '@/components/ui/error-banner';
+import { Radius, Spacing } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme';
 import { useClient } from '@/native/client';
 import { describeError } from '@/native/errors';
@@ -19,14 +21,17 @@ import { describeError } from '@/native/errors';
  */
 const TICKET_PREFIX = 'oximux://connect?ticket=';
 
+/** Side of the viewfinder cutout. Large enough that a desktop screen's code
+ * fills it from a comfortable arm's length. */
+const FRAME = 240;
+
 export default function PairScanScreen() {
-  const theme = useTheme();
   const [permission, requestPermission] = useCameraPermissions();
   const [error, setError] = useState<string>();
-  // Simulators have no camera, so scanning can never succeed there. Start such
-  // devices in manual entry rather than showing a viewfinder that stays black.
+  // Simulators have no camera, so scanning can never succeed there. Such devices
+  // start in manual entry rather than showing a viewfinder that stays black —
+  // which is why the paste form, not the camera, is what a simulator ever shows.
   const [manual, setManual] = useState(!Device.isDevice);
-  const [typed, setTyped] = useState('');
   const pair = useClient((s) => s.pair);
   /**
    * The camera fires `onBarcodeScanned` repeatedly while a code is in frame. A
@@ -42,6 +47,7 @@ export default function PairScanScreen() {
         setError('That is not an OxiMux pairing link.');
         return false;
       }
+      setError(undefined);
       try {
         await pair(value);
         router.replace('/sessions');
@@ -55,95 +61,138 @@ export default function PairScanScreen() {
   );
 
   const onScan = useCallback(
-    async ({ data }: { data: string }) => {
+    ({ data }: { data: string }) => {
       if (claimed.current || !data.startsWith(TICKET_PREFIX)) return;
       claimed.current = true;
       // Let the user retry without leaving the screen if the host refused.
-      if (!(await submit(data))) claimed.current = false;
+      void submit(data).then((ok) => {
+        if (!ok) claimed.current = false;
+      });
     },
     [submit]
   );
 
   if (manual) {
     return (
-      <ThemedView style={styles.fill}>
-        <SafeAreaView style={styles.centered}>
-          <ThemedText type="small" style={styles.hint}>
-            Paste the pairing link from Settings → Remote on your desktop.
-          </ThemedText>
-          <TextInput
-            value={typed}
-            onChangeText={setTyped}
-            placeholder="oximux://connect?ticket=…"
-            autoCapitalize="none"
-            autoCorrect={false}
-            multiline
-            style={[
-              styles.input,
-              { borderColor: theme.borderStrong, color: theme.textMuted },
-            ]}
-          />
-          <Pressable onPress={() => submit(typed)} style={styles.button}>
-            <ThemedText type="code">Pair</ThemedText>
-          </Pressable>
-          {Device.isDevice ? (
-            <Pressable onPress={() => setManual(false)} style={styles.button}>
-              <ThemedText type="small">Scan a QR code instead</ThemedText>
-            </Pressable>
-          ) : null}
-          {error ? (
-            <ThemedText type="small" style={styles.hint}>
-              {error}
-            </ThemedText>
-          ) : null}
-        </SafeAreaView>
-      </ThemedView>
+      <ManualEntry
+        error={error}
+        onDismissError={() => setError(undefined)}
+        onSubmit={submit}
+        onScanInstead={Device.isDevice ? () => setManual(false) : undefined}
+      />
     );
   }
 
-  if (!permission) return <Centered>Checking camera permission…</Centered>;
+  if (!permission) {
+    return <Prompt message="Checking camera permission…" />;
+  }
 
   if (!permission.granted) {
     return (
-      <Centered>
-        OxiMux needs the camera to scan the pairing code your desktop shows.
-        <Pressable onPress={requestPermission} style={styles.button}>
-          <ThemedText type="code">Grant camera access</ThemedText>
-        </Pressable>
-        <Pressable onPress={() => setManual(true)} style={styles.button}>
-          <ThemedText type="small">Paste a link instead</ThemedText>
-        </Pressable>
-      </Centered>
+      <Prompt message="OxiMux needs the camera to scan the pairing code your desktop shows.">
+        <Button label="Grant camera access" variant="primary" onPress={requestPermission} />
+        <Button label="Paste a link instead" variant="ghost" onPress={() => setManual(true)} />
+      </Prompt>
     );
   }
 
   return (
     <ThemedView style={styles.fill}>
       <CameraView
-        style={styles.fill}
+        style={StyleSheet.absoluteFill}
         facing="back"
         barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
         onBarcodeScanned={onScan}
       />
-      <SafeAreaView style={styles.overlay}>
-        <ThemedText type="small" style={styles.hint}>
-          {error ?? 'Point the camera at the pairing code in Settings → Remote.'}
-        </ThemedText>
-        <Pressable onPress={() => setManual(true)} style={styles.button}>
-          <ThemedText type="small">Paste a link instead</ThemedText>
-        </Pressable>
+      {/* A dimmed surround with a clear square cut out of it, built from plain
+          views rather than a mask: it tells the user where to aim without
+          obscuring the part of the frame the scanner is reading. */}
+      <SafeAreaView style={styles.fill}>
+        <View style={styles.scrim} />
+        <View style={styles.frameRow}>
+          <View style={styles.scrim} />
+          <View style={styles.frame} />
+          <View style={styles.scrim} />
+        </View>
+        <View style={[styles.scrim, styles.foot]}>
+          {error ? <ErrorBanner message={error} onDismiss={() => setError(undefined)} /> : null}
+          <ThemedText type="small" style={styles.hint}>
+            Point the camera at the code in Settings → Remote on your desktop.
+          </ThemedText>
+          <Button label="Paste a link instead" variant="ghost" onPress={() => setManual(true)} />
+        </View>
       </SafeAreaView>
     </ThemedView>
   );
 }
 
-function Centered({ children }: { children: React.ReactNode }) {
+/** Pasting the link, for a device with no camera or no permission for it. */
+function ManualEntry({
+  error,
+  onDismissError,
+  onSubmit,
+  onScanInstead,
+}: {
+  error?: string;
+  onDismissError: () => void;
+  onSubmit: (ticket: string) => Promise<boolean>;
+  onScanInstead?: () => void;
+}) {
+  const theme = useTheme();
+  const [typed, setTyped] = useState('');
+
   return (
     <ThemedView style={styles.fill}>
       <SafeAreaView style={styles.centered}>
         <ThemedText type="small" style={styles.hint}>
-          {children}
+          {onScanInstead
+            ? 'Paste the pairing link from Settings → Remote on your desktop.'
+            : 'This device has no camera, so paste the pairing link from Settings → Remote on your desktop instead.'}
         </ThemedText>
+        <TextInput
+          value={typed}
+          onChangeText={setTyped}
+          placeholder="oximux://connect?ticket=…"
+          placeholderTextColor={theme.textMuted}
+          autoCapitalize="none"
+          autoCorrect={false}
+          multiline
+          // The typed link is content, not a placeholder: it was muted before, so
+          // a pasted ticket read as greyed-out and unusable.
+          style={[styles.input, { borderColor: theme.borderStrong, color: theme.text }]}
+        />
+        {error ? <ErrorBanner message={error} onDismiss={onDismissError} /> : null}
+        <Button
+          label="Pair"
+          variant="primary"
+          disabled={typed.trim().length === 0}
+          onPress={() => void onSubmit(typed)}
+          style={styles.stretch}
+        />
+        {onScanInstead ? (
+          <Button label="Scan a QR code instead" variant="ghost" onPress={onScanInstead} />
+        ) : null}
+      </SafeAreaView>
+    </ThemedView>
+  );
+}
+
+/**
+ * A centred message with optional actions beneath it.
+ *
+ * The actions are siblings of the text, not children of it: they used to be
+ * passed *into* a `<ThemedText>`, which nests pressables inside a `<Text>` — a
+ * combination React Native lays out oddly on iOS and whose touches do not
+ * reliably land on Android.
+ */
+function Prompt({ message, children }: { message: string; children?: React.ReactNode }) {
+  return (
+    <ThemedView style={styles.fill}>
+      <SafeAreaView style={styles.centered}>
+        <ThemedText type="small" style={styles.hint}>
+          {message}
+        </ThemedText>
+        {children}
       </SafeAreaView>
     </ThemedView>
   );
@@ -158,14 +207,27 @@ const styles = StyleSheet.create({
     gap: Spacing.three,
     paddingHorizontal: Spacing.four,
   },
-  overlay: { position: 'absolute', bottom: 0, left: 0, right: 0, padding: Spacing.four },
+  stretch: { alignSelf: 'stretch' },
   hint: { textAlign: 'center' },
-  button: { paddingVertical: Spacing.three, paddingHorizontal: Spacing.four },
+  scrim: { flex: 1, backgroundColor: 'rgba(0, 0, 0, 0.55)' },
+  frameRow: { flexDirection: 'row', height: FRAME },
+  frame: {
+    width: FRAME,
+    borderWidth: 2,
+    borderColor: 'rgba(255, 255, 255, 0.9)',
+    borderRadius: Radius.lg,
+  },
+  foot: {
+    justifyContent: 'flex-start',
+    alignItems: 'center',
+    gap: Spacing.three,
+    padding: Spacing.four,
+  },
   input: {
     alignSelf: 'stretch',
     minHeight: 72,
     borderWidth: 1,
-    borderRadius: Spacing.two,
+    borderRadius: Radius.md,
     padding: Spacing.three,
   },
 });
