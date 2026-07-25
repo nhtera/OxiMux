@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "bindings": "npm run ubrn:ios --prefix modules/oximux-core",
     "postinstall": "node scripts/patch-expo-modules-jsi.mjs && node scripts/generate-xterm-bundle.mjs",
+    "eas-build-post-install": "node scripts/build-rust-core-for-eas.mjs",
     "xterm:bundle": "node scripts/generate-xterm-bundle.mjs",
     "test": "jest"
   },
