@@ -28,11 +28,17 @@ pub(super) fn build_single_card(
     typography: &Typography,
     cx: &mut Context<GitRowContextMenu>,
 ) -> gpui::Div {
+    // Panel rows carry repo-relative paths (porcelain v2 reports them
+    // that way) and the git ops below want them that way. Anything
+    // that touches the filesystem — open, reveal, copy-absolute —
+    // needs the workdir rejoined first.
+    let abs_path = absolute_path(&path, workdir);
+
     // ── 1. Open in editor — files only. The action handler in
     //   workspace_root tolerates clicks on deleted paths; the existing
     //   diff-tab open path (left-click on row) handles the same case
     //   silently when the path is gone from the worktree.
-    let open_path = path.clone();
+    let open_path = abs_path.clone();
     card = card.child(menu_row(
         "git-row-ctx-open",
         "Open in editor",
@@ -56,7 +62,7 @@ pub(super) fn build_single_card(
     card = card.child(separator(theme));
 
     // ── 2. Clipboard ops.
-    let copy_abs = path.clone();
+    let copy_abs = abs_path.clone();
     card = card.child(menu_row(
         "git-row-ctx-copy-abs",
         "Copy absolute path",
@@ -89,7 +95,7 @@ pub(super) fn build_single_card(
     }
 
     // ── 3. Reveal in Finder.
-    let reveal_path = path.clone();
+    let reveal_path = abs_path;
     card = card.child(menu_row(
         "git-row-ctx-reveal",
         "Reveal in Finder",
@@ -328,10 +334,26 @@ pub(super) fn build_folder_card(
     card
 }
 
-/// Compute the path relative to the repo workdir. Falls back to the
-/// file name when the path sits outside the workdir (rare — a
+/// Absolute on-disk path for a row. Panel paths arrive repo-relative,
+/// so filesystem consumers (open in editor, Reveal in Finder, copy
+/// absolute path) have to rejoin the workdir — a bare "test.txt"
+/// resolves against the process CWD and reads as a missing file.
+/// Already-absolute paths pass through so no caller can double-join.
+pub(super) fn absolute_path(path: &Path, workdir: Option<&PathBuf>) -> PathBuf {
+    match workdir {
+        Some(root) if path.is_relative() => root.join(path),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Compute the path relative to the repo workdir. Relative paths are
+/// already in that form and pass through untouched. Falls back to the
+/// file name when an absolute path sits outside the workdir (rare — a
 /// symlinked file or stale state).
 pub(super) fn relative_path_string(path: &Path, workdir: Option<&PathBuf>) -> Option<String> {
+    if path.is_relative() {
+        return Some(path.to_string_lossy().into_owned()).filter(|s| !s.is_empty());
+    }
     let rel = workdir
         .and_then(|root| path.strip_prefix(root.as_path()).ok())
         .map(|p| p.to_string_lossy().into_owned())
@@ -431,5 +453,47 @@ mod tests {
             relative_path_string(&path, None).as_deref(),
             Some("lib.rs")
         );
+    }
+
+    #[test]
+    fn relative_path_passes_panel_paths_through_whole() {
+        // Panel rows are already repo-relative — the old workdir
+        // strip_prefix missed and the basename fallback flattened
+        // "src/lib.rs" to "lib.rs".
+        let workdir = PathBuf::from("/repo");
+        let path = PathBuf::from("src/lib.rs");
+        assert_eq!(
+            relative_path_string(&path, Some(&workdir)).as_deref(),
+            Some("src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn absolute_path_rejoins_workdir_for_panel_paths() {
+        let workdir = PathBuf::from("/repo");
+        assert_eq!(
+            absolute_path(&PathBuf::from("test.txt"), Some(&workdir)),
+            PathBuf::from("/repo/test.txt")
+        );
+        assert_eq!(
+            absolute_path(&PathBuf::from("src/lib.rs"), Some(&workdir)),
+            PathBuf::from("/repo/src/lib.rs")
+        );
+    }
+
+    #[test]
+    fn absolute_path_never_double_joins() {
+        let workdir = PathBuf::from("/repo");
+        let already_absolute = PathBuf::from("/repo/src/lib.rs");
+        assert_eq!(
+            absolute_path(&already_absolute, Some(&workdir)),
+            already_absolute
+        );
+    }
+
+    #[test]
+    fn absolute_path_is_identity_without_workdir() {
+        let path = PathBuf::from("test.txt");
+        assert_eq!(absolute_path(&path, None), path);
     }
 }
