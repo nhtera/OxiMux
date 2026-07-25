@@ -8,7 +8,7 @@ import {
   useAudioRecorderState,
   type RecordingOptions,
 } from 'expo-audio';
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { toBase64 } from './base64';
 import { useClient } from './client';
@@ -38,6 +38,14 @@ const SAMPLE_RATE = 16_000;
 /** The hard cap the desktop also enforces (`MAX_RECORDING_SECS`). Kept in sync so
  * the phone stops before the host would reject an oversized clip. */
 const MAX_RECORDING_MS = 120_000;
+
+/** How many level samples the waveform keeps. Enough to fill the bar's width on a
+ * phone, so the oldest scroll off the left edge rather than the trace resetting. */
+export const WAVEFORM_SAMPLES = 44;
+
+/** How often a sample is pushed onto the waveform. Decoupled from the recorder's
+ * own poll so the trace advances at a steady rate even if metering repeats. */
+const WAVEFORM_INTERVAL_MS = 90;
 
 /** 16 kHz mono PCM16 WAV: the exact shape the desktop engine decodes without a
  * resample or a container parse. iOS writes true linear PCM; Android's recorder
@@ -72,9 +80,20 @@ const RECORDING_OPTIONS: RecordingOptions = {
  * doing nothing. */
 export type DictationPhase = 'idle' | 'recording' | 'transcribing' | 'denied';
 
+/**
+ * What the user asked for when they ended the recording.
+ *
+ * Two endings rather than one because dictating is where the two intents diverge
+ * most: `insert` drops the transcript in the box to be read and fixed first,
+ * `send` is the hands-free case where the whole point was not to touch the box.
+ */
+export type DictationIntent = 'insert' | 'send';
+
 type Options = {
   /** Called with a non-empty transcript to insert into the composer. */
   onText: (text: string) => void;
+  /** Called with a non-empty transcript that should be sent as a prompt. */
+  onSubmit: (text: string) => void;
   /** Surfaced alongside the composer's other action failures. */
   onError: (message: string) => void;
 };
@@ -100,16 +119,45 @@ async function readClipBase64(uri: string): Promise<string> {
   return toBase64(new Uint8Array(buffer));
 }
 
-export function useDictation({ onText, onError }: Options) {
+export function useDictation({ onText, onSubmit, onError }: Options) {
   const client = useClient((s) => s.client);
   const recorder = useAudioRecorder(RECORDING_OPTIONS);
   // Poll often enough that the level meter reads as live, not stepped.
   const recorderState = useAudioRecorderState(recorder, 100);
   const [phase, setPhase] = useState<DictationPhase>('idle');
+  const [levels, setLevels] = useState<number[]>([]);
+  // Set by `cancel`, read where the transcript would be handed over. Transcription
+  // is a round trip to the desktop, so a cancel routinely lands while one is in
+  // flight; without this the discarded clip would still arrive in the composer.
+  const discarded = useRef(false);
+  // The composer passes fresh closures every render (they read its current text
+  // and attachments), so holding them in a ref is what keeps `start`/`stop` stable
+  // enough to be safe effect dependencies — see the cap timer below.
+  const handlers = useRef({ onText, onSubmit, onError });
+  useEffect(() => {
+    handlers.current = { onText, onSubmit, onError };
+  });
 
   // Dictation needs the desktop to decode, so the button only exists while
   // connected — a disconnected phone hides it rather than offering a dead action.
   const available = !!client;
+
+  const level = phase === 'recording' ? meteringToLevel(recorderState.metering) : 0;
+  const latestLevel = useRef(level);
+  useEffect(() => {
+    latestLevel.current = level;
+  }, [level]);
+
+  // The waveform samples on its own clock rather than on the recorder's poll: a
+  // steady cadence is what makes the trace *travel*, and a repeated metering
+  // reading (silence, a held vowel) would otherwise stall it mid-word.
+  useEffect(() => {
+    if (phase !== 'recording') return;
+    const id = setInterval(() => {
+      setLevels((prev) => [...prev, latestLevel.current].slice(-WAVEFORM_SAMPLES));
+    }, WAVEFORM_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [phase]);
 
   const start = useCallback(async () => {
     if (!client || phase === 'recording' || phase === 'transcribing') return;
@@ -120,55 +168,70 @@ export function useDictation({ onText, onError }: Options) {
       }
       if (!permission.granted) {
         setPhase('denied');
-        onError('Microphone access is off — enable it in Settings to dictate.');
+        handlers.current.onError('Microphone access is off — enable it in Settings to dictate.');
         return;
       }
       await setAudioModeAsync({ allowsRecording: true, playsInSilentMode: true });
       await recorder.prepareToRecordAsync(RECORDING_OPTIONS);
       recorder.record();
+      discarded.current = false;
+      setLevels([]);
       setPhase('recording');
     } catch (e) {
       setPhase('idle');
-      onError(describeError(e));
+      handlers.current.onError(describeError(e));
     }
-  }, [client, phase, recorder, onError]);
+  }, [client, phase, recorder]);
 
-  const stop = useCallback(async () => {
-    if (phase !== 'recording') return;
-    setPhase('transcribing');
-    try {
-      await recorder.stop();
-      const uri = recorder.uri;
-      if (!uri) throw new Error('No recording was captured.');
-      const audioBase64 = await readClipBase64(uri);
-      const text = await client!.transcribeAudio(audioBase64, SAMPLE_RATE);
-      // An empty transcript is a silent clip — insert nothing rather than a blank.
-      if (text.trim().length > 0) onText(text);
-    } catch (e) {
-      onError(describeError(e));
-    } finally {
-      setPhase('idle');
-    }
-  }, [phase, recorder, client, onText, onError]);
+  const stop = useCallback(
+    async (intent: DictationIntent = 'insert') => {
+      if (phase !== 'recording') return;
+      setPhase('transcribing');
+      try {
+        await recorder.stop();
+        const uri = recorder.uri;
+        if (!uri) throw new Error('No recording was captured.');
+        const audioBase64 = await readClipBase64(uri);
+        const text = await client!.transcribeAudio(audioBase64, SAMPLE_RATE);
+        if (discarded.current) return;
+        // An empty transcript is a silent clip — do nothing rather than insert a
+        // blank or send an empty prompt.
+        if (text.trim().length === 0) return;
+        if (intent === 'send') handlers.current.onSubmit(text);
+        else handlers.current.onText(text);
+      } catch (e) {
+        if (!discarded.current) handlers.current.onError(describeError(e));
+      } finally {
+        setPhase('idle');
+      }
+    },
+    [phase, recorder, client]
+  );
 
   const cancel = useCallback(async () => {
+    // Flagged before anything is awaited so an in-flight transcription sees it.
+    discarded.current = true;
     if (phase === 'recording') {
       try {
         await recorder.stop();
       } catch {
         // Discarding — a failed stop on a cancel is not worth surfacing.
       }
+      setPhase('idle');
     }
-    setPhase('idle');
+    // While transcribing the flag is the whole cancel: the round trip cannot be
+    // recalled, so it runs to completion and its result is dropped. `stop`'s
+    // `finally` returns the phase to idle.
   }, [phase, recorder]);
 
-  // Auto-stop at the cap so a forgotten recording does not run past what the
-  // host will accept; the button also shows the elapsed time approaching it.
-  if (phase === 'recording' && recorderState.durationMillis >= MAX_RECORDING_MS) {
-    void stop();
-  }
+  // Auto-stop at the cap so a forgotten recording does not run past what the host
+  // will accept. It ends as an insert, never a send: nobody asked for the prompt
+  // to go out, and the clip is long enough that reading it back first matters.
+  useEffect(() => {
+    if (phase !== 'recording') return;
+    const id = setTimeout(() => void stop('insert'), MAX_RECORDING_MS);
+    return () => clearTimeout(id);
+  }, [phase, stop]);
 
-  const level = phase === 'recording' ? meteringToLevel(recorderState.metering) : 0;
-
-  return { phase, level, available, start, stop, cancel };
+  return { phase, level, levels, available, start, stop, cancel };
 }

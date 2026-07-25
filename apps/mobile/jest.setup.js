@@ -104,6 +104,10 @@ jest.mock('react-native-reanimated', () => {
       return v;
     },
     withRepeat: (v) => v,
+    // A no-op, but it must exist: every `withRepeat(-1)` in the app cancels on
+    // unmount, so without this any component with a looping animation throws
+    // during teardown rather than in the assertion the test is about.
+    cancelAnimation: () => {},
     runOnJS:
       (fn) =>
       (...args) =>
@@ -127,9 +131,13 @@ jest.mock('react-native-reanimated', () => {
 });
 
 jest.mock('@/native/use-dictation', () => ({
+  // Mirrors the real module's sample budget so a bar rendered under test pads to
+  // the same width it does on device.
+  WAVEFORM_SAMPLES: 44,
   useDictation: () => ({
     phase: 'idle',
     level: 0,
+    levels: [],
     available: false,
     start: jest.fn(),
     stop: jest.fn(),

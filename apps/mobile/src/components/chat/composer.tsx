@@ -3,6 +3,7 @@ import { useRef, useState } from 'react';
 import { Pressable, StyleSheet, TextInput, View } from 'react-native';
 
 import { AttachmentStrip } from '@/components/chat/attachment-strip';
+import { DictationBar } from '@/components/chat/dictation-bar';
 import { MicButton } from '@/components/chat/mic-button';
 import { filterCommands, SlashPalette, slashQuery } from '@/components/chat/slash-palette';
 import { ControlHeight, IconHitSlop } from '@/components/ui/control-geometry';
@@ -54,6 +55,9 @@ type Props = {
  * as (model, mode), then the two ways to finish — dictate and send. Everything in
  * it is a glyph on the same circular step, so the eye lands on the one filled
  * button and the rest recede.
+ *
+ * Dictating replaces the dock's contents outright — see [`DictationBar`]. Nothing
+ * in the row can be used while the microphone is open, so the row goes away.
  *
  * While a turn is in flight the primary action becomes **Steer** rather than
  * Send: typing mid-turn almost always means "also do this", and sending would
@@ -122,42 +126,82 @@ export function Composer({
     }
   };
 
-  // A dictated transcript is inserted like typed text — it never auto-sends, so a
-  // misheard word can be fixed before the prompt goes out. A separator is added
-  // only when the box already has text not ending in whitespace, so back-to-back
-  // dictations read as separate words rather than running together.
-  const insertDictated = (dictated: string) => {
-    setText((current) => {
-      const needsSpace = current.length > 0 && !/\s$/.test(current);
-      return `${current}${needsSpace ? ' ' : ''}${dictated}`;
-    });
-  };
-  const dictation = useDictation({ onText: insertDictated, onError });
+  /**
+   * A transcript always joins what is already in the box rather than replacing
+   * it, so "type a bit, dictate the rest" works and back-to-back dictations do
+   * not run together. The separator is added only when the tail is not already
+   * whitespace.
+   */
+  const joinDictated = (current: string, dictated: string) =>
+    `${current}${current.length > 0 && !/\s$/.test(current) ? ' ' : ''}${dictated}`;
 
-  const submit = async () => {
-    if (!canSubmit) return;
+  /**
+   * The one way a prompt leaves the composer, whether it was typed or spoken.
+   *
+   * Takes what to send explicitly rather than reading state, because a dictated
+   * send has to carry a transcript that has not been committed to the box yet —
+   * routing it through `setText` first would mean sending a render behind.
+   */
+  const dispatch = async (body: string, queued: Attachment[]) => {
+    const outgoing = body.trim();
+    if (busy || (outgoing.length === 0 && queued.length === 0)) return;
     impact();
     setBusy(true);
     // Clear optimistically: the desktop echoes the prompt back as a real entry,
     // so leaving it in the box would read as "not sent" once it appears above.
-    const queued = attachments;
     setText('');
     setAttachments([]);
     try {
-      const sent = await (steering ? onSteer(trimmed) : onSend(trimmed, queued));
+      // Attachments force a real send: steering carries text only on the wire, so
+      // a turn running with images queued still sends rather than dropping them.
+      const sent = await (turnActive && queued.length === 0
+        ? onSteer(outgoing)
+        : onSend(outgoing, queued));
       // ...but put it back if it never landed. On a phone the link drops
       // routinely, and silently eating a typed prompt is worse than the error
       // alone: the user would have to retype it with nothing to copy from.
       // The images come back for the same reason — re-picking them from the
       // library is a longer detour than retyping a sentence.
       if (!sent) {
-        setText((current) => (current.length > 0 ? current : trimmed));
+        setText((current) => (current.length > 0 ? current : outgoing));
         setAttachments((current) => (current.length > 0 ? current : queued));
       }
     } finally {
       setBusy(false);
     }
   };
+
+  const dictation = useDictation({
+    onText: (dictated) => setText((current) => joinDictated(current, dictated)),
+    // Dictating and then choosing Send goes out through the same path as a typed
+    // prompt — including whatever was already typed and attached, which is the
+    // only reading of "send" that does not silently drop work.
+    onSubmit: (dictated) => void dispatch(joinDictated(text, dictated), attachments),
+    onError,
+  });
+
+  const submit = () => void dispatch(text, attachments);
+
+  const phase = dictation.phase;
+
+  // The dock keeps its shape and swaps its contents, so starting dictation reads
+  // as the composer changing mode rather than as one control being replaced by a
+  // different bar that happens to sit in the same place.
+  if (phase === 'recording' || phase === 'transcribing') {
+    return (
+      <View style={styles.bar}>
+        <View style={[styles.dock, { backgroundColor: theme.surface1, borderColor: theme.border }]}>
+          <DictationBar
+            phase={phase}
+            levels={dictation.levels}
+            onCancel={() => void dictation.cancel()}
+            onStop={() => void dictation.stop('insert')}
+            onSend={() => void dictation.stop('send')}
+          />
+        </View>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.bar}>
@@ -215,10 +259,8 @@ export function Composer({
               transcribes, so a disconnected phone has nothing to offer here. */}
           {dictation.available ? (
             <MicButton
-              phase={dictation.phase}
-              level={dictation.level}
-              onStart={dictation.start}
-              onStop={dictation.stop}
+              denied={dictation.phase === 'denied'}
+              onStart={() => void dictation.start()}
             />
           ) : null}
 
