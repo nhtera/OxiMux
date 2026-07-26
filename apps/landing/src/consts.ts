@@ -14,7 +14,28 @@ export const SITE = {
     "Open-source, Rust-native development cockpit for macOS. Spawn isolated git worktrees, run coding agents in parallel, and review every change through a full Git UX.",
   license: "Apache-2.0",
   platform: "macOS 13.0+",
+  /**
+   * Resolves to the newest published GitHub release. This 404s until a release
+   * is actually tagged, so tag one before the site goes public.
+   */
+  download: "https://github.com/nhtera/OxiMux/releases/latest",
 } as const;
+
+/**
+ * Agent marks shown in the hero support strip. `icon` is an astro-icon local
+ * name resolving to src/icons/, which holds the desktop app's own monochrome
+ * glyphs so the web and the cockpit show the same mark for the same agent.
+ *
+ * Deliberately no "+N more" count: unlike the tools that advertise one, the
+ * honest statement here is the open-ended ACP line, not an invented number.
+ */
+export const AGENT_MARKS = [
+  { name: "Claude Code", icon: "claude-code" },
+  { name: "Codex", icon: "codex" },
+  { name: "Pi", icon: "pi" },
+  { name: "OpenCode", icon: "opencode" },
+  { name: "Copilot", icon: "copilot" },
+] as const;
 
 /**
  * Agents OxiMux can drive today. Sourced from the README capability list and

@@ -1,7 +1,7 @@
 ---
 import { Icon } from "astro-icon/components";
 import ShotFrame from "../shot-frame.astro";
-import { SITE } from "../../consts";
+import { SITE, AGENT_MARKS } from "../../consts";
 import cockpit from "../../assets/shots/cockpit.png";
 ---
 
@@ -49,18 +49,69 @@ import cockpit from "../../assets/shots/cockpit.png";
 
       <div class="mt-8 flex flex-wrap items-center gap-3">
         <a
-          href={SITE.repo}
+          href={SITE.download}
           class="press inline-flex items-center gap-2 rounded-[--radius-control] bg-fg px-5 py-3 text-sm font-medium whitespace-nowrap text-canvas hover:bg-white"
         >
-          <Icon name="simple-icons:github" class="size-4" aria-hidden="true" />
-          View on GitHub
+          <Icon name="simple-icons:apple" class="size-4" aria-hidden="true" />
+          Download for Mac
         </a>
-        <a
-          href="#build"
-          class="press inline-flex items-center gap-2 rounded-[--radius-control] border border-edge bg-panel px-5 py-3 text-sm whitespace-nowrap text-fg hover:border-edge-strong hover:bg-panel-alt"
+
+        <!--
+          iOS is a real client but is not distributed yet, so this is a state
+          chip rather than a link. A disabled anchor would still look clickable
+          and would land the reader nowhere; a span with the status spelled out
+          cannot mislead.
+        -->
+        <span
+          class="inline-flex items-center gap-2 rounded-[--radius-control] border border-edge px-4 py-3 text-sm whitespace-nowrap text-fg-muted"
         >
-          Build from source
+          <Icon name="ph:device-mobile" class="size-4" aria-hidden="true" />
+          iOS
+          <span
+            class="rounded-[--radius-chip] bg-panel-alt px-1.5 py-0.5 text-[11px] tracking-wide text-fg-subtle"
+          >
+            Soon
+          </span>
+        </span>
+
+        <a
+          href={SITE.repo}
+          aria-label="View OxiMux on GitHub"
+          class="press inline-flex items-center justify-center rounded-[--radius-control] border border-edge bg-panel p-3 text-fg hover:border-edge-strong hover:bg-panel-alt"
+        >
+          <Icon name="simple-icons:github" class="size-4" aria-hidden="true" />
         </a>
+      </div>
+
+      <a
+        href="#build"
+        class="press mt-4 inline-block text-sm text-fg-subtle underline-offset-4 hover:text-fg-muted hover:underline"
+      >
+        Build from source
+      </a>
+
+      <!--
+        Compatibility strip, not a trust badge: naming the agents is how a
+        reader confirms in two seconds that this drives the CLI they already
+        pay for. Marks are the desktop app's own monochrome glyphs.
+      -->
+      <div class="mt-10 flex flex-wrap items-center gap-x-4 gap-y-3">
+        <span class="text-sm text-fg-subtle">Supports</span>
+        <ul class="flex flex-wrap items-center gap-4">
+          {
+            AGENT_MARKS.map((agent) => (
+              <li class="flex items-center" title={agent.name}>
+                <Icon
+                  name={agent.icon}
+                  class="size-5 text-fg-muted transition-colors duration-200 hover:text-fg motion-reduce:transition-none"
+                  aria-hidden="true"
+                />
+                <span class="sr-only">{agent.name}</span>
+              </li>
+            ))
+          }
+        </ul>
+        <span class="text-sm text-fg-subtle">and any ACP agent</span>
       </div>
     </div>
 
