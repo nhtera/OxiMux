@@ -21,6 +21,19 @@ export function dataUri(image: ChatImage): string {
 }
 
 /**
+ * Whether an image arrived without its pixels.
+ *
+ * The desktop drops the payload from older attachments when a transcript would
+ * otherwise be too large to send in one piece, keeping the entry and its media
+ * type so this end can say an image was there. Rendering the empty data URI
+ * instead produces a blank tile, which reads as a bug in the app rather than as
+ * history that was too big to carry.
+ */
+export function isElided(image: ChatImage): boolean {
+  return image.data.length === 0;
+}
+
+/**
  * A full-screen viewer for one tool-returned image. Pinch to zoom, drag to pan
  * while zoomed, double-tap to toggle fit↔2×; the backdrop and close button both
  * dismiss. Rendered in a `Modal` so it floats above the transcript's own

@@ -15,6 +15,13 @@ pub enum SessionError {
     /// The host closed the connection (a clean `None` on receive).
     #[error("host closed the connection")]
     Closed,
+    /// The host's reply was too large for one frame, so it could not be
+    /// assembled. Distinct from [`Self::Transport`] because the connection
+    /// survives it — only this one call failed — and distinct from
+    /// [`Self::Closed`], which is what this used to surface as, sending everyone
+    /// hunting for a dropped link that never happened.
+    #[error("the reply was {len} bytes, over the {cap}-byte limit for one message")]
+    OversizeReply { len: usize, cap: usize },
     /// The host reported a protocol-level failure.
     #[error("host reported: {0:?}")]
     Rpc(RpcError),

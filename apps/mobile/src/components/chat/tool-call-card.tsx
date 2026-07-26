@@ -1,9 +1,9 @@
 import { useState } from 'react';
-import { Image } from 'expo-image';
 import { ChevronDown, ChevronRight, TriangleAlert } from 'lucide-react-native';
 import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
 
-import { ImageLightbox, dataUri } from '@/components/chat/image-lightbox';
+import { AttachmentThumb } from '@/components/chat/attachment-thumb';
+import { ImageLightbox } from '@/components/chat/image-lightbox';
 import { SubagentLogPanel } from '@/components/chat/subagent-log-panel';
 import { ThinkingShimmer } from '@/components/chat/thinking-shimmer';
 import { toolIcon } from '@/components/chat/tool-icon';
@@ -118,18 +118,13 @@ export function ToolCallCard({ call, children }: { call: ToolCall; children?: Re
           {call.images.length > 0 ? (
             <View style={styles.thumbs}>
               {call.images.map((image, i) => (
-                <Pressable
+                <AttachmentThumb
                   key={i}
+                  image={image}
+                  style={styles.thumb}
+                  label="View returned image"
                   onPress={() => setZoom(image)}
-                  accessibilityRole="imagebutton"
-                  accessibilityLabel="View returned image"
-                >
-                  <Image
-                    source={{ uri: dataUri(image) }}
-                    style={[styles.thumb, { backgroundColor: theme.surface2 }]}
-                    contentFit="cover"
-                  />
-                </Pressable>
+                />
               ))}
             </View>
           ) : null}

@@ -44,6 +44,16 @@ pub enum TransportError {
     /// An underlying I/O failure (stringified: impls span different error types).
     #[error("transport io error: {0}")]
     Io(String),
+    /// The peer announced a frame larger than this transport will assemble.
+    ///
+    /// **Recoverable, unlike the variants above.** The frame's length prefix says
+    /// exactly how many bytes to discard, so the transport resynchronizes by
+    /// dropping them and the stream stays usable — a caller must report this
+    /// against the one call it belongs to and keep reading. Treating it as fatal
+    /// costs the whole connection over a single reply, which for a multiplexed
+    /// transport also takes down every unrelated subscription riding it.
+    #[error("the peer sent a {len}-byte frame, over the {cap}-byte limit")]
+    FrameTooLarge { len: usize, cap: usize },
 }
 
 #[cfg(test)]

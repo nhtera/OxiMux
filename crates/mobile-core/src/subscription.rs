@@ -261,7 +261,21 @@ impl MobileClient {
                 let sub = SessionSubscription::rehydrated(session_id.clone(), entries, t.model, t.seq);
                 (sub, t.seq)
             }
-            Err(_) => (SessionSubscription::new(session_id.clone()), 0),
+            Err(err) => {
+                // Opening on the live stream alone is right — a session that
+                // refuses to open is worse than one missing its history — but an
+                // empty transcript is indistinguishable from a session that never
+                // had one, and it used to arrive alongside a connection error that
+                // at least hinted why. Now that a failed fetch no longer takes the
+                // connection down, nothing else would say anything, so the reason
+                // goes in the transcript: the same divider the importer uses when
+                // it caps a long history. This crate ships to the phone and carries
+                // no logger, so this is also the only surface it has.
+                let notice = ThreadEntry::ContextCompaction {
+                    summary: format!("Earlier messages could not be loaded \u{2014} {err}"),
+                };
+                (SessionSubscription::rehydrated(session_id.clone(), vec![notice], None, 0), 0)
+            }
         };
         let backlog = session
             .subscribe(&session_id, after)

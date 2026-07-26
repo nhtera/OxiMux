@@ -1,8 +1,8 @@
-import { Image } from 'expo-image';
 import { useState } from 'react';
 import { Pressable, StyleSheet, View } from 'react-native';
 
-import { ImageLightbox, dataUri } from '@/components/chat/image-lightbox';
+import { AttachmentThumb } from '@/components/chat/attachment-thumb';
+import { ImageLightbox } from '@/components/chat/image-lightbox';
 import { MarkdownBody } from '@/components/chat/markdown-body';
 import { MessageActions } from '@/components/chat/message-actions';
 import { ThemedText } from '@/components/themed-text';
@@ -23,18 +23,13 @@ export function UserBubble({ text, images }: { text: string; images: ChatImage[]
         {images.length > 0 ? (
           <View style={styles.thumbs}>
             {images.map((image, i) => (
-              <Pressable
+              <AttachmentThumb
                 key={i}
+                image={image}
+                style={styles.thumb}
+                label="View attached image"
                 onPress={() => setZoom(image)}
-                accessibilityRole="imagebutton"
-                accessibilityLabel="View attached image"
-              >
-                <Image
-                  source={{ uri: dataUri(image) }}
-                  style={[styles.thumb, { backgroundColor: theme.surface2 }]}
-                  contentFit="cover"
-                />
-              </Pressable>
+              />
             ))}
           </View>
         ) : null}

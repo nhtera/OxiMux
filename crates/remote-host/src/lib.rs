@@ -21,6 +21,7 @@ pub mod projects;
 pub mod rewind;
 pub mod terminals;
 pub mod transcribe;
+pub mod transcript_budget;
 
 pub use auth::{
     AppPubkey, AuthStore, DeviceInfo, DeviceStore, PairedDevice, PairingEvent, PairingSlot,

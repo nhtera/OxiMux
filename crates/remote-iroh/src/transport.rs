@@ -30,6 +30,11 @@ struct RecvHalf {
     stream: RecvStream,
     /// Bytes read off the wire but not yet returned as a complete frame.
     carry: Vec<u8>,
+    /// Bytes still owed to an oversize frame being discarded. Non-zero only
+    /// between reporting [`TransportError::FrameTooLarge`] and finishing the
+    /// resync; every byte read while it is set is dropped, never buffered, so
+    /// skipping a huge frame costs no more memory than skipping a small one.
+    skip: usize,
 }
 
 /// A framed [`Transport`] over one iroh bi-stream. Cloneable-shareable as
@@ -49,21 +54,42 @@ impl IrohTransport {
     pub fn new(conn: Connection, send: SendStream, recv: RecvStream) -> Self {
         Self {
             send: Mutex::new(send),
-            recv: Mutex::new(RecvHalf { stream: recv, carry: Vec::new() }),
+            recv: Mutex::new(RecvHalf { stream: recv, carry: Vec::new(), skip: 0 }),
             _conn: conn,
         }
     }
 }
 
+/// Discard up to `skip` buffered bytes, returning whether the skip finished.
+fn advance_skip(carry: &mut Vec<u8>, skip: &mut usize) -> bool {
+    let n = (*skip).min(carry.len());
+    carry.drain(..n);
+    *skip -= n;
+    *skip == 0
+}
+
 /// Pull one whole frame out of `carry` if a full `[len][body]` is buffered,
 /// draining it; `Ok(None)` if more bytes are still needed.
-fn take_frame(carry: &mut Vec<u8>) -> Result<Option<Vec<u8>>, TransportError> {
+///
+/// An over-cap length prefix is **resynchronized rather than fatal**: the prefix
+/// says exactly how far the frame runs, so its bytes are marked for discard and
+/// the error names the size. Once they have all been dropped the stream is back
+/// on a frame boundary and later frames parse normally. Refusing to advance here
+/// instead — the obvious reading of "reject the frame" — leaves the stream parked
+/// on bytes that can never form a frame, which is a stall dressed up as a check.
+fn take_frame(carry: &mut Vec<u8>, skip: &mut usize) -> Result<Option<Vec<u8>>, TransportError> {
+    if *skip > 0 && !advance_skip(carry, skip) {
+        return Ok(None);
+    }
     if carry.len() < 4 {
         return Ok(None);
     }
     let len = u32::from_be_bytes([carry[0], carry[1], carry[2], carry[3]]) as usize;
     if len > MAX_FRAME {
-        return Err(TransportError::Io(format!("frame length {len} exceeds cap {MAX_FRAME}")));
+        carry.drain(..4);
+        *skip = len;
+        advance_skip(carry, skip);
+        return Err(TransportError::FrameTooLarge { len, cap: MAX_FRAME });
     }
     if carry.len() < 4 + len {
         return Ok(None);
@@ -89,7 +115,8 @@ impl Transport for IrohTransport {
         loop {
             // Fast path: a whole frame is already buffered — no await, so a drop
             // on this path cannot lose anything.
-            if let Some(frame) = take_frame(&mut half.carry)? {
+            let RecvHalf { carry, skip, .. } = &mut *half;
+            if let Some(frame) = take_frame(carry, skip)? {
                 return Ok(Some(frame));
             }
             // Need more bytes. The stream read is the ONLY await; bytes land in the
@@ -145,6 +172,17 @@ mod tests {
         v
     }
 
+    /// `take_frame` against a fresh skip counter, for the cases that never
+    /// resynchronize (skip stays 0 throughout).
+    fn take(carry: &mut Vec<u8>) -> Result<Option<Vec<u8>>, TransportError> {
+        take_frame(carry, &mut 0)
+    }
+
+    /// A header for a frame of `len` bytes whose body never follows.
+    fn header(len: usize) -> Vec<u8> {
+        (len as u32).to_be_bytes().to_vec()
+    }
+
     /// The carry-reassembly core `recv` relies on: fewer than a whole frame's bytes
     /// yields nothing and leaves the carry untouched, so the next read completes it.
     /// This is the deterministic half of the cancel-safety property (the live
@@ -156,12 +194,12 @@ mod tests {
         let mut carry: Vec<u8> = full[..6].to_vec(); // len prefix + 2 body bytes
 
         // Header known but body short → nothing yet, and the bytes are kept.
-        assert_eq!(take_frame(&mut carry).unwrap(), None);
+        assert_eq!(take(&mut carry).unwrap(), None);
         assert_eq!(carry.len(), 6, "the partial frame stays staged");
 
         // The rest arrives → the whole frame comes out, carry drained.
         carry.extend_from_slice(&full[6..]);
-        assert_eq!(take_frame(&mut carry).unwrap(), Some(b"hello".to_vec()));
+        assert_eq!(take(&mut carry).unwrap(), Some(b"hello".to_vec()));
         assert!(carry.is_empty());
     }
 
@@ -172,24 +210,73 @@ mod tests {
         let mut carry = framed(b"ab");
         carry.extend_from_slice(&framed(b"cde"));
 
-        assert_eq!(take_frame(&mut carry).unwrap(), Some(b"ab".to_vec()));
-        assert_eq!(take_frame(&mut carry).unwrap(), Some(b"cde".to_vec()));
-        assert_eq!(take_frame(&mut carry).unwrap(), None);
+        assert_eq!(take(&mut carry).unwrap(), Some(b"ab".to_vec()));
+        assert_eq!(take(&mut carry).unwrap(), Some(b"cde".to_vec()));
+        assert_eq!(take(&mut carry).unwrap(), None);
     }
 
     /// Fewer than the 4 header bytes can't even name a length → buffer and wait.
     #[test]
     fn a_truncated_header_waits_for_more() {
         let mut carry = vec![0u8, 0, 0]; // 3 of the 4 length bytes
-        assert_eq!(take_frame(&mut carry).unwrap(), None);
+        assert_eq!(take(&mut carry).unwrap(), None);
         assert_eq!(carry.len(), 3);
     }
 
     /// A hostile/corrupt length prefix above the cap is rejected rather than driving
-    /// an unbounded allocation.
+    /// an unbounded allocation, and names both sizes so the report is actionable.
     #[test]
     fn an_oversize_length_prefix_is_rejected() {
-        let mut carry = ((MAX_FRAME + 1) as u32).to_be_bytes().to_vec();
-        assert!(matches!(take_frame(&mut carry), Err(TransportError::Io(_))));
+        let mut carry = header(MAX_FRAME + 1);
+        let mut skip = 0;
+        assert!(matches!(
+            take_frame(&mut carry, &mut skip),
+            Err(TransportError::FrameTooLarge { len, cap })
+                if len == MAX_FRAME + 1 && cap == MAX_FRAME
+        ));
+    }
+
+    /// The bug this guards: one over-cap reply used to end the connection, taking
+    /// every unrelated subscription on the multiplexed transport with it. The
+    /// oversize frame's bytes are discarded instead, and the frame behind it —
+    /// which may be a live event for a different session — still parses.
+    #[test]
+    fn the_stream_resynchronizes_after_an_oversize_frame() {
+        let body = [0xABu8; 32];
+        let mut carry = header(MAX_FRAME + 1);
+        carry.extend_from_slice(&body[..10]); // first bytes of the doomed frame
+        let mut skip = 0;
+
+        assert!(take_frame(&mut carry, &mut skip).is_err(), "reported once");
+        assert!(carry.is_empty(), "the buffered part of it was dropped, not retained");
+        assert_eq!(skip, MAX_FRAME + 1 - 10, "the rest is still owed");
+
+        // The remainder of the oversize frame trickles in and is swallowed whole.
+        let mut remaining = skip;
+        while remaining > 0 {
+            let n = remaining.min(8192);
+            carry.extend(std::iter::repeat_n(0xABu8, n));
+            remaining -= n;
+            assert_eq!(take_frame(&mut carry, &mut skip).unwrap(), None, "still skipping");
+        }
+        assert_eq!(skip, 0, "resynchronized");
+
+        // Back on a frame boundary: the next frame parses normally.
+        carry.extend_from_slice(&framed(b"next"));
+        assert_eq!(take_frame(&mut carry, &mut skip).unwrap(), Some(b"next".to_vec()));
+    }
+
+    /// An oversize frame that arrives fully buffered alongside the next one must
+    /// not eat into its neighbour — the skip is exactly the declared length.
+    #[test]
+    fn resynchronizing_consumes_only_the_oversize_frame() {
+        // A cap-sized skip is impractical to buffer in a test, so drive the same
+        // arithmetic through `advance_skip`, which is what bounds the discard.
+        let mut carry = vec![0u8; 10];
+        carry.extend_from_slice(&framed(b"kept"));
+        let mut skip = 10;
+
+        assert!(advance_skip(&mut carry, &mut skip), "the skip completes");
+        assert_eq!(take_frame(&mut carry, &mut skip).unwrap(), Some(b"kept".to_vec()));
     }
 }

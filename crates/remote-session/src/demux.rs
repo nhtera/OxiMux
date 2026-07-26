@@ -17,6 +17,7 @@ use futures::future::{Either, select};
 use futures::lock::Mutex as AsyncMutex;
 use oximux_remote_proto::messages::SessionSummary;
 use oximux_remote_proto::proto::{Request, Response};
+use oximux_remote_proto::transport::TransportError;
 use oximux_remote_proto::{HostEvent, Transport};
 
 use crate::error::SessionError;
@@ -60,7 +61,11 @@ pub type SessionsStream = mpsc::UnboundedReceiver<Vec<SessionSummary>>;
 /// `call` that registers *after* the pump already exited would otherwise orphan
 /// its sender forever, so it checks `alive` post-send and reclaims.
 struct Pending {
-    slot: Mutex<Option<oneshot::Sender<Response>>>,
+    /// Carries a `Result` rather than a bare `Response` so the pump can fail one
+    /// call without inventing a wire error for it — an oversize reply has no
+    /// `Response` representation, and there is no correlation id to attach a
+    /// separate error frame to.
+    slot: Mutex<Option<oneshot::Sender<Result<Response>>>>,
     alive: AtomicBool,
 }
 
@@ -135,7 +140,7 @@ impl Demux {
             self.pending.slot.lock().unwrap().take();
             return Err(SessionError::Closed);
         }
-        rx.await.map_err(|_| SessionError::Closed)
+        rx.await.map_err(|_| SessionError::Closed)?
     }
 }
 
@@ -157,6 +162,17 @@ impl DemuxPump {
             let frame = match select(self.transport.recv(), &mut self.shutdown).await {
                 Either::Left((Ok(Some(frame)), _)) => frame,
                 Either::Left((Ok(None), _)) => break, // host closed the connection
+                // The transport already resynchronized past the oversize frame, so
+                // the connection is still good: fail the call that was waiting on
+                // it and keep pumping. Ending the loop here instead would drop every
+                // live subscription over one reply, and would surface as `Closed` —
+                // a lost link, which is not what happened and not what to retry.
+                Either::Left((Err(TransportError::FrameTooLarge { len, cap }), _)) => {
+                    if let Some(tx) = self.pending.slot.lock().unwrap().take() {
+                        let _ = tx.send(Err(SessionError::OversizeReply { len, cap }));
+                    }
+                    continue;
+                }
                 Either::Left((Err(e), _)) => {
                     return Err(SessionError::Transport(e.to_string()));
                 }
@@ -191,7 +207,7 @@ impl DemuxPump {
                 }
                 reply => {
                     if let Some(tx) = self.pending.slot.lock().unwrap().take() {
-                        let _ = tx.send(reply);
+                        let _ = tx.send(Ok(reply));
                     }
                     // No pending slot for a non-event frame means the host sent an
                     // unsolicited reply — it never does; drop rather than desync.
@@ -236,6 +252,80 @@ mod tests {
         assert!(
             matches!(call_res, Err(SessionError::Closed)),
             "in-flight call reports Closed, got {call_res:?}"
+        );
+    }
+
+    /// A transport that answers the first request with an oversize frame and the
+    /// second normally. Models a host whose transcript reply was too large while
+    /// other traffic rides the same connection.
+    ///
+    /// `recv` blocks until a request has actually been sent, rather than handing
+    /// out a scripted sequence on demand: the pump is polled first, so a transport
+    /// that answers immediately would run the whole script before any caller had
+    /// registered a reply slot, and the test would prove nothing about routing.
+    struct OversizeThenHealthy {
+        requests: AsyncMutex<mpsc::UnboundedReceiver<()>>,
+        sent: mpsc::UnboundedSender<()>,
+        answered: Mutex<usize>,
+    }
+
+    impl OversizeThenHealthy {
+        fn new() -> Self {
+            let (sent, requests) = mpsc::unbounded();
+            Self { requests: AsyncMutex::new(requests), sent, answered: Mutex::new(0) }
+        }
+    }
+
+    #[async_trait]
+    impl Transport for OversizeThenHealthy {
+        async fn send(&self, _frame: Vec<u8>) -> std::result::Result<(), TransportError> {
+            let _ = self.sent.unbounded_send(());
+            Ok(())
+        }
+        async fn recv(&self) -> std::result::Result<Option<Vec<u8>>, TransportError> {
+            use futures::StreamExt as _;
+            // Wait for a request before answering one.
+            if self.requests.lock().await.next().await.is_none() {
+                return Ok(None);
+            }
+            let mut answered = self.answered.lock().unwrap();
+            *answered += 1;
+            match *answered {
+                1 => Err(TransportError::FrameTooLarge { len: 20_000_000, cap: 16_777_216 }),
+                _ => Ok(Some(Response::Pong.to_bytes().unwrap())),
+            }
+        }
+    }
+
+    /// The bug this guards: an over-cap reply used to end the pump, so a single
+    /// too-large transcript reported itself as a dropped link and took every live
+    /// subscription on the connection with it. The failure must land on the one
+    /// call that caused it, and the connection must keep serving.
+    #[test]
+    fn an_oversize_reply_fails_one_call_without_ending_the_connection() {
+        let (handle, pump, _events, _terminals, _sessions, _shutdown) =
+            demux(Arc::new(OversizeThenHealthy::new()));
+
+        let calls = async {
+            // The doomed call: named for what happened, not as a lost link.
+            let first = handle.call(Request::Ping).await;
+            assert!(
+                matches!(first, Err(SessionError::OversizeReply { len, cap })
+                    if len == 20_000_000 && cap == 16_777_216),
+                "the caller learns its reply was too large, got {first:?}",
+            );
+            // The connection survived: the very next RPC is answered.
+            let second = handle.call(Request::Ping).await;
+            assert_eq!(second.unwrap(), Response::Pong, "the connection still serves");
+        };
+
+        // `select`, not `join`: the pump only stops when its owner drops the
+        // shutdown sender, so waiting for it here would hang after the assertions
+        // have already been made.
+        let outcome = block_on(select(Box::pin(pump.run()), Box::pin(calls)));
+        assert!(
+            matches!(outcome, Either::Right(_)),
+            "the calls finished, meaning the pump never ended the connection",
         );
     }
 }

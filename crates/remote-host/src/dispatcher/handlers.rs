@@ -89,14 +89,29 @@ impl Dispatcher {
             return Response::Error(RpcError::UnknownSession);
         };
         let snap = handle.transcript_snapshot().unwrap_or_default();
+        let entries_json = if snap.entries_json.is_empty() {
+            "[]".to_string()
+        } else {
+            snap.entries_json
+        };
+        // Attachments accumulate for the life of a session, so this reply is the
+        // one whose size no other check bounds — the send-side guard passes each
+        // prompt on its own, and their sum lands here. Over the frame cap the
+        // client cannot assemble the reply at all, losing the whole history rather
+        // than the images that overflowed.
+        let (entries_json, stripped) =
+            crate::transcript_budget::fit_images(&entries_json, crate::transcript_budget::IMAGE_BUDGET);
+        if stripped > 0 {
+            tracing::debug!(
+                session_id,
+                stripped,
+                "dropped image data from older transcript entries to fit one frame"
+            );
+        }
         Response::SessionTranscript(SessionTranscriptWire {
             session_id: session_id.to_string(),
             seq: snap.seq,
-            entries_json: if snap.entries_json.is_empty() {
-                "[]".to_string()
-            } else {
-                snap.entries_json
-            },
+            entries_json,
             model: snap.model,
         })
     }

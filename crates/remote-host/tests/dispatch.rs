@@ -866,3 +866,68 @@ fn a_revoked_device_cannot_unpair_away_its_tombstone() {
 
     block_on(join(serve, script));
 }
+
+/// A transcript's attachments accumulate for the life of a session, and nothing
+/// else bounds this reply — the send-side guard clears each prompt on its own, and
+/// their sum lands here. Past the transport's frame cap the client cannot assemble
+/// the reply at all, so it loses the entire history rather than the images that
+/// overflowed. The oldest image data is dropped instead, newest kept.
+///
+/// End-to-end over the loopback because the trimming has to happen on the way out
+/// of the handler: the budget function is unit-tested on its own, which says
+/// nothing about whether `FetchTranscript` actually calls it.
+#[test]
+fn an_oversize_transcript_is_trimmed_to_fit_one_frame() {
+    use oximux_remote_host::transcript_budget::IMAGE_BUDGET;
+
+    let registry = Arc::new(SessionRegistry::new());
+    let session = registry.register("sess-1".into(), Arc::new(StubConnection::default()));
+
+    // Three images that together exceed the budget, oldest first.
+    let image = |n: usize| json!({ "media_type": "image/jpeg", "data": "A".repeat(n) });
+    let two_thirds = IMAGE_BUDGET * 2 / 3;
+    let entries = json!([
+        { "User": { "text": "oldest", "images": [image(two_thirds)] } },
+        { "User": { "text": "middle", "images": [image(two_thirds)] } },
+        { "User": { "text": "newest", "images": [image(two_thirds)] } },
+    ]);
+    session.publish_transcript(entries.to_string(), Some("claude-opus-5".into()));
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock);
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        let Response::SessionTranscript(t) =
+            call(&client, Request::FetchTranscript { session_id: "sess-1".into() }).await
+        else {
+            panic!("expected SessionTranscript");
+        };
+
+        let entries: serde_json::Value = serde_json::from_str(&t.entries_json).unwrap();
+        let data = |i: usize| entries[i]["User"]["images"][0]["data"].as_str().unwrap();
+
+        assert!(!data(2).is_empty(), "the newest image is the one a client is about to draw");
+        assert!(data(0).is_empty(), "the oldest lost its payload");
+        assert_eq!(entries.as_array().unwrap().len(), 3, "every message is still there");
+        assert_eq!(entries[0]["User"]["text"], "oldest", "including the text of a trimmed one");
+        assert_eq!(
+            entries[0]["User"]["images"][0]["media_type"], "image/jpeg",
+            "and its media type, so the client can say an image was here",
+        );
+        assert!(
+            t.entries_json.len() < IMAGE_BUDGET + two_thirds,
+            "the reply came down to something a frame can carry",
+        );
+        assert_eq!(t.model.as_deref(), Some("claude-opus-5"), "the rest of the reply is intact");
+    };
+    block_on(join(serve, script));
+}
