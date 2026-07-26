@@ -91,8 +91,9 @@ impl From<WireProject> for ProjectSummary {
 /// and a malformed attachment becomes impossible instead of a parse error.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ChatImage {
-    /// An image MIME type, e.g. `image/jpeg`. Passed through to the agent, which
-    /// decides what it accepts.
+    /// An image MIME type, e.g. `image/jpeg`. Checked against what an agent can
+    /// decode when the prompt is sent, so it must describe `data` — a camera
+    /// encoding like HEIC is refused rather than forwarded.
     pub media_type: String,
     /// The image bytes, base64. Note this inflates the payload by ~4/3, which is
     /// what the send-size ceiling is measured against.

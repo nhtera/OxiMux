@@ -4603,9 +4603,47 @@ impl AgentChatView {
         cx.notify();
     }
 
+    /// How many of an entry's attachments could not be decoded — drawn as
+    /// placeholder tiles so a picture that cannot be shown is visibly missing
+    /// rather than absent. Reads the same memo [`Self::decoded_images`] fills,
+    /// so it costs nothing beyond the decode already done.
+    fn undecodable_images(&self, idx: usize, images: &[ChatImage]) -> usize {
+        images.len() - self.decoded_images(idx, images).len()
+    }
+
+    /// A tile standing in for an attachment this build cannot draw (an encoding
+    /// with no decoder, or bytes that do not match their declared type). Sized
+    /// like a real thumbnail and deliberately not clickable — there is nothing
+    /// to open.
+    fn undecodable_tile(&self, entry_idx: usize, i: usize) -> AnyElement {
+        let theme = self.theme;
+        div()
+            .id(SharedString::from(format!("img-undecodable-{entry_idx}-{i}")))
+            .w(px(200.0))
+            .h(px(150.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(self.density.r_card))
+            .border_1()
+            .border_color(theme.border_inactive)
+            .bg(theme.bg_panel_alt)
+            .child(
+                div()
+                    .text_size(px(self.typography.t_body_sm))
+                    .text_color(theme.fg_subtle)
+                    .child("Image can't be displayed"),
+            )
+            .into_any_element()
+    }
+
     /// Decoded thumbnails for a user entry's attached images, memoized in
     /// [`Self::image_cache`] by the stable (entry, image) position so a streaming
-    /// repaint never re-decodes base64. Corrupt attachments are skipped.
+    /// repaint never re-decodes base64. Attachments that cannot be decoded are
+    /// skipped — this list is what the lightbox pager indexes into, so it must
+    /// hold only images that can actually be opened; the gap is drawn separately
+    /// by [`Self::undecodable_images`].
     fn decoded_images(&self, idx: usize, images: &[ChatImage]) -> Vec<Arc<Image>> {
         let mut cache = self.image_cache.borrow_mut();
         let mut out = Vec::with_capacity(images.len());
@@ -4632,8 +4670,9 @@ impl AgentChatView {
         let density = self.density;
         let typo = self.typography.clone();
         let decoded = self.decoded_images(idx, images);
+        let undecodable = self.undecodable_images(idx, images);
         let mut col = div().flex().flex_col().items_end().w_full().gap(px(6.0));
-        if !decoded.is_empty() {
+        if !decoded.is_empty() || undecodable > 0 {
             let mut thumbs = div()
                 .flex()
                 .flex_row()
@@ -4666,6 +4705,9 @@ impl AgentChatView {
                                 .object_fit(ObjectFit::Cover),
                         ),
                 );
+            }
+            for i in 0..undecodable {
+                thumbs = thumbs.child(self.undecodable_tile(idx, i));
             }
             col = col.child(thumbs);
         }

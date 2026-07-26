@@ -119,8 +119,14 @@ export function Composer({
 
   const attach = async () => {
     try {
-      const picked = await pickImages(room);
+      const { attachments: picked, skipped } = await pickImages(room);
       if (picked.length > 0) setAttachments((current) => [...current, ...picked]);
+      // A drop here means the image could not be decoded at all. Rare, but
+      // silence would read as "the pick worked" and the missing photo would only
+      // surface as a short attachment row the user has to notice themselves.
+      if (skipped > 0) {
+        onError(`Could not read ${skipped} of the selected image${skipped > 1 ? 's' : ''}.`);
+      }
     } catch (e) {
       onError(e instanceof Error ? e.message : 'Could not open the photo library.');
     }

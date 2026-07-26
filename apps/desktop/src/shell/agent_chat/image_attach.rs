@@ -83,10 +83,20 @@ pub fn is_image_path(path: &Path) -> bool {
 }
 
 /// Decode a persisted [`ChatImage`] into a renderable image (for transcript
-/// bubbles on restore). `None` if the base64 is corrupt.
+/// bubbles on restore). `None` if the base64 is corrupt, or if the bytes are an
+/// encoding we cannot draw — so the caller can say so instead of drawing nothing.
+///
+/// The format comes from the bytes, not from `media_type`: a sender can label a
+/// payload anything, and a wrong label used to end here as `ImageFormat::Png`,
+/// which decodes to nothing and paints an empty frame with no way to tell an
+/// unsupported image from a blank one. Some encodings are unsupported no matter
+/// how they are labelled — HEIC has no decoder in this stack — and those must
+/// reach the caller as `None` rather than as a silent gap.
 pub fn decode_render(chat: &ChatImage) -> Option<Arc<Image>> {
     let bytes = STANDARD.decode(&chat.data).ok()?;
-    let fmt = ImageFormat::from_mime_type(&chat.media_type).unwrap_or(ImageFormat::Png);
+    // `sniff` names only what this stack can draw, so the mime type is consulted
+    // second and purely to cover an encoding with no magic bytes to read (SVG).
+    let fmt = sniff(&bytes).or_else(|| ImageFormat::from_mime_type(&chat.media_type))?;
     Some(Arc::new(Image::from_bytes(fmt, bytes)))
 }
 
@@ -118,5 +128,40 @@ mod tests {
     #[test]
     fn garbage_bytes_do_not_panic() {
         assert!(pending_from_bytes(vec![0, 1, 2, 3], None).is_none());
+    }
+
+    /// A minimal HEIC header — enough for `ftyp`-based sniffing, which is all
+    /// that has to fail here.
+    fn heic_header() -> Vec<u8> {
+        let mut b = vec![0x00, 0x00, 0x00, 0x18];
+        b.extend_from_slice(b"ftypheic");
+        b.extend_from_slice(&[0u8; 16]);
+        b
+    }
+
+    /// The bug this guards: an iPhone photo arrived labelled `image/heic`, the
+    /// media type fell back to PNG, and the undecodable result painted an empty
+    /// frame that looked like a rendering bug rather than an unreadable image.
+    #[test]
+    fn heic_is_refused_rather_than_decoded_as_png() {
+        let chat = ChatImage {
+            media_type: "image/heic".into(),
+            data: STANDARD.encode(heic_header()),
+        };
+        assert!(decode_render(&chat).is_none());
+    }
+
+    /// The bytes decide the format, so a wrong label cannot produce a blank tile.
+    #[test]
+    fn a_mislabelled_png_still_renders() {
+        let chat =
+            ChatImage { media_type: "image/heic".into(), data: STANDARD.encode(red_png()) };
+        assert_eq!(decode_render(&chat).map(|i| i.format), Some(ImageFormat::Png));
+    }
+
+    #[test]
+    fn corrupt_base64_is_refused() {
+        let chat = ChatImage { media_type: "image/png".into(), data: "not base64!!".into() };
+        assert!(decode_render(&chat).is_none());
     }
 }

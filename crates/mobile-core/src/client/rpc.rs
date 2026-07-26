@@ -22,6 +22,31 @@ static CORR: AtomicU64 = AtomicU64::new(1);
 /// smaller, while guessing high is a dropped frame they cannot diagnose.
 const FRAME_HEADROOM: usize = 1024 * 1024;
 
+/// The image encodings an agent can actually read. Anything else is refused
+/// before it leaves the phone.
+const SUPPORTED_MEDIA_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+/// Refuse a prompt carrying an attachment no agent can decode.
+///
+/// The client re-encodes what the photo library hands back, so reaching this is
+/// already a bug — but the failure it prevents is expensive and silent: the host
+/// acks the prompt, the desktop paints an empty bubble, and the only symptom is
+/// the model saying it could not read an image, several seconds later and
+/// nowhere near the attachment that caused it. Refusing here keeps the error
+/// attached to the send that produced it.
+fn check_media_types(images: &[ChatImage]) -> Result<(), MobileError> {
+    for image in images {
+        let media_type = image.media_type.to_ascii_lowercase();
+        if !SUPPORTED_MEDIA_TYPES.contains(&media_type.as_str()) {
+            return Err(MobileError::Rpc(format!(
+                "cannot send a {} attachment \u{2014} images must be JPEG, PNG, GIF or WebP",
+                media_type,
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Refuse a prompt whose attachments cannot fit in one frame.
 ///
 /// The transport rejects an oversize frame as an IO error, which reaches the app
@@ -81,6 +106,7 @@ impl MobileClient {
         images: Vec<ChatImage>,
     ) -> Result<(), MobileError> {
         let session = self.shared.session()?;
+        check_media_types(&images)?;
         check_prompt_size(&text, &images)?;
         let images: Vec<oximux_agent_core::thread::ChatImage> =
             images.into_iter().map(Into::into).collect();
@@ -402,5 +428,47 @@ impl MobileClient {
             .transcribe_audio(&audio_base64, sample_rate)
             .await
             .map_err(|e| MobileError::Rpc(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(media_type: &str) -> ChatImage {
+        ChatImage { media_type: media_type.to_string(), data: "QUJD".into() }
+    }
+
+    #[test]
+    fn accepts_every_encoding_an_agent_can_read() {
+        for media_type in SUPPORTED_MEDIA_TYPES {
+            assert!(check_media_types(&[image(media_type)]).is_ok(), "{media_type} refused");
+        }
+    }
+
+    /// The bug this guards: an iPhone photo reaching the wire as HEIC acked, then
+    /// failed silently on the desktop and in the agent.
+    #[test]
+    fn refuses_heic() {
+        let err = check_media_types(&[image("image/heic")]).unwrap_err();
+        assert!(err.to_string().contains("image/heic"), "error should name the format: {err}");
+    }
+
+    /// A media type is written by the sender, so casing is not guaranteed.
+    #[test]
+    fn accepts_an_uppercase_media_type() {
+        assert!(check_media_types(&[image("IMAGE/JPEG")]).is_ok());
+    }
+
+    /// One bad attachment must refuse the whole prompt: a partial send would drop
+    /// an image the user watched themselves attach.
+    #[test]
+    fn refuses_the_prompt_when_only_one_attachment_is_bad() {
+        assert!(check_media_types(&[image("image/png"), image("image/heic")]).is_err());
+    }
+
+    #[test]
+    fn accepts_a_prompt_with_no_attachments() {
+        assert!(check_media_types(&[]).is_ok());
     }
 }
