@@ -126,16 +126,20 @@ mod tests {
     use std::fs;
 
     fn tmp() -> PathBuf {
+        // Per-test unique subdir. This used to be a nanosecond timestamp, which
+        // is NOT unique: the tests in this module run on parallel threads, and
+        // two that read the clock inside the same tick got the same directory.
+        // Whichever finished first then `remove_dir_all`'d it out from under the
+        // other, which failed mid-copy with ENOENT — a ~12% flake locally and a
+        // red CI run. pid + counter is unique by construction, across both
+        // threads and the concurrently-run test binaries.
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let mut dir = std::env::temp_dir();
-        // Per-test unique subdir; nanos avoids collisions across parallel runs.
-        let unique = format!(
-            "oximux-dup-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        dir.push(unique);
+        dir.push(format!(
+            "oximux-dup-test-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
