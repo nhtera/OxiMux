@@ -1,5 +1,5 @@
 //! Unit tests for `build_display_rows` — the pure helper inside
-//! `crates/app/src/shell/file_tree_view.rs`. No GPUI runtime, no
+//! `apps/desktop/src/shell/file_tree_view.rs`. No GPUI runtime, no
 //! filesystem. The `nodes` callback is an in-memory `HashMap` lookup.
 
 use oximux_app::shell::file_tree_view::{DisplayRow, RowKind, build_display_rows};

@@ -24,32 +24,53 @@ open dist/OxiMux.app
 
 ## Repo layout
 
+`apps/` holds the shippable product surfaces; `crates/` holds the libraries and
+sidecars they consume.
+
 ```
+apps/
+├── desktop/      GPUI host shell, bin `oximux` (package `oximux-app`):
+│                 panes/tabs/splits, SCM, diff viewer, command palette,
+│                 agent chat. Modules are foldered by concern
+│                 (app_settings/ agent_glue/ session_restore/ platform/
+│                 loaders/ shell/terminal/)
+└── mobile/       Expo / React Native client for pairing a phone to a
+                  desktop host. modules/oximux-core is the uniffi turbo
+                  module generated from crates/mobile-core (untracked —
+                  regenerate with `npm run bindings`)
 crates/
-├── app/          GPUI host shell: panes/tabs/splits, SCM, diff viewer,
-│                 command palette, agents dashboard. Modules are foldered
-│                 by concern (app_settings/ agent_glue/ session_restore/
-│                 platform/ loaders/ shell/terminal/)
-├── ui/           shared, app-agnostic widgets (FloatingSurface overlay,
+├── ui/           shared, app-agnostic GPUI widgets (FloatingSurface overlay,
 │                 button variants, confirm dialog) — depends only downward
 ├── core/         domain types (Project, Workspace, Pane, AgentSession)
 ├── pty/          portable-pty + alacritty_terminal backend
 ├── git/          git CLI wrappers, status poller, diff parser, clone
-├── agents/       AgentRuntime trait + Claude/Codex/Aider adapters
+├── agent-core/   portable agent-chat core (thread fold, ThreadEvent vocab,
+│                 stream-json decoder) — no gpui/pty/tokio, so it
+│                 cross-compiles for the mobile Rust core
+├── agents/       AgentRuntime trait + provider adapters (Claude, Codex,
+│                 ACP, Pi) and session import
 ├── editor/       gpui-component editor wrapper + LSP glue
+├── dictation/    offline voice dictation (sherpa-onnx + CoreAudio capture)
 ├── storage/      SQLite + migration ladder + CI guard
 ├── settings/     theme tokens, density, typography, TOML config
 ├── relay-proto/  wire protocol shared by relay daemon + client
 ├── relay/        out-of-process PTY relay daemon (survives relaunch)
-└── relay-client/ in-app client for the relay daemon
+├── relay-client/ in-app client for the relay daemon
+├── remote-proto/ remote-control wire protocol (desktop host ⇄ phone)
+├── remote-host/  in-app remote-control host: pairing auth + RPC dispatch
+├── remote-session/  client-side remote session (the phone's Rust core)
+├── remote-iroh/  iroh P2P (QUIC) transport for remote control
+├── mobile-core/  uniffi binding over remote-session for the RN app
+└── proc-cwd/     resolve a process's cwd from its pid
 xtask/            repo lint orchestrator (file-size cap etc.)
 docs/
-├── adr/                   architectural decision records (001-005)
 ├── design-guidelines.md   palette, density, typography (the contract)
+├── system-architecture.md source map + subsystem contracts
 ├── gpui-pins.md           GPUI + gpui-component SHA tuple + bump log
-└── brief.md               product vision and PRD
-plans/
-└── 260515-2012-oximux-v1-build/   nine-phase implementation plan
+├── brief.md               product vision and PRD
+└── adr/                   decision records — gitignored, local to each
+                           working copy
+plans/            implementation plans + reports — gitignored
 ```
 
 ## Capabilities
@@ -62,15 +83,15 @@ plans/
 - **Navigation** — a command palette (Quick Open + commands, fuzzy match), file explorer, search panel.
 - **Design system** — charcoal dark theme, cockpit density, typography scale (`oximux-settings`; see `docs/design-guidelines.md`).
 - **Guardrails** — `xtask file-size-lint` (warn > 1500 LOC / fail > 3000, with a ratchet allowlist that only shrinks), font-kit feature check, migration ladder count check, producer/consumer pre-commit hook.
-- ADRs 001 (stack), 002 (gpui-component), 003 (dogfood gate), 004 (no ACP in v1), 005 (fresh start).
+- **Decision records** — ADRs live under `docs/adr/`, which is **gitignored**: they are local to a working copy, not shipped with the repo, so the list below is the index rather than a set of links. 001 (stack), 002 (gpui-component), 003 (dogfood gate), 004 (no ACP in v1 — **superseded**; ACP adapters ship in `crates/agents/src/thread/acp/`), 005 (fresh start), 006 (Tier-1 reorg + `oximux-ui` extraction), 007 (`apps/desktop` relocation).
 
 ## Working agreements
 
 - **Keep files small** — aim for **< 500 LOC** per file (authoring guideline, not enforced). The lint enforces **warn > 1500 / fail > 3000** non-blank LOC; any file over 3000 must sit on the `xtask/file-size-allow.txt` ratchet allowlist and may only shrink. Split before you hit the warn band. (Where things live: see `docs/system-architecture.md` → "Source map".)
 - **Snake_case** for Rust files; kebab-case for shell scripts.
 - **Edit existing files** in-place. No `*_v2.rs`, `*_new.rs`, or `*_enhanced.rs`.
-- **Dogfood before tag**: see [ADR-003](docs/adr/adr-003-dogfood-gate.md).
-- **No code reuse** from `OxideADE-old`. Ideas only. See [ADR-005](docs/adr/adr-005-fresh-start.md).
+- **Dogfood before tag** (ADR-003).
+- **No code reuse** from `OxideADE-old`. Ideas only (ADR-005).
 
 ## Install pre-commit hook (optional)
 
@@ -82,4 +103,10 @@ Warns (does not block) when a staged diff deletes a public symbol so consumers c
 
 ## License
 
-MIT OR Apache-2.0 (dual). See ADR-005 for the rationale.
+[Apache License 2.0](LICENSE). You may use, modify, and redistribute OxiMux —
+including commercially — provided you retain the copyright notice, the
+[`NOTICE`](NOTICE) file, and mark any files you change.
+
+"OxiMux" and the OxiMux logo are **not** covered by the license grant
+(Apache-2.0 §6): forks are welcome, forks distributed under the OxiMux name are
+not.

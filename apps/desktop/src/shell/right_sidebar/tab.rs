@@ -50,7 +50,7 @@ pub fn visible_tabs(v: TabVisibility) -> Vec<RightTab> {
 impl RightTab {
     /// Asset path for the tab's SVG icon. Resolved by `CompositeAssets`:
     /// gpui-component's bundle ships `file.svg` / `search.svg` / `folder.svg`;
-    /// `git-branch.svg` is shipped locally in `crates/app/assets/icons/`.
+    /// `git-branch.svg` is shipped locally in `apps/desktop/assets/icons/`.
     pub fn icon_path(self) -> &'static str {
         match self {
             RightTab::Files => "icons/folder.svg",

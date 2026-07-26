@@ -14,11 +14,11 @@ The correct cargo idiom for git deps shared with an unpinned transitive crate is
 
 ## Required features
 
-`gpui_platform` MUST be built with `font-kit` on macOS — without it, no glyphs render and the failure is silent at compile time (caught only at runtime). See `crates/app/tests/font_kit_feature_check.rs` for the CI guard.
+`gpui_platform` MUST be built with `font-kit` on macOS — without it, no glyphs render and the failure is silent at compile time (caught only at runtime). See `apps/desktop/tests/font_kit_feature_check.rs` for the CI guard.
 
 `gpui-component`'s own workspace enables `font-kit, x11, wayland, runtime_shaders` unconditionally. We mirror that to stay binary-compatible.
 
-`gpui` is also listed in `crates/app/[dev-dependencies]` with `test-support` feature enabled (required for `#[gpui::test]` harness). This pulls `proptest` into the lockfile — expected, test-only, does not affect release binary.
+`gpui` is also listed in `apps/desktop/[dev-dependencies]` with `test-support` feature enabled (required for `#[gpui::test]` harness). This pulls `proptest` into the lockfile — expected, test-only, does not affect release binary.
 
 ## Current pin
 

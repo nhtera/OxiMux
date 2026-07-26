@@ -71,7 +71,7 @@ pub struct LspClient {
     next_id: AtomicI64,
     /// Tokio runtime handle captured at spawn time. `LspClient::spawn`
     /// is called from the gpui main thread where `rt.enter()` is alive
-    /// (see `crates/app/src/main.rs:51`). The handle is `Send + Clone`
+    /// (see `apps/desktop/src/main.rs:51`). The handle is `Send + Clone`
     /// so `LspHoverProvider` can hop futures back onto tokio's worker
     /// pool from gpui's GCD-backed background executor — without this,
     /// `tokio::time::timeout` panics with "no reactor running" the

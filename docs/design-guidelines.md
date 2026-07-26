@@ -4,7 +4,7 @@ This document is the source of truth for visual identity, palette, density, typo
 and composition patterns. It drives `crates/settings/src/theme.rs`, `density.rs`, and
 `typography.rs`; keep both in sync when changing any token.
 
-When the doc is silent: read the closest sibling code in `crates/app/src/shell/` and
+When the doc is silent: read the closest sibling code in `apps/desktop/src/shell/` and
 follow its lead. If the question is structural (which primitive, when), see the
 Primitive-Picking Fork. If the question is "is there a token for X", check the tables
 below first — every shipped surface routes through them.
@@ -308,7 +308,7 @@ row reads as "one button is screaming" instead of "this verb is destructive".
 `ui::danger_ghost(id, label, &theme, &density, typography, on_click)` renders a
 transparent-background div sized like a `.ghost().xsmall()` button, with
 `theme.status_error` foreground. The destructive intent reads through the color
-without breaking the row's visual hierarchy. Defined in `crates/app/src/ui/buttons.rs`.
+without breaking the row's visual hierarchy. Defined in `apps/desktop/src/ui/buttons.rs`.
 
 ## Floating Surface Chrome
 
@@ -331,7 +331,7 @@ stops reading as a hint and becomes a drawn line.
 
 The chrome — background, border, radius, positioning context, and the
 top-highlight — is single-sourced in `ui::FloatingSurface::floating_chrome`
-(`crates/app/src/ui/overlay.rs`). Apply it in-chain where a surface sets its
+(`apps/desktop/src/ui/overlay.rs`). Apply it in-chain where a surface sets its
 size/padding; do **not** re-hand-roll `bg_overlay` + `border_active` + `r_card`.
 Surface-specific padding, width, and content stay caller-owned.
 

@@ -65,7 +65,7 @@ pub enum NodeKind {
 /// so iteration order is deterministic (`BTreeMap` = lexical).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeNode {
-    /// Path from the tree root, e.g. `crates/app/src/main.rs`. The root
+    /// Path from the tree root, e.g. `apps/desktop/src/main.rs`. The root
     /// node carries an empty path.
     pub path: PathBuf,
     pub kind: NodeKind,

@@ -12,11 +12,11 @@ use anyhow::Result;
 use gpui::{AssetSource, SharedString};
 
 /// Local SVGs embedded via `include_bytes!`. Add a match arm + corresponding
-/// file in `crates/app/assets/icons/` to register a new asset.
+/// file in `apps/desktop/assets/icons/` to register a new asset.
 struct AppAssets;
 
 /// SVGs shipped locally. Each entry is `(asset path, embedded bytes)`. To add
-/// a new icon, drop the file under `crates/app/assets/icons/` and append a
+/// a new icon, drop the file under `apps/desktop/assets/icons/` and append a
 /// tuple here — no other wiring needed.
 const APP_ICONS: &[(&str, &[u8])] = &[
     (

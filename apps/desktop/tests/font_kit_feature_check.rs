@@ -15,7 +15,7 @@ use std::path::PathBuf;
 #[test]
 fn font_kit_is_in_lockfile() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // crates/app -> ../../Cargo.lock
+    // apps/desktop -> ../../Cargo.lock
     let lockfile = manifest_dir
         .parent()
         .and_then(|p| p.parent())

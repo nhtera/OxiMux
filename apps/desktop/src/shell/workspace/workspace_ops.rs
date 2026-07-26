@@ -3,7 +3,7 @@
 //!
 //! The pure `create_workspace_with_rollback` helper lives outside
 //! `WorkspaceRoot` so the rollback path can be exercised by an
-//! integration test (`crates/app/tests/workspace_create_rollback.rs`)
+//! integration test (`apps/desktop/tests/workspace_create_rollback.rs`)
 //! without a GPUI context. The extension methods on `WorkspaceRoot`
 //! land here too (rather than in `workspace_root.rs`) to keep the
 //! root file under the 800-LOC fail cap; they are the only consumers

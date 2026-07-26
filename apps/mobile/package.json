@@ -3,6 +3,7 @@
   "main": "expo-router/entry",
   "version": "0.1.0",
   "private": true,
+  "license": "Apache-2.0",
   "scripts": {
     "start": "expo start --dev-client",
     "android": "LANG=${LANG:-en_US.UTF-8} expo run:android",

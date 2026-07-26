@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/app",
+    "apps/desktop",
     "crates/ui",
     "crates/core",
     "crates/dictation",
@@ -28,13 +28,13 @@ members = [
 edition = "2024"
 version = "0.1.0"
 authors = ["nhtera"]
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 publish = false
 rust-version = "1.89"
 
 [workspace.dependencies]
 # Internal crates
-oximux-app      = { path = "crates/app" }
+oximux-app      = { path = "apps/desktop" }
 oximux-ui       = { path = "crates/ui" }
 oximux-core     = { path = "crates/core" }
 oximux-dictation = { path = "crates/dictation" }
@@ -159,7 +159,7 @@ lsp-types = { version = "0.97", features = ["proposed"] }
 # editor crate's `path_to_file_uri`; paths with spaces / unicode /
 # reserved chars round-trip cleanly only with proper encoding.
 url = "2"
-# macOS Application Support directory resolution (see crates/app/src/main.rs).
+# macOS Application Support directory resolution (see apps/desktop/src/main.rs).
 # default-features off: we only need `data_dir()` on macOS; the default
 # features pull in Windows/X11 helpers we never call.
 dirs = { version = "5", default-features = false }
