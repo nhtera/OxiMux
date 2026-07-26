@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AuthenticateRequest, ClientCapabilities, ContentBlock, CreateTerminalRequest,
-    CreateTerminalResponse,
+    CreateTerminalResponse, EnvVariable,
     FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest, KillTerminalResponse,
-    LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse, ReadTextFileRequest,
+    LoadSessionRequest, McpServer, McpServerStdio, NewSessionRequest, PromptRequest, PromptResponse, ReadTextFileRequest,
     ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SessionConfigId, SessionConfigOption,
     SessionConfigOptionValue, SessionId, SessionModeId, SessionModeState, SessionNotification,
@@ -37,6 +37,7 @@ use super::map::map_session_update;
 use super::{AcpState, Outbound, approvals, auth, client_fs, client_terminal};
 use crate::thread::entry::ChatImage;
 use crate::thread::event::{AuthMethodInfo, AuthMethodKind, ThreadEvent, TurnUsage};
+use crate::thread::mcp_server_spec::McpServerSpec;
 use crate::thread::tool_call::PermissionDecision;
 
 /// Run the whole ACP session to completion (blocks the worker thread). A spawn
@@ -50,6 +51,7 @@ pub(crate) fn run(
     resume_session_id: Option<String>,
     env: Vec<(String, String)>,
     auth_method: Option<String>,
+    mcp_servers: Vec<McpServerSpec>,
     event_tx: Sender<ThreadEvent>,
     outbound_rx: fmpsc::UnboundedReceiver<Outbound>,
     state: Arc<Mutex<AcpState>>,
@@ -61,6 +63,7 @@ pub(crate) fn run(
         resume_session_id,
         env,
         auth_method,
+        mcp_servers,
         event_tx.clone(),
         outbound_rx,
         state,
@@ -78,6 +81,7 @@ async fn session(
     resume_session_id: Option<String>,
     env: Vec<(String, String)>,
     auth_method: Option<String>,
+    mcp_servers: Vec<McpServerSpec>,
     event_tx: Sender<ThreadEvent>,
     mut outbound_rx: fmpsc::UnboundedReceiver<Outbound>,
     state: Arc<Mutex<AcpState>>,
@@ -340,7 +344,9 @@ async fn session(
             // agent signs in without re-showing the card. Consumed once.
             let mut auto_auth = auth_method;
             let (session_id, modes, config_options) = loop {
-                match open_session(&cx, load_id.as_deref(), &cwd, &state, &event_tx).await {
+                match open_session(&cx, load_id.as_deref(), &cwd, &state, &event_tx, &mcp_servers)
+                    .await
+                {
                     Ok(opened) => break opened,
                     Err(e) if auth::is_auth_required(&e) => {
                         // The env is set now, so `authenticate` can succeed on this
@@ -489,10 +495,40 @@ async fn session(
 async fn new_session(
     cx: &ConnectionTo<Agent>,
     cwd: PathBuf,
+    mcp_servers: &[McpServerSpec],
 ) -> Result<(SessionId, Option<SessionModeState>, Vec<SessionConfigOption>), agent_client_protocol::Error>
 {
-    let sess = cx.send_request(NewSessionRequest::new(cwd)).block_task().await?;
+    // `::new` already serializes `mcpServers: []` (locked by
+    // `new_session_request_serializes_empty_mcp_servers`), so the builder is
+    // only spent when the host actually declares servers — a no-server launch
+    // sends exactly what it sent before.
+    let mut req = NewSessionRequest::new(cwd);
+    if !mcp_servers.is_empty() {
+        req = req.mcp_servers(acp_mcp_servers(mcp_servers));
+    }
+    let sess = cx.send_request(req).block_task().await?;
     Ok((sess.session_id.clone(), sess.modes.clone(), sess.config_options.clone().unwrap_or_default()))
+}
+
+/// Host-declared servers → ACP's `McpServer` vocabulary. Stdio-only: every
+/// server OxiMux supplies is a local sidecar it spawns, so the Http/Sse/Acp
+/// variants have no host-side producer here.
+fn acp_mcp_servers(specs: &[McpServerSpec]) -> Vec<McpServer> {
+    specs
+        .iter()
+        .map(|s| {
+            McpServer::Stdio(
+                McpServerStdio::new(s.name.clone(), s.command.clone())
+                    .args(s.args.clone())
+                    .env(
+                        s.env
+                            .iter()
+                            .map(|(k, v)| EnvVariable::new(k.clone(), v.clone()))
+                            .collect(),
+                    ),
+            )
+        })
+        .collect()
 }
 
 /// The opened-session tuple the handshake continuation consumes.
@@ -509,9 +545,10 @@ async fn open_session(
     cwd: &Path,
     state: &Mutex<AcpState>,
     event_tx: &Sender<ThreadEvent>,
+    mcp_servers: &[McpServerSpec],
 ) -> Result<Opened, agent_client_protocol::Error> {
     let Some(id) = load_id else {
-        return new_session(cx, cwd.to_path_buf()).await;
+        return new_session(cx, cwd.to_path_buf(), mcp_servers).await;
     };
     let sid = SessionId::new(id);
     // Guard the replay: per spec the agent re-sends its history as
@@ -533,7 +570,7 @@ async fn open_session(
             let _ = event_tx.send(ThreadEvent::Error(format!(
                 "couldn't resume the previous agent session ({e}); starting fresh"
             )));
-            new_session(cx, cwd.to_path_buf()).await
+            new_session(cx, cwd.to_path_buf(), mcp_servers).await
         }
     }
 }
@@ -843,6 +880,32 @@ mod tests {
         let v = serde_json::to_value(NewSessionRequest::new(std::path::PathBuf::from("/tmp")))
             .expect("serialize NewSessionRequest");
         assert_eq!(v["mcpServers"], json!([]));
+    }
+
+    #[test]
+    fn host_mcp_servers_map_to_acp_stdio() {
+        // Host-declared servers reach `session/new` as stdio entries with their
+        // args and env intact — the ACP half of the injection seam.
+        let specs = vec![McpServerSpec::new("srv", "bin")
+            .args(vec!["mcp".into()])
+            .env(vec![("K".into(), "V".into())])];
+        let req = NewSessionRequest::new(std::path::PathBuf::from("/tmp"))
+            .mcp_servers(acp_mcp_servers(&specs));
+        let v = serde_json::to_value(&req).expect("serialize NewSessionRequest");
+
+        let entry = &v["mcpServers"][0];
+        assert_eq!(entry["name"], "srv");
+        assert_eq!(entry["command"], "bin");
+        assert_eq!(entry["args"], json!(["mcp"]));
+        assert_eq!(entry["env"][0]["name"], "K");
+        assert_eq!(entry["env"][0]["value"], "V");
+    }
+
+    #[test]
+    fn no_host_mcp_servers_maps_to_empty() {
+        // Mirrors the Claude side's `no_mcp_servers_emits_no_flag`: declaring
+        // none must leave `session/new` exactly as it was.
+        assert!(acp_mcp_servers(&[]).is_empty());
     }
 
     #[test]

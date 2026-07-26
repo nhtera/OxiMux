@@ -15,6 +15,7 @@ use super::claude_stream_json::ClaudeStreamJsonConnection;
 use super::codex::CodexAppServerConnection;
 use super::connection::{AgentConnection, ModelChoice};
 use super::event::ThreadEvent;
+use super::mcp_server_spec::McpServerSpec;
 use super::pi::posture::PiPosture;
 use super::pi::PiRpcConnection;
 use super::transport::Transport;
@@ -100,6 +101,14 @@ pub struct ConnectSpec {
     /// field per transport (`permission_mode`, `effort`, `codex_posture`) — a
     /// convention, not a shared abstraction.
     pub pi_posture: Option<PiPosture>,
+    /// MCP servers the *host* declares for this session — a sidecar OxiMux
+    /// spawns and supervises, on top of whatever the user's own config provides.
+    ///
+    /// Unlike the per-transport fields above this one is deliberately shared:
+    /// MCP is a cross-agent protocol, so the same declaration is meant to reach
+    /// Claude (`--mcp-config`) and ACP (`mcpServers`) alike. Empty for every
+    /// launch that declares none, which keeps those invocations unchanged.
+    pub mcp_servers: Vec<McpServerSpec>,
 }
 
 impl ConnectSpec {
@@ -133,7 +142,17 @@ impl ConnectSpec {
             codex_posture: None,
             pi_command: None,
             pi_posture: None,
+            // Set by the caller after construction when the host has servers to
+            // declare; a plain launch declares none.
+            mcp_servers: Vec::new(),
         }
+    }
+
+    /// Declare host-supplied MCP servers for this session. Builder-style so the
+    /// existing single-line `for_backend` call sites stay single-line.
+    pub fn with_mcp_servers(mut self, servers: Vec<McpServerSpec>) -> Self {
+        self.mcp_servers = servers;
+        self
     }
 }
 
@@ -150,6 +169,7 @@ pub fn connect(spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<
                 spec.resume_session_id.as_deref(),
                 spec.permission_mode.as_deref(),
                 spec.effort.as_deref(),
+                &spec.mcp_servers,
             )?;
             Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
@@ -180,6 +200,7 @@ pub fn connect(spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<
                 spec.resume_session_id.clone(),
                 spec.env.clone(),
                 spec.auth_method.clone(),
+                spec.mcp_servers.clone(),
             )?;
             Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
@@ -274,6 +295,7 @@ mod tests {
             codex_posture: None,
             pi_command: None,
             pi_posture: None,
+            mcp_servers: vec![],
         };
         // Can't `expect_err` — the Ok payload (`Box<dyn AgentConnection>`) isn't
         // `Debug`; match instead.
@@ -304,6 +326,7 @@ mod tests {
             codex_posture: None,
             pi_command: None,
             pi_posture: None,
+            mcp_servers: vec![],
         };
         let err = probe_catalog(spec).expect_err("probe must fail without a command");
         assert!(err.to_string().contains("acp_command"), "unexpected error: {err}");

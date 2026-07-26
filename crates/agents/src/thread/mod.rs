@@ -28,8 +28,8 @@ pub mod transport;
 // modules under their original `crate::thread::*` paths so every downstream
 // import site (and this file's own type re-exports below) resolves unchanged.
 pub use oximux_agent_core::thread::{
-    background_task, context_chip, entry, event, question, state, stream_json, tool_call,
-    tool_detail, turn_diff,
+    background_task, context_chip, entry, event, mcp_server_spec, question, state, stream_json,
+    tool_call, tool_detail, turn_diff,
 };
 
 pub use acp::AcpConnection;
@@ -55,6 +55,7 @@ pub use event::{
     AuthMethodInfo, AuthMethodKind, McpServerStatus, PlanEntryLite, SessionMeta, ThreadEvent,
     TurnUsage,
 };
+pub use mcp_server_spec::{to_claude_mcp_config, McpServerSpec};
 pub use question::{
     parse_questions, updated_input_json, AskQuestion, QuestionAnswer, QuestionAnswers,
     QuestionKind, QuestionOption, QuestionRequest,

@@ -20,6 +20,7 @@ pub mod background_task;
 pub mod context_chip;
 pub mod entry;
 pub mod event;
+pub mod mcp_server_spec;
 pub mod question;
 pub mod state;
 pub mod stream_json;
@@ -34,6 +35,7 @@ pub use event::{
     AuthMethodInfo, AuthMethodKind, McpServerStatus, PlanEntryLite, SessionMeta, ThreadEvent,
     TurnUsage,
 };
+pub use mcp_server_spec::{to_claude_mcp_config, McpServerSpec};
 pub use question::{
     parse_questions, updated_input_json, AskQuestion, QuestionAnswer, QuestionAnswers,
     QuestionKind, QuestionOption, QuestionRequest,

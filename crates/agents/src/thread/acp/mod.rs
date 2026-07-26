@@ -42,6 +42,7 @@ use futures::channel::mpsc as fmpsc;
 use futures::channel::oneshot;
 use serde_json::Value;
 
+use super::mcp_server_spec::McpServerSpec;
 use super::connection::{
     AgentCapabilities, AgentConnection, EffortChoice, FeatureControl, FeatureKind,
     FeatureSelectOption, FeatureValue, ModeChoice, ModelChoice,
@@ -336,7 +337,7 @@ impl AcpConnection {
         cwd: &Path,
         resume_session_id: Option<String>,
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
-        Self::spawn_with_env(command, args, cwd, resume_session_id, Vec::new(), None)
+        Self::spawn_with_env(command, args, cwd, resume_session_id, Vec::new(), None, Vec::new())
     }
 
     /// Like [`Self::spawn`], but seeds the subprocess with extra `env` overrides
@@ -346,6 +347,9 @@ impl AcpConnection {
     /// as real environment, never argv), and `auth_method` closes the "set env,
     /// then authenticate" loop without re-prompting. `spawn` is this with no
     /// extra env and no auto-authenticate, so every existing caller is unchanged.
+    ///
+    /// `mcp_servers` are servers the *host* declares for the session; empty
+    /// leaves `session/new` sending exactly the `mcpServers: []` it sent before.
     pub fn spawn_with_env(
         command: &str,
         args: &[String],
@@ -353,6 +357,7 @@ impl AcpConnection {
         resume_session_id: Option<String>,
         env: Vec<(String, String)>,
         auth_method: Option<String>,
+        mcp_servers: Vec<McpServerSpec>,
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
         let (event_tx, event_rx) = mpsc::channel::<ThreadEvent>();
         let (out_tx, out_rx) = fmpsc::unbounded::<Outbound>();
@@ -371,6 +376,7 @@ impl AcpConnection {
                     resume_session_id,
                     env,
                     auth_method,
+                    mcp_servers,
                     event_tx,
                     out_rx,
                     state,

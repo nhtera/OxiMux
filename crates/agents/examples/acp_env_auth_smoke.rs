@@ -60,6 +60,7 @@ fn main() {
         None,
         vec![(KEY_VAR.to_string(), "s3cr3t".to_string())],
         Some("api-key".to_string()),
+        Vec::new(),
     )
     .expect("spawn with env");
     let session_opened =

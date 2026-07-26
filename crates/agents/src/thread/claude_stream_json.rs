@@ -24,6 +24,7 @@ use super::connection::{
     ModelChoice,
 };
 use super::entry::ChatImage;
+use super::mcp_server_spec::{to_claude_mcp_config, McpServerSpec};
 use super::question::{AskQuestion, QuestionAnswers};
 use super::event::ThreadEvent;
 use super::stream_json::decode_line;
@@ -116,7 +117,7 @@ const DEFAULT_MODEL: &str = "sonnet";
 /// comparison showed identical permission behavior — but if Allow/Reject or
 /// AskUserQuestion ever regresses, narrow this back to `project`.
 pub fn build_args(model: Option<&str>) -> Vec<String> {
-    build_args_with_resume(model, None, None, None)
+    build_args_with_resume(model, None, None, None, &[])
 }
 
 /// Same as [`build_args`], plus `--resume <session_id>` when restoring a
@@ -127,11 +128,20 @@ pub fn build_args(model: Option<&str>) -> Vec<String> {
 /// disk, so this only needs to reconnect the *next* turn to the prior history.
 /// Permission mode and effort are both fixed at spawn (like `--model`), so a live
 /// switch of either respawns via this same path.
+///
+/// `mcp_servers` are servers the *host* declares (a sidecar OxiMux spawns and
+/// supervises). An empty slice emits no `--mcp-config` flag at all, so the
+/// no-servers invocation stays byte-identical to the pre-seam one — asserted by
+/// `no_mcp_servers_emits_no_flag`. Host servers are additive, not exclusive:
+/// `--strict-mcp-config` is deliberately NOT passed, because
+/// `--setting-sources user,project,local` above exists precisely so the chat
+/// still sees the user's own MCP servers.
 pub fn build_args_with_resume(
     model: Option<&str>,
     resume_session_id: Option<&str>,
     permission_mode: Option<&str>,
     effort: Option<&str>,
+    mcp_servers: &[McpServerSpec],
 ) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
@@ -179,6 +189,12 @@ pub fn build_args_with_resume(
         args.push("--resume".to_string());
         args.push(sid.to_string());
     }
+    // Host-declared MCP servers, passed as an inline JSON string (the CLI takes
+    // "JSON files or strings"). `None` for the empty case, so no flag is added.
+    if let Some(cfg) = to_claude_mcp_config(mcp_servers) {
+        args.push("--mcp-config".to_string());
+        args.push(cfg);
+    }
     args
 }
 
@@ -205,10 +221,17 @@ impl ClaudeStreamJsonConnection {
         session_id: Option<&str>,
         permission_mode: Option<&str>,
         effort: Option<&str>,
+        mcp_servers: &[McpServerSpec],
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
         let mut cmd = Command::new("claude");
-        cmd.args(build_args_with_resume(model, session_id, permission_mode, effort))
-            .current_dir(cwd);
+        cmd.args(build_args_with_resume(
+            model,
+            session_id,
+            permission_mode,
+            effort,
+            mcp_servers,
+        ))
+        .current_dir(cwd);
         Self::spawn_command(cmd)
     }
 
@@ -555,25 +578,25 @@ mod tests {
 
     #[test]
     fn build_args_appends_resume_when_session_id_set() {
-        let a = build_args_with_resume(None, Some("sid-123"), None, None);
+        let a = build_args_with_resume(None, Some("sid-123"), None, None, &[]);
         let i = a.iter().position(|x| x == "--resume").expect("--resume present");
         assert_eq!(a[i + 1], "sid-123");
         // blank / absent session id → no --resume
-        assert!(!build_args_with_resume(None, Some("  "), None, None).iter().any(|x| x == "--resume"));
-        assert!(!build_args_with_resume(None, None, None, None).iter().any(|x| x == "--resume"));
+        assert!(!build_args_with_resume(None, Some("  "), None, None, &[]).iter().any(|x| x == "--resume"));
+        assert!(!build_args_with_resume(None, None, None, None, &[]).iter().any(|x| x == "--resume"));
         // plain build_args never resumes
         assert!(!build_args(None).iter().any(|x| x == "--resume"));
     }
 
     #[test]
     fn build_args_appends_permission_mode_only_when_non_default() {
-        let a = build_args_with_resume(None, None, Some("acceptEdits"), None);
+        let a = build_args_with_resume(None, None, Some("acceptEdits"), None, &[]);
         let i = a.iter().position(|x| x == "--permission-mode").expect("--permission-mode present");
         assert_eq!(a[i + 1], "acceptEdits");
         // "default", blank, and none all omit the flag (a fresh spawn IS default).
         for pm in [Some("default"), Some("  "), None] {
             assert!(
-                !build_args_with_resume(None, None, pm, None).iter().any(|x| x == "--permission-mode"),
+                !build_args_with_resume(None, None, pm, None, &[]).iter().any(|x| x == "--permission-mode"),
                 "{pm:?} must not emit --permission-mode"
             );
         }
@@ -582,13 +605,55 @@ mod tests {
     }
 
     #[test]
+    fn no_mcp_servers_emits_no_flag() {
+        // The load-bearing invariant of the MCP seam: a launch that declares no
+        // host servers must produce EXACTLY the argv it produced before the
+        // seam existed. Anything else silently changes every existing session.
+        let bare = build_args_with_resume(None, None, None, None, &[]);
+        assert!(!bare.iter().any(|x| x == "--mcp-config"), "got {bare:?}");
+        assert_eq!(bare, build_args(None));
+    }
+
+    /// Payload shape verified end-to-end against claude-code 2.1.220: a config
+    /// of this exact form spawned a stdio server, its tools were discovered,
+    /// and a call round-tripped. If a CLI bump breaks `--mcp-config`, this test
+    /// still passes (it only checks what we emit) — re-run the live probe.
+    #[test]
+    fn mcp_servers_emit_one_config_flag() {
+        let spec = McpServerSpec::new("oximux-computer-use", "cua-driver")
+            .args(vec!["mcp".into(), "--socket".into(), "/tmp/s.sock".into()]);
+        let a = build_args_with_resume(None, None, None, None, std::slice::from_ref(&spec));
+
+        let i = a.iter().position(|x| x == "--mcp-config").expect("--mcp-config present");
+        // One flag, one JSON payload — not a file path, not repeated per server.
+        assert_eq!(a.iter().filter(|x| *x == "--mcp-config").count(), 1);
+        let cfg: Value = serde_json::from_str(&a[i + 1]).expect("payload is valid json");
+        assert_eq!(cfg["mcpServers"]["oximux-computer-use"]["command"], "cua-driver");
+
+        // Never paired with --strict-mcp-config: that would suppress the user's
+        // own servers, which `--setting-sources user,project,local` exists to load.
+        assert!(!a.iter().any(|x| x == "--strict-mcp-config"));
+    }
+
+    #[test]
+    fn mcp_servers_survive_a_resume() {
+        // A restored chat respawns through this same builder, so the servers
+        // must ride the resume path too — otherwise computer use silently
+        // disappears the first time a tab is reopened.
+        let spec = McpServerSpec::new("srv", "bin");
+        let a = build_args_with_resume(None, Some("sid-9"), None, None, std::slice::from_ref(&spec));
+        assert!(a.iter().any(|x| x == "--resume"));
+        assert!(a.iter().any(|x| x == "--mcp-config"));
+    }
+
+    #[test]
     fn build_args_appends_effort_when_set() {
-        let a = build_args_with_resume(None, None, None, Some("xhigh"));
+        let a = build_args_with_resume(None, None, None, Some("xhigh"), &[]);
         let i = a.iter().position(|x| x == "--effort").expect("--effort present");
         assert_eq!(a[i + 1], "xhigh");
         // blank / none omit the flag (CLI uses its configured default)
-        assert!(!build_args_with_resume(None, None, None, Some("  ")).iter().any(|x| x == "--effort"));
-        assert!(!build_args_with_resume(None, None, None, None).iter().any(|x| x == "--effort"));
+        assert!(!build_args_with_resume(None, None, None, Some("  "), &[]).iter().any(|x| x == "--effort"));
+        assert!(!build_args_with_resume(None, None, None, None, &[]).iter().any(|x| x == "--effort"));
         assert!(!build_args(None).iter().any(|x| x == "--effort"));
     }
 
