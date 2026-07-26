@@ -22,33 +22,34 @@ export const SITE = {
 } as const;
 
 /**
- * Agent marks shown in the hero support strip. `icon` is an astro-icon local
- * name resolving to src/icons/, which holds the desktop app's own monochrome
- * glyphs so the web and the cockpit show the same mark for the same agent.
+ * Agents OxiMux can drive today. Sourced from the README capability list and
+ * crates/agents (AgentRuntime trait plus provider adapters).
  *
- * Deliberately no "+N more" count: unlike the tools that advertise one, the
- * honest statement here is the open-ended ACP line, not an invented number.
+ * One list, two surfaces. The hero strip renders the entries that carry an
+ * `icon`; the features section renders all of them with their mechanism. Kept
+ * as a single array so the two can never drift out of sync.
+ *
+ * `icon` is an astro-icon local name resolving to src/icons/, which holds the
+ * desktop app's own monochrome glyphs, so the web and the cockpit show the same
+ * mark for the same agent.
  */
-export const AGENT_MARKS = [
-  { name: "Claude Code", icon: "claude-code" },
-  { name: "Codex", icon: "codex" },
-  { name: "Pi", icon: "pi" },
-  { name: "OpenCode", icon: "opencode" },
-  { name: "Copilot", icon: "copilot" },
+export const AGENTS = [
+  { name: "Claude Code", note: "stream-json adapter", icon: "claude-code" },
+  { name: "Codex", note: "app-server JSON-RPC", icon: "codex" },
+  { name: "Pi", note: "RPC transport", icon: "pi" },
+  { name: "OpenCode", note: "session import", icon: "opencode" },
+  { name: "Copilot", note: "session import", icon: "copilot" },
+  { name: "Any ACP agent", note: "Agent Client Protocol" },
 ] as const;
 
 /**
- * Agents OxiMux can drive today. Sourced from the README capability list and
- * crates/agents (AgentRuntime trait plus provider adapters).
+ * Hero strip subset. Deliberately no "+N more" count: unlike the tools that
+ * advertise one, the honest statement here is the open-ended ACP line, not an
+ * invented number.
  */
-export const AGENTS = [
-  { name: "Claude Code", note: "stream-json adapter" },
-  { name: "Codex", note: "app-server JSON-RPC" },
-  { name: "Pi", note: "RPC transport" },
-  { name: "OpenCode", note: "session import" },
-  { name: "Copilot", note: "session import" },
-  { name: "Any ACP agent", note: "Agent Client Protocol" },
-] as const;
+export const AGENT_MARKS = AGENTS.filter(
+  (agent): agent is (typeof AGENTS)[number] & { icon: string } => "icon" in agent
+);
 
 /**
  * Substrate claims. Each is a structural fact about how the app is built, not a

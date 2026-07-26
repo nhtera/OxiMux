@@ -8,7 +8,7 @@ import { SITE } from "../../consts";
     class="mx-auto flex max-w-2xl flex-col items-center text-center"
     data-reveal
   >
-<!-- No data-reveal here: the wrapper above already carries it, and nesting
+    <!-- No data-reveal here: the wrapper above already carries it, and nesting
          two reveal targets double-hides this heading. -->
     <h2
       class="font-mono text-2xl leading-tight font-semibold tracking-tight text-balance text-fg sm:text-4xl"
@@ -16,15 +16,30 @@ import { SITE } from "../../consts";
       Run your agents on something native.
     </h2>
     <p class="mt-5 max-w-md text-base leading-relaxed text-fg-muted">
-      Pre-1.0 and in active development, but already the tool it was built to
-      replace.
+      Pre-1.0 and in active development. It is already what OxiMux itself gets
+      built with.
     </p>
-    <a
-      href={SITE.repo}
-      class="press mt-8 inline-flex items-center gap-2 rounded-[--radius-control] bg-fg px-6 py-3 text-sm font-medium whitespace-nowrap text-canvas hover:bg-white"
-    >
-      <Icon name="simple-icons:github" class="size-4" aria-hidden="true" />
-      View on GitHub
-    </a>
+
+    <!--
+      Same two intents as the hero, same two labels. Download is the primary
+      action in both places and the repo link is called "GitHub" everywhere on
+      the page, so no single intent picks up a second name.
+    -->
+    <div class="mt-8 flex flex-wrap items-center justify-center gap-3">
+      <a
+        href={SITE.download}
+        class="press inline-flex items-center gap-2 rounded-[--radius-control] bg-fg px-6 py-3 text-sm font-medium whitespace-nowrap text-canvas hover:bg-white"
+      >
+        <Icon name="simple-icons:apple" class="size-4" aria-hidden="true" />
+        Download for Mac
+      </a>
+      <a
+        href={SITE.repo}
+        class="press inline-flex items-center gap-2 rounded-[--radius-control] border border-edge bg-panel px-6 py-3 text-sm whitespace-nowrap text-fg hover:border-edge-strong hover:bg-panel-alt"
+      >
+        <Icon name="simple-icons:github" class="size-4" aria-hidden="true" />
+        GitHub
+      </a>
+    </div>
   </div>
 </section>

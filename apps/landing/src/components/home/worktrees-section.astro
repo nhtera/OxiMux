@@ -1,5 +1,6 @@
 ---
 import ShotFrame from "../shot-frame.astro";
+import worktrees from "../../assets/shots/worktrees.png";
 ---
 
 <!--
@@ -25,8 +26,8 @@ import ShotFrame from "../shot-frame.astro";
 
     <div class="mt-12" data-reveal>
       <ShotFrame
-        alt="The worktree switcher, showing several isolated task worktrees for one repository."
-        pending="Worktree switcher with several isolated task worktrees open for one repository."
+        src={worktrees}
+        alt="The project rail showing a repository with its primary checkout and an isolated oximux/test-1 worktree, with two coding agents running side by side in split panes."
       />
     </div>
   </div>

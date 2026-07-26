@@ -1,5 +1,6 @@
 ---
 import ShotFrame from "../shot-frame.astro";
+import diff from "../../assets/shots/diff.png";
 
 const points = [
   "Staged and unstaged review with word-level diffs",
@@ -38,10 +39,15 @@ const points = [
     </div>
 
     <div data-reveal>
+      <!-- Ratio matches the crop exactly so object-cover never has anything to
+           trim. The capture is deliberately narrowed to the changed-file list
+           plus the diff pane: the rail and the source control panel already
+           appear in the two shots above, and dropping them here keeps the diff
+           text legible at column width. -->
       <ShotFrame
-        ratio="1 / 1"
-        alt="The diff viewer showing a word-level diff alongside the source control panel."
-        pending="Diff viewer with a word-level diff open next to the source control panel."
+        src={diff}
+        ratio="2020 / 1810"
+        alt="The diff viewer showing two changed files, a word-level diff with added and removed line tints, and collapsed unchanged-line runs."
       />
     </div>
   </div>

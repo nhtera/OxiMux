@@ -1,4 +1,5 @@
 ---
+import { Icon } from "astro-icon/components";
 import { AGENTS } from "../../consts";
 ---
 
@@ -14,22 +15,37 @@ import { AGENTS } from "../../consts";
       login. Nothing is proxied, wrapped, or resold.
     </p>
 
-    <ul class="mt-12 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
+    <!--
+      Dividers are resolved on the container with nth-child, not per item.
+      Mixing CSS `odd:`/`even:` (1-indexed) with a JS `i % 3` (0-indexed) put the
+      column rules on different cells in each row. Expressing every rule in the
+      same 1-indexed space keeps the grid honest at 1, 2, and 3 columns, and the
+      closing rule lives on the list so it lands under whichever row is last.
+    -->
+    <ul
+      class="mt-12 grid grid-cols-1 border-b border-edge sm:grid-cols-2 lg:grid-cols-3 [&>li]:border-t [&>li]:border-edge [&>li]:pr-8 sm:max-lg:[&>li:nth-child(2n)]:border-l sm:max-lg:[&>li:nth-child(2n)]:pl-8 lg:[&>li:not(:nth-child(3n+1))]:border-l lg:[&>li:not(:nth-child(3n+1))]:pl-8"
+    >
       {
         AGENTS.map((agent, i) => (
           <li
             data-reveal
             style={`--i: ${i}`}
-            class:list={[
-              "row-sweep border-t border-edge py-5",
-              i >= AGENTS.length - 1 && "border-b sm:border-b-0",
-              "sm:odd:pr-8 sm:even:border-l sm:even:border-edge sm:even:pl-8",
-              "lg:even:border-l-0 lg:even:pl-0 lg:odd:pr-0",
-              i % 3 !== 0 && "lg:border-l lg:border-edge lg:pl-8",
-            ]}
+            class="group row-sweep py-5"
           >
-            <span class="block font-mono text-base text-fg">{agent.name}</span>
-            <span class="mt-1 block text-sm text-fg-subtle">{agent.note}</span>
+            {/* The glyph is what keeps this from reading as six identical text
+                cells. ACP has no vendor mark by definition, so that cell gets a
+                protocol glyph rather than a blank gap. */}
+            <span class="flex items-center gap-2.5">
+              <Icon
+                name={"icon" in agent ? agent.icon : "ph:plugs-connected"}
+                class="size-[18px] shrink-0 text-fg-subtle transition-colors duration-200 group-hover:text-fg-muted motion-reduce:transition-none"
+                aria-hidden="true"
+              />
+              <span class="font-mono text-base text-fg">{agent.name}</span>
+            </span>
+            <span class="mt-1 block pl-[30px] text-sm text-fg-subtle">
+              {agent.note}
+            </span>
           </li>
         ))
       }

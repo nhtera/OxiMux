@@ -34,7 +34,9 @@ const { title, description, image } = Astro.props;
     <link rel="sitemap" href="/sitemap-index.xml" />
     <SeoMeta title={title} description={description} image={image} />
   </head>
-  <body class="min-h-screen bg-canvas font-sans text-fg antialiased">
+  <!-- 100dvh, not 100vh: on iOS Safari the address bar makes vh taller than the
+       visible viewport, which leaves a scrollable dead strip below the footer. -->
+  <body class="min-h-[100dvh] bg-canvas font-sans text-fg antialiased">
     <a
       href="#main"
       class="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-[--radius-control] focus:bg-overlay focus:px-3 focus:py-2 focus:text-sm"
