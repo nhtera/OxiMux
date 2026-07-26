@@ -63,16 +63,40 @@ use tokio::sync::broadcast;
 use oximux_remote_iroh::HostHandle;
 use oximux_remote_proto::PairingTicket;
 
-/// Monotonic source of stable per-view remote session ids. Decoupled from an
-/// agent's own (often not-yet-known-at-connect) session id: the phone only needs a
-/// key that stays stable for a desktop session's lifetime, and a fresh chat has no
-/// id until its subprocess assigns one. Process-wide, so ids never collide.
+/// Monotonic source of *placeholder* remote session ids, for a chat that has not
+/// yet been given an agent session id of its own.
+///
+/// Positional and per-process, so it names a view's build order rather than the
+/// conversation — worthless to a client once the desktop restarts. Everything with
+/// a real id uses that instead ([`remote_session_id_for`]); this only has to be
+/// collision-free for the run it exists in.
 static REMOTE_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// Mint the next stable remote session id (`"agent-N"`). Human-readable so it reads
-/// sensibly in the phone's session list.
+/// Mint the next placeholder remote session id (`"agent-N"`), for a chat with no
+/// agent session id yet. Prefer [`remote_session_id_for`], which falls back here.
 pub fn next_remote_session_id() -> String {
     format!("agent-{}", REMOTE_SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The id a session is known by remotely.
+///
+/// Derived from the agent's own session id whenever there is one, because a
+/// remote client's reference to a session has to survive a desktop restart. The
+/// counter cannot promise that: it numbers views in the order they happen to be
+/// built, so `agent-3` is a different conversation on every launch — and after a
+/// restart a phone holding one is pointing at whichever chat was third this time.
+/// The agent's id is minted once, keys the persisted transcript, and drives
+/// `--resume`, so it already names the conversation rather than its position.
+///
+/// A chat that has never completed a turn has no such id yet and falls back to
+/// the counter. It picks up a stable one the moment the agent mints it (see
+/// `AgentChatView::rekey_remote_session`), which is also the first moment it has
+/// any history worth reaching from another device.
+pub fn remote_session_id_for(agent_session_id: Option<&str>) -> String {
+    match agent_session_id {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => next_remote_session_id(),
+    }
 }
 
 /// A view's live tie into the registry: the handle to tee events through, plus the
@@ -273,6 +297,17 @@ impl RemoteControl {
     /// The shared session registry (the host serves from this same instance).
     pub fn registry(&self) -> Arc<SessionRegistry> {
         self.registry.clone()
+    }
+
+    /// Drop a session from the registry by id.
+    ///
+    /// For the one case a [`RemoteBinding`] cannot cover: a view re-keying itself
+    /// onto the agent's own session id has to remove the entry it was registered
+    /// under before, and by then its binding is already pointing at the new one.
+    /// Ordinary teardown goes through the binding, which carries the registry
+    /// with it precisely so `Drop` needs no context.
+    pub fn unregister(&self, id: &str) {
+        self.registry.unregister(id);
     }
 
     pub fn enabled(&self) -> bool {

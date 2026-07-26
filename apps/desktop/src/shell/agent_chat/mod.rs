@@ -518,7 +518,7 @@ use composer::{ComposerEvent, ComposerView, ControlVocab};
 use context_providers::{ContextRequest, ContextSource};
 use question_card::{QuestionCard, QuestionCardEvent};
 use tool_grouping::{plan_tool_grouping, summarize_tool_run, EntryDisplay, GroupSummary, GroupedTool};
-use crate::remote_control::{RemoteBinding, RemoteControl, next_remote_session_id};
+use crate::remote_control::{RemoteBinding, RemoteControl, remote_session_id_for};
 use oximux_agents::session_registry::{ChoiceKind, RemoteChoice, RemotePrompt, SessionMeta};
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
@@ -1333,7 +1333,10 @@ impl AgentChatView {
             .to_string()
         });
 
-        let remote_session_id = next_remote_session_id();
+        // Keyed on the agent's own session id when the thread has one — a
+        // restored chat always does — so a remote client's reference to this
+        // session survives the restart that just rebuilt this view.
+        let remote_session_id = remote_session_id_for(thread.session_id.as_deref());
         // Bind this session into the remote-control registry now if remote control
         // is enabled (else `None` — nothing registered, nothing teed).
         let remote = connection.clone().and_then(|conn| {
@@ -3336,7 +3339,9 @@ impl AgentChatView {
         // Mirror `new`: seed the palette's command metadata from the backend, so
         // a test exercises the same path the real constructor takes.
         push_slash_catalog(Some(connection.as_ref()), &composer, std::path::Path::new(""), cx);
-        let remote_session_id = next_remote_session_id();
+        // No thread yet in this constructor, so the placeholder is correct: a
+        // test view has never run and so has no agent session id to key on.
+        let remote_session_id = remote_session_id_for(None);
         let remote = cx
             .try_global::<RemoteControl>()
             .and_then(|rc| rc.bind(&remote_session_id, connection.clone()));
@@ -3634,6 +3639,12 @@ impl AgentChatView {
             }
             self.apply_event(ev, cx);
         }
+        // A fresh chat is registered under a placeholder id until the agent mints
+        // its own; once the fold has one, move the session onto it. Checked after
+        // the batch rather than at the event that carries the id, because which
+        // event that is differs per backend and missing it would strand the
+        // session under a placeholder — an id no later run can resolve.
+        self.rekey_remote_session_if_needed(cx);
         // Republish title/model after the fold has applied the batch, so a remote
         // session list shows what this tab shows (a `TitleUpdated` or a model swap
         // lands in the same batch). Done here, at the one place every event passes
@@ -3971,6 +3982,34 @@ impl AgentChatView {
     /// binding, then register the current connection under [`Self::remote_session_id`]
     /// — but only while remote control is enabled, so a disabled desktop registers
     /// nothing and clones no events. Called on connect and on respawn.
+    /// Move this session onto the agent's own id once the agent has minted one.
+    ///
+    /// A chat that has never run is registered under a positional placeholder,
+    /// which is worthless to a remote client the moment the desktop restarts.
+    /// The agent's id names the conversation instead, so the session is re-keyed
+    /// onto it at the first opportunity — which is also the first moment it has
+    /// any history worth reaching from another device.
+    ///
+    /// Re-registering under the new id restarts `seq` at 1, so the old id is
+    /// dropped only after the new one is live: a client subscribed to the
+    /// placeholder sees its stream end and resubscribes, rather than sitting on a
+    /// cursor no future event will ever exceed.
+    fn rekey_remote_session_if_needed(&mut self, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.thread.session_id.clone() else {
+            return;
+        };
+        if agent_id.is_empty() || agent_id == self.remote_session_id {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.remote_session_id, agent_id);
+        // `bind_remote` registers under the field just replaced; the old entry is
+        // removed afterwards so the two never coexist beyond this call.
+        self.bind_remote(cx);
+        if let Some(rc) = cx.try_global::<RemoteControl>() {
+            rc.unregister(&previous);
+        }
+    }
+
     fn bind_remote(&mut self, cx: &mut Context<Self>) {
         // Deliberately does NOT unregister first. On a respawn this runs again for
         // the same session id, and `register` swaps the backend in place — keeping
@@ -6491,6 +6530,65 @@ mod tests {
                 .any(|s| s["response"]["response"]["behavior"] == "deny"),
             "disconnect must send a deny control_response, got {sent:?}"
         );
+    }
+
+    /// The gap this closes: a session's remote id used to be a per-process
+    /// counter, so `agent-3` named a different conversation on every launch and a
+    /// phone holding one after a restart pointed at whatever was built third.
+    /// Once the agent mints its own id, the session moves onto it.
+    #[gpui::test]
+    async fn a_session_is_rekeyed_onto_the_agent_id_it_is_given(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(|cx| {
+            let rc = crate::remote_control::RemoteControl::new();
+            rc.set_enabled(true);
+            cx.set_global(rc);
+        });
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let placeholder = window
+            .update(cx, |view, _window, _cx| view.remote_session_id().to_string())
+            .unwrap();
+        assert!(
+            placeholder.starts_with("agent-"),
+            "a chat that has never run has only a placeholder, got {placeholder}",
+        );
+
+        window
+            .update(cx, |view, _window, cx| {
+                // The agent mints its id, then anything at all arrives.
+                view.thread.session_id = Some("11111111-2222-3333-4444-555555555555".into());
+                view.on_event(ThreadEvent::AssistantText("hi".into()), cx);
+
+                assert_eq!(
+                    view.remote_session_id(),
+                    "11111111-2222-3333-4444-555555555555",
+                    "the session moved onto the id that names the conversation",
+                );
+            })
+            .unwrap();
+
+        cx.update(|cx| {
+            let rc = cx.global::<crate::remote_control::RemoteControl>();
+            assert!(
+                rc.registry().get("11111111-2222-3333-4444-555555555555").is_some(),
+                "and is reachable under it",
+            );
+            assert!(
+                rc.registry().get(&placeholder).is_none(),
+                "while the placeholder is gone, so the list shows one session not two",
+            );
+        });
     }
 
     /// A normal streamed turn folds into user + assistant entries via `on_event`.
