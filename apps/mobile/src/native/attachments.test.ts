@@ -1,4 +1,9 @@
-import { readJpegOrientation, sniffMediaType } from '@/native/attachments';
+import {
+  MAX_ATTACHMENT_BASE64,
+  isSendable,
+  readJpegOrientation,
+  sniffMediaType,
+} from '@/native/attachments';
 
 /** Base64 of `bytes` followed by enough filler to clear the 12-byte minimum. */
 function b64(bytes: number[]): string {
@@ -110,5 +115,43 @@ describe('readJpegOrientation', () => {
     expect(readJpegOrientation('')).toBe(1);
     expect(readJpegOrientation('not base64 at all!!')).toBe(1);
     expect(readJpegOrientation(toBase64([0xff, 0xd8]))).toBe(1);
+  });
+});
+
+describe('isSendable', () => {
+  const upright = jpegWithOrientation(1);
+  const rotated = jpegWithOrientation(3);
+  const png = toBase64([0x89, ...ascii('PNG'), 0x0d, 0x0a, 0x1a, 0x0a]);
+
+  it('forwards a small upright image untouched', () => {
+    expect(isSendable(upright, 'image/jpeg')).toBe(true);
+    expect(isSendable(png, 'image/png')).toBe(true);
+  });
+
+  it('repairs a rotated JPEG', () => {
+    expect(isSendable(rotated, 'image/jpeg')).toBe(false);
+  });
+
+  /**
+   * The regression this pins: forwarding originals untouched meant three camera
+   * photos totalled 20 MB and the whole prompt was refused, with the message
+   * naming the total rather than the photo to drop. Each image now has to fit on
+   * its own, so a full set always fits.
+   */
+  it('repairs an image too large to share the frame', () => {
+    const huge = 'A'.repeat(MAX_ATTACHMENT_BASE64 + 1);
+    expect(isSendable(huge, 'image/jpeg')).toBe(false);
+    expect(isSendable(huge, 'image/png')).toBe(false);
+  });
+
+  it('holds a full set of attachments inside the frame budget', () => {
+    // The core refuses a prompt over ~15 MB of base64; eight at the per-image
+    // ceiling must stay under that or the ceiling is not doing its job.
+    expect(MAX_ATTACHMENT_BASE64 * 8).toBeLessThan(15 * 1024 * 1024);
+  });
+
+  /** Orientation is a JPEG concept — a PNG carries none, so it is never re-read. */
+  it('does not consult orientation for a non-JPEG', () => {
+    expect(isSendable(rotated, 'image/png')).toBe(true);
   });
 });

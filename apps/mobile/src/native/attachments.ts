@@ -24,24 +24,43 @@ export function toChatImage({ mediaType, data }: Attachment): ChatImage {
 /**
  * The JPEG quality used when an attachment has to be re-encoded.
  *
- * The core refuses a prompt whose attachments cannot fit in one transport frame,
- * and base64 inflates by ~4/3, so full-resolution phone photos reach that ceiling
- * in a handful. Compressing means the common case never hits the refusal — and an
- * agent reading a photo does not need the last decile of JPEG quality to do it.
+ * An agent reading a photo does not need the last decile of JPEG quality to do
+ * it, and the difference is most of the payload. Applies only to an image that
+ * had to be re-rendered anyway — one that is already sendable is forwarded
+ * byte-for-byte (see [`isSendable`]).
  *
- * This does not apply to an image that is already sendable: those are forwarded
- * byte-for-byte (see [`pickImages`]), because a re-encode of a screenshot costs
- * exactly the detail an agent is trying to read — JPEG rings around text.
- *
- * Note a re-encode does not make an attachment smaller than the camera's own
- * file: JPEG is the weaker codec, so a converted photo lands somewhat larger than
- * the HEIC it replaces (measured: 2.8 MB → 3.5 MB). The size ceiling is enforced
- * separately and reports itself clearly when hit.
+ * Note this alone does not make an attachment smaller than the camera's own
+ * file: JPEG is the weaker codec, so a straight transcode lands somewhat larger
+ * than the HEIC it replaces (measured: 2.8 MB → 3.5 MB). The resize to
+ * [`MAX_EDGE`] is what actually brings a photo down; the quality setting only
+ * trims what is left.
  */
 const QUALITY = 0.7;
 
 /** How many images one prompt may carry, matching the desktop composer. */
 export const MAX_ATTACHMENTS = 8;
+
+/**
+ * The longest edge an attachment is sent at.
+ *
+ * The agent's vision pipeline downsamples to roughly this before it looks at
+ * anything, so pixels beyond it are discarded after being paid for twice — once
+ * in transfer budget, once in the transcript that stores them forever. Resizing
+ * here is the rare case where the cheaper thing is also the lossless one.
+ */
+const MAX_EDGE = 1568;
+
+/**
+ * The base64 ceiling for one attachment.
+ *
+ * The core refuses a prompt whose attachments cannot fit in a single transport
+ * frame — roughly 15 MB across all of them — and that refusal names the total,
+ * not the photo responsible, so a user who picked several has nothing to act on
+ * beyond removing them one at a time. Holding each image to the frame budget
+ * divided by [`MAX_ATTACHMENTS`] means a full set always fits and the refusal
+ * becomes unreachable in normal use.
+ */
+export const MAX_ATTACHMENT_BASE64 = 1_800_000;
 
 /**
  * Decode the first `bytes` of a base64 payload into a binary string.
@@ -144,6 +163,32 @@ export function sniffMediaType(base64: string): string | null {
   return null;
 }
 
+/**
+ * Whether a picked image can go on the wire exactly as it came off the library.
+ *
+ * Three separate ways an image is unusable, checked together because they share
+ * one remedy — re-rendering it — and because leaving any of them out produces a
+ * failure a long way from here:
+ *
+ * - **Format.** A camera-roll photo is HEIC, which neither the desktop renderer
+ *   nor the agent can decode.
+ * - **Orientation.** A photo's pixels are stored in the sensor's orientation with
+ *   an EXIF tag saying how to turn them. iOS honours that tag, so the phone looks
+ *   right; the desktop's decoder and the agent both read raw pixels, so the same
+ *   bytes arrive rotated.
+ * - **Size.** Attachments share one transport frame, and a full-resolution photo
+ *   is several megabytes of base64 on its own, so a few of them are refused as a
+ *   group with no indication which one to drop.
+ *
+ * `mediaType` is passed in already sniffed rather than re-read, so the caller
+ * cannot check the encoding here and then send a different one.
+ */
+export function isSendable(base64: string, mediaType: string): boolean {
+  if (base64.length > MAX_ATTACHMENT_BASE64) return false;
+  if (mediaType === 'image/jpeg' && readJpegOrientation(base64) !== 1) return false;
+  return true;
+}
+
 /** What one trip through the picker produced. */
 export type PickResult = {
   attachments: Attachment[];
@@ -152,43 +197,73 @@ export type PickResult = {
 };
 
 /**
- * Render a picked image flat and encode it as upright JPEG, returning base64.
+ * Render a picked image flat at `format`, downscaled to [`MAX_EDGE`].
  *
- * The repair path, for the two things a photo library hands back that cannot be
- * sent as-is:
- *
- * - **Format.** A camera-roll photo is HEIC, which neither the desktop renderer
- *   nor the agent can decode.
- * - **Orientation.** A photo's pixels are stored in the sensor's orientation and
- *   an EXIF tag says how to turn them. iOS honours that tag, so the phone looks
- *   right; the desktop's decoder and the agent both read raw pixels, so the same
- *   bytes arrive rotated. Rendering to a bitmap bakes the rotation in, so every
- *   consumer sees the photo the right way up without needing EXIF support.
- *
- * Rendering also drops the remaining metadata by construction rather than by
- * whichever branch the picker happened to take.
- *
- * JPEG rather than PNG because the transport refuses an oversize frame: a
- * lossless encode of a full-resolution phone photo is several times larger and
- * would trip that refusal on a single attachment. The cost is alpha, which the
- * camera encodings that reach this path do not carry.
+ * Rendering to a bitmap is what fixes an unsendable image, and it fixes all
+ * three faults at once by construction: the output carries whatever encoding is
+ * asked for, the EXIF rotation is baked into the pixels so a consumer with no
+ * EXIF support still sees the photo upright, and the resize brings the payload
+ * down. It also drops the remaining metadata — GPS, device serial — rather than
+ * leaving that to whichever branch the picker happened to take.
  *
  * `null` if the image cannot be decoded at all — the one case where an
  * attachment genuinely has to be dropped.
  */
-async function reencodeAsJpeg(uri: string): Promise<string | null> {
-  const context = ImageManipulator.manipulate(uri);
+async function encode(
+  source: { uri: string; width: number; height: number },
+  format: SaveFormat,
+): Promise<ChatImage | null> {
+  const context = ImageManipulator.manipulate(source.uri);
+  // Only the long edge is given, so the other is derived and the aspect ratio
+  // cannot drift. Skipped entirely when the image is already small enough —
+  // upscaling a modest screenshot to the cap would invent detail and cost size.
+  if (Math.max(source.width, source.height) > MAX_EDGE) {
+    context.resize(
+      source.width >= source.height ? { width: MAX_EDGE } : { height: MAX_EDGE },
+    );
+  }
   let image: Awaited<ReturnType<typeof context.renderAsync>> | null = null;
   try {
     image = await context.renderAsync();
-    const saved = await image.saveAsync({ format: SaveFormat.JPEG, compress: QUALITY, base64: true });
-    return saved.base64 ?? null;
+    // `compress` is a JPEG parameter; a PNG save ignores it and stays lossless.
+    const saved = await image.saveAsync({ format, compress: QUALITY, base64: true });
+    const data = saved.base64;
+    if (!data) return null;
+    // Trust the bytes, not what we believe we just asked for. This is the single
+    // place the wire type is decided, and a payload whose label disagrees with
+    // its bytes fails far downstream — a blank bubble on the desktop, an error
+    // from the agent — with nothing pointing back here.
+    const mediaType = sniffMediaType(data);
+    return mediaType ? { mediaType, data } : null;
   } catch {
     return null;
   } finally {
     image?.release();
     context.release();
   }
+}
+
+/**
+ * Re-render an image into something sendable, keeping PNG when the source was
+ * PNG.
+ *
+ * Format is preserved rather than normalised to JPEG because the two kinds of
+ * image that reach here fail differently. A screenshot is PNG, and JPEG rings
+ * around exactly the text an agent was asked to read; a photo has no such detail
+ * to lose and compresses far better. Since the resize alone usually brings a
+ * screenshot under the ceiling, the lossless path is also normally the
+ * sufficient one — and where it is not, JPEG is the fallback rather than the
+ * default, so the cost is only paid by images that actually need it.
+ */
+async function repair(
+  source: { uri: string; width: number; height: number },
+  sourceWasPng: boolean,
+): Promise<ChatImage | null> {
+  if (!sourceWasPng) return encode(source, SaveFormat.JPEG);
+  const lossless = await encode(source, SaveFormat.PNG);
+  if (lossless && lossless.data.length <= MAX_ATTACHMENT_BASE64) return lossless;
+  // Still too large to be worth its losslessness — or unencodable as PNG.
+  return (await encode(source, SaveFormat.JPEG)) ?? lossless;
 }
 
 /**
@@ -199,11 +274,12 @@ async function reencodeAsJpeg(uri: string): Promise<string | null> {
  * itself on both platforms; a denial also arrives as a cancel, which is why
  * there is no separate branch for it here.
  *
- * An image that is already sendable — a supported encoding, stored upright — is
- * forwarded byte-for-byte. Only one that fails either test is repaired. That
- * distinction matters most for the screenshot case: screenshots are PNG and
- * always upright, and re-encoding one to JPEG would ring around exactly the text
- * the agent was asked to read.
+ * An image that is already sendable (see [`isSendable`]) is forwarded
+ * byte-for-byte; only one that fails a test is repaired, and then only as far as
+ * that test requires. The distinction matters most for the screenshot case:
+ * screenshots are PNG, upright, and usually modest, so they cross untouched
+ * rather than picking up JPEG ringing around exactly the text an agent was asked
+ * to read.
  */
 export async function pickImages(remaining: number): Promise<PickResult> {
   const result = await ImagePicker.launchImageLibraryAsync({
@@ -227,23 +303,17 @@ export async function pickImages(remaining: number): Promise<PickResult> {
   const picked = await Promise.all(
     result.assets.map(async (asset, index): Promise<Attachment | null> => {
       const id = `${asset.assetId ?? asset.uri}:${index}`;
-      // Forward the original when nothing is wrong with it. Both conditions are
+      // Forward the original when nothing is wrong with it. Every condition is
       // read off the bytes rather than the picker's description of them, so this
       // cannot forward something the desktop or the agent will choke on.
       const source = asset.base64;
-      if (source) {
-        const mediaType = sniffMediaType(source);
-        if (mediaType && readJpegOrientation(source) === 1) {
-          return { mediaType, data: source, uri: asset.uri, id };
-        }
+      const sourceType = source ? sniffMediaType(source) : null;
+      if (source && sourceType && isSendable(source, sourceType)) {
+        return { mediaType: sourceType, data: source, uri: asset.uri, id };
       }
-      const data = await reencodeAsJpeg(asset.uri);
-      // Trust the bytes, not what we believe we just wrote. This is the single
-      // place the wire type is decided, and a payload whose label disagrees with
-      // its bytes fails far downstream — a blank bubble on the desktop, an error
-      // from the agent — with nothing pointing back here.
-      if (!data || sniffMediaType(data) !== 'image/jpeg') return null;
-      return { mediaType: 'image/jpeg', data, uri: asset.uri, id };
+      const repaired = await repair(asset, sourceType === 'image/png');
+      if (!repaired) return null;
+      return { ...repaired, uri: asset.uri, id };
     }),
   );
 
