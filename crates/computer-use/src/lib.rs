@@ -22,8 +22,13 @@
 pub mod daemon;
 pub mod discovery;
 pub mod exec;
+pub mod grants;
+pub mod lifecycle;
 pub mod mcp;
+pub mod policy;
+pub mod proc;
 pub mod session;
+pub mod tools;
 pub mod verify;
 pub mod version;
 
@@ -31,7 +36,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub use daemon::DaemonState;
+pub use grants::{GrantTable, Provenance};
 pub use mcp::{bare_tool_name, is_computer_use_tool, server_spec, SERVER_NAME};
+pub use policy::{decide, Decision, PolicyContext};
 pub use session::{Reconciliation, SessionId, SessionLedger};
 pub use verify::VerifiedDriver;
 pub use version::Version;
@@ -76,6 +83,12 @@ pub enum Error {
 
     #[error("could not read a version from the driver (got: {output})")]
     UnreadableVersion { output: String },
+
+    #[error("{command} failed: {detail}")]
+    SessionCommandFailed {
+        command: &'static str,
+        detail: String,
+    },
 }
 
 /// Find the driver and put it through every gate — equivalently, "is screen

@@ -12,10 +12,12 @@
 //! pending, the drain task rejects it rather than leaving a dangling prompt.
 
 mod apply_patch;
+mod attention;
 mod auth_card;
 mod background_tasks_panel;
 mod bubble;
 mod composer;
+mod computer_use;
 mod composer_history;
 mod acp_terminal_host;
 mod context_meter;
@@ -385,51 +387,6 @@ pub enum AgentChatEvent {
     },
 }
 
-/// Classify a live thread event into an attention notification `(kind, body)`, or
-/// `None` when it isn't attention-worthy. A turn end (finished/errored) requires a
-/// turn to have been active (`was_active`) so a stray result can't banner; an
-/// intentional Stop (`interrupted`) is not a failure. Permission / question / auth
-/// prompts always signal — they block the user. Pure classifier: the host applies
-/// the focus / visibility / per-kind gates before anything surfaces.
-fn attention_for_event(
-    ev: &ThreadEvent,
-    was_active: bool,
-    interrupted: bool,
-) -> Option<(crate::notifier::NotificationKind, String)> {
-    use crate::notifier::NotificationKind;
-    match ev {
-        // An intentional Stop suppresses BOTH shapes of turn end it can produce: a
-        // Claude interrupt arrives as `is_error: true`, but an ACP cancel replies
-        // `StopReason::Cancelled` → `TurnEnded { is_error: false, turn_diff: None }`. Either way,
-        // `interrupted` means the user pressed Stop, so no "finished"/"failed"
-        // banner should fire — check it before the error split.
-        ThreadEvent::TurnEnded { .. } if was_active && interrupted => None,
-        ThreadEvent::TurnEnded { is_error: true, result, .. } if was_active => {
-            let head = result
-                .as_deref()
-                .unwrap_or_default()
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("")
-                .trim();
-            Some((NotificationKind::Failed, bubble::elide(head, 120)))
-        }
-        ThreadEvent::TurnEnded { is_error: false, .. } if was_active => {
-            Some((NotificationKind::Done, String::new()))
-        }
-        ThreadEvent::PermissionRequested { tool_name, .. } => {
-            Some((NotificationKind::NeedsApproval, tool_name.clone()))
-        }
-        ThreadEvent::QuestionAsked { .. } => {
-            Some((NotificationKind::NeedsApproval, "waiting for your answer".to_string()))
-        }
-        ThreadEvent::AuthRequired { .. } => {
-            Some((NotificationKind::NeedsApproval, "sign-in required".to_string()))
-        }
-        _ => None,
-    }
-}
-
 /// Which surface an agent-chat tab is showing: its structured chat, or a
 /// companion raw-PTY terminal running the same agent session resumed
 /// interactively (`claude --resume <id>`). The companion is spawned lazily on
@@ -519,6 +476,8 @@ use context_providers::{ContextRequest, ContextSource};
 use question_card::{QuestionCard, QuestionCardEvent};
 use tool_grouping::{plan_tool_grouping, summarize_tool_run, EntryDisplay, GroupSummary, GroupedTool};
 use crate::remote_control::{RemoteBinding, RemoteControl, remote_session_id_for};
+use attention::attention_for_event;
+use computer_use::{Decision, ScreenControl};
 use oximux_agents::session_registry::{ChoiceKind, RemoteChoice, RemotePrompt, SessionMeta};
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
@@ -622,6 +581,10 @@ pub struct AgentChatView {
     theme: Theme,
     density: Density,
     typography: Typography,
+    /// This chat's screen-control identity and the targets it may drive. Held
+    /// per view so two chats can never be confused for one another, and dropped
+    /// with the view, which releases its grants.
+    screen_control: ScreenControl,
     /// Launch context, retained so [`Self::respawn`] can re-spawn the subprocess
     /// (Stop→next-send resume) in the same directory with the same model.
     cwd: PathBuf,
@@ -1406,6 +1369,7 @@ impl AgentChatView {
             theme,
             density,
             typography,
+            screen_control: ScreenControl::new(&cwd),
             cwd,
             model,
             permission_mode: None,
@@ -3391,6 +3355,7 @@ impl AgentChatView {
             theme,
             density,
             typography,
+            screen_control: ScreenControl::new(&PathBuf::new()),
             cwd: PathBuf::new(),
             model: None,
             permission_mode: None,
@@ -3734,6 +3699,21 @@ impl AgentChatView {
     fn apply_event(&mut self, ev: ThreadEvent, cx: &mut Context<Self>) {
         let was_active = self.thread.turn_active;
         self.thread.apply(&ev);
+        // Screen-control calls are decided here because this is the only point
+        // OxiMux is in their path at all — the driver is a separate process the
+        // agent talks to directly. Runs after the fold so the card exists to be
+        // resolved, and answers nothing that isn't a screen-control tool.
+        if let ThreadEvent::PermissionRequested { request_id, tool_use_id, tool_name, input, .. } =
+            &ev
+        {
+            self.enforce_screen_control(
+                tool_name.clone(),
+                input.clone(),
+                request_id.clone(),
+                tool_use_id.clone().unwrap_or_else(|| request_id.clone()),
+                cx,
+            );
+        }
         // A couple of ACP session updates drive view/host state the ChatThread
         // fold alone doesn't reach: an agent-driven mode switch must sync the
         // picker's own field; a title update rides up to the tab label.
@@ -4401,6 +4381,28 @@ impl AgentChatView {
         cx.notify();
     }
 
+    /// Answer a screen-control call from policy, leaving everything else alone.
+    ///
+    /// Allow and Refuse resolve without troubling the user; `Ask` deliberately
+    /// does nothing, which leaves the ordinary permission card up for them to
+    /// decide. A refusal's reason goes back to the agent as the denial message,
+    /// so it can explain itself rather than retrying blindly.
+    fn enforce_screen_control(
+        &mut self,
+        tool_name: String,
+        input: serde_json::Value,
+        request_id: String,
+        tool_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let decision = match self.screen_control.decide(&tool_name, &input) {
+            Decision::NotApplicable | Decision::Ask { .. } => return,
+            Decision::Allow => PermissionDecision::Allow { updated_input: input },
+            Decision::Refuse { reason } => PermissionDecision::Deny { message: reason },
+        };
+        self.resolve_permission(tool_id, request_id, decision, cx);
+    }
+
     /// Answer a pending tool permission from a card button. Routes the decision
     /// to the connection by `request_id`, then transitions the local status so
     /// the card updates immediately: Allow → `InProgress` (the tool proceeds and
@@ -4409,7 +4411,7 @@ impl AgentChatView {
         &mut self,
         tool_id: String,
         request_id: String,
-        decision: PermissionDecision,
+        mut decision: PermissionDecision,
         cx: &mut Context<Self>,
     ) {
         // Idempotency guard: only answer a tool that is STILL awaiting. Once
@@ -4417,14 +4419,29 @@ impl AgentChatView {
         // buttons drop on re-render, but this closes the sub-frame window where
         // a stray second click could send a second control_response for an
         // already-decided request_id.
-        let still_awaiting = self.thread.entries.iter().any(|e| {
-            matches!(e, ThreadEntry::ToolCall(tc)
+        let awaiting = self.thread.entries.iter().find_map(|e| match e {
+            ThreadEntry::ToolCall(tc)
                 if tc.id == tool_id
                     && matches!(&tc.status,
-                        ToolCallStatus::WaitingForConfirmation(r) if r.request_id == request_id))
+                        ToolCallStatus::WaitingForConfirmation(r) if r.request_id == request_id) =>
+            {
+                Some((tc.name.clone(), tc.input.clone()))
+            }
+            _ => None,
         });
-        if !still_awaiting {
+        let Some((tool_name, tool_input)) = awaiting else {
             return;
+        };
+        // Approving a screen-control call is what grants its target, and the
+        // policy has the last word — a card can sit open a long time, and a
+        // target another chat claimed meanwhile is refused however this one is
+        // answered.
+        if matches!(
+            decision,
+            PermissionDecision::Allow { .. } | PermissionDecision::AllowWithSuggestion { .. }
+        ) && let Err(reason) = self.screen_control.approve(&tool_name, &tool_input)
+        {
+            decision = PermissionDecision::Deny { message: reason };
         }
         if let Some(conn) = &self.connection {
             let _ = conn.resolve_permission(&request_id, decision.clone());
@@ -6284,82 +6301,6 @@ mod tests {
     use oximux_agents::thread::connection::AgentCapabilities;
     use oximux_agents::thread::StubConnection;
     use serde_json::json;
-
-    #[test]
-    fn attention_classifies_turn_permission_question_auth() {
-        use crate::notifier::NotificationKind;
-        // A finished turn (a turn was active) → Done, empty body.
-        assert_eq!(
-            attention_for_event(
-                &ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None },
-                true,
-                false,
-            ),
-            Some((NotificationKind::Done, String::new())),
-        );
-        // An errored turn → Failed, first-line body.
-        assert_eq!(
-            attention_for_event(
-                &ThreadEvent::TurnEnded {
-                    result: Some("boom happened\nmore".into()), usage: None, is_error: true, turn_diff: None },
-                true,
-                false,
-            ),
-            Some((NotificationKind::Failed, "boom happened".to_string())),
-        );
-        // An intentional Stop (interrupted) errored turn → no banner (Claude shape).
-        assert_eq!(
-            attention_for_event(
-                &ThreadEvent::TurnEnded { result: Some("aborted".into()), usage: None, is_error: true, turn_diff: None },
-                true,
-                true,
-            ),
-            None,
-        );
-        // An intentional Stop on an ACP agent replies Cancelled → a NON-error turn
-        // end while interrupted; it must NOT fire a "finished" banner.
-        assert_eq!(
-            attention_for_event(
-                &ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None },
-                true,
-                true,
-            ),
-            None,
-        );
-        // A turn end with no prior active turn → no banner (stray result).
-        assert_eq!(
-            attention_for_event(
-                &ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None },
-                false,
-                false,
-            ),
-            None,
-        );
-        // Permission / question / auth all → NeedsApproval regardless of was_active.
-        assert!(matches!(
-            attention_for_event(
-                &ThreadEvent::PermissionRequested {
-                    request_id: "r".into(), tool_use_id: None, tool_name: "Bash".into(),
-                    input: json!({}), description: String::new(), suggestions: vec![],
-                    kind: oximux_agents::thread::PermissionKind::Tool,
-                },
-                false,
-                false,
-            ),
-            Some((NotificationKind::NeedsApproval, ref b)) if b == "Bash",
-        ));
-        assert!(matches!(
-            attention_for_event(&ThreadEvent::QuestionAsked {
-                request_id: "r".into(), tool_use_id: None, questions: vec![] }, false, false),
-            Some((NotificationKind::NeedsApproval, _)),
-        ));
-        assert!(matches!(
-            attention_for_event(&ThreadEvent::AuthRequired { methods: vec![], error: None }, false, false),
-            Some((NotificationKind::NeedsApproval, _)),
-        ));
-        // A plain text/tool event → nothing.
-        assert_eq!(attention_for_event(&ThreadEvent::AssistantText("hi".into()), true, false), None);
-    }
 
     /// An optimistic feature pick overlays the backend-advertised value so the
     /// control reflects the user's choice immediately (a toggle flips, a select

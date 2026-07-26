@@ -1,0 +1,381 @@
+//! Screen-control enforcement, hung off the permission round-trip.
+//!
+//! The driver runs as its own process that the agent talks to directly, so
+//! OxiMux is not in the tool-dispatch path and cannot gate a call by wrapping
+//! it. The one place we are in the path is `can_use_tool`: the agent asks
+//! before running a tool, and that ask arrives as
+//! [`ThreadEvent::PermissionRequested`]. Everything here hangs off that single
+//! interception point — a check placed anywhere else would simply never run.
+//!
+//! [`ThreadEvent::PermissionRequested`]: oximux_agents::thread::ThreadEvent::PermissionRequested
+//!
+//! ## What this does not cover
+//!
+//! Only tools from the server *OxiMux* declares. A user who wires the same
+//! driver into their own agent config under a different server name gets tool
+//! names this never matches, and no policy at all. That is a real gap and it
+//! belongs to the broader safety work, not here — the point of noting it is
+//! that the enforcement is scoped to what OxiMux itself hands the agent.
+
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::SystemTime;
+
+use oximux_computer_use::grants::{GrantTable, Provenance, Verdict};
+use oximux_computer_use::policy::{PolicyContext, decide};
+use oximux_computer_use::session::SessionId;
+use serde_json::Value;
+
+pub use oximux_computer_use::policy::Decision;
+
+/// Every chat's grants, in one table.
+///
+/// Process-wide on purpose: the cross-drive guard has to compare one chat's
+/// request against *every other* chat's grants, which a per-chat table
+/// structurally cannot do. Keys are per-view ids from [`next_chat_id`], so two
+/// chats never alias each other.
+///
+/// Shared by handle rather than reached as a static, so a test can scope one to
+/// the chats it creates. Two tests that both claim the same pid in one global
+/// table are not testing anything about chats — they are racing each other.
+static GRANTS: LazyLock<Arc<GrantTable>> = LazyLock::new(|| Arc::new(GrantTable::new()));
+
+/// Hands out chat ids. Monotonic and never reused within a process, so a grant
+/// cannot be inherited by a later chat that happened to land on the same slot.
+static NEXT_CHAT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_chat_id() -> u64 {
+    NEXT_CHAT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// One chat's screen-control identity and what it may drive.
+pub struct ScreenControl {
+    /// This chat's driver session. Also labels the on-screen agent cursor, so
+    /// it is derived rather than opaque.
+    session: SessionId,
+    /// The worktree this chat runs in, plus when it started — together, what
+    /// counts as "a binary this chat built for itself".
+    provenance: Option<Provenance>,
+    /// The table this chat's grants live in. Every chat in the app shares one.
+    grants: Arc<GrantTable>,
+}
+
+impl ScreenControl {
+    /// Start a chat's screen-control state. `cwd` is the chat's working
+    /// directory; a path that cannot be canonicalized yields no provenance, and
+    /// then every target is asked about rather than assumed.
+    pub fn new(cwd: &Path) -> Self {
+        Self::sharing(cwd, GRANTS.clone())
+    }
+
+    fn sharing(cwd: &Path, grants: Arc<GrantTable>) -> Self {
+        Self {
+            session: SessionId::for_agent(&format!("chat-{}", next_chat_id())),
+            provenance: Provenance::new(cwd, SystemTime::now()),
+            grants,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn session(&self) -> &SessionId {
+        &self.session
+    }
+
+    /// What should happen to this tool call.
+    ///
+    /// [`Decision::NotApplicable`] for everything that is not a screen-control
+    /// tool, which is the overwhelming majority — callers must treat it as
+    /// "leave this alone entirely".
+    pub fn decide(&self, tool_name: &str, input: &Value) -> Decision {
+        decide(
+            tool_name,
+            input,
+            &PolicyContext {
+                session: &self.session,
+                grants: &self.grants,
+                provenance: self.provenance.as_ref(),
+            },
+        )
+    }
+
+    /// Let a user's approval stand, recording the grant it implies.
+    ///
+    /// Runs on the approval path rather than at decision time, so an `Ask` the
+    /// user rejects — or never answers — leaves no grant behind.
+    ///
+    /// `Err(reason)` means the approval must not stand. The policy is re-run
+    /// here rather than trusted from when the card appeared, because a card can
+    /// sit open for a long time: another chat may have claimed that target in
+    /// the meantime, and a cross-drive is refused however the user answers.
+    pub fn approve(&self, tool_name: &str, input: &Value) -> Result<(), String> {
+        match self.decide(tool_name, input) {
+            Decision::NotApplicable | Decision::Allow => Ok(()),
+            Decision::Refuse { reason } => Err(reason),
+            Decision::Ask { pid: None } => Ok(()),
+            Decision::Ask { pid: Some(pid) } => {
+                if self.grants.grant(pid, &self.session) == Verdict::Granted {
+                    Ok(())
+                } else {
+                    Err(format!("process {pid} is being driven by another chat"))
+                }
+            }
+        }
+    }
+
+    /// Drop every grant this chat holds. Called when the chat closes and on
+    /// quit — a grant that outlived its chat would let the next occupant of
+    /// that target be driven with nobody having approved it.
+    pub fn release(&self) {
+        self.grants.release_all(&self.session);
+    }
+
+    #[cfg(test)]
+    pub fn granted_pids(&self) -> Vec<u32> {
+        self.grants.granted_to(&self.session)
+    }
+}
+
+impl Drop for ScreenControl {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Tests that drive a real [`AgentChatView`] rather than the policy directly —
+/// they are what prove the policy is actually consulted on the event path, which
+/// no amount of unit testing can establish. They live here rather than in the
+/// view's own test module because they belong with the thing they test, and
+/// because a child module can still reach the view's private state.
+#[cfg(test)]
+mod view_tests {
+    use std::sync::Arc;
+
+    use gpui::TestAppContext;
+    use oximux_agents::thread::{StubConnection, ThreadEvent};
+    use serde_json::json;
+
+    use oximux_settings::{Density, Theme, Typography};
+
+    use super::super::AgentChatView;
+
+    /// Open a chat over a stub connection, for tests that drive real events.
+    async fn stub_chat(
+        cx: &mut TestAppContext,
+    ) -> (gpui::WindowHandle<AgentChatView>, StubConnection) {
+        cx.update(gpui_component::init);
+        let stub = StubConnection::default();
+        let probe = stub.clone();
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(stub),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        (window, probe)
+    }
+
+    /// A screen-control call must reach the policy from the ordinary event path
+    /// — this is the whole premise of the design, since the driver is a separate
+    /// process OxiMux is otherwise not between. A `type_text` with no `pid`
+    /// targets whatever window the user is in, so it comes back denied, with the
+    /// reason carried to the agent rather than a bare refusal.
+    #[gpui::test]
+    async fn a_screen_control_call_is_decided_without_asking_the_user(cx: &mut TestAppContext) {
+        let (window, probe) = stub_chat(cx).await;
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.on_event(
+                    ThreadEvent::PermissionRequested {
+                        request_id: "r1".into(),
+                        tool_use_id: Some("t1".into()),
+                        tool_name: "mcp__computer-use__type_text".into(),
+                        input: json!({ "text": "rm -rf /" }),
+                        description: String::new(),
+                        suggestions: vec![],
+                        kind: oximux_agents::thread::PermissionKind::Tool,
+                    },
+                    cx,
+                );
+                assert!(
+                    view.thread.pending_permission().is_none(),
+                    "policy answered it, so nothing is left waiting for the user"
+                );
+            })
+            .expect("window update");
+
+        let sent = probe.sent();
+        let denial = sent
+            .iter()
+            .find(|s| s["response"]["response"]["behavior"] == "deny")
+            .unwrap_or_else(|| panic!("expected a deny, got {sent:?}"));
+        let message = denial["response"]["response"]["message"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            message.contains("did not name a target process"),
+            "the agent must be told what was wrong: {message}"
+        );
+    }
+
+    /// The other half, and the one that would be expensive to get wrong: every
+    /// tool that is not screen control keeps waiting for the user exactly as it
+    /// did before any of this existed.
+    #[gpui::test]
+    async fn an_ordinary_tool_still_waits_for_the_user(cx: &mut TestAppContext) {
+        let (window, probe) = stub_chat(cx).await;
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.on_event(
+                    ThreadEvent::PermissionRequested {
+                        request_id: "r1".into(),
+                        tool_use_id: Some("t1".into()),
+                        tool_name: "Bash".into(),
+                        input: json!({ "command": "ls" }),
+                        description: "ls".into(),
+                        suggestions: vec![],
+                        kind: oximux_agents::thread::PermissionKind::Tool,
+                    },
+                    cx,
+                );
+                assert!(
+                    view.thread.pending_permission().is_some(),
+                    "a non-screen-control tool must still raise a card"
+                );
+            })
+            .expect("window update");
+
+        assert!(
+            probe.sent().is_empty(),
+            "nothing may be auto-answered on the agent's behalf"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A chat with a table of its own.
+    ///
+    /// Not `ScreenControl::new`: that shares the app-wide table, and since
+    /// every test here claims the same pid (our own, the one pid guaranteed to
+    /// resolve), tests running in parallel would contend for it and refuse each
+    /// other's grants. That failure would look like a bug in the cross-drive
+    /// guard while actually being two tests racing.
+    fn chat() -> ScreenControl {
+        ScreenControl::sharing(Path::new("/tmp"), Arc::new(GrantTable::new()))
+    }
+
+    /// Two chats that can see each other's grants — the arrangement the
+    /// cross-drive guard exists for.
+    fn two_chats() -> (ScreenControl, ScreenControl) {
+        let shared = Arc::new(GrantTable::new());
+        (
+            ScreenControl::sharing(Path::new("/tmp"), shared.clone()),
+            ScreenControl::sharing(Path::new("/tmp"), shared),
+        )
+    }
+
+    fn ns(tool: &str) -> String {
+        format!("mcp__computer-use__{tool}")
+    }
+
+    #[test]
+    fn ordinary_tools_are_not_touched() {
+        let chat = chat();
+        for tool in ["Bash", "Edit", "Read", "mcp__github__create_issue"] {
+            assert_eq!(
+                chat.decide(tool, &json!({})),
+                Decision::NotApplicable,
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_chats_never_share_a_session_identity() {
+        // The premise of running several agents at once: each gets its own
+        // cursor, its own grants, and cannot be confused for the other.
+        let (a, b) = (chat(), chat());
+        assert_ne!(a.session(), b.session());
+    }
+
+    #[test]
+    fn approving_a_target_grants_it_and_the_next_call_passes() {
+        let chat = chat();
+        let pid = std::process::id();
+        let input = json!({ "pid": pid });
+
+        assert_eq!(
+            chat.decide(&ns("click"), &input),
+            Decision::Ask { pid: Some(pid) }
+        );
+        assert!(chat.approve(&ns("click"), &input).is_ok());
+        assert_eq!(chat.decide(&ns("click"), &input), Decision::Allow);
+    }
+
+    #[test]
+    fn a_refused_call_grants_nothing_even_if_approved() {
+        // Belt and braces: the approval path re-derives its own decision, so a
+        // card that somehow reached Allow for a refused shape still records no
+        // grant.
+        let chat = chat();
+        for input in [
+            json!({ "text": "x" }),
+            json!({ "pid": std::process::id(), "scope": "desktop" }),
+        ] {
+            assert!(chat.approve(&ns("type_text"), &input).is_err());
+        }
+        assert!(chat.granted_pids().is_empty());
+    }
+
+    #[test]
+    fn closing_a_chat_releases_its_grants() {
+        let pid = std::process::id();
+        let input = json!({ "pid": pid });
+
+        let (survivor, closing) = two_chats();
+        assert!(closing.approve(&ns("click"), &input).is_ok());
+        // While it is open, nobody else may claim its target.
+        assert!(matches!(
+            survivor.decide(&ns("click"), &input),
+            Decision::Refuse { .. }
+        ));
+
+        drop(closing);
+        // Closed — the target is free again, so it is merely unapproved.
+        assert_eq!(
+            survivor.decide(&ns("click"), &input),
+            Decision::Ask { pid: Some(pid) }
+        );
+    }
+
+    #[test]
+    fn one_chat_cannot_drive_another_chats_target() {
+        // The invariant the whole feature rests on. Two chats, one process:
+        // approving in A must not enable B.
+        let (a, b) = two_chats();
+        let pid = std::process::id();
+        let input = json!({ "pid": pid });
+        assert!(a.approve(&ns("type_text"), &input).is_ok());
+
+        let refusal = b.decide(&ns("type_text"), &input);
+        assert!(
+            matches!(&refusal, Decision::Refuse { reason } if reason.contains("another chat")),
+            "{refusal:?}"
+        );
+        // Nor can B promote itself by having its card approved: B's card may
+        // have gone up while the target was still free, and the answer arrives
+        // after A claimed it. The approval path re-decides for exactly this.
+        assert!(b.approve(&ns("type_text"), &input).is_err());
+    }
+}

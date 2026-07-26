@@ -13,6 +13,8 @@ path = "src/lib.rs"
 [dependencies]
 oximux-agent-core.workspace = true
 serde.workspace = true
+# `proc_pidpath`, for resolving a granted pid back to its executable.
+libc = "0.2"
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
