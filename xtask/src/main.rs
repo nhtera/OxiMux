@@ -76,10 +76,28 @@ fn file_size_lint() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut sources = Vec::new();
     for source_root in SOURCE_ROOTS {
-        sources.extend(collect_rs_files(&root.join(source_root))?);
+        let dir = root.join(source_root);
+        // Fail loudly on a stale row. `walk` treats a missing directory as
+        // "nothing to lint", so without this check a root that was renamed
+        // out from under the list would make the lint pass while silently
+        // covering none of it — the exact hole a hardcoded `crates` root left
+        // when the desktop app moved to `apps/desktop`.
+        if !dir.is_dir() {
+            return Err(format!(
+                "source root '{source_root}' does not exist (looked in {}) — \
+                 update SOURCE_ROOTS in xtask/src/main.rs",
+                dir.display()
+            )
+            .into());
+        }
+        sources.extend(collect_rs_files(&dir)?);
     }
     // Stable order regardless of read_dir(), so output diffs cleanly run to run.
     sources.sort();
+    // Overlapping roots (e.g. adding "apps" next to "apps/desktop") would
+    // otherwise lint and report every nested file twice and double the
+    // over-cap tally.
+    sources.dedup();
 
     for rs in sources {
         let loc = count_loc(&rs)?;

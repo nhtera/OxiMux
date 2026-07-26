@@ -6,8 +6,6 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ### 2026-07-26 — Desktop app relocated to `apps/desktop` (`refactor/apps-desktop`)
 
-Pure refactor, zero behavior change. ADR: `docs/adr/007-apps-desktop-relocation.md`.
-
 - **`c981a9a`** — `git mv crates/app apps/desktop`, so `apps/` now holds both
   product surfaces (`desktop`, `mobile`) and `crates/` holds libraries and
   sidecars. 426 renames plus the two `Cargo.toml` lines (`members`, the
@@ -24,10 +22,15 @@ Pure refactor, zero behavior change. ADR: `docs/adr/007-apps-desktop-relocation.
 - Fixed the one genuine runtime path the move broke: `run_editor_spike()` in
   `main.rs` joined `cwd + "crates/app/src/main.rs"` to choose the file the
   editor spike opens.
+- Follow-up hardening of the above: the new `SOURCE_ROOTS` list reproduced the
+  same silent-pass bug one level up, because `walk()` treats a missing
+  directory as "nothing to lint" — a row left stale by a future rename made the
+  lint exit 0 while covering none of that root. A missing root is now a hard
+  error, and overlapping roots are de-duplicated (they double-reported files
+  and doubled the over-cap tally).
 
 **Touches**: `apps/desktop/**` (moved), `Cargo.toml`, `xtask/src/main.rs`,
-`docs/{system-architecture,codebase-summary,design-guidelines,gpui-pins,development-roadmap,brief}.md`,
-`docs/adr/007-apps-desktop-relocation.md` (new)
+`docs/{system-architecture,codebase-summary,design-guidelines,gpui-pins,development-roadmap,brief}.md`
 
 ---
 
