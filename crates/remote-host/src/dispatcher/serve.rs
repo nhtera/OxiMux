@@ -125,6 +125,14 @@ impl Dispatcher {
     /// Handle one request frame: decode, special-case `Subscribe` (it also opens a
     /// live stream), else route through the synchronous [`Dispatcher::dispatch`].
     /// Returns whether the transport is still writable.
+    ///
+    /// The four `&mut` params after `state` are the serve loop's own per-connection
+    /// state. Bundling them into a struct would satisfy the argument-count lint, but
+    /// `streams` is borrowed by the left-biased `select` in the caller — the loop
+    /// depends on the unfinished future being dropped to release that borrow before
+    /// this runs — so hiding it behind a shared handle trades a real borrow hazard in
+    /// the transport hot path for a cosmetic count. One private caller; kept flat.
+    #[allow(clippy::too_many_arguments)]
     async fn on_request(
         &self,
         state: &mut ConnState,

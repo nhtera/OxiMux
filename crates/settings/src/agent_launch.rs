@@ -648,8 +648,10 @@ acp_args = "--experimental-acp --foo"
 
     #[test]
     fn default_chat_agent_prefers_the_configured_default() {
-        let mut s = AgentLaunchSettings::default();
-        s.default_agent = "codex".into();
+        let s = AgentLaunchSettings {
+            default_agent: "codex".into(),
+            ..Default::default()
+        };
         assert_eq!(s.default_chat_agent().as_deref(), Some("codex"));
     }
 

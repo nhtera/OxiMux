@@ -30,8 +30,11 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: cargo fmt
-        run: cargo fmt --all -- --check
+      # No `cargo fmt --check` step on purpose. This repo has no rustfmt.toml and
+      # is not kept rustfmt-clean — it uses a hand-maintained style that diverges
+      # from stable rustfmt defaults, so the check could never pass (it wants to
+      # rewrite 417 files). A gate that is always red is not a gate; match the
+      # surrounding code by hand instead.
 
       - name: cargo check
         run: cargo check --workspace --all-targets

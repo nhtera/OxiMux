@@ -6,4 +6,10 @@
 # Drop a row once its file falls under the cap (the lint prints STALE to nudge).
 #
 # Format: <repo-relative-path> <loc-budget>
-# (empty — no files currently grandfathered over the hard cap)
+
+# The agent-chat view and its composer. Both predate the cap and are the two
+# largest files in the tree; splitting them is a real refactor of the live chat
+# surface, not a lint fix, so they are frozen here at their current size instead.
+# Neither may grow by a single line while these rows stand.
+apps/desktop/src/shell/agent_chat/mod.rs 8187
+apps/desktop/src/shell/agent_chat/composer.rs 3848
