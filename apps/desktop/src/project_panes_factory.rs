@@ -1532,6 +1532,11 @@ pub(crate) fn save_persisted_tabs(
 /// idle session shouldn't churn SQLite. Dedup is keyed per settings key so
 /// projects/windows/chat-sessions dedupe independently; quit/switch saves flow
 /// through the same gate (skipping an identical write is always correct).
+///
+/// The store's identity is part of the cache key, not just the settings key.
+/// "Skipping an identical write is always correct" only holds for the database
+/// that already received it — keyed by name alone, two stores writing the same
+/// key with the same bytes alias, and the second write is dropped on the floor.
 fn set_deduped(repo: &SettingsRepo, key: String, json: &str) {
     let digest = {
         use std::hash::{Hash, Hasher};
@@ -1539,6 +1544,7 @@ fn set_deduped(repo: &SettingsRepo, key: String, json: &str) {
         json.hash(&mut hasher);
         hasher.finish()
     };
+    let store = repo.store_id();
     // A poisoned lock only means some thread panicked mid-access; the map is
     // plain data and stays usable — recover rather than abort the save (worst
     // case: one redundant write).
@@ -1546,7 +1552,7 @@ fn set_deduped(repo: &SettingsRepo, key: String, json: &str) {
         let last = LAST_SAVED_TABS_HASH
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if last.get(&key) == Some(&digest) {
+        if last.get(&store).and_then(|keys| keys.get(&key)) == Some(&digest) {
             return;
         }
     }
@@ -1558,6 +1564,8 @@ fn set_deduped(repo: &SettingsRepo, key: String, json: &str) {
             LAST_SAVED_TABS_HASH
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(store)
+                .or_default()
                 .insert(key, digest);
         }
         Err(err) => {
@@ -1566,11 +1574,17 @@ fn set_deduped(repo: &SettingsRepo, key: String, json: &str) {
     }
 }
 
-// Last-written layout JSON hash per settings key — the dedup gate for
-// `save_persisted_tabs`. Process-local: a fresh launch always writes
-// its first save, which is the conservative direction.
+// Last-written JSON hash per store, then per settings key — the dedup gate for
+// `save_persisted_tabs`. Process-local: a fresh launch always writes its first
+// save, which is the conservative direction.
+//
+// Keyed by store first because a settings key is only unique *within* a
+// database. Flattened to `key -> digest`, two stores writing identical bytes
+// under the same key aliased, and the second store's write was skipped — a
+// silent data loss that the single-database app never hit but that a test
+// binary opening one database per test hit constantly.
 static LAST_SAVED_TABS_HASH: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    std::sync::Mutex<std::collections::HashMap<u64, std::collections::HashMap<String, u64>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Read the open-windows manifest. Returns an empty manifest (→ legacy
@@ -2009,8 +2023,10 @@ mod tests {
         // A snapshot with an AgentChat tab (session id set) + its transcript
         // must: (a) write the transcript under `agent_chat:<sid>` — NOT inside
         // the layout blob; (b) reload it into `chat_transcripts` so the factory
-        // can rehydrate. Uses a unique project + session id to sidestep the
-        // process-global save dedup shared across tests.
+        // can rehydrate. The unique project + session id are no longer load
+        // bearing — the save dedup is keyed per store now, so tests sharing a
+        // key no longer steal each other's writes — but they cost nothing and
+        // keep the fixture self-describing.
         use crate::persisted_chat::{chat_settings_key, PersistedChatTranscript};
         use oximux_agents::thread::{AssistantMessage, ThreadEntry};
 
@@ -2075,6 +2091,74 @@ mod tests {
                 assert_eq!(loaded.chat_transcripts, vec![transcript]);
             }
             _ => panic!("expected snapshot with rehydrated transcript"),
+        }
+    }
+
+    #[test]
+    fn identical_saves_to_separate_stores_both_persist() {
+        // The dedup gate remembers "this key already holds these bytes", so two
+        // *different* stores writing the same key with the same content used to
+        // alias: the second save matched the first's digest and was skipped
+        // entirely, leaving that store without the data it was told to write.
+        //
+        // The app has one database, so this never surfaced there. A test binary
+        // running the whole suite in one process has many, and whichever test
+        // ran second silently lost its write — which is how
+        // `session_catalog::a_saved_session_serves_its_history_from_disk` came
+        // to fail about one run in three, but only under the full suite.
+        use crate::persisted_chat::{chat_settings_key, PersistedChatTranscript};
+        use oximux_agents::thread::ThreadEntry;
+
+        let sid = "sess-two-stores";
+        let snap = PersistedTabs {
+            tabs: vec![PersistedTab {
+                label: "Chat".into(),
+                kind: PersistedTabKind::AgentChat {
+                    cwd: "/tmp/proj".into(),
+                    model: Some("opus".into()),
+                    session_id: Some(sid.into()),
+                    draft: None,
+                    queued: vec![],
+                    unbound: false,
+                },
+                ..PersistedTab::default()
+            }],
+            chat_transcripts: vec![PersistedChatTranscript {
+                session_id: sid.into(),
+                model: Some("opus".into()),
+                entries: vec![ThreadEntry::User {
+                    text: "same in both stores".into(),
+                    images: vec![],
+                    checkpoint: None,
+                }],
+                slash_commands: vec![],
+                session_meta: Default::default(),
+                thinking_level: Default::default(),
+                provider: oximux_agents::thread::Transport::StreamJson,
+                acp_command: None,
+                acp_args: vec![],
+                codex_posture: None,
+                pi_posture: None,
+                choices: Default::default(),
+            }],
+            ..PersistedTabs::default()
+        };
+
+        // Byte-identical writes, same keys, two unrelated databases.
+        let first = SettingsRepo::new(oximux_storage::open_memory().expect("memory db"));
+        let second = SettingsRepo::new(oximux_storage::open_memory().expect("memory db"));
+        save_persisted_tabs(&first, "proj-two-stores", "main", &snap);
+        save_persisted_tabs(&second, "proj-two-stores", "main", &snap);
+
+        for (label, repo) in [("first", &first), ("second", &second)] {
+            assert!(
+                repo.get(&chat_settings_key(sid)).unwrap().is_some(),
+                "{label} store never received its transcript"
+            );
+            assert!(
+                repo.get(&settings_key("proj-two-stores", "main")).unwrap().is_some(),
+                "{label} store never received its layout"
+            );
         }
     }
 

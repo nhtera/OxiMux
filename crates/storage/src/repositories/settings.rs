@@ -16,6 +16,12 @@ impl SettingsRepo {
         Self { db }
     }
 
+    /// Identity of the database behind this repo — see [`Db::store_id`].
+    /// Repos over the same `Db` agree; repos over different ones never do.
+    pub fn store_id(&self) -> u64 {
+        self.db.store_id()
+    }
+
     pub fn get(&self, key: &str) -> Result<Option<String>, StorageError> {
         let value: Option<String> = self.db.with_conn(|c| {
             c.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {

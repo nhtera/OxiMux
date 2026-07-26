@@ -12,6 +12,7 @@
 
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OpenFlags};
@@ -19,9 +20,14 @@ use rusqlite::{Connection, OpenFlags};
 use crate::error::StorageError;
 use crate::migrations::{MIGRATIONS, run_migrations};
 
+/// Hands out [`Db::store_id`]. Monotonic and never reused within a process, so
+/// an id cannot alias a dropped store the way a pointer address could.
+static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone)]
 pub struct Db {
     conn: Arc<Mutex<Connection>>,
+    store_id: u64,
 }
 
 impl fmt::Debug for Db {
@@ -59,6 +65,18 @@ impl Db {
     pub fn conn(&self) -> Arc<Mutex<Connection>> {
         self.conn.clone()
     }
+
+    /// Identity of the underlying store, unique within this process.
+    ///
+    /// Clones share it — they are handles on the same database — while two
+    /// separately opened databases never collide. Exists so a caller caching
+    /// anything *about* a store can key on which store it came from. Without
+    /// that, a cache keyed only by row/setting name silently treats two
+    /// unrelated databases as one; the app has a single database and never
+    /// notices, but a test binary opening one per test does.
+    pub fn store_id(&self) -> u64 {
+        self.store_id
+    }
 }
 
 /// Open a SQLite database at `path`, applying WAL + FK + busy-timeout
@@ -73,6 +91,7 @@ pub fn open(path: &Path) -> Result<Db, StorageError> {
     run_migrations(&mut conn, MIGRATIONS)?;
     let db = Db {
         conn: Arc::new(Mutex::new(conn)),
+        store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
     };
     backfill_sort_orders(&db)?;
     Ok(db)
@@ -101,6 +120,7 @@ pub fn open_memory() -> Result<Db, StorageError> {
     run_migrations(&mut conn, MIGRATIONS)?;
     let db = Db {
         conn: Arc::new(Mutex::new(conn)),
+        store_id: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
     };
     backfill_sort_orders(&db)?;
     Ok(db)
