@@ -103,4 +103,10 @@ Warns (does not block) when a staged diff deletes a public symbol so consumers c
 
 ## License
 
-MIT OR Apache-2.0 (dual). See ADR-005 for the rationale.
+[Apache License 2.0](LICENSE). You may use, modify, and redistribute OxiMux —
+including commercially — provided you retain the copyright notice, the
+[`NOTICE`](NOTICE) file, and mark any files you change.
+
+"OxiMux" and the OxiMux logo are **not** covered by the license grant
+(Apache-2.0 §6): forks are welcome, forks distributed under the OxiMux name are
+not.
