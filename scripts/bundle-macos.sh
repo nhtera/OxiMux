@@ -144,10 +144,17 @@ sign_bundle() {
         opts+=(--options runtime --timestamp --entitlements "$ENTITLEMENTS")
     fi
     # Sign the bundled dylibs (voice-dictation's onnxruntime + sherpa-onnx)
-    # before the executables so the nested-first seal order holds. The `[[ -e ]]`
-    # guard skips the literal glob when no dylibs are present.
+    # before the executables so the nested-first seal order holds. The guard
+    # skips the literal glob when no dylibs are present.
+    #
+    # `-f && ! -L` and not `-e`: `cp -a` above deliberately preserves the
+    # versionless symlink (libonnxruntime.dylib -> libonnxruntime.1.17.1.dylib)
+    # because the dictation engine links against that name. `-e` follows the
+    # link and is therefore true for it, but codesign refuses a symlink with
+    # "Operation not permitted", which aborts the whole script under `set -e`.
+    # Signing the real file is sufficient; the link resolves to it.
     for dylib in "$APP_DIR/Contents/MacOS"/*.dylib; do
-        [[ -e "$dylib" ]] && codesign "${opts[@]}" "$dylib"
+        [[ -f "$dylib" && ! -L "$dylib" ]] && codesign "${opts[@]}" "$dylib"
     done
     codesign "${opts[@]}" "$APP_DIR/Contents/MacOS/oximux-relay"
     codesign "${opts[@]}" "$APP_DIR/Contents/MacOS/oximux"
