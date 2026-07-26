@@ -6964,6 +6964,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "oximux-computer-use"
+version = "0.1.0"
+dependencies = [
+ "oximux-agent-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "oximux-core"
 version = "0.1.0"
 dependencies = [

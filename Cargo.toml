@@ -9,6 +9,7 @@ members = [
     "crates/git",
     "crates/agent-core",
     "crates/agents",
+    "crates/computer-use",
     "crates/editor",
     "crates/storage",
     "crates/settings",
@@ -42,6 +43,7 @@ oximux-pty      = { path = "crates/pty" }
 oximux-git      = { path = "crates/git" }
 oximux-agent-core = { path = "crates/agent-core" }
 oximux-agents   = { path = "crates/agents" }
+oximux-computer-use = { path = "crates/computer-use" }
 oximux-editor   = { path = "crates/editor" }
 oximux-storage  = { path = "crates/storage" }
 oximux-settings = { path = "crates/settings" }
