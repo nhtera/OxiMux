@@ -36,6 +36,36 @@ pub struct DormantSession {
     pub cwd: Option<PathBuf>,
 }
 
+/// A dormant session's history, read straight from disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DormantTranscript {
+    /// The folded `Vec<ThreadEntry>` as JSON — the same shape a live session's
+    /// snapshot carries, so one reply path serves both.
+    pub entries_json: String,
+    /// The model it was last running, so a client rehydrating from this seeds its
+    /// fold with the same model a live session would have reported.
+    pub model: Option<String>,
+}
+
+/// One selectable option — a model, or a permission mode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DormantChoice {
+    pub id: String,
+    pub label: String,
+    pub description: Option<String>,
+}
+
+/// What a dormant session's pickers offer, as its backend last reported them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DormantChoices {
+    pub models: Vec<DormantChoice>,
+    pub modes: Vec<DormantChoice>,
+    /// The model in force, resolved — including the backend's default when the
+    /// user never picked one, or a picker renders everything unselected.
+    pub current_model: Option<String>,
+    pub current_mode: Option<String>,
+}
+
 /// The desktop's index of persisted sessions, and the means to bring one to life.
 #[async_trait]
 pub trait SessionCatalog: Send + Sync {
@@ -46,6 +76,33 @@ pub trait SessionCatalog: Send + Sync {
     /// that *are* live must be omitted; the registry is authoritative for those,
     /// and a duplicate row would show a session twice with conflicting status.
     fn dormant(&self) -> Vec<DormantSession>;
+
+    /// A dormant session's persisted transcript, read without building anything.
+    ///
+    /// This is what makes *reading* a session free. A client opening a
+    /// conversation to see what the agent did is the common case — far more
+    /// common than continuing one — and none of it needs a running agent, since
+    /// the history is already on disk. Only a prompt has to reach a live backend,
+    /// and that pays for [`SessionCatalog::open`] when it arrives.
+    ///
+    /// `None` means this desktop has no session under that id, which also answers
+    /// "does it exist?" for a subscribe that must not open a stream for an id
+    /// nobody has. A session that never saved a transcript still answers `Some`
+    /// with an empty entry list: it exists, it simply has nothing to show yet.
+    fn transcript(&self, session_id: &str) -> Option<DormantTranscript>;
+
+    /// A dormant session's pickers, as its backend last reported them.
+    ///
+    /// A backend answers this over its live connection, so without a persisted
+    /// copy a client opening a dormant session would make the desktop spawn an
+    /// agent to fill two dropdowns — undoing everything
+    /// [`SessionCatalog::transcript`] saves, since a client asks for both the
+    /// moment it opens a conversation.
+    ///
+    /// Empty lists are a legitimate answer, and the same one a backend that
+    /// offers no choices gives: the pickers are simply not shown. A session saved
+    /// before this was recorded reads as empty until the desktop next saves it.
+    fn choices(&self, session_id: &str) -> Option<DormantChoices>;
 
     /// Build the views behind `session_id` so it enters the registry.
     ///

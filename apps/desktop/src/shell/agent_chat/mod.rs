@@ -1529,6 +1529,16 @@ impl AgentChatView {
             acp_args: self.backend.acp_args.clone(),
             codex_posture: self.codex_posture_snapshot(),
             pi_posture: self.pi_posture_snapshot(),
+            // Read off the live connection while there is one: a remote client
+            // opening this session once it is dormant has no backend to ask, and
+            // making the desktop spawn one to fill two dropdowns would undo
+            // serving its history from disk.
+            choices: crate::persisted_chat::PersistedChoices {
+                models: self.connection.as_ref().map(|c| c.models()).unwrap_or_default(),
+                modes: self.connection.as_ref().map(|c| c.permission_modes()).unwrap_or_default(),
+                current_model: self.effective_model(),
+                current_mode: self.effective_permission_mode(),
+            },
         })
     }
 

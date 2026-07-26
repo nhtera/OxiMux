@@ -22,23 +22,25 @@ enum Picked {
     Live(Option<Box<Live>>),
 }
 
-/// The session a request acts on, when it names one.
+/// The session a request needs *running*, when it names one.
 ///
-/// Used to decide whether a dormant session has to be built before the request
-/// can be served. The catch-all is deliberate and safe in one direction only: a
-/// session-scoped request missed here still works for a live session and answers
-/// `UnknownSession` for a dormant one — the behaviour before catalogs existed —
-/// whereas listing a request that does *not* act on a session would build views
-/// for nothing.
-fn target_session(req: &Request) -> Option<&str> {
+/// Reading a session is deliberately absent: `FetchTranscript` and `ListChoices`
+/// are served from the catalog's persisted copy and `Subscribe` waits for the
+/// session rather than building it, so opening a conversation to see what
+/// happened in it costs no agent process. A client asks for all three the moment
+/// it opens one, so any of them building would undo the other two. Only the
+/// requests that must reach a live backend appear here.
+///
+/// The catch-all is safe in one direction only: a session-scoped request missed
+/// here still works for a live session and answers `UnknownSession` for a dormant
+/// one — the behaviour before catalogs existed — whereas listing a request that
+/// does *not* need a backend would spawn one for nothing.
+fn session_to_build(req: &Request) -> Option<&str> {
     match req {
         Request::GetSessionInfo { session_id }
-        | Request::FetchTranscript { session_id }
-        | Request::Subscribe { session_id, .. }
         | Request::EventsSince { session_id, .. }
         | Request::Steer { session_id, .. }
         | Request::Cancel { session_id }
-        | Request::ListChoices { session_id }
         | Request::SetModel { session_id, .. }
         | Request::SetPermissionMode { session_id, .. }
         | Request::RewindSession { session_id, .. }
@@ -189,7 +191,7 @@ impl Dispatcher {
         // behind it and so no registry entry, which would make the requests below
         // answer `UnknownSession`. Build it first, so a client can reach any
         // session that exists rather than only the ones the desktop happens to be
-        // displaying.
+        // displaying. Reads never come through here — see [`session_to_build`].
         //
         // Placed after authentication and behind the same per-session ACL the
         // handlers apply, because this spawns an agent process: an
@@ -197,7 +199,7 @@ impl Dispatcher {
         // a session-scoped device must not reach past its scope by naming an id.
         // A failure is logged and falls through — the handler then answers
         // `UnknownSession` on its own, which is the truthful answer.
-        if let Some(session_id) = target_session(&req)
+        if let Some(session_id) = session_to_build(&req)
             && self.registry.get(session_id).is_none()
             && let Some(catalog) = &self.catalog
             && let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth)

@@ -2035,6 +2035,7 @@ mod tests {
             acp_args: vec![],
             codex_posture: None,
             pi_posture: None,
+            choices: Default::default(),
         };
         let snap = PersistedTabs {
             tabs: vec![PersistedTab {
@@ -2098,6 +2099,7 @@ mod tests {
             acp_args: vec![],
             codex_posture: None,
             pi_posture: None,
+            choices: Default::default(),
         };
         let snap =
             PersistedTabs { chat_transcripts: vec![present.clone()], ..PersistedTabs::default() };

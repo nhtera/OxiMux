@@ -38,6 +38,15 @@ fn remote_title(title: Option<String>, cwd: Option<&std::path::Path>, session_id
     }
 }
 
+/// A catalog's picker option on the wire. Separate types because the catalog
+/// trait is the desktop's seam and stays free of wire shapes, the same way
+/// [`DormantSession`] does.
+///
+/// [`DormantSession`]: crate::catalog::DormantSession
+fn dormant_choice(choice: crate::catalog::DormantChoice) -> Choice {
+    Choice { id: choice.id, label: choice.label, description: choice.description }
+}
+
 impl Dispatcher {
     /// The per-device-filtered session list — the shared body behind both the
     /// [`Request::ListSessions`](oximux_remote_proto::proto::Request::ListSessions)
@@ -126,15 +135,24 @@ impl Dispatcher {
         if !self.auth.is_allowed_for(pubkey, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
-        let Some(handle) = self.registry.get(session_id) else {
-            return Response::Error(RpcError::UnknownSession);
+        // A live session's fold is authoritative. A dormant one is read from disk
+        // rather than built: history is what a client asks for most, and none of
+        // it needs a running agent. Only a prompt does, and that materializes the
+        // session when it arrives.
+        let (seq, entries_json, model) = match self.registry.get(session_id) {
+            Some(handle) => {
+                let snap = handle.transcript_snapshot().unwrap_or_default();
+                (snap.seq, snap.entries_json, snap.model)
+            }
+            None => match self.catalog.as_ref().and_then(|c| c.transcript(session_id)) {
+                // Seq 0: nothing has been ingested for a session with no live
+                // stream, so a subscriber resumes from its very first event.
+                Some(t) => (0, t.entries_json, t.model),
+                None => return Response::Error(RpcError::UnknownSession),
+            },
         };
-        let snap = handle.transcript_snapshot().unwrap_or_default();
-        let entries_json = if snap.entries_json.is_empty() {
-            "[]".to_string()
-        } else {
-            snap.entries_json
-        };
+        let entries_json =
+            if entries_json.is_empty() { "[]".to_string() } else { entries_json };
         // Attachments accumulate for the life of a session, so this reply is the
         // one whose size no other check bounds — the send-side guard passes each
         // prompt on its own, and their sum lands here. Over the frame cap the
@@ -151,9 +169,9 @@ impl Dispatcher {
         }
         Response::SessionTranscript(SessionTranscriptWire {
             session_id: session_id.to_string(),
-            seq: snap.seq,
+            seq,
             entries_json,
-            model: snap.model,
+            model,
         })
     }
 
@@ -361,8 +379,19 @@ impl Dispatcher {
         if !self.auth.is_allowed_for(pubkey, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
+        // A dormant session's pickers come from what its backend last reported,
+        // saved with its transcript. A client asks for choices the moment it opens
+        // a conversation, so building one here would spawn an agent on every read.
         let Some(handle) = self.registry.get(session_id) else {
-            return Response::Error(RpcError::UnknownSession);
+            return match self.catalog.as_ref().and_then(|c| c.choices(session_id)) {
+                Some(c) => Response::Choices(SessionChoices {
+                    models: c.models.into_iter().map(dormant_choice).collect(),
+                    modes: c.modes.into_iter().map(dormant_choice).collect(),
+                    current_model: c.current_model,
+                    current_mode: c.current_mode,
+                }),
+                None => Response::Error(RpcError::UnknownSession),
+            };
         };
         let meta = handle.meta_snapshot();
         Response::Choices(SessionChoices {

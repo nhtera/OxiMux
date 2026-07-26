@@ -941,6 +941,8 @@ struct FakeCatalog {
     registry: Option<Arc<SessionRegistry>>,
     /// When set, `open` refuses instead of registering.
     refuse: bool,
+    /// Persisted history per session id; anything absent reads as empty.
+    transcripts: std::collections::HashMap<String, String>,
 }
 
 #[async_trait::async_trait]
@@ -952,6 +954,39 @@ impl oximux_remote_host::catalog::SessionCatalog for FakeCatalog {
             .filter(|d| !live.iter().any(|(id, _)| *id == d.session_id))
             .cloned()
             .collect()
+    }
+
+    fn transcript(
+        &self,
+        session_id: &str,
+    ) -> Option<oximux_remote_host::catalog::DormantTranscript> {
+        let known = self.dormant.iter().find(|d| d.session_id == session_id)?;
+        Some(oximux_remote_host::catalog::DormantTranscript {
+            entries_json: self
+                .transcripts
+                .get(session_id)
+                .cloned()
+                .unwrap_or_else(|| "[]".to_string()),
+            model: known.model.clone(),
+        })
+    }
+
+    fn choices(&self, session_id: &str) -> Option<oximux_remote_host::catalog::DormantChoices> {
+        let known = self.dormant.iter().find(|d| d.session_id == session_id)?;
+        Some(oximux_remote_host::catalog::DormantChoices {
+            models: vec![oximux_remote_host::catalog::DormantChoice {
+                id: "claude-opus-5".into(),
+                label: "Opus 5".into(),
+                description: Some("Most capable".into()),
+            }],
+            modes: vec![oximux_remote_host::catalog::DormantChoice {
+                id: "plan".into(),
+                label: "Plan".into(),
+                description: None,
+            }],
+            current_model: known.model.clone(),
+            current_mode: Some("plan".into()),
+        })
     }
 
     async fn open(&self, session_id: &str) -> Result<(), String> {
@@ -1052,10 +1087,70 @@ fn a_session_listed_twice_by_the_catalog_appears_once() {
     block_on(join(serve, script));
 }
 
-/// Opening a dormant session builds it on demand, so the client's very first
-/// request against it succeeds rather than reporting an unknown session.
+/// Reading a session is free: its history is already on disk, so serving it needs
+/// no agent process. Only interacting does — see
+/// [`a_dormant_session_is_built_when_a_client_interacts_with_it`].
 #[test]
-fn a_dormant_session_is_built_when_a_client_reaches_for_it() {
+fn reading_a_dormant_session_builds_nothing() {
+    let registry = Arc::new(SessionRegistry::new());
+    let saved = json!([{ "User": { "text": "what did you change?", "images": [] } }]);
+    let catalog = Arc::new(FakeCatalog {
+        dormant: vec![dormant("cold-1", "Fix auth")],
+        registry: Some(registry.clone()),
+        transcripts: [("cold-1".to_string(), saved.to_string())].into_iter().collect(),
+        ..Default::default()
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher =
+        Dispatcher::new(registry.clone(), auth).with_clock(clock).with_catalog(catalog.clone());
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        let Response::SessionTranscript(t) =
+            call(&client, Request::FetchTranscript { session_id: "cold-1".into() }).await
+        else {
+            panic!("expected SessionTranscript");
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&t.entries_json).unwrap(),
+            saved,
+            "the persisted history came back as-is",
+        );
+        assert_eq!(t.seq, 0, "nothing has been ingested, so a subscriber starts at the beginning");
+        assert_eq!(t.model.as_deref(), Some("claude-opus-5"), "with the model that produced it");
+        // The pickers come from the same persisted copy. A client asks for these
+        // the moment it opens a conversation, so building here would have undone
+        // serving the history from disk.
+        let Response::Choices(choices) =
+            call(&client, Request::ListChoices { session_id: "cold-1".into() }).await
+        else {
+            panic!("expected Choices");
+        };
+        assert_eq!(choices.models.len(), 1, "the model picker has something to show");
+        assert_eq!(choices.current_model.as_deref(), Some("claude-opus-5"), "with one selected");
+        assert_eq!(choices.modes.len(), 1, "and so does the mode picker");
+
+        assert!(catalog.opened.lock().unwrap().is_empty(), "reading spawned nothing");
+    };
+    block_on(join(serve, script));
+    assert!(registry.get("cold-1").is_none(), "and left the session dormant");
+}
+
+/// Subscribing to a dormant session waits for it rather than building it: nothing
+/// is running, so there is nothing to stream yet. When something does bring it to
+/// life — this client's own prompt, or the user opening the tab — the events start
+/// flowing without the client having to ask again.
+#[test]
+fn subscribing_to_a_dormant_session_waits_instead_of_building_it() {
     let registry = Arc::new(SessionRegistry::new());
     let catalog = Arc::new(FakeCatalog {
         dormant: vec![dormant("cold-1", "Fix auth")],
@@ -1078,15 +1173,93 @@ fn a_dormant_session_is_built_when_a_client_reaches_for_it() {
         };
 
         let response =
-            call(&client, Request::FetchTranscript { session_id: "cold-1".into() }).await;
+            call(&client, Request::Subscribe { session_id: "cold-1".into(), after_seq: None }).await;
+        assert_eq!(
+            response,
+            Response::Events(Vec::new()),
+            "a session that is not running has produced nothing",
+        );
+        assert!(catalog.opened.lock().unwrap().is_empty(), "and was not built to say so");
+
+        // Something brings it to life — here the desktop opening the tab.
+        let handle = registry.register("cold-1".into(), Arc::new(StubConnection::default()));
+        handle.ingest(ThreadEvent::AssistantText("live now".into()));
+
+        let Response::Event(frame) = read_response(&client).await else {
+            panic!("expected the waiting subscription to deliver");
+        };
+        assert_eq!(frame.session_id, "cold-1");
+        assert_eq!(frame.seq, 1, "from its very first event");
+    };
+    block_on(join(serve, script));
+}
+
+/// An id nothing on this desktop knows must still be refused. Without the catalog
+/// check a typo would open a subscription that could never produce anything, and
+/// the client would sit on it instead of being told there is no such session.
+#[test]
+fn subscribing_to_an_unknown_session_is_still_refused() {
+    let registry = Arc::new(SessionRegistry::new());
+    let catalog = Arc::new(FakeCatalog {
+        dormant: vec![dormant("cold-1", "Fix auth")],
+        registry: Some(registry.clone()),
+        ..Default::default()
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock).with_catalog(catalog);
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+        assert_eq!(
+            call(&client, Request::Subscribe { session_id: "nope".into(), after_seq: None }).await,
+            Response::Error(RpcError::UnknownSession),
+        );
+    };
+    block_on(join(serve, script));
+}
+
+/// Interacting with a dormant session builds it on demand, so the client's first
+/// prompt lands rather than reporting an unknown session.
+#[test]
+fn a_dormant_session_is_built_when_a_client_interacts_with_it() {
+    let registry = Arc::new(SessionRegistry::new());
+    let catalog = Arc::new(FakeCatalog {
+        dormant: vec![dormant("cold-1", "Fix auth")],
+        registry: Some(registry.clone()),
+        ..Default::default()
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher =
+        Dispatcher::new(registry.clone(), auth).with_clock(clock).with_catalog(catalog.clone());
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        let response = call(&client, Request::Cancel { session_id: "cold-1".into() }).await;
         assert!(
-            matches!(response, Response::SessionTranscript(_)),
-            "the session was built and served, got {response:?}",
+            matches!(response, Response::Ack),
+            "the session was built and the command reached it, got {response:?}",
         );
         assert_eq!(catalog.opened.lock().unwrap().as_slice(), ["cold-1"], "built exactly once");
 
         // Now live, so a second request must not rebuild it.
-        let _ = call(&client, Request::FetchTranscript { session_id: "cold-1".into() }).await;
+        let _ = call(&client, Request::Cancel { session_id: "cold-1".into() }).await;
         assert_eq!(catalog.opened.lock().unwrap().len(), 1, "already live: not rebuilt");
     };
     block_on(join(serve, script));
@@ -1114,10 +1287,15 @@ fn an_unauthenticated_peer_cannot_make_the_desktop_build_a_session() {
     let script = async move {
         // No Register: the connection has proved nothing.
         assert_eq!(
-            call(&client, Request::FetchTranscript { session_id: "cold-1".into() }).await,
+            call(&client, Request::Cancel { session_id: "cold-1".into() }).await,
             Response::Error(RpcError::Unauthorized),
         );
         assert!(catalog.opened.lock().unwrap().is_empty(), "nothing was built");
+        // Reading it is refused on the same gate, even though reading builds nothing.
+        assert_eq!(
+            call(&client, Request::FetchTranscript { session_id: "cold-1".into() }).await,
+            Response::Error(RpcError::Unauthorized),
+        );
     };
     block_on(join(serve, script));
 }
@@ -1154,10 +1332,20 @@ fn a_scoped_device_cannot_build_a_session_outside_its_scope() {
         };
 
         assert_eq!(
-            call(&client, Request::FetchTranscript { session_id: "cold-2".into() }).await,
+            call(&client, Request::Cancel { session_id: "cold-2".into() }).await,
             Response::Error(RpcError::Unauthorized),
         );
         assert!(catalog.opened.lock().unwrap().is_empty(), "out-of-scope id built nothing");
+        // Nor can it read one, and nor can it wait on one: serving a dormant
+        // session from disk must not become a way around the scope.
+        assert_eq!(
+            call(&client, Request::FetchTranscript { session_id: "cold-2".into() }).await,
+            Response::Error(RpcError::Unauthorized),
+        );
+        assert_eq!(
+            call(&client, Request::Subscribe { session_id: "cold-2".into(), after_seq: None }).await,
+            Response::Error(RpcError::Unauthorized),
+        );
 
         // The list is scoped the same way, so it never even names the other one.
         let Response::Sessions(sessions) = call(&client, Request::ListSessions).await else {
@@ -1194,7 +1382,7 @@ fn a_session_that_cannot_be_built_reports_unknown() {
             panic!("expected Registered");
         };
         assert_eq!(
-            call(&client, Request::FetchTranscript { session_id: "cold-1".into() }).await,
+            call(&client, Request::Cancel { session_id: "cold-1".into() }).await,
             Response::Error(RpcError::UnknownSession),
         );
     };

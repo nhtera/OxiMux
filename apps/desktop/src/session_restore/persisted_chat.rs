@@ -32,6 +32,37 @@ pub fn chat_settings_key(session_id: &str) -> String {
     format!("{KEY_PREFIX}{session_id}")
 }
 
+/// What a session's model and permission-mode pickers need, cached so they can
+/// be rendered for a session with nothing running behind it.
+///
+/// A backend answers "which models do you offer?" over its live connection, so
+/// without this a remote client opening a dormant session would have to make the
+/// desktop spawn an agent just to populate two dropdowns — which is exactly the
+/// cost that serving history from disk exists to avoid. Cached for the same
+/// reason [`PersistedChatTranscript::slash_commands`] is: a resumed session says
+/// nothing until the first message, so the last known answer is the only one
+/// available until then.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PersistedChoices {
+    /// The model catalog this session's backend offered.
+    #[serde(default)]
+    pub models: Vec<oximux_agents::thread::ModelChoice>,
+    /// The permission/edit modes it offered.
+    #[serde(default)]
+    pub modes: Vec<oximux_agents::thread::ModeChoice>,
+    /// The model actually in force — including the backend's own default when the
+    /// user never picked one, which [`PersistedChatTranscript::model`]
+    /// deliberately omits so a restored tab still launches on that default rather
+    /// than pinning it. A picker needs the resolved answer or it renders every
+    /// model unselected, as if the session ran on none.
+    #[serde(default)]
+    pub current_model: Option<String>,
+    /// The permission mode in force, resolved the same way and for the same
+    /// reason: `None` means the backend's baseline, which no picker can name.
+    #[serde(default)]
+    pub current_mode: Option<String>,
+}
+
 /// A persisted chat transcript: the `session_id` used to `--resume`, the model
 /// the session ran under, and the ordered message history.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -93,6 +124,13 @@ pub struct PersistedChatTranscript {
     /// rather than re-derived.
     #[serde(default)]
     pub pi_posture: Option<oximux_agents::thread::pi::posture::PiPosture>,
+    /// What this session's pickers offer, so a remote client can render them
+    /// without a backend to ask. `#[serde(default)]` (→ empty) keeps blobs
+    /// written before this field loadable; their pickers stay hidden until the
+    /// desktop next saves the session, which is the same outcome as a backend
+    /// that offers no choices.
+    #[serde(default)]
+    pub choices: PersistedChoices,
 }
 
 /// Write one transcript blob. A serialize failure is logged and skipped rather
@@ -158,6 +196,7 @@ mod tests {
             acp_args: vec![],
             codex_posture: None,
             pi_posture: Some(PiPosture { tools: TOOLS_READ_ONLY.into(), context_files: false }),
+            choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
         let loaded = load_chat_transcript(&repo, "pi-sess").expect("blob loads");
@@ -201,6 +240,7 @@ mod tests {
             acp_args: vec![],
             codex_posture: None,
             pi_posture: None,
+            choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
         assert_eq!(load_chat_transcript(&repo, "sid-1"), Some(t));
@@ -233,6 +273,7 @@ mod tests {
             acp_args: vec!["--experimental-acp".into()],
             codex_posture: None,
             pi_posture: None,
+            choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
         let loaded = load_chat_transcript(&repo, "acp-sess").unwrap();

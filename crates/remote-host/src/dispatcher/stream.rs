@@ -75,6 +75,48 @@ fn live_stream(
     .boxed()
 }
 
+/// A stream that waits for `session_id` to enter the registry, then forwards its
+/// events — whatever it accumulated while waiting first, then live.
+///
+/// Subscribing to a dormant session has nothing to stream *yet*: nothing is
+/// running, so nothing produces events. Building one just to watch it sit idle
+/// would defeat reading a session for free, but leaving the client with no stream
+/// at all is worse — it would have to poll to notice that its own next prompt had
+/// brought the session to life. This waits instead, and costs one watch receiver.
+///
+/// Ends when the registry goes away (the host is shutting down), which is the only
+/// way the session can become permanently unreachable.
+fn deferred_live_stream(
+    registry: std::sync::Arc<oximux_agents::session_registry::SessionRegistry>,
+    session_id: SessionId,
+    after_seq: Seq,
+) -> BoxStream<'static, LiveFrame> {
+    stream::once(async move {
+        // Subscribed before the first lookup, so a session materializing between
+        // the two is caught by the very next tick rather than waited on forever.
+        let mut changes = registry.subscribe_changes();
+        loop {
+            if let Some(handle) = registry.get(&session_id) {
+                // Receiver before snapshot, exactly as a live subscribe does: an
+                // event landing in the gap is caught by the live half, and the
+                // serve loop's cursor drops whichever copy arrives second.
+                let rx = handle.subscribe();
+                let caught_up: Vec<LiveFrame> = handle
+                    .events_since(after_seq)
+                    .into_iter()
+                    .map(|(seq, event)| LiveFrame { session_id: session_id.clone(), seq, event })
+                    .collect();
+                return stream::iter(caught_up).chain(live_stream(session_id, rx)).boxed();
+            }
+            if changes.changed().await.is_err() {
+                return stream::empty().boxed();
+            }
+        }
+    })
+    .flatten()
+    .boxed()
+}
+
 /// Turn the registry's change receiver into a `'static` stream that yields a
 /// [`Live::SessionList`] tick on every session-list change. The generation counter
 /// coalesces, so a burst of changes wakes the serve loop once; the stream ends when
@@ -135,7 +177,7 @@ impl Dispatcher {
             return (Response::Error(RpcError::Unauthorized), None);
         }
         let Some(handle) = self.registry.get(session_id) else {
-            return (Response::Error(RpcError::UnknownSession), None);
+            return self.begin_dormant_subscribe(session_id, after_seq, cursors);
         };
 
         // Already streaming this session on this connection → backlog only,
@@ -157,6 +199,38 @@ impl Dispatcher {
             }
             Err(()) => (Response::Error(RpcError::Internal("event encode failed".into())), None),
         }
+    }
+
+    /// Subscribe to a session with no live views behind it.
+    ///
+    /// Answers with an empty backlog — a session that is not running has produced
+    /// no events — and a stream that starts forwarding once something brings it to
+    /// life. Building it here instead would make opening a conversation to read it
+    /// cost an agent process, which is the whole thing [`SessionCatalog::transcript`]
+    /// exists to avoid.
+    ///
+    /// [`SessionCatalog::transcript`]: crate::catalog::SessionCatalog::transcript
+    fn begin_dormant_subscribe(
+        &self,
+        session_id: &str,
+        after_seq: Seq,
+        cursors: &mut HashMap<SessionId, Seq>,
+    ) -> (Response, Option<BoxStream<'static, LiveFrame>>) {
+        // An id nothing on this desktop knows is not a session to wait on. Without
+        // this a typo would open a stream that could never produce anything, and
+        // the client would sit on it instead of being told there is no such
+        // session — the answer it got before dormant sessions were reachable.
+        if self.catalog.as_ref().and_then(|c| c.transcript(session_id)).is_none() {
+            return (Response::Error(RpcError::UnknownSession), None);
+        }
+        // Already waiting on this session for this connection: a second stream
+        // would deliver every event twice once it materializes.
+        if cursors.contains_key(session_id) {
+            return (Response::Events(Vec::new()), None);
+        }
+        cursors.insert(session_id.to_string(), after_seq);
+        let stream = deferred_live_stream(self.registry.clone(), session_id.to_string(), after_seq);
+        (Response::Events(Vec::new()), Some(stream))
     }
 
     /// Forward one live frame to the client, honoring the per-frame authorization

@@ -21,9 +21,11 @@ use std::sync::Arc;
 
 use futures::channel::oneshot;
 use oximux_agents::session_registry::SessionRegistry;
-use oximux_remote_host::catalog::{DormantSession, OpenGate, SessionCatalog};
+use oximux_remote_host::catalog::{
+    DormantChoice, DormantChoices, DormantSession, DormantTranscript, OpenGate, SessionCatalog,
+};
 
-use crate::session_restore::persisted_terminals::PersistedTabKind;
+use crate::session_restore::persisted_terminals::{PersistedTabKind, PersistedTabs};
 
 /// One request to build a session's project, and where to send the outcome.
 pub struct OpenRequest {
@@ -56,24 +58,37 @@ impl DesktopSessionCatalog {
         Self { registry, settings, projects, window_id, tx, gate: OpenGate::new() }
     }
 
+    /// Every project's persisted layout, in order.
+    ///
+    /// The layout is the index of what exists on disk — which sessions there are,
+    /// and the transcript each was last saved with — so both listing and reading
+    /// are answered from here without building anything.
+    fn layouts(&self) -> Vec<(String, PersistedTabs)> {
+        let Ok(projects) = self.projects.list_ordered(usize::from(u8::MAX)) else {
+            return Vec::new();
+        };
+        projects
+            .into_iter()
+            .filter_map(|project| {
+                match crate::project_panes_factory::load_persisted_tabs(
+                    &self.settings,
+                    &project.id,
+                    &self.window_id,
+                ) {
+                    crate::project_panes_factory::LoadedTabs::Snapshot(s) => Some((project.id, s)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     /// Every persisted chat session, paired with the project that owns it.
     ///
     /// A chat with no agent session id has never completed a turn: there is
     /// nothing to resume and no stable id to name it by, so it is not offered.
     fn persisted(&self) -> Vec<(String, DormantSession)> {
-        let Ok(projects) = self.projects.list_ordered(usize::from(u8::MAX)) else {
-            return Vec::new();
-        };
         let mut found = Vec::new();
-        for project in projects {
-            let snapshot = match crate::project_panes_factory::load_persisted_tabs(
-                &self.settings,
-                &project.id,
-                &self.window_id,
-            ) {
-                crate::project_panes_factory::LoadedTabs::Snapshot(s) => s,
-                _ => continue,
-            };
+        for (project_id, snapshot) in self.layouts() {
             // `tabs` is the flat concatenation of every group's tabs, so this one
             // pass covers both the legacy single-group and multi-group layouts.
             for tab in &snapshot.tabs {
@@ -84,7 +99,7 @@ impl DesktopSessionCatalog {
                     continue;
                 };
                 found.push((
-                    project.id.clone(),
+                    project_id.clone(),
                     DormantSession {
                         session_id,
                         title: Some(tab.label.clone()).filter(|l| !l.is_empty()),
@@ -96,6 +111,37 @@ impl DesktopSessionCatalog {
         }
         found
     }
+
+    /// The persisted tab that proves `session_id` exists, and the transcript blob
+    /// saved beside it.
+    ///
+    /// Two separate things: the tab is the session's existence, while the blob is
+    /// its contents and may legitimately be missing — a chat that never settled a
+    /// turn has a tab pointing at a session id and nothing saved under it.
+    fn saved(
+        &self,
+        session_id: &str,
+    ) -> Option<(PersistedTabKind, Option<crate::persisted_chat::PersistedChatTranscript>)> {
+        self.layouts().into_iter().find_map(|(_, snapshot)| {
+            let tab = snapshot.tabs.iter().find(|tab| match &tab.kind {
+                PersistedTabKind::AgentChat { session_id: Some(id), .. } => id == session_id,
+                _ => false,
+            })?;
+            let saved =
+                snapshot.chat_transcripts.iter().find(|t| t.session_id == session_id).cloned();
+            Some((tab.kind.clone(), saved))
+        })
+    }
+}
+
+fn model_choice(choice: oximux_agents::thread::ModelChoice) -> DormantChoice {
+    DormantChoice { id: choice.wire, label: choice.label, description: choice.description }
+}
+
+/// A mode has no description — the wire carries one for symmetry with models, and
+/// the picker renders a single-line row without it.
+fn mode_choice(choice: oximux_agents::thread::ModeChoice) -> DormantChoice {
+    DormantChoice { id: choice.wire, label: choice.label, description: None }
 }
 
 #[async_trait::async_trait]
@@ -108,6 +154,37 @@ impl SessionCatalog for DesktopSessionCatalog {
             // session would show it twice with contradictory status.
             .filter(|session| self.registry.get(&session.session_id).is_none())
             .collect()
+    }
+
+    fn transcript(&self, session_id: &str) -> Option<DormantTranscript> {
+        let (tab, saved) = self.saved(session_id)?;
+        let entries_json = saved
+            .as_ref()
+            .and_then(|t| serde_json::to_string(&t.entries).ok())
+            .unwrap_or_else(|| "[]".to_string());
+        // The transcript's own model over the tab's: it is written with the
+        // history, so it describes what actually produced these entries.
+        let model = saved.and_then(|t| t.model).or(match tab {
+            PersistedTabKind::AgentChat { model, .. } => model,
+            _ => None,
+        });
+        Some(DormantTranscript { entries_json, model })
+    }
+
+    fn choices(&self, session_id: &str) -> Option<DormantChoices> {
+        let (_, saved) = self.saved(session_id)?;
+        // A session saved before its pickers were recorded reads as empty, which
+        // is the same answer a backend offering no choices gives — the pickers
+        // are not shown, rather than shown broken.
+        let Some(saved) = saved else {
+            return Some(DormantChoices::default());
+        };
+        Some(DormantChoices {
+            models: saved.choices.models.into_iter().map(model_choice).collect(),
+            modes: saved.choices.modes.into_iter().map(mode_choice).collect(),
+            current_model: saved.choices.current_model,
+            current_mode: saved.choices.current_mode,
+        })
     }
 
     async fn open(&self, session_id: &str) -> Result<(), String> {
@@ -234,7 +311,127 @@ fn registration_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oximux_agents::thread::{AgentConnection, PermissionDecision};
+    use oximux_agents::thread::{AgentConnection, ModeChoice, ModelChoice, PermissionDecision};
+
+    use crate::persisted_chat::{PersistedChatTranscript, PersistedChoices};
+    use crate::session_restore::persisted_terminals::{PersistedTab, PersistedTabs};
+
+    const WINDOW: &str = "main";
+
+    /// A catalog over one project holding one saved chat, with its own in-memory
+    /// storage — the layout read is the whole point of these tests, so nothing
+    /// about it is stubbed.
+    fn catalog_over(transcript: PersistedChatTranscript) -> DesktopSessionCatalog {
+        let db = oximux_storage::open_memory().expect("memory db");
+        let settings = Arc::new(oximux_storage::SettingsRepo::new(db.clone()));
+        let projects = Arc::new(oximux_storage::ProjectRepo::new(db));
+        let project = projects.insert("thing", "/repo/thing", "main").expect("project");
+
+        let snapshot = PersistedTabs {
+            tabs: vec![PersistedTab {
+                label: "Fix auth".into(),
+                kind: PersistedTabKind::AgentChat {
+                    cwd: "/repo/thing".into(),
+                    model: Some("sonnet".into()),
+                    session_id: Some(transcript.session_id.clone()),
+                    draft: None,
+                    queued: vec![],
+                    unbound: false,
+                },
+                ..PersistedTab::default()
+            }],
+            chat_transcripts: vec![transcript],
+            ..PersistedTabs::default()
+        };
+        crate::project_panes_factory::save_persisted_tabs(
+            &settings,
+            &project.id,
+            WINDOW,
+            &snapshot,
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        DesktopSessionCatalog::new(
+            Arc::new(SessionRegistry::new()),
+            settings,
+            projects,
+            WINDOW.to_string(),
+            tx,
+        )
+    }
+
+    fn saved_chat(choices: PersistedChoices) -> PersistedChatTranscript {
+        PersistedChatTranscript {
+            session_id: "cold-1".into(),
+            model: Some("sonnet".into()),
+            entries: vec![oximux_agents::thread::ThreadEntry::User {
+                text: "what did you change?".into(),
+                images: vec![],
+                checkpoint: None,
+            }],
+            slash_commands: vec![],
+            session_meta: Default::default(),
+            thinking_level: Default::default(),
+            provider: oximux_agents::thread::Transport::StreamJson,
+            acp_command: None,
+            acp_args: vec![],
+            codex_posture: None,
+            pi_posture: None,
+            choices,
+        }
+    }
+
+    /// The history a client opens a conversation to read, served without building
+    /// anything.
+    #[test]
+    fn a_saved_session_serves_its_history_from_disk() {
+        let catalog = catalog_over(saved_chat(PersistedChoices::default()));
+
+        let transcript = catalog.transcript("cold-1").expect("the saved session is readable");
+        let entries: serde_json::Value =
+            serde_json::from_str(&transcript.entries_json).expect("entries are valid json");
+        assert_eq!(entries[0]["User"]["text"], "what did you change?");
+        assert_eq!(transcript.model.as_deref(), Some("sonnet"));
+        assert!(catalog.transcript("no-such-session").is_none(), "and nothing else is");
+    }
+
+    /// The pickers a client asks for the moment it opens a conversation, from the
+    /// same saved copy — so asking for them does not spawn the agent that reading
+    /// the history just avoided.
+    #[test]
+    fn a_saved_session_serves_its_pickers_from_disk() {
+        let catalog = catalog_over(saved_chat(PersistedChoices {
+            models: vec![ModelChoice {
+                wire: "claude-opus-5".into(),
+                label: "Opus 5".into(),
+                description: Some("Most capable".into()),
+            }],
+            modes: vec![ModeChoice { wire: "plan".into(), label: "Plan".into() }],
+            current_model: Some("claude-opus-5".into()),
+            current_mode: Some("plan".into()),
+        }));
+
+        let choices = catalog.choices("cold-1").expect("the saved session has pickers");
+        assert_eq!(choices.models.len(), 1);
+        assert_eq!(choices.models[0].id, "claude-opus-5");
+        assert_eq!(choices.models[0].description.as_deref(), Some("Most capable"));
+        assert_eq!(choices.modes[0].label, "Plan", "a mode carries no description");
+        assert_eq!(choices.modes[0].description, None);
+        assert_eq!(choices.current_model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(choices.current_mode.as_deref(), Some("plan"));
+    }
+
+    /// A session saved before pickers were recorded still opens — it simply offers
+    /// nothing, which is what a backend with no choices looks like too. Answering
+    /// `None` here would instead report the session as unknown.
+    #[test]
+    fn a_session_saved_without_pickers_still_opens() {
+        let catalog = catalog_over(saved_chat(PersistedChoices::default()));
+
+        let choices = catalog.choices("cold-1").expect("the session is still known");
+        assert!(choices.models.is_empty(), "no picker rather than a broken one");
+        assert!(choices.modes.is_empty());
+    }
 
     struct StubConn;
     impl AgentConnection for StubConn {

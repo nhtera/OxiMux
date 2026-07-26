@@ -67,7 +67,10 @@ pub struct ModelChoice {
 
 /// One permission/edit mode for the mode picker: `wire` is the backend value,
 /// `label` is what the user sees.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Serializable for the same reason [`ModelChoice`] is: a session's mode list is
+// persisted with its transcript so a remote client can render the picker for a
+// session that has no running backend to ask.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModeChoice {
     pub wire: String,
     pub label: String,
