@@ -419,9 +419,12 @@ impl Render for WorkspaceDialog {
                     _ => {}
                 }
             }))
-            .on_mouse_down(MouseButton::Left, |_event, _window, _cx| {
+            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
                 // Swallow press inside the card so it does not bubble to
-                // the overlay dismiss handler.
+                // the overlay dismiss handler. An empty closure does NOT
+                // swallow — `stop_propagation` is required, else clicking
+                // anywhere in the card dismisses the dialog.
+                cx.stop_propagation();
             })
             .flex()
             .flex_col()

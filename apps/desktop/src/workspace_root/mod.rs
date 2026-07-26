@@ -890,10 +890,15 @@ impl WorkspaceRoot {
         let weak_for_workspace: WeakEntity<WorkspaceRoot> = cx.weak_entity();
         let on_workspace_submit: OnWorkspaceSubmit = Box::new(move |submit, window, cx| {
             let weak = weak_for_workspace.clone();
-            let _ = weak.update_in(cx, |this, window, cx| {
+            // `update`, NOT `update_in`, and forward the OUTER window — same
+            // contract as `on_pick`/`on_select` above. This callback runs
+            // during mouse/action dispatch, where the window is already taken
+            // out of `cx.windows`; `update_in`'s nested window lookup fails
+            // there and returns an Err that this call site would discard,
+            // silently dropping the submit.
+            let _ = weak.update(cx, |this, cx| {
                 this.dispatch_workspace_submit(submit, window, cx);
             });
-            let _ = window; // referenced only inside the update_in callback
         });
         let workspace_dialog = cx.new(|cx| {
             WorkspaceDialog::new(
