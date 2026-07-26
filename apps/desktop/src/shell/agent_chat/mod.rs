@@ -1621,6 +1621,17 @@ impl AgentChatView {
         self.thread.session_id.as_deref()
     }
 
+    /// Why this session is not running, when it isn't.
+    ///
+    /// Read by the remote on-demand open path, which can see only that a session
+    /// failed to reach the registry and not why. The view holds the reason it is
+    /// already showing the user — a missing binary, a refused resume — so a
+    /// client that asked for the session gets that instead of a bare "unknown
+    /// session" on whatever request follows.
+    pub fn last_error(&self) -> Option<String> {
+        self.thread.last_error.clone()
+    }
+
     /// Whether this is still an unbound *New Agent* draft (no subprocess has
     /// spawned; the first send binds it). The host reads this to label the tab
     /// "New Agent" and to skip persisting the empty draft.

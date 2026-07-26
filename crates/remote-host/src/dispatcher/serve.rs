@@ -22,6 +22,41 @@ enum Picked {
     Live(Option<Box<Live>>),
 }
 
+/// The session a request acts on, when it names one.
+///
+/// Used to decide whether a dormant session has to be built before the request
+/// can be served. The catch-all is deliberate and safe in one direction only: a
+/// session-scoped request missed here still works for a live session and answers
+/// `UnknownSession` for a dormant one — the behaviour before catalogs existed —
+/// whereas listing a request that does *not* act on a session would build views
+/// for nothing.
+fn target_session(req: &Request) -> Option<&str> {
+    match req {
+        Request::GetSessionInfo { session_id }
+        | Request::FetchTranscript { session_id }
+        | Request::Subscribe { session_id, .. }
+        | Request::EventsSince { session_id, .. }
+        | Request::Steer { session_id, .. }
+        | Request::Cancel { session_id }
+        | Request::ListChoices { session_id }
+        | Request::SetModel { session_id, .. }
+        | Request::SetPermissionMode { session_id, .. }
+        | Request::RewindSession { session_id, .. }
+        | Request::GitStatus { session_id }
+        | Request::GitDiff { session_id, .. }
+        | Request::GitStage { session_id, .. }
+        | Request::GitUnstage { session_id, .. }
+        | Request::GitCommit { session_id, .. }
+        | Request::ListForgeItems { session_id, .. }
+        | Request::GetForgeItemDetail { session_id, .. }
+        | Request::ListForgeChecks { session_id } => Some(session_id),
+        Request::SendPrompt(r) => Some(&r.session_id),
+        Request::ResolvePermission(r) => Some(&r.session_id),
+        Request::AnswerQuestion(r) => Some(&r.session_id),
+        _ => None,
+    }
+}
+
 impl Dispatcher {
     /// Serve one connection until the peer closes or a send fails. A request
     /// yields exactly one response frame; a live subscription pushes many
@@ -150,6 +185,27 @@ impl Dispatcher {
                 return self.send(transport, err).await;
             }
         };
+        // A session whose project the desktop has not shown this run has no views
+        // behind it and so no registry entry, which would make the requests below
+        // answer `UnknownSession`. Build it first, so a client can reach any
+        // session that exists rather than only the ones the desktop happens to be
+        // displaying.
+        //
+        // Placed after authentication and behind the same per-session ACL the
+        // handlers apply, because this spawns an agent process: an
+        // unauthenticated peer must not be able to make the desktop do work, and
+        // a session-scoped device must not reach past its scope by naming an id.
+        // A failure is logged and falls through — the handler then answers
+        // `UnknownSession` on its own, which is the truthful answer.
+        if let Some(session_id) = target_session(&req)
+            && self.registry.get(session_id).is_none()
+            && let Some(catalog) = &self.catalog
+            && let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth)
+            && self.auth.is_allowed_for(&pubkey, session_id)
+            && let Err(err) = catalog.open(session_id).await
+        {
+            tracing::warn!(session_id, %err, "could not open a session a client asked for");
+        }
         // `Subscribe` is the one request that also opens a live stream, so it is
         // handled in the serve loop rather than the sync `dispatch`.
         if let Request::Subscribe { session_id, after_seq } = req {

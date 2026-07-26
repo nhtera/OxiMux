@@ -15,6 +15,7 @@
 pub mod launch_bridge;
 pub mod project_provider;
 pub mod rewind_bridge;
+pub mod session_catalog;
 pub mod relay_terminals;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -197,6 +198,9 @@ pub struct RemoteControl {
     /// list — an authorized client simply sees no quick-start projects, which is
     /// honest for a desktop with none; the create path stays gated regardless.
     projects: Option<Arc<dyn ProjectProvider>>,
+    /// The index of persisted-but-unbuilt sessions, so a client is not limited to
+    /// the projects the desktop has happened to show this run.
+    catalog: Option<Arc<dyn oximux_remote_host::catalog::SessionCatalog>>,
     /// The live host's auth store while one is bound, so the paired-devices UI can
     /// revoke against the *running* host (the dispatcher rechecks authorization on
     /// every RPC, so a revoke lands mid-session). Cleared on stop — with no host, the
@@ -238,6 +242,7 @@ impl RemoteControl {
             schedules: None,
             transcriber: None,
             projects: None,
+            catalog: None,
             auth: Mutex::new(None),
             awake: Mutex::new(None),
             endpoint_secret: None,
@@ -292,6 +297,11 @@ impl RemoteControl {
     /// quick-start projects match what the desktop shows.
     pub fn set_project_provider(&mut self, projects: Arc<dyn ProjectProvider>) {
         self.projects = Some(projects);
+    }
+
+    /// Let the host see and open sessions whose views have not been built.
+    pub fn set_session_catalog(&mut self, catalog: Arc<dyn oximux_remote_host::catalog::SessionCatalog>) {
+        self.catalog = Some(catalog);
     }
 
     /// The shared session registry (the host serves from this same instance).
@@ -390,6 +400,9 @@ impl RemoteControl {
         }
         if let Some(projects) = &self.projects {
             dispatcher = dispatcher.with_projects(Arc::clone(projects));
+        }
+        if let Some(catalog) = &self.catalog {
+            dispatcher = dispatcher.with_catalog(Arc::clone(catalog));
         }
         dispatcher
     }

@@ -102,6 +102,14 @@ pub struct Dispatcher {
     /// which lives above this crate (the same reason `launcher`/`rewinder` are
     /// seams and `schedules` is not).
     transcriber: Option<Arc<dyn crate::transcribe::AudioTranscriber>>,
+    /// The desktop's index of persisted-but-unopened sessions, when the host
+    /// exposes it.
+    ///
+    /// `None` restricts every surface to the registry, which means a client sees
+    /// only the sessions whose projects the desktop has already shown this run.
+    /// That is a degradation rather than a refusal — the sessions it can see all
+    /// work — so unlike `launcher` this has no `Unauthorized` answer.
+    catalog: Option<Arc<dyn crate::catalog::SessionCatalog>>,
     /// Wall clock (Unix seconds), injectable so tests are deterministic.
     now_secs: fn() -> u64,
 }
@@ -117,8 +125,16 @@ impl Dispatcher {
             rewinder: None,
             schedules: None,
             transcriber: None,
+            catalog: None,
             now_secs: system_now_secs,
         }
+    }
+
+    /// Let this dispatcher see and open sessions the desktop has persisted but
+    /// not yet built views for.
+    pub fn with_catalog(mut self, catalog: Arc<dyn crate::catalog::SessionCatalog>) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
 
     /// Expose the desktop's terminals over this dispatcher.

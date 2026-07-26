@@ -14,6 +14,7 @@
 //! free core they build on.
 
 pub mod auth;
+pub mod catalog;
 pub mod dispatcher;
 pub mod identity;
 pub mod launcher;

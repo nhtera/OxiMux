@@ -644,6 +644,107 @@ impl WorkspaceRoot {
         }
     }
 
+    /// Build and cache a project's panes if they do not exist yet, returning the
+    /// entity either way.
+    ///
+    /// Deliberately independent of which project is *active*. Building a
+    /// project's panes is what constructs its chat views, and constructing those
+    /// is what registers their sessions for remote control — so a remote client
+    /// reaching for a session in a project the user has not opened needs this to
+    /// run without the desktop's own view changing under them.
+    pub(crate) fn build_project_panes_if_absent(
+        &mut self,
+        project_id: &str,
+        project_root: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<crate::shell::project_panes::ProjectPanes> {
+        if let Some(panes) = self.project_panes_by_project.get(project_id) {
+            return panes.clone();
+        }
+        let window_id = self.window_id.clone();
+        let project_root = project_root.to_path_buf();
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let cli_runtime = self.cli_runtime.clone();
+        let notifier = self.notifier.clone();
+        let snapshot = match load_persisted_tabs(
+            &self.app_state.settings_repo,
+            project_id,
+            &window_id,
+        ) {
+            crate::project_panes_factory::LoadedTabs::Snapshot(s) => Some(s),
+            crate::project_panes_factory::LoadedTabs::Absent => None,
+            crate::project_panes_factory::LoadedTabs::Corrupt => {
+                // Payload preserved aside by the loader; boot continues
+                // on the default layout so a damaged blob can never
+                // keep the app from reaching a usable window.
+                self.push_toast(
+                    crate::shell::toast::ToastKind::Error,
+                    "Layout could not be restored — reset to default",
+                    cx,
+                );
+                None
+            }
+        };
+        let pane_buffers = crate::project_panes_factory::load_pane_buffers(
+            &self.app_state.pane_buffer_repo,
+            project_id,
+            &window_id,
+        );
+        let pane_relay_ids = self
+            .app_state
+            .pane_relay_id_repo
+            .get_all_for_project(project_id, &window_id)
+            .unwrap_or_else(|err| {
+                tracing::warn!(?err, project_id = %project_id, "load pane_relay_ids failed");
+                Vec::new()
+            });
+        // NO daemon round-trips on this path: the panes build mounts
+        // pending placeholders only, so first paint isn't gated behind
+        // per-tab attach/spawn RPCs. The reconcile spawned below does
+        // the relay work after paint and swaps live sessions in.
+        let build_started = std::time::Instant::now();
+        let (panes, pending_attaches) = build_project_panes(
+            project_root.clone(),
+            snapshot,
+            pane_buffers,
+            pane_relay_ids.clone(),
+            theme,
+            density,
+            typography,
+            cli_runtime,
+            notifier,
+            window,
+            cx,
+        );
+        tracing::info!(
+            project_id = %project_id,
+            pending = pending_attaches.len(),
+            elapsed_ms = build_started.elapsed().as_millis() as u64,
+            "project panes built (pre-paint, no relay RPCs)"
+        );
+        crate::project_panes_factory::spawn_attach_reconcile(
+            pane_relay_ids,
+            pending_attaches,
+            window,
+            cx,
+        );
+        // Install the save sink keyed to this project and window.
+        let settings_repo = self.app_state.settings_repo.clone();
+        let project_id_for_cb = project_id.to_string();
+        let window_id_for_cb = window_id.clone();
+        let save_cb: crate::shell::project_panes::SaveCallback =
+            std::sync::Arc::new(move |snap| {
+                save_persisted_tabs(&settings_repo, &project_id_for_cb, &window_id_for_cb, &snap);
+            });
+        panes.update(cx, |p, _| p.set_save_callback(save_cb));
+        self.project_panes_by_project
+            .insert(project_id.to_string(), panes.clone());
+        panes
+    }
+
     /// Set the currently active project. Stores it on `self`, triggers
     /// a re-render so the left rail picks up the new workspaces, and
     /// asynchronously rebuilds the right sidebar (Explorer / Source
@@ -724,92 +825,12 @@ impl WorkspaceRoot {
         // Lazy-build the project's panes entity on first activation. Subsequent
         // switches just resolve the existing entity via `active_project_panes()`
         // — pane-group + tab state survives the switch.
-        if !self.project_panes_by_project.contains_key(&project.id) {
-            let theme = self.theme;
-            let density = self.density;
-            let typography = self.typography.clone();
-            let cli_runtime = self.cli_runtime.clone();
-            let notifier = self.notifier.clone();
-            let snapshot = match load_persisted_tabs(
-                &self.app_state.settings_repo,
-                &project.id,
-                &window_id,
-            ) {
-                crate::project_panes_factory::LoadedTabs::Snapshot(s) => Some(s),
-                crate::project_panes_factory::LoadedTabs::Absent => None,
-                crate::project_panes_factory::LoadedTabs::Corrupt => {
-                    // Payload preserved aside by the loader; boot continues
-                    // on the default layout so a damaged blob can never
-                    // keep the app from reaching a usable window.
-                    self.push_toast(
-                        crate::shell::toast::ToastKind::Error,
-                        "Layout could not be restored — reset to default",
-                        cx,
-                    );
-                    None
-                }
-            };
-            let pane_buffers = crate::project_panes_factory::load_pane_buffers(
-                &self.app_state.pane_buffer_repo,
-                &project.id,
-                &window_id,
-            );
-            let pane_relay_ids = self
-                .app_state
-                .pane_relay_id_repo
-                .get_all_for_project(&project.id, &window_id)
-                .unwrap_or_else(|err| {
-                    tracing::warn!(?err, project_id = %project.id, "load pane_relay_ids failed");
-                    Vec::new()
-                });
-            // NO daemon round-trips on this path: the panes build mounts
-            // pending placeholders only, so first paint isn't gated behind
-            // per-tab attach/spawn RPCs. The reconcile spawned below does
-            // the relay work after paint and swaps live sessions in.
-            let build_started = std::time::Instant::now();
-            let (panes, pending_attaches) = build_project_panes(
-                project_root.clone(),
-                snapshot,
-                pane_buffers,
-                pane_relay_ids.clone(),
-                theme,
-                density,
-                typography,
-                cli_runtime,
-                notifier,
-                window,
-                cx,
-            );
-            tracing::info!(
-                project_id = %project.id,
-                pending = pending_attaches.len(),
-                elapsed_ms = build_started.elapsed().as_millis() as u64,
-                "project panes built (pre-paint, no relay RPCs)"
-            );
-            crate::project_panes_factory::spawn_attach_reconcile(
-                pane_relay_ids,
-                pending_attaches,
-                window,
-                cx,
-            );
-            // Install the save sink keyed to this project and window.
-            let settings_repo = self.app_state.settings_repo.clone();
-            let project_id = project.id.clone();
-            let window_id_for_cb = window_id.clone();
-            let save_cb: crate::shell::project_panes::SaveCallback =
-                std::sync::Arc::new(move |snap| {
-                    save_persisted_tabs(&settings_repo, &project_id, &window_id_for_cb, &snap);
-                });
-            panes.update(cx, |p, _| p.set_save_callback(save_cb));
-            self._project_panes_observer = Some(cx.observe(&panes, |_, _, cx| cx.notify()));
-            self.project_panes_by_project
-                .insert(project.id.clone(), panes.clone());
-            defer_focus_active(window, cx, panes);
-        } else if let Some(panes) = self.project_panes_by_project.get(&project.id).cloned() {
-            // Project already opened once — re-point observer.
-            self._project_panes_observer = Some(cx.observe(&panes, |_, _, cx| cx.notify()));
-            defer_focus_active(window, cx, panes);
-        }
+        // Both arms of the old branch ended the same way, so building and
+        // activating are now separate concerns: build (or resolve) the entity,
+        // then point the observer and focus at it.
+        let panes = self.build_project_panes_if_absent(&project.id, &project_root, window, cx);
+        self._project_panes_observer = Some(cx.observe(&panes, |_, _, cx| cx.notify()));
+        defer_focus_active(window, cx, panes);
         cx.notify();
 
         // Fast path: reuse a sidebar already built for this project this

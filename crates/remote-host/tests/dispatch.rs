@@ -931,3 +931,272 @@ fn an_oversize_transcript_is_trimmed_to_fit_one_frame() {
     };
     block_on(join(serve, script));
 }
+
+/// A catalog over a fixed set of dormant sessions that registers one on `open`,
+/// recording every id it was asked for.
+#[derive(Default)]
+struct FakeCatalog {
+    dormant: Vec<oximux_remote_host::catalog::DormantSession>,
+    opened: std::sync::Mutex<Vec<String>>,
+    registry: Option<Arc<SessionRegistry>>,
+    /// When set, `open` refuses instead of registering.
+    refuse: bool,
+}
+
+#[async_trait::async_trait]
+impl oximux_remote_host::catalog::SessionCatalog for FakeCatalog {
+    fn dormant(&self) -> Vec<oximux_remote_host::catalog::DormantSession> {
+        let live = self.registry.as_ref().map(|r| r.statuses()).unwrap_or_default();
+        self.dormant
+            .iter()
+            .filter(|d| !live.iter().any(|(id, _)| *id == d.session_id))
+            .cloned()
+            .collect()
+    }
+
+    async fn open(&self, session_id: &str) -> Result<(), String> {
+        self.opened.lock().unwrap().push(session_id.to_string());
+        if self.refuse {
+            return Err("the project could not be opened".into());
+        }
+        if let Some(registry) = &self.registry {
+            registry.register(session_id.to_string(), Arc::new(StubConnection::default()));
+        }
+        Ok(())
+    }
+}
+
+fn dormant(id: &str, title: &str) -> oximux_remote_host::catalog::DormantSession {
+    oximux_remote_host::catalog::DormantSession {
+        session_id: id.into(),
+        title: Some(title.into()),
+        model: Some("claude-opus-5".into()),
+        cwd: Some(std::path::PathBuf::from("/repo/thing")),
+    }
+}
+
+/// The gap this closes: the registry only holds sessions whose views the desktop
+/// has built, and it builds a project's views the first time that project is
+/// shown — so after a restart a phone saw one project's sessions, or none, and
+/// the rest looked deleted.
+#[test]
+fn sessions_the_desktop_has_not_opened_are_still_listed() {
+    let registry = Arc::new(SessionRegistry::new());
+    registry.register("live-1".into(), Arc::new(StubConnection::default()));
+    let catalog = Arc::new(FakeCatalog {
+        dormant: vec![dormant("cold-1", "Fix auth"), dormant("live-1", "stale duplicate")],
+        registry: Some(registry.clone()),
+        ..Default::default()
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock).with_catalog(catalog);
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        let Response::Sessions(sessions) = call(&client, Request::ListSessions).await else {
+            panic!("expected Sessions");
+        };
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert!(ids.contains(&"live-1"), "the live session is listed: {ids:?}");
+        assert!(ids.contains(&"cold-1"), "and so is one that was never opened: {ids:?}");
+        assert_eq!(ids.len(), 2, "a live session is not also listed as dormant: {ids:?}");
+
+        let cold = sessions.iter().find(|s| s.session_id == "cold-1").unwrap();
+        assert!(cold.title.contains("Fix auth"), "its saved title shows: {}", cold.title);
+        assert_eq!(cold.model.as_deref(), Some("claude-opus-5"), "and its model");
+        assert_eq!(cold.last_seq, 0, "nothing has streamed from it yet");
+    };
+    block_on(join(serve, script));
+}
+
+/// A session can sit in more than one project's saved layout — moving a tab
+/// between projects leaves the old entry behind — so the catalog can legitimately
+/// hand back the same id twice. Listing it twice would show one conversation as
+/// two, which is indistinguishable from the desktop having duplicated it.
+#[test]
+fn a_session_listed_twice_by_the_catalog_appears_once() {
+    let registry = Arc::new(SessionRegistry::new());
+    let catalog = Arc::new(FakeCatalog {
+        dormant: vec![dormant("cold-1", "Fix auth"), dormant("cold-1", "Fix auth")],
+        registry: Some(registry.clone()),
+        ..Default::default()
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock).with_catalog(catalog);
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+        let Response::Sessions(sessions) = call(&client, Request::ListSessions).await else {
+            panic!("expected Sessions");
+        };
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["cold-1"], "one row per session: {ids:?}");
+    };
+    block_on(join(serve, script));
+}
+
+/// Opening a dormant session builds it on demand, so the client's very first
+/// request against it succeeds rather than reporting an unknown session.
+#[test]
+fn a_dormant_session_is_built_when_a_client_reaches_for_it() {
+    let registry = Arc::new(SessionRegistry::new());
+    let catalog = Arc::new(FakeCatalog {
+        dormant: vec![dormant("cold-1", "Fix auth")],
+        registry: Some(registry.clone()),
+        ..Default::default()
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher =
+        Dispatcher::new(registry.clone(), auth).with_clock(clock).with_catalog(catalog.clone());
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        let response =
+            call(&client, Request::FetchTranscript { session_id: "cold-1".into() }).await;
+        assert!(
+            matches!(response, Response::SessionTranscript(_)),
+            "the session was built and served, got {response:?}",
+        );
+        assert_eq!(catalog.opened.lock().unwrap().as_slice(), ["cold-1"], "built exactly once");
+
+        // Now live, so a second request must not rebuild it.
+        let _ = call(&client, Request::FetchTranscript { session_id: "cold-1".into() }).await;
+        assert_eq!(catalog.opened.lock().unwrap().len(), 1, "already live: not rebuilt");
+    };
+    block_on(join(serve, script));
+    assert!(registry.get("cold-1").is_some(), "it stays live for later requests");
+}
+
+/// Building a session spawns an agent process, so an unauthenticated peer must
+/// not be able to trigger it by naming an id.
+#[test]
+fn an_unauthenticated_peer_cannot_make_the_desktop_build_a_session() {
+    let registry = Arc::new(SessionRegistry::new());
+    let catalog = Arc::new(FakeCatalog {
+        dormant: vec![dormant("cold-1", "Fix auth")],
+        registry: Some(registry.clone()),
+        ..Default::default()
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher =
+        Dispatcher::new(registry, auth).with_clock(clock).with_catalog(catalog.clone());
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        // No Register: the connection has proved nothing.
+        assert_eq!(
+            call(&client, Request::FetchTranscript { session_id: "cold-1".into() }).await,
+            Response::Error(RpcError::Unauthorized),
+        );
+        assert!(catalog.opened.lock().unwrap().is_empty(), "nothing was built");
+    };
+    block_on(join(serve, script));
+}
+
+/// A session-scoped device must not reach past its scope, and naming a dormant
+/// id must not be a way around that — nor a way to make the desktop do work.
+#[test]
+fn a_scoped_device_cannot_build_a_session_outside_its_scope() {
+    let registry = Arc::new(SessionRegistry::new());
+    let catalog = Arc::new(FakeCatalog {
+        dormant: vec![dormant("cold-1", "mine"), dormant("cold-2", "not mine")],
+        registry: Some(registry.clone()),
+        ..Default::default()
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, Some("cold-1".into()), false));
+    let dispatcher =
+        Dispatcher::new(registry, auth).with_clock(clock).with_catalog(catalog.clone());
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let reg = RegisterReq {
+            app_pubkey: pubkey,
+            device_name: "phone".into(),
+            proof: registration_proof(&SECRET, &pubkey, NOW),
+            timestamp_secs: NOW,
+            session_id: Some("cold-1".into()),
+        };
+        let Response::Registered { .. } = call(&client, Request::Register(reg)).await else {
+            panic!("expected Registered");
+        };
+
+        assert_eq!(
+            call(&client, Request::FetchTranscript { session_id: "cold-2".into() }).await,
+            Response::Error(RpcError::Unauthorized),
+        );
+        assert!(catalog.opened.lock().unwrap().is_empty(), "out-of-scope id built nothing");
+
+        // The list is scoped the same way, so it never even names the other one.
+        let Response::Sessions(sessions) = call(&client, Request::ListSessions).await else {
+            panic!("expected Sessions");
+        };
+        let ids: Vec<&str> = sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["cold-1"], "a scoped device enumerates only its own: {ids:?}");
+    };
+    block_on(join(serve, script));
+}
+
+/// A session that cannot be built answers as unknown rather than hanging or
+/// reporting something that implies the client did anything wrong.
+#[test]
+fn a_session_that_cannot_be_built_reports_unknown() {
+    let registry = Arc::new(SessionRegistry::new());
+    let catalog = Arc::new(FakeCatalog {
+        dormant: vec![dormant("cold-1", "Fix auth")],
+        registry: Some(registry.clone()),
+        refuse: true,
+        ..Default::default()
+    });
+
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock).with_catalog(catalog);
+    let pubkey = [0x33; 32];
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } = call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+        assert_eq!(
+            call(&client, Request::FetchTranscript { session_id: "cold-1".into() }).await,
+            Response::Error(RpcError::UnknownSession),
+        );
+    };
+    block_on(join(serve, script));
+}

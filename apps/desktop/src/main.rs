@@ -348,6 +348,33 @@ fn main() {
         remote_control.set_project_provider(std::sync::Arc::new(
             oximux_app::remote_control::project_provider::RepoProjects::new(app_state.project_repo()),
         ));
+        // Sessions the desktop has persisted but not built views for. The registry
+        // only holds a session once its chat view exists, and views are built per
+        // project as each is first shown — so without this a client sees only the
+        // projects the desktop happened to visit this run, which after a restart is
+        // one or none, and the rest look deleted. The catalog lists them from disk
+        // and builds one on demand; `serve_opens` does the building, since only the
+        // UI thread can. Installed unconditionally, like the launcher above.
+        {
+            // Bounded: an unbounded queue would let a client with a stale session
+            // list pile up builds faster than the UI can run them. A full queue
+            // refuses now, which the client can retry.
+            let (tx, requests) = tokio::sync::mpsc::channel(16);
+            let catalog = std::sync::Arc::new(
+                oximux_app::remote_control::session_catalog::DesktopSessionCatalog::new(
+                    remote_control.registry(),
+                    std::sync::Arc::new(app_state.settings_repo().clone()),
+                    std::sync::Arc::new(app_state.project_repo()),
+                    // The layout this catalog reads belongs to one window. A
+                    // second window's sessions are reachable once it has shown
+                    // their project itself, which is the pre-existing behaviour.
+                    oximux_app::window_registry::PRIMARY_WINDOW_ID.to_string(),
+                    tx,
+                ),
+            );
+            remote_control.set_session_catalog(catalog.clone());
+            oximux_app::remote_control::session_catalog::serve_opens(requests, catalog, cx);
+        }
         // Voice dictation the phone can drive: the desktop decodes clips with the
         // same speech engine and model manager its own composer uses, so a phone
         // dictation and a desktop one run through identical code. The service was

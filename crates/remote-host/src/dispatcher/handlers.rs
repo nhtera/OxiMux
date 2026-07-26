@@ -45,6 +45,47 @@ impl Dispatcher {
     /// [`SessionsChanged`](oximux_remote_proto::proto::Response::SessionsChanged)
     /// snapshot, so both honour the same scope filter and meta lookup.
     pub(super) fn snapshot_sessions(&self, pubkey: &AppPubkey) -> Vec<SessionSummary> {
+        let live = self.live_session_rows(pubkey);
+        let Some(catalog) = &self.catalog else {
+            return live;
+        };
+        // One row per session, whatever the catalog hands over. Two guards in one
+        // pass, because both failures look identical to a user — the same
+        // conversation listed twice:
+        //
+        // - The registry is authoritative for anything it holds, so a dormant row
+        //   for a live session would contradict the live one's status.
+        // - A session can appear in more than one project's saved layout (a tab
+        //   moved between projects leaves the old entry behind), so the catalog
+        //   can legitimately return the same id twice.
+        let mut seen: std::collections::HashSet<String> =
+            live.iter().map(|r| r.session_id.clone()).collect();
+        let mut rows = Vec::with_capacity(live.len());
+        let dormant: Vec<SessionSummary> = catalog
+            .dormant()
+            .into_iter()
+            .filter(|d| seen.insert(d.session_id.clone()))
+            // Same scoping as a live row: a session-scoped device must not learn
+            // that other sessions exist, whether or not they are running.
+            .filter(|d| self.auth.is_allowed_for(pubkey, &d.session_id))
+            .map(|d| SessionSummary {
+                title: remote_title(d.title, d.cwd.as_deref(), &d.session_id),
+                model: d.model,
+                // A dormant session has no event stream, so there is no cursor to
+                // resume from and nothing can be outstanding. A client opening it
+                // starts at 0, which is what it would get anyway.
+                last_seq: 0,
+                awaiting_permission: false,
+                session_id: d.session_id,
+            })
+            .collect();
+        rows.extend(live);
+        rows.extend(dormant);
+        rows
+    }
+
+    /// The session rows backed by a live view, which own their status.
+    fn live_session_rows(&self, pubkey: &AppPubkey) -> Vec<SessionSummary> {
         self.registry
             .statuses()
             .into_iter()
