@@ -21,14 +21,44 @@ jobs:
           rustup show
           rustup component add rustfmt clippy
 
+      # `target` and the sherpa-onnx prebuilts are cached as ONE entry, because
+      # they only make sense together. sherpa-rs-sys downloads those libraries
+      # outside `target` (into ~/Library/Caches/sherpa-rs) and bakes the path
+      # into its build-script output. Caching `target` alone meant a restored
+      # build script counted as fresh, so it never re-downloaded — and the link
+      # failed five minutes later with `library 'onnxruntime.1.17.1' not found`,
+      # which reads as a code error rather than a missing download. One entry
+      # keeps the fingerprint and the files it points at in step.
+      #
+      # The key is versioned separately from Cargo.lock so a fix like this one
+      # can invalidate entries saved under the old layout; bump `v2` whenever
+      # what is cached changes, not when dependencies do.
       - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/Library/Caches/sherpa-rs
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+
+      # Insurance against the same failure returning by another route: any cache
+      # that comes back with the build-script output but without the libraries
+      # would link against a path that is not there. Dropping the output makes
+      # cargo re-run the build script, which re-downloads them. Cheap, and it
+      # turns a late linker error into a step that fixes itself.
+      - name: Ensure the dictation libraries are present
+        run: |
+          if find ~/Library/Caches/sherpa-rs -name 'libonnxruntime*' -print -quit 2>/dev/null | grep -q .; then
+            echo "sherpa-onnx prebuilts present"
+          else
+            echo "sherpa-onnx prebuilts absent — forcing sherpa-rs-sys to re-run"
+            # `find`, not a glob: an unmatched glob is passed through literally
+            # by one shell and a hard error in another, and this step must not
+            # be the thing that fails the build.
+            find target -type d -name 'sherpa-rs-sys-*' -exec rm -rf {} + 2>/dev/null || true
+          fi
 
       # No `cargo fmt --check` step on purpose. This repo has no rustfmt.toml and
       # is not kept rustfmt-clean — it uses a hand-maintained style that diverges
