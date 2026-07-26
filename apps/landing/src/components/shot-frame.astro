@@ -1,0 +1,59 @@
+---
+import { Image } from "astro:assets";
+import type { ImageMetadata } from "astro";
+
+/**
+ * Frames a real product screenshot.
+ *
+ * When `src` is absent this renders a labelled empty slot at the correct
+ * aspect ratio rather than drawing a fake UI. A hand-built imitation of the
+ * cockpit would be the most obviously synthetic thing on the page, so the
+ * honest state of "no capture yet" is shown instead. Drop the capture in
+ * src/assets/shots/, import it, and pass it as `src`; nothing else changes.
+ */
+interface Props {
+  src?: ImageMetadata;
+  alt: string;
+  /** What still needs capturing. Shown only while `src` is missing. */
+  pending?: string;
+  ratio?: string;
+  priority?: boolean;
+  widths?: number[];
+  sizes?: string;
+}
+
+const {
+  src,
+  alt,
+  pending,
+  ratio = "1512 / 944",
+  priority = false,
+  widths = [800, 1200, 1600, 2400],
+  sizes = "(max-width: 768px) 100vw, min(1152px, 92vw)",
+} = Astro.props;
+---
+
+<figure
+  class="shot-hover overflow-hidden rounded-[--radius-card] border border-edge bg-panel shadow-[inset_0_1px_0_var(--color-highlight)]"
+  style={`aspect-ratio: ${ratio}`}
+>
+  {
+    src ? (
+      <Image
+        src={src}
+        alt={alt}
+        widths={widths}
+        sizes={sizes}
+        loading={priority ? "eager" : "lazy"}
+        fetchpriority={priority ? "high" : "auto"}
+        decoding={priority ? "sync" : "async"}
+        class="h-full w-full object-cover object-top"
+      />
+    ) : (
+      <div class="flex h-full w-full flex-col items-center justify-center gap-2 bg-panel-alt px-6 text-center">
+        <span class="font-mono text-xs text-fg-subtle">Screenshot slot</span>
+        <span class="max-w-sm text-sm text-fg-muted">{pending ?? alt}</span>
+      </div>
+    )
+  }
+</figure>

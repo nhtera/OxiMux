@@ -1,0 +1,89 @@
+---
+import { Icon } from "astro-icon/components";
+import { SITE } from "../../consts";
+
+/* Verbatim from the repo README quick start. If the README changes, change
+   these too: a build command that does not work is worse than none. */
+const build = [
+  { prompt: true, text: "git clone https://github.com/nhtera/OxiMux.git" },
+  { prompt: true, text: "cd OxiMux" },
+  { comment: true, text: "# the relay daemon keeps terminals alive across relaunches" },
+  { prompt: true, text: "cargo build -p oximux-relay --release" },
+  { prompt: true, text: "./scripts/bundle-macos.sh" },
+  { prompt: true, text: "open dist/OxiMux.app" },
+];
+---
+
+<section
+  id="build"
+  class="border-t border-edge bg-panel/40 px-5 py-20 sm:px-8 sm:py-28"
+>
+  <div class="mx-auto max-w-4xl">
+    <h2 data-reveal
+      class="font-mono text-2xl leading-tight font-semibold tracking-tight text-balance text-fg sm:text-3xl"
+    >
+      Read it. Fork it. Ship your own.
+    </h2>
+    <p class="mt-4 max-w-2xl text-base leading-relaxed text-fg-muted" data-reveal style="--i: 1">
+      OxiMux is {SITE.license} licensed. There is no telemetry to opt out of and
+      no account to create. Clone it and you have the whole thing.
+    </p>
+
+    <div
+      data-reveal
+      class="mt-10 overflow-hidden rounded-[--radius-card] border border-edge bg-canvas shadow-[inset_0_1px_0_var(--color-highlight)]"
+    >
+      <div class="flex items-center gap-2 border-b border-edge px-4 py-2.5">
+        <Icon
+          name="ph:terminal-window"
+          class="size-4 text-fg-subtle"
+          aria-hidden="true"
+        />
+        <span class="font-mono text-xs text-fg-subtle">build from source</span>
+      </div>
+      <!--
+        Deliberately not a <pre>. Inside <pre> the newlines and indentation of
+        this template's own formatting are preserved as literal text, which
+        turns every line into a paragraph-sized gap. Each line is its own block
+        instead, with whitespace handled by layout rather than by source shape.
+      -->
+      <div class="overflow-x-auto px-4 py-4 font-mono text-[13px]">
+        {
+          build.map((line, i) => (
+            <div class="type-line leading-7 whitespace-pre" style={`--i: ${i}`}>
+              {line.comment ? (
+                <span class="text-fg-subtle">{line.text}</span>
+              ) : (
+                <code>
+                  <span class="text-fg-subtle select-none">$ </span>
+                  <span class="text-fg">{line.text}</span>
+                </code>
+              )}
+            </div>
+          ))
+        }
+        <div
+          class="type-line leading-7"
+          style={`--i: ${build.length}`}
+          aria-hidden="true"
+        >
+          <span class="text-fg-subtle select-none">$ </span>
+          <span class="caret text-fg-subtle"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-8 flex flex-wrap items-center gap-3">
+      <a
+        href={SITE.repo}
+        class="press inline-flex items-center gap-2 rounded-[--radius-control] border border-edge bg-panel px-5 py-3 text-sm whitespace-nowrap text-fg hover:border-edge-strong hover:bg-panel-alt"
+      >
+        <Icon name="simple-icons:github" class="size-4" aria-hidden="true" />
+        Browse the source
+      </a>
+      <span class="text-sm text-fg-subtle">
+        Requires Rust 1.95 and {SITE.platform}.
+      </span>
+    </div>
+  </div>
+</section>

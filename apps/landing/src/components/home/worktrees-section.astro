@@ -1,0 +1,33 @@
+---
+import ShotFrame from "../shot-frame.astro";
+---
+
+<!--
+  Full-bleed capture under a narrow centred intro. Distinct from the split
+  sections that follow, so the page does not read as a zigzag of alternating
+  image and text rows.
+-->
+<section class="border-t border-edge px-5 py-20 sm:px-8 sm:py-28">
+  <div class="mx-auto max-w-6xl">
+    <div class="max-w-2xl" data-reveal>
+      <h2
+        class="font-mono text-2xl leading-tight font-semibold tracking-tight text-balance text-fg sm:text-3xl"
+      >
+        One task, one worktree, no collisions.
+      </h2>
+      <p class="mt-4 text-base leading-relaxed text-fg-muted">
+        Every task gets its own git worktree and its own branch. Two agents
+        never share a working tree, so parallel work cannot step on itself.
+        Create, switch, stash, and archive worktrees without touching your main
+        checkout.
+      </p>
+    </div>
+
+    <div class="mt-12" data-reveal>
+      <ShotFrame
+        alt="The worktree switcher, showing several isolated task worktrees for one repository."
+        pending="Worktree switcher with several isolated task worktrees open for one repository."
+      />
+    </div>
+  </div>
+</section>

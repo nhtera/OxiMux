@@ -1,0 +1,336 @@
+@import "tailwindcss";
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
+
+/* ---------------------------------------------------------------------------
+   OxiMux landing design tokens.
+
+   These mirror docs/design-guidelines.md one-for-one so the page reads as the
+   same product as the app. When a token changes in crates/settings/src/theme.rs,
+   change it here too. The surface ladder (base < panel < panel_alt < overlay)
+   is load-bearing: sections step up the ladder to signal depth without a shadow.
+
+   Mode: dark only, matching the app's v1 decision. The page theme is locked at
+   the root; no section inverts.
+
+   Color: strict monochrome. The app's guideline states the brand is the absence
+   of accent, so the only "accent" here is luminance. The single chromatic
+   exception is whatever appears inside real product screenshots.
+--------------------------------------------------------------------------- */
+
+@theme {
+  --font-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* Surface ladder */
+  --color-canvas: #0e0f11;
+  --color-panel: #15171a;
+  --color-panel-alt: #1b1e22;
+  --color-rail: #1d2024;
+  --color-overlay: #22262b;
+
+  /* Foreground ladder */
+  --color-fg: #e6e8eb;
+  --color-fg-muted: #9aa0a6;
+  --color-fg-subtle: #6b7177;
+
+  /* Edges */
+  --color-edge: oklch(1 0 0 / 8%);
+  --color-edge-strong: #3a4047;
+  --color-highlight: oklch(1 0 0 / 6%);
+  --color-hover: oklch(1 0 0 / 6%);
+  --color-selection: #2d3a4d;
+
+  /* Radius scale, from the app's density tokens.
+     Documented rule: cards 8, controls 4, chips 3. Applied everywhere. */
+  --radius-card: 8px;
+  --radius-control: 4px;
+  --radius-chip: 3px;
+}
+
+/* Anchor the canvas on the root so nothing can flash a lighter color behind
+   the page during navigation or overscroll. */
+html {
+  background-color: var(--color-canvas);
+  color-scheme: dark;
+}
+
+body {
+  /* Tabular numerals everywhere, matching the app. Counters, versions, and
+     stat figures must not reflow as digits change width. */
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background-color: var(--color-selection);
+  color: var(--color-fg);
+}
+
+/* Monochrome focus ring. The app uses a blue focus_ring token, but on the web a
+   high-contrast white ring is both more visible on charcoal and consistent with
+   the no-accent rule. */
+:focus-visible {
+  outline: 2px solid var(--color-fg);
+  outline-offset: 2px;
+  border-radius: var(--radius-control);
+}
+
+/* ---------------------------------------------------------------------------
+   Ambient depth.
+
+   A single very low-contrast radial lift behind the fold, so the near-black
+   canvas reads as a lit surface rather than a flat fill. No color, no mesh
+   gradient: this is luminance only, well under the threshold where it would
+   register as an accent.
+--------------------------------------------------------------------------- */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(60rem 40rem at 50% -10%, oklch(1 0 0 / 4%), transparent 65%),
+    radial-gradient(50rem 36rem at 100% 8%, oklch(1 0 0 / 2.5%), transparent 60%);
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  body::before {
+    display: none;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Hairline rule.
+
+   The app separates dense regions with a 1px white-alpha hairline rather than a
+   flat grey line, so the divider catches light over any surface tier. Same idea
+   here: sections are separated by hairlines, not by cards.
+--------------------------------------------------------------------------- */
+.hairline-t {
+  border-top: 1px solid var(--color-edge);
+}
+.hairline-b {
+  border-bottom: 1px solid var(--color-edge);
+}
+
+/* A raised surface: 1px top inner highlight reads as elevation without a
+   shadow. Ported from the app's edge_highlight treatment on floating cards. */
+.raised {
+  background-color: var(--color-panel);
+  border: 1px solid var(--color-edge);
+  border-radius: var(--radius-card);
+  box-shadow: inset 0 1px 0 var(--color-highlight);
+}
+
+/* ---------------------------------------------------------------------------
+   Motion.
+
+   The vocabulary is deliberately mechanical rather than playful: lines wipe in
+   the way a terminal paints them, the build block types itself, surfaces lift
+   on approach. Nothing bounces, nothing loops for decoration. Every effect
+   below is either revealing content in reading order, showing what a command
+   actually does, or acknowledging a pointer.
+
+   Everything is opt-in through `prefers-reduced-motion` and everything degrades
+   to the finished state, so a browser that runs none of this still shows a
+   correct, complete page.
+--------------------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  /* Belt and braces: any keyframe that slips through resolves instantly. */
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* --- Scroll reveal -------------------------------------------------------
+   Driven by IntersectionObserver (see base-layout) rather than a scroll
+   listener. Elements start hidden ONLY once the script has confirmed it is
+   running and motion is allowed, so a no-JS or reduced-motion visitor never
+   sees blank sections. */
+@media (prefers-reduced-motion: no-preference) {
+  html.js-reveal [data-reveal] {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+
+  html.js-reveal [data-reveal].is-visible {
+    opacity: 1;
+    transform: none;
+    transition:
+      opacity 0.65s cubic-bezier(0.16, 1, 0.3, 1),
+      transform 0.65s cubic-bezier(0.16, 1, 0.3, 1);
+    transition-delay: calc(var(--i, 0) * 70ms);
+  }
+}
+
+/* --- Headline wipe -------------------------------------------------------
+   Each line sits in an overflow clip and rises into it, so the headline paints
+   line by line the way terminal output arrives. */
+.line-clip {
+  display: block;
+  overflow: hidden;
+  /* Mono descenders need headroom or the clip shaves them. */
+  padding-bottom: 0.08em;
+}
+
+.line-clip > span {
+  display: block;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html.js-reveal .line-clip > span {
+    transform: translateY(105%);
+  }
+
+  html.js-reveal .is-visible .line-clip > span {
+    transform: none;
+    transition: transform 0.9s cubic-bezier(0.16, 1, 0.3, 1);
+    transition-delay: calc(var(--i, 0) * 110ms);
+  }
+}
+
+/* --- Terminal caret ------------------------------------------------------
+   The one intentionally perpetual animation on the page. It marks a live
+   prompt, which is the single place where a blink carries meaning. */
+.caret {
+  display: inline-block;
+  width: 0.55em;
+  height: 1em;
+  translate: 0 0.14em;
+  background-color: currentColor;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .caret {
+    animation: caret-blink 1.1s steps(1, end) infinite;
+  }
+}
+
+@keyframes caret-blink {
+  0%,
+  50% {
+    opacity: 1;
+  }
+  50.01%,
+  100% {
+    opacity: 0;
+  }
+}
+
+/* --- Typed build block ---------------------------------------------------
+   Each command wipes in left to right via clip-path, which stays on the
+   compositor. This is motivated rather than decorative: the section is about
+   running these commands, so showing them run is the content. */
+@media (prefers-reduced-motion: no-preference) {
+  html.js-reveal .type-line {
+    clip-path: inset(0 100% 0 0);
+  }
+
+  html.js-reveal .is-visible .type-line {
+    clip-path: inset(0 0 0 0);
+    transition: clip-path 0.34s steps(20, end);
+    /* Seven lines at 260ms lands the whole sequence in about 1.9s. Slower than
+       this and the reader is waiting on an animation to finish reading. */
+    transition-delay: calc(var(--i, 0) * 260ms);
+  }
+}
+
+/* --- Hero lift -----------------------------------------------------------
+   Scroll-driven, so the capture settles as the reader scrolls onto it. Pure
+   transform, and only where the browser supports a view timeline. */
+@supports (animation-timeline: view()) {
+  @media (prefers-reduced-motion: no-preference) {
+    .scroll-lift {
+      animation: lift-in linear both;
+      animation-timeline: view();
+      animation-range: entry 10% entry 90%;
+    }
+  }
+}
+
+@keyframes lift-in {
+  from {
+    transform: scale(0.955) translateY(26px);
+    opacity: 0.55;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+/* --- Ambient drift -------------------------------------------------------
+   A very slow luminance wander behind the fold so the canvas is never
+   perfectly static. Sub-perceptual frame to frame; it only registers as the
+   page not feeling dead. */
+@media (prefers-reduced-motion: no-preference) {
+  body::before {
+    animation: ambient-drift 38s ease-in-out infinite alternate;
+  }
+}
+
+@keyframes ambient-drift {
+  from {
+    transform: translate3d(-1.5%, -1%, 0) scale(1.04);
+  }
+  to {
+    transform: translate3d(1.5%, 1.5%, 0) scale(1.1);
+  }
+}
+
+/* --- Pointer feedback ----------------------------------------------------- */
+@media (prefers-reduced-motion: no-preference) {
+  .press {
+    transition:
+      background-color 0.15s cubic-bezier(0.16, 1, 0.3, 1),
+      border-color 0.15s cubic-bezier(0.16, 1, 0.3, 1),
+      color 0.15s cubic-bezier(0.16, 1, 0.3, 1),
+      transform 0.1s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  .press:active {
+    transform: translateY(1px);
+  }
+}
+
+/* A row that lights from its leading edge on hover, echoing the app's
+   hover_overlay convention rather than inventing a new highlight. */
+.row-sweep {
+  position: relative;
+  isolation: isolate;
+}
+
+.row-sweep::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(90deg, var(--color-hover), transparent 70%);
+  opacity: 0;
+  transition: opacity 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.row-sweep:hover::after,
+.row-sweep:focus-within::after {
+  opacity: 1;
+}
+
+/* The capture frame gains a touch of edge definition on approach. */
+.shot-hover {
+  transition:
+    border-color 0.4s cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.shot-hover:hover {
+  border-color: var(--color-edge-strong);
+  box-shadow:
+    inset 0 1px 0 var(--color-highlight),
+    0 24px 70px -30px rgb(0 0 0 / 0.9);
+}

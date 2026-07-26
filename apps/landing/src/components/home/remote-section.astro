@@ -1,0 +1,55 @@
+---
+import { Image } from "astro:assets";
+import phone from "../../assets/shots/mobile-sessions.png";
+---
+
+<!--
+  Mirror of the Git section's split, and the last one: the open source section
+  below breaks the pattern before a third image-and-text row would read as a
+  zigzag.
+
+  The capture is a real portrait phone screenshot rather than a landscape panel,
+  so it is constrained to device width and given a rounded bezel instead of
+  being stretched into the card frame the other sections use.
+-->
+<section class="border-t border-edge px-5 py-20 sm:px-8 sm:py-28">
+  <div
+    class="mx-auto grid max-w-6xl items-center gap-14 lg:grid-cols-2 lg:gap-16"
+  >
+    <div
+      class="flex justify-center lg:order-first lg:justify-start"
+      data-reveal
+    >
+      <div
+        class="shot-hover w-full max-w-[280px] overflow-hidden rounded-[28px] border border-edge bg-panel p-1.5 shadow-[inset_0_1px_0_var(--color-highlight),0_30px_80px_-40px_rgb(0_0_0/0.9)]"
+      >
+        <Image
+          src={phone}
+          alt="The OxiMux phone client showing sessions from the paired desktop, grouped by repository."
+          widths={[280, 560, 840]}
+          sizes="280px"
+          loading="lazy"
+          class="w-full rounded-[22px]"
+        />
+      </div>
+    </div>
+
+    <div class="lg:order-last" data-reveal>
+      <h2
+        class="font-mono text-2xl leading-tight font-semibold tracking-tight text-balance text-fg sm:text-3xl"
+      >
+        Your desk, or your pocket.
+      </h2>
+      <p class="mt-4 text-base leading-relaxed text-fg-muted">
+        Pair a phone by scanning a QR code once. From then on the phone talks to
+        your desktop over a direct, end-to-end encrypted QUIC link, with an
+        encrypted relay as fallback when the network blocks the direct path.
+      </p>
+      <p class="mt-4 text-base leading-relaxed text-fg-muted">
+        Every session on the desktop shows up on the phone, grouped by
+        repository. Read the transcript, review the diff, answer an approval
+        prompt, and keep the agent moving without going back to your desk.
+      </p>
+    </div>
+  </div>
+</section>

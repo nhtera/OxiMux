@@ -1,0 +1,38 @@
+---
+import { AGENTS } from "../../consts";
+---
+
+<section id="features" class="px-5 py-20 sm:px-8 sm:py-28">
+  <div class="mx-auto max-w-6xl">
+    <h2 data-reveal
+      class="max-w-2xl font-mono text-2xl leading-tight font-semibold tracking-tight text-balance text-fg sm:text-3xl"
+    >
+      Bring the agent you already pay for.
+    </h2>
+    <p class="mt-4 max-w-xl text-base leading-relaxed text-fg-muted" data-reveal style="--i: 1">
+      Each agent runs as its own subprocess using its own CLI and your existing
+      login. Nothing is proxied, wrapped, or resold.
+    </p>
+
+    <ul class="mt-12 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3">
+      {
+        AGENTS.map((agent, i) => (
+          <li
+            data-reveal
+            style={`--i: ${i}`}
+            class:list={[
+              "row-sweep border-t border-edge py-5",
+              i >= AGENTS.length - 1 && "border-b sm:border-b-0",
+              "sm:odd:pr-8 sm:even:border-l sm:even:border-edge sm:even:pl-8",
+              "lg:even:border-l-0 lg:even:pl-0 lg:odd:pr-0",
+              i % 3 !== 0 && "lg:border-l lg:border-edge lg:pl-8",
+            ]}
+          >
+            <span class="block font-mono text-base text-fg">{agent.name}</span>
+            <span class="mt-1 block text-sm text-fg-subtle">{agent.note}</span>
+          </li>
+        ))
+      }
+    </ul>
+  </div>
+</section>

@@ -1,0 +1,48 @@
+---
+import ShotFrame from "../shot-frame.astro";
+
+const points = [
+  "Staged and unstaged review with word-level diffs",
+  "Commit graph, branch picker, stash, and conflict banners",
+  "Commit messages drafted by an agent, edited by you",
+  "Push, pull, sync, CI status, and pull request creation",
+];
+---
+
+<section class="border-t border-edge px-5 py-20 sm:px-8 sm:py-28">
+  <div class="mx-auto grid max-w-6xl items-center gap-12 lg:grid-cols-2 lg:gap-16">
+    <div>
+      <h2
+        class="font-mono text-2xl leading-tight font-semibold tracking-tight text-balance text-fg sm:text-3xl"
+      >
+        Git is the trust layer.
+      </h2>
+      <p class="mt-4 text-base leading-relaxed text-fg-muted">
+        An agent that edits your repository is only useful if you can see what
+        it did. Every change lands as reviewable git state before it goes
+        anywhere.
+      </p>
+      <ul class="mt-8">
+        {
+          points.map((point, i) => (
+            <li
+              data-reveal
+              style={`--i: ${i}`}
+              class="row-sweep border-t border-edge px-2 py-3.5 text-sm leading-relaxed text-fg last:border-b"
+            >
+              {point}
+            </li>
+          ))
+        }
+      </ul>
+    </div>
+
+    <div data-reveal>
+      <ShotFrame
+        ratio="1 / 1"
+        alt="The diff viewer showing a word-level diff alongside the source control panel."
+        pending="Diff viewer with a word-level diff open next to the source control panel."
+      />
+    </div>
+  </div>
+</section>

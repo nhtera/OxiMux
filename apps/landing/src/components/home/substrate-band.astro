@@ -1,0 +1,38 @@
+---
+import { SUBSTRATE } from "../../consts";
+---
+
+<!--
+  Four structural facts about how the app is built, separated by hairlines
+  rather than boxed into cards. This is the app's own density convention: 1px
+  white-alpha rules do the grouping work that a card border would otherwise do.
+-->
+<section class="border-y border-edge bg-panel/40">
+  <div class="mx-auto max-w-6xl px-5 sm:px-8">
+    <dl class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4">
+      {
+        SUBSTRATE.map((item, i) => (
+          <div
+            data-reveal
+            style={`--i: ${i}`}
+            class:list={[
+              "py-8 lg:py-10",
+              i > 0 && "border-t border-edge sm:border-t-0",
+              i % 2 === 1 && "sm:border-l sm:border-edge sm:pl-8",
+              i >= 2 && "sm:border-t sm:border-edge sm:pt-8",
+              "lg:border-t-0! lg:pt-10!",
+              i > 0 && "lg:border-l lg:border-edge lg:pl-8",
+            ]}
+          >
+            <dt class="font-mono text-base font-semibold tracking-tight text-fg">
+              {item.label}
+            </dt>
+            <dd class="mt-2 max-w-[28ch] text-sm leading-relaxed text-fg-muted">
+              {item.detail}
+            </dd>
+          </div>
+        ))
+      }
+    </dl>
+  </div>
+</section>

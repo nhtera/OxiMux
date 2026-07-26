@@ -1,0 +1,36 @@
+---
+import { Icon } from "astro-icon/components";
+import { SITE } from "../consts";
+
+const year = new Date().getFullYear();
+---
+
+<footer class="border-t border-edge">
+  <div
+    class="mx-auto flex max-w-6xl flex-col gap-6 px-5 py-10 sm:flex-row sm:items-center sm:px-8"
+  >
+    <div class="flex flex-col gap-1">
+      <span class="font-mono text-sm font-semibold text-fg">OxiMux</span>
+      <span class="text-sm text-fg-subtle">
+        {SITE.license} licensed. Built with Rust and GPUI.
+      </span>
+    </div>
+
+    <div class="flex items-center gap-5 sm:ml-auto">
+      <a
+        href={SITE.repo}
+        class="press inline-flex items-center gap-2 text-sm text-fg-muted hover:text-fg"
+      >
+        <Icon name="simple-icons:github" class="size-4" aria-hidden="true" />
+        Source
+      </a>
+      <a
+        href={`${SITE.repo}/issues`}
+        class="press text-sm text-fg-muted hover:text-fg"
+      >
+        Issues
+      </a>
+      <span class="text-sm text-fg-subtle">&copy; {year}</span>
+    </div>
+  </div>
+</footer>

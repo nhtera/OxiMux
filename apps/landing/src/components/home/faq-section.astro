@@ -1,0 +1,35 @@
+---
+import { Icon } from "astro-icon/components";
+import { FAQ } from "../../consts";
+---
+
+<!-- Native details/summary: a working accordion with zero JavaScript. -->
+<section id="faq" class="border-t border-edge px-5 py-20 sm:px-8 sm:py-28">
+  <div class="mx-auto max-w-3xl">
+    <h2 data-reveal
+      class="font-mono text-2xl leading-tight font-semibold tracking-tight text-fg sm:text-3xl"
+    >
+      Common questions
+    </h2>
+
+    <div class="mt-10">
+      {
+        FAQ.map((item) => (
+          <details class="group border-t border-edge last:border-b">
+            <summary class="press row-sweep flex cursor-pointer list-none items-center gap-4 px-2 py-5 text-base text-fg marker:content-none hover:text-white">
+              <span class="flex-1">{item.q}</span>
+              <Icon
+                name="ph:plus"
+                class="size-4 shrink-0 text-fg-subtle transition-transform duration-200 group-open:rotate-45 motion-reduce:transition-none"
+                aria-hidden="true"
+              />
+            </summary>
+            <p class="max-w-[65ch] pb-6 text-sm leading-relaxed text-fg-muted">
+              {item.a}
+            </p>
+          </details>
+        ))
+      }
+    </div>
+  </div>
+</section>

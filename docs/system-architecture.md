@@ -768,7 +768,7 @@ Three independent closeouts, verified against a fresh bundled build of HEAD:
   time — both still resumed as a terminal PTY. **Wired in round-7** below:
   `⌘↵` on an OpenCode/Pi row now opens a transcript-only chat tab seeded from
   these mappers.
-- **Worktree-per-agent** (Paseo/Super parity). The New Agent composer's
+- **Worktree-per-agent** (reference-tool parity). The New Agent composer's
   worktree toggle (`agent_chat/roster.rs`) created a *git-only* worktree
   (`Repository::add_worktree`, no `WorkspaceRepo` write — the agent-chat view
   has no storage-layer handle) before the first send, rebinding the chat's

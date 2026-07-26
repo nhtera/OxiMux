@@ -1,0 +1,75 @@
+---
+import { Icon } from "astro-icon/components";
+import ShotFrame from "../shot-frame.astro";
+import { SITE } from "../../consts";
+import cockpit from "../../assets/shots/cockpit.png";
+---
+
+<!--
+  Asymmetric hero: copy is left-weighted rather than centred, and the capture
+  runs wider than the text column beneath it. Four text elements at most, so
+  there is no eyebrow, no trust strip, and no tagline under the buttons.
+
+  The headline wipes in line by line and the caret keeps blinking after it
+  lands, which is the page introducing itself in the product's own idiom.
+-->
+<section class="px-5 pt-16 pb-14 sm:px-8 sm:pt-24 sm:pb-20">
+  <div class="mx-auto max-w-6xl">
+    <div class="max-w-3xl" data-reveal>
+      <!--
+        Mono display runs roughly 15% wider per character than sans at the same
+        size, so this tops out a step below where a sans hero would. At 6xl the
+        second line alone spans the full measure and stops reading as a
+        headline.
+      -->
+      <h1
+        class="font-mono text-3xl leading-[1.08] font-semibold tracking-tight text-fg sm:text-4xl lg:text-5xl"
+      >
+        {
+          SITE.heroLines.map((line, i) => (
+            <span class="line-clip" style={`--i: ${i}`}>
+              <span>
+                {line}
+                {i === SITE.heroLines.length - 1 && (
+                  <>
+                    {" "}
+                    <span class="caret" aria-hidden="true" />
+                  </>
+                )}
+              </span>
+            </span>
+          ))
+        }
+      </h1>
+
+      <p class="mt-6 max-w-xl text-lg leading-relaxed text-fg-muted">
+        Spawn isolated worktrees, run Claude Code, Codex, and Pi in parallel,
+        review every diff. Rust and GPUI.
+      </p>
+
+      <div class="mt-8 flex flex-wrap items-center gap-3">
+        <a
+          href={SITE.repo}
+          class="press inline-flex items-center gap-2 rounded-[--radius-control] bg-fg px-5 py-3 text-sm font-medium whitespace-nowrap text-canvas hover:bg-white"
+        >
+          <Icon name="simple-icons:github" class="size-4" aria-hidden="true" />
+          View on GitHub
+        </a>
+        <a
+          href="#build"
+          class="press inline-flex items-center gap-2 rounded-[--radius-control] border border-edge bg-panel px-5 py-3 text-sm whitespace-nowrap text-fg hover:border-edge-strong hover:bg-panel-alt"
+        >
+          Build from source
+        </a>
+      </div>
+    </div>
+
+    <div class="scroll-lift mt-14 sm:mt-16">
+      <ShotFrame
+        src={cockpit}
+        priority
+        alt="The OxiMux cockpit: project rail on the left, agent and terminal tabs across the top, and the source control panel on the right showing changed files and the commit graph."
+      />
+    </div>
+  </div>
+</section>

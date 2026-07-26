@@ -1,0 +1,30 @@
+---
+import { Icon } from "astro-icon/components";
+import { SITE } from "../../consts";
+---
+
+<section class="border-t border-edge px-5 py-24 sm:px-8 sm:py-32">
+  <div
+    class="mx-auto flex max-w-2xl flex-col items-center text-center"
+    data-reveal
+  >
+<!-- No data-reveal here: the wrapper above already carries it, and nesting
+         two reveal targets double-hides this heading. -->
+    <h2
+      class="font-mono text-2xl leading-tight font-semibold tracking-tight text-balance text-fg sm:text-4xl"
+    >
+      Run your agents on something native.
+    </h2>
+    <p class="mt-5 max-w-md text-base leading-relaxed text-fg-muted">
+      Pre-1.0 and in active development, but already the tool it was built to
+      replace.
+    </p>
+    <a
+      href={SITE.repo}
+      class="press mt-8 inline-flex items-center gap-2 rounded-[--radius-control] bg-fg px-6 py-3 text-sm font-medium whitespace-nowrap text-canvas hover:bg-white"
+    >
+      <Icon name="simple-icons:github" class="size-4" aria-hidden="true" />
+      View on GitHub
+    </a>
+  </div>
+</section>

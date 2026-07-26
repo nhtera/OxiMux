@@ -1,0 +1,91 @@
+---
+import SeoMeta from "../components/seo-meta.astro";
+import SiteHeader from "../components/site-header.astro";
+import SiteFooter from "../components/site-footer.astro";
+import "../styles/global.css";
+
+/* Preload the two above-the-fold faces so they land at first paint instead of
+   being discovered late inside the CSS bundle. These resolve to the same hashed
+   files the @font-face rules reference, so this warms the exact cache entry and
+   closes the swap window that would otherwise reflow the hero. */
+import geistWoff2 from "@fontsource-variable/geist/files/geist-latin-wght-normal.woff2?url";
+import geistMonoWoff2 from "@fontsource-variable/geist-mono/files/geist-mono-latin-wght-normal.woff2?url";
+
+interface Props {
+  title: string;
+  description?: string;
+  image?: string;
+}
+
+const { title, description, image } = Astro.props;
+---
+
+<!doctype html>
+<html lang="en" class="scroll-smooth">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="generator" content={Astro.generator} />
+    <meta name="theme-color" content="#0e0f11" />
+    <link rel="preload" href={geistWoff2} as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href={geistMonoWoff2} as="font" type="font/woff2" crossorigin />
+    <link rel="icon" href="/favicon.png" type="image/png" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="sitemap" href="/sitemap-index.xml" />
+    <SeoMeta title={title} description={description} image={image} />
+  </head>
+  <body class="min-h-screen bg-canvas font-sans text-fg antialiased">
+    <a
+      href="#main"
+      class="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-[--radius-control] focus:bg-overlay focus:px-3 focus:py-2 focus:text-sm"
+    >
+      Skip to content
+    </a>
+    <SiteHeader />
+    <main id="main">
+      <slot />
+    </main>
+    <SiteFooter />
+
+    <script is:inline>
+      /* Reveal on approach.
+         IntersectionObserver rather than a scroll listener, so nothing runs per
+         frame. The `js-reveal` class is what actually hides the elements, and it
+         is only added once we know the script is alive and the reader has not
+         asked for reduced motion. That ordering is the whole safety story: no
+         JS, an old browser, or reduce-motion all leave the page fully visible
+         instead of blank. */
+      (() => {
+        const wants = window.matchMedia("(prefers-reduced-motion: reduce)");
+        if (wants.matches) return;
+
+        const targets = document.querySelectorAll("[data-reveal]");
+        if (!targets.length || !("IntersectionObserver" in window)) return;
+
+        document.documentElement.classList.add("js-reveal");
+
+        const io = new IntersectionObserver(
+          (entries) => {
+            for (const entry of entries) {
+              if (!entry.isIntersecting) continue;
+              entry.target.classList.add("is-visible");
+              io.unobserve(entry.target);
+            }
+          },
+          { rootMargin: "0px 0px -12% 0px", threshold: 0.15 }
+        );
+
+        for (const target of targets) io.observe(target);
+
+        /* If the reader flips reduce-motion on mid-visit, stop hiding anything
+           and show everything immediately. */
+        wants.addEventListener("change", (event) => {
+          if (!event.matches) return;
+          io.disconnect();
+          document.documentElement.classList.remove("js-reveal");
+          for (const target of targets) target.classList.add("is-visible");
+        });
+      })();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,51 @@
+---
+import { Icon } from "astro-icon/components";
+import { SITE } from "../consts";
+---
+
+<!--
+  Single-line nav, 64px tall. The app's own top bar is 32px and the brand
+  wordmark sits at 12px/600; this is the web translation of that proportion:
+  small wordmark, quiet links, one committed action on the right.
+-->
+<header
+  class="sticky top-0 z-40 h-16 border-b border-edge bg-canvas/80 backdrop-blur-md"
+>
+  <nav
+    aria-label="Primary"
+    class="mx-auto flex h-full max-w-6xl items-center gap-6 px-5 sm:px-8"
+  >
+    <a
+      href="/"
+      class="font-mono text-[15px] font-semibold tracking-tight text-fg"
+    >
+      OxiMux
+    </a>
+
+    <span class="hidden font-mono text-xs text-fg-subtle sm:inline">
+      {SITE.platform}
+    </span>
+
+    <div class="ml-auto flex items-center gap-1 sm:gap-2">
+      <a
+        href="#features"
+        class="press hidden rounded-[--radius-control] px-3 py-2 text-sm text-fg-muted hover:bg-hover hover:text-fg md:inline-block"
+      >
+        Features
+      </a>
+      <a
+        href="#faq"
+        class="press hidden rounded-[--radius-control] px-3 py-2 text-sm text-fg-muted hover:bg-hover hover:text-fg md:inline-block"
+      >
+        FAQ
+      </a>
+      <a
+        href={SITE.repo}
+        class="press inline-flex items-center gap-2 rounded-[--radius-control] border border-edge bg-panel px-3.5 py-2 text-sm text-fg hover:border-edge-strong hover:bg-panel-alt"
+      >
+        <Icon name="simple-icons:github" class="size-4" aria-hidden="true" />
+        GitHub
+      </a>
+    </div>
+  </nav>
+</header>

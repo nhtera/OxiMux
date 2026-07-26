@@ -1,0 +1,25 @@
+---
+import BaseLayout from "../layouts/base-layout.astro";
+import HeroSection from "../components/home/hero-section.astro";
+import SubstrateBand from "../components/home/substrate-band.astro";
+import AgentsSection from "../components/home/agents-section.astro";
+import WorktreesSection from "../components/home/worktrees-section.astro";
+import GitSection from "../components/home/git-section.astro";
+import RemoteSection from "../components/home/remote-section.astro";
+import OpenSourceSection from "../components/home/open-source-section.astro";
+import FaqSection from "../components/home/faq-section.astro";
+import CtaSection from "../components/home/cta-section.astro";
+import { SITE } from "../consts";
+---
+
+<BaseLayout title={`${SITE.name} — ${SITE.tagline}`}>
+  <HeroSection />
+  <SubstrateBand />
+  <AgentsSection />
+  <WorktreesSection />
+  <GitSection />
+  <RemoteSection />
+  <OpenSourceSection />
+  <FaqSection />
+  <CtaSection />
+</BaseLayout>

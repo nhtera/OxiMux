@@ -324,7 +324,7 @@ Round-3 follow-ups on the voice work, all live-verified in the running app.
   data dir, capped at 50) recorded at the single `DictationEvent::Final` choke
   point in `route_event` (captures every pane's transcripts); stored on-device
   only, formatted with `chrono`.
-- **Speech-model picker collapsed to a dropdown** (Orca-style) — the per-model
+- **Speech-model picker collapsed to a dropdown** — the per-model
   list (8 full rows of Download/Select/Delete chips) became a single "Speech
   model" row: a `DropdownButton` labeled with the active model, its description
   tracking that model's coverage. The menu shows every catalog model as a
@@ -649,7 +649,7 @@ live MCP elicitation, live GUI walk-through) stays user-gated.
 
 - **A New-Agent worktree is now a first-class `Workspace`.** The "Run in a fresh
   worktree" send no longer creates a git-only worktree with no sidebar presence.
-  The leaf carries no `WorkspaceRepo` (Orca thin-leaf), so it routes up: the
+  The leaf carries no `WorkspaceRepo` (thin-leaf convention), so it routes up: the
   roster emits `AgentChatEvent::WorktreeWorkspaceRequested{slug}` → the pane
   group dispatches the new `CreateWorktreeWorkspaceForActiveChat{slug}` action →
   `WorkspaceRoot` (owns `app_state`) resolves the active chat, runs the existing
@@ -687,7 +687,7 @@ live MCP elicitation, live GUI walk-through) stays user-gated.
   a live `claude` and drop the imported history) — they re-open from Session
   History like Diff/Tasks tabs; reopen dedups on `(preset_id, session_id)`.
   Copilot stays resume-only (no transcript mapper wired). **Why.** Modeled on
-  Super Conductor's terminal-resume bridge (Validation Session 1): read the past
+  the terminal-resume bridge pattern (Validation Session 1): read the past
   turns in Chat View, continue the session in a terminal.
 - **Verification.** Full workspace test suite green (`oximux-app --lib` 1254/0);
   the round-6 `send_on_armed_draft_stages_the_message_instead_of_binding` test was
@@ -920,7 +920,7 @@ tracked in `plans/260713-1243-agent-chat-round5-p1-wave/reports/gui-verification
 ### 2026-07-13 — Agent Chat round-4 P0 parity (5 protocol-correctness gaps)
 
 **What shipped:** five P0 agent-chat parity features closing the round-4 research
-gaps vs Paseo/Super Conductor, across the `oximux-agents` and `oximux-app` crates.
+gaps found in round-4 research, across the `oximux-agents` and `oximux-app` crates.
 
 **Claude:**
 - **Live tool-input streaming** — the decoder now handles `content_block_start`
