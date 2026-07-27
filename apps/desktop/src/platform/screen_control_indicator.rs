@@ -28,6 +28,35 @@ use oximux_computer_use::Driving;
 
 /// The line that has to survive being the only thing the user reads.
 const STOP_HINT: &str = "Press Esc to stop";
+/// Said in the same breath as the stop hint, always.
+///
+/// Escape drops every grant instantly, so nothing *new* can be driven — but the
+/// driver is a separate process and a call already sent to it runs to
+/// completion. Letting the user believe an in-flight click was recalled is the
+/// one way a working kill switch still gets someone hurt.
+const IN_FLIGHT_CAVEAT: &str = "An action already sent may still finish";
+
+/// Whether Escape can actually stop anything.
+///
+/// Carried into the copy rather than assumed, because the tap needs
+/// Accessibility permission and silently does not exist without it. Promising a
+/// panic key that does nothing is worse than admitting there is none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscapeState {
+    Armed,
+    Unavailable,
+}
+
+impl EscapeState {
+    fn hint(self) -> &'static str {
+        match self {
+            EscapeState::Armed => STOP_HINT,
+            EscapeState::Unavailable => {
+                "Esc cannot stop this — allow OxiMux under Privacy & Security › Accessibility"
+            }
+        }
+    }
+}
 
 /// What the menu bar should say for a given state, split out from AppKit so the
 /// copy is testable — the strings are the entire user-facing product here, and
@@ -37,12 +66,13 @@ struct Wording {
     title: String,
     /// Hover text, and the fallback for anyone who never opens the menu.
     tooltip: String,
-    /// Menu rows, top to bottom. Last is always the stop hint.
+    /// Menu rows, top to bottom. Ends with how to stop, and what stopping does
+    /// not undo.
     rows: Vec<String>,
 }
 
 impl Wording {
-    fn for_driving(driving: &Driving) -> Self {
+    fn for_driving(driving: &Driving, escape: EscapeState) -> Self {
         let summary = driving.summary();
         let apps: Vec<&str> = driving
             .sessions
@@ -59,11 +89,12 @@ impl Wording {
 
         let mut rows = vec![summary.clone()];
         rows.extend(driving.detail_lines());
-        rows.push(STOP_HINT.to_string());
+        rows.push(escape.hint().to_string());
+        rows.push(IN_FLIGHT_CAVEAT.to_string());
 
         Self {
             title,
-            tooltip: format!("{summary}. {STOP_HINT}."),
+            tooltip: format!("{summary}. {}. {IN_FLIGHT_CAVEAT}.", escape.hint()),
             rows,
         }
     }
@@ -111,7 +142,7 @@ mod imp {
         /// this is an indicator, and taking the app down to complain about
         /// where it was called from would be a far worse outcome than a missing
         /// dot.
-        pub fn update(&mut self, driving: &super::Driving) {
+        pub fn update(&mut self, driving: &super::Driving, escape: super::EscapeState) {
             let Some(mtm) = MainThreadMarker::new() else {
                 return;
             };
@@ -120,7 +151,7 @@ mod imp {
                 return;
             }
 
-            let copy = Wording::for_driving(driving);
+            let copy = Wording::for_driving(driving, escape);
             if self.showing.as_ref() == Some(&copy.rows) {
                 return;
             }
@@ -174,7 +205,7 @@ mod imp {
         pub fn new() -> Self {
             Self
         }
-        pub fn update(&mut self, _driving: &super::Driving) {}
+        pub fn update(&mut self, _driving: &super::Driving, _escape: super::EscapeState) {}
         pub fn hide(&mut self) {}
     }
 }
@@ -198,58 +229,74 @@ mod tests {
         }
     }
 
+    fn armed(sessions: &[(&str, &[&str])]) -> Wording {
+        Wording::for_driving(&driving(sessions), EscapeState::Armed)
+    }
+
     #[test]
     fn one_app_is_named_in_the_bar_itself() {
         // The whole answer fits, so making the user open a menu to get it would
         // be a wasted interaction at the moment they are most alarmed.
-        let copy = Wording::for_driving(&driving(&[("chat-1", &["Safari"])]));
-        assert_eq!(copy.title, "● Safari");
+        assert_eq!(armed(&[("chat-1", &["Safari"])]).title, "● Safari");
     }
 
     #[test]
     fn several_apps_are_counted_because_the_bar_has_no_room() {
-        let copy = Wording::for_driving(&driving(&[("chat-1", &["Safari", "Notes"])]));
-        assert_eq!(copy.title, "● 2 apps");
+        assert_eq!(armed(&[("chat-1", &["Safari", "Notes"])]).title, "● 2 apps");
     }
 
     #[test]
     fn the_same_app_under_two_agents_counts_once_in_the_bar() {
         // Two agents each driving their own build of one program is the shape
         // this feature exists for; "2 apps" would name something untrue.
-        let copy = Wording::for_driving(&driving(&[
-            ("chat-1", &["my-app"]),
-            ("chat-2", &["my-app"]),
-        ]));
+        let copy = armed(&[("chat-1", &["my-app"]), ("chat-2", &["my-app"])]);
         assert_eq!(copy.title, "● my-app");
     }
 
     #[test]
-    fn the_stop_hint_is_always_the_last_thing_said() {
-        // It is the only actionable row, and the one that must survive the user
-        // reading exactly one line.
+    fn how_to_stop_is_always_said_and_always_qualified() {
+        // The two rows that must survive the user reading only the end of the
+        // menu: what stops it, and what stopping does not undo.
         for state in [
-            driving(&[("chat-1", &["Safari"])]),
-            driving(&[("chat-1", &["Safari"]), ("chat-2", &["Notes"])]),
+            vec![("chat-1", &["Safari"][..])],
+            vec![("chat-1", &["Safari"][..]), ("chat-2", &["Notes"][..])],
         ] {
-            let copy = Wording::for_driving(&state);
-            assert_eq!(copy.rows.last().map(String::as_str), Some(STOP_HINT));
+            let copy = armed(&state);
+            assert_eq!(copy.rows.last().map(String::as_str), Some(IN_FLIGHT_CAVEAT));
+            assert!(copy.rows.iter().any(|r| r == STOP_HINT), "{:?}", copy.rows);
             assert!(copy.tooltip.contains(STOP_HINT), "{}", copy.tooltip);
+            assert!(copy.tooltip.contains(IN_FLIGHT_CAVEAT), "{}", copy.tooltip);
         }
     }
 
     #[test]
+    fn an_unarmed_escape_says_so_rather_than_promising_a_key_that_does_nothing() {
+        // The tap needs Accessibility permission and silently does not exist
+        // without it. Claiming otherwise is the one failure that gets someone
+        // hurt while they are pressing a key they were told would work.
+        let copy = Wording::for_driving(
+            &driving(&[("chat-1", &["Safari"])]),
+            EscapeState::Unavailable,
+        );
+        assert!(!copy.rows.iter().any(|r| r == STOP_HINT), "{:?}", copy.rows);
+        assert!(
+            copy.rows.iter().any(|r| r.contains("Accessibility")),
+            "{:?}",
+            copy.rows
+        );
+        assert!(!copy.tooltip.contains(STOP_HINT), "{}", copy.tooltip);
+    }
+
+    #[test]
     fn several_agents_each_get_a_row() {
-        let copy = Wording::for_driving(&driving(&[
-            ("chat-1", &["Safari"]),
-            ("chat-2", &["Notes"]),
-        ]));
+        let copy = armed(&[("chat-1", &["Safari"]), ("chat-2", &["Notes"])]);
         assert!(copy.rows.iter().any(|r| r.contains("chat-1")), "{:?}", copy.rows);
         assert!(copy.rows.iter().any(|r| r.contains("chat-2")), "{:?}", copy.rows);
     }
 
     #[test]
     fn the_tooltip_names_the_app_without_opening_the_menu() {
-        let copy = Wording::for_driving(&driving(&[("chat-1", &["Safari"])]));
+        let copy = armed(&[("chat-1", &["Safari"])]);
         assert!(copy.tooltip.contains("Safari"), "{}", copy.tooltip);
     }
 
@@ -260,9 +307,11 @@ mod tests {
     #[test]
     fn showing_and_hiding_never_panics() {
         let mut indicator = ScreenControlIndicator::new();
-        indicator.update(&driving(&[("chat-1", &["Safari"])]));
-        indicator.update(&driving(&[("chat-1", &["Safari"])]));
-        indicator.update(&Driving::default());
+        let live = driving(&[("chat-1", &["Safari"])]);
+        indicator.update(&live, EscapeState::Armed);
+        indicator.update(&live, EscapeState::Armed);
+        indicator.update(&live, EscapeState::Unavailable);
+        indicator.update(&Driving::default(), EscapeState::Armed);
         indicator.hide();
     }
 }

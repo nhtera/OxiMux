@@ -28,7 +28,8 @@ use std::time::{Duration, SystemTime};
 use gpui::{App, AsyncApp, Global};
 use oximux_computer_use::{Driving, GrantTable};
 
-use crate::platform::screen_control_indicator::ScreenControlIndicator;
+use crate::platform::escape_tap::{self, EscapeTap};
+use crate::platform::screen_control_indicator::{EscapeState, ScreenControlIndicator};
 
 /// How often to look. A second is fast enough that the dot appears while the
 /// user is still watching the action that caused it, and slow enough that the
@@ -87,8 +88,21 @@ pub fn install(cx: &mut App) {
     cx.spawn(async move |cx: &mut AsyncApp| {
         let mut last = FileStamp::default();
         let mut showing = false;
+        let mut stop = StopKey::default();
         loop {
             cx.background_executor().timer(TICK).await;
+
+            if stop.pressed() {
+                // Instant and app-wide: every screen-control call re-checks the
+                // table, so clearing it is what actually takes the keys away.
+                let aborted = path.clone();
+                cx.background_executor()
+                    .spawn(async move { GrantTable::at(&aborted).clear() })
+                    .await;
+                tracing::info!("Escape stopped screen control; all grants dropped");
+                // Force the next pass to redraw rather than trust the stamp.
+                last = FileStamp::default();
+            }
 
             let probe = path.clone();
             let Some(driving) = cx
@@ -100,11 +114,81 @@ pub fn install(cx: &mut App) {
             };
             last = FileStamp::of(&path);
             showing = !driving.is_idle();
+            let escape = stop.follow(showing);
 
-            cx.update_global::<Indicator, _>(|indicator, _| indicator.0.update(&driving));
+            cx.update_global::<Indicator, _>(|indicator, _| {
+                indicator.0.update(&driving, escape)
+            });
         }
     })
     .detach();
+}
+
+/// The Escape tap, armed only while something is actually being driven.
+///
+/// # Why it is not simply always on
+///
+/// The tap swallows *every* Escape on the machine. Armed for the life of a chat
+/// that merely could drive — potentially hours — it would break dismissing an
+/// input method's candidate window, leaving a dialog, and vim, everywhere. Tied
+/// to a held grant instead, the user loses Escape only while an agent actually
+/// holds the right to click.
+///
+/// # The gap that costs
+///
+/// Arming happens on the tick that first *sees* a grant, so up to [`TICK`]
+/// passes between an agent gaining the right to drive and Escape being able to
+/// stop it. The provenance path grants inside the decision for the first tool
+/// call, so that first action can land inside the gap. Closing it would mean
+/// arming on "an agent could drive" rather than "an agent may drive" — which is
+/// the always-on tap above, and a worse trade.
+#[derive(Default)]
+struct StopKey {
+    /// `None` while idle, and also when arming failed — the two are
+    /// distinguished by `blocked`, because only one of them is worth telling
+    /// the user about.
+    tap: Option<EscapeTap>,
+    /// Arming was tried for this run of grants and did not work. Latched so a
+    /// missing permission is reported once, not once a second.
+    blocked: bool,
+}
+
+impl StopKey {
+    /// Match the tap to whether anything is being driven, and report what the
+    /// indicator may now claim.
+    ///
+    /// Idle answers [`EscapeState::Unavailable`], which is simply true — there
+    /// is no tap. It cannot mislead: the indicator hides on the same condition,
+    /// so the permission warning has nowhere to appear.
+    fn follow(&mut self, driving: bool) -> EscapeState {
+        if !driving {
+            self.tap = None;
+            // Cleared, not latched: the user may have granted Accessibility
+            // since the last run, and the next one should find out.
+            self.blocked = false;
+            return EscapeState::Unavailable;
+        }
+        if self.tap.is_none() && !self.blocked {
+            match escape_tap::arm() {
+                Ok(tap) => self.tap = Some(tap),
+                Err(err) => {
+                    self.blocked = true;
+                    tracing::warn!(%err, "Escape cannot stop screen control");
+                }
+            }
+        }
+        if self.tap.is_some() {
+            EscapeState::Armed
+        } else {
+            EscapeState::Unavailable
+        }
+    }
+
+    /// Has Escape been pressed since the last check? Clears the flag, so one
+    /// press aborts once.
+    fn pressed(&self) -> bool {
+        self.tap.as_ref().is_some_and(EscapeTap::abort_requested)
+    }
 }
 
 /// One pass' worth of file work, off the UI thread. `None` means nothing
@@ -160,6 +244,53 @@ mod tests {
     fn a_tick_over_a_missing_store_does_no_work() {
         let path = PathBuf::from("/nonexistent/computer-use-grants.json");
         assert_eq!(tick(&path, FileStamp::default(), false), None);
+    }
+
+    /// Whether the tap can be created depends on Accessibility permission,
+    /// which CI does not have and a developer machine may not either. So these
+    /// assert the *contract* rather than that arming succeeds — which is the
+    /// stronger test anyway: the failure mode that matters is claiming Escape
+    /// works when it does not.
+    #[test]
+    fn arming_is_tried_once_per_run_of_grants() {
+        let mut stop = StopKey::default();
+        let first = stop.follow(true);
+        match first {
+            EscapeState::Armed => {
+                assert!(stop.tap.is_some());
+                assert!(!stop.blocked, "a success must not latch a failure");
+            }
+            EscapeState::Unavailable => {
+                assert!(stop.tap.is_none());
+                assert!(stop.blocked, "a failure must latch, or every tick retries");
+            }
+        }
+        assert_eq!(
+            stop.follow(true),
+            first,
+            "a second tick must not change the answer"
+        );
+    }
+
+    #[test]
+    fn going_idle_drops_the_tap_and_forgets_a_failure() {
+        // Dropping matters most: a tap left armed swallows every Escape on the
+        // machine, including an input method's candidate dismissal. Forgetting
+        // the failure matters because the user may have granted the permission
+        // in between.
+        let mut stop = StopKey::default();
+        stop.follow(true);
+        assert_eq!(stop.follow(false), EscapeState::Unavailable);
+        assert!(stop.tap.is_none());
+        assert!(!stop.blocked);
+    }
+
+    #[test]
+    fn nothing_is_pending_until_a_key_is_pressed() {
+        let mut stop = StopKey::default();
+        assert!(!stop.pressed(), "no tap means nothing to drain");
+        stop.follow(true);
+        assert!(!stop.pressed());
     }
 
     #[test]

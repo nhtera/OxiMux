@@ -34,6 +34,36 @@
 //! must be answered by re-enabling, or the tap goes quiet and stays quiet. It
 //! is the classic way this API fails in the field, which is why the callback
 //! does nothing but set a flag and post a wake-up.
+//!
+//! # A third way, which this module cannot currently detect
+//!
+//! While any process holds **secure event input** — a password field, the lock
+//! screen, some terminals — macOS delivers no keyboard events to any tap at
+//! all. That is the feature working as designed; it is what stops a keylogger.
+//!
+//! What makes it dangerous here is that it is invisible from this side:
+//! `CGEventTapCreate` still succeeds, [`arm`] still returns a guard, and
+//! `CGEventTapIsEnabled` still reports true. Escape simply never arrives. So a
+//! successful [`arm`] is **not** proof that Escape can stop an agent, and any
+//! UI built on that assumption is making the promise this module's whole
+//! premise says must not be made.
+//!
+//! Detecting it means reading `kCGSSessionSecureInputPID` out of IOKit's
+//! `IOConsoleUsers`; a non-zero pid there means no tap on the machine is
+//! receiving keys. Until that lands, the gap is real and known:
+//!
+//! ```text
+//! ioreg -l -d 1 -k IOConsoleUsers | grep kCGSSessionSecureInputPID
+//! ```
+
+/// Serialises the tests that arm a real tap.
+///
+/// The abort flag and the live-port slot are process-wide, so two tests holding
+/// taps at once would read each other's state: the live-key test's Escape would
+/// land in the other's assertion that nothing is pending. That flake would look
+/// exactly like a bug in the tap.
+#[cfg(test)]
+static TAP_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -202,6 +232,9 @@ mod imp {
     pub struct EscapeTap {
         port: CFMachPortRef,
         source: CFRunLoopSourceRef,
+        /// The loop the source was added to, so `Drop` removes it from the same
+        /// one it joined.
+        run_loop: CFRunLoopRef,
     }
 
     // SAFETY: the two pointers are CoreFoundation objects this type owns a
@@ -223,7 +256,7 @@ mod imp {
             // this guard; each CF object is released exactly once.
             unsafe {
                 CGEventTapEnable(self.port, false);
-                CFRunLoopRemoveSource(CFRunLoopGetMain(), self.source, kCFRunLoopCommonModes);
+                CFRunLoopRemoveSource(self.run_loop, self.source, kCFRunLoopCommonModes);
                 CFRelease(self.source);
                 CFRelease(self.port);
             }
@@ -240,6 +273,18 @@ mod imp {
     /// Must be called from the main thread: the run-loop source is added to the
     /// main run loop, which is where GPUI's event loop lives.
     pub fn arm() -> Result<EscapeTap, super::EscapeTapError> {
+        // SAFETY: returns the process's main run loop, which is where GPUI's
+        // event loop lives and therefore the only one guaranteed to be running.
+        arm_on(unsafe { CFRunLoopGetMain() })
+    }
+
+    /// [`arm`], against a caller-chosen run loop.
+    ///
+    /// Exists so a test can attach the tap to a loop it controls and pump it —
+    /// a `cargo test` binary never runs the main run loop, so a tap installed
+    /// there would be armed but permanently silent, and every assertion about
+    /// what it does with a real key press would be vacuous.
+    fn arm_on(run_loop: CFRunLoopRef) -> Result<EscapeTap, super::EscapeTapError> {
         ABORT_REQUESTED.store(false, Ordering::SeqCst);
         // SAFETY: a null `user_info` is valid — the callback ignores it and
         // reads process statics instead, because an `extern "C"` fn cannot
@@ -266,17 +311,117 @@ mod imp {
             return Err(super::EscapeTapError::NoRunLoopSource);
         }
 
-        // SAFETY: adding a live source to the main run loop in the common modes.
+        // SAFETY: adding a live source to a live run loop in the common modes.
         unsafe {
-            CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
+            CFRunLoopAddSource(run_loop, source, kCFRunLoopCommonModes);
             CGEventTapEnable(port, true);
         }
         *live_port().lock().expect("escape tap port poisoned") = port as usize;
-        Ok(EscapeTap { port, source })
+        Ok(EscapeTap {
+            port,
+            source,
+            run_loop,
+        })
     }
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        use crate::platform::escape_tap::TAP_SERIAL;
+
+        /// `kCGHIDEventTap` — below the session tap, so an event posted here is
+        /// seen by one exactly as the user's own key press would be. (Posting
+        /// at the session level instead lands *above* the tap and slips past
+        /// it, which is why AppleScript's `key code` cannot exercise this.)
+        const HID_EVENT_TAP: u32 = 0;
+        /// `kCGEventSourceStateHIDSystemState`.
+        const HID_SYSTEM_STATE: i32 = 1;
+
+        type CGEventSourceRef = *mut c_void;
+
+        #[link(name = "CoreGraphics", kind = "framework")]
+        unsafe extern "C" {
+            fn CGEventSourceCreate(state_id: i32) -> CGEventSourceRef;
+            fn CGEventCreateKeyboardEvent(
+                source: CGEventSourceRef,
+                keycode: u16,
+                key_down: bool,
+            ) -> CGEventRef;
+            fn CGEventPost(tap: u32, event: CGEventRef);
+        }
+
+        #[link(name = "CoreFoundation", kind = "framework")]
+        unsafe extern "C" {
+            static kCFRunLoopDefaultMode: CFStringRef;
+            fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+            fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source: bool)
+                -> i32;
+        }
+
+        fn post_escape() {
+            // SAFETY: a source and two events created here, posted, and released
+            // exactly once each.
+            unsafe {
+                let source = CGEventSourceCreate(HID_SYSTEM_STATE);
+                for down in [true, false] {
+                    let event =
+                        CGEventCreateKeyboardEvent(source, ESCAPE_KEYCODE as u16, down);
+                    if !event.is_null() {
+                        CGEventPost(HID_EVENT_TAP, event);
+                        CFRelease(event);
+                    }
+                }
+                if !source.is_null() {
+                    CFRelease(source);
+                }
+            }
+        }
+
+        /// The claim the module makes, exercised against a real key press
+        /// rather than against [`handling`] alone: an armed tap sees Escape and
+        /// records the abort.
+        ///
+        /// Attached to this thread's run loop and pumped here, because a
+        /// `cargo test` binary never runs the main one — a tap installed there
+        /// would be armed and permanently silent, and this assertion would pass
+        /// only by never having been tested.
+        ///
+        /// # Why it is ignored by default
+        ///
+        /// It needs **secure input to be off**, and that is not something a test
+        /// can arrange. While any process holds secure event input, macOS
+        /// delivers no keyboard events to any tap — by design, since that is
+        /// what stops keyloggers — yet `CGEventTapCreate` still succeeds and the
+        /// tap still reports itself enabled. Check with:
+        ///
+        /// ```text
+        /// ioreg -l -d 1 -k IOConsoleUsers | grep kCGSSessionSecureInputPID
+        /// ```
+        ///
+        /// A non-zero pid there means this test cannot pass, and neither can the
+        /// feature — see the module docs. Run it with `--ignored` when that
+        /// reads zero.
+        #[test]
+        #[ignore = "needs secure input off; see the doc comment"]
+        fn a_real_escape_press_reaches_an_armed_tap() {
+            let _serial = TAP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: this thread's run loop, which the pump below drives.
+            let Ok(tap) = arm_on(unsafe { CFRunLoopGetCurrent() }) else {
+                return;
+            };
+            post_escape();
+            // The callback runs on the run loop, so it has to be given a turn.
+            // Bounded: a tap that never fires must fail the assertion, not hang.
+            // SAFETY: pumping the current thread's run loop.
+            unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, false) };
+            assert!(
+                tap.abort_requested(),
+                "an armed tap must see a real Escape press"
+            );
+            // And one press aborts once — a second read must come back empty,
+            // or a single panic key would keep stopping later sessions.
+            assert!(!tap.abort_requested());
+        }
 
         /// Escape must be consumed, not merely observed. This is the assertion
         /// that stands in for the whole module's reason to exist.
@@ -402,6 +547,7 @@ mod tests {
     /// here rather than in front of a user with an agent mid-drive.
     #[test]
     fn arming_either_works_cleanly_or_fails_cleanly() {
+        let _serial = TAP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         match arm() {
             Ok(tap) => {
                 // Nothing has been pressed, so nothing is pending.
