@@ -15,6 +15,7 @@ mod nav;
 mod segmented;
 mod pane_about;
 mod pane_agents;
+mod pane_computer_use;
 mod pane_agents_launch;
 mod pane_keybindings;
 mod pane_notifications;
@@ -36,8 +37,8 @@ use gpui::{
 };
 use gpui_component::input::{InputEvent, InputState};
 use oximux_settings::{
-    AgentLaunchSettings, CommitMessageAiSettings, Density, DictationSettings, TerminalSettings,
-    Theme, Typography,
+    AgentLaunchSettings, CommitMessageAiSettings, ComputerUseSettings, Density, DictationSettings,
+    TerminalSettings, Theme, Typography,
 };
 use oximux_storage::SettingsRepo;
 
@@ -106,6 +107,12 @@ pub struct SettingsModal {
     /// before remote access is on doesn't consume the single attempt — the next
     /// open tries again, by which time the host may have bound.
     pub(super) remote_unpair_watch: bool,
+    /// Working copy of the screen-control settings, reseeded from the global at
+    /// each `open()` and written straight back on every edit.
+    pub(super) computer_use: ComputerUseSettings,
+    /// Result of the last driver check. Held rather than recomputed per frame:
+    /// verification spawns `codesign`, and the pane repaints constantly.
+    pub(super) driver_status: pane_computer_use::DriverStatus,
     /// Flat KV store the notification toggles persist into (keys in
     /// [`crate::notifier::keys`]), so prefs survive a restart.
     pub(crate) notify_repo: SettingsRepo,
@@ -207,6 +214,8 @@ impl SettingsModal {
             ai: CommitMessageAiSettings::default(),
             agent_launch: AgentLaunchSettings::default(),
             dictation: DictationSettings::default(),
+            computer_use: ComputerUseSettings::default(),
+            driver_status: pane_computer_use::DriverStatus::Unknown,
             notify,
             notify_repo,
             notifier,
@@ -261,6 +270,14 @@ impl SettingsModal {
             .try_global::<DictationSettings>()
             .cloned()
             .unwrap_or_default();
+        self.computer_use = cx
+            .try_global::<ComputerUseSettings>()
+            .cloned()
+            .unwrap_or_default();
+        // Re-checked per open rather than once at boot: the user may have
+        // installed or updated the driver since, and "not installed" is the
+        // status most likely to be stale.
+        self.driver_status = pane_computer_use::DriverStatus::resolve();
         // Start reporting devices that drop themselves, if the host is up. Not in
         // the constructor: the remote host binds later than the shell is built, so
         // subscribing there would find nothing to subscribe to.
@@ -430,6 +447,15 @@ impl SettingsModal {
     pub(super) fn persist_voice(&mut self, cx: &mut Context<Self>) {
         if let Err(err) = crate::dictation_settings::save(&self.dictation) {
             tracing::warn!(%err, "settings modal: failed to write dictation.toml");
+        }
+        cx.notify();
+    }
+
+    /// Persist the screen-control working copy to `computer_use.toml`. The
+    /// watcher reloads + swaps the global; we never set the global here.
+    pub(super) fn persist_computer_use(&mut self, cx: &mut Context<Self>) {
+        if let Err(err) = crate::computer_use_settings::save(&self.computer_use) {
+            tracing::warn!(%err, "settings modal: failed to write computer_use.toml");
         }
         cx.notify();
     }

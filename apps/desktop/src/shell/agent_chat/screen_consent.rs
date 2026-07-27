@@ -98,6 +98,7 @@ pub(super) fn warning_banner(
 /// Also absent for a sentinel target. "Always" and "this is equivalent to
 /// giving the agent a shell" do not belong on the same card; that approval
 /// should be a deliberate trip to settings, not a button next to Allow.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn always_allow_pill(
     prompt: &ScreenPrompt,
     tool_id: &str,

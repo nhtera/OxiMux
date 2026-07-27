@@ -46,7 +46,11 @@ pub struct AppGrant {
     pub name: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Off, everywhere, with nothing pre-approved — the one default a feature that
+/// can click on the user's behalf is allowed to have. Pinned by
+/// `default_is_off_everywhere_with_nothing_approved`, so a future field whose
+/// derived default is "on" fails a test rather than shipping.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ComputerUseSettings {
     /// Master switch. `false` means no agent is ever declared the screen-control
@@ -57,18 +61,6 @@ pub struct ComputerUseSettings {
     pub projects: Vec<PathBuf>,
     /// Apps that skip the consent card. Everything else asks.
     pub allowed_apps: Vec<AppGrant>,
-}
-
-impl Default for ComputerUseSettings {
-    fn default() -> Self {
-        // Off, everywhere, with nothing pre-approved. The one default a feature
-        // that can click on the user's behalf is allowed to have.
-        Self {
-            enabled: false,
-            projects: Vec::new(),
-            allowed_apps: Vec::new(),
-        }
-    }
 }
 
 impl Global for ComputerUseSettings {}

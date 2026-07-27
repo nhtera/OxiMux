@@ -6,6 +6,7 @@
 //! root so existing `crate::app_nap::…` paths keep resolving.
 
 pub mod app_nap;
+pub mod escape_tap;
 pub mod menu;
 pub mod mic_permission;
 pub mod single_instance;

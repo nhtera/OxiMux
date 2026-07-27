@@ -23,6 +23,7 @@ pub enum SettingsPane {
     Terminal,
     Agents,
     Voice,
+    ScreenControl,
     Notifications,
     Schedules,
     Remote,
@@ -32,10 +33,11 @@ pub enum SettingsPane {
 }
 
 impl SettingsPane {
-    pub(super) const ALL: [SettingsPane; 9] = [
+    pub(super) const ALL: [SettingsPane; 10] = [
         SettingsPane::Terminal,
         SettingsPane::Agents,
         SettingsPane::Voice,
+        SettingsPane::ScreenControl,
         SettingsPane::Notifications,
         SettingsPane::Schedules,
         SettingsPane::Remote,
@@ -49,6 +51,7 @@ impl SettingsPane {
             SettingsPane::Terminal => "Terminal",
             SettingsPane::Agents => "Agents / AI",
             SettingsPane::Voice => "Voice",
+            SettingsPane::ScreenControl => "Screen Control",
             SettingsPane::Notifications => "Notifications",
             SettingsPane::Schedules => "Schedules",
             SettingsPane::Remote => "Remote",
@@ -66,6 +69,7 @@ impl SettingsPane {
             SettingsPane::Terminal => "icons/square-terminal.svg",
             SettingsPane::Agents => "icons/sparkles.svg",
             SettingsPane::Voice => "icons/mic.svg",
+            SettingsPane::ScreenControl => "icons/crosshair.svg",
             SettingsPane::Notifications => "icons/bell.svg",
             SettingsPane::Schedules => "icons/history.svg",
             SettingsPane::Remote => "icons/globe.svg",
