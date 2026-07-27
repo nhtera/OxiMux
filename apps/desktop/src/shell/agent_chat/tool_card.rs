@@ -20,6 +20,7 @@ use super::AgentChatView;
 use super::bubble;
 use super::diff_card;
 use super::plan_approval_card;
+use super::screen_consent::{self, ScreenPrompt};
 use super::tool_bodies;
 
 /// Cap on the rendered tool-result body so a chatty tool can't blow up a row.
@@ -28,10 +29,14 @@ const RESULT_CHARS: usize = 4000;
 /// Render one tool call. A compact status row by default; framed as a card with
 /// Allow/Reject buttons while awaiting confirmation, and with raw-input/result
 /// blocks when expanded.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_tool_card(
     tc: &ToolCall,
     expanded: bool,
     provider: &str,
+    // Present only while a screen-control call waits on the user — it is what
+    // turns the generic Allow/Reject row into a consent card naming the app.
+    screen: Option<ScreenPrompt>,
     theme: Theme,
     density: Density,
     typo: &Typography,
@@ -110,7 +115,16 @@ pub(super) fn render_tool_card(
     }
 
     if let ToolCallStatus::WaitingForConfirmation(req) = &tc.status {
-        card = card.child(approval_row(tc, req, provider, theme, density, typo, cx));
+        card = card.child(approval_row(
+            tc,
+            req,
+            provider,
+            screen.as_ref(),
+            theme,
+            density,
+            typo,
+            cx,
+        ));
     }
 
     if expanded {
@@ -219,10 +233,12 @@ fn header_row(
 /// the decision to the connection by `request_id` and transitions the local
 /// status (Allow → InProgress so the tool proceeds; Reject → Rejected). Allow
 /// echoes the tool input as `updatedInput` (required by the transport).
+#[allow(clippy::too_many_arguments)]
 fn approval_row(
     tc: &ToolCall,
     req: &PermissionRequest,
     provider: &str,
+    screen: Option<&ScreenPrompt>,
     theme: Theme,
     density: Density,
     typo: &Typography,
@@ -236,7 +252,10 @@ fn approval_row(
     // same tool call.
     let input = tc.input.clone();
 
-    let prompt = if req.kind == PermissionKind::Mcp {
+    let prompt = if let Some(screen) = screen {
+        // Names the app, not the tool — see `screen_consent`.
+        screen.question(provider)
+    } else if req.kind == PermissionKind::Mcp {
         // An MCP elicitation: name the server so the card reads "MCP · github:
         // Authorize repo access?" rather than an unattributed prompt.
         format!("MCP · {}: {}", tc.name, req.description.trim())
@@ -283,6 +302,22 @@ fn approval_row(
         )
     };
 
+    // A durable "always allow this app", offered by OxiMux rather than the
+    // agent — the agent has no idea which apps the user trusts. Withheld for
+    // the categories where "always" is not a reasonable thing to click once.
+    let always_allow = screen.and_then(|screen| {
+        screen_consent::always_allow_pill(
+            screen,
+            &tc.id,
+            &req.request_id,
+            &tc.input,
+            theme,
+            density,
+            typo,
+            cx,
+        )
+    });
+
     // One pill per agent-offered suggestion (e.g. "Always (acceptEdits)",
     // "Always allow this pattern"). Choosing one allows this call AND applies
     // the suggestion so the CLI stops re-prompting for that tool/scope. Rendered
@@ -326,6 +361,8 @@ fn approval_row(
                 .text_color(theme.fg_base)
                 .child(SharedString::from(prompt)),
         )
+        // Above the buttons, so it is read before the click rather than after.
+        .children(screen.and_then(|s| screen_consent::warning_banner(s, theme, density, typo)))
         .child(
             div()
                 .flex()
@@ -335,6 +372,7 @@ fn approval_row(
                 .gap(px(density.gap_inline))
                 .child(allow)
                 .child(reject)
+                .children(always_allow)
                 .children(suggestion_pills),
         )
         .into_any_element()

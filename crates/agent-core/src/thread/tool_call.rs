@@ -328,6 +328,11 @@ pub enum PermissionKind {
     /// An MCP server is eliciting input/consent mid-tool (Codex
     /// `mcpServer/elicitation/request`), labeled "MCP · <server>".
     Mcp,
+    /// A screen-control call the policy could not settle on its own: the agent
+    /// wants to drive an app nobody has approved yet. Rendered with the app's
+    /// name and, for high-blast-radius categories, a warning about what the
+    /// approval actually enables.
+    Screen,
     /// Anything else that should surface as a generic consent card.
     Other,
 }

@@ -268,6 +268,11 @@ fn main() {
         // start/stop, so both install before any window opens.
         oximux_app::dictation_settings::install(cx);
         oximux_app::shell::agent_chat::install_dictation_service(cx);
+        // Screen-control settings (off by default). Installed before any window
+        // so the first chat to spawn reads a real value rather than finding no
+        // global and defaulting — the two agree, but only one of them is a
+        // decision the user made.
+        oximux_app::computer_use_settings::install(cx);
         // Resolve the reduced-motion preference once and install the Motion
         // global before any window opens, so the first animated surface reads
         // the right durations.

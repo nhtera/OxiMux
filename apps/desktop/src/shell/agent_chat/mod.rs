@@ -41,6 +41,7 @@ mod plan_panel;
 mod question_card;
 mod turn_summary_card;
 mod rewind_menu;
+mod screen_consent;
 mod session_detail;
 mod roster;
 mod slash_command_catalog;
@@ -477,8 +478,9 @@ use question_card::{QuestionCard, QuestionCardEvent};
 use tool_grouping::{plan_tool_grouping, summarize_tool_run, EntryDisplay, GroupSummary, GroupedTool};
 use crate::remote_control::{RemoteBinding, RemoteControl, remote_session_id_for};
 use attention::attention_for_event;
-use computer_use::{Decision, ScreenControl};
+use computer_use::ScreenControl;
 pub use computer_use::clear_stale_screen_control_grants;
+use screen_consent::ScreenPrompt;
 use oximux_agents::session_registry::{ChoiceKind, RemoteChoice, RemotePrompt, SessionMeta};
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
@@ -586,6 +588,10 @@ pub struct AgentChatView {
     /// per view so two chats can never be confused for one another, and dropped
     /// with the view, which releases its grants.
     screen_control: ScreenControl,
+    /// Who a pending screen-control card is asking about, keyed by tool-call id.
+    /// Resolved once when the card goes up (it costs a `codesign` spawn) and
+    /// dropped when the card is answered.
+    screen_prompts: HashMap<String, ScreenPrompt>,
     /// Launch context, retained so [`Self::respawn`] can re-spawn the subprocess
     /// (Stop→next-send resume) in the same directory with the same model.
     cwd: PathBuf,
@@ -1371,6 +1377,7 @@ impl AgentChatView {
             density,
             typography,
             screen_control: ScreenControl::new(&cwd),
+            screen_prompts: HashMap::new(),
             cwd,
             model,
             permission_mode: None,
@@ -3357,6 +3364,7 @@ impl AgentChatView {
             density,
             typography,
             screen_control: ScreenControl::new(&PathBuf::new()),
+            screen_prompts: HashMap::new(),
             cwd: PathBuf::new(),
             model: None,
             permission_mode: None,
@@ -3697,7 +3705,15 @@ impl AgentChatView {
     /// Fold one decoded event into the thread. Never repaints — the repaint is
     /// the batch's call to make ([`Self::apply_batch`]), once for all its
     /// events.
-    fn apply_event(&mut self, ev: ThreadEvent, cx: &mut Context<Self>) {
+    fn apply_event(&mut self, mut ev: ThreadEvent, cx: &mut Context<Self>) {
+        // Tag a screen-control request before the fold, so the card the fold
+        // builds is already the consent one. Purely a classification — whether
+        // it is *allowed* is the policy's business, below.
+        if let ThreadEvent::PermissionRequested { tool_name, kind, .. } = &mut ev
+            && oximux_computer_use::is_computer_use_tool(tool_name)
+        {
+            *kind = oximux_agents::thread::PermissionKind::Screen;
+        }
         let was_active = self.thread.turn_active;
         self.thread.apply(&ev);
         // Screen-control calls are decided here because this is the only point
@@ -4382,28 +4398,6 @@ impl AgentChatView {
         cx.notify();
     }
 
-    /// Answer a screen-control call from policy, leaving everything else alone.
-    ///
-    /// Allow and Refuse resolve without troubling the user; `Ask` deliberately
-    /// does nothing, which leaves the ordinary permission card up for them to
-    /// decide. A refusal's reason goes back to the agent as the denial message,
-    /// so it can explain itself rather than retrying blindly.
-    fn enforce_screen_control(
-        &mut self,
-        tool_name: String,
-        input: serde_json::Value,
-        request_id: String,
-        tool_id: String,
-        cx: &mut Context<Self>,
-    ) {
-        let decision = match self.screen_control.decide(&tool_name, &input) {
-            Decision::NotApplicable | Decision::Ask { .. } => return,
-            Decision::Allow => PermissionDecision::Allow { updated_input: input },
-            Decision::Refuse { reason } => PermissionDecision::Deny { message: reason },
-        };
-        self.resolve_permission(tool_id, request_id, decision, cx);
-    }
-
     /// Answer a pending tool permission from a card button. Routes the decision
     /// to the connection by `request_id`, then transitions the local status so
     /// the card updates immediately: Allow → `InProgress` (the tool proceeds and
@@ -4433,6 +4427,9 @@ impl AgentChatView {
         let Some((tool_name, tool_input)) = awaiting else {
             return;
         };
+        // Answered, so the resolved target is dead weight — and leaving it would
+        // make a later card for the same id name the wrong app.
+        self.screen_prompts.remove(&tool_id);
         // Approving a screen-control call is what grants its target, and the
         // policy has the last word — a card can sit open a long time, and a
         // target another chat claimed meanwhile is refused however this one is
@@ -5372,6 +5369,7 @@ impl AgentChatView {
                             tc,
                             expanded,
                             self.provider_label(),
+                            self.screen_prompts.get(&tc.id).cloned(),
                             theme,
                             density,
                             &typo,

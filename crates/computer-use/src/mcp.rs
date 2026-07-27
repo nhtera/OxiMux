@@ -23,10 +23,7 @@ use oximux_agent_core::thread::McpServerSpec;
 /// colliding with a server the user has configured themselves.
 pub const SERVER_NAME: &str = "oximux-computer-use";
 
-/// OxiMux's bundle identifier, passed as the driver's advisory host label so
-/// `check_permissions` output names who asked. Must track `CFBundleIdentifier`
-/// in `assets/Info.plist`.
-const HOST_BUNDLE_ID: &str = "dev.nhtera.oximux";
+use crate::HOST_BUNDLE_ID;
 
 /// Build the server declaration for a verified driver.
 ///

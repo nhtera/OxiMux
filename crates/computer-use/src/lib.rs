@@ -29,6 +29,7 @@ pub mod mcp;
 pub mod policy;
 pub mod proc;
 pub mod session;
+pub mod target;
 pub mod tools;
 pub mod verify;
 pub mod version;
@@ -36,11 +37,20 @@ pub mod version;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// OxiMux's own bundle identifier.
+///
+/// Used two ways that must not drift apart: as the driver's advisory host label
+/// (so `check_permissions` names who asked), and as the identity an agent is
+/// never allowed to drive. Must track `CFBundleIdentifier` in
+/// `assets/Info.plist`.
+pub const HOST_BUNDLE_ID: &str = "dev.nhtera.oximux";
+
 pub use daemon::DaemonState;
 pub use grants::{GrantTable, Provenance};
 pub use mcp::{bare_tool_name, is_computer_use_tool, server_spec, SERVER_NAME};
 pub use policy::{decide, Decision, PolicyContext};
 pub use session::{Reconciliation, SessionId, SessionLedger};
+pub use target::{Sentinel, TargetApp};
 pub use verify::VerifiedDriver;
 pub use version::Version;
 

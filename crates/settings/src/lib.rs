@@ -8,6 +8,7 @@
 pub mod agent_launch;
 pub mod autosave;
 pub mod commit_message_ai;
+pub mod computer_use;
 pub mod custom_commands;
 pub mod density;
 pub mod dictation;
@@ -25,6 +26,7 @@ pub use agent_launch::{
 };
 pub use autosave::AutosaveSettings;
 pub use commit_message_ai::{AgentSettings, CommitMessageAiMode, CommitMessageAiSettings};
+pub use computer_use::{AppGrant, ComputerUseSettings};
 pub use custom_commands::{CustomCommand, CustomCommandsFile, load_and_merge};
 pub use density::Density;
 pub use dictation::{DictationMode, DictationSettings, ModelUnloadTimeout};

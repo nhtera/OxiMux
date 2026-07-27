@@ -18,6 +18,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
+use crate::HOST_BUNDLE_ID;
+
 /// Bundle identifiers refused outright.
 ///
 /// Password managers, because the blast radius of one stray click is every
@@ -35,31 +37,79 @@ const BLOCKED_BUNDLE_IDS: &[&str] = &[
     "me.proton.pass.electron",
 ];
 
-/// Memo of executable path → blocked, so the policy does not spawn `codesign`
+/// Why a target is off-limits. Carried rather than collapsed to a bool so the
+/// refusal the agent reads says something true — "targeted a password manager"
+/// is actively misleading when the target was OxiMux itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blocked {
+    /// OxiMux. An agent driving us can answer its own consent cards.
+    Host,
+    /// A password manager or the keychain.
+    Credentials,
+}
+
+impl Blocked {
+    /// The noun phrase the refusal message is built from. Reads as
+    /// "`click` targeted {this}. Agents are never allowed to drive it."
+    pub fn reason(self) -> &'static str {
+        match self {
+            Blocked::Host => "OxiMux itself, which would let an agent approve its own actions",
+            Blocked::Credentials => {
+                "a password manager or keychain, where one click can expose every credential you have"
+            }
+        }
+    }
+}
+
+/// Memo of executable path → verdict, so the policy does not spawn `codesign`
 /// on every click.
 ///
 /// Safe as a process-global, unlike the grant table: this is a pure function of
 /// the path with no per-chat dimension, so two chats (or two tests) reading it
 /// cannot interfere. A stale entry would need a different program to appear at
 /// a path already inspected this run.
-static MEMO: LazyLock<Mutex<HashMap<PathBuf, bool>>> = LazyLock::new(Mutex::default);
+static MEMO: LazyLock<Mutex<HashMap<PathBuf, Option<Blocked>>>> = LazyLock::new(Mutex::default);
 
-/// Is the program at `executable` one an agent may never drive?
+/// Why the program at `executable` may never be driven, or `None` if it may.
 ///
 /// Unreadable identity counts as **not** blocked. That is the deliberate choice:
 /// this list is a floor on top of the grant model, not the thing standing
 /// between an agent and an arbitrary app — an ungranted process still has to be
 /// approved. Failing closed here would instead refuse every unsigned binary,
 /// including the freshly built ones this feature exists to drive.
-pub fn is_blocked(executable: &Path) -> bool {
+pub fn blocked_reason(executable: &Path) -> Option<Blocked> {
     if let Some(known) = MEMO.lock().expect("blocked memo poisoned").get(executable) {
         return *known;
     }
-    let blocked = bundle_identifier(executable).is_some_and(|id| is_blocked_identifier(&id));
+    let verdict = classify(executable);
     MEMO.lock()
         .expect("blocked memo poisoned")
-        .insert(executable.to_path_buf(), blocked);
-    blocked
+        .insert(executable.to_path_buf(), verdict);
+    verdict
+}
+
+/// Is the program at `executable` one an agent may never drive?
+pub fn is_blocked(executable: &Path) -> bool {
+    blocked_reason(executable).is_some()
+}
+
+fn classify(executable: &Path) -> Option<Blocked> {
+    if is_self(executable) {
+        return Some(Blocked::Host);
+    }
+    classify_identifier(&bundle_identifier(executable)?)
+}
+
+/// The verdict for a bundle id alone.
+///
+/// OxiMux is checked here as well as by [`is_self`] because the two catch
+/// different things: `is_self` catches the process we are, this catches a
+/// *second* copy of OxiMux the user is also running.
+fn classify_identifier(identifier: &str) -> Option<Blocked> {
+    if identifier.eq_ignore_ascii_case(HOST_BUNDLE_ID) {
+        return Some(Blocked::Host);
+    }
+    is_blocked_identifier(identifier).then_some(Blocked::Credentials)
 }
 
 /// Case-insensitive because bundle ids are matched that way by the system, and
@@ -68,6 +118,27 @@ fn is_blocked_identifier(identifier: &str) -> bool {
     BLOCKED_BUNDLE_IDS
         .iter()
         .any(|blocked| blocked.eq_ignore_ascii_case(identifier))
+}
+
+/// Is `executable` the program we are running inside?
+///
+/// The bundle-id entry covers the shipped app, but a developer build runs from
+/// `target/debug/` with an ad-hoc signature and no identifier at all — which is
+/// precisely the build being used while this feature is developed, and the one
+/// where an agent clicking our own Allow button would be discovered last.
+///
+/// Compared canonically, so a symlinked or `..`-laden spelling of the same file
+/// does not read as a different program.
+fn is_self(executable: &Path) -> bool {
+    let Ok(me) = std::env::current_exe() else {
+        return false;
+    };
+    match (me.canonicalize(), executable.canonicalize()) {
+        (Ok(me), Ok(other)) => me == other,
+        // An unreadable path cannot be confirmed as us; the bundle-id check and
+        // the grant model still apply to it.
+        _ => false,
+    }
 }
 
 /// The code-signing identifier of an arbitrary binary, which for an app bundle
@@ -142,6 +213,49 @@ mod tests {
             bundle_identifier(Path::new("/bin/echo")).as_deref(),
             Some("com.apple.echo"),
         );
+    }
+
+    #[test]
+    fn oximux_may_not_be_driven_by_its_own_agents() {
+        // The consent model rests on the user answering the card. An agent that
+        // can click our window answers it for them.
+        let me = std::env::current_exe().expect("test binary path");
+        assert!(is_self(&me), "the running binary must recognise itself");
+        assert_eq!(blocked_reason(&me), Some(Blocked::Host));
+        // And a second copy of OxiMux — a different process, so `is_self` says
+        // nothing about it — is refused on identity alone.
+        assert_eq!(classify_identifier(HOST_BUNDLE_ID), Some(Blocked::Host));
+    }
+
+    #[test]
+    fn the_refusal_names_the_right_reason() {
+        // Collapsed to a bool, a self-drive would have been reported to the
+        // agent as "targeted a password manager", which is simply untrue.
+        assert_ne!(Blocked::Host.reason(), Blocked::Credentials.reason());
+        assert!(Blocked::Host.reason().contains("OxiMux"));
+        assert_eq!(
+            classify_identifier("com.1password.1password"),
+            Some(Blocked::Credentials)
+        );
+        assert_eq!(classify_identifier("com.apple.Safari"), None);
+    }
+
+    #[test]
+    fn self_matching_sees_through_a_relative_spelling() {
+        // Canonicalization, not string equality: `target/debug/../debug/oximux`
+        // is the same program and must not read as a different one.
+        let me = std::env::current_exe().expect("test binary path");
+        let parent = me.parent().expect("a parent dir");
+        let file = me.file_name().expect("a file name");
+        let indirect = parent.join("..").join(
+            parent.file_name().expect("a dir name"),
+        ).join(file);
+        assert!(is_self(&indirect), "{indirect:?}");
+    }
+
+    #[test]
+    fn another_program_is_not_us() {
+        assert!(!is_self(Path::new("/bin/echo")));
     }
 
     #[test]

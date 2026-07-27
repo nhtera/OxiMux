@@ -287,13 +287,41 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A live process standing in for "some app the agent wants to drive".
+    ///
+    /// Not our own pid: OxiMux is refused outright, because an agent that can
+    /// drive us can approve its own consent cards. A spawned child is also
+    /// closer to what these tests claim to be about.
+    struct Target(std::process::Child);
+
+    impl Target {
+        fn spawn() -> Self {
+            Self(
+                std::process::Command::new("/bin/sleep")
+                    .arg("120")
+                    .spawn()
+                    .expect("spawn a target process"),
+            )
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for Target {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// A chat with a table of its own.
     ///
-    /// Not `ScreenControl::new`: that shares the app-wide table, and since
-    /// every test here claims the same pid (our own, the one pid guaranteed to
-    /// resolve), tests running in parallel would contend for it and refuse each
-    /// other's grants. That failure would look like a bug in the cross-drive
-    /// guard while actually being two tests racing.
+    /// Not `ScreenControl::new`: that shares the app-wide table, so tests
+    /// running in parallel would contend over it and refuse each other's
+    /// grants. That failure would look like a bug in the cross-drive guard
+    /// while actually being two tests racing.
     fn chat() -> ScreenControl {
         let dir = tempfile::tempdir().expect("tempdir");
         let table = GrantTable::in_data_dir(dir.path());
@@ -343,7 +371,8 @@ mod tests {
     #[test]
     fn approving_a_target_grants_it_and_the_next_call_passes() {
         let chat = chat();
-        let pid = std::process::id();
+        let target = Target::spawn();
+        let pid = target.pid();
         let input = json!({ "pid": pid });
 
         assert_eq!(
@@ -360,9 +389,10 @@ mod tests {
         // card that somehow reached Allow for a refused shape still records no
         // grant.
         let chat = chat();
+        let target = Target::spawn();
         for input in [
             json!({ "text": "x" }),
-            json!({ "pid": std::process::id(), "scope": "desktop" }),
+            json!({ "pid": target.pid(), "scope": "desktop" }),
         ] {
             assert!(chat.approve(&ns("type_text"), &input).is_err());
         }
@@ -371,7 +401,8 @@ mod tests {
 
     #[test]
     fn closing_a_chat_releases_its_grants() {
-        let pid = std::process::id();
+        let target = Target::spawn();
+        let pid = target.pid();
         let input = json!({ "pid": pid });
 
         let (survivor, closing) = two_chats();
@@ -395,8 +426,8 @@ mod tests {
         // The invariant the whole feature rests on. Two chats, one process:
         // approving in A must not enable B.
         let (a, b) = two_chats();
-        let pid = std::process::id();
-        let input = json!({ "pid": pid });
+        let target = Target::spawn();
+        let input = json!({ "pid": target.pid() });
         assert!(a.approve(&ns("type_text"), &input).is_ok());
 
         let refusal = b.decide(&ns("type_text"), &input);

@@ -153,12 +153,10 @@ fn decide_input(tool: &str, input: &Value, ctx: &PolicyContext<'_>) -> Decision 
             // manager is not approving what that enables. Checked here rather
             // than at the top so it costs a `codesign` spawn only for a target
             // nobody has approved yet, never on the repeated-click path.
-            if executable
-                .as_deref()
-                .is_some_and(crate::blocked::is_blocked)
-            {
+            if let Some(blocked) = executable.as_deref().and_then(crate::blocked::blocked_reason) {
                 return Decision::refuse(format!(
-                    "`{tool}` targeted a password manager or keychain, which agents are never allowed to drive"
+                    "`{tool}` targeted {}. Agents are never allowed to drive it.",
+                    blocked.reason()
                 ));
             }
             // A binary this agent built in its own worktree during this session
@@ -179,11 +177,47 @@ fn decide_input(tool: &str, input: &Value, ctx: &PolicyContext<'_>) -> Decision 
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use serde_json::json;
 
     fn ns(tool: &str) -> String {
         format!("mcp__oximux-computer-use__{tool}")
+    }
+
+    /// A live process standing in for "some app the agent wants to drive".
+    ///
+    /// The obvious candidate — our own pid — is not usable: OxiMux is refused
+    /// outright, because an agent that can drive us can approve its own consent
+    /// cards. So these tests spawn a real child and target that, which is also
+    /// closer to what they claim to be testing.
+    struct Target(std::process::Child);
+
+    impl Target {
+        /// `/bin/sleep`: present on every macOS, signed by Apple, and outlives
+        /// any test that targets it.
+        const EXECUTABLE: &'static str = "/bin/sleep";
+
+        fn spawn() -> Self {
+            Self(
+                std::process::Command::new(Self::EXECUTABLE)
+                    .arg("120")
+                    .spawn()
+                    .expect("spawn a target process"),
+            )
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for Target {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     struct Fixture {
@@ -195,9 +229,8 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            // A store per fixture: every test here claims our own pid, the one
-            // guaranteed to resolve, so a shared store would have parallel
-            // tests refusing each other's grants.
+            // A store per fixture, so tests running in parallel cannot refuse
+            // each other's grants over a shared table.
             let dir = tempfile::tempdir().expect("tempdir");
             Self {
                 session: SessionId::for_agent("chat-a"),
@@ -255,7 +288,8 @@ mod tests {
         // Scope wins over the grant: desktop scope ignores `pid` and lands on
         // the frontmost window regardless of what else the call carries.
         let f = Fixture::new();
-        let pid = std::process::id();
+        let target = Target::spawn();
+        let pid = target.pid();
         f.grants.grant(pid, &f.session);
         let reason =
             refusal(&f.decide("click", json!({ "pid": pid, "scope": "desktop" }))).to_string();
@@ -265,7 +299,8 @@ mod tests {
     #[test]
     fn foreground_delivery_is_refused_even_with_a_granted_pid() {
         let f = Fixture::new();
-        let pid = std::process::id();
+        let target = Target::spawn();
+        let pid = target.pid();
         f.grants.grant(pid, &f.session);
         let reason = refusal(&f.decide(
             "press_key",
@@ -278,7 +313,8 @@ mod tests {
     #[test]
     fn background_delivery_on_a_granted_pid_is_allowed() {
         let f = Fixture::new();
-        let pid = std::process::id();
+        let target = Target::spawn();
+        let pid = target.pid();
         f.grants.grant(pid, &f.session);
         assert_eq!(
             f.decide(
@@ -292,7 +328,8 @@ mod tests {
     #[test]
     fn an_ungranted_pid_asks_rather_than_refusing() {
         let f = Fixture::new();
-        let pid = std::process::id();
+        let target = Target::spawn();
+        let pid = target.pid();
         assert_eq!(
             f.decide("click", json!({ "pid": pid })),
             Decision::Ask { pid: Some(pid) }
@@ -302,7 +339,8 @@ mod tests {
     #[test]
     fn one_chat_cannot_drive_another_chats_process() {
         let f = Fixture::new();
-        let pid = std::process::id();
+        let target = Target::spawn();
+        let pid = target.pid();
         f.grants.grant(pid, &SessionId::for_agent("chat-b"));
         let reason = refusal(&f.decide("click", json!({ "pid": pid }))).to_string();
         assert!(reason.contains("another chat"), "{reason}");
@@ -322,7 +360,8 @@ mod tests {
         // Capture scope is per-session and immutable. Borrowing a different
         // session id is how a call would escape the scope OxiMux pinned.
         let f = Fixture::new();
-        let pid = std::process::id();
+        let target = Target::spawn();
+        let pid = target.pid();
         f.grants.grant(pid, &f.session);
         let reason = refusal(&f.decide(
             "click",
@@ -335,7 +374,8 @@ mod tests {
     #[test]
     fn a_call_carrying_our_own_session_id_is_fine() {
         let f = Fixture::new();
-        let pid = std::process::id();
+        let target = Target::spawn();
+        let pid = target.pid();
         f.grants.grant(pid, &f.session);
         assert_eq!(
             f.decide(
@@ -363,7 +403,8 @@ mod tests {
     #[test]
     fn tools_that_would_take_the_screen_are_refused() {
         let f = Fixture::new();
-        let pid = std::process::id();
+        let target = Target::spawn();
+        let pid = target.pid();
         f.grants.grant(pid, &f.session);
         // Each of these is refused despite naming a properly granted target —
         // the class decides, not the addressing.
@@ -407,9 +448,12 @@ mod tests {
     #[test]
     fn a_binary_built_in_this_session_is_driven_without_asking() {
         // The workflow the feature exists for: build in a worktree, run it,
-        // drive it. Our own test binary stands in for the freshly built app.
-        let exe = std::env::current_exe().expect("test binary path");
-        let root = exe.parent().expect("binary lives somewhere");
+        // drive it. The spawned child stands in for the freshly built app, and
+        // the directory it lives in for the worktree that produced it.
+        let target = Target::spawn();
+        let root = Path::new(Target::EXECUTABLE)
+            .parent()
+            .expect("the target lives somewhere");
         let prov = Provenance::new(root, std::time::UNIX_EPOCH).expect("provenance");
 
         let f = Fixture::new();
@@ -418,13 +462,29 @@ mod tests {
             grants: &f.grants,
             provenance: Some(&prov),
         };
-        let pid = std::process::id();
+        let pid = target.pid();
         assert_eq!(
             decide(&ns("click"), &json!({ "pid": pid }), &ctx),
             Decision::Allow
         );
         // And the grant is recorded, so the next call does not re-derive it.
         assert_eq!(f.grants.granted_to(&f.session), vec![pid]);
+    }
+
+    #[test]
+    fn oximux_is_refused_however_it_is_addressed() {
+        // The consent model assumes the user answers the card. An agent that
+        // can click our own window answers it for them, so this refusal has to
+        // survive a correctly addressed, background-delivered, window-scoped
+        // call — the shape every other check waves through.
+        let f = Fixture::new();
+        let reason = refusal(&f.decide(
+            "click",
+            json!({ "pid": std::process::id(), "scope": "window", "delivery_mode": "background" }),
+        ))
+        .to_string();
+        assert!(reason.contains("OxiMux itself"), "{reason}");
+        assert!(f.grants.granted_to(&f.session).is_empty());
     }
 
     #[test]

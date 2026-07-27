@@ -9,6 +9,7 @@
 
 pub mod agent_launch_settings;
 pub mod commit_message_ai_settings;
+pub mod computer_use_settings;
 pub mod dictation_settings;
 pub mod keybindings_settings;
 pub mod motion_settings;
