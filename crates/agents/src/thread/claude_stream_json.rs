@@ -117,7 +117,34 @@ const DEFAULT_MODEL: &str = "sonnet";
 /// comparison showed identical permission behavior — but if Allow/Reject or
 /// AskUserQuestion ever regresses, narrow this back to `project`.
 pub fn build_args(model: Option<&str>) -> Vec<String> {
-    build_args_with_resume(model, None, None, None, &[])
+    build_args_with_resume(model, None, None, None, &HostInjection::default())
+}
+
+/// What the *host* adds to a launch, on top of the session's own flags.
+///
+/// One struct rather than three more parameters because the three are one
+/// decision: OxiMux declares a sidecar server, registers the hook that polices
+/// its tools, and removes the ones no policy can make safe. Passing the first
+/// without the others hands an agent a capability with nothing watching it, so
+/// they are built together by whoever decides to grant it and travel from there
+/// as a unit.
+///
+/// Empty is the overwhelmingly common case and stays byte-identical to the
+/// pre-seam invocation: no field set emits no flag.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HostInjection<'a> {
+    /// Servers OxiMux supplies and supervises, rendered into `--mcp-config`.
+    pub mcp_servers: &'a [McpServerSpec],
+    /// Inline JSON for `--settings`. Additive to `--setting-sources`, which
+    /// keeps loading the user's own settings; this is the per-session layer.
+    ///
+    /// Exactly one may be passed — the CLI's behaviour with two `--settings`
+    /// flags is undocumented — so this is a single value rather than a list, and
+    /// anything else wanting to inject settings has to merge into it.
+    pub settings: Option<&'a str>,
+    /// Tool names for `--disallowedTools`, which removes them from the agent's
+    /// surface in every permission mode and outranks a user's `permissions.allow`.
+    pub disallowed_tools: &'a [String],
 }
 
 /// Same as [`build_args`], plus `--resume <session_id>` when restoring a
@@ -129,19 +156,18 @@ pub fn build_args(model: Option<&str>) -> Vec<String> {
 /// Permission mode and effort are both fixed at spawn (like `--model`), so a live
 /// switch of either respawns via this same path.
 ///
-/// `mcp_servers` are servers the *host* declares (a sidecar OxiMux spawns and
-/// supervises). An empty slice emits no `--mcp-config` flag at all, so the
-/// no-servers invocation stays byte-identical to the pre-seam one — asserted by
-/// `no_mcp_servers_emits_no_flag`. Host servers are additive, not exclusive:
-/// `--strict-mcp-config` is deliberately NOT passed, because
-/// `--setting-sources user,project,local` above exists precisely so the chat
-/// still sees the user's own MCP servers.
+/// `host` is what OxiMux itself adds — see [`HostInjection`]. An empty one emits
+/// no extra flags at all, so that invocation stays byte-identical to the
+/// pre-seam one — asserted by `no_host_injection_emits_no_flags`. Host servers
+/// are additive, not exclusive: `--strict-mcp-config` is deliberately NOT
+/// passed, because `--setting-sources user,project,local` above exists precisely
+/// so the chat still sees the user's own MCP servers.
 pub fn build_args_with_resume(
     model: Option<&str>,
     resume_session_id: Option<&str>,
     permission_mode: Option<&str>,
     effort: Option<&str>,
-    mcp_servers: &[McpServerSpec],
+    host: &HostInjection<'_>,
 ) -> Vec<String> {
     let mut args: Vec<String> = [
         "-p",
@@ -191,9 +217,23 @@ pub fn build_args_with_resume(
     }
     // Host-declared MCP servers, passed as an inline JSON string (the CLI takes
     // "JSON files or strings"). `None` for the empty case, so no flag is added.
-    if let Some(cfg) = to_claude_mcp_config(mcp_servers) {
+    if let Some(cfg) = to_claude_mcp_config(host.mcp_servers) {
         args.push("--mcp-config".to_string());
         args.push(cfg);
+    }
+    // Same inline form (`--settings <file-or-json>`), and the same reason: a
+    // temp file would have to outlive the spawn and be cleaned up after it.
+    if let Some(settings) = host.settings.map(str::trim).filter(|s| !s.is_empty()) {
+        args.push("--settings".to_string());
+        args.push(settings.to_string());
+    }
+    // Variadic (`--disallowedTools <tools...>`), so it goes last: it swallows
+    // every following argument that does not begin with a dash. Nothing is
+    // appended after this today — the prompt travels on stdin, not as a
+    // positional — and `disallowed_tools_stays_last` keeps it that way.
+    if !host.disallowed_tools.is_empty() {
+        args.push("--disallowedTools".to_string());
+        args.extend(host.disallowed_tools.iter().cloned());
     }
     args
 }
@@ -221,7 +261,7 @@ impl ClaudeStreamJsonConnection {
         session_id: Option<&str>,
         permission_mode: Option<&str>,
         effort: Option<&str>,
-        mcp_servers: &[McpServerSpec],
+        host: &HostInjection<'_>,
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
         let mut cmd = Command::new("claude");
         cmd.args(build_args_with_resume(
@@ -229,7 +269,7 @@ impl ClaudeStreamJsonConnection {
             session_id,
             permission_mode,
             effort,
-            mcp_servers,
+            host,
         ))
         .current_dir(cwd);
         Self::spawn_command(cmd)
@@ -578,25 +618,25 @@ mod tests {
 
     #[test]
     fn build_args_appends_resume_when_session_id_set() {
-        let a = build_args_with_resume(None, Some("sid-123"), None, None, &[]);
+        let a = build_args_with_resume(None, Some("sid-123"), None, None, &HostInjection::default());
         let i = a.iter().position(|x| x == "--resume").expect("--resume present");
         assert_eq!(a[i + 1], "sid-123");
         // blank / absent session id → no --resume
-        assert!(!build_args_with_resume(None, Some("  "), None, None, &[]).iter().any(|x| x == "--resume"));
-        assert!(!build_args_with_resume(None, None, None, None, &[]).iter().any(|x| x == "--resume"));
+        assert!(!build_args_with_resume(None, Some("  "), None, None, &HostInjection::default()).iter().any(|x| x == "--resume"));
+        assert!(!build_args_with_resume(None, None, None, None, &HostInjection::default()).iter().any(|x| x == "--resume"));
         // plain build_args never resumes
         assert!(!build_args(None).iter().any(|x| x == "--resume"));
     }
 
     #[test]
     fn build_args_appends_permission_mode_only_when_non_default() {
-        let a = build_args_with_resume(None, None, Some("acceptEdits"), None, &[]);
+        let a = build_args_with_resume(None, None, Some("acceptEdits"), None, &HostInjection::default());
         let i = a.iter().position(|x| x == "--permission-mode").expect("--permission-mode present");
         assert_eq!(a[i + 1], "acceptEdits");
         // "default", blank, and none all omit the flag (a fresh spawn IS default).
         for pm in [Some("default"), Some("  "), None] {
             assert!(
-                !build_args_with_resume(None, None, pm, None, &[]).iter().any(|x| x == "--permission-mode"),
+                !build_args_with_resume(None, None, pm, None, &HostInjection::default()).iter().any(|x| x == "--permission-mode"),
                 "{pm:?} must not emit --permission-mode"
             );
         }
@@ -605,13 +645,81 @@ mod tests {
     }
 
     #[test]
-    fn no_mcp_servers_emits_no_flag() {
-        // The load-bearing invariant of the MCP seam: a launch that declares no
-        // host servers must produce EXACTLY the argv it produced before the
-        // seam existed. Anything else silently changes every existing session.
-        let bare = build_args_with_resume(None, None, None, None, &[]);
-        assert!(!bare.iter().any(|x| x == "--mcp-config"), "got {bare:?}");
+    fn no_host_injection_emits_no_flags() {
+        // The load-bearing invariant of the host seam: a launch that injects
+        // nothing must produce EXACTLY the argv it produced before the seam
+        // existed. Anything else silently changes every existing session.
+        let bare = build_args_with_resume(None, None, None, None, &HostInjection::default());
+        for flag in ["--mcp-config", "--settings", "--disallowedTools"] {
+            assert!(!bare.iter().any(|x| x == flag), "{flag} in {bare:?}");
+        }
         assert_eq!(bare, build_args(None));
+    }
+
+    #[test]
+    fn settings_are_passed_inline_and_only_once() {
+        // Inline JSON rather than a temp file, and exactly one flag: the CLI's
+        // behaviour with two `--settings` is undocumented, so anything else
+        // wanting to inject settings has to merge into this one.
+        let json = r#"{"hooks":{"PreToolUse":[]}}"#;
+        let a = build_args_with_resume(
+            None,
+            None,
+            None,
+            None,
+            &HostInjection {
+                settings: Some(json),
+                ..Default::default()
+            },
+        );
+        let i = a.iter().position(|x| x == "--settings").expect("--settings present");
+        assert_eq!(a.iter().filter(|x| *x == "--settings").count(), 1);
+        assert_eq!(a[i + 1], json);
+        // Still additive: the user's own settings keep loading.
+        let j = a.iter().position(|x| x == "--setting-sources").expect("sources");
+        assert_eq!(a[j + 1], "user,project,local");
+
+        // Blank is the same as absent, so an empty declaration cannot emit a
+        // flag with nothing after it.
+        assert!(
+            !build_args_with_resume(
+                None,
+                None,
+                None,
+                None,
+                &HostInjection { settings: Some("  "), ..Default::default() },
+            )
+            .iter()
+            .any(|x| x == "--settings")
+        );
+    }
+
+    #[test]
+    fn disallowed_tools_stays_last() {
+        // `--disallowedTools <tools...>` is variadic: it swallows every
+        // following argument that does not start with a dash. A flag appended
+        // after it would be read as another tool name and silently lost.
+        let tools = vec![
+            "mcp__oximux-computer-use__replay_trajectory".to_string(),
+            "mcp__oximux-computer-use__get_desktop_state".to_string(),
+        ];
+        let spec = McpServerSpec::new("srv", "bin");
+        let a = build_args_with_resume(
+            Some("opus"),
+            Some("sid-1"),
+            Some("acceptEdits"),
+            Some("high"),
+            &HostInjection {
+                mcp_servers: std::slice::from_ref(&spec),
+                settings: Some("{}"),
+                disallowed_tools: &tools,
+            },
+        );
+        let i = a
+            .iter()
+            .position(|x| x == "--disallowedTools")
+            .expect("--disallowedTools present");
+        assert_eq!(&a[i + 1..], &tools[..], "every name, and nothing after them");
     }
 
     /// Payload shape verified end-to-end against claude-code 2.1.220: a config
@@ -622,7 +730,7 @@ mod tests {
     fn mcp_servers_emit_one_config_flag() {
         let spec = McpServerSpec::new("oximux-computer-use", "cua-driver")
             .args(vec!["mcp".into(), "--socket".into(), "/tmp/s.sock".into()]);
-        let a = build_args_with_resume(None, None, None, None, std::slice::from_ref(&spec));
+        let a = build_args_with_resume(None, None, None, None, &HostInjection { mcp_servers: std::slice::from_ref(&spec), ..Default::default() });
 
         let i = a.iter().position(|x| x == "--mcp-config").expect("--mcp-config present");
         // One flag, one JSON payload — not a file path, not repeated per server.
@@ -641,19 +749,19 @@ mod tests {
         // must ride the resume path too — otherwise computer use silently
         // disappears the first time a tab is reopened.
         let spec = McpServerSpec::new("srv", "bin");
-        let a = build_args_with_resume(None, Some("sid-9"), None, None, std::slice::from_ref(&spec));
+        let a = build_args_with_resume(None, Some("sid-9"), None, None, &HostInjection { mcp_servers: std::slice::from_ref(&spec), ..Default::default() });
         assert!(a.iter().any(|x| x == "--resume"));
         assert!(a.iter().any(|x| x == "--mcp-config"));
     }
 
     #[test]
     fn build_args_appends_effort_when_set() {
-        let a = build_args_with_resume(None, None, None, Some("xhigh"), &[]);
+        let a = build_args_with_resume(None, None, None, Some("xhigh"), &HostInjection::default());
         let i = a.iter().position(|x| x == "--effort").expect("--effort present");
         assert_eq!(a[i + 1], "xhigh");
         // blank / none omit the flag (CLI uses its configured default)
-        assert!(!build_args_with_resume(None, None, None, Some("  "), &[]).iter().any(|x| x == "--effort"));
-        assert!(!build_args_with_resume(None, None, None, None, &[]).iter().any(|x| x == "--effort"));
+        assert!(!build_args_with_resume(None, None, None, Some("  "), &HostInjection::default()).iter().any(|x| x == "--effort"));
+        assert!(!build_args_with_resume(None, None, None, None, &HostInjection::default()).iter().any(|x| x == "--effort"));
         assert!(!build_args(None).iter().any(|x| x == "--effort"));
     }
 

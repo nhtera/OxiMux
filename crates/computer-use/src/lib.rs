@@ -48,6 +48,15 @@ use std::time::Duration;
 /// `assets/Info.plist`.
 pub const HOST_BUNDLE_ID: &str = "dev.nhtera.oximux";
 
+/// The enforcing hook's binary, which ships beside the app executable.
+///
+/// Named here rather than at the one place that looks for it because the bundle
+/// script copies it in under this name and `[[bin]]` builds it under this name:
+/// three spellings of one string, and the two that are not Rust cannot be
+/// checked by anything. Keep them in step with
+/// `scripts/bundle-macos.sh`.
+pub const GATE_BINARY_NAME: &str = "oximux-screen-gate";
+
 pub use active::{Driving, DrivingSession};
 pub use daemon::DaemonState;
 pub use grants::{GrantTable, Provenance};

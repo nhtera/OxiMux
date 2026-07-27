@@ -76,13 +76,11 @@ fn needs_full_read(stamp: FileStamp, last: FileStamp, showing: bool) -> bool {
 /// Start the watch. Detached: it runs for the process's lifetime and has no
 /// owner to hang it off.
 pub fn install(cx: &mut App) {
-    let Some(path) = crate::shell::agent_chat::computer_use::grants_path() else {
-        // No data dir is a broken install. Screen control still works against a
-        // temp store; it is only the indicator that cannot find it, and a
-        // missing dot is not worth failing a launch over.
-        tracing::warn!("no app data dir; the screen-control indicator is off");
-        return;
-    };
+    // The same store the chats and the hook use, including its temp-dir fallback
+    // — which is the case that matters, since a broken install is exactly when
+    // an indicator that quietly watched a different file would go dark while
+    // agents kept driving.
+    let path = crate::shell::agent_chat::computer_use::grants_path();
     cx.set_global(Indicator(ScreenControlIndicator::new()));
 
     cx.spawn(async move |cx: &mut AsyncApp| {

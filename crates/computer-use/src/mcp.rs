@@ -46,16 +46,35 @@ pub fn server_spec(driver: &Path) -> McpServerSpec {
 
 /// Everything a chat must be given in order to have screen control.
 ///
-/// All three parts travel together deliberately. Handing an agent the server
-/// without the other two is the failure this type exists to prevent: the
-/// runtime policy would then run only in the permission modes that actually
-/// prompt, and measurement showed two ordinary situations where none does.
+/// The parts travel together deliberately, and in one direction: handing an
+/// agent the server without the hook is the failure this type exists to
+/// prevent, because the runtime policy would then run only in the permission
+/// modes that actually prompt, and measurement showed two ordinary situations
+/// where none does.
+///
+/// The reverse is not a failure but the ordinary case — see [`server`].
+///
+/// [`server`]: Declaration::server
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Declaration {
-    pub server: McpServerSpec,
+    /// The driver, when this chat is allowed to reach it.
+    ///
+    /// `None` for every chat the user has not opted in, which is nearly all of
+    /// them — and those chats are still given the hook. The reason is that the
+    /// thing being gated is not really the tools: the macOS Accessibility grant
+    /// behind them belongs to the OxiMux *process*, every child inherits it, and
+    /// an agent's shell is a child. So a chat with no screen-control tools can
+    /// still drive the screen through `osascript`, and the gate is what refuses
+    /// that. Registering it only where the tools are declared would put the
+    /// check exactly where it is least needed.
+    pub server: Option<McpServerSpec>,
     /// Namespaced tool names for `--disallowedTools`. The CLI removes these
     /// from the agent's surface entirely, in every permission mode, and a deny
     /// outranks a user's own `permissions.allow` rule.
+    ///
+    /// Empty when there is no server: these names would then match nothing, and
+    /// a deny list full of tools that do not exist reads as protection it is
+    /// not providing.
     pub disallowed_tools: Vec<String>,
     /// Inline JSON for `--settings`, registering the `PreToolUse` hook that
     /// decides everything the deny list cannot express — anything depending on
@@ -87,11 +106,13 @@ pub struct HookSpec<'a> {
     pub started_at: Option<std::time::SystemTime>,
 }
 
-/// Build the full declaration for a verified driver.
+/// Build the full declaration for a chat.
 ///
 /// The single way to obtain the server spec, so no call site can take one part
-/// and leave the rest.
-pub fn declaration(driver: &Path, hook: &HookSpec<'_>) -> Declaration {
+/// and leave the rest. `driver` is `None` for a chat that gets no
+/// screen-control tools — it still gets the hook, for the reason on
+/// [`Declaration::server`].
+pub fn declaration(driver: Option<&Path>, hook: &HookSpec<'_>) -> Declaration {
     let mut command = format!(
         "{} --chat {} --grants {} --host-exe {}",
         shell_quote(&hook.command.display().to_string()),
@@ -113,9 +134,7 @@ pub fn declaration(driver: &Path, hook: &HookSpec<'_>) -> Declaration {
     let hook_settings = serde_json::json!({
         "hooks": {
             "PreToolUse": [{
-                // Scoped to this server's tools so the gate is never consulted
-                // about a tool it does not own.
-                "matcher": format!("{}.*", tool_prefix()),
+                "matcher": hook_matcher(),
                 "hooks": [{ "type": "command", "command": command }],
             }]
         }
@@ -123,12 +142,41 @@ pub fn declaration(driver: &Path, hook: &HookSpec<'_>) -> Declaration {
     .to_string();
 
     Declaration {
-        server: server_spec(driver),
-        disallowed_tools: crate::tools::forbidden_names()
-            .map(|tool| format!("{}{tool}", tool_prefix()))
-            .collect(),
+        server: driver.map(server_spec),
+        disallowed_tools: driver
+            .map(|_| {
+                crate::tools::forbidden_names()
+                    .map(|tool| format!("{}{tool}", tool_prefix()))
+                    .collect()
+            })
+            .unwrap_or_default(),
         hook_settings,
     }
+}
+
+/// Which tool names the gate is consulted about.
+///
+/// Two families, and the second is the one an earlier draft missed: this
+/// server's own tools, and the **shell**. A command that drives the GUI is a
+/// screen-control call by another road — it reaches the same APIs with the same
+/// inherited grant — and [`crate::policy`] already refuses those. Scoped to the
+/// MCP prefix, that refusal would never have run, because the gate would never
+/// have been asked about a `Bash` call.
+///
+/// Built from [`crate::policy::SHELL_TOOLS`] so the two cannot drift: a shell
+/// tool added there is matched here without anyone remembering to.
+///
+/// Anchored, and the trailing `.*` is deliberate rather than redundant. The
+/// matcher is a regex whose anchoring the CLI does not document, and this shape
+/// is correct under either reading — a bare `^…prefix` would match nothing at
+/// all if the CLI wraps the pattern in a full-string match.
+pub fn hook_matcher() -> String {
+    let mut alternatives: Vec<String> = crate::policy::SHELL_TOOLS
+        .iter()
+        .map(|tool| (*tool).to_string())
+        .collect();
+    alternatives.push(format!("{}.*", tool_prefix()));
+    format!("^({})$", alternatives.join("|"))
 }
 
 /// Single-quote a value for the shell the CLI runs hook commands through.
@@ -206,7 +254,7 @@ mod tests {
 
     fn declared() -> Declaration {
         declaration(
-            Path::new("/bin/cua-driver"),
+            Some(Path::new("/bin/cua-driver")),
             &HookSpec {
                 command: Path::new("/Applications/OxiMux.app/Contents/MacOS/oximux-screen-gate"),
                 chat: "chat-7",
@@ -225,7 +273,7 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&declared().hook_settings).expect("valid json");
         let entry = &v["hooks"]["PreToolUse"][0];
-        assert_eq!(entry["matcher"], "mcp__oximux-computer-use__.*");
+        assert_eq!(entry["matcher"], hook_matcher());
         let command = entry["hooks"][0]["command"].as_str().expect("command");
         assert!(command.contains("oximux-screen-gate"), "{command}");
         assert!(command.contains("--chat 'chat-7'"), "{command}");
@@ -245,7 +293,7 @@ mod tests {
         // arguments, the gate would reject its own command line, and the chat
         // would run unenforced with nothing to show for it.
         let declared = declaration(
-            Path::new("/bin/cua-driver"),
+            Some(Path::new("/bin/cua-driver")),
             &HookSpec {
                 command: Path::new("/Apps/Oxi Mux.app/gate"),
                 chat: "chat-1",
@@ -300,6 +348,84 @@ mod tests {
                     .contains(&format!("mcp__oximux-computer-use__{tool}")),
                 "{tool} must stay available"
             );
+        }
+    }
+
+    /// The case nearly every chat is in: no screen-control tools, and the gate
+    /// registered anyway.
+    ///
+    /// Not a degenerate configuration — it is what protects the road around the
+    /// tools. OxiMux holds Accessibility process-wide so an agent's shell
+    /// inherits it, which means a chat with no server can still drive the screen
+    /// and the gate is the only thing that says no.
+    #[test]
+    fn a_chat_with_no_driver_still_gets_the_gate() {
+        let declared = declaration(
+            None,
+            &HookSpec {
+                command: Path::new("/Applications/OxiMux.app/Contents/MacOS/oximux-screen-gate"),
+                chat: "chat-7",
+                grants: Path::new("/data/grants.json"),
+                host: Path::new("/Applications/OxiMux.app/Contents/MacOS/oximux"),
+                worktree: None,
+                started_at: None,
+            },
+        );
+        assert!(declared.server.is_none(), "no tools without an opt-in");
+        // Names that would match nothing: the tools do not exist here.
+        assert!(declared.disallowed_tools.is_empty());
+
+        let v: serde_json::Value =
+            serde_json::from_str(&declared.hook_settings).expect("valid json");
+        let command = v["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("command");
+        assert!(command.contains("oximux-screen-gate"), "{command}");
+        assert!(command.contains("--chat 'chat-7'"), "{command}");
+    }
+
+    #[test]
+    fn the_matcher_is_the_exact_pattern_measured_against_the_cli() {
+        // Pinned, not because the text is precious but because the CLI's matcher
+        // semantics are undocumented and this specific string is the one a live
+        // run confirmed fires for a `Bash` call. Changing it means re-running
+        // `probes/matcher.py`, not just re-reading this file.
+        assert_eq!(
+            hook_matcher(),
+            r"^(Bash|bash|shell|local_shell|run_terminal_cmd|mcp__oximux-computer-use__.*)$"
+        );
+    }
+
+    #[test]
+    fn the_matcher_covers_the_shell_as_well_as_the_tools() {
+        // The half that is easy to lose: the policy refuses `osascript` inside a
+        // Bash call, and that refusal only ever runs if the gate is asked about
+        // Bash in the first place.
+        let matcher = regex::Regex::new(&hook_matcher()).expect("a valid regex");
+        for shell in crate::policy::SHELL_TOOLS {
+            assert!(matcher.is_match(shell), "{shell} must reach the gate");
+        }
+        for tool in ["click", "type_text", "get_window_state"] {
+            let name = format!("mcp__oximux-computer-use__{tool}");
+            assert!(matcher.is_match(&name), "{name} must reach the gate");
+        }
+    }
+
+    #[test]
+    fn the_matcher_leaves_every_other_tool_alone() {
+        // Each spawns a process per call, so a matcher that over-reaches is a
+        // tax on every turn — and puts this in the path of tools it does not own.
+        let matcher = regex::Regex::new(&hook_matcher()).expect("a valid regex");
+        for tool in [
+            "Read",
+            "Edit",
+            "WebFetch",
+            "mcp__github__create_issue",
+            // Near misses in both families.
+            "BashOutput",
+            "mcp__oximux-computer-use-extra__click",
+        ] {
+            assert!(!matcher.is_match(tool), "{tool} must not reach the gate");
         }
     }
 

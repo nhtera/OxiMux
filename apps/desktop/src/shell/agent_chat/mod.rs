@@ -489,11 +489,10 @@ use crate::shell::pane_group::PaneGroup;
 use crate::shell::terminal_view::TerminalView;
 use oximux_agents::thread::pi::posture::{self as pi_posture, PiPosture};
 use oximux_agents::thread::{
-    connect, probe_catalog, AgentConnection, AssistantMessage, AuthMethodKind, ChatBackend,
-    ChatImage, ChatThread, ConnectSpec, FeatureControl, FeatureKind, FeatureValue,
-    PermissionDecision, PermissionSuggestion, ProbedCatalog, QuestionAnswers,
-    QuestionRequest, ThreadEntry, ThreadEvent, ToolCall, ToolCallStatus, ToolDetail, Transport,
-    TurnUsage,
+    probe_catalog, AgentConnection, AssistantMessage, AuthMethodKind, ChatBackend, ChatImage,
+    ChatThread, ConnectSpec, FeatureControl, FeatureKind, FeatureValue, PermissionDecision,
+    PermissionSuggestion, ProbedCatalog, QuestionAnswers, QuestionRequest, ThreadEntry,
+    ThreadEvent, ToolCall, ToolCallStatus, ToolDetail, Transport, TurnUsage,
 };
 use oximux_agents::SharedBackend;
 use oximux_core::{AgentAdapter, AgentSessionId};
@@ -1164,6 +1163,7 @@ impl AgentChatView {
         let mut connection: Option<Arc<dyn AgentConnection>> = None;
         let mut disconnected = false;
         let mut drain_task = None;
+        let screen_control = ScreenControl::new(&cwd);
         // A fresh/restored session always starts in the default permission mode
         // (see the `permission_mode` field note); a live switch respawns.
         // An unbound draft (`!connect_now`) spawns nothing yet — the first send
@@ -1182,7 +1182,7 @@ impl AgentChatView {
             // session to the (permissive) default.
             spec.codex_posture = posture.codex.clone();
             spec.pi_posture = posture.pi.clone();
-            match connect(spec) {
+            match computer_use::connect_declaring(spec, &screen_control, cx) {
                 Ok((conn, rx)) => {
                     connection = Some(conn);
                     drain_task = Some(Self::spawn_drain(rx, cx));
@@ -1377,7 +1377,7 @@ impl AgentChatView {
             theme,
             density,
             typography,
-            screen_control: ScreenControl::new(&cwd),
+            screen_control,
             screen_prompts: HashMap::new(),
             cwd,
             model,
@@ -1515,13 +1515,6 @@ impl AgentChatView {
         })
     }
 
-    /// Pi's tool posture, read from the composer's feature picks. `None` for a
-    /// non-Pi chat or when nothing was changed (restore then applies the
-    /// deliberate default).
-    ///
-    /// Unlike Codex's, this posture is the session's ONLY tool gate — pi never
-    /// asks before running anything — so it is snapshotted for persistence
-    /// rather than left to be re-derived.
     /// The [`ConnectSpec`] a respawn launches on: the session's identity (model,
     /// resume id, mode, effort) plus every spawn-time choice the user has made.
     ///
@@ -1559,6 +1552,13 @@ impl AgentChatView {
         spec
     }
 
+    /// Pi's tool posture, read from the composer's feature picks. `None` for a
+    /// non-Pi chat or when nothing was changed (restore then applies the
+    /// deliberate default).
+    ///
+    /// Unlike Codex's, this posture is the session's ONLY tool gate — pi never
+    /// asks before running anything — so it is snapshotted for persistence
+    /// rather than left to be re-derived.
     fn pi_posture_snapshot(&self) -> Option<PiPosture> {
         if self.backend.transport != Transport::Rpc {
             return None;
@@ -2999,7 +2999,7 @@ impl AgentChatView {
             old.shutdown();
         }
         let spec = self.respawn_spec(env, auth_method);
-        match connect(spec) {
+        match computer_use::connect_declaring(spec, &self.screen_control, cx) {
             Ok((conn, rx)) => {
                 self.connection = Some(conn);
                 // Re-expose the respawned session to remote clients under the same

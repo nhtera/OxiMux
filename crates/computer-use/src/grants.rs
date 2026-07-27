@@ -383,6 +383,21 @@ impl Provenance {
         })
     }
 
+    /// The canonicalized worktree, for handing to the out-of-process gate.
+    ///
+    /// The resolved path rather than the one passed in, so the gate re-derives
+    /// its provenance from exactly what this one holds — the same input cannot
+    /// then produce two different answers on either side of the process
+    /// boundary.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// When the session began, likewise.
+    pub fn since(&self) -> SystemTime {
+        self.since
+    }
+
     /// Did this agent build `executable` during this session?
     ///
     /// Containment alone is not enough and never was: `cp -R /Applications/

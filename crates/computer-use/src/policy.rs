@@ -133,7 +133,12 @@ fn addressed_pid(input: &Value) -> Option<u32> {
 /// Listed rather than sniffed from the input shape: a tool that merely *has* a
 /// `command` field is not necessarily a shell, and guessing wrong in that
 /// direction puts this in the path of tools it does not own.
-const SHELL_TOOLS: &[&str] = &["Bash", "bash", "shell", "local_shell", "run_terminal_cmd"];
+///
+/// Public because the enforcing hook has to be *told* which tools to consult it
+/// about, and a matcher with its own hand-written copy of this list is a matcher
+/// that silently stops covering the shell the day a name is added here. See
+/// [`crate::mcp::hook_matcher`].
+pub const SHELL_TOOLS: &[&str] = &["Bash", "bash", "shell", "local_shell", "run_terminal_cmd"];
 
 /// The command a shell tool is about to run, or `None` if this is not one.
 ///

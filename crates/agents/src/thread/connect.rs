@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use super::acp::AcpConnection;
-use super::claude_stream_json::ClaudeStreamJsonConnection;
+use super::claude_stream_json::{ClaudeStreamJsonConnection, HostInjection};
 use super::codex::CodexAppServerConnection;
 use super::connection::{AgentConnection, ModelChoice};
 use super::event::ThreadEvent;
@@ -109,6 +109,18 @@ pub struct ConnectSpec {
     /// Claude (`--mcp-config`) and ACP (`mcpServers`) alike. Empty for every
     /// launch that declares none, which keeps those invocations unchanged.
     pub mcp_servers: Vec<McpServerSpec>,
+    /// Inline settings JSON for this session (Claude's `--settings`), carrying
+    /// the hooks OxiMux uses to police what it declared above.
+    ///
+    /// Claude-only, like `codex_posture` is Codex-only: hooks are that CLI's
+    /// mechanism and no other transport here has an equivalent. That asymmetry
+    /// is a real constraint on the caller rather than a gap to paper over — a
+    /// capability whose enforcement rides this field must not be declared to a
+    /// transport that drops it.
+    pub settings_json: Option<String>,
+    /// Tool names to strip from the agent's surface (`--disallowedTools`).
+    /// Claude-only for the same reason.
+    pub disallowed_tools: Vec<String>,
 }
 
 impl ConnectSpec {
@@ -142,17 +154,12 @@ impl ConnectSpec {
             codex_posture: None,
             pi_command: None,
             pi_posture: None,
-            // Set by the caller after construction when the host has servers to
-            // declare; a plain launch declares none.
+            // Set by the caller after construction when the host has something
+            // to declare; a plain launch declares nothing.
             mcp_servers: Vec::new(),
+            settings_json: None,
+            disallowed_tools: Vec::new(),
         }
-    }
-
-    /// Declare host-supplied MCP servers for this session. Builder-style so the
-    /// existing single-line `for_backend` call sites stay single-line.
-    pub fn with_mcp_servers(mut self, servers: Vec<McpServerSpec>) -> Self {
-        self.mcp_servers = servers;
-        self
     }
 }
 
@@ -169,7 +176,11 @@ pub fn connect(spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<
                 spec.resume_session_id.as_deref(),
                 spec.permission_mode.as_deref(),
                 spec.effort.as_deref(),
-                &spec.mcp_servers,
+                &HostInjection {
+                    mcp_servers: &spec.mcp_servers,
+                    settings: spec.settings_json.as_deref(),
+                    disallowed_tools: &spec.disallowed_tools,
+                },
             )?;
             Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
@@ -296,6 +307,8 @@ mod tests {
             pi_command: None,
             pi_posture: None,
             mcp_servers: vec![],
+            settings_json: None,
+            disallowed_tools: vec![],
         };
         // Can't `expect_err` — the Ok payload (`Box<dyn AgentConnection>`) isn't
         // `Debug`; match instead.
@@ -327,6 +340,8 @@ mod tests {
             pi_command: None,
             pi_posture: None,
             mcp_servers: vec![],
+            settings_json: None,
+            disallowed_tools: vec![],
         };
         let err = probe_catalog(spec).expect_err("probe must fail without a command");
         assert!(err.to_string().contains("acp_command"), "unexpected error: {err}");
