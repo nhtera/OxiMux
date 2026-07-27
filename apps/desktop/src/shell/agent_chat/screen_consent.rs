@@ -138,6 +138,29 @@ pub(super) fn always_allow_pill(
     ))
 }
 
+/// Has the user already said yes to this app, so no card is needed?
+///
+/// Split out of the view because it is the whole of "pre-approved apps don't
+/// prompt", and the rest of the path around it needs a live pid to reach — a
+/// test that had to launch a real signed application to check an allowlist
+/// lookup would be testing the launcher.
+///
+/// Two ways to answer no beyond "not on the list", both deliberate:
+///
+/// - **No bundle id, no match, ever.** The allowlist is keyed on bundle id, and
+///   an agent's own freshly built binary has none. This is the same fact that
+///   makes [`always_allow_pill`] withhold the button — the two must agree, or
+///   the card would offer an approval that could never be honoured.
+/// - **No settings loaded at all is a no.** The global is absent before the
+///   watcher installs it and if the file fails to parse. Reading that as "asked
+///   and answered" would turn a broken settings file into a blanket approval.
+fn is_pre_approved(target: &TargetApp, settings: Option<&ComputerUseSettings>) -> bool {
+    let (Some(bundle_id), Some(settings)) = (target.bundle_id.as_deref(), settings) else {
+        return false;
+    };
+    settings.is_allowed(bundle_id)
+}
+
 /// The view's half of the consent flow.
 ///
 /// Lives here rather than in the view's own module for two reasons: it is all
@@ -194,11 +217,7 @@ impl AgentChatView {
         let Some(target) = pid.and_then(TargetApp::describe) else {
             return true;
         };
-        let allowed = target.bundle_id.as_deref().is_some_and(|bundle_id| {
-            cx.try_global::<ComputerUseSettings>()
-                .is_some_and(|settings| settings.is_allowed(bundle_id))
-        });
-        if allowed {
+        if is_pre_approved(&target, cx.try_global::<ComputerUseSettings>()) {
             return false;
         }
         self.screen_prompts
@@ -266,6 +285,72 @@ mod tests {
     fn a_sentinel_target_carries_its_warning() {
         let p = prompt("Terminal", Some("com.apple.Terminal"), Some(Sentinel::Shell));
         assert!(p.sentinel.expect("a warning").warning().contains("shell"));
+    }
+
+    fn target(name: &str, bundle_id: Option<&str>) -> TargetApp {
+        TargetApp {
+            pid: 42,
+            executable: std::path::PathBuf::from(format!("/Applications/{name}.app")),
+            bundle_id: bundle_id.map(str::to_string),
+            name: name.to_string(),
+        }
+    }
+
+    fn allowing(bundle_id: &str, name: &str) -> ComputerUseSettings {
+        let mut settings = ComputerUseSettings::default();
+        settings.allow(bundle_id, name);
+        settings
+    }
+
+    #[test]
+    fn a_pre_approved_app_raises_no_card() {
+        let settings = allowing("com.apple.Safari", "Safari");
+        assert!(is_pre_approved(
+            &target("Safari", Some("com.apple.Safari")),
+            Some(&settings)
+        ));
+    }
+
+    #[test]
+    fn an_app_the_user_never_approved_still_asks() {
+        let settings = allowing("com.apple.Safari", "Safari");
+        assert!(!is_pre_approved(
+            &target("Notes", Some("com.apple.Notes")),
+            Some(&settings)
+        ));
+    }
+
+    #[test]
+    fn an_app_with_no_bundle_id_can_never_be_pre_approved() {
+        // The pairing that has to hold: `always_allow_pill` withholds the button
+        // for exactly this target, so if the lookup matched some other way the
+        // card would be offering an approval it could not honour — or honouring
+        // one it never offered.
+        let settings = allowing("com.apple.Safari", "Safari");
+        assert!(!is_pre_approved(&target("my-app", None), Some(&settings)));
+    }
+
+    #[test]
+    fn no_settings_loaded_means_ask() {
+        // Before the watcher installs the global, and after a settings file that
+        // will not parse. Neither is an approval.
+        assert!(!is_pre_approved(
+            &target("Safari", Some("com.apple.Safari")),
+            None
+        ));
+    }
+
+    #[test]
+    fn a_sentinel_app_added_by_hand_is_honoured() {
+        // Terminal cannot reach the list through the card — "always allow" is
+        // withheld for sentinels, and settings has no add-app affordance. The
+        // only way in is editing the file, which is the deliberate act the
+        // design asks for. Pinned because silently ignoring the row would leave
+        // the user with a setting that reads as on and does nothing.
+        let settings = allowing("com.apple.Terminal", "Terminal");
+        let terminal = target("Terminal", Some("com.apple.Terminal"));
+        assert_eq!(ScreenPrompt::from_target(&terminal).sentinel, Some(Sentinel::Shell));
+        assert!(is_pre_approved(&terminal, Some(&settings)));
     }
 
     #[test]

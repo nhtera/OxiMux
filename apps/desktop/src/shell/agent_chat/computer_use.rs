@@ -59,9 +59,21 @@ pub fn grants_path() -> Option<PathBuf> {
 
 /// Drop every grant from a previous run. Called once at startup: grants are
 /// scoped to a run, and a store surviving a crash would otherwise hand a fresh
-/// chat approvals nobody gave it.
+/// chat approvals nobody gave it — chat ids restart at 1 every run, so last
+/// run's `chat-1` rows are addressed to the id this run's first chat will mint.
+///
+/// Loud on failure rather than silent. There is nothing sensible to do about it
+/// from here — refusing to start over a stale grants file would be a worse
+/// trade than starting — but it is the one line in the log that explains why an
+/// agent could suddenly drive something nobody approved.
 pub fn clear_stale_screen_control_grants() {
-    GRANTS.clear();
+    if !GRANTS.clear() {
+        tracing::error!(
+            path = ?grants_path(),
+            "could not clear screen-control grants from the last run; a chat may \
+             inherit approvals nobody gave it"
+        );
+    }
 }
 
 /// Hands out chat ids. Monotonic and never reused within a process, so a grant
@@ -247,6 +259,59 @@ mod view_tests {
         );
     }
 
+    /// A target nobody approved leaves the card up, mid-turn, carrying the
+    /// app's name.
+    ///
+    /// The counterpart to the auto-answered refusal above, and the half that is
+    /// easy to lose: a policy change that turned `Ask` into `Allow` would still
+    /// pass every refusal test while quietly deleting consent.
+    ///
+    /// `/bin/sleep` stands in for the un-approved app, and its lack of a bundle
+    /// id is load-bearing rather than incidental — the allowlist is keyed on
+    /// bundle id, so a target without one can never be pre-approved and this
+    /// test cannot be made to pass by the user's own settings.
+    #[gpui::test]
+    async fn an_unapproved_target_leaves_the_card_up(cx: &mut TestAppContext) {
+        let (window, probe) = stub_chat(cx).await;
+        let mut target = std::process::Command::new("/bin/sleep")
+            .arg("120")
+            .spawn()
+            .expect("spawn a target process");
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.on_event(
+                    ThreadEvent::PermissionRequested {
+                        request_id: "r1".into(),
+                        tool_use_id: Some("t1".into()),
+                        tool_name: "mcp__oximux-computer-use__click".into(),
+                        input: json!({ "pid": target.id() }),
+                        description: String::new(),
+                        suggestions: vec![],
+                        kind: oximux_agents::thread::PermissionKind::Screen,
+                    },
+                    cx,
+                );
+                assert!(
+                    view.thread.pending_permission().is_some(),
+                    "an un-approved target must ask the user"
+                );
+                assert_eq!(
+                    view.screen_prompts.get("t1").map(|p| p.app.as_str()),
+                    Some("sleep"),
+                    "and the card must know which app it is asking about"
+                );
+            })
+            .expect("window update");
+
+        assert!(
+            probe.sent().is_empty(),
+            "nothing may be answered on the user's behalf"
+        );
+        let _ = target.kill();
+        let _ = target.wait();
+    }
+
     /// The other half, and the one that would be expensive to get wrong: every
     /// tool that is not screen control keeps waiting for the user exactly as it
     /// did before any of this existed.
@@ -419,6 +484,66 @@ mod tests {
             survivor.decide(&ns("click"), &input),
             Decision::Ask { pid: Some(pid) }
         );
+    }
+
+    #[test]
+    fn grants_from_a_previous_run_do_not_survive_a_restart() {
+        // Grants live in a file so the per-tool-call hook can read them, which
+        // means they outlive the process that made them. That is deliberate, and
+        // it is exactly what makes the startup clear load-bearing: chat ids
+        // restart at 1 every run, so a surviving `chat-1` row is addressed to
+        // the id the next run's first chat mints.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(oximux_computer_use::grants::GRANTS_FILE_NAME);
+        let target = Target::spawn();
+        let input = json!({ "pid": target.pid() });
+
+        let last_run = ScreenControl::sharing(Path::new("/tmp"), Arc::new(GrantTable::at(&path)));
+        assert!(last_run.approve(&ns("click"), &input).is_ok());
+        // Forgotten, not dropped: `Drop` releases, and a clean quit is not the
+        // case this guards. A crash is, and it runs no destructors.
+        std::mem::forget(last_run);
+        assert!(
+            !GrantTable::at(&path).all().is_empty(),
+            "the grant must genuinely reach disk, or clearing it proves nothing"
+        );
+
+        // What startup does, before any chat exists.
+        assert!(GrantTable::at(&path).clear());
+
+        let this_run = ScreenControl::sharing(Path::new("/tmp"), Arc::new(GrantTable::at(&path)));
+        assert_eq!(
+            this_run.decide(&ns("click"), &input),
+            Decision::Ask { pid: Some(target.pid()) },
+            "the first chat of a new run must be asked again"
+        );
+    }
+
+    /// The hazard the test above defends against, stated directly.
+    ///
+    /// [`next_chat_id`] counts from 1 per *process*, so `chat-1` is not a unique
+    /// name — it is the id both the last run's first chat and this run's first
+    /// chat get. Nothing else in the store distinguishes them, so a surviving
+    /// row is not stale data to be tidied up later; it is a live grant with this
+    /// run's chat already named on it.
+    #[test]
+    fn a_surviving_grant_would_be_inherited_by_the_next_runs_first_chat() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = GrantTable::in_data_dir(dir.path());
+        let target = Target::spawn();
+
+        // Two runs, each minting the id its first chat gets.
+        let last_run = SessionId::for_agent("chat-1");
+        let this_run = SessionId::for_agent("chat-1");
+        assert_eq!(table.grant(target.pid(), &last_run), Verdict::Granted);
+        assert_eq!(
+            table.check(target.pid(), &this_run),
+            Verdict::Granted,
+            "the ids are indistinguishable, which is the whole problem"
+        );
+
+        assert!(table.clear());
+        assert_eq!(table.check(target.pid(), &this_run), Verdict::Ungranted);
     }
 
     #[test]

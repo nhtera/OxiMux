@@ -96,10 +96,21 @@ pub fn install(cx: &mut App) {
                 // Instant and app-wide: every screen-control call re-checks the
                 // table, so clearing it is what actually takes the keys away.
                 let aborted = path.clone();
-                cx.background_executor()
+                let dropped = cx
+                    .background_executor()
                     .spawn(async move { GrantTable::at(&aborted).clear() })
                     .await;
-                tracing::info!("Escape stopped screen control; all grants dropped");
+                if dropped {
+                    tracing::info!("Escape stopped screen control; all grants dropped");
+                } else {
+                    // The user pressed the kill switch and it did not take. Of
+                    // everything here this is the one that must never be logged
+                    // at info alongside the successes.
+                    tracing::error!(
+                        ?path,
+                        "Escape could not drop screen-control grants; agents may still be driving"
+                    );
+                }
                 // Force the next pass to redraw rather than trust the stamp.
                 last = FileStamp::default();
             }

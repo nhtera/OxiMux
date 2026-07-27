@@ -160,10 +160,22 @@ mod tests {
     struct Target(std::process::Child);
 
     impl Target {
-        fn spawn(program: &str) -> Self {
+        /// Spawn a process that outlives the test and prints nothing.
+        ///
+        /// Args are per-program rather than one hardcoded `120`: that argument
+        /// belongs to `sleep`, and handing it to `cat` made it look for a file
+        /// named `120`, fail, and exit — leaving a target that resolved only
+        /// while it was still a zombie, so the test that read it passed or
+        /// failed on timing.
+        ///
+        /// stdin is piped for the same reason from the other direction: `cat`
+        /// with no argument reads stdin, and an inherited one is at EOF
+        /// immediately. Holding the write end open is what keeps it blocked.
+        fn spawn(program: &str, args: &[&str]) -> Self {
             Self(
                 std::process::Command::new(program)
-                    .arg("120")
+                    .args(args)
+                    .stdin(std::process::Stdio::piped())
                     .spawn()
                     .expect("spawn a target process"),
             )
@@ -199,7 +211,7 @@ mod tests {
     #[test]
     fn a_granted_target_is_named_by_its_program() {
         let (_dir, table) = table();
-        let target = Target::spawn("/bin/sleep");
+        let target = Target::spawn("/bin/sleep", &["120"]);
         table.grant(target.pid(), &SessionId::for_agent("chat-1"));
 
         let driving = Driving::read(&table);
@@ -215,7 +227,7 @@ mod tests {
         // The detail list exists to disambiguate several agents. With one, it
         // would only restate the summary alongside an id nobody asked for.
         let (_dir, table) = table();
-        let target = Target::spawn("/bin/sleep");
+        let target = Target::spawn("/bin/sleep", &["120"]);
         table.grant(target.pid(), &SessionId::for_agent("chat-1"));
         assert!(Driving::read(&table).detail_lines().is_empty());
     }
@@ -225,7 +237,7 @@ mod tests {
         // The parallelism premise: the user must be able to tell which of their
         // agents is doing what, and the list must not reshuffle on redraw.
         let (_dir, table) = table();
-        let (a, b) = (Target::spawn("/bin/sleep"), Target::spawn("/bin/cat"));
+        let (a, b) = (Target::spawn("/bin/sleep", &["120"]), Target::spawn("/bin/cat", &[]));
         table.grant(b.pid(), &SessionId::for_agent("chat-2"));
         table.grant(a.pid(), &SessionId::for_agent("chat-1"));
 
@@ -248,7 +260,7 @@ mod tests {
         // Nothing is being driven through a process that no longer exists, so
         // reporting it would overstate what is happening.
         let (_dir, table) = table();
-        let target = Target::spawn("/bin/sleep");
+        let target = Target::spawn("/bin/sleep", &["120"]);
         let pid = target.pid();
         table.grant(pid, &SessionId::for_agent("chat-1"));
         drop(target);

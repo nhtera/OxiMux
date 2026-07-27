@@ -147,11 +147,32 @@ impl GrantTable {
         let _ = self.with_locked(|grants| grants.retain(|_, g| g.owner != agent.as_str()));
     }
 
-    /// Drop every grant, whoever holds it. Runs at app start: grants are scoped
-    /// to a run, and a file surviving a crash would otherwise hand a fresh chat
-    /// approvals nobody gave it.
-    pub fn clear(&self) {
-        let _ = self.with_locked(|grants| grants.clear());
+    /// Drop every grant, whoever holds it. Runs at app start and when the kill
+    /// switch fires. Reports whether the store is definitely empty afterwards.
+    ///
+    /// # Why the answer is worth checking
+    ///
+    /// Chat ids restart at 1 every run. So a store that outlived a crash with
+    /// its rows intact does not merely hold stale data — its `chat-1` grants
+    /// are addressed to the id the *next* run's first chat will mint, and that
+    /// chat would inherit approvals nobody gave it. The startup clear is the
+    /// only thing standing between those two facts, which is why it may not
+    /// fail quietly.
+    ///
+    /// A store that cannot be rewritten is therefore removed instead: unlinking
+    /// needs write permission on the directory rather than the file, so it
+    /// still succeeds for the case that actually happens — a store left
+    /// read-only, or owned by another uid. A missing store reads as no grants
+    /// and is recreated by the next write.
+    #[must_use = "a store that could not be cleared still grants what it held"]
+    pub fn clear(&self) -> bool {
+        if self.with_locked(|grants| grants.clear()).is_ok() {
+            return true;
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => true,
+            Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+        }
     }
 
     /// Every live grant, as `(pid, owner)`, sorted by pid.
@@ -502,9 +523,50 @@ mod tests {
         table.grant(live_pid(), &a);
         table.seed(999_001, &b, Path::new("/usr/bin/true"));
 
-        table.clear();
+        assert!(table.clear());
         assert!(table.granted_to(&a).is_empty());
         assert!(table.granted_to(&b).is_empty());
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_rewritten_is_removed_instead() {
+        // The failure that matters, because the startup clear is what stops the
+        // next run's `chat-1` inheriting the last run's `chat-1` grants. A
+        // read-only store cannot even be opened for writing, so the rewrite path
+        // never gets as far as the rows — and returning "cleared" there would be
+        // a lie the whole feature rests on.
+        if unsafe { libc::geteuid() } == 0 {
+            // Root ignores the mode bits, so there is no unwritable file to
+            // arrange. Skipping beats asserting the opposite of the claim.
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(GRANTS_FILE_NAME);
+        std::fs::write(
+            &path,
+            r#"{"4242":{"owner":"oximux-chat-1","executable":"/bin/sleep"}}"#,
+        )
+        .expect("seed a store from a previous run");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+
+        let table = GrantTable::at(&path);
+        assert!(table.clear(), "removal is the fallback, not giving up");
+        assert!(
+            !path.exists(),
+            "a store that cannot be emptied must not be left holding grants"
+        );
+        // And the store recovers: the next write recreates it.
+        assert_eq!(table.grant(live_pid(), &agent("a")), Verdict::Granted);
+    }
+
+    #[test]
+    fn clearing_a_store_that_was_never_written_succeeds() {
+        // Startup runs this before anything has granted, which is the common
+        // case — "no file" is success, not a failure to report.
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(GrantTable::at(dir.path().join(GRANTS_FILE_NAME)).clear());
     }
 
     #[test]
