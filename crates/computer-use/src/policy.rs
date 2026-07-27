@@ -73,6 +73,19 @@ pub fn decide(tool_name: &str, input: &Value, ctx: &PolicyContext<'_>) -> Decisi
         return Decision::NotApplicable;
     };
 
+    // Ahead of the class check, and of everything below it. This refusal is not
+    // about which tool or which target — it is about nobody being at the screen
+    // to watch. A remote-started turn cannot reach any of it: not the read
+    // tools, not a target the agent built itself, not one the user pre-approved
+    // from the desk earlier.
+    if ctx.grants.is_remote_turn(ctx.session) {
+        return Decision::refuse(format!(
+            "`{tool}` was reached from a turn started on a paired phone. Screen control needs \
+             someone at the screen to see what is being driven and to answer the consent card, \
+             so it is refused for remote turns however the target is addressed."
+        ));
+    }
+
     let class = classify(tool);
     if let ToolClass::Forbidden(forbidden) = class {
         return Decision::refuse(format!("`{tool}` {}", forbidden.reason()));
@@ -322,6 +335,106 @@ mod tests {
                 "{tool}"
             );
         }
+    }
+
+    #[test]
+    fn a_turn_started_on_a_phone_cannot_reach_screen_control_at_all() {
+        // Every rung, including the ones that normally say yes without asking:
+        // a granted target, a read tool that needs no grant, and the consent
+        // path. The gate is the absence of a person, not the shape of the call.
+        let f = Fixture::new();
+        let target = Target::spawn();
+        let pid = target.pid();
+        f.grants.grant(pid, &f.session);
+        f.grants.begin_remote_turn(&f.session);
+
+        for (tool, input) in [
+            ("click", json!({ "pid": pid })),
+            ("type_text", json!({ "pid": pid, "text": "hi" })),
+            ("get_window_state", json!({ "pid": pid })),
+            ("launch_app", json!({ "bundle_id": "com.apple.Safari" })),
+        ] {
+            let reason = refusal(&f.decide(tool, input)).to_string();
+            assert!(reason.contains("paired phone"), "{tool}: {reason}");
+        }
+    }
+
+    #[test]
+    fn provenance_does_not_buy_a_remote_turn_a_way_in() {
+        // The rule the finding is specifically about: a phone prompt plus the
+        // worktree grant would otherwise drive a binary the agent just built
+        // with no card anywhere.
+        let target = Target::spawn();
+        let root = Path::new(Target::EXECUTABLE).parent().expect("a parent");
+        let prov = Provenance::new(root, std::time::UNIX_EPOCH).expect("provenance");
+
+        let f = Fixture::new();
+        f.grants.begin_remote_turn(&f.session);
+        let ctx = PolicyContext {
+            session: &f.session,
+            grants: &f.grants,
+            provenance: Some(&prov),
+        };
+        assert!(matches!(
+            decide(&ns("click"), &json!({ "pid": target.pid() }), &ctx),
+            Decision::Refuse { .. }
+        ));
+        assert!(
+            f.grants.granted_to(&f.session).is_empty(),
+            "and it must not have silently taken a grant on the way"
+        );
+    }
+
+    #[test]
+    fn the_next_local_turn_works_again() {
+        // Turn-scoped, not a session-wide kill: the user picking the same chat
+        // back up at their desk must not find screen control dead.
+        let f = Fixture::new();
+        let target = Target::spawn();
+        let pid = target.pid();
+
+        f.grants.begin_remote_turn(&f.session);
+        assert!(matches!(
+            f.decide("click", json!({ "pid": pid })),
+            Decision::Refuse { .. }
+        ));
+
+        f.grants.end_remote_turn(&f.session);
+        assert_eq!(
+            f.decide("click", json!({ "pid": pid })),
+            Decision::Ask { pid: Some(pid) }
+        );
+    }
+
+    #[test]
+    fn one_chats_remote_turn_does_not_gag_another_chat() {
+        // Sessions are independent; a phone prompt in one must not stop the
+        // agent the user is actively watching at their desk.
+        let f = Fixture::new();
+        let phone_chat = SessionId::for_agent("chat-remote");
+        f.grants.begin_remote_turn(&phone_chat);
+
+        let target = Target::spawn();
+        assert_eq!(
+            f.decide("click", json!({ "pid": target.pid() })),
+            Decision::Ask { pid: Some(target.pid()) }
+        );
+    }
+
+    #[test]
+    fn a_shell_command_is_still_judged_during_a_remote_turn() {
+        // The shell path runs before the remote check and must keep its own
+        // answers — an ordinary command from a phone prompt is still ordinary.
+        let f = Fixture::new();
+        f.grants.begin_remote_turn(&f.session);
+        assert_eq!(
+            decide("Bash", &json!({ "command": "cargo test" }), &f.ctx()),
+            Decision::NotApplicable
+        );
+        assert!(matches!(
+            decide("Bash", &json!({ "command": "cliclick c:1,1" }), &f.ctx()),
+            Decision::Refuse { .. }
+        ));
     }
 
     #[test]

@@ -17,5 +17,5 @@
 # below is raised to match, on the condition that the remote seam moves out to
 # its own child module and the number comes back down below 8187. Do not treat
 # this as licence to raise it again.
-apps/desktop/src/shell/agent_chat/mod.rs 8281
+apps/desktop/src/shell/agent_chat/mod.rs 8261
 apps/desktop/src/shell/agent_chat/composer.rs 3848

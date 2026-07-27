@@ -165,6 +165,20 @@ impl ScreenControl {
         self.grants.release_all(&self.session);
     }
 
+    /// This chat's next turn was started from a paired phone.
+    ///
+    /// Recorded in the shared store rather than on this struct because the
+    /// process that enforces it is the per-tool-call hook, which has no access
+    /// to anything in memory here.
+    pub fn begin_remote_turn(&self) {
+        self.grants.begin_remote_turn(&self.session);
+    }
+
+    /// The turn ended; judge the next one on its own origin.
+    pub fn end_remote_turn(&self) {
+        self.grants.end_remote_turn(&self.session);
+    }
+
     #[cfg(test)]
     pub fn granted_pids(&self) -> Vec<u32> {
         self.grants.granted_to(&self.session)
@@ -544,6 +558,33 @@ mod tests {
 
         assert!(table.clear());
         assert_eq!(table.check(target.pid(), &this_run), Verdict::Ungranted);
+    }
+
+    #[test]
+    fn a_phone_started_turn_is_refused_and_the_next_local_one_is_not() {
+        // The whole inbound gate as a chat sees it. A phone prompt marks the
+        // turn; every screen-control call in it is refused however addressed;
+        // the turn ending restores the ordinary consent path.
+        let chat = chat();
+        let target = Target::spawn();
+        let input = json!({ "pid": target.pid() });
+
+        chat.begin_remote_turn();
+        let refusal = chat.decide(&ns("click"), &input);
+        assert!(
+            matches!(&refusal, Decision::Refuse { reason } if reason.contains("paired phone")),
+            "{refusal:?}"
+        );
+        // And a card answered from the phone cannot promote it either — the
+        // approval path re-decides rather than trusting the earlier verdict.
+        assert!(chat.approve(&ns("click"), &input).is_err());
+        assert!(chat.granted_pids().is_empty());
+
+        chat.end_remote_turn();
+        assert_eq!(
+            chat.decide(&ns("click"), &input),
+            Decision::Ask { pid: Some(target.pid()) }
+        );
     }
 
     #[test]

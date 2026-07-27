@@ -39,6 +39,7 @@ mod pending_edit;
 mod plan_approval_card;
 mod plan_panel;
 mod question_card;
+mod remote_turn;
 mod turn_summary_card;
 mod rewind_menu;
 mod screen_consent;
@@ -481,7 +482,7 @@ use attention::attention_for_event;
 use computer_use::ScreenControl;
 pub use computer_use::clear_stale_screen_control_grants;
 use screen_consent::ScreenPrompt;
-use oximux_agents::session_registry::{ChoiceKind, RemoteChoice, RemotePrompt, SessionMeta};
+use oximux_agents::session_registry::{ChoiceKind, RemoteChoice, SessionMeta};
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;
 use crate::shell::pane_group::PaneGroup;
@@ -3536,22 +3537,6 @@ impl AgentChatView {
         })
     }
 
-    /// Drain relayed remote prompts (phone sends) and fold each as a user bubble.
-    /// Mirrors [`Self::spawn_drain`] but for the prompt-echo channel the registry
-    /// feeds on a remote `send_prompt`. Ends when the sender drops (rebind/teardown).
-    fn spawn_remote_prompt_relay(
-        mut rx: futures::channel::mpsc::UnboundedReceiver<RemotePrompt>,
-        cx: &mut Context<Self>,
-    ) -> Task<()> {
-        cx.spawn(async move |this: WeakEntity<Self>, cx| {
-            while let Some(prompt) = rx.next().await {
-                if this.update(cx, |view, cx| view.push_remote_user_bubble(prompt, cx)).is_err() {
-                    return; // view dropped
-                }
-            }
-        })
-    }
-
     /// The sender for this tab's choice relay, starting the relay on first use.
     ///
     /// One relay per view for its whole life, rather than one per binding: a
@@ -3606,14 +3591,6 @@ impl AgentChatView {
     /// for other subscribers, so this only pushes the bubble locally — it must NOT
     /// re-tee (that would double the prompt on the phone), mirroring how a
     /// desktop-typed prompt bubbles optimistically without folding the echo again.
-    fn push_remote_user_bubble(&mut self, prompt: RemotePrompt, cx: &mut Context<Self>) {
-        self.thread.push_user_message_with_images(prompt.text, prompt.images);
-        // Pin to the bottom so the new turn is in view, like a local send.
-        self.stick_to_bottom = true;
-        self.follow_frames = FOLLOW_FRAMES;
-        cx.notify();
-    }
-
     /// Fold a drained batch into the thread, then repaint once for the whole
     /// batch instead of once per event.
     ///
@@ -3716,6 +3693,7 @@ impl AgentChatView {
         }
         let was_active = self.thread.turn_active;
         self.thread.apply(&ev);
+        self.note_turn_boundary(&ev);
         // Screen-control calls are decided here because this is the only point
         // OxiMux is in their path at all — the driver is a separate process the
         // agent talks to directly. Runs after the fold so the card exists to be

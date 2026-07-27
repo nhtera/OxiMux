@@ -153,6 +153,14 @@ impl Dispatcher {
         };
         let entries_json =
             if entries_json.is_empty() { "[]".to_string() } else { entries_json };
+        // The live branch above was already scrubbed on the way into the
+        // registry. This one was not: a dormant session is read straight off
+        // disk, where the desktop's own persisted transcript keeps its screen
+        // captures. Same call, so both branches leave here in the same state.
+        let (entries_json, captures) = oximux_computer_use::scrub_transcript(&entries_json);
+        if captures > 0 {
+            tracing::debug!(session_id, captures, "dropped screen captures from stored history");
+        }
         // Attachments accumulate for the life of a session, so this reply is the
         // one whose size no other check bounds — the send-side guard passes each
         // prompt on its own, and their sum lands here. Over the frame cap the

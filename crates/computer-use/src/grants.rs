@@ -26,7 +26,7 @@
 //! second process — which is what makes the concurrency here testable without
 //! spawning anything.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
@@ -71,6 +71,37 @@ struct Grant {
     executable: PathBuf,
 }
 
+/// Everything the file holds.
+///
+/// The remote-turn set rides along with the grants rather than living in its own
+/// file because it is answering the same question from the same two processes,
+/// under the same lock. A second file would mean a second path to plumb into the
+/// hook's command line and a second thing to forget to clear.
+///
+/// The whole store is rebuilt at every app start, so this shape has no
+/// compatibility burden: a file written by an older build simply fails to parse
+/// and reads as empty, which is already the corrupt-store behaviour.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Store {
+    #[serde(default)]
+    grants: HashMap<u32, Grant>,
+    /// Screen-control sessions whose current turn was started from a paired
+    /// phone. Sorted so the file stays diffable while debugging.
+    #[serde(default)]
+    remote_turns: BTreeSet<String>,
+}
+
+impl Store {
+    fn is_empty(&self) -> bool {
+        self.grants.is_empty() && self.remote_turns.is_empty()
+    }
+
+    /// Cheap change detector for the write-back decision.
+    fn shape(&self) -> (usize, usize) {
+        (self.grants.len(), self.remote_turns.len())
+    }
+}
+
 /// Pid → owning agent, shared by every process that enforces.
 #[derive(Debug, Clone)]
 pub struct GrantTable {
@@ -95,7 +126,7 @@ impl GrantTable {
         let Some(found) = executable_of_pid(pid) else {
             return Verdict::Unresolvable;
         };
-        self.with_locked(|grants| match grants.get(&pid) {
+        self.with_locked(|store| match store.grants.get(&pid) {
             None => Verdict::Ungranted,
             Some(grant) if grant.owner != agent.as_str() => Verdict::HeldByAnother {
                 owner: grant.owner.clone(),
@@ -120,14 +151,14 @@ impl GrantTable {
         let Some(executable) = executable_of_pid(pid) else {
             return Verdict::Unresolvable;
         };
-        self.with_locked(|grants| match grants.get(&pid) {
+        self.with_locked(|store| match store.grants.get(&pid) {
             Some(grant) if grant.owner != agent.as_str() => Verdict::HeldByAnother {
                 owner: grant.owner.clone(),
             },
             // Re-granting to the same owner refreshes the recorded path, which
             // is what makes a legitimate relaunch-into-the-same-pid work.
             _ => {
-                grants.insert(
+                store.grants.insert(
                     pid,
                     Grant {
                         owner: agent.as_str().to_string(),
@@ -144,7 +175,7 @@ impl GrantTable {
     /// grant outliving its agent would be inherited by whoever next gets that
     /// session id.
     pub fn release_all(&self, agent: &SessionId) {
-        let _ = self.with_locked(|grants| grants.retain(|_, g| g.owner != agent.as_str()));
+        let _ = self.with_locked(|store| store.grants.retain(|_, g| g.owner != agent.as_str()));
     }
 
     /// Drop every grant, whoever holds it. Runs at app start and when the kill
@@ -166,7 +197,7 @@ impl GrantTable {
     /// and is recreated by the next write.
     #[must_use = "a store that could not be cleared still grants what it held"]
     pub fn clear(&self) -> bool {
-        if self.with_locked(|grants| grants.clear()).is_ok() {
+        if self.with_locked(|store| *store = Store::default()).is_ok() {
             return true;
         }
         match std::fs::remove_file(&self.path) {
@@ -183,8 +214,9 @@ impl GrantTable {
     /// machine. `owner` is the raw stored id: another process may have written
     /// it, so it is data rather than a value this process minted.
     pub fn all(&self) -> Vec<(u32, String)> {
-        self.with_locked(|grants| {
-            let mut rows: Vec<(u32, String)> = grants
+        self.with_locked(|store| {
+            let mut rows: Vec<(u32, String)> = store
+                .grants
                 .iter()
                 .map(|(pid, grant)| (*pid, grant.owner.clone()))
                 .collect();
@@ -194,10 +226,46 @@ impl GrantTable {
         .unwrap_or_default()
     }
 
+    /// Record that this session's current turn was started from a paired phone.
+    ///
+    /// # Why the phone is refused rather than asked
+    ///
+    /// A remote prompt is opaque text on a channel gated only by the device's
+    /// write tier. "Click Delete and confirm" is indistinguishable from any
+    /// other instruction, so the tier cannot help, and the worktree-provenance
+    /// rule would happily wave the call through for a binary the agent built
+    /// itself. What is actually missing is the person: screen control assumes
+    /// the user can see the screen being driven and can answer a card that
+    /// appears on the desktop. From a phone they can do neither.
+    ///
+    /// So this is a turn-scoped fact rather than a device permission, and it
+    /// lives in the shared store because the process that enforces it is the
+    /// per-tool-call hook, not this one.
+    pub fn begin_remote_turn(&self, agent: &SessionId) {
+        let _ = self.with_locked(|store| store.remote_turns.insert(agent.as_str().to_string()));
+    }
+
+    /// The turn finished, so the next one is judged on its own origin.
+    ///
+    /// Missing this call fails safe — screen control stays refused for that
+    /// session until something clears it — which is the right direction for a
+    /// signal whose absence means "a human is present".
+    pub fn end_remote_turn(&self, agent: &SessionId) {
+        let _ = self.with_locked(|store| store.remote_turns.remove(agent.as_str()));
+    }
+
+    /// Was this session's current turn started from a phone?
+    pub fn is_remote_turn(&self, agent: &SessionId) -> bool {
+        self.with_locked(|store| store.remote_turns.contains(agent.as_str()))
+            // An unreadable store cannot show that a human is at the desk.
+            .unwrap_or(true)
+    }
+
     /// Pids currently granted to an agent. For tests and for the transcript.
     pub fn granted_to(&self, agent: &SessionId) -> Vec<u32> {
-        self.with_locked(|grants| {
-            let mut pids: Vec<u32> = grants
+        self.with_locked(|store| {
+            let mut pids: Vec<u32> = store
+                .grants
                 .iter()
                 .filter(|(_, grant)| grant.owner == agent.as_str())
                 .map(|(pid, _)| *pid)
@@ -215,8 +283,8 @@ impl GrantTable {
     /// grant held on a pid that is not alive.
     #[cfg(test)]
     fn seed(&self, pid: u32, agent: &SessionId, executable: &Path) {
-        let _ = self.with_locked(|grants| {
-            grants.insert(
+        let _ = self.with_locked(|store| {
+            store.grants.insert(
                 pid,
                 Grant {
                     owner: agent.as_str().to_string(),
@@ -234,7 +302,7 @@ impl GrantTable {
     /// attached to, so concurrent holders would end up locking different inodes.
     /// The cost is that a crash mid-write can truncate the store — which reads
     /// as "no grants" and costs the user a re-approval, never a false allow.
-    fn with_locked<T>(&self, f: impl FnOnce(&mut HashMap<u32, Grant>) -> T) -> std::io::Result<T> {
+    fn with_locked<T>(&self, f: impl FnOnce(&mut Store) -> T) -> std::io::Result<T> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -260,14 +328,14 @@ impl GrantTable {
         // A corrupt store reads as empty rather than failing: this sits on the
         // path of every screen-control call, and refusing to answer would be a
         // worse failure than asking the user to approve a target again.
-        let mut grants: HashMap<u32, Grant> = serde_json::from_str(&raw).unwrap_or_default();
+        let mut store: Store = serde_json::from_str(&raw).unwrap_or_default();
 
-        let before = grants.len();
-        let outcome = f(&mut grants);
-        let changed = grants.len() != before || raw.is_empty() != grants.is_empty();
+        let before = store.shape();
+        let outcome = f(&mut store);
+        let changed = store.shape() != before || raw.is_empty() != store.is_empty();
 
         if changed || !raw.is_empty() {
-            let payload = serde_json::to_string(&grants).map_err(std::io::Error::other)?;
+            let payload = serde_json::to_string(&store).map_err(std::io::Error::other)?;
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
             file.write_all(payload.as_bytes())?;
@@ -559,6 +627,60 @@ mod tests {
         );
         // And the store recovers: the next write recreates it.
         assert_eq!(table.grant(live_pid(), &agent("a")), Verdict::Granted);
+    }
+
+    #[test]
+    fn a_remote_turn_is_visible_to_the_other_process() {
+        // The property that makes this work at all: the process that enforces
+        // is the per-tool-call hook, which learns everything from this file.
+        let (dir, app) = table();
+        let hook = GrantTable::in_data_dir(dir.path());
+        let a = agent("a");
+
+        assert!(!hook.is_remote_turn(&a));
+        app.begin_remote_turn(&a);
+        assert!(hook.is_remote_turn(&a));
+        app.end_remote_turn(&a);
+        assert!(!hook.is_remote_turn(&a));
+    }
+
+    #[test]
+    fn an_unreadable_store_reports_a_remote_turn() {
+        // The opposite direction from every other read here, and deliberately.
+        // Elsewhere an unreadable store costs a re-approval; here it would
+        // cost the assumption that someone is watching the screen. A missing
+        // answer must not read as "a human is present".
+        let dir = tempfile::tempdir().expect("tempdir");
+        let unreadable = dir.path().join("no-such-dir").join("nested").join("x.json");
+        std::fs::write(dir.path().join("no-such-dir"), b"a file, not a directory")
+            .expect("block the parent path");
+        assert!(GrantTable::at(&unreadable).is_remote_turn(&agent("a")));
+    }
+
+    #[test]
+    fn remote_turns_do_not_survive_the_startup_clear() {
+        // Same reasoning as the grants beside them: a marker left by a crash
+        // would refuse screen control in a fresh run with no way to see why.
+        let (_dir, table) = table();
+        let a = agent("a");
+        table.begin_remote_turn(&a);
+        assert!(table.clear());
+        assert!(!table.is_remote_turn(&a));
+    }
+
+    #[test]
+    fn a_remote_turn_and_a_grant_share_the_file_without_clobbering() {
+        let (_dir, table) = table();
+        let a = agent("a");
+        table.grant(live_pid(), &a);
+        table.begin_remote_turn(&a);
+
+        assert_eq!(table.granted_to(&a), vec![live_pid()]);
+        assert!(table.is_remote_turn(&a));
+
+        // And ending the turn leaves the grant alone.
+        table.end_remote_turn(&a);
+        assert_eq!(table.granted_to(&a), vec![live_pid()]);
     }
 
     #[test]

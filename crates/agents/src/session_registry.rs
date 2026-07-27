@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc;
+use oximux_computer_use::redact::{scrub_transcript, ScreenshotFilter};
 use tokio::sync::{broadcast, watch};
 
 use crate::thread::{
@@ -191,6 +192,15 @@ pub struct SessionHandle {
     /// (title/model or the awaiting-permission flag) so a session-list subscriber
     /// re-snapshots. Coalescing, so a burst wakes the subscriber once.
     changed: watch::Sender<u64>,
+    /// Drops screen captures from events on their way into the backlog.
+    ///
+    /// Placed here rather than in the remote host because everything a paired
+    /// phone can see comes out of this handle — the backlog, the live fan-out,
+    /// and the transcript snapshot — while the desktop renders from its own
+    /// thread and never reads any of them. Redacting at the door means no
+    /// refactor of the remote layer can reintroduce the leak: it has no way to
+    /// obtain the pixels in the first place.
+    screenshots: Mutex<ScreenshotFilter>,
 }
 
 impl SessionHandle {
@@ -206,10 +216,17 @@ impl SessionHandle {
     /// that, a producer could bump the counter, stall, and let a later producer
     /// append ahead of it — reordering the backlog `events_since` promises is
     /// ascending.
-    pub fn ingest(&self, event: ThreadEvent) -> Seq {
+    pub fn ingest(&self, mut event: ThreadEvent) -> Seq {
         // Track outstanding permission requests for the coarse status snapshot.
         if let ThreadEvent::PermissionRequested { request_id, .. } = &event {
             self.pending.lock().unwrap().insert(request_id.clone());
+        }
+
+        // Before anything retains or broadcasts it. A screen capture is a
+        // picture of whatever the user had on screen, and everything downstream
+        // of this line is read by paired phones rather than by the desktop.
+        if self.screenshots.lock().unwrap().scrub(&mut event) {
+            tracing::debug!("dropped a screen capture from an event bound for remote subscribers");
         }
 
         let seq = {
@@ -483,8 +500,18 @@ impl SessionHandle {
     /// resumes the live stream from exactly the point the snapshot already covers —
     /// no gap, no duplicate. Cheap enough for the desktop view to call whenever a
     /// settled turn lands; it is not on the per-token delta path.
+    ///
+    /// Screen captures are removed here for the same reason [`Self::ingest`]
+    /// removes them: this snapshot exists to be served to remote clients, and
+    /// the desktop renders from its own thread rather than reading it back. The
+    /// fold has already paired each tool call with its name, so no correlation
+    /// state is needed on this path.
     pub fn publish_transcript(&self, entries_json: String, model: Option<String>) {
         let seq = self.next_seq.load(Ordering::SeqCst).saturating_sub(1);
+        let (entries_json, scrubbed) = scrub_transcript(&entries_json);
+        if scrubbed > 0 {
+            tracing::debug!(scrubbed, "dropped screen captures from the published transcript");
+        }
         *self.transcript.lock().unwrap() = Some(TranscriptSnapshot { seq, entries_json, model });
     }
 
@@ -611,6 +638,7 @@ impl SessionRegistry {
             remote_prompt_tx: Mutex::new(None),
             remote_choice_tx: Mutex::new(None),
             changed: self.changed.clone(),
+            screenshots: Mutex::new(ScreenshotFilter::new()),
         });
         self.sessions.lock().unwrap().insert(id, handle.clone());
         // A newly registered session changes the list.
