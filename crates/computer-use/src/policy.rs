@@ -100,11 +100,20 @@ pub fn decide(tool_name: &str, input: &Value, ctx: &PolicyContext<'_>) -> Decisi
     // A call may carry a session id, which selects the capture policy it runs
     // under. Ours is pinned to window scope; another agent's is not ours to
     // borrow, and an id we never issued has a policy we know nothing about.
+    //
+    // The second sentence is not padding. Measured across the chats that have
+    // used this feature, **most invent an id on their first or second call** —
+    // `session` is advertised as an optional parameter, `start_session` is on
+    // the spawn-time deny list, and nothing ever tells an agent what its
+    // session is, so the model fills the field. Refusing is right; refusing
+    // without naming the remedy cost every one of them a wasted round-trip and
+    // left a failure in the transcript for something the user did not do wrong.
     if let Some(claimed) = input.get("session").and_then(Value::as_str)
         && claimed != ctx.session.as_str()
     {
         return Decision::refuse(format!(
-            "`{tool}` was addressed to screen-control session `{claimed}`, which does not belong to this chat"
+            "`{tool}` was addressed to screen-control session `{claimed}`, which does not belong to \
+             this chat. Omit the `session` field — this chat's own session is applied for you."
         ));
     }
 
@@ -121,7 +130,12 @@ pub fn decide(tool_name: &str, input: &Value, ctx: &PolicyContext<'_>) -> Decisi
 ///
 /// One reader for the field so the read path and the input path cannot come to
 /// different conclusions about who a call is aimed at.
-fn addressed_pid(input: &Value) -> Option<u32> {
+///
+/// Public for the same reason it is one function: the transcript names the app a
+/// call went to, and it has to mean the process the *policy* granted. A second
+/// reader that disagreed — about the key, about a pid that will not fit a `u32` —
+/// would put one app's name on a card that authorized another's.
+pub fn addressed_pid(input: &Value) -> Option<u32> {
     input
         .get("pid")
         .and_then(Value::as_u64)
@@ -683,6 +697,24 @@ mod tests {
         ))
         .to_string();
         assert!(reason.contains("does not belong to this chat"), "{reason}");
+    }
+
+    #[test]
+    fn the_session_refusal_tells_the_agent_what_to_do_instead() {
+        // Most agents that reach this feature invent a session id on their
+        // first or second call: `session` is an advertised optional parameter,
+        // `start_session` is denied at spawn, and nothing hands them a real
+        // one. The refusal has to close that loop or every chat pays a round
+        // trip and shows the user a failure for something that is not their
+        // mistake. Pinned because it reads like trimmable politeness.
+        let f = Fixture::new();
+        let target = Target::spawn();
+        let reason = refusal(&f.decide(
+            "get_window_state",
+            json!({ "pid": target.pid(), "session": "agent-A" }),
+        ))
+        .to_string();
+        assert!(reason.contains("Omit the `session` field"), "{reason}");
     }
 
     #[test]

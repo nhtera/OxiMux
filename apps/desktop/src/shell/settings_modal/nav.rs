@@ -51,7 +51,13 @@ impl SettingsPane {
             SettingsPane::Terminal => "Terminal",
             SettingsPane::Agents => "Agents / AI",
             SettingsPane::Voice => "Voice",
-            SettingsPane::ScreenControl => "Screen Control",
+            // "Computer use" rather than anything about screens: it is the term
+            // users arrive already knowing, the code has always spelled it that
+            // way (`oximux-computer-use`, `computer_use.toml`), and the sidebar
+            // entry directly below this one is Remote — which genuinely *is*
+            // controlling this screen from elsewhere. Two adjacent rows both
+            // named for screens would be read as two halves of one feature.
+            SettingsPane::ScreenControl => "Computer use",
             SettingsPane::Notifications => "Notifications",
             SettingsPane::Schedules => "Schedules",
             SettingsPane::Remote => "Remote",

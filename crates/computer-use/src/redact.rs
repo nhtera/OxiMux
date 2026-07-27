@@ -99,6 +99,18 @@ impl ScreenshotFilter {
 /// `ToolCall` entry carries its `name` and its `images` together, so no state is
 /// needed here.
 ///
+/// # Why this walks the tree instead of reading the array elements
+///
+/// `ThreadEntry` is an ordinary externally-tagged enum, so a tool call reaches
+/// the wire as `{"ToolCall": {"name": …, "images": […]}}` — the fields are one
+/// level down, not on the array element. A first version of this read them off
+/// the element and therefore matched nothing at all, while its unit tests passed
+/// against a flat shape written by hand. The tests below now build real
+/// [`ThreadEntry`] values for exactly that reason: the only shape worth
+/// asserting against is the one the app actually serializes.
+///
+/// [`ThreadEntry`]: oximux_agent_core::thread::ThreadEntry
+///
 /// A transcript that will not parse is returned untouched and reported as zero.
 /// That is the safe direction only because the caller's frame-budget step
 /// behaves the same way and is what actually fails loudly — see the caller.
@@ -112,22 +124,7 @@ pub fn scrub_transcript(entries_json: &str) -> (String, usize) {
 
     let mut scrubbed = 0usize;
     for entry in array.iter_mut() {
-        // The fold tags entries by kind; a tool call is the only shape that
-        // carries both a tool name and images.
-        let Some(name) = entry.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        if !crate::mcp::is_computer_use_tool(name) {
-            continue;
-        }
-        let Some(images) = entry.get_mut("images").and_then(Value::as_array_mut) else {
-            continue;
-        };
-        if images.is_empty() {
-            continue;
-        }
-        images.clear();
-        scrubbed += 1;
+        scrub_entry(entry, &mut scrubbed);
     }
 
     if scrubbed == 0 {
@@ -143,10 +140,45 @@ pub fn scrub_transcript(entries_json: &str) -> (String, usize) {
     }
 }
 
+/// Clear the images on every screen-control tool call reachable from `node`.
+///
+/// Recurses for the same reason the frame-budget pass downstream of it does: the
+/// wire shape is the desktop's entry taxonomy, and a redactor that hardcodes
+/// today's nesting stops working the day a variant moves — silently, and in the
+/// direction that leaks. What it matches on is the *pair*, a tool `name` beside
+/// an `images` array, which is a tool call wherever the fold decides to put it.
+fn scrub_entry(node: &mut Value, scrubbed: &mut usize) {
+    match node {
+        Value::Object(map) => {
+            let is_screen_call = map
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(crate::mcp::is_computer_use_tool);
+            if is_screen_call
+                && let Some(Value::Array(images)) = map.get_mut("images")
+                && !images.is_empty()
+            {
+                images.clear();
+                *scrubbed += 1;
+                return;
+            }
+            for value in map.values_mut() {
+                scrub_entry(value, scrubbed);
+            }
+        }
+        Value::Array(items) => {
+            for value in items.iter_mut() {
+                scrub_entry(value, scrubbed);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oximux_agent_core::thread::ChatImage;
+    use oximux_agent_core::thread::{ChatImage, ThreadEntry, ToolCall};
     use serde_json::json;
 
     fn image() -> ChatImage {
@@ -255,14 +287,39 @@ mod tests {
         assert_eq!(filter.screen_calls.len(), 1);
     }
 
+    /// A transcript in the shape the desktop actually publishes, built from the
+    /// real types rather than written out by hand.
+    ///
+    /// This is not fussiness. The first version of [`scrub_transcript`] read
+    /// `name` and `images` off the array element, which is where a hand-written
+    /// fixture puts them and is *not* where `ThreadEntry` puts them — the enum
+    /// is externally tagged, so they sit one level down under `"ToolCall"`. Every
+    /// test passed and the redactor matched nothing on the only input that
+    /// exists. A fixture that cannot drift from the serializer is the fix.
+    fn folded(calls: &[(&str, &[&str])]) -> String {
+        let entries: Vec<ThreadEntry> = calls
+            .iter()
+            .map(|(name, images)| {
+                let mut tc = ToolCall::new("t", *name, json!({}));
+                tc.images = images
+                    .iter()
+                    .map(|data| ChatImage {
+                        media_type: "image/png".into(),
+                        data: (*data).to_string(),
+                    })
+                    .collect();
+                ThreadEntry::ToolCall(tc)
+            })
+            .collect();
+        serde_json::to_string(&entries).expect("a folded transcript serializes")
+    }
+
     #[test]
     fn a_folded_transcript_loses_only_the_screen_captures() {
-        let transcript = json!([
-            { "name": "mcp__oximux-computer-use__screenshot", "images": [{ "media_type": "image/png", "data": "AAAA" }] },
-            { "name": "Read", "images": [{ "media_type": "image/png", "data": "BBBB" }] },
-            { "text": "an assistant message with no name at all" },
-        ])
-        .to_string();
+        let transcript = folded(&[
+            ("mcp__oximux-computer-use__get_window_state", &["AAAA"]),
+            ("Read", &["BBBB"]),
+        ]);
 
         let (scrubbed, count) = scrub_transcript(&transcript);
         assert_eq!(count, 1);
@@ -270,14 +327,48 @@ mod tests {
         assert!(scrubbed.contains("BBBB"), "the user's own image must remain");
     }
 
+    /// The regression that matters, stated on its own: the fields the redactor
+    /// reads are nested inside the variant tag, and a version that misses that
+    /// is indistinguishable from one that works until a screenshot reaches a
+    /// phone.
+    #[test]
+    fn a_capture_is_found_through_the_entry_variant_tag() {
+        let transcript = folded(&[("mcp__oximux-computer-use__zoom", &["AAAA"])]);
+        assert!(
+            transcript.contains("\"ToolCall\""),
+            "the fold is externally tagged, which is the whole point: {transcript}"
+        );
+        let (scrubbed, count) = scrub_transcript(&transcript);
+        assert_eq!(count, 1, "nested fields must still be reached");
+        assert!(!scrubbed.contains("AAAA"));
+    }
+
     #[test]
     fn a_transcript_with_nothing_to_remove_is_returned_byte_identical() {
         // The caller measures bytes against a frame budget, so re-serializing
         // would change the number it is about to check.
-        let transcript = json!([{ "name": "Bash", "images": [] }]).to_string();
+        let transcript = folded(&[("Bash", &[])]);
         let (out, count) = scrub_transcript(&transcript);
         assert_eq!(count, 0);
         assert_eq!(out, transcript);
+    }
+
+    /// An assistant message carries no tool name at all, and must survive the
+    /// walk untouched rather than tripping the name/images pair check.
+    #[test]
+    fn entries_that_are_not_tool_calls_are_left_alone() {
+        let entries = vec![
+            ThreadEntry::ContextCompaction { summary: "earlier history".into() },
+            ThreadEntry::User {
+                text: "look at this".into(),
+                images: vec![image()],
+                checkpoint: None,
+            },
+        ];
+        let transcript = serde_json::to_string(&entries).expect("serializes");
+        let (out, count) = scrub_transcript(&transcript);
+        assert_eq!(count, 0);
+        assert_eq!(out, transcript, "the user's own attachment stays");
     }
 
     #[test]

@@ -756,6 +756,26 @@ impl ChatThread {
         }
     }
 
+    /// Record *why* a tool call was refused, alongside the `Rejected` status the
+    /// caller is about to set.
+    ///
+    /// A refusal the user clicked needs no explanation — they wrote it. One
+    /// decided by policy carries a sentence the user has never seen: it goes to
+    /// the agent in the control response and, without this, nowhere else, so the
+    /// card reads as "refused" with no account of what was wrong.
+    ///
+    /// Kept on `result` rather than folded into the status so the card keeps its
+    /// refused glyph instead of reading as a tool that failed — those are
+    /// different things and the transcript should not blur them. Never
+    /// overwrites a result the backend already reported.
+    pub fn set_tool_refusal(&mut self, tool_id: &str, reason: &str) {
+        if let Some(tc) = self.tool_call_mut(tool_id)
+            && tc.result.is_none()
+        {
+            tc.result = Some(reason.to_string());
+        }
+    }
+
     /// Close a turn with its files-changed card, when it changed anything.
     ///
     /// `wire_diff` is the backend's own turn diff (Codex); it is authoritative

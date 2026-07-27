@@ -2235,6 +2235,68 @@ impl WorkspaceRoot {
         );
     }
 
+    /// Opt `project` in or out of the computer-use tools — the per-project half
+    /// of the two switches that decide whether its agents get them.
+    ///
+    /// Offered from the project's own menu rather than the settings pane
+    /// because this is where the user is looking at one specific project. The
+    /// pane lists what is on and takes things off; choosing a path out of a
+    /// global list is how the wrong repository gets enabled.
+    ///
+    /// Writes the TOML only. The settings watcher reparses and swaps the
+    /// global, and calling `set_global` here would race its debouncer — the
+    /// same contract the pane's own toggles keep.
+    pub(crate) fn set_computer_use_for_project(
+        &mut self,
+        project: &Project,
+        on: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut settings = cx
+            .try_global::<oximux_settings::ComputerUseSettings>()
+            .cloned()
+            .unwrap_or_default();
+        let root = std::path::Path::new(&project.root_path);
+
+        if on {
+            settings.enable_project(root);
+        } else if let Some(covering) = settings.covering_root(root)
+            && covering != root
+        {
+            // Enabled by an ancestor the user opted in separately. Removing
+            // this project's own path would take nothing away, so say where it
+            // actually comes from rather than appearing to have done something.
+            let covering = covering.display().to_string();
+            self.push_toast(
+                crate::shell::toast::ToastKind::Info,
+                format!("Computer use here comes from {covering} — turn it off there"),
+                cx,
+            );
+            return;
+        } else {
+            settings.disable_project(root);
+        }
+
+        if let Err(err) = crate::app_settings::computer_use_settings::save(&settings) {
+            tracing::warn!(%err, "could not write computer_use.toml");
+            self.push_toast(
+                crate::shell::toast::ToastKind::Error,
+                "Could not save the computer-use setting",
+                cx,
+            );
+            return;
+        }
+        self.push_toast(
+            crate::shell::toast::ToastKind::Success,
+            if on {
+                "Computer use on for this project"
+            } else {
+                "Computer use off for this project"
+            },
+            cx,
+        );
+    }
+
     /// Open the confirm dialog for removing a project from the
     /// cockpit. Removal is reversible (re-open the folder) and leaves
     /// every file on disk in place. On confirm: deletes

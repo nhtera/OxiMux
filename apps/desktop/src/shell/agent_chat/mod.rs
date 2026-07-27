@@ -42,6 +42,7 @@ mod question_card;
 mod remote_turn;
 mod turn_summary_card;
 mod rewind_menu;
+mod screen_card;
 mod screen_consent;
 mod session_detail;
 mod roster;
@@ -476,7 +477,10 @@ impl ThinkingLevel {
 use composer::{ComposerEvent, ComposerView, ControlVocab};
 use context_providers::{ContextRequest, ContextSource};
 use question_card::{QuestionCard, QuestionCardEvent};
-use tool_grouping::{plan_tool_grouping, summarize_tool_run, EntryDisplay, GroupSummary, GroupedTool};
+use tool_grouping::{
+    must_stay_visible, plan_tool_grouping, summarize_tool_run, EntryDisplay, GroupSummary,
+    GroupedTool,
+};
 use crate::remote_control::{RemoteBinding, RemoteControl, remote_session_id_for};
 use attention::attention_for_event;
 use computer_use::ScreenControl;
@@ -5232,20 +5236,7 @@ impl AgentChatView {
             .thread
             .entries
             .iter()
-            .map(|e| {
-                matches!(
-                    e,
-                    ThreadEntry::ToolCall(tc)
-                        if matches!(
-                            tc.status,
-                            ToolCallStatus::WaitingForConfirmation(_)
-                                | ToolCallStatus::AwaitingAnswer(_)
-                                | ToolCallStatus::Failed(_)
-                                | ToolCallStatus::Pending
-                                | ToolCallStatus::InProgress
-                        )
-                )
-            })
+            .map(|e| matches!(e, ThreadEntry::ToolCall(tc) if must_stay_visible(tc)))
             .collect();
         let group_plan = plan_tool_grouping(&is_tool, &force_show, &self.expanded_tool_runs);
 
@@ -5336,18 +5327,16 @@ impl AgentChatView {
                         self.question_cards.get(&tc.id).map(|c| c.clone().into_any_element())
                     } else if question_card::is_question(tc) {
                         // Answered/skipped question → a compact one-line summary.
-                        Some(question_card::render_settled(tc, theme, density, &typo)
-                            .into_any_element())
+                        Some(question_card::render_settled(tc, theme, density, &typo).into_any_element())
                     } else if plan_panel::is_plan(tc) {
-                        Some(plan_panel::render_plan_card(tc, theme, density, &typo)
-                            .into_any_element())
+                        Some(plan_panel::render_plan_card(tc, theme, density, &typo).into_any_element())
                     } else {
                         let expanded = self.expanded_tool_calls.contains(&tc.id);
                         let card = tool_card::render_tool_card(
                             tc,
                             expanded,
                             self.provider_label(),
-                            self.screen_prompts.get(&tc.id).cloned(),
+                            self.screen_context(tc),
                             theme,
                             density,
                             &typo,
@@ -5418,6 +5407,7 @@ impl AgentChatView {
                                 kind: ToolDetail::classify(&tc.name, tc.kind.as_deref(), &tc.input),
                                 failed: matches!(tc.status, ToolCallStatus::Failed(_)),
                                 target: bubble::tool_target(tc),
+                                screen: screen_card::is_screen_call(&tc.name),
                             }),
                             _ => None,
                         })

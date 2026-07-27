@@ -204,3 +204,54 @@ async fn add_worktree_existing_branch_errors() {
         .unwrap_err();
     assert!(matches!(err, GitError::NonZero { .. }), "got {err:?}");
 }
+
+/// The spawn path asks this on every chat, so it runs against a worktree git
+/// actually created rather than a hand-built directory — the pointer files it
+/// reads are git's, and a fixture that guessed their shape would pass while the
+/// real thing failed.
+#[tokio::test]
+async fn a_linked_worktree_resolves_back_to_its_main_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("a.txt"), "v1\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+
+    let wt_root = tempfile::tempdir().unwrap();
+    let wt_path = wt_root.path().join("oximux-wt-feat-x");
+    let repo = Repository::open(p).await.unwrap();
+    repo.add_worktree(&wt_path, "feat-x").await.unwrap();
+
+    let main = oximux_git::main_worktree_of(&wt_path).expect("a linked worktree resolves");
+    assert_eq!(main, p.canonicalize().unwrap());
+
+    // The worktree is a *sibling* of the repo, not a child — which is why
+    // containment alone cannot decide this and the lookup has to exist.
+    assert!(!wt_path.starts_with(p));
+}
+
+#[tokio::test]
+async fn a_primary_worktree_is_not_a_linked_one() {
+    // `.git` is a directory here, so the question answers itself and no
+    // capability is inherited from a repository that is already itself.
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("a.txt"), "v1\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+
+    assert_eq!(oximux_git::main_worktree_of(p), None);
+}
+
+#[tokio::test]
+async fn a_directory_that_is_not_a_repository_resolves_to_nothing() {
+    // Fails closed: an uncertain answer withholds the capability.
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(oximux_git::main_worktree_of(tmp.path()), None);
+    assert_eq!(
+        oximux_git::main_worktree_of(std::path::Path::new("/definitely/not/here")),
+        None
+    );
+}

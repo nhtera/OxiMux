@@ -60,9 +60,16 @@ impl AgentChatView {
     /// flag: clearing something already clear costs nothing, while a flag that
     /// drifted out of step would leave screen control refused for a chat with
     /// nothing on screen pointing at why.
+    ///
+    /// The same boundary ends the chat's *driving* turn. That mark is what the
+    /// menu-bar indicator and the Escape tap read, and its grant cannot end it:
+    /// a grant lasts as long as the chat, so anything waiting on the grant to
+    /// lapse would keep claiming this chat drives the screen — and keep Escape
+    /// swallowed machine-wide — until the tab was closed.
     pub(super) fn note_turn_boundary(&self, ev: &ThreadEvent) {
         if matches!(ev, ThreadEvent::TurnEnded { .. }) {
             self.screen_control.end_remote_turn();
+            self.screen_control.end_driving_turn();
         }
     }
 }

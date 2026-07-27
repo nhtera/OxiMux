@@ -91,6 +91,15 @@ fn main() {
         },
     );
 
+    // An allowed call is the moment this chat starts actually driving, as
+    // opposed to merely holding the right to. Recorded here because this hook is
+    // the only thing that sees every call: the provenance path grants without
+    // OxiMux ever showing a card, so a mark written at the card would miss the
+    // most common case entirely. Cleared at the turn boundary by the chat.
+    if matches!(decision, Decision::Allow) {
+        grants.begin_driving_turn(&session);
+    }
+
     if let Some(output) = render(&decision) {
         println!("{output}");
     }

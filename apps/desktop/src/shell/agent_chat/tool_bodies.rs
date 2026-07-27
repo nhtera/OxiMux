@@ -1,8 +1,9 @@
 //! Legible per-tool body renderers for the transcript, so common tools read
 //! like a chat instead of a raw-JSON log dump. Only Edit/Write/MultiEdit have a
 //! diff (see `diff_card`); this covers Bash/Read/Grep/Glob, Agent/Task, the web
-//! tools (WebFetch/WebSearch), and any `mcp__*` tool. Everything else falls back
-//! to the generic key:value input + result blocks in `tool_card`.
+//! tools (WebFetch/WebSearch), screen control (see `screen_card`), and any other
+//! `mcp__*` tool. Everything else falls back to the generic key:value input +
+//! result blocks in `tool_card`.
 //!
 //! Read-only and built on demand (the caller only invokes these when a card is
 //! expanded), and every output is capped by chars then rows so a chatty tool
@@ -42,6 +43,13 @@ pub(super) fn render_tool_body(
     density: Density,
     typo: &Typography,
 ) -> Option<AnyElement> {
+    // Ahead of the classifier, which would file a screen action under the
+    // generic MCP body. It is not a server-agnostic call: the transcript is the
+    // only record of what an agent did in a window the user was not watching,
+    // so the body says what was delivered and what the driver reported back.
+    if super::screen_card::is_screen_call(&tc.name) {
+        return Some(render_screen(tc, full, theme, density, typo));
+    }
     match ToolDetail::classify(&tc.name, tc.kind.as_deref(), &tc.input) {
         ToolDetail::Shell => Some(render_bash(tc, full, theme, density, typo)),
         ToolDetail::Read => Some(render_read(tc, full, theme, density, typo)),
@@ -326,6 +334,48 @@ fn render_mcp(tc: &ToolCall, full: bool, theme: Theme, density: Density, typo: &
     col.into_any_element()
 }
 
+/// A screen-control call → what was asked for, the driver's verdict in prose,
+/// then its raw reply.
+///
+/// The verdict is the part that had to be written rather than dumped. The
+/// driver answers with `{effect, verified, path, …}`, and `verified: false` on
+/// a delivered keystroke means "the accessibility layer could not read the
+/// change back", not "nothing happened" — left as a raw field it reads as a
+/// failure to the user and, worse, to the agent. The raw reply still renders
+/// underneath, so nothing is hidden by the sentence in front of it.
+fn render_screen(
+    tc: &ToolCall,
+    full: bool,
+    theme: Theme,
+    density: Density,
+    typo: &Typography,
+) -> AnyElement {
+    let mut col = div().flex().flex_col().gap(px(4.0)).w_full();
+    // Key:value rather than the MCP body's one-line JSON: these inputs are the
+    // record of what was aimed where, and `pid` matters as much as `text`.
+    if matches!(&tc.input, Value::Object(map) if !map.is_empty()) {
+        col = col.child(render_generic_input(tc, full, theme, density, typo));
+    }
+    if let Some(verdict) = super::screen_card::outcome(tc) {
+        col = col.child(caption(verdict, theme, typo));
+    }
+    if let Some(out) = tc.result.as_deref().filter(|s| !s.trim().is_empty()) {
+        col = col.child(code_block(out, theme.fg_muted, full, theme, density, typo));
+    }
+    // A capture returns pixels rather than text, and the thumbnails render
+    // below the card — say so, or a screenshot call with a terse reply reads as
+    // though it came back empty.
+    if !tc.images.is_empty() {
+        let n = tc.images.len();
+        col = col.child(caption(
+            format!("{n} screenshot{}", if n == 1 { "" } else { "s" }),
+            theme,
+            typo,
+        ));
+    }
+    col.into_any_element()
+}
+
 /// Grep/Glob → a count header + the match/file list (`noun` = "match"/"file").
 fn render_matches(
     tc: &ToolCall,
@@ -523,6 +573,40 @@ mod tests {
         let mut acp_switch = ToolCall::new("t", "Switch mode", json!({}));
         acp_switch.kind = Some("switch_mode".into());
         assert!(render_tool_body(&acp_switch, false, theme, density, &typo).is_none());
+    }
+
+    /// A screen action must not fall through to the generic MCP body, which
+    /// renders the input as one line of JSON — including a `verified: false`
+    /// that reads as a failure when it means the opposite.
+    #[test]
+    fn a_screen_action_gets_its_own_body_rather_than_the_mcp_one() {
+        let (theme, density, typo) = (Theme::default(), Density::default(), Typography::default());
+        let mut typed = ToolCall::new(
+            "t",
+            "mcp__oximux-computer-use__type_text",
+            json!({"pid": 4321, "text": "hello"}),
+        );
+        typed.result = Some(
+            json!({"characters": 5, "delivered_chars": 5, "effect": "confirmed"}).to_string(),
+        );
+        assert!(render_tool_body(&typed, false, theme, density, &typo).is_some());
+        // A capture whose reply is terse still says the pixels arrived.
+        let mut shot = ToolCall::new(
+            "t",
+            "mcp__oximux-computer-use__get_window_state",
+            json!({"pid": 4321}),
+        );
+        shot.images = vec![oximux_agents::thread::ChatImage {
+            media_type: "image/png".into(),
+            data: "iVBORw0KGgo=".into(),
+        }];
+        assert!(render_tool_body(&shot, false, theme, density, &typo).is_some());
+        // A refused call has no result at all and must still build.
+        let refused = ToolCall::new("t", "mcp__oximux-computer-use__click", json!({}));
+        assert!(render_tool_body(&refused, false, theme, density, &typo).is_some());
+        // Another server's tools are untouched by any of this.
+        let other = ToolCall::new("t", "mcp__computer-use__left_click", json!({"coordinate": [1, 2]}));
+        assert!(render_tool_body(&other, false, theme, density, &typo).is_some());
     }
 
     #[test]

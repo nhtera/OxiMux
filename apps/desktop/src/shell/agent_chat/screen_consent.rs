@@ -41,6 +41,22 @@ pub(super) struct ScreenPrompt {
     pub category: Category,
 }
 
+/// What the transcript knows about one screen-control call's target.
+///
+/// Two different lifetimes in one place, which is why it is a struct rather
+/// than the bare prompt it replaced: the card is up only while the user is
+/// being asked, and the app's name outlives the answer — every later action
+/// against the same process reads better for it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct ScreenContext {
+    /// Present only while this call is waiting on the user.
+    pub prompt: Option<ScreenPrompt>,
+    /// What the target process is called, when this chat has resolved it. See
+    /// [`screen_card`](super::screen_card) for why it is remembered rather than
+    /// looked up at render time.
+    pub app: Option<String>,
+}
+
 impl ScreenPrompt {
     pub(super) fn from_target(target: &TargetApp) -> Self {
         Self {
@@ -186,7 +202,17 @@ impl AgentChatView {
         tool_id: String,
         cx: &mut Context<Self>,
     ) {
-        let decision = match self.screen_control.decide(&tool_name, &input) {
+        let verdict = self.screen_control.decide(&tool_name, &input);
+        if matches!(verdict, Decision::NotApplicable) {
+            return;
+        }
+        // This is a screen-control call, so whatever process it names is a
+        // target this chat is driving. Name it now, while the pid still means
+        // what it meant when the call was made — refused and allowed calls
+        // alike, since a refusal the user has to read is exactly where "which
+        // app was that" matters most.
+        self.note_screen_target(&input);
+        let decision = match verdict {
             Decision::NotApplicable => return,
             Decision::Ask { pid } => {
                 if self.prepare_screen_card(&tool_id, pid, cx) {
@@ -198,9 +224,45 @@ impl AgentChatView {
                 PermissionDecision::Allow { updated_input: input }
             }
             Decision::Allow => PermissionDecision::Allow { updated_input: input },
-            Decision::Refuse { reason } => PermissionDecision::Deny { message: reason },
+            Decision::Refuse { reason } => {
+                // The sentence is on its way to the agent as the denial message.
+                // Keep a copy on the card, or the user watching this happen sees
+                // an action refuse itself and is told nothing about why.
+                self.thread.set_tool_refusal(&tool_id, &reason);
+                PermissionDecision::Deny { message: reason }
+            }
         };
         self.resolve_permission(tool_id, request_id, decision, cx);
+    }
+
+    /// Remember what the process a screen call names is called.
+    ///
+    /// The cheap path — a `proc_pidpath` and some string work, no `codesign`
+    /// spawn — because this runs for every screen-control call rather than only
+    /// the ones a human is about to read. A pid already known is left alone; see
+    /// [`ScreenControl::remember_app`](super::computer_use::ScreenControl::remember_app)
+    /// for why the first answer is the one that stands.
+    fn note_screen_target(&mut self, input: &serde_json::Value) {
+        let Some(pid) = oximux_computer_use::policy::addressed_pid(input) else {
+            return;
+        };
+        if self.screen_control.app_named(pid).is_some() {
+            return;
+        }
+        if let Some(name) = oximux_computer_use::target::name_of_pid(pid) {
+            self.screen_control.remember_app(pid, name);
+        }
+    }
+
+    /// What the card for `tc` should know about its target.
+    ///
+    /// Reads the pid through the policy's own accessor, so the name on the card
+    /// always belongs to the process the policy actually decided about.
+    pub(super) fn screen_context(&self, tc: &oximux_agents::thread::ToolCall) -> ScreenContext {
+        let app = oximux_computer_use::policy::addressed_pid(&tc.input)
+            .and_then(|pid| self.screen_control.app_named(pid))
+            .map(str::to_string);
+        ScreenContext { prompt: self.screen_prompts.get(&tc.id).cloned(), app }
     }
 
     /// Work out who an `Ask` is about. Returns whether the card should stay up.

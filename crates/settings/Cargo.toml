@@ -12,3 +12,8 @@ gpui = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+# Only to give the project-coverage tests a real directory to canonicalize —
+# the symlink case cannot be exercised against paths that do not exist.
+tempfile = { workspace = true }

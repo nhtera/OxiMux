@@ -72,20 +72,27 @@ pub(super) fn render(
             entries(modal, theme, density, typography, cx),
         ));
 
-    let projects = project_rows(modal, theme, density, typography, cx);
-    if !projects.is_empty() {
-        body = body
-            .child(section_title(
-                "Projects",
-                // Deliberately "get the tools" rather than "may drive apps":
-                // the list decides who is handed the screen-control tools, not
-                // who can reach the screen. See `footnotes`.
-                "These projects get the screen-control tools. Turn one on from its own window.",
-                theme,
-                typography,
-            ))
-            .child(entries_card(theme, density, typography, projects));
-    }
+    body = body
+        .child(section_title(
+            "Projects",
+            // Deliberately "get the tools" rather than "may drive apps": the
+            // list decides who is handed the computer-use tools, not who can
+            // reach the screen. See `footnotes`.
+            //
+            // The section renders even when empty. Hidden, it left a user who
+            // had just turned the master switch on with nothing on screen
+            // saying where the per-project half lives — and that half is not
+            // optional, so the feature looked broken rather than unfinished.
+            PROJECTS_BLURB,
+            theme,
+            typography,
+        ))
+        .child(entries_card(
+            theme,
+            density,
+            typography,
+            project_rows(modal, theme, density, typography, cx),
+        ));
 
     let apps = app_rows(modal, theme, density, typography, cx);
     body = body
@@ -148,7 +155,7 @@ pub(super) fn entries(
 ) -> Vec<SettingEntry> {
     vec![
         entry(
-            "Enable screen control",
+            "Enable computer use",
             // No longer "each project opts in separately" — true of the toggle,
             // but it read as a promise that the capability stays inside the
             // project, which the Accessibility grant does not honour.
@@ -166,7 +173,7 @@ pub(super) fn entries(
         ),
         entry(
             "Driver",
-            "Screen control runs through a separate signed helper the user installs.",
+            "Computer use runs through a separate signed helper the user installs.",
             driver_control(modal, theme, density, typography, cx),
         ),
     ]
@@ -215,12 +222,21 @@ fn driver_control(
         .into_any_element()
 }
 
-/// One row per opted-in project, each with a way out.
+/// Where the per-project opt-in actually is.
+///
+/// Names the control rather than gesturing at it ("from its own window" sent
+/// the reader looking for something that did not exist). One sentence, because
+/// settings prose does not wrap here.
+const PROJECTS_BLURB: &str =
+    "These projects get the computer-use tools. Add one from its ••• menu in the sidebar.";
+
+/// One row per opted-in project, each with a way out. Empty renders a single
+/// explanatory row rather than nothing, so the section never looks broken.
 ///
 /// There is deliberately no "add project" affordance here: a project is opted
-/// in from its own window, where the user can see which project they are
-/// enabling. Picking a path out of a list in a global settings pane is how the
-/// wrong repository gets enabled.
+/// in from its own menu in the sidebar, where the user can see which project
+/// they are enabling. Picking a path out of a list in a global settings pane is
+/// how the wrong repository gets enabled.
 fn project_rows(
     modal: &SettingsModal,
     theme: Theme,
@@ -228,6 +244,19 @@ fn project_rows(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> Vec<SettingEntry> {
+    if modal.computer_use.projects.is_empty() {
+        return vec![entry(
+            "No projects yet",
+            if modal.computer_use.enabled {
+                "Right-click a project in the sidebar, or use its ••• menu, to turn it on."
+            } else {
+                // The per-project control is not offered while the master
+                // switch is off, so pointing at it here would be a dead end.
+                "Turn computer use on above first, then enable it per project."
+            },
+            div(),
+        )];
+    }
     modal
         .computer_use
         .projects
@@ -330,6 +359,26 @@ mod tests {
         for note in FOOTNOTES {
             assert!(note.len() <= 90, "{note:?} will clip ({} chars)", note.len());
         }
+    }
+
+    /// The blurb has to name a control that exists.
+    ///
+    /// It once read "Turn one on from its own window", which described nothing:
+    /// there was no per-project affordance anywhere, `enable_project` had no
+    /// caller, and the only way into this list was hand-editing the TOML. The
+    /// sentence is the contract with that menu row — if the row moves, this
+    /// fails rather than quietly pointing at nothing again.
+    #[test]
+    fn the_projects_blurb_names_where_the_opt_in_lives() {
+        assert!(PROJECTS_BLURB.contains("menu"), "{PROJECTS_BLURB:?}");
+        assert!(PROJECTS_BLURB.contains("sidebar"), "{PROJECTS_BLURB:?}");
+        // Same clipping limit as the footnotes: prose does not wrap in this
+        // pane, so a long line is simply not read.
+        assert!(
+            PROJECTS_BLURB.chars().count() <= 90,
+            "will clip ({} chars)",
+            PROJECTS_BLURB.chars().count()
+        );
     }
 
     #[test]

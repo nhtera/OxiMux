@@ -30,14 +30,28 @@ const ANCHOR_Y_OFFSET: f32 = 4.0;
 pub enum ProjectRowAction {
     RevealInFinder,
     CopyPath,
+    /// Opt this project in or out of the computer-use tools.
+    ///
+    /// Lives here rather than in the settings pane deliberately: this is the
+    /// one place the user is looking at a specific project and can see which
+    /// one they are enabling. Picking a path out of a list in a global pane is
+    /// how the wrong repository gets enabled.
+    ToggleComputerUse,
     Remove,
 }
 
 impl ProjectRowAction {
-    fn label(self) -> &'static str {
+    /// The row's text, given whether this project already has computer use.
+    ///
+    /// Takes the state rather than reading it: the menu is rendered from a
+    /// snapshot taken when it opened, and a label that re-read global settings
+    /// mid-render could disagree with the action the click dispatches.
+    fn label(self, computer_use_on: bool) -> &'static str {
         match self {
             Self::RevealInFinder => "Reveal in Finder",
             Self::CopyPath => "Copy Path",
+            Self::ToggleComputerUse if computer_use_on => "Turn off computer use",
+            Self::ToggleComputerUse => "Turn on computer use",
             Self::Remove => "Remove Project",
         }
     }
@@ -52,6 +66,7 @@ impl ProjectRowAction {
 const ACTIONS: &[ProjectRowAction] = &[
     ProjectRowAction::RevealInFinder,
     ProjectRowAction::CopyPath,
+    ProjectRowAction::ToggleComputerUse,
     ProjectRowAction::Remove,
 ];
 
@@ -59,6 +74,15 @@ pub struct ProjectRowMenu {
     /// `None` when closed; `Some` carries the target project and the
     /// screen-pixel anchor point for the popover.
     open_for: Option<(Project, f32, f32)>,
+    /// This project's computer-use state, read once when the menu opened.
+    ///
+    /// `None` means the master switch is off, and the row is left out entirely
+    /// rather than shown doing nothing: the per-project opt-in is one of two
+    /// switches, so recording it while the other is off would leave the user
+    /// looking at a menu item they had just used and a project that still got
+    /// no tools. The master switch lives in Settings, which is where the
+    /// feature is discovered in the first place.
+    computer_use: Option<bool>,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
@@ -79,6 +103,7 @@ impl ProjectRowMenu {
     ) -> Self {
         Self {
             open_for: None,
+            computer_use: None,
             weak_root,
             theme,
             density,
@@ -88,6 +113,7 @@ impl ProjectRowMenu {
 
     /// Open the menu anchored at (x, y) for the given project.
     pub fn open(&mut self, project: Project, x: f32, y: f32, cx: &mut Context<Self>) {
+        self.computer_use = computer_use_state(&project, cx);
         self.open_for = Some((project, x, y + ANCHOR_Y_OFFSET));
         cx.notify();
     }
@@ -101,12 +127,28 @@ impl ProjectRowMenu {
         let Some((project, ..)) = self.open_for.clone() else {
             return;
         };
+        let on = self.computer_use.unwrap_or(false);
         let _ = self.weak_root.update(cx, |root, cx| match action {
             ProjectRowAction::RevealInFinder => root.reveal_project_in_finder(&project),
             ProjectRowAction::CopyPath => root.copy_project_path(&project, cx),
+            ProjectRowAction::ToggleComputerUse => {
+                root.set_computer_use_for_project(&project, !on, cx)
+            }
             ProjectRowAction::Remove => root.request_remove_project(project, window, cx),
         });
     }
+}
+
+/// Whether `project` has computer use, or `None` when the master switch is off.
+///
+/// Read at open time rather than per repaint: the answer involves resolving
+/// paths, and a menu whose label changed under the cursor would dispatch
+/// something other than what the user read.
+fn computer_use_state(project: &Project, cx: &gpui::App) -> Option<bool> {
+    let settings = cx.try_global::<oximux_settings::ComputerUseSettings>()?;
+    settings
+        .enabled
+        .then(|| settings.is_enabled_for(std::path::Path::new(&project.root_path)))
 }
 
 impl Render for ProjectRowMenu {
@@ -128,7 +170,12 @@ impl Render for ProjectRowMenu {
             .rounded(px(density.r_card))
             .shadow_lg();
 
-        for (ix, &action) in ACTIONS.iter().enumerate() {
+        let computer_use = self.computer_use;
+        let shown = ACTIONS
+            .iter()
+            .filter(|a| computer_use.is_some() || **a != ProjectRowAction::ToggleComputerUse);
+
+        for (ix, &action) in shown.enumerate() {
             // Hairline divider above the destructive action so it reads as
             // a separate group and isn't hit by reflex.
             if action.is_destructive() && ix > 0 {
@@ -157,7 +204,7 @@ impl Render for ProjectRowMenu {
                 .hover(|s| s.bg(theme.hover_overlay))
                 .text_size(px(typography.t_body_md))
                 .text_color(fg)
-                .child(action.label())
+                .child(action.label(computer_use.unwrap_or(false)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -203,9 +250,67 @@ mod tests {
 
     #[test]
     fn labels_are_human_readable() {
-        assert_eq!(ProjectRowAction::RevealInFinder.label(), "Reveal in Finder");
-        assert_eq!(ProjectRowAction::CopyPath.label(), "Copy Path");
-        assert_eq!(ProjectRowAction::Remove.label(), "Remove Project");
+        assert_eq!(
+            ProjectRowAction::RevealInFinder.label(false),
+            "Reveal in Finder"
+        );
+        assert_eq!(ProjectRowAction::CopyPath.label(false), "Copy Path");
+        assert_eq!(ProjectRowAction::Remove.label(false), "Remove Project");
+    }
+
+    #[test]
+    fn the_computer_use_row_says_which_way_it_will_go() {
+        // The label has to name the *result* of clicking, not the state: a row
+        // reading "Computer use" beside a project already using it tells the
+        // user nothing about what the click does.
+        assert_eq!(
+            ProjectRowAction::ToggleComputerUse.label(false),
+            "Turn on computer use"
+        );
+        assert_eq!(
+            ProjectRowAction::ToggleComputerUse.label(true),
+            "Turn off computer use"
+        );
+    }
+
+    /// The rendered rows, for a given master-switch state. Mirrors `render`'s
+    /// filter so the omission is asserted rather than inspected by eye.
+    fn shown(computer_use: Option<bool>) -> Vec<ProjectRowAction> {
+        ACTIONS
+            .iter()
+            .copied()
+            .filter(|a| computer_use.is_some() || *a != ProjectRowAction::ToggleComputerUse)
+            .collect()
+    }
+
+    #[test]
+    fn the_computer_use_row_is_absent_while_the_master_switch_is_off() {
+        // Showing it would record a per-project opt-in that changes nothing,
+        // because both switches are required — a control that appears to work
+        // and does not, which is the failure this row exists to end.
+        assert!(!shown(None).contains(&ProjectRowAction::ToggleComputerUse));
+        assert!(shown(Some(false)).contains(&ProjectRowAction::ToggleComputerUse));
+        assert!(shown(Some(true)).contains(&ProjectRowAction::ToggleComputerUse));
+    }
+
+    #[test]
+    fn hiding_the_computer_use_row_leaves_the_others_in_order() {
+        assert_eq!(
+            shown(None),
+            vec![
+                ProjectRowAction::RevealInFinder,
+                ProjectRowAction::CopyPath,
+                ProjectRowAction::Remove,
+            ]
+        );
+    }
+
+    #[test]
+    fn only_remove_is_destructive_among_the_new_rows() {
+        // Turning a capability off is not destructive — nothing is lost and the
+        // same menu turns it back on. Marking it so would put it below the
+        // divider, reading as a sibling of "Remove Project".
+        assert!(!ProjectRowAction::ToggleComputerUse.is_destructive());
     }
 
     #[test]

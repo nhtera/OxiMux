@@ -1,18 +1,48 @@
 //! Turn-grouping for the transcript: long runs of consecutive tool cards
 //! collapse to a head + "N more" expander + tail, so a tool-heavy turn doesn't
-//! flood the view. Pure and unit-testable — it decides per-entry visibility
-//! from three parallel bool/index inputs and knows nothing about rendering, and
-//! summarizes what a collapsed run did ([`summarize_tool_run`]) so the expander
-//! reads as work ("Edited 3 files · ran 2 commands") rather than a bare count.
+//! flood the view. Pure and unit-testable — [`plan_tool_grouping`] decides
+//! per-entry visibility from three parallel bool/index inputs and knows nothing
+//! about rendering, and [`summarize_tool_run`] says what a collapsed run did so
+//! the expander reads as work ("Edited 3 files · ran 2 commands") rather than a
+//! bare count.
+//!
+//! [`must_stay_visible`] is the exception that reads a `ToolCall` directly, and
+//! it lives here rather than at the call site because *which cards a collapse
+//! may hide* is the same decision as the collapse itself — a rule kept next to
+//! the fold it constrains, where it can be tested.
 
 use std::collections::HashSet;
 
-use oximux_agents::thread::ToolDetail;
+use oximux_agents::thread::{ToolCall, ToolCallStatus, ToolDetail};
 
 /// Runs of >8 consecutive tool cards collapse to first-3 + "N more" + last-2.
 const TOOL_RUN_COLLAPSE_THRESHOLD: usize = 8;
 const TOOL_RUN_HEAD: usize = 3;
 const TOOL_RUN_TAIL: usize = 2;
+
+/// Must this card stay visible even inside a collapsed run?
+///
+/// Anything still in flight or waiting on the user, plus anything that did not
+/// run and has something to say about why.
+///
+/// The second half is the part worth stating. A refusal decided by policy rather
+/// than clicked by the user carries a sentence they have not read yet, and it
+/// settles as `Rejected` — whose status, unlike `Failed`, holds no message. Left
+/// out of this list, a screen-control refusal would vanish behind "30 screen
+/// actions", which is exactly the failure the collapse is not allowed to cause.
+/// A `Rejected` the user clicked carries no result and may collapse: they made
+/// that decision and do not need it read back to them.
+pub(super) fn must_stay_visible(tc: &ToolCall) -> bool {
+    match &tc.status {
+        ToolCallStatus::WaitingForConfirmation(_)
+        | ToolCallStatus::AwaitingAnswer(_)
+        | ToolCallStatus::Failed(_)
+        | ToolCallStatus::Pending
+        | ToolCallStatus::InProgress => true,
+        ToolCallStatus::Rejected => tc.result.is_some(),
+        ToolCallStatus::Completed | ToolCallStatus::Canceled => false,
+    }
+}
 
 /// Per-entry render decision for the turn-grouping pass.
 #[derive(Debug, PartialEq)]
@@ -89,6 +119,11 @@ pub(super) struct GroupedTool {
     /// The card's target (a file path for the edit family). Only used to count
     /// DISTINCT files — three edits to one file are one file edited.
     pub target: Option<String>,
+    /// A screen-control call. Carried separately from `kind` because
+    /// [`ToolDetail`] is provider-agnostic and this is one specific server; a
+    /// variant there would push a detail of OxiMux's own plumbing into the
+    /// vocabulary every backend shares.
+    pub screen: bool,
 }
 
 /// What a collapsed run of tool cards did.
@@ -112,12 +147,19 @@ enum Verb {
     Search,
     Lookup,
     Agent,
+    Screen,
     Other,
 }
 
 impl Verb {
-    fn of(kind: ToolDetail) -> Verb {
-        match kind {
+    fn of(tool: &GroupedTool) -> Verb {
+        // Ahead of the archetype: a screen action classifies as a generic MCP
+        // call, and "30 tool calls" is exactly the summary that makes a
+        // collapsed run of screen control unreadable.
+        if tool.screen {
+            return Verb::Screen;
+        }
+        match tool.kind {
             ToolDetail::Edit | ToolDetail::Write => Verb::Edit,
             ToolDetail::Shell => Verb::Run,
             ToolDetail::Read => Verb::Read,
@@ -142,6 +184,7 @@ impl Verb {
             Verb::Search => format!("{n} {}", plural("search")),
             Verb::Lookup => format!("{n} {}", plural("lookup")),
             Verb::Agent => format!("{n} {}", plural("agent")),
+            Verb::Screen => format!("{n} computer-use {}", plural("action")),
             Verb::Other => format!("{n} tool {}", plural("call")),
         }
     }
@@ -155,10 +198,19 @@ impl Verb {
 /// noun already means. Ties break by verb order (stable across renders).
 pub(super) fn summarize_tool_run(tools: &[GroupedTool]) -> GroupSummary {
     let failed = tools.iter().filter(|t| t.failed).count();
-    let order = [Verb::Edit, Verb::Run, Verb::Read, Verb::Search, Verb::Lookup, Verb::Agent, Verb::Other];
+    let order = [
+        Verb::Edit,
+        Verb::Run,
+        Verb::Read,
+        Verb::Search,
+        Verb::Lookup,
+        Verb::Agent,
+        Verb::Screen,
+        Verb::Other,
+    ];
     let mut counts: Vec<(Verb, usize)> = Vec::new();
     for verb in order {
-        let group = tools.iter().filter(|t| Verb::of(t.kind) == verb);
+        let group = tools.iter().filter(|t| Verb::of(t) == verb);
         let n = if verb == Verb::Edit {
             let mut paths: Vec<&str> = group
                 .filter_map(|t| t.target.as_deref())
@@ -168,7 +220,7 @@ pub(super) fn summarize_tool_run(tools: &[GroupedTool]) -> GroupSummary {
             // An edit card with no target still edited something — count it, or a
             // run of untargeted edits would vanish from its own summary.
             let untargeted =
-                tools.iter().filter(|t| Verb::of(t.kind) == verb && t.target.is_none()).count();
+                tools.iter().filter(|t| Verb::of(t) == verb && t.target.is_none()).count();
             paths.len() + untargeted
         } else {
             group.count()
@@ -201,10 +253,16 @@ pub(super) fn summarize_tool_run(tools: &[GroupedTool]) -> GroupSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     /// A grouped card of `kind` targeting `target`.
     fn t(kind: ToolDetail, target: Option<&str>) -> GroupedTool {
-        GroupedTool { kind, failed: false, target: target.map(str::to_string) }
+        GroupedTool { kind, failed: false, target: target.map(str::to_string), screen: false }
+    }
+
+    /// A screen-control card, which classifies as a generic MCP call.
+    fn screen() -> GroupedTool {
+        GroupedTool { kind: ToolDetail::Mcp, failed: false, target: None, screen: true }
     }
 
     #[test]
@@ -243,6 +301,32 @@ mod tests {
         assert_eq!(summarize_tool_run(&[t(ToolDetail::SubAgent, None)]).label, "1 agent");
         assert_eq!(summarize_tool_run(&[t(ToolDetail::Fetch, None)]).label, "1 lookup");
         assert_eq!(summarize_tool_run(&[t(ToolDetail::Unknown, None)]).label, "1 tool call");
+    }
+
+    /// A screen-control run is the case the collapse exists for — an agent
+    /// clicking through a UI makes dozens of calls — and "30 tool calls" says
+    /// nothing about what the user's machine was doing while it did.
+    #[test]
+    fn a_collapsed_screen_run_says_it_was_screen_control() {
+        let run: Vec<GroupedTool> = (0..30).map(|_| screen()).collect();
+        assert_eq!(summarize_tool_run(&run).label, "30 computer-use actions");
+        assert_eq!(summarize_tool_run(&[screen()]).label, "1 computer-use action");
+    }
+
+    /// Screen actions and ordinary MCP calls both classify as
+    /// [`ToolDetail::Mcp`], so they would fall into one clause if the summary
+    /// went by archetype alone — and a run that drove the screen would be
+    /// indistinguishable from one that called a REST API.
+    #[test]
+    fn screen_actions_do_not_merge_into_the_generic_mcp_clause() {
+        let s = summarize_tool_run(&[
+            screen(),
+            screen(),
+            screen(),
+            t(ToolDetail::Mcp, None),
+            t(ToolDetail::Mcp, None),
+        ]);
+        assert_eq!(s.label, "3 computer-use actions · 2 tool calls");
     }
 
     #[test]
@@ -288,6 +372,33 @@ mod tests {
         let s = summarize_tool_run(&[]);
         assert!(s.label.is_empty(), "no cards, nothing to say");
         assert_eq!(s.failed, 0);
+    }
+
+    /// The rule the collapse is not allowed to break: a refusal the user has not
+    /// read stays on screen. A policy refusal settles as `Rejected`, which — the
+    /// trap here — carries no message in its status the way `Failed` does, so
+    /// only the recorded reason distinguishes it from a button the user clicked.
+    #[test]
+    fn a_refusal_the_user_has_not_read_never_collapses() {
+        let mut refused = ToolCall::new("t", "mcp__oximux-computer-use__click", json!({}));
+        refused.status = ToolCallStatus::Rejected;
+        refused.result = Some("`click` targeted a process another chat is driving".into());
+        assert!(must_stay_visible(&refused));
+
+        // The user's own Reject carries no reason and may collapse — they made
+        // that decision a moment ago.
+        let mut clicked = ToolCall::new("t", "Bash", json!({}));
+        clicked.status = ToolCallStatus::Rejected;
+        assert!(!must_stay_visible(&clicked));
+
+        // The rest of the taxonomy, unchanged.
+        let mut done = ToolCall::new("t", "Bash", json!({}));
+        done.status = ToolCallStatus::Completed;
+        assert!(!must_stay_visible(&done));
+        let mut failed = ToolCall::new("t", "Bash", json!({}));
+        failed.status = ToolCallStatus::Failed("boom".into());
+        assert!(must_stay_visible(&failed));
+        assert!(must_stay_visible(&ToolCall::new("t", "Bash", json!({}))), "in progress");
     }
 
     #[test]

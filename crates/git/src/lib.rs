@@ -45,4 +45,4 @@ pub use process::{GitCmd, Output, RawOutput};
 pub use remote::LeaseStatus;
 pub use repository::Repository;
 pub use status::parse_porcelain_v2;
-pub use worktree::{derive_slug, validate_slug};
+pub use worktree::{derive_slug, main_worktree_of, validate_slug};

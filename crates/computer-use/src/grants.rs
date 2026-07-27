@@ -89,16 +89,21 @@ struct Store {
     /// phone. Sorted so the file stays diffable while debugging.
     #[serde(default)]
     remote_turns: BTreeSet<String>,
+    /// Screen-control sessions whose current turn has actually driven
+    /// something, as opposed to merely holding the right to. Sorted for the
+    /// same reason as `remote_turns`.
+    #[serde(default)]
+    driving_turns: BTreeSet<String>,
 }
 
 impl Store {
     fn is_empty(&self) -> bool {
-        self.grants.is_empty() && self.remote_turns.is_empty()
+        self.grants.is_empty() && self.remote_turns.is_empty() && self.driving_turns.is_empty()
     }
 
     /// Cheap change detector for the write-back decision.
-    fn shape(&self) -> (usize, usize) {
-        (self.grants.len(), self.remote_turns.len())
+    fn shape(&self) -> (usize, usize, usize) {
+        (self.grants.len(), self.remote_turns.len(), self.driving_turns.len())
     }
 }
 
@@ -174,8 +179,16 @@ impl GrantTable {
     /// Drop every grant an agent holds. Called on agent exit and on quit — a
     /// grant outliving its agent would be inherited by whoever next gets that
     /// session id.
+    ///
+    /// The driving mark goes with them. A chat that closed mid-turn never
+    /// reaches a turn boundary, so this is the only thing that would clear it,
+    /// and leaving it set would keep the machine believing that a chat which no
+    /// longer exists is still driving.
     pub fn release_all(&self, agent: &SessionId) {
-        let _ = self.with_locked(|store| store.grants.retain(|_, g| g.owner != agent.as_str()));
+        let _ = self.with_locked(|store| {
+            store.grants.retain(|_, g| g.owner != agent.as_str());
+            store.driving_turns.remove(agent.as_str());
+        });
     }
 
     /// Drop every grant, whoever holds it. Runs at app start and when the kill
@@ -208,11 +221,15 @@ impl GrantTable {
 
     /// Every live grant, as `(pid, owner)`, sorted by pid.
     ///
-    /// The one read that is not scoped to a caller's own session, because the
-    /// question it answers is not "may I drive this?" but "is anything being
-    /// driven right now?" — which the indicator has to answer for the whole
-    /// machine. `owner` is the raw stored id: another process may have written
-    /// it, so it is data rather than a value this process minted.
+    /// Every grant on the machine, held or merely idle, as `(pid, owner)`.
+    ///
+    /// Not what the indicator or the kill switch want: a grant sits here for the
+    /// life of the chat that holds it, so this answers "what has been approved"
+    /// rather than "what is being driven". [`GrantTable::driving`] answers the
+    /// second, and is what anything user-facing should ask.
+    ///
+    /// `owner` is the raw stored id: another process may have written it, so it
+    /// is data rather than a value this process minted.
     pub fn all(&self) -> Vec<(u32, String)> {
         self.with_locked(|store| {
             let mut rows: Vec<(u32, String)> = store
@@ -259,6 +276,68 @@ impl GrantTable {
         self.with_locked(|store| store.remote_turns.contains(agent.as_str()))
             // An unreadable store cannot show that a human is at the desk.
             .unwrap_or(true)
+    }
+
+    /// Record that this session has just been allowed a screen-control call, so
+    /// its current turn is one that actually drives.
+    ///
+    /// # Why a grant is not enough on its own
+    ///
+    /// A grant lasts as long as the chat that holds it, which is the right
+    /// lifetime for consent — approving a target once should not mean answering
+    /// the same card every turn. It is the wrong lifetime for *activity*.
+    /// Anything keyed on "a grant exists" therefore claims an agent is driving
+    /// for hours after one finished, which is how the Escape tap came to swallow
+    /// every keystroke on an idle machine.
+    ///
+    /// So the two questions are stored separately: the grant answers "may this
+    /// chat drive that pid", and this answers "is it doing so right now".
+    /// [`GrantTable::driving`] is the only thing that needs both.
+    ///
+    /// Idempotent, because it is written on every allowed call rather than only
+    /// the first — the hook that writes it is a fresh process each time and has
+    /// no memory of whether it already did.
+    pub fn begin_driving_turn(&self, agent: &SessionId) {
+        let _ = self.with_locked(|store| store.driving_turns.insert(agent.as_str().to_string()));
+    }
+
+    /// The turn finished, so nothing is being driven under it any more.
+    ///
+    /// Missing this call fails *unsafe* in a small way — the machine keeps
+    /// believing an agent is driving, which costs the user their Escape key
+    /// until the chat closes. That is the failure this whole split exists to
+    /// prevent, so it is cleared unconditionally at every turn boundary and
+    /// again when the chat releases its grants, rather than only on the paths
+    /// that are known to have driven.
+    pub fn end_driving_turn(&self, agent: &SessionId) {
+        let _ = self.with_locked(|store| store.driving_turns.remove(agent.as_str()));
+    }
+
+    /// Grants belonging to a session that is driving *right now*, as
+    /// `(pid, owner)`.
+    ///
+    /// Both halves are read under one lock: asking for the grants and the live
+    /// turns separately would let a turn end between the two reads and report a
+    /// pid as driven by a session that had already stopped.
+    ///
+    /// This is the one read not scoped to a caller's own session, because the
+    /// question it answers is not "may I drive this?" but "is anything being
+    /// driven right now?" — which the indicator and the kill switch have to
+    /// answer for the whole machine. `owner` is the raw stored id: another
+    /// process may have written it, so it is data rather than a value this
+    /// process minted.
+    pub fn driving(&self) -> Vec<(u32, String)> {
+        self.with_locked(|store| {
+            let mut rows: Vec<(u32, String)> = store
+                .grants
+                .iter()
+                .filter(|(_, grant)| store.driving_turns.contains(&grant.owner))
+                .map(|(pid, grant)| (*pid, grant.owner.clone()))
+                .collect();
+            rows.sort_unstable();
+            rows
+        })
+        .unwrap_or_default()
     }
 
     /// Pids currently granted to an agent. For tests and for the transcript.
@@ -657,6 +736,75 @@ mod tests {
         assert!(hook.is_remote_turn(&a));
         app.end_remote_turn(&a);
         assert!(!hook.is_remote_turn(&a));
+    }
+
+    #[test]
+    fn a_driving_turn_crosses_the_process_boundary_the_same_way() {
+        // Written by the hook on an allowed call, read by the app to decide
+        // whether to arm the kill switch. Neither can see the other's memory.
+        let (dir, app) = table();
+        let hook = GrantTable::in_data_dir(dir.path());
+        let a = agent("a");
+        hook.grant(live_pid(), &a);
+
+        assert!(app.driving().is_empty());
+        hook.begin_driving_turn(&a);
+        assert_eq!(app.driving(), vec![(live_pid(), a.as_str().to_string())]);
+        app.end_driving_turn(&a);
+        assert!(app.driving().is_empty());
+    }
+
+    #[test]
+    fn a_driving_turn_without_a_grant_drives_nothing() {
+        // A read needs no grant, so a turn can be marked while nothing is
+        // actually driveable. Both halves are required before anything claims
+        // the screen is being controlled.
+        let (_dir, table) = table();
+        let a = agent("a");
+        table.begin_driving_turn(&a);
+        assert!(table.driving().is_empty());
+    }
+
+    #[test]
+    fn releasing_an_agent_also_stops_it_driving() {
+        // A chat closed mid-turn never reaches a turn boundary, so this is the
+        // only thing that clears its mark.
+        let (_dir, table) = table();
+        let a = agent("a");
+        table.grant(live_pid(), &a);
+        table.begin_driving_turn(&a);
+        assert!(!table.driving().is_empty());
+
+        table.release_all(&a);
+        assert!(table.driving().is_empty());
+        assert!(table.all().is_empty());
+    }
+
+    #[test]
+    fn driving_turns_do_not_survive_the_startup_clear() {
+        // Same reasoning as the grants themselves: chat ids restart at 1, so a
+        // mark that outlived a crash would be addressed to the next run's first
+        // chat and arm the kill switch for a turn nobody started.
+        let (_dir, table) = table();
+        let a = agent("a");
+        table.grant(live_pid(), &a);
+        table.begin_driving_turn(&a);
+
+        assert!(table.clear());
+        assert!(table.driving().is_empty());
+    }
+
+    #[test]
+    fn only_the_owner_of_a_grant_reports_it_as_driven() {
+        // The mark is keyed by session, so one agent's live turn must not
+        // promote another agent's idle grant into a claim.
+        let (_dir, table) = table();
+        let (a, b) = (agent("a"), agent("b"));
+        table.grant(live_pid(), &a);
+        table.begin_driving_turn(&b);
+
+        assert!(table.driving().is_empty());
+        assert_eq!(table.all(), vec![(live_pid(), a.as_str().to_string())]);
     }
 
     #[test]

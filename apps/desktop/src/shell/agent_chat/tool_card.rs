@@ -20,7 +20,8 @@ use super::AgentChatView;
 use super::bubble;
 use super::diff_card;
 use super::plan_approval_card;
-use super::screen_consent::{self, ScreenPrompt};
+use super::screen_card;
+use super::screen_consent::{self, ScreenContext, ScreenPrompt};
 use super::tool_bodies;
 
 /// Cap on the rendered tool-result body so a chatty tool can't blow up a row.
@@ -34,9 +35,10 @@ pub(super) fn render_tool_card(
     tc: &ToolCall,
     expanded: bool,
     provider: &str,
-    // Present only while a screen-control call waits on the user — it is what
-    // turns the generic Allow/Reject row into a consent card naming the app.
-    screen: Option<ScreenPrompt>,
+    // What is known about a screen-control call's target: the pending prompt
+    // that turns the generic Allow/Reject row into a consent card naming the
+    // app, and the app's name for the header of every later call to it.
+    screen: ScreenContext,
     theme: Theme,
     density: Density,
     typo: &Typography,
@@ -75,7 +77,30 @@ pub(super) fn render_tool_card(
     }
 
     let expandable = super::tool_sheet::is_sheet_expandable(tc);
-    card = card.child(header_row(tc, expanded, has_detail, expandable, theme, density, typo, cx));
+    card = card.child(header_row(
+        tc,
+        screen.app.as_deref(),
+        expanded,
+        has_detail,
+        expandable,
+        theme,
+        density,
+        typo,
+        cx,
+    ));
+
+    // A refused screen action explains itself without being expanded. The
+    // reason is already a sentence written for the user — what was missing is
+    // that a settled card shows only a ✗, so the one line saying why an agent
+    // stopped driving sat a click out of sight. Screen control only: the rest
+    // of the transcript's failure copy is the tool's own output, and hoisting
+    // that would put a stack trace in every collapsed row.
+    if !expanded
+        && screen_card::is_screen_call(&tc.name)
+        && let Some(reason) = screen_card::refusal(tc)
+    {
+        card = card.child(refusal_line(reason, theme, typo));
+    }
 
     // Live args preview: shown regardless of expand state while streaming, so the
     // card body grows during composition (a Write's content, a Bash command).
@@ -119,7 +144,7 @@ pub(super) fn render_tool_card(
             tc,
             req,
             provider,
-            screen.as_ref(),
+            screen.prompt.as_ref(),
             theme,
             density,
             typo,
@@ -162,6 +187,7 @@ pub(super) fn render_tool_card(
 #[allow(clippy::too_many_arguments)]
 fn header_row(
     tc: &ToolCall,
+    app: Option<&str>,
     expanded: bool,
     has_detail: bool,
     expandable: bool,
@@ -171,8 +197,15 @@ fn header_row(
     cx: &mut Context<AgentChatView>,
 ) -> AnyElement {
     let (glyph, glyph_color) = bubble::status_glyph(&tc.status, theme);
-    let mut label = bubble::tool_display_name(&tc.name);
-    if let Some(target) = bubble::tool_target(tc) {
+    // A screen action reads as what it did to which app; every other tool keeps
+    // the generic name+target line. The two are split because the generic
+    // target is also what search and the run summary index on, and neither of
+    // those wants an app name resolved for this chat only.
+    let (mut label, target) = match screen_card::display_name(tc) {
+        Some(label) => (label, screen_card::target(tc, app)),
+        None => (bubble::tool_display_name(&tc.name), bubble::tool_target(tc)),
+    };
+    if let Some(target) = target {
         label.push(' ');
         label.push_str(&bubble::elide(&target, 80));
     }
@@ -429,6 +462,24 @@ fn streaming_hint(theme: Theme, typo: &Typography) -> AnyElement {
         .text_size(px(typo.t_label_xs))
         .text_color(theme.fg_subtle)
         .child(SharedString::from("streaming…"))
+        .into_any_element()
+}
+
+/// Why a screen action did not run, shown on the collapsed card.
+///
+/// In the error tint and wrapped rather than elided: the refusals name a
+/// specific thing that was wrong (a target another chat holds, a scope that
+/// would have hit the user's own window), and a half-sentence would leave the
+/// user knowing only that something was blocked.
+fn refusal_line(reason: &str, theme: Theme, typo: &Typography) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .w_full()
+        .min_w_0()
+        .text_size(px(typo.t_label_xs))
+        .text_color(theme.status_error)
+        .child(SharedString::from(reason.to_string()))
         .into_any_element()
 }
 

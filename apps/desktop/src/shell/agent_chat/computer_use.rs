@@ -104,6 +104,16 @@ pub struct ScreenControl {
     provenance: Option<Provenance>,
     /// The table this chat's grants live in. Every chat in the app shares one.
     grants: Arc<GrantTable>,
+    /// What this chat has already worked out about the pids it is driving, so
+    /// the transcript can name an app instead of a number.
+    ///
+    /// A memo rather than a lookup because a pid only resolves while that
+    /// process is alive: a transcript reloaded tomorrow holds recycled pids, and
+    /// resolving one then would name the wrong app with total confidence. Filled
+    /// as calls are decided — which is when the answer is still true — and
+    /// deliberately not persisted, so a restored transcript says `process 4321`
+    /// rather than something it cannot stand behind.
+    known_apps: std::collections::HashMap<u32, String>,
 }
 
 impl ScreenControl {
@@ -121,7 +131,24 @@ impl ScreenControl {
             label,
             provenance: Provenance::new(cwd, SystemTime::now()),
             grants,
+            known_apps: std::collections::HashMap::new(),
         }
+    }
+
+    /// Note what `pid` is called, for the transcript to use later.
+    ///
+    /// First writer wins. A pid recycled mid-chat is a different program, and
+    /// the actions already recorded against it were aimed at the first one —
+    /// relabelling them retroactively would rewrite what the trail says
+    /// happened. The policy catches the recycling itself ([`Verdict::Recycled`])
+    /// and refuses the new call, so nothing is driven under the stale name.
+    pub fn remember_app(&mut self, pid: u32, name: String) {
+        self.known_apps.entry(pid).or_insert(name);
+    }
+
+    /// What this chat knows `pid` is called, or `None` if it never resolved one.
+    pub fn app_named(&self, pid: u32) -> Option<&str> {
+        self.known_apps.get(&pid).map(String::as_str)
     }
 
     #[cfg(test)]
@@ -158,13 +185,23 @@ impl ScreenControl {
     /// here rather than trusted from when the card appeared, because a card can
     /// sit open for a long time: another chat may have claimed that target in
     /// the meantime, and a cross-drive is refused however the user answers.
+    ///
+    /// A call that proceeds also marks this turn as one that drives. The hook
+    /// marks the calls it allows, but a call the *user* approves never reaches
+    /// it a second time — the hook stayed silent so this card could appear — so
+    /// without this the first click of every approved run would go unmarked.
     pub fn approve(&self, tool_name: &str, input: &Value) -> Result<(), String> {
         match self.decide(tool_name, input) {
-            Decision::NotApplicable | Decision::Allow => Ok(()),
+            Decision::NotApplicable => Ok(()),
+            Decision::Allow => {
+                self.grants.begin_driving_turn(&self.session);
+                Ok(())
+            }
             Decision::Refuse { reason } => Err(reason),
             Decision::Ask { pid: None } => Ok(()),
             Decision::Ask { pid: Some(pid) } => {
                 if self.grants.grant(pid, &self.session) == Verdict::Granted {
+                    self.grants.begin_driving_turn(&self.session);
                     Ok(())
                 } else {
                     Err(format!("process {pid} is being driven by another chat"))
@@ -178,6 +215,17 @@ impl ScreenControl {
     /// that target be driven with nobody having approved it.
     pub fn release(&self) {
         self.grants.release_all(&self.session);
+    }
+
+    /// This chat's turn is over, so it is no longer driving anything.
+    ///
+    /// Separate from [`Self::release`] because the two have different
+    /// lifetimes on purpose: the grant is consent and lasts as long as the chat,
+    /// while this is activity and lasts one turn. Collapsing them would either
+    /// re-ask the user for consent every turn, or leave the machine believing an
+    /// idle chat is still driving — which is what this exists to stop.
+    pub fn end_driving_turn(&self) {
+        self.grants.end_driving_turn(&self.session);
     }
 
     /// This chat's next turn was started from a paired phone.
@@ -334,12 +382,28 @@ fn plan(
     ))
 }
 
-/// Has the user turned screen control on for the project at `cwd`?
+/// Has the user turned screen control on for the project a chat in `cwd`
+/// belongs to?
 ///
 /// Absent settings read as off, which is also their default.
+///
+/// Two questions, cheapest first. The settings answer covers an opted-in root
+/// and everything beneath it, which is every chat that sits inside the project.
+/// It cannot cover a worktree: OxiMux creates those *beside* the project
+/// (`suggest_worktree_path` → `<parent>/oximux-wt-…`), so no containment rule
+/// reaches one. Resolving the worktree back to the repository that owns it is
+/// what makes "verify the build you just made" work in the isolation this
+/// feature exists for, rather than that being the one workflow it silently
+/// refuses.
+///
+/// The lookup reads two small files and only runs when the first check already
+/// said no, so an ordinary chat pays nothing for it.
 fn enabled_here(cwd: &Path, cx: &App) -> bool {
-    cx.try_global::<ComputerUseSettings>()
-        .is_some_and(|settings| settings.is_enabled_for(cwd))
+    let Some(settings) = cx.try_global::<ComputerUseSettings>() else {
+        return false;
+    };
+    settings.is_enabled_for(cwd)
+        || oximux_git::main_worktree_of(cwd).is_some_and(|main| settings.is_enabled_for(&main))
 }
 
 impl Drop for ScreenControl {
@@ -430,6 +494,53 @@ mod view_tests {
         );
     }
 
+    /// The turn ending must actually reach the driving mark.
+    ///
+    /// Unit-testing `end_driving_turn` proves the store forgets; only a real
+    /// `TurnEnded` down the ordinary event path proves anything ever calls it.
+    /// Nothing else would notice if that wiring were dropped — the feature keeps
+    /// working, and the only symptom is the user's Escape key quietly staying
+    /// swallowed after the agent has stopped.
+    #[gpui::test]
+    async fn a_turn_ending_stops_the_chat_being_reported_as_driving(cx: &mut TestAppContext) {
+        let (window, _probe) = stub_chat(cx).await;
+
+        window
+            .update(cx, |view, _window, cx| {
+                let target = std::process::Command::new("/bin/sleep")
+                    .arg("120")
+                    .spawn()
+                    .expect("spawn a target");
+                let input = json!({ "pid": target.id() });
+                view.screen_control
+                    .approve("mcp__oximux-computer-use__click", &input)
+                    .expect("an ungranted target is approvable");
+                assert!(
+                    !view.screen_control.grants.driving().is_empty(),
+                    "approving starts the driving turn"
+                );
+
+                view.on_event(
+                    ThreadEvent::TurnEnded {
+                        result: None,
+                        usage: None,
+                        is_error: false,
+                        turn_diff: None,
+                    },
+                    cx,
+                );
+                assert!(
+                    view.screen_control.grants.driving().is_empty(),
+                    "the turn ended, so nothing is being driven and Escape is the user's again"
+                );
+
+                let mut target = target;
+                let _ = target.kill();
+                let _ = target.wait();
+            })
+            .expect("window update");
+    }
+
     /// A target nobody approved leaves the card up, mid-turn, carrying the
     /// app's name.
     ///
@@ -479,6 +590,64 @@ mod view_tests {
             probe.sent().is_empty(),
             "nothing may be answered on the user's behalf"
         );
+        let _ = target.kill();
+        let _ = target.wait();
+    }
+
+    /// The transcript names the app for every later action against the same
+    /// process, including after the card that established the name is gone.
+    ///
+    /// This is what makes a settled run readable: the consent card names the app
+    /// once, and the thirty actions the user then approved would otherwise all
+    /// read `process 4321`. The name is resolved when the call is decided —
+    /// while the pid still means what it meant — and never re-derived at render
+    /// time, because a recycled pid would name the wrong app with no sign that
+    /// anything had changed.
+    #[gpui::test]
+    async fn the_app_named_on_the_card_labels_the_actions_that_follow(cx: &mut TestAppContext) {
+        let (window, _probe) = stub_chat(cx).await;
+        let mut target = std::process::Command::new("/bin/sleep")
+            .arg("120")
+            .spawn()
+            .expect("spawn a target process");
+        let pid = target.id();
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.on_event(
+                    ThreadEvent::PermissionRequested {
+                        request_id: "r1".into(),
+                        tool_use_id: Some("t1".into()),
+                        tool_name: "mcp__oximux-computer-use__click".into(),
+                        input: json!({ "pid": pid }),
+                        description: String::new(),
+                        suggestions: vec![],
+                        kind: oximux_agents::thread::PermissionKind::Screen,
+                    },
+                    cx,
+                );
+                // A second call to the same process, of the kind that arrives
+                // with no permission request at all once the target is granted.
+                let later = oximux_agents::thread::ToolCall::new(
+                    "t2",
+                    "mcp__oximux-computer-use__type_text",
+                    json!({ "pid": pid, "text": "hello" }),
+                );
+                let ctx = view.screen_context(&later);
+                assert_eq!(
+                    ctx.app.as_deref(),
+                    Some("sleep"),
+                    "a later action must inherit the name the card resolved"
+                );
+                assert!(
+                    ctx.prompt.is_none(),
+                    "and must not inherit the card itself — nothing is waiting on the user here"
+                );
+                let header = super::super::screen_card::target(&later, ctx.app.as_deref());
+                assert_eq!(header.as_deref(), Some("\"hello\" → sleep"));
+            })
+            .expect("window update");
+
         let _ = target.kill();
         let _ = target.wait();
     }
@@ -854,6 +1023,51 @@ mod tests {
     }
 
     #[test]
+    fn approving_a_target_marks_the_turn_as_one_that_drives() {
+        // The card path never reaches the hook a second time, so if the approval
+        // did not mark the turn itself, the first click of every approved run
+        // would happen with the kill switch disarmed and the menu bar silent.
+        let chat = chat();
+        let target = Target::spawn();
+        let input = json!({ "pid": target.pid() });
+
+        assert!(chat.grants.driving().is_empty());
+        assert!(chat.approve(&ns("click"), &input).is_ok());
+        assert_eq!(
+            chat.grants.driving(),
+            vec![(target.pid(), chat.session.as_str().to_string())]
+        );
+    }
+
+    #[test]
+    fn ending_the_turn_stops_the_claim_but_keeps_the_approval() {
+        // The lifetimes that must differ: consent is per chat, activity is per
+        // turn. The next turn drives the same target without a second card.
+        let chat = chat();
+        let target = Target::spawn();
+        let input = json!({ "pid": target.pid() });
+        assert!(chat.approve(&ns("click"), &input).is_ok());
+
+        chat.end_driving_turn();
+        assert!(chat.grants.driving().is_empty(), "nothing is being driven between turns");
+        assert_eq!(
+            chat.decide(&ns("click"), &input),
+            Decision::Allow,
+            "but the approval stands, so the next turn is not asked again"
+        );
+    }
+
+    #[test]
+    fn a_refused_call_never_marks_the_turn() {
+        // Otherwise a chat that only ever got refused would still take the
+        // user's Escape key for the rest of the turn.
+        let chat = chat();
+        let input = json!({ "text": "hi" }); // no pid: refused outright
+        assert!(chat.approve(&ns("type_text"), &input).is_err());
+        assert!(chat.grants.driving().is_empty());
+    }
+
+    #[test]
     fn one_chat_cannot_drive_another_chats_target() {
         // The invariant the whole feature rests on. Two chats, one process:
         // approving in A must not enable B.
@@ -871,5 +1085,121 @@ mod tests {
         // have gone up while the target was still free, and the answer arrives
         // after A claimed it. The approval path re-decides for exactly this.
         assert!(b.approve(&ns("type_text"), &input).is_err());
+    }
+}
+
+/// Which chats the project opt-in actually reaches.
+///
+/// Against a repository and worktree git created, not a hand-built pair of
+/// pointer files: the worktree case exists precisely because the layout is
+/// git's rather than ours, and a fixture that encoded our belief about it would
+/// agree with the code and disagree with the machine.
+#[cfg(test)]
+mod enablement_tests {
+    use super::*;
+
+    use gpui::TestAppContext;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git on PATH");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A committed repo plus a linked worktree beside it — the shape
+    /// `suggest_worktree_path` produces, where the worktree is a *sibling* of
+    /// the project rather than a child.
+    fn repo_with_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project).expect("mkdir");
+        git(&project, &["init", "-b", "main"]);
+        git(&project, &["config", "user.email", "t@example.com"]);
+        git(&project, &["config", "user.name", "t"]);
+        std::fs::write(project.join("a.txt"), "v1\n").expect("write");
+        git(&project, &["add", "a.txt"]);
+        git(&project, &["commit", "-m", "init"]);
+
+        let worktree = tmp.path().join("oximux-wt-feat-x");
+        git(
+            &project,
+            &["worktree", "add", worktree.to_str().expect("utf8"), "-b", "feat"],
+        );
+        (tmp, project, worktree)
+    }
+
+    fn with_settings(settings: ComputerUseSettings, cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(settings));
+    }
+
+    fn on_for(root: &Path) -> ComputerUseSettings {
+        let mut s = ComputerUseSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        s.enable_project(root);
+        s
+    }
+
+    #[gpui::test]
+    async fn an_opted_in_project_reaches_its_own_directory(cx: &mut TestAppContext) {
+        let (_tmp, project, _wt) = repo_with_worktree();
+        with_settings(on_for(&project), cx);
+        assert!(cx.update(|cx| enabled_here(&project, cx)));
+    }
+
+    #[gpui::test]
+    async fn it_reaches_a_chat_opened_on_a_subdirectory(cx: &mut TestAppContext) {
+        let (_tmp, project, _wt) = repo_with_worktree();
+        with_settings(on_for(&project), cx);
+        let sub = project.join("crates").join("thing");
+        assert!(cx.update(|cx| enabled_here(&sub, cx)));
+    }
+
+    #[gpui::test]
+    async fn it_reaches_a_worktree_of_that_project(cx: &mut TestAppContext) {
+        // The workflow this feature exists for: the agent builds in its own
+        // worktree and then drives the app it just built. The worktree is a
+        // sibling of the project, so containment alone answers no and the
+        // git-side resolution is what makes the opt-in mean what it says.
+        let (_tmp, project, worktree) = repo_with_worktree();
+        assert!(!worktree.starts_with(&project), "must be a sibling");
+        with_settings(on_for(&project), cx);
+        assert!(cx.update(|cx| enabled_here(&worktree, cx)));
+    }
+
+    #[gpui::test]
+    async fn it_does_not_reach_an_unrelated_repository(cx: &mut TestAppContext) {
+        let (_tmp, project, _wt) = repo_with_worktree();
+        let (_other_tmp, other, other_wt) = repo_with_worktree();
+        with_settings(on_for(&project), cx);
+        assert!(!cx.update(|cx| enabled_here(&other, cx)));
+        // Including that repository's worktrees, which resolve to *it*.
+        assert!(!cx.update(|cx| enabled_here(&other_wt, cx)));
+    }
+
+    #[gpui::test]
+    async fn the_master_switch_still_governs_every_one_of_those(cx: &mut TestAppContext) {
+        // Widening which directories a project covers must not widen what the
+        // project opt-in is: it is one of two switches and stays that way.
+        let (_tmp, project, worktree) = repo_with_worktree();
+        let mut settings = on_for(&project);
+        settings.enabled = false;
+        with_settings(settings, cx);
+        assert!(!cx.update(|cx| enabled_here(&project, cx)));
+        assert!(!cx.update(|cx| enabled_here(&worktree, cx)));
+    }
+
+    #[gpui::test]
+    async fn absent_settings_read_as_off(cx: &mut TestAppContext) {
+        let (_tmp, project, _wt) = repo_with_worktree();
+        assert!(!cx.update(|cx| enabled_here(&project, cx)));
     }
 }

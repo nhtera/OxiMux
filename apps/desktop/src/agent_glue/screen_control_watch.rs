@@ -139,18 +139,28 @@ pub fn install(cx: &mut App) {
 ///
 /// The tap swallows *every* Escape on the machine. Armed for the life of a chat
 /// that merely could drive — potentially hours — it would break dismissing an
-/// input method's candidate window, leaving a dialog, and vim, everywhere. Tied
-/// to a held grant instead, the user loses Escape only while an agent actually
-/// holds the right to click.
+/// input method's candidate window, leaving a dialog, and vim, everywhere.
+///
+/// # Why a held grant is not the signal
+///
+/// The obvious reading of "is an agent driving" is "does an agent hold a grant",
+/// and it is wrong by a wide margin. A grant is *consent*, and consent is
+/// answered once per chat so the user is not asked again every turn — so a chat
+/// that clicked once at breakfast still holds its grant at lunch. Keyed on that,
+/// this tap is armed for exactly the "potentially hours" the paragraph above
+/// rejects, and the menu bar spends those hours claiming apps are being driven
+/// while the machine sits idle.
+///
+/// So the tap follows a separate, turn-scoped mark: set by the hook when a call
+/// is actually allowed, cleared at the turn boundary. The user loses Escape
+/// while an agent is driving, and gets it back when the turn ends.
 ///
 /// # The gap that costs
 ///
-/// Arming happens on the tick that first *sees* a grant, so up to [`TICK`]
-/// passes between an agent gaining the right to drive and Escape being able to
-/// stop it. The provenance path grants inside the decision for the first tool
-/// call, so that first action can land inside the gap. Closing it would mean
-/// arming on "an agent could drive" rather than "an agent may drive" — which is
-/// the always-on tap above, and a worse trade.
+/// Arming happens on the tick that first *sees* the mark, so up to [`TICK`]
+/// passes between an agent's first allowed call and Escape being able to stop
+/// it. Closing it would mean arming on "an agent could drive" rather than "an
+/// agent is driving" — which is the always-on tap above, and a worse trade.
 #[derive(Default)]
 struct StopKey {
     /// `None` while idle, and also when arming failed — the two are

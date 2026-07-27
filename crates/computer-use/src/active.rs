@@ -34,8 +34,9 @@ use crate::target::name_of_pid;
 /// case — callers should treat [`Self::is_idle`] as the fast path.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Driving {
-    /// One entry per session holding at least one live grant, ordered by
-    /// session id so a redraw does not reshuffle the list under the user.
+    /// One entry per session that is mid-drive and holds at least one live
+    /// grant, ordered by session id so a redraw does not reshuffle the list
+    /// under the user.
     pub sessions: Vec<DrivingSession>,
 }
 
@@ -50,14 +51,22 @@ pub struct DrivingSession {
 }
 
 impl Driving {
-    /// Read the table and name everything in it.
+    /// Read the table and name what is being driven right now.
     ///
     /// A grant whose pid no longer resolves is dropped rather than shown as
     /// unknown: the process is gone, so nothing is being driven through it, and
     /// naming it "an unknown program" would be a scarier claim than the truth.
+    ///
+    /// Reads [`GrantTable::driving`] rather than every grant, because a grant
+    /// outlives the turn that used it — it is consent, and consent is answered
+    /// once per chat rather than once per turn. Built on every grant instead,
+    /// this would report an agent as driving from its first click until the user
+    /// closed the tab, and everything downstream believes it: the menu bar
+    /// claims apps are being driven while the machine sits idle, and the Escape
+    /// tap stays armed, swallowing a key the user needs everywhere else.
     pub fn read(grants: &GrantTable) -> Self {
         let mut sessions: Vec<DrivingSession> = Vec::new();
-        for (pid, owner) in grants.all() {
+        for (pid, owner) in grants.driving() {
             let Some(app) = name_of_pid(pid) else {
                 continue;
             };
@@ -199,6 +208,19 @@ mod tests {
         (dir, table)
     }
 
+    /// The state during an actual run: `agent` may drive `pid`, *and* is doing
+    /// so. Both halves are required, because a grant on its own is consent and
+    /// consent outlives the turn that used it — see [`Driving::read`].
+    ///
+    /// Worth a helper rather than two lines at each call site: a test that
+    /// granted without marking would still pass everywhere the assertion is
+    /// "nothing is being driven", while having stopped testing the reason.
+    fn driving_grant(table: &GrantTable, pid: u32, agent: &str) {
+        let session = SessionId::for_agent(agent);
+        table.grant(pid, &session);
+        table.begin_driving_turn(&session);
+    }
+
     #[test]
     fn nothing_granted_reads_as_idle() {
         let (_dir, table) = table();
@@ -212,7 +234,7 @@ mod tests {
     fn a_granted_target_is_named_by_its_program() {
         let (_dir, table) = table();
         let target = Target::spawn("/bin/sleep", &["120"]);
-        table.grant(target.pid(), &SessionId::for_agent("chat-1"));
+        driving_grant(&table, target.pid(), "chat-1");
 
         let driving = Driving::read(&table);
         assert!(!driving.is_idle());
@@ -228,7 +250,8 @@ mod tests {
         // would only restate the summary alongside an id nobody asked for.
         let (_dir, table) = table();
         let target = Target::spawn("/bin/sleep", &["120"]);
-        table.grant(target.pid(), &SessionId::for_agent("chat-1"));
+        driving_grant(&table, target.pid(), "chat-1");
+        assert!(!Driving::read(&table).is_idle(), "the agent must be driving for this to mean anything");
         assert!(Driving::read(&table).detail_lines().is_empty());
     }
 
@@ -238,8 +261,8 @@ mod tests {
         // agents is doing what, and the list must not reshuffle on redraw.
         let (_dir, table) = table();
         let (a, b) = (Target::spawn("/bin/sleep", &["120"]), Target::spawn("/bin/cat", &[]));
-        table.grant(b.pid(), &SessionId::for_agent("chat-2"));
-        table.grant(a.pid(), &SessionId::for_agent("chat-1"));
+        driving_grant(&table, b.pid(), "chat-2");
+        driving_grant(&table, a.pid(), "chat-1");
 
         let driving = Driving::read(&table);
         let labels: Vec<&str> = driving
@@ -262,10 +285,67 @@ mod tests {
         let (_dir, table) = table();
         let target = Target::spawn("/bin/sleep", &["120"]);
         let pid = target.pid();
-        table.grant(pid, &SessionId::for_agent("chat-1"));
+        driving_grant(&table, pid, "chat-1");
+        assert!(!Driving::read(&table).is_idle(), "must be driving before the pid dies");
         drop(target);
 
         assert!(Driving::read(&table).is_idle());
+    }
+
+    #[test]
+    fn a_grant_with_no_live_turn_is_not_reported_as_driving() {
+        // The whole reason the two are stored apart. A grant lasts as long as
+        // the chat that holds it, so a chat which drove once and then went idle
+        // still holds one — and anything reading grants alone would keep saying
+        // it is driving, hold the Escape tap armed, and swallow the key
+        // machine-wide until the tab was closed.
+        let (_dir, table) = table();
+        let target = Target::spawn("/bin/sleep", &["120"]);
+        table.grant(target.pid(), &SessionId::for_agent("chat-1"));
+
+        assert!(Driving::read(&table).is_idle());
+        assert_eq!(Driving::read(&table).summary(), "No agent is controlling this Mac");
+    }
+
+    #[test]
+    fn the_turn_boundary_stops_the_claim_without_dropping_the_grant() {
+        // Ending a turn must not cost the user their approval: the next turn
+        // drives the same target without a second consent card. Only the claim
+        // that something is happening right now goes away.
+        let (_dir, table) = table();
+        let target = Target::spawn("/bin/sleep", &["120"]);
+        let session = SessionId::for_agent("chat-1");
+        driving_grant(&table, target.pid(), "chat-1");
+        assert!(!Driving::read(&table).is_idle());
+
+        table.end_driving_turn(&session);
+        assert!(Driving::read(&table).is_idle(), "the turn ended, so nothing is being driven");
+        assert_eq!(
+            table.check(target.pid(), &session),
+            crate::grants::Verdict::Granted,
+            "but the approval survives the turn that used it"
+        );
+
+        // And a later turn re-arms without asking again.
+        table.begin_driving_turn(&session);
+        assert!(!Driving::read(&table).is_idle());
+    }
+
+    #[test]
+    fn one_agent_going_idle_leaves_the_other_driving() {
+        // Two agents run at different speeds, so their turns end at different
+        // times. The first to finish must not take the indicator — or the kill
+        // switch — down with it while the second is still clicking.
+        let (_dir, table) = table();
+        let (a, b) = (Target::spawn("/bin/sleep", &["120"]), Target::spawn("/bin/cat", &[]));
+        driving_grant(&table, a.pid(), "chat-1");
+        driving_grant(&table, b.pid(), "chat-2");
+
+        table.end_driving_turn(&SessionId::for_agent("chat-1"));
+
+        let driving = Driving::read(&table);
+        let labels: Vec<&str> = driving.sessions.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, vec!["chat-2"]);
     }
 
     #[test]

@@ -80,6 +80,46 @@ pub struct ComputerUseSettings {
 
 impl Global for ComputerUseSettings {}
 
+/// A path in the form both sides of a comparison can agree on.
+///
+/// `/tmp/x` and `/private/tmp/x` are one directory, and a rule written through a
+/// symlinked home would otherwise never fire.
+///
+/// Resolves the deepest ancestor that exists and re-attaches the rest, rather
+/// than resolving the whole path or nothing. Both halves of that matter:
+///
+/// - A stored root can name a directory that is temporarily absent — an
+///   unmounted volume, a worktree since deleted — and dropping the rule then
+///   would be indistinguishable from one the user never set.
+/// - Resolving *only* whole paths is worse than it looks, because it fails
+///   **asymmetrically**: the root resolves to `/private/var/…` while a
+///   not-yet-created subdirectory stays `/var/…`, and a containment check
+///   between them silently answers no. One side of a comparison must not be
+///   normalized while the other is not.
+///
+/// Same job as `Provenance::new`'s canonicalization on the enforcement side, and
+/// deliberately the same answer: the two run in different processes, and a root
+/// that resolved differently in each would decide the same chat twice.
+fn comparable(path: &Path) -> PathBuf {
+    let mut trailing = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(resolved) = cursor.canonicalize() {
+            return trailing
+                .iter()
+                .rev()
+                .fold(resolved, |acc: PathBuf, part| acc.join(part));
+        }
+        // Ran out of ancestors (a relative path, or one whose root does not
+        // resolve): nothing here is comparable, so hand back what we were given.
+        let (Some(name), Some(parent)) = (cursor.file_name(), cursor.parent()) else {
+            return path.to_path_buf();
+        };
+        trailing.push(name.to_os_string());
+        cursor = parent;
+    }
+}
+
 impl ComputerUseSettings {
     pub const FILE_NAME: &'static str = "computer_use.toml";
 
@@ -91,24 +131,68 @@ impl ComputerUseSettings {
         toml::to_string_pretty(self).unwrap_or_default()
     }
 
-    /// May agents rooted at `project` drive the screen? Both switches must
-    /// agree, which is the whole point of having two.
-    pub fn is_enabled_for(&self, project: &Path) -> bool {
-        self.enabled && self.projects.iter().any(|p| p == project)
+    /// May agents working in `dir` drive the screen? Both switches must agree,
+    /// which is the whole point of having two.
+    ///
+    /// `dir` is a chat's working directory, not necessarily a project root, so
+    /// this asks whether an opted-in root *covers* it — the root itself or
+    /// anything beneath. A chat opened on a subdirectory is still a chat in the
+    /// project the user enabled, and requiring the two to be spelled identically
+    /// would leave the pane listing a project whose chats silently get nothing.
+    ///
+    /// Containment is not the whole answer: a linked worktree is a *sibling* of
+    /// its project (`suggest_worktree_path` puts it at `<parent>/oximux-wt-…`),
+    /// so no amount of prefix matching reaches it. Resolving a worktree back to
+    /// its main repository needs git and belongs to the caller; this stays pure
+    /// so it can be tested without one.
+    pub fn is_enabled_for(&self, dir: &Path) -> bool {
+        self.covering_root(dir).is_some()
+    }
+
+    /// *Which* opted-in root covers `dir`, if any.
+    ///
+    /// The distinction matters to any control that offers to turn a project
+    /// back off. If the project is covered by an ancestor the user opted in —
+    /// a monorepo root, say, with a sub-package also added as its own project —
+    /// then removing the sub-package's own path removes nothing and the tools
+    /// stay. A control built on [`is_enabled_for`](Self::is_enabled_for) alone
+    /// would report "on", offer "turn off", and do nothing: exactly the silent
+    /// no-op this list is supposed to have stopped being.
+    pub fn covering_root(&self, dir: &Path) -> Option<&Path> {
+        if !self.enabled {
+            return None;
+        }
+        let dir = comparable(dir);
+        // Component-wise, so a sibling named `<root>-2` is not the prefix match
+        // a string comparison would make it.
+        self.projects
+            .iter()
+            .find(|root| dir.starts_with(comparable(root)))
+            .map(PathBuf::as_path)
     }
 
     /// Opt `project` in. Idempotent, so a double-click on the toggle cannot
     /// leave two entries behind.
+    ///
+    /// Stores the resolved path: the spawn path compares against a cwd the
+    /// kernel already resolved, and a root recorded through a symlink would sit
+    /// in the file looking enabled while matching nothing.
     pub fn enable_project(&mut self, project: &Path) {
-        if !self.projects.iter().any(|p| p == project) {
-            self.projects.push(project.to_path_buf());
+        let project = comparable(project);
+        if !self.projects.iter().any(|p| comparable(p) == project) {
+            self.projects.push(project);
         }
     }
 
     /// Opt `project` back out. Returns whether anything changed.
+    ///
+    /// Matches the way [`enable_project`](Self::enable_project) stores, so a row
+    /// added before this normalization existed can still be removed by clicking
+    /// it.
     pub fn disable_project(&mut self, project: &Path) -> bool {
+        let project = comparable(project);
         let before = self.projects.len();
-        self.projects.retain(|p| p != project);
+        self.projects.retain(|p| comparable(p) != project);
         self.projects.len() != before
     }
 
@@ -213,6 +297,110 @@ mod tests {
         let mut s = ComputerUseSettings::default();
         s.enable_project(Path::new("/repo"));
         assert!(!s.is_enabled_for(Path::new("/repo")));
+    }
+
+    #[test]
+    fn an_opted_in_project_covers_the_directories_beneath_it() {
+        // A chat opened on a subdirectory is still a chat in the project the
+        // user enabled. Requiring the two to be spelled identically left the
+        // pane listing a project whose chats silently got nothing.
+        let mut s = ComputerUseSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        s.enable_project(Path::new("/repo"));
+        assert!(s.is_enabled_for(Path::new("/repo")));
+        assert!(s.is_enabled_for(Path::new("/repo/crates/git")));
+    }
+
+    #[test]
+    fn a_sibling_sharing_a_name_prefix_is_not_covered() {
+        // The reason coverage is component-wise rather than a string prefix:
+        // `/repo-2` is a different repository that happens to sort next to the
+        // enabled one, and `starts_with` on `&str` would hand it the tools.
+        let mut s = ComputerUseSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        s.enable_project(Path::new("/repo"));
+        assert!(!s.is_enabled_for(Path::new("/repo-2")));
+        assert!(!s.is_enabled_for(Path::new("/repository")));
+        assert!(!s.is_enabled_for(Path::new("/")));
+    }
+
+    #[test]
+    fn coverage_survives_a_symlinked_spelling_of_the_same_directory() {
+        // The failure this prevents is silent and total: the pane lists the
+        // project, every chat in it is refused, and nothing says why.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("repo");
+        std::fs::create_dir(&real).expect("create");
+        let link = dir.path().join("link-to-repo");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        #[cfg(not(unix))]
+        std::os::windows::fs::symlink_dir(&real, &link).expect("symlink");
+
+        let mut s = ComputerUseSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        // Opted in through the link, asked about through the real path.
+        s.enable_project(&link);
+        assert!(s.is_enabled_for(&real));
+        // A subdirectory that does not exist yet — a worktree about to be
+        // created, a build dir not written. The root resolves and this does
+        // not, and resolving only one side of that comparison answers no.
+        assert!(s.is_enabled_for(&real.join("not-created-yet")));
+        // And the reverse, since either side may be the symlinked spelling.
+        let mut s = ComputerUseSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        s.enable_project(&real);
+        assert!(s.is_enabled_for(&link));
+    }
+
+    #[test]
+    fn coverage_names_the_root_it_came_from() {
+        // So a "turn this off" control can tell the difference between a
+        // project it can switch off and one enabled by an ancestor, where
+        // removing its own path would silently do nothing.
+        let mut s = ComputerUseSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        s.enable_project(Path::new("/monorepo"));
+        assert_eq!(
+            s.covering_root(Path::new("/monorepo/packages/app")),
+            Some(Path::new("/monorepo"))
+        );
+        assert_eq!(
+            s.covering_root(Path::new("/monorepo")),
+            Some(Path::new("/monorepo"))
+        );
+        assert_eq!(s.covering_root(Path::new("/elsewhere")), None);
+    }
+
+    #[test]
+    fn nothing_is_covered_while_the_master_switch_is_off() {
+        let mut s = ComputerUseSettings::default();
+        s.enable_project(Path::new("/repo"));
+        assert_eq!(s.covering_root(Path::new("/repo")), None);
+        assert_eq!(s.covering_root(Path::new("/repo/sub")), None);
+    }
+
+    #[test]
+    fn a_root_that_no_longer_exists_still_matches_itself() {
+        // An unmounted volume or a deleted worktree must not silently drop the
+        // user's rule — that is indistinguishable from never having set it.
+        let mut s = ComputerUseSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        s.enable_project(Path::new("/definitely/not/mounted"));
+        assert!(s.is_enabled_for(Path::new("/definitely/not/mounted")));
+        assert!(s.is_enabled_for(Path::new("/definitely/not/mounted/sub")));
     }
 
     #[test]

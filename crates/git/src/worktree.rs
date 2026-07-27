@@ -9,6 +9,48 @@ use crate::repository::Repository;
 use oximux_core::WorktreeInfo;
 use std::path::{Path, PathBuf};
 
+/// The working directory of the main repository that owns the linked worktree
+/// at `dir`, or `None` when `dir` is not a linked worktree.
+///
+/// **Synchronous and process-free**, unlike [`Repository::open`], because the
+/// caller runs on the agent-spawn path — a `git` subprocess there would block
+/// the UI thread on every chat that starts. It reads exactly the files git
+/// itself uses: a linked worktree's `.git` is a *file* holding
+/// `gitdir: <main>/.git/worktrees/<name>`, and that directory holds a
+/// `commondir` pointing back at the shared `.git`.
+///
+/// `commondir` rather than stripping `worktrees/<name>` off the tail: it is the
+/// pointer git maintains for this purpose, and it stays correct when the shared
+/// directory is somewhere the conventional layout would not predict.
+///
+/// Returns `None` on anything unexpected — a primary worktree, an unreadable
+/// pointer, a bare repository with no working tree to attribute. Every caller
+/// treats `None` as "not part of that project", so an uncertain answer withholds
+/// a capability rather than granting one.
+pub fn main_worktree_of(dir: &Path) -> Option<PathBuf> {
+    // A primary worktree's `.git` is a directory, so this read fails and the
+    // question is already answered.
+    let pointer = std::fs::read_to_string(dir.join(".git")).ok()?;
+    let gitdir = pointer.trim().strip_prefix("gitdir:")?.trim();
+    // Absolute in practice; joined so a relative pointer resolves against the
+    // worktree, which is what git means by one.
+    let gitdir = dir.join(gitdir);
+
+    let commondir = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+    // Canonicalized because `commondir` is written relative (`../..`) and
+    // `Path::parent` would otherwise hand back a path still ending in `..`.
+    let common = gitdir.join(commondir.trim()).canonicalize().ok()?;
+
+    // `<main>/.git` → `<main>`. A bare repository's shared directory is named
+    // for the repo (`foo.git`), and its parent is somebody else's folder, so
+    // require the conventional layout rather than guessing a working tree that
+    // does not exist.
+    if common.file_name() != Some(std::ffi::OsStr::new(".git")) {
+        return None;
+    }
+    common.parent().map(Path::to_path_buf)
+}
+
 impl Repository {
     /// Create a new linked worktree at `path` checked out on a brand-new
     /// branch `oximux/<slug>` (created from the current HEAD).
