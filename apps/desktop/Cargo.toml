@@ -149,6 +149,14 @@ objc2-app-kit = { version = "0.3", features = [
   "NSMenu",
   "NSMenuItem",
   "NSEvent",
+  # Screen-control indicator (`platform::screen_control_indicator`): a menu-bar
+  # status item, the only surface visible while the app an agent is driving is
+  # frontmost. NSStatusBarButton is an NSButton, hence the control chain.
+  "NSStatusBar",
+  "NSStatusItem",
+  "NSStatusBarButton",
+  "NSButton",
+  "NSControl",
 ] }
 objc2-web-kit = { version = "0.3", features = [
   "WKWebView",

@@ -44,6 +44,16 @@ impl TargetApp {
     }
 }
 
+/// Just the on-screen name for a pid, without resolving signing identity.
+///
+/// [`TargetApp::describe`] spawns `codesign`, which is fine on the ask path —
+/// a human is already reading — and wrong for anything that repeats. The
+/// indicator re-reads every live target on a timer, so it takes this path: a
+/// `proc_pidpath` call and some string work, no process spawn.
+pub fn name_of_pid(pid: u32) -> Option<String> {
+    crate::proc::executable_of_pid(pid).map(|path| display_name(&path))
+}
+
 /// A category where approving one action approves considerably more than it
 /// looks like.
 ///

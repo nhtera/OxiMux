@@ -154,6 +154,25 @@ impl GrantTable {
         let _ = self.with_locked(|grants| grants.clear());
     }
 
+    /// Every live grant, as `(pid, owner)`, sorted by pid.
+    ///
+    /// The one read that is not scoped to a caller's own session, because the
+    /// question it answers is not "may I drive this?" but "is anything being
+    /// driven right now?" — which the indicator has to answer for the whole
+    /// machine. `owner` is the raw stored id: another process may have written
+    /// it, so it is data rather than a value this process minted.
+    pub fn all(&self) -> Vec<(u32, String)> {
+        self.with_locked(|grants| {
+            let mut rows: Vec<(u32, String)> = grants
+                .iter()
+                .map(|(pid, grant)| (*pid, grant.owner.clone()))
+                .collect();
+            rows.sort_unstable();
+            rows
+        })
+        .unwrap_or_default()
+    }
+
     /// Pids currently granted to an agent. For tests and for the transcript.
     pub fn granted_to(&self, agent: &SessionId) -> Vec<u32> {
         self.with_locked(|grants| {

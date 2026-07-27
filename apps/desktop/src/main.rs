@@ -273,6 +273,11 @@ fn main() {
         // global and defaulting — the two agree, but only one of them is a
         // decision the user made.
         oximux_app::computer_use_settings::install(cx);
+        // The menu-bar indicator that appears while an agent can drive the
+        // screen. Watches the grant table rather than the approval path,
+        // because the enforcement hook grants from its own process — see the
+        // module docs. Idle cost is one `metadata()` call per second.
+        oximux_app::agent_glue::screen_control_watch::install(cx);
         // Resolve the reduced-motion preference once and install the Motion
         // global before any window opens, so the first animated surface reads
         // the right durations.

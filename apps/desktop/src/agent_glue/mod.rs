@@ -8,3 +8,4 @@
 pub mod agent_awake;
 pub mod agent_hooks_global;
 pub mod agent_status_hooks;
+pub mod screen_control_watch;

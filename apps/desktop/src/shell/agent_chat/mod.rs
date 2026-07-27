@@ -17,7 +17,7 @@ mod auth_card;
 mod background_tasks_panel;
 mod bubble;
 mod composer;
-mod computer_use;
+pub(crate) mod computer_use;
 mod composer_history;
 mod acp_terminal_host;
 mod context_meter;

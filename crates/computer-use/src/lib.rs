@@ -19,6 +19,7 @@
 //! thread, because the permission handler that will gate these tools is
 //! synchronous. That is what the bounded timeouts in [`exec`] are protecting.
 
+pub mod active;
 pub mod blocked;
 pub mod daemon;
 pub mod discovery;
@@ -45,6 +46,7 @@ use std::time::Duration;
 /// `assets/Info.plist`.
 pub const HOST_BUNDLE_ID: &str = "dev.nhtera.oximux";
 
+pub use active::{Driving, DrivingSession};
 pub use daemon::DaemonState;
 pub use grants::{GrantTable, Provenance};
 pub use mcp::{bare_tool_name, is_computer_use_tool, server_spec, SERVER_NAME};
