@@ -17,7 +17,7 @@
 //! belongs to the broader safety work, not here — the point of noting it is
 //! that the enforcement is scoped to what OxiMux itself hands the agent.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::SystemTime;
@@ -29,17 +29,40 @@ use serde_json::Value;
 
 pub use oximux_computer_use::policy::Decision;
 
-/// Every chat's grants, in one table.
+/// Where grants live for the whole app.
 ///
-/// Process-wide on purpose: the cross-drive guard has to compare one chat's
-/// request against *every other* chat's grants, which a per-chat table
-/// structurally cannot do. Keys are per-view ids from [`next_chat_id`], so two
-/// chats never alias each other.
+/// A file rather than an in-memory map because enforcement runs in two
+/// processes — this one, and the short-lived hook the agent's CLI spawns per
+/// tool call. Both open the same path; the store's `flock` makes the
+/// check-then-insert atomic between them.
 ///
 /// Shared by handle rather than reached as a static, so a test can scope one to
-/// the chats it creates. Two tests that both claim the same pid in one global
-/// table are not testing anything about chats — they are racing each other.
-static GRANTS: LazyLock<Arc<GrantTable>> = LazyLock::new(|| Arc::new(GrantTable::new()));
+/// the chats it creates. Two tests that both claim the same pid in one store
+/// are not testing anything about chats — they are racing each other.
+static GRANTS: LazyLock<Arc<GrantTable>> = LazyLock::new(|| {
+    Arc::new(match grants_path() {
+        Some(path) => GrantTable::at(path),
+        // No data dir is a broken install; keep screen control working against
+        // a temp store rather than failing the whole app to death over it.
+        None => GrantTable::at(std::env::temp_dir().join(oximux_computer_use::grants::GRANTS_FILE_NAME)),
+    })
+});
+
+/// The store's path, which is also what gets handed to the hook process so both
+/// sides cannot drift onto different files.
+pub fn grants_path() -> Option<PathBuf> {
+    dirs::data_dir().map(|dir| {
+        dir.join("dev.nhtera.oximux")
+            .join(oximux_computer_use::grants::GRANTS_FILE_NAME)
+    })
+}
+
+/// Drop every grant from a previous run. Called once at startup: grants are
+/// scoped to a run, and a store surviving a crash would otherwise hand a fresh
+/// chat approvals nobody gave it.
+pub fn clear_stale_screen_control_grants() {
+    GRANTS.clear();
+}
 
 /// Hands out chat ids. Monotonic and never reused within a process, so a grant
 /// cannot be inherited by a later chat that happened to land on the same slot.
@@ -195,7 +218,7 @@ mod view_tests {
                     ThreadEvent::PermissionRequested {
                         request_id: "r1".into(),
                         tool_use_id: Some("t1".into()),
-                        tool_name: "mcp__computer-use__type_text".into(),
+                        tool_name: "mcp__oximux-computer-use__type_text".into(),
                         input: json!({ "text": "rm -rf /" }),
                         description: String::new(),
                         suggestions: vec![],
@@ -272,13 +295,21 @@ mod tests {
     /// other's grants. That failure would look like a bug in the cross-drive
     /// guard while actually being two tests racing.
     fn chat() -> ScreenControl {
-        ScreenControl::sharing(Path::new("/tmp"), Arc::new(GrantTable::new()))
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = GrantTable::in_data_dir(dir.path());
+        // The tempdir is deliberately leaked for the test's lifetime: the store
+        // has to outlive the chat that reads it, and threading a guard through
+        // every call site would obscure what each test is actually asserting.
+        std::mem::forget(dir);
+        ScreenControl::sharing(Path::new("/tmp"), Arc::new(table))
     }
 
     /// Two chats that can see each other's grants — the arrangement the
     /// cross-drive guard exists for.
     fn two_chats() -> (ScreenControl, ScreenControl) {
-        let shared = Arc::new(GrantTable::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let shared = Arc::new(GrantTable::in_data_dir(dir.path()));
+        std::mem::forget(dir);
         (
             ScreenControl::sharing(Path::new("/tmp"), shared.clone()),
             ScreenControl::sharing(Path::new("/tmp"), shared),
@@ -286,7 +317,7 @@ mod tests {
     }
 
     fn ns(tool: &str) -> String {
-        format!("mcp__computer-use__{tool}")
+        format!("mcp__oximux-computer-use__{tool}")
     }
 
     #[test]

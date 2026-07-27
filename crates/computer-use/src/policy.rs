@@ -130,6 +130,11 @@ fn decide_input(tool: &str, input: &Value, ctx: &PolicyContext<'_>) -> Decision 
     };
 
     match ctx.grants.check(pid, ctx.session) {
+        // No blocked-app check on this path, deliberately. A granted pid was
+        // checked when it was granted, and its executable is pinned — a change
+        // comes back as `Recycled` below, not as a silent swap. Re-checking
+        // would spawn `codesign` on every click, and the enforcing process is
+        // spawned fresh per tool call, so nothing would ever be cached.
         Verdict::Granted => Decision::Allow,
         Verdict::HeldByAnother { .. } => Decision::refuse(format!(
             "`{tool}` targeted process {pid}, which another chat is driving"
@@ -141,12 +146,27 @@ fn decide_input(tool: &str, input: &Value, ctx: &PolicyContext<'_>) -> Decision 
             "`{tool}` targeted process {pid}, which is now a different program than the one you approved"
         )),
         Verdict::Ungranted => {
+            let executable = executable_of_pid(pid);
+            // Ahead of both the grant and the consent card: whether an app may
+            // be driven at all is not a question of *which* chat is asking, and
+            // not one a card can settle — approving "a click" into a password
+            // manager is not approving what that enables. Checked here rather
+            // than at the top so it costs a `codesign` spawn only for a target
+            // nobody has approved yet, never on the repeated-click path.
+            if executable
+                .as_deref()
+                .is_some_and(crate::blocked::is_blocked)
+            {
+                return Decision::refuse(format!(
+                    "`{tool}` targeted a password manager or keychain, which agents are never allowed to drive"
+                ));
+            }
             // A binary this agent built in its own worktree during this session
             // is the workflow the feature exists for; asking about it every
             // time would be noise. Anything else is the user's call.
             let built_here = ctx
                 .provenance
-                .zip(executable_of_pid(pid))
+                .zip(executable)
                 .is_some_and(|(prov, exe)| prov.built_this_session(&exe));
             if built_here && ctx.grants.grant(pid, ctx.session) == Verdict::Granted {
                 Decision::Allow
@@ -163,19 +183,26 @@ mod tests {
     use serde_json::json;
 
     fn ns(tool: &str) -> String {
-        format!("mcp__computer-use__{tool}")
+        format!("mcp__oximux-computer-use__{tool}")
     }
 
     struct Fixture {
         session: SessionId,
         grants: GrantTable,
+        /// Kept alive so the store outlives the fixture, not read directly.
+        _dir: tempfile::TempDir,
     }
 
     impl Fixture {
         fn new() -> Self {
+            // A store per fixture: every test here claims our own pid, the one
+            // guaranteed to resolve, so a shared store would have parallel
+            // tests refusing each other's grants.
+            let dir = tempfile::tempdir().expect("tempdir");
             Self {
                 session: SessionId::for_agent("chat-a"),
-                grants: GrantTable::new(),
+                grants: GrantTable::in_data_dir(dir.path()),
+                _dir: dir,
             }
         }
 

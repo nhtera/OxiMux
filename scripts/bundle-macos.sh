@@ -67,6 +67,11 @@
 # main binary. The app resolves it via current_exe()'s parent dir, and
 # without it every PTY falls back to an in-process backend that dies on
 # quit — so terminal scrollback/sessions never survive a relaunch.
+#
+# oximux-screen-gate ships the same way. It is the PreToolUse hook that
+# decides an agent's screen-control calls, spawned once per tool call by
+# the agent's own CLI. Missing from the bundle, the hook command fails to
+# run and the chat drives the screen with nothing enforcing it.
 
 set -euo pipefail
 
@@ -157,6 +162,7 @@ sign_bundle() {
         [[ -f "$dylib" && ! -L "$dylib" ]] && codesign "${opts[@]}" "$dylib"
     done
     codesign "${opts[@]}" "$APP_DIR/Contents/MacOS/oximux-relay"
+    codesign "${opts[@]}" "$APP_DIR/Contents/MacOS/oximux-screen-gate"
     codesign "${opts[@]}" "$APP_DIR/Contents/MacOS/oximux"
     codesign "${opts[@]}" "$APP_DIR"
     echo "==> Signed $APP_DIR (identity: $sign_id)"
@@ -331,6 +337,9 @@ if [[ "${1:-}" == "--debug-fast" ]]; then
     fi
     cp -f "target/debug/oximux" "$APP_DIR/Contents/MacOS/oximux"
     cp -f "target/debug/oximux-relay" "$APP_DIR/Contents/MacOS/oximux-relay"
+    if [[ -f "target/debug/oximux-screen-gate" ]]; then
+        cp -f "target/debug/oximux-screen-gate" "$APP_DIR/Contents/MacOS/oximux-screen-gate"
+    fi
     # Keep Info.plist + app icon in sync too, so a fast refresh produces a
     # complete bundle (correct menu-bar name + Dock icon), not just binaries.
     cp -f "assets/Info.plist" "$APP_DIR/Contents/Info.plist"
@@ -372,11 +381,12 @@ if [[ "$NOTARIZE" -eq 1 ]]; then
     require_notary_profile
 fi
 
-echo "==> Building oximux + oximux-relay ($PROFILE)"
+echo "==> Building oximux + oximux-relay + oximux-screen-gate ($PROFILE)"
 # `${CARGO_FLAGS[@]+...}` guards the expansion so an empty array (debug
 # profile) doesn't trip `set -u` ("unbound variable") on bash < 4.4.
 cargo build -p oximux-app --bin oximux ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
 cargo build -p oximux-relay --bin oximux-relay ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
+cargo build -p oximux-computer-use --bin oximux-screen-gate ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
 
 echo "==> Assembling $APP_DIR"
 rm -rf "$APP_DIR"
@@ -384,6 +394,7 @@ mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 
 cp "target/$TARGET_SUBDIR/oximux" "$APP_DIR/Contents/MacOS/oximux"
 cp "target/$TARGET_SUBDIR/oximux-relay" "$APP_DIR/Contents/MacOS/oximux-relay"
+cp "target/$TARGET_SUBDIR/oximux-screen-gate" "$APP_DIR/Contents/MacOS/oximux-screen-gate"
 cp "assets/Info.plist" "$APP_DIR/Contents/Info.plist"
 
 # App icon — charcoal rounded tile + terminal prompt glyph (matches the

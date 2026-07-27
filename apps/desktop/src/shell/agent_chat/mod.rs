@@ -478,6 +478,7 @@ use tool_grouping::{plan_tool_grouping, summarize_tool_run, EntryDisplay, GroupS
 use crate::remote_control::{RemoteBinding, RemoteControl, remote_session_id_for};
 use attention::attention_for_event;
 use computer_use::{Decision, ScreenControl};
+pub use computer_use::clear_stale_screen_control_grants;
 use oximux_agents::session_registry::{ChoiceKind, RemoteChoice, RemotePrompt, SessionMeta};
 use crate::shell::context_env::SurfaceIds;
 use crate::shell::pane_content::PaneContent;

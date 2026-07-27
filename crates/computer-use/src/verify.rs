@@ -148,6 +148,20 @@ fn read_signature(path: &Path) -> Result<SignatureInfo, Error> {
     })
 }
 
+/// The code-signing identifier of any binary — for an app bundle, its
+/// `CFBundleIdentifier`. `None` when the binary is unsigned, missing, or
+/// otherwise unreadable.
+///
+/// Distinct from [`verify`]: that one gates the *driver* and fails loudly.
+/// This one just reads an identity off an arbitrary program, for callers that
+/// treat "unknown" as an ordinary answer rather than an error.
+pub fn signing_identifier(path: &Path) -> Option<String> {
+    read_signature(path)
+        .ok()
+        .map(|signature| signature.identifier)
+        .filter(|identifier| !identifier.is_empty())
+}
+
 /// Value of a `Key=Value` line in `codesign -dvv` output.
 fn field(haystack: &str, key: &str) -> Option<String> {
     haystack.lines().find_map(|line| {

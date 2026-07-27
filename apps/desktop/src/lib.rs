@@ -34,6 +34,8 @@ pub mod session_restore;
 #[doc(inline)]
 pub use agent_glue::{agent_awake, agent_hooks_global, agent_status_hooks};
 #[doc(inline)]
+pub use shell::agent_chat::clear_stale_screen_control_grants;
+#[doc(inline)]
 pub use app_settings::{
     agent_launch_settings, commit_message_ai_settings, dictation_settings, keybindings_settings,
     motion_settings, scm_layout_settings, terminal_settings,

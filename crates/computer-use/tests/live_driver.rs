@@ -132,6 +132,55 @@ fn the_declared_server_matches_the_drivers_own_recommended_invocation() {
 }
 
 #[test]
+fn every_tool_the_driver_registers_is_classified() {
+    let Some(path) = installed() else { return };
+
+    let out =
+        oximux_computer_use::exec::run_bounded(&path, &["list-tools"], Duration::from_secs(10))
+            .expect("list-tools must run");
+    assert!(out.success(), "list-tools failed: {}", out.stderr);
+
+    // The classifier fails closed, so an unlisted tool is *refused* rather than
+    // waved through — safe, but it silently breaks a working feature after a
+    // driver update, and the deny list cannot cover a tool it has never heard
+    // of. This turns that into a visible failure at upgrade time.
+    let names: Vec<&str> = out
+        .stdout
+        .lines()
+        .filter_map(|line| line.split_once(':').map(|(name, _)| name.trim()))
+        .filter(|name| !name.is_empty() && !name.contains(char::is_whitespace))
+        .collect();
+
+    // Without this the test passes vacuously if the output format changes and
+    // the parse yields nothing — which is exactly the upgrade this guards.
+    assert!(
+        names.len() > 30,
+        "parsed only {} tool names; the `name: description` format likely changed",
+        names.len()
+    );
+    assert!(names.contains(&"click"), "parse missed a known tool: {names:?}");
+
+    let unclassified: Vec<String> = names
+        .into_iter()
+        .filter(|name| {
+            matches!(
+                oximux_computer_use::tools::classify(name),
+                oximux_computer_use::tools::ToolClass::Forbidden(
+                    oximux_computer_use::tools::Refusal::Unrecognised
+                )
+            )
+        })
+        .map(str::to_string)
+        .collect();
+
+    assert!(
+        unclassified.is_empty(),
+        "the driver registers tools this build has never classified — add them to \
+         `tools::TOOLS` with a deliberate class: {unclassified:?}"
+    );
+}
+
+#[test]
 fn the_driver_still_offers_the_tools_the_integration_assumes() {
     let Some(path) = installed() else { return };
 

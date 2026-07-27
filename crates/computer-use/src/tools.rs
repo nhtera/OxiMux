@@ -90,48 +90,106 @@ impl Refusal {
     }
 }
 
-/// Classify a bare driver tool name (`click`, not `mcp__computer-use__click`).
-pub fn classify(tool: &str) -> ToolClass {
+/// Every tool the driver registers, and what it is.
+///
+/// A table rather than a `match` because two things read it: the runtime policy
+/// via [`classify`], and the spawn-time deny list via [`forbidden_names`]. A
+/// second hand-written list of "dangerous tools" would drift from this one on
+/// the first driver release, and the drift would be silent in the direction
+/// that matters — a tool dropped from the deny list is a tool the agent can
+/// call.
+const TOOLS: &[(&str, ToolClass)] = {
     use Refusal::*;
     use ToolClass::*;
-    match tool {
+    &[
         // Input: delivered to a target process, each accepting `pid`.
-        "click" | "right_click" | "double_click" | "drag" | "scroll" | "hotkey" | "press_key"
-        | "type_text" | "set_value" => Input,
-
+        ("click", Input),
+        ("right_click", Input),
+        ("double_click", Input),
+        ("drag", Input),
+        ("scroll", Input),
+        ("hotkey", Input),
+        ("press_key", Input),
+        ("type_text", Input),
+        ("set_value", Input),
         // Reads. Window-scoped or pure metadata.
-        "get_window_state" | "get_accessibility_tree" | "list_windows" | "list_apps"
-        | "get_screen_size" | "get_cursor_position" | "zoom" | "check_permissions"
-        | "health_report" | "get_config" | "get_recording_state" | "get_session_state"
-        | "get_agent_cursor_state" | "get_browser_state" | "check_for_update" => Read,
-
+        ("get_window_state", Read),
+        ("get_accessibility_tree", Read),
+        ("list_windows", Read),
+        ("list_apps", Read),
+        ("get_screen_size", Read),
+        ("get_cursor_position", Read),
+        ("zoom", Read),
+        ("check_permissions", Read),
+        ("health_report", Read),
+        ("get_config", Read),
+        ("get_recording_state", Read),
+        ("get_session_state", Read),
+        ("get_agent_cursor_state", Read),
+        ("get_browser_state", Read),
+        ("check_for_update", Read),
         // The agent cursor: an overlay OxiMux wants drawn, not an input event.
         // `set_agent_cursor_enabled` is here rather than forbidden because
         // showing a cursor is fine; hiding one is caught on the field, since
         // the tool is the same either way.
-        "move_cursor" | "set_agent_cursor_style" | "set_agent_cursor_motion"
-        | "set_agent_cursor_enabled" => Overlay,
-
+        ("move_cursor", Overlay),
+        ("set_agent_cursor_style", Overlay),
+        ("set_agent_cursor_motion", Overlay),
+        ("set_agent_cursor_enabled", Overlay),
         // Starts a process the agent will then want to drive. Reasonable in the
         // build-and-run workflow, but it takes a bundle id and extra argv, so
         // it is the user's call and not a silent one.
-        "launch_app" => Consent,
+        ("launch_app", Consent),
+        ("replay_trajectory", Forbidden(ReplaysPastActions)),
+        ("bring_to_front", Forbidden(StealsFocus)),
+        ("kill_app", Forbidden(KillsProcesses)),
+        ("get_desktop_state", Forbidden(CapturesWholeScreen)),
+        ("start_recording", Forbidden(RecordsScreen)),
+        ("stop_recording", Forbidden(RecordsScreen)),
+        ("set_config", Forbidden(ReconfiguresDriver)),
+        ("install_ffmpeg", Forbidden(InstallsSoftware)),
+        ("start_session", Forbidden(ManagesSessions)),
+        ("end_session", Forbidden(ManagesSessions)),
+        ("escalate_session", Forbidden(ManagesSessions)),
+        // The browser family is matched by prefix in `classify` so a future
+        // `browser_*` addition is refused with an accurate reason. These are the
+        // ones that exist today, listed so they reach the deny list too — a
+        // prefix rule cannot be expressed as a CLI flag.
+        ("page", Forbidden(UnattributableBrowserSurface)),
+        ("browser_click", Forbidden(UnattributableBrowserSurface)),
+        ("browser_dialog", Forbidden(UnattributableBrowserSurface)),
+        ("browser_download", Forbidden(UnattributableBrowserSurface)),
+        ("browser_navigate", Forbidden(UnattributableBrowserSurface)),
+        ("browser_pointer", Forbidden(UnattributableBrowserSurface)),
+        ("browser_prepare", Forbidden(UnattributableBrowserSurface)),
+        ("browser_set_input_files", Forbidden(UnattributableBrowserSurface)),
+        ("browser_type", Forbidden(UnattributableBrowserSurface)),
+    ]
+};
 
-        "replay_trajectory" => Forbidden(ReplaysPastActions),
-        "bring_to_front" => Forbidden(StealsFocus),
-        "kill_app" => Forbidden(KillsProcesses),
-        "get_desktop_state" => Forbidden(CapturesWholeScreen),
-        "start_recording" | "stop_recording" => Forbidden(RecordsScreen),
-        "set_config" => Forbidden(ReconfiguresDriver),
-        "install_ffmpeg" => Forbidden(InstallsSoftware),
-        "start_session" | "end_session" | "escalate_session" => Forbidden(ManagesSessions),
-
-        _ if tool.starts_with("browser_") || tool == "page" => {
-            Forbidden(UnattributableBrowserSurface)
-        }
-
-        _ => Forbidden(Unrecognised),
+/// Classify a bare driver tool name (`click`, not `mcp__computer-use__click`).
+pub fn classify(tool: &str) -> ToolClass {
+    if let Some((_, class)) = TOOLS.iter().find(|(name, _)| *name == tool) {
+        return *class;
     }
+    // Not in the table. A `browser_*` name gets the accurate reason rather than
+    // the generic one; everything else fails closed.
+    if tool.starts_with("browser_") {
+        return ToolClass::Forbidden(Refusal::UnattributableBrowserSurface);
+    }
+    ToolClass::Forbidden(Refusal::Unrecognised)
+}
+
+/// The bare names of every tool that is refused outright.
+///
+/// Feeds the spawn-time deny list. Note what it cannot carry: a tool the driver
+/// adds later is absent here, so the CLI will not block it — [`classify`] still
+/// refuses it at runtime, which is why the two layers are not redundant.
+pub fn forbidden_names() -> impl Iterator<Item = &'static str> {
+    TOOLS
+        .iter()
+        .filter(|(_, class)| matches!(class, ToolClass::Forbidden(_)))
+        .map(|(name, _)| *name)
 }
 
 #[cfg(test)]
@@ -214,6 +272,48 @@ mod tests {
                 "{tool}"
             );
         }
+    }
+
+    #[test]
+    fn the_deny_list_covers_every_forbidden_tool_and_nothing_else() {
+        // The property that makes one table safe to read twice: anything
+        // `classify` refuses must reach the CLI deny list, and nothing the
+        // policy allows may be denied there (which would break the feature
+        // rather than merely fail to protect it).
+        let denied: Vec<&str> = forbidden_names().collect();
+        for name in &denied {
+            assert!(
+                matches!(classify(name), ToolClass::Forbidden(_)),
+                "{name} is on the deny list but not refused by the policy"
+            );
+        }
+        for (name, class) in TOOLS {
+            assert_eq!(
+                matches!(class, ToolClass::Forbidden(_)),
+                denied.contains(name),
+                "{name} disagrees between the table and the deny list"
+            );
+        }
+    }
+
+    #[test]
+    fn the_deny_list_names_the_tools_that_matter_most() {
+        let denied: Vec<&str> = forbidden_names().collect();
+        // Spot-check the ones whose absence would be worst, including the
+        // browser family — a prefix rule cannot be expressed as a CLI flag, so
+        // those must be enumerated to reach the deny list at all.
+        for name in [
+            "replay_trajectory",
+            "kill_app",
+            "bring_to_front",
+            "get_desktop_state",
+            "browser_type",
+            "page",
+        ] {
+            assert!(denied.contains(&name), "{name} missing from the deny list");
+        }
+        assert!(!denied.contains(&"click"), "input tools must stay available");
+        assert!(!denied.contains(&"get_window_state"), "reads must stay available");
     }
 
     #[test]

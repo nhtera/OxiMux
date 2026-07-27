@@ -19,6 +19,7 @@
 //! thread, because the permission handler that will gate these tools is
 //! synchronous. That is what the bounded timeouts in [`exec`] are protecting.
 
+pub mod blocked;
 pub mod daemon;
 pub mod discovery;
 pub mod exec;

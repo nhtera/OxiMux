@@ -116,6 +116,13 @@ fn main() {
     // invoke while the GUI is up — never contend for it.
     let _single_instance = enforce_single_instance();
 
+    // Screen-control grants are scoped to one run of the app. The store is a
+    // file so the per-tool-call enforcement hook can read it, which means it
+    // outlives a crash — and a surviving grant would hand a fresh chat an
+    // approval nobody gave it. Runs after the single-instance guard so a second
+    // launch that bows out cannot wipe the live instance's grants.
+    oximux_app::clear_stale_screen_control_grants();
+
     // Best-effort: open the repo at cwd. If we're not in a git tree, render
     // without the git column — the rest of the shell still works.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
