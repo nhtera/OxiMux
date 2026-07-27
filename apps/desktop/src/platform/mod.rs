@@ -5,6 +5,24 @@
 //! `menu` (native menu bar). Grouped for traversal; re-exported at the crate
 //! root so existing `crate::app_nap::…` paths keep resolving.
 
+/// Serialises every test that touches the machine's *global* input state.
+///
+/// Two of them do: `escape_tap` arms a real event tap and posts a real key,
+/// and `secure_input` really takes a secure-input hold. Run at the same time
+/// they break each other — a hold taken mid-pump starves the tap's key, and the
+/// tap test then fails saying the tap is broken about a machine where another
+/// test was muzzling it. One lock across both modules, because per-module locks
+/// are exactly what let that through.
+#[cfg(test)]
+pub(crate) static INPUT_STATE_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`INPUT_STATE_SERIAL`], ignoring poisoning — a panicking test has
+/// already failed, and refusing to run every later one adds noise, not signal.
+#[cfg(test)]
+pub(crate) fn serialize_input_state() -> std::sync::MutexGuard<'static, ()> {
+    INPUT_STATE_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub mod app_nap;
 pub mod escape_tap;
 pub mod menu;

@@ -415,6 +415,66 @@ mod tests {
         assert!(loaded.subagent_log.is_empty(), "serde default keeps old blobs loadable");
     }
 
+    /// Adding a variant to a persisted enum is the kind of change that looks
+    /// free and is not: a transcript written before `Screen` existed has no
+    /// `kind` at all, and one written after carries a string an older decoder
+    /// has never seen. Both directions have to keep loading, because the cost
+    /// of getting it wrong is a chat that will not reopen.
+    #[test]
+    fn permission_kind_survives_round_trip_and_pre_taxonomy_blobs() {
+        let request = PermissionRequest {
+            request_id: "r1".into(),
+            kind: PermissionKind::Screen,
+            description: "drive Safari".into(),
+            suggestions: vec![],
+        };
+        let blob = serde_json::to_string(&request).unwrap();
+        assert!(
+            blob.contains(r#""kind":"screen""#),
+            "the wire spelling is snake_case and load-bearing: {blob}"
+        );
+        assert_eq!(
+            serde_json::from_str::<PermissionRequest>(&blob).unwrap(),
+            request
+        );
+
+        // A transcript persisted before the taxonomy existed: no `kind` key.
+        let old = json!({
+            "request_id": "r0",
+            "description": "run ls",
+            "suggestions": [],
+        })
+        .to_string();
+        let loaded: PermissionRequest = serde_json::from_str(&old).unwrap();
+        assert_eq!(
+            loaded.kind,
+            PermissionKind::Tool,
+            "an absent kind must read as the common case, not fail the load"
+        );
+    }
+
+    /// Every variant has to survive the trip, not just the one that prompted
+    /// this. A `rename_all` typo shows up here rather than as a chat that will
+    /// not reopen.
+    #[test]
+    fn every_permission_kind_round_trips() {
+        for kind in [
+            PermissionKind::Tool,
+            PermissionKind::Plan,
+            PermissionKind::Mode,
+            PermissionKind::Mcp,
+            PermissionKind::Screen,
+            PermissionKind::Other,
+        ] {
+            let blob = serde_json::to_string(&kind).unwrap();
+            assert_eq!(
+                serde_json::from_str::<PermissionKind>(&blob).unwrap(),
+                kind,
+                "{kind:?} did not survive {blob}"
+            );
+        }
+    }
+
     #[test]
     fn parse_partial_json_truncated_object_and_open_string() {
         // Mid-value fragments Claude actually streams for a Write.

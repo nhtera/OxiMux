@@ -143,11 +143,7 @@ mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Turning secure input on is process-wide, so a parallel test reading the
-    /// registry mid-flight would see the other test's doing and call it the
-    /// machine's state.
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::platform::serialize_input_state;
 
     // The public Carbon calls that hold and release secure input. Using the
     // real mechanism is the point: a test that faked the state would prove the
@@ -196,7 +192,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_real_hold_is_seen_and_so_is_letting_go() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = serialize_input_state();
         let before = active();
         let Some(held) = SecureInputHeld::take() else {
             // Refused — it is only granted to an active app in some contexts.
@@ -221,7 +217,7 @@ mod tests {
     /// front of a user with an agent mid-drive.
     #[test]
     fn asking_is_safe_and_repeatable() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = serialize_input_state();
         let first = holder_pid();
         let second = holder_pid();
         assert_eq!(

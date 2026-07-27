@@ -51,15 +51,6 @@
 //! [`crate::platform::secure_input`] reads it out of the IORegistry, and
 //! callers must ask *both* before claiming the kill switch works.
 
-/// Serialises the tests that arm a real tap.
-///
-/// The abort flag and the live-port slot are process-wide, so two tests holding
-/// taps at once would read each other's state: the live-key test's Escape would
-/// land in the other's assertion that nothing is pending. That flake would look
-/// exactly like a bug in the tap.
-#[cfg(test)]
-static TAP_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(target_os = "macos")]
 mod imp {
     use std::ffi::c_void;
@@ -322,7 +313,7 @@ mod imp {
     mod tests {
         use super::*;
 
-        use crate::platform::escape_tap::TAP_SERIAL;
+        use crate::platform::serialize_input_state;
 
         /// `kCGHIDEventTap` — below the session tap, so an event posted here is
         /// seen by one exactly as the user's own key press would be. (Posting
@@ -391,7 +382,7 @@ mod imp {
         /// `#[ignore]`: on a machine in the ordinary state, this runs.
         #[test]
         fn a_real_escape_press_reaches_an_armed_tap() {
-            let _serial = TAP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            let _serial = serialize_input_state();
             if crate::platform::secure_input::active() {
                 // Nothing would arrive, and the failure would say "the tap is
                 // broken" about a machine where it is merely muzzled.
@@ -513,6 +504,7 @@ pub enum EscapeTapError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::serialize_input_state;
 
     #[test]
     fn every_failure_says_what_the_user_can_do_about_it() {
@@ -539,7 +531,7 @@ mod tests {
     /// here rather than in front of a user with an agent mid-drive.
     #[test]
     fn arming_either_works_cleanly_or_fails_cleanly() {
-        let _serial = TAP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = serialize_input_state();
         match arm() {
             Ok(tap) => {
                 // Nothing has been pressed, so nothing is pending.
