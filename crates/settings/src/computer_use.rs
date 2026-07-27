@@ -9,9 +9,24 @@
 //!
 //! [`enabled`](ComputerUseSettings::enabled) is the master switch; `projects`
 //! then names the project roots that actually get it. Both must say yes, so
-//! flipping the master does not hand screen control to every agent in every
-//! project at once — an agent driving the GUI is not something to opt into by
-//! side effect.
+//! flipping the master does not hand the screen-control tools to every agent in
+//! every project at once — an agent driving the GUI is not something to opt into
+//! by side effect.
+//!
+//! # What the project list does not do
+//!
+//! It scopes the *tools*, not the *permission*. Turning screen control on
+//! anywhere requires OxiMux to hold macOS Accessibility, because the Escape kill
+//! switch is an event tap and a tap does not exist without it. macOS attributes
+//! that grant to OxiMux as the responsible process, and every descendant
+//! inherits it — measured, not assumed: a binary spawned from an agent's shell
+//! tool reports `AXIsProcessTrusted() == true`, through an intervening helper
+//! whose whole job is to disclaim responsibility.
+//!
+//! So an agent's shell can reach GUI automation in a project that never appears
+//! in this list. `oximux_computer_use::gui_scripting` refuses the obvious
+//! commands that do, and the settings pane says so plainly rather than implying
+//! a fence that is not there.
 //!
 //! # Why this is not a `.oximux/` file
 //!

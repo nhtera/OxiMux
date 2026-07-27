@@ -61,6 +61,14 @@ pub struct PolicyContext<'a> {
 
 /// Decide a single tool call.
 pub fn decide(tool_name: &str, input: &Value, ctx: &PolicyContext<'_>) -> Decision {
+    // Shell first. A command that drives the GUI is a screen-control call
+    // wearing different clothes, and it reaches the same APIs — see
+    // [`crate::gui_scripting`] for why a shell tool inherits the grant at all,
+    // and for the honest limits of catching it this way.
+    if let Some(command) = shell_command(tool_name, input) {
+        return decide_shell(&command);
+    }
+
     let Some(tool) = crate::mcp::bare_tool_name(tool_name) else {
         return Decision::NotApplicable;
     };
@@ -87,6 +95,49 @@ pub fn decide(tool_name: &str, input: &Value, ctx: &PolicyContext<'_>) -> Decisi
         ToolClass::Overlay => decide_overlay(tool, input),
         ToolClass::Consent => Decision::Ask { pid: None },
         ToolClass::Input => decide_input(tool, input, ctx),
+    }
+}
+
+/// Shell tool names, across the agents this policy runs behind.
+///
+/// Listed rather than sniffed from the input shape: a tool that merely *has* a
+/// `command` field is not necessarily a shell, and guessing wrong in that
+/// direction puts this in the path of tools it does not own.
+const SHELL_TOOLS: &[&str] = &["Bash", "bash", "shell", "local_shell", "run_terminal_cmd"];
+
+/// The command a shell tool is about to run, or `None` if this is not one.
+///
+/// Two shapes: a plain string (Claude's `Bash`) and an argv array (`["bash",
+/// "-lc", "…"]`, as Codex sends). Joined rather than indexed, because which
+/// element holds the script depends on the flags in front of it.
+fn shell_command(tool_name: &str, input: &Value) -> Option<String> {
+    if !SHELL_TOOLS.contains(&tool_name) {
+        return None;
+    }
+    match input.get("command")? {
+        Value::String(command) => Some(command.clone()),
+        Value::Array(argv) => Some(
+            argv.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        _ => None,
+    }
+}
+
+/// A shell command is either ordinary — in which case this must not touch it —
+/// or it is GUI automation, in which case it is refused.
+///
+/// No `Ask` rung. A consent card for a shell command would have to ask "may this
+/// command drive the screen?" without being able to name what it would drive:
+/// the target of an `osascript` keystroke is whatever holds focus when it runs,
+/// which is not known at approval time and is the user's own window by default.
+/// There is nothing honest to put on the card.
+fn decide_shell(command: &str) -> Decision {
+    match crate::gui_scripting::classify_command(command) {
+        None => Decision::NotApplicable,
+        Some(kind) => Decision::refuse(format!("This command {}.", kind.reason())),
     }
 }
 
@@ -271,6 +322,85 @@ mod tests {
                 "{tool}"
             );
         }
+    }
+
+    #[test]
+    fn an_ordinary_shell_command_is_left_entirely_alone() {
+        // The negative that costs the most to get wrong: this now sees every
+        // shell call an agent makes, all day, in every project.
+        let f = Fixture::new();
+        for command in ["cargo test", "git status", "ls -la", "rg -n CGEventPost ."] {
+            assert_eq!(
+                decide("Bash", &json!({ "command": command }), &f.ctx()),
+                Decision::NotApplicable,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_shell_command_that_drives_the_gui_is_refused() {
+        // The bypass measured on this project: the accessibility grant OxiMux
+        // takes for the Escape kill switch is inherited by the agent's shell,
+        // in every project, whatever the per-project setting says.
+        let f = Fixture::new();
+        let reason = refusal(&decide(
+            "Bash",
+            &json!({ "command": r#"osascript -e 'tell application "System Events" to keystroke "x"'"# }),
+            &f.ctx(),
+        ))
+        .to_string();
+        assert!(reason.contains("accessibility API"), "{reason}");
+        assert!(reason.contains("screen-control tools"), "{reason}");
+    }
+
+    #[test]
+    fn an_argv_style_shell_tool_is_read_too() {
+        // Codex sends `["bash", "-lc", "…"]` rather than a bare string, and a
+        // reader that only understood one shape would enforce on one agent.
+        let f = Fixture::new();
+        assert!(matches!(
+            decide(
+                "shell",
+                &json!({ "command": ["bash", "-lc", "cliclick c:10,10"] }),
+                &f.ctx()
+            ),
+            Decision::Refuse { .. }
+        ));
+    }
+
+    #[test]
+    fn a_shell_refusal_never_becomes_a_consent_card() {
+        // There is nothing honest to put on such a card: the target of an
+        // osascript keystroke is whatever holds focus when it runs, which is
+        // unknown at approval time and is the user's own window by default.
+        let f = Fixture::new();
+        for command in [
+            r#"osascript -e 'tell app "System Events" to keystroke "x"'"#,
+            "cliclick c:1,1",
+            "osascript /tmp/x.scpt",
+        ] {
+            let decision = decide("Bash", &json!({ "command": command }), &f.ctx());
+            assert!(
+                matches!(decision, Decision::Refuse { .. }),
+                "{command} -> {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_that_is_not_a_shell_keeps_its_own_treatment() {
+        // `command` is a common field name. A tool merely having one must not
+        // drag it into the shell path.
+        let f = Fixture::new();
+        assert_eq!(
+            decide(
+                "mcp__other__run",
+                &json!({ "command": "cliclick c:10,10" }),
+                &f.ctx()
+            ),
+            Decision::NotApplicable
+        );
     }
 
     #[test]

@@ -77,7 +77,10 @@ pub(super) fn render(
         body = body
             .child(section_title(
                 "Projects",
-                "Agents in these projects may drive apps. Turn a project on from its own window.",
+                // Deliberately "get the tools" rather than "may drive apps":
+                // the list decides who is handed the screen-control tools, not
+                // who can reach the screen. See `footnotes`.
+                "These projects get the screen-control tools. Turn one on from its own window.",
                 theme,
                 typography,
             ))
@@ -98,16 +101,42 @@ pub(super) fn render(
         ))
         .child(entries_card(theme, density, typography, apps));
 
-    body.child(
-        div()
-            .pt(px(4.0))
-            .text_size(px(typography.t_sub_label))
-            .text_color(theme.fg_subtle)
-            // Said plainly, because the opposite belief is the dangerous one:
-            // an agent with a shell has other routes to the same driver.
-            .child("Guards against an agent's mistakes, not an agent trying to get around them."),
-    )
-    .into_any_element()
+    body.child(footnotes(theme, typography)).into_any_element()
+}
+
+/// The two things a user reading this pane could otherwise get wrong.
+///
+/// The first is the older one: an agent with a shell has routes to the same
+/// driver that no list here can close, so this is a guard against mistakes.
+///
+/// The second was measured during the coverage spike, and it is the reason the
+/// per-project wording elsewhere in this pane had to change. Turning screen
+/// control on requires OxiMux to hold macOS Accessibility — the Escape kill
+/// switch is an event tap, and a tap does not exist without it. macOS attributes
+/// that grant to OxiMux as the responsible process and **every descendant
+/// inherits it**, which includes each agent's shell tool, in every project,
+/// whether or not that project appears above. The list below controls which
+/// projects are handed the screen-control *tools*. It does not, and cannot,
+/// fence off the permission.
+///
+/// One line per sentence: prose in a settings pane does not wrap in this app, so
+/// a paragraph would clip at the pane edge rather than reflow.
+const FOOTNOTES: &[&str] = &[
+    "Guards against an agent's mistakes, not an agent trying to get around them.",
+    "Enabling this grants OxiMux macOS Accessibility, needed for Esc to stop an agent.",
+    "Every agent's shell inherits that grant — in all projects, not only those listed.",
+];
+
+fn footnotes(theme: Theme, typography: &Typography) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .pt(px(4.0))
+        .text_size(px(typography.t_sub_label))
+        .text_color(theme.fg_subtle)
+        .children(FOOTNOTES.iter().map(|note| div().child(*note)))
+        .into_any_element()
 }
 
 pub(super) fn entries(
@@ -120,7 +149,10 @@ pub(super) fn entries(
     vec![
         entry(
             "Enable screen control",
-            "Let agents click and type in other apps. Off by default; each project opts in separately.",
+            // No longer "each project opts in separately" — true of the toggle,
+            // but it read as a promise that the capability stays inside the
+            // project, which the Accessibility grant does not honour.
+            "Let agents click and type in other apps. Off until you turn it on here.",
             toggle_switch(
                 "screen-enabled",
                 modal.computer_use.enabled,
@@ -279,6 +311,26 @@ fn app_rows(
 mod tests {
     use super::*;
     use oximux_settings::ComputerUseSettings;
+
+    /// The pane must keep saying that the permission is not project-scoped.
+    ///
+    /// Pinned because this is exactly the kind of copy a later tidy-up removes
+    /// for being wordy — and because the sentence it replaced ("each project
+    /// opts in separately") read as a guarantee the OS does not make. The claim
+    /// was measured during the coverage spike: an agent's shell inherits
+    /// OxiMux's Accessibility grant regardless of which projects are listed.
+    #[test]
+    fn the_pane_does_not_promise_the_permission_is_per_project() {
+        let shown = FOOTNOTES.join("\n");
+        for claim in ["Accessibility", "shell inherits", "not only those listed"] {
+            assert!(shown.contains(claim), "the pane must still say: {claim}");
+        }
+        // And each line has to fit: settings prose does not wrap here, so a
+        // long one clips at the pane edge and the warning is simply not read.
+        for note in FOOTNOTES {
+            assert!(note.len() <= 90, "{note:?} will clip ({} chars)", note.len());
+        }
+    }
 
     #[test]
     fn a_verified_driver_reads_as_ready_with_its_version() {
