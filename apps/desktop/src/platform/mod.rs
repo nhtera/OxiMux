@@ -10,6 +10,7 @@ pub mod escape_tap;
 pub mod menu;
 pub mod mic_permission;
 pub mod screen_control_indicator;
+pub mod secure_input;
 pub mod single_instance;
 pub mod window_factory;
 pub mod window_registry;

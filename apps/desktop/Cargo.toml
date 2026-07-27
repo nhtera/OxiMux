@@ -108,6 +108,10 @@ objc2-foundation = { version = "0.3", features = [
   # `NSFileManager trashItemAtURL:` (reversible, unlike a hard unlink).
   "NSFileManager",
   "NSError",
+  # Secure-input detection (`platform::secure_input`): the IORegistry's
+  # `IOConsoleUsers` comes back as a toll-free-bridged CFArray of CFDictionary
+  # whose secure-input pid is an NSNumber.
+  "NSValue",
 ] }
 objc2-user-notifications = "0.3"
 # Voice-dictation microphone permission (`platform::mic_permission`):

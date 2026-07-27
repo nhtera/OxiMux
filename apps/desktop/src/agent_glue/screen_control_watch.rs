@@ -105,7 +105,7 @@ pub fn install(cx: &mut App) {
             }
 
             let probe = path.clone();
-            let Some(driving) = cx
+            let Some(reading) = cx
                 .background_executor()
                 .spawn(async move { tick(&probe, last, showing) })
                 .await
@@ -113,11 +113,11 @@ pub fn install(cx: &mut App) {
                 continue;
             };
             last = FileStamp::of(&path);
-            showing = !driving.is_idle();
-            let escape = stop.follow(showing);
+            showing = !reading.driving.is_idle();
+            let escape = stop.follow(showing, reading.secure_input);
 
             cx.update_global::<Indicator, _>(|indicator, _| {
-                indicator.0.update(&driving, escape)
+                indicator.0.update(&reading.driving, escape)
             });
         }
     })
@@ -157,16 +157,16 @@ impl StopKey {
     /// Match the tap to whether anything is being driven, and report what the
     /// indicator may now claim.
     ///
-    /// Idle answers [`EscapeState::Unavailable`], which is simply true — there
-    /// is no tap. It cannot mislead: the indicator hides on the same condition,
-    /// so the permission warning has nowhere to appear.
-    fn follow(&mut self, driving: bool) -> EscapeState {
+    /// `None` when nothing is being driven: there is no tap, and the question
+    /// the state answers does not arise. Returning a failure reason there would
+    /// name a cause for a machine on which nothing is happening.
+    fn follow(&mut self, driving: bool, secure_input: bool) -> Option<EscapeState> {
         if !driving {
             self.tap = None;
             // Cleared, not latched: the user may have granted Accessibility
             // since the last run, and the next one should find out.
             self.blocked = false;
-            return EscapeState::Unavailable;
+            return None;
         }
         if self.tap.is_none() && !self.blocked {
             match escape_tap::arm() {
@@ -177,11 +177,16 @@ impl StopKey {
                 }
             }
         }
-        if self.tap.is_some() {
-            EscapeState::Armed
-        } else {
-            EscapeState::Unavailable
+        if self.tap.is_none() {
+            return Some(EscapeState::NotPermitted);
         }
+        // Checked after arming, not instead of it: secure input comes and goes
+        // with whatever has focus, so a tap held through it starts working the
+        // moment it lifts. Only the claim changes, never the tap.
+        if secure_input {
+            return Some(EscapeState::SecureInput);
+        }
+        Some(EscapeState::Armed)
     }
 
     /// Has Escape been pressed since the last check? Clears the flag, so one
@@ -191,13 +196,32 @@ impl StopKey {
     }
 }
 
-/// One pass' worth of file work, off the UI thread. `None` means nothing
-/// changed and nothing is showing, so the tick has no work to do.
-fn tick(path: &PathBuf, last: FileStamp, showing: bool) -> Option<Driving> {
+/// What one pass learned about the world.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reading {
+    driving: Driving,
+    /// Whether macOS is withholding keys from every tap. Only asked when
+    /// something is being driven — it costs an IORegistry search, and the
+    /// answer is meaningless when there is no tap to be starved.
+    secure_input: bool,
+}
+
+/// One pass' worth of off-thread work. `None` means nothing changed and nothing
+/// is showing, so the tick has no work to do.
+///
+/// Both reads happen here rather than at the call site because both touch the
+/// system — a file lock and a registry walk — and the call site runs on the
+/// thread that paints.
+fn tick(path: &PathBuf, last: FileStamp, showing: bool) -> Option<Reading> {
     if !needs_full_read(FileStamp::of(path), last, showing) {
         return None;
     }
-    Some(Driving::read(&GrantTable::at(path)))
+    let driving = Driving::read(&GrantTable::at(path));
+    let secure_input = !driving.is_idle() && crate::platform::secure_input::active();
+    Some(Reading {
+        driving,
+        secure_input,
+    })
 }
 
 #[cfg(test)]
@@ -254,21 +278,40 @@ mod tests {
     #[test]
     fn arming_is_tried_once_per_run_of_grants() {
         let mut stop = StopKey::default();
-        let first = stop.follow(true);
+        let first = stop.follow(true, false);
         match first {
-            EscapeState::Armed => {
+            Some(EscapeState::Armed) => {
                 assert!(stop.tap.is_some());
                 assert!(!stop.blocked, "a success must not latch a failure");
             }
-            EscapeState::Unavailable => {
+            Some(EscapeState::NotPermitted) => {
                 assert!(stop.tap.is_none());
                 assert!(stop.blocked, "a failure must latch, or every tick retries");
             }
+            other => panic!("secure input was not reported, so cannot be it: {other:?}"),
         }
         assert_eq!(
-            stop.follow(true),
+            stop.follow(true, false),
             first,
             "a second tick must not change the answer"
+        );
+    }
+
+    #[test]
+    fn secure_input_is_reported_without_giving_up_the_tap() {
+        // It comes and goes with whatever has focus, so a tap torn down for it
+        // would have to be rebuilt the moment a password field lost focus —
+        // and would be missing in the gap. Only the claim changes.
+        let mut stop = StopKey::default();
+        if stop.follow(true, false) != Some(EscapeState::Armed) {
+            return; // No Accessibility here; covered by the test above.
+        }
+        assert_eq!(stop.follow(true, true), Some(EscapeState::SecureInput));
+        assert!(stop.tap.is_some(), "the tap must survive being starved");
+        assert_eq!(
+            stop.follow(true, false),
+            Some(EscapeState::Armed),
+            "and must be claimed working again the moment keys flow"
         );
     }
 
@@ -279,8 +322,12 @@ mod tests {
         // the failure matters because the user may have granted the permission
         // in between.
         let mut stop = StopKey::default();
-        stop.follow(true);
-        assert_eq!(stop.follow(false), EscapeState::Unavailable);
+        stop.follow(true, false);
+        assert_eq!(
+            stop.follow(false, false),
+            None,
+            "nothing driving means the question does not arise"
+        );
         assert!(stop.tap.is_none());
         assert!(!stop.blocked);
     }
@@ -289,7 +336,7 @@ mod tests {
     fn nothing_is_pending_until_a_key_is_pressed() {
         let mut stop = StopKey::default();
         assert!(!stop.pressed(), "no tap means nothing to drain");
-        stop.follow(true);
+        stop.follow(true, false);
         assert!(!stop.pressed());
     }
 
@@ -300,7 +347,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("computer-use-grants.json");
         std::fs::write(&path, "{}").expect("write");
-        let driving = tick(&path, FileStamp::of(&path), true).expect("a read was due");
-        assert!(driving.is_idle());
+        let reading = tick(&path, FileStamp::of(&path), true).expect("a read was due");
+        assert!(reading.driving.is_idle());
+        assert!(
+            !reading.secure_input,
+            "with nothing driving there is no tap to starve, so the registry \
+             is not walked and the answer stays false"
+        );
     }
 }

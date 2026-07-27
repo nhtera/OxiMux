@@ -35,26 +35,21 @@
 //! is the classic way this API fails in the field, which is why the callback
 //! does nothing but set a flag and post a wake-up.
 //!
-//! # A third way, which this module cannot currently detect
+//! # A third way, which this module cannot see for itself
 //!
 //! While any process holds **secure event input** — a password field, the lock
 //! screen, some terminals — macOS delivers no keyboard events to any tap at
 //! all. That is the feature working as designed; it is what stops a keylogger.
 //!
-//! What makes it dangerous here is that it is invisible from this side:
-//! `CGEventTapCreate` still succeeds, [`arm`] still returns a guard, and
-//! `CGEventTapIsEnabled` still reports true. Escape simply never arrives. So a
-//! successful [`arm`] is **not** proof that Escape can stop an agent, and any
-//! UI built on that assumption is making the promise this module's whole
-//! premise says must not be made.
+//! It is invisible from this side: `CGEventTapCreate` succeeds, [`arm`] returns
+//! a guard, and `CGEventTapIsEnabled` reports true. Escape simply never
+//! arrives. So **a successful [`arm`] is not proof that Escape can stop an
+//! agent**, and a UI built on that assumption makes exactly the promise this
+//! module's premise says must not be made.
 //!
-//! Detecting it means reading `kCGSSessionSecureInputPID` out of IOKit's
-//! `IOConsoleUsers`; a non-zero pid there means no tap on the machine is
-//! receiving keys. Until that lands, the gap is real and known:
-//!
-//! ```text
-//! ioreg -l -d 1 -k IOConsoleUsers | grep kCGSSessionSecureInputPID
-//! ```
+//! Nothing here can detect it, because the tap is not where the answer lives.
+//! [`crate::platform::secure_input`] reads it out of the IORegistry, and
+//! callers must ask *both* before claiming the kill switch works.
 
 /// Serialises the tests that arm a real tap.
 ///
@@ -386,25 +381,22 @@ mod imp {
         /// would be armed and permanently silent, and this assertion would pass
         /// only by never having been tested.
         ///
-        /// # Why it is ignored by default
+        /// # Two preconditions it checks rather than assumes
         ///
-        /// It needs **secure input to be off**, and that is not something a test
-        /// can arrange. While any process holds secure event input, macOS
-        /// delivers no keyboard events to any tap — by design, since that is
-        /// what stops keyloggers — yet `CGEventTapCreate` still succeeds and the
-        /// tap still reports itself enabled. Check with:
-        ///
-        /// ```text
-        /// ioreg -l -d 1 -k IOConsoleUsers | grep kCGSSessionSecureInputPID
-        /// ```
-        ///
-        /// A non-zero pid there means this test cannot pass, and neither can the
-        /// feature — see the module docs. Run it with `--ignored` when that
-        /// reads zero.
+        /// Accessibility permission, without which no tap exists; and **secure
+        /// input off**, without which macOS delivers no keys to any tap while
+        /// `CGEventTapCreate` still succeeds and the tap still reports itself
+        /// enabled. Neither is a test's to arrange, so each is detected and
+        /// skipped on — which is why the skip is a real branch here and not an
+        /// `#[ignore]`: on a machine in the ordinary state, this runs.
         #[test]
-        #[ignore = "needs secure input off; see the doc comment"]
         fn a_real_escape_press_reaches_an_armed_tap() {
             let _serial = TAP_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            if crate::platform::secure_input::active() {
+                // Nothing would arrive, and the failure would say "the tap is
+                // broken" about a machine where it is merely muzzled.
+                return;
+            }
             // SAFETY: this thread's run loop, which the pump below drives.
             let Ok(tap) = arm_on(unsafe { CFRunLoopGetCurrent() }) else {
                 return;

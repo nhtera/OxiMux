@@ -36,23 +36,35 @@ const STOP_HINT: &str = "Press Esc to stop";
 /// one way a working kill switch still gets someone hurt.
 const IN_FLIGHT_CAVEAT: &str = "An action already sent may still finish";
 
-/// Whether Escape can actually stop anything.
+/// Whether Escape can actually stop anything, and if not, why not.
 ///
-/// Carried into the copy rather than assumed, because the tap needs
-/// Accessibility permission and silently does not exist without it. Promising a
-/// panic key that does nothing is worse than admitting there is none.
+/// Carried into the copy rather than assumed, because both failures are silent
+/// from the tap's own side and neither is the user's fault to guess at.
+/// Promising a panic key that does nothing is worse than admitting there is
+/// none — and a reason the user can act on is better than either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EscapeState {
     Armed,
-    Unavailable,
+    /// No Accessibility permission, so no tap could be created at all.
+    NotPermitted,
+    /// A tap exists, but macOS is withholding keyboard events from every tap on
+    /// the machine. Nothing about the tap reveals this, which is why it is
+    /// asked about separately.
+    SecureInput,
 }
 
 impl EscapeState {
     fn hint(self) -> &'static str {
         match self {
             EscapeState::Armed => STOP_HINT,
-            EscapeState::Unavailable => {
+            EscapeState::NotPermitted => {
                 "Esc cannot stop this — allow OxiMux under Privacy & Security › Accessibility"
+            }
+            // Names the cause rather than a fix, because the fix depends on who
+            // is holding it: closing a password field, or locking and
+            // unlocking the screen when something has left it stuck on.
+            EscapeState::SecureInput => {
+                "Esc cannot stop this while macOS secure input is on"
             }
         }
     }
@@ -142,14 +154,17 @@ mod imp {
         /// this is an indicator, and taking the app down to complain about
         /// where it was called from would be a far worse outcome than a missing
         /// dot.
-        pub fn update(&mut self, driving: &super::Driving, escape: super::EscapeState) {
+        pub fn update(&mut self, driving: &super::Driving, escape: Option<super::EscapeState>) {
             let Some(mtm) = MainThreadMarker::new() else {
                 return;
             };
-            if driving.is_idle() {
+            // Two guards that must agree: no state means nothing is being
+            // driven, which is also what an idle `driving` means. Taking either
+            // as reason to hide is what keeps a stale claim off the menu bar.
+            let (false, Some(escape)) = (driving.is_idle(), escape) else {
                 self.hide();
                 return;
-            }
+            };
 
             let copy = Wording::for_driving(driving, escape);
             if self.showing.as_ref() == Some(&copy.rows) {
@@ -205,7 +220,7 @@ mod imp {
         pub fn new() -> Self {
             Self
         }
-        pub fn update(&mut self, _driving: &super::Driving, _escape: super::EscapeState) {}
+        pub fn update(&mut self, _driving: &super::Driving, _escape: Option<super::EscapeState>) {}
         pub fn hide(&mut self) {}
     }
 }
@@ -271,20 +286,39 @@ mod tests {
 
     #[test]
     fn an_unarmed_escape_says_so_rather_than_promising_a_key_that_does_nothing() {
-        // The tap needs Accessibility permission and silently does not exist
-        // without it. Claiming otherwise is the one failure that gets someone
-        // hurt while they are pressing a key they were told would work.
-        let copy = Wording::for_driving(
-            &driving(&[("chat-1", &["Safari"])]),
-            EscapeState::Unavailable,
-        );
-        assert!(!copy.rows.iter().any(|r| r == STOP_HINT), "{:?}", copy.rows);
+        // Both failures are silent from the tap's side. Claiming otherwise is
+        // the one that gets someone hurt while they are pressing a key they
+        // were told would work.
+        for state in [EscapeState::NotPermitted, EscapeState::SecureInput] {
+            let copy = Wording::for_driving(&driving(&[("chat-1", &["Safari"])]), state);
+            assert!(
+                !copy.rows.iter().any(|r| r == STOP_HINT),
+                "{state:?}: {:?}",
+                copy.rows
+            );
+            assert!(!copy.tooltip.contains(STOP_HINT), "{state:?}: {}", copy.tooltip);
+        }
+    }
+
+    #[test]
+    fn each_reason_escape_is_dead_is_named_distinctly() {
+        // "Esc does not work" without a cause is unactionable, and the two
+        // causes need opposite responses — one is a permission the user grants
+        // once, the other is transient and not theirs to fix.
         assert!(
-            copy.rows.iter().any(|r| r.contains("Accessibility")),
-            "{:?}",
-            copy.rows
+            EscapeState::NotPermitted.hint().contains("Accessibility"),
+            "{}",
+            EscapeState::NotPermitted.hint()
         );
-        assert!(!copy.tooltip.contains(STOP_HINT), "{}", copy.tooltip);
+        assert!(
+            EscapeState::SecureInput.hint().contains("secure input"),
+            "{}",
+            EscapeState::SecureInput.hint()
+        );
+        assert_ne!(
+            EscapeState::NotPermitted.hint(),
+            EscapeState::SecureInput.hint()
+        );
     }
 
     #[test]
@@ -308,10 +342,12 @@ mod tests {
     fn showing_and_hiding_never_panics() {
         let mut indicator = ScreenControlIndicator::new();
         let live = driving(&[("chat-1", &["Safari"])]);
-        indicator.update(&live, EscapeState::Armed);
-        indicator.update(&live, EscapeState::Armed);
-        indicator.update(&live, EscapeState::Unavailable);
-        indicator.update(&Driving::default(), EscapeState::Armed);
+        indicator.update(&live, Some(EscapeState::Armed));
+        indicator.update(&live, Some(EscapeState::Armed));
+        indicator.update(&live, Some(EscapeState::SecureInput));
+        // No state and no grants: both ways of saying nothing is happening.
+        indicator.update(&live, None);
+        indicator.update(&Driving::default(), Some(EscapeState::Armed));
         indicator.hide();
     }
 }
