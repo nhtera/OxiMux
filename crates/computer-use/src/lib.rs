@@ -56,7 +56,7 @@ pub use mcp::{bare_tool_name, is_computer_use_tool, server_spec, SERVER_NAME};
 pub use policy::{decide, Decision, PolicyContext};
 pub use redact::{scrub_transcript, ScreenshotFilter};
 pub use session::{Reconciliation, SessionId, SessionLedger};
-pub use target::{Sentinel, TargetApp};
+pub use target::{Category, TargetApp};
 pub use verify::VerifiedDriver;
 pub use version::Version;
 

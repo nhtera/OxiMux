@@ -38,6 +38,13 @@ struct Args {
     /// Path to the shared grant store. Passed rather than derived so the app
     /// and the hook cannot resolve different files.
     grants: PathBuf,
+    /// OxiMux's own executable, so the policy can recognise a call aimed at us.
+    ///
+    /// This process is the gate, not OxiMux, so `current_exe()` answers a
+    /// different question than the one being asked. Optional only because an
+    /// older command line would otherwise be rejected outright, which fails in
+    /// the worse direction — a chat with no gate at all.
+    host: Option<PathBuf>,
     /// The chat's worktree, for build provenance.
     worktree: Option<PathBuf>,
     /// When the chat started, as seconds since the epoch. A binary older than
@@ -80,6 +87,7 @@ fn main() {
             session: &session,
             grants: &grants,
             provenance: provenance.as_ref(),
+            host: args.host.as_deref(),
         },
     );
 
@@ -115,6 +123,7 @@ fn render(decision: &Decision) -> Option<String> {
 fn parse_args(args: impl Iterator<Item = String>) -> Option<Args> {
     let mut chat = None;
     let mut grants = None;
+    let mut host = None;
     let mut worktree = None;
     let mut since = None;
 
@@ -124,6 +133,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Option<Args> {
         match (flag.as_str(), value) {
             ("--chat", Some(v)) => chat = Some(v),
             ("--grants", Some(v)) => grants = Some(PathBuf::from(v)),
+            ("--host-exe", Some(v)) => host = Some(PathBuf::from(v)),
             ("--worktree", Some(v)) => worktree = Some(PathBuf::from(v)),
             ("--since", Some(v)) => {
                 since = v
@@ -137,6 +147,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Option<Args> {
     Some(Args {
         chat: chat?,
         grants: grants?,
+        host,
         worktree,
         since,
     })
@@ -165,6 +176,8 @@ mod tests {
             "chat-7",
             "--grants",
             "/tmp/grants.json",
+            "--host-exe",
+            "/Applications/OxiMux.app/Contents/MacOS/oximux",
             "--worktree",
             "/repo",
             "--since",
@@ -173,6 +186,10 @@ mod tests {
         .expect("valid");
         assert_eq!(parsed.chat, "chat-7");
         assert_eq!(parsed.grants, Path::new("/tmp/grants.json"));
+        assert_eq!(
+            parsed.host.as_deref(),
+            Some(Path::new("/Applications/OxiMux.app/Contents/MacOS/oximux"))
+        );
         assert_eq!(parsed.worktree.as_deref(), Some(Path::new("/repo")));
         assert_eq!(parsed.since.map(epoch_seconds), Some(1_700_000_000));
     }
@@ -184,6 +201,9 @@ mod tests {
         let parsed = args(&["--chat", "c", "--grants", "/tmp/g.json"]).expect("valid");
         assert!(parsed.worktree.is_none());
         assert!(parsed.since.is_none());
+        // Likewise the host: an older command line must still produce a gate,
+        // because rejecting it would leave the chat with none at all.
+        assert!(parsed.host.is_none());
     }
 
     #[test]

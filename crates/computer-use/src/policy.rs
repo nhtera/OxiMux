@@ -57,6 +57,12 @@ pub struct PolicyContext<'a> {
     pub grants: &'a GrantTable,
     /// What this agent built for itself, when it has a resolvable worktree.
     pub provenance: Option<&'a Provenance>,
+    /// The OxiMux binary this policy is protecting.
+    ///
+    /// `None` means "whatever process is running this", which is right in the
+    /// app and in tests and *wrong* in the gate, where the running process is
+    /// the gate itself. See [`crate::blocked::blocked_reason`].
+    pub host: Option<&'a std::path::Path>,
 }
 
 /// Decide a single tool call.
@@ -104,11 +110,22 @@ pub fn decide(tool_name: &str, input: &Value, ctx: &PolicyContext<'_>) -> Decisi
 
     match class {
         ToolClass::Forbidden(_) => unreachable!("handled above"),
-        ToolClass::Read => Decision::Allow,
+        ToolClass::Read => decide_read(tool, input, ctx),
         ToolClass::Overlay => decide_overlay(tool, input),
         ToolClass::Consent => Decision::Ask { pid: None },
         ToolClass::Input => decide_input(tool, input, ctx),
     }
+}
+
+/// The pid a call names, if it names one.
+///
+/// One reader for the field so the read path and the input path cannot come to
+/// different conclusions about who a call is aimed at.
+fn addressed_pid(input: &Value) -> Option<u32> {
+    input
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
 }
 
 /// Shell tool names, across the agents this policy runs behind.
@@ -166,6 +183,49 @@ fn decide_overlay(tool: &str, input: &Value) -> Decision {
     Decision::Allow
 }
 
+/// A read needs no grant — perception has to work before the agent has anything
+/// to ask about, since a read is how it finds the pid in the first place — but
+/// it is still a *targeting* question, and the driver's own schema is why.
+///
+/// `get_window_state` returns a screenshot of the window it names alongside the
+/// element tree, and returns it by default. So on this surface "read" and
+/// "photograph" are the same call, and the apps that may never be driven may
+/// equally never be photographed: our own window carries the consent card the
+/// agent would be answering and every other chat the user has open, and a
+/// password manager's carries the credentials. Refusing the click while
+/// allowing the picture would not be a smaller rule, it would be an incoherent
+/// one.
+///
+/// Unlike the input path there is no earlier check to lean on — nothing was
+/// ever granted, so nothing was ever inspected — which is why the `codesign`
+/// spawn happens here, on a call that is already grabbing pixels and crossing a
+/// socket. Only calls that name a pid pay it; the metadata reads name nothing.
+fn decide_read(tool: &str, input: &Value, ctx: &PolicyContext<'_>) -> Decision {
+    // A capture written to a path outlives the turn and walks around every
+    // filter downstream of this one. In particular it defeats the transcript
+    // redaction that keeps screen captures off a paired phone: that matches on
+    // the tool which produced the image, and a PNG the agent reads back later
+    // is an ordinary file read carrying an ordinary image.
+    if input.get("screenshot_out_file").is_some() {
+        return Decision::refuse(format!(
+            "`{tool}` asked to write its screenshot to a file, which would keep a picture of your screen after the turn ends"
+        ));
+    }
+    let Some(pid) = addressed_pid(input) else {
+        return Decision::Allow;
+    };
+    match executable_of_pid(pid)
+        .as_deref()
+        .and_then(|exe| crate::blocked::blocked_reason(exe, ctx.host))
+    {
+        Some(blocked) => Decision::refuse(format!(
+            "`{tool}` targeted {}. Agents are never allowed to read or capture it.",
+            blocked.reason()
+        )),
+        None => Decision::Allow,
+    }
+}
+
 fn decide_input(tool: &str, input: &Value, ctx: &PolicyContext<'_>) -> Decision {
     // "Use desktop with no pid/window_id to type into the frontmost
     // application" — the driver's own words. There is no target to attribute,
@@ -186,8 +246,7 @@ fn decide_input(tool: &str, input: &Value, ctx: &PolicyContext<'_>) -> Decision 
         ));
     }
 
-    let Some(pid) = input.get("pid").and_then(Value::as_u64).and_then(|p| u32::try_from(p).ok())
-    else {
+    let Some(pid) = addressed_pid(input) else {
         return Decision::refuse(format!(
             "`{tool}` did not name a target process, so it would act on whatever window is in front"
         ));
@@ -217,7 +276,10 @@ fn decide_input(tool: &str, input: &Value, ctx: &PolicyContext<'_>) -> Decision 
             // manager is not approving what that enables. Checked here rather
             // than at the top so it costs a `codesign` spawn only for a target
             // nobody has approved yet, never on the repeated-click path.
-            if let Some(blocked) = executable.as_deref().and_then(crate::blocked::blocked_reason) {
+            if let Some(blocked) = executable
+                .as_deref()
+                .and_then(|exe| crate::blocked::blocked_reason(exe, ctx.host))
+            {
                 return Decision::refuse(format!(
                     "`{tool}` targeted {}. Agents are never allowed to drive it.",
                     blocked.reason()
@@ -308,6 +370,9 @@ mod tests {
                 session: &self.session,
                 grants: &self.grants,
                 provenance: None,
+                // `None` is the honest value here: the test binary really is
+                // the process being protected, so `current_exe()` is right.
+                host: None,
             }
         }
 
@@ -374,6 +439,7 @@ mod tests {
             session: &f.session,
             grants: &f.grants,
             provenance: Some(&prov),
+            host: None,
         };
         assert!(matches!(
             decide(&ns("click"), &json!({ "pid": target.pid() }), &ctx),
@@ -682,8 +748,63 @@ mod tests {
         // Perception has to work before the agent has anything to ask about —
         // it is how it finds the pid in the first place.
         let f = Fixture::new();
+        let target = Target::spawn();
         assert_eq!(
-            f.decide("get_window_state", json!({ "pid": std::process::id() })),
+            f.decide("get_window_state", json!({ "pid": target.pid() })),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn a_read_that_names_nobody_is_allowed() {
+        // The discovery reads carry no target at all. Requiring one would break
+        // the only way an agent has of finding a pid to ask about.
+        let f = Fixture::new();
+        for tool in ["list_windows", "list_apps", "get_screen_size"] {
+            assert_eq!(f.decide(tool, json!({})), Decision::Allow, "{tool}");
+        }
+    }
+
+    #[test]
+    fn oximuxs_own_window_may_not_be_captured_either() {
+        // `get_window_state` returns a screenshot of the window it names, by
+        // default and alongside the tree. So refusing the click while allowing
+        // the picture would leave the agent reading its own consent card and
+        // every other chat the user has open.
+        let f = Fixture::new();
+        let reason = refusal(&f.decide(
+            "get_window_state",
+            json!({ "pid": std::process::id() }),
+        ))
+        .to_string();
+        assert!(reason.contains("OxiMux itself"), "{reason}");
+    }
+
+    #[test]
+    fn a_read_may_not_write_its_capture_to_a_file() {
+        // A capture on disk outlives the turn and walks around every filter
+        // downstream — including the transcript redaction that keeps screen
+        // captures off a paired phone, which matches on the tool that produced
+        // the image and cannot recognise a PNG read back later as a file.
+        let f = Fixture::new();
+        let target = Target::spawn();
+        let reason = refusal(&f.decide(
+            "get_window_state",
+            json!({ "pid": target.pid(), "screenshot_out_file": "/tmp/shot.png" }),
+        ))
+        .to_string();
+        assert!(reason.contains("file"), "{reason}");
+    }
+
+    #[test]
+    fn a_read_naming_a_dead_pid_is_allowed_rather_than_refused() {
+        // There is nothing to capture, so there is nothing to protect, and the
+        // driver will fail the call on its own terms with a better message than
+        // this layer could invent. Failing closed here would only add a second,
+        // less accurate error for an ordinary race.
+        let f = Fixture::new();
+        assert_eq!(
+            f.decide("get_window_state", json!({ "pid": u32::MAX })),
             Decision::Allow
         );
     }
@@ -704,6 +825,7 @@ mod tests {
             session: &f.session,
             grants: &f.grants,
             provenance: Some(&prov),
+            host: None,
         };
         let pid = target.pid();
         assert_eq!(
@@ -741,6 +863,7 @@ mod tests {
             session: &f.session,
             grants: &f.grants,
             provenance: Some(&prov),
+            host: None,
         };
         for input in [
             json!({ "text": "x" }),

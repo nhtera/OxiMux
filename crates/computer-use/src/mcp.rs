@@ -72,6 +72,15 @@ pub struct HookSpec<'a> {
     /// The shared grant store. Passed explicitly so the app and the hook cannot
     /// resolve different files.
     pub grants: &'a Path,
+    /// OxiMux's own executable — normally `std::env::current_exe()`.
+    ///
+    /// Passed for the same reason as `grants`, and it matters more than it
+    /// looks: the gate is a *separate binary*, so it cannot ask what process it
+    /// is and get a useful answer. Without this, "an agent may never drive
+    /// OxiMux" holds only for a shipped build, which is identifiable by bundle
+    /// id — a development build is ad-hoc signed with none, and that is the
+    /// build this feature is written in.
+    pub host: &'a Path,
     /// The chat's worktree and start time, for build provenance. `None` leaves
     /// the hook asking about every target rather than trusting its own builds.
     pub worktree: Option<&'a Path>,
@@ -84,10 +93,11 @@ pub struct HookSpec<'a> {
 /// and leave the rest.
 pub fn declaration(driver: &Path, hook: &HookSpec<'_>) -> Declaration {
     let mut command = format!(
-        "{} --chat {} --grants {}",
+        "{} --chat {} --grants {} --host-exe {}",
         shell_quote(&hook.command.display().to_string()),
         shell_quote(hook.chat),
         shell_quote(&hook.grants.display().to_string()),
+        shell_quote(&hook.host.display().to_string()),
     );
     if let Some(worktree) = hook.worktree {
         command.push_str(&format!(" --worktree {}", shell_quote(&worktree.display().to_string())));
@@ -201,6 +211,7 @@ mod tests {
                 command: Path::new("/Applications/OxiMux.app/Contents/MacOS/oximux-screen-gate"),
                 chat: "chat-7",
                 grants: Path::new("/data/grants.json"),
+                host: Path::new("/Applications/OxiMux.app/Contents/MacOS/oximux"),
                 worktree: Some(Path::new("/repo")),
                 started_at: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)),
             },
@@ -220,6 +231,12 @@ mod tests {
         assert!(command.contains("--chat 'chat-7'"), "{command}");
         assert!(command.contains("--grants '/data/grants.json'"), "{command}");
         assert!(command.contains("--since 1700000000"), "{command}");
+        // Without this the gate cannot tell that a call is aimed at OxiMux,
+        // because it is a different binary and `current_exe()` names itself.
+        assert!(
+            command.contains("--host-exe '/Applications/OxiMux.app/Contents/MacOS/oximux'"),
+            "{command}"
+        );
     }
 
     #[test]
@@ -233,6 +250,7 @@ mod tests {
                 command: Path::new("/Apps/Oxi Mux.app/gate"),
                 chat: "chat-1",
                 grants: Path::new("/data/grants.json"),
+                host: Path::new("/Apps/Oxi Mux.app/oximux"),
                 worktree: Some(Path::new("/Users/x/it's mine")),
                 started_at: None,
             },

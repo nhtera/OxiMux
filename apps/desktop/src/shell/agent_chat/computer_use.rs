@@ -130,6 +130,9 @@ impl ScreenControl {
                 session: &self.session,
                 grants: &self.grants,
                 provenance: self.provenance.as_ref(),
+                // In-process, so the running binary *is* the one to protect.
+                // The gate is the caller that has to be told; see `HookSpec`.
+                host: None,
             },
         )
     }

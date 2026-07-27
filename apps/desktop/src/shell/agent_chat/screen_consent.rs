@@ -15,7 +15,7 @@
 
 use gpui::{AnyElement, Context, IntoElement, ParentElement, SharedString, Styled, div, px};
 use oximux_agents::thread::PermissionDecision;
-use oximux_computer_use::{Sentinel, TargetApp};
+use oximux_computer_use::{Category, TargetApp};
 use oximux_settings::{ComputerUseSettings, Density, Theme, Typography};
 
 use super::AgentChatView;
@@ -26,7 +26,7 @@ use super::tool_card::pill_button;
 ///
 /// Held by the view against the tool-call id, because [`PermissionRequest`]
 /// carries only a description string and this needs structure — the bundle id
-/// for the allowlist, the sentinel for the warning.
+/// for the allowlist, the category for the warning.
 ///
 /// [`PermissionRequest`]: oximux_agents::thread::PermissionRequest
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,7 +36,9 @@ pub(super) struct ScreenPrompt {
     /// `None` for an ad-hoc signed binary — normal for an agent's own build,
     /// and the reason "always allow" is not always offered.
     pub bundle_id: Option<String>,
-    pub sentinel: Option<Sentinel>,
+    /// Only ever a category that reaches a card. A terminal or an editor is
+    /// refused before anyone is asked, so those never arrive here.
+    pub category: Category,
 }
 
 impl ScreenPrompt {
@@ -44,7 +46,7 @@ impl ScreenPrompt {
         Self {
             app: target.name.clone(),
             bundle_id: target.bundle_id.clone(),
-            sentinel: target.sentinel(),
+            category: target.category(),
         }
     }
 
@@ -69,7 +71,7 @@ pub(super) fn warning_banner(
     density: Density,
     typo: &Typography,
 ) -> Option<AnyElement> {
-    let sentinel = prompt.sentinel?;
+    let warning = prompt.category.warning()?;
     Some(
         div()
             .w_full()
@@ -81,7 +83,7 @@ pub(super) fn warning_banner(
             .bg(theme.status_warn.opacity(0.10))
             .text_size(px(typo.t_body_sm))
             .text_color(theme.status_warn)
-            .child(SharedString::from(sentinel.warning()))
+            .child(SharedString::from(warning))
             .into_any_element(),
     )
 }
@@ -95,9 +97,9 @@ pub(super) fn warning_banner(
 /// offering it, because the user would believe they had answered once and for
 /// all.
 ///
-/// Also absent for a sentinel target. "Always" and "this is equivalent to
-/// giving the agent a shell" do not belong on the same card; that approval
-/// should be a deliberate trip to settings, not a button next to Allow.
+/// Also absent for any target carrying a warning. "Always" and "this app is
+/// signed in to your bank" do not belong on the same card; that approval should
+/// be a deliberate trip to settings, not a button next to Allow.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn always_allow_pill(
     prompt: &ScreenPrompt,
@@ -109,7 +111,7 @@ pub(super) fn always_allow_pill(
     typo: &Typography,
     cx: &mut Context<AgentChatView>,
 ) -> Option<AnyElement> {
-    if prompt.sentinel.is_some() {
+    if prompt.category.warning().is_some() {
         return None;
     }
     let bundle_id = prompt.bundle_id.clone()?;
@@ -265,11 +267,11 @@ impl AgentChatView {
 mod tests {
     use super::*;
 
-    fn prompt(app: &str, bundle_id: Option<&str>, sentinel: Option<Sentinel>) -> ScreenPrompt {
+    fn prompt(app: &str, bundle_id: Option<&str>, category: Category) -> ScreenPrompt {
         ScreenPrompt {
             app: app.to_string(),
             bundle_id: bundle_id.map(str::to_string),
-            sentinel,
+            category,
         }
     }
 
@@ -277,14 +279,26 @@ mod tests {
     fn the_question_names_the_app_not_the_tool() {
         // Which app is the decision; which input action is nearly irrelevant to
         // it.
-        let q = prompt("Safari", Some("com.apple.Safari"), None).question("Claude");
-        assert_eq!(q, "Let Claude control Safari?");
+        let q = prompt("Notes", Some("com.apple.Notes"), Category::Other).question("Claude");
+        assert_eq!(q, "Let Claude control Notes?");
     }
 
     #[test]
-    fn a_sentinel_target_carries_its_warning() {
-        let p = prompt("Terminal", Some("com.apple.Terminal"), Some(Sentinel::Shell));
-        assert!(p.sentinel.expect("a warning").warning().contains("shell"));
+    fn a_warned_target_carries_its_warning_and_no_always_button() {
+        // The two go together: a category worth warning about is a category
+        // whose approval should be per-call, not a button next to Allow.
+        let p = prompt("Safari", Some("com.apple.Safari"), Category::Browser);
+        assert!(p.category.warning().expect("a warning").contains("signed in"));
+    }
+
+    #[test]
+    fn an_ordinary_target_carries_no_warning() {
+        // Over-warning is its own failure: a card that always warns is a card
+        // nobody reads.
+        assert_eq!(
+            prompt("my-app", None, Category::Other).category.warning(),
+            None
+        );
     }
 
     fn target(name: &str, bundle_id: Option<&str>) -> TargetApp {
@@ -341,15 +355,20 @@ mod tests {
     }
 
     #[test]
-    fn a_sentinel_app_added_by_hand_is_honoured() {
-        // Terminal cannot reach the list through the card — "always allow" is
-        // withheld for sentinels, and settings has no add-app affordance. The
-        // only way in is editing the file, which is the deliberate act the
-        // design asks for. Pinned because silently ignoring the row would leave
-        // the user with a setting that reads as on and does nothing.
+    fn an_allowlisted_terminal_never_reaches_this_path_at_all() {
+        // A user who hand-edited Terminal into the file before it was refused
+        // outright still has that row. It buys nothing now, and the reason is
+        // structural rather than a check here: `enforce_screen_control` consults
+        // the policy first, the policy refuses a never-driveable category ahead
+        // of `Ask`, and only `Ask` consults the allowlist. So a stale row is
+        // inert rather than an override.
         let settings = allowing("com.apple.Terminal", "Terminal");
         let terminal = target("Terminal", Some("com.apple.Terminal"));
-        assert_eq!(ScreenPrompt::from_target(&terminal).sentinel, Some(Sentinel::Shell));
+        assert!(
+            ScreenPrompt::from_target(&terminal).category.is_never_driveable(),
+            "a refused category must never be offered a card"
+        );
+        // The allowlist itself is untouched — it simply is not asked.
         assert!(is_pre_approved(&terminal, Some(&settings)));
     }
 
@@ -359,13 +378,24 @@ mod tests {
         // opinion about which app this is would be a second policy.
         let target = TargetApp {
             pid: 42,
-            executable: std::path::PathBuf::from("/Applications/Terminal.app/Contents/MacOS/Terminal"),
-            bundle_id: Some("com.apple.Terminal".into()),
-            name: "Terminal".into(),
+            executable: std::path::PathBuf::from("/Applications/Safari.app/Contents/MacOS/Safari"),
+            bundle_id: Some("com.apple.Safari".into()),
+            name: "Safari".into(),
         };
         let p = ScreenPrompt::from_target(&target);
-        assert_eq!(p.app, "Terminal");
-        assert_eq!(p.bundle_id.as_deref(), Some("com.apple.Terminal"));
-        assert_eq!(p.sentinel, Some(Sentinel::Shell));
+        assert_eq!(p.app, "Safari");
+        assert_eq!(p.bundle_id.as_deref(), Some("com.apple.Safari"));
+        assert_eq!(p.category, Category::Browser);
+    }
+
+    #[test]
+    fn an_unidentifiable_target_gets_the_ordinary_path() {
+        // An agent's own fresh build is ad-hoc signed with no bundle id, and it
+        // is the target this whole feature exists to drive. It must land in the
+        // plain category, not in a named one by default.
+        let p = ScreenPrompt::from_target(&target("my-app", None));
+        assert_eq!(p.category, Category::Other);
+        assert_eq!(p.category.warning(), None);
+        assert!(!p.category.is_never_driveable());
     }
 }
