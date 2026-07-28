@@ -189,6 +189,27 @@ fn import_item(
     }
 }
 
+/// Context injections and abort markers that codex records with role `user`
+/// even though the user never typed them (observed across real 0.14x rollouts).
+/// They must not become chat bubbles — and, as importantly, must not count as
+/// user TURNS: the companion-terminal sync anchors on the user-prompt count,
+/// and a live-started thread (whose user entries come only from the composer)
+/// would misalign against a fold that counted these.
+const PLUMBING_USER_TAGS: [&str; 6] = [
+    "<user_instructions>",
+    "<environment_context>",
+    "<turn_aborted>",
+    "<subagent_notification>",
+    "<recommended_plugins>",
+    "<skill",
+];
+
+/// Whether a user-role message body is one of the known plumbing injections.
+fn is_plumbing_user_text(text: &str) -> bool {
+    let t = text.trim_start();
+    PLUMBING_USER_TAGS.iter().any(|tag| t.starts_with(tag))
+}
+
 /// A `message` item → a user or assistant entry (developer/system are plumbing,
 /// skipped). Content blocks are `input_text` (user) / `output_text` (assistant).
 fn import_message(payload: &Value, entries: &mut Vec<ThreadEntry>) {
@@ -198,6 +219,7 @@ fn import_message(payload: &Value, entries: &mut Vec<ThreadEntry>) {
         return;
     }
     match role {
+        "user" if is_plumbing_user_text(&text) => {}
         "user" => entries.push(ThreadEntry::User { text, images: Vec::new(), checkpoint: None }),
         "assistant" => {
             entries.push(ThreadEntry::Assistant(AssistantMessage { text, ..Default::default() }));

@@ -104,6 +104,39 @@ fn encrypted_only_reasoning_and_unknown_items_are_skipped() {
 }
 
 #[test]
+fn plumbing_user_messages_are_skipped_but_real_prompts_kept() {
+    // Codex records context injections with role "user" (observed tags across
+    // real rollouts). They must not become bubbles or count as user turns —
+    // the companion-terminal sync anchors on the user-prompt count.
+    let plumbing = [
+        "<user_instructions>always be brief</user_instructions>",
+        "<environment_context>cwd: /x</environment_context>",
+        "<turn_aborted>user interrupted</turn_aborted>",
+        "<subagent_notification>child done</subagent_notification>",
+        "<recommended_plugins>list…</recommended_plugins>",
+        "<skill name=\"docs\">…</skill>",
+        "  <environment_context>leading whitespace</environment_context>",
+    ];
+    let mut lines: Vec<String> = plumbing
+        .iter()
+        .map(|t| {
+            line("response_item", json!({ "type": "message", "role": "user",
+                "content": [{ "type": "input_text", "text": t }] }))
+        })
+        .collect();
+    lines.push(line("response_item", json!({ "type": "message", "role": "user",
+        "content": [{ "type": "input_text", "text": "a real prompt, even one mentioning <skill>" }] })));
+    let imported = transcript_from_codex_str(&lines.join("\n"));
+    assert_eq!(imported.entries.len(), 1, "only the real prompt survives");
+    match &imported.entries[0] {
+        ThreadEntry::User { text, .. } => {
+            assert_eq!(text, "a real prompt, even one mentioning <skill>");
+        }
+        other => panic!("expected user, got {other:?}"),
+    }
+}
+
+#[test]
 fn unsettled_tool_at_eof_is_canceled_not_spinning() {
     let raw = line("response_item", json!({ "type": "function_call", "name": "wait",
         "arguments": "{}", "call_id": "open" }));
