@@ -99,7 +99,7 @@ pub mod platform {
     }
 
     /// Standard About panel — populated from the bundle's name / version /
-    /// icon (Info.plist), so it shows "OxiMux 0.1.0" with the app icon.
+    /// icon (Info.plist), so it shows the app name + bundle version with the app icon.
     pub fn about() {
         unsafe {
             let app = shared_app();

@@ -4,6 +4,38 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-29 — v0.1.1: fast open/quit with many sessions (`main`)
+
+- **`8b26ac0`** — `perf(agent-chat)`: restoring a layout eagerly spawned one
+  resumed agent CLI per chat tab, and each CLI re-reads its whole session file
+  at startup — a workspace with several long sessions took >10s to open and
+  pinned the CPU (measured: 7 concurrent `claude --resume` children, ~1.5 GB
+  RSS, at every launch). Restored chats now boot **dormant** (resumable-idle,
+  no subprocess); the visible tab connects on its first render, deferred off
+  the paint pass, and the remote entry points (session-catalog open, phone
+  rewind) connect on demand with a retryable failed-spawn path.
+  Persistence-side, the 15s layout autosave and the quit capture re-serialized
+  every open chat's full transcript (~45 MB of JSON on this workspace) each
+  pass. `ChatThread` now carries a revision counter bumped inside its mutators
+  — one structural chokepoint instead of per-call-site dirty flags — and the
+  save takes a transcript body only when the revision (or a view-held metadata
+  mark) moved past the last **committed** save; dirty state clears only after
+  the write is confirmed on disk. A `ConnectMode` enum replaces the overloaded
+  `connect_now` flag so every constructor flavor maps onto the state flags in
+  one place. Measured after: cold boot ~0.5s, quit capture 0–2 ms, exactly one
+  CLI child (the visible tab) instead of seven.
+- **`a4dea99`** — `chore(mobile)`: pin the Apple team id in `app.json` for EAS
+  iOS builds.
+
+**Touches**: `crates/agent-core/src/thread/state.rs`,
+`apps/desktop/src/shell/agent_chat/{mod,session_persistence,rewind_menu}.rs`,
+`apps/desktop/src/shell/project_panes/{mod,ops}.rs`,
+`apps/desktop/src/{project_panes_factory,main}.rs`,
+`apps/desktop/src/remote_control/session_catalog.rs`,
+`apps/desktop/src/shell/workspace/workspace_ops.rs`, `apps/mobile/app.json`
+
+---
+
 ### 2026-07-26 — Desktop app relocated to `apps/desktop` (`refactor/apps-desktop`)
 
 - **`c981a9a`** — `git mv crates/app apps/desktop`, so `apps/` now holds both
