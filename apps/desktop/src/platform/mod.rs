@@ -25,6 +25,7 @@ pub(crate) fn serialize_input_state() -> std::sync::MutexGuard<'static, ()> {
 
 pub mod app_nap;
 pub mod escape_tap;
+pub mod login_path;
 pub mod menu;
 pub mod mic_permission;
 pub mod screen_control_indicator;
