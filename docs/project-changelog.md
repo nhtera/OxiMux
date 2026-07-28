@@ -4,6 +4,62 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-29 — v0.1.2: companion terminal ↔ chat sync for every agent (`main`)
+
+A chat tab's companion terminal (⌃⇧V) resumes the SAME session interactively —
+but the two surfaces never told each other what happened. This release closes
+the loop in both directions, for Claude, Codex, Pi, and OpenCode, and fixes
+spawned Claude CLIs silently not saving transcripts at all.
+
+- **`01addad`** — `fix(spawn)`: a GUI (or relay daemon) launched from inside a
+  Claude Code session inherited `CLAUDE_CODE_CHILD_SESSION` (+11 sibling
+  markers, incl. cmux's `CLAUDE_CODE_SANDBOXED` trust bypass), so every
+  `claude` spawned in OxiMux showed "Transcript saving is off" and wrote no
+  session file. Both binaries now scrub the marker set first thing in `main`,
+  before any thread exists (env writes are only sound pre-thread in edition
+  2024; the relay restructured off `#[tokio::main]` for this). Codex/Pi/
+  OpenCode need no scrub — probed: none of their inherited env disables
+  persistence.
+- **`7b5f43b`** — `feat(agent-chat)`: turns typed in the companion terminal
+  land only in the CLI's session log; the chat view stayed stale until the tab
+  was reopened. Toggling Terminal→Chat now re-folds the log off the UI thread
+  and appends the suffix past the chat's known user turns (new
+  `tail_beyond_known_turns` anchor + `ChatThread::append_imported`).
+- **`8ed8824`** — `fix(agent-chat)`: the reverse hazard — a chat-sent prompt
+  never reaches an already-open interactive TUI, which then ANSWERS without it
+  and (Claude's jsonl is a parentUuid tree) forks the session into an orphaned
+  branch. Sending from the chat now marks the companion stale; the next toggle
+  reaps and respawns it (`--resume` re-reads the full log).
+- **`b9f8e8e`** — `fix(agents)`: Codex rollouts record context injections
+  (`<environment_context>`, `<recommended_plugins>`, …) with role "user"; the
+  importer now skips them so they neither render as fake bubbles nor skew the
+  sync anchor.
+- **`0fd1e15`** — `fix(agent-chat)`: the toggle-back fold now covers Codex
+  app-server chats — `codex resume` appends to the same rollout in place
+  (verified on codex 0.145), located by thread id under `~/.codex/sessions`.
+- **`2720bc1`** — `fix(agents)`: same plumbing filter for OpenCode — plugins
+  inject standalone user-role rows (`<ultrawork-mode>`,
+  `<user-prompt-submit-hook>`) that would misalign the anchor.
+- **`352b064`** — `feat(agent-chat)`: fold Pi (`--session` appends in place,
+  verified on pi 0.80; rollout located by the id embedded in its filename) and
+  OpenCode (SQLite store read-only by session id) companion turns into the
+  chat. And the load-bearing half: a non-empty fold now RESPAWNS the chat's
+  live connection — the old one never learned the terminal's turns, so its
+  next send would answer without them and, on parent-linked stores (Claude,
+  Pi), fork the session tree, permanently orphaning those turns from context.
+  Verified live on all four agents: chat→terminal→chat yields one linear
+  parent chain.
+
+**Touches**: `apps/desktop/src/platform/claude_session_env.rs` (new),
+`apps/desktop/src/main.rs`, `crates/relay/src/main.rs`,
+`apps/desktop/src/shell/agent_chat/{mod,companion_sync}.rs` (new submodule),
+`apps/desktop/src/shell/pane_group/tabs.rs`,
+`crates/agent-core/src/thread/state.rs`,
+`crates/agents/src/thread/{session_import,codex_session_import}.rs`,
+`crates/agents/src/session_log/{import_transcript_pi,import_transcript_opencode,import_provider_index}.rs`
+
+---
+
 ### 2026-07-29 — v0.1.1: fast open/quit with many sessions (`main`)
 
 - **`8b26ac0`** — `perf(agent-chat)`: restoring a layout eagerly spawned one
