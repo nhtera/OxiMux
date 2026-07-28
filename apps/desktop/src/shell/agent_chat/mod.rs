@@ -16,6 +16,7 @@ mod attention;
 mod auth_card;
 mod background_tasks_panel;
 mod bubble;
+mod companion_sync;
 mod composer;
 pub(crate) mod computer_use;
 mod composer_history;
@@ -1753,27 +1754,6 @@ impl AgentChatView {
         self.terminal = Some(terminal);
         self.companion_session = Some(session);
         self.view_mode = ChatViewMode::Terminal;
-        self.focus_active_surface(window, cx);
-        cx.notify();
-    }
-
-    /// Switch between chat and terminal view. Terminal requires the companion to
-    /// already exist (the host spawns it first via [`Self::attach_terminal`]); a
-    /// request for Terminal with no companion is a no-op. Focuses the newly-active
-    /// surface.
-    pub fn set_view_mode(
-        &mut self,
-        mode: ChatViewMode,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if mode == ChatViewMode::Terminal && self.terminal.is_none() {
-            return;
-        }
-        if self.view_mode == mode {
-            return;
-        }
-        self.view_mode = mode;
         self.focus_active_surface(window, cx);
         cx.notify();
     }

@@ -305,6 +305,35 @@ fn append_block(field: &mut String, t: &str) {
     field.push_str(t);
 }
 
+/// The suffix of a folded transcript that a chat already knowing
+/// `known_user_turns` user prompts has NOT seen: everything from the
+/// (known+1)-th user prompt onward.
+///
+/// This is how turns run in a companion terminal reach the chat view — the
+/// terminal resumes the same session id interactively, so its turns land only
+/// in the CLI's session log, never on the chat's connection. The chat re-folds
+/// the log and appends this tail.
+///
+/// Fails safe in both directions: a log with no unseen prompts returns empty
+/// (nothing to append, never a duplicate), and a log whose fold was capped
+/// ([`MAX_IMPORT_ENTRIES`] elides oldest history, shrinking its user count
+/// below `known_user_turns`) also returns empty rather than misaligning.
+pub fn tail_beyond_known_turns(
+    folded: Vec<ThreadEntry>,
+    known_user_turns: usize,
+) -> Vec<ThreadEntry> {
+    let mut seen = 0usize;
+    for (i, e) in folded.iter().enumerate() {
+        if matches!(e, ThreadEntry::User { .. }) {
+            seen += 1;
+            if seen > known_user_turns {
+                return folded[i..].to_vec();
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// Collapse to a single capped line for a divider label.
 fn one_line(s: &str) -> String {
     let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");

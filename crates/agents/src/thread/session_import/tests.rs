@@ -374,3 +374,51 @@ fn image_tool_result_becomes_placeholder_and_structured_is_captured() {
     assert!(tc.structured.is_some());
     assert_eq!(tc.status, ToolCallStatus::Completed);
 }
+
+// ---------------------------------------------------------------------------
+// tail_beyond_known_turns — the companion-terminal sync anchor
+// ---------------------------------------------------------------------------
+
+/// A minimal folded transcript: N (user, assistant) turn pairs.
+fn folded_turns(n: usize) -> Vec<ThreadEntry> {
+    let mut out = Vec::new();
+    for i in 1..=n {
+        out.extend(transcript_from_str(&join(&[
+            user_line(&format!("hi {i}")),
+            assistant_line(json!([{"type": "text", "text": format!("reply {i}")}])),
+        ])));
+    }
+    out
+}
+
+#[test]
+fn tail_starts_at_the_first_unseen_user_turn() {
+    // Chat knows 2 turns; the log grew to 4 in the terminal → the tail is
+    // turns 3+4, starting AT the user prompt (its reply rides along).
+    let tail = tail_beyond_known_turns(folded_turns(4), 2);
+    assert_eq!(tail.len(), 4, "two user+assistant pairs");
+    match &tail[0] {
+        ThreadEntry::User { text, .. } => assert_eq!(text, "hi 3"),
+        other => panic!("tail must start at the unseen user turn, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_log_with_nothing_unseen_yields_no_tail() {
+    // Equal counts → nothing to append; toggling back and forth never dupes.
+    assert!(tail_beyond_known_turns(folded_turns(3), 3).is_empty());
+}
+
+#[test]
+fn a_capped_fold_that_knows_less_than_the_chat_yields_no_tail() {
+    // MAX_IMPORT_ENTRIES elides oldest history, so a very long session's fold
+    // can carry FEWER user turns than the chat has. Misalignment must fail
+    // safe (skip the sync), not append the whole capped fold again.
+    assert!(tail_beyond_known_turns(folded_turns(2), 5).is_empty());
+}
+
+#[test]
+fn a_chat_with_no_turns_receives_the_whole_fold() {
+    let tail = tail_beyond_known_turns(folded_turns(2), 0);
+    assert_eq!(tail.len(), 4);
+}

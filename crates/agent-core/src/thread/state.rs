@@ -210,6 +210,19 @@ impl ChatThread {
         self.push_user_message_with_images(text, Vec::new());
     }
 
+    /// Append turns imported from the session's on-disk log — turns run in a
+    /// companion terminal on the same session id, which never flow through
+    /// this thread's connection. Bumps the revision so persistence saves them;
+    /// leaves the turn flags alone (imported turns already finished — or are
+    /// still running in the terminal, which owns them either way).
+    pub fn append_imported(&mut self, tail: Vec<ThreadEntry>) {
+        if tail.is_empty() {
+            return;
+        }
+        self.entries.extend(tail);
+        self.touch();
+    }
+
     /// Record a user prompt that carries attached images.
     pub fn push_user_message_with_images(
         &mut self,

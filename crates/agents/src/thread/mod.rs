@@ -47,7 +47,9 @@ pub use background_task::{BackgroundTask, BackgroundTaskKind, TaskStatus};
 pub use context_chip::{prepend_context, ContextChip, ContextKind};
 pub use entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};
 pub use turn_diff::TurnFileChange;
-pub use session_import::{transcript_from_jsonl, transcript_from_str, MAX_IMPORT_ENTRIES};
+pub use session_import::{
+    tail_beyond_known_turns, transcript_from_jsonl, transcript_from_str, MAX_IMPORT_ENTRIES,
+};
 pub use codex_session_import::{
     import_codex_rollout, locate_rollout, transcript_from_codex_str, CodexRolloutImport,
 };
