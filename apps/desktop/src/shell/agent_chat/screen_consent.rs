@@ -254,6 +254,46 @@ impl AgentChatView {
         }
     }
 
+    /// Note a screen capture the moment one comes back.
+    ///
+    /// Keyed on an image *arriving*, not on calling a tool that might take one.
+    /// The driver decides what returns a picture, and a list here of "tools that
+    /// capture" would be a copy of that decision, free to drift out of step with
+    /// it — claiming a capture that never happened, or missing one because the
+    /// driver grew a tool nobody added to our copy. An image in the result is
+    /// the thing itself, and it is the same signal the transcript redactor
+    /// already trusts to decide what must not reach a phone.
+    ///
+    /// The cost is that the first capture of a turn is announced just after it
+    /// is taken rather than just before. Nothing could announce it earlier and
+    /// still be true — the policy allows the call, so the pixels are taken
+    /// either way — and the indicator then stands for the rest of the turn,
+    /// while the agent can still take more and Escape can still stop it.
+    pub(super) fn note_screen_capture(&self, ev: &oximux_agents::thread::ThreadEvent) {
+        let oximux_agents::thread::ThreadEvent::ToolResultImages { tool_use_id, images } = ev else {
+            return;
+        };
+        if images.is_empty() {
+            return;
+        }
+        let captured = self.thread.entries.iter().rev().find_map(|entry| match entry {
+            oximux_agents::thread::ThreadEntry::ToolCall(tc)
+                if tc.id == *tool_use_id
+                    && oximux_computer_use::is_computer_use_tool(&tc.name) =>
+            {
+                // `Some(None)` is a real answer, not a miss: the call was ours
+                // and returned a picture, it just named no process. Collapsing
+                // it to "not found" would drop exactly the capture that is
+                // hardest to notice any other way.
+                Some(oximux_computer_use::policy::addressed_pid(&tc.input))
+            }
+            _ => None,
+        });
+        if let Some(pid) = captured {
+            self.screen_control.note_capture(pid);
+        }
+    }
+
     /// What the card for `tc` should know about its target.
     ///
     /// Reads the pid through the policy's own accessor, so the name on the card

@@ -92,6 +92,19 @@ pub fn decide(tool_name: &str, input: &Value, ctx: &PolicyContext<'_>) -> Decisi
         ));
     }
 
+    // Beside the remote check rather than further down, and for the same reason:
+    // neither is about which tool or which target. Dropping grants would stop
+    // input alone, and reading needs no grant — so a kill switch that only did
+    // that would leave the agent free to keep photographing the screen the user
+    // had just stopped it touching. Every class is refused, reads included,
+    // until the turn ends.
+    if ctx.grants.is_aborted(ctx.session) {
+        return Decision::refuse(format!(
+            "`{tool}` was refused because you pressed Escape to stop screen control. Nothing \
+             further will reach the screen this turn — send a new message to start over."
+        ));
+    }
+
     let class = classify(tool);
     if let ToolClass::Forbidden(forbidden) = class {
         return Decision::refuse(format!("`{tool}` {}", forbidden.reason()));

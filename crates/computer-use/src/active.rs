@@ -28,6 +28,11 @@
 use crate::grants::GrantTable;
 use crate::target::name_of_pid;
 
+/// Stands in for a window a capture did not name. Phrased as something the user
+/// can act on ("an agent has a picture of something of mine") rather than as an
+/// error, because it is not one — some capture tools simply take a window id.
+const UNNAMED_WINDOW: &str = "a window";
+
 /// Everything being driven, grouped by the agent driving it.
 ///
 /// Empty means nothing is being driven, which is the overwhelmingly common
@@ -40,14 +45,24 @@ pub struct Driving {
     pub sessions: Vec<DrivingSession>,
 }
 
-/// One agent and the apps it may currently drive.
+/// One agent and what it is currently doing to the screen.
+///
+/// The two lists are kept apart rather than merged into "apps involved" because
+/// they are different claims about the user's machine, and the weaker one is far
+/// commoner. Saying an agent *controls* a window it only photographed overstates
+/// what is happening; saying nothing at all about the photograph is how a
+/// capture went unannounced in the first place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrivingSession {
     /// The session id with its `oximux-` prefix stripped — the same label the
     /// agent's on-screen cursor carries, so the two can be matched up.
     pub label: String,
-    /// App names, deduped and ordered. Never empty.
-    pub apps: Vec<String>,
+    /// Apps this agent holds a grant on and is driving. Deduped and ordered.
+    pub controlling: Vec<String>,
+    /// Apps this agent has photographed this turn but cannot drive. Deduped and
+    /// ordered, and never overlapping `controlling` — a driven app is reported
+    /// as driven, which is the stronger and more useful fact.
+    pub reading: Vec<String>,
 }
 
 impl Driving {
@@ -66,26 +81,57 @@ impl Driving {
     /// tap stays armed, swallowing a key the user needs everywhere else.
     pub fn read(grants: &GrantTable) -> Self {
         let mut sessions: Vec<DrivingSession> = Vec::new();
-        for (pid, owner) in grants.driving() {
+        for (pid, owner, driven) in grants
+            .driving()
+            .into_iter()
+            .map(|(pid, owner)| (pid, owner, true))
+            .chain(grants.captured().into_iter().map(|(pid, owner)| (pid, owner, false)))
+        {
             let Some(app) = name_of_pid(pid) else {
                 continue;
             };
             let label = owner.strip_prefix("oximux-").unwrap_or(&owner).to_string();
-            match sessions.iter_mut().find(|s| s.label == label) {
-                Some(session) => {
-                    if !session.apps.contains(&app) {
-                        session.apps.push(app);
-                    }
+            let session = match sessions.iter_mut().position(|s| s.label == label) {
+                Some(at) => &mut sessions[at],
+                None => {
+                    sessions.push(DrivingSession {
+                        label,
+                        controlling: Vec::new(),
+                        reading: Vec::new(),
+                    });
+                    sessions.last_mut().expect("just pushed")
                 }
-                None => sessions.push(DrivingSession {
-                    label,
-                    apps: vec![app],
-                }),
+            };
+            let list = if driven { &mut session.controlling } else { &mut session.reading };
+            if !list.contains(&app) {
+                list.push(app);
             }
         }
+        // A session that photographed something nobody could attribute to a
+        // process still has to appear. Naming it vaguely is worth far more than
+        // the menu bar staying dark, which is the failure this exists to end.
+        for label in grants
+            .capturing()
+            .into_iter()
+            .map(|owner| owner.strip_prefix("oximux-").unwrap_or(&owner).to_string())
+        {
+            if !sessions.iter().any(|s| s.label == label) {
+                sessions.push(DrivingSession {
+                    label,
+                    controlling: Vec::new(),
+                    reading: vec![UNNAMED_WINDOW.to_string()],
+                });
+            }
+        }
+
         sessions.sort_by(|a, b| a.label.cmp(&b.label));
         for session in &mut sessions {
-            session.apps.sort();
+            session.controlling.sort();
+            // Driving is the stronger claim, so an app in both is reported only
+            // as driven. Ordering the two loops the other way would be a
+            // silent downgrade of exactly the case the user most needs named.
+            session.reading.retain(|app| !session.controlling.contains(app));
+            session.reading.sort();
         }
         Self { sessions }
     }
@@ -94,15 +140,26 @@ impl Driving {
         self.sessions.is_empty()
     }
 
-    /// Distinct apps across every session. Two agents driving two builds of the
-    /// same program is the expected shape here, so this counts names rather
-    /// than grants.
-    fn distinct_apps(&self) -> Vec<&str> {
+    /// Distinct apps across every session, driven and read alike. Two agents
+    /// driving two builds of the same program is the expected shape here, so
+    /// this counts names rather than grants.
+    ///
+    /// Used for the title, where the question is "how much of my machine is
+    /// involved" and the answer does not turn on which kind of involvement.
+    pub fn distinct_apps(&self) -> Vec<&str> {
         let mut apps: Vec<&str> = self
             .sessions
             .iter()
-            .flat_map(|s| s.apps.iter().map(String::as_str))
+            .flat_map(|s| s.controlling.iter().chain(s.reading.iter()).map(String::as_str))
             .collect();
+        apps.sort_unstable();
+        apps.dedup();
+        apps
+    }
+
+    fn distinct(&self, pick: fn(&DrivingSession) -> &Vec<String>) -> Vec<&str> {
+        let mut apps: Vec<&str> =
+            self.sessions.iter().flat_map(|s| pick(s).iter().map(String::as_str)).collect();
         apps.sort_unstable();
         apps.dedup();
         apps
@@ -114,39 +171,68 @@ impl Driving {
     /// Names the apps while there are few enough to name. Past that, a count is
     /// more useful than a truncated list: the point is "a lot is happening", and
     /// "Safari, Calculator and 4 more" reads as detail nobody can act on.
+    ///
+    /// Reading is reported in its own clause rather than folded in with driving.
+    /// A user who reads "controlling Safari" about a window that was only
+    /// photographed learns something false, and the credibility of the one
+    /// indicator they have depends on it never doing that.
     pub fn summary(&self) -> String {
-        let apps = self.distinct_apps();
-        if apps.is_empty() {
-            return "No agent is controlling this Mac".to_string();
+        let controlling = self.distinct(|s| &s.controlling);
+        let reading = self.distinct(|s| &s.reading);
+        if controlling.is_empty() && reading.is_empty() {
+            return "No agent is using this Mac's screen".to_string();
         }
         let who = if self.sessions.len() == 1 {
             "An agent is".to_string()
         } else {
             format!("{} agents are", self.sessions.len())
         };
-        if apps.len() > 3 {
-            return format!("{who} controlling {} apps", apps.len());
+        let mut clauses = Vec::new();
+        if !controlling.is_empty() {
+            clauses.push(format!("controlling {}", name_or_count(&controlling)));
         }
-        format!("{who} controlling {}", join_names(&apps))
+        if !reading.is_empty() {
+            clauses.push(format!("reading {}", name_or_count(&reading)));
+        }
+        format!("{who} {}", clauses.join(" and "))
     }
 
     /// Per-agent detail, for a menu that has room for it. One line each, so
-    /// several agents driving at once stays readable.
+    /// several agents working at once stays readable.
     ///
-    /// Skipped entirely for a single agent: it would just restate
-    /// [`Self::summary`] with an id most users have no use for.
+    /// Shown for a single agent only when it is doing both things at once —
+    /// otherwise it would restate [`Self::summary`] with an id most users have
+    /// no use for. Doing both is exactly when one line cannot carry it.
     pub fn detail_lines(&self) -> Vec<String> {
-        if self.sessions.len() < 2 {
+        let mixed = self.sessions.iter().any(|s| !s.controlling.is_empty() && !s.reading.is_empty());
+        if self.sessions.len() < 2 && !mixed {
             return Vec::new();
         }
         self.sessions
             .iter()
             .map(|session| {
-                let apps: Vec<&str> = session.apps.iter().map(String::as_str).collect();
-                format!("{} — {}", session.label, join_names(&apps))
+                let mut parts = Vec::new();
+                if !session.controlling.is_empty() {
+                    let apps: Vec<&str> = session.controlling.iter().map(String::as_str).collect();
+                    parts.push(format!("controlling {}", join_names(&apps)));
+                }
+                if !session.reading.is_empty() {
+                    let apps: Vec<&str> = session.reading.iter().map(String::as_str).collect();
+                    parts.push(format!("reading {}", join_names(&apps)));
+                }
+                format!("{} — {}", session.label, parts.join(", "))
             })
             .collect()
     }
+}
+
+/// Name them while there are few enough to name; past that a count carries more
+/// than a truncated list.
+fn name_or_count(apps: &[&str]) -> String {
+    if apps.len() > 3 {
+        return format!("{} apps", apps.len());
+    }
+    join_names(apps)
 }
 
 /// "a", "a and b", "a, b and c".
@@ -227,7 +313,7 @@ mod tests {
         let driving = Driving::read(&table);
         assert!(driving.is_idle());
         assert!(driving.detail_lines().is_empty());
-        assert_eq!(driving.summary(), "No agent is controlling this Mac");
+        assert_eq!(driving.summary(), "No agent is using this Mac's screen");
     }
 
     #[test]
@@ -240,7 +326,8 @@ mod tests {
         assert!(!driving.is_idle());
         assert_eq!(driving.sessions.len(), 1);
         assert_eq!(driving.sessions[0].label, "chat-1");
-        assert_eq!(driving.sessions[0].apps, vec!["sleep".to_string()]);
+        assert_eq!(driving.sessions[0].controlling, vec!["sleep".to_string()]);
+        assert!(driving.sessions[0].reading.is_empty(), "driving is not reading");
         assert_eq!(driving.summary(), "An agent is controlling sleep");
     }
 
@@ -273,7 +360,10 @@ mod tests {
         assert_eq!(labels, vec!["chat-1", "chat-2"]);
         assert_eq!(
             driving.detail_lines(),
-            vec!["chat-1 — sleep".to_string(), "chat-2 — cat".to_string()]
+            vec![
+                "chat-1 — controlling sleep".to_string(),
+                "chat-2 — controlling cat".to_string()
+            ]
         );
         assert!(driving.summary().starts_with("2 agents are controlling"));
     }
@@ -304,7 +394,7 @@ mod tests {
         table.grant(target.pid(), &SessionId::for_agent("chat-1"));
 
         assert!(Driving::read(&table).is_idle());
-        assert_eq!(Driving::read(&table).summary(), "No agent is controlling this Mac");
+        assert_eq!(Driving::read(&table).summary(), "No agent is using this Mac's screen");
     }
 
     #[test]
@@ -318,7 +408,7 @@ mod tests {
         driving_grant(&table, target.pid(), "chat-1");
         assert!(!Driving::read(&table).is_idle());
 
-        table.end_driving_turn(&session);
+        table.end_turn_activity(&session);
         assert!(Driving::read(&table).is_idle(), "the turn ended, so nothing is being driven");
         assert_eq!(
             table.check(target.pid(), &session),
@@ -332,6 +422,70 @@ mod tests {
     }
 
     #[test]
+    fn a_photographed_window_is_reported_as_read_not_controlled() {
+        // The distinction the whole split exists for. A capture needs no grant,
+        // so the agent cannot click this window — saying it "controls" it would
+        // be a louder claim than the truth, and the indicator's usefulness rests
+        // on it never overstating.
+        let (_dir, table) = table();
+        let target = Target::spawn("/bin/sleep", &["120"]);
+        table.note_capture(Some(target.pid()), &SessionId::for_agent("chat-1"));
+
+        let driving = Driving::read(&table);
+        assert!(!driving.is_idle(), "a capture is not nothing");
+        assert!(driving.sessions[0].controlling.is_empty());
+        assert_eq!(driving.sessions[0].reading, vec!["sleep".to_string()]);
+        assert_eq!(driving.summary(), "An agent is reading sleep");
+    }
+
+    #[test]
+    fn a_capture_that_named_no_process_still_shows() {
+        // `zoom` takes a window id and need not carry a pid, and a read with no
+        // pid is allowed. Reporting only the captures that happen to name a
+        // process would leave the same dark-menu-bar hole, just narrower.
+        let (_dir, table) = table();
+        table.note_capture(None, &SessionId::for_agent("chat-1"));
+
+        let driving = Driving::read(&table);
+        assert!(!driving.is_idle());
+        assert_eq!(driving.summary(), "An agent is reading a window");
+    }
+
+    #[test]
+    fn driving_and_reading_are_reported_in_one_breath() {
+        // The common shape of a real run: the agent photographs a window to find
+        // its buttons, then clicks a different app it was granted.
+        let (_dir, table) = table();
+        let (driven, read) = (Target::spawn("/bin/sleep", &["120"]), Target::spawn("/bin/cat", &[]));
+        driving_grant(&table, driven.pid(), "chat-1");
+        table.note_capture(Some(read.pid()), &SessionId::for_agent("chat-1"));
+
+        let driving = Driving::read(&table);
+        assert_eq!(driving.summary(), "An agent is controlling sleep and reading cat");
+        assert_eq!(
+            driving.detail_lines(),
+            vec!["chat-1 — controlling sleep, reading cat".to_string()],
+            "one agent doing both is exactly when a single summary line cannot carry it"
+        );
+    }
+
+    #[test]
+    fn an_app_both_driven_and_photographed_is_reported_as_driven() {
+        // Reads are how an agent finds what to click, so the same window is
+        // routinely both. Listing it twice would double-count it in the title
+        // and read as two separate things happening.
+        let (_dir, table) = table();
+        let target = Target::spawn("/bin/sleep", &["120"]);
+        driving_grant(&table, target.pid(), "chat-1");
+        table.note_capture(Some(target.pid()), &SessionId::for_agent("chat-1"));
+
+        let driving = Driving::read(&table);
+        assert_eq!(driving.sessions[0].controlling, vec!["sleep".to_string()]);
+        assert!(driving.sessions[0].reading.is_empty(), "the stronger claim wins");
+        assert_eq!(driving.distinct_apps(), vec!["sleep"], "and it counts once");
+    }
+
+    #[test]
     fn one_agent_going_idle_leaves_the_other_driving() {
         // Two agents run at different speeds, so their turns end at different
         // times. The first to finish must not take the indicator — or the kill
@@ -341,7 +495,7 @@ mod tests {
         driving_grant(&table, a.pid(), "chat-1");
         driving_grant(&table, b.pid(), "chat-2");
 
-        table.end_driving_turn(&SessionId::for_agent("chat-1"));
+        table.end_turn_activity(&SessionId::for_agent("chat-1"));
 
         let driving = Driving::read(&table);
         let labels: Vec<&str> = driving.sessions.iter().map(|s| s.label.as_str()).collect();
@@ -355,7 +509,8 @@ mod tests {
         let driving = Driving {
             sessions: vec![DrivingSession {
                 label: "chat-1".into(),
-                apps: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+                controlling: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+                reading: Vec::new(),
             }],
         };
         assert_eq!(driving.summary(), "An agent is controlling 4 apps");
@@ -366,7 +521,8 @@ mod tests {
         let driving = Driving {
             sessions: vec![DrivingSession {
                 label: "chat-1".into(),
-                apps: vec!["Safari".into(), "Calculator".into(), "Notes".into()],
+                controlling: vec!["Safari".into(), "Calculator".into(), "Notes".into()],
+                reading: Vec::new(),
             }],
         };
         // Sorted, not in grant order: the summary is redrawn on a timer, and a
@@ -385,11 +541,13 @@ mod tests {
             sessions: vec![
                 DrivingSession {
                     label: "chat-1".into(),
-                    apps: vec!["my-app".into()],
+                    controlling: vec!["my-app".into()],
+                    reading: Vec::new(),
                 },
                 DrivingSession {
                     label: "chat-2".into(),
-                    apps: vec!["my-app".into()],
+                    controlling: vec!["my-app".into()],
+                    reading: Vec::new(),
                 },
             ],
         };

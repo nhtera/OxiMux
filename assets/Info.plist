@@ -32,5 +32,11 @@
     <string>AppIcon</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>OxiMux uses the microphone for voice dictation.</string>
+    <!-- Without this key macOS never offers Input Monitoring, and the Escape
+         kill switch cannot be armed: a keyboard event tap is gated on that
+         permission, and an app the system never prompts for has to be added by
+         hand in System Settings, which nobody thinks to do. -->
+    <key>NSInputMonitoringUsageDescription</key>
+    <string>OxiMux watches for the Escape key so you can stop an agent that is controlling your screen.</string>
 </dict>
 </plist>

@@ -217,6 +217,16 @@ impl ScreenControl {
         self.grants.release_all(&self.session);
     }
 
+    /// Record that this chat has just photographed `pid`, or something the call
+    /// did not name.
+    ///
+    /// Needs no grant and raises no card, which is exactly why it has to be
+    /// recorded: a capture is otherwise the one thing an agent can do to the
+    /// user's screen that leaves no trace anywhere they would look.
+    pub fn note_capture(&self, pid: Option<u32>) {
+        self.grants.note_capture(pid, &self.session);
+    }
+
     /// This chat's turn is over, so it is no longer driving anything.
     ///
     /// Separate from [`Self::release`] because the two have different
@@ -224,8 +234,8 @@ impl ScreenControl {
     /// while this is activity and lasts one turn. Collapsing them would either
     /// re-ask the user for consent every turn, or leave the machine believing an
     /// idle chat is still driving — which is what this exists to stop.
-    pub fn end_driving_turn(&self) {
-        self.grants.end_driving_turn(&self.session);
+    pub fn end_turn_activity(&self) {
+        self.grants.end_turn_activity(&self.session);
     }
 
     /// This chat's next turn was started from a paired phone.
@@ -429,6 +439,36 @@ mod view_tests {
 
     use super::super::AgentChatView;
 
+    /// What *this* chat has photographed, and what it is driving.
+    ///
+    /// Scoped to the view's own session rather than reading the store whole. A
+    /// real `AgentChatView` shares the process-wide grant table, so the bare
+    /// accessors report every chat in the test binary — an assertion built on
+    /// them passes or fails on which other tests happen to be running
+    /// alongside, which is how the first version of these tests came to be
+    /// flaky.
+    fn captured_by(view: &AgentChatView) -> Vec<u32> {
+        let mine = view.screen_control.session.as_str();
+        view.screen_control
+            .grants
+            .captured()
+            .into_iter()
+            .filter(|(_, owner)| owner == mine)
+            .map(|(pid, _)| pid)
+            .collect()
+    }
+
+    fn driving_by(view: &AgentChatView) -> Vec<u32> {
+        let mine = view.screen_control.session.as_str();
+        view.screen_control
+            .grants
+            .driving()
+            .into_iter()
+            .filter(|(_, owner)| owner == mine)
+            .map(|(pid, _)| pid)
+            .collect()
+    }
+
     /// Open a chat over a stub connection, for tests that drive real events.
     async fn stub_chat(
         cx: &mut TestAppContext,
@@ -494,6 +534,93 @@ mod view_tests {
         );
     }
 
+    /// A capture coming back must actually reach the store.
+    ///
+    /// The whole fix rests on this wiring: a capture raises no card and needs no
+    /// grant, so if nothing recorded it the user's only signal — the menu bar —
+    /// would stay dark while an agent photographed their screen. That is the bug
+    /// this closes, and nothing else would notice if the call were dropped.
+    #[gpui::test]
+    async fn a_capture_coming_back_is_recorded_against_the_chat(cx: &mut TestAppContext) {
+        let (window, _probe) = stub_chat(cx).await;
+
+        window
+            .update(cx, |view, _window, cx| {
+                let mut target = std::process::Command::new("/bin/sleep")
+                    .arg("120")
+                    .spawn()
+                    .expect("spawn a target");
+                let pid = target.id();
+
+                view.on_event(
+                    ThreadEvent::ToolCallStarted {
+                        id: "t1".into(),
+                        name: "mcp__oximux-computer-use__get_window_state".into(),
+                        input: json!({ "pid": pid, "window_id": 1 }),
+                    },
+                    cx,
+                );
+                assert!(
+                    captured_by(view).is_empty(),
+                    "calling a read is not yet evidence that a picture was taken"
+                );
+
+                view.on_event(
+                    ThreadEvent::ToolResultImages {
+                        tool_use_id: "t1".into(),
+                        images: vec![oximux_agents::thread::ChatImage {
+                            media_type: "image/png".into(),
+                            data: "AAAA".into(),
+                        }],
+                    },
+                    cx,
+                );
+                assert_eq!(
+                    captured_by(view),
+                    vec![pid],
+                    "an image came back, so the screen was photographed"
+                );
+
+                let _ = target.kill();
+                let _ = target.wait();
+            })
+            .expect("window update");
+    }
+
+    /// An ordinary tool returning an image must not read as a screen capture.
+    ///
+    /// `Read` on a PNG in the repo produces images too. Counting those would put
+    /// a permanent claim in the menu bar that an agent is watching the screen,
+    /// which is how a safety indicator stops being believed.
+    #[gpui::test]
+    async fn an_image_from_an_ordinary_tool_is_not_a_screen_capture(cx: &mut TestAppContext) {
+        let (window, _probe) = stub_chat(cx).await;
+
+        window
+            .update(cx, |view, _window, cx| {
+                view.on_event(
+                    ThreadEvent::ToolCallStarted {
+                        id: "t1".into(),
+                        name: "Read".into(),
+                        input: json!({ "file_path": "/tmp/diagram.png" }),
+                    },
+                    cx,
+                );
+                view.on_event(
+                    ThreadEvent::ToolResultImages {
+                        tool_use_id: "t1".into(),
+                        images: vec![oximux_agents::thread::ChatImage {
+                            media_type: "image/png".into(),
+                            data: "AAAA".into(),
+                        }],
+                    },
+                    cx,
+                );
+                assert!(captured_by(view).is_empty());
+            })
+            .expect("window update");
+    }
+
     /// The turn ending must actually reach the driving mark.
     ///
     /// Unit-testing `end_driving_turn` proves the store forgets; only a real
@@ -515,10 +642,7 @@ mod view_tests {
                 view.screen_control
                     .approve("mcp__oximux-computer-use__click", &input)
                     .expect("an ungranted target is approvable");
-                assert!(
-                    !view.screen_control.grants.driving().is_empty(),
-                    "approving starts the driving turn"
-                );
+                assert!(!driving_by(view).is_empty(), "approving starts the driving turn");
 
                 view.on_event(
                     ThreadEvent::TurnEnded {
@@ -530,7 +654,7 @@ mod view_tests {
                     cx,
                 );
                 assert!(
-                    view.screen_control.grants.driving().is_empty(),
+                    driving_by(view).is_empty(),
                     "the turn ended, so nothing is being driven and Escape is the user's again"
                 );
 
@@ -1048,7 +1172,7 @@ mod tests {
         let input = json!({ "pid": target.pid() });
         assert!(chat.approve(&ns("click"), &input).is_ok());
 
-        chat.end_driving_turn();
+        chat.end_turn_activity();
         assert!(chat.grants.driving().is_empty(), "nothing is being driven between turns");
         assert_eq!(
             chat.decide(&ns("click"), &input),

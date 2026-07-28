@@ -92,14 +92,17 @@ pub fn install(cx: &mut App) {
 
             if stop.pressed() {
                 // Instant and app-wide: every screen-control call re-checks the
-                // table, so clearing it is what actually takes the keys away.
+                // table, so writing the abort is what actually takes the keys
+                // away. Dropping grants alone would stop only input — reading
+                // needs no grant, so the agent could go on photographing the
+                // screen it was just stopped from touching.
                 let aborted = path.clone();
                 let dropped = cx
                     .background_executor()
-                    .spawn(async move { GrantTable::at(&aborted).clear() })
+                    .spawn(async move { GrantTable::at(&aborted).abort() })
                     .await;
                 if dropped {
-                    tracing::info!("Escape stopped screen control; all grants dropped");
+                    tracing::info!("Escape stopped screen control for every active turn");
                 } else {
                     // The user pressed the kill switch and it did not take. Of
                     // everything here this is the one that must never be logged
@@ -182,7 +185,7 @@ impl StopKey {
     fn follow(&mut self, driving: bool, secure_input: bool) -> Option<EscapeState> {
         if !driving {
             self.tap = None;
-            // Cleared, not latched: the user may have granted Accessibility
+            // Cleared, not latched: the user may have granted the permission
             // since the last run, and the next one should find out.
             self.blocked = false;
             return None;
@@ -289,7 +292,7 @@ mod tests {
         assert_eq!(tick(&path, FileStamp::default(), false), None);
     }
 
-    /// Whether the tap can be created depends on Accessibility permission,
+    /// Whether the tap can be created depends on Input Monitoring permission,
     /// which CI does not have and a developer machine may not either. So these
     /// assert the *contract* rather than that arming succeeds — which is the
     /// stronger test anyway: the failure mode that matters is claiming Escape
@@ -323,7 +326,7 @@ mod tests {
         // and would be missing in the gap. Only the claim changes.
         let mut stop = StopKey::default();
         if stop.follow(true, false) != Some(EscapeState::Armed) {
-            return; // No Accessibility here; covered by the test above.
+            return; // No tap permission here; covered by the test above.
         }
         assert_eq!(stop.follow(true, true), Some(EscapeState::SecureInput));
         assert!(stop.tap.is_some(), "the tap must survive being starved");

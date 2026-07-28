@@ -26,7 +26,7 @@
 //! second process — which is what makes the concurrency here testable without
 //! spawning anything.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
@@ -94,16 +94,59 @@ struct Store {
     /// same reason as `remote_turns`.
     #[serde(default)]
     driving_turns: BTreeSet<String>,
+    /// Pid → the session that has photographed it during the current turn.
+    ///
+    /// Separate from `grants` because a capture needs no grant: reading is how
+    /// an agent finds the pid it will later ask about, so gating it would break
+    /// discovery. That makes this the *only* record that a window was
+    /// photographed, and without it the menu bar stays dark while an agent
+    /// reads the user's screen.
+    #[serde(default)]
+    captures: BTreeMap<u32, String>,
+    /// Sessions that have photographed *something* this turn.
+    ///
+    /// Not derivable from `captures`: not every capture names a process. Only
+    /// `get_window_state` requires a pid; `zoom` takes a window id and may carry
+    /// no pid at all, and a read with no pid is allowed. Keyed on the session
+    /// instead, so a capture nobody can attribute still lights the indicator —
+    /// covering only the ones that happen to name a process would leave the same
+    /// hole this exists to close, just a smaller one.
+    #[serde(default)]
+    capturing_turns: BTreeSet<String>,
+    /// Sessions whose current turn the user killed with Escape.
+    ///
+    /// Dropping grants stops input but not reading, so a kill switch built only
+    /// on grants would leave an agent free to go on photographing the screen it
+    /// was just stopped from touching. This is what makes Escape cover both.
+    #[serde(default)]
+    aborted_turns: BTreeSet<String>,
 }
 
 impl Store {
     fn is_empty(&self) -> bool {
-        self.grants.is_empty() && self.remote_turns.is_empty() && self.driving_turns.is_empty()
+        self.grants.is_empty()
+            && self.remote_turns.is_empty()
+            && self.driving_turns.is_empty()
+            && self.captures.is_empty()
+            && self.capturing_turns.is_empty()
+            && self.aborted_turns.is_empty()
     }
 
     /// Cheap change detector for the write-back decision.
-    fn shape(&self) -> (usize, usize, usize) {
-        (self.grants.len(), self.remote_turns.len(), self.driving_turns.len())
+    fn shape(&self) -> (usize, usize, usize, usize, usize, usize) {
+        (
+            self.grants.len(),
+            self.remote_turns.len(),
+            self.driving_turns.len(),
+            self.captures.len(),
+            self.capturing_turns.len(),
+            self.aborted_turns.len(),
+        )
+    }
+
+    /// Every session with turn-scoped activity of any kind.
+    fn active_sessions(&self) -> BTreeSet<String> {
+        self.driving_turns.iter().cloned().chain(self.capturing_turns.iter().cloned()).collect()
     }
 }
 
@@ -180,14 +223,17 @@ impl GrantTable {
     /// grant outliving its agent would be inherited by whoever next gets that
     /// session id.
     ///
-    /// The driving mark goes with them. A chat that closed mid-turn never
+    /// Its turn-scoped state goes with them. A chat that closed mid-turn never
     /// reaches a turn boundary, so this is the only thing that would clear it,
     /// and leaving it set would keep the machine believing that a chat which no
-    /// longer exists is still driving.
+    /// longer exists is still working.
     pub fn release_all(&self, agent: &SessionId) {
         let _ = self.with_locked(|store| {
             store.grants.retain(|_, g| g.owner != agent.as_str());
             store.driving_turns.remove(agent.as_str());
+            store.captures.retain(|_, owner| owner != agent.as_str());
+            store.capturing_turns.remove(agent.as_str());
+            store.aborted_turns.remove(agent.as_str());
         });
     }
 
@@ -301,16 +347,92 @@ impl GrantTable {
         let _ = self.with_locked(|store| store.driving_turns.insert(agent.as_str().to_string()));
     }
 
-    /// The turn finished, so nothing is being driven under it any more.
+    /// Record that this session has just photographed `pid`.
+    ///
+    /// Written when a capture is *observed coming back*, not when a tool that
+    /// might capture is called. The driver decides what returns an image, and a
+    /// second list here of "tools that take pixels" would be a copy of that
+    /// decision free to drift out of step with it — claiming a capture that
+    /// never happened, or worse, missing one. An image in the result is the
+    /// thing itself.
+    /// `pid` is `None` when the call named no process — see `capturing_turns`.
+    pub fn note_capture(&self, pid: Option<u32>, agent: &SessionId) {
+        let _ = self.with_locked(|store| {
+            if let Some(pid) = pid {
+                store.captures.insert(pid, agent.as_str().to_string());
+            }
+            store.capturing_turns.insert(agent.as_str().to_string());
+        });
+    }
+
+    /// Sessions that have photographed something this turn, named or not.
+    pub fn capturing(&self) -> BTreeSet<String> {
+        self.with_locked(|store| store.capturing_turns.clone()).unwrap_or_default()
+    }
+
+    /// Pids photographed during the current turn, as `(pid, owner)`.
+    pub fn captured(&self) -> Vec<(u32, String)> {
+        self.with_locked(|store| {
+            let mut rows: Vec<(u32, String)> =
+                store.captures.iter().map(|(pid, owner)| (*pid, owner.clone())).collect();
+            rows.sort_unstable();
+            rows
+        })
+        .unwrap_or_default()
+    }
+
+    /// The turn finished, so none of it is happening any more.
+    ///
+    /// Clears everything scoped to a turn: what was driven, what was
+    /// photographed, and whether Escape killed it. The abort flag is released
+    /// here and nowhere else — it is what refuses the rest of *that* turn, so
+    /// holding it past the boundary would silently disable screen control for a
+    /// chat with nothing on screen explaining why.
     ///
     /// Missing this call fails *unsafe* in a small way — the machine keeps
-    /// believing an agent is driving, which costs the user their Escape key
-    /// until the chat closes. That is the failure this whole split exists to
-    /// prevent, so it is cleared unconditionally at every turn boundary and
-    /// again when the chat releases its grants, rather than only on the paths
-    /// that are known to have driven.
-    pub fn end_driving_turn(&self, agent: &SessionId) {
-        let _ = self.with_locked(|store| store.driving_turns.remove(agent.as_str()));
+    /// believing an agent is working, which costs the user their Escape key
+    /// until the chat closes. That is the failure this split exists to prevent,
+    /// so it is called unconditionally at every turn boundary and again when the
+    /// chat releases its grants.
+    pub fn end_turn_activity(&self, agent: &SessionId) {
+        let _ = self.with_locked(|store| {
+            store.driving_turns.remove(agent.as_str());
+            store.captures.retain(|_, owner| owner != agent.as_str());
+            store.capturing_turns.remove(agent.as_str());
+            store.aborted_turns.remove(agent.as_str());
+        });
+    }
+
+    /// Escape: stop everything, and keep it stopped for the rest of the turn.
+    ///
+    /// Dropping grants alone would only stop *input*. Reading needs no grant, so
+    /// an agent stopped that way could go on photographing the screen it was
+    /// just refused permission to touch — a kill switch the user would
+    /// reasonably read as "stop looking at my screen" while it did nothing of
+    /// the kind. So every session with activity is marked, and the policy
+    /// refuses all of its screen-control calls until the turn ends.
+    ///
+    /// Reports whether the store is definitely in that state afterwards, for the
+    /// same reason [`GrantTable::clear`] does: a kill switch that did not take
+    /// must not be reported as one that did.
+    #[must_use = "an abort that did not take leaves the agent driving"]
+    pub fn abort(&self) -> bool {
+        self.with_locked(|store| {
+            let active = store.active_sessions();
+            store.grants.clear();
+            store.driving_turns.clear();
+            store.captures.clear();
+            store.capturing_turns.clear();
+            store.aborted_turns.extend(active);
+        })
+        .is_ok()
+    }
+
+    /// Did the user stop this session's current turn?
+    pub fn is_aborted(&self, agent: &SessionId) -> bool {
+        self.with_locked(|store| store.aborted_turns.contains(agent.as_str()))
+            // An unreadable store cannot show that the user did *not* press it.
+            .unwrap_or(true)
     }
 
     /// Grants belonging to a session that is driving *right now*, as
@@ -750,7 +872,7 @@ mod tests {
         assert!(app.driving().is_empty());
         hook.begin_driving_turn(&a);
         assert_eq!(app.driving(), vec![(live_pid(), a.as_str().to_string())]);
-        app.end_driving_turn(&a);
+        app.end_turn_activity(&a);
         assert!(app.driving().is_empty());
     }
 
@@ -792,6 +914,74 @@ mod tests {
 
         assert!(table.clear());
         assert!(table.driving().is_empty());
+    }
+
+    #[test]
+    fn escape_stops_reading_as_well_as_driving() {
+        // The reason abort exists rather than a second call to `clear`. Dropping
+        // grants stops input only; reading never needed one, so a kill switch
+        // built on grants alone would leave the agent free to go on
+        // photographing the screen the user had just stopped it touching.
+        let (_dir, table) = table();
+        let a = agent("a");
+        table.grant(live_pid(), &a);
+        table.begin_driving_turn(&a);
+        table.note_capture(Some(live_pid()), &a);
+
+        assert!(table.abort());
+        assert!(table.all().is_empty(), "grants dropped");
+        assert!(table.driving().is_empty());
+        assert!(table.captured().is_empty());
+        assert!(table.is_aborted(&a), "and the rest of the turn is refused");
+    }
+
+    #[test]
+    fn an_abort_lasts_the_turn_and_no_longer() {
+        // Held past the boundary it would silently disable screen control for a
+        // chat with nothing on screen explaining why; released early it would
+        // let the agent resume the turn the user just killed.
+        let (_dir, table) = table();
+        let a = agent("a");
+        table.note_capture(None, &a);
+        assert!(table.abort());
+        assert!(table.is_aborted(&a));
+
+        table.end_turn_activity(&a);
+        assert!(!table.is_aborted(&a), "a new turn starts clean");
+    }
+
+    #[test]
+    fn aborting_one_session_leaves_another_alone() {
+        // Escape is app-wide by design, but only over what is actually running:
+        // a chat with no activity has no turn to kill, and marking it would
+        // refuse a turn it had not started yet.
+        let (_dir, table) = table();
+        let (a, b) = (agent("a"), agent("b"));
+        table.begin_driving_turn(&a);
+
+        assert!(table.abort());
+        assert!(table.is_aborted(&a));
+        assert!(!table.is_aborted(&b));
+    }
+
+    #[test]
+    fn a_capture_with_no_pid_is_still_recorded_against_its_session() {
+        let (_dir, table) = table();
+        let a = agent("a");
+        table.note_capture(None, &a);
+
+        assert!(table.captured().is_empty(), "nothing to name");
+        assert!(table.capturing().contains(a.as_str()), "but it happened");
+    }
+
+    #[test]
+    fn captures_do_not_survive_the_startup_clear() {
+        let (_dir, table) = table();
+        let a = agent("a");
+        table.note_capture(Some(live_pid()), &a);
+        assert!(table.clear());
+        assert!(table.captured().is_empty());
+        assert!(table.capturing().is_empty());
     }
 
     #[test]

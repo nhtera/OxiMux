@@ -118,8 +118,8 @@ pub(super) fn render(
 ///
 /// The second was measured during the coverage spike, and it is the reason the
 /// per-project wording elsewhere in this pane had to change. Turning screen
-/// control on requires OxiMux to hold macOS Accessibility — the Escape kill
-/// switch is an event tap, and a tap does not exist without it. macOS attributes
+/// control on requires OxiMux to hold macOS Accessibility — it is what lets an
+/// agent act on another app's UI at all. macOS attributes
 /// that grant to OxiMux as the responsible process and **every descendant
 /// inherits it**, which includes each agent's shell tool, in every project,
 /// whether or not that project appears above. The list below controls which
@@ -130,8 +130,9 @@ pub(super) fn render(
 /// a paragraph would clip at the pane edge rather than reflow.
 const FOOTNOTES: &[&str] = &[
     "Guards against an agent's mistakes, not an agent trying to get around them.",
-    "Enabling this grants OxiMux macOS Accessibility, needed for Esc to stop an agent.",
+    "Enabling this grants OxiMux macOS Accessibility, which is how agents drive apps.",
     "Every agent's shell inherits that grant — in all projects, not only those listed.",
+    "Esc needs Input Monitoring as well — a separate switch, granted separately.",
 ];
 
 fn footnotes(theme: Theme, typography: &Typography) -> AnyElement {
@@ -351,7 +352,16 @@ mod tests {
     #[test]
     fn the_pane_does_not_promise_the_permission_is_per_project() {
         let shown = FOOTNOTES.join("\n");
-        for claim in ["Accessibility", "shell inherits", "not only those listed"] {
+        // "Input Monitoring" is pinned because the pane once said Accessibility
+        // was what Escape needed. It is not — a keyboard tap is gated on Input
+        // Monitoring — so anyone who granted the one they were told to got a
+        // kill switch that silently did nothing.
+        for claim in [
+            "Accessibility",
+            "shell inherits",
+            "not only those listed",
+            "Input Monitoring",
+        ] {
             assert!(shown.contains(claim), "the pane must still say: {claim}");
         }
         // And each line has to fit: settings prose does not wrap here, so a

@@ -3697,7 +3697,7 @@ impl AgentChatView {
         }
         let was_active = self.thread.turn_active;
         self.thread.apply(&ev);
-        self.note_turn_boundary(&ev);
+        self.note_screen_activity(&ev);
         // Screen-control calls are decided here because this is the only point
         // OxiMux is in their path at all — the driver is a separate process the
         // agent talks to directly. Runs after the fold so the card exists to be

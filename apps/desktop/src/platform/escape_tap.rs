@@ -24,10 +24,17 @@
 //!
 //! # Two ways it can fail, both reported rather than hidden
 //!
-//! Creating an active tap needs Accessibility permission. Without it
+//! Creating this tap needs **Input Monitoring**, which is a different switch
+//! from Accessibility and the one usually missing: macOS gates keyboard taps on
+//! it, so a build that already holds Accessibility still fails here. Without it
 //! `CGEventTapCreate` returns null, [`arm`] fails, and the caller must say so —
 //! a UI claiming Escape will stop an agent when it will not is worse than one
 //! that admits it cannot.
+//!
+//! The null says nothing about *which* switch it wanted, so anything shown to
+//! the user has to name both rather than pick one. Naming Accessibility alone
+//! sends someone who has already granted it back to a pane that is correct,
+//! where they will find nothing to change and conclude the feature is broken.
 //!
 //! macOS also *disables* a tap whose callback is too slow
 //! (`kCGEventTapDisabledByTimeout`). That arrives as a callback of its own and
@@ -107,6 +114,16 @@ mod imp {
         ) -> CFMachPortRef;
         fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
         fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+    }
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        /// Whether macOS considers *this process* Accessibility-trusted.
+        ///
+        /// The plain (non-`WithOptions`) form, so it answers without ever
+        /// raising a prompt — this is called on a timer while an agent runs, and
+        /// a dialog per tick would be its own bug.
+        fn AXIsProcessTrusted() -> bool;
     }
 
     #[link(name = "CoreFoundation", kind = "framework")]
@@ -254,7 +271,7 @@ mod imp {
     }
 
     /// Install the tap. `Err` means Escape cannot be intercepted — almost always
-    /// because OxiMux has no Accessibility permission.
+    /// because OxiMux has no Input Monitoring permission.
     ///
     /// Must be called from the main thread: the run-loop source is added to the
     /// main run loop, which is where GPUI's event loop lives.
@@ -286,6 +303,20 @@ mod imp {
             )
         };
         if port.is_null() {
+            // Which of the two permissions is missing is not recoverable from
+            // the null itself, and the System Settings panes have been observed
+            // to show a grant that the API does not honour. Asking macOS what it
+            // believes about this process separates "the pane is lying" from
+            // "the tap was refused for some other reason" — without it, both
+            // look identical from here and cost an afternoon each.
+            //
+            // SAFETY: no arguments, and the non-prompting form, so this is safe
+            // to call on any thread and cannot raise a dialog on a timer tick.
+            let trusted = unsafe { AXIsProcessTrusted() };
+            tracing::warn!(
+                accessibility_trusted = trusted,
+                "CGEventTapCreate returned null; the Escape tap cannot be installed"
+            );
             return Err(super::EscapeTapError::NotPermitted);
         }
 
@@ -374,7 +405,7 @@ mod imp {
         ///
         /// # Two preconditions it checks rather than assumes
         ///
-        /// Accessibility permission, without which no tap exists; and **secure
+        /// Input Monitoring permission, without which no tap exists; and **secure
         /// input off**, without which macOS delivers no keys to any tap while
         /// `CGEventTapCreate` still succeeds and the tap still reports itself
         /// enabled. Neither is a test's to arrange, so each is detected and
@@ -488,11 +519,13 @@ pub use imp::{EscapeTap, arm};
 /// Why Escape could not be intercepted.
 ///
 /// Distinguished rather than collapsed because the UI has to say something
-/// true: "grant Accessibility" is actionable, "not supported here" is not.
+/// true: a named permission is actionable, "not supported here" is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum EscapeTapError {
+    /// Names both panes because the failure cannot tell them apart, and the
+    /// less obvious one — Input Monitoring — is the one that is usually off.
     #[error(
-        "OxiMux needs Accessibility permission to stop an agent with Escape — grant it in System Settings › Privacy & Security › Accessibility"
+        "OxiMux needs Input Monitoring permission to stop an agent with Escape — grant it in System Settings › Privacy & Security › Input Monitoring, and check Accessibility there too"
     )]
     NotPermitted,
     #[error("could not attach the Escape tap to the run loop")]
@@ -509,8 +542,12 @@ mod tests {
     #[test]
     fn every_failure_says_what_the_user_can_do_about_it() {
         // The permission case is the one that actually happens, and it is
-        // useless unless it names the switch to flip.
+        // useless unless it names the switch to flip. Input Monitoring is the
+        // one that gates a keyboard tap, so naming only Accessibility strands
+        // anyone who has already granted that — which is the common case, since
+        // it is the permission every other part of screen control asks for.
         let denied = EscapeTapError::NotPermitted.to_string();
+        assert!(denied.contains("Input Monitoring"), "{denied}");
         assert!(denied.contains("Accessibility"), "{denied}");
         assert!(denied.contains("System Settings"), "{denied}");
         for err in [
@@ -522,7 +559,7 @@ mod tests {
         }
     }
 
-    /// Arming needs Accessibility permission, which CI does not have and a
+    /// Arming needs Input Monitoring permission, which CI does not have and a
     /// developer machine may not either — so this asserts the *contract* holds
     /// either way rather than that the tap succeeds.
     ///
