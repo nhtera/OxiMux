@@ -112,12 +112,20 @@ impl AgentChatView {
     /// count of user prompts (see
     /// [`oximux_agents::thread::tail_beyond_known_turns`]).
     ///
-    /// Claude stream-json and Codex app-server chats: both companions resume
-    /// the session IN PLACE (Claude appends to the per-project session jsonl;
-    /// Codex `resume` appends to the same rollout file — verified on codex
-    /// 0.145), so re-folding the log captures terminal-typed turns. ACP/Rpc
-    /// companions have no readable log wired — skipped. Also skipped while a
-    /// chat turn is in flight so an import can't interleave a streaming reply.
+    /// Every backend with a companion resumes the session IN PLACE (Claude
+    /// appends to the per-project session jsonl; Codex `resume` appends to the
+    /// same rollout file — verified on codex 0.145; Pi `--session <id>`
+    /// appends to the same rollout — verified on pi 0.80; OpenCode `--session
+    /// <id>` continues the same SQLite session rows), so re-folding the store
+    /// captures terminal-typed turns. ACP presets other than opencode never
+    /// spawn a companion (`interactive_resume: None`) — skipped. Also skipped
+    /// while a chat turn is in flight so an import can't interleave a
+    /// streaming reply.
+    ///
+    /// A non-empty fold also RESPAWNS the chat's live connection: the old one
+    /// never learned the terminal's turns, so its next send would answer
+    /// without them — and, on parent-linked stores (Claude, Pi), fork the
+    /// session tree and orphan them from context permanently.
     ///
     /// Known limitation: a turn still streaming IN THE TERMINAL at toggle time
     /// imports its reply as-written-so-far; the missing remainder arrives on a
@@ -133,11 +141,14 @@ impl AgentChatView {
             return;
         };
         // Where the companion's turns land, per backend. Claude's path is
-        // deterministic; a Codex rollout embeds its id in the filename and is
-        // found by a bounded walk of `~/.codex/sessions` (off the UI thread).
+        // deterministic; Codex/Pi rollouts embed the id in the filename and
+        // are found by a bounded walk of their session trees (off the UI
+        // thread); OpenCode's SQLite store is keyed by the session id itself.
         enum CompanionLog {
             Claude(PathBuf),
             Codex { codex_dir: PathBuf, thread_id: String },
+            Pi { home: PathBuf, session_id: String },
+            OpenCode { home: PathBuf, session_id: String },
         }
         let source = match self.backend.transport {
             Transport::StreamJson => CompanionLog::Claude(
@@ -148,7 +159,23 @@ impl AgentChatView {
                 codex_dir: home.join(".codex"),
                 thread_id: session_id,
             },
-            Transport::Acp | Transport::Rpc => return,
+            Transport::Rpc => CompanionLog::Pi { home, session_id },
+            Transport::Acp => {
+                // Only opencode has an interactive-resume companion AND a
+                // readable store importer keyed by the agent-supplied id.
+                let is_opencode = self
+                    .backend
+                    .acp_command
+                    .as_deref()
+                    .and_then(|cmd| {
+                        oximux_settings::ACP_PRESETS.iter().find(|p| p.command == cmd)
+                    })
+                    .is_some_and(|p| p.id == "opencode");
+                if !is_opencode {
+                    return;
+                }
+                CompanionLog::OpenCode { home, session_id }
+            }
         };
         let known = self.known_user_turns();
         cx.spawn(async move |this, cx| {
@@ -167,6 +194,24 @@ impl AgentChatView {
                                 .map(|import| import.entries)
                                 .unwrap_or_default()
                         }
+                        CompanionLog::Pi { home, session_id } => {
+                            oximux_agents::session_log::import_transcript_pi::locate_pi_session(
+                                &home,
+                                &session_id,
+                            )
+                            .map(|p| {
+                                oximux_agents::session_log::import_transcript_pi::pi_transcript(
+                                    &p,
+                                )
+                            })
+                            .unwrap_or_default()
+                        }
+                        CompanionLog::OpenCode { home, session_id } => {
+                            oximux_agents::session_log::import_transcript_opencode::opencode_transcript(
+                                &home,
+                                &session_id,
+                            )
+                        }
                     };
                     oximux_agents::thread::tail_beyond_known_turns(folded, known)
                 })
@@ -184,6 +229,18 @@ impl AgentChatView {
                 this.thread.append_imported(tail);
                 this.stick_to_bottom = true;
                 this.list_scroll.scroll_to_bottom();
+                // The chat's live connection loaded the session at spawn and
+                // never re-reads the log — after the terminal advanced it, the
+                // connection's in-memory context is missing those turns, and
+                // for parent-linked stores (Claude, Pi) its next send would
+                // fork the session tree, permanently orphaning them from
+                // context. Respawn (a fresh resume re-reads the full log) so
+                // the next send parents on the current leaf. A dormant chat
+                // has no connection yet and already resumes lazily on first
+                // send — nothing to refresh.
+                if this.connection.is_some() {
+                    this.respawn(cx);
+                }
                 cx.notify();
             });
         })

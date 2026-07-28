@@ -269,7 +269,7 @@ pub fn collect_pi(home: &Path, scope: &SessionScope, out: &mut Vec<SessionEntry>
 
 /// Depth-bounded collection of every `*.jsonl` under the Pi sessions tree
 /// (Pi groups files into `sessions/<project>/…`). Symlinks are never followed.
-fn collect_pi_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+pub(crate) fn collect_pi_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if depth > PI_MAX_DEPTH {
         return;
     }

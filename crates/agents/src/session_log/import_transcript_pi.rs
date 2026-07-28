@@ -18,12 +18,28 @@
 //! scan, so the cost is proportional to that one file, not every session in
 //! the picker.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use super::session_index::line_value;
 use crate::thread::{AssistantMessage, ThreadEntry, MAX_IMPORT_ENTRIES};
+
+/// Locate the rollout file for a Pi session id under `~/.pi/agent/sessions`.
+/// Pi embeds the id in the filename (`<ts>_<uuid>.jsonl`), so this reuses the
+/// index scan's bounded walk and matches on the id substring. Run on a
+/// background thread by callers — it stats every session file once. `None`
+/// when no file matches (a pruned or foreign session).
+pub fn locate_pi_session(home: &Path, session_id: &str) -> Option<PathBuf> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let mut files: Vec<PathBuf> = Vec::new();
+    super::import_provider_index::collect_pi_files(&home.join(".pi/agent/sessions"), 0, &mut files);
+    files.into_iter().find(|p| {
+        p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(session_id))
+    })
+}
 
 /// Build the transcript for one Pi rollout file. IO errors (missing file,
 /// permissions) degrade to an empty transcript — the resume still works with
