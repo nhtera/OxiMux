@@ -114,6 +114,22 @@ struct TurnAcc {
     tool_notices: Vec<ThreadEntry>,
 }
 
+/// User-role messages OpenCode plugins inject as standalone rows even though
+/// the user never typed them (observed in real stores). They must not become
+/// chat bubbles — and must not count as user TURNS: the companion-terminal
+/// sync anchors on the user-prompt count, and a live-started thread (whose
+/// user entries come only from the composer) would misalign against a fold
+/// that counted these. A list of observed tags, not a blanket `<`-prefix
+/// rule, so a real prompt pasting markup survives; an unlisted plugin's
+/// injection still renders (and can skew the sync anchor) until added here.
+const PLUMBING_USER_TAGS: [&str; 2] = ["<ultrawork-mode>", "<user-prompt-submit-hook>"];
+
+/// Whether a user-role turn body is one of the known plugin injections.
+fn is_plumbing_user_text(text: &str) -> bool {
+    let t = text.trim_start();
+    PLUMBING_USER_TAGS.iter().any(|tag| t.starts_with(tag))
+}
+
 impl TurnAcc {
     fn push_text(&mut self, t: &str) {
         append_line(&mut self.text, t);
@@ -127,7 +143,7 @@ impl TurnAcc {
     /// queued tool notices, then reset for the next message.
     fn flush(&mut self, entries: &mut Vec<ThreadEntry>) {
         match self.role.as_str() {
-            "user" if !self.text.is_empty() => {
+            "user" if !self.text.is_empty() && !is_plumbing_user_text(&self.text) => {
                 entries.push(ThreadEntry::User {
                     text: std::mem::take(&mut self.text),
                     images: Vec::new(),

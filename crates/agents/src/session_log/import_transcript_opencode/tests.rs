@@ -58,6 +58,60 @@ fn maps_text_reasoning_and_tool_parts_in_turn_order() {
 }
 
 #[test]
+fn plugin_injected_user_messages_are_skipped_but_real_prompts_kept() {
+    // OpenCode plugins record standalone user-role messages the user never
+    // typed. They must not become bubbles or count as user turns — the
+    // companion-terminal sync anchors on the user-prompt count.
+    let home = tempfile::tempdir().unwrap();
+    write_fixture_db(home.path());
+    let conn =
+        Connection::open(home.path().join(".local/share/opencode/opencode.db")).unwrap();
+    for (i, text) in [
+        "<ultrawork-mode>\n\n**MANDATORY**: placeholder",
+        "  <user-prompt-submit-hook>\n## Session placeholder",
+        "a real prompt that merely mentions <user-prompt-submit-hook> later",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mid = format!("msg_plumb{i}");
+        let t = 100 + i as i64;
+        conn.execute(
+            "INSERT INTO message VALUES (?1,'ses_fixture',?2,?2,'{\"role\":\"user\"}')",
+            rusqlite::params![mid, t],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO part VALUES (?1,?2,'ses_fixture',?3,?3,?4)",
+            rusqlite::params![
+                format!("prt_plumb{i}"),
+                mid,
+                t,
+                serde_json::json!({ "type": "text", "text": text }).to_string()
+            ],
+        )
+        .unwrap();
+    }
+    let entries = opencode_transcript(home.path(), "ses_fixture");
+    let users: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| match e {
+            ThreadEntry::User { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        users,
+        [
+            "placeholder prompt one",
+            "placeholder prompt two",
+            "a real prompt that merely mentions <user-prompt-submit-hook> later",
+        ],
+        "plumbing rows skipped, real prompts (fixture + appended) kept"
+    );
+}
+
+#[test]
 fn missing_database_yields_empty_transcript() {
     let home = tempfile::tempdir().unwrap();
     let entries = opencode_transcript(home.path(), "ses_fixture");
