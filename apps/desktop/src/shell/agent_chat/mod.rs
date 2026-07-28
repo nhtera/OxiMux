@@ -466,10 +466,8 @@ use oximux_agents::thread::{
     PermissionSuggestion, ProbedCatalog, QuestionAnswers, QuestionRequest, ThreadEntry,
     ThreadEvent, ToolCall, ToolCallStatus, ToolDetail, Transport, TurnUsage,
 };
-use oximux_agents::SharedBackend;
 use oximux_core::{AgentAdapter, AgentSessionId};
 use oximux_git::GitCmd;
-use oximux_pty::TerminalSessionId;
 use oximux_settings::{AgentLaunchSettings, Density, Theme, Typography};
 
 /// A transcript-only **import bridge**: an OpenCode / Pi session opened as a
@@ -653,6 +651,9 @@ pub struct AgentChatView {
     /// it (`runtime.cancel`) when the tab closes — else switching to terminal view
     /// then closing the tab would orphan a live CLI. `None` when no companion.
     companion_session: Option<AgentSessionId>,
+    /// The chat sent a prompt after the companion spawned — its CLI loaded the
+    /// session at spawn and is now missing turns; see `companion_sync`.
+    chat_advanced_since_companion: bool,
     /// Repaints this view when the companion terminal notifies (PTY output /
     /// scroll). Held alongside `terminal`; dropped when the companion is dropped.
     _terminal_observer: Option<Subscription>,
@@ -1402,6 +1403,7 @@ impl AgentChatView {
             view_mode: ChatViewMode::Chat,
             terminal: None,
             companion_session: None,
+            chat_advanced_since_companion: false,
             _terminal_observer: None,
             expanded_thinking: HashSet::new(),
             collapsed_thinking: HashSet::new(),
@@ -1729,33 +1731,6 @@ impl AgentChatView {
             // CLI wired (ACP presets today).
             TerminalAvailability::NoInteractiveResume
         }
-    }
-
-    /// Mount a freshly-spawned companion terminal (the host did the async
-    /// `start_session`) and switch to Terminal view. Builds the `TerminalView`
-    /// from this chat's own theme/density/typography, observes it for repaint,
-    /// and remembers the session id for reaping on close.
-    pub fn attach_terminal(
-        &mut self,
-        session: AgentSessionId,
-        backend: SharedBackend,
-        term_id: TerminalSessionId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let ids = SurfaceIds::fresh(self.cwd.to_string_lossy().into_owned());
-        let theme = self.theme;
-        let density = self.density;
-        let typography = self.typography.clone();
-        let terminal = cx.new(|cx| {
-            TerminalView::mount(backend, term_id, ids, theme, density, typography, window, cx)
-        });
-        self._terminal_observer = Some(cx.observe(&terminal, |_this, _tv, cx| cx.notify()));
-        self.terminal = Some(terminal);
-        self.companion_session = Some(session);
-        self.view_mode = ChatViewMode::Terminal;
-        self.focus_active_surface(window, cx);
-        cx.notify();
     }
 
     /// Focus the surface the active mode shows: the companion terminal in
@@ -2213,6 +2188,7 @@ impl AgentChatView {
         }
         // Optimistically record the prompt; the reply streams in via `on_event`.
         self.thread.push_user_message_with_images(text.clone(), images.clone());
+        self.note_chat_prompt_sent();
         // Snapshot the repo for this turn's rewind anchor (background — never
         // blocks the send). The user entry we just pushed is the last one.
         let user_index = self.thread.entries.len() - 1;
@@ -2276,7 +2252,10 @@ impl AgentChatView {
         // The bubble goes in at the point the user sent it, which is also where
         // the agent will act on it — the turn's remaining output lands after.
         match conn.steer(&text) {
-            Ok(()) => self.thread.push_user_message(&text),
+            Ok(()) => {
+                self.thread.push_user_message(&text);
+                self.note_chat_prompt_sent();
+            }
             Err(e) => self.thread.last_error = Some(format!("Steer failed: {e}")),
         }
         self.stick_to_bottom = true;
@@ -3348,6 +3327,7 @@ impl AgentChatView {
             view_mode: ChatViewMode::Chat,
             terminal: None,
             companion_session: None,
+            chat_advanced_since_companion: false,
             _terminal_observer: None,
             expanded_thinking: HashSet::new(),
             collapsed_thinking: HashSet::new(),

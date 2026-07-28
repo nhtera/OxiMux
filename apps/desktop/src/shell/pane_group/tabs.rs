@@ -1225,8 +1225,10 @@ impl PaneGroup {
 
     /// Toggle a specific agent-chat view between chat and its companion terminal.
     /// Switching to terminal spawns the resume terminal on first use (async, via
-    /// the runtime); switching back just flips the mode (the terminal stays alive
-    /// underneath so a re-toggle is instant). Shared by the ⌃⇧V action and the
+    /// the runtime) and RESPAWNS it when the chat advanced past it (see below);
+    /// otherwise the terminal stays alive underneath so a re-toggle is instant.
+    /// Switching back flips the mode and folds terminal-typed turns into the
+    /// chat (`sync_from_companion_terminal`). Shared by the ⌃⇧V action and the
     /// composer's terminal button.
     fn toggle_terminal_for_chat(
         &mut self,
@@ -1240,11 +1242,29 @@ impl PaneGroup {
             self.focus_active(window, cx);
             return;
         }
-        // Companion already exists → just show it.
         if view.read(cx).has_companion_terminal() {
-            view.update(cx, |v, cx| v.set_view_mode(ChatViewMode::Terminal, window, cx));
-            self.focus_active(window, cx);
-            return;
+            // Current companion → just show it (instant, the CLI stayed alive).
+            if !view.read(cx).companion_terminal_stale() {
+                view.update(cx, |v, cx| v.set_view_mode(ChatViewMode::Terminal, window, cx));
+                self.focus_active(window, cx);
+                return;
+            }
+            // The chat sent prompts after this companion spawned. Its CLI
+            // loaded the session at spawn and never re-reads the log, so those
+            // turns are missing from BOTH its display and its context — it
+            // would answer the next terminal prompt without them. Reap it and
+            // fall through to a fresh spawn, whose `--resume` re-reads the
+            // full log.
+            if let Some(stale) = view.read(cx).companion_session_id() {
+                let runtime = self.cli_runtime.clone();
+                cx.spawn_in(window, async move |_this, _cx| {
+                    if let Err(err) = runtime.cancel(stale).await {
+                        tracing::warn!(?err, "stale companion terminal cancel failed");
+                    }
+                })
+                .detach();
+            }
+            view.update(cx, |v, cx| v.drop_companion_terminal(cx));
         }
         // First switch: spawn the resume terminal, then attach it.
         let Some(spec) = view.read(cx).terminal_launch_spec() else {

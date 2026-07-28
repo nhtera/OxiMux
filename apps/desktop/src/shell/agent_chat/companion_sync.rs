@@ -11,10 +11,72 @@
 use gpui::{AppContext as _, Context, Window};
 
 use oximux_agents::thread::{ThreadEntry, Transport};
+use oximux_agents::SharedBackend;
+use oximux_core::AgentSessionId;
+use oximux_pty::TerminalSessionId;
+
+use crate::shell::context_env::SurfaceIds;
+use crate::shell::terminal_view::TerminalView;
 
 use super::{AgentChatView, ChatViewMode};
 
 impl AgentChatView {
+    /// Mount a freshly-spawned companion terminal (the host did the async
+    /// `start_session`) and switch to Terminal view. Builds the `TerminalView`
+    /// from this chat's own theme/density/typography, observes it for repaint,
+    /// and remembers the session id for reaping on close. A fresh mount is by
+    /// definition current — clears the staleness mark.
+    pub fn attach_terminal(
+        &mut self,
+        session: AgentSessionId,
+        backend: SharedBackend,
+        term_id: TerminalSessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids = SurfaceIds::fresh(self.cwd.to_string_lossy().into_owned());
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let terminal = cx.new(|cx| {
+            TerminalView::mount(backend, term_id, ids, theme, density, typography, window, cx)
+        });
+        self._terminal_observer = Some(cx.observe(&terminal, |_this, _tv, cx| cx.notify()));
+        self.terminal = Some(terminal);
+        self.companion_session = Some(session);
+        self.chat_advanced_since_companion = false;
+        self.view_mode = ChatViewMode::Terminal;
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
+    /// Record that the chat sent a prompt while a companion terminal exists.
+    /// The running interactive CLI loaded the session at spawn time and never
+    /// re-reads the log, so from this moment its context is missing turns —
+    /// the next switch to Terminal view must respawn it rather than show it.
+    pub(super) fn note_chat_prompt_sent(&mut self) {
+        if self.companion_session.is_some() {
+            self.chat_advanced_since_companion = true;
+        }
+    }
+
+    /// Whether the companion terminal's CLI is missing chat-sent turns and
+    /// must be respawned (fresh `--resume` re-reads the log) instead of shown.
+    pub fn companion_terminal_stale(&self) -> bool {
+        self.chat_advanced_since_companion
+    }
+
+    /// Detach the companion terminal from this view so a fresh one can be
+    /// spawned. The caller reaps the CLI's daemon session — this only drops
+    /// the view-side state (the `TerminalView` drop releases its subscriber).
+    pub fn drop_companion_terminal(&mut self, cx: &mut Context<Self>) {
+        self.terminal = None;
+        self.companion_session = None;
+        self._terminal_observer = None;
+        self.chat_advanced_since_companion = false;
+        cx.notify();
+    }
+
     /// Switch between chat and terminal view. Terminal requires the companion to
     /// already exist (the host spawns it first via [`Self::attach_terminal`]); a
     /// request for Terminal with no companion is a no-op. Focuses the newly-active
