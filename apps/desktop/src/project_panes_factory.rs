@@ -1494,12 +1494,16 @@ pub(crate) fn load_pane_buffers(
     }
 }
 
+/// Returns the session ids whose transcript blob is confirmed up to date on
+/// disk (written now, or skipped as byte-identical) — the caller commits
+/// those chats' dirty state, so a failed write stays dirty and retries on
+/// the next save.
 pub(crate) fn save_persisted_tabs(
     repo: &SettingsRepo,
     project_id: &str,
     window_id: &str,
     snap: &PersistedTabs,
-) {
+) -> Vec<String> {
     let key = settings_key(project_id, window_id);
     let json = match serde_json::to_string(snap) {
         Ok(j) => j,
@@ -1510,21 +1514,27 @@ pub(crate) fn save_persisted_tabs(
                 window_id,
                 "save_persisted_tabs: serialize failed"
             );
-            return;
+            return Vec::new();
         }
     };
     // The layout blob excludes chat transcripts (`#[serde(skip)]`); each rides
     // its own `agent_chat:<session_id>` key so a growing conversation never
     // pushes the layout blob past its size cap. Write those first so a restore
     // reading the layout always finds the matching transcript already on disk.
+    let mut synced = Vec::with_capacity(snap.chat_transcripts.len());
     for transcript in &snap.chat_transcripts {
         let chat_key = crate::persisted_chat::chat_settings_key(&transcript.session_id);
         match serde_json::to_string(transcript) {
-            Ok(t_json) => set_deduped(repo, chat_key, &t_json),
+            Ok(t_json) => {
+                if set_deduped(repo, chat_key, &t_json) {
+                    synced.push(transcript.session_id.clone());
+                }
+            }
             Err(err) => tracing::warn!(?err, session_id = %transcript.session_id, "save chat transcript: serialize failed"),
         }
     }
     set_deduped(repo, key, &json);
+    synced
 }
 
 /// Write `json` under `key`, skipping a byte-identical repeat. The periodic
@@ -1537,7 +1547,10 @@ pub(crate) fn save_persisted_tabs(
 /// "Skipping an identical write is always correct" only holds for the database
 /// that already received it — keyed by name alone, two stores writing the same
 /// key with the same bytes alias, and the second write is dropped on the floor.
-fn set_deduped(repo: &SettingsRepo, key: String, json: &str) {
+/// True when the key's bytes are now up to date on disk — written by this
+/// call, or skipped because they were already identical. False only when the
+/// write itself failed.
+fn set_deduped(repo: &SettingsRepo, key: String, json: &str) -> bool {
     let digest = {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1553,7 +1566,7 @@ fn set_deduped(repo: &SettingsRepo, key: String, json: &str) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if last.get(&store).and_then(|keys| keys.get(&key)) == Some(&digest) {
-            return;
+            return true;
         }
     }
     match repo.set(&key, json) {
@@ -1567,9 +1580,11 @@ fn set_deduped(repo: &SettingsRepo, key: String, json: &str) {
                 .entry(store)
                 .or_default()
                 .insert(key, digest);
+            true
         }
         Err(err) => {
             tracing::warn!(?err, key, "save_persisted_tabs: settings.set failed");
+            false
         }
     }
 }

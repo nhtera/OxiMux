@@ -118,11 +118,31 @@ pub struct ChatThread {
     /// to this. Cleared when the finalized `tool_use` block supersedes the
     /// preview. Transient (Claude live tool-input only).
     streaming_tool_id: Option<String>,
+    /// Monotonic mutation counter, bumped by every mutating method. Lets
+    /// persistence ask "did the thread change since the last save?" as a
+    /// structural fact (compare against a remembered value) instead of a
+    /// dirty flag every mutation call site must remember to set — a missed
+    /// site there silently serves a stale blob after quit. Direct writes to
+    /// the `pub` fields do NOT bump it; view-held metadata keeps its own
+    /// mark. Private so nothing outside can rewind it.
+    revision: u64,
 }
 
 impl ChatThread {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The current mutation count. Persistence remembers the value it saved
+    /// at; inequality means the transcript changed since.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Bump the mutation counter — every `&mut self` method that changes
+    /// transcript-visible state calls this.
+    fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Rebuild a thread from a persisted transcript on session restore. Seeds
@@ -177,6 +197,10 @@ impl ChatThread {
             slash_commands,
             slash_command_descriptions,
             slash_command_hints,
+            // Carry the counter PAST the reset — `Self::default()` would
+            // rewind it to a value persistence may have already recorded as
+            // saved, making the wipe look like "nothing changed".
+            revision: self.revision.wrapping_add(1),
             ..Self::default()
         };
     }
@@ -192,6 +216,7 @@ impl ChatThread {
         text: impl Into<String>,
         images: Vec<ChatImage>,
     ) {
+        self.touch();
         self.entries.push(ThreadEntry::User { text: text.into(), images, checkpoint: None });
         self.end_assistant_window();
         // A new turn begins: the prior turn's usage/summary no longer apply.
@@ -208,6 +233,10 @@ impl ChatThread {
 
     /// Fold one decoded event into the transcript.
     pub fn apply(&mut self, event: &ThreadEvent) {
+        // Over-approximates (an event that folds to nothing still bumps) —
+        // the cost is one avoidable serialize on the next save, never a
+        // missed one.
+        self.touch();
         match event {
             ThreadEvent::SessionInit { session_id, model, permission_mode, slash_commands, meta } => {
                 self.session_id = Some(session_id.clone());
@@ -682,6 +711,7 @@ impl ChatThread {
     /// `Rejected` — the process is being killed, so the request can never be
     /// answered, exactly like a live disconnect.
     pub fn interrupt(&mut self) {
+        self.touch();
         self.turn_active = false;
         // A tool whose arguments were still streaming (`content_block_start` opened
         // the card, the finalized `tool_use` block never arrived) would otherwise
@@ -716,6 +746,7 @@ impl ChatThread {
     /// the one at `expected_index` (the thread may have moved on while the
     /// checkpoint was being created in the background).
     pub fn attach_checkpoint(&mut self, expected_index: usize, sha: String) {
+        self.touch();
         if let Some(ThreadEntry::User { checkpoint, .. }) = self.entries.get_mut(expected_index) {
             *checkpoint = Some(CheckpointState { sha, show: false });
         }
@@ -724,6 +755,7 @@ impl ChatThread {
     /// Flip the "restore files" affordance on the user entry at `index` once
     /// the turn is known to have changed repo state.
     pub fn set_checkpoint_show(&mut self, index: usize, show: bool) {
+        self.touch();
         if let Some(ThreadEntry::User { checkpoint: Some(cp), .. }) = self.entries.get_mut(index) {
             cp.show = show;
         }
@@ -735,6 +767,7 @@ impl ChatThread {
     /// flight, streaming windows closed, stale footer cleared. Returns `None`
     /// (and mutates nothing) when the ordinal doesn't resolve.
     pub fn truncate_to_user(&mut self, ordinal: usize) -> Option<(String, Vec<ChatImage>)> {
+        self.touch();
         let idx = self.user_entry_index(ordinal)?;
         let removed = self.entries.drain(idx..).next();
         self.end_assistant_window();
@@ -751,6 +784,7 @@ impl ChatThread {
     /// user allows, or `Rejected` when they deny) — called by the connection
     /// layer alongside sending the control response.
     pub fn set_tool_status(&mut self, tool_id: &str, status: ToolCallStatus) {
+        self.touch();
         if let Some(tc) = self.tool_call_mut(tool_id) {
             tc.status = status;
         }
@@ -769,6 +803,7 @@ impl ChatThread {
     /// different things and the transcript should not blur them. Never
     /// overwrites a result the backend already reported.
     pub fn set_tool_refusal(&mut self, tool_id: &str, reason: &str) {
+        self.touch();
         if let Some(tc) = self.tool_call_mut(tool_id)
             && tc.result.is_none()
         {
@@ -801,6 +836,7 @@ impl ChatThread {
     /// answering replaces the `AwaitingAnswer` status that carries `is_secret`,
     /// so this is the last moment the secret-ness is knowable.
     pub fn mark_secret_answer(&mut self, tool_id: &str) {
+        self.touch();
         if let Some(tc) = self.tool_call_mut(tool_id) {
             tc.redact_result = true;
         }

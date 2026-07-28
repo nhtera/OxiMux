@@ -42,6 +42,7 @@ mod question_card;
 mod remote_turn;
 mod turn_summary_card;
 mod rewind_menu;
+mod session_persistence;
 mod screen_card;
 mod screen_consent;
 mod session_detail;
@@ -230,43 +231,9 @@ fn control_vocab_of(conn: Option<&dyn AgentConnection>) -> ControlVocab {
     }
 }
 
-/// A restored chat's persisted, backend-specific posture. Seeded into both the
-/// connection spawn and the composer's feature picks so a reopened session keeps
-/// the choice the user made rather than reverting to a default. Empty (all
-/// `None`) for a fresh launch.
-///
-/// One field per backend that has a posture — mirroring `ConnectSpec`'s
-/// one-launch-field-per-transport convention. Carried as a struct so adding a
-/// backend doesn't grow the arity of the construction chain it threads through.
-#[derive(Debug, Clone, Default)]
-pub struct RestoredPosture {
-    /// Codex `(approval_policy, sandbox)`.
-    pub codex: Option<(String, String)>,
-    /// Pi's tool allowlist + context-file choice.
-    pub pi: Option<PiPosture>,
-}
+pub use session_persistence::RestoredPosture;
+use session_persistence::{seed_posture_feature_values, ConnectMode};
 
-/// Build the initial composer feature-pick overlay for a restored chat, so the
-/// reopened session shows (and re-persists) the posture it was saved with.
-///
-/// For Pi this is load-bearing rather than cosmetic: its posture is the only
-/// tool gate that exists, and the default is the most permissive option — so a
-/// restore that dropped the picks would silently widen what the agent may do.
-fn seed_posture_feature_values(posture: &RestoredPosture) -> HashMap<String, FeatureValue> {
-    let mut map = HashMap::new();
-    if let Some((approval, sandbox)) = posture.codex.clone() {
-        map.insert("codex_approval_policy".to_string(), FeatureValue::Choice(approval));
-        map.insert("codex_sandbox".to_string(), FeatureValue::Choice(sandbox));
-    }
-    if let Some(pi) = posture.pi.clone() {
-        map.insert(pi_posture::FEATURE_TOOLS.to_string(), FeatureValue::Choice(pi.tools));
-        map.insert(
-            pi_posture::FEATURE_CONTEXT_FILES.to_string(),
-            FeatureValue::Bool(pi.context_files),
-        );
-    }
-    map
-}
 
 /// Overlay the user's optimistic feature picks onto the backend-advertised
 /// feature list so the composer reflects a toggle/select change immediately —
@@ -629,6 +596,23 @@ pub struct AgentChatView {
     /// respawns with `--resume`. Distinct from `disconnected` (an unexpected
     /// crash, which stays unavailable), so an intentional Stop shows no error.
     interrupted: bool,
+    /// A restored chat that has not spawned its subprocess yet. Restoring a
+    /// layout with many chat tabs must not launch one agent CLI per tab — a
+    /// resumed CLI re-reads its whole session file, so a boot with several
+    /// large sessions saturates the machine for tens of seconds. Instead the
+    /// view comes up resumable-idle and connects on its first render (only
+    /// the visible tab renders) or on an explicit remote open. Cleared by
+    /// [`Self::ensure_connected`]; `respawn` owns the actual connect.
+    dormant: bool,
+    /// The [`ChatThread::revision`] the last committed save persisted;
+    /// inequality with the live counter means the on-disk blob is stale.
+    /// Set only by [`Self::commit_transcript_save`] after a write succeeds;
+    /// `u64::MAX` = never saved. `Cell`: the save path reads via `Entity::read`.
+    last_saved_revision: std::cell::Cell<u64>,
+    /// Blob fields held on the VIEW (permission mode, thinking level,
+    /// posture picks) sit outside the thread's revision counter — their few
+    /// setters mark this instead. Cleared with `last_saved_revision`.
+    meta_dirty: std::cell::Cell<bool>,
     /// A "draft" chat opened via the unified **New Agent** entry: no subprocess
     /// has spawned yet, and `self.backend`/`self.model` reflect the *currently
     /// picked* (but not yet committed) agent + model. Deferred binding — the
@@ -945,7 +929,7 @@ impl AgentChatView {
             model,
             backend,
             ChatThread::new(),
-            true,
+            ConnectMode::Connect,
             RestoredPosture::default(),
             theme,
             density,
@@ -976,7 +960,7 @@ impl AgentChatView {
             model,
             backend,
             ChatThread::new(),
-            false,
+            ConnectMode::UnboundDraft,
             RestoredPosture::default(),
             theme,
             density,
@@ -1028,9 +1012,26 @@ impl AgentChatView {
         // Seeded from the blob so the session-detail popover is populated on a
         // restored chat; a later live init overwrites it.
         thread.session_meta = session_meta;
+        // Dormant: a restored chat spawns NO subprocess at construction (a
+        // resumed CLI re-reads its whole session file — a layout with many
+        // chat tabs would cold-start them all at boot). First render or a
+        // remote open connects via `ensure_connected` → `--resume`.
         let mut view = Self::assemble(
-            cwd, model, backend, thread, true, posture, theme, density, typography, window, cx,
+            cwd,
+            model,
+            backend,
+            thread,
+            ConnectMode::DormantResume,
+            posture,
+            theme,
+            density,
+            typography,
+            window,
+            cx,
         );
+        // The blob this view was built from IS the on-disk state — a save
+        // before any mutation must skip it.
+        view.last_saved_revision.set(view.thread.revision());
         view.thinking_level = thinking_level;
         // A resumed chat that already has history must NOT regenerate (or
         // overwrite) its label on the next send — mark it already-titled.
@@ -1039,8 +1040,9 @@ impl AgentChatView {
     }
 
     /// Construct a transcript-only **import bridge** for an OpenCode / Pi
-    /// session: seed the transcript, but spawn NO subprocess (`connect_now:
-    /// false`) — these providers have no in-app chat backend. Unlike a *New
+    /// session: seed the transcript, but spawn NO subprocess
+    /// ([`ConnectMode::ImportBridge`]) — these providers have no in-app chat
+    /// backend. Unlike a *New
     /// Agent* draft (also connection-less), this is not `unbound`: the composer
     /// is swapped for a Resume-in-terminal action ([`Self::import_bridge`]), and
     /// `send_text` is a no-op, so it can never masquerade as a live chat.
@@ -1057,8 +1059,8 @@ impl AgentChatView {
     ) -> Self {
         // Seed the transcript with no session id (no `--resume` this view can
         // drive) and the Claude backend as an inert placeholder — it's never
-        // connected (`connect_now: false`). The placeholder must not leak into
-        // the UI: `provider_label` reads the bridge's own name, so bubbles are
+        // connected. The placeholder must not leak into the UI:
+        // `provider_label` reads the bridge's own name, so bubbles are
         // captioned with the provider the transcript actually came from.
         let thread = ChatThread::rehydrated(None, None, entries, Vec::new());
         let mut view = Self::assemble(
@@ -1066,7 +1068,7 @@ impl AgentChatView {
             None,
             ChatBackend::stream_json(),
             thread,
-            false,
+            ConnectMode::ImportBridge,
             RestoredPosture::default(),
             theme,
             density,
@@ -1074,28 +1076,23 @@ impl AgentChatView {
             window,
             cx,
         );
-        // A bridge is NOT the New-Agent draft: clear the unbound picker shape so
-        // it never offers agent selection / worktree toggle / a live send.
-        view.unbound = false;
-        view.unbound_agent_id = None;
         view.title_generated = true;
         view.import_bridge = Some(bridge);
         view
     }
 
-    /// Shared construction for [`new`]/[`new_resumed`]: wire the composer, spawn
-    /// the subprocess (resuming when `thread.session_id` is set), and start the
-    /// event drain. A spawn failure degrades to a read-only error state so the
-    /// tab still opens and explains what went wrong.
+    /// Shared construction for every chat-view flavor: wire the composer,
+    /// spawn the subprocess when the mode says so (resuming when
+    /// `thread.session_id` is set), and start the event drain. A spawn
+    /// failure degrades to a read-only error state so the tab still opens
+    /// and explains what went wrong.
     #[allow(clippy::too_many_arguments)]
     fn assemble(
         cwd: PathBuf,
         model: Option<String>,
         backend: ChatBackend,
         mut thread: ChatThread,
-        // `false` opens an unbound **New Agent** draft: skip the subprocess spawn
-        // entirely and wait for the first send to bind (see [`Self::new_unbound`]).
-        connect_now: bool,
+        mode: ConnectMode,
         // A restored chat's persisted, backend-specific posture, seeded into the
         // connection spawn + the composer's feature picks so the reopened session
         // keeps the choice it was saved with. Empty for fresh launches.
@@ -1170,9 +1167,10 @@ impl AgentChatView {
         let screen_control = ScreenControl::new(&cwd);
         // A fresh/restored session always starts in the default permission mode
         // (see the `permission_mode` field note); a live switch respawns.
-        // An unbound draft (`!connect_now`) spawns nothing yet — the first send
-        // binds via `respawn()`, which connects `self.backend` fresh.
-        if connect_now {
+        // Only an eager chat spawns here. An unbound draft binds via
+        // `respawn()` on the first send; a dormant restore connects on first
+        // render / remote open; a bridge never connects.
+        if mode == ConnectMode::Connect {
             let mut spec = ConnectSpec::for_backend(
                 &backend,
                 cwd.clone(),
@@ -1298,7 +1296,7 @@ impl AgentChatView {
         // The unbound draft's initial agent id, derived from the seed backend's
         // transport (a New Agent draft defaults to Claude; the composer's agent
         // picker can switch it before the first send). `None` when bound.
-        let unbound_agent_id = (!connect_now).then(|| {
+        let unbound_agent_id = (mode == ConnectMode::UnboundDraft).then(|| {
             match backend.transport {
                 Transport::StreamJson => "claude-code",
                 Transport::AppServer => "codex",
@@ -1391,8 +1389,12 @@ impl AgentChatView {
             // display (and re-persist) the resumed choice.
             feature_values: seed_posture_feature_values(&posture),
             disconnected,
-            interrupted: false,
-            unbound: !connect_now,
+            // Dormant restores boot resumable-idle: a send respawns via --resume.
+            interrupted: mode == ConnectMode::DormantResume,
+            dormant: mode == ConnectMode::DormantResume,
+            last_saved_revision: std::cell::Cell::new(u64::MAX),
+            meta_dirty: std::cell::Cell::new(false),
+            unbound: mode == ConnectMode::UnboundDraft,
             unbound_agent_id,
             probed_catalogs: HashMap::new(),
             probe_catalogs_live: true,
@@ -1482,41 +1484,6 @@ impl AgentChatView {
             return &bridge.provider_display;
         }
         self.backend.provider_display_name()
-    }
-
-    pub fn transcript_snapshot(&self) -> Option<crate::persisted_chat::PersistedChatTranscript> {
-        let session_id = self.thread.session_id.clone()?;
-        if self.thread.entries.is_empty() {
-            return None;
-        }
-        Some(crate::persisted_chat::PersistedChatTranscript {
-            session_id,
-            model: self.thread.model.clone().or_else(|| self.model.clone()),
-            entries: self.thread.entries.clone(),
-            slash_commands: self.thread.slash_commands.clone(),
-            session_meta: self.thread.session_meta.clone(),
-            thinking_level: self.thinking_level,
-            // The backend that minted this session, so a restored tab reconnects
-            // the same provider (Claude stream-json / Codex app-server / an ACP
-            // command). The ACP command + args ride along because settings don't
-            // retain them per session — the transcript is the source of truth on
-            // restore. Empty for Claude/Codex.
-            provider: self.backend.transport,
-            acp_command: self.backend.acp_command.clone(),
-            acp_args: self.backend.acp_args.clone(),
-            codex_posture: self.codex_posture_snapshot(),
-            pi_posture: self.pi_posture_snapshot(),
-            // Read off the live connection while there is one: a remote client
-            // opening this session once it is dormant has no backend to ask, and
-            // making the desktop spawn one to fill two dropdowns would undo
-            // serving its history from disk.
-            choices: crate::persisted_chat::PersistedChoices {
-                models: self.connection.as_ref().map(|c| c.models()).unwrap_or_default(),
-                modes: self.connection.as_ref().map(|c| c.permission_modes()).unwrap_or_default(),
-                current_model: self.effective_model(),
-                current_mode: self.effective_permission_mode(),
-            },
-        })
     }
 
     /// The [`ConnectSpec`] a respawn launches on: the session's identity (model,
@@ -3017,6 +2984,15 @@ impl AgentChatView {
                 self.interrupted = false;
                 self.disconnected = false;
                 self.thread.last_error = None;
+                // Seed the context meter's denominator from a backend that
+                // knows its window without a turn (Pi: at handshake). A
+                // dormant restore first connects HERE, not in `assemble` —
+                // without this the meter is empty until a turn completes.
+                self.thread.last_known_context_window = self
+                    .connection
+                    .as_ref()
+                    .and_then(|c| c.context_window())
+                    .or(self.thread.last_known_context_window);
                 // This is the FIRST connection for a deferred-bound *New Agent*
                 // draft, so its palette metadata arrives here or not at all.
                 let (composer, cwd) = (self.composer.clone(), self.cwd.clone());
@@ -3052,6 +3028,8 @@ impl AgentChatView {
             return;
         }
         self.model = Some(model.clone());
+        // Direct field write — outside the thread's revision counter.
+        self.meta_dirty.set(true);
         self.thread.model = Some(model.clone());
         // On an unbound draft there's no subprocess to respawn — just record the
         // pick and re-seed so the picker's checkmark moves. The choice binds when
@@ -3116,6 +3094,8 @@ impl AgentChatView {
         }
         // Normalize the baseline to `None` so `respawn` omits the flag entirely.
         self.permission_mode = (mode != default_mode).then(|| mode.clone());
+        // The blob's `choices.current_mode` reads this pick.
+        self.meta_dirty.set(true);
         // Prefer an in-session runtime switch (ACP); fall back to the resume-respawn
         // path when the backend can't switch live (Claude's `set_mode` bails).
         let switched_live = self
@@ -3180,6 +3160,8 @@ impl AgentChatView {
         }
         // Remember the pick optimistically so the control reflects it at once,
         // even when the backend applies the change without echoing it back.
+        // The blob's codex/pi posture snapshots read these picks.
+        self.meta_dirty.set(true);
         self.feature_values.insert(id.clone(), value.clone());
         let switched_live = self
             .connection
@@ -3377,6 +3359,9 @@ impl AgentChatView {
             feature_values: HashMap::new(),
             disconnected: false,
             interrupted: false,
+            dormant: false,
+            last_saved_revision: std::cell::Cell::new(u64::MAX),
+            meta_dirty: std::cell::Cell::new(false),
             // The test injects a live connection, so this chat is already bound.
             unbound: false,
             unbound_agent_id: None,
@@ -4282,6 +4267,8 @@ impl AgentChatView {
     /// the pill above the composer. Persisted via `transcript_snapshot`.
     fn cycle_thinking_level(&mut self, cx: &mut Context<Self>) {
         self.thinking_level = self.thinking_level.next();
+        // Persisted on the transcript blob (view-held, outside the thread).
+        self.meta_dirty.set(true);
         cx.notify();
     }
 
@@ -5755,6 +5742,18 @@ impl Focusable for AgentChatView {
 
 impl Render for AgentChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A dormant restored chat connects on its first render — rendering is
+        // the visibility signal (hidden tabs never render). Deferred off the
+        // paint pass: the connect forks the agent process (plus a `codesign`
+        // check for computer-use chats), which would blow the frame budget.
+        if self.dormant {
+            let view = cx.entity().downgrade();
+            window.defer(cx, move |_window, cx| {
+                if let Some(view) = view.upgrade() {
+                    view.update(cx, |v, cx| v.ensure_connected(false, cx));
+                }
+            });
+        }
         // Terminal view: show the companion terminal full-body (the headless chat
         // process keeps running underneath). Returns early so none of the chat's
         // transcript/composer setup runs while the terminal is up.

@@ -737,7 +737,7 @@ impl WorkspaceRoot {
         let window_id_for_cb = window_id.clone();
         let save_cb: crate::shell::project_panes::SaveCallback =
             std::sync::Arc::new(move |snap| {
-                save_persisted_tabs(&settings_repo, &project_id_for_cb, &window_id_for_cb, &snap);
+                save_persisted_tabs(&settings_repo, &project_id_for_cb, &window_id_for_cb, &snap)
             });
         panes.update(cx, |p, _| p.set_save_callback(save_cb));
         self.project_panes_by_project

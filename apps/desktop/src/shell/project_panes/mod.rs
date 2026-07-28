@@ -58,8 +58,11 @@ use crate::shell::terminal_view::TerminalView;
 
 /// Persistence sink invoked after every tab/topology change. Captures
 /// `SettingsRepo` + `project_id`; serializes the snapshot to JSON +
-/// writes one row in `settings`.
-pub type SaveCallback = Arc<dyn Fn(PersistedTabs) + Send + Sync>;
+/// writes one row in `settings`. Returns the session ids whose transcript
+/// blob is confirmed up to date on disk (written, or skipped as identical)
+/// so `save_now` can commit their dirty state — a failed write stays dirty
+/// and retries on the next save.
+pub type SaveCallback = Arc<dyn Fn(PersistedTabs) -> Vec<String> + Send + Sync>;
 
 pub struct ProjectPanes {
     manager: PaneGroupManager,

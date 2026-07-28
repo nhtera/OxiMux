@@ -219,6 +219,12 @@ impl AgentChatView {
     ) -> Result<(), oximux_remote_host::RewindError> {
         use oximux_remote_host::RewindError;
 
+        // A restored session the desktop hasn't rendered yet is dormant: no
+        // connection, so `backend_supports_rewind` below would read as
+        // Unsupported even for a backend that supports it. A phone rewind is
+        // an explicit user action, so connect first (retry-capable, like the
+        // catalog open). No-op on an already-live chat.
+        self.ensure_connected(true, cx);
         // The files axis is refused rather than silently downgraded to a
         // conversation-only rewind: it overwrites the working tree, discarding
         // uncommitted work belonging to whoever is sitting at the desktop. A
@@ -383,6 +389,8 @@ impl AgentChatView {
         self.rewinding = false;
         match outcome {
             RewindOutcome::Done { new_sid, files_degraded } => {
+                // `truncate_to_user` bumps the thread's revision, which also
+                // covers the session-id swap below — the two land together.
                 self.thread.truncate_to_user(ordinal);
                 // Tell remote subscribers to truncate too. A rewind mutates the
                 // thread directly rather than through the event stream, so

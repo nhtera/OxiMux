@@ -274,9 +274,19 @@ fn open_session_project(
             let panes = workspace.update(cx, |workspace, cx| {
                 workspace.build_project_panes_if_absent(&project.id, &root, window, cx)
             });
-            // Registration happens while the chat view is constructed, inside the
-            // build above, so by the time it returns the session is either in the
-            // registry or it never will be.
+            // A restored chat view is built dormant (no subprocess, nothing
+            // registered) and normally connects on its first render — but a
+            // remote open targets a project the desktop may not be showing, so
+            // no render is coming. Connect it here; the resume respawn is what
+            // registers the session in the registry. No-op for a view that is
+            // already live.
+            let dormant_view = panes.read(cx).agent_chat_view_by_remote_id(session_id, cx);
+            if let Some(view) = dormant_view {
+                // retry_failed: a phone re-opening a session whose deferred
+                // connect failed earlier is an explicit retry — re-attempt the
+                // spawn instead of replaying the stale error forever.
+                view.update(cx, |v, cx| v.ensure_connected(true, cx));
+            }
             let cx: &gpui::App = cx;
             registration_outcome(&catalog.registry, session_id, || {
                 panes

@@ -528,7 +528,12 @@ fn install_app_lifecycle(
     cx.on_app_quit(move |cx| {
         oximux_app::shell::terminal_view::APP_QUITTING
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        let capture_started = std::time::Instant::now();
         window_registry::capture_session(cx);
+        tracing::info!(
+            elapsed_ms = capture_started.elapsed().as_millis() as u64,
+            "quit: session capture"
+        );
         // Persist the last-known git states so the next launch seeds from
         // them instead of flashing "loading git…". Best-effort: a write
         // error only costs one Loading flash next time.
@@ -566,7 +571,12 @@ fn install_app_lifecycle(
         if window_registry::remaining(cx) <= 1 {
             oximux_app::shell::terminal_view::APP_QUITTING
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            let capture_started = std::time::Instant::now();
             window_registry::capture_session(cx);
+            tracing::info!(
+                elapsed_ms = capture_started.elapsed().as_millis() as u64,
+                "quit: last-window session capture"
+            );
             cx.quit();
         } else if let Some(removed) = window_registry::remove(cx, window_id) {
             drop(removed);

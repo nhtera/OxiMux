@@ -542,18 +542,24 @@ impl ProjectPanes {
                                 }
                                 // Bound chats persist their transcript blob (an
                                 // unbound draft has none — no completed turn). Source
-                                // the tab's session-id pointer FROM that blob so the
-                                // pointer and blob stay in lockstep. A bound chat with
-                                // a session id but no blob (empty history — e.g. an
-                                // ACP session minted at connect, before any completed
-                                // turn) persists NO pointer, so restore reopens it
-                                // fresh instead of handing an orphaned, provider-
-                                // unknown id to `--resume` (which fails "Agent
-                                // unavailable").
-                                let transcript =
-                                    (!unbound).then(|| v.transcript_snapshot()).flatten();
-                                let session_id = transcript.as_ref().map(|t| t.session_id.clone());
-                                if let Some(t) = transcript {
+                                // the tab's session-id pointer FROM that snapshot so
+                                // the pointer and blob stay in lockstep. A bound chat
+                                // with a session id but no blob (empty history — e.g.
+                                // an ACP session minted at connect, before any
+                                // completed turn) persists NO pointer, so restore
+                                // reopens it fresh instead of handing an orphaned,
+                                // provider-unknown id to `--resume` (which fails
+                                // "Agent unavailable").
+                                //
+                                // The blob body comes back only when the thread
+                                // changed since the last save — a clean chat's blob
+                                // is already on disk, and re-serializing every open
+                                // transcript is what made quit scale with history
+                                // size. The pointer is persisted either way.
+                                let snapshot =
+                                    (!unbound).then(|| v.transcript_snapshot_for_save()).flatten();
+                                let session_id = snapshot.as_ref().map(|(sid, _)| sid.clone());
+                                if let Some((_, Some(t))) = snapshot {
                                     chat_transcripts.push(t);
                                 }
                                 (session_id, draft, queued, unbound)
@@ -721,17 +727,32 @@ impl ProjectPanes {
         }
     }
 
-    /// Build a snapshot + hand it to the save callback. No-op when no
-    /// callback is registered.
+    /// Build a snapshot + hand it to the save callback, then commit the
+    /// dirty state of every chat whose transcript the callback confirmed on
+    /// disk. No-op when no callback is registered.
     ///
     /// Takes `&App` (not `&mut Context<Self>`) so the on-quit hook in
     /// `main.rs` — which only has `&App` in its closure — can call it.
-    /// Snapshotting is a pure read of `self` + per-leaf grid reads; no
-    /// mutation, so a shared-ref context is sufficient.
+    /// Snapshotting itself is a pure read of `self` + per-leaf grid reads;
+    /// the only mutation is the post-write commit below, which flips
+    /// interior `Cell`s on the chat views (why `&App` still suffices).
+    /// Committing here — after the write, never at snapshot time — is what
+    /// lets a failed write stay dirty and retry on the next save.
     pub fn save_now(&self, cx: &gpui::App) {
-        if let Some(cb) = self.save_callback.clone() {
-            let snap = self.snapshot(cx);
-            cb(snap);
+        let Some(cb) = self.save_callback.clone() else {
+            return;
+        };
+        let snap = self.snapshot(cx);
+        let synced = cb(snap);
+        if synced.is_empty() {
+            return;
+        }
+        for group in self.groups.values() {
+            for tab in group.read(cx).tabs() {
+                if let crate::shell::pane_content::PaneContent::AgentChat(view) = &tab.content {
+                    view.read(cx).commit_transcript_save(&synced);
+                }
+            }
         }
     }
 
