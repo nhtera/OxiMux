@@ -45,6 +45,12 @@ const DB_FILE_NAME: &str = "oximux.db";
 fn main() {
     init_tracing();
 
+    // Before the runtime, and before anything spawns: launched from inside a
+    // Claude Code session, the process inherits session markers that make
+    // every `claude` spawned down-tree disable transcript saving. Must
+    // precede the first thread — it writes the environment.
+    oximux_app::platform::claude_session_env::scrub_inherited_claude_session_markers();
+
     // Before the runtime, and before anything spawns: a double-clicked app
     // inherits only launchd's four directories, and every agent CLI installs
     // outside them. Must precede the first thread — it writes the environment.

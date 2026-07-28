@@ -156,14 +156,67 @@ fn init_tracing(log_dir: Option<&Path>) -> Option<WorkerGuard> {
     guard
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
+// Variables Claude Code sets on child processes to mark them as part of a
+// running session. The daemon inherits them when the app that spawned it was
+// itself launched from inside a Claude Code session, and passes them on to
+// every terminal PTY — where a spawned `claude` then treats itself as a
+// nested child session and disables transcript saving. Identity-of-launch
+// only, never user configuration. Twin of the app-side scrub in
+// `apps/desktop/src/platform/claude_session_env.rs`.
+const CLAUDE_SESSION_MARKERS: [&str; 12] = [
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDECODE",
+    "CLAUDE_CODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_PARENT_SESSION_ID",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID",
+    "CLAUDE_CODE_HOST_SESSION_ID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_AGENT_SDK_VERSION",
+    "CLAUDE_CODE_SANDBOXED",
+];
+
+/// Remove inherited Claude Code session markers, returning what was dropped
+/// so the caller can log it once tracing is up.
+///
+/// Call before any thread exists — see the `unsafe` note below.
+fn scrub_inherited_claude_session_markers() -> Vec<&'static str> {
+    let mut dropped = Vec::new();
+    for name in CLAUDE_SESSION_MARKERS {
+        if std::env::var_os(name).is_none() {
+            continue;
+        }
+        // SAFETY: called from the top of `main`, before the tokio runtime and
+        // the tracing appender thread exist, so no other thread can be
+        // reading the environment. `remove_var` is only unsound when it races
+        // a concurrent read.
+        unsafe { std::env::remove_var(name) };
+        dropped.push(name);
+    }
+    dropped
+}
+
+// A sync `main` (not `#[tokio::main]`) so the environment scrub runs before
+// the runtime's worker threads exist — env mutation is only sound while the
+// process is single-threaded.
+fn main() -> Result<()> {
+    let dropped_markers = scrub_inherited_claude_session_markers();
+
     let parsed = parse_args()?;
     let _log_guard = init_tracing(parsed.log_dir.as_deref());
+    for marker in dropped_markers {
+        tracing::info!(marker, "dropped an inherited Claude Code session marker");
+    }
     tracing::info!(
         socket = %parsed.cfg.socket_path.display(),
         log_dir = ?parsed.log_dir,
         "starting oximux-relay"
     );
-    run_server(parsed.cfg).await
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?
+        .block_on(run_server(parsed.cfg))
 }
