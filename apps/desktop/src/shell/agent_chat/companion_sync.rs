@@ -8,6 +8,8 @@
 //! back from Terminal to Chat view ([`AgentChatView::set_view_mode`]): re-fold
 //! the log off the UI thread and append the suffix the thread hasn't seen.
 
+use std::path::PathBuf;
+
 use gpui::{AppContext as _, Context, Window};
 
 use oximux_agents::thread::{ThreadEntry, Transport};
@@ -110,19 +112,18 @@ impl AgentChatView {
     /// count of user prompts (see
     /// [`oximux_agents::thread::tail_beyond_known_turns`]).
     ///
-    /// Claude stream-json chats only: that's the log format the importer
-    /// reads, and the only backend whose companion resumes in-place today
-    /// (Codex rolls out its own file; ACP has no companion). Skipped while a
+    /// Claude stream-json and Codex app-server chats: both companions resume
+    /// the session IN PLACE (Claude appends to the per-project session jsonl;
+    /// Codex `resume` appends to the same rollout file — verified on codex
+    /// 0.145), so re-folding the log captures terminal-typed turns. ACP/Rpc
+    /// companions have no readable log wired — skipped. Also skipped while a
     /// chat turn is in flight so an import can't interleave a streaming reply.
     ///
     /// Known limitation: a turn still streaming IN THE TERMINAL at toggle time
     /// imports its reply as-written-so-far; the missing remainder arrives on a
     /// later reopen, not on the next toggle (the anchor has moved past it).
     pub(super) fn sync_from_companion_terminal(&mut self, cx: &mut Context<Self>) {
-        if self.companion_session.is_none()
-            || self.thread.turn_active
-            || self.backend.transport != Transport::StreamJson
-        {
+        if self.companion_session.is_none() || self.thread.turn_active {
             return;
         }
         let Some(session_id) = self.thread.session_id.clone() else {
@@ -131,15 +132,42 @@ impl AgentChatView {
         let Some(home) = dirs::home_dir() else {
             return;
         };
-        let log_path =
-            oximux_agents::session_log::project_log_dir(&home.join(".claude"), &self.cwd)
-                .join(format!("{session_id}.jsonl"));
+        // Where the companion's turns land, per backend. Claude's path is
+        // deterministic; a Codex rollout embeds its id in the filename and is
+        // found by a bounded walk of `~/.codex/sessions` (off the UI thread).
+        enum CompanionLog {
+            Claude(PathBuf),
+            Codex { codex_dir: PathBuf, thread_id: String },
+        }
+        let source = match self.backend.transport {
+            Transport::StreamJson => CompanionLog::Claude(
+                oximux_agents::session_log::project_log_dir(&home.join(".claude"), &self.cwd)
+                    .join(format!("{session_id}.jsonl")),
+            ),
+            Transport::AppServer => CompanionLog::Codex {
+                codex_dir: home.join(".codex"),
+                thread_id: session_id,
+            },
+            Transport::Acp | Transport::Rpc => return,
+        };
         let known = self.known_user_turns();
         cx.spawn(async move |this, cx| {
             let tail = cx
                 .background_spawn(async move {
-                    let folded = oximux_agents::thread::transcript_from_jsonl(&log_path)
-                        .unwrap_or_default();
+                    let folded = match source {
+                        CompanionLog::Claude(path) => {
+                            oximux_agents::thread::transcript_from_jsonl(&path)
+                                .unwrap_or_default()
+                        }
+                        CompanionLog::Codex { codex_dir, thread_id } => {
+                            oximux_agents::thread::locate_rollout(&codex_dir, &thread_id)
+                                .and_then(|p| {
+                                    oximux_agents::thread::import_codex_rollout(&p).ok()
+                                })
+                                .map(|import| import.entries)
+                                .unwrap_or_default()
+                        }
+                    };
                     oximux_agents::thread::tail_beyond_known_turns(folded, known)
                 })
                 .await;
