@@ -1,0 +1,163 @@
+# Build, sign, notarize, and publish the macOS release DMG.
+#
+# Trigger: pushing a version tag (v0.1.3), or manually via workflow_dispatch —
+# the manual path exists because Apple's notary service occasionally stalls
+# past any sane timeout; a re-run should not require re-tagging.
+#
+# The workflow produces a DRAFT release with the notarized DMG attached, so
+# release notes can be curated before publishing. Re-runs re-upload the asset
+# with --clobber.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#
+#   MACOS_CERT_P12_BASE64  Developer ID Application certificate, exported from
+#                          Keychain Access as a .p12 and base64-encoded:
+#                            base64 -i DeveloperID.p12 | pbcopy
+#   MACOS_CERT_PASSWORD    the password chosen at .p12 export
+#   NOTARY_KEY_P8          contents of the App Store Connect API key file
+#                          (AuthKey_<KEYID>.p8 — App Store Connect → Users and
+#                          Access → Integrations → App Store Connect API; the
+#                          key needs the Developer role or above)
+#   NOTARY_KEY_ID          the key id shown next to that key
+#   NOTARY_ISSUER_ID       the issuer id shown at the top of that page
+#
+# The signing identity name is derived from the imported certificate, not
+# stored as a secret — one fewer thing to rotate.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-macos:
+    name: macOS arm64 DMG
+    runs-on: macos-14
+    # Cold-cache release build of the whole workspace plus notarization wait;
+    # generous on purpose — a timeout here wastes a full expensive build.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      # Same cache layout and versioned key as ci.yml — see the comment there
+      # for why `target` and the sherpa-onnx prebuilts are one entry.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/Library/Caches/sherpa-rs
+            target
+          key: ${{ runner.os }}-cargo-release-v1-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Ensure the dictation libraries are present
+        run: |
+          if find ~/Library/Caches/sherpa-rs -name 'libonnxruntime*' -print -quit 2>/dev/null | grep -q .; then
+            echo "sherpa-onnx prebuilts present"
+          else
+            echo "sherpa-onnx prebuilts absent — forcing sherpa-rs-sys to re-run"
+            find target -type d -name 'sherpa-rs-sys-*' -exec rm -rf {} + 2>/dev/null || true
+          fi
+
+      # Releases are cut from tags named after the workspace version; packaging
+      # a bundle whose version disagrees with the tag is the failure this step
+      # exists to catch, before an hour of building.
+      - name: Verify tag matches Cargo.toml version
+        if: github.ref_type == 'tag'
+        run: |
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ "${GITHUB_REF_NAME}" != "v${CARGO_VERSION}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml v${CARGO_VERSION}" >&2
+            exit 1
+          fi
+
+      # A throwaway keychain holds the signing key for the duration of the job.
+      # Its password is random and never leaves this step; the always() cleanup
+      # step below deletes the keychain even when the build fails.
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          # Let codesign use the key without a GUI prompt (there is no GUI).
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+
+          # Derive the identity name from the certificate itself.
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+          if [[ -z "$IDENTITY" ]]; then
+            echo "no Developer ID Application identity found in the imported .p12" >&2
+            exit 1
+          fi
+          echo "MACOS_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "imported: $IDENTITY"
+
+      - name: Install create-dmg
+        run: brew install create-dmg
+
+      - name: Build and sign OxiMux.app
+        run: ./scripts/bundle-macos.sh --hardened --sign "$MACOS_SIGN_IDENTITY"
+
+      - name: Package, notarize, and staple the DMG
+        env:
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          export NOTARY_KEY_PATH="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$NOTARY_KEY_P8" > "$NOTARY_KEY_PATH"
+          ./scripts/make-dmg.sh --sign "$MACOS_SIGN_IDENTITY" --notarize
+          rm -f "$NOTARY_KEY_PATH"
+
+      # make-dmg.sh --notarize already hard-fails on stapler validate and the
+      # spctl Gatekeeper assessment — nothing un-notarized reaches this step.
+      - name: Upload DMG to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            TAG="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          fi
+          DMG=(dist/OxiMux-*-macos-arm64.dmg)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${DMG[@]}" --clobber
+          else
+            gh release create "$TAG" "${DMG[@]}" --draft --generate-notes \
+              --title "$TAG"
+          fi
+          echo "uploaded ${DMG[*]} to $TAG"
+
+      - name: Delete the build keychain
+        if: always()
+        run: |
+          if [[ -n "${KEYCHAIN:-}" && -f "$KEYCHAIN" ]]; then
+            security delete-keychain "$KEYCHAIN"
+          fi
