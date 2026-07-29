@@ -105,7 +105,8 @@ impl AgentChatView {
         // crashed live child keeps its stale handle, so this cannot re-spawn
         // a session the desktop's own error card governs.
         let failed_spawn = self.disconnected && self.connection.is_none();
-        if !self.dormant && !(retry_failed && failed_spawn) {
+        let should_connect = self.dormant || (retry_failed && failed_spawn);
+        if !should_connect {
             return;
         }
         self.dormant = false;
