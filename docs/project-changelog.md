@@ -4,6 +4,34 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-29 — v0.1.3: styled DMG distribution + release automation (`main`)
+
+Releases now ship as a signed, notarized drag-to-Applications DMG instead of a
+bare zip, and the whole pipeline runs in GitHub Actions off a version tag.
+
+- **`d5fd6b7`** — `feat(release)`: `scripts/make-dmg.sh` packages
+  `dist/OxiMux.app` into `OxiMux-<version>-macos-<arch>.dmg` via create-dmg
+  (app icon + Applications alias + dashed guide arrow over a HiDPI backdrop;
+  `scripts/generate-dmg-background.swift` regenerates it), signs the image,
+  and with `--notarize` submits it to Apple, staples the ticket, and
+  hard-gates on `stapler validate` + `spctl` before it can ship — one
+  submission covers the app inside. `.github/workflows/release.yml` runs the
+  same flow on `v*` tags (App Store Connect API key auth, throwaway keychain,
+  tag/version guard) and attaches the DMG to a draft GitHub release;
+  `workflow_dispatch` is the rerun path for notary stalls. Process + one-time
+  secrets setup documented in `docs/deployment-guide.md`.
+- **`b5f1c53`** — `fix(agent-chat)`: restate the `ensure_connected` guard
+  positively (`should_connect`) — CI's clippy 1.95 rejects the negated
+  compound form (`nonminimal_bool`), which had kept `main` red since the
+  v0.1.2 push.
+
+**Touches**: `scripts/{make-dmg.sh,generate-dmg-background.swift}` (new),
+`assets/dmg-background.tiff` (new), `.github/workflows/release.yml` (new),
+`docs/deployment-guide.md` (new),
+`apps/desktop/src/shell/agent_chat/session_persistence.rs`
+
+---
+
 ### 2026-07-29 — v0.1.2: companion terminal ↔ chat sync for every agent (`main`)
 
 A chat tab's companion terminal (⌃⇧V) resumes the SAME session interactively —
