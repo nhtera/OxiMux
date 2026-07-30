@@ -4,6 +4,52 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-30 — External-CLI auto-provisioning: zero-setup search + one-click driver install (`main`)
+
+Two setup steps that used to require a manual terminal command are now handled
+by the app itself.
+
+- **feat**: search (right-sidebar Search tab + Quick Open) needs no system
+  `ripgrep` anymore. `scripts/fetch-ripgrep.sh` fetches a pinned, sha256-verified
+  ripgrep 15.2.0 at build time (arch-matched to the app build, stamp-file
+  cached); `bundle-macos.sh` copies it into `OxiMux.app/Contents/MacOS/rg` and
+  signs it nested-first. Runtime resolution (`shell/tool_paths.rs::rg_program()`)
+  prefers the bundled sibling and falls back to PATH only for dev builds; the
+  "missing rg" hint at all 3 call sites now reads as a dev-build-only note.
+- **feat**: the Computer-use settings pane and onboarding wizard gained an
+  "Install driver…" / "Update driver…" button (`crates/computer-use/src/install/`)
+  that downloads, verifies, and installs the `cua-driver` computer-use daemon
+  in place — no manual download from GitHub releases required. Live progress +
+  Cancel; a "Download manually" fallback link on failure. Crash-safe swap via
+  `renamex_np(RENAME_SWAP)` (no empty-instant at the install path) with a
+  two-rename fallback for bundles where the kernel refuses the atomic swap;
+  the swapped-in bundle is re-verified before the previous one is discarded.
+  The daemon itself is never stopped — a running instance keeps serving the
+  old version until it next respawns.
+- **security**: driver installs now enforce bundle-level notarization
+  (`verify_notarized_bundle` — `spctl --assess --type execute`) in addition to
+  the existing codesign identity/publisher-team pin. A user-initiated browser
+  download gets Gatekeeper's notarization check for free via its quarantine
+  xattr; a programmatic in-app download carries none, so the installer asks
+  the same policy engine explicitly before anything reaches an install root.
+
+Verified: full workspace test suite green incl. live release-feed + live
+install E2E (real `cua-driver` 0.14.1 installed end-to-end), hardened-runtime
+signed bundle passes `codesign --verify --deep --strict`, `xtask`
+file-size-lint clean.
+
+**Touches**: `scripts/fetch-ripgrep.sh` (new), `scripts/bundle-macos.sh`,
+`apps/desktop/src/shell/tool_paths.rs` (new),
+`apps/desktop/src/shell/{command_palette/file_index,search_panel/{header_render,rg_runner}}.rs`,
+`apps/desktop/src/shell/mod.rs`,
+`apps/desktop/src/shell/driver_install.rs` (new),
+`apps/desktop/src/shell/settings_modal/pane_computer_use.rs`,
+`apps/desktop/src/shell/onboarding/{mod,driver_step}.rs`,
+`crates/computer-use/src/install/` (new: `mod`, `release_feed`, `pipeline`, `place`),
+`crates/computer-use/src/verify.rs`, `crates/computer-use/Cargo.toml`
+
+---
+
 ### 2026-07-29 — v0.1.3: styled DMG distribution + release automation (`main`)
 
 Releases now ship as a signed, notarized drag-to-Applications DMG instead of a

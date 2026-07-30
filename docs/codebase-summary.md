@@ -1,7 +1,7 @@
 # OxiMux — Codebase Summary
 
-**Updated**: 2026-07-18  
-**Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open index, lifecycle scripts, Create PR + CI checks, floating PiP terminal) + Agent Chat (round-7) shipped to main; Remote Control Phase 1-2 groundwork in progress on `feat/remote-control-headless-registry` (agent-core split + SessionRegistry, not yet wired into the view)  
+**Updated**: 2026-07-30  
+**Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open index, lifecycle scripts, Create PR + CI checks, floating PiP terminal) + Agent Chat (round-7) shipped to main; Remote Control Phase 1-2 groundwork in progress on `feat/remote-control-headless-registry` (agent-core split + SessionRegistry, not yet wired into the view); external-CLI auto-provisioning (bundled ripgrep + `cua-driver` one-click installer) shipped  
 **Tests**: workspace suite green; `oximux-app` lib 1258 tests (verified this session)
 
 ---
@@ -155,6 +155,11 @@ src/
     ├── file_tree_context_menu.rs Right-click overlay for Files-tab rows. WorkspaceRoot owns one shared entity (mirrors
     │                       tab_context_menu pattern). Open / Open to the Side dispatch OpenFileFromContextMenu →
     │                       routes through the same open_file_in_group / split_and_open_file as the file-drag flow.
+    ├── tool_paths.rs        rg_program() — resolves the ripgrep binary to spawn: the bundled
+    │                       sibling next to the running executable (Contents/MacOS/rg, copied
+    │                       there by bundle-macos.sh) first, bare "rg" (PATH lookup) as the
+    │                       dev-build fallback; used by all 3 rg call sites (search panel
+    │                       run_ripgrep/detect_rg_available, Quick Open scan_files)
     ├── context_env.rs      SurfaceIds struct; builds OXIMUX_* env var list for every spawned shell:
 │                       OXIMUX_WORKSPACE_ID (project root path), OXIMUX_SURFACE_ID,
 │                       OXIMUX_TAB_ID (minted UUIDs), OXIMUX_SOCKET_PATH; ids persisted
@@ -455,6 +460,48 @@ editor is an `InputState` on the modal (persists on blur/Enter, not per-key).
 
 ---
 
+## crates/computer-use — screen control for agents
+
+Wraps a user-installed, notarized third-party `cua-driver` daemon (machine-wide
+singleton shared with other MCP clients). This crate verifies/declares/gates
+it; it never starts, supervises, or reaps the daemon process itself.
+
+```
+src/
+├── lib.rs           re-exports; module doc states the ownership boundary above
+├── discovery.rs      find an installed CuaDriver.app (/Applications, ~/Applications)
+├── verify.rs         verify() gate: codesign --verify --strict → Identifier +
+│                     TeamIdentifier pin → min-version check; verify_notarized_bundle()
+│                     runs spctl --assess --type execute on the bundle — the Gatekeeper
+│                     notarization verdict, ENFORCED for programmatic (installer) installs
+│                     since those carry no quarantine xattr for Gatekeeper to check itself
+├── daemon.rs          reads daemon state (status) without managing lifecycle
+├── policy.rs / grants.rs / blocked.rs / target.rs   permission gate + scope model
+├── mcp.rs             MCP server_spec declaration
+├── session.rs         reconcile() cleans up this app's own driver sessions
+├── tools.rs / gui_scripting.rs / active.rs / proc.rs / redact.rs   driver tool surface
+└── install/           one-click install/update pipeline (new)
+    ├── mod.rs          spawn_install() — one install per process (AtomicBool lock);
+    │                   InstallEvent mpsc stream + pull-style status() for a
+    │                   reopened surface; RunGuard clears the lock even on panic
+    ├── release_feed.rs GitHub releases API, filtered to tag prefix `cua-driver-rs-v`;
+    │                   drafts skipped; prerelease flag ignored (upstream flags every
+    │                   driver release prerelease); checksums.txt parser
+    ├── pipeline.rs     resolve → download (ureq, connect/read timeouts + byte
+    │                   ceiling, sha256-hashed while streaming) → verify → place;
+    │                   downgrade guard compares against the currently-installed version
+    └── place.rs        writable_root() (/Applications else ~/Applications) + disk-space
+                        precheck; swap_in() — renamex_np(RENAME_SWAP) atomic bundle
+                        swap (no empty-instant), two-rename .bak fallback when the
+                        kernel refuses RENAME_SWAP; post-swap re-verify before the
+                        old bundle is discarded, roll-back restores it on failure
+```
+
+Full gate order + build-time bundled-ripgrep counterpart:
+`docs/system-architecture.md` → "External tool provisioning".
+
+---
+
 ## crates/storage — SQLite persistence (Phase 4)
 
 | File | Role |
@@ -593,6 +640,9 @@ src/
 **scripts** additions:
 - `scripts/oximux-launchd-install.sh` — opt-in launchd agent installer; `plutil`-lints plist; refuses if token file absent
 - `scripts/oximux-uninstall.sh` — full uninstall hygiene (socket, pid, log dir, launchd label)
+- `scripts/fetch-ripgrep.sh` — downloads pinned ripgrep 15.2.0, sha256-verifies vs the
+  release's own `.sha256` asset, arch-matched (lipo for universal) + stamp-file cached;
+  `bundle-macos.sh` copies the result to `Contents/MacOS/rg` and signs it nested-first
 
 ---
 

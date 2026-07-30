@@ -1,7 +1,7 @@
 # OxiMux — System Architecture
 
-**Updated**: 2026-07-14  
-**Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open, lifecycle scripts, Create PR + CI, floating PiP terminal, markdown preview) shipped
+**Updated**: 2026-07-30  
+**Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open, lifecycle scripts, Create PR + CI, floating PiP terminal, markdown preview) shipped; external-CLI auto-provisioning (bundled ripgrep + one-click verified `cua-driver` install) shipped
 
 ---
 
@@ -69,6 +69,7 @@ backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
 | `core` | `oximux-core` | `src/lib.rs` | shared domain types, no deps |
 | `pty` | `oximux-pty` | `src/lib.rs` | `TerminalBackend` + `PortablePtyBackend` |
 | `proc-cwd` | `oximux-proc-cwd` | `src/lib.rs` | resolve a process's working dir |
+| `computer-use` | `oximux-computer-use` | `src/lib.rs` | `cua-driver` discovery/verify, permission gate, MCP declaration, one-click installer (`install/`) — never starts/supervises the daemon |
 | `git` | `oximux-git` | `src/lib.rs` | `Repository`, `StatusPoller`, git ops, `GhCmd` |
 | `agent-core` | `oximux-agent-core` | `src/lib.rs` | portable `ThreadEvent` vocabulary + stream-json decoder + `ChatThread` fold (serde/serde_json/tracing only, no pty/rusqlite/ACP/gpui/tokio — mobile-portable); re-exported by `agents` under `crate::thread::*` |
 | `agents` | `oximux-agents` | `src/lib.rs` | `AgentRuntime` trait, `CliRuntime`, `StatusMachine`; `SessionRegistry` (gpui-free session event bus + command surface, built for Remote Control, not yet wired into the view) |
@@ -908,6 +909,64 @@ auto-declined divider, and subagent log capture were live-verified driving a
 real running app. The session-detail popover is unit-verified only — it
 renders for Claude alone, and Claude was unauthenticated under the sandboxed
 `HOME` used to run a dev build alongside the authoring session.
+
+---
+
+## External tool provisioning
+
+Two independent zero-setup paths so a fresh install needs no manual CLI installs.
+
+**Bundled ripgrep (build-time).** `scripts/fetch-ripgrep.sh` downloads a
+pinned ripgrep release (15.2.0), sha256-verifies it against the release's own
+`.sha256` asset, arch-matches the app build (lipo for a universal build), and
+caches via a stamp file (offline rebuilds stay a no-op). `bundle-macos.sh`
+copies it to `OxiMux.app/Contents/MacOS/rg` and signs it in the nested-first
+codesign block, before the bundle seal. Runtime resolution is
+`tool_paths::rg_program()` (`apps/desktop/src/shell/tool_paths.rs`): the
+bundled sibling of the running binary first, bare `rg` (PATH lookup) as the
+dev-build fallback. All 3 rg call sites — `search_panel::rg_runner`,
+`search_panel::header_render::detect_rg_available`, and Quick Open's
+`command_palette::file_index::scan_files` — resolve through it. Missing-rg
+hints were reworded to "(dev build?) — `brew install ripgrep`" since a
+bundled app build always has it.
+
+**Driver install pipeline (runtime, user-triggered).**
+`crates/computer-use/src/install/` — one-click install/update for the
+`cua-driver` computer-use daemon, driven from the settings Computer-use pane
+and a conditional onboarding step (`driver_step.rs`, skipped when already
+`Ready`). One install per process (`INSTALLING` atomic); a second surface
+observes the running install's pull-style `status()` instead of racing it.
+
+```
+release_feed.rs  GET the trycua releases feed, filter tag prefix
+                  `cua-driver-rs-v`, skip drafts; prerelease flag ignored
+                  (upstream flags every driver release prerelease)
+pipeline.rs       ureq download w/ connect+read timeouts + a byte ceiling,
+                  sha256 vs checksums.txt (transport integrity only —
+                  not the trust gate), /usr/bin/tar extract, downgrade
+                  guard vs the currently-installed version
+verify.rs         gate: codesign --verify --strict (binary intact) →
+                  Identifier + TeamIdentifier match (publisher pin) →
+                  bounded `--version` read → verify_notarized_bundle
+                  (spctl --assess --type execute on the bundle; ENFORCED
+                  for installs — a browser download gets Gatekeeper's
+                  notarization check for free via its quarantine xattr,
+                  a programmatic download carries none)
+place.rs          renamex_np(RENAME_SWAP) crash-safe swap (no empty-
+                  instant at the target path); two-rename .bak fallback
+                  for bundles where the kernel refuses RENAME_SWAP; the
+                  swapped-in bundle is re-verified before the old one is
+                  discarded — a failed re-verify rolls back
+```
+
+Gate order matters: the publisher-identity pins run before the untrusted
+binary executes at all beyond a bounded `--version`, and the bundle-level
+`spctl` notarization assessment runs last among the pre-install gates
+because it needs the extracted `.app`, not just the inner binary. The
+`cua-driver` daemon itself is never stopped or restarted by an install — it's
+a machine-wide singleton other MCP clients share — so a running daemon keeps
+serving the old version until it next respawns; the UI surfaces that after
+an upgrade.
 
 ---
 
