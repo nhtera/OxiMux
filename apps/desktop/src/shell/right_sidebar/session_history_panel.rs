@@ -486,6 +486,10 @@ impl Render for SessionHistoryPanel {
                     let expand_sid = sid.clone();
                     let expand_path = path.clone();
                     let header = div()
+                        // Stateful id: hover styles only repaint on hover change
+                        // for id'd elements; without it the highlight waits for
+                        // the next unrelated notify (the caret blink).
+                        .id(SharedString::from(format!("hist-row-{sid}")))
                         .flex()
                         .flex_row()
                         .items_center()
