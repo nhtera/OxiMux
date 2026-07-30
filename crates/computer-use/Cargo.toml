@@ -17,11 +17,14 @@ serde.workspace = true
 libc = "0.2"
 serde_json.workspace = true
 sha2.workspace = true
+# Driver installer: staging dir for download/extract before the verified swap.
+tempfile.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Driver installer download (same sync client the dictation model manager uses).
+ureq.workspace = true
 
 [dev-dependencies]
 # Only to run the hook matcher through a real regex engine, rather than
 # asserting on the pattern text and hoping it means what it reads like.
 regex.workspace = true
-tempfile.workspace = true

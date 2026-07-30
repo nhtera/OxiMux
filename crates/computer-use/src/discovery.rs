@@ -60,8 +60,10 @@ pub fn locate() -> Result<PathBuf, Error> {
     Err(Error::NotFound { searched })
 }
 
-/// Directories an installed `CuaDriver.app` can live in.
-fn install_roots() -> Vec<PathBuf> {
+/// Directories an installed `CuaDriver.app` can live in. Shared with the
+/// in-app installer (`install`), which writes to the first writable root —
+/// one list, so discovery and installation can never drift apart.
+pub(crate) fn install_roots() -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from("/Applications")];
     if let Some(home) = std::env::var_os("HOME") {
         roots.push(PathBuf::from(home).join("Applications"));

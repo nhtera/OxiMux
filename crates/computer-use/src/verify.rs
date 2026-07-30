@@ -148,6 +148,40 @@ fn read_signature(path: &Path) -> Result<SignatureInfo, Error> {
     })
 }
 
+/// Gatekeeper's own verdict on an app bundle — the notarization gate.
+///
+/// [`verify`] *reports* notarization (parsed off `codesign -dvv`) but does not
+/// reject on it: for a user-installed driver, Gatekeeper already enforced
+/// notarization at first launch because the browser download carried a
+/// quarantine xattr. The in-app installer has no such backstop — its download
+/// is programmatic and never quarantined — so before installing it must ask
+/// the same policy engine Gatekeeper uses, against the **bundle** (tickets
+/// staple at bundle level; the inner binary's `codesign -dvv` line alone is
+/// weaker evidence).
+///
+/// A stapled ticket validates offline. A notarized-but-unstapled bundle needs
+/// Apple's servers; a just-published release whose ticket has not propagated
+/// fails here with the verbatim `spctl` reason — a clear, retryable error.
+pub fn verify_notarized_bundle(bundle: &Path) -> Result<(), Error> {
+    let out = run_bounded(
+        Path::new("/usr/sbin/spctl"),
+        &[
+            "--assess",
+            "--type",
+            "execute",
+            &bundle.display().to_string(),
+        ],
+        VERIFY_TIMEOUT,
+    )?;
+    if out.success() {
+        return Ok(());
+    }
+    Err(Error::NotNotarized {
+        path: bundle.to_path_buf(),
+        detail: first_meaningful_line(&out.stderr),
+    })
+}
+
 /// The code-signing identifier of any binary — for an app bundle, its
 /// `CFBundleIdentifier`. `None` when the binary is unsigned, missing, or
 /// otherwise unreadable.
@@ -257,6 +291,31 @@ TeamIdentifier=YCK386LBJ7\n";
     fn unstapled_notarization_is_not_reported_as_notarized() {
         let unstapled = "Identifier=com.trycua.driver\nTeamIdentifier=YCK386LBJ7\n";
         assert!(field(unstapled, "Notarization Ticket").is_none());
+    }
+
+    /// The install-path gate must *reject*, not merely report. An unsigned
+    /// scratch bundle is the strongest fixture buildable in a test: it fails
+    /// Gatekeeper assessment for the same terminal reason an unnotarized one
+    /// does (no ticket, no accepted signature), proving the error path is a
+    /// hard stop.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unnotarized_bundle_is_rejected_not_reported() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = dir.path().join("Fake.app");
+        std::fs::create_dir_all(bundle.join("Contents/MacOS")).expect("mkdir");
+        std::fs::copy("/bin/ls", bundle.join("Contents/MacOS/Fake")).expect("copy");
+        std::fs::write(
+            bundle.join("Contents/Info.plist"),
+            "<plist version=\"1.0\"><dict>\
+             <key>CFBundleIdentifier</key><string>test.fake</string>\
+             <key>CFBundleExecutable</key><string>Fake</string>\
+             </dict></plist>",
+        )
+        .expect("plist");
+
+        let err = verify_notarized_bundle(&bundle).expect_err("must reject");
+        assert!(matches!(err, Error::NotNotarized { .. }), "got {err:?}");
     }
 
     #[test]

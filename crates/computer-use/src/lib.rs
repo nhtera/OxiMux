@@ -26,6 +26,7 @@ pub mod discovery;
 pub mod exec;
 pub mod grants;
 pub mod gui_scripting;
+pub mod install;
 pub mod lifecycle;
 pub mod mcp;
 pub mod policy;
@@ -106,6 +107,12 @@ pub enum Error {
 
     #[error("driver {found} is older than the required {minimum}")]
     DriverTooOld { found: Version, minimum: Version },
+
+    #[error(
+        "{} failed Gatekeeper assessment (not notarized?): {detail}",
+        path.display()
+    )]
+    NotNotarized { path: PathBuf, detail: String },
 
     #[error("could not read a version from the driver (got: {output})")]
     UnreadableVersion { output: String },
