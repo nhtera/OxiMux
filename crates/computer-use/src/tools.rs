@@ -133,6 +133,11 @@ const TOOLS: &[(&str, ToolClass)] = {
         // showing a cursor is fine; hiding one is caught on the field, since
         // the tool is the same either way.
         ("move_cursor", Overlay),
+        // `set_agent_cursor_theme` selects "an already-installed cursor theme"
+        // by id — no path, no download, and scoped to the caller's own session.
+        // `set_agent_cursor_style` is the name it carried before 0.14, kept
+        // because the supported floor is older than the rename.
+        ("set_agent_cursor_theme", Overlay),
         ("set_agent_cursor_style", Overlay),
         ("set_agent_cursor_motion", Overlay),
         ("set_agent_cursor_enabled", Overlay),
@@ -314,6 +319,23 @@ mod tests {
         }
         assert!(!denied.contains(&"click"), "input tools must stay available");
         assert!(!denied.contains(&"get_window_state"), "reads must stay available");
+    }
+
+    #[test]
+    fn the_agent_cursor_family_is_overlay() {
+        // The overlay is OxiMux's own attribution marker — it exists so the
+        // user can see which agent is acting. Refusing one of these does not
+        // block an action, it removes the thing that labels the action, so a
+        // rename in the driver must land here rather than fail closed.
+        for tool in [
+            "move_cursor",
+            "set_agent_cursor_theme",
+            "set_agent_cursor_style",
+            "set_agent_cursor_motion",
+            "set_agent_cursor_enabled",
+        ] {
+            assert_eq!(classify(tool), ToolClass::Overlay, "{tool}");
+        }
     }
 
     #[test]
