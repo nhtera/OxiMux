@@ -11,6 +11,8 @@ use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
+use crate::shell::tool_paths::rg_program;
+
 /// Hard cap on indexed paths. Bounds memory + keeps `filter_and_rank`
 /// snappy on huge repos. A streaming matcher (`nucleo`) is the follow-up
 /// if this proves limiting (see `match_engine.rs` note).
@@ -30,8 +32,10 @@ impl ScanError {
     /// can't be built.
     pub fn hint(&self) -> String {
         match self {
+            // The packaged app bundles rg, so this state is reachable only in
+            // dev builds (cargo run) on a machine without ripgrep.
             ScanError::RgMissing => {
-                "ripgrep (rg) not found — install it to search files (e.g. brew install ripgrep)"
+                "ripgrep missing (dev build?) — `brew install ripgrep`, or rebuild the app bundle"
                     .to_string()
             }
             ScanError::Failed(e) => format!("file scan failed: {e}"),
@@ -44,7 +48,7 @@ impl ScanError {
 /// is truncated (Quick Open degrades to the first N files rather than
 /// stalling). Spawns off the UI thread — call from a tokio runtime.
 pub async fn scan_files(root: PathBuf) -> Result<Vec<String>, ScanError> {
-    let mut cmd = Command::new("rg");
+    let mut cmd = Command::new(rg_program());
     cmd.arg("--files")
         .current_dir(&root)
         .stdin(Stdio::null())

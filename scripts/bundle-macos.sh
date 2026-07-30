@@ -161,6 +161,12 @@ sign_bundle() {
     for dylib in "$APP_DIR/Contents/MacOS"/*.dylib; do
         [[ -f "$dylib" && ! -L "$dylib" ]] && codesign "${opts[@]}" "$dylib"
     done
+    # Bundled third-party tools (rg) sign like our own helper binaries —
+    # nested-first, before the bundle seal. Guarded: an older bundle refreshed
+    # via --debug-fast may predate the tool.
+    if [[ -f "$APP_DIR/Contents/MacOS/rg" ]]; then
+        codesign "${opts[@]}" "$APP_DIR/Contents/MacOS/rg"
+    fi
     codesign "${opts[@]}" "$APP_DIR/Contents/MacOS/oximux-relay"
     codesign "${opts[@]}" "$APP_DIR/Contents/MacOS/oximux-screen-gate"
     codesign "${opts[@]}" "$APP_DIR/Contents/MacOS/oximux"
@@ -316,6 +322,17 @@ bundle_dylibs() {
     echo "==> Bundled dictation dylibs + @executable_path rpath"
 }
 
+# Bundle the pinned ripgrep beside our own binaries so search works with no
+# system rg. fetch-ripgrep.sh is cache-aware (stamp file), so this only hits
+# the network when the pinned version/arch changes; an offline build with a
+# warm cache is a no-op. No rg and no network is a hard error — shipping a
+# bundle whose search is silently broken costs more than failing here.
+bundle_rg() {
+    ./scripts/fetch-ripgrep.sh
+    cp -f "target/bundle-tools/rg" "$APP_DIR/Contents/MacOS/rg"
+    echo "==> Bundled rg"
+}
+
 # Fast path: refresh the bundled binary in place. Fail loudly if there
 # is no existing bundle to refresh — implicit `mkdir` would mask a
 # missing full-bundle step and surface as a launch failure later.
@@ -346,6 +363,12 @@ if [[ "${1:-}" == "--debug-fast" ]]; then
     if [[ -f "assets/AppIcon.icns" ]]; then
         mkdir -p "$APP_DIR/Contents/Resources"
         cp -f "assets/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
+    fi
+    # Refresh the bundled rg from the cache only — --debug-fast is the
+    # ~200ms loop and must never wait on the network. A missing cache just
+    # leaves the existing (or absent) bundled rg alone.
+    if [[ -f "target/bundle-tools/rg" ]]; then
+        cp -f "target/bundle-tools/rg" "$APP_DIR/Contents/MacOS/rg"
     fi
     # The fresh binary carries no rpath, so re-copy the dylibs + re-add it.
     bundle_dylibs debug
@@ -405,6 +428,9 @@ fi
 
 # Voice-dictation runtime dylibs (onnxruntime + sherpa-onnx) + rpath.
 bundle_dylibs "$TARGET_SUBDIR"
+
+# Pinned ripgrep for the search panel + Quick Open.
+bundle_rg
 
 sign_bundle
 

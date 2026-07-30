@@ -18,6 +18,7 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::shell::search_panel::search_state::SearchOptions;
+use crate::shell::tool_paths::rg_program;
 
 /// Hard upper bound: even if the caller asks for more, this is the ceiling
 /// passed to `--max-count` per-file to keep memory bounded on pathological
@@ -72,10 +73,11 @@ pub enum RgError {
     Process(String),
 }
 
-/// Detect whether `rg` is callable. Caller should call once at startup and
-/// cache the result — repeating it on every keystroke would be wasteful.
+/// Detect whether ripgrep (bundled or PATH) is callable. Caller should call
+/// once at startup and cache the result — repeating it on every keystroke
+/// would be wasteful.
 pub async fn detect_rg_available() -> bool {
-    match Command::new("rg").arg("--version").output().await {
+    match Command::new(rg_program()).arg("--version").output().await {
         Ok(out) => out.status.success(),
         Err(_) => false,
     }
@@ -94,7 +96,7 @@ pub async fn run_ripgrep(
     }
 
     let args = build_args(&opts);
-    let mut cmd = Command::new("rg");
+    let mut cmd = Command::new(rg_program());
     cmd.args(&args)
         .arg("--")
         .arg(&opts.query)

@@ -120,8 +120,9 @@ pub(super) fn render_header(panel: &SearchPanel, cx: &mut Context<SearchPanel>) 
     let summary = match panel.summary_state() {
         SummaryState::Loading => summary_banner("Searching…", theme, typography),
         SummaryState::Idle => div().into_any_element(),
+        // Reachable only in dev builds — the packaged app bundles rg.
         SummaryState::RgMissing => summary_banner(
-            "Install ripgrep to enable search (`brew install ripgrep`).",
+            "ripgrep missing (dev build?) — `brew install ripgrep`, or rebuild the app bundle.",
             theme,
             typography,
         ),
