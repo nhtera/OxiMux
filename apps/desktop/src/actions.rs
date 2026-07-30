@@ -585,6 +585,10 @@ actions!(
         /// round-trip to disk, a read-only keybindings list, and an
         /// appearance/about pane. Also reachable via the left-rail cog.
         OpenSettings,
+        /// Reopen the first-run welcome wizard (default agent + chat view).
+        /// Palette-only — reopening never clears the completion flag, so it
+        /// cannot re-trigger at boot.
+        ShowWelcomeWizard,
         /// Toggle the in-window floating ("PiP") terminal (Cmd+Shift+T).
         /// First dispatch spawns it at the active worktree cwd; subsequent
         /// dispatches show/hide it (the PTY persists across hides). The card's

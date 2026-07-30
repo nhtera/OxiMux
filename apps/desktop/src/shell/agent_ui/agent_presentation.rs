@@ -148,6 +148,8 @@ pub fn adapter_icon_path(adapter_id: &str) -> &'static str {
         "opencode" => "icons/opencode.svg",
         "copilot" => "icons/copilot.svg",
         "pi" => "icons/pi.svg",
+        "cursor" => "icons/cursor.svg",
+        "amp" => "icons/amp.svg",
         _ => "icons/sparkles.svg",
     }
 }

@@ -696,6 +696,13 @@ impl Render for WorkspaceRoot {
                 this.close_modal_overlays(cx);
                 this.settings_modal.update(cx, |m, cx| m.open(window, cx));
             }))
+            .on_action(cx.listener(|this, _: &ShowWelcomeWizard, window, cx| {
+                if this.onboarding.read(cx).is_open() {
+                    return;
+                }
+                this.close_modal_overlays(cx);
+                this.onboarding.update(cx, |wizard, cx| wizard.open(window, cx));
+            }))
             .on_action(cx.listener(|this, _: &ToggleFloatingTerminal, window, cx| {
                 this.toggle_floating_terminal(window, cx);
             }))
@@ -1724,6 +1731,9 @@ impl Render for WorkspaceRoot {
             // Settings modal — appended last so it paints above all other
             // children (last child = topmost z-layer in GPUI).
             .child(self.settings_modal.clone())
+            // Onboarding wizard — above the settings modal: on a fresh boot it
+            // must own the window until finished or skipped.
+            .child(self.onboarding.clone())
             // Toasts paint above even the modals so a transient event (commit
             // failed, agent done) is never hidden behind an open dialog. The
             // layer is non-interactive and bottom-right, so it doesn't steal

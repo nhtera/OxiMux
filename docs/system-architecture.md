@@ -102,8 +102,8 @@ backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
 
 One folder per cockpit zone: `agent_ui`, `agents_dashboard`, `browser_view`,
 `chrome`, `command_palette`, `commit_dialog`, `compose_bar`, `diff_view`,
-`file_explorer`, `forge`, `git_panel`, `left_rail`, `pane_group`, `panes`,
-`pr_dialog`, `project_panes`, `right_sidebar`, `search_panel`, `session_history`,
+`file_explorer`, `forge`, `git_panel`, `left_rail`, `onboarding`, `pane_group`,
+`panes`, `pr_dialog`, `project_panes`, `right_sidebar`, `search_panel`, `session_history`,
 `settings_modal`, `source_control`, `stash_panel`, `tasks_view`, `terminal`,
 `usage`, `welcome`, `workspace`, `worktree_panel`. Each re-exports its modules
 so existing `crate::shell::<name>::…` paths resolve regardless of folder.
@@ -123,6 +123,7 @@ WorkspaceRoot (GPUI entity)
 │   │       → MainPane::open_editor_in_focused_pane(path, window, cx)
 │   ├── palette: Entity<PaletteModal>      ← Cmd+P / Cmd+Shift+P overlay
 │   ├── settings_modal: Entity<SettingsModal> ← Cmd+, / left-rail cog overlay
+│   ├── onboarding: Entity<OnboardingWizard>  ← first-run welcome wizard (boot-gate mailbox; palette "Show Welcome Wizard")
 │   └── floating_terminal: Option<Entity<FloatingTerminal>> ← Cmd+Shift+T PiP overlay
 │         draggable/resizable; PTY persists across hide; geometry debounce-persisted
 │

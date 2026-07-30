@@ -80,7 +80,7 @@ use crate::actions::{
     CreateWorktreeWorkspaceForActiveChat,
     OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
     NewBrowserTab, NewTab, OpenChatSession, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory,
-    OpenSettings,
+    OpenSettings, ShowWelcomeWizard,
     OpenTabContextMenuAt, OpenTerminalContextMenuAt, ResumeAgentSession,
     OpenWorkspaceCreate, OpenWorkspaceJump, RequestOpenAdapterPicker, Search, SelectExplorerTab,
     SelectFilesTab, SelectHistoryTab,
@@ -252,6 +252,9 @@ pub struct WorkspaceRoot {
     /// terminal + AI settings that already round-trip to disk, plus
     /// read-only keybindings / appearance / about references.
     pub(crate) settings_modal: Entity<SettingsModal>,
+    /// First-run onboarding wizard (default agent + chat view). Opens on a
+    /// fresh install via the boot-gate mailbox; reopenable from the palette.
+    pub(crate) onboarding: Entity<crate::shell::onboarding::OnboardingWizard>,
     /// Quiet transient toast stack (bottom-right). Surfaces fleeting
     /// cross-surface events (agent done, commit failed, PR opened, clipboard)
     /// that the status bar's persistent state doesn't cover.
@@ -272,6 +275,8 @@ pub struct WorkspaceRoot {
     /// bindings (Cmd+,, etc.) keep dispatching instead of dying on an orphaned
     /// focus handle.
     pub(crate) _settings_modal_sub: Option<Subscription>,
+    /// Focus-restore guard for the onboarding wizard's close.
+    pub(crate) _onboarding_sub: Option<Subscription>,
     /// Same focus-restore guard for the command palette and project picker
     /// (both grab focus on open).
     pub(crate) _palette_sub: Option<Subscription>,
@@ -831,6 +836,30 @@ impl WorkspaceRoot {
                 cx,
             )
         });
+        // First-run onboarding wizard. Constructed closed; opened below when
+        // the boot gate armed the one-shot mailbox (fresh install only), or
+        // later via the "Show Welcome Wizard" palette action.
+        let onboarding = cx.new(|cx| {
+            crate::shell::onboarding::OnboardingWizard::new(
+                theme,
+                density,
+                typography.clone(),
+                app_state.settings_repo.clone(),
+                adapter_registry.clone(),
+                cx,
+            )
+        });
+        if crate::shell::onboarding::take_pending() {
+            // Deferred: `new()` grabs root focus further down (the chrome-action
+            // fallback), which would clobber a focus taken here in the same
+            // frame and leave the wizard keyboard-dead on the one path that
+            // matters (fresh install). Defer runs after construction, so the
+            // wizard's grab is the last one standing.
+            let onboarding = onboarding.clone();
+            window.defer(cx, move |window, cx| {
+                onboarding.update(cx, |wizard, cx| wizard.open(window, cx));
+            });
+        }
         let toast_layer = cx.new(|_| ToastLayer::new(theme, density, typography.clone()));
         // Register this window's layer as the active toast surface up front so
         // toasts work before the first window-activation event arrives.
@@ -857,6 +886,15 @@ impl WorkspaceRoot {
             &settings_modal,
             window,
             |root, _modal, _ev: &SettingsModalEvent, window, cx| {
+                root.focus_handle.focus(window, cx);
+            },
+        );
+        // Same contract for the onboarding wizard: it takes focus on open, so
+        // its close (Finish or Skip) must hand focus back or global chords die.
+        let onboarding_sub = cx.subscribe_in(
+            &onboarding,
+            window,
+            |root, _wizard, _ev: &crate::shell::onboarding::OnboardingEvent, window, cx| {
                 root.focus_handle.focus(window, cx);
             },
         );
@@ -1178,12 +1216,14 @@ impl WorkspaceRoot {
             floating_terminal_visible: false,
             _floating_terminal_sub: None,
             _settings_modal_sub: Some(settings_modal_sub),
+            _onboarding_sub: Some(onboarding_sub),
             _palette_sub: Some(palette_sub),
             _session_history_sub: Some(session_history_sub),
             _project_picker_sub: Some(project_picker_sub),
             app_state,
             project_picker,
             settings_modal,
+            onboarding,
             toast_layer,
             dictation_hud,
             workspace_dialog,

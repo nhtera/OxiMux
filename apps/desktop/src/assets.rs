@@ -138,6 +138,10 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/claude-code.svg",
         include_bytes!("../assets/icons/claude-code.svg"),
     ),
+    // Cursor + Amp marks for the onboarding agent picker (ACP presets have no
+    // builtin adapter, so no icon shipped before this).
+    ("icons/cursor.svg", include_bytes!("../assets/icons/cursor.svg")),
+    ("icons/amp.svg", include_bytes!("../assets/icons/amp.svg")),
     ("icons/codex.svg", include_bytes!("../assets/icons/codex.svg")),
     ("icons/aider.svg", include_bytes!("../assets/icons/aider.svg")),
     // Import-provider glyphs for the history/resume picker (generic marks).

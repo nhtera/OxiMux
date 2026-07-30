@@ -1,0 +1,521 @@
+//! First-run onboarding — the gate deciding whether the welcome wizard opens.
+//!
+//! The wizard itself (entity + views) lives in sibling modules; this file owns
+//! the persisted completion flag and the boot-time decision. The decision is
+//! communicated to the first workspace window through a one-shot pending
+//! mailbox (same idiom as `window_registry::consume_pending_tearoff`) so the
+//! shared window factory keeps its signature: Cmd+N windows and restored
+//! windows never consume it, only the fresh-boot window armed by `main.rs`.
+
+mod agent_step;
+mod view;
+mod view_step;
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use gpui::{AppContext as _, Context, Entity, EventEmitter, FocusHandle, Subscription, Window};
+use gpui_component::searchable_list::SearchableVec;
+use gpui_component::select::{SelectEvent, SelectState};
+use oximux_agents::AdapterRegistry;
+use oximux_settings::{AgentLaunchSettings, Density, OpenMode, Theme, Typography};
+use oximux_storage::SettingsRepo;
+
+use agent_step::{AgentRow, ModelSource, OnboardModelItem};
+
+/// SettingsRepo key marking onboarding as completed (or deliberately skipped).
+/// Presence is what matters, not the value; versioned so a future richer
+/// onboarding can re-trigger by minting a `.v2` key.
+pub const COMPLETED_SETTING: &str = "onboarding.completed.v1";
+
+/// The boot-time gate: show the wizard only on a true fresh install — no
+/// windows to restore AND the completion flag has never been written. Existing
+/// installs (non-empty manifest) are backfilled by the caller instead, so an
+/// upgrade never shows the wizard over a working setup.
+pub fn should_show_onboarding(manifest_empty: bool, flag_present: bool) -> bool {
+    manifest_empty && !flag_present
+}
+
+/// One-shot "open the wizard in the next workspace window" mailbox, armed by
+/// `main.rs` before the fresh-boot `open_workspace_window` call and consumed
+/// exactly once by `WorkspaceRoot` construction.
+static PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Arm the mailbox (fresh-boot path in `main.rs` only).
+pub fn set_pending() {
+    PENDING.store(true, Ordering::SeqCst);
+}
+
+/// Consume the mailbox. Returns `true` at most once per arming.
+pub fn take_pending() -> bool {
+    PENDING.swap(false, Ordering::SeqCst)
+}
+
+/// Emitted when the wizard closes (Finish or Skip). `WorkspaceRoot` listens
+/// and returns keyboard focus to itself so global bindings keep dispatching —
+/// the wizard grabs focus on open, and an orphaned focus handle after close
+/// would silently kill every chord.
+pub enum OnboardingEvent {
+    Closed,
+}
+
+/// Which wizard screen is showing. Two steps by design (welcome/agent, then
+/// chat view) — the "You're set" summary exists only in the review mockup, not
+/// in the product: Finish closes straight onto the welcome empty-state card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingStep {
+    Agent,
+    ChatView,
+}
+
+/// The first-run welcome wizard: a full-window occluding overlay, deliberately
+/// NOT dismissable by clicking the backdrop — Skip (or Esc) is the only way
+/// out without finishing, so a stray click can't half-complete onboarding.
+pub struct OnboardingWizard {
+    pub(super) open: bool,
+    pub(super) step: OnboardingStep,
+    pub(super) focus_handle: FocusHandle,
+    pub(super) theme: Theme,
+    pub(super) density: Density,
+    pub(super) typography: Typography,
+    /// Flat KV store the completion flag persists into. Finish and Skip both
+    /// write it — presence of the key is what the boot gate checks.
+    settings_repo: SettingsRepo,
+    /// Adapter inventory shared with the launch picker — the roster and the
+    /// PATH detection both come from it.
+    registry: Arc<AdapterRegistry>,
+    /// The picker rows, assembled once per open; availability lands as one
+    /// async update (rows grey out in place, never reshuffle mid-interaction).
+    pub(self) rows: Vec<AgentRow>,
+    /// Whether the "+N more" group is revealed.
+    pub(self) expanded: bool,
+    /// The currently highlighted agent (adapter id).
+    pub(self) selected_agent: Option<String>,
+    /// Step 2's choice. Preselected to `Chat` (the differentiated surface) —
+    /// a deliberate product call; the CODE default stays `Terminal`, so a Skip
+    /// changes nothing for users who never saw or wanted the wizard.
+    pub(self) open_mode: OpenMode,
+    /// Explicit model picks per agent id (wire values). Only explicit picks
+    /// persist on Finish — an untouched dropdown writes nothing.
+    pub(self) chosen_models: BTreeMap<String, String>,
+    /// Static model slugs per adapter id (from the registry), the Codex
+    /// fallback when the catalog cache is cold.
+    static_models: HashMap<String, &'static [&'static str]>,
+    /// The searchable model dropdown. Built lazily on first open (needs a
+    /// `Window`); re-seeded whenever the selected agent changes.
+    pub(self) model_select: Option<Entity<SelectState<SearchableVec<OnboardModelItem>>>>,
+    /// The `(wire, label, description)` set last pushed into the select, so
+    /// re-renders don't reset an open dropdown (composer's signature guard).
+    model_select_sig: Vec<(String, String, Option<String>)>,
+    _model_select_sub: Option<Subscription>,
+}
+
+impl OnboardingWizard {
+    pub fn new(
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        settings_repo: SettingsRepo,
+        registry: Arc<AdapterRegistry>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            open: false,
+            step: OnboardingStep::Agent,
+            focus_handle: cx.focus_handle(),
+            theme,
+            density,
+            typography,
+            settings_repo,
+            registry,
+            rows: Vec::new(),
+            expanded: false,
+            selected_agent: None,
+            open_mode: OpenMode::Chat,
+            chosen_models: BTreeMap::new(),
+            static_models: HashMap::new(),
+            model_select: None,
+            model_select_sig: Vec::new(),
+            _model_select_sub: None,
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Open (or reopen, via the palette action) at step 1. Takes focus so
+    /// Esc/Enter dispatch here instead of leaking to the pane below.
+    pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open = true;
+        self.step = OnboardingStep::Agent;
+        self.expanded = false;
+        self.build_roster(cx);
+        self.ensure_model_select(window, cx);
+        self.sync_model_select(window, cx);
+        self.spawn_detection(window, cx);
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Assemble the picker rows from the registry + ACP presets. Runs on every
+    /// open (cheap; no I/O) so a reopen reflects current chat-capability.
+    fn build_roster(&mut self, cx: &mut Context<Self>) {
+        let entries = self.registry.entries_without_detection();
+        self.static_models =
+            entries.iter().map(|e| (e.adapter_id.to_string(), e.models)).collect();
+        let pairs: Vec<(String, String)> = entries
+            .iter()
+            .map(|e| (e.adapter_id.to_string(), e.display_name.to_string()))
+            .collect();
+        let launch = cx.global::<AgentLaunchSettings>();
+        self.rows = agent_step::assemble_roster(&pairs, |id| launch.chat_capable(id));
+        // Preselect the first chat-capable row (mirrors default_chat_agent's
+        // builtins-first order); detection may move it if that CLI is missing.
+        if self.selected_agent.is_none() {
+            self.selected_agent =
+                self.rows.iter().find(|r| r.chat_capable).map(|r| r.id.clone());
+        }
+    }
+
+    /// One-shot PATH detection per open: registry adapters + ACP preset
+    /// commands under a shared 500ms cap (same contract as the launch picker).
+    /// Applies as a single state update — rows grey in place, no reshuffle.
+    fn spawn_detection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let registry = self.registry.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let detect = async {
+                let entries = registry.detect_available().await;
+                let mut presets = Vec::with_capacity(oximux_settings::ACP_PRESETS.len());
+                for preset in oximux_settings::ACP_PRESETS {
+                    presets.push((preset.id, oximux_agents::cli::which_on_path(preset.command).await));
+                }
+                (entries, presets)
+            };
+            let Ok((entries, presets)) =
+                tokio::time::timeout(Duration::from_millis(500), detect).await
+            else {
+                tracing::warn!("onboarding: agent detection timed out after 500ms");
+                return;
+            };
+            let _ = this.update_in(cx, |wizard, window, cx| {
+                for row in &mut wizard.rows {
+                    let hit = entries
+                        .iter()
+                        .find(|e| e.adapter_id == row.id)
+                        .map(|e| e.available)
+                        .or_else(|| {
+                            presets.iter().find(|(id, _)| *id == row.id).map(|(_, ok)| *ok)
+                        });
+                    row.available = hit;
+                }
+                // If the optimistic preselection turned out to be missing,
+                // move to the first installed chat-capable row.
+                let selected_missing = wizard
+                    .selected_row()
+                    .is_some_and(|r| !r.selectable());
+                if selected_missing {
+                    wizard.selected_agent = wizard
+                        .rows
+                        .iter()
+                        .find(|r| r.chat_capable && r.selectable())
+                        .map(|r| r.id.clone());
+                    wizard.sync_model_select(window, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn selected_row(&self) -> Option<&AgentRow> {
+        let id = self.selected_agent.as_deref()?;
+        self.rows.iter().find(|r| r.id == id)
+    }
+
+    /// Click / arrow-key selection of an agent row. Re-seeds the model select
+    /// for the newly selected agent.
+    pub(self) fn select_agent(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_agent.as_deref() == Some(id) {
+            return;
+        }
+        self.selected_agent = Some(id.to_string());
+        self.sync_model_select(window, cx);
+        cx.notify();
+    }
+
+    /// Arrow-key navigation across selectable rows, auto-expanding the "+N
+    /// more" group when the target sits inside it.
+    pub(self) fn move_selection(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let selectable: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|r| r.selectable())
+            .map(|r| r.id.clone())
+            .collect();
+        if selectable.is_empty() {
+            return;
+        }
+        let current = self
+            .selected_agent
+            .as_deref()
+            .and_then(|id| selectable.iter().position(|s| s == id))
+            .unwrap_or(0);
+        let next = current.saturating_add_signed(delta).min(selectable.len() - 1);
+        let id = selectable[next].clone();
+        if self.rows.iter().any(|r| r.id == id && r.more) {
+            self.expanded = true;
+        }
+        self.select_agent(&id, window, cx);
+    }
+
+    /// The model source for the currently selected agent. Never probes.
+    fn selected_model_source(&self, cx: &Context<Self>) -> ModelSource {
+        let Some(id) = self.selected_agent.as_deref() else {
+            return ModelSource::Deferred;
+        };
+        let cached = cx
+            .try_global::<crate::catalog_cache::CatalogCache>()
+            .and_then(|cache| cache.get(id))
+            .map(|catalog| (catalog.models, catalog.default_model));
+        let codex_static = self
+            .static_models
+            .get("codex")
+            .copied()
+            .unwrap_or(&[]);
+        agent_step::resolve_model_source(id, cached, codex_static)
+    }
+
+    pub(self) fn selected_model_source_is_rich(&self, cx: &Context<Self>) -> bool {
+        matches!(self.selected_model_source(cx), ModelSource::Rich { .. })
+    }
+
+    /// Build the model select entity once (needs a `Window`) and keep the
+    /// Confirm subscription alive. Programmatic seeding never emits Confirm,
+    /// so the handler only fires on real user picks.
+    fn ensure_model_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.model_select.is_some() {
+            return;
+        }
+        let select = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(Vec::<OnboardModelItem>::new()), None, window, cx)
+                .searchable(true)
+        });
+        self._model_select_sub = Some(cx.subscribe(
+            &select,
+            |this, _state, ev: &SelectEvent<SearchableVec<OnboardModelItem>>, cx| {
+                if let SelectEvent::Confirm(Some(wire)) = ev
+                    && let Some(id) = this.selected_agent.clone()
+                {
+                    this.chosen_models.insert(id, wire.clone());
+                    cx.notify();
+                }
+            },
+        ));
+        self.model_select = Some(select);
+    }
+
+    /// Re-seed the select's items + selection for the current agent. The
+    /// signature guard makes this a no-op when nothing changed, so calling it
+    /// from render never resets an open dropdown.
+    pub(self) fn sync_model_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(select) = self.model_select.clone() else {
+            return;
+        };
+        let (choices, default_model) = match self.selected_model_source(cx) {
+            ModelSource::Rich { choices, default_model } => (choices, default_model),
+            ModelSource::Deferred => (Vec::new(), None),
+        };
+        let sig: Vec<(String, String, Option<String>)> = choices
+            .iter()
+            .map(|m| (m.wire.clone(), m.label.clone(), m.description.clone()))
+            .collect();
+        if self.model_select_sig != sig {
+            self.model_select_sig = sig;
+            let items: Vec<OnboardModelItem> = choices
+                .iter()
+                .map(|m| OnboardModelItem {
+                    wire: m.wire.clone(),
+                    label: m.label.clone(),
+                    description: m.description.clone(),
+                })
+                .collect();
+            select.update(cx, |s, cx| s.set_items(SearchableVec::new(items), window, cx));
+        }
+        let current = self
+            .selected_agent
+            .as_deref()
+            .and_then(|id| self.chosen_models.get(id).cloned())
+            .or(default_model);
+        if let Some(wire) = current {
+            select.update(cx, |s, cx| s.set_selected_value(&wire, window, cx));
+        }
+    }
+
+    pub(super) fn next(&mut self, cx: &mut Context<Self>) {
+        match self.step {
+            OnboardingStep::Agent => {
+                self.step = OnboardingStep::ChatView;
+                cx.notify();
+            }
+            OnboardingStep::ChatView => self.finish(cx),
+        }
+    }
+
+    pub(super) fn back(&mut self, cx: &mut Context<Self>) {
+        if self.step == OnboardingStep::ChatView {
+            self.step = OnboardingStep::Agent;
+            cx.notify();
+        }
+    }
+
+    /// Skip: mark onboarding done WITHOUT touching any settings — the
+    /// `default_chat_agent()` fallback chain covers a user who never chose.
+    pub(super) fn skip(&mut self, cx: &mut Context<Self>) {
+        self.close_completed(cx);
+    }
+
+    /// Finish: persist the user's choices in ONE `agent_launch.toml` write
+    /// (the file watcher reloads + swaps the global — we never set the global
+    /// directly, same contract as the settings modal), then mark onboarding
+    /// done. A failed save keeps the wizard open with a toast rather than
+    /// closing with the choices silently dropped.
+    pub(super) fn finish(&mut self, cx: &mut Context<Self>) {
+        if let Some(selected) = self.selected_agent.clone() {
+            let mut launch = cx.global::<AgentLaunchSettings>().clone();
+            let model = self.chosen_models.get(&selected).cloned();
+            apply_finish(&mut launch, &selected, model.as_deref(), self.open_mode);
+            if let Err(err) = crate::agent_launch_settings::save(&launch) {
+                tracing::warn!(%err, "onboarding: failed to write agent_launch.toml");
+                crate::shell::toast::toast(
+                    cx,
+                    crate::shell::toast::ToastKind::Error,
+                    "Could not save onboarding choices — check disk space and try again",
+                );
+                return;
+            }
+        }
+        self.close_completed(cx);
+    }
+
+    /// Shared close path: write the completion flag (non-fatal on error — a
+    /// failed write only means the wizard shows again next launch), hide, and
+    /// tell the host to take focus back.
+    fn close_completed(&mut self, cx: &mut Context<Self>) {
+        if let Err(err) = self.settings_repo.set(COMPLETED_SETTING, "1") {
+            tracing::warn!(?err, "failed to persist onboarding completion flag");
+        }
+        self.open = false;
+        cx.emit(OnboardingEvent::Closed);
+        cx.notify();
+    }
+}
+
+impl EventEmitter<OnboardingEvent> for OnboardingWizard {}
+
+/// The Finish write, as a pure mutation so the field matrix unit-tests
+/// without GPUI: set the default agent and open mode; write a model only when
+/// the user explicitly picked one (an untouched dropdown must not pin today's
+/// default and silently hold the agent back from future defaults).
+fn apply_finish(
+    launch: &mut AgentLaunchSettings,
+    selected_agent: &str,
+    model: Option<&str>,
+    open_mode: OpenMode,
+) {
+    launch.default_agent = selected_agent.to_string();
+    if let Some(wire) = model {
+        // A preset agent (Cursor/Amp/OpenCode) is chat-capable only through
+        // the "no user entry" preset fallback — minting a bare entry here just
+        // to hold the model would flip it terminal-only (default transport is
+        // StreamJson with no ACP command). Seed the preset's ACP wiring into
+        // the fresh entry so an explicit model pick can't strip capability.
+        // An entry the user already configured is left untouched.
+        let fresh = launch.for_agent(selected_agent).is_none();
+        let preset = oximux_settings::acp_preset(selected_agent);
+        let entry = launch.entry_mut(selected_agent);
+        entry.model = wire.to_string();
+        if fresh && let Some(preset) = preset {
+            entry.transport = oximux_settings::Transport::Acp;
+            entry.acp_command = preset.command.to_string();
+            entry.acp_args = preset.args.to_string();
+        }
+    }
+    launch.default_open_mode = open_mode;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gate_matrix() {
+        // Fresh install, never onboarded → show.
+        assert!(should_show_onboarding(true, false));
+        // Fresh-looking manifest but flag present (e.g. wizard finished, then
+        // user quit before any window persisted) → never show again.
+        assert!(!should_show_onboarding(true, true));
+        // Existing install without the flag (pre-onboarding upgrade) → the
+        // caller backfills; the wizard stays hidden.
+        assert!(!should_show_onboarding(false, false));
+        // Existing install, flag present → hidden.
+        assert!(!should_show_onboarding(false, true));
+    }
+
+    #[test]
+    fn pending_mailbox_is_one_shot() {
+        assert!(!take_pending());
+        set_pending();
+        assert!(take_pending());
+        assert!(!take_pending());
+    }
+
+    #[test]
+    fn finish_write_matrix() {
+        // Full pick: agent + model + chat mode.
+        let mut launch = AgentLaunchSettings::default();
+        apply_finish(&mut launch, "claude-code", Some("sonnet"), OpenMode::Chat);
+        assert_eq!(launch.default_agent, "claude-code");
+        assert_eq!(launch.model_for("claude-code").as_deref(), Some("sonnet"));
+        assert_eq!(launch.default_open_mode, OpenMode::Chat);
+
+        // No explicit model pick → no model written, no entry minted.
+        let mut launch = AgentLaunchSettings::default();
+        apply_finish(&mut launch, "codex", None, OpenMode::Terminal);
+        assert_eq!(launch.default_agent, "codex");
+        assert_eq!(launch.model_for("codex"), None);
+        assert!(launch.for_agent("codex").is_none());
+        assert_eq!(launch.default_open_mode, OpenMode::Terminal);
+
+        // A model pick must not clobber the agent's other configured fields.
+        let mut launch = AgentLaunchSettings::default();
+        launch.entry_mut("codex").args = "--flag".to_string();
+        apply_finish(&mut launch, "codex", Some("gpt-5-codex"), OpenMode::Chat);
+        let entry = launch.for_agent("codex").unwrap();
+        assert_eq!(entry.args, "--flag");
+        assert_eq!(entry.model, "gpt-5-codex");
+    }
+
+    #[test]
+    fn finish_model_pick_keeps_preset_agent_chat_capable() {
+        // Regression: entry_mut on a preset id mints a default (StreamJson,
+        // no ACP command) entry, which used to flip Cursor/Amp/OpenCode
+        // terminal-only the moment a model was picked in onboarding.
+        for id in ["opencode", "cursor", "amp"] {
+            let mut launch = AgentLaunchSettings::default();
+            assert!(launch.chat_capable(id), "{id} chat-capable via preset fallback");
+            apply_finish(&mut launch, id, Some("some-model"), OpenMode::Chat);
+            assert!(launch.chat_capable(id), "{id} must stay chat-capable after model pick");
+            assert!(launch.opens_as_chat(id), "{id} must still open as chat");
+            assert_eq!(launch.model_for(id).as_deref(), Some("some-model"));
+        }
+        // A user-configured entry is NOT overwritten with preset wiring.
+        let mut launch = AgentLaunchSettings::default();
+        launch.entry_mut("opencode").acp_command = "my-custom-opencode".to_string();
+        launch.entry_mut("opencode").transport = oximux_settings::Transport::Acp;
+        apply_finish(&mut launch, "opencode", Some("m"), OpenMode::Chat);
+        assert_eq!(launch.for_agent("opencode").unwrap().acp_command, "my-custom-opencode");
+    }
+}

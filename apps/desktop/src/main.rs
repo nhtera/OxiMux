@@ -483,9 +483,27 @@ fn main() {
         // to the most-recent project.
         let manifest =
             oximux_app::project_panes_factory::load_windows_manifest(app_state.settings_repo());
+        // First-run onboarding gate. Presence of the flag is what counts —
+        // finished and skipped both write it. Existing installs (non-empty
+        // manifest) get the flag backfilled instead of a wizard: an upgrade
+        // must never open a welcome flow over a working setup.
+        let onboarded = app_state
+            .settings_repo()
+            .get(oximux_app::shell::onboarding::COMPLETED_SETTING)
+            .ok()
+            .flatten()
+            .is_some();
         if manifest.windows.is_empty() {
+            if oximux_app::shell::onboarding::should_show_onboarding(true, onboarded) {
+                oximux_app::shell::onboarding::set_pending();
+            }
             open_workspace_window(cx, repo, app_state);
         } else {
+            if !onboarded {
+                let _ = app_state
+                    .settings_repo()
+                    .set(oximux_app::shell::onboarding::COMPLETED_SETTING, "1");
+            }
             // Reserve every restored id up front so a later Cmd+N can't re-mint
             // one and alias a restored window's persisted rows.
             for entry in &manifest.windows {

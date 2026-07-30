@@ -11,7 +11,8 @@ use gpui::Action;
 use crate::actions::{
     ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseTab, NewTab,
     OpenCommandPalette, OpenCommitDialog, OpenQuickOpen, ReloadCustomCommands, Search,
-    SelectSourceControlTab, SplitHorizontal, SplitVertical, ToggleLeftSidebar, ToggleRightSidebar,
+    SelectSourceControlTab, ShowWelcomeWizard, SplitHorizontal, SplitVertical, ToggleLeftSidebar,
+    ToggleRightSidebar,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +160,11 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
         action_id: Some("reload_custom_commands"),
         make_action: || Box::new(ReloadCustomCommands),
     },
+    CommandEntry {
+        name: "Show Welcome Wizard",
+        action_id: None,
+        make_action: || Box::new(ShowWelcomeWizard),
+    },
 ];
 
 /// Build the unified candidate list from the static catalog plus loaded
@@ -222,9 +228,9 @@ mod tests {
     }
 
     #[test]
-    fn palette_commands_has_fifteen_entries() {
-        // 14 original + 1 "Reload Custom Commands"
-        assert_eq!(PALETTE_COMMANDS.len(), 15);
+    fn palette_commands_has_sixteen_entries() {
+        // 14 original + "Reload Custom Commands" + "Show Welcome Wizard"
+        assert_eq!(PALETTE_COMMANDS.len(), 16);
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub mod file_explorer;
 pub mod forge;
 pub mod git_panel;
 pub mod left_rail;
+pub mod onboarding;
 pub mod pane_group;
 pub mod panes;
 pub mod pr_dialog;
