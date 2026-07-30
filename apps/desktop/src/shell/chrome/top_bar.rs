@@ -18,7 +18,7 @@ use gpui::{
 };
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::actions::{OpenQuickOpen, ToggleLeftSidebar, ToggleRightSidebar};
+use crate::actions::{OpenQuickOpen, ToggleLeftSidebar, ToggleRightSidebar, ToggleWhatsNew};
 
 /// Width reserved on the left for macOS traffic lights (12px inset +
 /// 3 × ~14px buttons with ~6px gaps + comfortable breathing room before
@@ -39,12 +39,17 @@ const ICON_SIZE: f32 = 16.0;
 /// Wordmark is centered at y=15 inside the 30-px chrome strip; the OS
 /// draws macOS traffic lights centered at y=19 over the
 /// `TRAFFIC_LIGHT_GUTTER`, so the two visually align on a single row.
-pub fn left_header(theme: Theme, density: Density, typography: &Typography) -> impl IntoElement {
+pub fn left_header(
+    update_ready: bool,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> impl IntoElement {
     // The left column's header sits on the lifted rail surface — match it
     // so the rail reads as one continuous slab from titlebar to toolbar.
     chrome_strip(theme, density, true)
         .bg(theme.bg_rail)
-        .child(left_chrome_cluster(true, theme, typography))
+        .child(left_chrome_cluster(true, update_ready, theme, typography))
 }
 
 /// Header strip for the center column. Hosts any chrome bits whose
@@ -56,6 +61,7 @@ pub fn left_header(theme: Theme, density: Density, typography: &Typography) -> i
 pub fn center_header(
     left_open: bool,
     right_open: bool,
+    update_ready: bool,
     center_zone: Option<AnyElement>,
     right_tabs: Option<AnyElement>,
     // When the center column has a tab strip directly below this header,
@@ -70,7 +76,7 @@ pub fn center_header(
     if !left_open {
         // Left rail is collapsed — host the chrome cluster (toggle now uses
         // the "open" icon since clicking it expands the rail).
-        row = row.child(left_chrome_cluster(false, theme, typography));
+        row = row.child(left_chrome_cluster(false, update_ready, theme, typography));
     }
     let center: AnyElement = center_zone.unwrap_or_else(|| spacer_zone().into_any_element());
     row = row.child(center);
@@ -134,7 +140,12 @@ fn chrome_strip(theme: Theme, density: Density, bottom_border: bool) -> Div {
         )
 }
 
-fn left_chrome_cluster(left_open: bool, theme: Theme, typography: &Typography) -> impl IntoElement {
+fn left_chrome_cluster(
+    left_open: bool,
+    update_ready: bool,
+    theme: Theme,
+    typography: &Typography,
+) -> impl IntoElement {
     // Order: traffic gutter → wordmark → left-rail toggle. Keeping the
     // wordmark anchored left mirrors macOS native chrome.
     //
@@ -164,7 +175,7 @@ fn left_chrome_cluster(left_open: bool, theme: Theme, typography: &Typography) -
         .text_color(theme.fg_base)
         .child("OxiMux");
 
-    div()
+    let mut cluster = div()
         .flex()
         .flex_row()
         .items_center()
@@ -176,7 +187,44 @@ fn left_chrome_cluster(left_open: bool, theme: Theme, typography: &Typography) -
             left_toggle_icon(left_open),
             theme,
             ToggleSide::Left,
-        ))
+        ));
+    if update_ready {
+        cluster = cluster.child(update_pill(theme, typography));
+    }
+    cluster
+}
+
+/// Reference-editor-style title-bar "Update" pill. Renders only once a new
+/// version is fully downloaded, verified, and staged — never for a mere
+/// "available" version, so clicking through can always deliver. Opens the
+/// What's New popover (release notes + the restart button) rather than
+/// restarting directly: the pill sits in busy chrome, and a restart must
+/// stay one deliberate click away from a stray one.
+fn update_pill(theme: Theme, typography: &Typography) -> impl IntoElement {
+    let base = theme.status_info;
+    div()
+        .id("titlebar-update-pill")
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .h(px(20.0))
+        .px(px(10.0))
+        .ml(px(2.0))
+        .rounded(px(10.0))
+        .bg(base.alpha(0.9))
+        .text_size(px(typography.t_body_sm))
+        .font_weight(typography.w_semibold)
+        .text_color(theme.fg_base)
+        .cursor_pointer()
+        .hover(move |s| s.bg(base))
+        .on_mouse_down(
+            MouseButton::Left,
+            |_: &MouseDownEvent, window: &mut Window, cx: &mut gpui::App| {
+                window.dispatch_action(Box::new(ToggleWhatsNew), cx);
+            },
+        )
+        .child("Update")
 }
 
 fn right_chrome_cluster(

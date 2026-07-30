@@ -7,3 +7,4 @@ pub mod status_bar;
 pub mod tab_context_menu;
 pub mod toast;
 pub mod top_bar;
+pub mod whats_new;

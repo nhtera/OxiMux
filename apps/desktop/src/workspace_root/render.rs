@@ -201,6 +201,13 @@ impl Render for WorkspaceRoot {
             (right_tabs, None)
         };
 
+        // Title-bar Update pill: staged (downloaded + verified) update only.
+        // Rendered by whichever header currently hosts the left chrome
+        // cluster, so it survives collapsing the rail.
+        let update_ready_version = cx
+            .try_global::<crate::updater::UpdaterState>()
+            .and_then(|state| state.ready_version().map(str::to_string));
+
         let left_column = if self.left_rail_open {
             Some(
                 div()
@@ -208,7 +215,12 @@ impl Render for WorkspaceRoot {
                     .flex_col()
                     .h_full()
                     .flex_shrink_0()
-                    .child(top_bar::left_header(theme, density, typography))
+                    .child(top_bar::left_header(
+                        update_ready_version.is_some(),
+                        theme,
+                        density,
+                        typography,
+                    ))
                     .child(self.left_rail.clone()),
             )
         } else {
@@ -235,6 +247,7 @@ impl Render for WorkspaceRoot {
             let header = top_bar::center_header(
                 self.left_rail_open,
                 right_open,
+                update_ready_version.is_some(),
                 Some(command_center),
                 center_right_tabs,
                 has_tabs, // suppress header bottom border when the tab strip renders below
@@ -689,6 +702,10 @@ impl Render for WorkspaceRoot {
             }))
             .on_action(cx.listener(|_this, _: &RestartToUpdate, _window, cx| {
                 crate::updater::restart_to_update(cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::actions::ToggleWhatsNew, _window, cx| {
+                this.whats_new_open = !this.whats_new_open;
+                cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 // Toggle: a second Cmd+, (or cog click) closes it.
@@ -1663,6 +1680,57 @@ impl Render for WorkspaceRoot {
                     .then(|| self.floating_terminal.clone())
                     .flatten(),
             )
+            // "What's New" popover — release notes for the staged update,
+            // anchored under the title-bar Update pill. Gated on the updater
+            // actually being Ready so a stale open flag (update applied or
+            // discarded meanwhile) renders nothing rather than an empty card.
+            .when(self.whats_new_open, |parent| {
+                let ready = cx.try_global::<crate::updater::UpdaterState>().and_then(
+                    |state| match &state.status {
+                        oximux_auto_update::UpdateStatus::Ready { version, notes } => {
+                            Some((version.clone(), notes.clone()))
+                        }
+                        _ => None,
+                    },
+                );
+                let Some((version, notes)) = ready else {
+                    return parent;
+                };
+                let weak_close = cx.entity().downgrade();
+                let card = crate::shell::chrome::whats_new::view(
+                    &version,
+                    &notes,
+                    theme,
+                    density,
+                    typography,
+                );
+                parent.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .on_mouse_down(gpui::MouseButton::Left, move |_ev, _window, cx| {
+                            let _ = weak_close.update(cx, |this, cx| {
+                                this.whats_new_open = false;
+                                cx.notify();
+                            });
+                        })
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(80.0))
+                                .top(px(density.h_top_bar + 6.0))
+                                // Clicks on the card must not bubble to the
+                                // backdrop's dismiss handler — the user will
+                                // scroll and click while reading the notes.
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    |_ev, _window, cx| cx.stop_propagation(),
+                                )
+                                .child(card),
+                        ),
+                )
+            })
             // Pane Actions dropdown — appended before the palette so the
             // palette (more rare, larger) wins z-order when both are open.
             .child(self.pane_actions.clone())

@@ -422,6 +422,9 @@ pub struct WorkspaceRoot {
     pub(crate) usage_state: Option<oximux_agents::session_log::usage::UsageState>,
     /// Whether the in-window usage popover is open (non-macOS fallback render).
     pub(crate) usage_popover_open: bool,
+    /// Whether the "What's New" popover (staged-update release notes, opened
+    /// from the title-bar Update pill) is showing.
+    pub(crate) whats_new_open: bool,
     /// The open usage-popover panel window, if any (macOS floats it above the
     /// inline webview). `None` when closed.
     #[cfg(target_os = "macos")]
@@ -1253,6 +1256,7 @@ impl WorkspaceRoot {
             live_agents: HashMap::new(),
             usage_state: None,
             usage_popover_open: false,
+            whats_new_open: false,
             #[cfg(target_os = "macos")]
             usage_popover_window: None,
             rail_dirty: false,

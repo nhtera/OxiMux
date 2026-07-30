@@ -589,6 +589,11 @@ actions!(
         /// the updater reports a ready version; the swap itself happens in
         /// the quit path, so this is "quit, then come back".
         RestartToUpdate,
+        /// Toggle the "What's New" popover under the title-bar Update pill:
+        /// the staged release's notes plus the restart button. Only dispatched
+        /// while the updater reports a ready version (the pill is the only
+        /// trigger and it renders only in that state).
+        ToggleWhatsNew,
         /// Reopen the first-run welcome wizard (default agent + chat view).
         /// Palette-only — reopening never clears the completion flag, so it
         /// cannot re-trigger at boot.
