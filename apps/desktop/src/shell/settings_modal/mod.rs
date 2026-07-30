@@ -26,6 +26,10 @@ mod pane_terminal;
 mod pane_voice;
 mod view;
 
+/// The driver status type is shared with the onboarding wizard's driver step —
+/// one resolve/labels implementation, two surfaces.
+pub(crate) use pane_computer_use::DriverStatus;
+
 pub use nav::SettingsPane;
 
 use std::collections::BTreeMap;
@@ -113,6 +117,18 @@ pub struct SettingsModal {
     /// Result of the last driver check. Held rather than recomputed per frame:
     /// verification spawns `codesign`, and the pane repaints constantly.
     pub(super) driver_status: pane_computer_use::DriverStatus,
+    /// The in-flight driver install this modal started, if any. `None` while
+    /// idle — and also while merely *observing* an install another surface
+    /// owns (that state lives in `driver_install_ui`, fed by the backend's
+    /// pull-style status).
+    pub(super) driver_install: Option<crate::shell::driver_install::InstallHandle>,
+    /// What the Driver row renders for the install affordance.
+    pub(super) driver_install_ui: crate::shell::driver_install::DriverInstallUi,
+    /// Guards against stacking poll timers across repaints/reopens.
+    pub(super) driver_poll_running: bool,
+    /// Set when the install replaced an existing driver — gates the one-line
+    /// "old version until the daemon respawns" note.
+    pub(super) driver_upgraded: bool,
     /// Flat KV store the notification toggles persist into (keys in
     /// [`crate::notifier::keys`]), so prefs survive a restart.
     pub(crate) notify_repo: SettingsRepo,
@@ -216,6 +232,10 @@ impl SettingsModal {
             dictation: DictationSettings::default(),
             computer_use: ComputerUseSettings::default(),
             driver_status: pane_computer_use::DriverStatus::Unknown,
+            driver_install: None,
+            driver_install_ui: crate::shell::driver_install::DriverInstallUi::Idle,
+            driver_poll_running: false,
+            driver_upgraded: false,
             notify,
             notify_repo,
             notifier,
@@ -278,6 +298,20 @@ impl SettingsModal {
         // installed or updated the driver since, and "not installed" is the
         // status most likely to be stale.
         self.driver_status = pane_computer_use::DriverStatus::resolve();
+        // A modal reopened mid-install shows live progress: attach to the
+        // backend's pull-style status (cheap, unlike a resolve per tick) and
+        // restart the poll loop. A stale failure from a previous open is
+        // cleared — the fresh resolve above is the truth now.
+        if !self.driver_install_ui.is_running() {
+            self.driver_install_ui = match oximux_computer_use::install::status() {
+                Some(stage) => crate::shell::driver_install::DriverInstallUi::Running { stage },
+                None => crate::shell::driver_install::DriverInstallUi::Idle,
+            };
+            // The post-upgrade note belongs to the session that upgraded;
+            // a fresh open starts from the resolved truth alone.
+            self.driver_upgraded = false;
+        }
+        self.spawn_driver_install_poll(cx);
         // Start reporting devices that drop themselves, if the host is up. Not in
         // the constructor: the remote host binds later than the shell is built, so
         // subscribing there would find nothing to subscribe to.

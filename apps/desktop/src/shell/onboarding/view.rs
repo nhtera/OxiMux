@@ -45,7 +45,12 @@ impl Render for OnboardingWizard {
             .gap(px(7.0))
             .pb(px(16.0))
             .child(step_dot(step == OnboardingStep::Agent, theme))
-            .child(step_dot(step == OnboardingStep::ChatView, theme));
+            .child(step_dot(step == OnboardingStep::ChatView, theme))
+            // Third dot only when the driver step is reachable this run —
+            // a wizard that will finish from step 2 must not promise a step 3.
+            .when(self.driver_step_needed(), |row| {
+                row.child(step_dot(step == OnboardingStep::Driver, theme))
+            });
 
         let body = div()
             .id("onboarding-body")
@@ -56,6 +61,7 @@ impl Render for OnboardingWizard {
             .child(match step {
                 OnboardingStep::Agent => self.render_agent_step(cx),
                 OnboardingStep::ChatView => self.render_chat_view_step(cx),
+                OnboardingStep::Driver => self.render_driver_step(cx),
             });
 
         let footer = div()
@@ -70,7 +76,7 @@ impl Render for OnboardingWizard {
                     .flex()
                     .items_center()
                     .gap(px(density.gap_inline * 2.0))
-                    .when(step == OnboardingStep::ChatView, |row| {
+                    .when(step != OnboardingStep::Agent, |row| {
                         row.child(
                             Button::new("onboarding-back").ghost().label("← Back").on_click(
                                 cx.listener(|this, _, _window, cx| this.back(cx)),
@@ -82,7 +88,10 @@ impl Render for OnboardingWizard {
                             .primary()
                             .label(match step {
                                 OnboardingStep::Agent => "Continue →",
-                                OnboardingStep::ChatView => "Finish",
+                                OnboardingStep::ChatView if self.driver_step_needed() => {
+                                    "Continue →"
+                                }
+                                OnboardingStep::ChatView | OnboardingStep::Driver => "Finish",
                             })
                             .on_click(cx.listener(|this, _, _window, cx| this.next(cx))),
                     ),
@@ -221,7 +230,7 @@ impl OnboardingWizard {
     }
 }
 
-fn step_heading(
+pub(super) fn step_heading(
     title: &'static str,
     subtitle: &'static str,
     theme: oximux_settings::Theme,

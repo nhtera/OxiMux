@@ -13,6 +13,7 @@ use oximux_settings::{Density, Theme, Typography};
 use super::SettingsModal;
 use super::controls::{toggle_switch, value_chip};
 use super::layout::{SettingEntry, entries_card, entry, section_title};
+use crate::shell::driver_install::{self, DriverInstallUi};
 
 /// What `prepare()` reported about the installed driver, resolved when the
 /// modal opens rather than per repaint — it spawns `codesign`.
@@ -25,6 +26,11 @@ pub(crate) enum DriverStatus {
     /// the user can fix by installing something, and it is by far the most
     /// common.
     NotInstalled,
+    /// Installed and validly signed, but below the integration's floor. Its
+    /// own variant (not a `Problem` string) because the fix is the same
+    /// install pipeline wearing an "Update" label — string-matching the error
+    /// prose to decide that would break on any rewording.
+    Outdated { found: String, minimum: String },
     Problem { detail: String },
 }
 
@@ -36,17 +42,37 @@ impl DriverStatus {
                 version: driver.version.to_string(),
             },
             Err(oximux_computer_use::Error::NotFound { .. }) => DriverStatus::NotInstalled,
+            Err(oximux_computer_use::Error::DriverTooOld { found, minimum }) => {
+                DriverStatus::Outdated {
+                    found: found.to_string(),
+                    minimum: minimum.to_string(),
+                }
+            }
             Err(err) => DriverStatus::Problem {
                 detail: err.to_string(),
             },
         }
     }
 
-    fn summary(&self) -> SharedString {
+    /// The install affordance this status calls for, if any.
+    pub(crate) fn install_label(&self) -> Option<&'static str> {
+        match self {
+            DriverStatus::NotInstalled => Some("Install driver…"),
+            DriverStatus::Outdated { .. } => Some("Update driver…"),
+            // A `Problem` (bad signature, wrong team) is not fixed by
+            // reinstalling the same artifact; it gets the manual link only.
+            _ => None,
+        }
+    }
+
+    pub(crate) fn summary(&self) -> SharedString {
         match self {
             DriverStatus::Unknown => "Checking…".into(),
             DriverStatus::Ready { version } => format!("Installed, verified ({version})").into(),
             DriverStatus::NotInstalled => "Not installed".into(),
+            DriverStatus::Outdated { found, minimum } => {
+                format!("Driver {found} is older than the required {minimum}").into()
+            }
             // The specific reason, not "unavailable": "signed by team X" and
             // "older than the required version" call for opposite responses.
             DriverStatus::Problem { detail } => detail.clone().into(),
@@ -174,14 +200,32 @@ pub(super) fn entries(
         ),
         entry(
             "Driver",
-            "Computer use runs through a separate signed helper the user installs.",
+            "Computer use runs through a separate signed helper.",
             driver_control(modal, theme, density, typography, cx),
         ),
     ]
+    .into_iter()
+    .chain(
+        // Post-upgrade only: the shared daemon is deliberately left running,
+        // so the user should know old behavior may persist until it respawns.
+        (modal.driver_upgraded && matches!(modal.driver_status, DriverStatus::Ready { .. }))
+            .then(|| {
+                entry(
+                    "Driver updated",
+                    driver_install::UPGRADE_NOTE,
+                    div(),
+                )
+            }),
+    )
+    .collect()
 }
 
-/// The driver row's right-hand control: a status line, plus a re-check button
-/// so installing the helper does not need a restart to be noticed.
+/// The driver row's right-hand control.
+///
+/// While an install runs it shows live progress + Cancel; otherwise a status
+/// line, an Install/Update button when the status calls for one, a manual
+/// download link after a failure, and a re-check button so installing the
+/// helper by hand does not need a restart to be noticed.
 fn driver_control(
     modal: &SettingsModal,
     theme: Theme,
@@ -189,12 +233,56 @@ fn driver_control(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
+    if let DriverInstallUi::Running { stage } = &modal.driver_install_ui {
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(density.gap_inline))
+            .child(
+                div()
+                    .text_size(px(typography.t_body_sm))
+                    .text_color(theme.fg_muted)
+                    .child(driver_install::stage_label(stage)),
+            );
+        // Cancel only when this modal started the install — an observed
+        // install (another window's) gets progress but no inert button.
+        if modal.driver_install.is_some() {
+            row = row.child(value_chip(
+                "screen-driver-cancel",
+                "Cancel",
+                theme,
+                density,
+                typography,
+                |this, _w, cx| {
+                    if let Some(handle) = &this.driver_install {
+                        handle.cancel();
+                    }
+                    cx.notify();
+                },
+                cx,
+            ));
+        }
+        return row.into_any_element();
+    }
+
     let colour = match modal.driver_status {
         DriverStatus::Ready { .. } => theme.status_ok,
         DriverStatus::Unknown => theme.fg_muted,
-        DriverStatus::NotInstalled | DriverStatus::Problem { .. } => theme.status_warn,
+        DriverStatus::NotInstalled
+        | DriverStatus::Outdated { .. }
+        | DriverStatus::Problem { .. } => theme.status_warn,
     };
-    div()
+    let failure = match &modal.driver_install_ui {
+        DriverInstallUi::Failed { message } => Some(message.clone()),
+        _ => None,
+    };
+    let status_line = failure
+        .clone()
+        .map(SharedString::from)
+        .unwrap_or_else(|| modal.driver_status.summary());
+
+    let mut row = div()
         .flex()
         .flex_row()
         .items_center()
@@ -205,22 +293,111 @@ fn driver_control(
                 // off the pane — settings prose does not wrap here.
                 .max_w(px(240.0))
                 .text_size(px(typography.t_body_sm))
-                .text_color(colour)
-                .child(modal.driver_status.summary()),
-        )
-        .child(value_chip(
-            "screen-driver-recheck",
-            "Check again",
+                .text_color(if failure.is_some() {
+                    theme.status_warn
+                } else {
+                    colour
+                })
+                .child(status_line),
+        );
+    if let Some(label) = modal.driver_status.install_label() {
+        row = row.child(value_chip(
+            "screen-driver-install",
+            label,
             theme,
             density,
             typography,
-            |this, _w, cx| {
-                this.driver_status = DriverStatus::resolve();
-                cx.notify();
+            |this, _w, cx| this.start_driver_install(cx),
+            cx,
+        ));
+    }
+    // The manual escape hatch: after an install failure, and also for an
+    // on-disk `Problem` — the state the install button is deliberately
+    // withheld for, which would otherwise leave the user with no way forward.
+    if failure.is_some() || matches!(modal.driver_status, DriverStatus::Problem { .. }) {
+        row = row.child(value_chip(
+            "screen-driver-manual",
+            "Download manually",
+            theme,
+            density,
+            typography,
+            |_this, _w, _cx| {
+                crate::shell::open_url::open_url(driver_install::MANUAL_DOWNLOAD_URL);
             },
             cx,
-        ))
-        .into_any_element()
+        ));
+    }
+    row.child(value_chip(
+        "screen-driver-recheck",
+        "Check again",
+        theme,
+        density,
+        typography,
+        |this, _w, cx| {
+            this.driver_status = DriverStatus::resolve();
+            this.driver_install_ui = DriverInstallUi::Idle;
+            cx.notify();
+        },
+        cx,
+    ))
+    .into_any_element()
+}
+
+impl SettingsModal {
+    /// Kick off (or attach to) the driver install and start polling it.
+    pub(super) fn start_driver_install(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.driver_install_ui.is_running() {
+            return;
+        }
+        // Remember whether this is an upgrade before the status flips, so the
+        // stale-daemon note can be shown exactly when it applies.
+        self.driver_upgraded = matches!(
+            self.driver_status,
+            DriverStatus::Ready { .. } | DriverStatus::Outdated { .. }
+        );
+        let (handle, ui) = driver_install::begin();
+        self.driver_install = handle;
+        self.driver_install_ui = ui;
+        self.spawn_driver_install_poll(cx);
+        cx.notify();
+    }
+
+    /// Poll loop: pump backend events into UI state every tick until the
+    /// install reaches a terminal state, then re-resolve the driver status
+    /// (the pipeline's word is never trusted over a fresh `codesign` check).
+    pub(super) fn spawn_driver_install_poll(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.driver_poll_running || !self.driver_install_ui.is_running() {
+            return;
+        }
+        self.driver_poll_running = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(150))
+                    .await;
+                let done = this.update(cx, |this, cx| {
+                    let done =
+                        driver_install::pump(&mut this.driver_install, &mut this.driver_install_ui);
+                    if done {
+                        this.driver_poll_running = false;
+                        this.driver_status = DriverStatus::resolve();
+                        // The note only matters when the upgrade actually
+                        // landed — a failure means the old driver still runs
+                        // and still matches what is on disk.
+                        if !matches!(this.driver_status, DriverStatus::Ready { .. }) {
+                            this.driver_upgraded = false;
+                        }
+                    }
+                    cx.notify();
+                    done
+                });
+                if done.unwrap_or(true) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
 }
 
 /// Where the per-project opt-in actually is.

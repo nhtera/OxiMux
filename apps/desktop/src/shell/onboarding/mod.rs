@@ -8,6 +8,7 @@
 //! windows never consume it, only the fresh-boot window armed by `main.rs`.
 
 mod agent_step;
+mod driver_step;
 mod view;
 mod view_step;
 
@@ -61,13 +62,16 @@ pub enum OnboardingEvent {
     Closed,
 }
 
-/// Which wizard screen is showing. Two steps by design (welcome/agent, then
-/// chat view) — the "You're set" summary exists only in the review mockup, not
-/// in the product: Finish closes straight onto the welcome empty-state card.
+/// Which wizard screen is showing. Agent and chat-view always; the driver
+/// step only when the computer-use driver is missing or stale at open (a
+/// machine that already has it verified never sees the step). The "You're
+/// set" summary exists only in the review mockup, not in the product: Finish
+/// closes straight onto the welcome empty-state card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnboardingStep {
     Agent,
     ChatView,
+    Driver,
 }
 
 /// The first-run welcome wizard: a full-window occluding overlay, deliberately
@@ -110,6 +114,21 @@ pub struct OnboardingWizard {
     /// re-renders don't reset an open dropdown (composer's signature guard).
     model_select_sig: Vec<(String, String, Option<String>)>,
     _model_select_sub: Option<Subscription>,
+    /// Driver check made once at open (it spawns `codesign`); decides whether
+    /// the Driver step exists at all and what its body says.
+    pub(self) driver_status: crate::shell::settings_modal::DriverStatus,
+    /// Frozen at open: whether this run includes the Driver step. Deliberately
+    /// NOT recomputed from live state — a successful install mid-step must not
+    /// change the step count (dots) under the user's feet.
+    pub(self) driver_step_planned: bool,
+    /// Set when the install started from this wizard replaced an existing
+    /// driver — gates the "old version until the daemon respawns" note.
+    pub(self) driver_upgraded: bool,
+    /// The install this wizard started, plus what its step renders — the same
+    /// state machine the settings pane uses (`driver_install`).
+    pub(self) driver_install: Option<crate::shell::driver_install::InstallHandle>,
+    pub(self) driver_install_ui: crate::shell::driver_install::DriverInstallUi,
+    pub(self) driver_poll_running: bool,
 }
 
 impl OnboardingWizard {
@@ -139,6 +158,12 @@ impl OnboardingWizard {
             model_select: None,
             model_select_sig: Vec::new(),
             _model_select_sub: None,
+            driver_status: crate::shell::settings_modal::DriverStatus::Unknown,
+            driver_step_planned: false,
+            driver_upgraded: false,
+            driver_install: None,
+            driver_install_ui: crate::shell::driver_install::DriverInstallUi::Idle,
+            driver_poll_running: false,
         }
     }
 
@@ -152,6 +177,11 @@ impl OnboardingWizard {
         self.open = true;
         self.step = OnboardingStep::Agent;
         self.expanded = false;
+        // Once per open, not per transition: the step count (and dot row)
+        // must be stable for the whole run of the wizard.
+        self.driver_status = crate::shell::settings_modal::DriverStatus::resolve();
+        self.driver_step_planned = self.driver_status.install_label().is_some();
+        self.driver_upgraded = false;
         self.build_roster(cx);
         self.ensure_model_select(window, cx);
         self.sync_model_select(window, cx);
@@ -354,20 +384,39 @@ impl OnboardingWizard {
         }
     }
 
+    /// Whether the Driver step is part of this run — a machine whose driver is
+    /// already installed and verified never sees it. Frozen at open (dots,
+    /// navigation, and button labels must all agree for the whole run, even
+    /// after an install flips the live status to Ready mid-step).
+    pub(super) fn driver_step_needed(&self) -> bool {
+        self.driver_step_planned
+    }
+
     pub(super) fn next(&mut self, cx: &mut Context<Self>) {
         match self.step {
             OnboardingStep::Agent => {
                 self.step = OnboardingStep::ChatView;
                 cx.notify();
             }
-            OnboardingStep::ChatView => self.finish(cx),
+            OnboardingStep::ChatView if self.driver_step_needed() => {
+                self.step = OnboardingStep::Driver;
+                cx.notify();
+            }
+            OnboardingStep::ChatView | OnboardingStep::Driver => self.finish(cx),
         }
     }
 
     pub(super) fn back(&mut self, cx: &mut Context<Self>) {
-        if self.step == OnboardingStep::ChatView {
-            self.step = OnboardingStep::Agent;
-            cx.notify();
+        match self.step {
+            OnboardingStep::Driver => {
+                self.step = OnboardingStep::ChatView;
+                cx.notify();
+            }
+            OnboardingStep::ChatView => {
+                self.step = OnboardingStep::Agent;
+                cx.notify();
+            }
+            OnboardingStep::Agent => {}
         }
     }
 
