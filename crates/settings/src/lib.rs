@@ -6,6 +6,7 @@
 //! Phase 0 ships dark-only. Light mode is a Phase 8+ decision.
 
 pub mod agent_launch;
+pub mod auto_update;
 pub mod autosave;
 pub mod commit_message_ai;
 pub mod computer_use;
@@ -24,6 +25,7 @@ pub use agent_launch::{
     ACP_PRESETS, AcpPreset, AgentLaunchSettings, OpenMode, PerAgentLaunch, Transport, acp_preset,
     import_resume_command, split_args,
 };
+pub use auto_update::AutoUpdateSettings;
 pub use autosave::AutosaveSettings;
 pub use commit_message_ai::{AgentSettings, CommitMessageAiMode, CommitMessageAiSettings};
 pub use computer_use::{AppGrant, ComputerUseSettings};

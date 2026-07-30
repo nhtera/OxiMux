@@ -1,0 +1,29 @@
+[package]
+name = "oximux-auto-update"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Codesign/spctl gates and the same-volume copy/swap primitives the driver
+# installer uses — the updater must not fork its own copies of these.
+oximux-macos-trust.workspace = true
+# Unpredictable staging-dir suffixes; a guessable name in a group-writable
+# /Applications is a symlink pre-plant target.
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# Release feed + DMG download (same sync client as the driver installer).
+ureq.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
