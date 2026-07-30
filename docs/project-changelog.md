@@ -4,6 +4,26 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-31 — v0.1.5: title-bar Update pill + What's New release notes (`main`)
+
+The staged auto-updater (v0.1.4) gets a visible front door: a blue **Update**
+pill in the title bar and a What's New popover with the release's notes.
+
+- **`baf019a`** — `feat(desktop)`: Update pill renders after the wordmark once
+  a new version is downloaded, verified, and staged (never for a merely
+  "available" one), and migrates with the chrome cluster when the left rail
+  collapses. Clicking opens a What's New popover anchored under it: the
+  release's GitHub notes rendered as markdown, with **Later** (update still
+  applies at the next quit) and **Restart to update** (the existing
+  quit-swap-relaunch path). Live-verified end to end against a local feed:
+  pill → popover → restart → bundle swapped → relaunch.
+
+**Touches**: `apps/desktop/src/shell/chrome/whats_new.rs` (new),
+`apps/desktop/src/shell/chrome/top_bar.rs`,
+`apps/desktop/src/workspace_root/{mod,render}.rs`, `apps/desktop/src/actions.rs`
+
+---
+
 ### 2026-07-31 — v0.1.4: auto-update, first-run onboarding, multi-agent session history (`main`)
 
 First release the app can install by itself: v0.1.4 ships the staged
