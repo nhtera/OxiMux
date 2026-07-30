@@ -28,6 +28,7 @@ use gpui_component::{
 };
 
 use oximux_agents::session_log::{
+    import_provider_index::load_import_provider_preview,
     now_unix_ms,
     session_index::{SessionEntry, SessionIndex, SessionScope},
     session_preview::{PreviewMessage, PreviewRole, load_session_preview},
@@ -36,8 +37,8 @@ use oximux_core::AgentAdapter;
 use oximux_settings::{Theme, Typography};
 
 use crate::actions::{OpenChatSession, ResumeAgentSession};
-use crate::shell::agent_ui::agent_presentation::adapter_icon_path;
-use crate::shell::session_history::entry_opens_as_chat;
+use crate::shell::agent_ui::agent_presentation::{adapter_display_name, adapter_icon_path};
+use crate::shell::session_history::{adapter_display, entry_opens_as_chat};
 use crate::shell::session_history::picker::{
     entry_slug, filter_sessions, session_row_subtitle, session_row_title,
 };
@@ -192,31 +193,64 @@ impl SessionHistoryPanel {
 
     /// Expand/collapse a card's inline turn preview. Expanding one collapses the
     /// previous (accordion) and lazily loads the preview off-thread.
-    fn toggle_expand(&mut self, sid: String, path: Option<String>, cx: &mut Context<Self>) {
+    fn toggle_expand(
+        &mut self,
+        sid: String,
+        path: Option<String>,
+        preset_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         if self.expanded.as_deref() == Some(sid.as_str()) {
             self.expanded = None;
         } else {
             self.expanded = Some(sid.clone());
+            let path = path.filter(|p| !p.is_empty());
+            // Path-backed logs (Claude/Codex/Pi) need a path; store-keyed
+            // providers (OpenCode/Copilot SQLite) read by session id alone.
             if !self.previews.contains_key(&sid)
                 && !self.preview_loading.contains(&sid)
-                && let Some(path) = path.filter(|p| !p.is_empty())
+                && (path.is_some() || preset_id.is_some())
             {
-                self.load_preview(sid, path, cx);
+                self.load_preview(sid, path, preset_id, cx);
             }
         }
         cx.notify();
     }
 
     /// Read a session's opening turns off the UI thread and cache them.
-    fn load_preview(&mut self, sid: String, path: String, cx: &mut Context<Self>) {
+    /// Import-provider rows read their own store (SQLite / Pi JSONL); native
+    /// Claude/Codex rows read the transcript `.jsonl` head.
+    fn load_preview(
+        &mut self,
+        sid: String,
+        path: Option<String>,
+        preset_id: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.preview_loading.insert(sid.clone());
+        let session_id = sid.clone();
         let task = cx.spawn(async move |this, cx| {
             let Ok(executor) = this.read_with(cx, |_, cx| cx.background_executor().clone()) else {
                 return;
             };
             let msgs = executor
                 .spawn(async move {
-                    load_session_preview(std::path::Path::new(&path), PREVIEW_MAX_MESSAGES)
+                    if let Some(preset) = preset_id {
+                        match dirs::home_dir() {
+                            Some(home) => load_import_provider_preview(
+                                &home,
+                                &preset,
+                                &session_id,
+                                path.as_deref(),
+                                PREVIEW_MAX_MESSAGES,
+                            ),
+                            None => Vec::new(),
+                        }
+                    } else if let Some(path) = path {
+                        load_session_preview(std::path::Path::new(&path), PREVIEW_MAX_MESSAGES)
+                    } else {
+                        Vec::new()
+                    }
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
@@ -282,8 +316,15 @@ impl SessionHistoryPanel {
                     .child("Loading preview…"),
             );
         } else if let Some(msgs) = self.previews.get(sid).filter(|m| !m.is_empty()) {
+            // Import-provider rows label the assistant side with the provider
+            // name (OpenCode/Copilot/Pi); native rows with the adapter's.
+            let assistant_label = preset_id
+                .as_deref()
+                .map(adapter_display_name)
+                .unwrap_or_else(|| adapter_display(adapter))
+                .to_uppercase();
             for m in msgs {
-                col = col.child(preview_turn(m, theme, typo));
+                col = col.child(preview_turn(m, &assistant_label, theme, typo));
             }
         } else {
             col = col.child(
@@ -495,6 +536,7 @@ impl Render for SessionHistoryPanel {
                     // and the menu are siblings so their clicks never collide.
                     let expand_sid = sid.clone();
                     let expand_path = path.clone();
+                    let expand_preset = preset_id.clone();
                     let header = div()
                         // Stateful id: hover styles only repaint on hover change
                         // for id'd elements; without it the highlight waits for
@@ -526,6 +568,7 @@ impl Render for SessionHistoryPanel {
                                         this.toggle_expand(
                                             expand_sid.clone(),
                                             Some(expand_path.clone()),
+                                            expand_preset.clone(),
                                             cx,
                                         );
                                     }),
@@ -669,10 +712,15 @@ fn hint_row(msg: &str, theme: Theme, typo: &Typography) -> impl IntoElement {
 
 /// One previewed turn: a lifted, bordered box (so consecutive turns read as
 /// distinct cards) with an uppercase role chip over its height-clamped body.
-fn preview_turn(m: &PreviewMessage, theme: Theme, typo: &Typography) -> impl IntoElement {
+fn preview_turn(
+    m: &PreviewMessage,
+    assistant_label: &str,
+    theme: Theme,
+    typo: &Typography,
+) -> impl IntoElement {
     let (label, label_color) = match m.role {
-        PreviewRole::User => ("YOU", theme.focus_ring),
-        PreviewRole::Assistant => ("CLAUDE", theme.fg_muted),
+        PreviewRole::User => ("YOU".to_string(), theme.focus_ring),
+        PreviewRole::Assistant => (assistant_label.to_string(), theme.fg_muted),
     };
     div()
         .flex()

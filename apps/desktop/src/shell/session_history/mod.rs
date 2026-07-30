@@ -946,7 +946,7 @@ fn type_filter_chips(
 }
 
 /// Friendly name for the assistant side of a previewed transcript.
-fn adapter_display(adapter: oximux_core::AgentAdapter) -> &'static str {
+pub(crate) fn adapter_display(adapter: oximux_core::AgentAdapter) -> &'static str {
     match adapter {
         oximux_core::AgentAdapter::ClaudeCode => "Claude",
         oximux_core::AgentAdapter::Codex => "Codex",
