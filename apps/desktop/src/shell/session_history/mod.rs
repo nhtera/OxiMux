@@ -495,7 +495,7 @@ impl SessionHistoryModal {
 /// tab seeds the history and swaps the composer for Resume-in-terminal. Copilot
 /// stays resume-only (no transcript mapper wired); ACP presets / custom terminal
 /// resume in a terminal.
-fn entry_opens_as_chat(entry: &SessionEntry) -> bool {
+pub(crate) fn entry_opens_as_chat(entry: &SessionEntry) -> bool {
     if matches!(
         entry.adapter,
         oximux_core::AgentAdapter::ClaudeCode | oximux_core::AgentAdapter::Codex

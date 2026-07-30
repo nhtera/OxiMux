@@ -3,12 +3,15 @@
 //!
 //! Mirrors the reference agent-cockpit "session history" panel: a
 //! Project/All scope toggle, a search field, and a scrollable list of session
-//! rows (title + msg-count · relative-time · branch). Discovery reuses
-//! [`SessionIndex::build`] on the background executor; row labels + fuzzy filter
-//! reuse the shared [`crate::shell::session_history::picker`] helpers. Choosing a
-//! row dispatches [`OpenChatSession`], routed by `WorkspaceRoot` to the active
-//! pane group (import transcript + resume). Reopening as chat is the panel's one
-//! action; terminal-resume stays on the ⌘⇧H modal.
+//! rows (agent glyph + title + msg-count · relative-time · branch). Discovery
+//! reuses [`SessionIndex::build`] on the background executor; row labels + fuzzy
+//! filter reuse the shared [`crate::shell::session_history::picker`] helpers.
+//! Rows cover every chat-capable adapter (Claude/Codex native, OpenCode/Pi
+//! bridges) and lead with the adapter's icon so a session's origin is readable
+//! at a glance. Choosing a row dispatches [`OpenChatSession`] with the entry's
+//! own adapter + preset, routed by `WorkspaceRoot` to the active pane group
+//! (import transcript + resume). Reopening as chat is the panel's primary
+//! action; terminal-resume is on the row's ⋯ menu and the ⌘⇧H modal.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -33,8 +36,10 @@ use oximux_core::AgentAdapter;
 use oximux_settings::{Theme, Typography};
 
 use crate::actions::{OpenChatSession, ResumeAgentSession};
+use crate::shell::agent_ui::agent_presentation::adapter_icon_path;
+use crate::shell::session_history::entry_opens_as_chat;
 use crate::shell::session_history::picker::{
-    filter_sessions, session_row_subtitle, session_row_title,
+    entry_slug, filter_sessions, session_row_subtitle, session_row_title,
 };
 
 const CARET_BLINK_MS: u64 = 530;
@@ -135,11 +140,10 @@ impl SessionHistoryPanel {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                // Only Claude sessions can be imported into the chat view.
-                this.entries = entries
-                    .into_iter()
-                    .filter(|e| e.adapter == oximux_core::AgentAdapter::ClaudeCode)
-                    .collect();
+                // Every chat-capable session: Claude/Codex import live, OpenCode/
+                // Pi open as transcript bridges. Terminal-only adapters stay on
+                // the ⌘⇧H modal, since this panel's actions all lead to a chat tab.
+                this.entries = entries.into_iter().filter(entry_opens_as_chat).collect();
                 this.loading = false;
                 cx.notify();
             });
@@ -236,11 +240,14 @@ impl SessionHistoryPanel {
 
     /// The expanded card's inline turn preview (or a loading/empty hint) plus an
     /// "Open as chat" action, indented under the chevron.
+    #[allow(clippy::too_many_arguments)]
     fn render_preview(
         &self,
         sid: &str,
         path: &str,
         cwd: &str,
+        adapter: AgentAdapter,
+        preset_id: Option<String>,
         theme: Theme,
         typo: &Typography,
     ) -> impl IntoElement {
@@ -292,9 +299,10 @@ impl SessionHistoryPanel {
             session_id: sid.to_string(),
             path: path.to_string(),
             cwd: cwd.to_string(),
-            // This panel lists only Claude sessions (filtered at build time).
-            adapter: AgentAdapter::ClaudeCode,
-            preset_id: None,
+            adapter,
+            // `Some` for OpenCode/Pi → the handler builds a transcript bridge
+            // instead of a live resume.
+            preset_id,
         };
         col.child(
             div().flex().flex_row().pt(px(2.0)).child(
@@ -351,8 +359,7 @@ impl SessionHistoryPanel {
                 path: entry.path.clone().unwrap_or_default(),
                 cwd,
                 adapter: entry.adapter,
-                // This panel lists only Claude sessions.
-                preset_id: None,
+                preset_id: entry.preset_id.clone(),
             }),
             cx,
         );
@@ -477,6 +484,9 @@ impl Render for SessionHistoryPanel {
                     let sid = entry.session_id.clone();
                     let path = entry.path.clone().unwrap_or_default();
                     let cwd = self.entry_cwd(entry);
+                    let adapter = entry.adapter;
+                    let preset_id = entry.preset_id.clone();
+                    let icon_path = adapter_icon_path(entry_slug(entry));
                     let is_expanded = self.expanded.as_deref() == Some(sid.as_str());
                     let chevron = if is_expanded { "▾" } else { "▸" };
 
@@ -528,6 +538,15 @@ impl Render for SessionHistoryPanel {
                                         .text_color(t.fg_subtle)
                                         .child(chevron),
                                 )
+                                // Leading agent glyph: which agent this session
+                                // belongs to (Claude / Codex / OpenCode / Pi …).
+                                .child(
+                                    Icon::default()
+                                        .path(icon_path)
+                                        .size(px(13.0))
+                                        .flex_shrink_0()
+                                        .text_color(t.fg_muted),
+                                )
                                 .child(
                                     div()
                                         .flex()
@@ -551,11 +570,25 @@ impl Render for SessionHistoryPanel {
                                         }),
                                 ),
                         )
-                        .child(dots_menu(sid.clone(), path.clone(), cwd.clone()));
+                        .child(dots_menu(
+                            sid.clone(),
+                            path.clone(),
+                            cwd.clone(),
+                            adapter,
+                            preset_id.clone(),
+                        ));
 
                     let mut card = div().flex().flex_col().w_full().child(header);
                     if is_expanded {
-                        card = card.child(self.render_preview(&sid, &path, &cwd, t, &typo));
+                        card = card.child(self.render_preview(
+                            &sid,
+                            &path,
+                            &cwd,
+                            adapter,
+                            preset_id.clone(),
+                            t,
+                            &typo,
+                        ));
                     }
                     list = list.child(card);
                 }
@@ -674,20 +707,48 @@ fn preview_turn(m: &PreviewMessage, theme: Theme, typo: &Typography) -> impl Int
 /// The per-row `⋯` actions menu (reopen as chat, resume in terminal, copy ids,
 /// reveal the log). Actions are dispatched or write the clipboard directly, so
 /// the menu needs no entity handle — just the captured session facts.
-fn dots_menu(sid: String, path: String, cwd: String) -> impl IntoElement {
+fn dots_menu(
+    sid: String,
+    path: String,
+    cwd: String,
+    adapter: AgentAdapter,
+    preset_id: Option<String>,
+) -> impl IntoElement {
     Button::new(SharedString::from(format!("hist-dots-{sid}")))
         .ghost()
         .xsmall()
         .icon(Icon::default().path("icons/ellipsis.svg"))
         .tooltip("Session actions")
         .dropdown_menu_with_anchor(Anchor::TopRight, move |menu, _window, _cx| {
-            build_session_menu(menu, sid.clone(), path.clone(), cwd.clone())
+            build_session_menu(
+                menu,
+                sid.clone(),
+                path.clone(),
+                cwd.clone(),
+                adapter,
+                preset_id.clone(),
+            )
         })
 }
 
-fn build_session_menu(menu: PopupMenu, sid: String, path: String, cwd: String) -> PopupMenu {
+fn build_session_menu(
+    menu: PopupMenu,
+    sid: String,
+    path: String,
+    cwd: String,
+    adapter: AgentAdapter,
+    preset_id: Option<String>,
+) -> PopupMenu {
     let has_path = !path.is_empty();
     let (open_sid, open_path, open_cwd) = (sid.clone(), path.clone(), cwd.clone());
+    let open_preset = preset_id.clone();
+    // Pi resumes by rollout file path (`pi --session <file>`); everything else
+    // resumes by session id.
+    let resume_handle = if preset_id.as_deref() == Some("pi") && has_path {
+        path.clone()
+    } else {
+        sid.clone()
+    };
     let (resume_sid, resume_cwd) = (sid.clone(), cwd);
     let copy_sid = sid;
     // These actions are handled by element-level `on_action` handlers on
@@ -703,9 +764,8 @@ fn build_session_menu(menu: PopupMenu, sid: String, path: String, cwd: String) -
                         session_id: open_sid.clone(),
                         path: open_path.clone(),
                         cwd: open_cwd.clone(),
-                        // This panel lists only Claude sessions.
-                        adapter: AgentAdapter::ClaudeCode,
-                        preset_id: None,
+                        adapter,
+                        preset_id: open_preset.clone(),
                     }),
                     cx,
                 );
@@ -716,10 +776,9 @@ fn build_session_menu(menu: PopupMenu, sid: String, path: String, cwd: String) -
                 window.dispatch_action(
                     Box::new(ResumeAgentSession {
                         session_id: resume_sid.clone(),
-                        adapter: AgentAdapter::ClaudeCode,
-                        // Side panel lists Claude sessions only — native resume.
-                        preset_id: None,
-                        resume_handle: resume_sid.clone(),
+                        adapter,
+                        preset_id: preset_id.clone(),
+                        resume_handle: resume_handle.clone(),
                         cwd: resume_cwd.clone(),
                         fork: false,
                     }),
