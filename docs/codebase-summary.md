@@ -1,8 +1,8 @@
 # OxiMux — Codebase Summary
 
-**Updated**: 2026-07-30  
-**Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open index, lifecycle scripts, Create PR + CI checks, floating PiP terminal) + Agent Chat (round-7) shipped to main; Remote Control Phase 1-2 groundwork in progress on `feat/remote-control-headless-registry` (agent-core split + SessionRegistry, not yet wired into the view); external-CLI auto-provisioning (bundled ripgrep + `cua-driver` one-click installer) shipped  
-**Tests**: workspace suite green; `oximux-app` lib 1258 tests (verified this session)
+**Updated**: 2026-07-31  
+**Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open index, lifecycle scripts, Create PR + CI checks, floating PiP terminal) + Agent Chat (round-7) shipped to main; Remote Control Phase 1-2 groundwork in progress on `feat/remote-control-headless-registry` (agent-core split + SessionRegistry, not yet wired into the view); external-CLI auto-provisioning (bundled ripgrep + `cua-driver` one-click installer) shipped; desktop auto-update shipped  
+**Tests**: workspace suite green
 
 ---
 
@@ -65,6 +65,9 @@ src/
 ├── window_factory.rs       open_workspace_window (fresh window, persist_id "main" or minted)
 │                           open_workspace_window_with (with optional PendingTearOff payload);
 │                           registers window in WindowRegistry; last-window quit gate
+├── updater.rs              UpdaterState global; 6h background-check ticker (first check
+│                           60s after boot); boot sweep; apply_pending_at_quit (called from
+│                           on_app_quit) does the atomic bundle swap — never while running
 └── shell/
     ├── mod.rs
     ├── agent_presentation.rs AgentVerb struct + agent_verb() — single source of truth mapping
@@ -107,7 +110,8 @@ src/
     │   ├── pane_terminal.rs terminal settings form; writes terminal.toml via save()
     │   ├── pane_agents.rs  agent settings form; writes commit_message_ai.toml via save()
     │   ├── pane_keybindings.rs read-only keybinding display
-    │   └── pane_about.rs   version + license info
+    │   └── pane_about.rs   version + license info; auto-update toggle, status line,
+    │                       Check now / Restart now / Download update (reads UpdaterState)
     ├── floating_terminal.rs Cmd+Shift+T — in-window draggable/resizable PiP terminal card;
     │                       PTY persists across hide/show; close tears down; geometry
     │                       debounce-persisted to settings repo as JSON; NOT a second OS window
@@ -119,7 +123,9 @@ src/
     ├── pane_layout.rs      layout helpers
     ├── tabbed_pane.rs      TabbedPane entity: tab strip + active terminal
     ├── main_area.rs        thin dispatcher → welcome_view::view
-    ├── status_bar.rs       left | center git zone | right metric strip (N TTY | N agents | N panes)
+    ├── status_bar.rs       left | center git zone | right metric strip (N TTY | N agents | N panes);
+    │                       passive update-ready pill (UpdaterState.ready_version) opens
+    │                       Settings → About instead of restarting directly
     │                       pure helpers: tty_label / agent_label / pane_label / metric_color;
     │                       git zone mounts the SCM panel's cached PrimaryAction as a one-click
     │                       smart button (click → SourceControlPanel::trigger_primary_action)
@@ -229,10 +235,10 @@ src/
 **Tier-1 foldering (2026-06):** the formerly-flat top-level modules are grouped
 one folder deep for traversal (each folder re-exports its submodules at the
 crate root, so `crate::<name>::…` paths are unchanged):
-- `app_settings/` — terminal/motion/scm_layout/keybindings/commit_message_ai/agent_launch settings (host-level; distinct from the `oximux-settings` crate)
+- `app_settings/` — terminal/motion/scm_layout/keybindings/commit_message_ai/agent_launch/auto_update settings (host-level; distinct from the `oximux-settings` crate)
 - `agent_glue/` — agent_awake, agent_hooks_global, agent_status_hooks
 - `session_restore/` — relay_cold_restore, relay_supervisor, restore_fallback, persisted_terminals, git_state_cache (several are `impl WorkspaceRoot`, so they stay in `app`)
-- `platform/` — app_nap, single_instance, window_factory, window_registry, menu
+- `platform/` — app_nap, single_instance, window_factory, window_registry, menu, relaunch (detached-helper "restart to update")
 - `loaders/` — custom_commands_loader, `project_scripts_loader` (reads `.oximux/scripts.toml`), browser_profiles, file_http_client
 - `shell/terminal/` — the ~18 terminal-surface modules (terminal_view/canvas/row/links/palette/scrollbar/search*/context_menu/key_input/mouse_report/cell_metrics/box_drawing/adapter_picker/floating_terminal*)
 
@@ -499,6 +505,65 @@ src/
 
 Full gate order + build-time bundled-ripgrep counterpart:
 `docs/system-architecture.md` → "External tool provisioning".
+
+---
+
+## crates/macos-trust — shared trust primitives
+
+Extracted from `computer-use`'s installer so it and `auto-update` don't fork
+their own copies of the same codesign/spctl gate and crash-safe swap.
+
+```
+src/
+├── lib.rs     SignaturePolicy { identifier, team_id }; TrustError
+├── verify.rs  verify_signed() (codesign --verify --strict + -dvv identifier/
+│              TeamIdentifier parse) → read_signature() (lenient) →
+│              Signature::pinnable() (rejects empty/"not set" team ids) →
+│              verify_notarized_bundle() (spctl --assess)
+├── swap.rs    ditto_copy, exchange (renamex_np RENAME_SWAP), ensure_disk_space,
+│              dir_size, free_bytes
+└── exec.rs    run_bounded — bounded subprocess helper both callers spawn through
+```
+
+`computer-use` keeps only its own driver-specific policy constants; `verify()`
+and the swap primitives now delegate here.
+
+---
+
+## crates/auto-update — desktop self-update
+
+Checks GitHub releases in the background, downloads and stages a verified
+copy of the app next to the installed one, and lets the app's own quit path
+do the atomic swap — the bundle is never replaced while OxiMux is running.
+Full rationale + trust-anchor detail: `docs/system-architecture.md` →
+"Auto-update".
+
+```
+src/
+├── feed.rs      GET GitHub /releases/latest; pins the exact asset name
+│                OxiMux-{version}-macos-arm64.dmg
+├── version.rs   plain x.y.z parse/compare
+├── bundle.rs    eligibility() + boot-time signature pin; UnsupportedReason
+│                (NotABundle / Translocated / RootNotWritable / NoPinnableSignature)
+├── pipeline.rs  download → mount → stage → verify
+└── staging.rs   PendingUpdate manifest, random-suffix staging dirs, boot_sweep,
+                 apply_pending (the quit-time swap), recover_interrupted_swap
+```
+
+Public state machine: `UpdateStatus` (`Idle`/`Checking`/`Downloading`/
+`Installing`/`Ready`/`UpToDate`/`Unsupported`/`Failed`), tagged with a
+`CheckTrigger` (`Background`/`Manual`).
+
+App-side wiring lives outside this crate: `apps/desktop/src/updater.rs`
+(`UpdaterState` global, 6h ticker, boot sweep, quit-time swap via
+`apply_pending_at_quit` from `on_app_quit`), `apps/desktop/src/platform/relaunch.rs`
+(detached `/bin/sh` "restart now" helper — waits for the old pid's flock to
+release, then `open -n`s the bundle), and
+`apps/desktop/src/app_settings/auto_update_settings.rs` +
+`crates/settings/src/auto_update.rs` (`auto_update.toml`: enabled,
+last_run_version). UI surfaces: a passive status-bar pill when an update is
+ready, a Settings → About toggle + status line + Check now / Restart now /
+Download update, and a one-shot "Updated to vX.Y.Z" toast after an update lands.
 
 ---
 

@@ -4,6 +4,12 @@ How an OxiMux release gets built, signed, notarized, and published. The user-fac
 artifact is a styled DMG (`OxiMux-<version>-macos-arm64.dmg`) whose Finder window
 shows the app icon, an Applications alias, and a drag arrow.
 
+The asset name is load-bearing beyond distribution: the in-app auto-updater
+(`crates/auto-update/src/feed.rs`) pins the exact filename
+`OxiMux-{version}-macos-arm64.dmg` when resolving a release's download URL.
+Renaming the DMG artifact breaks auto-update for every install until the
+updater is changed to match.
+
 ## Artifacts & scripts
 
 | Piece | Role |

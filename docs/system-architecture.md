@@ -1,7 +1,7 @@
 # OxiMux — System Architecture
 
-**Updated**: 2026-07-30  
-**Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open, lifecycle scripts, Create PR + CI, floating PiP terminal, markdown preview) shipped; external-CLI auto-provisioning (bundled ripgrep + one-click verified `cua-driver` install) shipped
+**Updated**: 2026-07-31  
+**Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open, lifecycle scripts, Create PR + CI, floating PiP terminal, markdown preview) shipped; external-CLI auto-provisioning (bundled ripgrep + one-click verified `cua-driver` install) shipped; desktop auto-update shipped
 
 ---
 
@@ -70,6 +70,8 @@ backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
 | `pty` | `oximux-pty` | `src/lib.rs` | `TerminalBackend` + `PortablePtyBackend` |
 | `proc-cwd` | `oximux-proc-cwd` | `src/lib.rs` | resolve a process's working dir |
 | `computer-use` | `oximux-computer-use` | `src/lib.rs` | `cua-driver` discovery/verify, permission gate, MCP declaration, one-click installer (`install/`) — never starts/supervises the daemon |
+| `macos-trust` | `oximux-macos-trust` | `src/lib.rs` | shared codesign/spctl verification + crash-safe `renamex_np` bundle swap, extracted from `computer-use` so it and `auto-update` don't fork their own copies |
+| `auto-update` | `oximux-auto-update` | `src/lib.rs` | desktop app self-update: GitHub release feed, download/mount/stage/verify pipeline, `UpdateStatus` state machine — swap is staged only, never live |
 | `git` | `oximux-git` | `src/lib.rs` | `Repository`, `StatusPoller`, git ops, `GhCmd` |
 | `agent-core` | `oximux-agent-core` | `src/lib.rs` | portable `ThreadEvent` vocabulary + stream-json decoder + `ChatThread` fold (serde/serde_json/tracing only, no pty/rusqlite/ACP/gpui/tokio — mobile-portable); re-exported by `agents` under `crate::thread::*` |
 | `agents` | `oximux-agents` | `src/lib.rs` | `AgentRuntime` trait, `CliRuntime`, `StatusMachine`; `SessionRegistry` (gpui-free session event bus + command surface, built for Remote Control, not yet wired into the view) |
@@ -98,6 +100,7 @@ backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
 | `notifier/` | OS notifications |
 | `platform/` | macOS-specific glue (App Nap, single-instance) |
 | `session_restore/` | cold/warm session restore orchestration |
+| `updater.rs` | `UpdaterState` global; 6h background-check ticker; boot sweep; quit-time swap (`apply_pending_at_quit`, called from `on_app_quit`); user-initiated restart |
 
 ### `apps/desktop/src/shell/<domain>/` — GPUI views
 
@@ -967,6 +970,77 @@ because it needs the extracted `.app`, not just the inner binary. The
 a machine-wide singleton other MCP clients share — so a running daemon keeps
 serving the old version until it next respawns; the UI surfaces that after
 an upgrade.
+
+---
+
+## Auto-update
+
+The app checks GitHub releases in the background and, when eligible, ends up
+with a verified update *staged next to the running bundle* — but the swap
+only ever happens as part of quitting, never while the app is live.
+
+**Why the swap can't happen live.** Several subprocesses are resolved from
+the app bundle's path at spawn time: the relay daemon (whose Unix-socket name
+is compiled from `relay-proto`'s `PROTOCOL_VERSION`), the `agent-status` hook
+CLI embedded into already-running agent sessions, and the screen-control
+gate. Swapping the bundle under a live process would pair an old-version app
+with new-version helpers mid-session. So the pipeline stops at a *staged*
+copy plus a manifest, and `apps/desktop/src/updater.rs::apply_pending_at_quit`
+(called from `on_app_quit` in `main.rs`) does the actual `renamex_np` swap
+only after the app has decided to quit. The app never auto-restarts —
+restart is always user-initiated (`RestartToUpdate` action, or "Restart now"
+in Settings → About) — and an ignored update simply applies itself at the
+next ordinary quit.
+
+```
+crates/auto-update/src/
+├── feed.rs      GitHub /releases/latest; pins the exact asset name
+│                OxiMux-{version}-macos-arm64.dmg (see docs/deployment-guide.md)
+├── version.rs   plain x.y.z parse/compare
+├── bundle.rs    eligibility() — is this exe update-capable at all
+│                (UnsupportedReason: NotABundle / Translocated /
+│                RootNotWritable / NoPinnableSignature); boot-time signature pin
+├── pipeline.rs  download → mount DMG → stage a copy → verify
+└── staging.rs   PendingUpdate manifest, random-suffix staging dirs,
+                 boot_sweep (finish/discard a pending update found at boot),
+                 apply_pending (the quit-time swap), recover_interrupted_swap
+```
+
+Public state machine (`UpdateStatus`): `Idle → Checking → Downloading →
+Installing → Ready | UpToDate | Unsupported | Failed`, tagged with a
+`CheckTrigger` (`Background` vs `Manual`) so a background failure stays quiet
+while a user-clicked "Check now" surfaces its error. `apps/desktop/src/updater.rs`
+owns the `UpdaterState` global, a 6h ticker (first check 60s after boot), the
+boot sweep, and the quit-time swap; `apps/desktop/src/platform/relaunch.rs`
+is the detached `/bin/sh` helper for "Restart now" — it waits (bounded ~30s)
+for the old pid to exit (releasing the single-instance `flock`), then
+`open -n`s the bundle, since a new instance launched before the old one
+exits would just bounce off the still-held lock.
+
+**Trust anchor.** The running bundle's own `Identifier` + `TeamIdentifier`,
+captured once at boot via `oximux-macos-trust::read_signature` and never
+re-derived — an ad-hoc or "not set" team id is rejected as a pin
+(`Signature::pinnable()`). The staged copy has to clear, in order: codesign
+integrity (`verify_signed`), the identifier+team pin, `spctl --assess`
+(the only revocation-aware check — a programmatic download carries no
+quarantine xattr for Gatekeeper to check on its own), and a reconciliation of
+the staged bundle's own `Info.plist` `CFBundleShortVersionString` against the
+version the feed advertised, so a compromised feed can't republish an old
+signed build under a high-numbered tag. The download step enforces a
+redirect host allow-list (`github.com` / `*.githubusercontent.com`) and a
+2×-declared-size ceiling. Staging dirs use random suffixes with
+refuse-if-exists + a symlink recheck before the copy lands. Concurrent
+checks are guarded by an `AtomicBool` compare-and-swap. A
+`.update-pending-verify` sentinel wraps the quit-time swap; if boot finds it
+still present, the installed bundle is re-verified before anything else
+runs. `OXIMUX_UPDATE_FEED_URL` / `OXIMUX_UPDATE_SKIP_SPCTL` are
+`#[cfg(debug_assertions)]`-gated debug knobs, absent from release builds.
+
+`crates/macos-trust` (`oximux-macos-trust`) is shared with the `cua-driver`
+installer (see "External tool provisioning" above) — same threat model
+(a programmatic download that never gets Gatekeeper's quarantine-xattr
+check for free), same crash-safe same-volume-copy + `renamex_np(RENAME_SWAP)`
+placement primitive.
 
 ---
 

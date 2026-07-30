@@ -4,6 +4,74 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-31 — Desktop auto-update: background check, staged install, swap only at quit (`main`)
+
+OxiMux now updates itself: the app polls GitHub releases in the background,
+downloads and verifies a new build, and stages it next to the installed one —
+but never swaps a running bundle. The swap happens only as part of quitting,
+and restart is always the user's call.
+
+- **feat**: new `crates/auto-update` (`oximux-auto-update`) — `feed.rs` polls
+  GitHub `/releases/latest` pinned to the exact asset name
+  `OxiMux-{version}-macos-arm64.dmg`; `pipeline.rs` downloads, mounts, and
+  stages a copy; `staging.rs` tracks it via a `PendingUpdate` manifest in a
+  random-suffix staging dir, sweeps pending updates at boot, and does the
+  quit-time swap (`apply_pending`). Public state machine `UpdateStatus`
+  (`Idle`/`Checking`/`Downloading`/`Installing`/`Ready`/`UpToDate`/
+  `Unsupported`/`Failed`) tagged with a `CheckTrigger` so background failures
+  stay quiet while a user-clicked check surfaces its error.
+- **feat**: `apps/desktop/src/updater.rs` wires it into the app — a 6h
+  background ticker (first check 60s after boot), a boot sweep, and
+  `apply_pending_at_quit` called from `on_app_quit` in `main.rs`. The bundle
+  is never swapped while OxiMux runs: the relay daemon, the `agent-status`
+  hook CLI embedded into live agent sessions, and the screen-control gate are
+  all resolved from the bundle path at spawn time, so a live swap would hand
+  an old-version app new-version helpers. The app never auto-restarts;
+  restart is user-initiated only (`RestartToUpdate` action / "Restart now" in
+  Settings → About), and an ignored update just applies at the next ordinary
+  quit via `apps/desktop/src/platform/relaunch.rs` (a detached `/bin/sh`
+  helper that waits up to ~30s for the old pid's single-instance flock to
+  release before `open -n`-ing the new bundle).
+- **feat**: UI — a passive status-bar pill when an update is ready (opens
+  Settings → About); an automatic-updates toggle, status line, and Check now
+  / Restart now / Download update controls in Settings → About; a one-shot
+  "Updated to vX.Y.Z" toast after an update lands. Settings persist to
+  `auto_update.toml` via `apps/desktop/src/app_settings/auto_update_settings.rs`
+  + `crates/settings/src/auto_update.rs`.
+- **refactor**: new `crates/macos-trust` (`oximux-macos-trust`) extracts the
+  codesign/spctl verification and crash-safe `renamex_np` bundle-swap
+  primitives out of `crates/computer-use`'s driver installer, so the updater
+  doesn't fork its own copy of the same gate. `computer-use` now delegates to
+  it and keeps only its own driver-specific policy constants.
+- **security**: trust anchor is the running bundle's own `Identifier` +
+  `TeamIdentifier`, captured once at boot and never re-derived; ad-hoc or
+  "not set" team ids are rejected as pins. The staged copy must clear
+  codesign integrity, the identifier+team pin, `spctl --assess` (the only
+  revocation-aware check — a programmatic download carries no quarantine
+  xattr for Gatekeeper to check on its own), and a reconciliation of the
+  staged bundle's own `Info.plist` version against the version the feed
+  advertised, so a compromised feed can't republish an old signed build under
+  a high-numbered tag. Downloads enforce a redirect host allow-list
+  (`github.com` / `*.githubusercontent.com`) and a 2×-declared-size ceiling.
+  Staging dirs use random suffixes with refuse-if-exists + a symlink recheck.
+  Re-entrancy is an `AtomicBool` compare-and-swap. A `.update-pending-verify`
+  sentinel wraps the quit-time swap; found at boot, it triggers
+  re-verification of the installed bundle before anything else runs.
+  `OXIMUX_UPDATE_FEED_URL` / `OXIMUX_UPDATE_SKIP_SPCTL` debug knobs are
+  `#[cfg(debug_assertions)]`-gated and verified absent from release builds.
+
+**Touches**: `crates/macos-trust/` (new), `crates/auto-update/` (new),
+`apps/desktop/src/updater.rs` (new), `apps/desktop/src/main.rs`,
+`apps/desktop/src/platform/relaunch.rs` (new),
+`apps/desktop/src/app_settings/auto_update_settings.rs` (new),
+`crates/settings/src/auto_update.rs` (new),
+`apps/desktop/src/shell/settings_modal/pane_about.rs`,
+`apps/desktop/src/shell/chrome/status_bar.rs`,
+`apps/desktop/src/workspace_root/render.rs`,
+`crates/computer-use/src/verify.rs`, `crates/computer-use/Cargo.toml`
+
+---
+
 ### 2026-07-30 — External-CLI auto-provisioning: zero-setup search + one-click driver install (`main`)
 
 Two setup steps that used to require a manual terminal command are now handled
