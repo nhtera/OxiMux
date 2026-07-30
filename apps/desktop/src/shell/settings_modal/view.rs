@@ -75,7 +75,10 @@ impl SettingsModal {
                 ),
                 (
                     SettingsPane::About.label(),
-                    pane_about::about_entries(theme, typography),
+                    pane_about::update_entries(theme, density, typography, cx)
+                        .into_iter()
+                        .chain(pane_about::about_entries(theme, typography))
+                        .collect(),
                 ),
             ];
             return layout::search_results(&query, groups, theme, typography);
@@ -97,7 +100,9 @@ impl SettingsModal {
                 pane_keybindings::render(self, theme, density, typography, cx)
             }
             SettingsPane::Appearance => pane_about::render_appearance(&query, theme, typography),
-            SettingsPane::About => pane_about::render_about(&query, theme, typography),
+            SettingsPane::About => {
+                pane_about::render_about(&query, theme, density, typography, cx)
+            }
         }
     }
 }

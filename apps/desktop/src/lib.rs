@@ -14,6 +14,7 @@ pub mod remote_control;
 pub mod scheduler;
 pub mod shell;
 pub mod state;
+pub mod updater;
 pub mod workspace_root;
 
 // Shared widget layer extracted to the `oximux-ui` crate. Re-exported under the
@@ -37,8 +38,9 @@ pub use agent_glue::{agent_awake, agent_hooks_global, agent_status_hooks};
 pub use shell::agent_chat::clear_stale_screen_control_grants;
 #[doc(inline)]
 pub use app_settings::{
-    agent_launch_settings, commit_message_ai_settings, computer_use_settings, dictation_settings,
-    keybindings_settings, motion_settings, scm_layout_settings, terminal_settings,
+    agent_launch_settings, auto_update_settings, commit_message_ai_settings, computer_use_settings,
+    dictation_settings, keybindings_settings, motion_settings, scm_layout_settings,
+    terminal_settings,
 };
 #[doc(inline)]
 pub use loaders::{

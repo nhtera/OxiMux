@@ -687,6 +687,9 @@ impl Render for WorkspaceRoot {
                 this.project_picker
                     .update(cx, |p, cx| p.open(projects, window, cx));
             }))
+            .on_action(cx.listener(|_this, _: &RestartToUpdate, _window, cx| {
+                crate::updater::restart_to_update(cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 // Toggle: a second Cmd+, (or cog click) closes it.
                 if this.settings_modal.read(cx).is_open() {
@@ -1565,6 +1568,10 @@ impl Render for WorkspaceRoot {
                 // `update` (not `update_in`) per the GPUI memory note.
                 let scm_for_click = scm_panel.clone();
                 let weak_for_usage = cx.entity().downgrade();
+                let update_ready = cx
+                    .try_global::<crate::updater::UpdaterState>()
+                    .and_then(|state| state.ready_version().map(str::to_string));
+                let settings_for_update = self.settings_modal.downgrade();
                 status_bar::view(
                     theme,
                     density,
@@ -1575,6 +1582,7 @@ impl Render for WorkspaceRoot {
                     git_state.as_ref(),
                     primary,
                     self.usage_state.as_ref(),
+                    update_ready,
                     move |window, cx| {
                         if let Some(sc) = scm_for_click.clone() {
                             sc.update(cx, |panel, cx| {
@@ -1584,6 +1592,20 @@ impl Render for WorkspaceRoot {
                     },
                     move |window, cx| {
                         WorkspaceRoot::toggle_usage_popover(&weak_for_usage, window, cx);
+                    },
+                    move |window, cx| {
+                        // Everything about the update — notes, the restart
+                        // button, the automatic-checks toggle — lives in one
+                        // pane. The pill just takes them there.
+                        if let Some(modal) = settings_for_update.upgrade() {
+                            modal.update(cx, |m, cx| {
+                                m.open_to_pane(
+                                    crate::shell::settings_modal::SettingsPane::About,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
                     },
                 )
             })

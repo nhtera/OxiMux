@@ -1,11 +1,23 @@
-//! Read-only Appearance + About panes. Surfaces the active design tokens
-//! and build/runtime facts; nothing here writes to disk.
+//! Appearance + About panes: design tokens, build facts, and the update
+//! controls.
+//!
+//! The About pane is where *all* update feedback lives. Checking, downloading
+//! and failures never surface anywhere else in the app — a background check
+//! that fails is the updater's problem, not an interruption to hand the user.
+//! The one exception is a ready update, which earns a passive pill in the
+//! status bar because it is the only state that asks anything of them.
 
 use gpui::{AnyElement, IntoElement, ParentElement, SharedString, Styled, div, px};
-use oximux_settings::{Theme, Typography};
+use oximux_auto_update::{CheckTrigger, UpdateStatus};
+use oximux_settings::{AutoUpdateSettings, Theme, Typography};
 
-use super::controls::info_row;
-use super::layout::{SettingEntry, entry};
+use super::controls::{info_row, value_chip};
+use super::layout::{SettingEntry, entries_card, entry};
+use super::SettingsModal;
+use crate::updater::UpdaterState;
+
+/// Where a user goes when the app cannot update itself.
+const RELEASES_URL: &str = "https://github.com/nhtera/OxiMux/releases/latest";
 
 /// The Appearance pane's `label: value` facts.
 fn appearance_pairs(typography: &Typography) -> Vec<(SharedString, SharedString)> {
@@ -117,12 +129,196 @@ pub(super) fn render_appearance(query: &str, theme: Theme, typography: &Typograp
     )
 }
 
-pub(super) fn render_about(query: &str, theme: Theme, typography: &Typography) -> AnyElement {
-    info_pane(
+/// One line describing where the updater currently stands.
+///
+/// A failed *background* check reads as an aside ("will retry"), because the
+/// user did not ask and nothing is broken from where they sit. A failed
+/// *manual* check names the actual error — they clicked, so they are owed the
+/// reason.
+fn status_line(status: &UpdateStatus) -> String {
+    match status {
+        UpdateStatus::Idle => "Checks automatically".into(),
+        UpdateStatus::Checking { .. } => "Checking…".into(),
+        UpdateStatus::Downloading {
+            version,
+            received,
+            total,
+        } => match total {
+            Some(total) if *total > 0 => {
+                format!("Downloading v{version} — {}%", received * 100 / total)
+            }
+            _ => format!("Downloading v{version}…"),
+        },
+        UpdateStatus::Installing { version } => format!("Preparing v{version}…"),
+        UpdateStatus::Ready { version, .. } => {
+            format!("v{version} ready — restart to apply")
+        }
+        UpdateStatus::UpToDate => "Up to date".into(),
+        UpdateStatus::Unsupported(reason) => reason.describe().to_string(),
+        UpdateStatus::Failed {
+            error,
+            trigger: CheckTrigger::Manual,
+        } => format!("Couldn't check: {error}"),
+        UpdateStatus::Failed {
+            trigger: CheckTrigger::Background,
+            ..
+        } => "Couldn't check — will retry".into(),
+    }
+}
+
+/// Colour the status text by whether it wants attention. Only a ready update
+/// and a manual failure get a non-muted colour; everything else is chrome.
+fn status_colour(status: &UpdateStatus, theme: Theme) -> gpui::Hsla {
+    match status {
+        UpdateStatus::Ready { .. } => theme.status_ok,
+        UpdateStatus::Failed {
+            trigger: CheckTrigger::Manual,
+            ..
+        } => theme.status_error,
+        _ => theme.fg_muted,
+    }
+}
+
+/// The update row's right-hand control: status text plus a check button.
+///
+/// The button stays available while a check runs — the pipeline's own guard
+/// rejects a second one, so a click during a background check is harmless
+/// rather than something to disable a control over.
+fn update_control(
+    theme: Theme,
+    density: oximux_settings::Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    let status = cx
+        .try_global::<UpdaterState>()
+        .map_or(UpdateStatus::Idle, |state| state.status.clone());
+    let updatable = !matches!(status, UpdateStatus::Unsupported(_));
+
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(density.gap_inline))
+        .child(
+            div()
+                .text_size(px(typography.t_body_sm))
+                .text_color(status_colour(&status, theme))
+                .child(status_line(&status)),
+        );
+
+    if matches!(status, UpdateStatus::Ready { .. }) {
+        row = row.child(value_chip(
+            "auto-update-restart",
+            "Restart now",
+            theme,
+            density,
+            typography,
+            |_this, _w, cx| {
+                crate::updater::restart_to_update(cx);
+            },
+            cx,
+        ));
+    } else if updatable {
+        row = row.child(value_chip(
+            "auto-update-check",
+            "Check now",
+            theme,
+            density,
+            typography,
+            |_this, _w, cx| {
+                crate::updater::check_now(cx);
+                cx.notify();
+            },
+            cx,
+        ));
+    } else {
+        // Can't self-update, but the user is not stuck: a manual download
+        // still works, and for a non-writable install root that is the whole
+        // remedy. Without this the row states a problem and offers nothing.
+        row = row.child(value_chip(
+            "auto-update-download",
+            "Download update",
+            theme,
+            density,
+            typography,
+            |_this, _w, cx| {
+                cx.open_url(RELEASES_URL);
+            },
+            cx,
+        ));
+    }
+    row.into_any_element()
+}
+
+/// The About pane's interactive rows. Kept separate from `about_pairs` so the
+/// read-only facts stay a plain list.
+pub(super) fn update_entries(
+    theme: Theme,
+    density: oximux_settings::Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> Vec<SettingEntry> {
+    let enabled = cx
+        .try_global::<AutoUpdateSettings>()
+        .is_none_or(|settings| settings.enabled);
+
+    vec![
+        entry(
+            "Automatic updates",
+            "Check for new versions in the background. Updates apply when you \
+             quit — OxiMux never restarts on its own.",
+            super::controls::toggle_switch(
+                "auto-update-enabled",
+                enabled,
+                theme,
+                |_this, _w, cx| {
+                    let mut settings = cx
+                        .try_global::<AutoUpdateSettings>()
+                        .cloned()
+                        .unwrap_or_default();
+                    settings.enabled = !settings.enabled;
+                    if let Err(err) = crate::auto_update_settings::save(&settings, cx) {
+                        tracing::warn!(%err, "could not persist auto-update settings");
+                    }
+                    cx.notify();
+                },
+                cx,
+            ),
+        ),
+        entry(
+            "Updates",
+            "",
+            update_control(theme, density, typography, cx),
+        ),
+    ]
+}
+
+pub(super) fn render_about(
+    query: &str,
+    theme: Theme,
+    density: oximux_settings::Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    let facts = info_pane(
         query,
         &about_pairs(),
         "Agent cockpit — terminals, git review, and AI sessions in one window.",
         theme,
         typography,
-    )
+    );
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(16.0))
+        .child(entries_card(
+            theme,
+            density,
+            typography,
+            update_entries(theme, density, typography, cx),
+        ))
+        .child(facts)
+        .into_any_element()
 }

@@ -80,7 +80,7 @@ use crate::actions::{
     CreateWorktreeWorkspaceForActiveChat,
     OpenFileTreeContextMenuAt, OpenGitRowContextMenuAt, OpenPaneActions, OpenPaneActionsAt,
     NewBrowserTab, NewTab, OpenChatSession, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory,
-    OpenSettings, ShowWelcomeWizard,
+    OpenSettings, RestartToUpdate, ShowWelcomeWizard,
     OpenTabContextMenuAt, OpenTerminalContextMenuAt, ResumeAgentSession,
     OpenWorkspaceCreate, OpenWorkspaceJump, RequestOpenAdapterPicker, Search, SelectExplorerTab,
     SelectFilesTab, SelectHistoryTab,

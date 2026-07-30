@@ -445,6 +445,14 @@ impl SettingsModal {
         cx.notify();
     }
 
+    /// Open straight to `pane` — for callers that are already answering a
+    /// specific question, like the status-bar update pill.
+    pub fn open_to_pane(&mut self, pane: SettingsPane, window: &mut Window, cx: &mut Context<Self>) {
+        self.open(window, cx);
+        self.selected = pane;
+        cx.notify();
+    }
+
     pub(super) fn select_pane(&mut self, pane: SettingsPane, cx: &mut Context<Self>) {
         self.selected = pane;
         cx.notify();

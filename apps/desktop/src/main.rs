@@ -284,6 +284,11 @@ fn main() {
         // global and defaulting — the two agree, but only one of them is a
         // decision the user made.
         oximux_app::computer_use_settings::install(cx);
+        // Auto-update settings, and with them the answer to "did this boot
+        // follow an update?" — which has to be read before the recorded
+        // version is overwritten, so it is settled here and announced once a
+        // window exists to announce it in.
+        let upgraded_this_boot = oximux_app::auto_update_settings::install(cx);
         // The menu-bar indicator that appears while an agent can drive the
         // screen. Watches the grant table rather than the approval path,
         // because the enforcement hook grants from its own process — see the
@@ -443,6 +448,13 @@ fn main() {
         // hold, and gating it on "are there any schedules" would mean the first
         // one created never fires until the next launch.
         oximux_app::scheduler::Scheduler::install(app_state.schedule_store(), cx);
+        // Auto-update: recovers from an interrupted swap, sweeps crash
+        // leftovers, then checks periodically. Staging only — the swap itself
+        // happens at quit, so the running workspace is never disturbed.
+        oximux_app::updater::install(cx);
+        if upgraded_this_boot {
+            oximux_app::updater::announce_update(cx);
+        }
         // Install the full keymap (registry defaults ⊕ keybindings.toml
         // overrides) — this covers the menu-action chords too, and MUST run
         // before `set_menus`: GPUI reads the keymap when it builds the menu
@@ -570,6 +582,18 @@ fn install_app_lifecycle(
         // Agent picker instantly instead of paying a cold backend spawn.
         if let Some(cache) = cx.try_global::<oximux_app::catalog_cache::CatalogCache>() {
             cache.save_to(&quit_settings_repo);
+        }
+        // Apply a staged update, if one is waiting. Deliberately last: the
+        // session is already captured, so a swap that somehow stalls cannot
+        // cost the user their workspace. The swap itself is one rename —
+        // it is the re-verification either side of it that takes the time.
+        let swap_started = std::time::Instant::now();
+        let from_signal = SHUTDOWN_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+        if oximux_app::updater::apply_pending_at_quit(cx, from_signal) {
+            tracing::info!(
+                elapsed_ms = swap_started.elapsed().as_millis() as u64,
+                "quit: applied staged update"
+            );
         }
         async {}
     })

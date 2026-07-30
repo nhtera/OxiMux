@@ -100,7 +100,7 @@ pub fn primary_button_visible(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn view<F, G>(
+pub fn view<F, G, H>(
     theme: Theme,
     density: Density,
     typography: &Typography,
@@ -110,12 +110,16 @@ pub fn view<F, G>(
     git_state: Option<&PollState>,
     primary: Option<PrimaryAction>,
     usage: Option<&UsageState>,
+    // Version of a staged update awaiting restart, if any.
+    update_ready: Option<String>,
     on_primary_click: F,
     on_usage_click: G,
+    on_update_click: H,
 ) -> impl IntoElement
 where
     F: Fn(&mut Window, &mut App) + 'static,
     G: Fn(&mut Window, &mut App) + 'static,
+    H: Fn(&mut Window, &mut App) + 'static,
 {
     let git_label = git_zone_label(git_state);
     let show_primary = primary_button_visible(git_state, primary.as_ref());
@@ -216,6 +220,30 @@ where
             .child(label)
     });
 
+    // The only place a pending update touches the main window. Passive on
+    // purpose: it states a fact and opens the pane that explains it, rather
+    // than restarting anything on a stray click — an accidental restart would
+    // interrupt whatever the user's agents are mid-way through.
+    let update_pill = update_ready.map(|version| {
+        let hover_bg = theme.hover_overlay;
+        div()
+            .id("status-bar-update-ready")
+            .flex()
+            .items_center()
+            .h(px(16.))
+            .px(px(6.))
+            .rounded(px(density.r_chip))
+            .bg(theme.status_ok.alpha(0.12))
+            .text_size(px(typography.t_body_sm))
+            .text_color(theme.status_ok)
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg))
+            .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+                on_update_click(window, cx);
+            })
+            .child(format!("v{version} ready — restart to update"))
+    });
+
     div()
         .flex()
         .flex_row()
@@ -231,9 +259,11 @@ where
                 .flex()
                 .flex_1()
                 .items_center()
+                .gap(px(6.))
                 .text_size(px(typography.t_body_sm))
                 .text_color(theme.fg_subtle)
-                .child(format!("OxiMux v{}", env!("CARGO_PKG_VERSION"))),
+                .child(format!("OxiMux v{}", env!("CARGO_PKG_VERSION")))
+                .children(update_pill),
         )
         .child(git_zone)
         .child(

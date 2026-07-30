@@ -29,6 +29,7 @@ pub mod escape_tap;
 pub mod login_path;
 pub mod menu;
 pub mod mic_permission;
+pub mod relaunch;
 pub mod screen_control_indicator;
 pub mod secure_input;
 pub mod single_instance;

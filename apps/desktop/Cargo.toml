@@ -14,6 +14,8 @@ path = "src/main.rs"
 [dependencies]
 oximux-agents = { workspace = true }
 oximux-computer-use = { workspace = true }
+oximux-auto-update = { workspace = true }
+oximux-macos-trust = { workspace = true }
 oximux-core = { workspace = true }
 oximux-dictation = { workspace = true }
 oximux-editor = { workspace = true }
