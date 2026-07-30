@@ -285,7 +285,7 @@ fn download(
 
         // Throttle progress to whole-percent steps so the UI is not repainted
         // per 64 KiB chunk.
-        let percent = if total > 0 { received * 100 / total } else { 0 };
+        let percent = (received * 100).checked_div(total).unwrap_or(0);
         if percent > last_percent {
             last_percent = percent;
             emit(UpdateStatus::Downloading {

@@ -226,15 +226,15 @@ pub fn boot_sweep(cache_dir: &Path, bundle_root: &Path, manifest_path: &Path) {
     // Staging dirs are invisible in Finder; anything the manifest does not
     // reference would otherwise leak a full app copy per crash, forever.
     let referenced = PendingUpdate::load(manifest_path).map(|pending| pending.staged_path);
-    if let Some(parent) = bundle_root.parent() {
-        if let Ok(entries) = fs::read_dir(parent) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if name.starts_with(STAGING_PREFIX) && Some(&path) != referenced.as_ref() {
-                    let _ = fs::remove_dir_all(&path);
-                }
+    if let Some(parent) = bundle_root.parent()
+        && let Ok(entries) = fs::read_dir(parent)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(STAGING_PREFIX) && Some(&path) != referenced.as_ref() {
+                let _ = fs::remove_dir_all(&path);
             }
         }
     }

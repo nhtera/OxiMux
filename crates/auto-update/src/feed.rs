@@ -61,7 +61,7 @@ pub fn parse_latest(body: &str) -> Result<Release, UpdateError> {
         .assets
         .into_iter()
         .find(|asset| asset.name == wanted)
-        .ok_or_else(|| UpdateError::MissingAsset {
+        .ok_or(UpdateError::MissingAsset {
             name: wanted,
             tag: release.tag_name,
         })?;

@@ -123,7 +123,7 @@ pub fn install(cx: &mut App) {
             Ok(config) => config,
             Err(reason) => {
                 tracing::debug!(?reason, "auto-update disabled for this install");
-                let _ = cx.update(|cx| set_status(cx, UpdateStatus::Unsupported(reason)));
+                cx.update(|cx| set_status(cx, UpdateStatus::Unsupported(reason)));
                 return;
             }
         };
@@ -132,7 +132,7 @@ pub fn install(cx: &mut App) {
         // anything could have been staged. It is the process's trust anchor
         // for the rest of its life — including the quit-time swap, which
         // reads it back out of the global rather than re-deriving it.
-        let _ = cx.update(|cx| {
+        cx.update(|cx| {
             cx.global_mut::<UpdaterState>().config = Some(config.clone());
         });
 
@@ -153,7 +153,7 @@ pub fn install(cx: &mut App) {
             })
             .await;
         if let Some(status) = interrupted {
-            let _ = cx.update(|cx| set_status(cx, status));
+            cx.update(|cx| set_status(cx, status));
         }
 
         cx.background_executor().timer(FIRST_CHECK_DELAY).await;
@@ -204,7 +204,7 @@ pub fn announce_update(cx: &mut App) {
         cx.background_executor()
             .timer(Duration::from_millis(1500))
             .await;
-        let _ = cx.update(|cx| {
+        cx.update(|cx| {
             crate::shell::chrome::toast::toast(
                 cx,
                 crate::shell::chrome::toast::ToastKind::Success,
@@ -253,7 +253,7 @@ async fn run_check(config: UpdaterConfig, trigger: CheckTrigger, cx: &mut AsyncA
         let drained: Vec<UpdateStatus> = rx.try_iter().collect();
         let finished = handle.is_finished();
         for status in drained {
-            let _ = cx.update(|cx| set_status(cx, status));
+            cx.update(|cx| set_status(cx, status));
         }
         if finished {
             break;
@@ -267,7 +267,7 @@ async fn run_check(config: UpdaterConfig, trigger: CheckTrigger, cx: &mut AsyncA
         .spawn(async move { handle.join() })
         .await
     {
-        let _ = cx.update(|cx| set_status(cx, terminal));
+        cx.update(|cx| set_status(cx, terminal));
     }
 }
 
