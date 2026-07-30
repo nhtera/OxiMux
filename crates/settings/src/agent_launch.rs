@@ -367,8 +367,26 @@ impl AgentLaunchSettings {
 
     /// Mutable launch entry for `adapter_id`, inserting a default if absent.
     /// Used by the settings UI to flip toggles.
+    ///
+    /// Minting an entry hides the ACP-preset fallback from every resolution
+    /// accessor (`chat_capable`, `transport_for`, `acp_command_for`, …), so a
+    /// fresh entry for a preset id is seeded with the preset's ACP wiring —
+    /// otherwise the first UI toggle (skip-perms, model, enabled) would
+    /// silently flip Cursor/Amp/OpenCode terminal-only. A hand-written TOML
+    /// entry never passes through here, so writing a bare `[agents.cursor]`
+    /// block still suppresses the preset deliberately.
     pub fn entry_mut(&mut self, adapter_id: &str) -> &mut PerAgentLaunch {
-        self.agents.entry(adapter_id.to_string()).or_default()
+        self.agents.entry(adapter_id.to_string()).or_insert_with(|| {
+            match acp_preset(adapter_id) {
+                Some(p) => PerAgentLaunch {
+                    transport: Transport::Acp,
+                    acp_command: p.command.to_string(),
+                    acp_args: p.args.to_string(),
+                    ..PerAgentLaunch::default()
+                },
+                None => PerAgentLaunch::default(),
+            }
+        })
     }
 
     /// Extra CLI args for `adapter_id`, shell-split into argv tokens. Empty
@@ -819,6 +837,32 @@ disabled = true
         let mut s = AgentLaunchSettings::default();
         s.entry_mut("codex").args = "--foo".into();
         assert_eq!(s.args_for("codex"), vec!["--foo"]);
+        // Non-preset ids mint the plain default: no phantom ACP wiring.
+        let e = s.for_agent("codex").unwrap();
+        assert_eq!(e.transport, Transport::StreamJson);
+        assert!(e.acp_command.is_empty());
+    }
+
+    #[test]
+    fn entry_mut_on_preset_id_seeds_preset_wiring() {
+        // Any UI chip toggle mints its entry through entry_mut. A bare default
+        // entry would suppress the preset fallback (see
+        // non_acp_entry_on_a_preset_id_suppresses_the_preset) and silently
+        // flip the agent terminal-only — so a fresh entry for a preset id must
+        // carry the preset's ACP wiring through every resolution accessor.
+        for p in ACP_PRESETS {
+            let mut s = AgentLaunchSettings::default();
+            s.entry_mut(p.id).disabled = true; // any toggle that mints an entry
+            assert!(s.chat_capable(p.id), "{} must stay chat-capable", p.id);
+            assert_eq!(s.transport_for(p.id), Transport::Acp, "{}", p.id);
+            assert_eq!(s.acp_command_for(p.id).as_deref(), Some(p.command));
+            assert_eq!(s.acp_args_for(p.id), split_args(p.args));
+        }
+        // Seeding happens only at mint: an existing user entry is never touched.
+        let mut s = AgentLaunchSettings::default();
+        s.agents.insert("cursor".into(), PerAgentLaunch::default());
+        s.entry_mut("cursor").model = "m".into();
+        assert!(s.for_agent("cursor").unwrap().acp_command.is_empty());
     }
 
     #[test]

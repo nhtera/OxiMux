@@ -427,21 +427,10 @@ fn apply_finish(
 ) {
     launch.default_agent = selected_agent.to_string();
     if let Some(wire) = model {
-        // A preset agent (Cursor/Amp/OpenCode) is chat-capable only through
-        // the "no user entry" preset fallback — minting a bare entry here just
-        // to hold the model would flip it terminal-only (default transport is
-        // StreamJson with no ACP command). Seed the preset's ACP wiring into
-        // the fresh entry so an explicit model pick can't strip capability.
-        // An entry the user already configured is left untouched.
-        let fresh = launch.for_agent(selected_agent).is_none();
-        let preset = oximux_settings::acp_preset(selected_agent);
-        let entry = launch.entry_mut(selected_agent);
-        entry.model = wire.to_string();
-        if fresh && let Some(preset) = preset {
-            entry.transport = oximux_settings::Transport::Acp;
-            entry.acp_command = preset.command.to_string();
-            entry.acp_args = preset.args.to_string();
-        }
+        // entry_mut seeds a preset's ACP wiring when it mints a fresh entry,
+        // so holding the model here can't flip Cursor/Amp/OpenCode
+        // terminal-only (see finish_model_pick_keeps_preset_agent_chat_capable).
+        launch.entry_mut(selected_agent).model = wire.to_string();
     }
     launch.default_open_mode = open_mode;
 }
@@ -500,9 +489,11 @@ mod tests {
 
     #[test]
     fn finish_model_pick_keeps_preset_agent_chat_capable() {
-        // Regression: entry_mut on a preset id mints a default (StreamJson,
-        // no ACP command) entry, which used to flip Cursor/Amp/OpenCode
-        // terminal-only the moment a model was picked in onboarding.
+        // Regression: entry_mut on a preset id used to mint a bare default
+        // (StreamJson, no ACP command) entry, flipping Cursor/Amp/OpenCode
+        // terminal-only the moment a model was picked in onboarding. The guard
+        // now lives in AgentLaunchSettings::entry_mut; this test pins the
+        // Finish path end to end.
         for id in ["opencode", "cursor", "amp"] {
             let mut launch = AgentLaunchSettings::default();
             assert!(launch.chat_capable(id), "{id} chat-capable via preset fallback");
