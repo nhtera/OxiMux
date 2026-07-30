@@ -12,6 +12,9 @@ path = "src/lib.rs"
 
 [dependencies]
 oximux-agent-core.workspace = true
+# Shared codesign/spctl gates and atomic-swap primitives (also used by the
+# app's own updater — the two must not fork).
+oximux-macos-trust.workspace = true
 serde.workspace = true
 # `proc_pidpath`, for resolving a granted pid back to its executable.
 libc = "0.2"

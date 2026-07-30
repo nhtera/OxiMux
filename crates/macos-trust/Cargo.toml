@@ -1,0 +1,19 @@
+[package]
+name = "oximux-macos-trust"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# `renamex_np` (atomic two-path exchange) and `statvfs` (free-space probe).
+libc = "0.2"
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

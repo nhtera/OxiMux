@@ -10,6 +10,8 @@ members = [
     "crates/agent-core",
     "crates/agents",
     "crates/computer-use",
+    "crates/macos-trust",
+    "crates/auto-update",
     "crates/editor",
     "crates/storage",
     "crates/settings",
@@ -44,6 +46,8 @@ oximux-git      = { path = "crates/git" }
 oximux-agent-core = { path = "crates/agent-core" }
 oximux-agents   = { path = "crates/agents" }
 oximux-computer-use = { path = "crates/computer-use" }
+oximux-macos-trust = { path = "crates/macos-trust" }
+oximux-auto-update = { path = "crates/auto-update" }
 oximux-editor   = { path = "crates/editor" }
 oximux-storage  = { path = "crates/storage" }
 oximux-settings = { path = "crates/settings" }

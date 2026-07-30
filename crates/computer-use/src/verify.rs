@@ -24,6 +24,11 @@
 //!    not a gate.
 //! 3. Notarization ticket stapled — Apple has seen it.
 //!
+//! The gates themselves live in `oximux-macos-trust` (shared with the app's
+//! own updater — forked copies of signature-checking code would drift); this
+//! module owns the driver-specific policy, the version floor, and the audit
+//! hash.
+//!
 //! The observed SHA-256 is still computed and reported, so the settings pane
 //! and bug reports can state exactly which bytes ran. It is an audit trail,
 //! not a gate — the distinction the `dictation` model catalog got wrong when
@@ -32,6 +37,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use oximux_macos_trust::{SignaturePolicy, TrustError};
 use sha2::{Digest, Sha256};
 
 use crate::exec::run_bounded;
@@ -50,9 +56,9 @@ pub const EXPECTED_TEAM_ID: &str = "YCK386LBJ7";
 /// `--host-bundle-id` and the machine-readable `manifest` verb both need it.
 pub const MIN_VERSION: Version = Version::new(0, 12, 6);
 
-/// `codesign` is quick (~0.4s on a 48 MB universal binary) but runs on a user
-/// action, so it still gets a ceiling rather than an open-ended wait.
-const VERIFY_TIMEOUT: Duration = Duration::from_secs(20);
+/// Ceiling for the driver's own `--version` run — the driver talks to a
+/// machine-wide daemon and a wedged one must not freeze the caller.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// A driver that passed every check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,23 +72,17 @@ pub struct VerifiedDriver {
     pub sha256: String,
 }
 
+fn driver_policy() -> SignaturePolicy {
+    SignaturePolicy {
+        identifier: EXPECTED_IDENTIFIER.to_string(),
+        team_id: EXPECTED_TEAM_ID.to_string(),
+    }
+}
+
 /// Run every gate against `path`, or fail with the specific reason.
 pub fn verify(path: &Path) -> Result<VerifiedDriver, Error> {
-    verify_integrity(path)?;
-    let signature = read_signature(path)?;
-
-    if signature.identifier != EXPECTED_IDENTIFIER {
-        return Err(Error::UnexpectedIdentifier {
-            found: signature.identifier,
-            expected: EXPECTED_IDENTIFIER,
-        });
-    }
-    if signature.team_id != EXPECTED_TEAM_ID {
-        return Err(Error::UnexpectedTeamId {
-            found: signature.team_id,
-            expected: EXPECTED_TEAM_ID,
-        });
-    }
+    let signature =
+        oximux_macos_trust::verify_signed(path, &driver_policy()).map_err(from_trust)?;
 
     let version = read_version(path)?;
     if version < MIN_VERSION {
@@ -102,84 +102,11 @@ pub fn verify(path: &Path) -> Result<VerifiedDriver, Error> {
     })
 }
 
-/// `codesign --verify --strict`: does the binary still match its signature?
-fn verify_integrity(path: &Path) -> Result<(), Error> {
-    let out = run_bounded(
-        Path::new("/usr/bin/codesign"),
-        &["--verify", "--strict", &path.display().to_string()],
-        VERIFY_TIMEOUT,
-    )?;
-    if out.success() {
-        return Ok(());
-    }
-    Err(Error::SignatureInvalid {
-        path: path.to_path_buf(),
-        detail: first_meaningful_line(&out.stderr),
-    })
-}
-
-struct SignatureInfo {
-    identifier: String,
-    team_id: String,
-    notarized: bool,
-}
-
-/// `codesign -dvv` reports on **stderr**, and exits 0 even for a binary that
-/// fails `--verify` — it only displays. So this must never be used alone.
-fn read_signature(path: &Path) -> Result<SignatureInfo, Error> {
-    let out = run_bounded(
-        Path::new("/usr/bin/codesign"),
-        &["-dvv", &path.display().to_string()],
-        VERIFY_TIMEOUT,
-    )?;
-    if !out.success() {
-        return Err(Error::SignatureInvalid {
-            path: path.to_path_buf(),
-            detail: first_meaningful_line(&out.stderr),
-        });
-    }
-    Ok(SignatureInfo {
-        identifier: field(&out.stderr, "Identifier").unwrap_or_default(),
-        // Apple's own binaries report the literal `not set`; keeping it verbatim
-        // makes the mismatch error say something true.
-        team_id: field(&out.stderr, "TeamIdentifier").unwrap_or_default(),
-        notarized: field(&out.stderr, "Notarization Ticket")
-            .is_some_and(|v| v.eq_ignore_ascii_case("stapled")),
-    })
-}
-
-/// Gatekeeper's own verdict on an app bundle — the notarization gate.
-///
-/// [`verify`] *reports* notarization (parsed off `codesign -dvv`) but does not
-/// reject on it: for a user-installed driver, Gatekeeper already enforced
-/// notarization at first launch because the browser download carried a
-/// quarantine xattr. The in-app installer has no such backstop — its download
-/// is programmatic and never quarantined — so before installing it must ask
-/// the same policy engine Gatekeeper uses, against the **bundle** (tickets
-/// staple at bundle level; the inner binary's `codesign -dvv` line alone is
-/// weaker evidence).
-///
-/// A stapled ticket validates offline. A notarized-but-unstapled bundle needs
-/// Apple's servers; a just-published release whose ticket has not propagated
-/// fails here with the verbatim `spctl` reason — a clear, retryable error.
+/// Gatekeeper's own verdict on an app bundle — the notarization gate the
+/// in-app installer needs, since its programmatic download is never
+/// quarantined. See `oximux_macos_trust::verify_notarized_bundle`.
 pub fn verify_notarized_bundle(bundle: &Path) -> Result<(), Error> {
-    let out = run_bounded(
-        Path::new("/usr/sbin/spctl"),
-        &[
-            "--assess",
-            "--type",
-            "execute",
-            &bundle.display().to_string(),
-        ],
-        VERIFY_TIMEOUT,
-    )?;
-    if out.success() {
-        return Ok(());
-    }
-    Err(Error::NotNotarized {
-        path: bundle.to_path_buf(),
-        detail: first_meaningful_line(&out.stderr),
-    })
+    oximux_macos_trust::verify_notarized_bundle(bundle).map_err(from_trust)
 }
 
 /// The code-signing identifier of any binary — for an app bundle, its
@@ -190,24 +117,40 @@ pub fn verify_notarized_bundle(bundle: &Path) -> Result<(), Error> {
 /// This one just reads an identity off an arbitrary program, for callers that
 /// treat "unknown" as an ordinary answer rather than an error.
 pub fn signing_identifier(path: &Path) -> Option<String> {
-    read_signature(path)
+    oximux_macos_trust::read_signature(path)
         .ok()
         .map(|signature| signature.identifier)
         .filter(|identifier| !identifier.is_empty())
 }
 
-/// Value of a `Key=Value` line in `codesign -dvv` output.
-fn field(haystack: &str, key: &str) -> Option<String> {
-    haystack.lines().find_map(|line| {
-        line.strip_prefix(key)
-            .and_then(|rest| rest.strip_prefix('='))
-            .map(|value| value.trim().to_string())
-    })
+/// Map the shared gate's errors onto this crate's user-facing variants. The
+/// `expected` sides come from the local constants so settings-pane messages
+/// keep naming the driver's real policy.
+pub(crate) fn from_trust(err: TrustError) -> Error {
+    match err {
+        TrustError::Spawn { program, source } => Error::Spawn { program, source },
+        TrustError::Timeout { program, timeout } => Error::Timeout { program, timeout },
+        TrustError::SignatureInvalid { path, detail } => Error::SignatureInvalid { path, detail },
+        TrustError::UnexpectedIdentifier { found, .. } => Error::UnexpectedIdentifier {
+            found,
+            expected: EXPECTED_IDENTIFIER,
+        },
+        TrustError::UnexpectedTeamId { found, .. } => Error::UnexpectedTeamId {
+            found,
+            expected: EXPECTED_TEAM_ID,
+        },
+        TrustError::NotNotarized { path, detail } => Error::NotNotarized { path, detail },
+        // `ditto` never runs on the verify paths this module wraps.
+        TrustError::DittoFailed { detail } => Error::SessionCommandFailed {
+            command: "ditto",
+            detail,
+        },
+    }
 }
 
 /// `cua-driver --version` prints `cua-driver 0.12.6`.
 fn read_version(path: &Path) -> Result<Version, Error> {
-    let out = run_bounded(path, &["--version"], VERIFY_TIMEOUT)?;
+    let out = run_bounded(path, &["--version"], VERSION_TIMEOUT)?;
     let raw = if out.stdout.trim().is_empty() {
         out.stderr
     } else {
@@ -228,76 +171,25 @@ fn sha256_of(path: &Path) -> Result<String, Error> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn first_meaningful_line(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("no detail reported")
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = "Executable=/Applications/CuaDriver.app/Contents/MacOS/cua-driver\n\
-Identifier=com.trycua.driver\n\
-Authority=Developer ID Application: Cua AI, Inc. (YCK386LBJ7)\n\
-Notarization Ticket=stapled\n\
-Info.plist entries=15\n\
-TeamIdentifier=YCK386LBJ7\n";
-
     #[test]
-    fn parses_the_identity_fields_codesign_actually_emits() {
-        assert_eq!(field(SAMPLE, "Identifier").as_deref(), Some("com.trycua.driver"));
-        assert_eq!(field(SAMPLE, "TeamIdentifier").as_deref(), Some("YCK386LBJ7"));
-        assert_eq!(
-            field(SAMPLE, "Notarization Ticket").as_deref(),
-            Some("stapled")
-        );
+    fn trust_errors_keep_the_driver_policy_in_the_message() {
+        // The user needs the message to name the real pin, not a generic one.
+        let err = from_trust(TrustError::UnexpectedTeamId {
+            found: "not set".into(),
+            expected: "ignored".into(),
+        });
+        let msg = err.to_string();
+        assert!(msg.contains("not set"), "{msg}");
+        assert!(msg.contains(EXPECTED_TEAM_ID), "{msg}");
     }
 
-    #[test]
-    fn identifier_prefix_does_not_swallow_teamidentifier() {
-        // `Identifier` is a prefix of `TeamIdentifier`; a naive `contains` or a
-        // prefix match without the `=` would read the wrong line and let a
-        // mismatched team pass. Order the sample so the team line comes first.
-        let reversed = "TeamIdentifier=WRONGTEAM\nIdentifier=com.trycua.driver\n";
-        assert_eq!(
-            field(reversed, "Identifier").as_deref(),
-            Some("com.trycua.driver")
-        );
-        assert_eq!(
-            field(reversed, "TeamIdentifier").as_deref(),
-            Some("WRONGTEAM")
-        );
-    }
-
-    #[test]
-    fn an_apple_signed_binary_reports_no_team() {
-        // The case that proves `--verify` alone is not a gate: /bin/echo passes
-        // integrity verification but is not from this publisher.
-        let apple = "Identifier=com.apple.echo\nTeamIdentifier=not set\n";
-        assert_eq!(field(apple, "TeamIdentifier").as_deref(), Some("not set"));
-        assert_ne!(field(apple, "TeamIdentifier").unwrap(), EXPECTED_TEAM_ID);
-    }
-
-    #[test]
-    fn missing_fields_are_absent_rather_than_empty() {
-        assert!(field("Format=app bundle\n", "TeamIdentifier").is_none());
-    }
-
-    #[test]
-    fn unstapled_notarization_is_not_reported_as_notarized() {
-        let unstapled = "Identifier=com.trycua.driver\nTeamIdentifier=YCK386LBJ7\n";
-        assert!(field(unstapled, "Notarization Ticket").is_none());
-    }
-
-    /// The install-path gate must *reject*, not merely report. An unsigned
-    /// scratch bundle is the strongest fixture buildable in a test: it fails
-    /// Gatekeeper assessment for the same terminal reason an unnotarized one
-    /// does (no ticket, no accepted signature), proving the error path is a
-    /// hard stop.
+    /// The install-path gate must *reject*, not merely report — and the
+    /// rejection must surface as this crate's own `NotNotarized` so the
+    /// settings pane keeps its specific messaging.
     #[cfg(target_os = "macos")]
     #[test]
     fn an_unnotarized_bundle_is_rejected_not_reported() {
@@ -316,14 +208,5 @@ TeamIdentifier=YCK386LBJ7\n";
 
         let err = verify_notarized_bundle(&bundle).expect_err("must reject");
         assert!(matches!(err, Error::NotNotarized { .. }), "got {err:?}");
-    }
-
-    #[test]
-    fn first_meaningful_line_skips_blanks() {
-        assert_eq!(
-            first_meaningful_line("\n\n  code object is not signed at all\nmore\n"),
-            "code object is not signed at all"
-        );
-        assert_eq!(first_meaningful_line("   \n"), "no detail reported");
     }
 }
