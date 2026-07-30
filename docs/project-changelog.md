@@ -4,6 +4,41 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-07-31 — v0.1.4: auto-update, first-run onboarding, multi-agent session history (`main`)
+
+First release the app can install by itself: v0.1.4 ships the staged
+auto-updater, a first-run welcome wizard, zero-setup search/driver
+provisioning, and a Session History side panel that covers every chat-capable
+agent.
+
+- **`d0061d2`/`62a69a1`** — auto-update: background check → verified staged
+  install → swap only at quit, never a self-restart (full detail in the
+  auto-update entry below).
+- **`1127a26`** — `feat(onboarding)`: first-run welcome wizard.
+- **`e994a29`/`b3bc9ba`/`f1601b7`** — bundled verified ripgrep + in-app
+  download-verify-install pipeline for the computer-use driver, from settings
+  and onboarding (detail in the auto-provisioning entry below).
+- **`3f9ce16`** — `fix(desktop)`: session-history hover highlight repaints
+  instantly (stateful row id; it previously waited on the caret blink's
+  ~530ms notify).
+- **`91915db`** — `feat(desktop)`: history side panel rows lead with their
+  agent's icon and list every chat-capable session (Claude/Codex native,
+  OpenCode/Pi bridges); open/resume dispatch the entry's own adapter+preset.
+- **`c02d509`** — `feat(desktop)`: inline LATEST TURNS previews for
+  OpenCode/Pi/Copilot rows via `load_import_provider_preview`; assistant chip
+  shows the provider name.
+- **`5ae36c5`** — `fix(settings)`: seed ACP preset wiring when `entry_mut`
+  mints a fresh entry. **`2f98ff7`** — `fix(computer-use)`: classify the
+  renamed agent-cursor theme tool. **`45326cc`** — shared macOS trust
+  primitives crate.
+
+**Touches**: `crates/auto-update` (new), `apps/desktop/src/updater.rs` (new),
+onboarding + settings surfaces,
+`apps/desktop/src/shell/right_sidebar/session_history_panel.rs`,
+`apps/desktop/src/shell/session_history/mod.rs`
+
+---
+
 ### 2026-07-31 — Desktop auto-update: background check, staged install, swap only at quit (`main`)
 
 OxiMux now updates itself: the app polls GitHub releases in the background,
