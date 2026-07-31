@@ -35,10 +35,34 @@ pub async fn which_on_path(bin: &str) -> bool {
 /// path and on the UI thread's executor.
 pub async fn resolve_on_path(bin: &str) -> Option<PathBuf> {
     let bin = bin.to_owned();
-    tokio::task::spawn_blocking(move || which::which(bin).ok())
+    tokio::task::spawn_blocking(move || resolve_on_path_blocking(&bin))
         .await
         .ok()
         .flatten()
+}
+
+/// [`resolve_on_path`] without a runtime.
+///
+/// Spawn sites are synchronous — they are called from the UI thread, which has
+/// nothing to await on — and resolving is what makes a bare name work on
+/// Windows at all, so they need an answer without one. The cost is a handful of
+/// `stat`s; `which` does not spawn a process.
+pub fn resolve_on_path_blocking(bin: &str) -> Option<PathBuf> {
+    which::which(bin).ok()
+}
+
+/// The program to hand `Command::new` for a bare agent binary name.
+///
+/// Resolving first is not an optimisation. Rust's Windows spawn appends `.exe`
+/// and does not consult `PATHEXT`, so a bare name never finds the `claude.cmd`
+/// / `codex.cmd` shim npm installs — while detection, which goes through
+/// `which`, does find it. Left unresolved the two disagree, and an agent is
+/// advertised as installed and then fails to launch.
+///
+/// Falls back to the bare name on a miss so the failure stays a plain
+/// "not found" from the spawn rather than a different error shape here.
+pub fn program_for_spawn(bin: &str) -> PathBuf {
+    resolve_on_path_blocking(bin).unwrap_or_else(|| PathBuf::from(bin))
 }
 
 #[cfg(test)]

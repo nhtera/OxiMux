@@ -174,7 +174,10 @@ fn folder_row(
             cx.listener(move |panel, ev: &MouseDownEvent, _window, cx| {
                 if ev.modifiers.shift {
                     panel.select_paths_replace(click_subtree.clone(), cx);
-                } else if ev.modifiers.platform {
+                // `secondary()`, not `platform`: off macOS the latter is the
+                // Windows key, which the OS claims before the app sees it —
+                // collapse-siblings would be unreachable there.
+                } else if ev.modifiers.secondary() {
                     panel.collapse_dirs(click_siblings.clone(), cx);
                 } else {
                     panel.toggle_collapsed_dir(click_path.clone(), cx);

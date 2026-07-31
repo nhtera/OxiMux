@@ -54,7 +54,7 @@ impl RpcClient {
     /// Spawn `codex app-server` in `cwd`, start the reader thread, and return the
     /// client, the [`Inbound`] receiver, and the child (for reaping).
     pub fn spawn(cwd: &Path) -> Result<(RpcClient, Receiver<Inbound>, Child)> {
-        let mut cmd = Command::new("codex");
+        let mut cmd = Command::new(crate::cli::program_for_spawn("codex"));
         cmd.arg("app-server")
             .current_dir(cwd)
             .stdin(Stdio::piped())

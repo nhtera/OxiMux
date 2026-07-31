@@ -258,7 +258,7 @@ pub struct ClaudeStreamJsonConnection {
 impl ClaudeStreamJsonConnection {
     /// Spawn `claude` in `cwd` and start streaming decoded events.
     pub fn spawn(cwd: &Path, model: Option<&str>) -> Result<(Self, Receiver<ThreadEvent>)> {
-        let mut cmd = Command::new("claude");
+        let mut cmd = Command::new(crate::cli::program_for_spawn("claude"));
         cmd.args(build_args(model)).current_dir(cwd);
         Self::spawn_command(cmd)
     }
@@ -275,7 +275,7 @@ impl ClaudeStreamJsonConnection {
         effort: Option<&str>,
         host: &HostInjection<'_>,
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
-        let mut cmd = Command::new("claude");
+        let mut cmd = Command::new(crate::cli::program_for_spawn("claude"));
         cmd.args(build_args_with_resume(
             model,
             session_id,

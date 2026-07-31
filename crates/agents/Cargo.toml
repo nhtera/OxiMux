@@ -23,6 +23,10 @@ anyhow = { workspace = true }
 # Pure-Rust PATH walk that also knows Windows PATHEXT, so `claude` finds the
 # `claude.cmd` shim npm installs.
 which = { workspace = true }
+# The user's home directory. Not `$HOME`: that is unset on Windows outside
+# git-bash, so reading the variable directly makes `~/.claude/...` resolve for
+# some users and silently vanish for others.
+dirs = { workspace = true }
 async-trait = { workspace = true }
 # Encodes Codex image-item file bytes (imageView/imageGeneration paths) into the
 # standard-base64 `ChatImage` shape the transcript + thumbnail renderer expect.

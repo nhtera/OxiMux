@@ -12,7 +12,7 @@ pub(crate) mod detect;
 pub mod pi;
 
 pub use adapter::{CliAgentAdapter, CommandSpec, StatusPattern};
-pub use detect::{resolve_on_path, which_on_path};
+pub use detect::{program_for_spawn, resolve_on_path, resolve_on_path_blocking, which_on_path};
 pub use aider::AiderAdapter;
 pub use claude_code::ClaudeCodeAdapter;
 pub use codex::CodexAdapter;
