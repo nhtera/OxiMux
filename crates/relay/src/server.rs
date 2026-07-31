@@ -177,6 +177,9 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
 /// fails instead of joining it, and this function propagates that failure so
 /// the daemon exits and the GUI surfaces it. Failing to start is the correct
 /// outcome; attaching to a squatter's pipe is not.
+///
+/// That flag settles who may *create* the name. An owner-only descriptor
+/// settles who may connect to it, and is applied below.
 fn bind_listener(socket_path: &Path) -> Result<interprocess::local_socket::tokio::Listener> {
     let name = match endpoint_for(socket_path) {
         Endpoint::FsPath(path) => path.to_fs_name::<GenericFilePath>().with_context(|| {
@@ -186,8 +189,18 @@ fn bind_listener(socket_path: &Path) -> Result<interprocess::local_socket::tokio
             .to_ns_name::<GenericNamespaced>()
             .context("derived pipe name is not a usable name")?,
     };
-    ListenerOptions::new()
-        .name(name)
+
+    let options = ListenerOptions::new().name(name);
+
+    // `?` rather than a fallback: if the descriptor cannot be built we must not
+    // fall through to a pipe anyone can reach. See `pipe_security`.
+    #[cfg(windows)]
+    let options = {
+        use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
+        options.security_descriptor(crate::pipe_security::owner_only_descriptor()?)
+    };
+
+    options
         .create_tokio()
         .with_context(|| format!("bind {}", socket_path.display()))
 }

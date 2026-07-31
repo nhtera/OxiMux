@@ -6,6 +6,10 @@ pub mod checkpoint;
 pub mod codec;
 pub mod registry;
 pub mod ring_buffer;
+// The pipe's access control. Windows-only because it is the platform that
+// needs one stated: a unix socket is protected by the directory holding it.
+#[cfg(windows)]
+pub mod pipe_security;
 pub mod server;
 pub mod server_config;
 

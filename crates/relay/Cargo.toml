@@ -33,6 +33,17 @@ uuid = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.25", features = ["signal"] }
 
+# Building the named pipe's owner-only DACL: the token lookup that yields the
+# current user's SID, and the UTF-16 string the descriptor is parsed from.
+[target.'cfg(windows)'.dependencies]
+widestring = "1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 tracing-oslog = { workspace = true }
 

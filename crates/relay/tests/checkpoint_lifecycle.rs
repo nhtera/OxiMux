@@ -53,6 +53,9 @@ async fn checkpoint_written_on_tick_and_removed_on_close() {
     // app resolves split-inherit cwd from it kernel-side). Gated: every
     // Unix target reports a child pid, but a target without process ids
     // legitimately stores None and must not hard-fail the suite.
+    // Parsed on every platform so a malformed meta.json fails the suite
+    // anywhere; only the pid assertions below are Unix-shaped.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let meta: oximux_relay::checkpoint::CheckpointMeta =
         serde_json::from_slice(&std::fs::read(pty_dir.join("meta.json")).expect("read meta"))
             .expect("parse meta");

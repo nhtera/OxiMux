@@ -12,7 +12,6 @@ use oximux_pty::{
 use oximux_relay::{ServerConfig, run_server};
 use oximux_relay_client::{RelayBackend, RelayClient};
 use tempfile::TempDir;
-use tokio::net::UnixStream;
 use tokio::runtime::Runtime;
 
 struct Fixture {
@@ -40,20 +39,19 @@ fn boot_fixture() -> Fixture {
         .await;
     });
 
-    // Wait for the socket to accept.
-    runtime.block_on(async {
+    // Retry the real connect until the daemon is serving, and keep the client
+    // that succeeds. A separate readiness probe would open a connection only to
+    // throw it away, and would have to name a transport this test does not care
+    // about — `RelayClient` already dials whichever one the platform uses.
+    let client = runtime.block_on(async {
         for _ in 0..200 {
-            if UnixStream::connect(&socket).await.is_ok() {
-                return;
+            if let Ok(client) = RelayClient::connect(&socket, &token).await {
+                return client;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("relay socket never came up");
+        panic!("relay never came up");
     });
-
-    let client = runtime
-        .block_on(async { RelayClient::connect(&socket, &token).await })
-        .expect("client connect");
     let backend = RelayBackend::new(Arc::new(client), runtime.handle().clone());
 
     Fixture {

@@ -1,16 +1,33 @@
-// End-to-end: boot the relay in-process, drive it from a raw
-// UnixStream client, and verify the survival/replay contract that is
-// the entire reason this daemon exists.
+// End-to-end: boot the relay in-process, drive it from a raw local-socket
+// client, and verify the survival/replay contract that is the entire reason
+// this daemon exists.
+//
+// The client here dials through the same endpoint mapping the real one uses, so
+// this suite exercises whichever transport the running platform actually has —
+// a unix socket on unix, a named pipe on Windows — rather than only the former.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use interprocess::local_socket::tokio::Stream;
+use interprocess::local_socket::tokio::prelude::*;
+use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ToFsName, ToNsName};
 use oximux_relay::codec::{read_frame, write_frame};
 use oximux_relay::{ServerConfig, run_server};
-use oximux_relay_proto::{Frame, Hello, Notification, PROTOCOL_VERSION, Request, Response};
+use oximux_relay_proto::{
+    Endpoint, Frame, Hello, Notification, PROTOCOL_VERSION, Request, Response, endpoint_for,
+};
 use tempfile::TempDir;
-use tokio::net::UnixStream;
 use tokio::time::timeout;
+
+/// Dial the relay by the same path-to-endpoint rule both real ends use.
+async fn dial(socket: &Path) -> std::io::Result<Stream> {
+    let name = match endpoint_for(socket) {
+        Endpoint::FsPath(path) => path.to_fs_name::<GenericFilePath>()?,
+        Endpoint::Namespaced(name) => name.to_ns_name::<GenericNamespaced>()?,
+    };
+    Stream::connect(name).await
+}
 
 struct TestRelay {
     socket: PathBuf,
@@ -30,9 +47,9 @@ async fn boot_relay() -> TestRelay {
     let server_task = tokio::spawn(async move {
         let _ = run_server(cfg).await;
     });
-    // Spin until the socket file appears + accepts a connection.
+    // Spin until the endpoint exists and accepts a connection.
     for _ in 0..100 {
-        if UnixStream::connect(&socket).await.is_ok() {
+        if dial(&socket).await.is_ok() {
             return TestRelay {
                 socket,
                 token,
@@ -45,8 +62,8 @@ async fn boot_relay() -> TestRelay {
     panic!("relay socket never came up");
 }
 
-async fn connect_and_hello(relay: &TestRelay) -> (UnixStream, Vec<u8>) {
-    let mut stream = UnixStream::connect(&relay.socket).await.expect("connect");
+async fn connect_and_hello(relay: &TestRelay) -> (Stream, Vec<u8>) {
+    let mut stream = dial(&relay.socket).await.expect("connect");
     let hello = Frame::Request {
         request_id: 1,
         request: Request::Hello(Hello {
@@ -69,7 +86,7 @@ async fn connect_and_hello(relay: &TestRelay) -> (UnixStream, Vec<u8>) {
 }
 
 async fn req(
-    stream: &mut UnixStream,
+    stream: &mut Stream,
     buf: &mut Vec<u8>,
     request_id: u64,
     request: Request,
@@ -94,7 +111,7 @@ async fn req(
 }
 
 async fn collect_output(
-    stream: &mut UnixStream,
+    stream: &mut Stream,
     buf: &mut Vec<u8>,
     pty_id: &str,
     overall: Duration,
@@ -408,7 +425,7 @@ async fn agent_status_fans_out_osc_output_to_subscribers() {
 #[tokio::test]
 async fn bad_token_rejected_with_auth_failed() {
     let relay = boot_relay().await;
-    let mut stream = UnixStream::connect(&relay.socket).await.unwrap();
+    let mut stream = dial(&relay.socket).await.unwrap();
     let hello = Frame::Request {
         request_id: 1,
         request: Request::Hello(Hello {
@@ -440,7 +457,7 @@ async fn version_mismatch_is_rejected() {
     // daemon must close the connection (we observe that by EOF on the
     // next frame attempt).
     let relay = boot_relay().await;
-    let mut stream = UnixStream::connect(&relay.socket).await.unwrap();
+    let mut stream = dial(&relay.socket).await.unwrap();
     let hello = Frame::Request {
         request_id: 1,
         request: Request::Hello(Hello {
@@ -480,7 +497,7 @@ async fn shutdown_request_breaks_accept_loop_when_no_ptys_alive() {
 
     // Wait for readiness.
     for _ in 0..100 {
-        if UnixStream::connect(&socket).await.is_ok() {
+        if dial(&socket).await.is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
