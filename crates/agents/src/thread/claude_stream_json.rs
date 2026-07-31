@@ -19,9 +19,9 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
 use super::connection::{
-    control_response_json, question_answer_json, set_permission_mode_json, user_message_json,
-    user_message_json_with_images, AgentCapabilities, AgentConnection, EffortChoice, ModeChoice,
-    ModelChoice,
+    control_response_json, interrupt_json, question_answer_json, set_permission_mode_json,
+    user_message_json, user_message_json_with_images, AgentCapabilities, AgentConnection,
+    EffortChoice, ModeChoice, ModelChoice,
 };
 use super::entry::ChatImage;
 use super::mcp_server_spec::{to_claude_mcp_config, McpServerSpec};
@@ -239,7 +239,11 @@ pub fn build_args_with_resume(
 }
 
 pub struct ClaudeStreamJsonConnection {
-    stdin: Mutex<ChildStdin>,
+    // `Option` so `cancel_and_wait` can close the pipe: `claude` reads its input
+    // as a stream and exits at EOF, which is how a session is asked to end
+    // gracefully on both platforms. `None` means the session is on its way out
+    // and further writes are refused rather than panicking.
+    stdin: Mutex<Option<ChildStdin>>,
     child: Mutex<Child>,
     // Windows stand-in for the process group `claude` would otherwise be killed
     // through. `claude` runs tools as its own children — a `bash` tool can be
@@ -351,7 +355,7 @@ impl ClaudeStreamJsonConnection {
 
         Ok((
             Self {
-                stdin: Mutex::new(stdin),
+                stdin: Mutex::new(Some(stdin)),
                 child: Mutex::new(child),
                 #[cfg(windows)]
                 job,
@@ -363,10 +367,13 @@ impl ClaudeStreamJsonConnection {
     fn write_line(&self, v: &Value) -> Result<()> {
         // Avoid `.expect()` on the lock (poison would panic the caller); map to
         // a recoverable error instead.
-        let mut stdin = self
+        let mut guard = self
             .stdin
             .lock()
             .map_err(|_| anyhow!("agent stdin lock poisoned"))?;
+        let stdin = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("agent session is shutting down"))?;
         writeln!(stdin, "{v}").context("write to agent stdin")?;
         stdin.flush().context("flush agent stdin")?;
         Ok(())
@@ -536,48 +543,41 @@ impl AgentConnection for ClaudeStreamJsonConnection {
         Some(DEFAULT_EFFORT.to_string())
     }
 
-    /// Interrupt the in-flight turn by sending SIGINT to the child. `claude`
-    /// ends the turn gracefully, checkpoints the session server-side, then
-    /// exits (stdout EOF) — so the transcript stays consistent and the next send
-    /// can `--resume` the same session cleanly. SIGINT (not a hard kill) is what
-    /// keeps that checkpoint intact; the caller owns the resume-on-next-send.
-    #[cfg(unix)]
+    /// Interrupt the in-flight turn with a stdin `control_request`.
+    ///
+    /// `claude` ends the turn, checkpoints the session, and — unlike the SIGINT
+    /// this replaced — **stays alive**, so the next send continues the same
+    /// process instead of respawning it with `--resume`. One code path on every
+    /// platform: the signal version had no Windows counterpart, and the hard
+    /// kill standing in for it there destroyed the very checkpoint that makes a
+    /// session resumable.
     fn cancel(&self) -> Result<()> {
-        let child = self
-            .child
-            .lock()
-            .map_err(|_| anyhow!("agent child lock poisoned"))?;
-        let pid = child.id() as libc::pid_t;
-        // SAFETY: `pid` is our own spawned child; `kill(2)` with a real signal
-        // number is sound and simply delivers the signal (or returns an errno).
-        let rc = unsafe { libc::kill(pid, libc::SIGINT) };
-        if rc != 0 {
-            return Err(anyhow!(
-                "failed to interrupt agent: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(())
+        self.write_line(&interrupt_json())
     }
 
-    #[cfg(not(unix))]
-    fn cancel(&self) -> Result<()> {
-        let mut child = self
-            .child
-            .lock()
-            .map_err(|_| anyhow!("agent child lock poisoned"))?;
-        child.kill().context("interrupt agent")?;
-        Ok(())
-    }
-
-    /// SIGINT, then poll `try_wait` until the child is reaped (its transcript
-    /// file is fully flushed once the process is gone). Escalates to a hard
-    /// kill after 5s in case the CLI wedges on the way down. Blocking — the
-    /// rewind flow runs this on a background thread.
+    /// Interrupt, then block until the child is actually reaped.
+    ///
+    /// Callers use this before reading the agent's on-disk session file
+    /// (rewind's truncate-fork), so "the turn ended" is not enough — the
+    /// transcript is only certainly flushed once the process is gone.
+    ///
+    /// Which is why closing stdin is part of this and not of `cancel`: the
+    /// interrupt deliberately leaves the process running, so something has to
+    /// ask it to leave. `claude` reads its input as a stream and exits at EOF,
+    /// so dropping the pipe is the graceful way to say so — and it works on
+    /// both platforms, where a signal did not.
     fn cancel_and_wait(&self) -> Result<()> {
-        // Best-effort SIGINT first; if the process already exited this errors
-        // (ESRCH) and the reap below still succeeds, so don't bail on it.
+        // Best-effort: if the turn already ended, or the pipe is already gone,
+        // the reap below still does its job — so neither step bails.
         let _ = self.cancel();
+        {
+            let mut stdin = self
+                .stdin
+                .lock()
+                .map_err(|_| anyhow!("agent stdin lock poisoned"))?;
+            // Dropping the writer closes the pipe; the child sees EOF and exits.
+            let _ = stdin.take();
+        }
         let mut child = self
             .child
             .lock()

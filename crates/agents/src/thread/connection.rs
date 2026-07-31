@@ -212,9 +212,11 @@ pub trait AgentConnection: Send + Sync {
     /// Terminate the session and its process.
     fn shutdown(&self);
 
-    /// Interrupt the in-flight turn. Claude: SIGINT the child (which ends the
-    /// turn and exits the process — the caller resumes on the next send). ACP:
-    /// `session/cancel`. Default is a no-op for backends that can't interrupt.
+    /// Interrupt the in-flight turn. Every backend does this over its own
+    /// protocol — Claude `{subtype:"interrupt"}`, Codex `turn/interrupt`, pi
+    /// `Abort`, ACP `session/cancel` — so none of them depends on a signal, and
+    /// the turn ends without the process ending with it. Default is a no-op for
+    /// backends that can't interrupt.
     fn cancel(&self) -> Result<()> {
         Ok(())
     }
@@ -452,6 +454,32 @@ pub fn set_permission_mode_json(mode: &str) -> Value {
            "request": {"subtype": "set_permission_mode", "mode": mode}})
 }
 
+/// Build the stdin `control_request` JSON that interrupts the in-flight turn
+/// (`{subtype:"interrupt"}`).
+///
+/// Verified against the shipping CLI rather than inferred: the binary carries
+/// `{type:"control_request",request_id:<uuid>,request:{subtype:"interrupt"}}`
+/// in the same table as `set_permission_mode` and `can_use_tool`, and answers
+/// with a response whose `still_queued` lists anything it did not drop. It
+/// requires streaming-input mode, which is how the session is always launched
+/// (`--input-format stream-json`).
+///
+/// This replaced a SIGINT. Both end the turn, but SIGINT also ended the
+/// *process*, so every cancel cost a respawn-with-`--resume` on the next send;
+/// the control request leaves the session live. It also gives Windows a cancel
+/// at all — there is no signal to send there, and the hard kill that stood in
+/// for one destroyed the checkpoint that makes a session resumable.
+///
+/// Fire-and-forget: the ack is dropped by the decoder, and the `request_id` is
+/// minted from a process counter because nothing correlates the reply.
+pub fn interrupt_json() -> Value {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+    let request_id = format!("oximux-interrupt-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed));
+    json!({"type": "control_request", "request_id": request_id,
+           "request": {"subtype": "interrupt"}})
+}
+
 /// Build the stdin `control_response` JSON answering an `AskUserQuestion`
 /// `can_use_tool` request. Structurally a permission-style `allow`, but the
 /// `updatedInput` carries the echoed questions plus the user's `answers` map
@@ -608,6 +636,20 @@ mod tests {
             user_message_json("hi"),
             json!({"type":"user","message":{"role":"user","content":"hi"}})
         );
+    }
+
+    #[test]
+    fn interrupt_json_shape() {
+        // Pinned against the shape read out of the shipping CLI. Getting any of
+        // these three keys wrong makes Stop silently do nothing — the CLI drops
+        // a control_request it cannot parse, and nothing surfaces.
+        let v = interrupt_json();
+        assert_eq!(v["type"], "control_request");
+        assert_eq!(v["request"]["subtype"], "interrupt");
+        let id1 = v["request_id"].as_str().unwrap().to_string();
+        let id2 = interrupt_json()["request_id"].as_str().unwrap().to_string();
+        assert!(id1.starts_with("oximux-interrupt-"));
+        assert_ne!(id1, id2, "each request mints a fresh id");
     }
 
     #[test]

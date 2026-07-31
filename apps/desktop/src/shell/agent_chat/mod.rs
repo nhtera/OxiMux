@@ -2856,11 +2856,17 @@ impl AgentChatView {
         cx.notify();
     }
 
-    /// Interrupt the streaming turn (the composer's Stop button). SIGINTs the
-    /// child, finalizes the transcript, and fail-closes any pending approval,
-    /// then marks the session **resumable-idle**: the next send respawns via
-    /// `--resume`. Not marked `disconnected` — the stop was intentional, so no
-    /// error banner is shown.
+    /// Interrupt the streaming turn (the composer's Stop button). Asks the agent
+    /// to end the turn over its own protocol, finalizes the transcript, and
+    /// fail-closes any pending approval, then marks the session
+    /// **resumable-idle**: the next send respawns via `--resume`. Not marked
+    /// `disconnected` — the stop was intentional, so no error banner is shown.
+    ///
+    /// The respawn is now belt-and-braces rather than required: a protocol
+    /// interrupt leaves the process alive and the session usable, so a later
+    /// change could send straight into the live child and skip it. Left in place
+    /// because dropping it changes the resume path for every backend, not just
+    /// Claude.
     fn stop_turn(&mut self, cx: &mut Context<Self>) {
         if !self.thread.turn_active {
             return; // nothing is streaming
@@ -2933,8 +2939,10 @@ impl AgentChatView {
         cx: &mut Context<Self>,
     ) {
         // Reap the old connection before replacing it — `Child`'s Drop neither
-        // kills nor waits, so after a Stop this harvests the already-dead child
-        // (and hard-kills it if somehow still alive).
+        // kills nor waits. A Stop now interrupts the turn over the protocol
+        // rather than signalling the process, so after one the child is still
+        // *alive* and this is what ends it; it also harvests a child that died
+        // on its own.
         if let Some(old) = self.connection.take() {
             old.shutdown();
         }
