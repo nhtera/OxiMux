@@ -77,3 +77,50 @@ jobs:
 
       - name: xtask file-size-lint
         run: cargo run -p xtask -- file-size-lint
+
+  # Permanent gate for the Windows port. macOS is still the only shipping
+  # target, so this job checks that the workspace COMPILES for Windows — it
+  # does not run tests or clippy. Its whole job is to stop a macOS-only API
+  # from landing on a shared path unnoticed, which is exactly the class of
+  # breakage that made the port expensive to start.
+  #
+  # Native runner rather than a cross-check from macOS on purpose: only a real
+  # windows-msvc host surfaces link/manifest problems, and the C-dependency
+  # build scripts (rusqlite's bundled sqlite, ring) need a real MSVC toolchain.
+  # Locally, `cargo check --target x86_64-pc-windows-gnu` with mingw-w64 is a
+  # fast proxy — `cfg(windows)` resolves identically — but `target_env` does
+  # not, so this job is the authority.
+  #
+  # No `--all-targets`: the test targets still reach for Unix APIs directly and
+  # gating them is later-phase work. Library and binary targets are the gate.
+  windows-check:
+    name: windows compile gate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
+
+      # The two excluded crates are macOS-only by construction, not by
+      # oversight: `macos-trust` wraps codesign/spctl and `computer-use` drives
+      # the Accessibility APIs. They are workspace members, so `--workspace`
+      # would still try to build them; nothing in the Windows dependency graph
+      # reaches either. Adding a crate here is a decision to leave it behind on
+      # Windows — do it deliberately.
+      - name: cargo check
+        run: >
+          cargo check --workspace --target x86_64-pc-windows-msvc
+          --exclude oximux-computer-use
+          --exclude oximux-macos-trust

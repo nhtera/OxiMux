@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use oximux_relay::codec::{read_frame, write_frame};
-use oximux_relay::server::{ServerConfig, run_server};
+use oximux_relay::{ServerConfig, run_server};
 use oximux_relay_proto::{Frame, Hello, Notification, PROTOCOL_VERSION, Request, Response};
 use tempfile::TempDir;
 use tokio::net::UnixStream;

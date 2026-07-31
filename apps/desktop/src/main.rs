@@ -11,7 +11,9 @@
 //! exits the runtime, then the runtime itself shuts down gracefully.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use gpui::{
@@ -288,11 +290,15 @@ fn main() {
         // follow an update?" — which has to be read before the recorded
         // version is overwritten, so it is settled here and announced once a
         // window exists to announce it in.
+        // The answer is only acted on where there is an updater to have
+        // performed the upgrade; the settings install itself still has to run.
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
         let upgraded_this_boot = oximux_app::auto_update_settings::install(cx);
         // The menu-bar indicator that appears while an agent can drive the
         // screen. Watches the grant table rather than the approval path,
         // because the enforcement hook grants from its own process — see the
         // module docs. Idle cost is one `metadata()` call per second.
+        #[cfg(target_os = "macos")]
         oximux_app::agent_glue::screen_control_watch::install(cx);
         // Resolve the reduced-motion preference once and install the Motion
         // global before any window opens, so the first animated surface reads
@@ -451,9 +457,12 @@ fn main() {
         // Auto-update: recovers from an interrupted swap, sweeps crash
         // leftovers, then checks periodically. Staging only — the swap itself
         // happens at quit, so the running workspace is never disturbed.
-        oximux_app::updater::install(cx);
-        if upgraded_this_boot {
-            oximux_app::updater::announce_update(cx);
+        #[cfg(target_os = "macos")]
+        {
+            oximux_app::updater::install(cx);
+            if upgraded_this_boot {
+                oximux_app::updater::announce_update(cx);
+            }
         }
         // Install the full keymap (registry defaults ⊕ keybindings.toml
         // overrides) — this covers the menu-action chords too, and MUST run
@@ -587,13 +596,16 @@ fn install_app_lifecycle(
         // session is already captured, so a swap that somehow stalls cannot
         // cost the user their workspace. The swap itself is one rename —
         // it is the re-verification either side of it that takes the time.
-        let swap_started = std::time::Instant::now();
-        let from_signal = SHUTDOWN_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
-        if oximux_app::updater::apply_pending_at_quit(cx, from_signal) {
-            tracing::info!(
-                elapsed_ms = swap_started.elapsed().as_millis() as u64,
-                "quit: applied staged update"
-            );
+        #[cfg(target_os = "macos")]
+        {
+            let swap_started = std::time::Instant::now();
+            let from_signal = SHUTDOWN_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+            if oximux_app::updater::apply_pending_at_quit(cx, from_signal) {
+                tracing::info!(
+                    elapsed_ms = swap_started.elapsed().as_millis() as u64,
+                    "quit: applied staged update"
+                );
+            }
         }
         async {}
     })
@@ -650,6 +662,7 @@ static SHUTDOWN_SIGNAL: AtomicBool = AtomicBool::new(false);
 /// Count of shutdown signals received. The first drives the graceful
 /// `cx.quit()` path; the second escalates to a hard kill so a wedged
 /// foreground executor can never leave the app un-quittable.
+#[cfg(unix)]
 static SHUTDOWN_SIGNAL_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// How long the graceful `cx.quit()` path gets after the first shutdown
@@ -661,6 +674,7 @@ const SHUTDOWN_GRACE_DEADLINE: Duration = Duration::from_secs(3);
 /// is the number of signals seen BEFORE this one: the first (0) drives the
 /// graceful path; any repeat (>= 1) means graceful is likely wedged, so we
 /// restore the default disposition and re-raise.
+#[cfg(unix)]
 fn signal_should_force_exit(prior_count: u32) -> bool {
     prior_count >= 1
 }
@@ -676,6 +690,7 @@ fn signal_should_force_exit(prior_count: u32) -> bool {
 /// the SECOND signal we restore the default disposition and re-raise,
 /// letting the kernel terminate us immediately. `signal` + `raise` are
 /// both async-signal-safe.
+#[cfg(unix)]
 extern "C" fn handle_shutdown_signal(sig: libc::c_int) {
     SHUTDOWN_SIGNAL.store(true, Ordering::SeqCst);
     if signal_should_force_exit(SHUTDOWN_SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst)) {
@@ -691,6 +706,12 @@ extern "C" fn handle_shutdown_signal(sig: libc::c_int) {
 /// quit from inside the GPUI event loop is what makes on_app_quit fire
 /// — a bare process exit (e.g. SIGKILL) cannot be rescued.
 fn install_signal_watchdog(cx: &mut gpui::App) {
+    // Windows has no signal model, and the console-control and end-session
+    // paths that replace it are their own piece of work. Nothing flips
+    // `SHUTDOWN_SIGNAL` there yet, so the poll loop below simply never fires —
+    // and there is nothing for it to preserve either, the relay daemon having
+    // no Windows transport to hold PTYs across.
+    #[cfg(unix)]
     // SAFETY: libc::signal is async-signal-safe for installing a
     // handler. We pass a plain extern "C" fn with no captured state.
     unsafe {
@@ -710,7 +731,12 @@ fn install_signal_watchdog(cx: &mut gpui::App) {
             if SHUTDOWN_SIGNAL.load(Ordering::SeqCst) {
                 std::thread::sleep(SHUTDOWN_GRACE_DEADLINE);
                 // Still running ⇒ graceful quit stalled. 130 = 128 + SIGINT.
-                unsafe { libc::_exit(130) };
+                #[cfg(unix)]
+                unsafe {
+                    libc::_exit(130)
+                };
+                #[cfg(not(unix))]
+                std::process::exit(130);
             }
             std::thread::sleep(Duration::from_millis(100));
         })

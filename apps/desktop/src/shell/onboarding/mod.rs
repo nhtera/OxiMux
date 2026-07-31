@@ -8,6 +8,7 @@
 //! windows never consume it, only the fresh-boot window armed by `main.rs`.
 
 mod agent_step;
+#[cfg(target_os = "macos")]
 mod driver_step;
 mod view;
 mod view_step;
@@ -116,6 +117,7 @@ pub struct OnboardingWizard {
     _model_select_sub: Option<Subscription>,
     /// Driver check made once at open (it spawns `codesign`); decides whether
     /// the Driver step exists at all and what its body says.
+    #[cfg(target_os = "macos")]
     pub(self) driver_status: crate::shell::settings_modal::DriverStatus,
     /// Frozen at open: whether this run includes the Driver step. Deliberately
     /// NOT recomputed from live state — a successful install mid-step must not
@@ -123,11 +125,15 @@ pub struct OnboardingWizard {
     pub(self) driver_step_planned: bool,
     /// Set when the install started from this wizard replaced an existing
     /// driver — gates the "old version until the daemon respawns" note.
+    #[cfg(target_os = "macos")]
     pub(self) driver_upgraded: bool,
     /// The install this wizard started, plus what its step renders — the same
     /// state machine the settings pane uses (`driver_install`).
+    #[cfg(target_os = "macos")]
     pub(self) driver_install: Option<crate::shell::driver_install::InstallHandle>,
+    #[cfg(target_os = "macos")]
     pub(self) driver_install_ui: crate::shell::driver_install::DriverInstallUi,
+    #[cfg(target_os = "macos")]
     pub(self) driver_poll_running: bool,
 }
 
@@ -158,11 +164,16 @@ impl OnboardingWizard {
             model_select: None,
             model_select_sig: Vec::new(),
             _model_select_sub: None,
+            #[cfg(target_os = "macos")]
             driver_status: crate::shell::settings_modal::DriverStatus::Unknown,
             driver_step_planned: false,
+            #[cfg(target_os = "macos")]
             driver_upgraded: false,
+            #[cfg(target_os = "macos")]
             driver_install: None,
+            #[cfg(target_os = "macos")]
             driver_install_ui: crate::shell::driver_install::DriverInstallUi::Idle,
+            #[cfg(target_os = "macos")]
             driver_poll_running: false,
         }
     }
@@ -179,9 +190,18 @@ impl OnboardingWizard {
         self.expanded = false;
         // Once per open, not per transition: the step count (and dot row)
         // must be stable for the whole run of the wizard.
-        self.driver_status = crate::shell::settings_modal::DriverStatus::resolve();
-        self.driver_step_planned = self.driver_status.install_label().is_some();
-        self.driver_upgraded = false;
+        // No screen-control driver to install off macOS, so the wizard is one
+        // step shorter there rather than showing a step that cannot succeed.
+        #[cfg(target_os = "macos")]
+        {
+            self.driver_status = crate::shell::settings_modal::DriverStatus::resolve();
+            self.driver_step_planned = self.driver_status.install_label().is_some();
+            self.driver_upgraded = false;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.driver_step_planned = false;
+        }
         self.build_roster(cx);
         self.ensure_model_select(window, cx);
         self.sync_model_select(window, cx);
@@ -390,6 +410,15 @@ impl OnboardingWizard {
     /// after an install flips the live status to Ready mid-step).
     pub(super) fn driver_step_needed(&self) -> bool {
         self.driver_step_planned
+    }
+
+    /// Unreachable off macOS — `driver_step_planned` is never set there, so the
+    /// wizard never navigates to `OnboardingStep::Driver`. The body exists only
+    /// because the step enum and its match arm are platform-neutral; keeping
+    /// the variant costs one empty div and keeps step navigation in one shape.
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn render_driver_step(&mut self, _cx: &mut Context<Self>) -> gpui::Div {
+        gpui::div()
     }
 
     pub(super) fn next(&mut self, cx: &mut Context<Self>) {

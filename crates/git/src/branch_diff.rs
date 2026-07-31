@@ -19,7 +19,9 @@ use crate::process::GitCmd;
 use crate::repository::Repository;
 use crate::error::Result;
 use oximux_core::{BranchCommittedFile, BranchRange, DiffStatus};
+#[cfg(unix)]
 use std::ffi::OsStr;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
@@ -189,8 +191,21 @@ fn parse_name_status_z(buf: &[u8]) -> Vec<(DiffStatus, PathBuf)> {
 /// Raw bytes → `PathBuf` without lossy UTF-8 rewriting (macOS paths are
 /// arbitrary bytes). `-z` output is already unquoted, so the bytes are the
 /// literal path.
+#[cfg(unix)]
 fn path_from_bytes(b: &[u8]) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(b).to_os_string())
+}
+
+/// Raw bytes → `PathBuf`, decoding as UTF-8.
+///
+/// Windows paths are UTF-16 and `OsString` has no byte constructor there, so
+/// the byte-exact round-trip above is not available. Git emits these paths as
+/// UTF-8 (it re-encodes from UTF-16 at its own boundary), which makes the lossy
+/// decode exact in practice; a path that survives git but not this step would
+/// have to be invalid UTF-8 on a platform that cannot produce it.
+#[cfg(windows)]
+fn path_from_bytes(b: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(b).into_owned())
 }
 
 #[cfg(test)]

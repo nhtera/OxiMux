@@ -101,12 +101,26 @@ fn resolve_on_path(program: &str) -> Option<String> {
 }
 
 /// `true` when `path` is a regular file with an executable bit set.
+#[cfg(unix)]
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     match std::fs::metadata(path) {
         Ok(meta) => meta.is_file() && (meta.permissions().mode() & 0o111 != 0),
         Err(_) => false,
     }
+}
+
+/// `true` when `path` is a regular file.
+///
+/// Windows has no executable bit — what makes a file runnable is its extension
+/// being in `PATHEXT`. This check therefore only answers half the question, and
+/// the PATH walk above will miss `rust-analyzer.exe` when asked for
+/// `rust-analyzer`. Extension resolution belongs with the wider PATH/PATHEXT
+/// work, not here; until then a Windows user must configure the server command
+/// with its extension.
+#[cfg(windows)]
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
 #[cfg(test)]

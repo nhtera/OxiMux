@@ -6,6 +6,8 @@ use std::time::Duration;
 use dashmap::DashMap;
 use oximux_relay_proto::{Frame, Hello, Notification, PROTOCOL_VERSION, Request, Response};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -32,6 +34,11 @@ pub enum ClientError {
     Timeout(Duration),
     #[error("handshake failed: {0}")]
     Handshake(String),
+    /// No local-socket transport on this platform yet. Distinct from `Io` so
+    /// the caller can tell "the daemon is not reachable here by design" from
+    /// "the connection attempt failed", which have different remedies.
+    #[error("no relay transport on this platform yet (named pipes are unimplemented)")]
+    UnsupportedPlatform,
 }
 
 // Upper bound on how long a synchronous RPC waits for the daemon's
@@ -58,6 +65,40 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 type SubId = u64;
 type PtySubscribers = Arc<DashMap<String, Vec<(SubId, mpsc::UnboundedSender<Notification>)>>>;
 
+/// Open the byte stream to the daemon and hand back its two halves. The only
+/// platform-specific step in the client — everything above it is framing.
+///
+/// Splitting here rather than in the caller is deliberate: `UnixStream` splits
+/// into two independently-owned halves with no shared lock, while the generic
+/// `tokio::io::split` puts a `BiLock` between reader and writer. This socket
+/// carries every keystroke one way and every byte of PTY output the other, so
+/// that lock would sit on the hottest path in the app.
+#[cfg(unix)]
+async fn dial(
+    socket_path: &Path,
+) -> Result<
+    (
+        tokio::net::unix::OwnedReadHalf,
+        tokio::net::unix::OwnedWriteHalf,
+    ),
+    ClientError,
+> {
+    Ok(UnixStream::connect(socket_path).await?.into_split())
+}
+
+/// Stand-in half types for platforms with no local-socket transport yet.
+///
+/// Nameable but never produced: `dial` below always fails. They exist so the
+/// handshake and both I/O loops stay type-checked everywhere rather than
+/// disappearing behind a `cfg` — those are the parts a future change is most
+/// likely to break without noticing.
+#[cfg(not(unix))]
+async fn dial(
+    _socket_path: &Path,
+) -> Result<(tokio::io::Empty, tokio::io::Sink), ClientError> {
+    Err(ClientError::UnsupportedPlatform)
+}
+
 pub struct RelayClient {
     write_tx: mpsc::Sender<Frame>,
     pending: Arc<DashMap<u64, oneshot::Sender<Response>>>,
@@ -73,9 +114,27 @@ pub struct RelayClient {
 }
 
 impl RelayClient {
+    /// Dial the daemon's local socket and complete the handshake.
+    ///
+    /// Only the dial is platform-specific; everything after it is framing over
+    /// a byte stream, so [`Self::handshake`] takes the connected halves rather
+    /// than the path. That is the seam a named-pipe transport plugs into.
     pub async fn connect(socket_path: &Path, token: &str) -> Result<Self, ClientError> {
-        let stream = UnixStream::connect(socket_path).await?;
-        let (mut read_half, mut write_half) = stream.into_split();
+        let (read_half, write_half) = dial(socket_path).await?;
+        Self::handshake(read_half, write_half, token).await
+    }
+
+    /// Handshake and start the reader/writer tasks over an already-connected
+    /// pair of stream halves.
+    async fn handshake<R, W>(
+        mut read_half: R,
+        mut write_half: W,
+        token: &str,
+    ) -> Result<Self, ClientError>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
 
         // --- Handshake (must complete before the reader task starts
         //     consuming response frames) ----------------------------
@@ -248,8 +307,8 @@ fn unsubscribe_from(subscribers: &PtySubscribers, pty_id: &str, sub_id: SubId) {
     subscribers.remove_if(pty_id, |_, subs| subs.is_empty());
 }
 
-async fn reader_loop(
-    mut read_half: tokio::net::unix::OwnedReadHalf,
+async fn reader_loop<R: AsyncRead + Unpin>(
+    mut read_half: R,
     mut buf: Vec<u8>,
     pending: Arc<DashMap<u64, oneshot::Sender<Response>>>,
     subscribers: PtySubscribers,

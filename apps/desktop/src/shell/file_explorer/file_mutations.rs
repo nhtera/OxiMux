@@ -87,6 +87,17 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
             let target = std::fs::read_link(&from)?;
             #[cfg(unix)]
             std::os::unix::fs::symlink(&target, &to)?;
+            // Windows needs to know up front whether the link points at a
+            // directory, so it resolves the source (`from`, following the
+            // link) rather than inspecting `target`, which may be relative.
+            // Creating these can require Developer Mode; the error propagates
+            // rather than leaving a copy that quietly lost its links.
+            #[cfg(windows)]
+            if std::fs::metadata(&from).is_ok_and(|m| m.is_dir()) {
+                std::os::windows::fs::symlink_dir(&target, &to)?;
+            } else {
+                std::os::windows::fs::symlink_file(&target, &to)?;
+            }
         } else if ft.is_dir() {
             copy_dir_recursive(&from, &to)?;
         } else {

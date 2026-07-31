@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result};
 use futures::channel::mpsc;
-use oximux_computer_use::redact::{scrub_transcript, ScreenshotFilter};
+use oximux_agent_core::redact::{scrub_transcript, ScreenshotFilter};
 use tokio::sync::{broadcast, watch};
 
 use crate::thread::{

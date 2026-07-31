@@ -18,8 +18,11 @@
 //! `agent-status` helper CLIs and the dev spikes run before this check, so they
 //! never contend with a live window.
 
+#[cfg(unix)]
 use std::fs::OpenOptions;
+#[cfg(unix)]
 use std::io::{Seek, SeekFrom, Write};
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -56,6 +59,7 @@ pub enum AcquireOutcome {
 /// `Ok(AlreadyRunning)` — a live holder has it; the caller should activate the
 /// holder and exit. `Err` — an unexpected filesystem/lock error; the caller
 /// should log and degrade to a normal boot rather than refuse to start.
+#[cfg(unix)]
 pub fn try_acquire(lock_path: &Path) -> std::io::Result<AcquireOutcome> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -93,8 +97,28 @@ pub fn try_acquire(lock_path: &Path) -> std::io::Result<AcquireOutcome> {
     Err(err)
 }
 
+/// No lock is taken off Unix yet, so this reports failure rather than success.
+///
+/// The caller's documented response to `Err` is to log and boot normally, which
+/// is the honest state of affairs: `LockFileEx` and the window-message
+/// activation that pairs with it are their own piece of work. Returning
+/// `Acquired` instead would claim a guarantee — only one instance owns the
+/// layout store — that nothing is enforcing, and the symptom (a second launch
+/// silently overwriting the first's saved terminals) surfaces far from here.
+#[cfg(not(unix))]
+pub fn try_acquire(lock_path: &Path) -> std::io::Result<AcquireOutcome> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!(
+            "single-instance lock is unimplemented on this platform ({})",
+            lock_path.display()
+        ),
+    ))
+}
+
 /// Read the PID the current holder recorded in the lock file. `None` when the
 /// file is unreadable or hasn't been written yet (a holder mid-acquire).
+#[cfg(unix)]
 fn read_holder_pid(lock_path: &Path) -> Option<u32> {
     std::fs::read_to_string(lock_path).ok()?.trim().parse().ok()
 }

@@ -18,7 +18,15 @@ mod background_tasks_panel;
 mod bubble;
 mod companion_sync;
 mod composer;
+#[cfg(target_os = "macos")]
 pub(crate) mod computer_use;
+// Where computer use does not exist, these three keep their names and answer
+// accordingly — see the module's own header for why that beats cfg-ing ~35
+// call sites through the transcript renderer.
+#[cfg(not(target_os = "macos"))]
+mod screen_control_absent;
+#[cfg(not(target_os = "macos"))]
+use screen_control_absent::{computer_use, screen_card, screen_consent};
 mod composer_history;
 mod acp_terminal_host;
 mod context_meter;
@@ -44,7 +52,9 @@ mod remote_turn;
 mod turn_summary_card;
 mod rewind_menu;
 mod session_persistence;
+#[cfg(target_os = "macos")]
 mod screen_card;
+#[cfg(target_os = "macos")]
 mod screen_consent;
 mod session_detail;
 mod roster;
@@ -3636,7 +3646,7 @@ impl AgentChatView {
         // builds is already the consent one. Purely a classification — whether
         // it is *allowed* is the policy's business, below.
         if let ThreadEvent::PermissionRequested { tool_name, kind, .. } = &mut ev
-            && oximux_computer_use::is_computer_use_tool(tool_name)
+            && oximux_agent_core::screen_tools::is_computer_use_tool(tool_name)
         {
             *kind = oximux_agents::thread::PermissionKind::Screen;
         }

@@ -8,7 +8,6 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-oximux-computer-use.workspace = true
 oximux-core = { workspace = true }
 # Portable fold + wire vocabulary + stream-json decoder, re-exported under the
 # original `crate::thread::*` paths (see src/thread/mod.rs). Split out so the

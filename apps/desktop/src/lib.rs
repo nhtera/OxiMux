@@ -14,6 +14,9 @@ pub mod remote_control;
 pub mod scheduler;
 pub mod shell;
 pub mod state;
+// Staging and swapping a `.app` bundle, verified against a codesign pin.
+// Windows gets a versioned-directory updater of its own later.
+#[cfg(target_os = "macos")]
 pub mod updater;
 pub mod workspace_root;
 

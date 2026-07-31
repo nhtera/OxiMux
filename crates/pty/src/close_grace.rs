@@ -20,7 +20,13 @@ use std::time::Duration;
 /// Outcome of the SIGTERM step. Drives whether `close_with_grace` waits
 /// for the watcher to exit naturally (`Sent` / `AlreadyGone`) or escalates
 /// to SIGKILL immediately (`Failed` / `Skipped`).
+///
+/// Off Unix only `Skipped` is reachable today, so the other three read as dead
+/// code — kept whole rather than cfg'd down to one variant because the grace
+/// logic and its five tests are platform-neutral, and the Windows graceful-stop
+/// path (job objects) will construct the same outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) enum TermResult {
     /// SIGTERM delivered successfully — give the watcher the grace window
     /// to observe the child's graceful exit.

@@ -29,7 +29,11 @@ pub mod escape_tap;
 pub mod login_path;
 pub mod menu;
 pub mod mic_permission;
+// Waits out the old pid in a detached `sh`, then `open -n`s the bundle. Paired
+// with the macOS updater's quit-time swap, and macOS-shaped throughout.
+#[cfg(target_os = "macos")]
 pub mod relaunch;
+#[cfg(target_os = "macos")]
 pub mod screen_control_indicator;
 pub mod secure_input;
 pub mod single_instance;

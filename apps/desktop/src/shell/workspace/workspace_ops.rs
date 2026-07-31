@@ -2212,16 +2212,22 @@ impl WorkspaceRoot {
         cx.notify();
     }
 
-    /// Open the project's root directory in the macOS Finder. Best-effort:
-    /// a spawn failure is logged, never surfaced as a hard error, because
-    /// "reveal" is a convenience action with no state to keep consistent.
+    /// Open the project's root directory in the system file manager.
+    /// Best-effort: a spawn failure is logged, never surfaced as a hard error,
+    /// because "reveal" is a convenience action with no state to keep
+    /// consistent.
     pub(crate) fn reveal_project_in_finder(&self, project: &Project) {
         #[cfg(target_os = "macos")]
-        if let Err(err) = std::process::Command::new("open")
+        let launcher = "open";
+        #[cfg(windows)]
+        let launcher = "explorer";
+
+        #[cfg(any(target_os = "macos", windows))]
+        if let Err(err) = std::process::Command::new(launcher)
             .arg(&project.root_path)
             .spawn()
         {
-            tracing::warn!(?err, path = %project.root_path, "reveal_project_in_finder: open failed");
+            tracing::warn!(?err, path = %project.root_path, "reveal_project_in_finder: {launcher} failed");
         }
     }
 

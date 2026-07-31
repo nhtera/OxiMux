@@ -12,6 +12,7 @@
 // to /dev/null + log file + `mem::forget(child)` so the kernel
 // reparents to PID 1 when the app dies. No `waitpid` — no zombie.
 
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,6 +22,7 @@ use anyhow::{Context, Result, bail};
 use oximux_relay_client::{ClientError, RelayClient};
 use oximux_relay_proto::ErrCode;
 use thiserror::Error;
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use uuid::Uuid;
 
@@ -199,13 +201,20 @@ impl RelaySupervisor {
         // Quick TCP-level reachability before paying for Hello.
         // tokio::UnixStream::connect returns immediately if the
         // socket file is missing or refused.
-        let reachable = tokio::time::timeout(
-            HANDSHAKE_QUICK_TIMEOUT,
-            UnixStream::connect(self.socket_path()),
-        )
-        .await;
-        if !matches!(reachable, Ok(Ok(_))) {
-            return ExistingConnect::Absent;
+        //
+        // Skipped where there is no local-socket transport: the handshake
+        // below fails immediately there anyway, so the pre-probe would only
+        // add a second way to say the same thing.
+        #[cfg(unix)]
+        {
+            let reachable = tokio::time::timeout(
+                HANDSHAKE_QUICK_TIMEOUT,
+                UnixStream::connect(self.socket_path()),
+            )
+            .await;
+            if !matches!(reachable, Ok(Ok(_))) {
+                return ExistingConnect::Absent;
+            }
         }
         // Now the full handshake — verifies the daemon also speaks
         // our protocol version and accepts the token.

@@ -31,7 +31,6 @@ pub mod lifecycle;
 pub mod mcp;
 pub mod policy;
 pub mod proc;
-pub mod redact;
 pub mod session;
 pub mod target;
 pub mod tools;
@@ -64,7 +63,11 @@ pub use grants::{GrantTable, Provenance};
 pub use gui_scripting::GuiScripting;
 pub use mcp::{bare_tool_name, is_computer_use_tool, server_spec, SERVER_NAME};
 pub use policy::{decide, Decision, PolicyContext};
-pub use redact::{scrub_transcript, ScreenshotFilter};
+// Screenshot scrubbing moved to `oximux-agent-core` so it keeps compiling on
+// platforms this crate does not build for (see that crate's `redact` module).
+// Re-exported under the old path because this crate is where callers expect
+// anything screen-control-shaped to live.
+pub use oximux_agent_core::redact::{scrub_transcript, ScreenshotFilter};
 pub use session::{Reconciliation, SessionId, SessionLedger};
 pub use target::{Category, TargetApp};
 pub use verify::VerifiedDriver;

@@ -23,11 +23,11 @@
 //! tool-call ids belong to the screen-control server, learned from the
 //! `ToolCallStarted` that must precede any result for that id.
 //!
-//! [`ThreadEvent::ToolResultImages`]: oximux_agent_core::thread::ThreadEvent::ToolResultImages
+//! [`ThreadEvent::ToolResultImages`]: crate::thread::ThreadEvent::ToolResultImages
 
 use std::collections::VecDeque;
 
-use oximux_agent_core::thread::ThreadEvent;
+use crate::thread::ThreadEvent;
 use serde_json::Value;
 
 /// How many screen-control tool-call ids to remember.
@@ -61,7 +61,7 @@ impl ScreenshotFilter {
     pub fn scrub(&mut self, event: &mut ThreadEvent) -> bool {
         match event {
             ThreadEvent::ToolCallStarted { id, name, .. } => {
-                if crate::mcp::is_computer_use_tool(name) {
+                if crate::screen_tools::is_computer_use_tool(name) {
                     self.remember(id.clone());
                 }
                 false
@@ -109,7 +109,7 @@ impl ScreenshotFilter {
 /// [`ThreadEntry`] values for exactly that reason: the only shape worth
 /// asserting against is the one the app actually serializes.
 ///
-/// [`ThreadEntry`]: oximux_agent_core::thread::ThreadEntry
+/// [`ThreadEntry`]: crate::thread::ThreadEntry
 ///
 /// A transcript that will not parse is returned untouched and reported as zero.
 /// That is the safe direction only because the caller's frame-budget step
@@ -153,7 +153,7 @@ fn scrub_entry(node: &mut Value, scrubbed: &mut usize) {
             let is_screen_call = map
                 .get("name")
                 .and_then(Value::as_str)
-                .is_some_and(crate::mcp::is_computer_use_tool);
+                .is_some_and(crate::screen_tools::is_computer_use_tool);
             if is_screen_call
                 && let Some(Value::Array(images)) = map.get_mut("images")
                 && !images.is_empty()
@@ -178,7 +178,7 @@ fn scrub_entry(node: &mut Value, scrubbed: &mut usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oximux_agent_core::thread::{ChatImage, ThreadEntry, ToolCall};
+    use crate::thread::{ChatImage, ThreadEntry, ToolCall};
     use serde_json::json;
 
     fn image() -> ChatImage {

@@ -9,7 +9,7 @@ use std::time::Duration;
 use oximux_pty::{
     PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent, TerminalSessionId,
 };
-use oximux_relay::server::{ServerConfig, run_server};
+use oximux_relay::{ServerConfig, run_server};
 use oximux_relay_client::{RelayBackend, RelayClient};
 use tempfile::TempDir;
 use tokio::net::UnixStream;

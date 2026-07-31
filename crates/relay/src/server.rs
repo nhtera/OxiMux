@@ -14,11 +14,8 @@ use uuid::Uuid;
 use crate::checkpoint::CheckpointStore;
 use crate::codec::{CodecError, read_frame, write_frame};
 use crate::registry::{PtyRegistry, RegistryError, SUBSCRIBER_QUEUE, SpawnArgs};
+use crate::server_config::ServerConfig;
 
-// Daemon self-exit if no clients attached and no PTYs alive for this
-// long. Plan's "Locked decisions": 24h. Configurable for tests via
-// `ServerConfig.idle_timeout`.
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24);
 const DEFAULT_IDLE_TICK: Duration = Duration::from_secs(60);
 
 // Disk-checkpoint cadence: each tick persists every PTY's replay ring
@@ -29,39 +26,6 @@ const CHECKPOINT_TICK: Duration = Duration::from_secs(5);
 // Checkpoint dirs untouched this long are orphans (their pane was
 // dropped from every layout while no daemon was around to clean up).
 const CHECKPOINT_GC_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 7);
-
-pub struct ServerConfig {
-    pub socket_path: PathBuf,
-    pub token_file: PathBuf,
-    // None skips PID-file writing (useful for in-process tests).
-    pub pid_path: Option<PathBuf>,
-    // None disables idle GC. Tests override with short values to
-    // exercise the auto-exit path without sleeping for a day.
-    pub idle_timeout: Option<Duration>,
-    // None uses `DEFAULT_IDLE_TICK`. Tests can pick a sub-second tick
-    // so the idle timer reaches its threshold quickly.
-    pub idle_tick_interval: Option<Duration>,
-    // Root directory for per-PTY disk scrollback checkpoints. None
-    // disables checkpointing entirely (in-process tests).
-    pub checkpoint_dir: Option<PathBuf>,
-    // None uses `CHECKPOINT_TICK`. Tests pick sub-second ticks so a
-    // checkpoint lands without multi-second sleeps.
-    pub checkpoint_tick_interval: Option<Duration>,
-}
-
-impl ServerConfig {
-    pub fn idle_disabled(socket_path: PathBuf, token_file: PathBuf) -> Self {
-        Self {
-            socket_path,
-            token_file,
-            pid_path: None,
-            idle_timeout: None,
-            idle_tick_interval: None,
-            checkpoint_dir: None,
-            checkpoint_tick_interval: None,
-        }
-    }
-}
 
 // Drop guard: removes the bound socket path on drop so a crashed
 // relay can be replaced by a fresh spawn without manual cleanup.

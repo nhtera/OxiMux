@@ -13,9 +13,11 @@ path = "src/main.rs"
 
 [dependencies]
 oximux-agents = { workspace = true }
-oximux-computer-use = { workspace = true }
+# The portable half of the agent-chat core. Reached directly (rather than
+# through `oximux-agents`) for the pieces that must stay compiled on every
+# platform — screenshot scrubbing and the screen-tool naming contract.
+oximux-agent-core = { workspace = true }
 oximux-auto-update = { workspace = true }
-oximux-macos-trust = { workspace = true }
 oximux-core = { workspace = true }
 oximux-dictation = { workspace = true }
 oximux-editor = { workspace = true }
@@ -77,6 +79,16 @@ sha1 = "0.10"
 hmac = "0.12"
 two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
 
+# Embedded browser-tab engine: one Rust API over the platform webview
+# (WKWebView on macOS, WebView2 on Windows). `build_as_child` attaches the
+# webview to GPUI's native window surface via the `raw-window-handle` already in
+# the graph; no `tao`/gtk pulled in on either (those are Linux-only optional
+# features). Chosen for exactly this cross-platform reach over a macOS-only
+# objc2-web-kit binding. `devtools` is enabled explicitly so the inspector
+# methods (open/close/is_devtools_open) exist in release too — wry only turns
+# them on automatically under debug_assertions, which broke release builds.
+wry = { version = "0.55", features = ["devtools"] }
+
 # Relay supervisor's `pre_exec` calls libc::umask so the bundled
 # socket/token files come out 0600. libc is already in the transitive
 # graph via nix/tokio but pulling it explicitly is cheaper than the
@@ -85,6 +97,13 @@ two-face = { version = "0.5.1", default-features = false, features = ["syntect-f
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Screen control drives the macOS Accessibility APIs and its installer/updater
+# gates shell out to codesign and spctl. Both are macOS all the way down, so
+# they leave the dependency graph entirely elsewhere rather than growing stub
+# implementations. The features they back are hidden, not faked — see
+# `docs/windows-port-exclusions.md`.
+oximux-computer-use = { workspace = true }
+oximux-macos-trust = { workspace = true }
 # Objective-C bridge for the NSProcessInfo `beginActivityWithOptions`
 # App Nap opt-out (`app_nap`) and the AppKit menu-item responder selectors
 # (`menu::platform`). objc2 is the maintained successor and is already in the
@@ -126,15 +145,6 @@ objc2-av-foundation = { version = "0.3", features = [
   "block2",
 ] }
 block2 = "0.6"
-# Embedded browser-tab engine: one Rust API over the platform webview
-# (WKWebView on macOS). `build_as_child` attaches the webview to GPUI's
-# native window surface via the `raw-window-handle` already in the graph; no
-# `tao`/gtk pulled in on macOS (those are Linux-only optional features).
-# Chosen for future cross-platform (WebView2 / WebKitGTK) over a macOS-only
-# objc2-web-kit binding. `devtools` is enabled explicitly so the inspector
-# methods (open/close/is_devtools_open) exist in release too — wry only turns
-# them on automatically under debug_assertions, which broke release builds.
-wry = { version = "0.55", features = ["devtools"] }
 # Browser agent-context screenshot: `WKWebView.takeSnapshot` returns an
 # `NSImage`; app-kit's `NSBitmapImageRep` re-encodes it to PNG bytes for the
 # clipboard. web-kit's snapshot method is feature-gated on the snapshot

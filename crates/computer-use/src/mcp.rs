@@ -12,16 +12,13 @@ use std::path::Path;
 
 use oximux_agent_core::thread::McpServerSpec;
 
-/// Name the server is declared under. It is not cosmetic: agents namespace MCP
-/// tools as `mcp__<server>__<tool>`, so this string is the prefix every later
-/// policy check matches on. Changing it silently unhooks those checks.
-///
-/// Prefixed with the app name rather than the bare `computer-use`, which a live
-/// run showed is **silently dropped** — declared under that name the server
-/// never appears in the session's server list at all, with no error, and the
-/// agent simply reports the tools missing. A namespaced name also avoids
-/// colliding with a server the user has configured themselves.
-pub const SERVER_NAME: &str = "oximux-computer-use";
+// The server name and the tool-name predicates derived from it live in
+// `oximux-agent-core`, because the transcript scrubber has to match on them
+// even where this crate does not build. Re-exported here so callers keep
+// reaching for them at the screen-control crate, which is where they read.
+pub use oximux_agent_core::screen_tools::{
+    bare_tool_name, is_computer_use_tool, tool_prefix, SERVER_NAME,
+};
 
 use crate::HOST_BUNDLE_ID;
 
@@ -186,29 +183,6 @@ pub fn hook_matcher() -> String {
 /// reject its own command line, silently leaving the chat unenforced.
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
-}
-
-/// The namespaced prefix agents give this server's tools.
-pub fn tool_prefix() -> String {
-    format!("mcp__{SERVER_NAME}__")
-}
-
-/// Is `tool_name` one of this server's tools?
-///
-/// Lives next to [`SERVER_NAME`] so the prefix format is derived in exactly one
-/// place — a policy check that hardcodes its own copy is a check that silently
-/// stops matching when the name changes.
-pub fn is_computer_use_tool(tool_name: &str) -> bool {
-    tool_name.starts_with(&tool_prefix())
-}
-
-/// The bare driver tool behind a namespaced name, e.g. `click`.
-pub fn bare_tool_name(tool_name: &str) -> Option<&str> {
-    tool_name.strip_prefix("mcp__").and_then(|rest| {
-        rest.strip_prefix(SERVER_NAME)
-            .and_then(|rest| rest.strip_prefix("__"))
-            .filter(|bare| !bare.is_empty())
-    })
 }
 
 #[cfg(test)]

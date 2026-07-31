@@ -144,8 +144,11 @@ fn init_tracing(log_dir: Option<&Path>) -> Option<WorkerGuard> {
 
     #[cfg(target_os = "macos")]
     let oslog_layer = Some(tracing_oslog::OsLogger::new("dev.nhtera.oximux", "relay"));
+    // `Identity` rather than a concrete `fmt::Layer`: this sits partway up a
+    // `Layered` stack, and naming `Layer<Registry>` pins the subscriber type to
+    // the bottom of that stack instead of wherever it actually composes.
     #[cfg(not(target_os = "macos"))]
-    let oslog_layer: Option<fmt::Layer<tracing_subscriber::Registry>> = None;
+    let oslog_layer: Option<tracing_subscriber::layer::Identity> = None;
 
     tracing_subscriber::registry()
         .with(env_filter)

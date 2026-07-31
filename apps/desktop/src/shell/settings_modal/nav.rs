@@ -33,11 +33,28 @@ pub enum SettingsPane {
 }
 
 impl SettingsPane {
+    /// The variant stays defined everywhere so navigation and the pane match
+    /// keep one shape; it is simply not offered where screen control does not
+    /// exist, rather than opening a pane that can only explain itself away.
+    #[cfg(target_os = "macos")]
     pub(super) const ALL: [SettingsPane; 10] = [
         SettingsPane::Terminal,
         SettingsPane::Agents,
         SettingsPane::Voice,
         SettingsPane::ScreenControl,
+        SettingsPane::Notifications,
+        SettingsPane::Schedules,
+        SettingsPane::Remote,
+        SettingsPane::Keybindings,
+        SettingsPane::Appearance,
+        SettingsPane::About,
+    ];
+
+    #[cfg(not(target_os = "macos"))]
+    pub(super) const ALL: [SettingsPane; 9] = [
+        SettingsPane::Terminal,
+        SettingsPane::Agents,
+        SettingsPane::Voice,
         SettingsPane::Notifications,
         SettingsPane::Schedules,
         SettingsPane::Remote,
