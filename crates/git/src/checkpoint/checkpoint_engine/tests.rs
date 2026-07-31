@@ -24,6 +24,43 @@ async fn engine(dir: &Path) -> CheckpointEngine {
     CheckpointEngine::new(dir).await.unwrap().expect("is a repo")
 }
 
+/// The phrase list, tested directly rather than only through a real prune.
+///
+/// `pruned_object_reports_missing` below exercises whatever git is installed,
+/// so it covers exactly one spelling — the one that machine's version happens
+/// to emit — and silently stops covering the others. Recording them here is
+/// what keeps a phrase from being dropped as "unused" on the next edit.
+#[test]
+fn missing_object_recognises_every_known_spelling() {
+    for stderr in [
+        "fatal: bad object 614180d",
+        "fatal: not a valid object name HEAD~5",
+        "fatal: bad revision 'deadbeef'",
+        "error: unable to read tree 614180d",
+        // git 2.35, `read-tree` against a pruned commit-ish.
+        "fatal: reference is not a tree: 614180d1450a7e8e8bd31c783a653a6ebcfcfbc4",
+        "fatal: 614180d is not a tree object",
+    ] {
+        assert!(is_missing_object(stderr), "should classify as missing: {stderr}");
+    }
+}
+
+/// The negative half, which matters more than it looks: classifying a real
+/// failure as a pruned object tells the user their checkpoint is gone when the
+/// truth is something they could fix.
+#[test]
+fn missing_object_does_not_swallow_unrelated_failures() {
+    for stderr in [
+        "fatal: not a git repository (or any of the parent directories): .git",
+        "error: could not read config file .git/config",
+        "fatal: pathspec 'nope.txt' did not match any files",
+        "error: Your local changes would be overwritten by checkout.",
+        "fatal: detected dubious ownership in repository",
+    ] {
+        assert!(!is_missing_object(stderr), "should NOT be missing-object: {stderr}");
+    }
+}
+
 fn read(dir: &Path, name: &str) -> String {
     std::fs::read_to_string(dir.join(name)).unwrap()
 }
