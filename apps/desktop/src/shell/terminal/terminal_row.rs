@@ -37,7 +37,8 @@ pub fn build_row(
     // padding above and below. Half-block characters (▀ U+2580, ▄ U+2584,
     // █ U+2588) rely on glyphs touching with zero gap so ▄-then-▀ across
     // adjacent rows joins into a solid pixel column. Caller passes a
-    // line_height tuned to Menlo's em-square (~17 px at 14 pt) so the
+    // line_height tuned to the mono face's em-square (~16.4–16.9 px at
+    // 14 pt for Menlo and Consolas alike) so the
     // padding collapses; Claude Code's mascot is the canonical regression
     // case and should now render with the same pixel resolution as
     // mainstream GPU-accelerated terminals.

@@ -37,6 +37,59 @@ pub struct Typography {
     pub ui_fallbacks: Vec<SharedString>,
 }
 
+/// The faces each platform is guaranteed to ship.
+///
+/// GPUI looks `Font::family` up verbatim, and `FontFallbacks` only cascades
+/// for *individual glyph* lookups inside a family that already loaded — a
+/// primary which fails to resolve at all drops to the platform's default UI
+/// face, which is proportional. In the terminal that is not a subtle
+/// degradation: `terminal_canvas` pins every glyph to a `cell_width`
+/// measured from `'m'`, so a proportional fallback leaves narrow characters
+/// (`i`, `l`, `1`, `:`) left-aligned in a cell sized for the widest
+/// lowercase glyph, and the whole grid reads as randomly spaced. The primary
+/// therefore has to be a face the OS always has.
+#[cfg(target_os = "macos")]
+mod platform_fonts {
+    /// Menlo is the only mono face guaranteeable on every macOS 13+ install
+    /// (Geist Mono is opt-in, and "SF Mono" registers as `.SF NS Mono` /
+    /// `SFMono-Regular`, which font-kit's family selector misses). It
+    /// carries the full Block Elements range (U+2580–259F) and Box Drawing
+    /// (U+2500–257F), which half-block pixel art needs — Claude Code's
+    /// mascot is the canonical regression case.
+    pub const MONO: &str = "Menlo";
+    pub const MONO_FALLBACKS: &[&str] = &["SF Mono", "Monaco"];
+    pub const UI: &str = "Helvetica Neue";
+    pub const UI_FALLBACKS: &[&str] = &["Helvetica"];
+}
+
+#[cfg(target_os = "windows")]
+mod platform_fonts {
+    /// Consolas ships with every Windows since Vista. It covers Box Drawing
+    /// in full, and of Block Elements it carries exactly the eight that
+    /// half-block rendering uses (▀ ▄ █ ▌ ▐ ░ ▒ ▓) — the 24 it lacks are the
+    /// eighth-fraction blocks that sparkline-style output wants. Cascadia
+    /// Mono covers those plus Braille, but only arrives with Windows
+    /// Terminal rather than with Windows, so it sits in the fallback slot
+    /// where being absent costs nothing.
+    pub const MONO: &str = "Consolas";
+    pub const MONO_FALLBACKS: &[&str] = &["Cascadia Mono", "Segoe UI Symbol"];
+    /// Segoe UI is what the Helvetica Neue lookup was already landing on by
+    /// accident. Naming it is a no-op visually and stops the UI chrome from
+    /// depending on where GPUI's default happens to point.
+    pub const UI: &str = "Segoe UI";
+    pub const UI_FALLBACKS: &[&str] = &["Tahoma"];
+}
+
+/// Not a platform we ship, but the crate should still build and render
+/// something monospaced if someone compiles for it.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+mod platform_fonts {
+    pub const MONO: &str = "DejaVu Sans Mono";
+    pub const MONO_FALLBACKS: &[&str] = &["Liberation Mono", "Noto Sans Mono"];
+    pub const UI: &str = "DejaVu Sans";
+    pub const UI_FALLBACKS: &[&str] = &["Liberation Sans"];
+}
+
 impl Typography {
     pub fn cockpit() -> Self {
         Self {
@@ -52,23 +105,20 @@ impl Typography {
             w_medium: FontWeight::MEDIUM,
             w_semibold: FontWeight::SEMIBOLD,
 
-            // `Menlo` is the primary because it's the only mono face we can
-            // guarantee on every macOS 13+ install (Geist Mono is opt-in,
-            // and "SF Mono" registers as `.SF NS Mono` / `SFMono-Regular`
-            // which font-kit's family selector misses). It carries the
-            // full Block Elements range (U+2580–259F) and Box Drawing
-            // (U+2500–257F), which is required for half-block pixel art
-            // — Claude Code's mascot is the canonical regression case.
-            //
-            // `FontFallbacks` in GPUI only cascades for *individual glyph*
-            // lookups inside an already-loaded family, not when the
-            // primary family fails to load entirely. So the primary MUST
-            // resolve, and the fallbacks act as glyph-coverage backups
-            // (e.g. SF Mono / Monaco for non-Latin scripts).
-            family_mono: "Menlo".into(),
-            family_ui: "Helvetica Neue".into(),
-            mono_fallbacks: vec!["SF Mono".into(), "Monaco".into()],
-            ui_fallbacks: vec!["Helvetica".into()],
+            // Per-platform because the primary MUST resolve — see
+            // `platform_fonts` for why a missing primary degrades the
+            // terminal grid rather than just swapping a typeface. The
+            // fallbacks are glyph-coverage backups only.
+            family_mono: platform_fonts::MONO.into(),
+            family_ui: platform_fonts::UI.into(),
+            mono_fallbacks: platform_fonts::MONO_FALLBACKS
+                .iter()
+                .map(|name| (*name).into())
+                .collect(),
+            ui_fallbacks: platform_fonts::UI_FALLBACKS
+                .iter()
+                .map(|name| (*name).into())
+                .collect(),
         }
     }
 

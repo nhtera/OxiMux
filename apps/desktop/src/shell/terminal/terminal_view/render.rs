@@ -268,9 +268,11 @@ impl Render for TerminalView {
             .bg(theme.bg_base)
             .text_color(theme.fg_base)
             // `.font(...)` over `.font_family(...)` so the configured
-            // fallback chain (SF Mono → Menlo → Monaco) takes effect when
-            // the primary face (Geist Mono) isn't installed. `font_family`
-            // takes a single literal name and never cascades. The canvas
+            // per-platform fallback chain takes effect for glyphs the
+            // primary face lacks; `font_family` takes a single literal name
+            // and never cascades. Note the chain does NOT rescue a primary
+            // that fails to load at all — see `Typography::platform_fonts`.
+            // The canvas
             // paint reads typography directly, but keeping the font on
             // the root is the right default for any non-canvas children
             // (overlays, error banners) that may inherit it later.

@@ -15,16 +15,23 @@
 use gpui::{Pixels, Window, px};
 use oximux_settings::Typography;
 
-/// Extra pixels added on top of `t_body_lg` to derive line-height. Tuned
-/// to Menlo's em-square (~16.9 px at 14 pt) plus a sliver of safety so
-/// half-block glyphs (▀ ▄ █) tile cleanly. Anything looser leaves
-/// vertical padding and breaks pixel-art mascots.
+/// Extra pixels added on top of `t_body_lg` to derive line-height. Tuned so
+/// half-block glyphs (▀ ▄ █) tile cleanly: the mono face's em-square plus a
+/// sliver of safety. Anything looser leaves vertical padding and breaks
+/// pixel-art mascots.
+///
+/// The margin differs slightly per platform because the faces do: at 14 pt
+/// Menlo's em-square is ~16.9 px against the resulting 17 px line, Consolas'
+/// is 16.39 px. Both tile; Consolas can round to a 1 px seam between stacked
+/// full blocks at 1× scaling, which is why this stays a single constant
+/// rather than being tightened for one face at the other's expense.
 pub const LINE_HEIGHT_EXTRA: f32 = 3.0;
 
 /// Fallback used when font resolution fails — e.g. headless tests with no
 /// real text system, or a Typography that points at a missing primary
 /// family before GPUI's fallback chain has cached anything. Roughly the
-/// 'm' advance for Menlo 14 pt.
+/// 'm' advance for Menlo at 14 pt (Consolas is 7.7); only ever used where
+/// nothing is actually painted, so the imprecision costs nothing.
 const FALLBACK_CELL_WIDTH: f32 = 8.4;
 
 #[derive(Debug, Clone, Copy)]

@@ -127,9 +127,22 @@ Single font family. Numbers tabular everywhere for diff alignment and counters.
 | `t_body_md` | 13 | 400 | Sidebar rows, body text |
 | `t_body_lg` | 14 | 400 | Main content, terminal default |
 
-**Font stack**: `"Geist Mono"`, `"SF Mono"`, `Menlo`, `monospace` (terminal + editor).
-`"Inter"`, `"SF Pro Text"`, `system-ui` (UI chrome). System fallbacks ensure font-kit
-always finds a face.
+**Font stack**: per-platform, because the *primary* family has to be one the OS
+is guaranteed to ship. Defined in `oximux-settings::typography::platform_fonts`.
+
+| | macOS | Windows |
+|---|---|---|
+| Mono (terminal + editor) | `Menlo` → SF Mono, Monaco | `Consolas` → Cascadia Mono, Segoe UI Symbol |
+| UI chrome | `Helvetica Neue` → Helvetica | `Segoe UI` → Tahoma |
+
+The arrows are **not** a CSS cascade. GPUI looks the primary up verbatim, and
+`FontFallbacks` only covers individual glyphs missing from a family that already
+loaded — it does not rescue a primary that fails to resolve at all. When the
+primary is missing, GPUI drops to the platform default UI face, which is
+*proportional*: since `terminal_canvas` pins every glyph to a `cell_width`
+measured from `'m'`, narrow characters then sit left-aligned in over-wide cells
+and the grid reads as randomly spaced. Naming a font the target OS lacks is
+therefore a rendering bug, not a downgrade.
 
 ## Color Roles
 
