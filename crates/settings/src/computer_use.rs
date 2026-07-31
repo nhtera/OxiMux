@@ -269,6 +269,45 @@ impl ComputerUseSettings {
 mod tests {
     use super::*;
 
+    /// An absolute path naming something that does not exist, spelled for the
+    /// running platform.
+    ///
+    /// A `/repo` literal is not a substitute: on Windows an absolute path needs
+    /// a prefix, so `Path::new("/repo").is_absolute()` is `false` there and
+    /// `sanitized` drops it as a relative path. Built from `temp_dir` rather
+    /// than a hardcoded drive so nothing here assumes `C:` exists or that the
+    /// suite runs from any particular volume.
+    fn abs(name: &str) -> PathBuf {
+        std::env::temp_dir().join(name)
+    }
+
+    /// Make `link` a second spelling of the directory `target`.
+    ///
+    /// Windows uses a **junction**, not a symlink. `symlink_dir` needs
+    /// `SeCreateSymbolicLinkPrivilege`, which an unelevated process does not
+    /// hold outside Developer Mode — it fails with `ERROR_PRIVILEGE_NOT_HELD`
+    /// (os error 1314). A junction needs no privilege, and `canonicalize`
+    /// resolves it through the same `GetFinalPathNameByHandle` path, so the
+    /// aliasing this test is about is exercised identically. The alternative
+    /// was skipping the case on Windows, which would leave the platform where
+    /// path spellings diverge most as the one platform with no coverage.
+    #[cfg(unix)]
+    fn alias_dir(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).expect("symlink");
+    }
+
+    #[cfg(windows)]
+    fn alias_dir(target: &Path, link: &Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("run mklink");
+        assert!(status.success(), "mklink /J failed: {status}");
+    }
+
     #[test]
     fn default_is_off_everywhere_with_nothing_approved() {
         let s = ComputerUseSettings::default();
@@ -329,17 +368,14 @@ mod tests {
     }
 
     #[test]
-    fn coverage_survives_a_symlinked_spelling_of_the_same_directory() {
+    fn coverage_survives_an_aliased_spelling_of_the_same_directory() {
         // The failure this prevents is silent and total: the pane lists the
         // project, every chat in it is refused, and nothing says why.
         let dir = tempfile::tempdir().expect("tempdir");
         let real = dir.path().join("repo");
         std::fs::create_dir(&real).expect("create");
         let link = dir.path().join("link-to-repo");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&real, &link).expect("symlink");
-        #[cfg(not(unix))]
-        std::os::windows::fs::symlink_dir(&real, &link).expect("symlink");
+        alias_dir(&real, &link);
 
         let mut s = ComputerUseSettings {
             enabled: true,
@@ -370,16 +406,21 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        s.enable_project(Path::new("/monorepo"));
+        let root = abs("monorepo");
+        s.enable_project(&root);
+        // Compare against the entry `enable_project` actually stored, not
+        // against `root` as written. `comparable` normalizes on the way in, and
+        // what it returns is platform-specific — on Windows a canonicalized
+        // path carries a `\\?\` prefix, on macOS `/tmp` resolves to
+        // `/private/tmp`. The contract under test is "covering_root hands back
+        // the stored root", and `projects` is where that root is visible.
+        let stored = s.projects[0].clone();
         assert_eq!(
-            s.covering_root(Path::new("/monorepo/packages/app")),
-            Some(Path::new("/monorepo"))
+            s.covering_root(&root.join("packages/app")),
+            Some(stored.as_path())
         );
-        assert_eq!(
-            s.covering_root(Path::new("/monorepo")),
-            Some(Path::new("/monorepo"))
-        );
-        assert_eq!(s.covering_root(Path::new("/elsewhere")), None);
+        assert_eq!(s.covering_root(&root), Some(stored.as_path()));
+        assert_eq!(s.covering_root(&abs("elsewhere")), None);
     }
 
     #[test]
@@ -474,8 +515,8 @@ mod tests {
         let raw = ComputerUseSettings {
             enabled: true,
             projects: vec![
-                PathBuf::from("/repo"),
-                PathBuf::from("/repo"),
+                abs("repo"),
+                abs("repo"),
                 // Cannot match the absolute root the spawn path holds, so it
                 // would look enabled while doing nothing.
                 PathBuf::from("relative/repo"),
@@ -497,7 +538,7 @@ mod tests {
         }
         .sanitized();
 
-        assert_eq!(raw.projects, vec![PathBuf::from("/repo")]);
+        assert_eq!(raw.projects, vec![abs("repo")]);
         assert_eq!(raw.allowed_apps.len(), 1);
         assert_eq!(raw.allowed_apps[0].bundle_id, "com.apple.Safari");
         assert_eq!(raw.allowed_apps[0].name, "Safari");

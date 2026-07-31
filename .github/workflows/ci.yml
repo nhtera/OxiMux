@@ -127,13 +127,15 @@ jobs:
           --exclude oximux-computer-use
           --exclude oximux-macos-trust
 
-      # Blocking, and deliberately narrow. These four crates are where the
+      # Blocking, and deliberately narrow. These five crates are where the
       # Windows-specific behavior lives and where a failure is unambiguous:
       # owner-only asserts the DACL reads back protected and single-owner,
       # job-object asserts a killed job takes a detached grandchild with it,
       # shell-env asserts the resolved shell is a program that exists (which is
-      # what proves the pwsh probe works at all), and pty's unit tests carry
-      # the OSC 7 drive-letter handling.
+      # what proves the pwsh probe works at all), pty's unit tests carry the
+      # OSC 7 drive-letter handling, and settings covers the screen-control
+      # opt-in's path matching — where "absolute" and "the same directory under
+      # another name" both mean something different than they do on Unix.
       #
       # Kept as separate steps rather than one combined invocation: cargo
       # applies `--lib`/`--test` across every `-p` given and silently skips a
@@ -146,6 +148,7 @@ jobs:
           -p oximux-job-object
           -p oximux-shell-env
           -p oximux-pty
+          -p oximux-settings
 
       # The only end-to-end coverage of the piece carrying the most
       # Windows-specific machinery. Between them these boot the daemon over a
