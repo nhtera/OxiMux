@@ -150,6 +150,19 @@ jobs:
           -p oximux-pty
           -p oximux-settings
 
+      # The desktop crate's unit suite passes in full on Windows as of the
+      # single-instance fix and the fixture ports alongside it, so it graduates
+      # from the informational sweep to a gate. Named separately from the list
+      # above because it is not "Windows-specific behavior" — it is 1400+ tests
+      # that merely now hold on Windows, and keeping it its own step means a
+      # failure here reads as a regression rather than as a platform quirk.
+      #
+      # It earns the slot: one of those 17 failures was a real bug (the
+      # single-instance lock could not read its own holder PID under mandatory
+      # locking), and it sat undetected because nothing blocking ran this.
+      - name: cargo test (desktop app unit suite)
+        run: cargo test --lib --target x86_64-pc-windows-msvc -p oximux-app
+
       # The only end-to-end coverage of the piece carrying the most
       # Windows-specific machinery. Between them these boot the daemon over a
       # real named pipe, run the v8 mutual handshake from both ends, and
