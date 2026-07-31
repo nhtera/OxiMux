@@ -30,7 +30,11 @@ pub enum BellStyle {
 
 /// All user-tunable terminal knobs. `#[serde(default)]` lets a partial TOML
 /// override only the keys it sets; unknown keys are ignored for forward-compat.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+// Not `Copy`: the shell override is a `String`. The render path reads this
+// per frame, so that matters — but cloning the default costs nothing, since
+// an empty `String` owns no allocation. Only a user who actually sets a
+// custom shell pays for the copy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalSettings {
     /// Off-screen rows retained per pane. Sourced at spawn.
@@ -63,6 +67,13 @@ pub struct TerminalSettings {
     /// On by default; turn off if your own prompt already emits OSC 133 and
     /// you see doubled marks.
     pub shell_integration: bool,
+    /// Program a new terminal runs. Empty means "work it out": the inherited
+    /// `$SHELL` on unix, PowerShell on Windows.
+    ///
+    /// An absolute path is the reliable spelling. A bare name is resolved by
+    /// the spawning process, which for a relay-backed terminal is the daemon,
+    /// whose `PATH` need not match the app's.
+    pub shell: String,
     /// How a bell is surfaced.
     pub bell: BellStyle,
 }
@@ -86,6 +97,7 @@ impl Default for TerminalSettings {
             option_as_meta: true,
             copy_on_select: false,
             shell_integration: true,
+            shell: String::new(),
             bell: BellStyle::Visual,
         }
     }
@@ -118,6 +130,12 @@ impl TerminalSettings {
         self.dim_alpha = self.dim_alpha.clamp(0.0, 1.0);
         self.unfocused_alpha = self.unfocused_alpha.clamp(0.0, 1.0);
         self.unfocused_cursor_alpha = self.unfocused_cursor_alpha.clamp(0.0, 1.0);
+        // A stray space around a hand-typed path would otherwise be spawned
+        // literally, and the failure ("no such file") names a path that looks
+        // exactly right.
+        if self.shell.trim().len() != self.shell.len() {
+            self.shell = self.shell.trim().to_string();
+        }
         self
     }
 }
@@ -184,6 +202,28 @@ mod tests {
         assert!(s.blink_interval_ms >= 60, "1ms blink would thrash");
         assert_eq!(s.dim_alpha, 1.0, "alpha clamped to <= 1");
         assert_eq!(s.unfocused_alpha, 0.0, "negative alpha clamped to >= 0");
+    }
+
+    #[test]
+    fn shell_override_defaults_to_auto_and_is_trimmed() {
+        // Empty is the "work it out" sentinel; anything else is taken as the
+        // user's explicit choice.
+        assert!(TerminalSettings::default().shell.is_empty());
+
+        let set = TerminalSettings::from_toml_str("shell = \"/opt/homebrew/bin/fish\"\n")
+            .expect("parse");
+        assert_eq!(set.shell, "/opt/homebrew/bin/fish");
+
+        let padded = TerminalSettings::from_toml_str("shell = \"  /bin/bash \"\n")
+            .expect("parse")
+            .sanitized();
+        assert_eq!(padded.shell, "/bin/bash");
+
+        // Whitespace-only is the same as unset, not a request to spawn "".
+        let blank = TerminalSettings::from_toml_str("shell = \"   \"\n")
+            .expect("parse")
+            .sanitized();
+        assert!(blank.shell.is_empty());
     }
 
     #[test]

@@ -288,7 +288,7 @@ impl SettingsModal {
     pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.terminal = cx
             .try_global::<TerminalSettings>()
-            .copied()
+            .cloned()
             .unwrap_or_default();
         self.ai = cx
             .try_global::<CommitMessageAiSettings>()

@@ -21,7 +21,9 @@ use notify_debouncer_full::{
 use oximux_settings::TerminalSettings;
 use tokio::sync::mpsc;
 
-use crate::shell::terminal_view::{set_shell_integration_enabled, set_spawn_scrollback};
+use crate::shell::terminal_view::{
+    set_shell_integration_enabled, set_spawn_scrollback, set_spawn_shell,
+};
 
 
 /// Debounce window for settings edits. Generous: a save can fire several
@@ -45,7 +47,7 @@ fn load() -> TerminalSettings {
     match std::fs::read_to_string(&path) {
         Ok(text) => match TerminalSettings::from_toml_str(&text) {
             Ok(parsed) => {
-                let clean = parsed.sanitized();
+                let clean = parsed.clone().sanitized();
                 if clean != parsed {
                     // Silent clamps create a UX trap: the user's value on disk
                     // and the value the app uses disagree. Warn so a typo like
@@ -89,6 +91,7 @@ fn seed_default_if_absent() {
 fn apply(cx: &mut App, settings: TerminalSettings) {
     set_spawn_scrollback(settings.scrollback_lines);
     set_shell_integration_enabled(settings.shell_integration);
+    set_spawn_shell(settings.shell.clone());
     cx.set_global(settings);
 }
 

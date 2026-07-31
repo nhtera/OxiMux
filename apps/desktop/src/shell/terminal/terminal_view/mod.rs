@@ -150,42 +150,13 @@ pub fn register_terminal_key_bindings(cx: &mut App) {
 /// Read the live terminal settings global, falling back to defaults when it
 /// isn't installed (headless tests, early startup before `set_global`).
 pub fn terminal_settings(cx: &App) -> TerminalSettings {
-    cx.try_global::<TerminalSettings>().copied().unwrap_or_default()
+    cx.try_global::<TerminalSettings>().cloned().unwrap_or_default()
 }
 
-/// Process-wide mirror of `TerminalSettings::scrollback_lines`. The PTY spawn
-/// helpers are `cx`-less free functions, so they read scrollback here instead
-/// of threading the global through every call site. The settings loader and
-/// the live-reload watcher (both of which hold `cx`) keep it in sync.
-static SPAWN_SCROLLBACK: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(5000);
-
-/// Update the spawn-scrollback mirror from settings. Called once at startup and
-/// on every settings reload.
-pub fn set_spawn_scrollback(lines: usize) {
-    SPAWN_SCROLLBACK.store(lines, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn spawn_scrollback() -> usize {
-    SPAWN_SCROLLBACK.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Process-wide mirror of `TerminalSettings::shell_integration`. Read by the
-/// `cx`-less PTY spawn helpers (and the dormant-promote paths) to decide
-/// whether to inject the OSC 133 shell-integration bootstrap. Kept in sync by
-/// the settings loader + live-reload watcher (both `cx`-holding).
-static SHELL_INTEGRATION_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
-
-/// Update the shell-integration mirror from settings. Called once at startup
-/// and on every settings reload.
-pub fn set_shell_integration_enabled(enabled: bool) {
-    SHELL_INTEGRATION_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub(crate) fn shell_integration_enabled() -> bool {
-    SHELL_INTEGRATION_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-}
+mod spawn_settings;
+pub use spawn_settings::{set_shell_integration_enabled, set_spawn_scrollback, set_spawn_shell};
+pub(crate) use spawn_settings::shell_integration_enabled;
+use spawn_settings::{shell_spawn_config, spawn_scrollback};
 
 /// Width (px) of the overlay scrollbar gutter on the terminal's right edge.
 const SCROLLBAR_WIDTH: f32 = 10.0;
@@ -317,14 +288,7 @@ pub fn spawn_local_pty_sized(
     let (cols, rows) = dims.unwrap_or((DEFAULT_COLS, DEFAULT_ROWS));
     // Relay-backed path: one shared backend across the whole app.
     if let Some(shared) = SHARED_BACKEND.get() {
-        let mut cfg = SpawnConfig {
-            cwd: cwd.clone(),
-            env: env.clone(),
-            cols,
-            rows,
-            scrollback: spawn_scrollback(),
-            ..SpawnConfig::default()
-        };
+        let mut cfg = shell_spawn_config(cwd.clone(), env.clone(), cols, rows);
         super::shell_integration::augment_spawn_config(&mut cfg);
         // Spawn is a synchronous daemon round-trip on the calling thread
         // (background executor from the restore reconcile; main thread for
@@ -353,14 +317,7 @@ fn spawn_fallback_portable(
     (cols, rows): (u16, u16),
 ) -> Option<(SharedBackend, TerminalSessionId)> {
     let mut backend = PortablePtyBackend::new();
-    let mut cfg = SpawnConfig {
-        cwd,
-        env,
-        cols,
-        rows,
-        scrollback: spawn_scrollback(),
-        ..SpawnConfig::default()
-    };
+    let mut cfg = shell_spawn_config(cwd, env, cols, rows);
     super::shell_integration::augment_spawn_config(&mut cfg);
     let session_id = match backend.spawn(cfg) {
         Ok(id) => id,
