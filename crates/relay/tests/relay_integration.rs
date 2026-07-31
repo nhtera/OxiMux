@@ -38,13 +38,18 @@ struct TestRelay {
 }
 
 async fn boot_relay() -> TestRelay {
+    boot_relay_with(|_cfg| {}).await
+}
+
+async fn boot_relay_with(tweak: impl FnOnce(&mut ServerConfig)) -> TestRelay {
     let dir = TempDir::new().expect("tempdir");
     let socket = dir.path().join("relay-v1.sock");
     let token_file = dir.path().join("relay-v1.token");
     let token = "deadbeef-test-token".to_string();
     std::fs::write(&token_file, &token).expect("write token");
 
-    let cfg = ServerConfig::idle_disabled(socket.clone(), token_file);
+    let mut cfg = ServerConfig::idle_disabled(socket.clone(), token_file);
+    tweak(&mut cfg);
     let server_task = tokio::spawn(async move {
         let _ = run_server(cfg).await;
     });
@@ -166,6 +171,80 @@ async fn collect_output(
         }
     }
     (out, exit)
+}
+
+#[tokio::test]
+async fn the_last_client_leaving_flushes_a_checkpoint() {
+    // Losing the last client is the daemon's stand-in for the user logging out,
+    // because the signals that would say so directly cannot be relied on for a
+    // detached, console-less process on Windows.
+    let checkpoints = TempDir::new().expect("tempdir");
+    let base = checkpoints.path().to_path_buf();
+    let tick_base = base.clone();
+    let relay = boot_relay_with(move |cfg| {
+        cfg.checkpoint_dir = Some(tick_base);
+        // Far beyond the life of this test. If a checkpoint shows up, the
+        // periodic tick is not what put it there — which is the whole claim.
+        cfg.checkpoint_tick_interval = Some(Duration::from_secs(3600));
+    })
+    .await;
+
+    let (mut stream, mut buf) = connect_and_hello(&relay).await;
+    let resp = req(
+        &mut stream,
+        &mut buf,
+        3,
+        Request::Spawn {
+            cwd: "/tmp".into(),
+            cols: 80,
+            rows: 24,
+            shell: Some("/bin/sh".into()),
+            args: Vec::new(),
+            env: vec![],
+        },
+    )
+    .await;
+    let pty_id = match resp {
+        Response::SpawnOk { pty_id, .. } => pty_id,
+        other => panic!("spawn failed: {other:?}"),
+    };
+    // Give the ring something worth persisting. No `exit` — the PTY has to
+    // outlive the client, which is the case a checkpoint is for.
+    let _ = req(
+        &mut stream,
+        &mut buf,
+        4,
+        Request::Write {
+            pty_id: pty_id.clone(),
+            bytes: b"echo checkpoint-me\n".to_vec(),
+        },
+    )
+    .await;
+
+    // `meta.json` is seeded at spawn, so it proves nothing here. The ring
+    // snapshot is what a checkpoint pass writes, and with the tick pushed out
+    // of reach its appearance can only be the disconnect flush.
+    let scrollback = base.join(&pty_id).join("scrollback.bin");
+    assert!(
+        !scrollback.exists(),
+        "no ring snapshot should exist before the client leaves"
+    );
+
+    drop(stream); // the last client disconnects
+
+    let mut found = false;
+    for _ in 0..250 {
+        if scrollback.exists() {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        found,
+        "last disconnect must checkpoint; nothing at {}",
+        scrollback.display()
+    );
 }
 
 #[tokio::test]

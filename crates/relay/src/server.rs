@@ -135,16 +135,40 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
                     }
                 };
                 let registry = Arc::clone(&registry);
+                let registry_for_flush = Arc::clone(&registry);
                 let token = token.clone();
                 let session_id = session_id.clone();
                 let shutdown = Arc::clone(&shutdown);
                 let active_sessions = Arc::clone(&active_sessions);
+                let checkpointing = checkpoints.is_some();
                 tokio::spawn(async move {
-                    let _session_guard = SessionGuard::new(active_sessions);
-                    if let Err(e) =
-                        session_loop(stream, registry, token, session_id, shutdown).await
                     {
-                        tracing::debug!(?e, "session ended");
+                        let _session_guard = SessionGuard::new(Arc::clone(&active_sessions));
+                        if let Err(e) =
+                            session_loop(stream, registry, token, session_id, shutdown).await
+                        {
+                            tracing::debug!(?e, "session ended");
+                        }
+                    } // guard drops here, so the count below excludes us
+
+                    // Losing the last client is this daemon's best proxy for the
+                    // user logging out or shutting down. The signal handlers that
+                    // would say so directly are wired but unproven for a detached
+                    // process with no console, and the periodic tick can be up to
+                    // its full interval stale — which is scrollback the next launch
+                    // would cold-restore without.
+                    //
+                    // Racing with another session ending is fine in both
+                    // directions: two departures can both observe zero and flush
+                    // twice, which is idempotent, and whoever decrements last
+                    // always reads its own decrement, so the flush cannot be
+                    // skipped by both.
+                    if checkpointing && active_sessions.load(Ordering::SeqCst) == 0 {
+                        tracing::debug!("last client disconnected; checkpointing");
+                        let _ = tokio::task::spawn_blocking(move || {
+                            registry_for_flush.checkpoint_all()
+                        })
+                        .await;
                     }
                 });
             }
@@ -219,18 +243,23 @@ fn spawn_checkpoint_tick(registry: Arc<PtyRegistry>, tick: Duration) {
     });
 }
 
-// Ref-counted "is anyone attached?" tracker for the idle GC. Increments
-// on session start, decrements on drop — covers panic-unwind exits too.
+// Ref-counted "is anyone attached?" tracker for the idle GC, and for the
+// flush the last departing session runs. Increments on session start,
+// decrements on drop — covers panic-unwind exits too.
+//
+// `SeqCst` rather than `Relaxed`: the accept loop reads this counter straight
+// after dropping a guard to decide whether it was the last one out, and that
+// decision has to see every other session's decrement.
 struct SessionGuard(Arc<AtomicUsize>);
 impl SessionGuard {
     fn new(counter: Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
+        counter.fetch_add(1, Ordering::SeqCst);
         Self(counter)
     }
 }
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
