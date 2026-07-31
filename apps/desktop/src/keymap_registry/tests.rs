@@ -107,11 +107,16 @@ fn unknown_action_id_warns() {
 
 #[test]
 fn conflict_detection_flags_duplicate_chords() {
-    // Move new_tab onto search_scrollback's default chord.
-    let out = resolve(&overrides(&[("new_tab", "cmd-f")]));
+    // Move new_tab onto search_scrollback's default chord. `secondary-`, not
+    // `cmd-`, for the reason spelled out in `override_with_unparseable_chord`
+    // below: the collision is against a *shipped default*, and those are written
+    // with `secondary-`. On Windows `cmd-f` normalizes to a literal Command
+    // modifier that nothing else holds, so there was no conflict to find and the
+    // test failed while the detector was working.
+    let out = resolve(&overrides(&[("new_tab", "secondary-f")]));
     let conflicts = conflicting_chords(&out.effective);
     assert_eq!(conflicts.len(), 1);
-    assert!(conflicts.contains(normalize_chord("cmd-f").unwrap().as_str()));
+    assert!(conflicts.contains(normalize_chord("secondary-f").unwrap().as_str()));
 }
 
 #[test]
@@ -184,19 +189,30 @@ mod rebind_plan {
         assert!(plan_rebind(&map, &map).is_empty());
     }
 
+    // These plans are compared against *shipped defaults*, which are written
+    // with `secondary-`. `normalize_chord` unparses to the concrete modifier —
+    // `cmd-t` on macOS, `ctrl-t` on Windows — so a `cmd-` literal here named a
+    // chord no default held off macOS, and the needle matched nothing. The
+    // `bind_index`/`shadow_index` helpers normalize what they are given, so
+    // `secondary-` is all that is needed.
     #[test]
     fn moved_chord_is_shadowed_then_bound() {
         let prev = effective(&[]);
-        let next = effective(&[("new_tab", "cmd-y")]);
+        let next = effective(&[("new_tab", "secondary-y")]);
         let steps = plan_rebind(&prev, &next);
         // Old chord dies, new chord binds after its shadow (if any).
-        assert!(shadow_index(&steps, "cmd-t") < steps.len());
-        assert!(shadow_index(&steps, "cmd-y") < bind_index(&steps, "new_tab", "cmd-y"));
-        // Nothing else owns cmd-t in `next`, so it must NOT be re-bound.
+        assert!(shadow_index(&steps, "secondary-t") < steps.len());
+        assert!(
+            shadow_index(&steps, "secondary-y")
+                < bind_index(&steps, "new_tab", "secondary-y")
+        );
+        // Nothing else owns new_tab's old chord in `next`, so it must NOT be
+        // re-bound.
+        let old = normalize_chord("secondary-t").expect("parses");
         assert!(
             !steps
                 .iter()
-                .any(|s| matches!(s, RebindStep::Bind(_, c) if c == "cmd-t"))
+                .any(|s| matches!(s, RebindStep::Bind(_, c) if *c == old))
         );
     }
 
@@ -204,13 +220,19 @@ mod rebind_plan {
     fn conflict_then_resolve_rebinds_the_surviving_owner() {
         // Step 1 gave new_tab search's chord (conflict); step 2 moves
         // search away to a free chord. The surviving owner (new_tab @
-        // cmd-f) must be re-bound AFTER the cmd-f shadow, or the shadow —
-        // appended after new_tab's step-1 binding — would leave cmd-f dead.
-        let prev = effective(&[("new_tab", "cmd-f")]);
-        let next = effective(&[("new_tab", "cmd-f"), ("search_scrollback", "cmd-9")]);
+        // secondary-f) must be re-bound AFTER the secondary-f shadow, or the
+        // shadow — appended after new_tab's step-1 binding — leaves it dead.
+        let prev = effective(&[("new_tab", "secondary-f")]);
+        let next = effective(&[("new_tab", "secondary-f"), ("search_scrollback", "secondary-9")]);
         let steps = plan_rebind(&prev, &next);
-        assert!(shadow_index(&steps, "cmd-f") < bind_index(&steps, "new_tab", "cmd-f"));
-        assert!(shadow_index(&steps, "cmd-9") < bind_index(&steps, "search_scrollback", "cmd-9"));
+        assert!(
+            shadow_index(&steps, "secondary-f")
+                < bind_index(&steps, "new_tab", "secondary-f")
+        );
+        assert!(
+            shadow_index(&steps, "secondary-9")
+                < bind_index(&steps, "search_scrollback", "secondary-9")
+        );
     }
 
     #[test]
@@ -235,7 +257,13 @@ mod rebind_plan {
 #[test]
 fn display_lookup_falls_back_to_defaults_without_install() {
     // No App in unit tests — the lazily-seeded default map must serve.
-    assert_eq!(display_chord_for("open_quick_open").as_deref(), Some("⌘P"));
+    // `open_quick_open`'s default is `secondary-p`, so the glyph is platform-
+    // dependent; hardcoding ⌘ asserted macOS everywhere.
+    let expected = format!("{SECONDARY_GLYPH}P");
+    assert_eq!(
+        display_chord_for("open_quick_open").as_deref(),
+        Some(expected.as_str())
+    );
     assert_eq!(display_chord_for("reload_custom_commands"), None);
     assert_eq!(display_chord_for("no_such_action"), None);
 }

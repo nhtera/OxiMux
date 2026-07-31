@@ -218,7 +218,10 @@ mod tests {
     fn built_items_resolve_chords_from_registry() {
         let items = build_palette_items(&[]);
         let new_tab = items.iter().find(|i| i.name == "New Tab").unwrap();
-        assert_eq!(new_tab.keybinding.as_deref(), Some("⌘T"));
+        // `new_tab`'s default is `secondary-t`, so the modifier glyph follows the
+        // platform rather than being ⌘ everywhere.
+        let expected = format!("{}T", crate::keymap_registry::SECONDARY_GLYPH);
+        assert_eq!(new_tab.keybinding.as_deref(), Some(expected.as_str()));
         // Group splits ship unbound — no chip until the user binds them.
         let split = items
             .iter()

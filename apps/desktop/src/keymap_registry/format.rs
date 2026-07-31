@@ -32,6 +32,21 @@ fn format_stroke(stroke: &str) -> String {
     out
 }
 
+/// The glyph `secondary-` renders as on this platform: `⌘` on macOS, `⌃`
+/// elsewhere.
+///
+/// For tests that assert on how a *shipped default* renders. Defaults are
+/// written with `secondary-` (see `inventory`), so an expectation hardcoded to
+/// `⌘` is asserting the macOS spelling everywhere — which is how eight of these
+/// tests came to fail on Windows while the code under them was correct. Derived
+/// from the same `cfg` as `split_stroke` below, so the two cannot drift.
+#[cfg(test)]
+pub(crate) const SECONDARY_GLYPH: &str = if cfg!(target_os = "macos") {
+    "⌘"
+} else {
+    "⌃"
+};
+
 /// Split "secondary-shift-t" into ordered modifier glyphs + the bare key. The
 /// key is everything after the last modifier token, so "cmd--" (cmd + minus)
 /// and bare "-" survive.
