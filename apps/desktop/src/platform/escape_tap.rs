@@ -573,7 +573,16 @@ mod tests {
             Ok(tap) => {
                 // Nothing has been pressed, so nothing is pending.
                 assert!(!tap.abort_requested());
-                drop(tap);
+                // Tear down before re-arming. On macOS `Drop` releases the
+                // run-loop source, and releasing it here is the whole setup for
+                // the re-arm below. Written as a scope rather than `drop(tap)`
+                // because the Windows stub has no `Drop` impl, which makes
+                // `drop()` on it a `clippy::drop_non_drop` error — the call
+                // would be a no-op there, but the scope says what is meant on
+                // both platforms.
+                {
+                    let _armed = tap;
+                }
                 // And a second arm after a clean teardown must still work —
                 // the case a leaked run-loop source would break.
                 let again = arm().expect("re-arming after teardown");
