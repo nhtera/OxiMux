@@ -191,13 +191,25 @@ jobs:
       - name: cargo test (relay checkpoint lifecycle)
         run: cargo test --target x86_64-pc-windows-msvc -p oximux-relay --test checkpoint_lifecycle
 
-      # Non-blocking on purpose: nobody has ever run these on Windows, so the
-      # first result is data, not a verdict. It exists to produce the list of
-      # what actually fails, which is what should drive widening the gate
-      # above. Flip it to blocking once the list is empty — and if it stays
-      # non-blocking for long, that is a signal it is being ignored.
-      - name: cargo test (full unit suite, informational)
-        continue-on-error: true
+      # Blocking as of the port of the last macOS-shaped fixtures: this was the
+      # informational sweep, kept non-blocking to produce the list of what
+      # actually failed on Windows, with instructions to flip it once that list
+      # was empty. It is empty — every crate here passes on a real windows-msvc
+      # host — so it is now the gate, and the enumerated steps above are kept
+      # only because a named failure is faster to read than one buried in a
+      # workspace run.
+      #
+      # It found real bugs on the way, which is the argument for it being
+      # blocking rather than advisory: the single-instance lock could not read
+      # its own holder PID under Windows' mandatory file locking, and the
+      # checkpoint engine failed to recognise one git version's phrasing for a
+      # pruned object. Both were invisible while nothing here could fail.
+      #
+      # One residual fragility worth knowing when this goes red: git's stderr
+      # wording is what `is_missing_object` matches on, so a runner with a git
+      # whose phrasing is not yet in that list fails `pruned_object_reports_missing`.
+      # The fix is to add the phrase, not to loosen the matcher.
+      - name: cargo test (full unit suite)
         run: >
           cargo test --workspace --lib --target x86_64-pc-windows-msvc
           --exclude oximux-computer-use
