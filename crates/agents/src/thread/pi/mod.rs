@@ -71,6 +71,14 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct PiRpcConnection {
     rpc: PiRpcClient,
     child: Arc<Mutex<Child>>,
+    /// Windows stand-in for the process group. pi's whole shutdown design leans
+    /// on SIGTERM reaching its handler so it can reap the *detached* children
+    /// its bash tool spawns — there is no Windows equivalent of either half of
+    /// that, so the job object is what makes those children accountable to
+    /// something. `Arc` because `terminate` hands the escalation to a detached
+    /// thread that outlives the caller.
+    #[cfg(windows)]
+    job: Option<Arc<oximux_job_object::JobObject>>,
     /// Live session facts: the current model (picker label, thinking levels,
     /// context window) and thinking level. Mutable — `set_model` and
     /// `set_thinking_level` both change it in-session, and pi re-clamps thinking
@@ -253,9 +261,20 @@ impl PiRpcConnection {
         let mut map_state = map::PiState::with_context_window(context_window);
         let shared_state = Arc::new(Mutex::new(Some(state)));
 
+        #[cfg(windows)]
+        let job = match oximux_job_object::JobObject::adopt(&child) {
+            Ok(job) => Some(Arc::new(job)),
+            Err(e) => {
+                tracing::warn!(?e, "could not put pi in a job object");
+                None
+            }
+        };
+
         let conn = Self {
             rpc: rpc.clone(),
             child: Arc::new(Mutex::new(child)),
+            #[cfg(windows)]
+            job,
             state: shared_state.clone(),
             models,
             commands,
@@ -375,6 +394,8 @@ impl PiRpcConnection {
             }
         }
         let child = self.child.clone();
+        #[cfg(windows)]
+        let job = self.job.clone();
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + TERM_GRACE;
             loop {
@@ -387,12 +408,25 @@ impl PiRpcConnection {
                     Ok(None) => {}
                 }
                 if std::time::Instant::now() >= deadline {
+                    // On unix this is the lossy path: pi never ran its handler,
+                    // so its detached bash children are orphaned. On Windows the
+                    // job object catches them instead — there was never a
+                    // handler to run, but there is a tree to end.
+                    #[cfg(unix)]
                     tracing::warn!(
                         "pi did not exit within {TERM_GRACE:?} of SIGTERM; escalating to \
                          SIGKILL — any running bash tool children will be orphaned"
                     );
+                    #[cfg(windows)]
+                    tracing::warn!(
+                        "pi did not exit within {TERM_GRACE:?}; terminating its job object"
+                    );
                     let _ = guard.kill();
                     let _ = guard.wait();
+                    #[cfg(windows)]
+                    if let Some(job) = &job {
+                        let _ = job.kill();
+                    }
                     return;
                 }
                 drop(guard); // never sleep holding the lock
@@ -1825,6 +1859,10 @@ while true; do sleep 0.05; done
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // SIGTERM semantics, driven by a `trap`-ing shell script. There is no
+    // Windows counterpart to either half, so this is gated with the contract it
+    // tests rather than left to pass vacuously.
+    #[cfg(unix)]
     #[test]
     fn shutdown_does_not_block_the_caller_when_pi_ignores_sigterm() {
         // Both callers of shutdown() — a respawn and Drop — run on the GPUI main
@@ -1857,6 +1895,7 @@ while true; do sleep 0.05; done
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn dropping_without_shutdown_still_reaps_the_child() {
         // `pi --mode rpc` never self-exits, so a forgotten shutdown() would leak
@@ -1892,14 +1931,14 @@ sleep 30
     }
 
     /// Whether `pid` still exists. Signal 0 only probes.
+    ///
+    /// Unix-only on purpose: its callers assert `!pid_alive(..)`, so a stub
+    /// returning `false` off unix would make both of them pass without testing
+    /// anything.
+    #[cfg(unix)]
     fn pid_alive(pid: u32) -> bool {
-        #[cfg(unix)]
-        {
-            // SAFETY: signal 0 performs no signal delivery, only a permission +
-            // existence check on the pid.
-            return unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-        }
-        #[allow(unreachable_code)]
-        false
+        // SAFETY: signal 0 performs no signal delivery, only a permission +
+        // existence check on the pid.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
 }

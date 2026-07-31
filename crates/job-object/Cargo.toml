@@ -1,0 +1,21 @@
+[package]
+name = "oximux-job-object"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# Windows-only by construction: on unix a process group already does this job,
+# and every call site keeps the signal code it has. Depending on this crate from
+# a cross-platform manifest is fine — it compiles to nothing off Windows.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    # `CreateJobObjectW` takes a SECURITY_ATTRIBUTES pointer, so the job-object
+    # bindings do not resolve without the Security module in scope.
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

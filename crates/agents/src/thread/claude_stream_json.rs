@@ -241,6 +241,14 @@ pub fn build_args_with_resume(
 pub struct ClaudeStreamJsonConnection {
     stdin: Mutex<ChildStdin>,
     child: Mutex<Child>,
+    // Windows stand-in for the process group `claude` would otherwise be killed
+    // through. `claude` runs tools as its own children — a `bash` tool can be
+    // holding a build or a dev server — and `Child::kill` ends only `claude`
+    // itself, leaving those with no parent to account for them. Held for the
+    // connection's life: the job's kill-on-close limit means an app crash reaps
+    // the tree instead of stranding it.
+    #[cfg(windows)]
+    job: Option<oximux_job_object::JobObject>,
 }
 
 impl ClaudeStreamJsonConnection {
@@ -328,10 +336,25 @@ impl ClaudeStreamJsonConnection {
             // Reject.
         });
 
+        // Adopted before the connection is handed out, so every later kill path
+        // has a tree to end. A failure here is logged rather than fatal: the
+        // agent still works, and what is lost is the guarantee about its tool
+        // children, not the session.
+        #[cfg(windows)]
+        let job = match oximux_job_object::JobObject::adopt(&child) {
+            Ok(job) => Some(job),
+            Err(e) => {
+                tracing::warn!(?e, "could not put claude in a job object");
+                None
+            }
+        };
+
         Ok((
             Self {
                 stdin: Mutex::new(stdin),
                 child: Mutex::new(child),
+                #[cfg(windows)]
+                job,
             },
             rx,
         ))
@@ -567,6 +590,13 @@ impl AgentConnection for ClaudeStreamJsonConnection {
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
+                // `kill` ends `claude` alone; on Windows the tools it launched
+                // are separate processes that outlive it, so the tree has to be
+                // ended explicitly.
+                #[cfg(windows)]
+                if let Some(job) = &self.job {
+                    let _ = job.kill();
+                }
                 return Ok(());
             }
             thread::sleep(std::time::Duration::from_millis(50));
@@ -582,6 +612,12 @@ impl AgentConnection for ClaudeStreamJsonConnection {
         };
         let _ = child.kill();
         let _ = child.wait();
+        // Same reason as the escalation above: killing `claude` says nothing
+        // about the tools it started.
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            let _ = job.kill();
+        }
     }
 }
 

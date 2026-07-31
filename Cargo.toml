@@ -5,6 +5,7 @@ members = [
     "crates/ui",
     "crates/core",
     "crates/owner-only",
+    "crates/job-object",
     "crates/dictation",
     "crates/pty",
     "crates/git",
@@ -44,6 +45,9 @@ oximux-core     = { path = "crates/core" }
 # Owner-only access for the secrets we write to disk. Its own crate because the
 # desktop app, the relay daemon and the remote host share no other dependency.
 oximux-owner-only = { path = "crates/owner-only" }
+# Windows tree-kill for agent CLIs and terminal PTYs. Its own crate for the same
+# reason as owner-only: the relay and the agents crate share no dependency.
+oximux-job-object = { path = "crates/job-object" }
 oximux-dictation = { path = "crates/dictation" }
 oximux-pty      = { path = "crates/pty" }
 oximux-git      = { path = "crates/git" }

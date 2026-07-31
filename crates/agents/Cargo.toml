@@ -128,3 +128,8 @@ path = "examples/mock_acp_env_auth_agent.rs"
 [[example]]
 name = "acp_env_auth_smoke"
 path = "examples/acp_env_auth_smoke.rs"
+
+# Windows stand-in for the process groups the unix cancel paths signal: agent
+# CLIs run tools as their own children, and TerminateProcess ends only the CLI.
+[target.'cfg(windows)'.dependencies]
+oximux-job-object = { workspace = true }

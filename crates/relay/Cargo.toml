@@ -39,9 +39,12 @@ uuid = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.25", features = ["signal"] }
 
-# Only to hand the pipe's security descriptor to `interprocess` as UTF-16.
+# Windows-only. `widestring` hands the pipe's security descriptor to
+# `interprocess` as UTF-16; the job object is the process group's stand-in, so a
+# closed terminal takes its whole process tree with it.
 [target.'cfg(windows)'.dependencies]
 widestring = "1"
+oximux-job-object = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tracing-oslog = { workspace = true }

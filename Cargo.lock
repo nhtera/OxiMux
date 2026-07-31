@@ -6915,6 +6915,7 @@ dependencies = [
  "oximux-agent-core",
  "oximux-core",
  "oximux-git",
+ "oximux-job-object",
  "oximux-pty",
  "oximux-storage",
  "regex",
@@ -7098,6 +7099,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "oximux-job-object"
+version = "0.1.5"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "oximux-macos-trust"
 version = "0.1.5"
 dependencies = [
@@ -7161,6 +7169,7 @@ dependencies = [
  "dashmap",
  "interprocess",
  "nix 0.25.1",
+ "oximux-job-object",
  "oximux-owner-only",
  "oximux-proc-cwd",
  "oximux-relay-proto",

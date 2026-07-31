@@ -119,6 +119,13 @@ struct Entry {
     // Best-effort PID of the spawned child for the SIGTERM step. None
     // on non-Unix or when portable-pty returns None.
     pid: Option<u32>,
+    // Windows stand-in for the process group: holds the shell and everything it
+    // spawned, so `close` can end the tree rather than just the shell. Kept
+    // alive for the entry's lifetime — the job's kill-on-close limit means
+    // dropping this reaps the tree, which is what makes a daemon crash clean up
+    // after itself.
+    #[cfg(windows)]
+    job: Option<Arc<oximux_job_object::JobObject>>,
     // Phase-07: per-PTY counters surfaced by `Request::Stats`.
     bytes_in: AtomicU64,
     bytes_out: Arc<AtomicU64>,
@@ -206,6 +213,23 @@ impl PtyRegistry {
         let child = pair.slave.spawn_command(command).context("spawn shell")?;
         let killer = child.clone_killer();
         let pid = child.process_id();
+        // Windows has no process group to signal, and `ChildKiller::kill` ends
+        // exactly the shell — the compiler, dev server or test runner it was
+        // running keeps going with nothing left to account for it. A job object
+        // is what gives the tree a single handle to end. Adopted immediately
+        // after spawn, so the only escapee would be something the shell forked
+        // before its first instruction ran.
+        #[cfg(windows)]
+        let job = pid.and_then(|pid| match oximux_job_object::JobObject::adopt_pid(pid) {
+            Ok(job) => Some(Arc::new(job)),
+            Err(e) => {
+                // Not fatal: the PTY still works and the direct child is still
+                // killable. What is lost is the guarantee about its descendants,
+                // which is worth a warning rather than a failed spawn.
+                tracing::warn!(?e, pid, "could not put PTY child in a job object");
+                None
+            }
+        });
         // The slave fd is duplicated into the child by spawn_command;
         // we no longer need our copy. Dropping it lets the kernel
         // deliver EOF to the master read side once the child exits.
@@ -276,6 +300,8 @@ impl PtyRegistry {
             child_exited,
             exit_code,
             pid,
+            #[cfg(windows)]
+            job,
             bytes_in: AtomicU64::new(0),
             bytes_out,
             started_at: Instant::now(),
@@ -501,6 +527,16 @@ impl PtyRegistry {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let _ = entry.killer.lock().expect("killer poisoned").kill();
+        // The killer above ends the shell; on Windows that leaves its
+        // descendants running, so the job is what actually closes the session.
+        // After the grace window rather than instead of it: a shell given the
+        // chance to exit on its own lets its children finish writing.
+        #[cfg(windows)]
+        if let Some(job) = &entry.job
+            && let Err(e) = job.kill()
+        {
+            tracing::warn!(?e, pty_id, "job-object tree kill failed");
+        }
         // Deliberate kill — nothing to cold-restore. The reader thread
         // also removes on its way out; remove is idempotent.
         if let Some(store) = &self.checkpoints {
