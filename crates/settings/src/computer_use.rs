@@ -100,11 +100,22 @@ impl Global for ComputerUseSettings {}
 /// Same job as `Provenance::new`'s canonicalization on the enforcement side, and
 /// deliberately the same answer: the two run in different processes, and a root
 /// that resolved differently in each would decide the same chat twice.
+///
+/// The resolved half goes through `dunce::simplified`, which drops the `\\?\`
+/// verbatim prefix `canonicalize` adds on Windows wherever that is safe. The
+/// prefix is not wrong — every comparison here is prefix-to-prefix, so it
+/// matched fine — but `enable_project` stores this value in `computer_use.toml`,
+/// which people read and hand-edit, and `\\?\D:\repo` is not a spelling anyone
+/// would type back. Stripping it at the display edge instead would leave the
+/// stored form prefixed and put a second normalization between the file and the
+/// comparison, which is how the two sides drift apart. On other platforms this
+/// is a no-op, so macOS keeps resolving to exactly what `Provenance::new` does.
 fn comparable(path: &Path) -> PathBuf {
     let mut trailing = Vec::new();
     let mut cursor = path;
     loop {
         if let Ok(resolved) = cursor.canonicalize() {
+            let resolved = dunce::simplified(&resolved).to_path_buf();
             return trailing
                 .iter()
                 .rev()
@@ -409,9 +420,8 @@ mod tests {
         let root = abs("monorepo");
         s.enable_project(&root);
         // Compare against the entry `enable_project` actually stored, not
-        // against `root` as written. `comparable` normalizes on the way in, and
-        // what it returns is platform-specific — on Windows a canonicalized
-        // path carries a `\\?\` prefix, on macOS `/tmp` resolves to
+        // against `root` as written. `comparable` normalizes on the way in and
+        // what it returns is platform-specific — on macOS `/tmp` resolves to
         // `/private/tmp`. The contract under test is "covering_root hands back
         // the stored root", and `projects` is where that root is visible.
         let stored = s.projects[0].clone();
@@ -421,6 +431,33 @@ mod tests {
         );
         assert_eq!(s.covering_root(&root), Some(stored.as_path()));
         assert_eq!(s.covering_root(&abs("elsewhere")), None);
+    }
+
+    #[test]
+    fn a_stored_root_is_spelled_the_way_someone_would_type_it() {
+        // `enable_project` stores what `comparable` returns, and that value is
+        // serialized into computer_use.toml for people to read and hand-edit.
+        // On Windows `canonicalize` hands back `\\?\D:\...`, which matches
+        // correctly but is a spelling no user would write or recognize as their
+        // own project. Needs a directory that really exists, since `comparable`
+        // returns the input untouched when nothing resolves — which would pass
+        // this vacuously.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s = ComputerUseSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        s.enable_project(dir.path());
+
+        let stored = s.projects[0].to_string_lossy().into_owned();
+        assert!(
+            !stored.starts_with(r"\\?\"),
+            "stored root kept the verbatim prefix: {stored}"
+        );
+        // Paired with the assertion above on purpose: stripping a prefix that
+        // both sides of a comparison carried is only correct if containment
+        // still holds afterwards.
+        assert!(s.is_enabled_for(&dir.path().join("packages/app")));
     }
 
     #[test]

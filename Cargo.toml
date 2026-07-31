@@ -109,6 +109,12 @@ tokio = { version = "1", features = ["full"] }
 interprocess = { version = "2.4", features = ["tokio"] }
 futures = "0.3"
 anyhow = "1"
+# Strips the `\\?\` verbatim prefix that `Path::canonicalize` adds on Windows,
+# where it is safe to drop. Canonicalized paths get stored in settings files and
+# compared against user-typed ones, and the prefix is correct-but-unspellable in
+# both roles. Already in the graph transitively; declared so the direct use is
+# visible. No-op on other platforms.
+dunce = "1"
 async-trait = "0.1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }

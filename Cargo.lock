@@ -7305,6 +7305,7 @@ name = "oximux-settings"
 version = "0.1.5"
 dependencies = [
  "anyhow",
+ "dunce",
  "gpui",
  "serde",
  "tempfile",
