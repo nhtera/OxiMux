@@ -135,10 +135,10 @@ jobs:
       # what proves the pwsh probe works at all), and pty's unit tests carry
       # the OSC 7 drive-letter handling.
       #
-      # `--lib` because the integration tests under `tests/` still spawn
-      # `/bin/sh` and assert on POSIX shell output. Porting those is worth
-      # doing — they are the only end-to-end relay coverage — but a test that
-      # fails for a reason unrelated to the code under test is not a gate.
+      # Kept as separate steps rather than one combined invocation: cargo
+      # applies `--lib`/`--test` across every `-p` given and silently skips a
+      # package that has no such target, so a typo'd target name would run
+      # nothing and still report success. One command per step fails loudly.
       - name: cargo test (windows-specific crates)
         run: >
           cargo test --lib --target x86_64-pc-windows-msvc
@@ -146,6 +146,19 @@ jobs:
           -p oximux-job-object
           -p oximux-shell-env
           -p oximux-pty
+
+      # The only end-to-end coverage of the piece carrying the most
+      # Windows-specific machinery. Between them these boot the daemon over a
+      # real named pipe, run the v8 mutual handshake from both ends, and
+      # exercise spawn/attach/detach/replay/checkpoint — none of which a
+      # compile check says anything about.
+      - name: cargo test (relay daemon end-to-end)
+        run: cargo test --target x86_64-pc-windows-msvc -p oximux-relay --test relay_integration
+
+      - name: cargo test (relay client end-to-end)
+        run: >
+          cargo test --target x86_64-pc-windows-msvc
+          -p oximux-relay-client --test relay_client_integration
 
       # Non-blocking on purpose: nobody has ever run these on Windows, so the
       # first result is data, not a verdict. It exists to produce the list of

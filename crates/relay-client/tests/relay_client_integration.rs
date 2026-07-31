@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use oximux_pty::{
-    PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent, TerminalSessionId,
-};
+use oximux_pty::{SpawnConfig, TerminalBackend, TerminalEvent, TerminalSessionId};
+// Only the in-process latency probe uses this, and that probe is unix-only.
+#[cfg(unix)]
+use oximux_pty::PortablePtyBackend;
 use oximux_relay::{ServerConfig, run_server};
 use oximux_relay_client::{RelayBackend, RelayClient};
 use tempfile::TempDir;
@@ -18,6 +19,48 @@ struct Fixture {
     backend: RelayBackend,
     _runtime: Arc<Runtime>,
     _dir: TempDir,
+}
+
+/// A shell that exists on the running platform, chosen for predictability
+/// rather than for what a user would get: these tests assert on shell output,
+/// so `cmd.exe` beats PowerShell here (no banner, no profile, and `echo`/`exit`
+/// mean the same thing as in `sh`).
+fn test_shell() -> String {
+    if cfg!(windows) {
+        std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string())
+    } else {
+        "/bin/sh".to_string()
+    }
+}
+
+/// A directory the spawned shell can sit in. `/tmp` is not a path on Windows.
+fn test_cwd() -> PathBuf {
+    if cfg!(windows) {
+        std::env::temp_dir()
+    } else {
+        PathBuf::from("/tmp")
+    }
+}
+
+/// Terminate command lines for the shell under test. `cmd.exe` reads console
+/// input terminated by CR; `sh` accepts either.
+fn lines(cmds: &[&str]) -> Vec<u8> {
+    let eol = if cfg!(windows) { "\r\n" } else { "\n" };
+    cmds.iter()
+        .flat_map(|c| format!("{c}{eol}").into_bytes())
+        .collect()
+}
+
+/// `echo` of two env vars joined by a pipe, in the running shell's syntax. The
+/// values can only appear in the EXPANDED output, never in the command line the
+/// tty echoes back — which is what makes the assertion mean something.
+fn echo_two_vars(a: &str, b: &str) -> String {
+    if cfg!(windows) {
+        // `^` escapes the pipe; cmd would otherwise read it as an operator.
+        format!("echo %{a}%^|%{b}%")
+    } else {
+        format!("echo \"${a}|${b}\"")
+    }
 }
 
 fn boot_fixture() -> Fixture {
@@ -82,15 +125,15 @@ fn drain_until<F: Fn(&TerminalEvent) -> bool>(
 fn spawn_write_observe_output_then_exit() {
     let mut fx = boot_fixture();
     let cfg = SpawnConfig {
-        shell: "/bin/sh".into(),
-        cwd: PathBuf::from("/tmp"),
+        shell: test_shell(),
+        cwd: test_cwd(),
         cols: 80,
         rows: 24,
         ..SpawnConfig::default()
     };
     let id = fx.backend.spawn(cfg).expect("spawn");
     fx.backend
-        .write(id, b"echo CLIENT_HELLO\nexit\n")
+        .write(id, &lines(&["echo CLIENT_HELLO", "exit"]))
         .expect("write");
 
     let events = drain_until(&mut fx.backend, Duration::from_secs(5), |e| {
@@ -120,8 +163,8 @@ fn status_consumer_cannot_steal_relay_renderer_events() {
     let original_id = fx
         .backend
         .spawn(SpawnConfig {
-            shell: "/bin/sh".into(),
-            cwd: PathBuf::from("/tmp"),
+            shell: test_shell(),
+            cwd: test_cwd(),
             ..SpawnConfig::default()
         })
         .expect("spawn");
@@ -137,7 +180,7 @@ fn status_consumer_cannot_steal_relay_renderer_events() {
         .attach_existing(&external_id)
         .expect("restore existing PTY");
     fx.backend
-        .write(id, b"printf 'STATUS_MARKER\\n'; exit 7\n")
+        .write(id, &lines(&["echo STATUS_MARKER", "exit 7"]))
         .expect("write restored command");
 
     let output_deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -207,8 +250,8 @@ fn status_consumer_cannot_steal_relay_renderer_events() {
 fn spawn_config_env_reaches_child_via_backend() {
     let mut fx = boot_fixture();
     let cfg = SpawnConfig {
-        shell: "/bin/sh".into(),
-        cwd: PathBuf::from("/tmp"),
+        shell: test_shell(),
+        cwd: test_cwd(),
         cols: 80,
         rows: 24,
         env: vec![
@@ -219,7 +262,10 @@ fn spawn_config_env_reaches_child_via_backend() {
     };
     let id = fx.backend.spawn(cfg).expect("spawn");
     fx.backend
-        .write(id, b"echo \"$OXIMUX_WORKSPACE_ID|$OXIMUX_TAB_ID\"\nexit\n")
+        .write(
+            id,
+            &lines(&[&echo_two_vars("OXIMUX_WORKSPACE_ID", "OXIMUX_TAB_ID"), "exit"]),
+        )
         .expect("write");
 
     let events = drain_until(&mut fx.backend, Duration::from_secs(5), |e| {
@@ -247,8 +293,8 @@ fn detach_keeps_pty_alive_for_reattach() {
     // driving the same live shell. Contrast with `close`, which kills it.
     let mut fx = boot_fixture();
     let cfg = SpawnConfig {
-        shell: "/bin/sh".into(),
-        cwd: PathBuf::from("/tmp"),
+        shell: test_shell(),
+        cwd: test_cwd(),
         cols: 80,
         rows: 24,
         ..SpawnConfig::default()
@@ -280,7 +326,7 @@ fn detach_keeps_pty_alive_for_reattach() {
 
     // B drives the live shell → proves the PTY survived the detach.
     fx.backend
-        .write(id_b, b"echo SURVIVED_DETACH\nexit\n")
+        .write(id_b, &lines(&["echo SURVIVED_DETACH", "exit"]))
         .expect("write via B");
     let events = drain_until(&mut fx.backend, Duration::from_secs(5), |e| {
         matches!(e, TerminalEvent::Exit { .. })
@@ -304,15 +350,15 @@ fn detach_keeps_pty_alive_for_reattach() {
 fn snapshot_mirrors_remote_state() {
     let mut fx = boot_fixture();
     let cfg = SpawnConfig {
-        shell: "/bin/sh".into(),
-        cwd: PathBuf::from("/tmp"),
+        shell: test_shell(),
+        cwd: test_cwd(),
         cols: 80,
         rows: 24,
         ..SpawnConfig::default()
     };
     let id = fx.backend.spawn(cfg).expect("spawn");
     fx.backend
-        .write(id, b"printf 'LOCAL_GRID_OK\\n'\n")
+        .write(id, &lines(&["echo LOCAL_GRID_OK"]))
         .expect("write");
 
     // Wait for the bytes to flow back; drain_events advances state
@@ -334,7 +380,7 @@ fn snapshot_mirrors_remote_state() {
         "grid missing marker; got {rendered:?}"
     );
 
-    fx.backend.write(id, b"exit\n").expect("write exit");
+    fx.backend.write(id, &lines(&["exit"])).expect("write exit");
     let _ = drain_until(&mut fx.backend, Duration::from_secs(2), |e| {
         matches!(e, TerminalEvent::Exit { .. })
     });
@@ -351,8 +397,8 @@ fn snapshot_mirrors_remote_state() {
 fn resize_applies_to_local_grid_synchronously() {
     let mut fx = boot_fixture();
     let cfg = SpawnConfig {
-        shell: "/bin/sh".into(),
-        cwd: PathBuf::from("/tmp"),
+        shell: test_shell(),
+        cwd: test_cwd(),
         cols: 80,
         rows: 24,
         ..SpawnConfig::default()
@@ -388,7 +434,7 @@ fn resize_applies_to_local_grid_synchronously() {
     });
     assert!(saw_resize, "no synchronous Resize event");
 
-    fx.backend.write(id, b"exit\n").ok();
+    fx.backend.write(id, &lines(&["exit"])).ok();
 }
 
 // End-to-end keystroke latency probe. Measures write→echo round-trip
@@ -398,6 +444,11 @@ fn resize_applies_to_local_grid_synchronously() {
 //       --test relay_client_integration -- --ignored --nocapture \
 //       keystroke_echo_latency
 // Ignored by default so the normal `cargo test` cycle stays under 1s.
+// Driven by `cat` echoing stdin line-by-line and ended with a raw Ctrl+C,
+// which are tty line-discipline behaviors; cmd.exe has no equivalent that
+// echoes each write back immediately. Porting needs a different probe, not
+// a different command.
+#[cfg(unix)]
 #[test]
 #[ignore]
 fn keystroke_echo_latency() {
@@ -405,8 +456,8 @@ fn keystroke_echo_latency() {
 
     let mut fx = boot_fixture();
     let cfg = SpawnConfig {
-        shell: "/bin/sh".into(),
-        cwd: PathBuf::from("/tmp"),
+        shell: test_shell(),
+        cwd: test_cwd(),
         cols: 80,
         rows: 24,
         ..SpawnConfig::default()
@@ -471,6 +522,11 @@ fn keystroke_echo_latency() {
 // A/B counterpart: same latency probe against the in-process backend,
 // so the relay numbers can be compared against the "no daemon" baseline.
 // Same invocation pattern (--ignored --nocapture).
+// Driven by `cat` echoing stdin line-by-line and ended with a raw Ctrl+C,
+// which are tty line-discipline behaviors; cmd.exe has no equivalent that
+// echoes each write back immediately. Porting needs a different probe, not
+// a different command.
+#[cfg(unix)]
 #[test]
 #[ignore]
 fn keystroke_echo_latency_in_process() {
@@ -478,8 +534,8 @@ fn keystroke_echo_latency_in_process() {
 
     let mut backend = PortablePtyBackend::new();
     let cfg = SpawnConfig {
-        shell: "/bin/sh".into(),
-        cwd: PathBuf::from("/tmp"),
+        shell: test_shell(),
+        cwd: test_cwd(),
         cols: 80,
         rows: 24,
         ..SpawnConfig::default()
@@ -530,15 +586,15 @@ fn keystroke_echo_latency_in_process() {
 fn attach_existing_replays_into_local_state() {
     let mut fx = boot_fixture();
     let cfg = SpawnConfig {
-        shell: "/bin/sh".into(),
-        cwd: PathBuf::from("/tmp"),
+        shell: test_shell(),
+        cwd: test_cwd(),
         cols: 80,
         rows: 24,
         ..SpawnConfig::default()
     };
     let original_id = fx.backend.spawn(cfg).expect("spawn");
     fx.backend
-        .write(original_id, b"printf 'PERSIST_MARKER\\n'\n")
+        .write(original_id, &lines(&["echo PERSIST_MARKER"]))
         .expect("write");
     // Wait for the byte to land in the daemon's ring buffer.
     let _ = drain_until(
@@ -621,8 +677,8 @@ fn seeded_synthetic_exits_fire_once_and_floor_fresh_ids() {
 
     // (c) fresh spawns clear the inherited floor.
     let cfg = SpawnConfig {
-        shell: "/bin/sh".into(),
-        cwd: PathBuf::from("/tmp"),
+        shell: test_shell(),
+        cwd: test_cwd(),
         cols: 80,
         rows: 24,
         ..SpawnConfig::default()
