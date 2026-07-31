@@ -160,6 +160,21 @@ jobs:
           cargo test --target x86_64-pc-windows-msvc
           -p oximux-relay-client --test relay_client_integration
 
+      # These three were ported to Windows at the same time as the two suites
+      # above, and need naming here for the same reason those do: nothing else
+      # reaches them. The pty step is `--lib`, which skips integration targets
+      # under tests/, and the informational sweep below is `--lib` too. A suite
+      # ported for a platform that never runs it is worse than one left
+      # unported — it compiles green and rots without anyone noticing.
+      - name: cargo test (pty backend smoke)
+        run: cargo test --target x86_64-pc-windows-msvc -p oximux-pty --test backend_smoke
+
+      - name: cargo test (pty snapshot smoke)
+        run: cargo test --target x86_64-pc-windows-msvc -p oximux-pty --test snapshot_smoke
+
+      - name: cargo test (relay checkpoint lifecycle)
+        run: cargo test --target x86_64-pc-windows-msvc -p oximux-relay --test checkpoint_lifecycle
+
       # Non-blocking on purpose: nobody has ever run these on Windows, so the
       # first result is data, not a verdict. It exists to produce the list of
       # what actually fails, which is what should drive widening the gate
