@@ -6917,6 +6917,7 @@ dependencies = [
  "oximux-git",
  "oximux-job-object",
  "oximux-pty",
+ "oximux-shell-env",
  "oximux-storage",
  "regex",
  "rusqlite",
@@ -7158,6 +7159,7 @@ dependencies = [
  "anyhow",
  "nix 0.25.1",
  "oximux-core",
+ "oximux-shell-env",
  "portable-pty",
 ]
 
@@ -7173,6 +7175,7 @@ dependencies = [
  "oximux-owner-only",
  "oximux-proc-cwd",
  "oximux-relay-proto",
+ "oximux-shell-env",
  "portable-pty",
  "rand 0.8.6",
  "serde",
@@ -7304,6 +7307,14 @@ dependencies = [
  "serde",
  "tempfile",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "oximux-shell-env"
+version = "0.1.5"
+dependencies = [
+ "portable-pty",
+ "which 6.0.3",
 ]
 
 [[package]]

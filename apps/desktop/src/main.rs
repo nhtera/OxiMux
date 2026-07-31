@@ -53,6 +53,10 @@ fn main() {
     // Before the runtime, and before anything spawns: a double-clicked app
     // inherits only launchd's four directories, and every agent CLI installs
     // outside them. Must precede the first thread — it writes the environment.
+    //
+    // Windows has no equivalent gap: a process started from Explorer gets the
+    // machine and user PATH out of the registry, the same one a console gets.
+    #[cfg(unix)]
     oximux_app::platform::login_path::adopt_login_shell_path();
 
     // Boot the tokio runtime that every git op + status poller relies on.

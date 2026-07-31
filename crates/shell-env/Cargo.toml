@@ -1,0 +1,18 @@
+[package]
+name = "oximux-shell-env"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# The `CommandBuilder` the env seeding writes into. Both consumers already
+# depend on portable-pty, so this adds nothing to either dependency graph.
+portable-pty = { workspace = true }
+
+# PATH + PATHEXT resolution for the Windows shell probe. The same crate the
+# agent-CLI detector uses, so `.exe`/`.cmd` handling has one implementation.
+[target.'cfg(windows)'.dependencies]
+which = { workspace = true }

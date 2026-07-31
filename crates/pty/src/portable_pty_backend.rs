@@ -15,6 +15,7 @@
 //! receiver can be wrapped or replaced without changing the trait surface.
 
 use anyhow::{Context, Result};
+use oximux_shell_env::seed_utf8_locale;
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -689,24 +690,6 @@ fn try_send_renderer_event(tx: &SyncSender<TerminalEvent>, event: TerminalEvent)
     match tx.try_send(event) {
         Ok(()) | Err(TrySendError::Full(_)) => true,
         Err(TrySendError::Disconnected(_)) => false,
-    }
-}
-
-/// Seed a UTF-8 locale on a spawned shell when the environment supplies none.
-///
-/// A GUI-launched app inherits no `LANG`/`LC_*` from LaunchServices, unlike
-/// Terminal.app, which injects a locale on startup. Without one, an interactive
-/// `zsh` falls back to the C locale and its line editor mangles multibyte
-/// input: Vietnamese/CJK text (typed, pasted, or dictated) echoes back as
-/// `<XX>` meta bytes rather than the intended glyphs. Seed a UTF-8 ctype only
-/// when nothing is set, and before the caller/user rc runs so any explicit
-/// locale still wins.
-fn seed_utf8_locale(command: &mut CommandBuilder) {
-    if std::env::var_os("LC_ALL").is_none()
-        && std::env::var_os("LC_CTYPE").is_none()
-        && std::env::var_os("LANG").is_none()
-    {
-        command.env("LANG", "en_US.UTF-8");
     }
 }
 

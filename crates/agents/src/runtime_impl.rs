@@ -472,9 +472,9 @@ impl AgentRuntime for CliRuntime {
 
 /// The login shell used to wrap a relay-spawned agent. The relay daemon's
 /// Spawn RPC takes only a shell (no argv), so we run the user's shell and
-/// `exec` the agent into it. Falls back to zsh when `$SHELL` is unset.
+/// hand the agent to it as a launch line.
 fn wrapper_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into())
+    oximux_shell_env::default_shell()
 }
 
 /// Resolve a program (possibly a bare name like `claude`) to an absolute
@@ -495,9 +495,16 @@ async fn resolve_program_abs(program: &std::path::Path) -> Option<std::path::Pat
     resolved.is_absolute().then_some(resolved)
 }
 
-/// Build the one-line `exec <program> <args…>` command written into the
-/// wrapper shell's stdin. Every token is POSIX-quoted so paths/args with
-/// spaces or shell metacharacters survive intact.
+/// Build the one-line command written into the wrapper shell's stdin. Every
+/// token is quoted for the shell that will read it, so paths/args with spaces
+/// or shell metacharacters survive intact.
+///
+/// `exec` replaces the shell, which is what makes the agent the PTY's leaf
+/// process — cancel's process-group signal and the exit→EOF status both depend
+/// on that. PowerShell has no `exec`, so the Windows form keeps the shell as a
+/// parent and forwards the exit code instead; the job object introduced for
+/// tree-kill is what covers the difference.
+#[cfg(unix)]
 fn build_launch_line(program: &std::path::Path, args: &[String]) -> String {
     let mut line = String::from("exec ");
     line.push_str(&shell_quote(&program.to_string_lossy()));
@@ -509,9 +516,29 @@ fn build_launch_line(program: &std::path::Path, args: &[String]) -> String {
     line
 }
 
+/// PowerShell form of [`build_launch_line`]. `&` is the call operator, needed
+/// because the program arrives as a quoted string rather than a bare command.
+///
+/// Assumes PowerShell, which is what the shell resolver returns unless neither
+/// PowerShell is installed — a state where nothing else here would work either.
+#[cfg(windows)]
+fn build_launch_line(program: &std::path::Path, args: &[String]) -> String {
+    let mut line = String::from("& ");
+    line.push_str(&shell_quote(&program.to_string_lossy()));
+    for a in args {
+        line.push(' ');
+        line.push_str(&shell_quote(a));
+    }
+    // Without this the shell sits at a prompt after the agent exits, and the
+    // PTY never reaches EOF — the status machine would never see the exit.
+    line.push_str("; exit $LASTEXITCODE\r\n");
+    line
+}
+
 /// Minimal POSIX shell quoting. Bare-word when the token is all "safe"
 /// characters; otherwise single-quote and escape embedded single quotes
 /// as `'\''`. Sufficient for argv tokens (no need to handle newlines).
+#[cfg(unix)]
 fn shell_quote(s: &str) -> String {
     let safe = !s.is_empty()
         && s.bytes().all(|b| {
@@ -522,6 +549,16 @@ fn shell_quote(s: &str) -> String {
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
     }
+}
+
+/// PowerShell single-quoted literal: no interpolation happens inside one, so
+/// the only character needing care is the quote itself, which doubles.
+///
+/// Always quoted, never bare — a Windows path is full of `\`, and a bare token
+/// would also let `$` and backtick through to the parser.
+#[cfg(windows)]
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// Per-session poll loop. Owns the `StatusMachine` for its session — the

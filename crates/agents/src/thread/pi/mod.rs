@@ -851,6 +851,38 @@ fn which_on_path(bin: &str) -> Option<PathBuf> {
     which::which(bin).ok()
 }
 
+/// The shell and argv that ask "where is `bin`?" with the user's own startup
+/// files loaded. That is the whole point of the probe: the answer differs from
+/// a plain PATH lookup exactly when a startup file edits PATH.
+///
+/// The two platforms get there differently. A POSIX login shell (`-l`) sources
+/// the profile chain a version manager hooks into; PowerShell has no comparable
+/// login mode on Windows (`-Login` is honored only on unix builds), but it
+/// loads `$PROFILE` for `-Command` unless told not to — which is the same
+/// recovery, since a Windows PATH edit that a GUI launch misses lives there.
+#[cfg(unix)]
+fn login_probe_command(bin: &str) -> (String, Vec<String>) {
+    (
+        oximux_shell_env::default_shell(),
+        vec!["-lc".to_string(), format!("command -v {bin}")],
+    )
+}
+
+#[cfg(windows)]
+fn login_probe_command(bin: &str) -> (String, Vec<String>) {
+    (
+        oximux_shell_env::default_shell(),
+        vec![
+            "-NoLogo".to_string(),
+            "-Command".to_string(),
+            // `-ErrorAction SilentlyContinue` so a missing command prints
+            // nothing instead of an error record the caller would parse as a
+            // path. Empty stdout is already the "not found" signal.
+            format!("(Get-Command {bin} -ErrorAction SilentlyContinue).Source"),
+        ],
+    )
+}
+
 /// Ask a login shell where `bin` is — recovers nvm/volta/bun installs that a
 /// Finder-launched app can't see.
 ///
@@ -859,10 +891,9 @@ fn which_on_path(bin: &str) -> Option<PathBuf> {
 /// runs on the UI thread, so it must never wait forever — a slow shell degrades
 /// to "pi not found" (an actionable error) rather than a frozen app.
 fn login_shell_which(bin: &str) -> Option<PathBuf> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let (shell, args) = login_probe_command(bin);
     let mut child = Command::new(shell)
-        .arg("-lc")
-        .arg(format!("command -v {bin}"))
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

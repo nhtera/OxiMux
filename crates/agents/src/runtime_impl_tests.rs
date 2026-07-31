@@ -426,3 +426,48 @@ fn agent_paste_bytes_wraps_multiline_for_bracketed_review_sends() {
     let out = agent_paste_bytes("ok\x1b[201~evil", true);
     assert_eq!(out, b"\x1b[200~ok[201~evil\x1b[201~");
 }
+
+// The wrapper shell reads this line off stdin, so a path or flag containing a
+// space, a quote, or a shell metacharacter has to survive as ONE token — an
+// agent installed under "Program Files" or a prompt flag with an apostrophe
+// would otherwise be split or, worse, partly executed.
+#[cfg(unix)]
+#[test]
+fn posix_launch_line_execs_and_quotes_every_token() {
+    let line = build_launch_line(
+        &PathBuf::from("/opt/my tools/claude"),
+        &["--flag".to_string(), "it's here".to_string()],
+    );
+    assert_eq!(
+        line,
+        "exec '/opt/my tools/claude' --flag 'it'\\''s here'\n"
+    );
+    // exec is what makes the agent the PTY leaf; without it the shell stays in
+    // the middle and the exit status the caller polls never arrives.
+    assert!(line.starts_with("exec "));
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_launch_line_calls_and_forwards_the_exit_code() {
+    let line = build_launch_line(
+        &PathBuf::from(r"C:\Program Files\nodejs\claude.cmd"),
+        &["--flag".to_string(), "it's here".to_string()],
+    );
+    assert_eq!(
+        line,
+        "& 'C:\\Program Files\\nodejs\\claude.cmd' '--flag' 'it''s here'; \
+         exit $LASTEXITCODE\r\n"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_quoting_neutralizes_interpolation_and_backslashes() {
+    // A single-quoted PowerShell string interpolates nothing, so `$` and the
+    // backtick escape are inert and a Windows path needs no doubling.
+    assert_eq!(shell_quote(r"C:\Users\me\$env:PATH"), r"'C:\Users\me\$env:PATH'");
+    assert_eq!(shell_quote("a`b"), "'a`b'");
+    // The one character that does need care is the quote itself.
+    assert_eq!(shell_quote("don't"), "'don''t'");
+}

@@ -14,6 +14,9 @@ oximux-core = { workspace = true }
 # phone's Rust core can reuse the fold without pty/sqlite/ACP deps.
 oximux-agent-core = { workspace = true }
 oximux-pty = { workspace = true }
+# The shell an agent gets wrapped in when it can't be spawned directly, and the
+# shell a PATH-recovery probe runs under.
+oximux-shell-env = { workspace = true }
 anyhow = { workspace = true }
 # "Is this agent CLI installed?" and bare-name -> absolute-path resolution
 # (`cli::detect`, the pi binary resolver, the detached-spawn program resolver).

@@ -20,6 +20,7 @@ oximux-relay-proto = { workspace = true }
 # Restricting the pid file, and — on Windows — building the named pipe's
 # owner-only DACL from the same definition the token and key files use.
 oximux-owner-only = { workspace = true }
+oximux-shell-env = { workspace = true }
 anyhow = { workspace = true }
 dashmap = { workspace = true }
 interprocess = { workspace = true }

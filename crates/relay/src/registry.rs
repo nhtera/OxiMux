@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use dashmap::DashMap;
 use oximux_relay_proto::{ErrCode, Notification, PtyDescriptor, PtyStats};
+use oximux_shell_env::seed_utf8_locale;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
@@ -177,10 +178,10 @@ impl PtyRegistry {
             })
             .context("openpty")?;
 
-        let shell = args
-            .shell
-            .or_else(|| std::env::var("SHELL").ok())
-            .unwrap_or_else(|| "/bin/zsh".into());
+        // Resolved here, not client-side, and that ordering is the point: a
+        // paired phone asking for "a terminal" has no idea what shells the
+        // host has, so the host is the only end that can answer.
+        let shell = args.shell.unwrap_or_else(oximux_shell_env::default_shell);
         // Mint the PTY id up front so it can be injected into the child's
         // environment as OXIMUX_PTY_ID — the `oximux notify` CLI reads it to
         // tell the daemon which pane to raise attention on.
@@ -838,24 +839,6 @@ fn pty_id_of(notif: &Notification) -> &str {
         | Notification::Exit { pty_id, .. }
         | Notification::Attention { pty_id, .. }
         | Notification::Gapped { pty_id } => pty_id,
-    }
-}
-
-/// Seed a UTF-8 locale on a spawned shell when the environment supplies none.
-///
-/// A GUI-launched app — and the detached daemon it spawns — inherits no
-/// `LANG`/`LC_*` from LaunchServices, unlike Terminal.app, which injects a
-/// locale on startup. Without one, an interactive `zsh` falls back to the C
-/// locale and its line editor mangles multibyte input: Vietnamese/CJK text
-/// (typed, pasted, or dictated) echoes back as `<XX>` meta bytes rather than
-/// the intended glyphs. Seed a UTF-8 ctype only when nothing is set, and
-/// before the caller/user rc runs so any explicit locale still wins.
-fn seed_utf8_locale(command: &mut CommandBuilder) {
-    if std::env::var_os("LC_ALL").is_none()
-        && std::env::var_os("LC_CTYPE").is_none()
-        && std::env::var_os("LANG").is_none()
-    {
-        command.env("LANG", "en_US.UTF-8");
     }
 }
 
