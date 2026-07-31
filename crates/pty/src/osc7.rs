@@ -233,8 +233,34 @@ pub fn parse_file_uri(uri: &str) -> Option<PathBuf> {
     let slash = rest.find('/')?;
     let raw_path = &rest[slash..];
     let decoded = percent_decode(raw_path)?;
-    let path = PathBuf::from(decoded);
+    let path = PathBuf::from(uri_path_to_native(&decoded));
     if path.is_absolute() { Some(path) } else { None }
+}
+
+/// Turn the path component of a `file:` URI into one the platform calls
+/// absolute. A no-op off Windows.
+fn uri_path_to_native(path: &str) -> &str {
+    if cfg!(windows) {
+        strip_drive_slash(path)
+    } else {
+        path
+    }
+}
+
+/// Drop the slash a `file:` URI puts in front of a Windows drive letter.
+///
+/// URIs always spell the path with a leading slash, so `C:\Users\me` travels
+/// as `file:///C:/Users/me` and arrives here as `/C:/Users/me`. Rust reads that
+/// as rooted but prefixless, which on Windows is NOT absolute — so without this
+/// the caller's absolute check discards every cwd a shell reports, and OSC 7 is
+/// the only cwd source there (no `/proc`, no libproc).
+///
+/// Compiled on every platform, not `#[cfg]`-ed, so the rule stays testable
+/// where the tests actually run.
+fn strip_drive_slash(path: &str) -> &str {
+    let b = path.as_bytes();
+    let is_drive = b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':';
+    if is_drive { &path[1..] } else { path }
 }
 
 /// Minimal percent-decode for OSC 7 paths. RFC 3986 says path segments
@@ -486,6 +512,33 @@ mod tests {
         // it; the OS resolves `..` later. The point of this test is just
         // to document that we DON'T normalize and DON'T reject `..`.
         assert_eq!(paths, vec![PathBuf::from("/relative/path/../escape")]);
+    }
+
+    #[test]
+    fn a_windows_drive_loses_the_uri_slash() {
+        // What a shell on Windows emits for C:\Users\me\proj. The rule runs
+        // on every platform so it can be checked here; only the caller is
+        // cfg-ed, because "/C:/x" is a legitimate (if odd) path on unix.
+        assert_eq!(strip_drive_slash("/C:/Users/me/proj"), "C:/Users/me/proj");
+        assert_eq!(strip_drive_slash("/d:/lower/drive"), "d:/lower/drive");
+        // A POSIX path must survive untouched, including one that merely
+        // starts with a letter or contains a colon further along.
+        assert_eq!(strip_drive_slash("/Users/me/proj"), "/Users/me/proj");
+        assert_eq!(strip_drive_slash("/c/not-a-drive"), "/c/not-a-drive");
+        assert_eq!(strip_drive_slash("/tmp/a:b"), "/tmp/a:b");
+        // Too short to be a drive spec.
+        assert_eq!(strip_drive_slash("/C"), "/C");
+        assert_eq!(strip_drive_slash(""), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_osc7_yields_an_absolute_path() {
+        // The end-to-end shape: without the slash fix `is_absolute()` is false
+        // and the hit is dropped, so cwd tracking never reports anything.
+        let paths = collect(b"\x1b]7;file:///C:/Users/me/proj\x07");
+        assert_eq!(paths, vec![PathBuf::from("C:/Users/me/proj")]);
+        assert!(paths[0].is_absolute());
     }
 
     #[test]
