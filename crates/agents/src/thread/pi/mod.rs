@@ -953,6 +953,50 @@ fn is_executable(p: &Path) -> bool {
 mod tests {
     use super::*;
 
+    /// Write an executable fake `pi` into `dir` and return the path to spawn.
+    ///
+    /// These fakes have to be real programs — `PiRpcConnection::spawn` execs the
+    /// configured path and talks JSON-RPC over its pipes — which makes them the
+    /// one thing in this suite that cannot be written once for both platforms:
+    ///
+    /// - unix gets the `sh` script plus a `chmod`.
+    /// - Windows cannot exec a shebang at all (`%1 is not a valid Win32
+    ///   application`, os error 193) and `CreateProcess` infers no extension
+    ///   from a bare `pi`. So the fake is a `.cmd`, which `CreateProcess` does
+    ///   run through the command processor, shimmed onto a `.ps1` holding the
+    ///   real logic — `cmd`'s own language is not up to a JSON-RPC loop.
+    ///
+    /// Both scripts are passed in rather than translated, because they are not
+    /// mechanically translatable and pretending otherwise hides which behaviour
+    /// each platform is actually asserting.
+    fn write_fake_pi(dir: &Path, sh: &str, powershell: &str) -> PathBuf {
+        #[cfg(unix)]
+        {
+            let _ = powershell;
+            let path = dir.join("pi");
+            std::fs::write(&path, sh).expect("write fake");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            path
+        }
+        #[cfg(windows)]
+        {
+            let _ = sh;
+            std::fs::write(dir.join("pi.ps1"), powershell).expect("write fake");
+            let path = dir.join("pi.cmd");
+            // `-File` (not `-Command`) so the script is not re-parsed by cmd,
+            // and `%*` forwards argv so a fake can branch on `--session`.
+            std::fs::write(
+                &path,
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass \
+                 -File \"%~dp0pi.ps1\" %*\r\n",
+            )
+            .expect("write shim");
+            path
+        }
+    }
+
     /// Live handshake against the real `pi`. Ignored by default (needs pi
     /// installed); costs no model tokens — `get_state` never calls a provider.
     ///
@@ -1490,14 +1534,23 @@ while IFS= read -r line; do
   esac
 done
 "#;
-        std::fs::write(dir.join("pi"), script).expect("write fake");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir.join("pi"), std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
-        let fake = dir.join("pi");
+        // The same fake in PowerShell. Reads through `[Console]::In` and flushes
+        // explicitly: the handshake blocks on the `get_state` reply, and
+        // PowerShell's own output buffering would stall it.
+        let ps = r#"
+if ($args -join ' ' -match '--session') {
+  [Console]::Error.WriteLine("No session found matching 'gone'")
+  exit 1
+}
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  if ($line -match '"id":"([^"]*)"') { $id = $Matches[1] }
+  if ($line -match '"type":"get_state"') {
+    [Console]::Out.Write('{"id":"' + $id + '","type":"response","command":"get_state","success":true,"data":{"sessionId":"brand-new"}}' + "`n")
+    [Console]::Out.Flush()
+  }
+}
+"#;
+        let fake = write_fake_pi(&dir, script, ps);
         let (conn, rx) = PiRpcConnection::spawn(
             &dir,
             None,
@@ -1527,15 +1580,11 @@ done
         // a fixable error into a mystery.
         let dir = std::env::temp_dir().join(format!("pi-badauth-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch");
-        std::fs::write(dir.join("pi"), "#!/bin/sh\necho 'pi: no credentials found' >&2\nexit 1\n")
-            .expect("write fake");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir.join("pi"), std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
-        let fake = dir.join("pi");
+        let fake = write_fake_pi(
+            &dir,
+            "#!/bin/sh\necho 'pi: no credentials found' >&2\nexit 1\n",
+            "[Console]::Error.WriteLine('pi: no credentials found')\nexit 1\n",
+        );
         let err = PiRpcConnection::spawn(&dir, None, fake.to_str(), PiPosture::default(), Some("sess-1"))
             .err()
             .expect("a credentials failure must not be retried as a fresh session");
@@ -1545,7 +1594,16 @@ done
 
     #[test]
     fn a_configured_absolute_path_that_is_missing_fails_readably() {
-        let err = resolve_pi_binary(Some("/nope/not/here/pi"))
+        // Absolute for the running platform. `resolve_pi_binary` gates the
+        // readable bail on `is_absolute()`, and `/nope/...` is not absolute on
+        // Windows — it fell through as a bare name for PATH lookup, so nothing
+        // failed and the assertion read as a missing guard.
+        let missing = if cfg!(windows) {
+            r"C:\nope\not\here\pi.exe"
+        } else {
+            "/nope/not/here/pi"
+        };
+        let err = resolve_pi_binary(Some(missing))
             .expect_err("a configured path that doesn't exist must fail");
         assert!(err.to_string().contains("not found"), "got {err}");
     }
@@ -1858,6 +1916,13 @@ sleep 2
         assert!(err.to_string().contains("posture"), "got {err}");
     }
 
+    // Gated for the same reason as its sibling below, which already was: the
+    // test is a `trap ... TERM` shell script asserting a signal, and Windows has
+    // neither half. `terminate()` cfg's the `libc::kill` out and reaps the tool
+    // children through the job object instead — a different mechanism with the
+    // same guarantee, covered by the job-object suite rather than here. The gate
+    // was written for the pair and only landed on one of them.
+    #[cfg(unix)]
     #[test]
     fn shutdown_signals_term_not_kill_so_pi_can_reap_its_tool_children() {
         // The load-bearing lifecycle fact: pi's SIGTERM/SIGHUP handler is the

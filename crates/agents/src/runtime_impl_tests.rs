@@ -30,7 +30,11 @@ fn lock_recover_survives_poisoned_mutex() {
 fn echo_cfg(program: &str, args: Vec<String>) -> AgentSessionConfig {
     AgentSessionConfig {
         adapter: AgentAdapter::Custom,
-        worktree_path: PathBuf::from("/"),
+        // `test_cwd()`, not `/`: on Windows `/` names the current drive root,
+        // which is not a directory to start a process in — the spawn failed with
+        // "the system cannot find the path specified" before the program name
+        // even mattered.
+        worktree_path: oximux_shell_env::test_support::test_cwd(),
         prompt: None,
         model: None,
         effort: None,
@@ -40,6 +44,70 @@ fn echo_cfg(program: &str, args: Vec<String>) -> AgentSessionConfig {
         rows: 24,
         custom_command: Some((program.to_string(), args)),
         resumption: oximux_core::SessionResumption::None,
+    }
+}
+
+/// A session config that runs `commands` through the platform's shell.
+///
+/// `CustomCommandAdapter` spawns `(program, args)` into a PTY directly, so the
+/// old fixtures had to name real executables: `/bin/echo`, `/bin/sleep`,
+/// `/bin/cat`, `/bin/sh -c …`. None exist on Windows, and none are even absolute
+/// paths there, so each failed at `CreateProcessW`. Routing through
+/// `test_shell()` + `run_script()` keeps the platform spelling in
+/// `oximux-shell-env` — where this repo already decided it lives — and leaves
+/// each test naming the behaviour it needs.
+fn shell_cfg(commands: &[&str]) -> AgentSessionConfig {
+    use oximux_shell_env::test_support::{run_script, test_shell};
+    let args = run_script(commands);
+    echo_cfg(&test_shell(), args)
+}
+
+/// Read one line from the terminal, then exit 0. The point of the readline
+/// tests is that a bare `\r` submits, which is true of `sh`'s `read` and of
+/// `cmd`'s `set /p` alike.
+fn read_one_line() -> &'static str {
+    if cfg!(windows) { "set /p x=" } else { "read x" }
+}
+
+/// Read a line, print `STATUS_MARKER`, read another, exit 7.
+fn gated_marker_script() -> Vec<&'static str> {
+    if cfg!(windows) {
+        vec!["set /p first=", "echo STATUS_MARKER", "set /p second=", "exit 7"]
+    } else {
+        vec!["read first; printf 'STATUS_MARKER\\n'; read second; exit 7"]
+    }
+}
+
+/// One line of terminal input, terminated so the reader on the other side
+/// actually sees a submitted line.
+///
+/// A bare `\n` is enough for `sh`'s `read`, and not enough for a Windows
+/// console: `cmd`'s `set /p` submits on CR, so `"first\n"` left it blocked
+/// forever and the session never reached a terminal status. This is the same
+/// distinction `oximux_shell_env::test_support::lines` exists for; spelled here
+/// because these tests submit one line at a time rather than a whole script.
+fn line(text: &str) -> String {
+    if cfg!(windows) {
+        format!("{text}\r")
+    } else {
+        format!("{text}\n")
+    }
+}
+
+/// Stay alive consuming stdin. `send_message_writes_to_pty` asserts only that
+/// the write lands and the session survives it, which is what `cat` provided
+/// and what `more` provides on Windows.
+fn stdin_reader() -> &'static str {
+    if cfg!(windows) { "more" } else { "cat" }
+}
+
+/// Occupy `secs` seconds. `cmd` has no `sleep`, and its `timeout` refuses to run
+/// with redirected stdin; `ping` with n+1 pings is the conventional stand-in.
+fn sleep_for(secs: u32) -> String {
+    if cfg!(windows) {
+        format!("ping -n {} 127.0.0.1 >nul", secs + 1)
+    } else {
+        format!("sleep {secs}")
     }
 }
 
@@ -53,7 +121,7 @@ fn runtime_with_custom() -> CliRuntime {
 async fn start_session_unknown_adapter_errors() {
     let rt = CliRuntime::new();
     let err = rt
-        .start_session(echo_cfg("/bin/true", vec![]))
+        .start_session(shell_cfg(&["exit 0"]))
         .await
         .unwrap_err();
     assert!(err.to_string().contains("no adapter"));
@@ -63,7 +131,7 @@ async fn start_session_unknown_adapter_errors() {
 async fn custom_echo_runs_to_done() {
     let rt = runtime_with_custom();
     let id = rt
-        .start_session(echo_cfg("/bin/echo", vec!["hello".into()]))
+        .start_session(shell_cfg(&["echo hello"]))
         .await
         .expect("start_session");
 
@@ -85,7 +153,7 @@ async fn custom_echo_runs_to_done() {
     let final_status = result.expect("did not reach terminal status in time");
     match final_status {
         AgentStatus::Done { code } => {
-            // /bin/echo exits 0
+            // `echo` exits 0
             assert_eq!(code, Some(0), "expected exit code 0, got {code:?}");
         }
         other => panic!("expected Done, got {other:?}"),
@@ -95,10 +163,10 @@ async fn custom_echo_runs_to_done() {
 #[tokio::test(flavor = "multi_thread")]
 async fn current_status_starts_at_idle() {
     let rt = runtime_with_custom();
-    // /bin/sleep gives us a few seconds of "running but not yet done"
+    // A short sleep gives us a few seconds of "running but not yet done"
     // to query while the session is live.
     let id = rt
-        .start_session(echo_cfg("/bin/sleep", vec!["2".into()]))
+        .start_session(shell_cfg(&[&sleep_for(2)]))
         .await
         .expect("start_session");
     let initial = rt.current_status(id).expect("current_status");
@@ -111,7 +179,7 @@ async fn current_status_starts_at_idle() {
 async fn cancel_terminates_session_and_removes_entry() {
     let rt = runtime_with_custom();
     let id = rt
-        .start_session(echo_cfg("/bin/sleep", vec!["30".into()]))
+        .start_session(shell_cfg(&[&sleep_for(30)]))
         .await
         .expect("start_session");
     // Cancel should return well before the 30 s sleep finishes.
@@ -130,13 +198,13 @@ async fn cancel_terminates_session_and_removes_entry() {
 #[tokio::test(flavor = "multi_thread")]
 async fn send_message_writes_to_pty() {
     let rt = runtime_with_custom();
-    // /bin/cat echoes whatever we feed it; we just verify write() does
-    // not error and the session survives the write.
+    // A stdin reader stays alive while we feed it; we just verify write()
+    // does not error and the session survives the write.
     let id = rt
-        .start_session(echo_cfg("/bin/cat", vec![]))
+        .start_session(shell_cfg(&[stdin_reader()]))
         .await
         .expect("start_session");
-    rt.send_message(id, "ping\n").await.expect("send_message");
+    rt.send_message(id, &line("ping")).await.expect("send_message");
     // status is still non-terminal
     let s = rt.current_status(id).expect("current_status");
     assert!(!s.is_terminal());
@@ -160,7 +228,7 @@ async fn send_message_unknown_session_errors() {
 async fn cr_terminated_reply_submits_a_readline() {
     let rt = runtime_with_custom();
     let id = rt
-        .start_session(echo_cfg("/bin/sh", vec!["-c".into(), "read x; exit 0".into()]))
+        .start_session(shell_cfg(&[read_one_line(), "exit 0"]))
         .await
         .expect("start_session");
     let mut rx = rt.subscribe_status(id).expect("subscribe");
@@ -199,7 +267,7 @@ async fn cancel_unknown_session_errors() {
 async fn subscribe_then_cancel_publishes_terminal_status() {
     let rt = runtime_with_custom();
     let id = rt
-        .start_session(echo_cfg("/bin/sleep", vec!["30".into()]))
+        .start_session(shell_cfg(&[&sleep_for(30)]))
         .await
         .expect("start_session");
     let mut rx = rt.subscribe_status(id).expect("subscribe");
@@ -240,7 +308,7 @@ async fn subscribe_then_cancel_publishes_terminal_status() {
 async fn double_cancel_second_call_errors() {
     let rt = runtime_with_custom();
     let id = rt
-        .start_session(echo_cfg("/bin/sleep", vec!["30".into()]))
+        .start_session(shell_cfg(&[&sleep_for(30)]))
         .await
         .expect("start_session");
     rt.cancel(id).await.expect("first cancel");
@@ -256,7 +324,7 @@ async fn double_cancel_second_call_errors() {
 async fn backend_for_returns_live_handle_shared_with_poll_task() {
     let rt = runtime_with_custom();
     let id = rt
-        .start_session(echo_cfg("/bin/sleep", vec!["30".into()]))
+        .start_session(shell_cfg(&[&sleep_for(30)]))
         .await
         .expect("start_session");
     let backend = rt.backend_for(id).expect("backend_for");
@@ -283,20 +351,14 @@ async fn status_polling_preserves_renderer_output_and_exit() {
     const MARKER: &[u8] = b"STATUS_MARKER";
     let rt = runtime_with_custom();
     let id = rt
-        .start_session(echo_cfg(
-            "/bin/sh",
-            vec![
-                "-c".into(),
-                "read first; printf 'STATUS_MARKER\\n'; read second; exit 7".into(),
-            ],
-        ))
+        .start_session(shell_cfg(&gated_marker_script()))
         .await
         .expect("start gated shell");
     let backend = rt.backend_for(id).expect("renderer backend");
     let term_id = rt.terminal_session_id(id).expect("terminal session id");
     let mut status = rt.subscribe_status(id).expect("status receiver");
 
-    rt.send_message(id, "first\n")
+    rt.send_message(id, &line("first"))
         .await
         .expect("release output");
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -344,7 +406,7 @@ async fn status_polling_preserves_renderer_output_and_exit() {
         "status poller stole renderer marker"
     );
 
-    rt.send_message(id, "second\n").await.expect("release exit");
+    rt.send_message(id, &line("second")).await.expect("release exit");
     tokio::time::timeout(Duration::from_secs(3), async {
         while !status.borrow().status.is_terminal() {
             status.changed().await.expect("status task remains live");
@@ -392,7 +454,7 @@ async fn terminal_session_id_unknown_session_errors() {
 async fn backend_for_after_cancel_returns_unknown_session() {
     let rt = runtime_with_custom();
     let id = rt
-        .start_session(echo_cfg("/bin/sleep", vec!["30".into()]))
+        .start_session(shell_cfg(&[&sleep_for(30)]))
         .await
         .expect("start_session");
     rt.cancel(id).await.expect("cancel");

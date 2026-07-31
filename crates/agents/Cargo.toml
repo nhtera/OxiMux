@@ -61,6 +61,10 @@ libc = "0.2"
 
 [dev-dependencies]
 oximux-git = { workspace = true }
+# The shell spellings the spawn/runtime tests drive their fixture programs
+# through. Same crate the shipping build already depends on; the feature only
+# adds the test helpers.
+oximux-shell-env = { workspace = true, features = ["test-support"] }
 # Only the schedule-store tests need this, to apply the real migrations against
 # an in-memory database. The store itself takes a Connection, so the shipping
 # build keeps no dependency on the storage crate.
