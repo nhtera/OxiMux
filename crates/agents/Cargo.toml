@@ -15,6 +15,11 @@ oximux-core = { workspace = true }
 oximux-agent-core = { workspace = true }
 oximux-pty = { workspace = true }
 anyhow = { workspace = true }
+# "Is this agent CLI installed?" and bare-name -> absolute-path resolution
+# (`cli::detect`, the pi binary resolver, the detached-spawn program resolver).
+# Pure-Rust PATH walk that also knows Windows PATHEXT, so `claude` finds the
+# `claude.cmd` shim npm installs.
+which = { workspace = true }
 async-trait = { workspace = true }
 # Encodes Codex image-item file bytes (imageView/imageGeneration paths) into the
 # standard-base64 `ChatImage` shape the transcript + thumbnail renderer expect.

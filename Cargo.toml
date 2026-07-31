@@ -208,6 +208,13 @@ ignore = "0.4"
 notify-debouncer-full = "0.4"
 # Temp dirs for file-tree backend unit tests (dev-dep on the editor crate).
 tempfile = "3"
+# PATH resolution for "is this agent CLI installed?" and for turning a bare
+# name into an absolute path. Replaces four hand-rolled versions — two that
+# shelled out to the `which` binary and two that walked PATH themselves. The
+# crate is pure Rust (no spawn), and it is what knows about Windows `PATHEXT`,
+# so `claude` resolves to the `claude.cmd` shim npm installs. Already in the
+# graph transitively at this version; declaring it adds no new compilation.
+which = "6"
 # Phase 10 — word-level diff inside the diff viewer. `similar` produces
 # `TextDiff::from_words` op streams that drive per-token coloring inside
 # modified-modified line pairs. Pure Rust, no `unicode-bidi` transitive

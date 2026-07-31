@@ -24,12 +24,10 @@ use notify_debouncer_full::{
 use oximux_settings::ComputerUseSettings;
 use tokio::sync::mpsc;
 
-/// Same per-user data dir as every other settings file.
-const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
 const DEBOUNCE_MS: u64 = 250;
 
 fn data_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join(APP_DATA_SUBDIR))
+    crate::app_paths::data_dir()
 }
 
 fn settings_path() -> Option<PathBuf> {

@@ -807,11 +807,14 @@ fn resolve_pi_binary(configured: Option<&str>) -> Result<PathBuf> {
 }
 
 /// First match for `bin` on the inherited PATH.
+///
+/// Synchronous on purpose — this runs inside `connect`, which is called from
+/// the UI thread and has no runtime to await on. The `which` crate does not
+/// spawn, so the cost is a handful of `stat`s either way; what it adds over the
+/// hand-rolled walk this replaced is `PATHEXT` handling on Windows, where `pi`
+/// installs as `pi.cmd`.
 fn which_on_path(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(bin))
-        .find(|p| is_executable(p))
+    which::which(bin).ok()
 }
 
 /// Ask a login shell where `bin` is — recovers nvm/volta/bun installs that a

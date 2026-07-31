@@ -25,7 +25,6 @@ use oximux_auto_update::staging::SwapOutcome;
 use oximux_auto_update::{CheckTrigger, UpdateStatus, UpdaterConfig, Version};
 use oximux_settings::AutoUpdateSettings;
 
-const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
 const MANIFEST_FILE: &str = "pending-update.json";
 /// Sentinel written across the quit-time swap. Present at boot means the swap
 /// never confirmed, so the installed bundle is re-verified before trusting it.
@@ -66,7 +65,7 @@ impl UpdaterState {
 }
 
 fn data_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join(APP_DATA_SUBDIR))
+    crate::app_paths::data_dir()
 }
 
 fn manifest_path() -> Option<PathBuf> {
@@ -78,7 +77,7 @@ fn sentinel_path() -> Option<PathBuf> {
 }
 
 fn cache_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join(APP_DATA_SUBDIR))
+    crate::app_paths::cache_dir()
 }
 
 fn current_version() -> Version {

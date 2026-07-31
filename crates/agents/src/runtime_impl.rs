@@ -487,15 +487,11 @@ async fn resolve_program_abs(program: &std::path::Path) -> Option<std::path::Pat
     if program.is_absolute() {
         return Some(program.to_path_buf());
     }
-    let output = tokio::process::Command::new("which")
-        .arg(program.as_os_str())
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let resolved = std::path::PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    let resolved = crate::cli::resolve_on_path(program.to_str()?).await?;
+    // The daemon `exec`s this directly, so a relative answer would resolve
+    // against its cwd rather than ours. `which` returns absolute paths, but the
+    // caller's fallback (the login-shell wrapper) is the right answer if that
+    // ever stops being true — so check rather than assume.
     resolved.is_absolute().then_some(resolved)
 }
 

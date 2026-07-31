@@ -5,6 +5,7 @@
 //! binary at `src/main.rs` imports from this library.
 
 pub mod actions;
+pub mod app_paths;
 pub mod assets;
 pub mod keymap_registry;
 pub mod left_rail_layout;

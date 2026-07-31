@@ -6896,6 +6896,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "uuid",
+ "which 6.0.3",
 ]
 
 [[package]]
@@ -7042,6 +7043,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "which 6.0.3",
 ]
 
 [[package]]

@@ -86,9 +86,13 @@ fn empty_override_unbinds() {
 #[test]
 fn invalid_chord_keeps_default_and_warns() {
     let out = resolve(&overrides(&[("new_tab", "cmd-notakey")]));
+    // `secondary-`, not `cmd-`: this compares against the shipped default, and
+    // the two normalize to the same modifier only on macOS. Written as `cmd-`
+    // this assertion would keep passing here while silently ceasing to check
+    // anything real on a platform where they differ.
     assert_eq!(
         out.effective.get("new_tab").unwrap().as_deref(),
-        normalize_chord("cmd-t").as_deref()
+        normalize_chord("secondary-t").as_deref()
     );
     assert_eq!(out.warnings.len(), 1);
     assert!(out.warnings[0].contains("new_tab"));

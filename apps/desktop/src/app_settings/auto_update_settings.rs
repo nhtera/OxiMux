@@ -14,10 +14,8 @@ use std::path::PathBuf;
 use gpui::App;
 use oximux_settings::AutoUpdateSettings;
 
-const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
-
 fn settings_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join(APP_DATA_SUBDIR).join(AutoUpdateSettings::FILE_NAME))
+    crate::app_paths::data_dir().map(|d| d.join(AutoUpdateSettings::FILE_NAME))
 }
 
 fn load() -> AutoUpdateSettings {

@@ -24,6 +24,8 @@ use crate::actions::{
     ToggleDictation, ToggleFloatingTerminal, ToggleLeftSidebar, ToggleRightSidebar,
     ToggleZoomSubPane,
 };
+// The AppKit application menu's actions, bound only where that menu exists.
+#[cfg(target_os = "macos")]
 use crate::menu::{HideApp, HideOthers, Minimize, Quit};
 use oximux_editor::{EditorZoomIn, EditorZoomOut, EditorZoomReset, SaveFile};
 
@@ -42,26 +44,31 @@ macro_rules! entry {
 }
 
 /// Chord notes inherited from the original keymap:
+/// - Chords are written with gpui's `secondary-` modifier, NOT `cmd-`. The two
+///   are the same key on macOS, but `cmd-` maps to `platform`, which off macOS
+///   is the *Windows* key — so `cmd-p` would have become Win+P (Project a
+///   display) rather than Quick Open. `secondary-` is Command on macOS and
+///   Control elsewhere, which is what every one of these chords means.
 /// - macOS strips `shift` and remaps the key to the shifted character
 ///   (`]`→`}`, `[`→`{`), so binding strings use the post-shift char —
-///   `cmd-shift-]` would never match.
+///   `secondary-shift-]` would never match.
 /// - ctrl-tab is the cross-platform "last tab" standard (cmd-tab is
 ///   reserved by macOS for app switching).
 /// - ctrl-shift-1/2/3 are free of macOS system bindings.
 pub const ACTIONS: &[ActionSpec] = &[
     // ---- Global -----------------------------------------------------
-    entry!("open_settings", "Open settings", Global, "cmd-,", OpenSettings),
-    entry!("new_window", "New window", Global, "cmd-n", NewWindow),
-    entry!("open_project_picker", "Open project", Global, "cmd-o", OpenProjectPicker),
-    entry!("open_workspace_create", "New workspace", Global, "cmd-shift-n", OpenWorkspaceCreate),
-    entry!("new_agent", "New agent", Global, "cmd-shift-a", NewAgent),
-    entry!("new_agent_chat", "New agent chat", Global, "cmd-shift-c", NewAgentChat),
-    entry!("toggle_dictation", "Toggle voice dictation", Global, "cmd-e", ToggleDictation),
+    entry!("open_settings", "Open settings", Global, "secondary-,", OpenSettings),
+    entry!("new_window", "New window", Global, "secondary-n", NewWindow),
+    entry!("open_project_picker", "Open project", Global, "secondary-o", OpenProjectPicker),
+    entry!("open_workspace_create", "New workspace", Global, "secondary-shift-n", OpenWorkspaceCreate),
+    entry!("new_agent", "New agent", Global, "secondary-shift-a", NewAgent),
+    entry!("new_agent_chat", "New agent chat", Global, "secondary-shift-c", NewAgentChat),
+    entry!("toggle_dictation", "Toggle voice dictation", Global, "secondary-e", ToggleDictation),
     entry!(
         "toggle_floating_terminal",
         "Toggle floating terminal",
         Global,
-        "cmd-shift-t",
+        "secondary-shift-t",
         ToggleFloatingTerminal
     ),
     entry!(
@@ -71,10 +78,10 @@ pub const ACTIONS: &[ActionSpec] = &[
         "ctrl-shift-v",
         ToggleChatTerminalView
     ),
-    entry!("save_file", "Save file", Global, "cmd-s", SaveFile),
-    entry!("editor_zoom_in", "Zoom in editor", Global, "cmd-=", EditorZoomIn),
-    entry!("editor_zoom_out", "Zoom out editor", Global, "cmd--", EditorZoomOut),
-    entry!("editor_zoom_reset", "Reset editor zoom", Global, "cmd-0", EditorZoomReset),
+    entry!("save_file", "Save file", Global, "secondary-s", SaveFile),
+    entry!("editor_zoom_in", "Zoom in editor", Global, "secondary-=", EditorZoomIn),
+    entry!("editor_zoom_out", "Zoom out editor", Global, "secondary--", EditorZoomOut),
+    entry!("editor_zoom_reset", "Reset editor zoom", Global, "secondary-0", EditorZoomReset),
     entry!(
         "reload_custom_commands",
         "Reload custom commands",
@@ -82,26 +89,35 @@ pub const ACTIONS: &[ActionSpec] = &[
         "",
         ReloadCustomCommands
     ),
+    // The AppKit application menu's own items. Deliberately NOT migrated to
+    // `secondary-`: three of the four name concepts Windows does not have
+    // (hide app, hide others), and the Ctrl chords they would translate into
+    // are spoken for elsewhere — Ctrl+H is Replace, Ctrl+M is Enter in a
+    // terminal. An action that cannot work should not hold a chord hostage.
+    #[cfg(target_os = "macos")]
     entry!("quit", "Quit OxiMux", Global, "cmd-q", Quit),
+    #[cfg(target_os = "macos")]
     entry!("hide_app", "Hide OxiMux", Global, "cmd-h", HideApp),
+    #[cfg(target_os = "macos")]
     entry!("hide_others", "Hide others", Global, "cmd-alt-h", HideOthers),
+    #[cfg(target_os = "macos")]
     entry!("minimize_window", "Minimize window", Global, "cmd-m", Minimize),
     // ---- Tabs -------------------------------------------------------
-    entry!("new_tab", "New tab", Tabs, "cmd-t", NewTab),
-    entry!("new_browser_tab", "New browser tab", Tabs, "cmd-shift-b", NewBrowserTab),
+    entry!("new_tab", "New tab", Tabs, "secondary-t", NewTab),
+    entry!("new_browser_tab", "New browser tab", Tabs, "secondary-shift-b", NewBrowserTab),
     // cmd-w closes the active sub-pane when the focused tab has multiple
     // sub-panes, else the per-pane tab, else the whole tab (cascade lives
     // in `PaneGroup::on_close_tab`).
-    entry!("close_tab", "Close tab / sub-pane", Tabs, "cmd-w", CloseTab),
-    entry!("next_tab", "Next tab", Tabs, "cmd-}", NextTab),
-    entry!("prev_tab", "Previous tab", Tabs, "cmd-{", PrevTab),
+    entry!("close_tab", "Close tab / sub-pane", Tabs, "secondary-w", CloseTab),
+    entry!("next_tab", "Next tab", Tabs, "secondary-}", NextTab),
+    entry!("prev_tab", "Previous tab", Tabs, "secondary-{", PrevTab),
     entry!("mru_next_tab", "Most-recent tab", Tabs, "ctrl-tab", MruNext),
     entry!("mru_prev_tab", "Least-recent tab", Tabs, "ctrl-shift-tab", MruPrev),
     // ---- Panes & Layout ----------------------------------------------
     // cmd-d / cmd-shift-d split the focused terminal tab into sub-panes;
     // tab-GROUP splits default unbound (palette + context menu).
-    entry!("split_sub_pane_right", "Split sub-pane right", Panes, "cmd-d", SplitSubPaneRight),
-    entry!("split_sub_pane_down", "Split sub-pane down", Panes, "cmd-shift-d", SplitSubPaneDown),
+    entry!("split_sub_pane_right", "Split sub-pane right", Panes, "secondary-d", SplitSubPaneRight),
+    entry!("split_sub_pane_down", "Split sub-pane down", Panes, "secondary-shift-d", SplitSubPaneDown),
     entry!(
         "split_group_horizontal",
         "Split pane group horizontally",
@@ -110,25 +126,25 @@ pub const ACTIONS: &[ActionSpec] = &[
         SplitHorizontal
     ),
     entry!("split_group_vertical", "Split pane group vertically", Panes, "", SplitVertical),
-    entry!("focus_next_sub_pane", "Focus next sub-pane", Panes, "cmd-]", FocusNextSubPane),
-    entry!("focus_prev_sub_pane", "Focus previous sub-pane", Panes, "cmd-[", FocusPrevSubPane),
+    entry!("focus_next_sub_pane", "Focus next sub-pane", Panes, "secondary-]", FocusNextSubPane),
+    entry!("focus_prev_sub_pane", "Focus previous sub-pane", Panes, "secondary-[", FocusPrevSubPane),
     entry!(
         "focus_next_pane_group",
         "Focus next pane group",
         Panes,
-        "cmd-shift-}",
+        "secondary-shift-}",
         FocusNextPane
     ),
     entry!(
         "focus_prev_pane_group",
         "Focus previous pane group",
         Panes,
-        "cmd-shift-{",
+        "secondary-shift-{",
         FocusPrevPane
     ),
     // Zoom = expand the focused sub-pane; second press restores.
-    entry!("toggle_zoom_sub_pane", "Zoom sub-pane", Panes, "cmd-shift-enter", ToggleZoomSubPane),
-    entry!("close_pane_group", "Close pane group", Panes, "cmd-shift-w", CloseGroup),
+    entry!("toggle_zoom_sub_pane", "Zoom sub-pane", Panes, "secondary-shift-enter", ToggleZoomSubPane),
+    entry!("close_pane_group", "Close pane group", Panes, "secondary-shift-w", CloseGroup),
     entry!("layout_stacked", "Layout: stacked", Panes, "ctrl-shift-1", ApplyLayoutStacked),
     entry!(
         "layout_horizontal",
@@ -145,8 +161,8 @@ pub const ACTIONS: &[ActionSpec] = &[
         ApplyLayoutBottomTerminal
     ),
     // ---- Terminal & Agents -------------------------------------------
-    entry!("search_scrollback", "Search scrollback", Terminal, "cmd-f", Search),
-    entry!("find_next_match", "Find next match", Terminal, "cmd-g", FindNextMatch),
+    entry!("search_scrollback", "Search scrollback", Terminal, "secondary-f", Search),
+    entry!("find_next_match", "Find next match", Terminal, "secondary-g", FindNextMatch),
     // cmd-shift-g (the platform "find previous" convention) is owned by
     // select_source_control_tab, a shipped default; prev gets the alt
     // variant instead. Both are user-rebindable.
@@ -157,46 +173,46 @@ pub const ACTIONS: &[ActionSpec] = &[
         "send_selection_to_agent",
         "Send selection to agent",
         Terminal,
-        "cmd-shift-i",
+        "secondary-shift-i",
         SendTerminalSelectionToAgent
     ),
     entry!(
         "send_last_output_to_agent",
         "Send last output to agent",
         Terminal,
-        "cmd-shift-o",
+        "secondary-shift-o",
         SendLastCommandOutputToAgent
     ),
     // ---- Source Control ----------------------------------------------
-    entry!("open_commit_dialog", "Commit dialog", Scm, "cmd-k", OpenCommitDialog),
+    entry!("open_commit_dialog", "Commit dialog", Scm, "secondary-k", OpenCommitDialog),
     entry!(
         "refresh_source_control",
         "Refresh source control",
         Scm,
-        "cmd-r",
+        "secondary-r",
         RefreshSourceControl
     ),
     entry!(
         "select_source_control_tab",
         "Source control tab",
         Scm,
-        "cmd-shift-g",
+        "secondary-shift-g",
         SelectSourceControlTab
     ),
     // ---- Navigation ---------------------------------------------------
-    entry!("open_quick_open", "Quick Open (files)", Navigation, "cmd-p", OpenQuickOpen),
+    entry!("open_quick_open", "Quick Open (files)", Navigation, "secondary-p", OpenQuickOpen),
     entry!(
         "open_composer_bar",
         "Compose prompt to agent",
         Navigation,
-        "cmd-i",
+        "secondary-i",
         OpenComposerBar
     ),
     entry!(
         "open_session_history",
         "Session history (resume / fork)",
         Navigation,
-        "cmd-shift-h",
+        "secondary-shift-h",
         OpenSessionHistory
     ),
     // Command palette uses cmd-shift-p (cmd-k is the commit dialog).
@@ -204,35 +220,35 @@ pub const ACTIONS: &[ActionSpec] = &[
         "open_command_palette",
         "Command palette",
         Navigation,
-        "cmd-shift-p",
+        "secondary-shift-p",
         OpenCommandPalette
     ),
     // Jump to any workspace/worktree across all projects.
-    entry!("open_workspace_jump", "Jump to workspace", Navigation, "cmd-j", OpenWorkspaceJump),
-    entry!("toggle_left_sidebar", "Toggle left sidebar", Navigation, "cmd-b", ToggleLeftSidebar),
+    entry!("open_workspace_jump", "Jump to workspace", Navigation, "secondary-j", OpenWorkspaceJump),
+    entry!("toggle_left_sidebar", "Toggle left sidebar", Navigation, "secondary-b", ToggleLeftSidebar),
     entry!(
         "toggle_right_sidebar",
         "Toggle right sidebar",
         Navigation,
-        "cmd-l",
+        "secondary-l",
         ToggleRightSidebar
     ),
-    entry!("select_explorer_tab", "Explorer tab", Navigation, "cmd-shift-e", SelectExplorerTab),
-    entry!("select_search_tab", "Search tab", Navigation, "cmd-shift-f", SelectSearchTab),
-    entry!("select_history_tab", "Session History tab", Navigation, "cmd-shift-y", SelectHistoryTab),
+    entry!("select_explorer_tab", "Explorer tab", Navigation, "secondary-shift-e", SelectExplorerTab),
+    entry!("select_search_tab", "Search tab", Navigation, "secondary-shift-f", SelectSearchTab),
+    entry!("select_history_tab", "Session History tab", Navigation, "secondary-shift-y", SelectHistoryTab),
     // Browser-style steps through this window's workspace-activation history.
     entry!(
         "nav_workspace_back",
         "Workspace history back",
         Navigation,
-        "cmd-alt-left",
+        "secondary-alt-left",
         NavWorkspaceBack
     ),
     entry!(
         "nav_workspace_forward",
         "Workspace history forward",
         Navigation,
-        "cmd-alt-right",
+        "secondary-alt-right",
         NavWorkspaceForward
     ),
     // Esc dismisses any open transient overlay (handled at WorkspaceRoot).

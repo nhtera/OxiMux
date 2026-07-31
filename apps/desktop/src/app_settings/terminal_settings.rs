@@ -23,16 +23,13 @@ use tokio::sync::mpsc;
 
 use crate::shell::terminal_view::{set_shell_integration_enabled, set_spawn_scrollback};
 
-/// Mirror of `main.rs::APP_DATA_SUBDIR` — kept in lockstep so settings land
-/// next to `oximux.db`.
-const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
 
 /// Debounce window for settings edits. Generous: a save can fire several
 /// FSEvents; one reload per burst is plenty.
 const DEBOUNCE_MS: u64 = 250;
 
 fn data_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join(APP_DATA_SUBDIR))
+    crate::app_paths::data_dir()
 }
 
 fn settings_path() -> Option<PathBuf> {

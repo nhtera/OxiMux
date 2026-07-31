@@ -48,8 +48,11 @@ impl KeybindingOverrides {
         let mut out = String::from(
             "# OxiMux keyboard-shortcut overrides.\n\
              # One `action_id = \"chord\"` per line; action ids are shown in\n\
-             # Settings -> Keybindings. Chords use gpui syntax, e.g. \"cmd-shift-t\"\n\
-             # or multi-stroke \"cmd-k cmd-b\". An empty string unbinds the action.\n\n",
+             # Settings -> Keybindings. Chords use gpui syntax, e.g.\n\
+             # \"secondary-shift-t\" or multi-stroke \"secondary-k secondary-b\".\n\
+             # `secondary` is Command on macOS and Control elsewhere; `cmd` also\n\
+             # works but always means the platform key (the Windows key off a\n\
+             # Mac). An empty string unbinds the action.\n\n",
         );
         for (key, chord) in overrides {
             let key = if key

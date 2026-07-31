@@ -32,7 +32,7 @@ use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt
 use crate::shell::left_rail::{LatestStatusMap, RailAgentTarget, WorkspaceAgentList};
 use crate::shell::pane_group::FocusedRailAgent;
 use crate::shell::workspace_dialog::{WorkspaceDialogMode, WorkspaceDialogSubmit};
-use crate::workspace_root::{APP_DATA_SUBDIR, WorkspaceRoot};
+use crate::workspace_root::WorkspaceRoot;
 
 /// A back/forward history entry: a workspace identified by its owning project
 /// id plus its workspace id. Refs (not full `Workspace` clones) so navigation
@@ -423,13 +423,12 @@ pub(crate) fn refocus_active_pane(
 }
 
 /// Compose the worktree dir path:
-/// `<app_data>/dev.nhtera.oximux/projects/<project_id>/worktrees/<slug>`.
-/// Returns `None` when `dirs::data_dir()` is unavailable (sandbox or
+/// `<app_data>/projects/<project_id>/worktrees/<slug>`.
+/// Returns `None` when the app data directory is unavailable (sandbox or
 /// unset `$HOME`) — caller surfaces this as a create failure.
 fn worktree_path(project_id: &str, slug: &str) -> Option<PathBuf> {
     Some(
-        dirs::data_dir()?
-            .join(APP_DATA_SUBDIR)
+        crate::app_paths::data_dir()?
             .join("projects")
             .join(project_id)
             .join("worktrees")

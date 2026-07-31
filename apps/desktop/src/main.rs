@@ -34,10 +34,7 @@ use oximux_relay_client::{RelayBackend, RelayClient};
 use oximux_storage::Db;
 use tracing_subscriber::EnvFilter;
 
-/// macOS bundle identifier — anchors the on-disk data directory under
-/// `~/Library/Application Support`. Must stay in lockstep with
-/// `CFBundleIdentifier` in `assets/Info.plist`.
-const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
+use oximux_app::app_paths;
 /// Scope for the remote-control host key. The host is process-wide (it serves every
 /// workspace's sessions from one registry), so it uses ONE app-level identity rather
 /// than `HostIdentity`'s per-workspace keying.
@@ -338,8 +335,7 @@ fn main() {
         // paired phone dials — would change on every restart and silently break
         // every existing pairing. A key that can't be loaded degrades to an
         // ephemeral identity rather than blocking boot.
-        if let Some(data_dir) = dirs::data_dir() {
-            let key_dir = data_dir.join(APP_DATA_SUBDIR);
+        if let Some(key_dir) = app_paths::data_dir() {
             match oximux_remote_host::HostIdentity::load_or_generate(&key_dir, HOST_IDENTITY_SCOPE)
             {
                 Ok(identity) => {
@@ -926,11 +922,10 @@ fn enforce_single_instance() -> Option<oximux_app::single_instance::SingleInstan
     use oximux_app::single_instance::{
         AcquireOutcome, activate_existing_instance, lock_path_in, try_acquire,
     };
-    let Some(data_dir) = dirs::data_dir() else {
+    let Some(dir) = app_paths::data_dir() else {
         tracing::warn!("no data_dir; skipping single-instance guard");
         return None;
     };
-    let dir = data_dir.join(APP_DATA_SUBDIR);
     if let Err(err) = std::fs::create_dir_all(&dir) {
         tracing::warn!(?err, "cannot create data dir; skipping single-instance guard");
         return None;
@@ -963,14 +958,13 @@ fn enforce_single_instance() -> Option<oximux_app::single_instance::SingleInstan
 /// path is fatal — `eprintln` + `exit(1)` rather than panic so the user
 /// sees a one-line message instead of a Rust backtrace.
 fn open_db_or_exit() -> Db {
-    let Some(data_dir) = dirs::data_dir() else {
+    let Some(db_dir) = app_paths::data_dir() else {
         eprintln!(
-            "oximux: cannot resolve Application Support directory; \
+            "oximux: cannot resolve the application data directory; \
              try setting $HOME or running outside a restrictive sandbox"
         );
         std::process::exit(1);
     };
-    let db_dir = data_dir.join(APP_DATA_SUBDIR);
     if let Err(err) = std::fs::create_dir_all(&db_dir) {
         eprintln!(
             "oximux: cannot create data directory {}: {err}",
@@ -1013,14 +1007,11 @@ fn run_notify_cli(rt: &tokio::runtime::Runtime) -> i32 {
             return 1;
         }
     };
-    let (Some(data_dir), Some(home)) = (dirs::data_dir(), dirs::home_dir()) else {
+    let (Some(data_dir), Some(log_dir)) = (app_paths::data_dir(), app_paths::log_dir()) else {
         eprintln!("oximux notify: cannot resolve application data directory");
         return 1;
     };
-    let supervisor = RelaySupervisor::new(
-        data_dir.join(APP_DATA_SUBDIR),
-        home.join("Library/Logs").join(APP_DATA_SUBDIR),
-    );
+    let supervisor = RelaySupervisor::new(data_dir, log_dir);
     let socket = supervisor.socket_path();
     let token = match std::fs::read_to_string(supervisor.token_path()) {
         Ok(t) => t.trim().to_owned(),
@@ -1142,14 +1133,11 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
         message.as_deref(),
     );
 
-    let (Some(data_dir), Some(home)) = (dirs::data_dir(), dirs::home_dir()) else {
+    let (Some(data_dir), Some(log_dir)) = (app_paths::data_dir(), app_paths::log_dir()) else {
         eprintln!("oximux agent-status: cannot resolve application data directory");
         return 1;
     };
-    let supervisor = RelaySupervisor::new(
-        data_dir.join(APP_DATA_SUBDIR),
-        home.join("Library/Logs").join(APP_DATA_SUBDIR),
-    );
+    let supervisor = RelaySupervisor::new(data_dir, log_dir);
     let socket = supervisor.socket_path();
     let token = match std::fs::read_to_string(supervisor.token_path()) {
         Ok(t) => t.trim().to_owned(),
@@ -1198,17 +1186,14 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
 fn boot_relay_supervisor(
     pane_relay_id_repo: oximux_storage::PaneRelayIdRepo,
 ) -> Option<tokio::runtime::Runtime> {
-    let Some(data_dir) = dirs::data_dir() else {
+    let Some(runtime_dir) = app_paths::data_dir() else {
         tracing::warn!("no data_dir; skipping relay supervisor");
         return None;
     };
-    let runtime_dir = data_dir.join(APP_DATA_SUBDIR);
-    let Some(home) = dirs::home_dir() else {
-        tracing::warn!("no home_dir; skipping relay supervisor");
+    let Some(log_dir) = app_paths::log_dir() else {
+        tracing::warn!("no log_dir; skipping relay supervisor");
         return None;
     };
-    // macOS convention: per-app logs live under ~/Library/Logs.
-    let log_dir = home.join("Library/Logs").join(APP_DATA_SUBDIR);
 
     // Dedicated runtime for the relay client's reader/writer tasks and
     // every later `block_on`. Two workers is plenty: the socket I/O is
