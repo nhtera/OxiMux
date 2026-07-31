@@ -22,6 +22,45 @@ cargo run -p oximux-app --release
 open dist/OxiMux.app
 ```
 
+### Building on Windows
+
+macOS is still the shipping target; the Windows port lives on `feat/windows`.
+What it leaves behind is recorded in
+[`docs/windows-port-exclusions.md`](docs/windows-port-exclusions.md). There is no
+Windows packaging script yet, so a build runs out of `target/`.
+
+Beyond the Rust toolchain and the MSVC build tools, Windows needs **LLVM**, which
+macOS gets for free from Xcode:
+
+```powershell
+winget install LLVM.LLVM
+```
+
+`sherpa-rs-sys` — reached only through `oximux-dictation`, and so only by
+`oximux-app` — runs `bindgen`, which needs `libclang`. Nothing else in the
+workspace does, which is why every crate except the desktop app builds without
+this.
+
+`C:\Program Files\LLVM\bin` must then be on `PATH`, not merely named in
+`LIBCLANG_PATH`: with only the latter, libclang loads but cannot locate its own
+resource-dir headers, and the build fails on `'stdint.h' file not found`. The
+winget package does not add it to `PATH` for you.
+
+Neither requirement shows up in CI — GitHub's Windows runners preinstall LLVM —
+so the compile gate passing is not evidence that a clean machine can build.
+
+`--workspace` commands need the two macOS-only crates excluded, the same way the
+Windows CI job spells it:
+
+```powershell
+cargo check --workspace --all-targets `
+  --exclude oximux-computer-use --exclude oximux-macos-trust
+
+# Build the relay first here too — the app resolves `oximux-relay.exe` as a
+# sibling of its own binary.
+cargo build -p oximux-relay -p oximux-app
+```
+
 ## Repo layout
 
 `apps/` holds the shippable product surfaces; `crates/` holds the libraries and
