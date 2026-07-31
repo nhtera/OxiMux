@@ -39,15 +39,23 @@ pub struct Typography {
 
 /// The faces each platform is guaranteed to ship.
 ///
-/// GPUI looks `Font::family` up verbatim, and `FontFallbacks` only cascades
-/// for *individual glyph* lookups inside a family that already loaded — a
-/// primary which fails to resolve at all drops to the platform's default UI
-/// face, which is proportional. In the terminal that is not a subtle
-/// degradation: `terminal_canvas` pins every glyph to a `cell_width`
-/// measured from `'m'`, so a proportional fallback leaves narrow characters
-/// (`i`, `l`, `1`, `:`) left-aligned in a cell sized for the widest
-/// lowercase glyph, and the whole grid reads as randomly spaced. The primary
-/// therefore has to be a face the OS always has.
+/// GPUI looks `Font::family` up verbatim, and `FontFallbacks` only cascades for
+/// *individual glyph* lookups inside a family that already loaded. It does not
+/// rescue a primary that fails to resolve at all — that goes to
+/// `TextSystem::resolve_font`, which walks a hardcoded stack inside gpui whose
+/// only monospace entry is the `.ZedMono` sentinel. So the primary should still
+/// be a face the OS always has: a miss means the grid is drawn in a typeface
+/// nobody chose, and `terminal_canvas` pins every glyph to a `cell_width`
+/// measured from `'m'`, so any width mismatch shows up as uneven spacing.
+///
+/// `apps/desktop` bundles Lilex, which is what `.ZedMono` resolves to, so the
+/// floor under that path is at least monospace rather than the proportional
+/// `Segoe UI` it used to land on. Keeping the platform primary correct is still
+/// the first line of defence; the bundled font is the net, not the plan.
+///
+/// Lilex is last in every `MONO_FALLBACKS` for the *other* reason — glyphs
+/// missing from a family that did load. It maps all 32 Block Elements at its
+/// ASCII advance, so it backstops Consolas's 8-of-32.
 #[cfg(target_os = "macos")]
 mod platform_fonts {
     /// Menlo is the only mono face guaranteeable on every macOS 13+ install
@@ -57,22 +65,23 @@ mod platform_fonts {
     /// (U+2500–257F), which half-block pixel art needs — Claude Code's
     /// mascot is the canonical regression case.
     pub const MONO: &str = "Menlo";
-    pub const MONO_FALLBACKS: &[&str] = &["SF Mono", "Monaco"];
+    pub const MONO_FALLBACKS: &[&str] = &["SF Mono", "Monaco", "Lilex"];
     pub const UI: &str = "Helvetica Neue";
     pub const UI_FALLBACKS: &[&str] = &["Helvetica"];
 }
 
 #[cfg(target_os = "windows")]
 mod platform_fonts {
-    /// Consolas ships with every Windows since Vista. It covers Box Drawing
-    /// in full, and of Block Elements it carries exactly the eight that
-    /// half-block rendering uses (▀ ▄ █ ▌ ▐ ░ ▒ ▓) — the 24 it lacks are the
-    /// eighth-fraction blocks that sparkline-style output wants. Cascadia
-    /// Mono covers those plus Braille, but only arrives with Windows
-    /// Terminal rather than with Windows, so it sits in the fallback slot
-    /// where being absent costs nothing.
+    /// Consolas ships with every Windows since Vista. It covers Box Drawing in
+    /// full, and of Block Elements it carries exactly the eight that half-block
+    /// rendering uses (▀ ▄ █ ▌ ▐ ░ ▒ ▓) — the 24 it lacks are the
+    /// eighth-fraction blocks that sparkline-style output wants. Bundled Lilex
+    /// covers those (32/32), so unlike the other two fallbacks it is not a
+    /// maybe. Cascadia Mono is still worth naming ahead of it for Braille,
+    /// which neither Consolas nor Lilex has, but it arrives with Windows
+    /// Terminal rather than with Windows.
     pub const MONO: &str = "Consolas";
-    pub const MONO_FALLBACKS: &[&str] = &["Cascadia Mono", "Segoe UI Symbol"];
+    pub const MONO_FALLBACKS: &[&str] = &["Cascadia Mono", "Segoe UI Symbol", "Lilex"];
     /// Segoe UI is what the Helvetica Neue lookup was already landing on by
     /// accident. Naming it is a no-op visually and stops the UI chrome from
     /// depending on where GPUI's default happens to point.
@@ -81,11 +90,14 @@ mod platform_fonts {
 }
 
 /// Not a platform we ship, but the crate should still build and render
-/// something monospaced if someone compiles for it.
+/// something monospaced if someone compiles for it. Unlike macOS and Windows
+/// there is no face a Linux install is *guaranteed* to have — a minimal
+/// container can lack all three of these — which is the case bundled Lilex
+/// exists for.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod platform_fonts {
     pub const MONO: &str = "DejaVu Sans Mono";
-    pub const MONO_FALLBACKS: &[&str] = &["Liberation Mono", "Noto Sans Mono"];
+    pub const MONO_FALLBACKS: &[&str] = &["Liberation Mono", "Noto Sans Mono", "Lilex"];
     pub const UI: &str = "DejaVu Sans";
     pub const UI_FALLBACKS: &[&str] = &["Liberation Sans"];
 }
@@ -123,19 +135,19 @@ impl Typography {
     }
 
     /// Build a GPUI `Font` for terminal/editor surfaces with the configured
-    /// fallback chain. Call sites use `.font(typography.mono_font())` instead
-    /// of `.font_family(...)` so a missing primary (e.g. Geist Mono not
-    /// installed) cascades through `mono_fallbacks` before GPUI's built-in
-    /// system default kicks in.
+    /// fallback chain. Call sites use `.font(typography.mono_font())` rather
+    /// than `.font_family(...)` so glyphs the primary lacks cascade through
+    /// `mono_fallbacks` instead of painting as tofu.
     pub fn mono_font(&self) -> Font {
         Font {
             family: self.family_mono.clone(),
             // Ligatures off: terminals must show literal byte sequences.
             // `->` should be two characters, not `→`; `==` two equals, not
-            // `⩵`. Menlo doesn't ligature anyway, but locking this in keeps
-            // behavior correct if the user later swaps to a ligature font
-            // (JetBrains Mono, Fira Code, etc.) — terminals disable
-            // ligatures so glyph cells stay 1:1 with character cells.
+            // `⩵`. This stopped being hypothetical when Lilex joined the
+            // chain — it ligates by default, and a ligature spanning two
+            // character cells cannot survive `shape_line`'s per-glyph
+            // `force_width`, which is what keeps glyph cells 1:1 with
+            // character cells.
             features: FontFeatures::disable_ligatures(),
             fallbacks: Some(FontFallbacks::from_fonts(
                 self.mono_fallbacks.iter().map(|s| s.to_string()).collect(),

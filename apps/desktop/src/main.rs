@@ -215,6 +215,16 @@ fn main() {
 
     app.run(move |cx| {
         gpui_component::init(cx);
+        // Before anything paints: registers bundled Lilex, which is what stands
+        // between a font that fails to resolve and a proportional face pinned to
+        // a monospace grid. See `assets::load_fonts`.
+        if let Err(err) = oximux_app::assets::load_fonts(cx) {
+            tracing::error!(
+                %err,
+                "failed to register embedded fonts; a font miss will now fall back \
+                 to a proportional face and the terminal grid will look ragged"
+            );
+        }
         // Replace gpui's default `NullHttpClient` (fails every request) with a
         // file:// reader so markdown-preview images that resolve to local repo
         // paths actually load — the image element fetches every URL through the
@@ -794,6 +804,9 @@ fn run_editor_spike() {
     let app = gpui_platform::application().with_assets(CompositeAssets);
     app.run(move |cx| {
         gpui_component::init(cx);
+        // Same font registration as the production path — a spike that renders
+        // in a different face is not showing you what ships.
+        let _ = oximux_app::assets::load_fonts(cx);
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
         {
             let palette = oximux_settings::Theme::charcoal();
@@ -863,6 +876,7 @@ fn run_file_tree_spike() {
     let app = gpui_platform::application().with_assets(CompositeAssets);
     app.run(move |cx| {
         gpui_component::init(cx);
+        let _ = oximux_app::assets::load_fonts(cx);
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
         // Keep the spike's input chrome in step with the production init
         // blocks above — debugging input styling in the spike must show

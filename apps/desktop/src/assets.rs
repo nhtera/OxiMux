@@ -4,12 +4,14 @@
 //! `git-branch.svg` for the Source Control tab) while still falling through
 //! to the rich `IconName::*` catalog for everything else.
 //!
-//! Wired in `main.rs::with_assets(CompositeAssets)`.
+//! Wired in `main.rs::with_assets(CompositeAssets)`. Fonts are registered
+//! separately via [`load_fonts`] — `add_fonts` takes bytes directly rather than
+//! going through `AssetSource`.
 
 use std::borrow::Cow;
 
 use anyhow::Result;
-use gpui::{AssetSource, SharedString};
+use gpui::{App, AssetSource, SharedString};
 
 /// Local SVGs embedded via `include_bytes!`. Add a match arm + corresponding
 /// file in `apps/desktop/assets/icons/` to register a new asset.
@@ -212,6 +214,49 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/trash.svg"),
     ),
 ];
+
+/// Lilex, bundled so a monospace face is always present. OFL-1.1; the license
+/// ships beside the faces in `assets/fonts/lilex/OFL.txt`.
+///
+/// All four faces on purpose: a missing weight falls back the same way a missing
+/// family does, so bundling Regular alone would leave SGR bold and italic to
+/// whatever the host happens to have.
+const EMBEDDED_FONTS: &[&[u8]] = &[
+    include_bytes!("../assets/fonts/lilex/Lilex-Regular.ttf"),
+    include_bytes!("../assets/fonts/lilex/Lilex-Bold.ttf"),
+    include_bytes!("../assets/fonts/lilex/Lilex-Italic.ttf"),
+    include_bytes!("../assets/fonts/lilex/Lilex-BoldItalic.ttf"),
+];
+
+/// Register the embedded fonts. Call once at startup, before anything paints.
+///
+/// This is load-bearing for the terminal even though nothing names Lilex as a
+/// primary. `TextSystem::resolve_font` answers a primary that fails to resolve
+/// by walking a *hardcoded* stack inside gpui:
+///
+/// ```text
+/// .ZedMono, .ZedSans, Helvetica, Segoe UI, Ubuntu, Adwaita Sans,
+/// Cantarell, Noto Sans, DejaVu Sans, Arial
+/// ```
+///
+/// Not one entry there is a monospace face the OS ships. `.ZedMono` is a
+/// sentinel gpui maps to `Lilex` — which resolves only if the *application*
+/// bundled it, as Zed does and we previously did not. So a mono primary that
+/// failed to resolve fell through to the first proportional face that did
+/// (`Segoe UI` on Windows), and since `cell_metrics` sizes every cell from
+/// `advance('m')`, the whole terminal grid came out unevenly spaced. Bundling
+/// Lilex puts a monospace floor under that path: the typeface is not what was
+/// asked for, but the grid stays a grid.
+///
+/// Lilex is also the last entry in `mono_fallbacks`, which covers the unrelated
+/// case of a glyph missing from a family that *did* load. Consolas maps only 8
+/// of the 32 Block Elements, so eighth-fraction blocks — sparklines, progress
+/// bars, half-block image output — would otherwise paint as tofu on Windows.
+/// Lilex maps all 32, at the same 0.6 em advance as its ASCII.
+pub fn load_fonts(cx: &App) -> Result<()> {
+    cx.text_system()
+        .add_fonts(EMBEDDED_FONTS.iter().map(|bytes| Cow::Borrowed(*bytes)).collect())
+}
 
 impl AssetSource for AppAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
