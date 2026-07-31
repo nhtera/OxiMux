@@ -109,7 +109,9 @@ cp -a "$APP_DIR" "$STAGING/"
 
 echo "==> Building $DMG"
 rm -f "$DMG"
-# Layout contract with assets/dmg-background.tiff (660x400, icon centers).
+# Layout contract with assets/dmg-background.tiff (660x350 = the window's
+# 660x400 minus title/status bar; must stay a 72-dpi 1x image — Finder
+# ignores dpi tags and draws backdrops at raw pixel size).
 # --hdiutil-retries: create-dmg drives Finder via AppleScript and hdiutil,
 # both of which are intermittently flaky on CI runners; retries are the
 # tool's own supported mitigation.

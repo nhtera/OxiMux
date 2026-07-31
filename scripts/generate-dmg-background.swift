@@ -4,14 +4,21 @@
 //
 // Run:  swift scripts/generate-dmg-background.swift
 //
-// Renders the 660x400pt canvas at 1x and 2x and fuses them into one HiDPI
-// TIFF via `tiffutil -cathidpicheck`, so the backdrop stays crisp on retina
-// displays. The palette is light and appearance-neutral: Finder draws icon
-// labels adaptively (black in light mode), and a dark backdrop would make
-// them unreadable there.
+// The image must be exactly the Finder CONTENT area in PIXELS. Two traps,
+// both verified empirically on macOS 15:
+//   1. Finder ignores dpi metadata for window backdrops — a HiDPI TIFF
+//      (72+144 dpi pages) or a 144-dpi single page is drawn at raw pixel
+//      size, i.e. 2x blown up and off-center. So: one 72-dpi 1x page only.
+//   2. create-dmg's --window-size is the WHOLE window; the backdrop view is
+//      that minus the title bar (~22pt) and status bar (~28pt). A 400pt-tall
+//      image in a 400pt window overflows, crops the caption, and shows a
+//      scrollbar. So the canvas is 660x350 for the 660x400 window.
+// The palette is light and appearance-neutral: Finder draws icon labels
+// adaptively (black in light mode), and a dark backdrop would make them
+// unreadable there.
 //
-// Layout contract (window is 660x400, icon size 128, coordinates are icon
-// CENTERS in create-dmg's top-left origin):
+// Layout contract (window 660x400, image 660x350, icon size 128,
+// coordinates are icon CENTERS in create-dmg's top-left origin):
 //   OxiMux.app icon      at (165, 190)
 //   Applications alias   at (495, 190)
 //   dashed guide arrow   between them, centered at (330, 190)
@@ -19,9 +26,9 @@
 import AppKit
 
 let widthPt: CGFloat = 660
-let heightPt: CGFloat = 400
+let heightPt: CGFloat = 350
 
-func render(scale: CGFloat, to url: URL) {
+func render(scale: CGFloat) -> NSBitmapImageRep {
     let pxW = Int(widthPt * scale)
     let pxH = Int(heightPt * scale)
     guard
@@ -31,8 +38,7 @@ func render(scale: CGFloat, to url: URL) {
             colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
         )
     else { fatalError("could not allocate bitmap") }
-    // Stamp the point size so Finder (and tiffutil) treat the 2x render as
-    // 144dpi rather than a larger 72dpi image.
+    // Point size = canvas size, so the encoded page stays 72 dpi.
     rep.size = NSSize(width: widthPt, height: heightPt)
 
     NSGraphicsContext.saveGraphicsState()
@@ -58,7 +64,7 @@ func render(scale: CGFloat, to url: URL) {
     cg.fill(CGRect(x: 0, y: 0, width: widthPt, height: 6))
 
     // Dashed outline arrow pointing at the Applications alias. CoreGraphics
-    // origin is bottom-left: icon centers sit 190pt from the TOP, i.e. y=210.
+    // origin is bottom-left: icon centers sit 190pt from the TOP.
     let cx: CGFloat = 330
     let cy: CGFloat = heightPt - 190
     let shaftHalf: CGFloat = 16   // half-height of the shaft
@@ -100,30 +106,19 @@ func render(scale: CGFloat, to url: URL) {
 
     NSGraphicsContext.restoreGraphicsState()
 
-    guard let png = rep.representation(using: .png, properties: [:]) else {
-        fatalError("PNG encode failed")
-    }
-    try! png.write(to: url)
-    print("wrote \(url.path) (\(pxW)x\(pxH))")
+    print("rendered \(pxW)x\(pxH) @\(Int(scale))x")
+    return rep
 }
 
-let fm = FileManager.default
-let repoRoot = URL(fileURLWithPath: fm.currentDirectoryPath)
-let tmp = repoRoot.appendingPathComponent("dist", isDirectory: true)
-try? fm.createDirectory(at: tmp, withIntermediateDirectories: true)
-let png1x = tmp.appendingPathComponent("dmg-bg-1x.png")
-let png2x = tmp.appendingPathComponent("dmg-bg-2x.png")
-render(scale: 1, to: png1x)
-render(scale: 2, to: png2x)
+// Single 72-dpi page only — see the header for why HiDPI variants break.
+guard
+    let tiff = NSBitmapImageRep.representationOfImageReps(
+        in: [render(scale: 1)], using: .tiff,
+        properties: [.compressionMethod: NSBitmapImageRep.TIFFCompression.lzw.rawValue]
+    )
+else { fatalError("TIFF encode failed") }
 
-// Fuse into a single HiDPI TIFF; Finder picks the right representation.
+let repoRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
 let out = repoRoot.appendingPathComponent("assets/dmg-background.tiff")
-let task = Process()
-task.executableURL = URL(fileURLWithPath: "/usr/bin/tiffutil")
-task.arguments = ["-cathidpicheck", png1x.path, png2x.path, "-out", out.path]
-try! task.run()
-task.waitUntilExit()
-guard task.terminationStatus == 0 else { fatalError("tiffutil failed") }
-try? fm.removeItem(at: png1x)
-try? fm.removeItem(at: png2x)
+try! tiff.write(to: out)
 print("wrote \(out.path)")
