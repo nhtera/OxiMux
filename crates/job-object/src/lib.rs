@@ -213,8 +213,18 @@ mod tests {
         dir
     }
 
-    /// Write the grandchild script into `dir`. It waits, then drops a marker
-    /// beside itself — so if it is still alive after the kill, it says so.
+    /// Write the grandchild script into `dir`. It announces itself, waits, then
+    /// drops a marker beside itself — so if it is still alive after the kill, it
+    /// says so.
+    ///
+    /// The `started.txt` line is the synchronisation the tests below need. Both
+    /// of them kill something and then reason about `marker.txt`, and that
+    /// reasoning is only valid once the grandchild is actually running: killing
+    /// the parent `cmd` first is not a slower version of the same test, it is a
+    /// different one, in which no grandchild is ever created and every assertion
+    /// about its fate holds vacuously. Measured on Windows 10, `start /b` needs
+    /// a few hundred ms to get a second `cmd.exe` off the ground, so the
+    /// unsynchronised version lost that race every time.
     ///
     /// `%~dp0` is the script's own directory, which means no path is ever
     /// passed on a command line: `cmd.exe` parses quotes by its own rules,
@@ -223,10 +233,23 @@ mod tests {
         let script = dir.join("grandchild.cmd");
         std::fs::write(
             &script,
-            "@echo off\r\nping -n 4 127.0.0.1 > NUL\r\necho alive > \"%~dp0marker.txt\"\r\n",
+            "@echo off\r\n\
+             echo started > \"%~dp0started.txt\"\r\n\
+             ping -n 4 127.0.0.1 > NUL\r\n\
+             echo alive > \"%~dp0marker.txt\"\r\n",
         )
         .expect("write script");
         script
+    }
+
+    /// Block until the grandchild says it is running. Panics rather than
+    /// returning a bool: every caller needs this to have happened, and a test
+    /// that quietly proceeds without it is the vacuous one described above.
+    fn await_grandchild_start(dir: &Path) {
+        assert!(
+            file_appears_within(&dir.join("started.txt"), Duration::from_secs(20)),
+            "grandchild never started, so nothing below would be under test"
+        );
     }
 
     /// `start /b` detaches the grandchild — the shape that survives a plain
@@ -244,16 +267,19 @@ mod tests {
             .expect("spawn cmd")
     }
 
-    fn marker_appears_within(dir: &Path, wait: Duration) -> bool {
-        let marker = dir.join("marker.txt");
+    fn file_appears_within(path: &Path, wait: Duration) -> bool {
         let deadline = Instant::now() + wait;
         while Instant::now() < deadline {
-            if marker.exists() {
+            if path.exists() {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
         false
+    }
+
+    fn marker_appears_within(dir: &Path, wait: Duration) -> bool {
+        file_appears_within(&dir.join("marker.txt"), wait)
     }
 
     #[test]
@@ -275,12 +301,27 @@ mod tests {
     fn dropping_the_job_ends_the_child() {
         // The property an app crash relies on: nobody calls `kill`, the handle
         // just goes away. Without KILL_ON_JOB_CLOSE this test hangs on `wait`.
+        //
+        // Asserted on elapsed time rather than exit status, because kill-on-close
+        // and `TerminateJobObject` do not report the same way: the explicit call
+        // stamps the code it was given (hence `TREE_KILL_EXIT_CODE` in the test
+        // above), while a close-triggered reap leaves the process reporting **0**
+        // — indistinguishable from `ping` having run to completion. Time is what
+        // separates them, and by a wide margin: the sleeper needs ~30s, so
+        // returning inside 10 means it was reaped rather than awaited.
         let mut child = spawn_sleeper();
         let job = JobObject::adopt(&child).expect("adopt");
-        drop(job);
 
-        let status = child.wait().expect("wait");
-        assert!(!status.success(), "closing the job must reap the tree");
+        let start = Instant::now();
+        drop(job);
+        let _ = child.wait().expect("wait");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "closing the job must reap the tree, but the child ran for {elapsed:?} \
+             (the sleeper's own duration is ~30s, so this one was not killed)"
+        );
     }
 
     // The control. Without it, "no marker" could mean the job worked OR that
@@ -291,6 +332,7 @@ mod tests {
         let dir = scratch("control");
         write_grandchild_script(&dir);
         let mut child = spawn_detached_tree(&dir);
+        await_grandchild_start(&dir);
 
         // End the direct child only. A detached grandchild is untouched by
         // this, which is the problem job objects exist to solve.
@@ -309,7 +351,14 @@ mod tests {
         let dir = scratch("jobbed");
         write_grandchild_script(&dir);
         let mut child = spawn_detached_tree(&dir);
+        // Adopt before waiting, not after: the crate's one known gap is the
+        // window between `CreateProcess` returning and the assignment landing,
+        // and a grandchild spawned inside it would escape the job. Assignment
+        // happens microseconds after `spawn` returns while `start /b` needs
+        // hundreds of milliseconds, so ordering it this way keeps the wait from
+        // manufacturing the very race the module documents.
         let job = JobObject::adopt(&child).expect("adopt");
+        await_grandchild_start(&dir);
 
         job.kill().expect("kill");
         let status = child.wait().expect("wait");
