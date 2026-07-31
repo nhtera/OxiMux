@@ -12,6 +12,7 @@ use std::time::Duration;
 use interprocess::local_socket::tokio::Stream;
 use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ToFsName, ToNsName};
+use oximux_shell_env::test_support::{echo_program, echo_two_vars, lines, test_cwd, test_shell};
 use oximux_relay::codec::{read_frame, write_frame};
 use oximux_relay::{ServerConfig, run_server};
 use oximux_relay_proto::{
@@ -30,65 +31,17 @@ async fn dial(socket: &Path) -> std::io::Result<Stream> {
     Stream::connect(name).await
 }
 
-/// A shell that exists on the running platform, chosen for predictability
-/// rather than for what a user would get: these tests assert on shell output,
-/// so `cmd.exe` beats PowerShell here (no banner to skip, no profile to load,
-/// and `echo`/`exit` mean the same thing as in `sh`).
-fn test_shell() -> String {
-    if cfg!(windows) {
-        std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string())
-    } else {
-        "/bin/sh".to_string()
-    }
-}
 
-/// A directory the spawned shell can sit in. `/tmp` is not a path on Windows.
-fn test_cwd() -> String {
-    if cfg!(windows) {
-        std::env::temp_dir().to_string_lossy().into_owned()
-    } else {
-        "/tmp".to_string()
-    }
-}
 
-/// Terminate a command line for the shell under test. `cmd.exe` reads console
-/// input line-terminated by CR; `sh` is happy with either.
-fn line(cmd: &str) -> Vec<u8> {
-    let eol = if cfg!(windows) { "\r\n" } else { "\n" };
-    format!("{cmd}{eol}").into_bytes()
-}
 
-/// Two command lines in one write, which several tests need (run something,
-/// then exit).
-fn lines(cmds: &[&str]) -> Vec<u8> {
-    cmds.iter().flat_map(|c| line(c)).collect()
-}
 
-/// `echo` of two env vars joined by a pipe character, in the running shell's
-/// syntax. The values can only appear in the EXPANDED output, never in the
-/// command line the tty echoes back — which is what makes the assertion mean
-/// something rather than reading back its own input.
-fn echo_two_vars(a: &str, b: &str) -> String {
-    if cfg!(windows) {
-        // `^` escapes the pipe; cmd would otherwise read it as an operator.
-        format!("echo %{a}%^|%{b}%")
-    } else {
-        format!("echo \"${a}|${b}\"")
-    }
-}
 
-/// A program and argv that print the argument and exit without reading input,
-/// so the marker can only have come from argv. Windows has no `/bin/echo`;
-/// `cmd /c echo` is the closest thing that still never touches the console.
-fn echo_program(arg: &str) -> (String, Vec<String>) {
-    if cfg!(windows) {
-        (
-            test_shell(),
-            vec!["/c".to_string(), "echo".to_string(), arg.to_string()],
-        )
-    } else {
-        ("/bin/echo".to_string(), vec![arg.to_string()])
-    }
+
+/// `Request::Spawn` carries cwd as a `String`; the shared helper yields the
+/// `PathBuf` the client-side API wants. Adapt here rather than teach the shared
+/// rule about two spellings.
+fn cwd() -> String {
+    test_cwd().to_string_lossy().into_owned()
 }
 
 struct TestRelay {
@@ -256,7 +209,7 @@ async fn the_last_client_leaving_flushes_a_checkpoint() {
         &mut buf,
         3,
         Request::Spawn {
-            cwd: test_cwd(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
             shell: Some(test_shell()),
@@ -277,7 +230,7 @@ async fn the_last_client_leaving_flushes_a_checkpoint() {
         4,
         Request::Write {
             pty_id: pty_id.clone(),
-            bytes: line("echo checkpoint-me"),
+            bytes: lines(&["echo checkpoint-me"]),
         },
     )
     .await;
@@ -317,7 +270,7 @@ async fn hello_handshake_then_echo_command() {
         &mut buf,
         2,
         Request::Spawn {
-            cwd: test_cwd(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
             shell: Some(test_shell()),
@@ -364,7 +317,7 @@ async fn attach_replays_buffered_output_then_streams_live() {
         &mut a_buf,
         2,
         Request::Spawn {
-            cwd: test_cwd(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
             shell: Some(test_shell()),
@@ -383,7 +336,7 @@ async fn attach_replays_buffered_output_then_streams_live() {
         3,
         Request::Write {
             pty_id: pty_id.clone(),
-            bytes: line("echo ALPHA_MARKER_A"),
+            bytes: lines(&["echo ALPHA_MARKER_A"]),
         },
     )
     .await;
@@ -463,7 +416,7 @@ async fn notify_fans_out_attention_to_subscribers() {
         &mut a_buf,
         2,
         Request::Spawn {
-            cwd: test_cwd(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
             shell: Some(test_shell()),
@@ -535,7 +488,7 @@ async fn agent_status_fans_out_osc_output_to_subscribers() {
         &mut a_buf,
         2,
         Request::Spawn {
-            cwd: test_cwd(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
             shell: Some(test_shell()),
@@ -766,7 +719,7 @@ async fn shutdown_refused_while_ptys_alive() {
         &mut buf,
         2,
         Request::Spawn {
-            cwd: test_cwd(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
             shell: Some(test_shell()),
@@ -798,7 +751,7 @@ async fn stats_endpoint_returns_per_pty_counters() {
         &mut buf,
         2,
         Request::Spawn {
-            cwd: test_cwd(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
             shell: Some(test_shell()),
@@ -811,7 +764,7 @@ async fn stats_endpoint_returns_per_pty_counters() {
         Response::SpawnOk { pty_id, .. } => pty_id,
         other => panic!("{other:?}"),
     };
-    let written = line("echo STATS_PROBE");
+    let written = lines(&["echo STATS_PROBE"]);
     let resp = req(
         &mut s,
         &mut buf,
@@ -928,7 +881,7 @@ async fn multi_attach_min_size_and_detach_grows_back() {
         &mut a_buf,
         2,
         Request::Spawn {
-            cwd: test_cwd(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
             shell: Some(test_shell()),
@@ -1052,7 +1005,7 @@ async fn unclean_disconnect_releases_attachment_and_grows_back() {
         &mut a_buf,
         2,
         Request::Spawn {
-            cwd: test_cwd(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
             shell: Some(test_shell()),
@@ -1148,7 +1101,7 @@ async fn two_simultaneous_subscribers_both_receive_output() {
         &mut a_buf,
         2,
         Request::Spawn {
-            cwd: test_cwd(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
             shell: Some(test_shell()),
@@ -1224,7 +1177,7 @@ async fn detach_then_fresh_client_reattach_gets_scrollback() {
         &mut a_buf,
         2,
         Request::Spawn {
-            cwd: test_cwd(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
             shell: Some(test_shell()),
@@ -1247,7 +1200,7 @@ async fn detach_then_fresh_client_reattach_gets_scrollback() {
         3,
         Request::Write {
             pty_id: pty_id.clone(),
-            bytes: line("echo PERSIST_DETACH_MARKER"),
+            bytes: lines(&["echo PERSIST_DETACH_MARKER"]),
         },
     )
     .await;
@@ -1323,7 +1276,7 @@ async fn close_request_removes_pty_from_list() {
         &mut buf,
         2,
         Request::Spawn {
-            cwd: test_cwd(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
             shell: Some(test_shell()),
@@ -1380,7 +1333,7 @@ async fn spawn_env_reaches_child_process() {
         &mut buf,
         2,
         Request::Spawn {
-            cwd: test_cwd(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
             shell: Some(test_shell()),
@@ -1436,7 +1389,7 @@ async fn spawn_args_reach_child_process() {
         &mut buf,
         2,
         Request::Spawn {
-            cwd: test_cwd(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
             // Run echo directly (not an interactive shell) so the marker can
@@ -1479,7 +1432,7 @@ async fn replay_returns_the_ring_without_adding_an_attachment() {
         &mut buf,
         2,
         Request::Spawn {
-            cwd: test_cwd(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
             shell: Some(test_shell()),
@@ -1502,7 +1455,7 @@ async fn replay_returns_the_ring_without_adding_an_attachment() {
         3,
         Request::Write {
             pty_id: pty_id.clone(),
-            bytes: line("echo marker"),
+            bytes: lines(&["echo marker"]),
         },
     )
     .await;

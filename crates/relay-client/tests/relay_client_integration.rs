@@ -2,7 +2,6 @@
 // drive it through `RelayBackend` (sync TerminalBackend API). Proves
 // the trait contract is upheld across the socket.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +9,7 @@ use oximux_pty::{SpawnConfig, TerminalBackend, TerminalEvent, TerminalSessionId}
 // Only the in-process latency probe uses this, and that probe is unix-only.
 #[cfg(unix)]
 use oximux_pty::PortablePtyBackend;
+use oximux_shell_env::test_support::{echo_two_vars, lines, test_cwd, test_shell};
 use oximux_relay::{ServerConfig, run_server};
 use oximux_relay_client::{RelayBackend, RelayClient};
 use tempfile::TempDir;
@@ -21,47 +21,9 @@ struct Fixture {
     _dir: TempDir,
 }
 
-/// A shell that exists on the running platform, chosen for predictability
-/// rather than for what a user would get: these tests assert on shell output,
-/// so `cmd.exe` beats PowerShell here (no banner, no profile, and `echo`/`exit`
-/// mean the same thing as in `sh`).
-fn test_shell() -> String {
-    if cfg!(windows) {
-        std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string())
-    } else {
-        "/bin/sh".to_string()
-    }
-}
 
-/// A directory the spawned shell can sit in. `/tmp` is not a path on Windows.
-fn test_cwd() -> PathBuf {
-    if cfg!(windows) {
-        std::env::temp_dir()
-    } else {
-        PathBuf::from("/tmp")
-    }
-}
 
-/// Terminate command lines for the shell under test. `cmd.exe` reads console
-/// input terminated by CR; `sh` accepts either.
-fn lines(cmds: &[&str]) -> Vec<u8> {
-    let eol = if cfg!(windows) { "\r\n" } else { "\n" };
-    cmds.iter()
-        .flat_map(|c| format!("{c}{eol}").into_bytes())
-        .collect()
-}
 
-/// `echo` of two env vars joined by a pipe, in the running shell's syntax. The
-/// values can only appear in the EXPANDED output, never in the command line the
-/// tty echoes back — which is what makes the assertion mean something.
-fn echo_two_vars(a: &str, b: &str) -> String {
-    if cfg!(windows) {
-        // `^` escapes the pipe; cmd would otherwise read it as an operator.
-        format!("echo %{a}%^|%{b}%")
-    } else {
-        format!("echo \"${a}|${b}\"")
-    }
-}
 
 fn boot_fixture() -> Fixture {
     let dir = TempDir::new().expect("tempdir");

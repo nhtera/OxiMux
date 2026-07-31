@@ -8,7 +8,10 @@
 //!   2. Bounded channel deadlock (we'd time out before the marker).
 //!   3. Exit detection broken (we'd see Output but never Exit).
 
+use oximux_shell_env::test_support::{lines, run_script, test_cwd, test_shell};
 use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent};
+// Only the `#[cfg(unix)]` OSC 7 test below constructs a PathBuf.
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -16,13 +19,29 @@ const MARKER: &str = "OXIMUX_HELLO";
 const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// argv that makes the shell print a literal OSC 7 sequence.
+///
+/// Unix-only, and not for want of trying: `cmd.exe` has no way to emit a bare
+/// ESC byte, and routing this one case through PowerShell would mean quoting an
+/// escape through two parsers to test a code path that is platform-neutral once
+/// the bytes exist. What IS Windows-specific here — decoding `file:///C:/...`
+/// into an absolute path — is covered by unit tests in `oximux_pty::osc7` that
+/// do run there.
+#[cfg(unix)]
+fn osc7_emitter() -> Vec<String> {
+    vec![
+        "-c".to_string(),
+        "printf '\\033]7;file:///tmp/osc7-test\\007OXIMUX_DONE\\n'".to_string(),
+    ]
+}
+
 #[test]
 fn spawn_echo_drains_marker_and_exit() {
     let mut backend = PortablePtyBackend::new();
     let cfg = SpawnConfig {
-        shell: "/bin/sh".into(),
-        args: vec!["-c".into(), format!("echo {MARKER}")],
-        cwd: PathBuf::from("/"),
+        shell: test_shell(),
+        args: run_script(&[&format!("echo {MARKER}")]),
+        cwd: test_cwd(),
         env: Vec::new(),
         cols: 80,
         rows: 24,
@@ -79,8 +98,8 @@ fn status_drain_does_not_consume_renderer_output_or_exit() {
     let mut backend = PortablePtyBackend::new();
     let id = backend
         .spawn(SpawnConfig {
-            shell: "/bin/sh".into(),
-            args: vec!["-c".into(), "printf 'STATUS_MARKER\\n'; exit 7".into()],
+            shell: test_shell(),
+            args: run_script(&["echo STATUS_MARKER", "exit 7"]),
             capture_status_events: true,
             ..SpawnConfig::default()
         })
@@ -133,12 +152,16 @@ fn status_drain_does_not_consume_renderer_output_or_exit() {
     backend.close(id).expect("close status test shell");
 }
 
+// Generates 2 MB with `yes | head`, which cmd.exe has no counterpart for.
+// The property under test — the status stream still delivers Exit after the
+// renderer queue overflows — is platform-neutral ring-buffer behavior.
+#[cfg(unix)]
 #[test]
 fn status_exit_survives_renderer_backpressure() {
     let mut backend = PortablePtyBackend::new();
     let id = backend
         .spawn(SpawnConfig {
-            shell: "/bin/sh".into(),
+            shell: test_shell(),
             args: vec![
                 "-c".into(),
                 "yes X | head -c 2097152; printf 'STATUS_TAIL\\n'; exit 7".into(),
@@ -198,7 +221,7 @@ fn spawn_dormant_prefill_then_promote_to_live() {
 
     // Pre-promote: write must reject (no PTY child yet).
     let write_err = backend
-        .write(id, b"echo nope\n")
+        .write(id, &lines(&["echo nope"]))
         .expect_err("write on dormant session must error");
     let msg = format!("{write_err:#}");
     assert!(
@@ -232,9 +255,9 @@ fn spawn_dormant_prefill_then_promote_to_live() {
         .promote_to_live(
             id,
             SpawnConfig {
-                shell: "/bin/sh".into(),
-                args: vec!["-c".into(), "exit 0".into()],
-                cwd: PathBuf::from("/"),
+                shell: test_shell(),
+                args: run_script(&["exit 0"]),
+                cwd: test_cwd(),
                 env: Vec::new(),
                 cols: 80,
                 rows: 24,
@@ -283,9 +306,9 @@ fn spawn_dormant_prefill_then_promote_to_live() {
 fn promote_to_live_rejects_already_live_session() {
     let mut backend = PortablePtyBackend::new();
     let cfg = SpawnConfig {
-        shell: "/bin/sh".into(),
-        args: vec!["-c".into(), "exit 0".into()],
-        cwd: PathBuf::from("/"),
+        shell: test_shell(),
+        args: run_script(&["exit 0"]),
+        cwd: test_cwd(),
         env: Vec::new(),
         cols: 80,
         rows: 24,
@@ -338,9 +361,9 @@ fn write_output_on_dormant_session_lands_in_grid() {
 fn write_output_rejects_live_session() {
     let mut backend = PortablePtyBackend::new();
     let cfg = SpawnConfig {
-        shell: "/bin/sh".into(),
-        args: vec!["-c".into(), "exit 0".into()],
-        cwd: PathBuf::from("/"),
+        shell: test_shell(),
+        args: run_script(&["exit 0"]),
+        cwd: test_cwd(),
         env: Vec::new(),
         cols: 80,
         rows: 24,
@@ -365,6 +388,8 @@ fn write_output_rejects_live_session() {
 ///   - watcher wiring the OSC 7 scanner alongside grid advancement,
 ///   - the Arc<Mutex<Option<PathBuf>>> threading,
 ///   - `cwd_hint` accessor on the backend.
+// Needs a shell that can emit a raw ESC byte; see `osc7_emitter`.
+#[cfg(unix)]
 #[test]
 fn osc7_emission_populates_cwd_hint() {
     let mut backend = PortablePtyBackend::new();
@@ -372,12 +397,9 @@ fn osc7_emission_populates_cwd_hint() {
     // is `ESC ] 7 ; file:///tmp/osc7-test BEL`. We add a final newline +
     // an OXIMUX_DONE marker so the test knows when the chunk landed.
     let cfg = SpawnConfig {
-        shell: "/bin/sh".into(),
-        args: vec![
-            "-c".into(),
-            "printf '\\033]7;file:///tmp/osc7-test\\007OXIMUX_DONE\\n'".into(),
-        ],
-        cwd: PathBuf::from("/"),
+        shell: test_shell(),
+        args: osc7_emitter(),
+        cwd: test_cwd(),
         env: Vec::new(),
         cols: 80,
         rows: 24,
@@ -432,9 +454,9 @@ fn cwd_hint_is_none_before_first_osc7() {
 
     // Live session that never emits OSC 7: cwd_hint also None.
     let cfg = SpawnConfig {
-        shell: "/bin/sh".into(),
-        args: vec!["-c".into(), "echo no-osc7-here".into()],
-        cwd: PathBuf::from("/"),
+        shell: test_shell(),
+        args: run_script(&["echo no-osc7-here"]),
+        cwd: test_cwd(),
         env: Vec::new(),
         cols: 80,
         rows: 24,

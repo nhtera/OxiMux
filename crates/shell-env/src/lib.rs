@@ -168,3 +168,87 @@ mod tests {
         }
     }
 }
+
+/// Shell spellings for integration tests that drive a real PTY.
+///
+/// Behind a feature so it never ships in a normal build, but in this crate
+/// rather than copied into each test file: four suites need the same rule, and
+/// four copies of "how do I say this to the platform's shell" is precisely the
+/// thing that drifts — someone fixes cmd quoting in one and not the others.
+///
+/// `cmd.exe`, not PowerShell, on purpose. Tests assert on shell output, and cmd
+/// has no banner, no profile to load, and the same `echo`/`exit` spelling as
+/// `sh`. Predictability beats matching what a user would actually get; the
+/// product's own default is resolved by [`default_shell`].
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use std::path::PathBuf;
+
+    /// The shell these tests drive.
+    pub fn test_shell() -> String {
+        if cfg!(windows) {
+            std::env::var("COMSPEC").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".to_string())
+        } else {
+            "/bin/sh".to_string()
+        }
+    }
+
+    /// A directory a spawned shell can sit in. `/tmp` is not a path on Windows,
+    /// and `/` there names the current drive root, which is not somewhere to
+    /// start a process.
+    pub fn test_cwd() -> PathBuf {
+        if cfg!(windows) {
+            std::env::temp_dir()
+        } else {
+            PathBuf::from("/tmp")
+        }
+    }
+
+    /// Terminate command lines for the shell under test. `cmd.exe` reads
+    /// console input terminated by CR; `sh` accepts either.
+    pub fn lines(cmds: &[&str]) -> Vec<u8> {
+        let eol = if cfg!(windows) { "\r\n" } else { "\n" };
+        cmds.iter()
+            .flat_map(|c| format!("{c}{eol}").into_bytes())
+            .collect()
+    }
+
+    /// argv that runs `commands` non-interactively and exits — `sh -c` and
+    /// `cmd /c`. The separator differs: `;` sequences unconditionally in sh,
+    /// and `&` is its cmd counterpart (`&&` would stop at the first failure,
+    /// which would swallow a deliberate non-zero exit).
+    pub fn run_script(commands: &[&str]) -> Vec<String> {
+        if cfg!(windows) {
+            vec!["/c".to_string(), commands.join(" & ")]
+        } else {
+            vec!["-c".to_string(), commands.join("; ")]
+        }
+    }
+
+    /// `echo` of two env vars joined by a pipe, in the running shell's syntax.
+    /// The values can only appear in the EXPANDED output, never in the command
+    /// line the tty echoes back — which is what keeps the assertion honest
+    /// instead of reading back its own input.
+    pub fn echo_two_vars(a: &str, b: &str) -> String {
+        if cfg!(windows) {
+            // `^` escapes the pipe; cmd would otherwise read it as an operator.
+            format!("echo %{a}%^|%{b}%")
+        } else {
+            format!("echo \"${a}|${b}\"")
+        }
+    }
+
+    /// A program and argv that print `arg` and exit without reading input, so a
+    /// marker can only have come from argv. Windows has no `/bin/echo`;
+    /// `cmd /c echo` is the nearest thing that still never touches the console.
+    pub fn echo_program(arg: &str) -> (String, Vec<String>) {
+        if cfg!(windows) {
+            (
+                test_shell(),
+                vec!["/c".to_string(), "echo".to_string(), arg.to_string()],
+            )
+        } else {
+            ("/bin/echo".to_string(), vec![arg.to_string()])
+        }
+    }
+}

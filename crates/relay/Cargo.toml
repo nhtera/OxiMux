@@ -51,4 +51,5 @@ oximux-job-object = { workspace = true }
 tracing-oslog = { workspace = true }
 
 [dev-dependencies]
+oximux-shell-env = { workspace = true, features = ["test-support"] }
 tempfile = "3"

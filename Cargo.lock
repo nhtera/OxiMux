@@ -7201,6 +7201,7 @@ dependencies = [
  "oximux-pty",
  "oximux-relay",
  "oximux-relay-proto",
+ "oximux-shell-env",
  "rand 0.8.6",
  "tempfile",
  "thiserror 1.0.69",

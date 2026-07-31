@@ -8,8 +8,8 @@
 //!   2. `fill_snapshot` reads the wrong dimensions (returns a partial grid).
 //!   3. Resize path corrupts the grid (we resize mid-test).
 
+use oximux_shell_env::test_support::{run_script, test_cwd, test_shell};
 use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 const MARKER: &str = "OXIMUX_GRID_OK";
@@ -20,9 +20,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 fn snapshot_contains_echoed_marker() {
     let mut backend = PortablePtyBackend::new();
     let cfg = SpawnConfig {
-        shell: "/bin/sh".into(),
-        args: vec!["-c".into(), format!("printf '{MARKER}'")],
-        cwd: PathBuf::from("/"),
+        shell: test_shell(),
+        args: run_script(&[&format!("echo {MARKER}")]),
+        cwd: test_cwd(),
         env: Vec::new(),
         cols: 80,
         rows: 24,

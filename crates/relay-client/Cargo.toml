@@ -22,5 +22,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+oximux-shell-env = { workspace = true, features = ["test-support"] }
 oximux-relay = { workspace = true }
 tempfile = "3"
