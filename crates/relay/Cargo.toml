@@ -19,6 +19,7 @@ oximux-proc-cwd = { workspace = true }
 oximux-relay-proto = { workspace = true }
 anyhow = { workspace = true }
 dashmap = { workspace = true }
+interprocess = { workspace = true }
 portable-pty = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

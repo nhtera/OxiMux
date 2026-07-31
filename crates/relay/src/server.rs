@@ -1,13 +1,17 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use interprocess::local_socket::ListenerOptions;
+use interprocess::local_socket::tokio::Stream;
+use interprocess::local_socket::tokio::prelude::*;
+use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ToFsName, ToNsName};
 use oximux_relay_proto::{
-    ErrCode, Frame, HelloAck, Notification, PROTOCOL_VERSION, Request, Response,
+    Endpoint, ErrCode, Frame, HelloAck, Notification, PROTOCOL_VERSION, Request, Response,
+    endpoint_for,
 };
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
@@ -29,7 +33,11 @@ const CHECKPOINT_GC_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 
 // Drop guard: removes the bound socket path on drop so a crashed
 // relay can be replaced by a fresh spawn without manual cleanup.
+// Unix only — a named pipe is a kernel object with no filesystem entry,
+// and vanishes with the last handle to it.
+#[cfg(unix)]
 struct SocketGuard(PathBuf);
+#[cfg(unix)]
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -57,9 +65,13 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
 
     // Best-effort: clean a stale socket left by a previous crash. If
     // the path is held by a *live* daemon, bind() will fail loudly.
+    // No analogue on Windows: there is no filesystem entry to go stale,
+    // and a name still held by a live daemon must fail rather than be
+    // cleared away (see `bind_listener`).
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&cfg.socket_path);
-    let listener = UnixListener::bind(&cfg.socket_path)
-        .with_context(|| format!("bind {}", cfg.socket_path.display()))?;
+    let listener = bind_listener(&cfg.socket_path)?;
+    #[cfg(unix)]
     let _socket_guard = SocketGuard(cfg.socket_path.clone());
 
     let _pid_guard = if let Some(pid_path) = &cfg.pid_path {
@@ -113,7 +125,7 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
                 break;
             }
             accept_res = listener.accept() => {
-                let (stream, _addr) = match accept_res {
+                let stream = match accept_res {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!(?e, "accept failed");
@@ -147,6 +159,37 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Bind the local socket both the GUI and this daemon agree on.
+///
+/// The two platforms differ in what "the name is already taken" means, and the
+/// difference is load-bearing:
+///
+/// **Unix** binds a socket file. The caller has already unlinked a stale one,
+/// and the containing directory is what keeps other accounts out.
+///
+/// **Windows** binds a name in the machine-wide `\\.\pipe\` namespace, where
+/// whoever calls `CreateNamedPipe` first owns the name — so a hostile process
+/// that guesses it and gets there first would have every GUI in the session
+/// handing it keystrokes. `FILE_FLAG_FIRST_PIPE_INSTANCE`, which the listener
+/// sets on its first instance, is the defence: creating an already-claimed name
+/// fails instead of joining it, and this function propagates that failure so
+/// the daemon exits and the GUI surfaces it. Failing to start is the correct
+/// outcome; attaching to a squatter's pipe is not.
+fn bind_listener(socket_path: &Path) -> Result<interprocess::local_socket::tokio::Listener> {
+    let name = match endpoint_for(socket_path) {
+        Endpoint::FsPath(path) => path.to_fs_name::<GenericFilePath>().with_context(|| {
+            format!("socket path is not a usable name: {}", socket_path.display())
+        })?,
+        Endpoint::Namespaced(name) => name
+            .to_ns_name::<GenericNamespaced>()
+            .context("derived pipe name is not a usable name")?,
+    };
+    ListenerOptions::new()
+        .name(name)
+        .create_tokio()
+        .with_context(|| format!("bind {}", socket_path.display()))
 }
 
 // Periodic disk-checkpoint driver. Runs for the daemon's lifetime —
@@ -218,52 +261,74 @@ fn write_pid_file(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-// Wire SIGTERM + SIGINT to the shared shutdown notify. tokio's signal
-// driver requires a multi-thread runtime to be active, which `main.rs`
-// guarantees. SIGINT is included for foreground dev runs (ctrl-c).
+// Wire the platform's "you are going away" signals to the shared shutdown
+// notify, which is what gets a final scrollback checkpoint onto disk. tokio's
+// signal driver requires a multi-thread runtime to be active, which `main.rs`
+// guarantees.
 fn install_signal_handler(shutdown: Arc<Notify>) {
     tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sigterm = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(?e, "install SIGTERM failed");
-                    return;
-                }
-            };
-            let mut sigint = match signal(SignalKind::interrupt()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(?e, "install SIGINT failed");
-                    return;
-                }
-            };
-            tokio::select! {
-                _ = sigterm.recv() => tracing::info!("SIGTERM received"),
-                _ = sigint.recv() => tracing::info!("SIGINT received"),
-            }
-            shutdown.notify_waiters();
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = shutdown;
-        }
+        wait_for_shutdown_signal().await;
+        shutdown.notify_waiters();
     });
+}
+
+// SIGTERM is the host reboot/logout path; SIGINT covers foreground dev runs.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (mut sigterm, mut sigint) = match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) {
+        (Ok(term), Ok(int)) => (term, int),
+        (term, int) => {
+            let e = term.err().or(int.err());
+            tracing::error!(?e, "install shutdown signal handler failed");
+            return;
+        }
+    };
+    tokio::select! {
+        _ = sigterm.recv() => tracing::info!("SIGTERM received"),
+        _ = sigint.recv() => tracing::info!("SIGINT received"),
+    }
+}
+
+// Windows has no SIGTERM. The nearest equivalents are console control events,
+// and the daemon is spawned detached with no console — so `ctrl_shutdown` and
+// `ctrl_logoff` may never be delivered here at all. They are wired up because
+// when they *do* arrive they are the only warning we get, but nothing may
+// depend on them: the periodic checkpoint tick, and a flush when the last GUI
+// disconnects, are what actually bound scrollback loss on this platform.
+#[cfg(windows)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::windows::{ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+    let (mut c, mut close, mut logoff, mut sd) =
+        match (ctrl_c(), ctrl_close(), ctrl_logoff(), ctrl_shutdown()) {
+            (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+            _ => {
+                tracing::error!("install console control handlers failed");
+                return;
+            }
+        };
+    tokio::select! {
+        _ = c.recv() => tracing::info!("Ctrl-C received"),
+        _ = close.recv() => tracing::info!("console close received"),
+        _ = logoff.recv() => tracing::info!("logoff received"),
+        _ = sd.recv() => tracing::info!("system shutdown received"),
+    }
 }
 
 // Per-connection logic. Hello first; reject anything else until a
 // valid Hello arrives. After Hello, dispatch Request → Response and
 // forward subscriber Notifications to the outbound writer.
 async fn session_loop(
-    stream: UnixStream,
+    stream: Stream,
     registry: Arc<PtyRegistry>,
     token: String,
     session_id: String,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
-    let (mut read_half, mut write_half) = stream.into_split();
+    let (mut read_half, mut write_half) = stream.split();
     let mut buf = Vec::with_capacity(8 * 1024);
 
     // === Hello handshake (must be the first frame) ============================

@@ -4,11 +4,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
-use oximux_relay_proto::{Frame, Hello, Notification, PROTOCOL_VERSION, Request, Response};
+use interprocess::local_socket::tokio::prelude::*;
+use interprocess::local_socket::tokio::{RecvHalf, SendHalf, Stream};
+use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ToFsName, ToNsName};
+use oximux_relay_proto::{
+    Endpoint, Frame, Hello, Notification, PROTOCOL_VERSION, Request, Response, endpoint_for,
+};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
-#[cfg(unix)]
-use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -34,11 +37,6 @@ pub enum ClientError {
     Timeout(Duration),
     #[error("handshake failed: {0}")]
     Handshake(String),
-    /// No local-socket transport on this platform yet. Distinct from `Io` so
-    /// the caller can tell "the daemon is not reachable here by design" from
-    /// "the connection attempt failed", which have different remedies.
-    #[error("no relay transport on this platform yet (named pipes are unimplemented)")]
-    UnsupportedPlatform,
 }
 
 // Upper bound on how long a synchronous RPC waits for the daemon's
@@ -68,35 +66,17 @@ type PtySubscribers = Arc<DashMap<String, Vec<(SubId, mpsc::UnboundedSender<Noti
 /// Open the byte stream to the daemon and hand back its two halves. The only
 /// platform-specific step in the client — everything above it is framing.
 ///
-/// Splitting here rather than in the caller is deliberate: `UnixStream` splits
-/// into two independently-owned halves with no shared lock, while the generic
+/// Splitting here rather than in the caller is deliberate: this yields two
+/// independently-owned halves with no shared lock, while the generic
 /// `tokio::io::split` puts a `BiLock` between reader and writer. This socket
 /// carries every keystroke one way and every byte of PTY output the other, so
 /// that lock would sit on the hottest path in the app.
-#[cfg(unix)]
-async fn dial(
-    socket_path: &Path,
-) -> Result<
-    (
-        tokio::net::unix::OwnedReadHalf,
-        tokio::net::unix::OwnedWriteHalf,
-    ),
-    ClientError,
-> {
-    Ok(UnixStream::connect(socket_path).await?.into_split())
-}
-
-/// Stand-in half types for platforms with no local-socket transport yet.
-///
-/// Nameable but never produced: `dial` below always fails. They exist so the
-/// handshake and both I/O loops stay type-checked everywhere rather than
-/// disappearing behind a `cfg` — those are the parts a future change is most
-/// likely to break without noticing.
-#[cfg(not(unix))]
-async fn dial(
-    _socket_path: &Path,
-) -> Result<(tokio::io::Empty, tokio::io::Sink), ClientError> {
-    Err(ClientError::UnsupportedPlatform)
+async fn dial(socket_path: &Path) -> Result<(RecvHalf, SendHalf), ClientError> {
+    let name = match endpoint_for(socket_path) {
+        Endpoint::FsPath(path) => path.to_fs_name::<GenericFilePath>()?,
+        Endpoint::Namespaced(name) => name.to_ns_name::<GenericNamespaced>()?,
+    };
+    Ok(Stream::connect(name).await?.split())
 }
 
 pub struct RelayClient {
@@ -274,6 +254,29 @@ impl RelayClient {
 
     pub fn unsubscribe_pty(&self, pty_id: &str, sub_id: SubId) {
         unsubscribe_from(&self.pty_subscribers, pty_id, sub_id);
+    }
+}
+
+impl Drop for RelayClient {
+    /// Close the inbound half explicitly instead of relying on the daemon to
+    /// hang up first.
+    ///
+    /// Dropping `write_tx` retires the writer task once it has drained, and on
+    /// a unix socket that alone is enough: dropping the write half shuts down
+    /// the write direction, the daemon reads EOF and ends the session, and the
+    /// reader here then sees EOF and exits on its own.
+    ///
+    /// A named pipe has no half-shutdown. Nothing would reach the daemon, its
+    /// session would stay parked on a read that never completes, and the reader
+    /// task here would block forever holding the pipe open — leaking a task and
+    /// a daemon session per client. Aborting the reader drops that half on
+    /// every platform, so the handle closes once the writer has finished.
+    ///
+    /// Only the reader is aborted. The writer is left to drain so frames
+    /// already queued still reach the daemon; it stops on its own when the
+    /// channel closes.
+    fn drop(&mut self) {
+        self._reader_task.abort();
     }
 }
 

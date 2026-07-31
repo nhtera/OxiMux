@@ -86,6 +86,14 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", 
 
 # Async + util
 tokio = { version = "1", features = ["full"] }
+# GUI<->relay local transport: unix-domain sockets on unix, named pipes on
+# Windows, behind one tokio type. Two properties this pin is relied on for,
+# both verified against 2.4.2's source: a security descriptor set on
+# `ListenerOptions` reaches `CreateNamedPipeW` through the *tokio* constructor
+# (not only the sync one), and the unix stream splits via `into_split` rather
+# than a `BiLock` — this socket carries every keystroke and every byte of PTY
+# output, so a lock between the halves would sit on the hottest path in the app.
+interprocess = { version = "2.4", features = ["tokio"] }
 futures = "0.3"
 anyhow = "1"
 async-trait = "0.1"

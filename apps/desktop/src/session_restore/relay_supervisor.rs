@@ -22,8 +22,6 @@ use anyhow::{Context, Result, bail};
 use oximux_relay_client::{ClientError, RelayClient};
 use oximux_relay_proto::ErrCode;
 use thiserror::Error;
-#[cfg(unix)]
-use tokio::net::UnixStream;
 use uuid::Uuid;
 
 /// Typed boot outcome so the caller can branch on `VersionMismatch` —
@@ -198,26 +196,15 @@ impl RelaySupervisor {
         if token.is_empty() {
             return ExistingConnect::Absent;
         }
-        // Quick TCP-level reachability before paying for Hello.
-        // tokio::UnixStream::connect returns immediately if the
-        // socket file is missing or refused.
+        // Straight to the handshake — no reachability pre-probe. Dialing is the
+        // first thing `RelayClient::connect` does and it fails just as fast when
+        // nothing is listening, so a pre-probe only bought a second connection
+        // that was immediately dropped. It also had to be skipped on platforms
+        // without a unix socket, which left the two boot paths subtly different
+        // for no gain.
         //
-        // Skipped where there is no local-socket transport: the handshake
-        // below fails immediately there anyway, so the pre-probe would only
-        // add a second way to say the same thing.
-        #[cfg(unix)]
-        {
-            let reachable = tokio::time::timeout(
-                HANDSHAKE_QUICK_TIMEOUT,
-                UnixStream::connect(self.socket_path()),
-            )
-            .await;
-            if !matches!(reachable, Ok(Ok(_))) {
-                return ExistingConnect::Absent;
-            }
-        }
-        // Now the full handshake — verifies the daemon also speaks
-        // our protocol version and accepts the token.
+        // The handshake additionally verifies the daemon speaks our protocol
+        // version and accepts the token, which reachability alone never did.
         match tokio::time::timeout(
             HANDSHAKE_QUICK_TIMEOUT,
             RelayClient::connect(&self.socket_path(), token),
