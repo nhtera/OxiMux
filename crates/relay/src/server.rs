@@ -9,9 +9,11 @@ use interprocess::local_socket::tokio::Stream;
 use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ToFsName, ToNsName};
 use oximux_relay_proto::{
-    Endpoint, ErrCode, Frame, HelloAck, Notification, PROTOCOL_VERSION, Request, Response,
-    endpoint_for,
+    Endpoint, ErrCode, Frame, HelloAck, HelloChallenge, NONCE_LEN, Nonce, Notification,
+    PROTOCOL_VERSION, Request, Response, client_proof, endpoint_for, proofs_match, server_proof,
 };
+use rand::RngCore;
+use rand::rngs::OsRng;
 use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
@@ -378,13 +380,42 @@ async fn session_loop(
         let _ = write_frame(&mut write_half, &resp).await;
         bail!("version mismatch");
     }
-    if hello.token != token {
-        let resp = err_response(request_id, ErrCode::AuthFailed, "bad token");
+
+    // Answer with our own nonce and a proof that we hold the token. This goes
+    // out before the client has proved anything: an impostor cannot produce it,
+    // so the client learns it dialled the wrong thing while it still has
+    // nothing to lose by hanging up. Proving ourselves to an unauthenticated
+    // caller costs nothing — the proof is worthless without the token, and a
+    // caller that already has the token is the one we are talking to.
+    let mut server_nonce: Nonce = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut server_nonce);
+    let challenge = Frame::Response {
+        request_id,
+        response: Response::HelloChallenge(HelloChallenge {
+            server_protocol_version: PROTOCOL_VERSION,
+            server_nonce,
+            server_proof: server_proof(&token, &server_nonce, &hello.client_nonce),
+        }),
+    };
+    write_frame(&mut write_half, &challenge).await?;
+
+    let second = read_frame(&mut read_half, &mut buf).await?;
+    let Frame::Request {
+        request_id: proof_request_id,
+        request: Request::HelloProof(proof),
+    } = second
+    else {
+        bail!("client did not answer the challenge with HelloProof");
+    };
+    let expected = client_proof(&token, &server_nonce, &hello.client_nonce);
+    if !proofs_match(&proof.client_proof, &expected) {
+        let resp = err_response(proof_request_id, ErrCode::AuthFailed, "bad token");
         let _ = write_frame(&mut write_half, &resp).await;
         bail!("bad token");
     }
+
     let ack = Frame::Response {
-        request_id,
+        request_id: proof_request_id,
         response: Response::HelloAck(HelloAck {
             server_protocol_version: PROTOCOL_VERSION,
             session_id: session_id.clone(),
@@ -536,7 +567,10 @@ async fn handle_request(
     request: Request,
 ) -> Response {
     match request {
-        Request::Hello(_) => Response::Err {
+        // Both handshake frames are single-use. Re-sending either after the
+        // session is up is not a client we recognise, so neither gets a second
+        // chance to re-run auth on an already-authenticated connection.
+        Request::Hello(_) | Request::HelloProof(_) => Response::Err {
             code: ErrCode::AuthFailed,
             message: "Hello already completed".into(),
         },

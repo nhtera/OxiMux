@@ -24,6 +24,9 @@ anyhow = { workspace = true }
 dashmap = { workspace = true }
 interprocess = { workspace = true }
 portable-pty = { workspace = true }
+# Handshake nonces. OsRng specifically — these must be unpredictable, and a
+# replayable nonce would undo the whole point of the challenge.
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

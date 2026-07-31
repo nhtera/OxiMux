@@ -42,17 +42,19 @@ pub enum SupervisorError {
     Other(#[from] anyhow::Error),
 }
 
-// Bumped to v6 alongside `PROTOCOL_VERSION`: `Request::AgentStatus` (agent
-// hooks report structured status via `oximux agent-status`). Earlier bumps:
-// v5 `Spawn.args` (direct agent argv), v4 multi-client attach
-// (`attachment_id` + `Detach`), v3 Notify/Attention, v2 `AttachOk` dims.
+// Bumped to v8 alongside `PROTOCOL_VERSION`: the handshake no longer puts the
+// token on the wire, exchanging nonce-bound proofs instead. Earlier bumps:
+// v7 `Notification::Gapped` + `Request::Replay`, v6 `Request::AgentStatus`
+// (agent hooks report structured status via `oximux agent-status`), v5
+// `Spawn.args` (direct agent argv), v4 multi-client attach (`attachment_id` +
+// `Detach`), v3 Notify/Attention, v2 `AttachOk` dims.
 // The bincode wire format isn't self-describing, so a fresh client must NOT
 // reuse an older daemon that can't decode the new shapes. A new socket name
 // guarantees the new client spawns a new daemon; any stale older daemon
 // idles out on its own socket.
-const SOCKET_FILENAME: &str = "relay-v7.sock";
-const TOKEN_FILENAME: &str = "relay-v7.token";
-const PID_FILENAME: &str = "relay-v7.pid";
+const SOCKET_FILENAME: &str = "relay-v8.sock";
+const TOKEN_FILENAME: &str = "relay-v8.token";
+const PID_FILENAME: &str = "relay-v8.pid";
 
 const HANDSHAKE_QUICK_TIMEOUT: Duration = Duration::from_millis(500);
 const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -497,9 +499,9 @@ mod tests {
     #[test]
     fn supervisor_paths_under_runtime_dir() {
         let s = RelaySupervisor::new(PathBuf::from("/tmp/runtime"), PathBuf::from("/tmp/logs"));
-        assert_eq!(s.socket_path(), PathBuf::from("/tmp/runtime/relay-v7.sock"));
-        assert_eq!(s.token_path(), PathBuf::from("/tmp/runtime/relay-v7.token"));
-        assert_eq!(s.pid_path(), PathBuf::from("/tmp/runtime/relay-v7.pid"));
+        assert_eq!(s.socket_path(), PathBuf::from("/tmp/runtime/relay-v8.sock"));
+        assert_eq!(s.token_path(), PathBuf::from("/tmp/runtime/relay-v8.token"));
+        assert_eq!(s.pid_path(), PathBuf::from("/tmp/runtime/relay-v8.pid"));
         assert_eq!(s.log_path(), PathBuf::from("/tmp/logs/relay.log"));
     }
 

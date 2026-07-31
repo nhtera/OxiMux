@@ -15,7 +15,8 @@ use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ToFsName, T
 use oximux_relay::codec::{read_frame, write_frame};
 use oximux_relay::{ServerConfig, run_server};
 use oximux_relay_proto::{
-    Endpoint, Frame, Hello, Notification, PROTOCOL_VERSION, Request, Response, endpoint_for,
+    Endpoint, Frame, Hello, HelloProof, NONCE_LEN, Notification, PROTOCOL_VERSION, Request,
+    Response, client_proof, endpoint_for, proofs_match, server_proof,
 };
 use tempfile::TempDir;
 use tokio::time::timeout;
@@ -64,16 +65,44 @@ async fn boot_relay() -> TestRelay {
 
 async fn connect_and_hello(relay: &TestRelay) -> (Stream, Vec<u8>) {
     let mut stream = dial(&relay.socket).await.expect("connect");
+    let mut buf = Vec::new();
+    let client_nonce = [7u8; NONCE_LEN];
     let hello = Frame::Request {
         request_id: 1,
         request: Request::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
-            token: relay.token.clone(),
             client_id: "test-client".into(),
+            client_nonce,
         }),
     };
     write_frame(&mut stream, &hello).await.expect("hello write");
-    let mut buf = Vec::new();
+
+    let challenge = read_frame(&mut stream, &mut buf).await.expect("challenge");
+    let Frame::Response {
+        response: Response::HelloChallenge(c),
+        ..
+    } = challenge
+    else {
+        panic!("expected HelloChallenge, got {challenge:?}");
+    };
+    // The daemon has to prove itself before we say anything else — a test that
+    // skipped this would still pass against a server that never proved it.
+    assert!(
+        proofs_match(
+            &c.server_proof,
+            &server_proof(&relay.token, &c.server_nonce, &client_nonce)
+        ),
+        "daemon's proof did not verify"
+    );
+
+    let proof = Frame::Request {
+        request_id: 2,
+        request: Request::HelloProof(HelloProof {
+            client_proof: client_proof(&relay.token, &c.server_nonce, &client_nonce),
+        }),
+    };
+    write_frame(&mut stream, &proof).await.expect("proof write");
+
     let ack = read_frame(&mut stream, &mut buf).await.expect("hello ack");
     let Frame::Response {
         response: Response::HelloAck(_),
@@ -426,16 +455,37 @@ async fn agent_status_fans_out_osc_output_to_subscribers() {
 async fn bad_token_rejected_with_auth_failed() {
     let relay = boot_relay().await;
     let mut stream = dial(&relay.socket).await.unwrap();
+    let mut buf = Vec::new();
+    let client_nonce = [3u8; NONCE_LEN];
     let hello = Frame::Request {
         request_id: 1,
         request: Request::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
-            token: "wrong".into(),
             client_id: "x".into(),
+            client_nonce,
         }),
     };
     write_frame(&mut stream, &hello).await.unwrap();
-    let mut buf = Vec::new();
+
+    let challenge = read_frame(&mut stream, &mut buf).await.unwrap();
+    let Frame::Response {
+        response: Response::HelloChallenge(c),
+        ..
+    } = challenge
+    else {
+        panic!("expected HelloChallenge, got {challenge:?}");
+    };
+
+    // A client holding the wrong token can still answer — it just cannot
+    // produce a proof that verifies.
+    let proof = Frame::Request {
+        request_id: 2,
+        request: Request::HelloProof(HelloProof {
+            client_proof: client_proof("wrong", &c.server_nonce, &client_nonce),
+        }),
+    };
+    write_frame(&mut stream, &proof).await.unwrap();
+
     let f = read_frame(&mut stream, &mut buf).await.unwrap();
     match f {
         Frame::Response {
@@ -451,6 +501,53 @@ async fn bad_token_rejected_with_auth_failed() {
 }
 
 #[tokio::test]
+async fn the_daemon_proves_itself_before_the_client_reveals_anything() {
+    // The property the challenge exists for. A client that dialled an impostor
+    // must be able to tell from the daemon's own first reply — before it has
+    // sent a proof of its own — so that holding the endpoint is not enough to
+    // harvest anything.
+    let relay = boot_relay().await;
+    let mut stream = dial(&relay.socket).await.unwrap();
+    let mut buf = Vec::new();
+    let client_nonce = [11u8; NONCE_LEN];
+    let hello = Frame::Request {
+        request_id: 1,
+        request: Request::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_id: "x".into(),
+            client_nonce,
+        }),
+    };
+    write_frame(&mut stream, &hello).await.unwrap();
+
+    let challenge = read_frame(&mut stream, &mut buf).await.unwrap();
+    let Frame::Response {
+        response: Response::HelloChallenge(c),
+        ..
+    } = challenge
+    else {
+        panic!("expected HelloChallenge, got {challenge:?}");
+    };
+
+    assert!(
+        proofs_match(
+            &c.server_proof,
+            &server_proof(&relay.token, &c.server_nonce, &client_nonce)
+        ),
+        "the real daemon's proof must verify"
+    );
+    // ...and a proof over anything else must not, or the check above would pass
+    // for an impostor too.
+    assert!(
+        !proofs_match(
+            &c.server_proof,
+            &server_proof("wrong", &c.server_nonce, &client_nonce)
+        ),
+        "a proof from a daemon without the token must not verify"
+    );
+}
+
+#[tokio::test]
 async fn version_mismatch_is_rejected() {
     // Plan's phase-07 "Tests" item: connecting with a future
     // protocol_version must produce ErrCode::VersionMismatch and the
@@ -462,8 +559,8 @@ async fn version_mismatch_is_rejected() {
         request_id: 1,
         request: Request::Hello(Hello {
             protocol_version: PROTOCOL_VERSION + 999,
-            token: relay.token.clone(),
             client_id: "x".into(),
+            client_nonce: [0u8; NONCE_LEN],
         }),
     };
     write_frame(&mut stream, &hello).await.unwrap();

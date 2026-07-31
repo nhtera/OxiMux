@@ -7165,6 +7165,7 @@ dependencies = [
  "oximux-proc-cwd",
  "oximux-relay-proto",
  "portable-pty",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "tempfile",
@@ -7188,6 +7189,7 @@ dependencies = [
  "oximux-pty",
  "oximux-relay",
  "oximux-relay-proto",
+ "rand 0.8.6",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -7200,7 +7202,9 @@ name = "oximux-relay-proto"
 version = "0.1.5"
 dependencies = [
  "bincode 2.0.1",
+ "hmac",
  "serde",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
 ]
 

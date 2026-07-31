@@ -8,8 +8,11 @@ use interprocess::local_socket::tokio::prelude::*;
 use interprocess::local_socket::tokio::{RecvHalf, SendHalf, Stream};
 use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ToFsName, ToNsName};
 use oximux_relay_proto::{
-    Endpoint, Frame, Hello, Notification, PROTOCOL_VERSION, Request, Response, endpoint_for,
+    Endpoint, Frame, Hello, HelloProof, NONCE_LEN, Nonce, Notification, PROTOCOL_VERSION, Request,
+    Response, client_proof, endpoint_for, proofs_match, server_proof,
 };
+use rand::RngCore;
+use rand::rngs::OsRng;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
@@ -118,22 +121,65 @@ impl RelayClient {
 
         // --- Handshake (must complete before the reader task starts
         //     consuming response frames) ----------------------------
+        // The token is never sent. Each side proves it holds it by MACing both
+        // nonces; see `oximux_relay_proto::auth` for what that buys and why the
+        // daemon goes first.
         let client_id = Uuid::new_v4().to_string();
+        let mut client_nonce: Nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut client_nonce);
         let hello = Frame::Request {
             request_id: 0,
             request: Request::Hello(Hello {
                 protocol_version: PROTOCOL_VERSION,
-                token: token.to_owned(),
                 client_id,
+                client_nonce,
             }),
         };
         write_frame(&mut write_half, &hello).await?;
 
         let mut buf = Vec::with_capacity(4 * 1024);
+        let challenge = read_frame(&mut read_half, &mut buf).await?;
+        let challenge = match challenge {
+            Frame::Response {
+                request_id: 0,
+                response: Response::HelloChallenge(c),
+            } => c,
+            Frame::Response {
+                response: Response::Err { code, message },
+                ..
+            } => {
+                return Err(ClientError::Daemon { code, message });
+            }
+            other => {
+                return Err(ClientError::Handshake(format!(
+                    "expected HelloChallenge, got {other:?}"
+                )));
+            }
+        };
+
+        // Whoever answered has to prove it can read the token file before we
+        // say anything else. Failing here means the endpoint is held by
+        // something that is not our daemon — on Windows, a squatted pipe name —
+        // so we abandon the connection rather than hand it a session.
+        let expected = server_proof(token, &challenge.server_nonce, &client_nonce);
+        if !proofs_match(&challenge.server_proof, &expected) {
+            return Err(ClientError::Handshake(
+                "daemon could not prove it holds the token — endpoint may be impersonated".into(),
+            ));
+        }
+
+        let proof = Frame::Request {
+            request_id: 1,
+            request: Request::HelloProof(HelloProof {
+                client_proof: client_proof(token, &challenge.server_nonce, &client_nonce),
+            }),
+        };
+        write_frame(&mut write_half, &proof).await?;
+
         let ack = read_frame(&mut read_half, &mut buf).await?;
         let server_session_id = match ack {
             Frame::Response {
-                request_id: 0,
+                request_id: 1,
                 response: Response::HelloAck(ack),
             } => ack.session_id,
             Frame::Response {
