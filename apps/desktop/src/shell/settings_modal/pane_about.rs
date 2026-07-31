@@ -272,10 +272,14 @@ pub(super) fn update_entries(
     // Nothing to configure without an updater: the toggle would gate a
     // background check that does not run, and the status row would have no
     // status. Omit the section rather than render controls that do nothing.
+    // Tail expression rather than an early `return`: with the macOS arms below
+    // compiled out, this block *is* the function body, and `return` in tail
+    // position is what `clippy::needless_return` fires on. Only reachable off
+    // macOS, so only clippy running on a Windows host ever saw it.
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (theme, density, typography, &cx);
-        return Vec::new();
+        Vec::new()
     }
     #[cfg(target_os = "macos")]
     let enabled = cx
