@@ -10,20 +10,17 @@
 //! instance to the foreground and bows out instead of booting a second racing
 //! window set.
 //!
-//! The lock is an `flock(LOCK_EX | LOCK_NB)` held for the process lifetime by
-//! keeping the open file alive inside the returned guard. The kernel releases
-//! it automatically when the process exits — including a crash or SIGKILL — so
-//! a dead instance never strands a stale lock (the failure mode a bare pidfile
-//! has). The companion only short-circuits the GUI boot path; the `notify` /
+//! The lock is a non-blocking exclusive lock (`flock` on unix, `LockFileEx` on
+//! Windows, both via `fd-lock`) held for the process lifetime by keeping the
+//! open file alive inside the returned guard. The OS releases it when the
+//! process exits — including a crash or SIGKILL — so a dead instance never
+//! strands a stale lock, which is the failure mode a bare pidfile has. The
+//! companion only short-circuits the GUI boot path; the `notify` /
 //! `agent-status` helper CLIs and the dev spikes run before this check, so they
 //! never contend with a live window.
 
-#[cfg(unix)]
 use std::fs::OpenOptions;
-#[cfg(unix)]
 use std::io::{Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// Lock file name under the app data directory. Sits alongside the relay
@@ -38,9 +35,10 @@ pub fn lock_path_in(data_dir: &Path) -> PathBuf {
 /// Held for the whole process lifetime. Dropping it (or process exit) closes
 /// the underlying descriptor, which releases the advisory lock.
 pub struct SingleInstanceGuard {
-    // The lock lives on the open file description; keeping the `File` alive is
-    // the entire mechanism. The field is never read — it is held for its Drop.
-    _file: std::fs::File,
+    // The lock lives on the open file description (unix) / handle (Windows);
+    // keeping the `File` alive is the entire mechanism. The field is never read
+    // — it is held for its Drop, which closes the file and frees the lock.
+    _lock: fd_lock::RwLock<std::fs::File>,
 }
 
 /// Outcome of trying to take the single-instance lock.
@@ -59,66 +57,58 @@ pub enum AcquireOutcome {
 /// `Ok(AlreadyRunning)` — a live holder has it; the caller should activate the
 /// holder and exit. `Err` — an unexpected filesystem/lock error; the caller
 /// should log and degrade to a normal boot rather than refuse to start.
-#[cfg(unix)]
 pub fn try_acquire(lock_path: &Path) -> std::io::Result<AcquireOutcome> {
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         // Do NOT truncate on open: a contender must read the holder's recorded
-        // PID, and we only rewrite the file after winning the flock below.
+        // PID, and we only rewrite the file after winning the lock below.
         .truncate(false)
         .open(lock_path)?;
 
-    // SAFETY: `flock` is a thin libc call on a valid descriptor we own; the
-    // file stays open for the call's duration. `LOCK_NB` makes it return
-    // immediately rather than blocking when another description holds the lock.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        // We own the lock. Record our PID so a later contender can name (and
-        // activate) us. Best-effort: a write failure here doesn't lose the
-        // lock, it only leaves the contender without a PID to focus.
-        let _ = file.set_len(0);
-        let _ = file.seek(SeekFrom::Start(0));
-        let _ = writeln!(file, "{}", std::process::id());
-        let _ = file.flush();
-        return Ok(AcquireOutcome::Acquired(SingleInstanceGuard { _file: file }));
-    }
+    let mut lock = fd_lock::RwLock::new(file);
+    // The result is reduced to a bool inside this statement so the borrow of
+    // `lock` ends with it — the guard borrows `lock`, and `lock` has to be
+    // movable into the returned guard below.
+    let won = match lock.try_write() {
+        Ok(mut guard) => {
+            // We own the lock. Record our PID so a later contender can name
+            // (and activate) us. Best-effort: a write failure here doesn't lose
+            // the lock, it only leaves the contender without a PID to focus.
+            let _ = guard.set_len(0);
+            let _ = guard.seek(SeekFrom::Start(0));
+            let _ = writeln!(*guard, "{}", std::process::id());
+            let _ = guard.flush();
 
-    let err = std::io::Error::last_os_error();
-    // `EWOULDBLOCK` is the "lock is held" signal — the only non-error outcome
-    // of a non-blocking `flock`. (It shares a value with `EAGAIN` on macOS, so
-    // matching the one constant covers both.)
-    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        return Ok(AcquireOutcome::AlreadyRunning {
+            // Deliberate: the guard's `Drop` unlocks, and we want the lock held
+            // for the life of the process. Forgetting it leaves the lock on the
+            // still-open file, so the OS drops it when we exit — which is what
+            // makes a crash or SIGKILL release it too, rather than stranding a
+            // lock no future launch can clear. `lock` owns the `File`, so the
+            // handle stays open until `SingleInstanceGuard` is dropped.
+            std::mem::forget(guard);
+            true
+        }
+        // `fd-lock` normalises "someone else holds it" to `WouldBlock` on both
+        // platforms — `EWOULDBLOCK` from `flock`, `ERROR_LOCK_VIOLATION` from
+        // `LockFileEx` — so this is the one contention arm, not a unix-shaped
+        // errno check that would quietly fall through to `Err` on Windows.
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(err) => return Err(err),
+    };
+
+    if won {
+        Ok(AcquireOutcome::Acquired(SingleInstanceGuard { _lock: lock }))
+    } else {
+        Ok(AcquireOutcome::AlreadyRunning {
             holder_pid: read_holder_pid(lock_path),
-        });
+        })
     }
-    Err(err)
-}
-
-/// No lock is taken off Unix yet, so this reports failure rather than success.
-///
-/// The caller's documented response to `Err` is to log and boot normally, which
-/// is the honest state of affairs: `LockFileEx` and the window-message
-/// activation that pairs with it are their own piece of work. Returning
-/// `Acquired` instead would claim a guarantee — only one instance owns the
-/// layout store — that nothing is enforcing, and the symptom (a second launch
-/// silently overwriting the first's saved terminals) surfaces far from here.
-#[cfg(not(unix))]
-pub fn try_acquire(lock_path: &Path) -> std::io::Result<AcquireOutcome> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        format!(
-            "single-instance lock is unimplemented on this platform ({})",
-            lock_path.display()
-        ),
-    ))
 }
 
 /// Read the PID the current holder recorded in the lock file. `None` when the
 /// file is unreadable or hasn't been written yet (a holder mid-acquire).
-#[cfg(unix)]
 fn read_holder_pid(lock_path: &Path) -> Option<u32> {
     std::fs::read_to_string(lock_path).ok()?.trim().parse().ok()
 }
@@ -149,8 +139,55 @@ pub fn activate_existing_instance(pid: u32) {
     }
 }
 
-/// No-op activation on platforms without AppKit.
-#[cfg(not(target_os = "macos"))]
+/// Name of the broadcast message a second launch uses to ask the live instance
+/// to come forward. `RegisterWindowMessage` maps this string to the same
+/// message id for every process on the desktop, which is what lets two
+/// unrelated instances agree on one without sharing anything else.
+#[cfg(windows)]
+pub const ACTIVATE_MESSAGE: &str = "OxiMuxActivate";
+
+/// Ask the running instance to raise its windows.
+///
+/// Deliberately not a socket, a pipe, or any other channel: the only capability
+/// being conveyed is "come to the front", and a broadcast window message can
+/// carry nothing else. Anything richer would be new attack surface — reachable
+/// by every process on the desktop — in exchange for a feature nobody asked
+/// for.
+///
+/// Windows normally refuses focus changes from a process the user is not
+/// interacting with. `AllowSetForegroundWindow` is how the launching process
+/// hands its own (just-granted, since the user launched us) foreground right to
+/// the holder, so the holder's own `SetForegroundWindow` is honoured rather
+/// than flashing its taskbar button.
+#[cfg(windows)]
+pub fn activate_existing_instance(pid: u32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AllowSetForegroundWindow, HWND_BROADCAST, PostMessageW, RegisterWindowMessageW,
+    };
+
+    let Ok(name) = widestring::U16CString::from_str(ACTIVATE_MESSAGE) else {
+        return;
+    };
+    // SAFETY: `name` is NUL-terminated and outlives the call.
+    let msg = unsafe { RegisterWindowMessageW(name.as_ptr()) };
+    if msg == 0 {
+        return;
+    }
+
+    // Best-effort, and failure is survivable: the worst case is the holder
+    // blinks in the taskbar instead of coming forward.
+    // SAFETY: plain Win32 calls with no pointer arguments.
+    unsafe {
+        AllowSetForegroundWindow(pid);
+        // Broadcast rather than target a window: the holder's HWND is not
+        // knowable from here, and every process filters on the registered id,
+        // which no other application has registered.
+        PostMessageW(HWND_BROADCAST, msg, 0, 0);
+    }
+}
+
+/// No-op activation on platforms with neither AppKit nor Win32.
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn activate_existing_instance(_pid: u32) {}
 
 #[cfg(test)]

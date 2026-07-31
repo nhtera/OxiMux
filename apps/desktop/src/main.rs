@@ -1489,6 +1489,10 @@ mod tests {
     // shutdown signal must take the graceful `cx.quit()` path, and any
     // REPEAT must hard-escalate (restore SIG_DFL + re-raise) so a wedged
     // foreground executor can't leave the app un-quittable.
+    //
+    // Gated with the code under test: `signal_should_force_exit` is the unix
+    // signal path, and Windows has no counterpart to escalate through yet.
+    #[cfg(unix)]
     #[test]
     fn first_shutdown_signal_is_graceful_repeats_escalate() {
         assert!(
