@@ -3,11 +3,18 @@
 //! Design:
 //! - One `Session` per spawn. Owns master, writer, a clone-killer for the
 //!   child, and a watcher thread join handle.
-//! - The watcher thread owns the reader + the child, reads to EOF, and
-//!   emits `Output` chunks via a bounded `mpsc::sync_channel(256)`. When
-//!   the reader sees EOF it waits the child and emits `Exit`.
+//! - The watcher thread emits `Output` chunks via a bounded
+//!   `mpsc::sync_channel(256)`, fed by a reader thread and a reaper thread it
+//!   spawns. A session ends on whichever lands first: the reader seeing EOF, or
+//!   the child being reaped plus a short drain. Both routes emit exactly one
+//!   `Exit`, after every `Output` that preceded it.
+//! - Two routes rather than one because EOF is not universal: a ConPTY output
+//!   pipe outlives its child, so on Windows a self-terminating shell produces no
+//!   EOF at all. See `POST_EXIT_DRAIN`.
 //! - `close` signals shutdown via the killer + drops master/writer, which
-//!   closes file descriptors and lets the watcher exit cleanly.
+//!   closes file descriptors and lets the watcher exit cleanly. That drop is
+//!   also what finally unblocks a reader thread parked on a ConPTY that its
+//!   child has already left.
 //!
 //! No tokio runtime requirement — `std::thread` + `std::sync::mpsc::sync_channel`
 //! gives us the same bounded-channel guarantee with one less moving part.
@@ -20,10 +27,10 @@ use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, nativ
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::backend::{SpawnConfig, TerminalBackend, TerminalSessionId};
 use crate::close_grace::{JoinHandleWatcher, close_with_grace, term_step};
@@ -46,6 +53,36 @@ const CANCEL_GRACE: Duration = Duration::from_secs(5);
 /// 50 ms × 100 iterations = 5 s ceiling; sleep imprecision on loaded
 /// hosts is acceptable since the grace is best-effort, not a hard SLA.
 const KILL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long the watcher keeps draining output after the child has been reaped,
+/// before it declares the session finished and emits `Exit`.
+///
+/// This is what makes exit detection work on Windows, where waiting for the
+/// reader to see EOF is not an option: a ConPTY's output pipe stays open for as
+/// long as the pseudoconsole does, and the pseudoconsole belongs to the master,
+/// which `close()` holds until the user closes the tab. So on Windows the reader
+/// never reports EOF for a child that exited on its own, and `Exit` keyed off
+/// EOF alone would simply never be published — terminals would sit there looking
+/// alive, and agent sessions would never reach `Done`.
+///
+/// The window exists because reaping the child and reading the last of its
+/// output are separate races: `child.wait()` can return while bytes it already
+/// wrote are still in flight. 200 ms is far longer than that hand-off needs and
+/// far shorter than a user notices, and it only ever delays a session that has
+/// already ended.
+///
+/// Deliberately a deadline from the moment of reaping, not an idle timeout that
+/// each new chunk pushes back. A detached grandchild can inherit the pty and keep
+/// writing after the child this session owns has gone — `start /b` on Windows,
+/// `nohup` off it — and an idle timeout would then never elapse, which lands back
+/// on the exact bug this constant exists to fix. A fixed window means `Exit` is
+/// published within a bounded time of the child dying, whatever else holds the
+/// pty open.
+const POST_EXIT_DRAIN: Duration = Duration::from_millis(200);
+
+/// How often the watcher loop wakes to re-check the child while no output is
+/// arriving. Also the granularity of [`POST_EXIT_DRAIN`].
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 struct Session {
     /// PTY-bound handles. `None` for sessions in the dormant state
@@ -624,10 +661,10 @@ fn watch_session(
     cwd_hint: Arc<Mutex<Option<PathBuf>>>,
     status_events: Arc<Mutex<HashMap<TerminalSessionId, VecDeque<TerminalEvent>>>>,
 ) {
-    // Reap the child independently while the reader drains through EOF. The
-    // reader's renderer notifications are nonblocking, so an absent renderer
-    // cannot stop the PTY drain. Status Exit is published below only after all
-    // preceding Output, preserving lifecycle ordering.
+    // Reap the child independently of the reader. The reader's renderer
+    // notifications are nonblocking, so an absent renderer cannot stop the PTY
+    // drain. Status Exit is published below only after all preceding Output,
+    // preserving lifecycle ordering.
     let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let code = child.wait().ok().and_then(|status| {
@@ -639,51 +676,129 @@ fn watch_session(
         });
         let _ = exit_tx.send(code);
     });
-    let mut buf = [0u8; READ_BUFFER_BYTES];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let bytes_slice = &buf[..n];
-                // Drive the grid + collect derived events (bell, cwd, command
-                // marks, progress, title, clipboard, device replies) in one
-                // locked pass. The OSC scanner now lives in `TerminalState`.
-                let derived = match state.lock() {
-                    Ok(mut s) => s.advance_collecting(id, bytes_slice),
-                    Err(_) => Vec::new(),
-                };
-                // Forward derived events BEFORE the Output chunk so attention
-                // (bell) lands ahead of the bytes that raised it. OSC 7 cwd is
-                // absorbed locally into the cheap cwd cache rather than the
-                // event stream — `cwd_hint()` is the lookup surface.
-                for ev in derived {
-                    match ev {
-                        TerminalEvent::CwdChanged { path, .. } => {
-                            if let Ok(mut slot) = cwd_hint.lock() {
-                                *slot = Some(path);
-                            }
-                        }
-                        other => {
-                            if !try_send_renderer_event(&tx, other) {
-                                return;
-                            }
-                        }
+
+    // The blocking `read` gets a thread of its own so the loop below can watch
+    // the child and the output at the same time. Keeping the read inline would
+    // mean the only way out of this function is EOF, which is exactly the
+    // assumption that does not hold on Windows (see `POST_EXIT_DRAIN`).
+    //
+    // Dropping `bytes_tx` on the way out is how the reader reports EOF, so the
+    // unix path still ends the session the moment the pty closes, unchanged.
+    let (bytes_tx, bytes_rx) = sync_channel::<Vec<u8>>(EVENT_CHANNEL_CAPACITY);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; READ_BUFFER_BYTES];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => {
+                    // Blocking send, unlike the renderer hand-off below: PTY
+                    // bytes drive the grid, so dropping them on a full channel
+                    // would corrupt terminal state rather than just skip a
+                    // frame. Backpressure onto the pty is the correct response.
+                    if bytes_tx.send(buf[..n].to_vec()).is_err() {
+                        return;
                     }
                 }
-                let bytes = bytes_slice.to_vec();
-                let output = TerminalEvent::Output { id, bytes };
-                push_status_event(&status_events, id, &output);
-                if !try_send_renderer_event(&tx, output) {
+                Err(_) => return,
+            }
+        }
+    });
+
+    let mut code = None;
+    // `Some(_)` once the child has been reaped: the point after which output can
+    // only be the tail of what it already wrote.
+    let mut drain_deadline: Option<Instant> = None;
+    let mut saw_eof = false;
+
+    loop {
+        match bytes_rx.recv_timeout(DRAIN_POLL_INTERVAL) {
+            Ok(chunk) => {
+                if !forward_chunk(id, &chunk, &tx, &state, &cwd_hint, &status_events) {
                     return;
                 }
             }
-            Err(_) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                saw_eof = true;
+                break;
+            }
+        }
+
+        if drain_deadline.is_none()
+            && let Ok(reaped) = exit_rx.try_recv()
+        {
+            code = reaped;
+            drain_deadline = Some(Instant::now() + POST_EXIT_DRAIN);
+        }
+        if let Some(deadline) = drain_deadline
+            && Instant::now() >= deadline
+        {
+            break;
         }
     }
-    let code = exit_rx.recv().ok().flatten();
+
+    // Whatever the reader already handed over outranks `Exit`, so take it before
+    // publishing. Bounded by the channel, so this cannot spin.
+    while let Ok(chunk) = bytes_rx.try_recv() {
+        if !forward_chunk(id, &chunk, &tx, &state, &cwd_hint, &status_events) {
+            return;
+        }
+    }
+
+    // The EOF path has not consulted the reaper yet, and its exit code is worth
+    // blocking for: EOF means the pty is gone, so `wait` is about to return.
+    if saw_eof {
+        code = exit_rx.recv().ok().flatten();
+    }
+
     let exit = TerminalEvent::Exit { id, code };
     push_status_event(&status_events, id, &exit);
     let _ = tx.send(exit);
+}
+
+/// Drive one chunk of PTY bytes into the grid and out to the renderer.
+///
+/// Returns `false` when the renderer is gone, which is the caller's signal to
+/// abandon the session without publishing `Exit`.
+fn forward_chunk(
+    id: TerminalSessionId,
+    chunk: &[u8],
+    tx: &SyncSender<TerminalEvent>,
+    state: &Arc<Mutex<TerminalState>>,
+    cwd_hint: &Arc<Mutex<Option<PathBuf>>>,
+    status_events: &Arc<Mutex<HashMap<TerminalSessionId, VecDeque<TerminalEvent>>>>,
+) -> bool {
+    // Drive the grid + collect derived events (bell, cwd, command marks,
+    // progress, title, clipboard, device replies) in one locked pass. The OSC
+    // scanner now lives in `TerminalState`.
+    let derived = match state.lock() {
+        Ok(mut s) => s.advance_collecting(id, chunk),
+        Err(_) => Vec::new(),
+    };
+    // Forward derived events BEFORE the Output chunk so attention (bell) lands
+    // ahead of the bytes that raised it. OSC 7 cwd is absorbed locally into the
+    // cheap cwd cache rather than the event stream — `cwd_hint()` is the lookup
+    // surface.
+    for ev in derived {
+        match ev {
+            TerminalEvent::CwdChanged { path, .. } => {
+                if let Ok(mut slot) = cwd_hint.lock() {
+                    *slot = Some(path);
+                }
+            }
+            other => {
+                if !try_send_renderer_event(tx, other) {
+                    return false;
+                }
+            }
+        }
+    }
+    let output = TerminalEvent::Output {
+        id,
+        bytes: chunk.to_vec(),
+    };
+    push_status_event(status_events, id, &output);
+    try_send_renderer_event(tx, output)
 }
 
 fn try_send_renderer_event(tx: &SyncSender<TerminalEvent>, event: TerminalEvent) -> bool {

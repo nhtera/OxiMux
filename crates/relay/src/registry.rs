@@ -732,6 +732,30 @@ fn send_sigterm(pid: Option<u32>) {
 /// `Notification::Exit { code }` (`None` here) to a late-reconnecting client.
 const EXIT_CODE_NONE: i32 = i32::MIN;
 
+/// How long [`reader_loop`] keeps draining output after the child has been
+/// reaped, before it publishes `Exit`.
+///
+/// The daemon cannot key exit off the reader seeing EOF, because on Windows it
+/// never does: a ConPTY's output pipe belongs to the pseudoconsole, which
+/// outlives the child and is released only when the master is dropped at
+/// `close`. A shell that exits on its own — `exit`, a crash, a finished agent —
+/// produces no EOF at all, so an EOF-only loop would never fan out
+/// `Notification::Exit`, never drop the checkpoint, and leave the entry looking
+/// live to `list` forever.
+///
+/// The window covers the hand-off race: `child.wait()` can return while the last
+/// bytes the child wrote are still in flight, and those belong in the ring ahead
+/// of `Exit`. It only ever delays a session that has already ended.
+///
+/// A deadline from the moment of reaping rather than an idle timeout, for the same
+/// reason as its twin in `oximux-pty`: a detached grandchild that inherits the pty
+/// and keeps writing would hold an idle timeout open forever, and the session
+/// would never report `Exit` — the original bug, reintroduced.
+const POST_EXIT_DRAIN: Duration = Duration::from_millis(200);
+
+/// Wake-up granularity for the drain loop while no output is arriving.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 // The reader task owns the PTY's full I/O state (reader, child handle, ring,
 // subscribers, exit flags); threading it as discrete args keeps the spawn site
 // explicit rather than hiding it behind a bag struct.
@@ -747,33 +771,89 @@ fn reader_loop(
     bytes_out: Arc<AtomicU64>,
     checkpoints: Option<Arc<CheckpointStore>>,
 ) {
-    let mut buf = [0u8; READ_CHUNK_BYTES];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let bytes = &buf[..n];
-                bytes_out.fetch_add(n as u64, Ordering::Relaxed);
-                // Lock-order discipline: ring before subscribers, same
-                // order `attach` uses, to keep snapshot+push atomic.
-                let mut rb = ring.lock().expect("ring poisoned");
-                rb.push(bytes);
-                drop(rb);
-                fan_out(
-                    &subscribers,
-                    Notification::Output {
-                        pty_id: pty_id.clone(),
-                        bytes: bytes.to_vec(),
-                    },
-                );
-            }
-            Err(e) => {
-                tracing::debug!(?e, pty_id, "reader EOF/err");
-                break;
+    // Reap on a thread of its own rather than after the read loop, and read on a
+    // thread of its own rather than inline, so the loop below can end the session
+    // on whichever comes first: EOF, or the child being reaped plus a short
+    // drain. Waiting for EOF alone is what does not port — see `POST_EXIT_DRAIN`.
+    let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel::<Option<i32>>(1);
+    std::thread::spawn(move || {
+        let code = child.wait().ok().map(|s| s.exit_code() as i32);
+        let _ = exit_tx.send(code);
+    });
+
+    // Dropping `bytes_tx` is how the reader reports EOF, keeping the unix path's
+    // "pty closed, session over" behaviour exactly as it was.
+    let (bytes_tx, bytes_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+    let pty_id_for_reader = pty_id.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; READ_CHUNK_BYTES];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => {
+                    // Blocking send: these bytes are the scrollback, so applying
+                    // backpressure to the pty is right and dropping them is not.
+                    if bytes_tx.send(buf[..n].to_vec()).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(?e, pty_id = pty_id_for_reader, "reader EOF/err");
+                    return;
+                }
             }
         }
+    });
+
+    let publish = |bytes: &[u8]| {
+        bytes_out.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        // Lock-order discipline: ring before subscribers, same
+        // order `attach` uses, to keep snapshot+push atomic.
+        let mut rb = ring.lock().expect("ring poisoned");
+        rb.push(bytes);
+        drop(rb);
+        fan_out(
+            &subscribers,
+            Notification::Output {
+                pty_id: pty_id.clone(),
+                bytes: bytes.to_vec(),
+            },
+        );
+    };
+
+    let mut reaped: Option<Option<i32>> = None;
+    let mut drain_deadline: Option<Instant> = None;
+    loop {
+        match bytes_rx.recv_timeout(DRAIN_POLL_INTERVAL) {
+            Ok(chunk) => publish(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if reaped.is_none()
+            && let Ok(code) = exit_rx.try_recv()
+        {
+            reaped = Some(code);
+            drain_deadline = Some(Instant::now() + POST_EXIT_DRAIN);
+        }
+        if let Some(deadline) = drain_deadline
+            && Instant::now() >= deadline
+        {
+            break;
+        }
     }
-    let code = child.wait().ok().map(|s| s.exit_code() as i32);
+
+    // Output the reader already handed over belongs in the ring ahead of `Exit`.
+    while let Ok(chunk) = bytes_rx.try_recv() {
+        publish(&chunk);
+    }
+
+    // On the EOF route the reaper has not been consulted yet, and its status is
+    // worth blocking for: EOF means the pty is gone, so `wait` is about to
+    // return. On the reaped route the code is already in hand.
+    let code = match reaped {
+        Some(code) => code,
+        None => exit_rx.recv().unwrap_or(None),
+    };
     // Stash the status BEFORE flipping `child_exited`, so any reader that
     // observes the flag (here or in `attach`) also sees the final code.
     exit_code.store(code.unwrap_or(EXIT_CODE_NONE), Ordering::Release);
