@@ -79,10 +79,9 @@ jobs:
         run: cargo run -p xtask -- file-size-lint
 
   # Permanent gate for the Windows port. macOS is still the only shipping
-  # target, so this job checks that the workspace COMPILES for Windows — it
-  # does not run tests or clippy. Its whole job is to stop a macOS-only API
-  # from landing on a shared path unnoticed, which is exactly the class of
-  # breakage that made the port expensive to start.
+  # target; this job stops a macOS-only API from landing on a shared path
+  # unnoticed, which is exactly the class of breakage that made the port
+  # expensive to start.
   #
   # Native runner rather than a cross-check from macOS on purpose: only a real
   # windows-msvc host surfaces link/manifest problems, and the C-dependency
@@ -91,8 +90,11 @@ jobs:
   # fast proxy — `cfg(windows)` resolves identically — but `target_env` does
   # not, so this job is the authority.
   #
-  # No `--all-targets`: the test targets still reach for Unix APIs directly and
-  # gating them is later-phase work. Library and binary targets are the gate.
+  # It also RUNS a narrow set of tests. That matters more than it sounds: the
+  # port is being written on a machine with no Windows, so this runner is the
+  # only thing that executes any of it. The DACL assertions and the job-object
+  # tree kill are not checkable anywhere else — a green compile says nothing
+  # about whether a job object actually reaps a grandchild.
   windows-check:
     name: windows compile gate
     runs-on: windows-latest
@@ -121,6 +123,38 @@ jobs:
       # Windows — do it deliberately.
       - name: cargo check
         run: >
-          cargo check --workspace --target x86_64-pc-windows-msvc
+          cargo check --workspace --all-targets --target x86_64-pc-windows-msvc
+          --exclude oximux-computer-use
+          --exclude oximux-macos-trust
+
+      # Blocking, and deliberately narrow. These four crates are where the
+      # Windows-specific behavior lives and where a failure is unambiguous:
+      # owner-only asserts the DACL reads back protected and single-owner,
+      # job-object asserts a killed job takes a detached grandchild with it,
+      # shell-env asserts the resolved shell is a program that exists (which is
+      # what proves the pwsh probe works at all), and pty's unit tests carry
+      # the OSC 7 drive-letter handling.
+      #
+      # `--lib` because the integration tests under `tests/` still spawn
+      # `/bin/sh` and assert on POSIX shell output. Porting those is worth
+      # doing — they are the only end-to-end relay coverage — but a test that
+      # fails for a reason unrelated to the code under test is not a gate.
+      - name: cargo test (windows-specific crates)
+        run: >
+          cargo test --lib --target x86_64-pc-windows-msvc
+          -p oximux-owner-only
+          -p oximux-job-object
+          -p oximux-shell-env
+          -p oximux-pty
+
+      # Non-blocking on purpose: nobody has ever run these on Windows, so the
+      # first result is data, not a verdict. It exists to produce the list of
+      # what actually fails, which is what should drive widening the gate
+      # above. Flip it to blocking once the list is empty — and if it stays
+      # non-blocking for long, that is a signal it is being ignored.
+      - name: cargo test (full unit suite, informational)
+        continue-on-error: true
+        run: >
+          cargo test --workspace --lib --target x86_64-pc-windows-msvc
           --exclude oximux-computer-use
           --exclude oximux-macos-trust

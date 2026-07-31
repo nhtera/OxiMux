@@ -295,6 +295,22 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    /// An absolute path and the URI body a shell would emit for it, spelled
+    /// for whichever platform the test runs on. `/tmp/foo` is not absolute on
+    /// Windows, so hard-coding it would have meant either a POSIX-only test or
+    /// no Windows coverage at all — and OSC 7 is the ONLY cwd source there.
+    fn abs(rel: &str) -> (String, PathBuf) {
+        if cfg!(windows) {
+            (format!("/C:/{rel}"), PathBuf::from(format!("C:/{rel}")))
+        } else {
+            (format!("/{rel}"), PathBuf::from(format!("/{rel}")))
+        }
+    }
+
+    fn osc7(uri_body: &str) -> Vec<u8> {
+        format!("\x1b]7;file://{uri_body}\x07").into_bytes()
+    }
+
     fn collect(bytes: &[u8]) -> Vec<PathBuf> {
         let mut scanner = OscScanner::new();
         let mut paths = Vec::new();
@@ -315,40 +331,38 @@ mod tests {
 
     #[test]
     fn bel_terminated_osc7_yields_path() {
-        // `ESC ] 7 ; file:///tmp/foo BEL`
-        let bytes = b"\x1b]7;file:///tmp/foo\x07";
-        let paths = collect(bytes);
-        assert_eq!(paths, vec![PathBuf::from("/tmp/foo")]);
+        // `ESC ] 7 ; file://<abs> BEL`
+        let (uri, want) = abs("tmp/foo");
+        assert_eq!(collect(&osc7(&uri)), vec![want]);
     }
 
     #[test]
     fn st_terminated_osc7_yields_path() {
-        // `ESC ] 7 ; file:///tmp/bar ESC \`
-        let bytes = b"\x1b]7;file:///tmp/bar\x1b\\";
-        let paths = collect(bytes);
-        assert_eq!(paths, vec![PathBuf::from("/tmp/bar")]);
+        // Same payload, terminated by ST (`ESC \`) rather than BEL.
+        let (uri, want) = abs("tmp/bar");
+        let bytes = format!("\x1b]7;file://{uri}\x1b\\").into_bytes();
+        assert_eq!(collect(&bytes), vec![want]);
     }
 
     #[test]
     fn osc7_with_hostname_strips_host_correctly() {
-        let bytes = b"\x1b]7;file://localhost/Users/test/project\x07";
-        let paths = collect(bytes);
-        assert_eq!(paths, vec![PathBuf::from("/Users/test/project")]);
+        let (uri, want) = abs("Users/test/project");
+        assert_eq!(collect(&osc7(&format!("localhost{uri}"))), vec![want]);
     }
 
     #[test]
     fn percent_encoded_space_decodes_correctly() {
-        let bytes = b"\x1b]7;file:///tmp/with%20space\x07";
-        let paths = collect(bytes);
-        assert_eq!(paths, vec![PathBuf::from("/tmp/with space")]);
+        let (uri, _) = abs("tmp/with%20space");
+        let (_, want) = abs("tmp/with space");
+        assert_eq!(collect(&osc7(&uri)), vec![want]);
     }
 
     #[test]
     fn percent_encoded_utf8_decodes_correctly() {
-        // "/tmp/é" — `é` is U+00E9 = UTF-8 `0xC3 0xA9`.
-        let bytes = b"\x1b]7;file:///tmp/%C3%A9\x07";
-        let paths = collect(bytes);
-        assert_eq!(paths, vec![PathBuf::from("/tmp/é")]);
+        // `é` is U+00E9 = UTF-8 `0xC3 0xA9`.
+        let (uri, _) = abs("tmp/%C3%A9");
+        let (_, want) = abs("tmp/é");
+        assert_eq!(collect(&osc7(&uri)), vec![want]);
     }
 
     #[test]
@@ -361,9 +375,11 @@ mod tests {
 
     #[test]
     fn multiple_osc7_in_one_chunk_emit_all() {
-        let bytes = b"\x1b]7;file:///a\x07prompt$ \x1b]7;file:///b\x07";
-        let paths = collect(bytes);
-        assert_eq!(paths, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+        let (uri_a, want_a) = abs("a");
+        let (uri_b, want_b) = abs("b");
+        let bytes =
+            format!("\x1b]7;file://{uri_a}\x07prompt$ \x1b]7;file://{uri_b}\x07").into_bytes();
+        assert_eq!(collect(&bytes), vec![want_a, want_b]);
     }
 
     #[test]
@@ -377,12 +393,14 @@ mod tests {
                 }
             })
         };
-        // Chunk 1: ESC ] 7 ; file:///abs
-        push_cwd(&mut scanner, b"\x1b]7;file:///abs", &mut paths);
+        // Chunk 1: ESC ] 7 ; file://<abs>  — no terminator yet.
+        let (uri, _) = abs("abs");
+        let (_, want) = abs("abs/path");
+        push_cwd(&mut scanner, format!("\x1b]7;file://{uri}").as_bytes(), &mut paths);
         assert!(paths.is_empty(), "no terminator yet");
         // Chunk 2: /path BEL
         push_cwd(&mut scanner, b"/path\x07", &mut paths);
-        assert_eq!(paths, vec![PathBuf::from("/abs/path")]);
+        assert_eq!(paths, vec![want]);
     }
 
     #[test]
@@ -397,10 +415,11 @@ mod tests {
                 }
             })
         };
-        push_cwd(&mut scanner, b"\x1b]7;file:///x\x1b", &mut paths);
+        let (uri, want) = abs("x");
+        push_cwd(&mut scanner, format!("\x1b]7;file://{uri}\x1b").as_bytes(), &mut paths);
         assert!(paths.is_empty(), "ST not completed");
         push_cwd(&mut scanner, b"\\rest", &mut paths);
-        assert_eq!(paths, vec![PathBuf::from("/x")]);
+        assert_eq!(paths, vec![want]);
     }
 
     #[test]
@@ -494,15 +513,19 @@ mod tests {
         // 5000 bytes of garbage inside OSC, never terminated within the
         // chunk. Scanner must not allocate forever and must resync on
         // next ESC.
+        let (uri, want) = abs("ok");
         let mut bytes = Vec::with_capacity(5200);
         bytes.extend_from_slice(b"\x1b]7;");
         bytes.extend(std::iter::repeat_n(b'x', 5000));
-        bytes.extend_from_slice(b"\x1b]7;file:///ok\x07");
+        bytes.extend_from_slice(&osc7(&uri));
         let paths = collect(&bytes);
         // Runaway dropped; second OSC 7 still parses.
-        assert_eq!(paths, vec![PathBuf::from("/ok")]);
+        assert_eq!(paths, vec![want]);
     }
 
+    // POSIX-only spelling: `/relative/...` has no drive, so on Windows it is
+    // correctly rejected as not-absolute rather than passed through.
+    #[cfg(unix)]
     #[test]
     fn relative_path_is_rejected() {
         // No leading slash on the path component.

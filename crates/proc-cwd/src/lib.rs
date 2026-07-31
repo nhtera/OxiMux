@@ -144,6 +144,16 @@ mod tests {
         assert!(cwd.exists(), "CWD must point to a real path, got {cwd:?}");
     }
 
+    /// The documented behavior off macOS: no panic, no guess, just `None`.
+    /// Callers treat that as "ask the shell instead" (OSC 7), so returning a
+    /// wrong answer would be worse than returning nothing.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn an_unsupported_platform_reports_no_cwd() {
+        assert!(cwd_of_pid(std::process::id()).is_none());
+        assert!(cwd_of_pid(u32::MAX).is_none());
+    }
+
     /// Non-existent pid returns None rather than panicking or returning
     /// a stale path from a previous query.
     #[cfg(target_os = "macos")]

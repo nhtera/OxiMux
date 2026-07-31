@@ -183,17 +183,77 @@ impl Drop for OwnedHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
 
-    /// `cmd /c` a command that outlives its parent unless the tree is killed.
+    /// ~30s of doing nothing, safe with stdin redirected.
+    ///
+    /// NOT `timeout /t`: that one refuses to run when stdin is not a console
+    /// ("Input redirection is not supported") and exits immediately with a
+    /// non-zero code — which is exactly what a killed child looks like, so
+    /// every assertion here would have passed without testing anything.
+    const SLEEP_30: &str = "ping -n 31 127.0.0.1 > NUL";
+
     fn spawn_sleeper() -> Child {
         Command::new("cmd")
-            .args(["/c", "timeout /t 30 /nobreak > NUL"])
+            .args(["/c", SLEEP_30])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn cmd")
+    }
+
+    /// A private directory for one test's script + marker.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oximux-job-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// Write the grandchild script into `dir`. It waits, then drops a marker
+    /// beside itself — so if it is still alive after the kill, it says so.
+    ///
+    /// `%~dp0` is the script's own directory, which means no path is ever
+    /// passed on a command line: `cmd.exe` parses quotes by its own rules,
+    /// not the CRT's, and a temp path with a space would be a coin flip.
+    fn write_grandchild_script(dir: &Path) -> PathBuf {
+        let script = dir.join("grandchild.cmd");
+        std::fs::write(
+            &script,
+            "@echo off\r\nping -n 4 127.0.0.1 > NUL\r\necho alive > \"%~dp0marker.txt\"\r\n",
+        )
+        .expect("write script");
+        script
+    }
+
+    /// `start /b` detaches the grandchild — the shape that survives a plain
+    /// TerminateProcess on the direct child, and the whole reason a job object
+    /// is here rather than a pid list. Run from `dir`, so the script is named
+    /// relatively and nothing needs quoting.
+    fn spawn_detached_tree(dir: &Path) -> Child {
+        Command::new("cmd")
+            .args(["/c", &format!("start /b grandchild.cmd & {SLEEP_30}")])
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cmd")
+    }
+
+    fn marker_appears_within(dir: &Path, wait: Duration) -> bool {
+        let marker = dir.join("marker.txt");
+        let deadline = Instant::now() + wait;
+        while Instant::now() < deadline {
+            if marker.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
     }
 
     #[test]
@@ -223,26 +283,44 @@ mod tests {
         assert!(!status.success(), "closing the job must reap the tree");
     }
 
+    // The control. Without it, "no marker" could mean the job worked OR that
+    // the grandchild never ran at all — and a test that cannot tell those
+    // apart is the one that lets a broken tree-kill ship.
     #[test]
-    fn a_grandchild_is_covered_without_being_tracked() {
-        // `cmd /c start` launches a *detached* grandchild — the shape that
-        // survives a plain TerminateProcess on the direct child, and the whole
-        // reason a job object is here rather than a pid list.
-        let mut child = Command::new("cmd")
-            .args(["/c", "start /b timeout /t 30 /nobreak > NUL & timeout /t 30 /nobreak > NUL"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn cmd");
+    fn an_unjobbed_grandchild_outlives_its_parent() {
+        let dir = scratch("control");
+        write_grandchild_script(&dir);
+        let mut child = spawn_detached_tree(&dir);
+
+        // End the direct child only. A detached grandchild is untouched by
+        // this, which is the problem job objects exist to solve.
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            marker_appears_within(&dir, Duration::from_secs(15)),
+            "grandchild should have survived its parent and written the marker"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_grandchild_dies_with_the_job() {
+        let dir = scratch("jobbed");
+        write_grandchild_script(&dir);
+        let mut child = spawn_detached_tree(&dir);
         let job = JobObject::adopt(&child).expect("adopt");
 
         job.kill().expect("kill");
-
-        // The direct child dying is necessary but not the interesting part; the
-        // job reports its own emptiness by killing everything at once, so a
-        // clean `wait` here with no lingering handles is the observable signal.
         let status = child.wait().expect("wait");
-        assert!(!status.success());
+        assert!(!status.success(), "direct child must die too");
+
+        // The actual guarantee: the grandchild never gets to write. Waited out
+        // well past its own delay, so "not yet" cannot be mistaken for "never".
+        assert!(
+            !marker_appears_within(&dir, Duration::from_secs(10)),
+            "grandchild survived the job kill"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -243,6 +243,11 @@ mod tests {
         .is_terminal());
     }
 
+    // The single-flight lock guards the macOS pipeline, and every type this
+    // needs to build a config — the bundle, the codesign pin — describes a
+    // `.app`. Windows gets its own staging path; when it lands, this test's
+    // counterpart goes with it.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_second_spawn_while_one_runs_is_rejected() {
         // Claim the lock by hand to simulate an in-flight check without any
