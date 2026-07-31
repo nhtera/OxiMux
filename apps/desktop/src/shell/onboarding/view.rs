@@ -8,6 +8,7 @@ use gpui::{
     div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
+use std::time::Instant;
 
 use super::{OnboardingStep, OnboardingWizard};
 
@@ -26,10 +27,17 @@ impl Render for OnboardingWizard {
         self.sync_model_select(window, cx);
         // The wizard is modal: while open it must own keyboard dispatch. Late
         // focus grabs elsewhere (e.g. a deferred focus-active-tab) would leave
-        // Esc/Enter dead, so re-assert whenever focus has left the wizard's
-        // subtree entirely. `contains_focused` keeps this a no-op while a
-        // child (the model dropdown's search input) legitimately holds focus.
-        if !self.focus_handle.contains_focused(window, cx) {
+        // Esc/Enter dead, so re-assert while focus has left the wizard's subtree
+        // — but only for a moment after opening. `contains_focused` cannot tell
+        // "someone stole focus" from "a popup that opened this frame owns it",
+        // because it answers from the previously rendered frame; reclaiming
+        // forever therefore closed the model dropdown on the next repaint. See
+        // `FOCUS_CLAIM_WINDOW`.
+        if self
+            .focus_claim_until
+            .is_some_and(|deadline| Instant::now() < deadline)
+            && !self.focus_handle.contains_focused(window, cx)
+        {
             self.focus_handle.focus(window, cx);
         }
         let theme = self.theme;

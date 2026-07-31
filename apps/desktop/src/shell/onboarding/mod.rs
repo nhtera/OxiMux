@@ -16,7 +16,7 @@ mod view_step;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{AppContext as _, Context, Entity, EventEmitter, FocusHandle, Subscription, Window};
 use gpui_component::searchable_list::SearchableVec;
@@ -115,6 +115,9 @@ pub struct OnboardingWizard {
     /// re-renders don't reset an open dropdown (composer's signature guard).
     model_select_sig: Vec<(String, String, Option<String>)>,
     _model_select_sub: Option<Subscription>,
+    /// How long the wizard still reclaims keyboard focus on render. See
+    /// [`FOCUS_CLAIM_WINDOW`] for why the reclaim is bounded at all.
+    pub(self) focus_claim_until: Option<Instant>,
     /// Driver check made once at open (it spawns `codesign`); decides whether
     /// the Driver step exists at all and what its body says.
     #[cfg(target_os = "macos")]
@@ -136,6 +139,26 @@ pub struct OnboardingWizard {
     #[cfg(target_os = "macos")]
     pub(self) driver_poll_running: bool,
 }
+
+/// How long after opening the wizard keeps reclaiming keyboard focus.
+///
+/// The reclaim exists for a boot-time race: a deferred focus-active-tab landing
+/// after the wizard opens would leave Esc/Enter dead. It used to run on every
+/// render, which made it fight the user instead of the race — and it lost the
+/// model dropdown outright.
+///
+/// The reason is subtle enough to be worth writing down. `contains_focused`
+/// answers from the **last rendered** frame's dispatch tree. When the dropdown
+/// opens, `Select` focuses a list that lives inside a popup which did not exist
+/// in that frame, so the check says focus has left the wizard, the wizard takes
+/// it back, and `Select::on_blur` closes the popup. Any repaint triggers this,
+/// which is why merely hovering the menu made it vanish — and why no amount of
+/// signature-guarding the item list could have saved it.
+///
+/// Bounding the reclaim resolves it without weakening the guarantee it was added
+/// for: the race it defends against happens while the window is still coming up,
+/// and the dropdown cannot be open before the user has had a chance to click it.
+const FOCUS_CLAIM_WINDOW: Duration = Duration::from_secs(2);
 
 impl OnboardingWizard {
     pub fn new(
@@ -164,6 +187,7 @@ impl OnboardingWizard {
             model_select: None,
             model_select_sig: Vec::new(),
             _model_select_sub: None,
+            focus_claim_until: None,
             #[cfg(target_os = "macos")]
             driver_status: crate::shell::settings_modal::DriverStatus::Unknown,
             driver_step_planned: false,
@@ -188,6 +212,7 @@ impl OnboardingWizard {
         self.open = true;
         self.step = OnboardingStep::Agent;
         self.expanded = false;
+        self.focus_claim_until = Some(Instant::now() + FOCUS_CLAIM_WINDOW);
         // Once per open, not per transition: the step count (and dot row)
         // must be stable for the whole run of the wizard.
         // No screen-control driver to install off macOS, so the wizard is one
