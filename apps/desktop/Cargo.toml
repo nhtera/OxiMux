@@ -27,6 +27,8 @@ oximux-pty = { workspace = true }
 async-trait = { workspace = true }
 oximux-relay-client = { workspace = true }
 oximux-relay-proto = { workspace = true }
+# Owner-only access on the relay auth token this process writes.
+oximux-owner-only = { workspace = true }
 # Remote control: the in-app iroh host (bind + accept loop) that serves the
 # SessionRegistry to paired phones, its transport-agnostic dispatcher/auth, and
 # the shared wire types (PairingTicket).
@@ -88,6 +90,9 @@ two-face = { version = "0.5.1", default-features = false, features = ["syntect-f
 # methods (open/close/is_devtools_open) exist in release too — wry only turns
 # them on automatically under debug_assertions, which broke release builds.
 wry = { version = "0.55", features = ["devtools"] }
+# Single-instance guard: one non-blocking exclusive file lock over `flock` and
+# `LockFileEx`, with contention normalised to `WouldBlock` on both.
+fd-lock = "4"
 
 # Relay supervisor's `pre_exec` calls libc::umask so the bundled
 # socket/token files come out 0600. libc is already in the transitive
@@ -95,6 +100,16 @@ wry = { version = "0.55", features = ["devtools"] }
 # `libc::` qualifier dance through nix's re-exports.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Bringing the already-running instance forward: a registered broadcast message
+# and the foreground-right handoff that lets the holder honour it.
+[target.'cfg(windows)'.dependencies]
+widestring = "1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Screen control drives the macOS Accessibility APIs and its installer/updater

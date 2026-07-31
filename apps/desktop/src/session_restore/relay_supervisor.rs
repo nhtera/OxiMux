@@ -11,6 +11,13 @@
 // SIGHUP on the app's PG doesn't reach the daemon) + redirect stdio
 // to /dev/null + log file + `mem::forget(child)` so the kernel
 // reparents to PID 1 when the app dies. No `waitpid` — no zombie.
+//
+// Detach recipe (Windows): `CREATE_NO_WINDOW` and nothing else. A child
+// there already outlives its parent by default — there is no reparenting
+// and no zombie to avoid, because the two processes were never linked in
+// the first place (that link only exists if someone puts them in a shared
+// Job Object, which we do not). `mem::forget(child)` is still correct, but
+// it is now leaking a handle rather than dodging a `waitpid`.
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -307,13 +314,12 @@ fn write_token(path: &Path, token: &str) -> Result<()> {
         .open(path)
         .with_context(|| format!("open token file {}", path.display()))?;
     f.write_all(token.as_bytes()).context("write token bytes")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perm = f.metadata()?.permissions();
-        perm.set_mode(0o600);
-        f.set_permissions(perm)?;
-    }
+    // This token is the relay's whole authentication story, so the restriction
+    // is applied rather than inherited — and its failure is propagated, because
+    // a readable token is not a smaller problem than no token at all.
+    drop(f);
+    oximux_owner_only::restrict_file(path)
+        .with_context(|| format!("restrict token file {}", path.display()))?;
     Ok(())
 }
 
@@ -385,6 +391,29 @@ fn spawn_detached(
         }
     }
 
+    #[cfg(windows)]
+    {
+        // The relay is a console-subsystem binary, so without this a
+        // console window flashes up on every launch and then sits in the
+        // taskbar for the daemon's whole life. Its stdio is already
+        // redirected to the log file, so the console has nothing to show.
+        //
+        // There is no `process_group(0)` analogue to add: that call exists
+        // on unix so a SIGHUP aimed at the app's group misses the daemon,
+        // and a process with no console window is out of reach of console
+        // control events for the same reason.
+        //
+        // Consequence for the shutdown path: whether a process started this
+        // way can still receive CTRL_SHUTDOWN_EVENT / CTRL_LOGOFF_EVENT is
+        // exactly the question the signal wiring in `relay/src/main.rs`
+        // leaves open, and this flag makes the pessimistic answer more
+        // likely. Nothing depends on those handlers — the 5s checkpoint tick
+        // plus flush-on-last-disconnect is what bounds scrollback loss.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
     let child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", binary.display()))?;
@@ -417,15 +446,32 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn write_token_sets_0600_perms() {
-        use std::os::unix::fs::PermissionsExt;
+    fn write_token_restricts_the_file_to_us() {
+        // The token is the relay's entire authentication story, so this asserts
+        // the restriction off the written file rather than trusting the call.
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("tok");
         write_token(&path, "deadbeef").unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "expected 0600, got {mode:o}");
+        assert!(oximux_owner_only::is_restricted_to_owner(&path).unwrap());
+    }
+
+    #[test]
+    fn write_token_narrows_a_file_that_already_existed_wide() {
+        // Rewriting over a token left behind by an earlier build must not
+        // inherit whatever access that file had.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("tok");
+        std::fs::write(&path, "stale").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
+
+        write_token(&path, "deadbeef").unwrap();
+
+        assert!(oximux_owner_only::is_restricted_to_owner(&path).unwrap());
     }
 
     #[test]

@@ -4,6 +4,7 @@ members = [
     "apps/desktop",
     "crates/ui",
     "crates/core",
+    "crates/owner-only",
     "crates/dictation",
     "crates/pty",
     "crates/git",
@@ -40,6 +41,9 @@ rust-version = "1.89"
 oximux-app      = { path = "apps/desktop" }
 oximux-ui       = { path = "crates/ui" }
 oximux-core     = { path = "crates/core" }
+# Owner-only access for the secrets we write to disk. Its own crate because the
+# desktop app, the relay daemon and the remote host share no other dependency.
+oximux-owner-only = { path = "crates/owner-only" }
 oximux-dictation = { path = "crates/dictation" }
 oximux-pty      = { path = "crates/pty" }
 oximux-git      = { path = "crates/git" }

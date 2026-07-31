@@ -17,6 +17,9 @@ path = "src/lib.rs"
 [dependencies]
 oximux-proc-cwd = { workspace = true }
 oximux-relay-proto = { workspace = true }
+# Restricting the pid file, and — on Windows — building the named pipe's
+# owner-only DACL from the same definition the token and key files use.
+oximux-owner-only = { workspace = true }
 anyhow = { workspace = true }
 dashmap = { workspace = true }
 interprocess = { workspace = true }
@@ -33,16 +36,9 @@ uuid = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.25", features = ["signal"] }
 
-# Building the named pipe's owner-only DACL: the token lookup that yields the
-# current user's SID, and the UTF-16 string the descriptor is parsed from.
+# Only to hand the pipe's security descriptor to `interprocess` as UTF-16.
 [target.'cfg(windows)'.dependencies]
 widestring = "1"
-windows-sys = { version = "0.61", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_System_Threading",
-] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tracing-oslog = { workspace = true }

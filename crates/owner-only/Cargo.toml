@@ -1,0 +1,25 @@
+[package]
+name = "oximux-owner-only"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+# The pieces needed to name the running account and hand Windows a DACL that
+# lists only it: the token lookup that yields the SID, the SDDL parser, and the
+# UTF-16 strings both speak in.
+[target.'cfg(windows)'.dependencies]
+widestring = "1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"

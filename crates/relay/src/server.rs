@@ -271,6 +271,14 @@ fn write_pid_file(path: &std::path::Path) -> Result<()> {
         .open(path)
         .with_context(|| format!("open pid file {}", path.display()))?;
     write!(&mut f, "{}", std::process::id()).context("write pid")?;
+    drop(f);
+    // Not a secret — the supervisor only reads this to poll whether the daemon
+    // is still alive, so the worst a reader learns is a PID. It is restricted
+    // anyway so that "everything the relay writes beside its socket is
+    // owner-only" holds without exceptions to remember, and so a tampered value
+    // cannot drive the supervisor's liveness check.
+    oximux_owner_only::restrict_file(path)
+        .with_context(|| format!("restrict pid file {}", path.display()))?;
     Ok(())
 }
 
