@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use dashmap::DashMap;
 use oximux_relay_proto::{ErrCode, Notification, PtyDescriptor, PtyStats};
-use oximux_shell_env::seed_utf8_locale;
+use oximux_shell_env::{clear_inherited_colour_suppression, seed_utf8_locale};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
@@ -208,6 +208,14 @@ impl PtyRegistry {
         // explicit override still wins, though callers shouldn't set it).
         command.env("OXIMUX_PTY_ID", &pty_id);
         seed_utf8_locale(&mut command);
+        // The daemon is the worst-affected spawn site, and the reason this call
+        // exists. It is started detached by the app and outlives it, so it
+        // carries whatever environment the app was launched with — forever.
+        // Launch OxiMux once from a coding agent's shell and every pane in
+        // every session from then on renders monochrome, with nothing in any
+        // log to say why. Before the caller loop, so an explicit
+        // `args.env` entry still wins.
+        clear_inherited_colour_suppression(&mut command);
         for (k, v) in &args.env {
             command.env(k, v);
         }

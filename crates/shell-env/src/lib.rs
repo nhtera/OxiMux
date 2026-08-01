@@ -104,9 +104,79 @@ pub fn seed_utf8_locale(command: &mut CommandBuilder) {
     }
 }
 
+/// Environment variables that tell a child "this terminal cannot do colour".
+///
+/// `NO_COLOR` (any non-empty value) and `FORCE_COLOR=0` are both honoured by
+/// essentially every modern CLI — chalk, supports-color, clap, ripgrep, and the
+/// agent CLIs OxiMux exists to host.
+const COLOUR_SUPPRESSORS: &[&str] = &["NO_COLOR", "FORCE_COLOR"];
+
+/// Drop inherited "no colour" flags from a PTY child's environment.
+///
+/// OxiMux forces `TERM=xterm-256color` and `COLORTERM=truecolor` on every PTY
+/// child, because a GUI-launched app (and a detached relay daemon even more so)
+/// inherits no terminal identity of its own. Passing an inherited `NO_COLOR`
+/// through alongside those is self-contradictory: the same environment would
+/// tell the child both that the terminal renders 24-bit colour and that it must
+/// not use any.
+///
+/// The variable is almost never the user's: it is injected by whatever launched
+/// OxiMux. Coding agents set `NO_COLOR=1` on their child processes so tool
+/// output arrives as clean text — which is correct for the tools they run, and
+/// wrong for a terminal emulator started from one, whose panes then render
+/// every agent, pager and build tool in flat monochrome. Nothing reports it;
+/// the terminal simply looks wrong.
+///
+/// The cost is real and worth naming: a user who sets `NO_COLOR` globally
+/// loses it *for OxiMux panes only*. The escape hatch is that this runs before
+/// the caller-supplied environment is applied, so an explicit
+/// `SpawnConfig`/`SpawnArgs` entry still wins, as does anything the user's own
+/// shell profile exports once the pane is live.
+pub fn clear_inherited_colour_suppression(command: &mut CommandBuilder) {
+    for key in COLOUR_SUPPRESSORS {
+        command.env_remove(key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The removal has to happen for every name a CLI might read, and it has to
+    /// leave the terminal-identity vars alone — stripping `COLORTERM` here
+    /// would break the very thing this exists to protect.
+    #[test]
+    fn colour_suppressors_are_removed_and_identity_is_left_alone() {
+        let mut command = CommandBuilder::new("cmd");
+        command.env("TERM", "xterm-256color");
+        command.env("COLORTERM", "truecolor");
+        for key in COLOUR_SUPPRESSORS {
+            command.env(key, "1");
+        }
+
+        clear_inherited_colour_suppression(&mut command);
+
+        for key in COLOUR_SUPPRESSORS {
+            assert!(
+                command.get_env(key).is_none(),
+                "{key} survived the scrub and would still silence colour"
+            );
+        }
+        assert_eq!(command.get_env("TERM").unwrap(), "xterm-256color");
+        assert_eq!(command.get_env("COLORTERM").unwrap(), "truecolor");
+    }
+
+    /// A caller that deliberately asks for no colour must still get it. This is
+    /// the escape hatch the doc comment promises, and it only holds because
+    /// every spawn site applies the caller's environment *after* the scrub.
+    #[test]
+    fn a_caller_can_still_ask_for_no_colour_afterwards() {
+        let mut command = CommandBuilder::new("cmd");
+        command.env("NO_COLOR", "1");
+        clear_inherited_colour_suppression(&mut command);
+        command.env("NO_COLOR", "1");
+        assert_eq!(command.get_env("NO_COLOR").unwrap(), "1");
+    }
 
     #[test]
     fn default_shell_is_a_program_that_exists() {

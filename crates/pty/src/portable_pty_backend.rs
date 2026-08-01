@@ -21,8 +21,9 @@
 //! When the UI layer eventually needs async coordination, the bounded
 //! receiver can be wrapped or replaced without changing the trait surface.
 
+use crate::conpty_c0::ConptyC0Filter;
 use anyhow::{Context, Result};
-use oximux_shell_env::seed_utf8_locale;
+use oximux_shell_env::{clear_inherited_colour_suppression, seed_utf8_locale};
 use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -175,6 +176,11 @@ impl TerminalBackend for PortablePtyBackend {
         // Host-terminal identity so tools/agents can detect the emulator.
         command.env("TERM_PROGRAM", "oximux");
         seed_utf8_locale(&mut command);
+        // After the identity defaults above and before the caller loop below:
+        // an inherited `NO_COLOR` would otherwise contradict the `COLORTERM`
+        // just set, and a caller that genuinely wants no colour can still say
+        // so in `cfg.env`.
+        clear_inherited_colour_suppression(&mut command);
         for (k, v) in &cfg.env {
             command.env(k, v);
         }
@@ -304,6 +310,11 @@ impl TerminalBackend for PortablePtyBackend {
         // Host-terminal identity so tools/agents can detect the emulator.
         command.env("TERM_PROGRAM", "oximux");
         seed_utf8_locale(&mut command);
+        // After the identity defaults above and before the caller loop below:
+        // an inherited `NO_COLOR` would otherwise contradict the `COLORTERM`
+        // just set, and a caller that genuinely wants no colour can still say
+        // so in `cfg.env`.
+        clear_inherited_colour_suppression(&mut command);
         for (k, v) in &cfg.env {
             command.env(k, v);
         }
@@ -709,10 +720,14 @@ fn watch_session(
     // only be the tail of what it already wrote.
     let mut drain_deadline: Option<Instant> = None;
     let mut saw_eof = false;
+    // Lives for the session, not the chunk: a sequence can be split by
+    // wherever the pipe happened to break, so the phase has to carry over.
+    let mut c0 = ConptyC0Filter::new();
 
     loop {
         match bytes_rx.recv_timeout(DRAIN_POLL_INTERVAL) {
             Ok(chunk) => {
+                let chunk = c0.apply(&chunk);
                 if !forward_chunk(id, &chunk, &tx, &state, &cwd_hint, &status_events) {
                     return;
                 }
@@ -740,6 +755,7 @@ fn watch_session(
     // Whatever the reader already handed over outranks `Exit`, so take it before
     // publishing. Bounded by the channel, so this cannot spin.
     while let Ok(chunk) = bytes_rx.try_recv() {
+        let chunk = c0.apply(&chunk);
         if !forward_chunk(id, &chunk, &tx, &state, &cwd_hint, &status_events) {
             return;
         }
