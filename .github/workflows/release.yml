@@ -1,12 +1,16 @@
-# Build, sign, notarize, and publish the macOS release DMG.
+# Build and publish the release artifacts: a signed, notarized macOS DMG and an
+# unsigned Windows x64 zip.
 #
 # Trigger: pushing a version tag (v0.1.3), or manually via workflow_dispatch —
 # the manual path exists because Apple's notary service occasionally stalls
 # past any sane timeout; a re-run should not require re-tagging.
 #
-# The workflow produces a DRAFT release with the notarized DMG attached, so
-# release notes can be curated before publishing. Re-runs re-upload the asset
-# with --clobber.
+# The workflow produces a DRAFT release with both assets attached, so release
+# notes can be curated before publishing. Re-runs re-upload with --clobber.
+#
+# The two jobs are independent: neither platform's artifact waits on the other,
+# and either can be re-run alone. Only the macOS half needs the secrets below —
+# Windows has no signing step at all, for the reason spelled out on that job.
 #
 # Required repository secrets (Settings → Secrets and variables → Actions):
 #
@@ -161,3 +165,86 @@ jobs:
           if [[ -n "${KEYCHAIN:-}" && -f "$KEYCHAIN" ]]; then
             security delete-keychain "$KEYCHAIN"
           fi
+
+  # Windows x64 zip.
+  #
+  # Deliberately NOT `needs: release-macos`. The macOS job can sit for an hour
+  # waiting on Apple's notary service — the workflow header says as much — and
+  # there is no reason a Windows artifact should be held behind that. The cost
+  # is that both jobs may try to create the draft release; the create step below
+  # tolerates losing that race, so whichever finishes first creates it and the
+  # other uploads into it.
+  #
+  # There is no signing step and no installer. Windows code signing needs a
+  # certificate from a CA, which cannot be self-issued, so the artifact is an
+  # unsigned zip and SmartScreen will say so on first run. That is honest about
+  # what it is; a self-signed binary would look signed and warn anyway.
+  release-windows:
+    name: Windows x64 zip
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show
+          rustup target add x86_64-pc-windows-msvc
+
+      # Same layout and key style as the windows-check job in ci.yml, versioned
+      # separately so a release-only cache problem can be invalidated on its own.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-v1-${{ hashFiles('**/Cargo.lock') }}
+
+      # Same reasoning as the macOS job's version check: catch a tag that
+      # disagrees with Cargo.toml before paying for the build, not after.
+      - name: Verify tag matches Cargo.toml version
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' |
+                    Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($env:GITHUB_REF_NAME -ne "v$cargo") {
+            throw "tag $env:GITHUB_REF_NAME does not match Cargo.toml v$cargo"
+          }
+
+      # The bundle script builds, lays out dist/OxiMux, asserts the icon
+      # resource made it into the executable, and zips. Its assertions are the
+      # point: a Windows build that silently omits oximux-screen-gate.exe runs
+      # every agent chat unenforced and otherwise looks normal.
+      - name: Build and package
+        shell: pwsh
+        run: ./scripts/bundle-windows.ps1 -Target x86_64-pc-windows-msvc -Zip
+
+      - name: Upload zip to the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          if ($env:GITHUB_REF_TYPE -ne 'tag') {
+            $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' |
+                        Select-Object -First 1).Matches[0].Groups[1].Value
+            $tag = "v$version"
+          }
+          $zip = Get-ChildItem dist/OxiMux-*-windows-*.zip | Select-Object -First 1
+          if (-not $zip) { throw 'no zip in dist/ - did bundle-windows.ps1 run?' }
+
+          # `gh release view` failing means "not created yet". Creating it may
+          # still lose to the macOS job doing the same thing a second earlier,
+          # so the create is allowed to fail; the upload afterwards is what has
+          # to succeed.
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --draft --generate-notes --title $tag
+            if ($LASTEXITCODE -ne 0) { Write-Host 'release already created by another job' }
+          }
+          gh release upload $tag $zip.FullName --clobber
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed with exit code $LASTEXITCODE" }
+          Write-Host "uploaded $($zip.Name) to $tag"

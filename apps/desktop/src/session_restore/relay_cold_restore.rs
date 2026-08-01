@@ -88,7 +88,12 @@ pub struct ColdRestore {
 /// the same runtime dir the relay supervisor passes as the socket's
 /// parent (the daemon derives this exact path from its socket flag).
 pub fn default_checkpoints_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join("dev.nhtera.oximux").join("checkpoints"))
+    // Through `app_paths` so this really is the supervisor's runtime dir. It
+    // used to spell `dirs::data_dir()` itself, which on Windows is the roaming
+    // profile while the supervisor passes the local one — so this read a
+    // directory the daemon never wrote to, and cold restore reported "nothing
+    // to restore" for every pane instead of failing visibly.
+    crate::app_paths::data_dir().map(|d| d.join("checkpoints"))
 }
 
 /// Read and compose the cold restore for a dead PTY id. Returns `None`

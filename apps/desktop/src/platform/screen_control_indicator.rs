@@ -79,6 +79,13 @@ impl EscapeState {
 /// an indicator that says the wrong thing is worse than none.
 struct Wording {
     /// Next to the dot. Short: this sits in a bar competing with the clock.
+    ///
+    /// macOS only, and its absence elsewhere is a real difference rather than an
+    /// oversight: a notification-area icon has no text beside it, so on Windows
+    /// the only text surface is the tooltip and "which app" has to be read from
+    /// there. Kept on the shared type rather than cfg'd away so both platforms
+    /// derive their copy from one place and the strings stay tested once.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     title: String,
     /// Hover text, and the fallback for anyone who never opens the menu.
     tooltip: String,
@@ -203,9 +210,185 @@ mod imp {
     }
 }
 
+/// The Windows analogue: a notification-area icon carrying the same copy.
+///
+/// # Why the tray and not a window of our own
+///
+/// Same argument as the menu bar. The moment this has to work is the moment
+/// OxiMux is not what the user is looking at, so anything drawn in our own
+/// window is invisible exactly then. The notification area is the surface
+/// Windows itself uses for background-activity signals, and it survives another
+/// app being maximised.
+///
+/// # The honest weakness, which macOS does not have
+///
+/// Windows 10 and 11 hide newly-registered tray icons in the overflow flyout by
+/// default. A macOS status item is visible the moment it is created; this one
+/// may be one click away until the user drags it out. So this is a *weaker*
+/// indicator than the menu-bar dot, not an equal one, and it is the reason
+/// `docs/windows-port-exclusions.md` still records a gap here.
+///
+/// It is not nothing — the icon is present, the tooltip carries the full
+/// wording, and the overflow flyout itself lights up — but nobody should read
+/// this module as having closed the difference.
+///
+/// # No message loop
+///
+/// The icon is deliberately inert: no click handling, no menu, matching the
+/// macOS side where every row is disabled. Stopping an agent is Escape's job.
+/// That is what lets this work without pumping messages for the hidden window —
+/// nothing is ever delivered to it.
+#[cfg(windows)]
+mod imp {
+    use std::ptr::null_mut;
+
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::UI::Shell::{
+        NIF_ICON, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, HWND_MESSAGE, IDI_WARNING, LoadIconW,
+    };
+
+    use super::Wording;
+
+    /// The predefined `STATIC` class, rather than one registered for this.
+    ///
+    /// Registering a class would drag in `WNDCLASSW`, which windows-sys gates
+    /// behind the GDI feature for the sake of a background brush this window
+    /// will never paint. The window exists only to give the icon an owner and is
+    /// never shown, never painted, and never pumped, so a predefined class is
+    /// exactly as good and costs nothing.
+    const CLASS_NAME: &str = "STATIC";
+
+    /// `szTip` is a fixed 128-wide-char field, so the wording is truncated to
+    /// fit rather than being rejected outright — a shortened warning beats none.
+    const TIP_CAPACITY: usize = 127;
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    #[derive(Default)]
+    pub struct ScreenControlIndicator {
+        /// The hidden window owning the icon, and the last copy pushed to it.
+        /// Held for the same reason the macOS side holds its status item: there
+        /// is no "find my icon" call, and leaking one would leave a permanent
+        /// claim that an agent is driving when none is.
+        window: Option<HWND>,
+        showing: Option<Vec<String>>,
+    }
+
+    // SAFETY-adjacent: the HWND is created and destroyed on whichever thread
+    // drives this indicator and is never handed to another. `Send` is not
+    // derived and not needed.
+    impl ScreenControlIndicator {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        pub fn update(&mut self, driving: &super::Driving, escape: Option<super::EscapeState>) {
+            // Both guards must agree, exactly as on macOS: no escape state means
+            // nothing is being driven, and so does an idle `driving`. Either one
+            // is reason enough to take the icon away.
+            let (false, Some(escape)) = (driving.is_idle(), escape) else {
+                self.hide();
+                return;
+            };
+
+            let copy = Wording::for_driving(driving, escape);
+            if self.showing.as_ref() == Some(&copy.rows) {
+                return;
+            }
+
+            let existed = self.window.is_some();
+            let Some(window) = self.window.or_else(create_window) else {
+                // No window means no icon. Report it once rather than silently
+                // driving the screen with nothing on display.
+                tracing::warn!("could not create the screen-control indicator window");
+                return;
+            };
+            self.window = Some(window);
+
+            let mut data = notify_data(window);
+            data.uFlags = NIF_ICON | NIF_TIP;
+            data.hIcon = unsafe { LoadIconW(null_mut(), IDI_WARNING) };
+            for (slot, unit) in data
+                .szTip
+                .iter_mut()
+                .zip(wide(&copy.tooltip).into_iter().take(TIP_CAPACITY).chain(std::iter::once(0)))
+            {
+                *slot = unit;
+            }
+
+            let message = if existed { NIM_MODIFY } else { NIM_ADD };
+            if unsafe { Shell_NotifyIconW(message, &data) } == 0 {
+                // A failed ADD leaves nothing showing; drop the window so the
+                // next update retries from scratch rather than sending MODIFY
+                // for an icon that was never added.
+                if !existed {
+                    self.hide();
+                }
+                tracing::warn!("the screen-control indicator could not be shown");
+                return;
+            }
+
+            self.showing = Some(copy.rows);
+        }
+
+        pub fn hide(&mut self) {
+            if let Some(window) = self.window.take() {
+                let data = notify_data(window);
+                unsafe {
+                    Shell_NotifyIconW(NIM_DELETE, &data);
+                    DestroyWindow(window);
+                }
+            }
+            self.showing = None;
+        }
+    }
+
+    impl Drop for ScreenControlIndicator {
+        fn drop(&mut self) {
+            self.hide();
+        }
+    }
+
+    /// The icon's identity. One per window, so `uID` is a constant.
+    fn notify_data(window: HWND) -> NOTIFYICONDATAW {
+        let mut data: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+        data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        data.hWnd = window;
+        data.uID = 1;
+        data
+    }
+
+    /// A message-only window to own the icon. Never shown, never pumped.
+    fn create_window() -> Option<HWND> {
+        let class = wide(CLASS_NAME);
+        let window = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        };
+        (!window.is_null()).then_some(window)
+    }
+}
+
 /// Everywhere else the indicator is a no-op that still compiles, so callers do
 /// not grow `cfg` branches around a safety signal.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 mod imp {
     #[derive(Default)]
     pub struct ScreenControlIndicator;

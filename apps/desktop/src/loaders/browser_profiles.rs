@@ -13,8 +13,6 @@ use gpui::App;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Mirror of the other settings loaders' per-user data subdir.
-const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
 const FILE_NAME: &str = "browser_profiles.json";
 
 /// A named, isolated browser profile. `id`'s bytes are the data-store
@@ -49,7 +47,7 @@ impl BrowserProfiles {
 }
 
 fn settings_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join(APP_DATA_SUBDIR).join(FILE_NAME))
+    crate::app_paths::data_dir().map(|d| d.join(FILE_NAME))
 }
 
 fn load() -> BrowserProfiles {

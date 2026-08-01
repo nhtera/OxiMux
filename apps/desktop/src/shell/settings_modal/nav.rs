@@ -36,7 +36,12 @@ impl SettingsPane {
     /// The variant stays defined everywhere so navigation and the pane match
     /// keep one shape; it is simply not offered where screen control does not
     /// exist, rather than opening a pane that can only explain itself away.
-    #[cfg(target_os = "macos")]
+    ///
+    /// Offered on Windows too, though what it opens is a different pane. Screen
+    /// control is not available there, but the decision the pane exists for —
+    /// approving an unsigned driver binary — is real, has to be made before the
+    /// feature can ever be turned on, and has nowhere else to live.
+    #[cfg(any(target_os = "macos", windows))]
     pub(super) const ALL: [SettingsPane; 10] = [
         SettingsPane::Terminal,
         SettingsPane::Agents,
@@ -50,7 +55,7 @@ impl SettingsPane {
         SettingsPane::About,
     ];
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     pub(super) const ALL: [SettingsPane; 9] = [
         SettingsPane::Terminal,
         SettingsPane::Agents,

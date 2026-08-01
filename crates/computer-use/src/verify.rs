@@ -35,12 +35,12 @@
 //! it shipped `archive_sha256: None` and then skipped verification entirely.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use oximux_macos_trust::{SignaturePolicy, TrustError};
-use sha2::{Digest, Sha256};
 
 use crate::exec::run_bounded;
+use crate::trust::{Trust, TrustStore};
 use crate::version::Version;
 use crate::Error;
 
@@ -60,16 +60,36 @@ pub const MIN_VERSION: Version = Version::new(0, 12, 6);
 /// machine-wide daemon and a wedged one must not freeze the caller.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Why this binary is allowed to be handed to an agent.
+///
+/// Two anchors, and the difference is not cosmetic — it is the difference
+/// between "a certificate authority vouches for the publisher" and "the user
+/// vouched for these bytes". Modelled as an enum rather than optional fields so
+/// no caller can render a Windows driver as though a signature had been checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustBasis {
+    /// The OS vouched for the publisher: Developer ID signature, pinned team,
+    /// stapled notarization ticket.
+    Signature {
+        identifier: String,
+        team_id: String,
+        notarized: bool,
+    },
+    /// The user vouched for these exact bytes, and nothing vouches for the
+    /// publisher. See [`crate::trust`] for what that does and does not buy —
+    /// UI built on this must say "unverified publisher".
+    UserPinned { approved_at: SystemTime },
+}
+
 /// A driver that passed every check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedDriver {
     pub path: PathBuf,
     pub version: Version,
-    pub identifier: String,
-    pub team_id: String,
-    pub notarized: bool,
-    /// Audit trail, not a gate — see the module docs.
+    /// Audit trail under [`TrustBasis::Signature`]; the gate itself under
+    /// [`TrustBasis::UserPinned`], where it is the only identity there is.
     pub sha256: String,
+    pub basis: TrustBasis,
 }
 
 fn driver_policy() -> SignaturePolicy {
@@ -95,10 +115,60 @@ pub fn verify(path: &Path) -> Result<VerifiedDriver, Error> {
     Ok(VerifiedDriver {
         path: path.to_path_buf(),
         version,
-        identifier: signature.identifier,
-        team_id: signature.team_id,
-        notarized: signature.notarized,
-        sha256: sha256_of(path)?,
+        sha256: crate::trust::sha256_of(path)?,
+        basis: TrustBasis::Signature {
+            identifier: signature.identifier,
+            team_id: signature.team_id,
+            notarized: signature.notarized,
+        },
+    })
+}
+
+/// The Windows gate: run every check that does not need a publisher.
+///
+/// Ordering is load-bearing and is the reason this is not simply `verify` with
+/// a different first step. The trust verdict comes **before** the version read,
+/// because reading a version means executing the binary — and an unapproved
+/// binary must never be executed. See [`crate::trust`].
+///
+/// Compiled everywhere rather than gated to Windows so its tests run on every
+/// host; only [`crate::prepare`] differs by platform.
+pub fn verify_pinned(path: &Path, store: &TrustStore) -> Result<VerifiedDriver, Error> {
+    let (sha256, approved_at) = match store.evaluate(path)? {
+        Trust::Unapproved { sha256 } => {
+            return Err(Error::NotApproved {
+                path: path.to_path_buf(),
+                sha256,
+            })
+        }
+        Trust::Superseded {
+            approved, found, ..
+        } => {
+            return Err(Error::TrustSuperseded {
+                path: path.to_path_buf(),
+                approved,
+                found,
+            })
+        }
+        Trust::Approved {
+            sha256,
+            approved_at,
+        } => (sha256, approved_at),
+    };
+
+    let version = read_version(path)?;
+    if version < MIN_VERSION {
+        return Err(Error::DriverTooOld {
+            found: version,
+            minimum: MIN_VERSION,
+        });
+    }
+
+    Ok(VerifiedDriver {
+        path: path.to_path_buf(),
+        version,
+        sha256,
+        basis: TrustBasis::UserPinned { approved_at },
     })
 }
 
@@ -159,16 +229,6 @@ fn read_version(path: &Path) -> Result<Version, Error> {
     Version::parse_from_output(&raw).ok_or_else(|| Error::UnreadableVersion {
         output: raw.chars().take(200).collect(),
     })
-}
-
-fn sha256_of(path: &Path) -> Result<String, Error> {
-    let bytes = std::fs::read(path).map_err(|source| Error::Spawn {
-        program: path.display().to_string(),
-        source,
-    })?;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 #[cfg(test)]

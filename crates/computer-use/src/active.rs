@@ -266,7 +266,7 @@ mod tests {
         /// stdin is piped for the same reason from the other direction: `cat`
         /// with no argument reads stdin, and an inherited one is at EOF
         /// immediately. Holding the write end open is what keeps it blocked.
-        fn spawn(program: &str, args: &[&str]) -> Self {
+        fn spawn((program, args): (&str, &[&str])) -> Self {
             Self(
                 std::process::Command::new(program)
                     .args(args)
@@ -319,16 +319,17 @@ mod tests {
     #[test]
     fn a_granted_target_is_named_by_its_program() {
         let (_dir, table) = table();
-        let target = Target::spawn("/bin/sleep", &["120"]);
+        let target = Target::spawn(crate::fixtures::long_lived());
         driving_grant(&table, target.pid(), "chat-1");
 
         let driving = Driving::read(&table);
         assert!(!driving.is_idle());
         assert_eq!(driving.sessions.len(), 1);
         assert_eq!(driving.sessions[0].label, "chat-1");
-        assert_eq!(driving.sessions[0].controlling, vec!["sleep".to_string()]);
+        let named = crate::fixtures::long_lived_name();
+        assert_eq!(driving.sessions[0].controlling, vec![named.clone()]);
         assert!(driving.sessions[0].reading.is_empty(), "driving is not reading");
-        assert_eq!(driving.summary(), "An agent is controlling sleep");
+        assert_eq!(driving.summary(), format!("An agent is controlling {named}"));
     }
 
     #[test]
@@ -336,7 +337,7 @@ mod tests {
         // The detail list exists to disambiguate several agents. With one, it
         // would only restate the summary alongside an id nobody asked for.
         let (_dir, table) = table();
-        let target = Target::spawn("/bin/sleep", &["120"]);
+        let target = Target::spawn(crate::fixtures::long_lived());
         driving_grant(&table, target.pid(), "chat-1");
         assert!(!Driving::read(&table).is_idle(), "the agent must be driving for this to mean anything");
         assert!(Driving::read(&table).detail_lines().is_empty());
@@ -347,7 +348,7 @@ mod tests {
         // The parallelism premise: the user must be able to tell which of their
         // agents is doing what, and the list must not reshuffle on redraw.
         let (_dir, table) = table();
-        let (a, b) = (Target::spawn("/bin/sleep", &["120"]), Target::spawn("/bin/cat", &[]));
+        let (a, b) = (Target::spawn(crate::fixtures::long_lived()), Target::spawn(crate::fixtures::long_lived_alt()));
         driving_grant(&table, b.pid(), "chat-2");
         driving_grant(&table, a.pid(), "chat-1");
 
@@ -361,8 +362,8 @@ mod tests {
         assert_eq!(
             driving.detail_lines(),
             vec![
-                "chat-1 — controlling sleep".to_string(),
-                "chat-2 — controlling cat".to_string()
+                format!("chat-1 — controlling {}", crate::fixtures::long_lived_name()),
+                format!("chat-2 — controlling {}", crate::fixtures::long_lived_alt_name()),
             ]
         );
         assert!(driving.summary().starts_with("2 agents are controlling"));
@@ -373,7 +374,7 @@ mod tests {
         // Nothing is being driven through a process that no longer exists, so
         // reporting it would overstate what is happening.
         let (_dir, table) = table();
-        let target = Target::spawn("/bin/sleep", &["120"]);
+        let target = Target::spawn(crate::fixtures::long_lived());
         let pid = target.pid();
         driving_grant(&table, pid, "chat-1");
         assert!(!Driving::read(&table).is_idle(), "must be driving before the pid dies");
@@ -390,7 +391,7 @@ mod tests {
         // it is driving, hold the Escape tap armed, and swallow the key
         // machine-wide until the tab was closed.
         let (_dir, table) = table();
-        let target = Target::spawn("/bin/sleep", &["120"]);
+        let target = Target::spawn(crate::fixtures::long_lived());
         table.grant(target.pid(), &SessionId::for_agent("chat-1"));
 
         assert!(Driving::read(&table).is_idle());
@@ -403,7 +404,7 @@ mod tests {
         // drives the same target without a second consent card. Only the claim
         // that something is happening right now goes away.
         let (_dir, table) = table();
-        let target = Target::spawn("/bin/sleep", &["120"]);
+        let target = Target::spawn(crate::fixtures::long_lived());
         let session = SessionId::for_agent("chat-1");
         driving_grant(&table, target.pid(), "chat-1");
         assert!(!Driving::read(&table).is_idle());
@@ -428,14 +429,15 @@ mod tests {
         // be a louder claim than the truth, and the indicator's usefulness rests
         // on it never overstating.
         let (_dir, table) = table();
-        let target = Target::spawn("/bin/sleep", &["120"]);
+        let target = Target::spawn(crate::fixtures::long_lived());
         table.note_capture(Some(target.pid()), &SessionId::for_agent("chat-1"));
 
         let driving = Driving::read(&table);
         assert!(!driving.is_idle(), "a capture is not nothing");
+        let named = crate::fixtures::long_lived_name();
         assert!(driving.sessions[0].controlling.is_empty());
-        assert_eq!(driving.sessions[0].reading, vec!["sleep".to_string()]);
-        assert_eq!(driving.summary(), "An agent is reading sleep");
+        assert_eq!(driving.sessions[0].reading, vec![named.clone()]);
+        assert_eq!(driving.summary(), format!("An agent is reading {named}"));
     }
 
     #[test]
@@ -456,15 +458,24 @@ mod tests {
         // The common shape of a real run: the agent photographs a window to find
         // its buttons, then clicks a different app it was granted.
         let (_dir, table) = table();
-        let (driven, read) = (Target::spawn("/bin/sleep", &["120"]), Target::spawn("/bin/cat", &[]));
+        let (driven, read) = (Target::spawn(crate::fixtures::long_lived()), Target::spawn(crate::fixtures::long_lived_alt()));
         driving_grant(&table, driven.pid(), "chat-1");
         table.note_capture(Some(read.pid()), &SessionId::for_agent("chat-1"));
 
+        let (driven_name, read_name) = (
+            crate::fixtures::long_lived_name(),
+            crate::fixtures::long_lived_alt_name(),
+        );
         let driving = Driving::read(&table);
-        assert_eq!(driving.summary(), "An agent is controlling sleep and reading cat");
+        assert_eq!(
+            driving.summary(),
+            format!("An agent is controlling {driven_name} and reading {read_name}")
+        );
         assert_eq!(
             driving.detail_lines(),
-            vec!["chat-1 — controlling sleep, reading cat".to_string()],
+            vec![format!(
+                "chat-1 — controlling {driven_name}, reading {read_name}"
+            )],
             "one agent doing both is exactly when a single summary line cannot carry it"
         );
     }
@@ -475,14 +486,15 @@ mod tests {
         // routinely both. Listing it twice would double-count it in the title
         // and read as two separate things happening.
         let (_dir, table) = table();
-        let target = Target::spawn("/bin/sleep", &["120"]);
+        let target = Target::spawn(crate::fixtures::long_lived());
         driving_grant(&table, target.pid(), "chat-1");
         table.note_capture(Some(target.pid()), &SessionId::for_agent("chat-1"));
 
         let driving = Driving::read(&table);
-        assert_eq!(driving.sessions[0].controlling, vec!["sleep".to_string()]);
+        let named = crate::fixtures::long_lived_name();
+        assert_eq!(driving.sessions[0].controlling, vec![named.clone()]);
         assert!(driving.sessions[0].reading.is_empty(), "the stronger claim wins");
-        assert_eq!(driving.distinct_apps(), vec!["sleep"], "and it counts once");
+        assert_eq!(driving.distinct_apps(), vec![named], "and it counts once");
     }
 
     #[test]
@@ -491,7 +503,7 @@ mod tests {
         // times. The first to finish must not take the indicator — or the kill
         // switch — down with it while the second is still clicking.
         let (_dir, table) = table();
-        let (a, b) = (Target::spawn("/bin/sleep", &["120"]), Target::spawn("/bin/cat", &[]));
+        let (a, b) = (Target::spawn(crate::fixtures::long_lived()), Target::spawn(crate::fixtures::long_lived_alt()));
         driving_grant(&table, a.pid(), "chat-1");
         driving_grant(&table, b.pid(), "chat-2");
 

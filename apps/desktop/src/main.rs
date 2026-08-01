@@ -10,6 +10,17 @@
 //! then runtime — is intentional: GPUI returns from `app.run`, the guard
 //! exits the runtime, then the runtime itself shuts down gracefully.
 
+// Windows decides at link time whether a process gets a console, and there is
+// no way to ask for one later that does not flash an empty black window first.
+// A released build must not: double-clicking OxiMux would open a console behind
+// it that stays for the session and closes the app when closed.
+//
+// Debug builds keep the console on purpose. It is where `tracing` goes, and the
+// subsystem is the difference between `cargo run` printing logs and printing
+// nothing at all. Release builds lose stdout entirely — anything that must
+// survive a packaged run has to reach a file or the event log, not `eprintln!`.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
@@ -43,6 +54,22 @@ const DB_FILE_NAME: &str = "oximux.db";
 
 fn main() {
     init_tracing();
+
+    // Before anything resolves a data path: seven modules used to pick their
+    // own directory, which on Windows put them in the roaming profile while
+    // the rest of the app used the local one. They now all go through
+    // `app_paths`, so whatever those builds already wrote has to be adopted
+    // or it is simply abandoned — including the screen-control grant store.
+    // Move-if-absent, so this is a no-op on every platform where the two
+    // directories were the same and on every run after the first.
+    let adopted = oximux_app::app_paths::migrate_legacy_data();
+    if !adopted.is_empty() {
+        tracing::info!(
+            count = adopted.len(),
+            files = ?adopted,
+            "adopted app data left in the legacy roaming directory"
+        );
+    }
 
     // Before the runtime, and before anything spawns: launched from inside a
     // Claude Code session, the process inherits session markers that make
@@ -305,12 +332,19 @@ fn main() {
         // performed the upgrade; the settings install itself still has to run.
         #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
         let upgraded_this_boot = oximux_app::auto_update_settings::install(cx);
-        // The menu-bar indicator that appears while an agent can drive the
-        // screen. Watches the grant table rather than the approval path,
-        // because the enforcement hook grants from its own process — see the
-        // module docs. Idle cost is one `metadata()` call per second.
-        #[cfg(target_os = "macos")]
-        oximux_app::agent_glue::screen_control_watch::install(cx);
+        // The indicator that appears while an agent can drive the screen — a
+        // menu-bar item on macOS, a notification-area icon on Windows. Watches
+        // the grant table rather than the approval path, because the
+        // enforcement hook grants from its own process — see the module docs.
+        // Idle cost is one `metadata()` call per second.
+        //
+        // Unconditional on purpose. This line carried its own copy of the
+        // platform predicate, and when screen control was turned on for Windows
+        // only the module's copy was updated — so the tray code was compiled,
+        // correct, and never called, and an agent drove the screen with nothing
+        // on display saying so. Nothing failed, which is why it survived a full
+        // test run. The predicate now lives once, beside the module.
+        oximux_app::agent_glue::install_screen_control_watch(cx);
         // Resolve the reduced-motion preference once and install the Motion
         // global before any window opens, so the first animated surface reads
         // the right durations.

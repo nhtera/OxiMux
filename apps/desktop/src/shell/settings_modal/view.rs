@@ -13,7 +13,7 @@ use super::{
     CARD_HEIGHT, CARD_WIDTH, SettingsModal, SettingsPane, layout, nav, pane_about, pane_agents,
     pane_keybindings, pane_notifications, pane_remote, pane_schedules, pane_terminal, pane_voice,
 };
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use super::pane_computer_use;
 
 /// Drag payload marker for the title-bar move gesture. Mirrors the floating
@@ -54,7 +54,7 @@ impl SettingsModal {
                     SettingsPane::Voice.label(),
                     pane_voice::entries(self, theme, density, typography, cx),
                 ),
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", windows))]
                 (
                     SettingsPane::ScreenControl.label(),
                     pane_computer_use::entries(self, theme, density, typography, cx),
@@ -90,12 +90,12 @@ impl SettingsModal {
             SettingsPane::Terminal => pane_terminal::render(self, theme, density, typography, cx),
             SettingsPane::Agents => pane_agents::render(self, theme, density, typography, cx),
             SettingsPane::Voice => pane_voice::render(self, theme, density, typography, cx),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             SettingsPane::ScreenControl => {
                 pane_computer_use::render(self, theme, density, typography, cx)
             }
             // Not reachable: the pane is absent from `SettingsPane::ALL` here.
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", windows)))]
             SettingsPane::ScreenControl => gpui::div().into_any_element(),
             SettingsPane::Notifications => {
                 pane_notifications::render(self, theme, density, typography, cx)

@@ -20,16 +20,44 @@
 //! other* chat's grants — which a per-process table structurally cannot do once
 //! a second process is asking.
 //!
-//! So the store is a small JSON file guarded by `flock`, following the same
-//! idiom as the app's single-instance guard. `flock` attaches to the open file
-//! *description*, so a second open within one process contends exactly like a
-//! second process — which is what makes the concurrency here testable without
-//! spawning anything.
+//! So the store is a small JSON file guarded by a whole-file exclusive lock,
+//! taken through `fd-lock` — the same crate as the app's single-instance
+//! guard, which this module was already written to mirror. That is `flock` on
+//! unix and `LockFileEx` on Windows. The lock attaches to the open file
+//! *description* (unix) / handle (Windows), so a second open within one
+//! process contends exactly like a second process — which is what makes the
+//! concurrency here testable without spawning anything.
+//!
+//! # One Windows difference that does not bite, and one that does
+//!
+//! Windows byte-range locks are **mandatory**, not advisory: while a holder's
+//! lock is live, access through any *other* handle fails outright. The app's
+//! single-instance guard was bitten by this and records it at
+//! `platform::single_instance::pid_path_for`.
+//!
+//! It is harmless here because every read and write goes through
+//! [`GrantTable::with_locked`], on the same handle that holds the lock — the
+//! lock owner is never denied its own region. If anything is ever added that
+//! reads this file without taking the lock, it will work on macOS and fail on
+//! Windows, which is the worst way round to find out.
+//!
+//! What does differ is the *reasoning* behind [`GrantTable::clear`]'s unlink
+//! fallback, though not its outcome. "Unlinking needs permission on the
+//! directory, not the file" is POSIX; `DeleteFileW` refuses outright while
+//! `FILE_ATTRIBUTE_READONLY` is set. The fallback still works because
+//! `std::fs::remove_file` clears that attribute first, deliberately matching
+//! Unix — so on Windows the guarantee rests on a library promise rather than
+//! an OS one. Pinned by `a_read_only_store_is_still_cleared_on_windows`.
+//!
+//! The genuinely different case is a store another process holds open, which
+//! Windows refuses to delete without `FILE_SHARE_DELETE` and Rust does not
+//! request. The lock makes this rare — a concurrent holder is normally waited
+//! out rather than raced — but unlike the read-only case there is no library
+//! guarantee papering over it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -507,22 +535,22 @@ impl GrantTable {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&self.path)?;
 
-        // SAFETY: a thin libc call on a descriptor we own and keep open for the
-        // call's duration. Blocking rather than `LOCK_NB`: the critical section
-        // is one small read-modify-write, and a caller that gave up on
-        // contention would have to fail open or fail closed, both worse than
-        // waiting microseconds.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let _unlock = FlockGuard(file.as_raw_fd());
+        // Blocking rather than `try_write`: the critical section is one small
+        // read-modify-write, and a caller that gave up on contention would have
+        // to fail open or fail closed, both worse than waiting microseconds.
+        //
+        // The guard both holds the lock and derefs to the `File`, so every
+        // access below is on the handle that owns the lock — which is what
+        // keeps this correct under Windows' mandatory byte-range locks.
+        let mut lock = fd_lock::RwLock::new(file);
+        let mut file = lock.write()?;
 
         let mut raw = String::new();
         file.read_to_string(&mut raw)?;
@@ -543,19 +571,6 @@ impl GrantTable {
             file.flush()?;
         }
         Ok(outcome)
-    }
-}
-
-/// Releases the `flock` on scope exit. Closing the descriptor would do it too,
-/// but unlocking explicitly keeps it next to the lock — and holding the raw fd
-/// rather than a `&File` leaves the file itself free to be read and written.
-struct FlockGuard(std::os::fd::RawFd);
-
-impl Drop for FlockGuard {
-    fn drop(&mut self) {
-        // SAFETY: same descriptor we locked. The `File` outlives this guard, so
-        // the fd is still open.
-        unsafe { libc::flock(self.0, libc::LOCK_UN) };
     }
 }
 
@@ -710,7 +725,7 @@ mod tests {
         // the granted process exited and its number was handed to another.
         let (_dir, table) = table();
         let a = agent("a");
-        table.seed(live_pid(), &a, Path::new("/usr/bin/true"));
+        table.seed(live_pid(), &a, Path::new(crate::fixtures::some_executable()));
         assert!(matches!(
             table.check(live_pid(), &a),
             Verdict::Recycled { .. }
@@ -722,7 +737,7 @@ mod tests {
         let (_dir, table) = table();
         let (a, b) = (agent("a"), agent("b"));
         table.grant(live_pid(), &a);
-        table.seed(999_001, &b, Path::new("/usr/bin/true"));
+        table.seed(999_001, &b, Path::new(crate::fixtures::some_executable()));
 
         table.release_all(&a);
         assert!(table.granted_to(&a).is_empty());
@@ -805,13 +820,17 @@ mod tests {
         let (_dir, table) = table();
         let (a, b) = (agent("a"), agent("b"));
         table.grant(live_pid(), &a);
-        table.seed(999_001, &b, Path::new("/usr/bin/true"));
+        table.seed(999_001, &b, Path::new(crate::fixtures::some_executable()));
 
         assert!(table.clear());
         assert!(table.granted_to(&a).is_empty());
         assert!(table.granted_to(&b).is_empty());
     }
 
+    // `target_os = "macos"` rather than `unix`: the `geteuid` check below needs
+    // `libc`, which is now declared only for macOS. The Windows restatement is
+    // `a_read_only_store_is_still_cleared_on_windows`.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_store_that_cannot_be_rewritten_is_removed_instead() {
         // The failure that matters, because the startup clear is what stops the
@@ -834,6 +853,45 @@ mod tests {
         )
         .expect("seed a store from a previous run");
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+
+        let table = GrantTable::at(&path);
+        assert!(table.clear(), "removal is the fallback, not giving up");
+        assert!(
+            !path.exists(),
+            "a store that cannot be emptied must not be left holding grants"
+        );
+        // And the store recovers: the next write recreates it.
+        assert_eq!(table.grant(live_pid(), &agent("a")), Verdict::Granted);
+    }
+
+    /// The Windows restatement of the test above — and the guarantee holds,
+    /// for a reason worth writing down because it is not obvious.
+    ///
+    /// The fallback's stated reasoning is POSIX: unlinking needs permission on
+    /// the *directory* rather than the file. That argument does not transfer —
+    /// `DeleteFileW` refuses outright while `FILE_ATTRIBUTE_READONLY` is set.
+    ///
+    /// It works anyway because `std::fs::remove_file` has cleared the read-only
+    /// attribute before deleting since Rust 1.77, specifically to match Unix
+    /// semantics. So the *conclusion* ports even though the reasoning does not,
+    /// and it ports by standing on a library guarantee rather than an OS one.
+    ///
+    /// Measured rather than assumed: an earlier version of this test asserted
+    /// the opposite and failed.
+    #[cfg(windows)]
+    #[test]
+    fn a_read_only_store_is_still_cleared_on_windows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(GRANTS_FILE_NAME);
+        std::fs::write(
+            &path,
+            r#"{"4242":{"owner":"oximux-chat-1","executable":"C:\\Windows\\System32\\cmd.exe"}}"#,
+        )
+        .expect("seed a store from a previous run");
+
+        let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).expect("mark read-only");
 
         let table = GrantTable::at(&path);
         assert!(table.clear(), "removal is the fallback, not giving up");
@@ -1103,6 +1161,19 @@ mod tests {
         assert!(!prov.built_this_session(&path));
     }
 
+    /// Unix-only for its *fixture*, not its subject.
+    ///
+    /// `std::os::windows::fs::symlink_file` needs `SeCreateSymbolicLinkPrivilege`
+    /// or Developer Mode, so an unprivileged CI box cannot build the link this
+    /// arranges. `crates/settings/src/computer_use.rs` hit the same wall and
+    /// works around it with `mklink /J` directory junctions.
+    ///
+    /// The property being tested — that canonicalization sees through a link
+    /// before the containment check — matters at least as much on Windows,
+    /// where discovery deliberately resolves junctions. It is left uncovered
+    /// here rather than quietly assumed: Phase 4 owns app identity and should
+    /// restate this with a junctioned-directory fixture.
+    #[cfg(unix)]
     #[test]
     fn a_symlink_pointing_out_of_the_worktree_is_refused() {
         let (dir, started) = provenance_fixture();

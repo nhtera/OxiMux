@@ -18,14 +18,14 @@ mod background_tasks_panel;
 mod bubble;
 mod companion_sync;
 mod composer;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) mod computer_use;
 // Where computer use does not exist, these three keep their names and answer
 // accordingly — see the module's own header for why that beats cfg-ing ~35
 // call sites through the transcript renderer.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 mod screen_control_absent;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 use screen_control_absent::{computer_use, screen_card, screen_consent};
 mod composer_history;
 mod acp_terminal_host;
@@ -52,9 +52,9 @@ mod remote_turn;
 mod turn_summary_card;
 mod rewind_menu;
 mod session_persistence;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod screen_card;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod screen_consent;
 mod session_detail;
 mod roster;

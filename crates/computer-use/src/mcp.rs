@@ -20,6 +20,11 @@ pub use oximux_agent_core::screen_tools::{
     bare_tool_name, is_computer_use_tool, tool_prefix, SERVER_NAME,
 };
 
+// Read only by `server_spec`, and only in its non-Windows arm: the advisory
+// host label describes a macOS permission grant that has no Windows analogue.
+// The constant itself stays defined for every platform — it is also the
+// never-drive identity, which is meaningful regardless.
+#[cfg(not(windows))]
 use crate::HOST_BUNDLE_ID;
 
 /// Build the server declaration for a verified driver.
@@ -33,12 +38,43 @@ use crate::HOST_BUNDLE_ID;
 ///   for a screenshot-shaped one matching an agent's *native* computer-use
 ///   tools. Agent Chat cannot use those anyway, and the standard surface is the
 ///   one with the accessibility-tree paths that work on background windows.
+///
+/// # Not available on Windows yet
+///
+/// Gated behind the `windows-screen-control` feature, because this is the
+/// function that constitutes a screen-driving capability: its return value is
+/// handed to a spawned agent.
+///
+/// The safety pair `docs/windows-port-exclusions.md` demanded — the
+/// `gui_scripting` brake and the Escape kill switch — has landed. What is still
+/// missing is the *trust* gate: the published Windows driver binaries are
+/// unsigned, so [`crate::verify`] has nothing to check and this would declare
+/// an unverified third-party binary to an agent. See the crate docs.
+///
+/// A direct caller on Windows gets a "cannot find function" error rather than a
+/// working driver declaration. See [`declaration`] for the same rule applied to
+/// the path callers are actually meant to use.
+#[cfg(any(not(windows), feature = "windows-screen-control"))]
 pub fn server_spec(driver: &Path) -> McpServerSpec {
-    McpServerSpec::new(SERVER_NAME, driver.display().to_string()).args(vec![
+    // `--host-bundle-id` is an advisory label the driver echoes back in
+    // `check_permissions` output, and `permissions` is documented "(macOS)" —
+    // there is no grant on Windows for it to describe. Confirmed against the
+    // driver's own manifest, which recommends a bare `["mcp"]` there:
+    //
+    //   cua-driver manifest -p  ->  "mcp_invocation": { "args": ["mcp"] }
+    //
+    // `HOST_BUNDLE_ID` itself stays meaningful on every platform — it is also
+    // the identity an agent may never drive (see [`crate::blocked`]).
+    #[cfg(windows)]
+    let args = vec!["mcp".to_string()];
+    #[cfg(not(windows))]
+    let args = vec![
         "mcp".to_string(),
         "--host-bundle-id".to_string(),
         HOST_BUNDLE_ID.to_string(),
-    ])
+    ];
+
+    McpServerSpec::new(SERVER_NAME, driver.display().to_string()).args(args)
 }
 
 /// Everything a chat must be given in order to have screen control.
@@ -110,6 +146,21 @@ pub struct HookSpec<'a> {
 /// screen-control tools — it still gets the hook, for the reason on
 /// [`Declaration::server`].
 pub fn declaration(driver: Option<&Path>, hook: &HookSpec<'_>) -> Declaration {
+    // Windows may not reach a screen-control tool while the driver it would
+    // reach is unverifiable, so every chat is treated as a chat with no driver:
+    // no server, and no deny list naming tools that are not there.
+    //
+    // The hook below is still built and still installed — that is the whole
+    // point, and the reason this degrades rather than refusing to compile. A
+    // Windows build gets the policing hook on every chat before it gets any
+    // screen control at all, which is the safe order and the one
+    // `docs/windows-port-exclusions.md` asks for.
+    #[cfg(all(windows, not(feature = "windows-screen-control")))]
+    let driver: Option<&Path> = {
+        let _ = driver;
+        None
+    };
+
     let mut command = format!(
         "{} --chat {} --grants {} --host-exe {}",
         shell_quote(&hook.command.display().to_string()),
@@ -139,7 +190,12 @@ pub fn declaration(driver: Option<&Path>, hook: &HookSpec<'_>) -> Declaration {
     .to_string();
 
     Declaration {
+        #[cfg(any(not(windows), feature = "windows-screen-control"))]
         server: driver.map(server_spec),
+        // `driver` is unconditionally `None` here, but `server_spec` does not
+        // exist to name at all, so the field is built rather than mapped.
+        #[cfg(all(windows, not(feature = "windows-screen-control")))]
+        server: None,
         disallowed_tools: driver
             .map(|_| {
                 crate::tools::forbidden_names()
@@ -181,15 +237,96 @@ pub fn hook_matcher() -> String {
 /// Paths here come from the user's filesystem — a worktree with a space or an
 /// apostrophe would otherwise split into extra arguments and the gate would
 /// reject its own command line, silently leaving the chat unenforced.
+#[cfg(not(windows))]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// Quote a value for a Windows command line.
+///
+/// # Why the POSIX form is not merely suboptimal here but broken
+///
+/// Single quotes mean nothing to `cmd.exe`. Handed
+/// `'C:\Program Files\OxiMux\oximux-screen-gate.exe'` it would look for a
+/// program named `'C:\Program` and fail — and the paths this quotes are
+/// `%LOCALAPPDATA%`- and `C:\Program Files`-shaped, so the case with a space in
+/// it is the *normal* one rather than the edge case it is on macOS.
+///
+/// A hook command that cannot run is the worst failure mode this crate has: the
+/// chat proceeds, the gate never executes, and nothing reports that the policy
+/// stopped being enforced.
+///
+/// # The rules being implemented
+///
+/// `CommandLineToArgvW`, which is what the gate's own argv parsing goes
+/// through:
+///
+/// - a run of backslashes followed by `"` — each backslash escapes the next, so
+///   they must be doubled and the quote escaped;
+/// - a run of backslashes at the end of the value — doubled, or they would
+///   escape the closing quote and swallow it. `C:\repo\` is an ordinary path
+///   and would otherwise produce `"C:\repo\"`;
+/// - backslashes anywhere else — literal, and left alone.
+///
+/// # What this does not fix
+///
+/// `cmd.exe` expands `%NAME%` *inside* double quotes, so a path containing a
+/// percent-delimited run that happens to match a defined environment variable
+/// is still rewritten before the gate sees it. There is no escape for that on a
+/// `cmd /c` command line — only a batch file has `%%` — so it is recorded
+/// rather than handled. Percent signs are legal but rare in Windows paths, and
+/// both delimiters must be present and the name must resolve.
+#[cfg(windows)]
+fn shell_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+
+    let mut backslashes = 0usize;
+    for ch in value.chars() {
+        match ch {
+            '\\' => {
+                backslashes += 1;
+                quoted.push(ch);
+            }
+            '"' => {
+                // Every pending backslash is about to precede a quote, so each
+                // one needs its own escape, and then the quote needs one.
+                for _ in 0..backslashes {
+                    quoted.push('\\');
+                }
+                backslashes = 0;
+                quoted.push('\\');
+                quoted.push('"');
+            }
+            _ => {
+                backslashes = 0;
+                quoted.push(ch);
+            }
+        }
+    }
+    // Trailing run: double it so the closing quote stays a closing quote.
+    for _ in 0..backslashes {
+        quoted.push('\\');
+    }
+
+    quoted.push('"');
+    quoted
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(not(windows), feature = "windows-screen-control"))]
     use oximux_agent_core::thread::to_claude_mcp_config;
 
+    /// Tests of what a chat *with* a driver is handed.
+    ///
+    /// Gated off on Windows for the same reason the code is: there is no
+    /// `server_spec` to call, and a declaration there never carries a server.
+    /// The Windows counterpart is
+    /// `the_windows_gate_withholds_the_driver_but_not_the_hook`, which asserts
+    /// exactly that.
+    #[cfg(any(not(windows), feature = "windows-screen-control"))]
     #[test]
     fn spec_invokes_the_driver_in_mcp_mode() {
         let spec = server_spec(Path::new("/Applications/CuaDriver.app/Contents/MacOS/cua-driver"));
@@ -201,6 +338,34 @@ mod tests {
         assert_eq!(spec.args[0], "mcp");
     }
 
+    /// The argv difference Phase 0 measured against the driver's own manifest.
+    ///
+    /// Windows gets a bare `["mcp"]`; macOS additionally carries the advisory
+    /// host label. Asserted per-platform in one test rather than two so the
+    /// contrast is visible — the risk here is not getting one wrong, it is
+    /// changing one and forgetting the other exists.
+    #[cfg(any(not(windows), feature = "windows-screen-control"))]
+    #[test]
+    fn the_host_bundle_label_is_macos_only() {
+        let spec = server_spec(Path::new("/bin/cua-driver"));
+        assert_eq!(spec.args[0], "mcp");
+
+        #[cfg(windows)]
+        assert_eq!(
+            spec.args,
+            vec!["mcp".to_string()],
+            "`permissions` is macOS-only, so there is no grant for the label to \
+             describe — the driver's own manifest recommends a bare `mcp`"
+        );
+
+        #[cfg(not(windows))]
+        {
+            assert!(spec.args.iter().any(|a| a == "--host-bundle-id"));
+            assert!(spec.args.iter().any(|a| a == HOST_BUNDLE_ID));
+        }
+    }
+
+    #[cfg(any(not(windows), feature = "windows-screen-control"))]
     #[test]
     fn spec_omits_socket_and_compat_flags() {
         // Both would change which daemon or which tool surface the agent gets.
@@ -214,6 +379,7 @@ mod tests {
         );
     }
 
+    #[cfg(any(not(windows), feature = "windows-screen-control"))]
     #[test]
     fn spec_renders_into_the_agent_config_payload() {
         // End-to-end through the injection seam: what an agent is handed.
@@ -250,17 +416,133 @@ mod tests {
         assert_eq!(entry["matcher"], hook_matcher());
         let command = entry["hooks"][0]["command"].as_str().expect("command");
         assert!(command.contains("oximux-screen-gate"), "{command}");
-        assert!(command.contains("--chat 'chat-7'"), "{command}");
-        assert!(command.contains("--grants '/data/grants.json'"), "{command}");
+        assert!(command.contains(&format!("--chat {}", shell_quote("chat-7"))), "{command}");
+        assert!(
+            command.contains(&format!("--grants {}", shell_quote("/data/grants.json"))),
+            "{command}"
+        );
         assert!(command.contains("--since 1700000000"), "{command}");
         // Without this the gate cannot tell that a call is aimed at OxiMux,
         // because it is a different binary and `current_exe()` names itself.
         assert!(
-            command.contains("--host-exe '/Applications/OxiMux.app/Contents/MacOS/oximux'"),
+            command.contains(&format!(
+                "--host-exe {}",
+                shell_quote("/Applications/OxiMux.app/Contents/MacOS/oximux")
+            )),
             "{command}"
         );
     }
 
+    /// Windows quoting, which is a different algorithm rather than a different
+    /// quote character — see [`shell_quote`].
+    #[cfg(windows)]
+    #[test]
+    fn hook_paths_survive_windows_quoting() {
+        let declared = declaration(
+            None,
+            &HookSpec {
+                command: Path::new(r"C:\Program Files\OxiMux\oximux-screen-gate.exe"),
+                chat: "chat-1",
+                grants: Path::new(r"C:\Users\u\AppData\Roaming\OxiMux\grants.json"),
+                host: Path::new(r"C:\Program Files\OxiMux\oximux.exe"),
+                // A worktree at a drive-relative root, so the value ends in a
+                // backslash — the case that silently eats the closing quote.
+                worktree: Some(Path::new(r"C:\repo\")),
+                started_at: None,
+            },
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&declared.hook_settings).expect("valid json");
+        let command = v["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("command");
+
+        // Double quotes, because `cmd` does not know what a single quote is.
+        assert!(
+            command.contains(r#""C:\Program Files\OxiMux\oximux-screen-gate.exe""#),
+            "{command}"
+        );
+        assert!(!command.contains('\''), "no POSIX quoting: {command}");
+
+        // The trailing backslash is doubled, so the quote still closes.
+        assert!(command.contains(r#""C:\repo\\""#), "{command}");
+
+        // And the whole thing still splits back into the arguments the gate
+        // expects — the property all of the above is in service of.
+        let args = split_windows_command_line(command);
+        assert!(
+            args.contains(&r"C:\repo\".to_string()),
+            "worktree did not round-trip: {args:?}"
+        );
+        assert!(
+            args.contains(&r"C:\Program Files\OxiMux\oximux.exe".to_string()),
+            "host exe did not round-trip: {args:?}"
+        );
+    }
+
+    /// A minimal `CommandLineToArgvW`, so the quoting test asserts a
+    /// round-trip rather than a spelling.
+    ///
+    /// Written out rather than calling the real API because the point is to
+    /// check `shell_quote` against the documented rules, and a test that used
+    /// the same Windows call the quoting was derived from could agree with it
+    /// while both were wrong.
+    #[cfg(windows)]
+    fn split_windows_command_line(line: &str) -> Vec<String> {
+        let mut args = Vec::new();
+        let mut current = String::new();
+        let mut in_quotes = false;
+        let mut backslashes = 0usize;
+        let mut started = false;
+
+        let flush_backslashes = |current: &mut String, backslashes: &mut usize| {
+            for _ in 0..*backslashes {
+                current.push('\\');
+            }
+            *backslashes = 0;
+        };
+
+        for ch in line.chars() {
+            match ch {
+                '\\' => {
+                    backslashes += 1;
+                    started = true;
+                }
+                '"' => {
+                    // Pairs of backslashes are literal; an odd one escapes.
+                    for _ in 0..backslashes / 2 {
+                        current.push('\\');
+                    }
+                    if backslashes % 2 == 1 {
+                        current.push('"');
+                    } else {
+                        in_quotes = !in_quotes;
+                    }
+                    backslashes = 0;
+                    started = true;
+                }
+                ' ' if !in_quotes => {
+                    flush_backslashes(&mut current, &mut backslashes);
+                    if started {
+                        args.push(std::mem::take(&mut current));
+                        started = false;
+                    }
+                }
+                _ => {
+                    flush_backslashes(&mut current, &mut backslashes);
+                    current.push(ch);
+                    started = true;
+                }
+            }
+        }
+        flush_backslashes(&mut current, &mut backslashes);
+        if started {
+            args.push(current);
+        }
+        args
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn hook_paths_survive_a_space_or_an_apostrophe() {
         // A worktree under "~/My Projects" would otherwise split into extra
@@ -288,6 +570,7 @@ mod tests {
         assert!(command.contains(r"'/Users/x/it'\''s mine'"), "{command}");
     }
 
+    #[cfg(any(not(windows), feature = "windows-screen-control"))]
     #[test]
     fn the_declaration_denies_the_tools_the_policy_forbids() {
         let declared = declared();
@@ -311,6 +594,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(not(windows), feature = "windows-screen-control"))]
     #[test]
     fn the_declaration_leaves_the_working_tools_alone() {
         // Denying these would break the feature rather than protect it.
@@ -355,7 +639,60 @@ mod tests {
             .as_str()
             .expect("command");
         assert!(command.contains("oximux-screen-gate"), "{command}");
-        assert!(command.contains("--chat 'chat-7'"), "{command}");
+        assert!(
+            command.contains(&format!("--chat {}", shell_quote("chat-7"))),
+            "{command}"
+        );
+    }
+
+    /// The Windows exclusion, asserted rather than assumed.
+    ///
+    /// `docs/windows-port-exclusions.md` requires the policing hook to ship in
+    /// the same change as any screen-driving capability, and observes that
+    /// "nothing in the compiler would say so". This is the runtime half of
+    /// making it say so: a caller that passes a perfectly good driver path —
+    /// the mistake this is guarding against — gets no server and no tool names
+    /// back, and still gets the hook.
+    ///
+    /// Deleting this test is as much a decision as deleting the `cfg`s, which
+    /// is the point. It fails the moment Windows can declare the driver, so
+    /// Phase 5 has to come back here deliberately.
+    #[cfg(all(windows, not(feature = "windows-screen-control")))]
+    #[test]
+    fn the_windows_gate_withholds_the_driver_but_not_the_hook() {
+        let declared = declaration(
+            Some(Path::new(r"C:\Users\u\AppData\Local\Programs\Cua\bin\cua-driver.exe")),
+            &HookSpec {
+                command: Path::new(r"C:\Program Files\OxiMux\oximux-screen-gate.exe"),
+                chat: "chat-7",
+                grants: Path::new(r"C:\Users\u\AppData\Roaming\OxiMux\grants.json"),
+                host: Path::new(r"C:\Program Files\OxiMux\oximux.exe"),
+                worktree: None,
+                started_at: None,
+            },
+        );
+
+        assert!(
+            declared.server.is_none(),
+            "Windows must not be handed a screen-control server while the \
+             driver it points at cannot be verified"
+        );
+        assert!(
+            declared.disallowed_tools.is_empty(),
+            "a deny list without a server names tools that do not exist"
+        );
+
+        // The half that must still be there: every chat gets the hook.
+        let v: serde_json::Value =
+            serde_json::from_str(&declared.hook_settings).expect("valid json");
+        let command = v["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .expect("command");
+        assert!(command.contains("oximux-screen-gate"), "{command}");
+        assert!(
+            command.contains(&format!("--chat {}", shell_quote("chat-7"))),
+            "{command}"
+        );
     }
 
     #[test]

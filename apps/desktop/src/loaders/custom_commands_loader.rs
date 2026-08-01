@@ -17,12 +17,10 @@ use std::path::{Path, PathBuf};
 
 use oximux_settings::{CustomCommand, CustomCommandsFile, load_and_merge};
 
-const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
-
-/// Returns the global commands.toml path, or `None` when `dirs::data_dir()`
-/// is unavailable (rare on macOS, but defensive).
+/// Returns the global commands.toml path, or `None` when the data directory
+/// is unavailable (rare, but defensive).
 fn global_commands_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join(APP_DATA_SUBDIR).join(oximux_settings::custom_commands::FILE_NAME))
+    crate::app_paths::data_dir().map(|d| d.join(oximux_settings::custom_commands::FILE_NAME))
 }
 
 /// Load and parse one commands TOML file. Returns an empty `Vec` when the

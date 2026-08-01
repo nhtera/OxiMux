@@ -353,14 +353,18 @@ mod tests {
     struct Target(std::process::Child);
 
     impl Target {
-        /// `/bin/sleep`: present on every macOS, signed by Apple, and outlives
-        /// any test that targets it.
-        const EXECUTABLE: &'static str = "/bin/sleep";
+        /// A stock system program that outlives any test targeting it — see
+        /// [`crate::fixtures::long_lived`] for which one, per platform.
+        fn executable() -> &'static str {
+            crate::fixtures::long_lived().0
+        }
 
         fn spawn() -> Self {
+            let (program, args) = crate::fixtures::long_lived();
             Self(
-                std::process::Command::new(Self::EXECUTABLE)
-                    .arg("120")
+                std::process::Command::new(program)
+                    .args(args)
+                    .stdin(std::process::Stdio::piped())
                     .spawn()
                     .expect("spawn a target process"),
             )
@@ -420,6 +424,46 @@ mod tests {
         }
     }
 
+    /// Shell commands that [`crate::gui_scripting`] classifies as driving the
+    /// GUI, in whatever form this platform's agents would write them.
+    ///
+    /// These tests are about the *policy* — that a classified command is
+    /// refused, is refused even mid-remote-turn, and never becomes a consent
+    /// card. Which binary does the driving is `gui_scripting`'s subject, not
+    /// this module's, so it is named once here rather than inline at each
+    /// assertion.
+    fn gui_driving_commands() -> [&'static str; 3] {
+        #[cfg(windows)]
+        {
+            [
+                r#"powershell -Command "$w = New-Object -ComObject WScript.Shell; $w.SendKeys('x')""#,
+                "nircmd movecursor 1 1",
+                "wscript automate.vbs",
+            ]
+        }
+        #[cfg(not(windows))]
+        {
+            [
+                r#"osascript -e 'tell app "System Events" to keystroke "x"'"#,
+                "cliclick c:1,1",
+                "osascript /tmp/x.scpt",
+            ]
+        }
+    }
+
+    /// One command that synthesizes input by name alone, for the argv-shaped
+    /// and remote-turn cases.
+    fn input_synthesis_command() -> &'static str {
+        #[cfg(windows)]
+        {
+            "nircmd movecursor 10 10"
+        }
+        #[cfg(not(windows))]
+        {
+            "cliclick c:10,10"
+        }
+    }
+
     #[test]
     fn a_tool_from_another_server_is_left_alone() {
         // The single most important negative: everything that is not a
@@ -462,7 +506,7 @@ mod tests {
         // worktree grant would otherwise drive a binary the agent just built
         // with no card anywhere.
         let target = Target::spawn();
-        let root = Path::new(Target::EXECUTABLE).parent().expect("a parent");
+        let root = Path::new(Target::executable()).parent().expect("a parent");
         let prov = Provenance::new(root, std::time::UNIX_EPOCH).expect("provenance");
 
         let f = Fixture::new();
@@ -530,7 +574,11 @@ mod tests {
             Decision::NotApplicable
         );
         assert!(matches!(
-            decide("Bash", &json!({ "command": "cliclick c:1,1" }), &f.ctx()),
+            decide(
+                "Bash",
+                &json!({ "command": input_synthesis_command() }),
+                &f.ctx()
+            ),
             Decision::Refuse { .. }
         ));
     }
@@ -554,15 +602,22 @@ mod tests {
         // The bypass measured on this project: the accessibility grant OxiMux
         // takes for the Escape kill switch is inherited by the agent's shell,
         // in every project, whatever the per-project setting says.
+        //
+        // On Windows the reasoning differs — there is no grant to inherit,
+        // because synthesizing input never needed one — but the refusal and its
+        // instruction to use the real tools are the same.
         let f = Fixture::new();
         let reason = refusal(&decide(
             "Bash",
-            &json!({ "command": r#"osascript -e 'tell application "System Events" to keystroke "x"'"# }),
+            &json!({ "command": gui_driving_commands()[0] }),
             &f.ctx(),
         ))
         .to_string();
-        assert!(reason.contains("accessibility API"), "{reason}");
         assert!(reason.contains("screen-control tools"), "{reason}");
+        assert!(
+            reason.contains("bypasses the screen-control consent"),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -573,7 +628,7 @@ mod tests {
         assert!(matches!(
             decide(
                 "shell",
-                &json!({ "command": ["bash", "-lc", "cliclick c:10,10"] }),
+                &json!({ "command": ["bash", "-lc", input_synthesis_command()] }),
                 &f.ctx()
             ),
             Decision::Refuse { .. }
@@ -586,11 +641,7 @@ mod tests {
         // osascript keystroke is whatever holds focus when it runs, which is
         // unknown at approval time and is the user's own window by default.
         let f = Fixture::new();
-        for command in [
-            r#"osascript -e 'tell app "System Events" to keystroke "x"'"#,
-            "cliclick c:1,1",
-            "osascript /tmp/x.scpt",
-        ] {
+        for command in gui_driving_commands() {
             let decision = decide("Bash", &json!({ "command": command }), &f.ctx());
             assert!(
                 matches!(decision, Decision::Refuse { .. }),
@@ -865,7 +916,7 @@ mod tests {
         // drive it. The spawned child stands in for the freshly built app, and
         // the directory it lives in for the worktree that produced it.
         let target = Target::spawn();
-        let root = Path::new(Target::EXECUTABLE)
+        let root = Path::new(Target::executable())
             .parent()
             .expect("the target lives somewhere");
         let prov = Provenance::new(root, std::time::UNIX_EPOCH).expect("provenance");

@@ -78,6 +78,13 @@ jobs:
       - name: xtask file-size-lint
         run: cargo run -p xtask -- file-size-lint
 
+      # The Windows icon is derived from the macOS one, so it goes stale on
+      # whichever machine edits `assets/AppIcon.icns` — which is this one, not
+      # the Windows runner. Checking it here is what makes "regenerate the .ico"
+      # a step nobody has to remember.
+      - name: xtask icon --check
+        run: cargo run -p xtask -- icon --check
+
   # Permanent gate for the Windows port. macOS is still the only shipping
   # target; this job stops a macOS-only API from landing on a shared path
   # unnoticed, which is exactly the class of breakage that made the port
@@ -115,16 +122,26 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
 
-      # The two excluded crates are macOS-only by construction, not by
-      # oversight: `macos-trust` wraps codesign/spctl and `computer-use` drives
-      # the Accessibility APIs. They are workspace members, so `--workspace`
-      # would still try to build them; nothing in the Windows dependency graph
-      # reaches either. Adding a crate here is a decision to leave it behind on
-      # Windows — do it deliberately.
+      # `macos-trust` is macOS-shaped by construction: it wraps codesign and
+      # spctl. Note what the exclusion does and does not buy. Its library is
+      # already in the Windows graph — `oximux-auto-update` depends on it
+      # unconditionally — and compiles there, so this only skips its own tests,
+      # 6 of which fail on Windows because their fixtures are POSIX-shaped
+      # (`/bin/sleep`, `ditto`, statvfs) rather than because the code under test
+      # is macOS-only. That is a gap parked deliberately, not a settled
+      # decision: the same fixture problem in `computer-use` was fixed rather
+      # than excluded (`crates/computer-use/src/fixtures.rs`).
+      #
+      # `computer-use` used to sit beside it and no longer does. The desktop app
+      # depends on it under `cfg(windows)` for the **policing hook** — not for
+      # screen control, which stays off — so it was already being compiled here
+      # as a dependency. Excluding it only skipped its own tests, which is the
+      # worse half: the crate now carries a Windows blocklist, a Windows GUI
+      # scripting brake and Windows command-line quoting, none of which a
+      # dependency build exercises.
       - name: cargo check
         run: >
           cargo check --workspace --all-targets --target x86_64-pc-windows-msvc
-          --exclude oximux-computer-use
           --exclude oximux-macos-trust
 
       # Blocking, and deliberately narrow. These five crates are where the
@@ -162,6 +179,22 @@ jobs:
       # locking), and it sat undetected because nothing blocking ran this.
       - name: cargo test (desktop app unit suite)
         run: cargo test --lib --target x86_64-pc-windows-msvc -p oximux-app
+
+      # Screen control is off on Windows and the driver is never declared, but
+      # the crate is compiled and half-used: the PreToolUse hook ships, and with
+      # it the executable blocklist, the GUI-scripting brake and the
+      # `CommandLineToArgvW` quoting the hook's own command line depends on.
+      #
+      # All-targets rather than `--lib`, for the reason the pty steps below
+      # spell out — the installer suites live under `tests/` and the workspace
+      # sweep is `--lib`, so nothing else would reach them.
+      #
+      # Two `live_driver` tests self-ignore without a real driver binary. That
+      # is correct here and would be a hole on macOS; the Windows job has no
+      # driver to point them at because there is not yet a Windows driver worth
+      # trusting. See `plans/260801-0157-windows-computer-use/findings.md`.
+      - name: cargo test (computer-use, hook half)
+        run: cargo test --target x86_64-pc-windows-msvc -p oximux-computer-use
 
       # The only end-to-end coverage of the piece carrying the most
       # Windows-specific machinery. Between them these boot the daemon over a
@@ -212,5 +245,4 @@ jobs:
       - name: cargo test (full unit suite)
         run: >
           cargo test --workspace --lib --target x86_64-pc-windows-msvc
-          --exclude oximux-computer-use
           --exclude oximux-macos-trust

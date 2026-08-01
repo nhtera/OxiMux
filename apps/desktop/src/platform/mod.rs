@@ -37,7 +37,7 @@ pub mod mic_permission;
 // with the macOS updater's quit-time swap, and macOS-shaped throughout.
 #[cfg(target_os = "macos")]
 pub mod relaunch;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub mod screen_control_indicator;
 pub mod secure_input;
 pub mod single_instance;

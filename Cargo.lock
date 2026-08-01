@@ -6946,6 +6946,7 @@ dependencies = [
  "cbc",
  "chrono",
  "dirs 5.0.1",
+ "embed-resource",
  "fd-lock",
  "futures",
  "gpui",
@@ -7026,6 +7027,8 @@ dependencies = [
 name = "oximux-computer-use"
 version = "0.1.5"
 dependencies = [
+ "base64",
+ "fd-lock",
  "libc",
  "oximux-agent-core",
  "oximux-macos-trust",
@@ -7037,6 +7040,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13400,6 +13404,7 @@ name = "xtask"
 version = "0.1.5"
 dependencies = [
  "anyhow",
+ "image",
 ]
 
 [[package]]

@@ -15,8 +15,15 @@ mod nav;
 mod segmented;
 mod pane_about;
 mod pane_agents;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod pane_computer_use;
+/// The Windows half of the same pane. Separate module rather than a fork of
+/// `pane_computer_use` because almost none of that pane transfers: there is no
+/// signature to report, no in-app installer to drive, and the master switch and
+/// project list gate driver *tools*, which Windows does not yet declare. What is
+/// left is a decision macOS never has to make.
+#[cfg(windows)]
+mod pane_driver_trust;
 mod pane_agents_launch;
 mod pane_keybindings;
 mod pane_notifications;
@@ -120,6 +127,11 @@ pub struct SettingsModal {
     /// verification spawns `codesign`, and the pane repaints constantly.
     #[cfg(target_os = "macos")]
     pub(super) driver_status: pane_computer_use::DriverStatus,
+    /// Windows' equivalent: where the installed driver stands with the user.
+    /// Held rather than recomputed per frame for the same reason — resolving it
+    /// hashes the binary, and once approved also runs `--version`.
+    #[cfg(windows)]
+    pub(super) driver_trust: pane_driver_trust::TrustState,
     /// The in-flight driver install this modal started, if any. `None` while
     /// idle — and also while merely *observing* an install another surface
     /// owns (that state lives in `driver_install_ui`, fed by the backend's
@@ -240,6 +252,8 @@ impl SettingsModal {
             computer_use: ComputerUseSettings::default(),
             #[cfg(target_os = "macos")]
             driver_status: pane_computer_use::DriverStatus::Unknown,
+            #[cfg(windows)]
+            driver_trust: pane_driver_trust::TrustState::Unknown,
             #[cfg(target_os = "macos")]
             driver_install: None,
             #[cfg(target_os = "macos")]
@@ -325,6 +339,13 @@ impl SettingsModal {
                 // a fresh open starts from the resolved truth alone.
                 self.driver_upgraded = false;
             }
+        }
+        #[cfg(windows)]
+        {
+            // Same reasoning as the macOS resolve above: the user may have
+            // installed — or re-installed, which is the interesting case here —
+            // the driver since the modal was last open.
+            self.driver_trust = pane_driver_trust::TrustState::resolve();
         }
         #[cfg(target_os = "macos")]
         self.spawn_driver_install_poll(cx);
@@ -511,7 +532,7 @@ impl SettingsModal {
 
     /// Persist the screen-control working copy to `computer_use.toml`. The
     /// watcher reloads + swaps the global; we never set the global here.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     pub(super) fn persist_computer_use(&mut self, cx: &mut Context<Self>) {
         if let Err(err) = crate::computer_use_settings::save(&self.computer_use) {
             tracing::warn!(%err, "settings modal: failed to write computer_use.toml");

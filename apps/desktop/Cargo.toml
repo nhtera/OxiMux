@@ -104,11 +104,33 @@ libc = "0.2"
 # Bringing the already-running instance forward: a registered broadcast message
 # and the foreground-right handoff that lets the holder honour it.
 [target.'cfg(windows)'.dependencies]
+# Screen control, and the policing hook that is wider than it.
+#
+# `windows-screen-control` is what lets `mcp::server_spec` exist here, so the
+# driver can be declared to an agent. It stays a feature rather than becoming
+# unconditional because the crate's own tests need to be able to build the
+# gated-off shape — and because turning it on is a decision about handing agents
+# an unsigned third-party binary, which should be visible in a manifest rather
+# than buried in a `cfg`.
+#
+# The hook would be warranted here even with the feature off, for a reason macOS
+# does not have: synthesizing input on Windows needs no permission at all, so an
+# agent's shell can drive the screen whether or not anything was opted into.
+oximux-computer-use = { workspace = true, features = ["windows-screen-control"] }
 widestring = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
+    # `SetWindowsHookExW(WH_KEYBOARD_LL, …)` and the message-pump calls the
+    # Escape kill switch is built on (`escape_tap`).
     "Win32_UI_WindowsAndMessaging",
+    # `SendInput`, used only by `escape_tap`'s tests to synthesize a real
+    # Escape press — the one thing that proves the hook actually swallows it.
+    "Win32_UI_Input_KeyboardAndMouse",
+    # `Shell_NotifyIconW` — the notification-area icon that says an agent is
+    # driving the screen (`screen_control_indicator`). The Windows stand-in for
+    # the macOS menu-bar status item, and a weaker one; see that module.
+    "Win32_UI_Shell",
 ] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -203,6 +225,19 @@ objc2-web-kit = { version = "0.3", features = [
 ] }
 # `CGRect` for the element-rect snapshot region (already in the graph).
 objc2-core-foundation = "0.3"
+
+# Application icon → the executable's resource section (see build.rs). Already
+# in the graph as GPUI's build-dependency, so this adds a manifest line rather
+# than a compile.
+#
+# Deliberately NOT under `cfg(windows)`: build-dependencies resolve against the
+# *host*, so a cross-compile from macOS to Windows would drop the crate while
+# build.rs — which keys off the target — still called it, and the failure would
+# be "unresolved import" in a build script. On a non-Windows host the crate
+# compiles to a stub that reports `NotWindows`, so the cost of leaving it in is
+# nil.
+[build-dependencies]
+embed-resource = "3"
 
 [dev-dependencies]
 # Decodes the rendered pairing QR back to its payload, so the code is proven

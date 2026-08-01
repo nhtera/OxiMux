@@ -26,8 +26,18 @@ open dist/OxiMux.app
 
 macOS is still the shipping target; the Windows port lives on `feat/windows`.
 What it leaves behind is recorded in
-[`docs/windows-port-exclusions.md`](docs/windows-port-exclusions.md). There is no
-Windows packaging script yet, so a build runs out of `target/`.
+[`docs/windows-port-exclusions.md`](docs/windows-port-exclusions.md).
+
+```powershell
+# Produce dist/OxiMux — the app plus every sibling it resolves at runtime
+# (relay daemon, screen-control hook, ripgrep, dictation DLLs).
+./scripts/bundle-windows.ps1
+./dist/OxiMux/oximux.exe
+```
+
+Running straight out of `target/` works too, but only the bundle carries
+`oximux-screen-gate.exe`, and without it agent chats run unpoliced. See
+[`docs/windows-packaging.md`](docs/windows-packaging.md).
 
 Beyond the Rust toolchain and the MSVC build tools, Windows needs **LLVM**, which
 macOS gets for free from Xcode:
@@ -49,12 +59,12 @@ winget package does not add it to `PATH` for you.
 Neither requirement shows up in CI — GitHub's Windows runners preinstall LLVM —
 so the compile gate passing is not evidence that a clean machine can build.
 
-`--workspace` commands need the two macOS-only crates excluded, the same way the
-Windows CI job spells it:
+`--workspace` commands need one macOS-only crate excluded, the same way the
+Windows CI job spells it. `oximux-computer-use` used to sit beside it and no
+longer does — it compiles and its tests pass on Windows:
 
 ```powershell
-cargo check --workspace --all-targets `
-  --exclude oximux-computer-use --exclude oximux-macos-trust
+cargo check --workspace --all-targets --exclude oximux-macos-trust
 
 # Build the relay first here too — the app resolves `oximux-relay.exe` as a
 # sibling of its own binary.

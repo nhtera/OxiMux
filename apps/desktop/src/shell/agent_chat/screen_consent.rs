@@ -36,9 +36,38 @@ pub(super) struct ScreenPrompt {
     /// `None` for an ad-hoc signed binary — normal for an agent's own build,
     /// and the reason "always allow" is not always offered.
     pub bundle_id: Option<String>,
+    /// What a persisted "always allow" row is keyed on, which is not the same
+    /// evidence on both platforms — see [`allow_key`].
+    pub allow_key: Option<String>,
     /// Only ever a category that reaches a card. A terminal or an editor is
     /// refused before anyone is asked, so those never arrive here.
     pub category: Category,
+}
+
+/// The stable identity an allowlist row is stored under.
+///
+/// **macOS** uses the code-signing bundle id. It survives updates and moves, and
+/// renaming a file cannot forge it.
+///
+/// **Windows** has no equivalent, so the key is the executable's full path. That
+/// is a weaker key and the difference is worth stating rather than papering
+/// over: a *different* binary later written to an approved path inherits the
+/// approval, which a bundle id would have caught. It is still the strongest
+/// thing available — the full path rather than the file name, so approving one
+/// `chrome.exe` is not approving every file that happens to be called that.
+///
+/// Without this the whole allowlist was inert on Windows: keyed on a bundle id
+/// that is always `None` there, "Always allow" could never be offered and the
+/// settings pane's Approved apps list could never gain a row.
+fn allow_key(target: &TargetApp) -> Option<String> {
+    #[cfg(windows)]
+    {
+        Some(target.executable.display().to_string()).filter(|key| !key.is_empty())
+    }
+    #[cfg(not(windows))]
+    {
+        target.bundle_id.clone()
+    }
 }
 
 /// What the transcript knows about one screen-control call's target.
@@ -62,6 +91,7 @@ impl ScreenPrompt {
         Self {
             app: target.name.clone(),
             bundle_id: target.bundle_id.clone(),
+            allow_key: allow_key(target),
             category: target.category(),
         }
     }
@@ -107,11 +137,12 @@ pub(super) fn warning_banner(
 /// The "Always allow <App>" pill, when the target has a stable identity to
 /// remember it by.
 ///
-/// Absent for an unsigned binary on purpose: a persisted grant is keyed on
-/// bundle id, and an agent's freshly built app has none. Offering the button
-/// anyway would produce a grant that silently matched nothing — worse than not
-/// offering it, because the user would believe they had answered once and for
-/// all.
+/// Absent when the target has nothing durable to key a row on — on macOS an
+/// ad-hoc signed binary with no bundle id, which is exactly what an agent's own
+/// fresh build is. Offering the button anyway would produce a grant that
+/// silently matched nothing, which is worse than not offering it: the user would
+/// believe they had answered once and for all. See [`allow_key`] for what each
+/// platform keys on and what Windows gives up by having no bundle id.
 ///
 /// Also absent for any target carrying a warning. "Always" and "this app is
 /// signed in to your bank" do not belong on the same card; that approval should
@@ -130,7 +161,7 @@ pub(super) fn always_allow_pill(
     if prompt.category.warning().is_some() {
         return None;
     }
-    let bundle_id = prompt.bundle_id.clone()?;
+    let key = prompt.allow_key.clone()?;
     let app = prompt.app.clone();
     let (tool_id, request_id, input) = (
         tool_id.to_string(),
@@ -145,7 +176,7 @@ pub(super) fn always_allow_pill(
         typo,
         cx.listener(move |this, _e: &gpui::ClickEvent, _w, cx| {
             this.always_allow_screen_app(
-                &bundle_id,
+                &key,
                 &app,
                 tool_id.clone(),
                 request_id.clone(),
@@ -173,10 +204,10 @@ pub(super) fn always_allow_pill(
 ///   watcher installs it and if the file fails to parse. Reading that as "asked
 ///   and answered" would turn a broken settings file into a blanket approval.
 fn is_pre_approved(target: &TargetApp, settings: Option<&ComputerUseSettings>) -> bool {
-    let (Some(bundle_id), Some(settings)) = (target.bundle_id.as_deref(), settings) else {
+    let (Some(key), Some(settings)) = (allow_key(target), settings) else {
         return false;
     };
-    settings.is_allowed(bundle_id)
+    settings.is_allowed(&key)
 }
 
 /// The view's half of the consent flow.
@@ -336,7 +367,7 @@ impl AgentChatView {
     /// the debouncer and could lose the grant.
     fn always_allow_screen_app(
         &mut self,
-        bundle_id: &str,
+        key: &str,
         app: &str,
         tool_id: String,
         request_id: String,
@@ -347,7 +378,7 @@ impl AgentChatView {
             .try_global::<ComputerUseSettings>()
             .cloned()
             .unwrap_or_default();
-        settings.allow(bundle_id, app);
+        settings.allow(key, app);
         if let Err(err) = crate::app_settings::computer_use_settings::save(&settings) {
             tracing::warn!(%err, "could not persist the screen-control allowlist");
             crate::shell::toast::toast(
@@ -369,10 +400,15 @@ impl AgentChatView {
 mod tests {
     use super::*;
 
+    /// The identifier doubles as the allowlist key here: these tests predate the
+    /// platform split and are about copy and affordances, not about which
+    /// evidence produced the key. `allow_key`'s own behaviour is covered by the
+    /// `TargetApp`-shaped tests below, which go through `from_target`.
     fn prompt(app: &str, bundle_id: Option<&str>, category: Category) -> ScreenPrompt {
         ScreenPrompt {
             app: app.to_string(),
             bundle_id: bundle_id.map(str::to_string),
+            allow_key: bundle_id.map(str::to_string),
             category,
         }
     }
@@ -412,19 +448,74 @@ mod tests {
         }
     }
 
+    /// A target in a known category, identified the way the running platform
+    /// identifies apps.
+    ///
+    /// The two platforms answer "what app is this?" from different evidence —
+    /// macOS reads a code-signing bundle id, Windows reads the executable's file
+    /// name — so a fixture that hardcodes one of them tests nothing on the
+    /// other. These tests are about categories and the allowlist, never about
+    /// which evidence produced the category.
+    fn categorised(kind: Category) -> TargetApp {
+        #[cfg(windows)]
+        let (executable, bundle_id, name) = match kind {
+            Category::Browser => (r"C:\Program Files\Google\Chrome\chrome.exe", None, "Chrome"),
+            Category::Terminal => (
+                r"C:\Program Files\WindowsApps\WindowsTerminal.exe",
+                None,
+                "WindowsTerminal",
+            ),
+            other => panic!("no Windows fixture for {other:?}"),
+        };
+        #[cfg(not(windows))]
+        let (executable, bundle_id, name) = match kind {
+            Category::Browser => (
+                "/Applications/Safari.app/Contents/MacOS/Safari",
+                Some("com.apple.Safari"),
+                "Safari",
+            ),
+            Category::Terminal => (
+                "/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+                Some("com.apple.Terminal"),
+                "Terminal",
+            ),
+            other => panic!("no macOS fixture for {other:?}"),
+        };
+
+        TargetApp {
+            pid: 42,
+            executable: std::path::PathBuf::from(executable),
+            bundle_id: bundle_id.map(str::to_string),
+            name: name.to_string(),
+        }
+    }
+
     fn allowing(bundle_id: &str, name: &str) -> ComputerUseSettings {
         let mut settings = ComputerUseSettings::default();
         settings.allow(bundle_id, name);
         settings
     }
 
+    /// Pre-approve exactly what `is_pre_approved` will look this target up by.
+    ///
+    /// Writing the bundle id directly only worked while the key *was* the bundle
+    /// id. On Windows the row is keyed on the executable path, so a test that
+    /// hardcodes an identifier is asserting against a row the lookup will never
+    /// find — and it would fail for a reason that has nothing to do with what it
+    /// is testing.
+    fn allowing_target(target: &TargetApp) -> ComputerUseSettings {
+        let mut settings = ComputerUseSettings::default();
+        if let Some(key) = allow_key(target) {
+            settings.allow(&key, &target.name);
+        }
+        settings
+    }
+
     #[test]
     fn a_pre_approved_app_raises_no_card() {
-        let settings = allowing("com.apple.Safari", "Safari");
-        assert!(is_pre_approved(
-            &target("Safari", Some("com.apple.Safari")),
-            Some(&settings)
-        ));
+        let safari = target("Safari", Some("com.apple.Safari"));
+        let settings = allowing_target(&safari);
+        assert!(is_pre_approved(&safari, Some(&settings)));
     }
 
     #[test]
@@ -464,29 +555,28 @@ mod tests {
         // the policy first, the policy refuses a never-driveable category ahead
         // of `Ask`, and only `Ask` consults the allowlist. So a stale row is
         // inert rather than an override.
-        let settings = allowing("com.apple.Terminal", "Terminal");
-        let terminal = target("Terminal", Some("com.apple.Terminal"));
+        let terminal = categorised(Category::Terminal);
         assert!(
             ScreenPrompt::from_target(&terminal).category.is_never_driveable(),
             "a refused category must never be offered a card"
         );
-        // The allowlist itself is untouched — it simply is not asked.
+        // The allowlist itself is untouched — it simply is not asked. Keyed on
+        // whatever identifies this target here, since that is what a hand-edited
+        // row would have carried.
+        let settings = allowing_target(&terminal);
         assert!(is_pre_approved(&terminal, Some(&settings)));
     }
 
     #[test]
     fn a_target_resolves_straight_from_the_policy_layers_view_of_it() {
         // The card must not re-derive identity by its own rules; a second
-        // opinion about which app this is would be a second policy.
-        let target = TargetApp {
-            pid: 42,
-            executable: std::path::PathBuf::from("/Applications/Safari.app/Contents/MacOS/Safari"),
-            bundle_id: Some("com.apple.Safari".into()),
-            name: "Safari".into(),
-        };
+        // opinion about which app this is would be a second policy. Asserted as
+        // pass-through rather than against fixed strings, because the strings
+        // are what differ per platform and the pass-through is what does not.
+        let target = categorised(Category::Browser);
         let p = ScreenPrompt::from_target(&target);
-        assert_eq!(p.app, "Safari");
-        assert_eq!(p.bundle_id.as_deref(), Some("com.apple.Safari"));
+        assert_eq!(p.app, target.name);
+        assert_eq!(p.bundle_id, target.bundle_id);
         assert_eq!(p.category, Category::Browser);
     }
 
