@@ -17,6 +17,9 @@ oximux-pty = { workspace = true }
 # The shell an agent gets wrapped in when it can't be spawned directly, and the
 # shell a PATH-recovery probe runs under.
 oximux-shell-env = { workspace = true }
+# CREATE_NO_WINDOW on agent-CLI / probe / curl spawns (empty console windows
+# otherwise pop out of the GUI-subsystem Windows build).
+oximux-no-window = { workspace = true }
 anyhow = { workspace = true }
 # "Is this agent CLI installed?" and bare-name -> absolute-path resolution
 # (`cli::detect`, the pi binary resolver, the detached-spawn program resolver).

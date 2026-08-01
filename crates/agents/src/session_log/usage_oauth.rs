@@ -233,13 +233,17 @@ fn curl_usage_endpoint(token: &str) -> Option<(u16, String)> {
          header = \"anthropic-beta: {OAUTH_BETA_HEADER}\"\n\
          header = \"User-Agent: {USER_AGENT}\"\n"
     );
-    let mut child = Command::new(curl_binary())
-        .args(["-K", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    let mut child = {
+        use oximux_no_window::NoWindow as _;
+        Command::new(curl_binary())
+            .args(["-K", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .no_window()
+            .spawn()
+            .ok()?
+    };
     child.stdin.take()?.write_all(config.as_bytes()).ok()?;
     let out = child.wait_with_output().ok()?;
     if !out.status.success() {

@@ -9,6 +9,9 @@ rust-version.workspace = true
 
 [dependencies]
 oximux-core = { workspace = true }
+# CREATE_NO_WINDOW on LSP-server spawns (a console `rust-analyzer.exe` would
+# otherwise pop an empty terminal window out of the GUI-subsystem build).
+oximux-no-window = { workspace = true }
 # Autosave cadence (debounce/enabled) is read from `AutosaveSettings`, a GPUI
 # global installed by the app. Settings is a leaf crate — no dependency cycle.
 oximux-settings = { workspace = true }

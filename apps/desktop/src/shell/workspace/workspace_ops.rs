@@ -461,13 +461,17 @@ async fn run_cleanup_bounded(worktree_path: &Path, timeout: std::time::Duration)
     };
     let cleanup = cleanup.to_string();
     let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg("-lc")
-        .arg(&cleanup)
-        .current_dir(worktree_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
+    {
+        use oximux_no_window::NoWindow as _;
+        cmd.arg("-lc")
+            .arg(&cleanup)
+            .current_dir(worktree_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .no_window()
+            .kill_on_drop(true);
+    }
     let wt = worktree_path.display();
     match tokio::time::timeout(timeout, cmd.status()).await {
         Ok(Ok(status)) if status.success() => {

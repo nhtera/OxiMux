@@ -6917,6 +6917,7 @@ dependencies = [
  "oximux-core",
  "oximux-git",
  "oximux-job-object",
+ "oximux-no-window",
  "oximux-pty",
  "oximux-shell-env",
  "oximux-storage",
@@ -6974,6 +6975,7 @@ dependencies = [
  "oximux-editor",
  "oximux-git",
  "oximux-macos-trust",
+ "oximux-no-window",
  "oximux-owner-only",
  "oximux-proc-cwd",
  "oximux-pty",
@@ -7032,6 +7034,7 @@ dependencies = [
  "libc",
  "oximux-agent-core",
  "oximux-macos-trust",
+ "oximux-no-window",
  "regex",
  "serde",
  "serde_json",
@@ -7060,6 +7063,7 @@ dependencies = [
  "dirs 5.0.1",
  "futures",
  "hound",
+ "oximux-no-window",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -7079,6 +7083,7 @@ dependencies = [
  "lsp-types",
  "notify-debouncer-full",
  "oximux-core",
+ "oximux-no-window",
  "oximux-settings",
  "serde",
  "serde_json",
@@ -7095,6 +7100,7 @@ version = "0.1.5"
 dependencies = [
  "futures",
  "oximux-core",
+ "oximux-no-window",
  "serde",
  "serde_json",
  "tempfile",
@@ -7138,6 +7144,13 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "uniffi",
+]
+
+[[package]]
+name = "oximux-no-window"
+version = "0.1.5"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

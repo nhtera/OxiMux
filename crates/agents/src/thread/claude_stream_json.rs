@@ -290,9 +290,13 @@ impl ClaudeStreamJsonConnection {
     /// Spawn an already-built command (the real `claude` command, or a fake in
     /// tests) and wire stdout → `decode_line` → the returned receiver.
     pub fn spawn_command(mut cmd: Command) -> Result<(Self, Receiver<ThreadEvent>)> {
+        use oximux_no_window::NoWindow as _;
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // All I/O is these pipes — never let Windows conjure a console
+            // window for the CLI's whole (long) lifetime.
+            .no_window();
         let mut child = cmd.spawn().context("spawn agent process")?;
         let stdout = child.stdout.take().context("agent stdout missing")?;
         let stdin = child.stdin.take().context("agent stdin missing")?;

@@ -17,6 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::Error;
+use oximux_no_window::NoWindow as _;
 
 /// How often the wait loop checks whether the child has exited. Small enough
 /// that a fast command (the common case — `status` and `--version` return in
@@ -47,6 +48,7 @@ impl Output {
 pub fn run_bounded(program: &Path, args: &[&str], timeout: Duration) -> Result<Output, Error> {
     let mut child = Command::new(program)
         .args(args)
+        .no_window()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

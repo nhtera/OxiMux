@@ -1,0 +1,13 @@
+[package]
+name = "oximux-no-window"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Only for the `tokio::process::Command` impl — the crate spawns nothing
+# itself. Workspace-pinned, so this adds no new compilation to the graph.
+tokio = { workspace = true }

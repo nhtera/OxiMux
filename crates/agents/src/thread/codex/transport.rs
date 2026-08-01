@@ -66,7 +66,8 @@ impl RpcClient {
     /// Spawn an already-built command (the real `codex`, or a fake in tests) and
     /// wire its stdout into the reader/router.
     pub fn spawn_command(mut cmd: Command) -> Result<(RpcClient, Receiver<Inbound>, Child)> {
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        use oximux_no_window::NoWindow as _;
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).no_window();
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;

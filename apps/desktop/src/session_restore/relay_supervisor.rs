@@ -406,27 +406,25 @@ fn spawn_detached(
         }
     }
 
-    #[cfg(windows)]
+    // Windows: the relay is a console-subsystem binary, so without this a
+    // console window flashes up on every launch and then sits in the
+    // taskbar for the daemon's whole life. Its stdio is already
+    // redirected to the log file, so the console has nothing to show.
+    //
+    // There is no `process_group(0)` analogue to add: that call exists
+    // on unix so a SIGHUP aimed at the app's group misses the daemon,
+    // and a process with no console window is out of reach of console
+    // control events for the same reason.
+    //
+    // Consequence for the shutdown path: whether a process started this
+    // way can still receive CTRL_SHUTDOWN_EVENT / CTRL_LOGOFF_EVENT is
+    // exactly the question the signal wiring in `relay/src/main.rs`
+    // leaves open, and this flag makes the pessimistic answer more
+    // likely. Nothing depends on those handlers — the 5s checkpoint tick
+    // plus flush-on-last-disconnect is what bounds scrollback loss.
     {
-        // The relay is a console-subsystem binary, so without this a
-        // console window flashes up on every launch and then sits in the
-        // taskbar for the daemon's whole life. Its stdio is already
-        // redirected to the log file, so the console has nothing to show.
-        //
-        // There is no `process_group(0)` analogue to add: that call exists
-        // on unix so a SIGHUP aimed at the app's group misses the daemon,
-        // and a process with no console window is out of reach of console
-        // control events for the same reason.
-        //
-        // Consequence for the shutdown path: whether a process started this
-        // way can still receive CTRL_SHUTDOWN_EVENT / CTRL_LOGOFF_EVENT is
-        // exactly the question the signal wiring in `relay/src/main.rs`
-        // leaves open, and this flag makes the pessimistic answer more
-        // likely. Nothing depends on those handlers — the 5s checkpoint tick
-        // plus flush-on-last-disconnect is what bounds scrollback loss.
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        use oximux_no_window::NoWindow as _;
+        cmd.no_window();
     }
 
     let child = cmd

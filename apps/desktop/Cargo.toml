@@ -22,6 +22,10 @@ oximux-core = { workspace = true }
 oximux-dictation = { workspace = true }
 oximux-editor = { workspace = true }
 oximux-git = { workspace = true }
+# CREATE_NO_WINDOW on every child this GUI-subsystem process spawns directly
+# (rg, cleanup scripts, the relay daemon) — without it Windows pops an empty
+# console window per console-subsystem child.
+oximux-no-window = { workspace = true }
 oximux-proc-cwd = { workspace = true }
 oximux-pty = { workspace = true }
 async-trait = { workspace = true }

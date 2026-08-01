@@ -18,6 +18,8 @@ windows-screen-control = []
 
 [dependencies]
 oximux-agent-core.workspace = true
+# CREATE_NO_WINDOW on driver subprocess runs.
+oximux-no-window = { workspace = true }
 # Shared codesign/spctl gates and atomic-swap primitives (also used by the
 # app's own updater — the two must not fork).
 #

@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use oximux_no_window::NoWindow as _;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -108,6 +109,7 @@ pub async fn run_plan(
         // locale so the model receives deterministic byte sequences.
         .env("LANG", "C")
         .env("LC_ALL", "C")
+        .no_window()
         .kill_on_drop(true);
 
     let mut child = match cmd.spawn() {

@@ -24,6 +24,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use oximux_no_window::NoWindow as _;
 use lsp_types::{
     ClientCapabilities, CompletionContext, CompletionParams, CompletionResponse,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
@@ -97,6 +98,7 @@ impl LspClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .no_window()
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawn `{program}` (is it on PATH?)"))?;

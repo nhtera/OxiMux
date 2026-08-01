@@ -891,12 +891,14 @@ fn login_probe_command(bin: &str) -> (String, Vec<String>) {
 /// runs on the UI thread, so it must never wait forever — a slow shell degrades
 /// to "pi not found" (an actionable error) rather than a frozen app.
 fn login_shell_which(bin: &str) -> Option<PathBuf> {
+    use oximux_no_window::NoWindow as _;
     let (shell, args) = login_probe_command(bin);
     let mut child = Command::new(shell)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .no_window()
         .spawn()
         .ok()?;
 
