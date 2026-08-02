@@ -398,8 +398,8 @@ fn driver_control(
             theme,
             density,
             typography,
-            |_this, _w, _cx| {
-                crate::shell::open_url::open_url(driver_install::MANUAL_DOWNLOAD_URL);
+            |_this, _w, cx| {
+                crate::shell::open_url::open_url(driver_install::MANUAL_DOWNLOAD_URL, cx);
             },
             cx,
         ));

@@ -509,9 +509,7 @@ impl TerminalView {
     fn open_link(&mut self, target: LinkTarget, window: &mut Window, cx: &mut Context<Self>) {
         match target {
             LinkTarget::Url(url) => {
-                if let Err(err) = std::process::Command::new("open").arg(&url).spawn() {
-                    tracing::warn!(?err, %url, "failed to open url");
-                }
+                cx.open_url(&url);
             }
             LinkTarget::Path { path, line, col } => {
                 let resolved = self.resolve_path(&path);

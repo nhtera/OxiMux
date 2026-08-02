@@ -80,9 +80,10 @@ impl OnboardingWizard {
                         Button::new("onboarding-driver-manual")
                             .ghost()
                             .label("Download manually")
-                            .on_click(|_, _, _| {
+                            .on_click(|_, _, cx| {
                                 crate::shell::open_url::open_url(
                                     driver_install::MANUAL_DOWNLOAD_URL,
+                                    cx,
                                 );
                             }),
                     );

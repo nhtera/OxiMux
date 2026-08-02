@@ -107,7 +107,7 @@ pub(super) fn build_single_card(
         density,
         typography.clone(),
         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-            spawn_reveal(&reveal_path);
+            cx.reveal_path(&reveal_path);
             this.close(cx);
         }),
     ));
@@ -368,22 +368,6 @@ pub(super) fn relative_path_string(path: &Path, workdir: Option<&PathBuf>) -> Op
         .map(|p| p.to_string_lossy().into_owned())
         .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()));
     rel.filter(|s| !s.is_empty())
-}
-
-/// Spawn `open -R <path>` and drop the child handle. Failures land in
-/// tracing because Finder errors aren't actionable for the user.
-fn spawn_reveal(path: &Path) {
-    if let Err(err) = std::process::Command::new("open")
-        .arg("-R")
-        .arg(path)
-        .spawn()
-    {
-        tracing::warn!(
-            ?err,
-            path = %path.display(),
-            "reveal in finder failed"
-        );
-    }
 }
 
 pub(super) fn separator(theme: Theme) -> impl IntoElement {

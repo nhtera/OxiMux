@@ -57,12 +57,6 @@ fn open_in_external(app: &str, path: &Path) {
     }
 }
 
-fn reveal_in_finder(path: &Path) {
-    if let Err(err) = Command::new("open").arg("-R").arg(path).spawn() {
-        tracing::warn!(?err, "editor: reveal-in-finder failed");
-    }
-}
-
 /// Write `value` to the clipboard and confirm with a toast.
 fn copy_with_toast(value: String, toast: &'static str, window: &mut Window, cx: &mut App) {
     tracing::info!(toast, "editor-header: copy action fired; pushing notification");
@@ -157,7 +151,7 @@ pub fn actions_overlay(path: &Path, has_text: bool, cx: &Context<EditorView>) ->
         accent,
         fg,
         cx.listener(move |view, _, _w, cx| {
-            reveal_in_finder(&reveal_target);
+            cx.reveal_path(&reveal_target);
             view.close_actions_menu();
             cx.notify();
         }),

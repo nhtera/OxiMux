@@ -335,7 +335,7 @@ impl OnboardingWizard {
                     .hover(|s| s.text_color(theme.fg_base).border_color(theme.border_active))
                     .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                         cx.stop_propagation();
-                        crate::shell::open_url::open_url(url);
+                        crate::shell::open_url::open_url(url, cx);
                     })
                     .child("Install ↗"),
             );

@@ -384,7 +384,7 @@ pub(super) fn open_action(
         .cursor_pointer()
         .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _w, cx: &mut App| {
             cx.stop_propagation();
-            open_url(&url);
+            open_url(&url, cx);
         })
         .child("↗".to_string())
         .into_any_element()

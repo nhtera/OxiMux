@@ -183,8 +183,8 @@ impl SearchPanel {
         cx.notify();
     }
 
-    pub(super) fn open_match(&self, file_path: &PathBuf) {
-        let _ = std::process::Command::new("open").arg(file_path).spawn();
+    pub(super) fn open_match(&self, file_path: &std::path::Path, cx: &gpui::App) {
+        cx.open_with_system(file_path);
     }
 
     pub(super) fn last_results(&self) -> Option<&SearchResults> {

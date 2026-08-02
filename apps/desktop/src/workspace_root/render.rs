@@ -1155,14 +1155,13 @@ impl Render for WorkspaceRoot {
                 },
             ))
             .on_action(cx.listener(
-                |_this, action: &crate::actions::OpenInFinder, _window, _cx| {
-                    // `open <dir>` opens Finder at the target. Distinct from
-                    // `open -R` (reveal) which opens Finder with the path
-                    // selected — used for the workspace-root overflow item.
+                |_this, action: &crate::actions::OpenInFinder, _window, cx| {
+                    // `open_with_system` on a directory opens the file manager
+                    // AT the target. Distinct from `reveal_path` which opens it
+                    // with the path selected in its parent — used for the
+                    // workspace-root overflow item.
                     let path = std::path::PathBuf::from(&action.path);
-                    if let Err(err) = std::process::Command::new("open").arg(&path).spawn() {
-                        tracing::warn!(?err, path = %path.display(), "open in finder failed");
-                    }
+                    cx.open_with_system(&path);
                 },
             ))
             .on_action(cx.listener(

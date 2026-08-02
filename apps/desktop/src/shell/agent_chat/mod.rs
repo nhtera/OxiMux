@@ -3730,7 +3730,7 @@ impl AgentChatView {
             // The worker produced the sign-in URL (Codex) → open it in the system
             // browser. The card stays pending until `AuthOutcome` resolves it.
             ThreadEvent::AuthUrl { url } => {
-                crate::shell::open_url::open_url(url);
+                crate::shell::open_url::open_url(url, cx);
             }
             // A browser OAuth sign-in resolved (Codex). Success → drop the card so
             // the composer re-enables (it's disabled while `self.auth.is_some()`)

@@ -850,14 +850,11 @@ fn build_session_menu(
                 }),
             )
             .item(
-                // `open -R` reveals AND selects the file in Finder — plain `open`
-                // (what `OpenInFinder` dispatches) would instead try to OPEN the
-                // .jsonl in a text editor. Run it directly; no action needed.
-                PopupMenuItem::new("Reveal log in Finder").on_click(move |_, _window, _cx| {
-                    let _ = std::process::Command::new("open")
-                        .arg("-R")
-                        .arg(&reveal_path)
-                        .spawn();
+                // `reveal_path` reveals AND selects the file in the platform's
+                // file manager — plain `open` (what `OpenInFinder` dispatches)
+                // would instead try to OPEN the .jsonl in a text editor.
+                PopupMenuItem::new("Reveal log in Finder").on_click(move |_, _window, cx| {
+                    cx.reveal_path(std::path::Path::new(&reveal_path));
                 }),
             );
     }
