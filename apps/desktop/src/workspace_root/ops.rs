@@ -1304,7 +1304,6 @@ impl WorkspaceRoot {
             let _ = cx.update(|_window, cx| {
                 crate::window_factory::open_workspace_window_with(
                     cx,
-                    None, // repo resolved from project_id in window_factory
                     app_state,
                     dest_window_id,
                     project_id,

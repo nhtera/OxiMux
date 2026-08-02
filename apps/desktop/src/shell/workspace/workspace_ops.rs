@@ -802,11 +802,15 @@ impl WorkspaceRoot {
         // sidebar's status poller so only the active project polls git —
         // otherwise every cached sidebar would keep ticking its own
         // `git status` in the background.
+        //
+        // No sidebar yet means this is the window's FIRST activation (boot
+        // builds no sidebar — see `WorkspaceRoot::new`), so the default is the
+        // long-standing "default-collapsed on app boot", not open.
         let prior_open = self
             .right_sidebar
             .as_ref()
             .map(|s| s.read(cx).open)
-            .unwrap_or(true);
+            .unwrap_or(false);
         if let Some(outgoing_sidebar) = self.right_sidebar.as_ref() {
             outgoing_sidebar.read(cx).set_polling_focused(false);
         }
@@ -882,12 +886,14 @@ impl WorkspaceRoot {
                 let typography = this.typography.clone();
                 // Carry the previous sidebar's open/collapsed state across
                 // the rebuild — the right column must stay where the user
-                // left it, not snap back open on every project switch.
+                // left it, not snap back open on every project switch. No
+                // sidebar yet = first activation of this window, which starts
+                // collapsed (the "default-collapsed on app boot" behavior).
                 let prior_open = this
                     .right_sidebar
                     .as_ref()
                     .map(|s| s.read(cx).open)
-                    .unwrap_or(true);
+                    .unwrap_or(false);
                 let weak = cx.weak_entity();
                 let on_open =
                     crate::workspace_root::WorkspaceRoot::build_on_open_file_callback(weak.clone());

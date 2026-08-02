@@ -9,7 +9,6 @@
 use gpui::{
     AnyView, App, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
 };
-use oximux_git::Repository;
 
 use crate::state::AppState;
 use crate::workspace_root::WorkspaceRoot;
@@ -47,13 +46,18 @@ pub fn workspace_window_options(cx: &mut App, cascade: usize) -> WindowOptions {
 /// project (multi-window restore at boot + tear-off); `None` bootstraps the
 /// most-recent project (fresh window via Cmd+N).
 ///
+/// No `Repository` is taken: the git sidebar is built by the project-activation
+/// path, which opens the project's repo asynchronously after the window is up.
+/// Threading a pre-opened repo through here is how a blocking `git` spawn once
+/// ended up on the first-paint path (multi-second stall on the packaged
+/// Windows build — see `WorkspaceRoot::new`).
+///
 /// After registration, checks the pending tear-off mailbox
 /// (`window_registry::consume_pending_tearoff`). When an entry is waiting for
 /// this `window_id`, the new window mounts the torn-off relay PTY as its first
 /// tab instead of spawning a fresh shell.
 pub fn open_workspace_window_with(
     cx: &mut App,
-    repo: Option<Repository>,
     app_state: AppState,
     window_id: String,
     restore_project: Option<String>,
@@ -66,7 +70,7 @@ pub fn open_workspace_window_with(
     let pending = crate::window_registry::consume_pending_tearoff(&window_id);
     let _ = cx.open_window(options, move |window, cx| {
         let workspace =
-            cx.new(|cx| WorkspaceRoot::new(repo, app_state, window_id.clone(), window, cx));
+            cx.new(|cx| WorkspaceRoot::new(app_state, window_id.clone(), window, cx));
         match restore_project.as_deref() {
             Some(project_id) => {
                 workspace.update(cx, |root, cx| {
@@ -96,7 +100,7 @@ pub fn open_workspace_window_with(
 /// Open a fresh workspace window with a freshly-minted persist id ("main"
 /// for the first, "w{n}" for subsequent). Bootstraps the most-recent project.
 /// Used by `main.rs` for the initial window and the Cmd+N handler.
-pub fn open_workspace_window(cx: &mut App, repo: Option<Repository>, app_state: AppState) {
+pub fn open_workspace_window(cx: &mut App, app_state: AppState) {
     let persist_id = crate::window_registry::next_persist_id(cx);
-    open_workspace_window_with(cx, repo, app_state, persist_id, None);
+    open_workspace_window_with(cx, app_state, persist_id, None);
 }

@@ -39,7 +39,6 @@ use oximux_app::relay_supervisor::{RelaySupervisor, SupervisorError};
 use oximux_app::shell::terminal_view::install_shared_backend;
 use oximux_app::state;
 use oximux_app::window_factory::{open_workspace_window, open_workspace_window_with};
-use oximux_git::Repository;
 use oximux_pty::TerminalBackend;
 use oximux_relay_client::{RelayBackend, RelayClient};
 use oximux_storage::Db;
@@ -164,16 +163,13 @@ fn main() {
     // launch that bows out cannot wipe the live instance's grants.
     oximux_app::clear_stale_screen_control_grants();
 
-    // Best-effort: open the repo at cwd. If we're not in a git tree, render
-    // without the git column — the rest of the shell still works.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let repo = match rt.block_on(Repository::open(&cwd)) {
-        Ok(r) => Some(r),
-        Err(err) => {
-            tracing::info!(?err, "no git repository at cwd; git column hidden");
-            None
-        }
-    };
+    // boot: repo open is post-paint. No `Repository::open` here on purpose —
+    // it spawns `git`, and on the packaged Windows (GUI-subsystem) build the
+    // process's FIRST console-child spawn can block for seconds inside
+    // CreateProcess's console-host setup, which used to sit on the first-paint
+    // path and made every launch feel slow. The git sidebar is instead built
+    // by `set_active_project`'s async arm, which opens the active project's
+    // repo off the UI thread after the window is already up.
 
     // Open SQLite + hydrate boot state. A failure here means every later
     // write would fail too, so we surface the error loudly via eprintln +
@@ -222,6 +218,15 @@ fn main() {
     // Per-tab attach/spawn no longer happens pre-paint — see
     // `spawn_attach_reconcile` — so this timing line plus the panes-build
     // and reconcile lines bracket the whole boot cost story.
+    //
+    // Windows cold-boot caveat: with the git open moved post-paint, the
+    // daemon spawn here is the process's FIRST child spawn, and a GUI-
+    // subsystem parent's first console-child CreateProcess can pay a
+    // multi-second console-host init on some machines. Warm boots (daemon
+    // already running — the common case, since it survives app restarts)
+    // skip the spawn entirely. Making this handshake non-blocking needs
+    // the shared-backend install to stop being a boot-time-once event
+    // first; see `CliRuntime::with_shared_backend`'s captured Option.
     let relay_boot_started = std::time::Instant::now();
     let _relay_rt = boot_relay_supervisor(app_state.pane_relay_id_repo().clone());
     tracing::info!(
@@ -540,7 +545,7 @@ fn main() {
         // subsequent window is opened by that same handler through the shared
         // `open_workspace_window` factory, so each gets an independent
         // `WorkspaceRoot` and the quit / close paths treat them uniformly.
-        install_app_lifecycle(cx, repo.clone(), app_state.clone());
+        install_app_lifecycle(cx, app_state.clone());
 
         // Reopen the windows that were open at the last quit. An empty /
         // absent manifest (fresh install, or data from before multi-window)
@@ -562,7 +567,7 @@ fn main() {
             if oximux_app::shell::onboarding::should_show_onboarding(true, onboarded) {
                 oximux_app::shell::onboarding::set_pending();
             }
-            open_workspace_window(cx, repo, app_state);
+            open_workspace_window(cx, app_state);
         } else {
             if !onboarded {
                 let _ = app_state
@@ -577,7 +582,6 @@ fn main() {
             for entry in manifest.windows {
                 open_workspace_window_with(
                     cx,
-                    repo.clone(),
                     app_state.clone(),
                     entry.window_id,
                     entry.project_id,
@@ -592,20 +596,15 @@ fn main() {
 /// is what makes multi-window correct: a SINGLE quit observer iterates every
 /// tracked window, and a SINGLE window-closed observer decides "last window →
 /// quit the app" vs. "dismiss just this window".
-fn install_app_lifecycle(
-    cx: &mut gpui::App,
-    repo: Option<Repository>,
-    app_state: oximux_app::state::AppState,
-) {
+fn install_app_lifecycle(cx: &mut gpui::App, app_state: oximux_app::state::AppState) {
     use oximux_app::window_registry;
 
     // Cmd+N → open another independent workspace window. Handled globally
     // (not on `WorkspaceRoot`) because opening a window needs `&mut App`.
     {
-        let repo = repo.clone();
         let app_state = app_state.clone();
         cx.on_action::<NewWindow>(move |_, cx| {
-            open_workspace_window(cx, repo.clone(), app_state.clone());
+            open_workspace_window(cx, app_state.clone());
         });
     }
 
