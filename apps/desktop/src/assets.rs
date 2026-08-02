@@ -76,6 +76,26 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/plus.svg",
         include_bytes!("../assets/icons/plus.svg"),
     ),
+    // Windows caption-button glyphs (minimize / maximize / restore / close),
+    // drawn in the thin-stroke style of native Windows chrome. Used only by
+    // the custom title-bar controls on Windows — see
+    // `shell/chrome/window_controls.rs`.
+    (
+        "icons/win-minimize.svg",
+        include_bytes!("../assets/icons/win-minimize.svg"),
+    ),
+    (
+        "icons/win-maximize.svg",
+        include_bytes!("../assets/icons/win-maximize.svg"),
+    ),
+    (
+        "icons/win-restore.svg",
+        include_bytes!("../assets/icons/win-restore.svg"),
+    ),
+    (
+        "icons/win-close.svg",
+        include_bytes!("../assets/icons/win-close.svg"),
+    ),
     (
         "icons/circle-slash.svg",
         include_bytes!("../assets/icons/circle-slash.svg"),

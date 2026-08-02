@@ -12,18 +12,41 @@
 //! closed, the activity-bar tabs + right toggle move to the end of the
 //! center header.
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, Div, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    Styled, Window, div, px, svg,
+    Anchor, AnyElement, Div, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Styled, Window, WindowControlArea, div, px, svg,
+};
+use gpui_component::{
+    Icon, Sizable as _,
+    button::{Button, ButtonVariants as _},
+    menu::{DropdownMenu as _, PopupMenu, PopupMenuItem},
 };
 use oximux_settings::{Density, Theme, Typography};
 
-use crate::actions::{OpenQuickOpen, ToggleLeftSidebar, ToggleRightSidebar, ToggleWhatsNew};
+use crate::actions::{
+    NewWindow, OpenQuickOpen, OpenSettings, ToggleLeftSidebar, ToggleRightSidebar, ToggleWhatsNew,
+};
+use crate::shell::chrome::window_controls::WindowsWindowControls;
 
 /// Width reserved on the left for macOS traffic lights (12px inset +
 /// 3 × ~14px buttons with ~6px gaps + comfortable breathing room before
 /// the left-sidebar toggle button starts).
 const TRAFFIC_LIGHT_GUTTER: f32 = 76.0;
+
+/// Windows draws no traffic lights, so the wordmark leads the strip with a
+/// small inset instead of the macOS gutter.
+const WINDOWS_LEADING_INSET: f32 = 8.0;
+
+/// Leading gutter for the current platform: traffic-light clearance on
+/// macOS, a hair of breathing room elsewhere.
+fn leading_gutter() -> f32 {
+    if cfg!(target_os = "macos") {
+        TRAFFIC_LIGHT_GUTTER
+    } else {
+        WINDOWS_LEADING_INSET
+    }
+}
 
 /// Each toggle icon's hit target. Public so positioning code (e.g. the
 /// Pane Actions dropdown anchor) can compute distances from the window
@@ -115,6 +138,17 @@ fn chrome_strip(theme: Theme, density: Density, bottom_border: bool) -> Div {
     if bottom_border {
         strip = strip.border_b_1().border_color(theme.border_inactive);
     }
+    // Windows: with `appears_transparent` GPUI strips the native caption, so
+    // the strip itself must be marked as the drag region. WM_NCHITTEST then
+    // resolves it to HTCAPTION and the OS provides drag, double-click
+    // maximize, Snap, and the right-click system menu natively. Interactive
+    // children opt OUT of the drag region by occluding their own hitbox
+    // (`.occlude()`) — the hit-test walk stops at the first opaque hitbox,
+    // so an occluded button never resolves to HTCAPTION. macOS keeps native
+    // NSWindow titlebar dragging and needs neither.
+    if cfg!(target_os = "windows") {
+        strip = strip.window_control_area(WindowControlArea::Drag);
+    }
     strip
         // Double-click on the chrome row → toggle window Zoom (the green
         // traffic-light action). With `appears_transparent: true` we paint
@@ -181,8 +215,13 @@ fn left_chrome_cluster(
         .items_center()
         .h_full()
         .flex_shrink_0()
-        .child(div().w(px(TRAFFIC_LIGHT_GUTTER)))
+        .child(div().w(px(leading_gutter())))
         .child(wordmark)
+        // Windows has no native menu bar (GPUI's `set_menus` only stores the
+        // menus there), so the app menu collapses into a `⋯` dropdown next
+        // to the wordmark — the same pattern the reference app uses on
+        // Windows. macOS keeps the real menu bar and skips the button.
+        .when(cfg!(target_os = "windows"), |c| c.child(app_menu_button()))
         .child(toggle_button(
             left_toggle_icon(left_open),
             theme,
@@ -192,6 +231,45 @@ fn left_chrome_cluster(
         cluster = cluster.child(update_pill(theme, typography));
     }
     cluster
+}
+
+/// Title-bar `⋯` application menu (Windows only). Hosts the items macOS
+/// serves from its native menu bar: New Window, Settings, Quit. Edit-menu
+/// items (undo/copy/paste) are deliberately absent — on Windows those are
+/// plain keymap bindings with no OS menu semantics to mirror.
+///
+/// The occluding wrapper keeps the button clickable inside the strip's
+/// `WindowControlArea::Drag` region — see the note in [`chrome_strip`].
+fn app_menu_button() -> impl IntoElement {
+    div().occlude().flex_shrink_0().child(
+        Button::new("titlebar-app-menu")
+            .ghost()
+            .xsmall()
+            .icon(Icon::default().path("icons/ellipsis.svg"))
+            .tooltip("Menu")
+            .dropdown_menu_with_anchor(
+                Anchor::TopLeft,
+                |menu: PopupMenu, _window: &mut Window, _cx: &mut gpui::Context<'_, PopupMenu>| {
+                    menu.min_w(px(200.0))
+                        .item(PopupMenuItem::new("New Window").on_click(
+                            |_, window: &mut Window, cx: &mut gpui::App| {
+                                window.dispatch_action(Box::new(NewWindow), cx);
+                            },
+                        ))
+                        .item(PopupMenuItem::new("Settings…").on_click(
+                            |_, window: &mut Window, cx: &mut gpui::App| {
+                                window.dispatch_action(Box::new(OpenSettings), cx);
+                            },
+                        ))
+                        .separator()
+                        .item(PopupMenuItem::new("Quit OxiMux").on_click(
+                            |_, window: &mut Window, cx: &mut gpui::App| {
+                                window.dispatch_action(Box::new(crate::menu::Quit), cx);
+                            },
+                        ))
+                },
+            ),
+    )
 }
 
 /// Reference-editor-style title-bar "Update" pill. Renders only once a new
@@ -217,6 +295,8 @@ fn update_pill(theme: Theme, typography: &Typography) -> impl IntoElement {
         .font_weight(typography.w_semibold)
         .text_color(theme.fg_base)
         .cursor_pointer()
+        // Opt out of the Windows title-bar drag region (see `chrome_strip`).
+        .when(cfg!(target_os = "windows"), |d| d.occlude())
         .hover(move |s| s.bg(base))
         .on_mouse_down(
             MouseButton::Left,
@@ -250,7 +330,23 @@ fn right_chrome_cluster(
         zone_base.flex_shrink_0()
     };
     if let Some(tabs) = right_tabs {
-        zone = zone.child(tabs);
+        // Windows: the activity tabs sit inside the strip's drag region, so
+        // they need an occluding wrapper to stay clickable (see
+        // `chrome_strip`). The wrapper mirrors the cluster's row layout so
+        // it is invisible to the flexbox.
+        if cfg!(target_os = "windows") {
+            zone = zone.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h_full()
+                    .occlude()
+                    .child(tabs),
+            );
+        } else {
+            zone = zone.child(tabs);
+        }
     }
     if right_open {
         // Push the close toggle to the trailing edge while keeping
@@ -260,11 +356,17 @@ fn right_chrome_cluster(
     // The "..." pane-actions button used to live here; it now ships
     // inside the hoisted tab strip itself so it stays adjacent to the
     // tabs (matching the reference editor's chrome).
-    zone.child(toggle_button(
+    zone = zone.child(toggle_button(
         right_toggle_icon(right_open),
         theme,
         ToggleSide::Right,
-    ))
+    ));
+    // Windows: this cluster always ends at the window's top-right corner
+    // (in `right_header` when the sidebar is open, appended to
+    // `center_header` when closed), so it hosts the custom caption buttons.
+    zone.when(cfg!(target_os = "windows"), |z| {
+        z.child(WindowsWindowControls::new(theme))
+    })
 }
 
 fn spacer_zone() -> impl IntoElement {
@@ -311,6 +413,9 @@ pub fn command_center(
         .border_1()
         .border_color(theme.border_inactive)
         .cursor_pointer()
+        // Opt out of the Windows title-bar drag region (see `chrome_strip`);
+        // the flanks around the field stay draggable chrome.
+        .when(cfg!(target_os = "windows"), |d| d.occlude())
         .hover(|s| s.border_color(theme.border_active))
         .on_mouse_down(
             MouseButton::Left,
@@ -377,6 +482,8 @@ fn toggle_button(icon_path: &'static str, theme: Theme, side: ToggleSide) -> imp
         .items_center()
         .justify_center()
         .cursor_pointer()
+        // Opt out of the Windows title-bar drag region (see `chrome_strip`).
+        .when(cfg!(target_os = "windows"), |d| d.occlude())
         .on_mouse_down(
             MouseButton::Left,
             move |_: &MouseDownEvent, window: &mut Window, cx: &mut gpui::App| match side {
