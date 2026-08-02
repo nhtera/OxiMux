@@ -23,6 +23,13 @@
 //! ConPTY: `[Console]::CursorLeft` reports **1**, and the byte arrives at the
 //! terminal **unchanged**. Both halves of the mismatch in one observation.
 //!
+//! Not every ConPTY drifts: the windows-2025 CI image gives the byte zero
+//! width in its own buffer and never forwards it, so there is nothing to
+//! reconcile and this filter idles. The snapshot smoke test therefore asserts
+//! column *parity* against `[Console]::CursorLeft` rather than a literal
+//! frame, which also guards the reverse failure — this filter spacing a byte
+//! a fixed ConPTY gave no width to.
+//!
 //! # What this cost in practice
 //!
 //! Claude Code emits a stray `0x0F` on the first redraw of its input line. Its

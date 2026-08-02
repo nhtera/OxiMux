@@ -367,23 +367,26 @@ fn snapshot_preserves_palette_and_truecolour() {
     );
 }
 
-/// A byte ConPTY gives a column to must get a column here too.
+/// Our grid and ConPTY must agree on which column a bare `0x0F` leaves the
+/// cursor in.
 ///
-/// ConPTY's screen buffer inherits DOS semantics, where `0x0F` is a printable
-/// CP437 glyph occupying one column. It then forwards the byte verbatim
-/// instead of re-encoding it — and VT reads `0x0F` as SI, a control worth no
-/// columns. From that point ConPTY's idea of the cursor column runs one ahead
-/// of the terminal's, so every *relative* cursor move it emits afterwards
-/// lands a column too far left. That is what turned Claude Code's `❯ hi` into
-/// `❯h i`: a backspace overshot and the typed character overwrote the prompt
-/// separator. `ConptyC0Filter` reconciles the two models at the read boundary.
+/// The conhost this was written against inherits DOS semantics in its screen
+/// buffer — `0x0F` is a printable CP437 glyph worth **one** column — and then
+/// forwards the byte verbatim, which VT reads as SI, a control worth **zero**.
+/// From that point ConPTY's idea of the cursor runs one ahead of the
+/// terminal's, every relative move afterwards lands a column too far left, and
+/// that is what turned Claude Code's `❯ hi` into `❯h i`. `ConptyC0Filter`
+/// reconciles the two models at the read boundary. Newer ConPTY builds (the
+/// windows-2025 runner image) instead give the byte zero width in their own
+/// buffer and never forward it — no disagreement, and the filter correctly
+/// idles.
 ///
-/// This asserts the invariant rather than replaying the original frame. A
-/// synthetic child cannot reproduce that frame reliably — ConPTY collapses a
-/// short script's incremental writes into one absolutely-addressed repaint,
-/// which corrects the drift on its own and makes such a test pass with the
-/// filter removed. Column parity is the property the fix actually rests on,
-/// and it is directly observable.
+/// So the assertion is *parity*, not a literal frame: the child asks ConPTY
+/// where its cursor is (`[Console]::CursorLeft`, the same probe that
+/// characterized the defect — see `conpty_c0.rs`) and this test asserts `B`
+/// landed in that column of our grid. On a drift-y conhost a missing filter
+/// fails it (columns disagree by one); on a fixed conhost it also fails if the
+/// filter ever *over-corrects* by spacing a byte ConPTY gave no width to.
 ///
 /// The unit tests in `conpty_c0` cover the state machine; this covers the
 /// question they cannot — that the filter sits on the path the bytes take.
@@ -392,7 +395,7 @@ fn snapshot_preserves_palette_and_truecolour() {
 /// VT meaning and are passed through untouched.
 #[test]
 #[cfg(windows)]
-fn a_byte_conpty_counts_as_a_column_occupies_one_here() {
+fn conpty_and_the_grid_agree_where_a_c0_byte_leaves_the_cursor() {
     // Written from the test so the fixture cannot drift from the assertion.
     // Pure ASCII: PowerShell 5.1 reads a BOM-less .ps1 as ANSI, so a literal
     // non-ASCII character would break the parse.
@@ -403,7 +406,11 @@ fn a_byte_conpty_counts_as_a_column_occupies_one_here() {
             "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n",
             "[Console]::Out.Write('A')\n",
             "[Console]::Out.Write([char]0x0F)\n",
+            "$col = [Console]::CursorLeft\n",
             "[Console]::Out.Write('B')\n",
+            "[Console]::Out.Write([char]13)\n",
+            "[Console]::Out.Write([char]10)\n",
+            "[Console]::Out.Write(\"COL=$col\")\n",
             "[Console]::Out.Flush()\n",
         ),
     )
@@ -419,12 +426,24 @@ fn a_byte_conpty_counts_as_a_column_occupies_one_here() {
         ],
     );
 
-    let row: String = snap.cells[0].iter().take(3).map(|c| c.ch).collect();
+    let row: String = snap.cells[0].iter().map(|c| c.ch).collect();
+    let report: String = snap.cells[1].iter().map(|c| c.ch).collect();
+    let conpty_col: usize = report
+        .trim()
+        .strip_prefix("COL=")
+        .unwrap_or_else(|| panic!("probe report missing, row 1 was {report:?}"))
+        .trim_end()
+        .parse()
+        .expect("probe column parses");
+    let grid_col = snap.cells[0]
+        .iter()
+        .position(|c| c.ch == 'B')
+        .unwrap_or_else(|| panic!("`B` never rendered, row 0 was {row:?}"));
     assert_eq!(
-        row, "A B",
-        "`A`, 0x0F, `B` came back as {row:?}. ConPTY put `B` in column 2 of \
-         its own buffer; anything else here means the two disagree about the \
-         width of that byte, and every relative cursor move after it on this \
-         line will be off by one."
+        grid_col, conpty_col,
+        "after `A` + 0x0F, ConPTY reported its cursor at column {conpty_col} \
+         but `B` landed at column {grid_col} of our grid (row: {row:?}). The \
+         two disagree about the width of that byte, and every relative cursor \
+         move after it on this line will be off by one."
     );
 }
