@@ -633,10 +633,11 @@ impl WorkspaceRoot {
     }
 
     /// Mount a plain confirm dialog for a file-tree Delete. On confirm the
-    /// target is moved to the macOS Trash (reversible) and the tree refreshes;
-    /// an open editor tab for the path is left to the external-mutation sweep,
-    /// which flags it as deleted. Reuses the shared `confirm_dialog` slot +
-    /// observer, same as the SCM discard flow.
+    /// target is moved to the platform's reversible-delete bin (macOS Trash /
+    /// Windows Recycle Bin) and the tree refreshes; an open editor tab for the
+    /// path is left to the external-mutation sweep, which flags it as deleted.
+    /// Reuses the shared `confirm_dialog` slot + observer, same as the SCM
+    /// discard flow.
     pub(crate) fn mount_file_delete_confirm(
         &mut self,
         path: std::path::PathBuf,
@@ -648,7 +649,9 @@ impl WorkspaceRoot {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
         let kind = if path.is_dir() { "folder" } else { "file" };
-        let body = format!("Move the {kind} “{name}” to the Trash? You can restore it from the Trash.");
+        let trash = crate::shell::file_explorer::file_mutations::trash_name();
+        let body =
+            format!("Move the {kind} “{name}” to the {trash}? You can restore it from the {trash}.");
 
         let target = path.clone();
         let weak = cx.entity().downgrade();
@@ -664,10 +667,10 @@ impl WorkspaceRoot {
         });
 
         let prompt = ConfirmPrompt {
-            title: "Move to Trash".into(),
+            title: format!("Move to {trash}").into(),
             body: body.into(),
             on_confirm,
-            confirm_label: Some("Move to Trash".into()),
+            confirm_label: Some(format!("Move to {trash}").into()),
             on_cancel: None,
             secondary: None,
         };
