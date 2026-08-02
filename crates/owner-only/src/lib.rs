@@ -68,9 +68,16 @@ pub fn is_restricted_to_owner(path: &Path) -> io::Result<bool> {
         // Protected, or inherited ACEs can widen it after the fact; exactly one
         // allow-ACE, or something was added alongside ours rather than
         // displacing what the directory contributed; and that ACE is us.
-        Ok(sddl.starts_with("D:P")
-            && sddl.matches("(A;").count() == 1
-            && sddl.contains(&current_user_sid()?))
+        if !(sddl.starts_with("D:P") && sddl.matches("(A;").count() == 1) {
+            return Ok(false);
+        }
+        // The ACE's SID cannot be compared as text: the serializer compresses
+        // well-known accounts to aliases, so for a built-in Administrator the
+        // SID we wrote reads back as `LA`. Canonicalize before comparing.
+        let Some(token) = ace_sid(&sddl) else {
+            return Ok(false);
+        };
+        Ok(windows_impl::canonical_sid(token)? == current_user_sid()?)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -118,6 +125,15 @@ pub fn dacl_sddl(path: &Path) -> io::Result<String> {
 
 #[cfg(windows)]
 mod windows_impl;
+
+/// The SID token of the first allow-ACE in an SDDL DACL — the `LA` of
+/// `D:PAI(A;;FA;;;LA)`. `None` when there is no allow-ACE to name one.
+#[cfg(windows)]
+fn ace_sid(sddl: &str) -> Option<&str> {
+    let ace = sddl.split_once("(A;")?.1;
+    let ace = &ace[..ace.find(')')?];
+    ace.rsplit(';').next().filter(|token| !token.is_empty())
+}
 
 #[cfg(test)]
 mod tests {
@@ -224,6 +240,26 @@ mod tests {
             1,
             "expected exactly one allow-ACE, got {sddl}"
         );
-        assert!(sddl.contains(&sid), "ACE must name {sid}: {sddl}");
+        // Via `canonical_sid`, not `contains`: on an account the SDDL
+        // serializer knows by name (CI runs as the built-in Administrator),
+        // the ACE reads back as an alias like `LA` rather than the SID.
+        let token = ace_sid(&sddl).expect("allow-ACE carries a SID token");
+        assert_eq!(
+            windows_impl::canonical_sid(token).expect("canonicalize"),
+            sid,
+            "ACE must name {sid}: {sddl}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ace_sid_finds_the_token_in_both_spellings() {
+        assert_eq!(ace_sid("D:PAI(A;;FA;;;LA)"), Some("LA"));
+        assert_eq!(
+            ace_sid("D:P(A;;GA;;;S-1-5-21-1-2-3-500)"),
+            Some("S-1-5-21-1-2-3-500")
+        );
+        assert_eq!(ace_sid("D:P"), None, "no ACE, no token");
+        assert_eq!(ace_sid("D:PAI(A;;FA;;;)"), None, "empty token is not a SID");
     }
 }

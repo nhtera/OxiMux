@@ -8,12 +8,13 @@ use widestring::{U16CStr, U16CString};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
-    SetNamedSecurityInfoW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW,
+    GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetTokenInformation,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
+    TokenUser,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -147,6 +148,35 @@ pub(crate) fn current_user_sid() -> io::Result<String> {
     }
 }
 
+/// Canonicalize an SDDL SID token to its literal `S-1-…` spelling.
+///
+/// The SDDL serializer compresses well-known accounts to two-letter aliases —
+/// on a machine whose user is the built-in Administrator, the ACE written as
+/// `S-1-5-21-…-500` reads back as `LA` — so a readback can never be compared
+/// against [`current_user_sid`] as text. Round-tripping the token through a
+/// real SID yields one spelling for both sides of that comparison.
+pub(crate) fn canonical_sid(token: &str) -> io::Result<String> {
+    let wide = U16CString::from_str(token)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "SID token contains a NUL"))?;
+    // SAFETY: `wide` is NUL-terminated and outlives the call; both out-buffers
+    // are LocalAlloc'd by their callee and freed here on every path.
+    unsafe {
+        let mut sid: PSID = std::ptr::null_mut();
+        if ConvertStringSidToSidW(wide.as_ptr(), &mut sid) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut sid_str: *mut u16 = std::ptr::null_mut();
+        let ok = ConvertSidToStringSidW(sid, &mut sid_str);
+        LocalFree(sid.cast());
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let s = U16CStr::from_ptr_str(sid_str).to_string_lossy();
+        LocalFree(sid_str.cast());
+        Ok(s)
+    }
+}
+
 /// A security descriptor parsed from SDDL, freed on drop.
 struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
 
@@ -261,6 +291,22 @@ mod tests {
     fn the_running_user_has_a_resolvable_sid() {
         let sid = current_user_sid().expect("current user must have a SID");
         assert!(sid.starts_with("S-1-"), "got {sid}");
+    }
+
+    #[test]
+    fn an_alias_and_its_literal_sid_canonicalize_alike() {
+        // BUILTIN\Administrators has a fixed SID, so the pair is stable on any
+        // machine. This is the exact shape of the readback problem: the same
+        // account, spelled two ways.
+        assert_eq!(
+            canonical_sid("BA").expect("alias"),
+            canonical_sid("S-1-5-32-544").expect("literal"),
+        );
+    }
+
+    #[test]
+    fn a_garbage_sid_token_is_an_error_not_a_match() {
+        assert!(canonical_sid("not-a-sid").is_err());
     }
 
     #[test]
