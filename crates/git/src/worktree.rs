@@ -66,15 +66,20 @@ impl Repository {
             .arg(path.as_os_str())
             .run()
             .await?;
-        // Look up the newly-added worktree by path. Canonicalize because git
-        // emits canonical paths in `--porcelain` output but the caller may
-        // have passed e.g. a relative or symlinked path.
+        // Look up the newly-added worktree by path. BOTH sides are
+        // canonicalized: the caller may have passed a relative or symlinked
+        // path, and git's `--porcelain` output is not `fs::canonicalize`'s
+        // shape either — on Windows git prints `C:/...` while canonicalize
+        // returns the `\\?\C:\...` verbatim form, which never compares equal
+        // as `PathBuf`s. Round-tripping each listed path through the same
+        // canonicalization is what makes the comparison mean "same directory"
+        // rather than "same spelling".
         let target = std::fs::canonicalize(path)
             .map_err(|e| GitError::parse(format!("canonicalize worktree path: {e}")))?;
         let entries = self.list_worktrees().await?;
         entries
             .into_iter()
-            .find(|w| w.path == target)
+            .find(|w| std::fs::canonicalize(&w.path).is_ok_and(|p| p == target))
             .ok_or_else(|| {
                 GitError::parse(format!(
                     "new worktree at {target:?} not present in `git worktree list`"
