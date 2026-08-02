@@ -811,7 +811,8 @@ mod tests {
     #[test]
     fn claude_vocab_matches_expected() {
         let (conn, _rx) =
-            ClaudeStreamJsonConnection::spawn_command(Command::new("true")).expect("spawn");
+            ClaudeStreamJsonConnection::spawn_command(crate::thread::sh_fixture::sh_script(":"))
+                .expect("spawn");
         let models: Vec<String> = conn.models().into_iter().map(|m| m.wire).collect();
         assert_eq!(models, vec!["opus", "fable", "sonnet", "haiku"]);
         // Every blurb leads with the versioned name, which is the only place the
@@ -887,7 +888,7 @@ mod tests {
     /// clear. The ring keeps only a bounded tail.
     #[test]
     fn large_stderr_does_not_block_child() {
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         // 200 KiB to stderr, one stream-json result line to stdout, then exit.
         cmd.arg("-c").arg(
             "yes ERRORLINE | head -c 200000 1>&2; \
@@ -914,7 +915,7 @@ mod tests {
         let l2 = serde_json::json!({"type":"result","subtype":"success",
             "result":"done","total_cost_usd":0.0})
         .to_string();
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(format!("printf '%s\\n' '{l1}' '{l2}'"));
 
         let (_conn, rx) = ClaudeStreamJsonConnection::spawn_command(cmd).expect("spawn fake");

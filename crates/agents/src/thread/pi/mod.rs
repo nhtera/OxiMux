@@ -1676,7 +1676,7 @@ while IFS= read -r line; do
   esac
 done
 "#;
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         cmd
     }
@@ -1724,7 +1724,7 @@ done
     #[test]
     fn a_pi_without_commands_still_connects() {
         // `get_commands` failing must cost the palette, not the session.
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(
             r#"
 while IFS= read -r line; do
@@ -1887,7 +1887,7 @@ done
     fn a_pi_that_dies_during_the_handshake_fails_with_its_stderr() {
         // The failure users actually hit (bad auth / bad flag). It must not hang
         // the new chat, and the message must say what pi said.
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg("read line; echo 'pi: no credentials found' >&2; exit 1");
         let start = std::time::Instant::now();
         let err = PiRpcConnection::spawn_command(cmd).err().expect("must fail");
@@ -1906,7 +1906,7 @@ read line
 printf '{"id":"s1","type":"response","command":"get_state","success":true,"data":{"sessionId":"s"}}\n'
 sleep 2
 "#;
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         let (conn, _rx) = PiRpcConnection::spawn_command(cmd).expect("handshake");
         let err = conn
@@ -1944,7 +1944,7 @@ while true; do sleep 0.05; done
 "#,
             m = marker.display()
         );
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         let (conn, _rx) = PiRpcConnection::spawn_command(cmd).expect("handshake");
         conn.shutdown();
@@ -1973,7 +1973,7 @@ read line
 printf '{"id":"s1","type":"response","command":"get_state","success":true,"data":{"sessionId":"s"}}\n'
 while true; do sleep 0.05; done
 "#;
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         let (conn, _rx) = PiRpcConnection::spawn_command(cmd).expect("handshake");
         let start = std::time::Instant::now();
@@ -2003,7 +2003,7 @@ read line
 printf '{"id":"s1","type":"response","command":"get_state","success":true,"data":{"sessionId":"s"}}\n'
 sleep 30
 "#;
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         let (conn, _rx) = PiRpcConnection::spawn_command(cmd).expect("handshake");
         let pid = conn.child.lock().unwrap().id();
