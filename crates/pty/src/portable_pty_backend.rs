@@ -761,9 +761,12 @@ fn watch_session(
         }
     }
 
-    // The EOF path has not consulted the reaper yet, and its exit code is worth
-    // blocking for: EOF means the pty is gone, so `wait` is about to return.
-    if saw_eof {
+    // On EOF the exit code is worth blocking for: the pty is gone, so `wait`
+    // is about to return. But only if the reaper has not been consulted yet —
+    // when the child was reaped first (`drain_deadline` set) and EOF arrived
+    // inside the drain window, the channel is already empty with its sender
+    // gone, and a second recv would clobber the real code with `None`.
+    if saw_eof && drain_deadline.is_none() {
         code = exit_rx.recv().ok().flatten();
     }
 
