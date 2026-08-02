@@ -8,6 +8,8 @@
 //! only revocable if it can be found.
 
 use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
+#[cfg(target_os = "macos")]
+use gpui::SharedString;
 use oximux_settings::{Density, Theme, Typography};
 
 use super::SettingsModal;
