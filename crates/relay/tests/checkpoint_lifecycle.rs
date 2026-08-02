@@ -77,16 +77,33 @@ async fn checkpoint_written_on_tick_and_removed_on_close() {
     })
     .await;
 
-    // A second pass with no new output is a no-op (skip-if-unchanged):
-    // observe via mtime stability.
-    let before = std::fs::metadata(pty_dir.join("scrollback.bin"))
-        .and_then(|m| m.modified())
-        .expect("mtime");
-    registry.checkpoint_all();
-    let after = std::fs::metadata(pty_dir.join("scrollback.bin"))
-        .and_then(|m| m.modified())
-        .expect("mtime");
-    assert_eq!(before, after, "unchanged PTY must not rewrite its checkpoint");
+    // A pass with no new output is a no-op (skip-if-unchanged): observe via
+    // mtime stability. Polled until stable rather than asserted on the very
+    // next pass, because "no new output" is a state the PTY settles into, not
+    // one the first checkpoint already guarantees — a Windows shell through
+    // ConPTY keeps trickling startup output (banner, prompt repaints) after
+    // its first bytes land, and each trickle makes the following rewrite
+    // legitimate. The contract under test is that an idle PTY STOPS being
+    // rewritten, and that is what the stability probe asserts.
+    let mtime = || {
+        std::fs::metadata(pty_dir.join("scrollback.bin"))
+            .and_then(|m| m.modified())
+            .expect("mtime")
+    };
+    let mut settled = false;
+    for _ in 0..200 {
+        let before = mtime();
+        registry.checkpoint_all();
+        if mtime() == before {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        settled,
+        "unchanged PTY must stop rewriting its checkpoint once output settles"
+    );
 
     registry
         .close(&pty_id, Duration::from_millis(500))
