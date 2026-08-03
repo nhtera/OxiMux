@@ -9,9 +9,11 @@
 //! whose `pvi_cdir.vip_path` field is the absolute CWD. This is the
 //! same syscall `lsof -p <pid>` uses for its `cwd` line.
 //!
-//! Non-macOS: returns `None` for now. Linux could read `/proc/<pid>/cwd`;
-//! Windows has its own API. Wire those when the app actually ships on
-//! those platforms.
+//! Linux: readlink on `/proc/<pid>/cwd` — the kernel keeps the symlink
+//! pointed at the process's live working directory.
+//!
+//! Elsewhere (Windows): returns `None` for now. Windows has its own API;
+//! wire it when something actually needs it there.
 
 use std::path::PathBuf;
 
@@ -25,10 +27,32 @@ pub fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
     {
         macos::cwd_of_pid(pid)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::cwd_of_pid(pid)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = pid;
         None
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::path::PathBuf;
+
+    pub fn cwd_of_pid(pid: u32) -> Option<PathBuf> {
+        // Fails with ENOENT for a dead or zombie pid and EACCES for
+        // another user's process — all of which mean "no answer" here.
+        let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+        // A directory removed while still the process's cwd reads back
+        // as "<path> (deleted)" — a name that never existed. Callers
+        // prefer no answer over a wrong one (they fall back to OSC 7).
+        if path.to_string_lossy().ends_with(" (deleted)") {
+            return None;
+        }
+        Some(path)
     }
 }
 
@@ -134,8 +158,9 @@ mod tests {
     use super::cwd_of_pid;
 
     /// Self-test: our own process pid must report a real CWD. Guards
-    /// against the FFI struct layout drifting from the kernel header.
-    #[cfg(target_os = "macos")]
+    /// against the FFI struct layout drifting from the kernel header on
+    /// macOS, and against the /proc symlink shape changing on Linux.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn cwd_of_self_returns_existing_path() {
         let pid = std::process::id();
@@ -144,10 +169,10 @@ mod tests {
         assert!(cwd.exists(), "CWD must point to a real path, got {cwd:?}");
     }
 
-    /// The documented behavior off macOS: no panic, no guess, just `None`.
-    /// Callers treat that as "ask the shell instead" (OSC 7), so returning a
-    /// wrong answer would be worse than returning nothing.
-    #[cfg(not(target_os = "macos"))]
+    /// The documented behavior off macOS/Linux: no panic, no guess, just
+    /// `None`. Callers treat that as "ask the shell instead" (OSC 7), so
+    /// returning a wrong answer would be worse than returning nothing.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn an_unsupported_platform_reports_no_cwd() {
         assert!(cwd_of_pid(std::process::id()).is_none());
@@ -156,12 +181,42 @@ mod tests {
 
     /// Non-existent pid returns None rather than panicking or returning
     /// a stale path from a previous query.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn cwd_of_unlikely_pid_returns_none() {
         // u32::MAX is well outside any realistic pid range; macOS pid_t
         // is i32 so values above 2^31 wrap to negative and the syscall
-        // rejects them.
+        // rejects them, and no /proc entry can exist for it on Linux.
         assert!(cwd_of_pid(u32::MAX).is_none());
+    }
+
+    /// A child spawned with an explicit working directory reports that
+    /// directory back — proving the lookup reads the *target* pid's
+    /// state, which the self-pid test alone cannot show.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn cwd_of_child_reports_spawn_directory() {
+        // Canonicalize before comparing: the tempdir may live behind a
+        // symlink (/var -> /private/var on macOS) and the kernel reports
+        // the resolved path.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let expected = dir.path().canonicalize().expect("canonicalize tempdir");
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(dir.path())
+            .spawn()
+            .expect("spawn sleep in tempdir");
+        // Poll briefly rather than asserting the first read: if the
+        // runtime fell back to fork/exec, the parent can observe the
+        // child before its chdir has landed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut got = cwd_of_pid(child.id());
+        while got.as_deref() != Some(expected.as_path()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            got = cwd_of_pid(child.id());
+        }
+        child.kill().ok();
+        child.wait().ok();
+        assert_eq!(got.as_deref(), Some(expected.as_path()));
     }
 }

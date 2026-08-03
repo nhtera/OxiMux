@@ -7167,6 +7167,7 @@ name = "oximux-proc-cwd"
 version = "0.1.6"
 dependencies = [
  "libc",
+ "tempfile",
 ]
 
 [[package]]

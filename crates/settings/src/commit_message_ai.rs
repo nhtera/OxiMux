@@ -11,6 +11,7 @@
 //! time, so a mid-session edit takes effect on the next sparkles
 //! click without restarting OxiMux.
 
+#[cfg(feature = "gpui")]
 use gpui::Global;
 use serde::{Deserialize, Serialize};
 
@@ -102,6 +103,7 @@ impl Default for CommitMessageAiSettings {
     }
 }
 
+#[cfg(feature = "gpui")]
 impl Global for CommitMessageAiSettings {}
 
 impl CommitMessageAiSettings {

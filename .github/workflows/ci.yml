@@ -85,6 +85,83 @@ jobs:
       - name: xtask icon --check
         run: cargo run -p xtask -- icon --check
 
+  # Linux leg of the portability gate, added ahead of the CLI/serve work: the
+  # crate set below is exactly what the `oximux` CLI and `oximux serve` reuse,
+  # and "Windows-CI-proven, therefore probably Linux-clean" is an assumption
+  # until a Linux runner says so. GPUI, dictation, computer-use, macos-trust,
+  # auto-update, editor and ui stay out on purpose — the CLI does not link
+  # them, and keeping them out is what lets this job run on a plain ubuntu
+  # image with no GUI system libraries.
+  linux-check:
+    name: linux cli-crate gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
+
+      # `oximux-settings` is deliberately missing from this list: with default
+      # features it links gpui, which is exactly what a headless consumer must
+      # not do. It gets its own gpui-free step below.
+      - name: cargo check (CLI crate set)
+        run: >
+          cargo check --all-targets
+          -p oximux-core
+          -p oximux-pty
+          -p oximux-git
+          -p oximux-agent-core
+          -p oximux-agents
+          -p oximux-storage
+          -p oximux-relay-proto
+          -p oximux-relay
+          -p oximux-relay-client
+          -p oximux-remote-proto
+          -p oximux-remote-host
+          -p oximux-remote-session
+          -p oximux-remote-iroh
+          -p oximux-shell-env
+          -p oximux-owner-only
+          -p oximux-proc-cwd
+          -p oximux-job-object
+          -p oximux-no-window
+
+      # The step above already builds remote-iroh's accept-loop half: selected
+      # via `-p`, the crate's OWN `default = ["host"]` applies (the opt-in
+      # lives in the workspace dependency alias, which sets
+      # `default-features = false`). What that step never builds is the
+      # client-only shape — the one the mobile core consumes today and the
+      # CLI's remote client will — so that is the variant checked here.
+      # `--lib`, not `--all-targets`: the integration tests under tests/
+      # exercise the accept loop and only compile with `host` on.
+      - name: cargo check (remote-iroh client half, host off)
+        run: cargo check --lib -p oximux-remote-iroh --no-default-features
+
+      # The build the CLI will actually use: settings with the UI toolkit
+      # absent from the dependency tree entirely.
+      - name: cargo check (settings without gpui)
+        run: cargo check --all-targets -p oximux-settings --no-default-features
+
+      # Separate test steps, not one `-p a -p b --test t` invocation: cargo
+      # applies `--test` across every `-p` given and silently skips a package
+      # without that target, so proc-cwd's unit tests would never run.
+      - name: cargo test (proc-cwd Linux arm)
+        run: cargo test -p oximux-proc-cwd
+
+      # The only end-to-end coverage of PTY spawn/attach/replay on Linux —
+      # same rationale as the Windows job's step of the same name.
+      - name: cargo test (relay daemon end-to-end)
+        run: cargo test -p oximux-relay --test relay_integration
+
   # Permanent gate for the Windows port. macOS is still the only shipping
   # target; this job stops a macOS-only API from landing on a shared path
   # unnoticed, which is exactly the class of breakage that made the port
