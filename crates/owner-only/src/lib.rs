@@ -16,6 +16,23 @@
 //! relay daemon, and the remote host — have no other crate in common. The
 //! alternative was the same SID lookup written out three times, which is how
 //! security code drifts.
+//!
+//! # Directories are not files, and Windows is not unix
+//!
+//! [`prepare_owner_only_dir`] exists because the app's whole data directory —
+//! not just the individual secrets in it — has to be closed to other accounts.
+//! The two platforms need different things from it:
+//!
+//! - On unix `0700` on the directory is sufficient on its own. Denying `x`
+//!   denies traversal, so nothing inside is reachable by another user no matter
+//!   how permissive its own mode is.
+//! - On Windows it is **not** sufficient. `SeChangeNotifyPrivilege` ("bypass
+//!   traverse checking") is granted to Everyone by default, so a restrictive
+//!   DACL on a directory does not stop anyone who knows the full path to a file
+//!   inside it. The directory's ACE is therefore written *inheritable*, so
+//!   files created later carry it too — and files that already existed still
+//!   need their own [`restrict_file`], because inheritance is applied at
+//!   creation and never retroactively.
 
 use std::io;
 use std::path::Path;
@@ -37,7 +54,7 @@ pub fn restrict_file(path: &Path) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        windows_impl::set_owner_only_dacl(path)
+        windows_impl::set_owner_only_dacl(path, &owner_only_sddl()?)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -46,6 +63,82 @@ pub fn restrict_file(path: &Path) -> io::Result<()> {
             io::ErrorKind::Unsupported,
             "no way to restrict file access on this platform",
         ))
+    }
+}
+
+/// Create `dir` if it does not exist, restrict it to the account running this
+/// process, and **verify by readback** that it stayed that way.
+///
+/// The one call sites should reach for. A directory holding secrets is not
+/// protected by the write having been issued — it is protected by the mode or
+/// descriptor that is actually on it afterwards, which is a different claim and
+/// the only one worth asserting. An unverifiable restriction is an error rather
+/// than a warning: a caller that continues past this believing the directory is
+/// closed is worse off than one that knows it is not.
+///
+/// Idempotent, so it is safe on every boot rather than only on first run — and
+/// it must run on every boot, because the directory may pre-date the version
+/// that started restricting it.
+pub fn prepare_owner_only_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    restrict_dir(dir)?;
+    if !is_dir_restricted_to_owner(dir)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is not owner-only after restricting it",
+                dir.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Restrict a directory so only the account running this process can enter it.
+///
+/// See the module docs for why this alone is enough on unix and is not on
+/// Windows.
+pub fn restrict_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(windows)]
+    {
+        windows_impl::set_owner_only_dacl(path, &owner_only_dir_sddl()?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no way to restrict directory access on this platform",
+        ))
+    }
+}
+
+/// Whether `path` is a directory only the running account can enter.
+///
+/// The directory counterpart of [`is_restricted_to_owner`] — `0700` rather than
+/// `0600`, since a directory without `x` cannot be traversed even by its owner.
+pub fn is_dir_restricted_to_owner(path: &Path) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(std::fs::metadata(path)?.permissions().mode() & 0o777 == 0o700)
+    }
+    #[cfg(windows)]
+    {
+        // Identical check to the file case: what matters is that the DACL is
+        // protected and names us alone. The inheritance flags the directory
+        // carries live inside the ACE and do not change who it admits.
+        windows_dacl_names_only_us(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(false)
     }
 }
 
@@ -64,26 +157,36 @@ pub fn is_restricted_to_owner(path: &Path) -> io::Result<bool> {
     }
     #[cfg(windows)]
     {
-        let sddl = dacl_sddl(path)?;
-        // Protected, or inherited ACEs can widen it after the fact; exactly one
-        // allow-ACE, or something was added alongside ours rather than
-        // displacing what the directory contributed; and that ACE is us.
-        if !(sddl.starts_with("D:P") && sddl.matches("(A;").count() == 1) {
-            return Ok(false);
-        }
-        // The ACE's SID cannot be compared as text: the serializer compresses
-        // well-known accounts to aliases, so for a built-in Administrator the
-        // SID we wrote reads back as `LA`. Canonicalize before comparing.
-        let Some(token) = ace_sid(&sddl) else {
-            return Ok(false);
-        };
-        Ok(windows_impl::canonical_sid(token)? == current_user_sid()?)
+        windows_dacl_names_only_us(path)
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         Ok(false)
     }
+}
+
+/// Whether `path`'s DACL is protected and admits this account alone.
+///
+/// Shared by the file and directory readbacks: on Windows the question is the
+/// same for both, since access there comes from the descriptor rather than from
+/// mode bits that mean different things per object type.
+#[cfg(windows)]
+fn windows_dacl_names_only_us(path: &Path) -> io::Result<bool> {
+    let sddl = dacl_sddl(path)?;
+    // Protected, or inherited ACEs can widen it after the fact; exactly one
+    // allow-ACE, or something was added alongside ours rather than
+    // displacing what the directory contributed; and that ACE is us.
+    if !(sddl.starts_with("D:P") && sddl.matches("(A;").count() == 1) {
+        return Ok(false);
+    }
+    // The ACE's SID cannot be compared as text: the serializer compresses
+    // well-known accounts to aliases, so for a built-in Administrator the
+    // SID we wrote reads back as `LA`. Canonicalize before comparing.
+    let Some(token) = ace_sid(&sddl) else {
+        return Ok(false);
+    };
+    Ok(windows_impl::canonical_sid(token)? == current_user_sid()?)
 }
 
 /// SDDL granting the current user full control of an object and naming nobody
@@ -99,6 +202,24 @@ pub fn is_restricted_to_owner(path: &Path) -> io::Result<bool> {
 #[cfg(windows)]
 pub fn owner_only_sddl() -> io::Result<String> {
     Ok(format!("D:P(A;;GA;;;{})", windows_impl::current_user_sid()?))
+}
+
+/// The same DACL for a directory, with the ACE marked inheritable.
+///
+/// `OICI` — object-inherit, container-inherit — so files and subdirectories
+/// created inside carry it too. Necessary rather than tidy: bypass-traverse-
+/// checking means a restrictive descriptor on the directory does not protect
+/// what is inside it, so without inheritance the directory's own DACL would
+/// guard nothing but the directory entry itself.
+///
+/// Inheritance applies at creation time only. Files that pre-date the call
+/// still need [`restrict_file`].
+#[cfg(windows)]
+pub fn owner_only_dir_sddl() -> io::Result<String> {
+    Ok(format!(
+        "D:P(A;OICI;GA;;;{})",
+        windows_impl::current_user_sid()?
+    ))
 }
 
 /// The SID of the account this process runs as (`S-1-5-21-…`).
@@ -206,6 +327,115 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("chmod");
 
         assert!(!is_restricted_to_owner(&path).expect("read back"));
+    }
+
+    #[test]
+    fn preparing_a_dir_creates_it_restricted_and_keeps_us_in() {
+        // The whole contract in one place: it appears, it is closed to others,
+        // and we can still write to it. A restriction that locked out the owner
+        // would satisfy every "not world readable" assertion and brick the app.
+        let base = tempfile::tempdir().expect("tempdir");
+        let dir = base.path().join("nested").join("data");
+
+        prepare_owner_only_dir(&dir).expect("prepare");
+
+        assert!(dir.is_dir(), "the directory should have been created");
+        assert!(is_dir_restricted_to_owner(&dir).expect("read back"));
+        fs::write(dir.join("probe"), b"x").expect("owner must retain write access");
+    }
+
+    #[test]
+    fn preparing_an_existing_wide_open_dir_closes_it() {
+        // The upgrade path, and the reason this runs on every boot rather than
+        // only on first run: the directory already exists, created by a build
+        // that never restricted it.
+        let base = tempfile::tempdir().expect("tempdir");
+        let dir = base.path().join("data");
+        fs::create_dir_all(&dir).expect("seed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("widen");
+            assert!(!is_dir_restricted_to_owner(&dir).expect("read back"));
+        }
+        fs::write(dir.join("oximux.db"), b"transcripts").expect("seed file");
+
+        prepare_owner_only_dir(&dir).expect("prepare");
+
+        assert!(is_dir_restricted_to_owner(&dir).expect("read back"));
+        assert_eq!(
+            fs::read(dir.join("oximux.db")).expect("contents survive"),
+            b"transcripts".to_vec(),
+            "hardening must not disturb what is already in the directory"
+        );
+    }
+
+    #[test]
+    fn preparing_is_idempotent() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let dir = base.path().join("data");
+        prepare_owner_only_dir(&dir).expect("first");
+        prepare_owner_only_dir(&dir).expect("second run must be a no-op, not an error");
+        assert!(is_dir_restricted_to_owner(&dir).expect("read back"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dir_lands_on_0700_not_0600() {
+        // 0600 would pass a naive "no group/other bits" check and still be
+        // useless: without `x` the owner cannot traverse its own directory.
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().expect("tempdir");
+        let dir = base.path().join("d");
+        fs::create_dir(&dir).expect("mkdir");
+
+        restrict_dir(&dir).expect("restrict");
+
+        let mode = fs::metadata(&dir).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "got {mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_dir_predicate_rejects_a_traversable_dir() {
+        // Guards the predicate: one that returned true unconditionally would
+        // make the readback in `prepare_owner_only_dir` vacuous.
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().expect("tempdir");
+        let dir = base.path().join("d");
+        fs::create_dir(&dir).expect("mkdir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("widen");
+
+        assert!(!is_dir_restricted_to_owner(&dir).expect("read back"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_dir_dacl_is_protected_and_inheritable() {
+        // Inheritance is the load-bearing part on Windows: bypass-traverse-
+        // checking means the directory's own descriptor does not protect the
+        // files inside it, so the ACE has to flow down to them at creation.
+        let base = tempfile::tempdir().expect("tempdir");
+        let dir = base.path().join("d");
+        fs::create_dir(&dir).expect("mkdir");
+
+        restrict_dir(&dir).expect("restrict");
+
+        let sddl = dacl_sddl(&dir).expect("read back");
+        assert!(sddl.starts_with("D:P"), "must be protected: {sddl}");
+        assert_eq!(sddl.matches("(A;").count(), 1, "one allow-ACE: {sddl}");
+        assert!(
+            sddl.contains("OICI"),
+            "the ACE must be object- and container-inheritable: {sddl}"
+        );
+        assert!(is_dir_restricted_to_owner(&dir).expect("predicate agrees"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_dir_sddl_names_the_running_user() {
+        let sddl = owner_only_dir_sddl().expect("sddl");
+        assert!(sddl.starts_with("D:P(A;OICI;GA;;;S-1-"), "got {sddl}");
     }
 
     #[cfg(windows)]

@@ -21,17 +21,20 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 /// The only SDDL revision Windows defines.
 const SDDL_REVISION_1: u32 = 1;
 
-/// Replace `path`'s DACL with one naming only the current user, and mark it
-/// protected so the parent directory's inheritable ACEs do not flow back in.
-pub(crate) fn set_owner_only_dacl(path: &Path) -> io::Result<()> {
+/// Replace `path`'s DACL with `sddl`, and mark it protected so the parent
+/// directory's inheritable ACEs do not flow back in.
+///
+/// `SE_FILE_OBJECT` covers directories as well as files, so the only thing that
+/// varies between the two is the descriptor the caller passes — a directory's
+/// carries inheritance flags (see `owner_only_dir_sddl`), a file's does not.
+pub(crate) fn set_owner_only_dacl(path: &Path, sddl: &str) -> io::Result<()> {
     // Checked up front so a missing file is `NotFound` here exactly as it is on
     // unix, rather than whichever error code `SetNamedSecurityInfoW` happens to
     // pick — callers use that distinction to tell "not protected" from "not
     // there", and this crate's contract should not vary by platform.
     let _ = path.metadata()?;
 
-    let sddl = super::owner_only_sddl()?;
-    let descriptor = SecurityDescriptor::from_sddl(&sddl)?;
+    let descriptor = SecurityDescriptor::from_sddl(sddl)?;
     let dacl = descriptor.dacl()?;
 
     let mut wide_path = U16CString::from_os_str(path.as_os_str())

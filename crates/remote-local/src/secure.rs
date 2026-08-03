@@ -15,24 +15,17 @@ use rand::rngs::OsRng;
 /// and token, then verify by readback that it is traversable by the owner
 /// alone. Reachability is one of the two trust factors, so a directory that
 /// cannot be verified is a hard error, not a warning.
+///
+/// The restriction itself lives in `owner-only` rather than here. This
+/// directory is the app's whole data root — database, settings, grant store —
+/// so the desktop hardens it at startup whether or not local access is ever
+/// enabled, and two chmod paths racing to define "owner-only" for one directory
+/// is how the two definitions drift apart. This call is the belt to that
+/// braces: by the time a listener binds, the guarantee must hold regardless of
+/// what ran earlier.
 pub(crate) fn prepare_runtime_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("restrict {}", dir.display()))?;
-        let mode = std::fs::metadata(dir)
-            .with_context(|| format!("stat {}", dir.display()))?
-            .permissions()
-            .mode();
-        if mode & 0o777 != 0o700 {
-            bail!("{} is not owner-only after chmod (mode {mode:o})", dir.display());
-        }
-    }
-    // Windows: the pipe never lives in this directory (the namespace is flat);
-    // only the token file does, and that carries its own verified DACL.
-    Ok(())
+    oximux_owner_only::prepare_owner_only_dir(dir)
+        .with_context(|| format!("restrict {}", dir.display()))
 }
 
 /// Restrict the just-bound socket file itself and verify by readback. The
@@ -109,15 +102,24 @@ mod tests {
         assert_eq!(read_token_file(&path).unwrap(), token);
     }
 
-    #[cfg(unix)]
+    /// Deliberately not `cfg(unix)`: this used to be a no-op on Windows — the
+    /// directory got no descriptor at all, on the reasoning that only the token
+    /// file lived there and it carried its own. That reasoning does not survive
+    /// the directory being the app's whole data root, so the Windows arm now
+    /// stamps an inheritable owner-only DACL and this has to run there to say
+    /// so.
     #[test]
     fn runtime_dir_is_owner_only_after_prepare() {
-        use std::os::unix::fs::PermissionsExt as _;
         let base = tempfile::tempdir().unwrap();
         let dir = base.path().join("runtime");
         prepare_runtime_dir(&dir).unwrap();
-        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o700);
+        assert!(oximux_owner_only::is_dir_restricted_to_owner(&dir).unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "got {mode:o}");
+        }
     }
 
     /// A pre-existing world-readable token file must come out restricted —

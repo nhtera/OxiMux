@@ -54,6 +54,24 @@ const DB_FILE_NAME: &str = "oximux.db";
 fn main() {
     init_tracing();
 
+    // Before anything writes into the data directory — including the migration
+    // immediately below, which creates it. Everything in there is private to
+    // this account, and until this call existed none of it was closed to the
+    // other accounts on the machine.
+    //
+    // A warning rather than a fatal: the app is still usable when its data
+    // directory cannot be restricted (an exotic filesystem, a network home),
+    // and refusing to start would be a worse outcome than a boot that says so.
+    // Secrets have their own per-file restriction with its own hard failure, so
+    // this degrading does not silently downgrade the token or the host key.
+    if let Err(err) = oximux_app::app_paths::harden_data_dir() {
+        tracing::warn!(
+            ?err,
+            "could not restrict the app data directory to this account; \
+             transcripts and settings may be readable by other users"
+        );
+    }
+
     // Before anything resolves a data path: seven modules used to pick their
     // own directory, which on Windows put them in the roaming profile while
     // the rest of the app used the local one. They now all go through
@@ -1036,7 +1054,7 @@ fn open_db_or_exit() -> Db {
         std::process::exit(1);
     }
     let db_path = db_dir.join(DB_FILE_NAME);
-    match oximux_storage::open(&db_path) {
+    let db = match oximux_storage::open(&db_path) {
         Ok(db) => db,
         Err(err) => {
             eprintln!(
@@ -1045,6 +1063,45 @@ fn open_db_or_exit() -> Db {
                 db_path.display()
             );
             std::process::exit(1);
+        }
+    };
+    restrict_db_files(&db_path);
+    db
+}
+
+/// Restrict the database and its WAL sidecars to this account.
+///
+/// Belt to the data directory's braces, and on Windows not merely that. There,
+/// bypass-traverse-checking is granted to Everyone by default, so a restrictive
+/// descriptor on the directory does not stop anyone who knows the path to a
+/// file inside it; the directory's ACE is inheritable, which covers files
+/// created from now on but never a database that pre-dates the upgrade. On unix
+/// `0700` on the directory is already sufficient and this is pure defence in
+/// depth — the position the relay's token takes for the same reason.
+///
+/// The `-wal` and `-shm` sidecars matter as much as the database: recent
+/// transactions live in the WAL, so protecting only the main file would leave
+/// the newest transcripts readable. They exist only while a connection is open,
+/// hence after the open above rather than before it.
+///
+/// Best-effort by design. A database that cannot be restricted is still a
+/// working database, and this runs on a path whose every other failure is
+/// fatal — turning a permissions hiccup into a refusal to start would trade a
+/// real regression for a hypothetical one.
+fn restrict_db_files(db_path: &std::path::Path) {
+    let mut name = db_path.as_os_str().to_os_string();
+    name.push("-wal");
+    let wal = std::path::PathBuf::from(name);
+    let mut name = db_path.as_os_str().to_os_string();
+    name.push("-shm");
+    let shm = std::path::PathBuf::from(name);
+
+    for path in [db_path, wal.as_path(), shm.as_path()] {
+        if !path.exists() {
+            continue;
+        }
+        if let Err(err) = oximux_owner_only::restrict_file(path) {
+            tracing::warn!(?err, path = %path.display(), "could not restrict database file");
         }
     }
 }

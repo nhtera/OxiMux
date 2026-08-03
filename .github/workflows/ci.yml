@@ -242,6 +242,9 @@ jobs:
       # OSC 7 drive-letter handling, and settings covers the screen-control
       # opt-in's path matching — where "absolute" and "the same directory under
       # another name" both mean something different than they do on Unix.
+      # remote-local earns its place now that preparing the runtime directory
+      # stamps an inheritable DACL there instead of being a Unix-only chmod: the
+      # workspace check compiles that arm, and only this step runs it.
       #
       # Kept as separate steps rather than one combined invocation: cargo
       # applies `--lib`/`--test` across every `-p` given and silently skips a
@@ -255,6 +258,7 @@ jobs:
           -p oximux-shell-env
           -p oximux-pty
           -p oximux-settings
+          -p oximux-remote-local
 
       # The desktop crate's unit suite passes in full on Windows as of the
       # single-instance fix and the fixture ports alongside it, so it graduates
