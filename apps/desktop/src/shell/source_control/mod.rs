@@ -429,6 +429,14 @@ impl SourceControlPanel {
                 commit_area::CommitAreaEvent::CreatePrRequested => {
                     panel.open_pr_dialog(window, cx);
                 }
+                commit_area::CommitAreaEvent::StageAllRequested => {
+                    let paths = panel.unstaged_paths();
+                    if !paths.is_empty() {
+                        panel
+                            .git_panel
+                            .update(cx, |gp, cx| gp.stage_paths_bulk(paths, cx));
+                    }
+                }
             },
         );
 

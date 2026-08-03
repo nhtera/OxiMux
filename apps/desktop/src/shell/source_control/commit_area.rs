@@ -116,6 +116,10 @@ pub enum CommitStatus {
 pub enum CommitAreaEvent {
     /// User chose "Create PR" — the panel should open the compose dialog.
     CreatePrRequested,
+    /// Primary button resolved to Stage All — the panel owns the git
+    /// state (unstaged path list) and the GitPanel entity, so staging
+    /// is delegated up rather than duplicated here.
+    StageAllRequested,
 }
 
 pub struct CommitArea {
@@ -321,18 +325,33 @@ impl CommitArea {
         self.message_state.read(cx).focus_handle(cx)
     }
 
-    /// Submit if the primary action says we can. Caller passes the resolved
+    /// Dispatch the resolved primary action. Caller passes the resolved
     /// `PrimaryAction` so we only run when the rendered button would be
     /// enabled — keeps the keyboard path (Cmd+Enter, future binding) honest.
+    /// Every kind the resolver can produce is routed to its standing op —
+    /// a rendered enabled verb must never no-op on click.
     ///
     /// `&mut Window` is plumbed through so the auto-clear of the textarea
     /// after a successful commit (`set_value` requires Window) can fire
     /// inside the completion path's `update_in` block.
     pub fn submit(&mut self, action: &PrimaryAction, window: &mut Window, cx: &mut Context<Self>) {
-        if action.disabled || action.kind != PrimaryActionKind::Commit {
+        if action.disabled {
             return;
         }
-        super::commit_ops::run_commit(self, super::commit_ops::CommitFollowup::None, window, cx);
+        match action.kind {
+            PrimaryActionKind::Commit => super::commit_ops::run_commit(
+                self,
+                super::commit_ops::CommitFollowup::None,
+                window,
+                cx,
+            ),
+            PrimaryActionKind::Stage => cx.emit(CommitAreaEvent::StageAllRequested),
+            PrimaryActionKind::Push => self.push(cx),
+            PrimaryActionKind::Pull => self.pull(cx),
+            PrimaryActionKind::Sync => self.sync(cx),
+            PrimaryActionKind::Publish => self.publish(cx),
+            PrimaryActionKind::CreatePR => self.create_pr(cx),
+        }
     }
 
     /// Commit-then-push convenience used by the dropdown's "Commit & Push"
