@@ -158,6 +158,35 @@ async fn req(
     }
 }
 
+/// Read frames until this PTY emits its first output, returning whether it did.
+///
+/// Distinct from [`collect_output`], which drains until its deadline because it
+/// wants everything the shell said. This one stops at the first byte, so a test
+/// can establish "the shell has spoken" without paying the timeout on success.
+async fn wait_for_first_output(
+    stream: &mut Stream,
+    buf: &mut Vec<u8>,
+    pty_id: &str,
+    overall: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + overall;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline - tokio::time::Instant::now();
+        match timeout(remaining, read_frame(stream, buf)).await {
+            Ok(Ok(Frame::Notification(Notification::Output { pty_id: id, bytes })))
+                if id == pty_id && !bytes.is_empty() =>
+            {
+                return true;
+            }
+            // Some other frame, or another PTY's output: keep waiting.
+            Ok(Ok(_)) => continue,
+            // Read error or the deadline expired mid-read.
+            _ => break,
+        }
+    }
+    false
+}
+
 async fn collect_output(
     stream: &mut Stream,
     buf: &mut Vec<u8>,
@@ -235,6 +264,23 @@ async fn the_last_client_leaving_flushes_a_checkpoint() {
     )
     .await;
 
+    // Wait for the shell to actually emit something before leaving, and treat
+    // silence as a failed setup rather than letting it become a mysterious
+    // failure below.
+    //
+    // This is load-bearing, not hygiene. `checkpoint_all` skips any PTY whose
+    // `bytes_out` has not moved since the last pass, so a client that
+    // disconnects before its shell has echoed anything gets no scrollback
+    // written — correctly, since there is nothing to persist. Dropping the
+    // stream right after the write raced shell startup against that check, and
+    // on a loaded machine the shell lost: no output, no checkpoint, and a poll
+    // below that could never succeed no matter how long it ran.
+    assert!(
+        wait_for_first_output(&mut stream, &mut buf, &pty_id, Duration::from_secs(30)).await,
+        "the shell must produce output before the client leaves, or there is \
+         nothing for a checkpoint to contain"
+    );
+
     // `meta.json` is seeded at spawn, so it proves nothing here. The ring
     // snapshot is what a checkpoint pass writes, and with the tick pushed out
     // of reach its appearance can only be the disconnect flush.
@@ -247,12 +293,14 @@ async fn the_last_client_leaving_flushes_a_checkpoint() {
     drop(stream); // the last client disconnects
 
     // Poll rather than sleep-then-check, so a fast machine finishes in one
-    // iteration and a slow one is still given room. The ceiling is generous on
-    // purpose: this whole binary runs in ~0.3s on an idle dev machine and took
-    // 6.4s on a loaded CI runner, so a bound tuned to local timings is a bound
-    // that fails on CI for reasons unrelated to checkpointing. What the
-    // assertion demands is unchanged — the snapshot must appear — only the
-    // patience is.
+    // iteration and a loaded one is still given room — this binary runs in
+    // ~0.3s on an idle dev machine and has taken 32s on a CI runner.
+    //
+    // Patience alone would not save this test, and an earlier attempt to fix it
+    // by raising this ceiling failed for that reason: whether a checkpoint gets
+    // written at all is decided at disconnect time by the `bytes_out` check in
+    // `checkpoint_all`, so once the client has left, waiting longer cannot
+    // change the answer. The wait above is what makes this one meaningful.
     let mut found = false;
     for _ in 0..1_500 {
         if scrollback.exists() {
