@@ -202,14 +202,50 @@ jobs:
           rustup show
           rustup target add x86_64-pc-windows-msvc
 
+      # Same one-entry rule as the macOS job, and for the same reason — this
+      # job was left out of that fix and hit it: `cargs.lib` (a sherpa-onnx
+      # prebuilt) went missing on a restored cache and the desktop suite died
+      # at link time with `LNK1181: cannot open input file`, which reads as a
+      # broken dependency rather than as a download that never happened.
+      # sherpa-rs-sys puts the Windows libraries under %LOCALAPPDATA%, outside
+      # `target`, and bakes that path into its build-script output; caching
+      # `target` alone restores the fingerprint without the files it names.
+      #
+      # Key bumped to v2 so entries saved under the old layout cannot satisfy
+      # the new one.
       - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/AppData/Local/sherpa-rs
             target
-          key: ${{ runner.os }}-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+
+      # The macOS counterpart of this step, transposed: any cache that comes
+      # back with the build-script output but without the libraries would link
+      # against a path that is not there, so drop the output and let cargo
+      # re-run the build script that downloads them.
+      #
+      # Must never be the step that fails the build — every lookup tolerates a
+      # missing directory and the step exits 0 regardless.
+      - name: Ensure the dictation libraries are present
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $prebuilts = Join-Path $env:LOCALAPPDATA 'sherpa-rs'
+          $lib = Get-ChildItem -Path $prebuilts -Recurse -Filter 'cargs.lib' `
+              -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($lib) {
+            Write-Host "sherpa-onnx prebuilts present: $($lib.FullName)"
+          } else {
+            Write-Host "sherpa-onnx prebuilts absent - forcing sherpa-rs-sys to re-run"
+            Get-ChildItem -Path target -Recurse -Directory -Filter 'sherpa-rs-sys-*' `
+                -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          exit 0
 
       # `macos-trust` is macOS-shaped by construction: it wraps codesign and
       # spctl. Note what the exclusion does and does not buy. Its library is
