@@ -174,19 +174,30 @@ pub fn is_restricted_to_owner(path: &Path) -> io::Result<bool> {
 #[cfg(windows)]
 fn windows_dacl_names_only_us(path: &Path) -> io::Result<bool> {
     let sddl = dacl_sddl(path)?;
-    // Protected, or inherited ACEs can widen it after the fact; exactly one
-    // allow-ACE, or something was added alongside ours rather than
-    // displacing what the directory contributed; and that ACE is us.
-    if !(sddl.starts_with("D:P") && sddl.matches("(A;").count() == 1) {
+    // Protected, or ACEs inherited from the parent can widen this after the
+    // fact.
+    if !sddl.starts_with("D:P") {
         return Ok(false);
     }
-    // The ACE's SID cannot be compared as text: the serializer compresses
-    // well-known accounts to aliases, so for a built-in Administrator the
-    // SID we wrote reads back as `LA`. Canonicalize before comparing.
-    let Some(token) = ace_sid(&sddl) else {
-        return Ok(false);
-    };
-    Ok(windows_impl::canonical_sid(token)? == current_user_sid()?)
+    let us = current_user_sid()?;
+    let mut saw_an_ace = false;
+    for token in ace_sids(&sddl) {
+        saw_an_ace = true;
+        // The ACE's SID cannot be compared as text: the serializer compresses
+        // well-known accounts to aliases, so for a built-in Administrator the
+        // SID we wrote reads back as `LA`. Canonicalize before comparing — and
+        // treat a token that will not canonicalize as one we cannot vouch for,
+        // which answers "is this restricted?" in the safe direction rather than
+        // failing the whole call over a descriptor we did not write.
+        match windows_impl::canonical_sid(token) {
+            Ok(sid) if sid == us => {}
+            _ => return Ok(false),
+        }
+    }
+    // An empty DACL denies everyone, us included. That is not "restricted to
+    // the owner", it is an unusable object, and reporting it as restricted
+    // would hand the caller a directory it cannot write to.
+    Ok(saw_an_ace)
 }
 
 /// SDDL granting the current user full control of an object and naming nobody
@@ -235,10 +246,13 @@ pub fn current_user_sid() -> io::Result<String> {
 /// applied and is not. Also useful when diagnosing a permission complaint from
 /// a real install.
 ///
-/// Note that the string will not match [`owner_only_sddl`] verbatim: Windows
-/// expands the generic rights in a stored ACE to the object-specific mask, so
-/// the `GA` that went in reads back as `FA` on a file. Assert on the protected
-/// flag, the ACE count and the SID — not on the mask spelling.
+/// Note that the string will not match [`owner_only_sddl`] verbatim, and not
+/// only in its mask spelling. Windows expands the generic rights in a stored ACE
+/// to the object-specific mask, so the `GA` that went in reads back as `FA` on a
+/// file — and on a *directory* an inheritable ACE comes back as two, an
+/// effective one plus an inherit-only one. Assert on the protected flag and on
+/// the SIDs the ACEs name; not on the mask spelling, and not on how many ACEs
+/// the object type happened to need.
 #[cfg(windows)]
 pub fn dacl_sddl(path: &Path) -> io::Result<String> {
     windows_impl::read_dacl_sddl(path)
@@ -247,13 +261,35 @@ pub fn dacl_sddl(path: &Path) -> io::Result<String> {
 #[cfg(windows)]
 mod windows_impl;
 
-/// The SID token of the first allow-ACE in an SDDL DACL — the `LA` of
-/// `D:PAI(A;;FA;;;LA)`. `None` when there is no allow-ACE to name one.
-#[cfg(windows)]
-fn ace_sid(sddl: &str) -> Option<&str> {
-    let ace = sddl.split_once("(A;")?.1;
-    let ace = &ace[..ace.find(')')?];
-    ace.rsplit(';').next().filter(|token| !token.is_empty())
+/// The SID token of every ACE in an SDDL DACL — both `LA`s of
+/// `D:PAI(A;;FA;;;LA)(A;OICIIO;GA;;;LA)`.
+///
+/// Every ACE rather than the first, and every ACE *type* rather than allow
+/// alone, because the question this answers is "does this descriptor name
+/// anyone but us", and an ACE of any type naming a stranger is a stranger the
+/// descriptor knows about.
+///
+/// Counting them is not the same question and is not a stable one: Windows
+/// normalizes a single inheritable ACE on a container into two — an effective
+/// ACE for the directory itself with the generic rights mapped to specific, and
+/// an inherit-only ACE carrying the generic rights down to what is created
+/// inside. One write, two ACEs, and the count is a property of the object type
+/// rather than of who is admitted.
+///
+/// A malformed ACE yields whatever sits in its last field, empty string
+/// included, rather than being skipped — an ACE that cannot be read is not an
+/// ACE that can be dismissed.
+///
+/// Compiled outside Windows only for its test. The parsing is pure string work
+/// and nothing about it is platform-specific, so gating it away from the other
+/// platforms' test runs would put the half of this that *can* be checked
+/// anywhere into the half that only CI's Windows runner ever executes.
+#[cfg(any(windows, test))]
+fn ace_sids(sddl: &str) -> impl Iterator<Item = &str> {
+    sddl.split('(')
+        .skip(1)
+        .filter_map(|rest| rest.split_once(')'))
+        .filter_map(|(ace, _)| ace.rsplit(';').next())
 }
 
 #[cfg(test)]
@@ -423,10 +459,23 @@ mod tests {
 
         let sddl = dacl_sddl(&dir).expect("read back");
         assert!(sddl.starts_with("D:P"), "must be protected: {sddl}");
-        assert_eq!(sddl.matches("(A;").count(), 1, "one allow-ACE: {sddl}");
         assert!(
             sddl.contains("OICI"),
             "the ACE must be object- and container-inheritable: {sddl}"
+        );
+        // Deliberately not an ACE count. Writing one inheritable ACE on a
+        // container yields two on readback — `D:PAI(A;;FA;;;LA)(A;OICIIO;GA;;;LA)`
+        // — because Windows splits the effective grant from the inherit-only
+        // one. An earlier version of this asserted a count of 1 and failed
+        // against a perfectly correct descriptor.
+        let sids: Vec<_> = ace_sids(&sddl)
+            .map(|token| windows_impl::canonical_sid(token).expect("canonicalize"))
+            .collect();
+        let us = current_user_sid().expect("sid");
+        assert!(!sids.is_empty(), "an empty DACL admits nobody: {sddl}");
+        assert!(
+            sids.iter().all(|sid| *sid == us),
+            "every ACE must name {us}: {sddl}"
         );
         assert!(is_dir_restricted_to_owner(&dir).expect("predicate agrees"));
     }
@@ -465,31 +514,54 @@ mod tests {
             sddl.starts_with("D:P"),
             "DACL must be protected or inheritance can widen it later: {sddl}"
         );
-        assert_eq!(
-            sddl.matches("(A;").count(),
-            1,
-            "expected exactly one allow-ACE, got {sddl}"
-        );
+        // A count of exactly one *is* meaningful here, where it is not on a
+        // directory: a file takes no inherit-only ACE, so a second one would
+        // mean ours was added alongside what the parent contributed rather than
+        // displacing it.
+        let mut tokens = ace_sids(&sddl);
         // Via `canonical_sid`, not `contains`: on an account the SDDL
         // serializer knows by name (CI runs as the built-in Administrator),
         // the ACE reads back as an alias like `LA` rather than the SID.
-        let token = ace_sid(&sddl).expect("allow-ACE carries a SID token");
+        let token = tokens.next().expect("the ACE carries a SID token");
         assert_eq!(
             windows_impl::canonical_sid(token).expect("canonicalize"),
             sid,
             "ACE must name {sid}: {sddl}"
         );
+        assert!(
+            tokens.next().is_none(),
+            "expected exactly one ACE on a file, got {sddl}"
+        );
     }
 
-    #[cfg(windows)]
+    /// Runs everywhere on purpose — see [`ace_sids`]. The shapes asserted here
+    /// are transcribed from a real Windows readback, so the parser stays
+    /// checkable on the platforms that develop it.
     #[test]
-    fn ace_sid_finds_the_token_in_both_spellings() {
-        assert_eq!(ace_sid("D:PAI(A;;FA;;;LA)"), Some("LA"));
+    fn ace_sids_finds_every_token_in_both_spellings() {
+        assert_eq!(ace_sids("D:PAI(A;;FA;;;LA)").collect::<Vec<_>>(), ["LA"]);
         assert_eq!(
-            ace_sid("D:P(A;;GA;;;S-1-5-21-1-2-3-500)"),
-            Some("S-1-5-21-1-2-3-500")
+            ace_sids("D:P(A;;GA;;;S-1-5-21-1-2-3-500)").collect::<Vec<_>>(),
+            ["S-1-5-21-1-2-3-500"]
         );
-        assert_eq!(ace_sid("D:P"), None, "no ACE, no token");
-        assert_eq!(ace_sid("D:PAI(A;;FA;;;)"), None, "empty token is not a SID");
+        // The shape a directory actually reads back as, and the one that broke
+        // the count-based predicate: one effective ACE plus the inherit-only
+        // ACE Windows splits out of it, both naming the same account.
+        assert_eq!(
+            ace_sids("D:PAI(A;;FA;;;LA)(A;OICIIO;GA;;;LA)").collect::<Vec<_>>(),
+            ["LA", "LA"]
+        );
+        // A deny-ACE names an account too, and the predicate has to see it.
+        assert_eq!(
+            ace_sids("D:P(A;;FA;;;LA)(D;;FA;;;BA)").collect::<Vec<_>>(),
+            ["LA", "BA"]
+        );
+        assert!(ace_sids("D:P").next().is_none(), "no ACE, no token");
+        assert_eq!(
+            ace_sids("D:PAI(A;;FA;;;)").collect::<Vec<_>>(),
+            [""],
+            "a malformed ACE is surfaced, not skipped — the predicate must \
+             reject what it cannot read rather than pass over it"
+        );
     }
 }

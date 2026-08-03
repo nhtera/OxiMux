@@ -226,7 +226,6 @@ mod tests {
         );
     }
 
-
     /// Guards the migration that introduced this module: every caller used to
     /// resolve through `dirs::data_dir()`, and on macOS the switch to
     /// `data_local_dir` has to be a no-op or existing installs lose their data.
