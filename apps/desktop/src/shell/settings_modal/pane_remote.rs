@@ -432,9 +432,13 @@ pub(super) fn render(
     col = col.child(pair_row(devices.is_empty(), theme, density, typography, cx));
 
     // Paired devices + one-tap revoke. Listed whether or not remote is on, so a
-    // device can be cut off without first turning remote access back on.
-    if !devices.is_empty() {
-        col = col.child(devices_section(devices, theme, density, typography, cx));
+    // device can be cut off without first turning remote access back on. The
+    // local CLI appears here as a synthetic row while enabled, so "who can
+    // control my sessions" stays answerable in this one list.
+    let local_on =
+        cx.try_global::<RemoteControl>().is_some_and(|rc| rc.local_enabled());
+    if !devices.is_empty() || local_on {
+        col = col.child(devices_section(devices, local_on, theme, density, typography, cx));
     }
 
     // Reference material, below the things you came here to do: what the network
@@ -923,12 +927,65 @@ fn device_state_label(revoked: bool, last_seen: Option<u64>) -> String {
 /// persisted, so it survives a restart.
 fn devices_section(
     devices: Vec<oximux_remote_host::DeviceInfo>,
+    local_on: bool,
     theme: Theme,
     density: Density,
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
     let mut rows: Vec<AnyElement> = Vec::new();
+
+    // The local CLI's synthetic row: not a paired device (no pubkey, no
+    // durable record — its lifetime IS the toggle), but it belongs in the
+    // one list that answers "who can control my sessions". Disabling here is
+    // its revocation: the listener and every live CLI connection drop.
+    if local_on {
+        rows.push(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(density.gap_inline))
+                .h(px(density.h_action_row))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(px(typography.t_body_sm))
+                                .text_color(theme.fg_base)
+                                .child("This computer — oximux CLI"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(typography.t_sub_label))
+                                .text_color(theme.fg_subtle)
+                                .child("local socket · full access while enabled"),
+                        ),
+                )
+                .child(value_chip(
+                    "local-cli-disable",
+                    "Disable",
+                    theme,
+                    density,
+                    typography,
+                    move |this, _window, cx| {
+                        if let Some(rc) = cx.try_global::<RemoteControl>() {
+                            rc.stop_local();
+                        }
+                        this.persist_flag(
+                            crate::remote_control::LOCAL_ENABLED_SETTING,
+                            false,
+                            cx,
+                        );
+                        cx.notify();
+                    },
+                    cx,
+                ))
+                .into_any_element(),
+        );
+    }
 
     for (idx, device) in devices.into_iter().enumerate() {
         let oximux_remote_host::DeviceInfo { pubkey, name, read_only, last_seen, revoked } = device;
@@ -1061,7 +1118,41 @@ pub(super) fn entries(
             "Stop it idle-sleeping, so a paired device can still reach it. Sleeping with the lid closed is unaffected.",
             keep_awake_toggle(theme, cx),
         ),
+        entry(
+            "Allow local CLI access",
+            "Let the oximux command on this machine view and drive sessions over an \
+             owner-only local socket. Nothing is published to the network.",
+            local_toggle(theme, cx),
+        ),
     ]
+}
+
+/// Local CLI access — its own switch beside remote, never implied by it.
+fn local_toggle(theme: Theme, cx: &mut gpui::Context<SettingsModal>) -> AnyElement {
+    let current =
+        cx.try_global::<RemoteControl>().is_some_and(|rc| rc.local_enabled());
+    toggle_switch("local-cli-enabled", current, theme, on_local_toggle, cx)
+}
+
+/// Flip local CLI access: on binds the control socket (minting a fresh token);
+/// off tears down the listener and every live CLI connection with it.
+fn on_local_toggle(
+    this: &mut SettingsModal,
+    _window: &mut gpui::Window,
+    cx: &mut gpui::Context<SettingsModal>,
+) {
+    let Some(turning_on) =
+        cx.try_global::<RemoteControl>().map(|rc| !rc.local_enabled())
+    else {
+        return;
+    };
+    if turning_on {
+        RemoteControl::start_local(cx);
+    } else if let Some(rc) = cx.try_global::<RemoteControl>() {
+        rc.stop_local();
+    }
+    this.persist_flag(crate::remote_control::LOCAL_ENABLED_SETTING, turning_on, cx);
+    cx.notify();
 }
 
 /// The keep-awake companion. Reads the live flag on the shared assertion rather

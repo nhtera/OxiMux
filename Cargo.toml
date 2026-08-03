@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "apps/cli",
     "apps/desktop",
     "crates/ui",
     "crates/core",
@@ -26,6 +27,7 @@ members = [
     "crates/remote-host",
     "crates/remote-session",
     "crates/remote-iroh",
+    "crates/remote-local",
     "crates/mobile-core",
     "crates/proc-cwd",
     "xtask",
@@ -42,6 +44,7 @@ rust-version = "1.89"
 [workspace.dependencies]
 # Internal crates
 oximux-app      = { path = "apps/desktop" }
+oximux-cli      = { path = "apps/cli" }
 oximux-ui       = { path = "crates/ui" }
 oximux-core     = { path = "crates/core" }
 # Owner-only access for the secrets we write to disk. Its own crate because the
@@ -81,6 +84,7 @@ oximux-remote-session = { path = "crates/remote-session" }
 # consumers ask for it explicitly with `features = ["host"]`.
 oximux-remote-iroh = { path = "crates/remote-iroh", default-features = false }
 oximux-mobile-core = { path = "crates/mobile-core" }
+oximux-remote-local = { path = "crates/remote-local" }
 oximux-proc-cwd = { path = "crates/proc-cwd" }
 
 # GPUI — see docs/gpui-pins.md. We deliberately do NOT pin `rev` here. The
@@ -202,6 +206,9 @@ url = "2"
 # default-features off: we only need `data_dir()` on macOS; the default
 # features pull in Windows/X11 helpers we never call.
 dirs = { version = "5", default-features = false }
+# CLI arg parsing — derive is the single source of truth for parse/help/
+# completions and the `agent-context` schema dump.
+clap = { version = "4", features = ["derive"] }
 # Native folder picker — wraps NSOpenPanel on macOS via objc2. We use
 # `AsyncFileDialog` from the GPUI `cx.spawn` task so the OxiMux window
 # stays responsive while the panel is open. default-features off:

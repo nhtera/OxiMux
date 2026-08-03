@@ -11,7 +11,7 @@ use oximux_remote_proto::proto::{Choice, Response, RpcError, SessionChoices};
 use oximux_remote_proto::HostEvent;
 
 use super::Dispatcher;
-use crate::auth::AppPubkey;
+use crate::auth::Peer;
 
 /// The project label a phone session row shows for attribution — the final path
 /// component of the session's working directory (its workspace root). `None` when
@@ -53,8 +53,8 @@ impl Dispatcher {
     /// reply and every pushed
     /// [`SessionsChanged`](oximux_remote_proto::proto::Response::SessionsChanged)
     /// snapshot, so both honour the same scope filter and meta lookup.
-    pub(super) fn snapshot_sessions(&self, pubkey: &AppPubkey) -> Vec<SessionSummary> {
-        let live = self.live_session_rows(pubkey);
+    pub(super) fn snapshot_sessions(&self, peer: &Peer) -> Vec<SessionSummary> {
+        let live = self.live_session_rows(peer);
         let Some(catalog) = &self.catalog else {
             return live;
         };
@@ -76,7 +76,7 @@ impl Dispatcher {
             .filter(|d| seen.insert(d.session_id.clone()))
             // Same scoping as a live row: a session-scoped device must not learn
             // that other sessions exist, whether or not they are running.
-            .filter(|d| self.auth.is_allowed_for(pubkey, &d.session_id))
+            .filter(|d| self.auth.is_allowed_for(peer, &d.session_id))
             .map(|d| SessionSummary {
                 title: remote_title(d.title, d.cwd.as_deref(), &d.session_id),
                 model: d.model,
@@ -94,13 +94,13 @@ impl Dispatcher {
     }
 
     /// The session rows backed by a live view, which own their status.
-    fn live_session_rows(&self, pubkey: &AppPubkey) -> Vec<SessionSummary> {
+    fn live_session_rows(&self, peer: &Peer) -> Vec<SessionSummary> {
         self.registry
             .statuses()
             .into_iter()
             // A session-scoped device must only learn about sessions it may act
             // on — never enumerate the full session set.
-            .filter(|(session_id, _)| self.auth.is_allowed_for(pubkey, session_id))
+            .filter(|(session_id, _)| self.auth.is_allowed_for(peer, session_id))
             .map(|(session_id, status)| {
                 // Title/model/cwd are published by the desktop view via the
                 // registry's session meta. The title is project-qualified for the
@@ -122,8 +122,8 @@ impl Dispatcher {
             .collect()
     }
 
-    pub(super) fn list_sessions(&self, pubkey: &AppPubkey) -> Response {
-        Response::Sessions(self.snapshot_sessions(pubkey))
+    pub(super) fn list_sessions(&self, peer: &Peer) -> Response {
+        Response::Sessions(self.snapshot_sessions(peer))
     }
 
     /// Serve a session's authoritative folded-transcript snapshot so a client opens
@@ -131,8 +131,8 @@ impl Dispatcher {
     /// restart, which lives only in the view's fold and never entered the event ring.
     /// An empty base (`"[]"`, seq 0) is returned when the view has not published yet,
     /// so the client opens cleanly and the live stream fills it rather than erroring.
-    pub(super) fn fetch_transcript(&self, pubkey: &AppPubkey, session_id: &str) -> Response {
-        if !self.auth.is_allowed_for(pubkey, session_id) {
+    pub(super) fn fetch_transcript(&self, peer: &Peer, session_id: &str) -> Response {
+        if !self.auth.is_allowed_for(peer, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         // A live session's fold is authoritative. A dormant one is read from disk
@@ -183,8 +183,8 @@ impl Dispatcher {
         })
     }
 
-    pub(super) fn session_info(&self, pubkey: &AppPubkey, session_id: &str) -> Response {
-        if !self.auth.is_allowed_for(pubkey, session_id) {
+    pub(super) fn session_info(&self, peer: &Peer, session_id: &str) -> Response {
+        if !self.auth.is_allowed_for(peer, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(handle) = self.registry.get(session_id) else {
@@ -206,13 +206,13 @@ impl Dispatcher {
         })
     }
 
-    pub(super) fn send_prompt(&self, pubkey: &AppPubkey, req: SendPromptReq) -> Response {
-        self.scoped(pubkey, &req.session_id, |h| h.send_prompt(&req.text, &req.images))
+    pub(super) fn send_prompt(&self, peer: &Peer, req: SendPromptReq) -> Response {
+        self.scoped(peer, &req.session_id, |h| h.send_prompt(&req.text, &req.images))
     }
 
-    pub(super) fn resolve_permission(&self, pubkey: &AppPubkey, req: ResolvePermissionReq) -> Response {
+    pub(super) fn resolve_permission(&self, peer: &Peer, req: ResolvePermissionReq) -> Response {
         // Deciding a permission lets an agent act, so it is a write.
-        if !self.auth.may_write(pubkey, &req.session_id) {
+        if !self.auth.may_write(peer, &req.session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         let decision = match req.decision() {
@@ -236,9 +236,9 @@ impl Dispatcher {
         }
     }
 
-    pub(super) fn answer_question(&self, pubkey: &AppPubkey, req: AnswerQuestionReq) -> Response {
+    pub(super) fn answer_question(&self, peer: &Peer, req: AnswerQuestionReq) -> Response {
         // Answering releases a blocked turn, so it is a write.
-        if !self.auth.may_write(pubkey, &req.session_id) {
+        if !self.auth.may_write(peer, &req.session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(handle) = self.registry.get(&req.session_id) else {
@@ -256,8 +256,8 @@ impl Dispatcher {
         }
     }
 
-    pub(super) fn events_since(&self, pubkey: &AppPubkey, session_id: &str, after_seq: u64) -> Response {
-        if !self.auth.is_allowed_for(pubkey, session_id) {
+    pub(super) fn events_since(&self, peer: &Peer, session_id: &str, after_seq: u64) -> Response {
+        if !self.auth.is_allowed_for(peer, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(handle) = self.registry.get(session_id) else {
@@ -293,13 +293,13 @@ impl Dispatcher {
     /// the terminal RPCs treat a missing `TerminalSource`.
     pub(super) async fn create_session(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         cwd: &str,
         agent_id: Option<&str>,
     ) -> Response {
         // Refuse a session-scoped device before anything else: `may_write` alone
         // would let one through, since it has no session to narrow against.
-        if !self.auth.may_create_sessions(pubkey) {
+        if !self.auth.may_create_sessions(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(launcher) = self.launcher.as_ref() else {
@@ -324,8 +324,8 @@ impl Dispatcher {
     /// them. A session-scoped device is refused outright; a host with no project
     /// provider answers an empty list, since "this desktop exposes no projects" is
     /// not a capability worth hiding (the create path stays gated regardless).
-    pub(super) async fn list_projects(&self, pubkey: &AppPubkey) -> Response {
-        if !self.auth.may_create_sessions(pubkey) {
+    pub(super) async fn list_projects(&self, peer: &Peer) -> Response {
+        if !self.auth.may_create_sessions(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
         match self.projects.as_ref() {
@@ -347,12 +347,12 @@ impl Dispatcher {
     /// ordinal would silently destroy turns the user meant to keep.
     pub(super) async fn rewind_session(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         session_id: &str,
         ordinal: usize,
         include_files: bool,
     ) -> Response {
-        if !self.auth.may_write(pubkey, session_id) {
+        if !self.auth.may_write(peer, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(rewinder) = self.rewinder.as_ref() else {
@@ -383,8 +383,8 @@ impl Dispatcher {
     /// backend advertises nothing until its handshake completes, and some agents
     /// offer no mode choices at all. The phone hides a picker with no options
     /// rather than showing an empty one.
-    pub(super) fn list_choices(&self, pubkey: &AppPubkey, session_id: &str) -> Response {
-        if !self.auth.is_allowed_for(pubkey, session_id) {
+    pub(super) fn list_choices(&self, peer: &Peer, session_id: &str) -> Response {
+        if !self.auth.is_allowed_for(peer, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         // A dormant session's pickers come from what its backend last reported,
@@ -440,12 +440,12 @@ impl Dispatcher {
     /// client.
     pub(super) async fn set_choice(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         session_id: &str,
         kind: ChoiceKind,
         value: &str,
     ) -> Response {
-        if !self.auth.may_write(pubkey, session_id) {
+        if !self.auth.may_write(peer, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(handle) = self.registry.get(session_id) else {
@@ -477,11 +477,11 @@ impl Dispatcher {
     /// Every caller of this is state-changing (prompt/steer/cancel), so the gate is
     /// `may_write` — a read-only device is refused here even though it may read the
     /// same session.
-    pub(super) fn scoped<F>(&self, pubkey: &AppPubkey, session_id: &str, f: F) -> Response
+    pub(super) fn scoped<F>(&self, peer: &Peer, session_id: &str, f: F) -> Response
     where
         F: FnOnce(&SessionHandle) -> anyhow::Result<()>,
     {
-        if !self.auth.may_write(pubkey, session_id) {
+        if !self.auth.may_write(peer, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(handle) = self.registry.get(session_id) else {

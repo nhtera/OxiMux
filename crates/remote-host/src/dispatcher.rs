@@ -31,7 +31,7 @@ use oximux_remote_proto::proto::{
     RpcError, is_compatible,
 };
 
-use crate::auth::{AppPubkey, AuthStore};
+use crate::auth::{AppPubkey, AuthStore, LocalScope, Peer};
 
 /// One connection's mutable state: what it has proven, and which protocol
 /// version it speaks.
@@ -59,6 +59,12 @@ enum ConnAuthn {
     PendingChallenge { app_pubkey: AppPubkey, nonce: [u8; 32] },
     /// Authenticated as this device.
     Authed { app_pubkey: AppPubkey },
+    /// A caller on the desktop's local socket, authenticated by the listener
+    /// against the local bearer token **before** this connection reached the
+    /// dispatcher. Enters only through [`Dispatcher::serve_local`] — no wire
+    /// request constructs it, which is what keeps local authority unreachable
+    /// from any remote transport.
+    LocalAuthed { scope: LocalScope },
 }
 
 /// Serves RPCs for connections, backed by one [`SessionRegistry`] + [`AuthStore`].
@@ -201,12 +207,24 @@ impl Dispatcher {
         match req {
             Request::Hello(h) => self.handle_hello(state, h),
             Request::Ping => Response::Pong,
+            // A local connection is already authenticated; letting the remote
+            // handshake run on it would overwrite `LocalAuthed` with whatever
+            // state the handshake reaches — a downgrade at best, and at worst a
+            // path for a local caller to smuggle itself into the paired-device
+            // world. Refused outright.
+            Request::Register(_) | Request::Connect(_) | Request::AuthProve(_)
+                if matches!(state.authn, ConnAuthn::LocalAuthed { .. }) =>
+            {
+                Response::Error(RpcError::BadRequest(
+                    "a local connection does not pair; it is already authenticated".into(),
+                ))
+            }
             Request::Register(r) => self.handle_register(&mut state.authn, r),
             Request::Connect(c) => self.handle_connect(&mut state.authn, c),
             Request::AuthProve(a) => self.handle_auth_prove(&mut state.authn, &a.signature),
-            // Everything below requires an authenticated, still-authorized device.
-            other => match authorized_pubkey(&state.authn, &self.auth) {
-                Some(pubkey) => self.handle_session_rpc(&pubkey, other),
+            // Everything below requires an authenticated, still-authorized caller.
+            other => match authorized_peer(&state.authn, &self.auth) {
+                Some(peer) => self.handle_session_rpc(&peer, other),
                 None => Response::Error(RpcError::Unauthorized),
             },
         }
@@ -214,41 +232,48 @@ impl Dispatcher {
 
     /// Route an authenticated request to its handler (in [`handlers`]). `Subscribe`
     /// never reaches here — the serve loop intercepts it to open the live stream.
-    fn handle_session_rpc(&self, pubkey: &AppPubkey, req: Request) -> Response {
+    fn handle_session_rpc(&self, peer: &Peer, req: Request) -> Response {
         match req {
-            Request::ListSessions => self.list_sessions(pubkey),
-            Request::GetSessionInfo { session_id } => self.session_info(pubkey, &session_id),
-            Request::FetchTranscript { session_id } => self.fetch_transcript(pubkey, &session_id),
-            Request::SendPrompt(r) => self.send_prompt(pubkey, r),
-            Request::ResolvePermission(r) => self.resolve_permission(pubkey, r),
-            Request::AnswerQuestion(r) => self.answer_question(pubkey, r),
+            Request::ListSessions => self.list_sessions(peer),
+            Request::GetSessionInfo { session_id } => self.session_info(peer, &session_id),
+            Request::FetchTranscript { session_id } => self.fetch_transcript(peer, &session_id),
+            Request::SendPrompt(r) => self.send_prompt(peer, r),
+            Request::ResolvePermission(r) => self.resolve_permission(peer, r),
+            Request::AnswerQuestion(r) => self.answer_question(peer, r),
             Request::Steer { session_id, text } => {
-                self.scoped(pubkey, &session_id, |h| h.steer(&text))
+                self.scoped(peer, &session_id, |h| h.steer(&text))
             }
-            Request::Cancel { session_id } => self.scoped(pubkey, &session_id, |h| h.cancel()),
-            Request::ListChoices { session_id } => self.list_choices(pubkey, &session_id),
+            Request::Cancel { session_id } => self.scoped(peer, &session_id, |h| h.cancel()),
+            Request::ListChoices { session_id } => self.list_choices(peer, &session_id),
             Request::EventsSince { session_id, after_seq } => {
-                self.events_since(pubkey, &session_id, after_seq)
+                self.events_since(peer, &session_id, after_seq)
             }
-            Request::ListSchedules => self.list_schedules(pubkey),
+            Request::ListSchedules => self.list_schedules(peer),
             Request::CreateSchedule { name, cwd, prompt, agent_id, recurrence } => {
-                self.create_schedule(pubkey, name, cwd, prompt, agent_id, recurrence)
+                self.create_schedule(peer, name, cwd, prompt, agent_id, recurrence)
             }
-            Request::DeleteSchedule { id } => self.delete_schedule(pubkey, &id),
+            Request::DeleteSchedule { id } => self.delete_schedule(peer, &id),
             Request::SetScheduleEnabled { id, enabled } => {
-                self.set_schedule_enabled(pubkey, &id, enabled)
+                self.set_schedule_enabled(peer, &id, enabled)
             }
             Request::GetScheduleRuns { schedule_id, limit } => {
-                self.schedule_runs(pubkey, &schedule_id, limit)
+                self.schedule_runs(peer, &schedule_id, limit)
             }
             // Un-enrolling itself. Gated on the authenticated connection alone: it
             // only ever narrows the caller's own access, so neither full scope nor
             // write access is the right thing to ask for — a session-scoped,
-            // read-only device may still stop being paired.
-            Request::Unpair => {
-                self.auth.forget_self(pubkey);
-                Response::Ack
-            }
+            // read-only device may still stop being paired. A local caller has no
+            // enrollment to drop; its lifetime is the desktop's toggle, so it is
+            // pointed there instead of being told a no-op succeeded.
+            Request::Unpair => match peer.remote_pubkey() {
+                Some(pubkey) => {
+                    self.auth.forget_self(pubkey);
+                    Response::Ack
+                }
+                None => Response::Error(RpcError::BadRequest(
+                    "a local connection is not paired; disable local CLI access in the desktop settings instead".into(),
+                )),
+            },
             // Handshake variants (handled before auth) and `Subscribe` (intercepted
             // in `serve`) never reach here.
             _ => Response::Error(RpcError::BadRequest("unexpected request".into())),
@@ -256,12 +281,18 @@ impl Dispatcher {
     }
 }
 
-/// The device this connection is authenticated as, if it is still authorized.
+/// The caller this connection is authenticated as, if it is still authorized.
 /// Returns `None` for an unauthenticated OR revoked connection — the per-RPC (and
-/// per-live-frame) revocation gate. `pub(super)` so the serve loop shares it.
-fn authorized_pubkey(state: &ConnAuthn, auth: &AuthStore) -> Option<AppPubkey> {
+/// per-live-frame) revocation gate. A local connection was authenticated by the
+/// listener when it accepted the socket; its "revocation" is the desktop tearing
+/// the listener (and every open local connection) down when the toggle goes off.
+/// `pub(super)` so the serve loop shares it.
+fn authorized_peer(state: &ConnAuthn, auth: &AuthStore) -> Option<Peer> {
     match state {
-        ConnAuthn::Authed { app_pubkey } if auth.is_authorized(app_pubkey) => Some(*app_pubkey),
+        ConnAuthn::Authed { app_pubkey } if auth.is_authorized(app_pubkey) => {
+            Some(Peer::remote(*app_pubkey))
+        }
+        ConnAuthn::LocalAuthed { scope } => Some(Peer::local(scope.clone())),
         _ => None,
     }
 }

@@ -25,12 +25,12 @@ use oximux_remote_proto::messages::{
 use oximux_remote_proto::proto::{Response, RpcError};
 
 use super::Dispatcher;
-use crate::auth::AppPubkey;
+use crate::auth::Peer;
 
 impl Dispatcher {
     /// Every schedule the desktop holds. A full-scope read; empty is normal.
-    pub(super) fn list_schedules(&self, pubkey: &AppPubkey) -> Response {
-        if !self.auth.may_read_schedules(pubkey) {
+    pub(super) fn list_schedules(&self, peer: &Peer) -> Response {
+        if !self.auth.may_read_schedules(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(store) = self.schedules.as_ref() else {
@@ -55,14 +55,14 @@ impl Dispatcher {
     /// frame could, and the store must not be the last line of defence.
     pub(super) fn create_schedule(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         name: String,
         cwd: String,
         prompt: String,
         agent_id: Option<String>,
         recurrence: RecurrenceWire,
     ) -> Response {
-        if !self.auth.may_manage_schedules(pubkey) {
+        if !self.auth.may_manage_schedules(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(store) = self.schedules.as_ref() else {
@@ -87,8 +87,8 @@ impl Dispatcher {
     }
 
     /// Delete a schedule. Idempotent — deleting one already gone is success.
-    pub(super) fn delete_schedule(&self, pubkey: &AppPubkey, id: &str) -> Response {
-        if !self.auth.may_manage_schedules(pubkey) {
+    pub(super) fn delete_schedule(&self, peer: &Peer, id: &str) -> Response {
+        if !self.auth.may_manage_schedules(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(store) = self.schedules.as_ref() else {
@@ -106,11 +106,11 @@ impl Dispatcher {
     /// Enable or disable a schedule without deleting it.
     pub(super) fn set_schedule_enabled(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         id: &str,
         enabled: bool,
     ) -> Response {
-        if !self.auth.may_manage_schedules(pubkey) {
+        if !self.auth.may_manage_schedules(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(store) = self.schedules.as_ref() else {
@@ -131,11 +131,11 @@ impl Dispatcher {
     /// A schedule's recent run history, most recent first. A full-scope read.
     pub(super) fn schedule_runs(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         schedule_id: &str,
         limit: u32,
     ) -> Response {
-        if !self.auth.may_read_schedules(pubkey) {
+        if !self.auth.may_read_schedules(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(store) = self.schedules.as_ref() else {

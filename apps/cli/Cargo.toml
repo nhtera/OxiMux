@@ -1,0 +1,38 @@
+[package]
+name = "oximux-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# The scriptable client of a running OxiMux host — desktop app today,
+# `oximux serve` later — over the owner-only local control socket, and (in a
+# later phase) any paired host over iroh.
+#
+# The cargo target is `oximux-cli` because `apps/desktop` already owns the bin
+# name `oximux`, and two packages producing one bin name make
+# `cargo build --workspace` overwrite whichever built second. The command
+# users type is still `oximux`: the installer places this binary on PATH under
+# that name.
+
+[[bin]]
+name = "oximux-cli"
+path = "src/main.rs"
+
+[dependencies]
+oximux-remote-local = { workspace = true }
+oximux-remote-proto = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+# The E2E suite stands up a real dispatcher behind a real socket and drives
+# the compiled binary against it.
+oximux-remote-host = { workspace = true }
+oximux-agents = { workspace = true }
+tempfile = { workspace = true }

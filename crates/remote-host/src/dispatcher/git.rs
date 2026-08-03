@@ -26,7 +26,7 @@ use oximux_remote_proto::messages::{
 use oximux_remote_proto::proto::{Response, RpcError};
 
 use super::Dispatcher;
-use crate::auth::AppPubkey;
+use crate::auth::Peer;
 
 /// A repository resolved from a session, ready for a git call.
 struct SessionRepo {
@@ -43,14 +43,14 @@ impl Dispatcher {
     /// read-only device silently gaining commit rights.
     async fn session_repo(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         session_id: &str,
         write: bool,
     ) -> Result<SessionRepo, Response> {
         let allowed = if write {
-            self.auth.may_write(pubkey, session_id)
+            self.auth.may_write(peer, session_id)
         } else {
-            self.auth.is_allowed_for(pubkey, session_id)
+            self.auth.is_allowed_for(peer, session_id)
         };
         if !allowed {
             return Err(Response::Error(RpcError::Unauthorized));
@@ -114,8 +114,8 @@ impl SessionRepo {
 
 impl Dispatcher {
     /// Working-tree status of the repository the session lives in.
-    pub(super) async fn git_status(&self, pubkey: &AppPubkey, session_id: &str) -> Response {
-        let repo = match self.session_repo(pubkey, session_id, false).await {
+    pub(super) async fn git_status(&self, peer: &Peer, session_id: &str) -> Response {
+        let repo = match self.session_repo(peer, session_id, false).await {
             Ok(r) => r,
             Err(resp) => return resp,
         };
@@ -135,13 +135,13 @@ impl Dispatcher {
     /// is why containment happens here, at the boundary.
     pub(super) async fn git_diff(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         session_id: &str,
         path: &str,
         staged: bool,
         untracked: bool,
     ) -> Response {
-        let repo = match self.session_repo(pubkey, session_id, false).await {
+        let repo = match self.session_repo(peer, session_id, false).await {
             Ok(r) => r,
             Err(resp) => return resp,
         };
@@ -173,31 +173,31 @@ impl Dispatcher {
     /// Stage paths into the index.
     pub(super) async fn git_stage(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         session_id: &str,
         paths: &[String],
     ) -> Response {
-        self.stage_or_unstage(pubkey, session_id, paths, true).await
+        self.stage_or_unstage(peer, session_id, paths, true).await
     }
 
     /// Remove paths from the index, leaving the worktree untouched.
     pub(super) async fn git_unstage(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         session_id: &str,
         paths: &[String],
     ) -> Response {
-        self.stage_or_unstage(pubkey, session_id, paths, false).await
+        self.stage_or_unstage(peer, session_id, paths, false).await
     }
 
     async fn stage_or_unstage(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         session_id: &str,
         paths: &[String],
         stage: bool,
     ) -> Response {
-        let repo = match self.session_repo(pubkey, session_id, true).await {
+        let repo = match self.session_repo(peer, session_id, true).await {
             Ok(r) => r,
             Err(resp) => return resp,
         };
@@ -230,11 +230,11 @@ impl Dispatcher {
     /// must not be able to silently discard it.
     pub(super) async fn git_commit(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         session_id: &str,
         message: &str,
     ) -> Response {
-        let repo = match self.session_repo(pubkey, session_id, true).await {
+        let repo = match self.session_repo(peer, session_id, true).await {
             Ok(r) => r,
             Err(resp) => return resp,
         };

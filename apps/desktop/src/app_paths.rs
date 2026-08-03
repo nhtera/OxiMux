@@ -148,6 +148,14 @@ mod tests {
         );
     }
 
+    /// The CLI dials where the desktop binds: `remote-local` carries its own
+    /// copy of this path (the CLI cannot depend on the app), and a drift
+    /// between the two reads as "host unreachable" with both sides healthy.
+    #[test]
+    fn control_socket_convention_matches_the_data_dir() {
+        assert_eq!(data_dir(), oximux_remote_local::default_runtime_dir());
+    }
+
     /// Guards the migration that introduced this module: every caller used to
     /// resolve through `dirs::data_dir()`, and on macOS the switch to
     /// `data_local_dir` has to be a no-op or existing installs lose their data.

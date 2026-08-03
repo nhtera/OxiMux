@@ -13,6 +13,7 @@
 //! [`AgentChatView`]: crate::shell::agent_chat
 
 pub mod launch_bridge;
+pub mod local_listener;
 pub mod project_provider;
 pub mod rewind_bridge;
 pub mod session_catalog;
@@ -33,6 +34,11 @@ pub const ENABLED_SETTING: &str = "remote.enabled";
 /// governing the other would make turning off a notification setting stop a
 /// paired phone from reaching this Mac.
 pub const KEEP_AWAKE_SETTING: &str = "remote.keep_awake";
+
+/// Settings key for local CLI access — the owner-only control socket the
+/// `oximux` CLI dials. Its own switch, **default off**: enabling remote access
+/// for a phone must not silently open a local control surface, and vice versa.
+pub const LOCAL_ENABLED_SETTING: &str = "local.enabled";
 
 /// How long an opened pairing window stays redeemable.
 ///
@@ -217,6 +223,14 @@ pub struct RemoteControl {
     /// id — and since a paired phone dials by that id, every restart would silently
     /// invalidate every pairing. `None` = ephemeral identity (tests).
     endpoint_secret: Option<[u8; 32]>,
+    /// Local CLI access — a second, independent switch beside `enabled`. Either
+    /// one populates the session registry; both off keeps the tested
+    /// `disabled_binds_nothing` invariant: no registry rows, no socket, no token.
+    local_enabled: AtomicBool,
+    /// The running local listener, once bound. Dropping the handle aborts the
+    /// accept loop AND every in-flight CLI connection — the local analogue of
+    /// dropping the iroh `HostHandle`.
+    local: Mutex<Option<local_listener::LocalHandle>>,
 }
 
 impl Global for RemoteControl {}
@@ -246,6 +260,8 @@ impl RemoteControl {
             auth: Mutex::new(None),
             awake: Mutex::new(None),
             endpoint_secret: None,
+            local_enabled: AtomicBool::new(false),
+            local: Mutex::new(None),
         }
     }
 
@@ -326,6 +342,14 @@ impl RemoteControl {
 
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Release);
+    }
+
+    pub fn local_enabled(&self) -> bool {
+        self.local_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_local_enabled(&self, on: bool) {
+        self.local_enabled.store(on, Ordering::Release);
     }
 
     /// Assemble a fresh dispatcher + CSPRNG seed for a host bind. Serves
@@ -575,14 +599,83 @@ impl RemoteControl {
         .detach();
     }
 
-    /// Register `id`→`conn` and return the binding **iff remote is enabled**;
-    /// `None` when disabled, so the caller does no work and holds no binding.
+    /// Register `id`→`conn` and return the binding **iff some control surface
+    /// is enabled** — remote, local CLI, or both. `None` with both off, so the
+    /// caller does no work and holds no binding: population is gated, never
+    /// unconditional, which is what keeps `disabled_binds_nothing` true for
+    /// users who enabled neither.
     pub fn bind(&self, id: &str, conn: Arc<dyn AgentConnection>) -> Option<RemoteBinding> {
-        if !self.enabled() {
+        if !(self.enabled() || self.local_enabled()) {
             return None;
         }
         let handle = self.registry.register(id.to_string(), conn);
         Some(RemoteBinding { registry: self.registry.clone(), handle })
+    }
+
+    /// Assemble the dispatcher a local listener serves. Shares the live host's
+    /// auth store when one is bound (so the paired-device ACL the UI edits is
+    /// the one a hypothetical remote check consults), else builds one seeded
+    /// from durable storage WITHOUT retaining it — `self.auth` means "the live
+    /// remote host's store" to the pairing UI, and the local listener must not
+    /// impersonate that.
+    fn prepare_local(&self) -> Arc<Dispatcher> {
+        let auth = self.auth.lock().unwrap().clone().unwrap_or_else(|| {
+            Arc::new(match &self.devices {
+                Some(devices) => AuthStore::with_store(devices.clone()),
+                None => AuthStore::new(),
+            })
+        });
+        Arc::new(self.dispatcher(auth))
+    }
+
+    /// Flip local CLI access on and bind the control socket. The flag and the
+    /// bind travel together for the reason [`resume_at_launch`] documents; a
+    /// missing tokio runtime or data dir is a warn-and-degrade, not a panic.
+    ///
+    /// [`resume_at_launch`]: Self::resume_at_launch
+    pub fn start_local(cx: &mut gpui::App) {
+        let Some(rc) = cx.try_global::<RemoteControl>() else {
+            return;
+        };
+        rc.set_local_enabled(true);
+        let dispatcher = rc.prepare_local();
+        let Some(dir) = crate::app_paths::data_dir() else {
+            tracing::warn!("no data dir; local control socket not bound");
+            return;
+        };
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("no tokio runtime; local control socket not bound");
+            return;
+        };
+        match local_listener::start(dispatcher, dir, rt) {
+            Ok(handle) => *rc.local.lock().unwrap() = Some(handle),
+            // The flag stays on so the UI reflects the user's choice, but with
+            // nothing bound the CLI reports the host unreachable — which is
+            // true, and better than a toggle that looks on and answers nothing.
+            Err(err) => tracing::warn!(%err, "local control socket failed to bind"),
+        }
+    }
+
+    /// Mint a credential confining one agent process to `session_id`, for the
+    /// spawner to inject into that process's environment. `None` when local
+    /// access is off — there is no listener to honor it, and an agent that
+    /// receives no credential simply cannot reach the control socket.
+    pub fn grant_agent_credential(&self, session_id: &str) -> Option<String> {
+        self.local.lock().unwrap().as_ref().map(|h| h.grant_session(session_id))
+    }
+
+    /// Drop an agent's credential when its session ends.
+    pub fn revoke_agent_credential(&self, session_id: &str) {
+        if let Some(handle) = self.local.lock().unwrap().as_ref() {
+            handle.revoke_session(session_id);
+        }
+    }
+
+    /// Flip local CLI access off: the listener, its socket file, and every
+    /// in-flight CLI connection go down with the handle. Idempotent.
+    pub fn stop_local(&self) {
+        self.set_local_enabled(false);
+        self.local.lock().unwrap().take();
     }
 }
 
@@ -776,8 +869,25 @@ mod tests {
     fn disabled_binds_nothing() {
         let rc = RemoteControl::new();
         assert!(!rc.enabled());
+        assert!(!rc.local_enabled(), "local CLI access defaults off too");
         assert!(rc.bind("agent-1", a_conn()).is_none());
         assert!(rc.registry().is_empty(), "no session registered while disabled");
+    }
+
+    /// Local CLI access alone populates the registry — the gate is widened to
+    /// either switch, not moved: with remote still off, sessions register for
+    /// the local listener to serve.
+    #[test]
+    fn local_access_alone_binds_sessions() {
+        let rc = RemoteControl::new();
+        rc.set_local_enabled(true);
+        assert!(!rc.enabled(), "remote stays off");
+        assert!(rc.bind("agent-1", a_conn()).is_some());
+        assert!(!rc.registry().is_empty());
+        // And turning it off again restores the empty-gate behavior for NEW
+        // sessions (live bindings are cut by the listener teardown, not here).
+        rc.stop_local();
+        assert!(rc.bind("agent-2", a_conn()).is_none());
     }
 
     /// Enabled binds a session whose teed events reach a live subscriber in order.

@@ -498,6 +498,18 @@ fn main() {
         if remote_was_on {
             oximux_app::remote_control::RemoteControl::resume_at_launch(cx);
         }
+        // Local CLI access resumes on the same reasoning, under its own key:
+        // a scripted workflow must survive an app restart without someone
+        // reopening Settings. Default off — absent key binds nothing.
+        let local_was_on = app_state
+            .settings_repo()
+            .get(oximux_app::remote_control::LOCAL_ENABLED_SETTING)
+            .ok()
+            .flatten()
+            .is_some_and(|v| v == "true");
+        if local_was_on {
+            oximux_app::remote_control::RemoteControl::start_local(cx);
+        }
         // Start the scheduled-run ticker. Installed unconditionally: with no
         // schedules it costs one indexed read every tick and takes no keep-awake
         // hold, and gating it on "are there any schedules" would mean the first

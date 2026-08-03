@@ -38,6 +38,8 @@ oximux-owner-only = { workspace = true }
 # the shared wire types (PairingTicket).
 oximux-remote-host = { workspace = true }
 oximux-remote-iroh = { workspace = true, features = ["host"] }
+# The owner-only control socket the `oximux` CLI dials (opt-in listener).
+oximux-remote-local = { workspace = true }
 oximux-remote-proto = { workspace = true }
 oximux-settings = { workspace = true }
 oximux-storage = { workspace = true }

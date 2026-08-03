@@ -134,6 +134,8 @@ jobs:
           -p oximux-proc-cwd
           -p oximux-job-object
           -p oximux-no-window
+          -p oximux-remote-local
+          -p oximux-cli
 
       # The step above already builds remote-iroh's accept-loop half: selected
       # via `-p`, the crate's OWN `default = ["host"]` applies (the opt-in
@@ -161,6 +163,16 @@ jobs:
       # same rationale as the Windows job's step of the same name.
       - name: cargo test (relay daemon end-to-end)
         run: cargo test -p oximux-relay --test relay_integration
+
+      # The CLI's trust factors are filesystem facts (0700 dir, 0600 socket
+      # and token, readback-asserted), so the only Linux that ever checks
+      # them is this runner. The CLI E2E drives the compiled binary against
+      # a live dispatcher over a real socket — exit codes are the contract.
+      - name: cargo test (local control socket)
+        run: cargo test -p oximux-remote-local
+
+      - name: cargo test (oximux CLI end-to-end)
+        run: cargo test -p oximux-cli
 
   # Permanent gate for the Windows port. macOS is still the only shipping
   # target; this job stops a macOS-only API from landing on a shared path
@@ -300,6 +312,17 @@ jobs:
 
       - name: cargo test (relay checkpoint lifecycle)
         run: cargo test --target x86_64-pc-windows-msvc -p oximux-relay --test checkpoint_lifecycle
+
+      # Windows is a full-parity CLI target, and the named pipe carries an
+      # explicit owner-only DACL instead of directory permissions — a claim
+      # only a real windows-msvc host can verify. The `--lib` sweep below
+      # reaches the unit tests; these two reach the integration suites under
+      # tests/, which it cannot.
+      - name: cargo test (local control socket)
+        run: cargo test --target x86_64-pc-windows-msvc -p oximux-remote-local
+
+      - name: cargo test (oximux CLI end-to-end)
+        run: cargo test --target x86_64-pc-windows-msvc -p oximux-cli
 
       # Blocking as of the port of the last macOS-shaped fixtures: this was the
       # informational sweep, kept non-blocking to produce the list of what

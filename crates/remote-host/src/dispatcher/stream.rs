@@ -23,7 +23,7 @@ use oximux_remote_proto::{HostEvent, Transport};
 use tokio::sync::{broadcast, watch};
 
 use super::Dispatcher;
-use crate::auth::AppPubkey;
+use crate::auth::Peer;
 
 /// One live event as it leaves the merged subscription stream, tagged with the
 /// session it belongs to (the merge erases which stream produced it).
@@ -168,12 +168,12 @@ impl Dispatcher {
     /// Returns the immediate response and, only on the first subscribe, the stream.
     pub(super) fn begin_subscribe(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         session_id: &str,
         after_seq: u64,
         cursors: &mut HashMap<SessionId, Seq>,
     ) -> (Response, Option<BoxStream<'static, LiveFrame>>) {
-        if !self.auth.is_allowed_for(pubkey, session_id) {
+        if !self.auth.is_allowed_for(peer, session_id) {
             return (Response::Error(RpcError::Unauthorized), None);
         }
         let Some(handle) = self.registry.get(session_id) else {
@@ -238,14 +238,14 @@ impl Dispatcher {
     /// transport is still writable (`false` → the serve loop should stop).
     pub(super) async fn forward_live(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         cursors: &mut HashMap<SessionId, Seq>,
         transport: &dyn Transport,
         frame: LiveFrame,
     ) -> bool {
         // Revocation / scope bites the live stream too: suppress silently but keep
         // the connection open (other sessions may still be permitted).
-        if !self.auth.is_allowed_for(pubkey, &frame.session_id) {
+        if !self.auth.is_allowed_for(peer, &frame.session_id) {
             return true;
         }
         // Never re-send a `seq` already covered by the backlog batch (or an
@@ -282,18 +282,18 @@ impl Dispatcher {
     /// life and double every push.
     pub(super) fn begin_subscribe_sessions(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         already: &mut bool,
     ) -> (Response, Option<BoxStream<'static, Live>>) {
         if *already {
-            return (Response::Sessions(self.snapshot_sessions(pubkey)), None);
+            return (Response::Sessions(self.snapshot_sessions(peer)), None);
         }
         // Receiver before snapshot so a change landing in the gap fires a tick
         // rather than being missed — an extra identical push is harmless. The
         // immediate reply is a plain `Sessions` (routed to the client's RPC slot);
         // only the later change pushes are `SessionsChanged`.
         let rx = self.registry.subscribe_changes();
-        let snapshot = self.snapshot_sessions(pubkey);
+        let snapshot = self.snapshot_sessions(peer);
         *already = true;
         (Response::Sessions(snapshot), Some(sessions_stream(rx)))
     }
@@ -301,8 +301,8 @@ impl Dispatcher {
     /// Push the current session list, recomputed per change so the per-device scope
     /// filter is honoured on every push — mirroring `forward_live`'s per-frame
     /// recheck. Returns whether the transport is still writable.
-    pub(super) async fn forward_sessions(&self, pubkey: &AppPubkey, transport: &dyn Transport) -> bool {
-        let snapshot = self.snapshot_sessions(pubkey);
+    pub(super) async fn forward_sessions(&self, peer: &Peer, transport: &dyn Transport) -> bool {
+        let snapshot = self.snapshot_sessions(peer);
         transport
             .send(
                 Response::SessionsChanged(snapshot)
@@ -316,8 +316,8 @@ impl Dispatcher {
 
 impl Dispatcher {
     /// List the terminals this device may see.
-    pub(super) async fn list_terminals(&self, pubkey: &AppPubkey) -> Response {
-        if !self.auth.may_use_terminals(pubkey) {
+    pub(super) async fn list_terminals(&self, peer: &Peer) -> Response {
+        if !self.auth.may_use_terminals(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(source) = &self.terminals else {
@@ -342,11 +342,11 @@ impl Dispatcher {
     /// repeatable rather than something a client is punished for.
     pub(super) async fn begin_term_attach(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         pty_id: &str,
         attached: &mut HashMap<String, tokio::sync::oneshot::Sender<()>>,
     ) -> (Response, Option<BoxStream<'static, Live>>) {
-        if !self.auth.may_use_terminals(pubkey) {
+        if !self.auth.may_use_terminals(peer) {
             return (Response::Error(RpcError::Unauthorized), None);
         }
         let Some(source) = &self.terminals else {
@@ -379,8 +379,8 @@ impl Dispatcher {
 
     /// Type into a terminal. The gate here is the write tier, not merely
     /// terminal visibility — this is arbitrary code execution on the desktop.
-    pub(super) async fn term_input(&self, pubkey: &AppPubkey, pty_id: &str, bytes: &[u8]) -> Response {
-        if !self.auth.may_drive_terminals(pubkey) {
+    pub(super) async fn term_input(&self, peer: &Peer, pty_id: &str, bytes: &[u8]) -> Response {
+        if !self.auth.may_drive_terminals(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(source) = &self.terminals else {
@@ -402,12 +402,12 @@ impl Dispatcher {
     /// other attachment including the desktop's own window.
     pub(super) async fn term_resize(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         pty_id: &str,
         cols: u16,
         rows: u16,
     ) -> Response {
-        if !self.auth.may_drive_terminals(pubkey) {
+        if !self.auth.may_drive_terminals(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(source) = &self.terminals else {
@@ -466,7 +466,7 @@ fn term_stream(
 /// Forward one terminal frame. Returns whether the transport is still writable.
 pub(super) async fn forward_terminal(
     auth: &crate::auth::AuthStore,
-    pubkey: &AppPubkey,
+    peer: &Peer,
     transport: &dyn Transport,
     pty_id: String,
     frame: crate::terminals::TerminalFrame,
@@ -474,7 +474,7 @@ pub(super) async fn forward_terminal(
     // Per-frame recheck, matching the session path: a device revoked or
     // downgraded mid-stream stops seeing a terminal it was already watching.
     // Read access is the right gate here — this direction never types.
-    if !auth.may_use_terminals(pubkey) {
+    if !auth.may_use_terminals(peer) {
         return true;
     }
     let response = match frame {

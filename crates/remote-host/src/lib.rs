@@ -25,10 +25,8 @@ pub mod transcribe;
 pub mod transcript_budget;
 
 pub use auth::{
-    AppPubkey, AuthStore, DeviceInfo, DeviceStore, PairedDevice, PairingEvent, PairingSlot,
-    StorageDeviceStore,
-    StoredDevice,
-    mint_pairing_secret, registration_proof,
+    AppPubkey, AuthStore, DeviceInfo, DeviceStore, LocalScope, PairedDevice, PairingEvent,
+    PairingSlot, StorageDeviceStore, StoredDevice, mint_pairing_secret, registration_proof,
 };
 pub use dispatcher::Dispatcher;
 pub use identity::HostIdentity;
