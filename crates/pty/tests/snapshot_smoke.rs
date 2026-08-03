@@ -19,7 +19,10 @@ const MARKER: &str = "OXIMUX_GRID_OK";
 const RED_MARKER: &str = "OXIMUXRED";
 const PALETTE_MARKER: &str = "OXIMUX256";
 const TRUECOLOR_MARKER: &str = "OXIMUXRGB";
-const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+// Upper bound only — the poll loops below return as soon as the child
+// exits. Generous because ConPTY child spawn on a contended shared CI
+// runner can stall well past a few seconds when tests run in parallel.
+const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[test]
