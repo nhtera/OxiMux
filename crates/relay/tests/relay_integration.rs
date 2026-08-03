@@ -246,8 +246,15 @@ async fn the_last_client_leaving_flushes_a_checkpoint() {
 
     drop(stream); // the last client disconnects
 
+    // Poll rather than sleep-then-check, so a fast machine finishes in one
+    // iteration and a slow one is still given room. The ceiling is generous on
+    // purpose: this whole binary runs in ~0.3s on an idle dev machine and took
+    // 6.4s on a loaded CI runner, so a bound tuned to local timings is a bound
+    // that fails on CI for reasons unrelated to checkpointing. What the
+    // assertion demands is unchanged — the snapshot must appear — only the
+    // patience is.
     let mut found = false;
-    for _ in 0..250 {
+    for _ in 0..1_500 {
         if scrollback.exists() {
             found = true;
             break;
@@ -256,7 +263,7 @@ async fn the_last_client_leaving_flushes_a_checkpoint() {
     }
     assert!(
         found,
-        "last disconnect must checkpoint; nothing at {}",
+        "last disconnect must checkpoint; nothing at {} after 30s",
         scrollback.display()
     );
 }
