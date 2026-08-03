@@ -32,15 +32,38 @@ fn format_stroke(stroke: &str) -> String {
     out
 }
 
-/// Split "cmd-shift-t" into ordered modifier glyphs + the bare key. The key
-/// is everything after the last modifier token, so "cmd--" (cmd + minus)
+/// The glyph `secondary-` renders as on this platform: `⌘` on macOS, `⌃`
+/// elsewhere.
+///
+/// For tests that assert on how a *shipped default* renders. Defaults are
+/// written with `secondary-` (see `inventory`), so an expectation hardcoded to
+/// `⌘` is asserting the macOS spelling everywhere — which is how eight of these
+/// tests came to fail on Windows while the code under them was correct. Derived
+/// from the same `cfg` as `split_stroke` below, so the two cannot drift.
+#[cfg(test)]
+pub(crate) const SECONDARY_GLYPH: &str = if cfg!(target_os = "macos") {
+    "⌘"
+} else {
+    "⌃"
+};
+
+/// Split "secondary-shift-t" into ordered modifier glyphs + the bare key. The
+/// key is everything after the last modifier token, so "cmd--" (cmd + minus)
 /// and bare "-" survive.
+///
+/// `secondary` is gpui's platform-relative modifier and is what the default
+/// chords are written in: it means Command on macOS and Control elsewhere, so
+/// it has to land in a different bucket per platform. Missing it here would not
+/// mis-render a glyph — it would fall through to the key branch and print the
+/// whole chord as its own key name.
 fn split_stroke(stroke: &str) -> (Vec<&'static str>, &str) {
     let (mut cmd, mut ctrl, mut alt, mut shift, mut func) = (false, false, false, false, false);
     let mut rest = stroke;
     while let Some((head, tail)) = rest.split_once('-') {
         let glyph = match head {
             "cmd" | "super" | "win" => &mut cmd,
+            "secondary" if cfg!(target_os = "macos") => &mut cmd,
+            "secondary" => &mut ctrl,
             "ctrl" => &mut ctrl,
             "alt" => &mut alt,
             "shift" => &mut shift,
@@ -99,5 +122,62 @@ fn key_glyph(key: &str) -> String {
                 None => String::new(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secondary_renders_as_the_platform_modifier() {
+        // The chord the inventory actually ships. Whatever glyph this is, it
+        // must not be the literal token — the failure mode of not handling
+        // `secondary` is a settings pane full of "Secondary-shift-t".
+        let rendered = format_chord("secondary-shift-t");
+        assert!(
+            !rendered.to_lowercase().contains("secondary"),
+            "got {rendered}"
+        );
+        if cfg!(target_os = "macos") {
+            assert_eq!(rendered, "⌘⇧T");
+        } else {
+            assert_eq!(rendered, "⌃⇧T");
+        }
+    }
+
+    #[test]
+    fn secondary_and_cmd_agree_on_macos() {
+        // The migration's whole safety claim: rewriting `cmd-` to `secondary-`
+        // changes nothing a macOS user sees.
+        if cfg!(target_os = "macos") {
+            assert_eq!(format_chord("secondary-k"), format_chord("cmd-k"));
+        }
+    }
+
+    #[test]
+    fn multi_stroke_chords_format_each_stroke() {
+        let rendered = format_chord("secondary-k secondary-b");
+        let expected = if cfg!(target_os = "macos") {
+            "⌘K ⌘B"
+        } else {
+            "⌃K ⌃B"
+        };
+        assert_eq!(rendered, expected);
+    }
+
+    #[test]
+    fn tokens_split_modifiers_from_the_key() {
+        let tokens = format_chord_tokens("secondary-shift-e");
+        let modifier = if cfg!(target_os = "macos") { "⌘" } else { "⌃" };
+        assert_eq!(tokens, vec![modifier, "⇧", "E"]);
+    }
+
+    #[test]
+    fn a_trailing_dash_is_the_key_not_an_empty_one() {
+        // "secondary--" is the zoom-out chord: platform modifier plus minus.
+        let rendered = format_chord("secondary--");
+        let modifier = if cfg!(target_os = "macos") { "⌘" } else { "⌃" };
+        assert_eq!(rendered, format!("{modifier}-"));
     }
 }

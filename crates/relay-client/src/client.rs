@@ -4,9 +4,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
-use oximux_relay_proto::{Frame, Hello, Notification, PROTOCOL_VERSION, Request, Response};
+use interprocess::local_socket::tokio::prelude::*;
+use interprocess::local_socket::tokio::{RecvHalf, SendHalf, Stream};
+use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ToFsName, ToNsName};
+use oximux_relay_proto::{
+    Endpoint, Frame, Hello, HelloProof, NONCE_LEN, Nonce, Notification, PROTOCOL_VERSION, Request,
+    Response, client_proof, endpoint_for, proofs_match, server_proof,
+};
+use rand::RngCore;
+use rand::rngs::OsRng;
 use thiserror::Error;
-use tokio::net::UnixStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -58,6 +66,22 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 type SubId = u64;
 type PtySubscribers = Arc<DashMap<String, Vec<(SubId, mpsc::UnboundedSender<Notification>)>>>;
 
+/// Open the byte stream to the daemon and hand back its two halves. The only
+/// platform-specific step in the client — everything above it is framing.
+///
+/// Splitting here rather than in the caller is deliberate: this yields two
+/// independently-owned halves with no shared lock, while the generic
+/// `tokio::io::split` puts a `BiLock` between reader and writer. This socket
+/// carries every keystroke one way and every byte of PTY output the other, so
+/// that lock would sit on the hottest path in the app.
+async fn dial(socket_path: &Path) -> Result<(RecvHalf, SendHalf), ClientError> {
+    let name = match endpoint_for(socket_path) {
+        Endpoint::FsPath(path) => path.to_fs_name::<GenericFilePath>()?,
+        Endpoint::Namespaced(name) => name.to_ns_name::<GenericNamespaced>()?,
+    };
+    Ok(Stream::connect(name).await?.split())
+}
+
 pub struct RelayClient {
     write_tx: mpsc::Sender<Frame>,
     pending: Arc<DashMap<u64, oneshot::Sender<Response>>>,
@@ -73,28 +97,89 @@ pub struct RelayClient {
 }
 
 impl RelayClient {
+    /// Dial the daemon's local socket and complete the handshake.
+    ///
+    /// Only the dial is platform-specific; everything after it is framing over
+    /// a byte stream, so [`Self::handshake`] takes the connected halves rather
+    /// than the path. That is the seam a named-pipe transport plugs into.
     pub async fn connect(socket_path: &Path, token: &str) -> Result<Self, ClientError> {
-        let stream = UnixStream::connect(socket_path).await?;
-        let (mut read_half, mut write_half) = stream.into_split();
+        let (read_half, write_half) = dial(socket_path).await?;
+        Self::handshake(read_half, write_half, token).await
+    }
+
+    /// Handshake and start the reader/writer tasks over an already-connected
+    /// pair of stream halves.
+    async fn handshake<R, W>(
+        mut read_half: R,
+        mut write_half: W,
+        token: &str,
+    ) -> Result<Self, ClientError>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
 
         // --- Handshake (must complete before the reader task starts
         //     consuming response frames) ----------------------------
+        // The token is never sent. Each side proves it holds it by MACing both
+        // nonces; see `oximux_relay_proto::auth` for what that buys and why the
+        // daemon goes first.
         let client_id = Uuid::new_v4().to_string();
+        let mut client_nonce: Nonce = [0u8; NONCE_LEN];
+        OsRng.fill_bytes(&mut client_nonce);
         let hello = Frame::Request {
             request_id: 0,
             request: Request::Hello(Hello {
                 protocol_version: PROTOCOL_VERSION,
-                token: token.to_owned(),
                 client_id,
+                client_nonce,
             }),
         };
         write_frame(&mut write_half, &hello).await?;
 
         let mut buf = Vec::with_capacity(4 * 1024);
+        let challenge = read_frame(&mut read_half, &mut buf).await?;
+        let challenge = match challenge {
+            Frame::Response {
+                request_id: 0,
+                response: Response::HelloChallenge(c),
+            } => c,
+            Frame::Response {
+                response: Response::Err { code, message },
+                ..
+            } => {
+                return Err(ClientError::Daemon { code, message });
+            }
+            other => {
+                return Err(ClientError::Handshake(format!(
+                    "expected HelloChallenge, got {other:?}"
+                )));
+            }
+        };
+
+        // Whoever answered has to prove it can read the token file before we
+        // say anything else. Failing here means the endpoint is held by
+        // something that is not our daemon — on Windows, a squatted pipe name —
+        // so we abandon the connection rather than hand it a session.
+        let expected = server_proof(token, &challenge.server_nonce, &client_nonce);
+        if !proofs_match(&challenge.server_proof, &expected) {
+            return Err(ClientError::Handshake(
+                "daemon could not prove it holds the token — endpoint may be impersonated".into(),
+            ));
+        }
+
+        let proof = Frame::Request {
+            request_id: 1,
+            request: Request::HelloProof(HelloProof {
+                client_proof: client_proof(token, &challenge.server_nonce, &client_nonce),
+            }),
+        };
+        write_frame(&mut write_half, &proof).await?;
+
         let ack = read_frame(&mut read_half, &mut buf).await?;
         let server_session_id = match ack {
             Frame::Response {
-                request_id: 0,
+                request_id: 1,
                 response: Response::HelloAck(ack),
             } => ack.session_id,
             Frame::Response {
@@ -218,6 +303,29 @@ impl RelayClient {
     }
 }
 
+impl Drop for RelayClient {
+    /// Close the inbound half explicitly instead of relying on the daemon to
+    /// hang up first.
+    ///
+    /// Dropping `write_tx` retires the writer task once it has drained, and on
+    /// a unix socket that alone is enough: dropping the write half shuts down
+    /// the write direction, the daemon reads EOF and ends the session, and the
+    /// reader here then sees EOF and exits on its own.
+    ///
+    /// A named pipe has no half-shutdown. Nothing would reach the daemon, its
+    /// session would stay parked on a read that never completes, and the reader
+    /// task here would block forever holding the pipe open — leaking a task and
+    /// a daemon session per client. Aborting the reader drops that half on
+    /// every platform, so the handle closes once the writer has finished.
+    ///
+    /// Only the reader is aborted. The writer is left to drain so frames
+    /// already queued still reach the daemon; it stops on its own when the
+    /// channel closes.
+    fn drop(&mut self) {
+        self._reader_task.abort();
+    }
+}
+
 /// Append a subscriber Sender for `pty_id`. Split out from the method so the
 /// fan-out bookkeeping can be unit-tested without a live socket.
 fn subscribe_into(
@@ -248,8 +356,8 @@ fn unsubscribe_from(subscribers: &PtySubscribers, pty_id: &str, sub_id: SubId) {
     subscribers.remove_if(pty_id, |_, subs| subs.is_empty());
 }
 
-async fn reader_loop(
-    mut read_half: tokio::net::unix::OwnedReadHalf,
+async fn reader_loop<R: AsyncRead + Unpin>(
+    mut read_half: R,
     mut buf: Vec<u8>,
     pending: Arc<DashMap<u64, oneshot::Sender<Response>>>,
     subscribers: PtySubscribers,

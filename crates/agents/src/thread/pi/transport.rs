@@ -59,7 +59,8 @@ impl PiRpcClient {
     /// Spawn an already-built command (the real `pi`, or a fake in tests) and
     /// wire its stdout into the reader/router.
     pub fn spawn_command(mut cmd: Command) -> Result<(PiRpcClient, Receiver<Inbound>, Child)> {
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        use oximux_no_window::NoWindow as _;
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).no_window();
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -300,7 +301,7 @@ printf '{"id":"s1","type":"response","command":"get_state","success":true,"data"
 printf '{"type":"agent_settled"}\n'
 sleep 0.2
 "#;
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         let (rpc, inbound, _child) = PiRpcClient::spawn_command(cmd).expect("spawn fake");
         let r = rpc
@@ -321,7 +322,7 @@ sleep 0.2
         // pending request must fail via the EOF drain (fast), and the error must
         // carry pi's stderr — "exited" alone can't distinguish bad auth from a
         // bad flag.
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg("read line; echo 'boom: bad auth' >&2; exit 1");
         let (rpc, _inbound, mut child) = PiRpcClient::spawn_command(cmd).expect("spawn fake");
         assert!(rpc.is_alive());
@@ -352,7 +353,7 @@ sleep 0.2
         let line = serde_json::to_string(&payload).unwrap();
         assert!(line.contains(sep), "the fixture must actually contain U+2028");
         let script = format!("read line\nprintf '%s\\n' '{line}'\nsleep 0.2\n");
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         let (rpc, _inbound, _child) = PiRpcClient::spawn_command(cmd).expect("spawn fake");
         let data = rpc
@@ -375,7 +376,7 @@ printf '{"type":"some_future_event","x":1}\n'
 printf '{"id":"s1","type":"response","command":"get_state","success":true,"data":{"sessionId":"ok"}}\n'
 sleep 0.2
 "#;
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         let (rpc, _inbound, _child) = PiRpcClient::spawn_command(cmd).expect("spawn fake");
         let data = rpc
@@ -393,7 +394,7 @@ read line
 printf '{"id":"c1","type":"response","command":"compact","success":false,"error":"Nothing to compact (session too small)"}\n'
 sleep 0.2
 "#;
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         let (rpc, _inbound, _child) = PiRpcClient::spawn_command(cmd).expect("spawn fake");
         let r = rpc

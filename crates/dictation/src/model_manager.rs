@@ -356,8 +356,10 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// Extract a `.tar.bz2` into `dest`, stripping the leading archive dir so files
 /// land directly. Uses the system `tar` (present on macOS, handles bzip2).
 fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
+    use oximux_no_window::NoWindow as _;
     std::fs::create_dir_all(dest)?;
     let status = std::process::Command::new("tar")
+        .no_window()
         .arg("-xjf")
         .arg(archive)
         .arg("-C")

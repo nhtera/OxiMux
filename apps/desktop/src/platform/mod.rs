@@ -26,10 +26,18 @@ pub(crate) fn serialize_input_state() -> std::sync::MutexGuard<'static, ()> {
 pub mod app_nap;
 pub mod claude_session_env;
 pub mod escape_tap;
+// Every line assumes POSIX: `:`-separated PATH, a `-lc` login shell, launchd's
+// four-directory stub. Windows inherits a real PATH from the registry, so
+// there is nothing here to port.
+#[cfg(unix)]
 pub mod login_path;
 pub mod menu;
 pub mod mic_permission;
+// Waits out the old pid in a detached `sh`, then `open -n`s the bundle. Paired
+// with the macOS updater's quit-time swap, and macOS-shaped throughout.
+#[cfg(target_os = "macos")]
 pub mod relaunch;
+#[cfg(any(target_os = "macos", windows))]
 pub mod screen_control_indicator;
 pub mod secure_input;
 pub mod single_instance;

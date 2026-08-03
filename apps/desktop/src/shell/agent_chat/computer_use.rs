@@ -54,12 +54,47 @@ static GRANTS: LazyLock<Arc<GrantTable>> = LazyLock::new(|| Arc::new(GrantTable:
 /// honest-looking answer (skip) would have left the chat with no gate while this
 /// process happily went on using a fallback store of its own.
 pub fn grants_path() -> PathBuf {
-    dirs::data_dir()
-        .map(|dir| dir.join("dev.nhtera.oximux"))
+    crate::app_paths::data_dir()
         // No data dir is a broken install; keep screen control working against
         // a temp store rather than failing the whole app to death over it.
         .unwrap_or_else(std::env::temp_dir)
         .join(oximux_computer_use::grants::GRANTS_FILE_NAME)
+}
+
+/// Where the user's driver approval is recorded, on the one platform that has
+/// to ask for one.
+///
+/// Lives here rather than in the settings pane that writes it, for the same
+/// reason [`grants_path`] does: the pane records the approval and this module
+/// reads it at spawn, and if those two ever resolved different files the pane
+/// would report a driver as approved while every chat kept refusing it — with
+/// nothing in either place looking wrong.
+///
+/// `app_paths::data_dir` rather than the `dirs::data_dir` above, which is the
+/// *roaming* profile on Windows. An approval is a statement about one binary on
+/// one machine and must not follow the user to another. The grant store's use of
+/// the roaming dir is a pre-existing inconsistency, not a precedent.
+#[cfg(windows)]
+pub fn trust_store() -> oximux_computer_use::TrustStore {
+    oximux_computer_use::TrustStore::for_app_data_dir(
+        crate::app_paths::data_dir().unwrap_or_else(std::env::temp_dir),
+    )
+}
+
+/// Put the installed driver through every gate this platform has.
+///
+/// The two anchors are not interchangeable and neither is the call: macOS asks
+/// the OS about a publisher, Windows asks a store what the user approved, and
+/// the Windows signature takes that store as an argument precisely so no caller
+/// can forget to name one.
+#[cfg(not(windows))]
+fn verified_driver() -> Result<oximux_computer_use::VerifiedDriver, oximux_computer_use::Error> {
+    oximux_computer_use::prepare()
+}
+
+#[cfg(windows)]
+fn verified_driver() -> Result<oximux_computer_use::VerifiedDriver, oximux_computer_use::Error> {
+    oximux_computer_use::prepare(&trust_store())
 }
 
 /// Drop every grant from a previous run. Called once at startup: grants are
@@ -273,7 +308,7 @@ fn gate_binary() -> Option<PathBuf> {
     let gate = std::env::current_exe()
         .ok()?
         .parent()?
-        .join(oximux_computer_use::GATE_BINARY_NAME);
+        .join(oximux_computer_use::gate_binary_file_name());
     gate.is_file().then_some(gate)
 }
 
@@ -321,7 +356,7 @@ fn declare(spec: &mut ConnectSpec, chat: &ScreenControl, cx: &App) {
             if !enabled_here(&spec.cwd, cx) {
                 return None;
             }
-            match oximux_computer_use::prepare() {
+            match verified_driver() {
                 Ok(driver) => Some(driver.path),
                 Err(err) => {
                     tracing::warn!(%err, "screen control is on for this project but the driver is not usable");
@@ -428,6 +463,51 @@ impl Drop for ScreenControl {
 /// view's own test module because they belong with the thing they test, and
 /// because a child module can still reach the view's private state.
 #[cfg(test)]
+/// A process that outlives the test, to stand in for an app being driven.
+///
+/// Platform-split for the same reason `oximux_computer_use::fixtures` is:
+/// none of these tests are about *which* binary is running. They are about
+/// grants, pids and cards, and `/bin/sleep` was only ever the cheapest way
+/// to get a live pid — a fact that stayed invisible while the whole module
+/// was macOS-only.
+///
+/// `ping -n 120 127.0.0.1` is the Windows equivalent: present on every
+/// install, long-lived, and harmless.
+/// What the card will call [`spawn_long_lived`]'s process.
+///
+/// Derived from the fixture rather than written out, so the two cannot drift:
+/// the display name drops `.exe` on Windows, which is the kind of detail a
+/// hardcoded string gets wrong silently.
+#[cfg(test)]
+fn long_lived_name() -> String {
+    let program = spawn_long_lived();
+    Path::new(program.get_program())
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .expect("the fixture names a program")
+}
+
+#[cfg(test)]
+fn spawn_long_lived() -> std::process::Command {
+    #[cfg(windows)]
+    let (program, args): (&str, &[&str]) =
+        (r"C:\Windows\System32\PING.EXE", &["-n", "120", "127.0.0.1"]);
+    #[cfg(not(windows))]
+    let (program, args): (&str, &[&str]) = ("/bin/sleep", &["120"]);
+
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        // Silenced, or `ping`'s per-second chatter is interleaved through the
+        // whole test run's output. `sleep` never had anything to say, so this
+        // only became necessary once the fixture had to work on Windows.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    command
+}
+
+
+#[cfg(test)]
 mod view_tests {
     use std::sync::Arc;
 
@@ -437,6 +517,7 @@ mod view_tests {
 
     use oximux_settings::{Density, Theme, Typography};
 
+    use super::{long_lived_name, spawn_long_lived};
     use super::super::AgentChatView;
 
     /// What *this* chat has photographed, and what it is driving.
@@ -546,8 +627,7 @@ mod view_tests {
 
         window
             .update(cx, |view, _window, cx| {
-                let mut target = std::process::Command::new("/bin/sleep")
-                    .arg("120")
+                let mut target = spawn_long_lived()
                     .spawn()
                     .expect("spawn a target");
                 let pid = target.id();
@@ -634,8 +714,7 @@ mod view_tests {
 
         window
             .update(cx, |view, _window, cx| {
-                let target = std::process::Command::new("/bin/sleep")
-                    .arg("120")
+                let target = spawn_long_lived()
                     .spawn()
                     .expect("spawn a target");
                 let input = json!({ "pid": target.id() });
@@ -679,8 +758,7 @@ mod view_tests {
     #[gpui::test]
     async fn an_unapproved_target_leaves_the_card_up(cx: &mut TestAppContext) {
         let (window, probe) = stub_chat(cx).await;
-        let mut target = std::process::Command::new("/bin/sleep")
-            .arg("120")
+        let mut target = spawn_long_lived()
             .spawn()
             .expect("spawn a target process");
 
@@ -704,7 +782,7 @@ mod view_tests {
                 );
                 assert_eq!(
                     view.screen_prompts.get("t1").map(|p| p.app.as_str()),
-                    Some("sleep"),
+                    Some(long_lived_name().as_str()),
                     "and the card must know which app it is asking about"
                 );
             })
@@ -730,8 +808,7 @@ mod view_tests {
     #[gpui::test]
     async fn the_app_named_on_the_card_labels_the_actions_that_follow(cx: &mut TestAppContext) {
         let (window, _probe) = stub_chat(cx).await;
-        let mut target = std::process::Command::new("/bin/sleep")
-            .arg("120")
+        let mut target = spawn_long_lived()
             .spawn()
             .expect("spawn a target process");
         let pid = target.id();
@@ -760,7 +837,7 @@ mod view_tests {
                 let ctx = view.screen_context(&later);
                 assert_eq!(
                     ctx.app.as_deref(),
-                    Some("sleep"),
+                    Some(long_lived_name().as_str()),
                     "a later action must inherit the name the card resolved"
                 );
                 assert!(
@@ -768,7 +845,10 @@ mod view_tests {
                     "and must not inherit the card itself — nothing is waiting on the user here"
                 );
                 let header = super::super::screen_card::target(&later, ctx.app.as_deref());
-                assert_eq!(header.as_deref(), Some("\"hello\" → sleep"));
+                assert_eq!(
+                    header.as_deref(),
+                    Some(format!("\"hello\" → {}", long_lived_name()).as_str())
+                );
             })
             .expect("window update");
 
@@ -826,8 +906,7 @@ mod tests {
     impl Target {
         fn spawn() -> Self {
             Self(
-                std::process::Command::new("/bin/sleep")
-                    .arg("120")
+                spawn_long_lived()
                     .spawn()
                     .expect("spawn a target process"),
             )
@@ -858,7 +937,11 @@ mod tests {
         // has to outlive the chat that reads it, and threading a guard through
         // every call site would obscure what each test is actually asserting.
         std::mem::forget(dir);
-        ScreenControl::sharing(Path::new("/tmp"), Arc::new(table))
+        // A real directory, because provenance is only built when the worktree
+        // canonicalizes — a path that does not exist yields `None` and the chat
+        // silently loses `--worktree`/`--since`. `/tmp` made that invisible on
+        // macOS by happening to exist.
+        ScreenControl::sharing(&std::env::temp_dir(), Arc::new(table))
     }
 
     /// Two chats that can see each other's grants — the arrangement the

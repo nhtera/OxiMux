@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use dashmap::DashMap;
 use oximux_relay_proto::{ErrCode, Notification, PtyDescriptor, PtyStats};
+use oximux_shell_env::{clear_inherited_colour_suppression, seed_utf8_locale};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::error::TrySendError;
@@ -119,6 +120,13 @@ struct Entry {
     // Best-effort PID of the spawned child for the SIGTERM step. None
     // on non-Unix or when portable-pty returns None.
     pid: Option<u32>,
+    // Windows stand-in for the process group: holds the shell and everything it
+    // spawned, so `close` can end the tree rather than just the shell. Kept
+    // alive for the entry's lifetime — the job's kill-on-close limit means
+    // dropping this reaps the tree, which is what makes a daemon crash clean up
+    // after itself.
+    #[cfg(windows)]
+    job: Option<Arc<oximux_job_object::JobObject>>,
     // Phase-07: per-PTY counters surfaced by `Request::Stats`.
     bytes_in: AtomicU64,
     bytes_out: Arc<AtomicU64>,
@@ -170,10 +178,10 @@ impl PtyRegistry {
             })
             .context("openpty")?;
 
-        let shell = args
-            .shell
-            .or_else(|| std::env::var("SHELL").ok())
-            .unwrap_or_else(|| "/bin/zsh".into());
+        // Resolved here, not client-side, and that ordering is the point: a
+        // paired phone asking for "a terminal" has no idea what shells the
+        // host has, so the host is the only end that can answer.
+        let shell = args.shell.unwrap_or_else(oximux_shell_env::default_shell);
         // Mint the PTY id up front so it can be injected into the child's
         // environment as OXIMUX_PTY_ID — the `oximux notify` CLI reads it to
         // tell the daemon which pane to raise attention on.
@@ -200,12 +208,37 @@ impl PtyRegistry {
         // explicit override still wins, though callers shouldn't set it).
         command.env("OXIMUX_PTY_ID", &pty_id);
         seed_utf8_locale(&mut command);
+        // The daemon is the worst-affected spawn site, and the reason this call
+        // exists. It is started detached by the app and outlives it, so it
+        // carries whatever environment the app was launched with — forever.
+        // Launch OxiMux once from a coding agent's shell and every pane in
+        // every session from then on renders monochrome, with nothing in any
+        // log to say why. Before the caller loop, so an explicit
+        // `args.env` entry still wins.
+        clear_inherited_colour_suppression(&mut command);
         for (k, v) in &args.env {
             command.env(k, v);
         }
         let child = pair.slave.spawn_command(command).context("spawn shell")?;
         let killer = child.clone_killer();
         let pid = child.process_id();
+        // Windows has no process group to signal, and `ChildKiller::kill` ends
+        // exactly the shell — the compiler, dev server or test runner it was
+        // running keeps going with nothing left to account for it. A job object
+        // is what gives the tree a single handle to end. Adopted immediately
+        // after spawn, so the only escapee would be something the shell forked
+        // before its first instruction ran.
+        #[cfg(windows)]
+        let job = pid.and_then(|pid| match oximux_job_object::JobObject::adopt_pid(pid) {
+            Ok(job) => Some(Arc::new(job)),
+            Err(e) => {
+                // Not fatal: the PTY still works and the direct child is still
+                // killable. What is lost is the guarantee about its descendants,
+                // which is worth a warning rather than a failed spawn.
+                tracing::warn!(?e, pid, "could not put PTY child in a job object");
+                None
+            }
+        });
         // The slave fd is duplicated into the child by spawn_command;
         // we no longer need our copy. Dropping it lets the kernel
         // deliver EOF to the master read side once the child exits.
@@ -276,6 +309,8 @@ impl PtyRegistry {
             child_exited,
             exit_code,
             pid,
+            #[cfg(windows)]
+            job,
             bytes_in: AtomicU64::new(0),
             bytes_out,
             started_at: Instant::now(),
@@ -501,6 +536,16 @@ impl PtyRegistry {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let _ = entry.killer.lock().expect("killer poisoned").kill();
+        // The killer above ends the shell; on Windows that leaves its
+        // descendants running, so the job is what actually closes the session.
+        // After the grace window rather than instead of it: a shell given the
+        // chance to exit on its own lets its children finish writing.
+        #[cfg(windows)]
+        if let Some(job) = &entry.job
+            && let Err(e) = job.kill()
+        {
+            tracing::warn!(?e, pty_id, "job-object tree kill failed");
+        }
         // Deliberate kill — nothing to cold-restore. The reader thread
         // also removes on its way out; remove is idempotent.
         if let Some(store) = &self.checkpoints {
@@ -695,6 +740,30 @@ fn send_sigterm(pid: Option<u32>) {
 /// `Notification::Exit { code }` (`None` here) to a late-reconnecting client.
 const EXIT_CODE_NONE: i32 = i32::MIN;
 
+/// How long [`reader_loop`] keeps draining output after the child has been
+/// reaped, before it publishes `Exit`.
+///
+/// The daemon cannot key exit off the reader seeing EOF, because on Windows it
+/// never does: a ConPTY's output pipe belongs to the pseudoconsole, which
+/// outlives the child and is released only when the master is dropped at
+/// `close`. A shell that exits on its own — `exit`, a crash, a finished agent —
+/// produces no EOF at all, so an EOF-only loop would never fan out
+/// `Notification::Exit`, never drop the checkpoint, and leave the entry looking
+/// live to `list` forever.
+///
+/// The window covers the hand-off race: `child.wait()` can return while the last
+/// bytes the child wrote are still in flight, and those belong in the ring ahead
+/// of `Exit`. It only ever delays a session that has already ended.
+///
+/// A deadline from the moment of reaping rather than an idle timeout, for the same
+/// reason as its twin in `oximux-pty`: a detached grandchild that inherits the pty
+/// and keeps writing would hold an idle timeout open forever, and the session
+/// would never report `Exit` — the original bug, reintroduced.
+const POST_EXIT_DRAIN: Duration = Duration::from_millis(200);
+
+/// Wake-up granularity for the drain loop while no output is arriving.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 // The reader task owns the PTY's full I/O state (reader, child handle, ring,
 // subscribers, exit flags); threading it as discrete args keeps the spawn site
 // explicit rather than hiding it behind a bag struct.
@@ -710,33 +779,89 @@ fn reader_loop(
     bytes_out: Arc<AtomicU64>,
     checkpoints: Option<Arc<CheckpointStore>>,
 ) {
-    let mut buf = [0u8; READ_CHUNK_BYTES];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let bytes = &buf[..n];
-                bytes_out.fetch_add(n as u64, Ordering::Relaxed);
-                // Lock-order discipline: ring before subscribers, same
-                // order `attach` uses, to keep snapshot+push atomic.
-                let mut rb = ring.lock().expect("ring poisoned");
-                rb.push(bytes);
-                drop(rb);
-                fan_out(
-                    &subscribers,
-                    Notification::Output {
-                        pty_id: pty_id.clone(),
-                        bytes: bytes.to_vec(),
-                    },
-                );
-            }
-            Err(e) => {
-                tracing::debug!(?e, pty_id, "reader EOF/err");
-                break;
+    // Reap on a thread of its own rather than after the read loop, and read on a
+    // thread of its own rather than inline, so the loop below can end the session
+    // on whichever comes first: EOF, or the child being reaped plus a short
+    // drain. Waiting for EOF alone is what does not port — see `POST_EXIT_DRAIN`.
+    let (exit_tx, exit_rx) = std::sync::mpsc::sync_channel::<Option<i32>>(1);
+    std::thread::spawn(move || {
+        let code = child.wait().ok().map(|s| s.exit_code() as i32);
+        let _ = exit_tx.send(code);
+    });
+
+    // Dropping `bytes_tx` is how the reader reports EOF, keeping the unix path's
+    // "pty closed, session over" behaviour exactly as it was.
+    let (bytes_tx, bytes_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+    let pty_id_for_reader = pty_id.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; READ_CHUNK_BYTES];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => return,
+                Ok(n) => {
+                    // Blocking send: these bytes are the scrollback, so applying
+                    // backpressure to the pty is right and dropping them is not.
+                    if bytes_tx.send(buf[..n].to_vec()).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(?e, pty_id = pty_id_for_reader, "reader EOF/err");
+                    return;
+                }
             }
         }
+    });
+
+    let publish = |bytes: &[u8]| {
+        bytes_out.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        // Lock-order discipline: ring before subscribers, same
+        // order `attach` uses, to keep snapshot+push atomic.
+        let mut rb = ring.lock().expect("ring poisoned");
+        rb.push(bytes);
+        drop(rb);
+        fan_out(
+            &subscribers,
+            Notification::Output {
+                pty_id: pty_id.clone(),
+                bytes: bytes.to_vec(),
+            },
+        );
+    };
+
+    let mut reaped: Option<Option<i32>> = None;
+    let mut drain_deadline: Option<Instant> = None;
+    loop {
+        match bytes_rx.recv_timeout(DRAIN_POLL_INTERVAL) {
+            Ok(chunk) => publish(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        if reaped.is_none()
+            && let Ok(code) = exit_rx.try_recv()
+        {
+            reaped = Some(code);
+            drain_deadline = Some(Instant::now() + POST_EXIT_DRAIN);
+        }
+        if let Some(deadline) = drain_deadline
+            && Instant::now() >= deadline
+        {
+            break;
+        }
     }
-    let code = child.wait().ok().map(|s| s.exit_code() as i32);
+
+    // Output the reader already handed over belongs in the ring ahead of `Exit`.
+    while let Ok(chunk) = bytes_rx.try_recv() {
+        publish(&chunk);
+    }
+
+    // On the EOF route the reaper has not been consulted yet, and its status is
+    // worth blocking for: EOF means the pty is gone, so `wait` is about to
+    // return. On the reaped route the code is already in hand.
+    let code = match reaped {
+        Some(code) => code,
+        None => exit_rx.recv().unwrap_or(None),
+    };
     // Stash the status BEFORE flipping `child_exited`, so any reader that
     // observes the flag (here or in `attach`) also sees the final code.
     exit_code.store(code.unwrap_or(EXIT_CODE_NONE), Ordering::Release);
@@ -802,24 +927,6 @@ fn pty_id_of(notif: &Notification) -> &str {
         | Notification::Exit { pty_id, .. }
         | Notification::Attention { pty_id, .. }
         | Notification::Gapped { pty_id } => pty_id,
-    }
-}
-
-/// Seed a UTF-8 locale on a spawned shell when the environment supplies none.
-///
-/// A GUI-launched app — and the detached daemon it spawns — inherits no
-/// `LANG`/`LC_*` from LaunchServices, unlike Terminal.app, which injects a
-/// locale on startup. Without one, an interactive `zsh` falls back to the C
-/// locale and its line editor mangles multibyte input: Vietnamese/CJK text
-/// (typed, pasted, or dictated) echoes back as `<XX>` meta bytes rather than
-/// the intended glyphs. Seed a UTF-8 ctype only when nothing is set, and
-/// before the caller/user rc runs so any explicit locale still wins.
-fn seed_utf8_locale(command: &mut CommandBuilder) {
-    if std::env::var_os("LC_ALL").is_none()
-        && std::env::var_os("LC_CTYPE").is_none()
-        && std::env::var_os("LANG").is_none()
-    {
-        command.env("LANG", "en_US.UTF-8");
     }
 }
 

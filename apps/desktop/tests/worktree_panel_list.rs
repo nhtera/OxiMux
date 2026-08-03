@@ -17,7 +17,12 @@ fn wt(path: &str, branch: Option<&str>, is_main: bool, is_locked: bool) -> Workt
 #[test]
 fn suggest_path_uses_main_parent() {
     let suggestion = suggest_worktree_path(Path::new("/home/dev/proj"), "feat");
-    assert_eq!(suggestion, "/home/dev/oximux-wt-feat");
+    // Built with `join` rather than spelled out: the suggestion uses the
+    // platform separator (`\` on Windows), and that's correct — only the
+    // "sibling of the main worktree, named oximux-wt-<slug>" shape is the
+    // contract here.
+    let expected = Path::new("/home/dev").join("oximux-wt-feat");
+    assert_eq!(Path::new(&suggestion), expected.as_path());
 }
 
 #[test]

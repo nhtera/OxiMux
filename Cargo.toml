@@ -4,6 +4,10 @@ members = [
     "apps/desktop",
     "crates/ui",
     "crates/core",
+    "crates/owner-only",
+    "crates/job-object",
+    "crates/no-window",
+    "crates/shell-env",
     "crates/dictation",
     "crates/pty",
     "crates/git",
@@ -40,6 +44,21 @@ rust-version = "1.89"
 oximux-app      = { path = "apps/desktop" }
 oximux-ui       = { path = "crates/ui" }
 oximux-core     = { path = "crates/core" }
+# Owner-only access for the secrets we write to disk. Its own crate because the
+# desktop app, the relay daemon and the remote host share no other dependency.
+oximux-owner-only = { path = "crates/owner-only" }
+# Windows tree-kill for agent CLIs and terminal PTYs. Its own crate for the same
+# reason as owner-only: the relay and the agents crate share no dependency.
+oximux-job-object = { path = "crates/job-object" }
+# CREATE_NO_WINDOW on every spawned child, so a console-subsystem `git`/`node`/
+# `rg` doesn't pop an empty terminal window out of the GUI-subsystem app. Its
+# own crate for the usual reason: the spawn sites span crates that share no
+# other dependency.
+oximux-no-window = { path = "crates/no-window" }
+# Which shell a terminal runs, and the locale it needs. Same sharing problem
+# again, and here the duplication was already real: both consumers carried a
+# byte-identical copy of the locale fix.
+oximux-shell-env = { path = "crates/shell-env" }
 oximux-dictation = { path = "crates/dictation" }
 oximux-pty      = { path = "crates/pty" }
 oximux-git      = { path = "crates/git" }
@@ -86,8 +105,22 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", 
 
 # Async + util
 tokio = { version = "1", features = ["full"] }
+# GUI<->relay local transport: unix-domain sockets on unix, named pipes on
+# Windows, behind one tokio type. Two properties this pin is relied on for,
+# both verified against 2.4.2's source: a security descriptor set on
+# `ListenerOptions` reaches `CreateNamedPipeW` through the *tokio* constructor
+# (not only the sync one), and the unix stream splits via `into_split` rather
+# than a `BiLock` — this socket carries every keystroke and every byte of PTY
+# output, so a lock between the halves would sit on the hottest path in the app.
+interprocess = { version = "2.4", features = ["tokio"] }
 futures = "0.3"
 anyhow = "1"
+# Strips the `\\?\` verbatim prefix that `Path::canonicalize` adds on Windows,
+# where it is safe to drop. Canonicalized paths get stored in settings files and
+# compared against user-typed ones, and the prefix is correct-but-unspellable in
+# both roles. Already in the graph transitively; declared so the direct use is
+# visible. No-op on other platforms.
+dunce = "1"
 async-trait = "0.1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
@@ -208,6 +241,13 @@ ignore = "0.4"
 notify-debouncer-full = "0.4"
 # Temp dirs for file-tree backend unit tests (dev-dep on the editor crate).
 tempfile = "3"
+# PATH resolution for "is this agent CLI installed?" and for turning a bare
+# name into an absolute path. Replaces four hand-rolled versions — two that
+# shelled out to the `which` binary and two that walked PATH themselves. The
+# crate is pure Rust (no spawn), and it is what knows about Windows `PATHEXT`,
+# so `claude` resolves to the `claude.cmd` shim npm installs. Already in the
+# graph transitively at this version; declaring it adds no new compilation.
+which = "6"
 # Phase 10 — word-level diff inside the diff viewer. `similar` produces
 # `TextDiff::from_words` op streams that drive per-token coloring inside
 # modified-modified line pairs. Pure Rust, no `unicode-bidi` transitive

@@ -77,3 +77,172 @@ jobs:
 
       - name: xtask file-size-lint
         run: cargo run -p xtask -- file-size-lint
+
+      # The Windows icon is derived from the macOS one, so it goes stale on
+      # whichever machine edits `assets/AppIcon.icns` — which is this one, not
+      # the Windows runner. Checking it here is what makes "regenerate the .ico"
+      # a step nobody has to remember.
+      - name: xtask icon --check
+        run: cargo run -p xtask -- icon --check
+
+  # Permanent gate for the Windows port. macOS is still the only shipping
+  # target; this job stops a macOS-only API from landing on a shared path
+  # unnoticed, which is exactly the class of breakage that made the port
+  # expensive to start.
+  #
+  # Native runner rather than a cross-check from macOS on purpose: only a real
+  # windows-msvc host surfaces link/manifest problems, and the C-dependency
+  # build scripts (rusqlite's bundled sqlite, ring) need a real MSVC toolchain.
+  # Locally, `cargo check --target x86_64-pc-windows-gnu` with mingw-w64 is a
+  # fast proxy — `cfg(windows)` resolves identically — but `target_env` does
+  # not, so this job is the authority.
+  #
+  # It also RUNS a narrow set of tests. That matters more than it sounds: the
+  # port is being written on a machine with no Windows, so this runner is the
+  # only thing that executes any of it. The DACL assertions and the job-object
+  # tree kill are not checkable anywhere else — a green compile says nothing
+  # about whether a job object actually reaps a grandchild.
+  windows-check:
+    name: windows compile gate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
+
+      # `macos-trust` is macOS-shaped by construction: it wraps codesign and
+      # spctl. Note what the exclusion does and does not buy. Its library is
+      # already in the Windows graph — `oximux-auto-update` depends on it
+      # unconditionally — and compiles there, so this only skips its own tests,
+      # 6 of which fail on Windows because their fixtures are POSIX-shaped
+      # (`/bin/sleep`, `ditto`, statvfs) rather than because the code under test
+      # is macOS-only. That is a gap parked deliberately, not a settled
+      # decision: the same fixture problem in `computer-use` was fixed rather
+      # than excluded (`crates/computer-use/src/fixtures.rs`).
+      #
+      # `computer-use` used to sit beside it and no longer does. The desktop app
+      # depends on it under `cfg(windows)` for the **policing hook** — not for
+      # screen control, which stays off — so it was already being compiled here
+      # as a dependency. Excluding it only skipped its own tests, which is the
+      # worse half: the crate now carries a Windows blocklist, a Windows GUI
+      # scripting brake and Windows command-line quoting, none of which a
+      # dependency build exercises.
+      - name: cargo check
+        run: >
+          cargo check --workspace --all-targets --target x86_64-pc-windows-msvc
+          --exclude oximux-macos-trust
+
+      # Blocking, and deliberately narrow. These five crates are where the
+      # Windows-specific behavior lives and where a failure is unambiguous:
+      # owner-only asserts the DACL reads back protected and single-owner,
+      # job-object asserts a killed job takes a detached grandchild with it,
+      # shell-env asserts the resolved shell is a program that exists (which is
+      # what proves the pwsh probe works at all), pty's unit tests carry the
+      # OSC 7 drive-letter handling, and settings covers the screen-control
+      # opt-in's path matching — where "absolute" and "the same directory under
+      # another name" both mean something different than they do on Unix.
+      #
+      # Kept as separate steps rather than one combined invocation: cargo
+      # applies `--lib`/`--test` across every `-p` given and silently skips a
+      # package that has no such target, so a typo'd target name would run
+      # nothing and still report success. One command per step fails loudly.
+      - name: cargo test (windows-specific crates)
+        run: >
+          cargo test --lib --target x86_64-pc-windows-msvc
+          -p oximux-owner-only
+          -p oximux-job-object
+          -p oximux-shell-env
+          -p oximux-pty
+          -p oximux-settings
+
+      # The desktop crate's unit suite passes in full on Windows as of the
+      # single-instance fix and the fixture ports alongside it, so it graduates
+      # from the informational sweep to a gate. Named separately from the list
+      # above because it is not "Windows-specific behavior" — it is 1400+ tests
+      # that merely now hold on Windows, and keeping it its own step means a
+      # failure here reads as a regression rather than as a platform quirk.
+      #
+      # It earns the slot: one of those 17 failures was a real bug (the
+      # single-instance lock could not read its own holder PID under mandatory
+      # locking), and it sat undetected because nothing blocking ran this.
+      - name: cargo test (desktop app unit suite)
+        run: cargo test --lib --target x86_64-pc-windows-msvc -p oximux-app
+
+      # Screen control is off on Windows and the driver is never declared, but
+      # the crate is compiled and half-used: the PreToolUse hook ships, and with
+      # it the executable blocklist, the GUI-scripting brake and the
+      # `CommandLineToArgvW` quoting the hook's own command line depends on.
+      #
+      # All-targets rather than `--lib`, for the reason the pty steps below
+      # spell out — the installer suites live under `tests/` and the workspace
+      # sweep is `--lib`, so nothing else would reach them.
+      #
+      # Two `live_driver` tests self-ignore without a real driver binary. That
+      # is correct here and would be a hole on macOS; the Windows job has no
+      # driver to point them at because there is not yet a Windows driver worth
+      # trusting. See `plans/260801-0157-windows-computer-use/findings.md`.
+      - name: cargo test (computer-use, hook half)
+        run: cargo test --target x86_64-pc-windows-msvc -p oximux-computer-use
+
+      # The only end-to-end coverage of the piece carrying the most
+      # Windows-specific machinery. Between them these boot the daemon over a
+      # real named pipe, run the v8 mutual handshake from both ends, and
+      # exercise spawn/attach/detach/replay/checkpoint — none of which a
+      # compile check says anything about.
+      - name: cargo test (relay daemon end-to-end)
+        run: cargo test --target x86_64-pc-windows-msvc -p oximux-relay --test relay_integration
+
+      - name: cargo test (relay client end-to-end)
+        run: >
+          cargo test --target x86_64-pc-windows-msvc
+          -p oximux-relay-client --test relay_client_integration
+
+      # These three were ported to Windows at the same time as the two suites
+      # above, and need naming here for the same reason those do: nothing else
+      # reaches them. The pty step is `--lib`, which skips integration targets
+      # under tests/, and the informational sweep below is `--lib` too. A suite
+      # ported for a platform that never runs it is worse than one left
+      # unported — it compiles green and rots without anyone noticing.
+      - name: cargo test (pty backend smoke)
+        run: cargo test --target x86_64-pc-windows-msvc -p oximux-pty --test backend_smoke
+
+      - name: cargo test (pty snapshot smoke)
+        run: cargo test --target x86_64-pc-windows-msvc -p oximux-pty --test snapshot_smoke
+
+      - name: cargo test (relay checkpoint lifecycle)
+        run: cargo test --target x86_64-pc-windows-msvc -p oximux-relay --test checkpoint_lifecycle
+
+      # Blocking as of the port of the last macOS-shaped fixtures: this was the
+      # informational sweep, kept non-blocking to produce the list of what
+      # actually failed on Windows, with instructions to flip it once that list
+      # was empty. It is empty — every crate here passes on a real windows-msvc
+      # host — so it is now the gate, and the enumerated steps above are kept
+      # only because a named failure is faster to read than one buried in a
+      # workspace run.
+      #
+      # It found real bugs on the way, which is the argument for it being
+      # blocking rather than advisory: the single-instance lock could not read
+      # its own holder PID under Windows' mandatory file locking, and the
+      # checkpoint engine failed to recognise one git version's phrasing for a
+      # pruned object. Both were invisible while nothing here could fail.
+      #
+      # One residual fragility worth knowing when this goes red: git's stderr
+      # wording is what `is_missing_object` matches on, so a runner with a git
+      # whose phrasing is not yet in that list fails `pruned_object_reports_missing`.
+      # The fix is to add the phrase, not to loosen the matcher.
+      - name: cargo test (full unit suite)
+        run: >
+          cargo test --workspace --lib --target x86_64-pc-windows-msvc
+          --exclude oximux-macos-trust

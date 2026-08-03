@@ -5,6 +5,7 @@
 //! binary at `src/main.rs` imports from this library.
 
 pub mod actions;
+pub mod app_paths;
 pub mod assets;
 pub mod keymap_registry;
 pub mod left_rail_layout;
@@ -14,6 +15,9 @@ pub mod remote_control;
 pub mod scheduler;
 pub mod shell;
 pub mod state;
+// Staging and swapping a `.app` bundle, verified against a codesign pin.
+// Windows gets a versioned-directory updater of its own later.
+#[cfg(target_os = "macos")]
 pub mod updater;
 pub mod workspace_root;
 

@@ -10,14 +10,29 @@ rust-version.workspace = true
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Gate on the Windows safety pair (the `gui_scripting` brake + the Escape
+# hook). Until both land, enabling this crate on Windows is a compile error —
+# see the guard in `lib.rs` and `docs/windows-port-exclusions.md`.
+windows-screen-control = []
+
 [dependencies]
 oximux-agent-core.workspace = true
+# CREATE_NO_WINDOW on driver subprocess runs.
+oximux-no-window = { workspace = true }
 # Shared codesign/spctl gates and atomic-swap primitives (also used by the
 # app's own updater — the two must not fork).
+#
+# Still an all-platform dependency even though it is macOS-shaped: `verify.rs`
+# has not been split yet, and on Windows its `codesign` call fails as a
+# `Spawn` error, which is an honest "no trust gate here" rather than a wrong
+# answer. Moves under `cfg(target_os = "macos")` when the trust gate splits.
 oximux-macos-trust.workspace = true
 serde.workspace = true
-# `proc_pidpath`, for resolving a granted pid back to its executable.
-libc = "0.2"
+# Cross-process lock for the grant store: `flock` on unix, `LockFileEx` on
+# Windows, contention normalised on both. Same crate as the app's
+# single-instance guard, which `grants.rs` was already written to mirror.
+fd-lock = "4"
 serde_json.workspace = true
 sha2.workspace = true
 # Driver installer: staging dir for download/extract before the verified swap.
@@ -26,6 +41,24 @@ thiserror.workspace = true
 tracing.workspace = true
 # Driver installer download (same sync client the dictation model manager uses).
 ureq.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Decoding `powershell -EncodedCommand <base64>` so the payload can be
+# classified as the script it is, rather than refused for being unreadable.
+base64.workspace = true
+windows-sys = { version = "0.61", features = [
+    # `OpenProcess` / `CloseHandle`, and the handle type they trade in.
+    "Win32_Foundation",
+    # `QueryFullProcessImageNameW`, for resolving a pid to its executable —
+    # the Windows counterpart to macOS's `proc_pidpath`.
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# `proc_pidpath`, for resolving a granted pid back to its executable. Only
+# `proc.rs` uses it, and only on macOS — Windows resolves a pid through
+# `QueryFullProcessImageNameW` instead.
+libc = "0.2"
 
 [dev-dependencies]
 # Only to run the hook matcher through a real regex engine, rather than

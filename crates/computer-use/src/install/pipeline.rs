@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use super::release_feed::{self, DriverRelease, RELEASES_URL};
 use super::{place, InstallError, InstallStage};
 use crate::verify::{self, VerifiedDriver};
-use crate::{exec, Error};
+use crate::exec;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Per-`read()` ceiling, not whole-transfer: a healthy slow link keeps making
@@ -98,19 +98,39 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), InstallError> {
     Ok(())
 }
 
-/// A release older than what is already installed is refused even when validly
-/// signed — the feed is publish-date ordered and identity gates alone cannot
-/// stop a re-published old build.
-fn guard_downgrade(candidate: crate::Version) -> Result<(), InstallError> {
-    let installed = match crate::prepare() {
+/// The version of the driver already installed, if one can be trusted enough to
+/// read a version off.
+#[cfg(not(windows))]
+fn installed_version() -> Option<crate::Version> {
+    match crate::prepare() {
         Ok(driver) => Some(driver.version),
         // A too-old install still has a readable version; upgrading over it is
         // the whole point. Any other state (missing, broken signature) has no
         // trustworthy version to compare against.
-        Err(Error::DriverTooOld { found, .. }) => Some(found),
+        Err(crate::Error::DriverTooOld { found, .. }) => Some(found),
         Err(_) => None,
-    };
-    match installed {
+    }
+}
+
+/// Windows has no in-app installer, so there is never an OxiMux-managed install
+/// to downgrade.
+///
+/// This module downloads and stages a notarized macOS `.app`; none of that has a
+/// Windows meaning. Under the user-anchored trust model the user installs the
+/// driver by whatever route they trust and approves the bytes
+/// (see [`crate::trust`]), which is also why `prepare` cannot be called here —
+/// on Windows it requires a trust store, and this module has no business
+/// deciding whose approval to consult.
+#[cfg(windows)]
+fn installed_version() -> Option<crate::Version> {
+    None
+}
+
+/// A release older than what is already installed is refused even when validly
+/// signed — the feed is publish-date ordered and identity gates alone cannot
+/// stop a re-published old build.
+fn guard_downgrade(candidate: crate::Version) -> Result<(), InstallError> {
+    match installed_version() {
         Some(installed) if candidate < installed => Err(InstallError::Downgrade {
             staged: candidate,
             installed,

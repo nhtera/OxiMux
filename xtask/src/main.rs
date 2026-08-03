@@ -3,6 +3,10 @@
 //! Subcommands:
 //!   xtask file-size-lint   Walk the Rust source roots and warn > 1500 LOC,
 //!                          fail > 3000.
+//!   xtask data-dir-lint    Fail if anything outside `app_paths` picks its own
+//!                          data/cache directory.
+//!   xtask icon             Regenerate the Windows .ico from the macOS .icns.
+//!   xtask icon --check     Fail if the checked-in .ico is stale.
 //!   xtask ci-check         Run all xtask checks back-to-back.
 //!
 //! Thresholds match GPUI reality (large render/impl files are idiomatic). A
@@ -10,6 +14,9 @@
 //! files still over the hard cap at their recorded LOC: an allowlisted file may
 //! shrink freely but fails the moment it grows past its recorded size, so the
 //! debt can only go down. Drop a row once the file falls under the cap.
+
+mod data_dir_lint;
+mod icon;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,9 +36,21 @@ const SOURCE_ROOTS: &[&str] = &["crates", "apps/desktop"];
 
 fn main() -> ExitCode {
     let cmd = std::env::args().nth(1).unwrap_or_else(|| "help".into());
+    let check = std::env::args().any(|a| a == "--check");
     let result = match cmd.as_str() {
         "file-size-lint" => file_size_lint(),
-        "ci-check" => file_size_lint(),
+        "data-dir-lint" => data_dir_lint(),
+        "icon" => icon::run(check),
+        // Every check CI should run, in one command. `icon --check` is here
+        // rather than in a Windows-only job because the icon is derived from a
+        // file in the repo, not from the host — it goes stale on whichever
+        // platform edits the source, and that is usually not Windows. The
+        // data-dir lint is here for the same reason inverted: the mistake it
+        // catches is invisible on macOS, so it has to run on every platform's
+        // CI rather than Windows'.
+        "ci-check" => file_size_lint()
+            .and_then(|()| data_dir_lint())
+            .and_then(|()| icon::run(true)),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -61,19 +80,19 @@ fn print_help() {
          \n\
          COMMANDS:\n\
            file-size-lint   Enforce {WARN_LOC} warn / {FAIL_LOC} fail LOC caps across {roots}\n\
-           ci-check         Run all checks (currently: file-size-lint)\n\
+           data-dir-lint    Keep data/cache path choices inside app_paths\n\
+           icon [--check]   Derive assets/windows/OxiMux.ico from assets/AppIcon.icns\n\
+           ci-check         Run all checks (file-size-lint, data-dir-lint, icon --check)\n\
            help             Print this message"
     );
 }
 
-fn file_size_lint() -> Result<(), Box<dyn std::error::Error>> {
-    let root = workspace_root()?;
-    let allow = load_allowlist(&root)?;
-    // Track which allowlist rows we actually saw over-cap, to flag stale rows.
-    let mut seen_over_cap: HashMap<String, bool> = allow.keys().map(|k| (k.clone(), false)).collect();
-    let mut warn = 0usize;
-    let mut fail = 0usize;
-
+/// Every `.rs` file under [`SOURCE_ROOTS`], deduped.
+///
+/// Shared by the lints rather than copied into each: a second copy of this
+/// walk is a second place for a renamed source root to be missed, and a lint
+/// that silently covers nothing still passes.
+fn collect_sources(root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let mut sources = Vec::new();
     for source_root in SOURCE_ROOTS {
         let dir = root.join(source_root);
@@ -92,6 +111,28 @@ fn file_size_lint() -> Result<(), Box<dyn std::error::Error>> {
         }
         sources.extend(collect_rs_files(&dir)?);
     }
+    // Overlapping roots (e.g. adding "apps" next to "apps/desktop") would
+    // otherwise lint and report every nested file twice.
+    sources.sort();
+    sources.dedup();
+    Ok(sources)
+}
+
+fn data_dir_lint() -> Result<(), Box<dyn std::error::Error>> {
+    let root = workspace_root()?;
+    let sources = collect_sources(&root)?;
+    data_dir_lint::run(&sources, &root)
+}
+
+fn file_size_lint() -> Result<(), Box<dyn std::error::Error>> {
+    let root = workspace_root()?;
+    let allow = load_allowlist(&root)?;
+    // Track which allowlist rows we actually saw over-cap, to flag stale rows.
+    let mut seen_over_cap: HashMap<String, bool> = allow.keys().map(|k| (k.clone(), false)).collect();
+    let mut warn = 0usize;
+    let mut fail = 0usize;
+
+    let mut sources = collect_sources(&root)?;
     // Stable order regardless of read_dir(), so output diffs cleanly run to run.
     sources.sort();
     // Overlapping roots (e.g. adding "apps" next to "apps/desktop") would

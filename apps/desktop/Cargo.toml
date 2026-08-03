@@ -13,18 +13,26 @@ path = "src/main.rs"
 
 [dependencies]
 oximux-agents = { workspace = true }
-oximux-computer-use = { workspace = true }
+# The portable half of the agent-chat core. Reached directly (rather than
+# through `oximux-agents`) for the pieces that must stay compiled on every
+# platform — screenshot scrubbing and the screen-tool naming contract.
+oximux-agent-core = { workspace = true }
 oximux-auto-update = { workspace = true }
-oximux-macos-trust = { workspace = true }
 oximux-core = { workspace = true }
 oximux-dictation = { workspace = true }
 oximux-editor = { workspace = true }
 oximux-git = { workspace = true }
+# CREATE_NO_WINDOW on every child this GUI-subsystem process spawns directly
+# (rg, cleanup scripts, the relay daemon) — without it Windows pops an empty
+# console window per console-subsystem child.
+oximux-no-window = { workspace = true }
 oximux-proc-cwd = { workspace = true }
 oximux-pty = { workspace = true }
 async-trait = { workspace = true }
 oximux-relay-client = { workspace = true }
 oximux-relay-proto = { workspace = true }
+# Owner-only access on the relay auth token this process writes.
+oximux-owner-only = { workspace = true }
 # Remote control: the in-app iroh host (bind + accept loop) that serves the
 # SessionRegistry to paired phones, its transport-agnostic dispatcher/auth, and
 # the shared wire types (PairingTicket).
@@ -77,6 +85,19 @@ sha1 = "0.10"
 hmac = "0.12"
 two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
 
+# Embedded browser-tab engine: one Rust API over the platform webview
+# (WKWebView on macOS, WebView2 on Windows). `build_as_child` attaches the
+# webview to GPUI's native window surface via the `raw-window-handle` already in
+# the graph; no `tao`/gtk pulled in on either (those are Linux-only optional
+# features). Chosen for exactly this cross-platform reach over a macOS-only
+# objc2-web-kit binding. `devtools` is enabled explicitly so the inspector
+# methods (open/close/is_devtools_open) exist in release too — wry only turns
+# them on automatically under debug_assertions, which broke release builds.
+wry = { version = "0.55", features = ["devtools"] }
+# Single-instance guard: one non-blocking exclusive file lock over `flock` and
+# `LockFileEx`, with contention normalised to `WouldBlock` on both.
+fd-lock = "4"
+
 # Relay supervisor's `pre_exec` calls libc::umask so the bundled
 # socket/token files come out 0600. libc is already in the transitive
 # graph via nix/tokio but pulling it explicitly is cheaper than the
@@ -84,7 +105,46 @@ two-face = { version = "0.5.1", default-features = false, features = ["syntect-f
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Bringing the already-running instance forward: a registered broadcast message
+# and the foreground-right handoff that lets the holder honour it.
+[target.'cfg(windows)'.dependencies]
+# Screen control, and the policing hook that is wider than it.
+#
+# `windows-screen-control` is what lets `mcp::server_spec` exist here, so the
+# driver can be declared to an agent. It stays a feature rather than becoming
+# unconditional because the crate's own tests need to be able to build the
+# gated-off shape — and because turning it on is a decision about handing agents
+# an unsigned third-party binary, which should be visible in a manifest rather
+# than buried in a `cfg`.
+#
+# The hook would be warranted here even with the feature off, for a reason macOS
+# does not have: synthesizing input on Windows needs no permission at all, so an
+# agent's shell can drive the screen whether or not anything was opted into.
+oximux-computer-use = { workspace = true, features = ["windows-screen-control"] }
+widestring = "1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    # `SetWindowsHookExW(WH_KEYBOARD_LL, …)` and the message-pump calls the
+    # Escape kill switch is built on (`escape_tap`).
+    "Win32_UI_WindowsAndMessaging",
+    # `SendInput`, used only by `escape_tap`'s tests to synthesize a real
+    # Escape press — the one thing that proves the hook actually swallows it.
+    "Win32_UI_Input_KeyboardAndMouse",
+    # `Shell_NotifyIconW` — the notification-area icon that says an agent is
+    # driving the screen (`screen_control_indicator`). The Windows stand-in for
+    # the macOS menu-bar status item, and a weaker one; see that module.
+    "Win32_UI_Shell",
+] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
+# Screen control drives the macOS Accessibility APIs and its installer/updater
+# gates shell out to codesign and spctl. Both are macOS all the way down, so
+# they leave the dependency graph entirely elsewhere rather than growing stub
+# implementations. The features they back are hidden, not faked — see
+# `docs/windows-port-exclusions.md`.
+oximux-computer-use = { workspace = true }
+oximux-macos-trust = { workspace = true }
 # Objective-C bridge for the NSProcessInfo `beginActivityWithOptions`
 # App Nap opt-out (`app_nap`) and the AppKit menu-item responder selectors
 # (`menu::platform`). objc2 is the maintained successor and is already in the
@@ -126,15 +186,6 @@ objc2-av-foundation = { version = "0.3", features = [
   "block2",
 ] }
 block2 = "0.6"
-# Embedded browser-tab engine: one Rust API over the platform webview
-# (WKWebView on macOS). `build_as_child` attaches the webview to GPUI's
-# native window surface via the `raw-window-handle` already in the graph; no
-# `tao`/gtk pulled in on macOS (those are Linux-only optional features).
-# Chosen for future cross-platform (WebView2 / WebKitGTK) over a macOS-only
-# objc2-web-kit binding. `devtools` is enabled explicitly so the inspector
-# methods (open/close/is_devtools_open) exist in release too — wry only turns
-# them on automatically under debug_assertions, which broke release builds.
-wry = { version = "0.55", features = ["devtools"] }
 # Browser agent-context screenshot: `WKWebView.takeSnapshot` returns an
 # `NSImage`; app-kit's `NSBitmapImageRep` re-encodes it to PNG bytes for the
 # clipboard. web-kit's snapshot method is feature-gated on the snapshot
@@ -178,6 +229,19 @@ objc2-web-kit = { version = "0.3", features = [
 ] }
 # `CGRect` for the element-rect snapshot region (already in the graph).
 objc2-core-foundation = "0.3"
+
+# Application icon → the executable's resource section (see build.rs). Already
+# in the graph as GPUI's build-dependency, so this adds a manifest line rather
+# than a compile.
+#
+# Deliberately NOT under `cfg(windows)`: build-dependencies resolve against the
+# *host*, so a cross-compile from macOS to Windows would drop the crate while
+# build.rs — which keys off the target — still called it, and the failure would
+# be "unresolved import" in a build script. On a non-Windows host the crate
+# compiles to a stub that reports `NotWindows`, so the cost of leaving it in is
+# nil.
+[build-dependencies]
+embed-resource = "3"
 
 [dev-dependencies]
 # Decodes the rendered pairing QR back to its payload, so the code is proven

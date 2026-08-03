@@ -101,10 +101,11 @@ fn render_row(task: &BackgroundTask, theme: &Theme, density: &Density, typo: &Ty
                 .text_color(theme.fg_subtle)
                 .cursor_pointer()
                 .hover(|s| s.text_color(theme.fg_base))
-                .on_mouse_down(MouseButton::Left, move |_, _window, _cx| {
-                    // `open -R` reveals AND selects the file (its .jsonl / stdout)
-                    // in Finder rather than opening it in an editor.
-                    let _ = std::process::Command::new("open").arg("-R").arg(&output).spawn();
+                .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                    // `reveal_path` reveals AND selects the file (its .jsonl /
+                    // stdout) in the file manager rather than opening it in an
+                    // editor.
+                    cx.reveal_path(std::path::Path::new(&output));
                 })
                 .child(SharedString::from("View output")),
         );

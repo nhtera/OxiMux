@@ -12,6 +12,7 @@ gpui = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }
+dunce = { workspace = true }
 
 [dev-dependencies]
 # Only to give the project-coverage tests a real directory to canonicalize —

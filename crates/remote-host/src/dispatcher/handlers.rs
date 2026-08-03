@@ -157,7 +157,7 @@ impl Dispatcher {
         // registry. This one was not: a dormant session is read straight off
         // disk, where the desktop's own persisted transcript keeps its screen
         // captures. Same call, so both branches leave here in the same state.
-        let (entries_json, captures) = oximux_computer_use::scrub_transcript(&entries_json);
+        let (entries_json, captures) = oximux_agent_core::redact::scrub_transcript(&entries_json);
         if captures > 0 {
             tracing::debug!(session_id, captures, "dropped screen captures from stored history");
         }

@@ -7,6 +7,7 @@
 //! - Locale-stable stderr (`LANG=C`) for predictable error messages.
 
 use crate::error::{GitError, Result};
+use oximux_no_window::NoWindow as _;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -144,6 +145,10 @@ impl GitCmd {
             .stdin(stdin_mode)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
+            // The status poller runs this every 500 ms; without the flag each
+            // poll flashes an empty console window out of the GUI-subsystem
+            // Windows build.
+            .no_window()
             .kill_on_drop(true);
 
         // NB: `tokio::process::Command::spawn` returns ErrorKind::NotFound for

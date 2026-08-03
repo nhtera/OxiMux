@@ -52,7 +52,28 @@ pub fn holder_pid() -> Option<u32> {
     imp::holder_pid()
 }
 
-/// Everywhere else there are no event taps to withhold from.
+/// `None` everywhere else — but on Windows that means **unknown**, not clear.
+///
+/// It used to be true that there was nothing to withhold from off macOS. Once
+/// [`crate::platform::escape_tap`] grew a `WH_KEYBOARD_LL` implementation it
+/// stopped being true: a low-level hook can be starved of the very key it
+/// exists to catch, by the secure desktop (UAC consent, Ctrl+Alt+Del, the lock
+/// screen) and by UIPI when the foreground window outranks OxiMux.
+///
+/// What Windows does not offer is a way to *ask*. There is no `IOConsoleUsers`
+/// equivalent to read, so this cannot distinguish "nothing is withholding keys"
+/// from "something is and we cannot see it".
+///
+/// The `None` is therefore load-bearing in the wrong direction, and the
+/// asymmetry with macOS is worth stating plainly: there, a `None` is a real
+/// answer that is occasionally wrong after a failed read; here it is not an
+/// answer at all. Callers that render "Press Esc to stop an agent" must not
+/// treat this as confirmation on Windows — the honest string is that Escape
+/// *should* stop it, not that it will.
+///
+/// Open decision #6 in `plans/260801-0157-windows-computer-use/` — the UI half
+/// belongs with the settings pane in Phase 7. This is the note that keeps the
+/// next reader from concluding the question was already settled.
 #[cfg(not(target_os = "macos"))]
 pub fn holder_pid() -> Option<u32> {
     None

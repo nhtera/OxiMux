@@ -315,20 +315,59 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// The document directory these fixtures resolve against, absolute for the
+    /// running platform.
+    ///
+    /// `/repo/docs` is not absolute on Windows, and `absolutize_one` ends in
+    /// `url::Url::from_file_path`, which requires an absolute path — so every
+    /// rewrite declined and the URLs came back unchanged. The production path is
+    /// portable precisely *because* it delegates to the `url` crate instead of
+    /// formatting `file://` by hand: a real `C:\repo\docs` yields
+    /// `file:///C:/repo/docs/cat.png`, drive letter and separators handled. Only
+    /// the fixture was Unix-only.
+    fn base() -> &'static Path {
+        if cfg!(windows) {
+            Path::new(r"C:\repo\docs")
+        } else {
+            Path::new("/repo/docs")
+        }
+    }
+
     fn abs(src: &str) -> String {
-        absolutize_image_paths(src, Path::new("/repo/docs"))
+        absolutize_image_paths(src, base())
+    }
+
+    /// The `file://` URL `base()` resolves `rel` to.
+    ///
+    /// Most tests here are about the *scanner* — finding `![…](…)`, skipping
+    /// titles and angle brackets, leaving remote URLs alone — and the URL text is
+    /// incidental to that, so deriving it keeps them from carrying a
+    /// per-platform expected string apiece. The URL *shape* is pinned literally
+    /// in `rewrites_simple_relative_image` and the percent-encoding in
+    /// `rewrites_angle_bracket_url`, so an encoding change still fails somewhere.
+    fn url_for(rel: &str) -> String {
+        url::Url::from_file_path(normalize_lexically(&base().join(rel)))
+            .expect("fixture base is absolute")
+            .to_string()
     }
 
     #[test]
     fn rewrites_simple_relative_image() {
-        assert_eq!(abs("![cat](cat.png)"), "![cat](file:///repo/docs/cat.png)");
+        // The one literal expectation, so the URL shape itself is pinned rather
+        // than derived from the same call the code makes.
+        let expected = if cfg!(windows) {
+            "![cat](file:///C:/repo/docs/cat.png)"
+        } else {
+            "![cat](file:///repo/docs/cat.png)"
+        };
+        assert_eq!(abs("![cat](cat.png)"), expected);
     }
 
     #[test]
     fn rewrites_dot_slash_relative_image() {
         assert_eq!(
             abs("![x](./img/cat.png)"),
-            "![x](file:///repo/docs/img/cat.png)"
+            format!("![x]({})", url_for("img/cat.png"))
         );
     }
 
@@ -336,7 +375,7 @@ mod tests {
     fn resolves_parent_dir_segments() {
         assert_eq!(
             abs("![x](../assets/cat.png)"),
-            "![x](file:///repo/assets/cat.png)"
+            format!("![x]({})", url_for("../assets/cat.png"))
         );
     }
 
@@ -344,7 +383,7 @@ mod tests {
     fn preserves_title_after_url() {
         assert_eq!(
             abs(r#"![x](cat.png "a cat")"#),
-            r#"![x](file:///repo/docs/cat.png "a cat")"#
+            format!(r#"![x]({} "a cat")"#, url_for("cat.png"))
         );
     }
 
@@ -366,9 +405,17 @@ mod tests {
     fn parent_dir_past_root_clamps_to_root() {
         // `..` is clamped at root rather than producing `/../`; the file just
         // won't exist (broken image), which is the accepted degraded outcome.
+        //
+        // "Root" is platform-shaped: `/` on unix, but the drive root `C:\` on
+        // Windows, where clamping stops at the prefix rather than discarding it.
+        let (root, expected) = if cfg!(windows) {
+            (Path::new(r"C:\repo"), "![x](file:///C:/x.png)")
+        } else {
+            (Path::new("/repo"), "![x](file:///x.png)")
+        };
         assert_eq!(
-            absolutize_image_paths("![x](../../../x.png)", Path::new("/repo")),
-            "![x](file:///x.png)"
+            absolutize_image_paths("![x](../../../x.png)", root),
+            expected
         );
     }
 
@@ -381,19 +428,25 @@ mod tests {
 
     #[test]
     fn rewrites_angle_bracket_url() {
-        assert_eq!(
-            abs("![x](<my cat.png>)"),
+        // Literal, because percent-encoding the space is the point of this one.
+        let expected = if cfg!(windows) {
+            "![x](file:///C:/repo/docs/my%20cat.png)"
+        } else {
             "![x](file:///repo/docs/my%20cat.png)"
-        );
+        };
+        assert_eq!(abs("![x](<my cat.png>)"), expected);
     }
 
     #[test]
     fn handles_multiple_images_and_surrounding_text() {
         let src = "intro ![a](a.png) middle ![b](https://x/y.png) end ![c](sub/c.png)";
         let got = abs(src);
-        assert!(got.contains("![a](file:///repo/docs/a.png)"));
-        assert!(got.contains("![b](https://x/y.png)"));
-        assert!(got.contains("![c](file:///repo/docs/sub/c.png)"));
+        assert!(got.contains(&format!("![a]({})", url_for("a.png"))), "{got}");
+        assert!(got.contains("![b](https://x/y.png)"), "{got}");
+        assert!(
+            got.contains(&format!("![c]({})", url_for("sub/c.png"))),
+            "{got}"
+        );
     }
 
     #[test]
@@ -405,7 +458,26 @@ mod tests {
     #[test]
     fn preserves_utf8_content() {
         let src = "日本語 ![猫](neko.png) テキスト";
-        assert_eq!(abs(src), "日本語 ![猫](file:///repo/docs/neko.png) テキスト");
+        assert_eq!(
+            abs(src),
+            format!("日本語 ![猫]({}) テキスト", url_for("neko.png"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_absolute_image_path_resolves_rather_than_being_joined() {
+        // The Windows analogue of the `/abs/cat.png` case in
+        // `leaves_remote_and_absolute_untouched`. `C:/abs/cat.png` trips none of
+        // the early-outs — no leading `/`, no `://` — so it reaches
+        // `base_dir.join(url)`, and `Path::join` *replaces* the base when the
+        // argument is absolute. The result is the drive path itself, not
+        // `C:\repo\docs\C:\abs\...`, which is the correct answer arrived at by a
+        // route worth pinning: an early-out added later must not change it.
+        assert_eq!(
+            abs("![x](C:/abs/cat.png)"),
+            "![x](file:///C:/abs/cat.png)"
+        );
     }
 
     #[test]

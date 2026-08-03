@@ -84,9 +84,9 @@ fn identity_path(dir: &Path, workdir: &str) -> PathBuf {
     dir.join(format!("remote-host-{hex}.key"))
 }
 
-/// Write the key bytes with `0600` perms (owner read/write only). On Unix the
-/// file is *created* `0600` so the private key is never briefly world/group
-/// readable in the window between write and chmod.
+/// Write the key bytes so only this account can read them. On Unix the file is
+/// *created* `0600` so the private key is never briefly world/group readable in
+/// the window between write and chmod.
 fn persist(path: &Path, bytes: [u8; 32]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -102,15 +102,18 @@ fn persist(path: &Path, bytes: [u8; 32]) -> io::Result<()> {
             .mode(0o600)
             .open(path)?;
         f.write_all(&bytes)?;
-        // Re-assert perms in case the file pre-existed with looser bits (`mode`
-        // only applies on creation).
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
     #[cfg(not(unix))]
     {
         fs::write(path, bytes)?;
     }
+    // Re-assert access in case the file pre-existed with something looser —
+    // creation flags only apply to a file that did not already exist. On
+    // Windows this is also where the restriction is *first* established, since
+    // there is no create-time equivalent of `mode`, so a failure here has to
+    // propagate: a private signing key readable by other accounts is worse than
+    // no Remote Control at all.
+    oximux_owner_only::restrict_file(path)?;
     Ok(())
 }
 
@@ -131,13 +134,11 @@ mod tests {
         let other = HostIdentity::load_or_generate(&dir, "/repo/b").expect("other");
         assert_ne!(first.public_key_bytes(), other.public_key_bytes());
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let path = identity_path(&dir, "/repo/a");
-            let mode = fs::metadata(&path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "key file is 0600");
-        }
+        let path = identity_path(&dir, "/repo/a");
+        assert!(
+            oximux_owner_only::is_restricted_to_owner(&path).unwrap(),
+            "private signing key must not be readable by other accounts"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -10,21 +10,20 @@
 //! instance to the foreground and bows out instead of booting a second racing
 //! window set.
 //!
-//! The lock is an `flock(LOCK_EX | LOCK_NB)` held for the process lifetime by
-//! keeping the open file alive inside the returned guard. The kernel releases
-//! it automatically when the process exits — including a crash or SIGKILL — so
-//! a dead instance never strands a stale lock (the failure mode a bare pidfile
-//! has). The companion only short-circuits the GUI boot path; the `notify` /
+//! The lock is a non-blocking exclusive lock (`flock` on unix, `LockFileEx` on
+//! Windows, both via `fd-lock`) held for the process lifetime by keeping the
+//! open file alive inside the returned guard. The OS releases it when the
+//! process exits — including a crash or SIGKILL — so a dead instance never
+//! strands a stale lock, which is the failure mode a bare pidfile has. The
+//! companion only short-circuits the GUI boot path; the `notify` /
 //! `agent-status` helper CLIs and the dev spikes run before this check, so they
 //! never contend with a live window.
 
 use std::fs::OpenOptions;
-use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 /// Lock file name under the app data directory. Sits alongside the relay
-/// `relay-v7.{sock,pid,token}` files — same placement convention.
+/// `relay-v8.{sock,pid,token}` files — same placement convention.
 pub const LOCK_FILENAME: &str = "oximux-gui.lock";
 
 /// Resolve the GUI lock path inside a given data directory.
@@ -32,20 +31,41 @@ pub fn lock_path_in(data_dir: &Path) -> PathBuf {
     data_dir.join(LOCK_FILENAME)
 }
 
+/// Where the holder records its PID, beside the lock it holds.
+///
+/// A separate file rather than the lock file's contents, because `LockFileEx`
+/// byte-range locks on Windows are **mandatory**, not advisory like `flock`:
+/// while the holder's lock is live, any read through a different handle fails
+/// with `ERROR_LOCK_VIOLATION`. A contender reading the PID is by definition
+/// reading while someone holds the lock, so writing it inside the locked file
+/// made `holder_pid` unconditionally `None` on Windows — the lock worked,
+/// nothing could be told who owned it, and a second launch went silent instead
+/// of raising the running window.
+///
+/// This does not reintroduce the stale-pidfile problem the module doc rejects.
+/// Liveness is still decided entirely by the lock; the PID is only consulted on
+/// the path where the lock was already lost, which means a holder is alive to
+/// have written it. A PID left behind by a crash is unreachable, because the
+/// next launch takes the lock that crash released and rewrites the file.
+fn pid_path_for(lock_path: &Path) -> PathBuf {
+    lock_path.with_extension("pid")
+}
+
 /// Held for the whole process lifetime. Dropping it (or process exit) closes
 /// the underlying descriptor, which releases the advisory lock.
 pub struct SingleInstanceGuard {
-    // The lock lives on the open file description; keeping the `File` alive is
-    // the entire mechanism. The field is never read — it is held for its Drop.
-    _file: std::fs::File,
+    // The lock lives on the open file description (unix) / handle (Windows);
+    // keeping the `File` alive is the entire mechanism. The field is never read
+    // — it is held for its Drop, which closes the file and frees the lock.
+    _lock: fd_lock::RwLock<std::fs::File>,
 }
 
 /// Outcome of trying to take the single-instance lock.
 pub enum AcquireOutcome {
     /// This process now owns the lock.
     Acquired(SingleInstanceGuard),
-    /// Another live instance already owns it. `holder_pid` is the PID recorded
-    /// in the lock file (when it was readable + parseable), used to bring that
+    /// Another live instance already owns it. `holder_pid` is the PID the holder
+    /// recorded beside the lock (when readable + parseable), used to bring that
     /// instance forward.
     AlreadyRunning { holder_pid: Option<u32> },
 }
@@ -57,46 +77,62 @@ pub enum AcquireOutcome {
 /// holder and exit. `Err` — an unexpected filesystem/lock error; the caller
 /// should log and degrade to a normal boot rather than refuse to start.
 pub fn try_acquire(lock_path: &Path) -> std::io::Result<AcquireOutcome> {
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        // Do NOT truncate on open: a contender must read the holder's recorded
-        // PID, and we only rewrite the file after winning the flock below.
         .truncate(false)
         .open(lock_path)?;
 
-    // SAFETY: `flock` is a thin libc call on a valid descriptor we own; the
-    // file stays open for the call's duration. `LOCK_NB` makes it return
-    // immediately rather than blocking when another description holds the lock.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc == 0 {
-        // We own the lock. Record our PID so a later contender can name (and
-        // activate) us. Best-effort: a write failure here doesn't lose the
-        // lock, it only leaves the contender without a PID to focus.
-        let _ = file.set_len(0);
-        let _ = file.seek(SeekFrom::Start(0));
-        let _ = writeln!(file, "{}", std::process::id());
-        let _ = file.flush();
-        return Ok(AcquireOutcome::Acquired(SingleInstanceGuard { _file: file }));
-    }
+    let mut lock = fd_lock::RwLock::new(file);
+    // The result is reduced to a bool inside this statement so the borrow of
+    // `lock` ends with it — the guard borrows `lock`, and `lock` has to be
+    // movable into the returned guard below.
+    let won = match lock.try_write() {
+        Ok(guard) => {
+            // We own the lock. Record our PID beside it — see `pid_path_for` for
+            // why beside and not inside — so a later contender can name (and
+            // activate) us. Best-effort: a write failure here doesn't lose the
+            // lock, it only leaves the contender without a PID to focus.
+            let _ = std::fs::write(
+                pid_path_for(lock_path),
+                format!("{}\n", std::process::id()),
+            );
 
-    let err = std::io::Error::last_os_error();
-    // `EWOULDBLOCK` is the "lock is held" signal — the only non-error outcome
-    // of a non-blocking `flock`. (It shares a value with `EAGAIN` on macOS, so
-    // matching the one constant covers both.)
-    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        return Ok(AcquireOutcome::AlreadyRunning {
+            // Deliberate: the guard's `Drop` unlocks, and we want the lock held
+            // for the life of the process. Forgetting it leaves the lock on the
+            // still-open file, so the OS drops it when we exit — which is what
+            // makes a crash or SIGKILL release it too, rather than stranding a
+            // lock no future launch can clear. `lock` owns the `File`, so the
+            // handle stays open until `SingleInstanceGuard` is dropped.
+            std::mem::forget(guard);
+            true
+        }
+        // `fd-lock` normalises "someone else holds it" to `WouldBlock` on both
+        // platforms — `EWOULDBLOCK` from `flock`, `ERROR_LOCK_VIOLATION` from
+        // `LockFileEx` — so this is the one contention arm, not a unix-shaped
+        // errno check that would quietly fall through to `Err` on Windows.
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => false,
+        Err(err) => return Err(err),
+    };
+
+    if won {
+        Ok(AcquireOutcome::Acquired(SingleInstanceGuard { _lock: lock }))
+    } else {
+        Ok(AcquireOutcome::AlreadyRunning {
             holder_pid: read_holder_pid(lock_path),
-        });
+        })
     }
-    Err(err)
 }
 
-/// Read the PID the current holder recorded in the lock file. `None` when the
+/// Read the PID the current holder recorded beside the lock. `None` when the
 /// file is unreadable or hasn't been written yet (a holder mid-acquire).
 fn read_holder_pid(lock_path: &Path) -> Option<u32> {
-    std::fs::read_to_string(lock_path).ok()?.trim().parse().ok()
+    std::fs::read_to_string(pid_path_for(lock_path))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Bring the already-running instance to the foreground so the user sees their
@@ -125,8 +161,55 @@ pub fn activate_existing_instance(pid: u32) {
     }
 }
 
-/// No-op activation on platforms without AppKit.
-#[cfg(not(target_os = "macos"))]
+/// Name of the broadcast message a second launch uses to ask the live instance
+/// to come forward. `RegisterWindowMessage` maps this string to the same
+/// message id for every process on the desktop, which is what lets two
+/// unrelated instances agree on one without sharing anything else.
+#[cfg(windows)]
+pub const ACTIVATE_MESSAGE: &str = "OxiMuxActivate";
+
+/// Ask the running instance to raise its windows.
+///
+/// Deliberately not a socket, a pipe, or any other channel: the only capability
+/// being conveyed is "come to the front", and a broadcast window message can
+/// carry nothing else. Anything richer would be new attack surface — reachable
+/// by every process on the desktop — in exchange for a feature nobody asked
+/// for.
+///
+/// Windows normally refuses focus changes from a process the user is not
+/// interacting with. `AllowSetForegroundWindow` is how the launching process
+/// hands its own (just-granted, since the user launched us) foreground right to
+/// the holder, so the holder's own `SetForegroundWindow` is honoured rather
+/// than flashing its taskbar button.
+#[cfg(windows)]
+pub fn activate_existing_instance(pid: u32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        AllowSetForegroundWindow, HWND_BROADCAST, PostMessageW, RegisterWindowMessageW,
+    };
+
+    let Ok(name) = widestring::U16CString::from_str(ACTIVATE_MESSAGE) else {
+        return;
+    };
+    // SAFETY: `name` is NUL-terminated and outlives the call.
+    let msg = unsafe { RegisterWindowMessageW(name.as_ptr()) };
+    if msg == 0 {
+        return;
+    }
+
+    // Best-effort, and failure is survivable: the worst case is the holder
+    // blinks in the taskbar instead of coming forward.
+    // SAFETY: plain Win32 calls with no pointer arguments.
+    unsafe {
+        AllowSetForegroundWindow(pid);
+        // Broadcast rather than target a window: the holder's HWND is not
+        // knowable from here, and every process filters on the registered id,
+        // which no other application has registered.
+        PostMessageW(HWND_BROADCAST, msg, 0, 0);
+    }
+}
+
+/// No-op activation on platforms with neither AppKit nor Win32.
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn activate_existing_instance(_pid: u32) {}
 
 #[cfg(test)]
@@ -139,15 +222,38 @@ mod tests {
         let path = lock_path_in(dir.path());
         match try_acquire(&path).unwrap() {
             AcquireOutcome::Acquired(_guard) => {
-                let recorded = std::fs::read_to_string(&path).unwrap();
+                // Reads the PID file, not the lock file. Reading the lock file
+                // here is what caught the Windows bug this pairs with: the read
+                // goes through a fresh handle, and `LockFileEx` denies that while
+                // the lock is held (os error 33).
                 assert_eq!(
-                    recorded.trim().parse::<u32>().unwrap(),
-                    std::process::id(),
+                    read_holder_pid(&path),
+                    Some(std::process::id()),
                     "holder must record its own PID"
                 );
             }
             AcquireOutcome::AlreadyRunning { .. } => panic!("fresh path must acquire"),
         }
+    }
+
+    #[test]
+    fn the_pid_is_recorded_outside_the_locked_file() {
+        // The lock file must stay empty. If a future change writes the PID back
+        // into it, this fails on every platform rather than only on the one
+        // where mandatory locking makes it unreadable — the bug was invisible on
+        // macOS, where `flock` is advisory and the read just works.
+        let dir = tempfile::tempdir().unwrap();
+        let path = lock_path_in(dir.path());
+        let _guard = match try_acquire(&path).unwrap() {
+            AcquireOutcome::Acquired(g) => g,
+            AcquireOutcome::AlreadyRunning { .. } => panic!("fresh path must acquire"),
+        };
+        assert_eq!(
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or_default(),
+            0,
+            "lock file must carry no payload"
+        );
+        assert!(pid_path_for(&path).exists(), "PID must be recorded beside it");
     }
 
     // flock locks attach to the open file *description*, so a second open of

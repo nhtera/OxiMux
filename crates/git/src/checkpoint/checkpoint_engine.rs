@@ -225,12 +225,36 @@ fn supports_restore(version_line: &str) -> bool {
     major > 2 || (major == 2 && minor >= 23)
 }
 
+/// Whether a git failure means "the object is gone" rather than "the command
+/// was wrong".
+///
+/// Substring-matching git's human-readable stderr is the only option — git
+/// returns 128 for every fatal and exposes no machine-readable reason — but it
+/// makes this function **version-fragile by construction**, and it fails in the
+/// worst direction: an unrecognised phrase does not degrade, it surfaces a raw
+/// `Git(NonZero)` to a caller whose whole contract is to fall back cleanly when
+/// a checkpoint has been pruned.
+///
+/// So phrases are added on sight rather than replaced: `reference is not a tree`
+/// came from git 2.35 against a real pruned checkpoint, and newer builds phrase
+/// the same condition differently, which is why the older spelling has to stay
+/// listed alongside them.
+///
+/// Over-broad in the other direction is worse, though, and tempting — a generic
+/// `does not exist` or `could not read` would catch more prune spellings and
+/// also swallow a misconfigured repo, reporting "your checkpoint was pruned" for
+/// something the user could have fixed. Every entry here names an object or a
+/// revision specifically.
 fn is_missing_object(stderr: &str) -> bool {
     let s = stderr.to_ascii_lowercase();
     s.contains("bad object")
         || s.contains("not a valid object")
         || s.contains("bad revision")
         || s.contains("unable to read tree")
+        // Both spellings of "that sha is not a readable tree", which is what a
+        // pruned commit-ish looks like to `read-tree`. 2.35 says the first.
+        || s.contains("is not a tree")
+        || s.contains("not a tree object")
 }
 
 #[cfg(test)]

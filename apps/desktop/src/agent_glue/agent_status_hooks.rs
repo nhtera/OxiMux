@@ -630,7 +630,16 @@ mod tests {
         .unwrap();
         drop(f);
 
-        let stdin = format!(r#"{{"hook_event_name":"Stop","transcript_path":"{}"}}"#, path.display());
+        // Built through serde rather than `format!`: a Windows path interpolated
+        // raw carries `\` into a JSON string literal, where `\U` is an invalid
+        // escape. The whole document then failed to parse and the function
+        // correctly returned None — a test bug that read exactly like the
+        // transcript walk being broken.
+        let stdin = serde_json::json!({
+            "hook_event_name": "Stop",
+            "transcript_path": path.to_string_lossy(),
+        })
+        .to_string();
         let msg = last_assistant_message_from_hook_json(&stdin);
         let _ = std::fs::remove_file(&path);
         assert_eq!(msg.as_deref(), Some("Done! Shipped the fix."));

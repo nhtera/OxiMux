@@ -99,6 +99,8 @@ impl NativeWebview {
         I: Fn(String) + 'static,
     {
         let on_ipc = callbacks.on_ipc;
+        // `mut` only where a platform branch below reconfigures the builder.
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut builder = WebViewBuilder::new()
             .with_url(url)
             .with_user_agent(BROWSER_USER_AGENT)

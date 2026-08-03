@@ -9,6 +9,9 @@ rust-version.workspace = true
 
 [dependencies]
 oximux-core = { workspace = true }
+# CREATE_NO_WINDOW on LSP-server spawns (a console `rust-analyzer.exe` would
+# otherwise pop an empty terminal window out of the GUI-subsystem build).
+oximux-no-window = { workspace = true }
 # Autosave cadence (debounce/enabled) is read from `AutosaveSettings`, a GPUI
 # global installed by the app. Settings is a leaf crate — no dependency cycle.
 oximux-settings = { workspace = true }
@@ -29,6 +32,10 @@ lsp-types = { workspace = true }
 # round-trip against rust-analyzer's response URIs — the naive
 # `format!("file://{}", path.display())` breaks for paths with spaces.
 url = { workspace = true }
+# Resolves a configured language-server command that is a bare name rather than
+# a path. Replaces a hand-rolled PATH walk that keyed on the Unix executable
+# bit — a concept Windows does not have, where runnability is PATHEXT instead.
+which = { workspace = true }
 
 # Async runtime for the LSP child + stdio framing. Tokio is already alive
 # inside gpui callbacks (see apps/desktop/src/main.rs:47-51 rt.enter guard).

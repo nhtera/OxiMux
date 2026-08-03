@@ -12,7 +12,11 @@
 
 use std::time::Duration;
 
-use oximux_computer_use::{daemon, discovery, mcp, verify, Error};
+use oximux_computer_use::{daemon, discovery, verify, Error};
+// Only the declared-invocation check reaches for it, and that is gated off on
+// Windows until the safety pair lands.
+#[cfg(any(not(windows), feature = "windows-screen-control"))]
+use oximux_computer_use::mcp;
 
 /// Locate the driver, or return `None` so the caller can skip.
 fn installed() -> Option<std::path::PathBuf> {
@@ -32,17 +36,29 @@ fn a_real_driver_passes_every_gate() {
 
     let driver = verify::verify(&path).expect("installed driver must pass verification");
 
-    assert_eq!(driver.identifier, verify::EXPECTED_IDENTIFIER);
-    assert_eq!(driver.team_id, verify::EXPECTED_TEAM_ID);
+    // `verify` is the signature gate specifically, so it can only ever vouch on
+    // that basis — a user-pinned verdict coming back from here would mean the
+    // publisher check had been swapped out for the weaker Windows anchor.
+    match &driver.basis {
+        verify::TrustBasis::Signature {
+            identifier,
+            team_id,
+            notarized,
+        } => {
+            assert_eq!(identifier, verify::EXPECTED_IDENTIFIER);
+            assert_eq!(team_id, verify::EXPECTED_TEAM_ID);
+            assert!(
+                notarized,
+                "expected a stapled notarization ticket on a Developer ID build"
+            );
+        }
+        other => panic!("verify must vouch by signature, got {other:?}"),
+    }
     assert!(
         driver.version >= verify::MIN_VERSION,
         "installed {} is below the {} floor",
         driver.version,
         verify::MIN_VERSION
-    );
-    assert!(
-        driver.notarized,
-        "expected a stapled notarization ticket on a Developer ID build"
     );
     assert_eq!(driver.sha256.len(), 64, "sha256 must be a full hex digest");
 }
@@ -96,6 +112,14 @@ fn status_is_readable_and_bounded() {
     );
 }
 
+/// Skipped on Windows for now: `mcp::server_spec` does not exist there until
+/// the safety pair lands, so there is no declared invocation to compare.
+///
+/// Worth restating rather than deleting once it does. Phase 0 measured
+/// `cua-driver manifest -p` on Windows recommending a bare `["mcp"]` — no
+/// `--host-bundle-id` — so this is precisely the drift check that would catch
+/// Phase 6 getting the Windows argv wrong.
+#[cfg(any(not(windows), feature = "windows-screen-control"))]
 #[test]
 fn the_declared_server_matches_the_drivers_own_recommended_invocation() {
     let Some(path) = installed() else { return };

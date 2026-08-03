@@ -63,7 +63,7 @@ pub fn run_create_pr(area: &mut CommitArea, opts: CreatePrOptions, cx: &mut Cont
                     // status so the button stops offering Create PR right away
                     // instead of after the 30s throttle.
                     area.pr_status_dirty = true;
-                    crate::shell::open_url::open_url(&url);
+                    crate::shell::open_url::open_url(&url, cx);
                     crate::shell::toast::toast(
                         cx,
                         crate::shell::toast::ToastKind::Success,

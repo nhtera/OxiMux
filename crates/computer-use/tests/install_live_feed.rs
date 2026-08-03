@@ -6,10 +6,7 @@
 //! cargo test -p oximux-computer-use --test install_live_feed -- --ignored
 //! ```
 
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-
-use oximux_computer_use::install::{self, InstallEvent, release_feed};
+use oximux_computer_use::install::release_feed;
 
 /// The full pipeline against the real release feed: downloads, verifies
 /// (publisher + notarization), and installs the actual driver to an install
@@ -18,9 +15,21 @@ use oximux_computer_use::install::{self, InstallEvent, release_feed};
 /// ```sh
 /// cargo test -p oximux-computer-use --test install_live_feed -- --ignored the_live_install
 /// ```
+///
+/// macOS only, and that is the design rather than a porting gap: the pipeline
+/// downloads a notarized `.app` and gates it on a Developer ID signature, none
+/// of which the unsigned Windows artifacts have. On Windows the user installs
+/// the driver themselves and approves the bytes — see `oximux_computer_use::trust`.
+#[cfg(not(windows))]
 #[test]
 #[ignore = "downloads and installs the real CuaDriver.app"]
 fn the_live_install_pipeline_installs_a_verified_driver() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    use oximux_computer_use::install::{self, InstallEvent};
+    use oximux_computer_use::TrustBasis;
+
     let cancel = Arc::new(AtomicBool::new(false));
     let (events, join) = install::spawn_install(cancel).expect("no install already running");
 
@@ -37,7 +46,11 @@ fn the_live_install_pipeline_installs_a_verified_driver() {
         .expect("pipeline must succeed against the live feed");
 
     assert!(stages >= 3, "expected resolve/download/verify/install stages");
-    assert!(driver.notarized, "installed driver must carry a ticket");
+    assert!(
+        matches!(driver.basis, TrustBasis::Signature { notarized: true, .. }),
+        "installed driver must carry a ticket, got {:?}",
+        driver.basis
+    );
     assert!(
         driver.path.exists(),
         "verified driver must exist at {}",

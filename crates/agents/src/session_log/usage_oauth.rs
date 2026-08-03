@@ -163,6 +163,14 @@ fn scoped_keychain_service(config_dir: &str) -> String {
     format!("{KEYCHAIN_SERVICE}-{suffix}")
 }
 
+/// The macOS Keychain item, or `None` anywhere else.
+///
+/// Gated rather than left to fail on its own: `/usr/bin/security` and `$USER`
+/// are both macOS spellings, so off it this spawned a process that could only
+/// fail, once per service on every usage poll. The caller's on-disk
+/// `.credentials.json` fallback is the real source on those platforms and is
+/// reached either way — this only skips the doomed attempt in front of it.
+#[cfg(target_os = "macos")]
 fn read_keychain_credentials(service: &str) -> Option<String> {
     let user = std::env::var("USER").ok()?;
     let out = Command::new("/usr/bin/security")
@@ -176,12 +184,37 @@ fn read_keychain_credentials(service: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+#[cfg(not(target_os = "macos"))]
+fn read_keychain_credentials(_service: &str) -> Option<String> {
+    None
+}
+
 fn token_from_credentials_json(raw: &str) -> Option<String> {
     let v: Value = serde_json::from_str(raw).ok()?;
     let token = v
         .pointer("/claudeAiOauth/accessToken")
         .and_then(Value::as_str)?;
     (!token.is_empty()).then(|| token.to_string())
+}
+
+/// Absolute path to `curl`.
+///
+/// Absolute rather than a bare name because this request carries an OAuth
+/// bearer token, and a bare name would let whatever comes first on `PATH`
+/// receive it. `/usr/bin/curl` does not exist on Windows, which shipped curl
+/// in `System32` from 1803 on — the equivalent system-owned location, so the
+/// property that made the unix path absolute survives the port.
+fn curl_binary() -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("SystemRoot")
+            .unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+        std::path::PathBuf::from(root).join(r"System32\curl.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        std::path::PathBuf::from("/usr/bin/curl")
+    }
 }
 
 /// GET the usage endpoint, returning `(http_status, body)`. The
@@ -200,13 +233,17 @@ fn curl_usage_endpoint(token: &str) -> Option<(u16, String)> {
          header = \"anthropic-beta: {OAUTH_BETA_HEADER}\"\n\
          header = \"User-Agent: {USER_AGENT}\"\n"
     );
-    let mut child = Command::new("/usr/bin/curl")
-        .args(["-K", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    let mut child = {
+        use oximux_no_window::NoWindow as _;
+        Command::new(curl_binary())
+            .args(["-K", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .no_window()
+            .spawn()
+            .ok()?
+    };
     child.stdin.take()?.write_all(config.as_bytes()).ok()?;
     let out = child.wait_with_output().ok()?;
     if !out.status.success() {

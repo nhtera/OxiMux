@@ -8,15 +8,22 @@
 //! status bar because it is the only state that asks anything of them.
 
 use gpui::{AnyElement, IntoElement, ParentElement, SharedString, Styled, div, px};
+#[cfg(target_os = "macos")]
 use oximux_auto_update::{CheckTrigger, UpdateStatus};
-use oximux_settings::{AutoUpdateSettings, Theme, Typography};
+#[cfg(target_os = "macos")]
+use oximux_settings::AutoUpdateSettings;
+use oximux_settings::{Theme, Typography};
 
-use super::controls::{info_row, value_chip};
+use super::controls::info_row;
+#[cfg(target_os = "macos")]
+use super::controls::value_chip;
 use super::layout::{SettingEntry, entries_card, entry};
 use super::SettingsModal;
+#[cfg(target_os = "macos")]
 use crate::updater::UpdaterState;
 
 /// Where a user goes when the app cannot update itself.
+#[cfg(target_os = "macos")]
 const RELEASES_URL: &str = "https://github.com/nhtera/OxiMux/releases/latest";
 
 /// The Appearance pane's `label: value` facts.
@@ -135,6 +142,7 @@ pub(super) fn render_appearance(query: &str, theme: Theme, typography: &Typograp
 /// user did not ask and nothing is broken from where they sit. A failed
 /// *manual* check names the actual error — they clicked, so they are owed the
 /// reason.
+#[cfg(target_os = "macos")]
 fn status_line(status: &UpdateStatus) -> String {
     match status {
         UpdateStatus::Idle => "Checks automatically".into(),
@@ -168,6 +176,7 @@ fn status_line(status: &UpdateStatus) -> String {
 
 /// Colour the status text by whether it wants attention. Only a ready update
 /// and a manual failure get a non-muted colour; everything else is chrome.
+#[cfg(target_os = "macos")]
 fn status_colour(status: &UpdateStatus, theme: Theme) -> gpui::Hsla {
     match status {
         UpdateStatus::Ready { .. } => theme.status_ok,
@@ -184,6 +193,7 @@ fn status_colour(status: &UpdateStatus, theme: Theme) -> gpui::Hsla {
 /// The button stays available while a check runs — the pipeline's own guard
 /// rejects a second one, so a click during a background check is harmless
 /// rather than something to disable a control over.
+#[cfg(target_os = "macos")]
 fn update_control(
     theme: Theme,
     density: oximux_settings::Density,
@@ -259,10 +269,24 @@ pub(super) fn update_entries(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> Vec<SettingEntry> {
+    // Nothing to configure without an updater: the toggle would gate a
+    // background check that does not run, and the status row would have no
+    // status. Omit the section rather than render controls that do nothing.
+    // Tail expression rather than an early `return`: with the macOS arms below
+    // compiled out, this block *is* the function body, and `return` in tail
+    // position is what `clippy::needless_return` fires on. Only reachable off
+    // macOS, so only clippy running on a Windows host ever saw it.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (theme, density, typography, &cx);
+        Vec::new()
+    }
+    #[cfg(target_os = "macos")]
     let enabled = cx
         .try_global::<AutoUpdateSettings>()
         .is_none_or(|settings| settings.enabled);
 
+    #[cfg(target_os = "macos")]
     vec![
         entry(
             "Automatic updates",

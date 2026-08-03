@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Same per-user data dir as `dictation.toml` + the model store.
-const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
 const HISTORY_FILE: &str = "dictation-history.jsonl";
 /// How many transcripts to keep. Older entries fall off the end.
 pub const HISTORY_CAP: usize = 50;
@@ -26,7 +24,7 @@ pub struct HistoryEntry {
 }
 
 fn history_path() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join(APP_DATA_SUBDIR).join(HISTORY_FILE))
+    crate::app_paths::data_dir().map(|d| d.join(HISTORY_FILE))
 }
 
 /// All history entries, newest first. Best-effort: a missing/unreadable file

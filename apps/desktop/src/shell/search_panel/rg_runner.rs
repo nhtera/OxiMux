@@ -7,6 +7,7 @@
 //! Path representation is "text-only" for v1 — non-UTF8 paths are dropped
 //! with a trace warning rather than supported via the `bytes` variant.
 
+use oximux_no_window::NoWindow as _;
 use serde::Deserialize;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -77,7 +78,7 @@ pub enum RgError {
 /// once at startup and cache the result — repeating it on every keystroke
 /// would be wasteful.
 pub async fn detect_rg_available() -> bool {
-    match Command::new(rg_program()).arg("--version").output().await {
+    match Command::new(rg_program()).arg("--version").no_window().output().await {
         Ok(out) => out.status.success(),
         Err(_) => false,
     }
@@ -104,6 +105,7 @@ pub async fn run_ripgrep(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .no_window()
         .kill_on_drop(true);
 
     let mut child = match cmd.spawn() {

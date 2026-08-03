@@ -133,7 +133,7 @@ pub fn corrupt_layouts_dir() -> Option<PathBuf> {
     {
         return Some(PathBuf::from(p));
     }
-    dirs::data_dir().map(|d| d.join("dev.nhtera.oximux").join("corrupt-layouts"))
+    crate::app_paths::data_dir().map(|d| d.join("corrupt-layouts"))
 }
 
 /// Save a rejected payload as `<key>-<epoch-secs>.corrupt.json` under

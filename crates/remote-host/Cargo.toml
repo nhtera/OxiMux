@@ -20,9 +20,6 @@ rust-version.workspace = true
 oximux-remote-proto = { workspace = true }
 oximux-agent-core = { workspace = true }
 oximux-agents = { workspace = true }
-# Screen captures must not leave the host; the scrubber lives with the rest of
-# the screen-control policy so both sides of that rule stay in one crate.
-oximux-computer-use = { workspace = true }
 # Durable paired-device/ACL persistence (RemoteDeviceRepo). Desktop-only host,
 # so the rusqlite pull-in is fine — this crate never ships to mobile.
 oximux-storage = { workspace = true }
@@ -30,6 +27,8 @@ oximux-storage = { workspace = true }
 # via `oximux_git::path_guard` at this boundary before any disk access.
 oximux-git = { workspace = true }
 oximux-core = { workspace = true }
+# Owner-only access on the private signing key written by `identity.rs`.
+oximux-owner-only = { workspace = true }
 # Schedule rows carry `DateTime<Local>` fires; this boundary formats them to
 # RFC-3339 for the wire and derives the tick clock from the injected `now_secs`.
 chrono = { workspace = true }

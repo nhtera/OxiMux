@@ -575,7 +575,7 @@ async fn keymap_cmd_w_closes_per_pane_tab_first(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     // cmd-w drives the close cascade: per-pane tab first, group tab survives.
-    cx.simulate_keystrokes(window.into(), "cmd-w");
+    cx.simulate_keystrokes(window.into(), "secondary-w");
 
     cx.read(|app| {
         let group = window.read(app).expect("PaneGroup alive");
@@ -622,14 +622,14 @@ async fn keymap_apply_live_moves_a_binding_and_kills_the_old_chord(cx: &mut Test
         crate::keymap_registry::apply_live(cx, &std::collections::BTreeMap::new());
         let overrides = std::collections::BTreeMap::from([(
             "close_tab".to_string(),
-            "cmd-e".to_string(),
+            "secondary-e".to_string(),
         )]);
         let warnings = crate::keymap_registry::apply_live(cx, &overrides);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
     });
 
     // Old chord must be dead (shadowed), leaving both per-pane tabs alive.
-    cx.simulate_keystrokes(window.into(), "cmd-w");
+    cx.simulate_keystrokes(window.into(), "secondary-w");
     cx.read(|app| {
         let group = window.read(app).expect("PaneGroup alive");
         let tab = group.active_tab().expect("active tab");
@@ -644,7 +644,7 @@ async fn keymap_apply_live_moves_a_binding_and_kills_the_old_chord(cx: &mut Test
     });
 
     // New chord drives the same close cascade.
-    cx.simulate_keystrokes(window.into(), "cmd-e");
+    cx.simulate_keystrokes(window.into(), "secondary-e");
     cx.read(|app| {
         let group = window.read(app).expect("PaneGroup alive");
         let tab = group.active_tab().expect("active tab");

@@ -12,11 +12,16 @@ oximux-pty = { workspace = true }
 oximux-relay-proto = { workspace = true }
 anyhow = { workspace = true }
 dashmap = { workspace = true }
+interprocess = { workspace = true }
+# Handshake nonce. OsRng specifically — a predictable nonce would let a
+# recorded daemon proof be replayed at us.
+rand = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+oximux-shell-env = { workspace = true, features = ["test-support"] }
 oximux-relay = { workspace = true }
 tempfile = "3"

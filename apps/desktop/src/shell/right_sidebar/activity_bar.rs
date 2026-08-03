@@ -145,24 +145,30 @@ fn tooltip_label(tab: RightTab) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keymap_registry::SECONDARY_GLYPH as SEC;
 
     #[test]
     fn shortcut_hint_reads_registry_defaults() {
-        // Resolved from the keymap registry — no hand-mirrored strings.
+        // Resolved from the keymap registry — no hand-mirrored strings. The
+        // modifier glyph comes from the registry too, because these defaults are
+        // `secondary-` chords and render as ⌃ off macOS.
         assert_eq!(shortcut_hint(RightTab::Files), "");
-        assert_eq!(shortcut_hint(RightTab::Explorer), "⌘⇧E");
-        assert_eq!(shortcut_hint(RightTab::Search), "⌘⇧F");
-        assert_eq!(shortcut_hint(RightTab::SourceControl), "⌘⇧G");
+        assert_eq!(shortcut_hint(RightTab::Explorer), format!("{SEC}⇧E"));
+        assert_eq!(shortcut_hint(RightTab::Search), format!("{SEC}⇧F"));
+        assert_eq!(shortcut_hint(RightTab::SourceControl), format!("{SEC}⇧G"));
     }
 
     #[test]
     fn tooltip_label_drops_parens_when_unbound() {
         assert_eq!(tooltip_label(RightTab::Files), "Files");
-        assert_eq!(tooltip_label(RightTab::Explorer), "Explorer (⌘⇧E)");
-        assert_eq!(tooltip_label(RightTab::Search), "Search (⌘⇧F)");
+        assert_eq!(
+            tooltip_label(RightTab::Explorer),
+            format!("Explorer ({SEC}⇧E)")
+        );
+        assert_eq!(tooltip_label(RightTab::Search), format!("Search ({SEC}⇧F)"));
         assert_eq!(
             tooltip_label(RightTab::SourceControl),
-            "Source Control (⌘⇧G)"
+            format!("Source Control ({SEC}⇧G)")
         );
     }
 }

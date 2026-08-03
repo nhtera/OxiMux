@@ -88,7 +88,12 @@ pub struct ColdRestore {
 /// the same runtime dir the relay supervisor passes as the socket's
 /// parent (the daemon derives this exact path from its socket flag).
 pub fn default_checkpoints_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join("dev.nhtera.oximux").join("checkpoints"))
+    // Through `app_paths` so this really is the supervisor's runtime dir. It
+    // used to spell `dirs::data_dir()` itself, which on Windows is the roaming
+    // profile while the supervisor passes the local one — so this read a
+    // directory the daemon never wrote to, and cold restore reported "nothing
+    // to restore" for every pane instead of failing visibly.
+    crate::app_paths::data_dir().map(|d| d.join("checkpoints"))
 }
 
 /// Read and compose the cold restore for a dead PTY id. Returns `None`
@@ -255,6 +260,23 @@ fn find_subslice(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 mod tests {
     use super::*;
 
+    /// A `meta.json` body naming `cwd`, JSON-escaped.
+    ///
+    /// The cwd has to be a directory that really exists at an absolute path:
+    /// `read_cold_restore` keeps it only when `is_absolute() && is_dir()`. The
+    /// old fixtures used `"/"`, which satisfies both on Unix and *neither* on
+    /// Windows — a rooted path with no drive prefix is not absolute there — so
+    /// the cwd was dropped, and for a session with no replayable scrollback that
+    /// turned the whole restore into `None`. Passing the test's own tempdir holds
+    /// on every platform and exercises the `is_dir` half honestly rather than
+    /// leaning on `/` happening to exist.
+    fn meta_json(cwd: &Path) -> String {
+        let cwd = cwd.to_string_lossy().replace('\\', "\\\\");
+        format!(
+            r#"{{"cwd":"{cwd}","cols":80,"rows":24,"started_at_epoch_secs":1,"ended_at_epoch_secs":null}}"#
+        )
+    }
+
     #[test]
     fn truncate_keeps_plain_output() {
         assert_eq!(truncate_alt_screen(b"hello\r\nworld"), b"hello\r\nworld");
@@ -302,11 +324,7 @@ mod tests {
         let base = tmp.path().join("checkpoints");
         let dir = base.join("pty-1");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("meta.json"),
-            br#"{"cwd":"/","cols":80,"rows":24,"started_at_epoch_secs":1,"ended_at_epoch_secs":null}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.join("meta.json"), meta_json(tmp.path())).unwrap();
         std::fs::write(dir.join("scrollback.bin"), b"recovered output").unwrap();
 
         let restore = read_cold_restore(&base, "pty-1").expect("restorable");
@@ -314,7 +332,7 @@ mod tests {
         assert!(s.contains("recovered output"));
         assert!(s.contains("--- session restored ---"));
         assert!(s.starts_with("\x1b[2J"), "clears before replaying");
-        assert_eq!(restore.cwd.as_deref(), Some(Path::new("/")));
+        assert_eq!(restore.cwd.as_deref(), Some(tmp.path()));
         assert_eq!(restore.dims, Some((80, 24)));
 
         consume_checkpoint(&base, "pty-1");
@@ -406,17 +424,13 @@ mod tests {
         ] {
             let dir = base.join(id);
             std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join("meta.json"),
-                br#"{"cwd":"/","cols":80,"rows":24,"started_at_epoch_secs":1,"ended_at_epoch_secs":null}"#,
-            )
-            .unwrap();
+            std::fs::write(dir.join("meta.json"), meta_json(tmp.path())).unwrap();
             if let Some(bytes) = scrollback {
                 std::fs::write(dir.join("scrollback.bin"), bytes).unwrap();
             }
             let restore = read_cold_restore(&base, id).expect("cwd-only restore");
             assert!(restore.bytes.is_empty(), "{id}: no prefill bytes");
-            assert_eq!(restore.cwd.as_deref(), Some(Path::new("/")), "{id}");
+            assert_eq!(restore.cwd.as_deref(), Some(tmp.path()), "{id}");
         }
 
         // Nothing replayable AND no usable cwd → truly nothing to restore.

@@ -87,6 +87,17 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
             let target = std::fs::read_link(&from)?;
             #[cfg(unix)]
             std::os::unix::fs::symlink(&target, &to)?;
+            // Windows needs to know up front whether the link points at a
+            // directory, so it resolves the source (`from`, following the
+            // link) rather than inspecting `target`, which may be relative.
+            // Creating these can require Developer Mode; the error propagates
+            // rather than leaving a copy that quietly lost its links.
+            #[cfg(windows)]
+            if std::fs::metadata(&from).is_ok_and(|m| m.is_dir()) {
+                std::os::windows::fs::symlink_dir(&target, &to)?;
+            } else {
+                std::os::windows::fs::symlink_file(&target, &to)?;
+            }
         } else if ft.is_dir() {
             copy_dir_recursive(&from, &to)?;
         } else {
@@ -113,11 +124,94 @@ pub fn move_to_trash(path: &Path) -> Result<(), String> {
         .map_err(|err| err.localizedDescription().to_string())
 }
 
-/// Non-macOS fallback. OxiMux ships macOS-only today; this keeps the crate
-/// compiling on other targets (CI lint hosts) without a real Trash.
-#[cfg(not(target_os = "macos"))]
+/// Move `path` to the Windows Recycle Bin via `SHFileOperationW` with
+/// `FOF_ALLOWUNDO` — the same reversible delete the macOS arm gets from
+/// `trashItemAtURL:`. The younger `IFileOperation` COM API does the same job
+/// with apartment-threading ceremony this one call doesn't need.
+#[cfg(windows)]
+pub fn move_to_trash(path: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::{
+        FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW,
+        SHFileOperationW,
+    };
+
+    // A relative path would be resolved against the shell's idea of the
+    // current directory, not the file tree's root — refuse rather than
+    // recycle a guess.
+    if !path.is_absolute() {
+        return Err(format!("path is not absolute: {}", path.display()));
+    }
+    // `SHFileOperationW` predates both forward-slash tolerance and the `\\?\`
+    // long-path prefix: the former is normalized here, the latter rejected
+    // (the API fails on it with an unrelated-looking error, so name the real
+    // problem instead). Explorer's own delete has the same length ceiling.
+    if path.as_os_str().encode_wide().take(4).eq(r"\\?\".encode_utf16()) {
+        return Err(format!(
+            "path uses the \\\\?\\ prefix, which the shell delete API cannot handle: {}",
+            path.display()
+        ));
+    }
+    // pFrom is a double-NUL-terminated list of NUL-separated paths; a single
+    // path still needs BOTH terminators or the shell reads past the string.
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .map(|c| if c == u16::from(b'/') { u16::from(b'\\') } else { c })
+        .chain([0, 0])
+        .collect();
+
+    let mut op = SHFILEOPSTRUCTW {
+        hwnd: std::ptr::null_mut(),
+        wFunc: FO_DELETE,
+        pFrom: wide.as_ptr(),
+        pTo: std::ptr::null(),
+        // ALLOWUNDO is the Recycle Bin itself; the three UI suppressions make
+        // this silent like the macOS call — OxiMux's confirm dialog already
+        // asked, so a second shell-owned prompt would be noise. windows-sys
+        // types the constants u32 but the struct field is the header's WORD.
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI) as u16,
+        fAnyOperationsAborted: 0,
+        hNameMappings: std::ptr::null_mut(),
+        lpszProgressTitle: std::ptr::null(),
+    };
+
+    // SAFETY: `op` is a fully-initialized SHFILEOPSTRUCTW; `wide` outlives the
+    // call and carries the double-NUL terminator the pFrom contract requires.
+    let code = unsafe { SHFileOperationW(&mut op) };
+    if code == 0 && op.fAnyOperationsAborted == 0 {
+        return Ok(());
+    }
+    if code == 0 {
+        return Err("delete was cancelled".to_string());
+    }
+    // Mixed error space: Win32 codes below 0x71, pre-Win32 shell `DE_*` codes
+    // from 0x71 up. Translate the ones a file-tree delete can realistically
+    // hit; anything else keeps its number so a bug report stays actionable.
+    let reason = match code as u32 {
+        0x02 | 0x03 | 0x7C => "file or folder not found",
+        0x05 | 0x78 | 0x86 => "access denied",
+        0x20 => "the file is in use by another program",
+        0x74 => "the operation was cancelled",
+        0x7E => "a file with that folder's name already exists",
+        other => return Err(format!("shell delete failed (code 0x{other:X})")),
+    };
+    Err(reason.to_string())
+}
+
+/// Fallback for platforms with neither Trash FFI nor a Recycle Bin binding
+/// (CI lint hosts). Keeps the crate compiling; never reachable from a shipped
+/// build.
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn move_to_trash(_path: &Path) -> Result<(), String> {
-    Err("move to Trash is only implemented on macOS".to_string())
+    Err("move to Trash is not implemented on this platform".to_string())
+}
+
+/// What the reversible-delete destination is called on this platform — the
+/// difference between a dialog that reads native ("Recycle Bin") and one that
+/// reads ported ("Trash" on Windows).
+pub fn trash_name() -> &'static str {
+    if cfg!(windows) { "Recycle Bin" } else { "Trash" }
 }
 
 #[cfg(test)]
@@ -194,6 +288,36 @@ mod tests {
         assert_eq!(dest.file_name().unwrap(), "tree copy");
         let copied_link = dest.join("link");
         assert!(copied_link.symlink_metadata().unwrap().file_type().is_symlink());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // Really recycles a file (one tiny tombstone in the runner's Recycle Bin);
+    // the assertion that matters is that the original path is gone, i.e. the
+    // shell accepted the operation rather than erroring or silently no-oping.
+    #[cfg(windows)]
+    #[test]
+    fn move_to_trash_removes_the_file() {
+        let dir = tmp();
+        let victim = dir.join("recycle-me.txt");
+        fs::write(&victim, b"bye").unwrap();
+        move_to_trash(&victim).unwrap();
+        assert!(!victim.exists(), "file must be gone from its original path");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn move_to_trash_rejects_relative_paths() {
+        let err = move_to_trash(Path::new("relative\\nope.txt")).unwrap_err();
+        assert!(err.contains("not absolute"), "got: {err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn move_to_trash_reports_missing_files() {
+        let dir = tmp();
+        let err = move_to_trash(&dir.join("never-existed.txt")).unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
         fs::remove_dir_all(&dir).ok();
     }
 

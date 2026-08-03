@@ -17,6 +17,11 @@ pub use format::{format_chord, format_chord_tokens};
 pub use inventory::ACTIONS;
 pub use rebind::apply_live;
 
+/// Re-exported for tests elsewhere in the crate that assert on a default
+/// chord's rendering — see the const's own docs.
+#[cfg(test)]
+pub(crate) use format::SECONDARY_GLYPH;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{OnceLock, RwLock};
 

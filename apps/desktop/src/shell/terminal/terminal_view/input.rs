@@ -509,9 +509,7 @@ impl TerminalView {
     fn open_link(&mut self, target: LinkTarget, window: &mut Window, cx: &mut Context<Self>) {
         match target {
             LinkTarget::Url(url) => {
-                if let Err(err) = std::process::Command::new("open").arg(&url).spawn() {
-                    tracing::warn!(?err, %url, "failed to open url");
-                }
+                cx.open_url(&url);
             }
             LinkTarget::Path { path, line, col } => {
                 let resolved = self.resolve_path(&path);
@@ -994,17 +992,16 @@ impl TerminalView {
         let Some(cwd) = self.dormant_cwd.take() else {
             return;
         };
-        let mut cfg = SpawnConfig {
-            // Clone so the cwd survives a failed promote (see
-            // `respawn_if_dormant`): the pane stays dormant + retryable.
-            cwd: cwd.clone(),
-            // Re-inject the SAME context ids on the inline wake path too.
-            env: self.ids.env(),
-            cols: self.target_grid.0.max(DEFAULT_COLS),
-            rows: self.target_grid.1.max(DEFAULT_ROWS),
-            scrollback: spawn_scrollback(),
-            ..SpawnConfig::default()
-        };
+        // Clone so the cwd survives a failed promote (see
+        // `respawn_if_dormant`): the pane stays dormant + retryable. The env
+        // re-injects the SAME context ids on the inline wake path too, so a
+        // respawned shell keeps its OXIMUX_SURFACE_ID / TAB_ID.
+        let mut cfg = shell_spawn_config(
+            cwd.clone(),
+            self.ids.env(),
+            self.target_grid.0.max(DEFAULT_COLS),
+            self.target_grid.1.max(DEFAULT_ROWS),
+        );
         crate::shell::terminal::shell_integration::augment_spawn_config(&mut cfg);
         let session_id = self.session_id;
         let promote_result = self

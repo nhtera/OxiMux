@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::auth::{Nonce, Proof};
 use crate::error::ErrCode;
 
 // Bumped whenever the wire schema changes in a non-additive way. The
@@ -41,13 +42,36 @@ use crate::error::ErrCode;
 // re-fetch the ring WITHOUT minting an attachment, so recovering from a gap
 // does not add a second attachment whose stale size would keep voting in the
 // daemon's smallest-screen-wins `min`.
-pub const PROTOCOL_VERSION: u32 = 7;
+// v8: the handshake stops putting the token on the wire. `Hello` carries a
+// client nonce instead, the daemon answers with `HelloChallenge` (its own nonce
+// plus a proof that it holds the token), and the client answers that with
+// `HelloProof`. Both proofs cover both nonces — see `crate::auth` for why each
+// piece is there. Wire break in both directions, so the endpoint bumps to
+// `relay-v8`.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub protocol_version: u32,
-    pub token: String,
     pub client_id: String,
+    /// Fresh per connection. Binds the daemon's proof to *this* handshake, so a
+    /// proof recorded from an earlier one cannot be replayed back at us.
+    pub client_nonce: Nonce,
+}
+
+/// The daemon's half of the handshake: it proves it holds the token *before*
+/// the client proves anything, so an impostor is caught while the client still
+/// has nothing to lose by hanging up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelloChallenge {
+    pub server_protocol_version: u32,
+    pub server_nonce: Nonce,
+    pub server_proof: Proof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HelloProof {
+    pub client_proof: Proof,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +108,7 @@ pub struct PtyStats {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Request {
     Hello(Hello),
+    HelloProof(HelloProof),
     Spawn {
         cwd: String,
         cols: u16,
@@ -171,6 +196,7 @@ pub enum Request {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
     HelloAck(HelloAck),
+    HelloChallenge(HelloChallenge),
     // `attachment_id` identifies the spawning session's auto-attachment
     // (Spawn auto-attaches the caller). The client stores it so its
     // `Resize`/`Detach` for this PTY address the right attachment.

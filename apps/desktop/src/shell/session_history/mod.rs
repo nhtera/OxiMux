@@ -52,7 +52,7 @@ const SESSION_HISTORY_KEY_CONTEXT: &str = "SessionHistoryModal";
 pub fn register_session_history_key_bindings(cx: &mut App) {
     cx.bind_keys([
         gpui::KeyBinding::new(
-            "cmd-enter",
+            "secondary-enter",
             OpenHistoryEntryAsChat,
             Some(SESSION_HISTORY_KEY_CONTEXT),
         ),

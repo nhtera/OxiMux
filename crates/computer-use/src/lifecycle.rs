@@ -160,25 +160,25 @@ mod tests {
 
     #[test]
     fn ending_succeeds_against_a_driver_that_accepts_it() {
-        // /usr/bin/true takes any arguments and exits 0, standing in for a
+        // A program that takes any arguments and exits 0, standing in for a
         // driver that ended the session.
         let dir = tempfile::tempdir().expect("tempdir");
         let ledger = SessionLedger::in_data_dir(dir.path());
         let id = SessionId::for_agent("chat-a");
         ledger.record(&id).expect("record");
 
-        end(Path::new("/usr/bin/true"), &ledger, &id).expect("end");
+        end(&crate::fixtures::always_succeeds(), &ledger, &id).expect("end");
         assert!(ledger.outstanding().expect("read").is_empty());
     }
 
     #[test]
     fn a_refusal_carries_the_drivers_own_words() {
-        // /usr/bin/false exits non-zero with no output, so this also covers the
+        // The stub exits non-zero with no output, so this also covers the
         // no-detail fallback rather than producing an empty message.
         let dir = tempfile::tempdir().expect("tempdir");
         let ledger = SessionLedger::in_data_dir(dir.path());
         let err = end(
-            Path::new("/usr/bin/false"),
+            &crate::fixtures::always_fails(),
             &ledger,
             &SessionId::for_agent("chat-a"),
         )

@@ -72,9 +72,13 @@ pub struct SpawnConfig {
 impl Default for SpawnConfig {
     fn default() -> Self {
         Self {
-            shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into()),
+            shell: oximux_shell_env::default_shell(),
             args: Vec::new(),
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            // `current_dir` fails only if the cwd was deleted or became
+            // unreadable. The old fallback was `/`, which names the current
+            // drive's root on Windows and is not somewhere to drop a user;
+            // the temp dir is a real writable directory on both platforms.
+            cwd: std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()),
             env: Vec::new(),
             cols: 80,
             rows: 24,

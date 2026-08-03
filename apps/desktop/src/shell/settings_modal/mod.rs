@@ -15,7 +15,15 @@ mod nav;
 mod segmented;
 mod pane_about;
 mod pane_agents;
+#[cfg(any(target_os = "macos", windows))]
 mod pane_computer_use;
+/// The Windows half of the same pane. Separate module rather than a fork of
+/// `pane_computer_use` because almost none of that pane transfers: there is no
+/// signature to report, no in-app installer to drive, and the master switch and
+/// project list gate driver *tools*, which Windows does not yet declare. What is
+/// left is a decision macOS never has to make.
+#[cfg(windows)]
+mod pane_driver_trust;
 mod pane_agents_launch;
 mod pane_keybindings;
 mod pane_notifications;
@@ -28,6 +36,7 @@ mod view;
 
 /// The driver status type is shared with the onboarding wizard's driver step —
 /// one resolve/labels implementation, two surfaces.
+#[cfg(target_os = "macos")]
 pub(crate) use pane_computer_use::DriverStatus;
 
 pub use nav::SettingsPane;
@@ -116,18 +125,28 @@ pub struct SettingsModal {
     pub(super) computer_use: ComputerUseSettings,
     /// Result of the last driver check. Held rather than recomputed per frame:
     /// verification spawns `codesign`, and the pane repaints constantly.
+    #[cfg(target_os = "macos")]
     pub(super) driver_status: pane_computer_use::DriverStatus,
+    /// Windows' equivalent: where the installed driver stands with the user.
+    /// Held rather than recomputed per frame for the same reason — resolving it
+    /// hashes the binary, and once approved also runs `--version`.
+    #[cfg(windows)]
+    pub(super) driver_trust: pane_driver_trust::TrustState,
     /// The in-flight driver install this modal started, if any. `None` while
     /// idle — and also while merely *observing* an install another surface
     /// owns (that state lives in `driver_install_ui`, fed by the backend's
     /// pull-style status).
+    #[cfg(target_os = "macos")]
     pub(super) driver_install: Option<crate::shell::driver_install::InstallHandle>,
     /// What the Driver row renders for the install affordance.
+    #[cfg(target_os = "macos")]
     pub(super) driver_install_ui: crate::shell::driver_install::DriverInstallUi,
     /// Guards against stacking poll timers across repaints/reopens.
+    #[cfg(target_os = "macos")]
     pub(super) driver_poll_running: bool,
     /// Set when the install replaced an existing driver — gates the one-line
     /// "old version until the daemon respawns" note.
+    #[cfg(target_os = "macos")]
     pub(super) driver_upgraded: bool,
     /// Flat KV store the notification toggles persist into (keys in
     /// [`crate::notifier::keys`]), so prefs survive a restart.
@@ -231,10 +250,17 @@ impl SettingsModal {
             agent_launch: AgentLaunchSettings::default(),
             dictation: DictationSettings::default(),
             computer_use: ComputerUseSettings::default(),
+            #[cfg(target_os = "macos")]
             driver_status: pane_computer_use::DriverStatus::Unknown,
+            #[cfg(windows)]
+            driver_trust: pane_driver_trust::TrustState::Unknown,
+            #[cfg(target_os = "macos")]
             driver_install: None,
+            #[cfg(target_os = "macos")]
             driver_install_ui: crate::shell::driver_install::DriverInstallUi::Idle,
+            #[cfg(target_os = "macos")]
             driver_poll_running: false,
+            #[cfg(target_os = "macos")]
             driver_upgraded: false,
             notify,
             notify_repo,
@@ -276,7 +302,7 @@ impl SettingsModal {
     pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.terminal = cx
             .try_global::<TerminalSettings>()
-            .copied()
+            .cloned()
             .unwrap_or_default();
         self.ai = cx
             .try_global::<CommitMessageAiSettings>()
@@ -294,23 +320,34 @@ impl SettingsModal {
             .try_global::<ComputerUseSettings>()
             .cloned()
             .unwrap_or_default();
-        // Re-checked per open rather than once at boot: the user may have
-        // installed or updated the driver since, and "not installed" is the
-        // status most likely to be stale.
-        self.driver_status = pane_computer_use::DriverStatus::resolve();
-        // A modal reopened mid-install shows live progress: attach to the
-        // backend's pull-style status (cheap, unlike a resolve per tick) and
-        // restart the poll loop. A stale failure from a previous open is
-        // cleared — the fresh resolve above is the truth now.
-        if !self.driver_install_ui.is_running() {
-            self.driver_install_ui = match oximux_computer_use::install::status() {
-                Some(stage) => crate::shell::driver_install::DriverInstallUi::Running { stage },
-                None => crate::shell::driver_install::DriverInstallUi::Idle,
-            };
-            // The post-upgrade note belongs to the session that upgraded;
-            // a fresh open starts from the resolved truth alone.
-            self.driver_upgraded = false;
+        #[cfg(target_os = "macos")]
+        {
+            // Re-checked per open rather than once at boot: the user may have
+            // installed or updated the driver since, and "not installed" is the
+            // status most likely to be stale.
+            self.driver_status = pane_computer_use::DriverStatus::resolve();
+            // A modal reopened mid-install shows live progress: attach to the
+            // backend's pull-style status (cheap, unlike a resolve per tick) and
+            // restart the poll loop. A stale failure from a previous open is
+            // cleared — the fresh resolve above is the truth now.
+            if !self.driver_install_ui.is_running() {
+                self.driver_install_ui = match oximux_computer_use::install::status() {
+                    Some(stage) => crate::shell::driver_install::DriverInstallUi::Running { stage },
+                    None => crate::shell::driver_install::DriverInstallUi::Idle,
+                };
+                // The post-upgrade note belongs to the session that upgraded;
+                // a fresh open starts from the resolved truth alone.
+                self.driver_upgraded = false;
+            }
         }
+        #[cfg(windows)]
+        {
+            // Same reasoning as the macOS resolve above: the user may have
+            // installed — or re-installed, which is the interesting case here —
+            // the driver since the modal was last open.
+            self.driver_trust = pane_driver_trust::TrustState::resolve();
+        }
+        #[cfg(target_os = "macos")]
         self.spawn_driver_install_poll(cx);
         // Start reporting devices that drop themselves, if the host is up. Not in
         // the constructor: the remote host binds later than the shell is built, so
@@ -495,6 +532,7 @@ impl SettingsModal {
 
     /// Persist the screen-control working copy to `computer_use.toml`. The
     /// watcher reloads + swaps the global; we never set the global here.
+    #[cfg(any(target_os = "macos", windows))]
     pub(super) fn persist_computer_use(&mut self, cx: &mut Context<Self>) {
         if let Err(err) = crate::computer_use_settings::save(&self.computer_use) {
             tracing::warn!(%err, "settings modal: failed to write computer_use.toml");

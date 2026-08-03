@@ -7,16 +7,24 @@
 //! already said yes to — because a grant given once in a card, months ago, is
 //! only revocable if it can be found.
 
-use gpui::{AnyElement, IntoElement, ParentElement, SharedString, Styled, div, px};
+use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
+#[cfg(target_os = "macos")]
+use gpui::SharedString;
 use oximux_settings::{Density, Theme, Typography};
 
 use super::SettingsModal;
 use super::controls::{toggle_switch, value_chip};
 use super::layout::{SettingEntry, entries_card, entry, section_title};
+#[cfg(target_os = "macos")]
 use crate::shell::driver_install::{self, DriverInstallUi};
 
 /// What `prepare()` reported about the installed driver, resolved when the
 /// modal opens rather than per repaint — it spawns `codesign`.
+///
+/// macOS only. Windows has no publisher to report and no in-app installer to
+/// offer, so its driver row is `pane_driver_trust`'s instead — same position in
+/// the pane, an entirely different question.
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DriverStatus {
     /// Not looked for yet (the modal has never been opened).
@@ -34,6 +42,7 @@ pub(crate) enum DriverStatus {
     Problem { detail: String },
 }
 
+#[cfg(target_os = "macos")]
 impl DriverStatus {
     /// Look for the driver and put it through every gate.
     pub(crate) fn resolve() -> Self {
@@ -134,7 +143,35 @@ pub(super) fn render(
         ))
         .child(entries_card(theme, density, typography, apps));
 
-    body.child(footnotes(theme, typography)).into_any_element()
+    body
+        .children(driver_detail(modal, theme, density, typography))
+        .child(footnotes(theme, typography))
+        .into_any_element()
+}
+
+/// The evidence card under the Driver row: path, size, digest.
+///
+/// Windows only, because it is the disclosure behind an approval decision macOS
+/// never has to make — there the publisher answers it and there is nothing for
+/// the user to compare.
+#[cfg(windows)]
+fn driver_detail(
+    modal: &SettingsModal,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> Option<AnyElement> {
+    super::pane_driver_trust::detail_card(modal, theme, density, typography)
+}
+
+#[cfg(target_os = "macos")]
+fn driver_detail(
+    _modal: &SettingsModal,
+    _theme: Theme,
+    _density: Density,
+    _typography: &Typography,
+) -> Option<AnyElement> {
+    None
 }
 
 /// The two things a user reading this pane could otherwise get wrong.
@@ -154,11 +191,24 @@ pub(super) fn render(
 ///
 /// One line per sentence: prose in a settings pane does not wrap in this app, so
 /// a paragraph would clip at the pane edge rather than reflow.
+#[cfg(target_os = "macos")]
 const FOOTNOTES: &[&str] = &[
     "Guards against an agent's mistakes, not an agent trying to get around them.",
     "Enabling this grants OxiMux macOS Accessibility, which is how agents drive apps.",
     "Every agent's shell inherits that grant — in all projects, not only those listed.",
     "Esc needs Input Monitoring as well — a separate switch, granted separately.",
+];
+
+/// The Windows set. Deliberately not a translation of the list above: none of
+/// those permissions exist here, and the two things a Windows user has to know
+/// instead are that the driver's publisher was never checked and that the kill
+/// switch cannot be confirmed live.
+#[cfg(windows)]
+const FOOTNOTES: &[&str] = &[
+    "Guards against an agent's mistakes, not an agent trying to get around them.",
+    "The driver is unsigned — you approved the exact file, not its publisher.",
+    "Every agent's shell can reach the screen, in all projects, not only those listed.",
+    "Esc stops an agent, but Windows cannot confirm the key is being seen.",
 ];
 
 fn footnotes(theme: Theme, typography: &Typography) -> AnyElement {
@@ -198,26 +248,54 @@ pub(super) fn entries(
                 cx,
             ),
         ),
-        entry(
-            "Driver",
-            "Computer use runs through a separate signed helper.",
-            driver_control(modal, theme, density, typography, cx),
-        ),
+        driver_entry(modal, theme, density, typography, cx),
     ]
     .into_iter()
-    .chain(
-        // Post-upgrade only: the shared daemon is deliberately left running,
-        // so the user should know old behavior may persist until it respawns.
-        (modal.driver_upgraded && matches!(modal.driver_status, DriverStatus::Ready { .. }))
-            .then(|| {
-                entry(
-                    "Driver updated",
-                    driver_install::UPGRADE_NOTE,
-                    div(),
-                )
-            }),
-    )
+    .chain(upgrade_note(modal))
     .collect()
+}
+
+/// The Driver row, which asks a different question on each platform: macOS asks
+/// whether the publisher checks out, Windows asks whether *you* approved these
+/// bytes. Same slot, so the pane around it does not have to know which.
+#[cfg(target_os = "macos")]
+fn driver_entry(
+    modal: &SettingsModal,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> SettingEntry {
+    entry(
+        "Driver",
+        "Computer use runs through a separate signed helper.",
+        driver_control(modal, theme, density, typography, cx),
+    )
+}
+
+#[cfg(windows)]
+fn driver_entry(
+    modal: &SettingsModal,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> SettingEntry {
+    super::pane_driver_trust::driver_entry(modal, theme, density, typography, cx)
+}
+
+/// Post-upgrade only: the shared daemon is deliberately left running, so the
+/// user should know old behavior may persist until it respawns. Tied to the
+/// in-app installer, which is macOS-only.
+#[cfg(target_os = "macos")]
+fn upgrade_note(modal: &SettingsModal) -> Option<SettingEntry> {
+    (modal.driver_upgraded && matches!(modal.driver_status, DriverStatus::Ready { .. }))
+        .then(|| entry("Driver updated", driver_install::UPGRADE_NOTE, div()))
+}
+
+#[cfg(windows)]
+fn upgrade_note(_modal: &SettingsModal) -> Option<SettingEntry> {
+    None
 }
 
 /// The driver row's right-hand control.
@@ -226,6 +304,7 @@ pub(super) fn entries(
 /// line, an Install/Update button when the status calls for one, a manual
 /// download link after a failure, and a re-check button so installing the
 /// helper by hand does not need a restart to be noticed.
+#[cfg(target_os = "macos")]
 fn driver_control(
     modal: &SettingsModal,
     theme: Theme,
@@ -321,8 +400,8 @@ fn driver_control(
             theme,
             density,
             typography,
-            |_this, _w, _cx| {
-                crate::shell::open_url::open_url(driver_install::MANUAL_DOWNLOAD_URL);
+            |_this, _w, cx| {
+                crate::shell::open_url::open_url(driver_install::MANUAL_DOWNLOAD_URL, cx);
             },
             cx,
         ));
@@ -343,6 +422,7 @@ fn driver_control(
     .into_any_element()
 }
 
+#[cfg(target_os = "macos")]
 impl SettingsModal {
     /// Kick off (or attach to) the driver install and start polling it.
     pub(super) fn start_driver_install(&mut self, cx: &mut gpui::Context<Self>) {
@@ -516,6 +596,23 @@ fn app_rows(
 
 #[cfg(test)]
 mod tests {
+    /// The Windows footnotes carry the one disclosure the macOS pane does not
+    /// need: the driver's publisher was never checked. Asserted here rather
+    /// than trusted to review, because it is the sentence that keeps the
+    /// approval honest and it is easy to lose in a reword.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_footnotes_disclose_the_unsigned_driver() {
+        assert!(
+            FOOTNOTES.iter().any(|n| n.contains("unsigned")),
+            "the Windows pane must say the driver is unsigned"
+        );
+        assert!(
+            !FOOTNOTES.iter().any(|n| n.contains("Accessibility")),
+            "macOS permission copy must not leak into the Windows pane"
+        );
+    }
+
     use super::*;
     use oximux_settings::ComputerUseSettings;
 
@@ -526,6 +623,10 @@ mod tests {
     /// opts in separately") read as a guarantee the OS does not make. The claim
     /// was measured during the coverage spike: an agent's shell inherits
     /// OxiMux's Accessibility grant regardless of which projects are listed.
+    /// macOS only: every claim below names a macOS permission. The Windows list
+    /// makes different promises and is pinned by
+    /// `the_windows_footnotes_disclose_the_unsigned_driver`.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_pane_does_not_promise_the_permission_is_per_project() {
         let shown = FOOTNOTES.join("\n");
@@ -541,8 +642,14 @@ mod tests {
         ] {
             assert!(shown.contains(claim), "the pane must still say: {claim}");
         }
-        // And each line has to fit: settings prose does not wrap here, so a
-        // long one clips at the pane edge and the warning is simply not read.
+    }
+
+    /// Split from the macOS claim list above because it is the one thing about
+    /// these strings that is not platform-specific: settings prose does not wrap
+    /// here, so a long line clips at the pane edge and the warning is simply not
+    /// read. The Windows list has to obey it too.
+    #[test]
+    fn every_footnote_fits_the_pane() {
         for note in FOOTNOTES {
             assert!(note.len() <= 90, "{note:?} will clip ({} chars)", note.len());
         }
@@ -568,6 +675,9 @@ mod tests {
         );
     }
 
+    /// `DriverStatus` is the macOS driver row; Windows answers a different
+    /// question in `pane_driver_trust`, which carries its own tests.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_verified_driver_reads_as_ready_with_its_version() {
         let status = DriverStatus::Ready {
@@ -577,6 +687,9 @@ mod tests {
         assert!(status.summary().contains("verified"));
     }
 
+    /// `DriverStatus` is the macOS driver row; Windows answers a different
+    /// question in `pane_driver_trust`, which carries its own tests.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_verification_failure_shows_the_specific_reason() {
         // "Unavailable" would be useless here: a wrong signing team and an
@@ -587,17 +700,26 @@ mod tests {
         assert!(status.summary().contains("WRONG"), "{}", status.summary());
     }
 
+    /// `DriverStatus` is the macOS driver row; Windows answers a different
+    /// question in `pane_driver_trust`, which carries its own tests.
+    #[cfg(target_os = "macos")]
     #[test]
     fn not_installed_is_its_own_state() {
         assert_eq!(DriverStatus::NotInstalled.summary(), "Not installed");
     }
 
+    /// `DriverStatus` is the macOS driver row; Windows answers a different
+    /// question in `pane_driver_trust`, which carries its own tests.
+    #[cfg(target_os = "macos")]
     #[test]
     fn an_unopened_pane_does_not_claim_the_driver_is_missing() {
         // The default must not read as a verdict — it has not looked yet.
         assert_eq!(DriverStatus::Unknown.summary(), "Checking…");
     }
 
+    /// `DriverStatus` is the macOS driver row; Windows answers a different
+    /// question in `pane_driver_trust`, which carries its own tests.
+    #[cfg(target_os = "macos")]
     #[test]
     fn resolving_never_panics_whatever_is_installed() {
         // Runs on every CI machine, none of which have the driver; the point is

@@ -204,9 +204,13 @@ impl Render for WorkspaceRoot {
         // Title-bar Update pill: staged (downloaded + verified) update only.
         // Rendered by whichever header currently hosts the left chrome
         // cluster, so it survives collapsing the rail.
+        // Always `None` where there is no updater yet, which renders no pill.
+        #[cfg(target_os = "macos")]
         let update_ready_version = cx
             .try_global::<crate::updater::UpdaterState>()
             .and_then(|state| state.ready_version().map(str::to_string));
+        #[cfg(not(target_os = "macos"))]
+        let update_ready_version: Option<String> = None;
 
         let left_column = if self.left_rail_open {
             Some(
@@ -701,7 +705,12 @@ impl Render for WorkspaceRoot {
                     .update(cx, |p, cx| p.open(projects, window, cx));
             }))
             .on_action(cx.listener(|_this, _: &RestartToUpdate, _window, cx| {
+                // Only reachable from the Update pill, which does not render
+                // without an updater to stage anything.
+                #[cfg(target_os = "macos")]
                 crate::updater::restart_to_update(cx);
+                #[cfg(not(target_os = "macos"))]
+                let _ = cx;
             }))
             .on_action(cx.listener(|this, _: &crate::actions::ToggleWhatsNew, _window, cx| {
                 this.whats_new_open = !this.whats_new_open;
@@ -1146,14 +1155,13 @@ impl Render for WorkspaceRoot {
                 },
             ))
             .on_action(cx.listener(
-                |_this, action: &crate::actions::OpenInFinder, _window, _cx| {
-                    // `open <dir>` opens Finder at the target. Distinct from
-                    // `open -R` (reveal) which opens Finder with the path
-                    // selected — used for the workspace-root overflow item.
+                |_this, action: &crate::actions::OpenInFinder, _window, cx| {
+                    // `open_with_system` on a directory opens the file manager
+                    // AT the target. Distinct from `reveal_path` which opens it
+                    // with the path selected in its parent — used for the
+                    // workspace-root overflow item.
                     let path = std::path::PathBuf::from(&action.path);
-                    if let Err(err) = std::process::Command::new("open").arg(&path).spawn() {
-                        tracing::warn!(?err, path = %path.display(), "open in finder failed");
-                    }
+                    cx.open_with_system(&path);
                 },
             ))
             .on_action(cx.listener(
@@ -1585,9 +1593,12 @@ impl Render for WorkspaceRoot {
                 // `update` (not `update_in`) per the GPUI memory note.
                 let scm_for_click = scm_panel.clone();
                 let weak_for_usage = cx.entity().downgrade();
+                #[cfg(target_os = "macos")]
                 let update_ready = cx
                     .try_global::<crate::updater::UpdaterState>()
                     .and_then(|state| state.ready_version().map(str::to_string));
+                #[cfg(not(target_os = "macos"))]
+                let update_ready: Option<String> = None;
                 let settings_for_update = self.settings_modal.downgrade();
                 status_bar::view(
                     theme,
@@ -1685,6 +1696,7 @@ impl Render for WorkspaceRoot {
             // actually being Ready so a stale open flag (update applied or
             // discarded meanwhile) renders nothing rather than an empty card.
             .when(self.whats_new_open, |parent| {
+                #[cfg(target_os = "macos")]
                 let ready = cx.try_global::<crate::updater::UpdaterState>().and_then(
                     |state| match &state.status {
                         oximux_auto_update::UpdateStatus::Ready { version, notes } => {
@@ -1693,6 +1705,8 @@ impl Render for WorkspaceRoot {
                         _ => None,
                     },
                 );
+                #[cfg(not(target_os = "macos"))]
+                let ready: Option<(String, String)> = None;
                 let Some((version, notes)) = ready else {
                     return parent;
                 };

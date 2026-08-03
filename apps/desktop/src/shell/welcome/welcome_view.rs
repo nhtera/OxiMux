@@ -188,9 +188,14 @@ mod tests {
                 "welcome hint `{id}` should resolve a default chord"
             );
         }
+        // `open_project_picker`'s default is a `secondary-` chord, so the leading
+        // token is ⌘ on macOS and ⌃ elsewhere — it was pinned to ⌘ here.
         assert_eq!(
             crate::keymap_registry::display_tokens_for("open_project_picker").unwrap(),
-            vec!["\u{2318}".to_string(), "O".to_string()]
+            vec![
+                crate::keymap_registry::SECONDARY_GLYPH.to_string(),
+                "O".to_string()
+            ]
         );
     }
 

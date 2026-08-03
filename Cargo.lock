@@ -2337,6 +2337,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "doctest-file"
+version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2db04e74f0a9a93103b50e90b96024c9b2bdca8bce6a632ec71b88736d3d359"
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2737,6 +2743,17 @@ name = "fax"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caf1079563223d5d59d83c85886a56e586cfd5c1a26292e971a0fa266531ac5a"
+
+[[package]]
+name = "fd-lock"
+version = "4.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
+dependencies = [
+ "cfg-if",
+ "rustix 1.1.4",
+ "windows-sys 0.59.0",
+]
 
 [[package]]
 name = "fdeflate"
@@ -4769,6 +4786,21 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "interprocess"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "069323743400cb7ab06a8fe5c1ed911d36b6919ec531661d034c89083629595b"
+dependencies = [
+ "doctest-file",
+ "futures-core",
+ "libc",
+ "recvmsg",
+ "tokio",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6878,13 +6910,16 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
+ "dirs 5.0.1",
  "futures",
  "libc",
  "oximux-agent-core",
- "oximux-computer-use",
  "oximux-core",
  "oximux-git",
+ "oximux-job-object",
+ "oximux-no-window",
  "oximux-pty",
+ "oximux-shell-env",
  "oximux-storage",
  "regex",
  "rusqlite",
@@ -6897,6 +6932,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "uuid",
+ "which 6.0.3",
 ]
 
 [[package]]
@@ -6911,6 +6947,8 @@ dependencies = [
  "cbc",
  "chrono",
  "dirs 5.0.1",
+ "embed-resource",
+ "fd-lock",
  "futures",
  "gpui",
  "gpui-component",
@@ -6928,6 +6966,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-user-notifications",
  "objc2-web-kit",
+ "oximux-agent-core",
  "oximux-agents",
  "oximux-auto-update",
  "oximux-computer-use",
@@ -6936,6 +6975,8 @@ dependencies = [
  "oximux-editor",
  "oximux-git",
  "oximux-macos-trust",
+ "oximux-no-window",
+ "oximux-owner-only",
  "oximux-proc-cwd",
  "oximux-pty",
  "oximux-relay-client",
@@ -6964,6 +7005,8 @@ dependencies = [
  "tracing-subscriber",
  "two-face",
  "uuid",
+ "widestring",
+ "windows-sys 0.61.2",
  "wry",
 ]
 
@@ -6986,9 +7029,12 @@ dependencies = [
 name = "oximux-computer-use"
 version = "0.1.5"
 dependencies = [
+ "base64",
+ "fd-lock",
  "libc",
  "oximux-agent-core",
  "oximux-macos-trust",
+ "oximux-no-window",
  "regex",
  "serde",
  "serde_json",
@@ -6997,6 +7043,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "ureq",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7016,6 +7063,7 @@ dependencies = [
  "dirs 5.0.1",
  "futures",
  "hound",
+ "oximux-no-window",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -7035,6 +7083,7 @@ dependencies = [
  "lsp-types",
  "notify-debouncer-full",
  "oximux-core",
+ "oximux-no-window",
  "oximux-settings",
  "serde",
  "serde_json",
@@ -7042,6 +7091,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "which 6.0.3",
 ]
 
 [[package]]
@@ -7050,6 +7100,7 @@ version = "0.1.5"
 dependencies = [
  "futures",
  "oximux-core",
+ "oximux-no-window",
  "serde",
  "serde_json",
  "tempfile",
@@ -7057,6 +7108,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "oximux-job-object"
+version = "0.1.5"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7089,6 +7147,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "oximux-no-window"
+version = "0.1.5"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
+name = "oximux-owner-only"
+version = "0.1.5"
+dependencies = [
+ "tempfile",
+ "widestring",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "oximux-proc-cwd"
 version = "0.1.5"
 dependencies = [
@@ -7103,6 +7177,7 @@ dependencies = [
  "anyhow",
  "nix 0.25.1",
  "oximux-core",
+ "oximux-shell-env",
  "portable-pty",
 ]
 
@@ -7112,10 +7187,15 @@ version = "0.1.5"
 dependencies = [
  "anyhow",
  "dashmap",
+ "interprocess",
  "nix 0.25.1",
+ "oximux-job-object",
+ "oximux-owner-only",
  "oximux-proc-cwd",
  "oximux-relay-proto",
+ "oximux-shell-env",
  "portable-pty",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "tempfile",
@@ -7126,6 +7206,7 @@ dependencies = [
  "tracing-oslog",
  "tracing-subscriber",
  "uuid",
+ "widestring",
 ]
 
 [[package]]
@@ -7134,9 +7215,12 @@ version = "0.1.5"
 dependencies = [
  "anyhow",
  "dashmap",
+ "interprocess",
  "oximux-pty",
  "oximux-relay",
  "oximux-relay-proto",
+ "oximux-shell-env",
+ "rand 0.8.6",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -7149,7 +7233,9 @@ name = "oximux-relay-proto"
 version = "0.1.5"
 dependencies = [
  "bincode 2.0.1",
+ "hmac",
  "serde",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
 ]
 
@@ -7166,9 +7252,9 @@ dependencies = [
  "hmac",
  "oximux-agent-core",
  "oximux-agents",
- "oximux-computer-use",
  "oximux-core",
  "oximux-git",
+ "oximux-owner-only",
  "oximux-remote-proto",
  "oximux-storage",
  "rand 0.8.6",
@@ -7236,10 +7322,19 @@ name = "oximux-settings"
 version = "0.1.5"
 dependencies = [
  "anyhow",
+ "dunce",
  "gpui",
  "serde",
  "tempfile",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "oximux-shell-env"
+version = "0.1.5"
+dependencies = [
+ "portable-pty",
+ "which 6.0.3",
 ]
 
 [[package]]
@@ -8300,6 +8395,12 @@ dependencies = [
  "core_maths",
  "font-types",
 ]
+
+[[package]]
+name = "recvmsg"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
 
 [[package]]
 name = "redox_syscall"
@@ -13316,6 +13417,7 @@ name = "xtask"
 version = "0.1.5"
 dependencies = [
  "anyhow",
+ "image",
 ]
 
 [[package]]

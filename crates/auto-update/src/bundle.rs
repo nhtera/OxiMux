@@ -3,6 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
 use oximux_macos_trust::SignaturePolicy;
 
 /// Why the updater is disabled for this process. Each variant surfaces in
@@ -44,6 +45,7 @@ impl UnsupportedReason {
 /// currently sits at the bundle path — after a staged update lands, that is
 /// the new bundle, and a drifting anchor defeats the point of pinning.
 #[derive(Debug, Clone)]
+#[cfg(target_os = "macos")]
 pub struct InstalledApp {
     pub bundle_root: PathBuf,
     pub pin: SignaturePolicy,
@@ -53,6 +55,7 @@ pub struct InstalledApp {
 ///
 /// Runs one `codesign -dvv` (~sub-second) plus a write probe; call it off the
 /// UI thread.
+#[cfg(target_os = "macos")]
 pub fn eligibility(exe: &Path) -> Result<InstalledApp, UnsupportedReason> {
     let bundle_root = bundle_root_of(exe).ok_or(UnsupportedReason::NotABundle)?;
 
@@ -105,6 +108,7 @@ pub fn bundle_root_of(exe: &Path) -> Option<PathBuf> {
 
 /// Probed by creating a file — directory permission bits under-report on
 /// macOS.
+#[cfg(target_os = "macos")]
 fn dir_is_writable(dir: &Path) -> bool {
     let probe = dir.join(format!(".oximux-write-probe-{}", std::process::id()));
     let ok = std::fs::write(&probe, b"").is_ok();
@@ -138,6 +142,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn a_translocated_bundle_is_refused() {
         // Translocated paths look like real bundles; only the marker
         // component gives them away. eligibility() must catch it before the

@@ -13,17 +13,46 @@
 //! **This list is a floor, not a survey.** It cannot enumerate every sensitive
 //! app, and it is not a security boundary — an agent with a shell has other
 //! routes. It removes the most damaging accident.
+//!
+//! # The one place Windows is stronger than macOS
+//!
+//! Windows integrity levels enforce something this list only asks for. UIPI
+//! stops a process from sending input to any window owned by a
+//! higher-integrity process, in the kernel, with no list to maintain: an
+//! unelevated OxiMux **cannot** inject into an elevated app, whatever the user
+//! approves and whatever this table says. The driver surfaces the attempt as a
+//! structured `background_uipi_blocked` refusal rather than as a silent
+//! no-op — an honest failure, and a rare case of the platform doing this
+//! module's job properly.
+//!
+//! It also means [`crate::proc::executable_of_pid`] returning `None` for an
+//! elevated target is the *correct* answer rather than a limitation: OxiMux
+//! could not drive that process anyway. Recorded because both look like bugs
+//! to fix, and fixing either would be removing a guarantee.
+//!
+//! Note what it does *not* cover. Almost everything this list names — password
+//! managers, browsers, editors — runs at the same integrity level as OxiMux,
+//! so UIPI has no opinion about them. It raises the floor under elevated
+//! processes only, and that is why the table is still the thing doing the work.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
+// Read only by `classify_identifier`, which is macOS-only: Windows catches a
+// second OxiMux by executable name in `classify_executable` instead.
+#[cfg(not(windows))]
 use crate::HOST_BUNDLE_ID;
 
 /// Bundle identifiers refused outright.
 ///
 /// Password managers, because the blast radius of one stray click is every
 /// credential the user has, and Keychain Access for the same reason.
+///
+/// macOS-only, along with the three functions that read it: a bundle id is a
+/// macOS concept, and reading one costs a `codesign` spawn. Windows takes the
+/// [`WINDOWS_BLOCKED_EXECUTABLES`] path instead.
+#[cfg(not(windows))]
 const BLOCKED_BUNDLE_IDS: &[&str] = &[
     "com.1password.1password",
     "com.1password.safari",
@@ -35,6 +64,37 @@ const BLOCKED_BUNDLE_IDS: &[&str] = &[
     "com.nordsec.nordpass",
     "me.proton.pass.catalyst",
     "me.proton.pass.electron",
+];
+
+/// Executable names refused outright on Windows.
+///
+/// The counterpart to [`BLOCKED_BUNDLE_IDS`], keyed on file name because
+/// Windows has no bundle id — see [`crate::target`] for what that key is worth
+/// and where it fails.
+///
+/// The last two are not password managers and are here anyway:
+///
+/// - **`lsass.exe`** is the Local Security Authority. It holds credential
+///   material for the whole session; it is also protected by the OS and by
+///   integrity level, so this entry is belt-and-braces rather than the only
+///   thing standing there.
+/// - **`credwiz.exe`** and `rundll32 keymgr.dll` front the Credential Manager,
+///   which is the Windows credential store in the same sense as the keychain.
+#[cfg(windows)]
+const WINDOWS_BLOCKED_EXECUTABLES: &[&str] = &[
+    "1Password.exe",
+    "Bitwarden.exe",
+    "KeePass.exe",
+    "KeePassXC.exe",
+    "Dashlane.exe",
+    "NordPass.exe",
+    "Proton Pass.exe",
+    "RoboForm.exe",
+    "enpass.exe",
+    "LastPass.exe",
+    "keymgr.dll",
+    "credwiz.exe",
+    "lsass.exe",
 ];
 
 /// Why a target is off-limits. Carried rather than collapsed to a bool so the
@@ -101,9 +161,18 @@ pub fn blocked_reason(executable: &Path, host: Option<&Path>) -> Option<Blocked>
     if let Some(known) = MEMO.lock().expect("blocked memo poisoned").get(executable) {
         return *known;
     }
+
+    // Windows has no bundle id, and `bundle_identifier` shells out to
+    // `codesign`, which does not exist there. Left as-is this would resolve
+    // every target to `None` — meaning *nothing* is refused on Windows except
+    // OxiMux itself, silently, with the whole table above still compiling.
+    #[cfg(windows)]
+    let verdict = classify_executable(executable);
+    #[cfg(not(windows))]
     let verdict = bundle_identifier(executable)
         .as_deref()
         .and_then(classify_identifier);
+
     MEMO.lock()
         .expect("blocked memo poisoned")
         .insert(executable.to_path_buf(), verdict);
@@ -120,6 +189,7 @@ pub fn is_blocked(executable: &Path, host: Option<&Path>) -> bool {
 /// OxiMux is checked here as well as by [`is_host`] because the two catch
 /// different things: `is_host` catches the binary we are serving, this catches a
 /// *second* copy of OxiMux the user is also running.
+#[cfg(not(windows))]
 fn classify_identifier(identifier: &str) -> Option<Blocked> {
     if identifier.eq_ignore_ascii_case(HOST_BUNDLE_ID) {
         return Some(Blocked::Host);
@@ -141,8 +211,51 @@ fn classify_identifier(identifier: &str) -> Option<Blocked> {
     }
 }
 
+/// The verdict for an executable path, on Windows.
+///
+/// Mirrors [`classify_identifier`] with the file name as the key. The order is
+/// the same and matters for the same reason: a refusal has to name the right
+/// cause, and a password manager that also happened to match a category should
+/// still be reported as credentials.
+///
+/// A second copy of OxiMux is caught here by executable name, where macOS
+/// catches it by bundle id — weaker, but [`is_host`] already covers the copy
+/// that matters, which is the one being served.
+#[cfg(windows)]
+fn classify_executable(executable: &Path) -> Option<Blocked> {
+    let name = executable.file_name().and_then(|name| name.to_str())?;
+
+    // A *second* copy of OxiMux — a different process, so `is_host` says
+    // nothing about it. On macOS the bundle id catches this; here the
+    // executable name is all there is, which is weak but not nothing, and the
+    // alternative is that the case goes entirely unhandled on this platform.
+    //
+    // `oximux.exe` is the `[[bin]]` name in `apps/desktop/Cargo.toml`. Two
+    // spellings of one string, and only one of them is Rust.
+    if name.eq_ignore_ascii_case("oximux.exe") {
+        return Some(Blocked::Host);
+    }
+
+    if WINDOWS_BLOCKED_EXECUTABLES
+        .iter()
+        .any(|blocked| blocked.eq_ignore_ascii_case(name))
+    {
+        return Some(Blocked::Credentials);
+    }
+
+    match crate::target::Category::of_executable(executable) {
+        crate::target::Category::Terminal => Some(Blocked::Shell),
+        crate::target::Category::Editor => Some(Blocked::Editor),
+        other => {
+            debug_assert!(!other.is_never_driveable(), "{other:?} refused but unmapped");
+            None
+        }
+    }
+}
+
 /// Case-insensitive because bundle ids are matched that way by the system, and
 /// the published spellings are inconsistent (`LastPass` vs `nordpass`).
+#[cfg(not(windows))]
 fn is_blocked_identifier(identifier: &str) -> bool {
     BLOCKED_BUNDLE_IDS
         .iter()
@@ -187,12 +300,21 @@ fn is_host(executable: &Path, declared: Option<&Path>) -> bool {
 /// parsing `Info.plist`: that file is often a *binary* plist, which would mean a
 /// new dependency, and the signed identifier is the harder one to forge of the
 /// two.
+#[cfg(not(windows))]
 fn bundle_identifier(executable: &Path) -> Option<String> {
     crate::verify::signing_identifier(executable)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The bundle-id blocklist, which is macOS-only along with the functions
+    /// it exercises. The Windows restatement is [`super::tests::windows_blocklist`],
+    /// keyed on executable name; keeping them as sibling modules makes the pair
+    /// visible rather than leaving one looking like the whole story.
+    #[cfg(not(windows))]
+    mod bundle_id_blocklist {
     use super::*;
 
     #[test]
@@ -261,6 +383,7 @@ mod tests {
         assert!(!is_blocked_identifier("com.1password.1password.helper"));
         assert!(!is_blocked_identifier("password"));
     }
+    }
 
     #[test]
     fn an_unsigned_or_missing_binary_is_not_blocked() {
@@ -270,6 +393,19 @@ mod tests {
         assert!(!is_blocked(Path::new("/nonexistent/binary"), None));
     }
 
+    /// macOS-only because the identity it reads is macOS-only.
+    ///
+    /// There is no `CFBundleIdentifier` on Windows, and cua's own permission
+    /// model says so — it identifies apps by canonical absolute executable
+    /// path there. Phase 4 of
+    /// `plans/260801-0157-windows-computer-use/` owns the Windows blocklist and
+    /// should restate this against an Authenticode subject, which is the
+    /// nearest thing to a stable identity a Windows binary carries.
+    ///
+    /// Left uncovered rather than approximated: a version of this that matched
+    /// on file name would pass while testing nothing, since a file name is
+    /// exactly what an impostor controls.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_real_signed_binary_resolves_and_is_allowed() {
         // Exercises the codesign path end to end — a parser change that broke
@@ -289,9 +425,19 @@ mod tests {
         let me = std::env::current_exe().expect("test binary path");
         assert!(is_host(&me, None), "the running binary must recognise itself");
         assert_eq!(blocked_reason(&me, None), Some(Blocked::Host));
+
         // And a second copy of OxiMux — a different process, so `is_host` says
-        // nothing about it — is refused on identity alone.
+        // nothing about it — is refused on identity alone. The identity that
+        // carries that differs per platform: a bundle id on macOS, and on
+        // Windows only the executable name, which is the weaker claim the
+        // module docs own up to.
+        #[cfg(not(windows))]
         assert_eq!(classify_identifier(HOST_BUNDLE_ID), Some(Blocked::Host));
+        #[cfg(windows)]
+        assert_eq!(
+            classify_executable(Path::new(r"C:\Program Files\OxiMux\oximux.exe")),
+            Some(Blocked::Host)
+        );
     }
 
     #[test]
@@ -300,13 +446,100 @@ mod tests {
         // gets wrong: the gate is its own binary, so unless it is told which
         // one OxiMux is, a development build — ad-hoc signed, no bundle id —
         // reads as an ordinary app and becomes driveable.
-        let elsewhere = Path::new("/bin/echo");
+        // Any real, unremarkable system binary that is not this test process.
+        let elsewhere = Path::new(crate::fixtures::some_executable());
         assert!(!is_blocked(elsewhere, None), "ordinarily not us");
         assert_eq!(
             blocked_reason(elsewhere, Some(elsewhere)),
             Some(Blocked::Host),
             "declared as the host, it must be refused"
         );
+    }
+
+    #[cfg(windows)]
+    mod windows_blocklist {
+        use super::*;
+
+        #[test]
+        fn known_password_managers_are_blocked_by_executable() {
+            for exe in [
+                r"C:\Program Files\1Password\app\8\1Password.exe",
+                r"C:\Users\u\AppData\Local\Programs\Bitwarden\Bitwarden.exe",
+                r"C:\Program Files\KeePassXC\KeePassXC.exe",
+                r"C:\Windows\System32\lsass.exe",
+            ] {
+                assert_eq!(
+                    classify_executable(Path::new(exe)),
+                    Some(Blocked::Credentials),
+                    "{exe}"
+                );
+            }
+        }
+
+        #[test]
+        fn terminals_and_editors_are_refused_with_their_own_reason() {
+            // The two must not collapse: "targeted a password manager" would be
+            // untrue of VS Code, and the agent reads this sentence verbatim.
+            assert_eq!(
+                classify_executable(Path::new(r"C:\Windows\System32\cmd.exe")),
+                Some(Blocked::Shell)
+            );
+            assert_eq!(
+                classify_executable(Path::new(r"C:\P\WindowsTerminal.exe")),
+                Some(Blocked::Shell)
+            );
+            assert_eq!(
+                classify_executable(Path::new(r"C:\P\Microsoft VS Code\Code.exe")),
+                Some(Blocked::Editor)
+            );
+        }
+
+        #[test]
+        fn ordinary_apps_are_not_blocked() {
+            // Including the driver itself and an agent's own build, which is
+            // the target the whole feature exists for.
+            for exe in [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Users\u\AppData\Local\Programs\Cua\bin\cua-driver.exe",
+                r"C:\repo\target\debug\my-app.exe",
+            ] {
+                assert_eq!(classify_executable(Path::new(exe)), None, "{exe}");
+            }
+        }
+
+        #[test]
+        fn matching_ignores_case_like_the_filesystem() {
+            assert_eq!(
+                classify_executable(Path::new(r"C:\x\1PASSWORD.EXE")),
+                Some(Blocked::Credentials)
+            );
+        }
+
+        #[test]
+        fn a_credential_store_outranks_a_category_match() {
+            // Order matters: were the category consulted first, an entry that
+            // matched both would be reported with the weaker reason.
+            let creds = classify_executable(Path::new(r"C:\x\1Password.exe"));
+            assert_eq!(creds, Some(Blocked::Credentials));
+            assert_ne!(creds, Some(Blocked::Editor));
+        }
+
+        /// The regression this whole arm exists to prevent.
+        ///
+        /// Before it, `blocked_reason` on Windows went through `codesign`,
+        /// which does not exist there — so every lookup resolved to "not
+        /// blocked" while the table above still compiled and read as live
+        /// policy. Nothing failed; the floor was simply not there.
+        #[test]
+        fn the_blocklist_actually_runs_on_windows() {
+            assert_eq!(
+                blocked_reason(Path::new(r"C:\Program Files\1Password\app\8\1Password.exe"), None),
+                Some(Blocked::Credentials),
+                "the Windows blocklist must be reached by the real entry point, \
+                 not merely defined"
+            );
+            assert!(is_blocked(Path::new(r"C:\Windows\System32\cmd.exe"), None));
+        }
     }
 
     #[test]
@@ -328,8 +561,16 @@ mod tests {
             }
         }
         assert!(Blocked::Host.reason().contains("OxiMux"));
+
+        // And the classifier really does produce one of them, per platform.
+        #[cfg(not(windows))]
         assert_eq!(
             classify_identifier("com.1password.1password"),
+            Some(Blocked::Credentials)
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            classify_executable(Path::new(r"C:\P\1Password\1Password.exe")),
             Some(Blocked::Credentials)
         );
     }

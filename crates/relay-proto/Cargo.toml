@@ -11,3 +11,8 @@ rust-version.workspace = true
 bincode = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+# The handshake proofs. Pure computation, so this stays a crate with no I/O and
+# no async — both ends MUST derive proofs from one definition, since two that
+# drift apart is a security bug that presents as a connection failure.
+hmac = { workspace = true }
+sha2 = { workspace = true }

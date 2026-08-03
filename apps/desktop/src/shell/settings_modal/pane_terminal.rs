@@ -47,7 +47,7 @@ pub(super) fn entries(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> Vec<SettingEntry> {
-    let t = modal.terminal;
+    let t = &modal.terminal;
 
     let scrollback = stepper(
         "term-scrollback",

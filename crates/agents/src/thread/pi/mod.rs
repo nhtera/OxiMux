@@ -71,6 +71,14 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct PiRpcConnection {
     rpc: PiRpcClient,
     child: Arc<Mutex<Child>>,
+    /// Windows stand-in for the process group. pi's whole shutdown design leans
+    /// on SIGTERM reaching its handler so it can reap the *detached* children
+    /// its bash tool spawns — there is no Windows equivalent of either half of
+    /// that, so the job object is what makes those children accountable to
+    /// something. `Arc` because `terminate` hands the escalation to a detached
+    /// thread that outlives the caller.
+    #[cfg(windows)]
+    job: Option<Arc<oximux_job_object::JobObject>>,
     /// Live session facts: the current model (picker label, thinking levels,
     /// context window) and thinking level. Mutable — `set_model` and
     /// `set_thinking_level` both change it in-session, and pi re-clamps thinking
@@ -253,9 +261,20 @@ impl PiRpcConnection {
         let mut map_state = map::PiState::with_context_window(context_window);
         let shared_state = Arc::new(Mutex::new(Some(state)));
 
+        #[cfg(windows)]
+        let job = match oximux_job_object::JobObject::adopt(&child) {
+            Ok(job) => Some(Arc::new(job)),
+            Err(e) => {
+                tracing::warn!(?e, "could not put pi in a job object");
+                None
+            }
+        };
+
         let conn = Self {
             rpc: rpc.clone(),
             child: Arc::new(Mutex::new(child)),
+            #[cfg(windows)]
+            job,
             state: shared_state.clone(),
             models,
             commands,
@@ -375,6 +394,8 @@ impl PiRpcConnection {
             }
         }
         let child = self.child.clone();
+        #[cfg(windows)]
+        let job = self.job.clone();
         std::thread::spawn(move || {
             let deadline = std::time::Instant::now() + TERM_GRACE;
             loop {
@@ -387,12 +408,25 @@ impl PiRpcConnection {
                     Ok(None) => {}
                 }
                 if std::time::Instant::now() >= deadline {
+                    // On unix this is the lossy path: pi never ran its handler,
+                    // so its detached bash children are orphaned. On Windows the
+                    // job object catches them instead — there was never a
+                    // handler to run, but there is a tree to end.
+                    #[cfg(unix)]
                     tracing::warn!(
                         "pi did not exit within {TERM_GRACE:?} of SIGTERM; escalating to \
                          SIGKILL — any running bash tool children will be orphaned"
                     );
+                    #[cfg(windows)]
+                    tracing::warn!(
+                        "pi did not exit within {TERM_GRACE:?}; terminating its job object"
+                    );
                     let _ = guard.kill();
                     let _ = guard.wait();
+                    #[cfg(windows)]
+                    if let Some(job) = &job {
+                        let _ = job.kill();
+                    }
                     return;
                 }
                 drop(guard); // never sleep holding the lock
@@ -807,11 +841,46 @@ fn resolve_pi_binary(configured: Option<&str>) -> Result<PathBuf> {
 }
 
 /// First match for `bin` on the inherited PATH.
+///
+/// Synchronous on purpose — this runs inside `connect`, which is called from
+/// the UI thread and has no runtime to await on. The `which` crate does not
+/// spawn, so the cost is a handful of `stat`s either way; what it adds over the
+/// hand-rolled walk this replaced is `PATHEXT` handling on Windows, where `pi`
+/// installs as `pi.cmd`.
 fn which_on_path(bin: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(bin))
-        .find(|p| is_executable(p))
+    which::which(bin).ok()
+}
+
+/// The shell and argv that ask "where is `bin`?" with the user's own startup
+/// files loaded. That is the whole point of the probe: the answer differs from
+/// a plain PATH lookup exactly when a startup file edits PATH.
+///
+/// The two platforms get there differently. A POSIX login shell (`-l`) sources
+/// the profile chain a version manager hooks into; PowerShell has no comparable
+/// login mode on Windows (`-Login` is honored only on unix builds), but it
+/// loads `$PROFILE` for `-Command` unless told not to — which is the same
+/// recovery, since a Windows PATH edit that a GUI launch misses lives there.
+#[cfg(unix)]
+fn login_probe_command(bin: &str) -> (String, Vec<String>) {
+    (
+        oximux_shell_env::default_shell(),
+        vec!["-lc".to_string(), format!("command -v {bin}")],
+    )
+}
+
+#[cfg(windows)]
+fn login_probe_command(bin: &str) -> (String, Vec<String>) {
+    (
+        oximux_shell_env::default_shell(),
+        vec![
+            "-NoLogo".to_string(),
+            "-Command".to_string(),
+            // `-ErrorAction SilentlyContinue` so a missing command prints
+            // nothing instead of an error record the caller would parse as a
+            // path. Empty stdout is already the "not found" signal.
+            format!("(Get-Command {bin} -ErrorAction SilentlyContinue).Source"),
+        ],
+    )
 }
 
 /// Ask a login shell where `bin` is — recovers nvm/volta/bun installs that a
@@ -822,13 +891,14 @@ fn which_on_path(bin: &str) -> Option<PathBuf> {
 /// runs on the UI thread, so it must never wait forever — a slow shell degrades
 /// to "pi not found" (an actionable error) rather than a frozen app.
 fn login_shell_which(bin: &str) -> Option<PathBuf> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    use oximux_no_window::NoWindow as _;
+    let (shell, args) = login_probe_command(bin);
     let mut child = Command::new(shell)
-        .arg("-lc")
-        .arg(format!("command -v {bin}"))
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .no_window()
         .spawn()
         .ok()?;
 
@@ -884,6 +954,50 @@ fn is_executable(p: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write an executable fake `pi` into `dir` and return the path to spawn.
+    ///
+    /// These fakes have to be real programs — `PiRpcConnection::spawn` execs the
+    /// configured path and talks JSON-RPC over its pipes — which makes them the
+    /// one thing in this suite that cannot be written once for both platforms:
+    ///
+    /// - unix gets the `sh` script plus a `chmod`.
+    /// - Windows cannot exec a shebang at all (`%1 is not a valid Win32
+    ///   application`, os error 193) and `CreateProcess` infers no extension
+    ///   from a bare `pi`. So the fake is a `.cmd`, which `CreateProcess` does
+    ///   run through the command processor, shimmed onto a `.ps1` holding the
+    ///   real logic — `cmd`'s own language is not up to a JSON-RPC loop.
+    ///
+    /// Both scripts are passed in rather than translated, because they are not
+    /// mechanically translatable and pretending otherwise hides which behaviour
+    /// each platform is actually asserting.
+    fn write_fake_pi(dir: &Path, sh: &str, powershell: &str) -> PathBuf {
+        #[cfg(unix)]
+        {
+            let _ = powershell;
+            let path = dir.join("pi");
+            std::fs::write(&path, sh).expect("write fake");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            path
+        }
+        #[cfg(windows)]
+        {
+            let _ = sh;
+            std::fs::write(dir.join("pi.ps1"), powershell).expect("write fake");
+            let path = dir.join("pi.cmd");
+            // `-File` (not `-Command`) so the script is not re-parsed by cmd,
+            // and `%*` forwards argv so a fake can branch on `--session`.
+            std::fs::write(
+                &path,
+                "@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass \
+                 -File \"%~dp0pi.ps1\" %*\r\n",
+            )
+            .expect("write shim");
+            path
+        }
+    }
 
     /// Live handshake against the real `pi`. Ignored by default (needs pi
     /// installed); costs no model tokens — `get_state` never calls a provider.
@@ -1422,14 +1536,23 @@ while IFS= read -r line; do
   esac
 done
 "#;
-        std::fs::write(dir.join("pi"), script).expect("write fake");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir.join("pi"), std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
-        let fake = dir.join("pi");
+        // The same fake in PowerShell. Reads through `[Console]::In` and flushes
+        // explicitly: the handshake blocks on the `get_state` reply, and
+        // PowerShell's own output buffering would stall it.
+        let ps = r#"
+if ($args -join ' ' -match '--session') {
+  [Console]::Error.WriteLine("No session found matching 'gone'")
+  exit 1
+}
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  if ($line -match '"id":"([^"]*)"') { $id = $Matches[1] }
+  if ($line -match '"type":"get_state"') {
+    [Console]::Out.Write('{"id":"' + $id + '","type":"response","command":"get_state","success":true,"data":{"sessionId":"brand-new"}}' + "`n")
+    [Console]::Out.Flush()
+  }
+}
+"#;
+        let fake = write_fake_pi(&dir, script, ps);
         let (conn, rx) = PiRpcConnection::spawn(
             &dir,
             None,
@@ -1459,15 +1582,11 @@ done
         // a fixable error into a mystery.
         let dir = std::env::temp_dir().join(format!("pi-badauth-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch");
-        std::fs::write(dir.join("pi"), "#!/bin/sh\necho 'pi: no credentials found' >&2\nexit 1\n")
-            .expect("write fake");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir.join("pi"), std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
-        let fake = dir.join("pi");
+        let fake = write_fake_pi(
+            &dir,
+            "#!/bin/sh\necho 'pi: no credentials found' >&2\nexit 1\n",
+            "[Console]::Error.WriteLine('pi: no credentials found')\nexit 1\n",
+        );
         let err = PiRpcConnection::spawn(&dir, None, fake.to_str(), PiPosture::default(), Some("sess-1"))
             .err()
             .expect("a credentials failure must not be retried as a fresh session");
@@ -1477,7 +1596,16 @@ done
 
     #[test]
     fn a_configured_absolute_path_that_is_missing_fails_readably() {
-        let err = resolve_pi_binary(Some("/nope/not/here/pi"))
+        // Absolute for the running platform. `resolve_pi_binary` gates the
+        // readable bail on `is_absolute()`, and `/nope/...` is not absolute on
+        // Windows — it fell through as a bare name for PATH lookup, so nothing
+        // failed and the assertion read as a missing guard.
+        let missing = if cfg!(windows) {
+            r"C:\nope\not\here\pi.exe"
+        } else {
+            "/nope/not/here/pi"
+        };
+        let err = resolve_pi_binary(Some(missing))
             .expect_err("a configured path that doesn't exist must fail");
         assert!(err.to_string().contains("not found"), "got {err}");
     }
@@ -1548,7 +1676,7 @@ while IFS= read -r line; do
   esac
 done
 "#;
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         cmd
     }
@@ -1596,7 +1724,7 @@ done
     #[test]
     fn a_pi_without_commands_still_connects() {
         // `get_commands` failing must cost the palette, not the session.
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(
             r#"
 while IFS= read -r line; do
@@ -1759,7 +1887,7 @@ done
     fn a_pi_that_dies_during_the_handshake_fails_with_its_stderr() {
         // The failure users actually hit (bad auth / bad flag). It must not hang
         // the new chat, and the message must say what pi said.
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg("read line; echo 'pi: no credentials found' >&2; exit 1");
         let start = std::time::Instant::now();
         let err = PiRpcConnection::spawn_command(cmd).err().expect("must fail");
@@ -1778,7 +1906,7 @@ read line
 printf '{"id":"s1","type":"response","command":"get_state","success":true,"data":{"sessionId":"s"}}\n'
 sleep 2
 "#;
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         let (conn, _rx) = PiRpcConnection::spawn_command(cmd).expect("handshake");
         let err = conn
@@ -1790,6 +1918,13 @@ sleep 2
         assert!(err.to_string().contains("posture"), "got {err}");
     }
 
+    // Gated for the same reason as its sibling below, which already was: the
+    // test is a `trap ... TERM` shell script asserting a signal, and Windows has
+    // neither half. `terminate()` cfg's the `libc::kill` out and reaps the tool
+    // children through the job object instead — a different mechanism with the
+    // same guarantee, covered by the job-object suite rather than here. The gate
+    // was written for the pair and only landed on one of them.
+    #[cfg(unix)]
     #[test]
     fn shutdown_signals_term_not_kill_so_pi_can_reap_its_tool_children() {
         // The load-bearing lifecycle fact: pi's SIGTERM/SIGHUP handler is the
@@ -1809,7 +1944,7 @@ while true; do sleep 0.05; done
 "#,
             m = marker.display()
         );
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         let (conn, _rx) = PiRpcConnection::spawn_command(cmd).expect("handshake");
         conn.shutdown();
@@ -1822,6 +1957,10 @@ while true; do sleep 0.05; done
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // SIGTERM semantics, driven by a `trap`-ing shell script. There is no
+    // Windows counterpart to either half, so this is gated with the contract it
+    // tests rather than left to pass vacuously.
+    #[cfg(unix)]
     #[test]
     fn shutdown_does_not_block_the_caller_when_pi_ignores_sigterm() {
         // Both callers of shutdown() — a respawn and Drop — run on the GPUI main
@@ -1834,7 +1973,7 @@ read line
 printf '{"id":"s1","type":"response","command":"get_state","success":true,"data":{"sessionId":"s"}}\n'
 while true; do sleep 0.05; done
 "#;
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         let (conn, _rx) = PiRpcConnection::spawn_command(cmd).expect("handshake");
         let start = std::time::Instant::now();
@@ -1854,6 +1993,7 @@ while true; do sleep 0.05; done
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn dropping_without_shutdown_still_reaps_the_child() {
         // `pi --mode rpc` never self-exits, so a forgotten shutdown() would leak
@@ -1863,7 +2003,7 @@ read line
 printf '{"id":"s1","type":"response","command":"get_state","success":true,"data":{"sessionId":"s"}}\n'
 sleep 30
 "#;
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         let (conn, _rx) = PiRpcConnection::spawn_command(cmd).expect("handshake");
         let pid = conn.child.lock().unwrap().id();
@@ -1889,14 +2029,14 @@ sleep 30
     }
 
     /// Whether `pid` still exists. Signal 0 only probes.
+    ///
+    /// Unix-only on purpose: its callers assert `!pid_alive(..)`, so a stub
+    /// returning `false` off unix would make both of them pass without testing
+    /// anything.
+    #[cfg(unix)]
     fn pid_alive(pid: u32) -> bool {
-        #[cfg(unix)]
-        {
-            // SAFETY: signal 0 performs no signal delivery, only a permission +
-            // existence check on the pid.
-            return unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
-        }
-        #[allow(unreachable_code)]
-        false
+        // SAFETY: signal 0 performs no signal delivery, only a permission +
+        // existence check on the pid.
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
 }

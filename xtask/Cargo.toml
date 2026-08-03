@@ -13,3 +13,13 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+# `xtask icon` derives the Windows .ico from the macOS .icns: PNG in, PNG and
+# hand-written BMP out.
+#
+# Not `workspace = true`: a member may add features to an inherited dependency
+# but may not turn the workspace's defaults off, and the defaults here matter.
+# The full set pulls the AVIF encoder (rav1e) — minutes of build time for a
+# lint runner that will never encode a video frame. The version tracks the
+# workspace's `image` by hand; cargo resolves both to one entry in the lock, so
+# a drift shows up as a second `image` there rather than silently.
+image = { version = "0.25", default-features = false, features = ["ico", "png", "bmp"] }

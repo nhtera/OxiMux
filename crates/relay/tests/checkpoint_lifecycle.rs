@@ -4,10 +4,10 @@
 // remains on disk is therefore an unclean death — the exact contract
 // the app's cold-restore reader depends on.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use oximux_shell_env::test_support::{lines, test_cwd, test_shell};
 use oximux_relay::checkpoint::CheckpointStore;
 use oximux_relay::registry::{PtyRegistry, SpawnArgs};
 use oximux_relay_proto::Notification;
@@ -16,10 +16,10 @@ use tokio::time::timeout;
 
 fn spawn_args() -> SpawnArgs {
     SpawnArgs {
-        cwd: PathBuf::from("/"),
+        cwd: test_cwd(),
         cols: 80,
         rows: 24,
-        shell: Some("/bin/sh".into()),
+        shell: Some(test_shell()),
         args: Vec::new(),
         env: Vec::new(),
     }
@@ -53,6 +53,9 @@ async fn checkpoint_written_on_tick_and_removed_on_close() {
     // app resolves split-inherit cwd from it kernel-side). Gated: every
     // Unix target reports a child pid, but a target without process ids
     // legitimately stores None and must not hard-fail the suite.
+    // Parsed on every platform so a malformed meta.json fails the suite
+    // anywhere; only the pid assertions below are Unix-shaped.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let meta: oximux_relay::checkpoint::CheckpointMeta =
         serde_json::from_slice(&std::fs::read(pty_dir.join("meta.json")).expect("read meta"))
             .expect("parse meta");
@@ -74,16 +77,33 @@ async fn checkpoint_written_on_tick_and_removed_on_close() {
     })
     .await;
 
-    // A second pass with no new output is a no-op (skip-if-unchanged):
-    // observe via mtime stability.
-    let before = std::fs::metadata(pty_dir.join("scrollback.bin"))
-        .and_then(|m| m.modified())
-        .expect("mtime");
-    registry.checkpoint_all();
-    let after = std::fs::metadata(pty_dir.join("scrollback.bin"))
-        .and_then(|m| m.modified())
-        .expect("mtime");
-    assert_eq!(before, after, "unchanged PTY must not rewrite its checkpoint");
+    // A pass with no new output is a no-op (skip-if-unchanged): observe via
+    // mtime stability. Polled until stable rather than asserted on the very
+    // next pass, because "no new output" is a state the PTY settles into, not
+    // one the first checkpoint already guarantees — a Windows shell through
+    // ConPTY keeps trickling startup output (banner, prompt repaints) after
+    // its first bytes land, and each trickle makes the following rewrite
+    // legitimate. The contract under test is that an idle PTY STOPS being
+    // rewritten, and that is what the stability probe asserts.
+    let mtime = || {
+        std::fs::metadata(pty_dir.join("scrollback.bin"))
+            .and_then(|m| m.modified())
+            .expect("mtime")
+    };
+    let mut settled = false;
+    for _ in 0..200 {
+        let before = mtime();
+        registry.checkpoint_all();
+        if mtime() == before {
+            settled = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        settled,
+        "unchanged PTY must stop rewriting its checkpoint once output settles"
+    );
 
     registry
         .close(&pty_id, Duration::from_millis(500))
@@ -151,7 +171,7 @@ async fn natural_shell_exit_removes_checkpoint() {
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Notification>(64);
     registry.attach(&pty_id, tx).expect("attach");
-    registry.write(&pty_id, b"exit\n").expect("write exit");
+    registry.write(&pty_id, &lines(&["exit"])).expect("write exit");
 
     timeout(Duration::from_secs(5), async {
         while let Some(n) = rx.recv().await {
@@ -180,7 +200,7 @@ async fn attach_after_exit_replays_exit_to_new_subscriber() {
     // Subscriber A drives the shell to a clean exit and observes it.
     let (tx_a, mut rx_a) = tokio::sync::mpsc::channel::<Notification>(64);
     registry.attach(&pty_id, tx_a).expect("attach A");
-    registry.write(&pty_id, b"exit\n").expect("write exit");
+    registry.write(&pty_id, &lines(&["exit"])).expect("write exit");
     let code_a = timeout(Duration::from_secs(5), async {
         loop {
             match rx_a.recv().await {
@@ -231,7 +251,7 @@ async fn exited_pty_is_excluded_from_list() {
     // Drive the shell to a clean exit and wait until the registry observes it.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Notification>(64);
     registry.attach(&pty_id, tx).expect("attach");
-    registry.write(&pty_id, b"exit\n").expect("write exit");
+    registry.write(&pty_id, &lines(&["exit"])).expect("write exit");
     timeout(Duration::from_secs(5), async {
         loop {
             match rx.recv().await {

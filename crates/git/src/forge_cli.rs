@@ -7,6 +7,7 @@
 //! here once and [`crate::gh::GhCmd`] / [`crate::glab::GlabCmd`] delegate.
 
 use crate::error::{GitError, Result};
+use oximux_no_window::NoWindow as _;
 use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
@@ -34,6 +35,7 @@ pub(crate) async fn run_raw(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        .no_window()
         .kill_on_drop(true);
     for (k, v) in envs {
         cmd.env(k, v);

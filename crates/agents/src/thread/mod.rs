@@ -21,6 +21,8 @@ pub mod connection;
 pub mod pi;
 pub mod session_file_fork;
 pub mod session_import;
+#[cfg(test)]
+pub(crate) mod sh_fixture;
 pub mod transport;
 
 // The pure fold + wire vocabulary + stream-json decoder now live in the

@@ -8,6 +8,7 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 
+use oximux_no_window::NoWindow as _;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
@@ -54,6 +55,7 @@ pub async fn scan_files(root: PathBuf) -> Result<Vec<String>, ScanError> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .no_window()
         .kill_on_drop(true);
 
     let mut child = match cmd.spawn() {

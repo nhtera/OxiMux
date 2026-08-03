@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use oximux_agents::thread::connection::SlashCommandInfo;
 
@@ -56,7 +56,10 @@ pub type CommandCatalog = HashMap<String, CommandMeta>;
 /// source is skipped, never panics. Blocking I/O — call from a background task.
 pub fn discover_catalog(cwd: &Path) -> CommandCatalog {
     let mut cat = built_in_catalog();
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+    // `dirs`, not `$HOME`: Windows sets `USERPROFILE` and leaves `HOME` unset
+    // outside git-bash, so reading the variable skipped both scans entirely and
+    // the palette lost every user-level command without saying so.
+    if let Some(home) = dirs::home_dir() {
         scan_user_skills(&home.join(".claude/skills"), &mut cat);
         scan_plugin_cache(&home.join(".claude/plugins/cache"), &mut cat);
     }

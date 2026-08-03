@@ -587,16 +587,9 @@ impl Render for TabContextMenu {
                 density,
                 typography.clone(),
                 cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                    // `open -R <path>` selects the file in Finder.
-                    // Failure here is non-fatal — log + ignore so a
-                    // permission denial doesn't crash the renderer.
-                    if let Err(err) = std::process::Command::new("open")
-                        .arg("-R")
-                        .arg(&reveal_path)
-                        .spawn()
-                    {
-                        tracing::warn!(?err, path = %reveal_path.display(), "reveal in finder failed");
-                    }
+                    // Selects the file in the platform file manager. Failure is
+                    // non-fatal — gpui logs it; nothing to surface here.
+                    cx.reveal_path(&reveal_path);
                     this.close(cx);
                 }),
             ));

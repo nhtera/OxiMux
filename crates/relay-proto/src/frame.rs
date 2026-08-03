@@ -178,8 +178,8 @@ mod tests {
             request_id: 1,
             request: Request::Hello(Hello {
                 protocol_version: 1,
-                token: "deadbeef".into(),
                 client_id: "abc-123".into(),
+                client_nonce: [0xab; crate::auth::NONCE_LEN],
             }),
         });
     }
@@ -189,8 +189,11 @@ mod tests {
         let variants = [
             Request::Hello(Hello {
                 protocol_version: 1,
-                token: "t".into(),
                 client_id: "c".into(),
+                client_nonce: [1; crate::auth::NONCE_LEN],
+            }),
+            Request::HelloProof(crate::messages::HelloProof {
+                client_proof: [2; crate::auth::PROOF_LEN],
             }),
             Request::Spawn {
                 cwd: "/tmp".into(),
@@ -243,6 +246,11 @@ mod tests {
             Response::HelloAck(HelloAck {
                 server_protocol_version: 1,
                 session_id: "sess-1".into(),
+            }),
+            Response::HelloChallenge(crate::messages::HelloChallenge {
+                server_protocol_version: 1,
+                server_nonce: [3; crate::auth::NONCE_LEN],
+                server_proof: [4; crate::auth::PROOF_LEN],
             }),
             Response::SpawnOk {
                 pty_id: "pty-1".into(),

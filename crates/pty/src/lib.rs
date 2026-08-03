@@ -11,6 +11,7 @@
 
 pub mod backend;
 pub(crate) mod close_grace;
+pub(crate) mod conpty_c0;
 pub mod events;
 pub mod grid_serializer;
 pub mod osc7;

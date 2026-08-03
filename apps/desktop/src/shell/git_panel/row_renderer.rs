@@ -324,14 +324,18 @@ pub(super) fn row(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |panel, ev: &MouseDownEvent, window, cx| {
-                // Cmd-click (macOS `platform`) toggles a row in/out of
-                // the selection — additive. Shift+Click replaces with
-                // the inclusive range from the anchor to this row.
-                // Bare click replaces with a single-row selection AND
-                // is the only modifier path that opens the diff tab —
-                // additive / range operations are about building a
-                // multi-row set, not navigating.
-                if ev.modifiers.platform {
+                // Cmd-click on macOS, Ctrl-click elsewhere (`secondary`)
+                // toggles a row in/out of the selection — additive.
+                // Shift+Click replaces with the inclusive range from the
+                // anchor to this row. Bare click replaces with a
+                // single-row selection AND is the only modifier path that
+                // opens the diff tab — additive / range operations are
+                // about building a multi-row set, not navigating.
+                //
+                // `secondary()` rather than `platform`: the latter is the
+                // Windows key off macOS, which the OS claims before the app
+                // sees it, so additive selection would simply not exist there.
+                if ev.modifiers.secondary() {
                     panel.toggle_selection(click_path.clone(), cx);
                 } else if ev.modifiers.shift {
                     panel.extend_range_to(click_path.clone(), cx);

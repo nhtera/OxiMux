@@ -8,6 +8,7 @@
 //! windows never consume it, only the fresh-boot window armed by `main.rs`.
 
 mod agent_step;
+#[cfg(target_os = "macos")]
 mod driver_step;
 mod view;
 mod view_step;
@@ -15,7 +16,7 @@ mod view_step;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{AppContext as _, Context, Entity, EventEmitter, FocusHandle, Subscription, Window};
 use gpui_component::searchable_list::SearchableVec;
@@ -114,8 +115,12 @@ pub struct OnboardingWizard {
     /// re-renders don't reset an open dropdown (composer's signature guard).
     model_select_sig: Vec<(String, String, Option<String>)>,
     _model_select_sub: Option<Subscription>,
+    /// How long the wizard still reclaims keyboard focus on render. See
+    /// [`FOCUS_CLAIM_WINDOW`] for why the reclaim is bounded at all.
+    pub(self) focus_claim_until: Option<Instant>,
     /// Driver check made once at open (it spawns `codesign`); decides whether
     /// the Driver step exists at all and what its body says.
+    #[cfg(target_os = "macos")]
     pub(self) driver_status: crate::shell::settings_modal::DriverStatus,
     /// Frozen at open: whether this run includes the Driver step. Deliberately
     /// NOT recomputed from live state — a successful install mid-step must not
@@ -123,13 +128,37 @@ pub struct OnboardingWizard {
     pub(self) driver_step_planned: bool,
     /// Set when the install started from this wizard replaced an existing
     /// driver — gates the "old version until the daemon respawns" note.
+    #[cfg(target_os = "macos")]
     pub(self) driver_upgraded: bool,
     /// The install this wizard started, plus what its step renders — the same
     /// state machine the settings pane uses (`driver_install`).
+    #[cfg(target_os = "macos")]
     pub(self) driver_install: Option<crate::shell::driver_install::InstallHandle>,
+    #[cfg(target_os = "macos")]
     pub(self) driver_install_ui: crate::shell::driver_install::DriverInstallUi,
+    #[cfg(target_os = "macos")]
     pub(self) driver_poll_running: bool,
 }
+
+/// How long after opening the wizard keeps reclaiming keyboard focus.
+///
+/// The reclaim exists for a boot-time race: a deferred focus-active-tab landing
+/// after the wizard opens would leave Esc/Enter dead. It used to run on every
+/// render, which made it fight the user instead of the race — and it lost the
+/// model dropdown outright.
+///
+/// The reason is subtle enough to be worth writing down. `contains_focused`
+/// answers from the **last rendered** frame's dispatch tree. When the dropdown
+/// opens, `Select` focuses a list that lives inside a popup which did not exist
+/// in that frame, so the check says focus has left the wizard, the wizard takes
+/// it back, and `Select::on_blur` closes the popup. Any repaint triggers this,
+/// which is why merely hovering the menu made it vanish — and why no amount of
+/// signature-guarding the item list could have saved it.
+///
+/// Bounding the reclaim resolves it without weakening the guarantee it was added
+/// for: the race it defends against happens while the window is still coming up,
+/// and the dropdown cannot be open before the user has had a chance to click it.
+const FOCUS_CLAIM_WINDOW: Duration = Duration::from_secs(2);
 
 impl OnboardingWizard {
     pub fn new(
@@ -158,11 +187,17 @@ impl OnboardingWizard {
             model_select: None,
             model_select_sig: Vec::new(),
             _model_select_sub: None,
+            focus_claim_until: None,
+            #[cfg(target_os = "macos")]
             driver_status: crate::shell::settings_modal::DriverStatus::Unknown,
             driver_step_planned: false,
+            #[cfg(target_os = "macos")]
             driver_upgraded: false,
+            #[cfg(target_os = "macos")]
             driver_install: None,
+            #[cfg(target_os = "macos")]
             driver_install_ui: crate::shell::driver_install::DriverInstallUi::Idle,
+            #[cfg(target_os = "macos")]
             driver_poll_running: false,
         }
     }
@@ -177,11 +212,21 @@ impl OnboardingWizard {
         self.open = true;
         self.step = OnboardingStep::Agent;
         self.expanded = false;
+        self.focus_claim_until = Some(Instant::now() + FOCUS_CLAIM_WINDOW);
         // Once per open, not per transition: the step count (and dot row)
         // must be stable for the whole run of the wizard.
-        self.driver_status = crate::shell::settings_modal::DriverStatus::resolve();
-        self.driver_step_planned = self.driver_status.install_label().is_some();
-        self.driver_upgraded = false;
+        // No screen-control driver to install off macOS, so the wizard is one
+        // step shorter there rather than showing a step that cannot succeed.
+        #[cfg(target_os = "macos")]
+        {
+            self.driver_status = crate::shell::settings_modal::DriverStatus::resolve();
+            self.driver_step_planned = self.driver_status.install_label().is_some();
+            self.driver_upgraded = false;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.driver_step_planned = false;
+        }
         self.build_roster(cx);
         self.ensure_model_select(window, cx);
         self.sync_model_select(window, cx);
@@ -390,6 +435,15 @@ impl OnboardingWizard {
     /// after an install flips the live status to Ready mid-step).
     pub(super) fn driver_step_needed(&self) -> bool {
         self.driver_step_planned
+    }
+
+    /// Unreachable off macOS — `driver_step_planned` is never set there, so the
+    /// wizard never navigates to `OnboardingStep::Driver`. The body exists only
+    /// because the step enum and its match arm are platform-neutral; keeping
+    /// the variant costs one empty div and keeps step navigation in one shape.
+    #[cfg(not(target_os = "macos"))]
+    pub(super) fn render_driver_step(&mut self, _cx: &mut Context<Self>) -> gpui::Div {
+        gpui::div()
     }
 
     pub(super) fn next(&mut self, cx: &mut Context<Self>) {

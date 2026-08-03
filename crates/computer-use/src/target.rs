@@ -9,6 +9,33 @@
 //! Resolution costs a `codesign` spawn, so it happens on the ask path only,
 //! which is by definition a human-speed moment. The [`crate::blocked`] memo
 //! makes a repeat lookup of the same path free.
+//!
+//! # Windows identifies apps by path, and that is weaker
+//!
+//! There is no `CFBundleIdentifier` on Windows. cua's own permission model says
+//! the same thing and resolves it the same way: on Windows and Linux an app is
+//! identified by its **canonical absolute executable path**.
+//!
+//! So [`Category`] is keyed on the executable's *file name* there, and the
+//! honesty problem has to be stated rather than glossed. A file name is
+//! attacker-controlled:
+//!
+//! - Renaming a binary to `1Password.exe` gets it **refused**. Harmless — the
+//!   failure is in the safe direction.
+//! - Renaming `cmd.exe` to `helper.exe` gets it **allowed**, dodging the
+//!   `Terminal` refusal. That one is a real bypass.
+//!
+//! This does not make the module useless, but it does bound what it claims.
+//! [`crate::blocked`] already documents itself as "a floor, not a survey" and
+//! explicitly not a security boundary — an agent with a shell has other routes
+//! regardless. The floor still removes the most damaging *accident*, which is
+//! what it is for. What it must not do is read as a fence.
+//!
+//! The stronger key is the Authenticode subject, which an attacker cannot
+//! forge without a matching certificate. Wiring it in belongs with the trust
+//! gate (Phase 2 of `plans/260801-0157-windows-computer-use/`), because it
+//! needs the same signature reader; see [`Category::of_executable`] for the
+//! seam it will slot into.
 
 use std::path::{Path, PathBuf};
 
@@ -21,6 +48,11 @@ pub struct TargetApp {
     /// signed binaries this feature mostly drives — an agent's own fresh build
     /// has no stable identity, which is exactly why those are granted by build
     /// provenance rather than by a persisted allowlist.
+    ///
+    /// Always `None` on Windows, where no such identifier exists. It is kept in
+    /// the struct rather than `cfg`-ed away so the consent card and the
+    /// transcript keep one shape across platforms; the classification that
+    /// actually happens there is keyed on [`Self::executable`].
     pub bundle_id: Option<String>,
     /// What to call it on screen.
     pub name: String,
@@ -45,8 +77,17 @@ impl TargetApp {
     /// to be: a fresh build has no bundle id, so treating "no id" as anything
     /// else would either refuse the workflow this exists for or warn on every
     /// card until nobody reads them.
+    /// On Windows there is no bundle id to consult, so this keys on the
+    /// executable instead — see the module docs for what that costs.
     pub fn category(&self) -> Category {
-        self.bundle_id.as_deref().map_or(Category::Other, Category::of)
+        #[cfg(windows)]
+        {
+            Category::of_executable(&self.executable)
+        }
+        #[cfg(not(windows))]
+        {
+            self.bundle_id.as_deref().map_or(Category::Other, Category::of)
+        }
     }
 }
 
@@ -112,6 +153,33 @@ impl Category {
             .map_or(Self::Other, |(_, category)| *category)
     }
 
+    /// The category the program at `path` falls into, keyed on its file name.
+    ///
+    /// The Windows counterpart to [`Self::of`]. Matched on the file name rather
+    /// than the full path because install locations vary wildly — per-user vs.
+    /// machine-wide, Store vs. MSI vs. portable — while the executable name is
+    /// stable across all of them.
+    ///
+    /// # The seam for a stronger key
+    ///
+    /// When the trust gate lands, this should consult the Authenticode subject
+    /// *first* and fall back to the file name only when the binary is unsigned:
+    /// a subject cannot be forged by renaming a file, and every app in the
+    /// tables below is signed by a publisher who is not the user. The fallback
+    /// has to stay, because the freshly built binaries this feature exists to
+    /// drive are unsigned by definition — refusing to classify them would
+    /// refuse the workflow.
+    #[cfg(windows)]
+    pub fn of_executable(path: &Path) -> Self {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Self::Other;
+        };
+        WINDOWS_CATEGORIES
+            .iter()
+            .find(|(exe, _)| exe.eq_ignore_ascii_case(name))
+            .map_or(Self::Other, |(_, category)| *category)
+    }
+
     /// Whether an agent may never address this category at all, whatever the
     /// user approves.
     ///
@@ -134,6 +202,14 @@ impl Category {
             Self::FileManager => {
                 Some("A file manager can move and delete anything you can.")
             }
+            // The machine noun differs per platform; the rest of the sentence
+            // does not. Split here rather than at the call site so there is one
+            // place where this copy is written.
+            #[cfg(windows)]
+            Self::SystemSettings => Some(
+                "Settings can change this PC's security settings, including the ones screen control depends on.",
+            ),
+            #[cfg(not(windows))]
             Self::SystemSettings => Some(
                 "System Settings can change this Mac's security settings, including the permissions screen control depends on.",
             ),
@@ -185,6 +261,73 @@ const CATEGORIES: &[(&str, Category)] = {
     ]
 };
 
+/// Executable names that are not ordinary apps, by category.
+///
+/// The Windows counterpart to [`CATEGORIES`], and the same kind of floor: it
+/// cannot name every terminal, and an unlisted one falls through to `Other`.
+///
+/// Two entries deserve their reasoning written down, because both look like
+/// over-reach and neither is:
+///
+/// - **`conhost.exe`** hosts the console window for a classic console app.
+///   Driving it is driving whatever shell it is hosting.
+/// - **`explorer.exe`** is both the file manager *and* the shell process that
+///   owns the desktop, taskbar, and Start menu. `FileManager` is the weaker of
+///   the two readings, so it warns rather than refuses — but a click there can
+///   reach considerably more than a folder.
+///
+/// `powershell_ise.exe` is listed as an editor rather than a terminal only
+/// because the refusal reason reads better; both categories refuse outright.
+#[cfg(windows)]
+const WINDOWS_CATEGORIES: &[(&str, Category)] = {
+    use Category::*;
+    &[
+        ("WindowsTerminal.exe", Terminal),
+        ("OpenConsole.exe", Terminal),
+        ("conhost.exe", Terminal),
+        ("cmd.exe", Terminal),
+        ("powershell.exe", Terminal),
+        ("pwsh.exe", Terminal),
+        ("wt.exe", Terminal),
+        ("bash.exe", Terminal),
+        ("wsl.exe", Terminal),
+        ("ubuntu.exe", Terminal),
+        ("mintty.exe", Terminal),
+        ("putty.exe", Terminal),
+        ("alacritty.exe", Terminal),
+        ("wezterm-gui.exe", Terminal),
+        ("Hyper.exe", Terminal),
+        ("Code.exe", Editor),
+        ("Code - Insiders.exe", Editor),
+        ("VSCodium.exe", Editor),
+        ("Cursor.exe", Editor),
+        ("Zed.exe", Editor),
+        ("devenv.exe", Editor),
+        ("idea64.exe", Editor),
+        ("rider64.exe", Editor),
+        ("clion64.exe", Editor),
+        ("pycharm64.exe", Editor),
+        ("webstorm64.exe", Editor),
+        ("rustrover64.exe", Editor),
+        ("sublime_text.exe", Editor),
+        ("notepad++.exe", Editor),
+        ("powershell_ise.exe", Editor),
+        ("msedge.exe", Browser),
+        ("chrome.exe", Browser),
+        ("firefox.exe", Browser),
+        ("brave.exe", Browser),
+        ("opera.exe", Browser),
+        ("vivaldi.exe", Browser),
+        ("arc.exe", Browser),
+        ("iexplore.exe", Browser),
+        ("explorer.exe", FileManager),
+        ("SystemSettings.exe", SystemSettings),
+        ("control.exe", SystemSettings),
+        ("mmc.exe", SystemSettings),
+        ("secpol.msc", SystemSettings),
+    ]
+};
+
 /// A human name for an executable path.
 ///
 /// Prefers the enclosing `.app` bundle's name, because that is what the user
@@ -192,7 +335,12 @@ const CATEGORIES: &[(&str, Category)] = {
 /// "Safari", and so is a bundle whose inner binary was renamed. Falls back to
 /// the file name for a bare executable, which is the normal shape of the fresh
 /// builds this feature exists to drive.
-fn display_name(executable: &Path) -> String {
+/// On Windows there is no bundle to look up to, so the file name is all there
+/// is — minus the `.exe`, which Explorer hides and which reads as noise on a
+/// consent card ("Let the agent control chrome.exe"). The extension is dropped
+/// only for display; every comparison elsewhere keeps it.
+pub(crate) fn display_name(executable: &Path) -> String {
+    #[cfg(not(windows))]
     if let Some(app) = executable.components().rev().find_map(|component| {
         let name = component.as_os_str().to_str()?;
         name.strip_suffix(".app")
@@ -200,17 +348,28 @@ fn display_name(executable: &Path) -> String {
     {
         return app.to_string();
     }
-    executable
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("an unknown program")
-        .to_string()
+
+    let Some(name) = executable.file_name().and_then(|name| name.to_str()) else {
+        return "an unknown program".to_string();
+    };
+
+    #[cfg(windows)]
+    if let Some(stem) = name.strip_suffix(".exe").or_else(|| name.strip_suffix(".EXE"))
+        && !stem.is_empty()
+    {
+        return stem.to_string();
+    }
+
+    name.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // `.app` bundles are a macOS shape; the Windows naming rule is covered by
+    // `windows_identity::a_display_name_drops_the_extension_but_a_comparison_does_not`.
+    #[cfg(not(windows))]
     #[test]
     fn a_bundled_app_is_named_by_its_bundle() {
         // What the user sees in the Dock, not the inner binary's file name.
@@ -224,6 +383,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn a_nested_bundle_is_named_by_the_innermost_one() {
         // Helpers live inside their host's bundle; the inner one is the process
@@ -331,6 +491,95 @@ mod tests {
         Category::SystemSettings,
         Category::Other,
     ];
+
+    #[cfg(windows)]
+    mod windows_identity {
+        use super::*;
+
+        #[test]
+        fn each_named_category_is_recognised_by_executable() {
+            for (exe, expected) in [
+                (r"C:\Program Files\WindowsApps\WindowsTerminal.exe", Category::Terminal),
+                (r"C:\Windows\System32\cmd.exe", Category::Terminal),
+                (r"C:\Users\u\AppData\Local\Programs\Microsoft VS Code\Code.exe", Category::Editor),
+                (r"C:\Program Files\Google\Chrome\Application\chrome.exe", Category::Browser),
+                (r"C:\Windows\explorer.exe", Category::FileManager),
+                (r"C:\Windows\ImmersiveControlPanel\SystemSettings.exe", Category::SystemSettings),
+            ] {
+                assert_eq!(Category::of_executable(Path::new(exe)), expected, "{exe}");
+            }
+        }
+
+        #[test]
+        fn the_install_location_does_not_change_the_verdict() {
+            // Windows apps land wherever the installer chose — per-user,
+            // machine-wide, Store, or portable off a USB stick. Keying on the
+            // directory would refuse a terminal in one location and allow the
+            // same binary in another.
+            for path in [
+                r"C:\Program Files\PowerShell\7\pwsh.exe",
+                r"C:\Users\u\Downloads\portable\pwsh.exe",
+                r"D:\tools\pwsh.exe",
+            ] {
+                assert_eq!(Category::of_executable(Path::new(path)), Category::Terminal, "{path}");
+            }
+        }
+
+        #[test]
+        fn executable_matching_ignores_case() {
+            // Windows paths are case-insensitive, so `CMD.EXE` and `cmd.exe`
+            // are the same file. Matching case-sensitively would let a
+            // differently-cased spelling walk past the refusal.
+            assert_eq!(Category::of_executable(Path::new(r"C:\W\CMD.EXE")), Category::Terminal);
+            assert_eq!(Category::of_executable(Path::new(r"C:\W\code.EXE")), Category::Editor);
+        }
+
+        #[test]
+        fn an_unrecognised_executable_is_other() {
+            // Must stay the default: an agent's own fresh build is exactly this
+            // case, and it is what the feature exists to drive.
+            for path in [r"C:\repo\target\debug\my-app.exe", r"C:\x\notepad.exe", ""] {
+                assert_eq!(Category::of_executable(Path::new(path)), Category::Other, "{path}");
+            }
+        }
+
+        #[test]
+        fn a_near_miss_name_lands_in_other() {
+            // Equality on the whole file name, not a prefix or a substring. A
+            // helper shipped beside an editor is not the editor.
+            for path in [r"C:\x\Code Helper.exe", r"C:\x\cmd-wrapper.exe", r"C:\x\chrome_proxy.exe"] {
+                assert_eq!(Category::of_executable(Path::new(path)), Category::Other, "{path}");
+            }
+        }
+
+        #[test]
+        fn a_display_name_drops_the_extension_but_a_comparison_does_not() {
+            // The card says "chrome"; the table still matches "chrome.exe".
+            let path = Path::new(r"C:\Program Files\Google\Chrome\Application\chrome.exe");
+            assert_eq!(display_name(path), "chrome");
+            assert_eq!(Category::of_executable(path), Category::Browser);
+
+            // A name that is nothing but the extension keeps it, rather than
+            // rendering as an empty consent card.
+            assert_eq!(display_name(Path::new(r"C:\x\.exe")), ".exe");
+        }
+
+        #[test]
+        fn a_renamed_terminal_escapes_the_refusal() {
+            // Not an aspiration — a statement of the known limit, pinned so it
+            // cannot be quietly assumed away. Path identity is what Windows
+            // offers and it is forgeable by anyone who can rename a file.
+            //
+            // If this test ever fails, the classifier gained a stronger key
+            // (an Authenticode subject) and the module docs saying "a floor,
+            // not a fence" should be revisited to match.
+            assert_eq!(
+                Category::of_executable(Path::new(r"C:\x\totally-not-a-shell.exe")),
+                Category::Other,
+                "renaming cmd.exe defeats a file-name classifier"
+            );
+        }
+    }
 
     #[test]
     fn a_dead_pid_describes_as_nothing() {

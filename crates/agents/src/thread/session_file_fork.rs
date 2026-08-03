@@ -38,8 +38,10 @@ impl ForkError {
 
 /// Default projects root: `~/.claude/projects`.
 pub fn default_projects_root() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".claude").join("projects"))
+    // `dirs`, not `$HOME`: Windows sets `USERPROFILE` and leaves `HOME` unset
+    // outside git-bash, so reading the variable returned `None` there and the
+    // whole projects tree silently went missing.
+    Some(dirs::home_dir()?.join(".claude").join("projects"))
 }
 
 /// Locate `<root>/*/<sid>.jsonl`. Globbing by sid avoids the lossy

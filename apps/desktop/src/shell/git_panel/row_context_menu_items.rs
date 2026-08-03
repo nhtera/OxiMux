@@ -107,7 +107,7 @@ pub(super) fn build_single_card(
         density,
         typography.clone(),
         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-            spawn_reveal(&reveal_path);
+            cx.reveal_path(&reveal_path);
             this.close(cx);
         }),
     ));
@@ -370,22 +370,6 @@ pub(super) fn relative_path_string(path: &Path, workdir: Option<&PathBuf>) -> Op
     rel.filter(|s| !s.is_empty())
 }
 
-/// Spawn `open -R <path>` and drop the child handle. Failures land in
-/// tracing because Finder errors aren't actionable for the user.
-fn spawn_reveal(path: &Path) {
-    if let Err(err) = std::process::Command::new("open")
-        .arg("-R")
-        .arg(path)
-        .spawn()
-    {
-        tracing::warn!(
-            ?err,
-            path = %path.display(),
-            "reveal in finder failed"
-        );
-    }
-}
-
 pub(super) fn separator(theme: Theme) -> impl IntoElement {
     div().h(px(1.0)).my(px(4.0)).bg(theme.border_inactive)
 }
@@ -435,20 +419,46 @@ where
 mod tests {
     use super::*;
 
+    /// An absolute path spelled for the running platform.
+    ///
+    /// `/repo` is not absolute on Windows — `Path::is_absolute` wants a prefix —
+    /// so `relative_path_string` took its relative branch and passed the whole
+    /// thing through, which is the *correct* behaviour for a relative path (see
+    /// `relative_path_passes_panel_paths_through_whole`). Only the fixture was
+    /// Unix-only. Nothing here touches the filesystem, so a synthetic drive is
+    /// fine and `C:` need not exist.
+    fn abs(rest: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:\{}", rest.replace('/', r"\")))
+        } else {
+            PathBuf::from(format!("/{rest}"))
+        }
+    }
+
+    /// A repo-relative path in the separator the platform's `strip_prefix` +
+    /// `to_string_lossy` will actually produce.
+    fn rel(parts: &[&str]) -> String {
+        parts
+            .iter()
+            .fold(PathBuf::new(), |acc, part| acc.join(part))
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
     fn relative_path_strips_workdir_prefix() {
-        let workdir = PathBuf::from("/repo");
-        let path = PathBuf::from("/repo/src/lib.rs");
+        let workdir = abs("repo");
+        let path = abs("repo/src/lib.rs");
         assert_eq!(
-            relative_path_string(&path, Some(&workdir)).as_deref(),
-            Some("src/lib.rs")
+            relative_path_string(&path, Some(&workdir)),
+            Some(rel(&["src", "lib.rs"]))
         );
     }
 
     #[test]
     fn relative_path_falls_back_to_basename_when_outside_workdir() {
-        let workdir = PathBuf::from("/repo");
-        let path = PathBuf::from("/elsewhere/notes.md");
+        let workdir = abs("repo");
+        let path = abs("elsewhere/notes.md");
         assert_eq!(
             relative_path_string(&path, Some(&workdir)).as_deref(),
             Some("notes.md")
@@ -457,7 +467,7 @@ mod tests {
 
     #[test]
     fn relative_path_falls_back_to_basename_with_no_workdir() {
-        let path = PathBuf::from("/abs/src/lib.rs");
+        let path = abs("abs/src/lib.rs");
         assert_eq!(
             relative_path_string(&path, None).as_deref(),
             Some("lib.rs")

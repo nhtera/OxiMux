@@ -35,14 +35,8 @@ use gpui::{
 };
 use oximux_agents::{AdapterRegistry, AgentRuntime, AgentSessionConfig, CliRuntime};
 use oximux_core::{AgentAdapter, Project};
-use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
 
-/// macOS Application Support sub-directory anchor. Must mirror the same
-/// constant in `apps/desktop/src/main.rs` — kept duplicated rather than
-/// re-exported because `main.rs` is a binary and `workspace_root.rs` is
-/// the library, and the two share no module today.
-pub(crate) const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
 
 /// Cadence of the rail's per-worktree diff-count refresh. Deliberately slower
 /// than the SCM status poll: each round shells out `git diff --numstat` per
@@ -545,7 +539,6 @@ impl WorkspaceRoot {
     }
 
     pub fn new(
-        repo: Option<Repository>,
         app_state: AppState,
         window_id: String,
         window: &mut Window,
@@ -620,42 +613,15 @@ impl WorkspaceRoot {
         // Built before the right-sidebar so the Files-tab `OnOpenFile` callback
         // can capture it and route clicks back to `open_file_in_active_pane`.
         let weak_self: WeakEntity<WorkspaceRoot> = cx.weak_entity();
-        let right_sidebar = repo.clone().map(|r| {
-            let root_path = r.workdir().to_path_buf();
-            let on_open = Self::build_on_open_file_callback(weak_self.clone());
-            let on_open_diff = Self::build_on_open_diff_callback(weak_self.clone(), r.clone());
-            let on_query = Self::build_on_query_active_path_callback(weak_self.clone());
-            let worktree_settings_repo = Some(app_state.worktree_settings_repo.clone());
-            // Phase 13: load persisted panel width clamped against the
-            // live window so a too-large value from a wider monitor
-            // can't overflow a smaller one on next boot.
-            let window_width = f32::from(window.bounds().size.width);
-            let initial_width = px(crate::scm_layout_settings::load_panel_width(
-                &app_state.settings_repo,
-                window_width,
-            ));
-            let layout_boot = crate::shell::right_sidebar::SidebarLayoutBoot {
-                initial_width: Some(initial_width),
-                settings_repo: Some(app_state.settings_repo.clone()),
-            };
-            cx.new(|cx| {
-                RightSidebar::new(
-                    Some(r),
-                    root_path,
-                    false, // default-collapsed on app boot
-                    Some(on_open),
-                    Some(on_open_diff),
-                    Some(on_query),
-                    worktree_settings_repo,
-                    layout_boot,
-                    theme,
-                    density,
-                    typography.clone(),
-                    window,
-                    cx,
-                )
-            })
-        });
+        // No sidebar at construction. Every sidebar is built by
+        // `set_active_project`'s async arm (which opens the project's repo off
+        // the UI thread) — the same path project switches and tear-off windows
+        // already take. Boot deliberately passes no repo: opening one means
+        // spawning `git`, and on the packaged Windows build the process's
+        // FIRST child spawn can block for seconds inside CreateProcess's
+        // console-host setup — a cost that must never sit on the first-paint
+        // path (see main.rs, "boot: repo open is post-paint").
+        let right_sidebar: Option<Entity<RightSidebar>> = None;
         let left_rail = cx.new(|cx| LeftRail::new(weak_self.clone(), cx));
         // Load persisted rail layout (width + collapsed groups) so it
         // survives restart.

@@ -147,11 +147,38 @@ async fn textarea_clears_after_successful_commit(cx: &mut TestAppContext) {
         })
         .expect("submit");
 
-    // Drain tokio + gpui. The tokio op runs on a separate thread
-    // (the rt entered above); after it sends through the oneshot,
-    // gpui picks up on the next foreground tick. Sleep gives the
-    // tokio side room to land before park drains gpui. Same pattern
-    // as `git_panel_discard_flow::confirmed_discard_restores_file`.
+    // The tokio op runs on a separate thread (the rt entered above); after it
+    // sends through the oneshot, gpui picks up on the next foreground tick.
+    // Two-phase wait, because the pipeline has a variable-latency half and a
+    // fixed-cost half:
+    //
+    // 1. Poll the REPO for the commit. The git child's spawn latency varies by
+    //    machine (a cold Windows spawn behind an AV scan costs anywhere from
+    //    tens of ms to seconds), so any single pre-sized nap here is a flake.
+    //    The poll deliberately watches git rather than the textarea — laps of
+    //    `run_until_parked` while the tokio worker is still mid-commit trip
+    //    the test scheduler's determinism check ("activity on thread
+    //    tokio-rt-worker"), the same trap the failure-path note at the bottom
+    //    of this file describes.
+    // 2. One short sleep + park for what remains: the oneshot send and the
+    //    foreground tick, whose cost does not vary by machine.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["log", "-1", "--format=%s"])
+            .output()
+            .expect("git log");
+        if String::from_utf8_lossy(&head.stdout).trim() == "test commit subject" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "commit never landed in the repo within 10s",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     std::thread::sleep(std::time::Duration::from_millis(150));
     cx.run_until_parked();
 

@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use oximux_no_window::NoWindow as _;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -108,6 +109,7 @@ pub async fn run_plan(
         // locale so the model receives deterministic byte sequences.
         .env("LANG", "C")
         .env("LC_ALL", "C")
+        .no_window()
         .kill_on_drop(true);
 
     let mut child = match cmd.spawn() {
@@ -231,6 +233,47 @@ mod tests {
         }
     }
 
+    /// A plan that runs `command` through the platform's shell.
+    ///
+    /// `run_plan` spawns `binary` with `args` directly — no shell in between —
+    /// so the old fixtures named real programs: `/bin/echo`, `/bin/cat`,
+    /// `/usr/bin/false`, `/bin/sleep`. None of those exist on Windows, and the
+    /// paths are not even absolute there, so every one failed with
+    /// `BinaryNotFound` or a `CreateProcessW` error.
+    ///
+    /// Routing through `test_shell()` + `run_script()` puts the platform
+    /// difference in one place, in the crate the repo already keeps it in, and
+    /// leaves each test naming the *behaviour* it needs. None of these tests is
+    /// about binary resolution — `run_plan_returns_binary_not_found_for_missing_command`
+    /// is, and it deliberately still spawns a bare name directly.
+    fn shell_plan(command: &str, stdin: Option<&str>) -> CommitMessagePlan {
+        use oximux_shell_env::test_support::{run_script, test_shell};
+        CommitMessagePlan {
+            binary: test_shell(),
+            args: run_script(&[command]),
+            stdin_payload: stdin.map(str::to_string),
+            label: command.to_string(),
+        }
+    }
+
+    /// Copy stdin to stdout. `cat` has no builtin counterpart in `cmd`; `more`
+    /// is the one that pipes cleanly (`type` needs a file, and `findstr` would
+    /// impose a pattern).
+    fn copy_stdin_command() -> &'static str {
+        if cfg!(windows) { "more" } else { "cat" }
+    }
+
+    /// Occupy several seconds producing nothing. `cmd` has no `sleep`, and its
+    /// `timeout` refuses to run when stdin is redirected ("ERROR: Input
+    /// redirection is not supported") — which is exactly how `run_plan` spawns.
+    fn slow_command() -> &'static str {
+        if cfg!(windows) {
+            "ping -n 6 127.0.0.1 >nul"
+        } else {
+            "sleep 5"
+        }
+    }
+
     #[tokio::test]
     async fn run_plan_returns_binary_not_found_for_missing_command() {
         let plan = plan_for("oximux-non-existent-binary-xyz", vec![], None);
@@ -243,8 +286,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_plan_returns_empty_when_echo_returns_blank() {
-        // /bin/echo of an empty arg → "" on stdout → cleaned → empty.
-        let plan = plan_for("/bin/echo", vec!["-n"], None);
+        // No output at all → cleaned → empty. (`echo -n` was the unix
+        // spelling; `cmd`'s echo has no -n, so this asks for silence directly.)
+        let plan = shell_plan("exit 0", None);
         let result = run_plan(plan, &tmp_cwd(), Arc::new(AtomicBool::new(false)), GENERATION_TIMEOUT).await;
         match result {
             Err(GenerationError::EmptyOutput { .. }) => {}
@@ -254,7 +298,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_plan_returns_message_when_echo_returns_text() {
-        let plan = plan_for("/bin/echo", vec!["feat: hello"], None);
+        let plan = shell_plan("echo feat: hello", None);
         let message = run_plan(plan, &tmp_cwd(), Arc::new(AtomicBool::new(false)), GENERATION_TIMEOUT)
             .await
             .expect("echo should succeed");
@@ -263,8 +307,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_plan_pipes_stdin_payload() {
-        // cat reads stdin and writes to stdout — round-trip the payload.
-        let plan = plan_for("/bin/cat", vec![], Some("feat: from stdin"));
+        // Reads stdin and writes it to stdout — round-trip the payload.
+        let plan = shell_plan(copy_stdin_command(), Some("feat: from stdin"));
         let message = run_plan(plan, &tmp_cwd(), Arc::new(AtomicBool::new(false)), GENERATION_TIMEOUT)
             .await
             .expect("cat should succeed");
@@ -273,9 +317,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_plan_surfaces_non_zero_exit_as_agent_failed() {
-        // `false` exits 1 with no stdout/stderr → AgentFailed with
-        // generic detail (no ERROR: line to extract).
-        let plan = plan_for("/usr/bin/false", vec![], None);
+        // Exits 1 with no stdout/stderr → AgentFailed with generic detail
+        // (no ERROR: line to extract).
+        let plan = shell_plan("exit 1", None);
         let result = run_plan(plan, &tmp_cwd(), Arc::new(AtomicBool::new(false)), GENERATION_TIMEOUT).await;
         match result {
             Err(GenerationError::AgentFailed { .. }) => {}
@@ -286,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn run_plan_honours_cancel_flag_set_before_start() {
         let cancel = Arc::new(AtomicBool::new(true));
-        let plan = plan_for("/bin/echo", vec!["hello"], None);
+        let plan = shell_plan("echo hello", None);
         let result = run_plan(plan, &tmp_cwd(), cancel, GENERATION_TIMEOUT).await;
         match result {
             Err(GenerationError::Canceled { .. }) => {}
@@ -296,11 +340,11 @@ mod tests {
 
     #[tokio::test]
     async fn run_plan_honours_cancel_flag_set_mid_flight() {
-        // `sleep 5` would normally run 5s; flip cancel after 100ms
-        // and verify we get Canceled instead of waiting it out.
+        // The fixture would normally run ~5s; flip cancel after 100ms and
+        // verify we get Canceled instead of waiting it out.
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_setter = cancel.clone();
-        let plan = plan_for("/bin/sleep", vec!["5"], None);
+        let plan = shell_plan(slow_command(), None);
         let cwd = tmp_cwd();
 
         let setter = tokio::spawn(async move {

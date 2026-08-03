@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 oximux-core = { workspace = true }
+oximux-shell-env = { workspace = true }
 anyhow = { workspace = true }
 portable-pty = { workspace = true }
 alacritty_terminal = { workspace = true }
@@ -19,3 +20,6 @@ alacritty_terminal = { workspace = true }
 # instead of pulling a second major. Only `sys::signal::kill` + `Pid` are
 # used; both have been stable in nix for many releases.
 nix = { version = "0.25", features = ["signal"] }
+
+[dev-dependencies]
+oximux-shell-env = { workspace = true, features = ["test-support"] }

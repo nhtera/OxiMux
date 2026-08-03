@@ -1,16 +1,48 @@
-// End-to-end: boot the relay in-process, drive it from a raw
-// UnixStream client, and verify the survival/replay contract that is
-// the entire reason this daemon exists.
+// End-to-end: boot the relay in-process, drive it from a raw local-socket
+// client, and verify the survival/replay contract that is the entire reason
+// this daemon exists.
+//
+// The client here dials through the same endpoint mapping the real one uses, so
+// this suite exercises whichever transport the running platform actually has —
+// a unix socket on unix, a named pipe on Windows — rather than only the former.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use interprocess::local_socket::tokio::Stream;
+use interprocess::local_socket::tokio::prelude::*;
+use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ToFsName, ToNsName};
+use oximux_shell_env::test_support::{echo_program, echo_two_vars, lines, test_cwd, test_shell};
 use oximux_relay::codec::{read_frame, write_frame};
-use oximux_relay::server::{ServerConfig, run_server};
-use oximux_relay_proto::{Frame, Hello, Notification, PROTOCOL_VERSION, Request, Response};
+use oximux_relay::{ServerConfig, run_server};
+use oximux_relay_proto::{
+    Endpoint, Frame, Hello, HelloProof, NONCE_LEN, Notification, PROTOCOL_VERSION, Request,
+    Response, client_proof, endpoint_for, proofs_match, server_proof,
+};
 use tempfile::TempDir;
-use tokio::net::UnixStream;
 use tokio::time::timeout;
+
+/// Dial the relay by the same path-to-endpoint rule both real ends use.
+async fn dial(socket: &Path) -> std::io::Result<Stream> {
+    let name = match endpoint_for(socket) {
+        Endpoint::FsPath(path) => path.to_fs_name::<GenericFilePath>()?,
+        Endpoint::Namespaced(name) => name.to_ns_name::<GenericNamespaced>()?,
+    };
+    Stream::connect(name).await
+}
+
+
+
+
+
+
+
+/// `Request::Spawn` carries cwd as a `String`; the shared helper yields the
+/// `PathBuf` the client-side API wants. Adapt here rather than teach the shared
+/// rule about two spellings.
+fn cwd() -> String {
+    test_cwd().to_string_lossy().into_owned()
+}
 
 struct TestRelay {
     socket: PathBuf,
@@ -20,19 +52,24 @@ struct TestRelay {
 }
 
 async fn boot_relay() -> TestRelay {
+    boot_relay_with(|_cfg| {}).await
+}
+
+async fn boot_relay_with(tweak: impl FnOnce(&mut ServerConfig)) -> TestRelay {
     let dir = TempDir::new().expect("tempdir");
     let socket = dir.path().join("relay-v1.sock");
     let token_file = dir.path().join("relay-v1.token");
     let token = "deadbeef-test-token".to_string();
     std::fs::write(&token_file, &token).expect("write token");
 
-    let cfg = ServerConfig::idle_disabled(socket.clone(), token_file);
+    let mut cfg = ServerConfig::idle_disabled(socket.clone(), token_file);
+    tweak(&mut cfg);
     let server_task = tokio::spawn(async move {
         let _ = run_server(cfg).await;
     });
-    // Spin until the socket file appears + accepts a connection.
+    // Spin until the endpoint exists and accepts a connection.
     for _ in 0..100 {
-        if UnixStream::connect(&socket).await.is_ok() {
+        if dial(&socket).await.is_ok() {
             return TestRelay {
                 socket,
                 token,
@@ -45,18 +82,46 @@ async fn boot_relay() -> TestRelay {
     panic!("relay socket never came up");
 }
 
-async fn connect_and_hello(relay: &TestRelay) -> (UnixStream, Vec<u8>) {
-    let mut stream = UnixStream::connect(&relay.socket).await.expect("connect");
+async fn connect_and_hello(relay: &TestRelay) -> (Stream, Vec<u8>) {
+    let mut stream = dial(&relay.socket).await.expect("connect");
+    let mut buf = Vec::new();
+    let client_nonce = [7u8; NONCE_LEN];
     let hello = Frame::Request {
         request_id: 1,
         request: Request::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
-            token: relay.token.clone(),
             client_id: "test-client".into(),
+            client_nonce,
         }),
     };
     write_frame(&mut stream, &hello).await.expect("hello write");
-    let mut buf = Vec::new();
+
+    let challenge = read_frame(&mut stream, &mut buf).await.expect("challenge");
+    let Frame::Response {
+        response: Response::HelloChallenge(c),
+        ..
+    } = challenge
+    else {
+        panic!("expected HelloChallenge, got {challenge:?}");
+    };
+    // The daemon has to prove itself before we say anything else — a test that
+    // skipped this would still pass against a server that never proved it.
+    assert!(
+        proofs_match(
+            &c.server_proof,
+            &server_proof(&relay.token, &c.server_nonce, &client_nonce)
+        ),
+        "daemon's proof did not verify"
+    );
+
+    let proof = Frame::Request {
+        request_id: 2,
+        request: Request::HelloProof(HelloProof {
+            client_proof: client_proof(&relay.token, &c.server_nonce, &client_nonce),
+        }),
+    };
+    write_frame(&mut stream, &proof).await.expect("proof write");
+
     let ack = read_frame(&mut stream, &mut buf).await.expect("hello ack");
     let Frame::Response {
         response: Response::HelloAck(_),
@@ -69,7 +134,7 @@ async fn connect_and_hello(relay: &TestRelay) -> (UnixStream, Vec<u8>) {
 }
 
 async fn req(
-    stream: &mut UnixStream,
+    stream: &mut Stream,
     buf: &mut Vec<u8>,
     request_id: u64,
     request: Request,
@@ -94,7 +159,7 @@ async fn req(
 }
 
 async fn collect_output(
-    stream: &mut UnixStream,
+    stream: &mut Stream,
     buf: &mut Vec<u8>,
     pty_id: &str,
     overall: Duration,
@@ -123,6 +188,80 @@ async fn collect_output(
 }
 
 #[tokio::test]
+async fn the_last_client_leaving_flushes_a_checkpoint() {
+    // Losing the last client is the daemon's stand-in for the user logging out,
+    // because the signals that would say so directly cannot be relied on for a
+    // detached, console-less process on Windows.
+    let checkpoints = TempDir::new().expect("tempdir");
+    let base = checkpoints.path().to_path_buf();
+    let tick_base = base.clone();
+    let relay = boot_relay_with(move |cfg| {
+        cfg.checkpoint_dir = Some(tick_base);
+        // Far beyond the life of this test. If a checkpoint shows up, the
+        // periodic tick is not what put it there — which is the whole claim.
+        cfg.checkpoint_tick_interval = Some(Duration::from_secs(3600));
+    })
+    .await;
+
+    let (mut stream, mut buf) = connect_and_hello(&relay).await;
+    let resp = req(
+        &mut stream,
+        &mut buf,
+        3,
+        Request::Spawn {
+            cwd: cwd(),
+            cols: 80,
+            rows: 24,
+            shell: Some(test_shell()),
+            args: Vec::new(),
+            env: vec![],
+        },
+    )
+    .await;
+    let pty_id = match resp {
+        Response::SpawnOk { pty_id, .. } => pty_id,
+        other => panic!("spawn failed: {other:?}"),
+    };
+    // Give the ring something worth persisting. No `exit` — the PTY has to
+    // outlive the client, which is the case a checkpoint is for.
+    let _ = req(
+        &mut stream,
+        &mut buf,
+        4,
+        Request::Write {
+            pty_id: pty_id.clone(),
+            bytes: lines(&["echo checkpoint-me"]),
+        },
+    )
+    .await;
+
+    // `meta.json` is seeded at spawn, so it proves nothing here. The ring
+    // snapshot is what a checkpoint pass writes, and with the tick pushed out
+    // of reach its appearance can only be the disconnect flush.
+    let scrollback = base.join(&pty_id).join("scrollback.bin");
+    assert!(
+        !scrollback.exists(),
+        "no ring snapshot should exist before the client leaves"
+    );
+
+    drop(stream); // the last client disconnects
+
+    let mut found = false;
+    for _ in 0..250 {
+        if scrollback.exists() {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        found,
+        "last disconnect must checkpoint; nothing at {}",
+        scrollback.display()
+    );
+}
+
+#[tokio::test]
 async fn hello_handshake_then_echo_command() {
     let relay = boot_relay().await;
     let (mut stream, mut buf) = connect_and_hello(&relay).await;
@@ -131,10 +270,10 @@ async fn hello_handshake_then_echo_command() {
         &mut buf,
         2,
         Request::Spawn {
-            cwd: "/tmp".into(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
-            shell: Some("/bin/sh".into()),
+            shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
         },
@@ -152,7 +291,7 @@ async fn hello_handshake_then_echo_command() {
         3,
         Request::Write {
             pty_id: pty_id.clone(),
-            bytes: b"echo hi\nexit\n".to_vec(),
+            bytes: lines(&["echo hi", "exit"]),
         },
     )
     .await;
@@ -178,10 +317,10 @@ async fn attach_replays_buffered_output_then_streams_live() {
         &mut a_buf,
         2,
         Request::Spawn {
-            cwd: "/tmp".into(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
-            shell: Some("/bin/sh".into()),
+            shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
         },
@@ -197,7 +336,7 @@ async fn attach_replays_buffered_output_then_streams_live() {
         3,
         Request::Write {
             pty_id: pty_id.clone(),
-            bytes: b"echo ALPHA_MARKER_A\n".to_vec(),
+            bytes: lines(&["echo ALPHA_MARKER_A"]),
         },
     )
     .await;
@@ -251,7 +390,7 @@ async fn attach_replays_buffered_output_then_streams_live() {
         3,
         Request::Write {
             pty_id: pty_id.clone(),
-            bytes: b"echo BETA_MARKER_B\nexit\n".to_vec(),
+            bytes: lines(&["echo BETA_MARKER_B", "exit"]),
         },
     )
     .await;
@@ -277,10 +416,10 @@ async fn notify_fans_out_attention_to_subscribers() {
         &mut a_buf,
         2,
         Request::Spawn {
-            cwd: "/tmp".into(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
-            shell: Some("/bin/sh".into()),
+            shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
         },
@@ -349,10 +488,10 @@ async fn agent_status_fans_out_osc_output_to_subscribers() {
         &mut a_buf,
         2,
         Request::Spawn {
-            cwd: "/tmp".into(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
-            shell: Some("/bin/sh".into()),
+            shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
         },
@@ -408,17 +547,38 @@ async fn agent_status_fans_out_osc_output_to_subscribers() {
 #[tokio::test]
 async fn bad_token_rejected_with_auth_failed() {
     let relay = boot_relay().await;
-    let mut stream = UnixStream::connect(&relay.socket).await.unwrap();
+    let mut stream = dial(&relay.socket).await.unwrap();
+    let mut buf = Vec::new();
+    let client_nonce = [3u8; NONCE_LEN];
     let hello = Frame::Request {
         request_id: 1,
         request: Request::Hello(Hello {
             protocol_version: PROTOCOL_VERSION,
-            token: "wrong".into(),
             client_id: "x".into(),
+            client_nonce,
         }),
     };
     write_frame(&mut stream, &hello).await.unwrap();
-    let mut buf = Vec::new();
+
+    let challenge = read_frame(&mut stream, &mut buf).await.unwrap();
+    let Frame::Response {
+        response: Response::HelloChallenge(c),
+        ..
+    } = challenge
+    else {
+        panic!("expected HelloChallenge, got {challenge:?}");
+    };
+
+    // A client holding the wrong token can still answer — it just cannot
+    // produce a proof that verifies.
+    let proof = Frame::Request {
+        request_id: 2,
+        request: Request::HelloProof(HelloProof {
+            client_proof: client_proof("wrong", &c.server_nonce, &client_nonce),
+        }),
+    };
+    write_frame(&mut stream, &proof).await.unwrap();
+
     let f = read_frame(&mut stream, &mut buf).await.unwrap();
     match f {
         Frame::Response {
@@ -434,19 +594,66 @@ async fn bad_token_rejected_with_auth_failed() {
 }
 
 #[tokio::test]
+async fn the_daemon_proves_itself_before_the_client_reveals_anything() {
+    // The property the challenge exists for. A client that dialled an impostor
+    // must be able to tell from the daemon's own first reply — before it has
+    // sent a proof of its own — so that holding the endpoint is not enough to
+    // harvest anything.
+    let relay = boot_relay().await;
+    let mut stream = dial(&relay.socket).await.unwrap();
+    let mut buf = Vec::new();
+    let client_nonce = [11u8; NONCE_LEN];
+    let hello = Frame::Request {
+        request_id: 1,
+        request: Request::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION,
+            client_id: "x".into(),
+            client_nonce,
+        }),
+    };
+    write_frame(&mut stream, &hello).await.unwrap();
+
+    let challenge = read_frame(&mut stream, &mut buf).await.unwrap();
+    let Frame::Response {
+        response: Response::HelloChallenge(c),
+        ..
+    } = challenge
+    else {
+        panic!("expected HelloChallenge, got {challenge:?}");
+    };
+
+    assert!(
+        proofs_match(
+            &c.server_proof,
+            &server_proof(&relay.token, &c.server_nonce, &client_nonce)
+        ),
+        "the real daemon's proof must verify"
+    );
+    // ...and a proof over anything else must not, or the check above would pass
+    // for an impostor too.
+    assert!(
+        !proofs_match(
+            &c.server_proof,
+            &server_proof("wrong", &c.server_nonce, &client_nonce)
+        ),
+        "a proof from a daemon without the token must not verify"
+    );
+}
+
+#[tokio::test]
 async fn version_mismatch_is_rejected() {
     // Plan's phase-07 "Tests" item: connecting with a future
     // protocol_version must produce ErrCode::VersionMismatch and the
     // daemon must close the connection (we observe that by EOF on the
     // next frame attempt).
     let relay = boot_relay().await;
-    let mut stream = UnixStream::connect(&relay.socket).await.unwrap();
+    let mut stream = dial(&relay.socket).await.unwrap();
     let hello = Frame::Request {
         request_id: 1,
         request: Request::Hello(Hello {
             protocol_version: PROTOCOL_VERSION + 999,
-            token: relay.token.clone(),
             client_id: "x".into(),
+            client_nonce: [0u8; NONCE_LEN],
         }),
     };
     write_frame(&mut stream, &hello).await.unwrap();
@@ -480,7 +687,7 @@ async fn shutdown_request_breaks_accept_loop_when_no_ptys_alive() {
 
     // Wait for readiness.
     for _ in 0..100 {
-        if UnixStream::connect(&socket).await.is_ok() {
+        if dial(&socket).await.is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -512,10 +719,10 @@ async fn shutdown_refused_while_ptys_alive() {
         &mut buf,
         2,
         Request::Spawn {
-            cwd: "/tmp".into(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
-            shell: Some("/bin/sh".into()),
+            shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
         },
@@ -544,10 +751,10 @@ async fn stats_endpoint_returns_per_pty_counters() {
         &mut buf,
         2,
         Request::Spawn {
-            cwd: "/tmp".into(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
-            shell: Some("/bin/sh".into()),
+            shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
         },
@@ -557,7 +764,7 @@ async fn stats_endpoint_returns_per_pty_counters() {
         Response::SpawnOk { pty_id, .. } => pty_id,
         other => panic!("{other:?}"),
     };
-    let written = b"echo STATS_PROBE\n";
+    let written = lines(&["echo STATS_PROBE"]);
     let resp = req(
         &mut s,
         &mut buf,
@@ -674,10 +881,10 @@ async fn multi_attach_min_size_and_detach_grows_back() {
         &mut a_buf,
         2,
         Request::Spawn {
-            cwd: "/tmp".into(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
-            shell: Some("/bin/sh".into()),
+            shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
         },
@@ -798,10 +1005,10 @@ async fn unclean_disconnect_releases_attachment_and_grows_back() {
         &mut a_buf,
         2,
         Request::Spawn {
-            cwd: "/tmp".into(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
-            shell: Some("/bin/sh".into()),
+            shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
         },
@@ -894,10 +1101,10 @@ async fn two_simultaneous_subscribers_both_receive_output() {
         &mut a_buf,
         2,
         Request::Spawn {
-            cwd: "/tmp".into(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
-            shell: Some("/bin/sh".into()),
+            shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
         },
@@ -932,7 +1139,7 @@ async fn two_simultaneous_subscribers_both_receive_output() {
         3,
         Request::Write {
             pty_id: pty_id.clone(),
-            bytes: b"echo FANOUT_MARKER\nexit\n".to_vec(),
+            bytes: lines(&["echo FANOUT_MARKER", "exit"]),
         },
     )
     .await;
@@ -970,10 +1177,10 @@ async fn detach_then_fresh_client_reattach_gets_scrollback() {
         &mut a_buf,
         2,
         Request::Spawn {
-            cwd: "/tmp".into(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
-            shell: Some("/bin/sh".into()),
+            shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
         },
@@ -993,7 +1200,7 @@ async fn detach_then_fresh_client_reattach_gets_scrollback() {
         3,
         Request::Write {
             pty_id: pty_id.clone(),
-            bytes: b"echo PERSIST_DETACH_MARKER\n".to_vec(),
+            bytes: lines(&["echo PERSIST_DETACH_MARKER"]),
         },
     )
     .await;
@@ -1046,7 +1253,7 @@ async fn detach_then_fresh_client_reattach_gets_scrollback() {
         3,
         Request::Write {
             pty_id: pty_id.clone(),
-            bytes: b"echo LIVE_AFTER_DETACH\nexit\n".to_vec(),
+            bytes: lines(&["echo LIVE_AFTER_DETACH", "exit"]),
         },
     )
     .await;
@@ -1069,10 +1276,10 @@ async fn close_request_removes_pty_from_list() {
         &mut buf,
         2,
         Request::Spawn {
-            cwd: "/tmp".into(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
-            shell: Some("/bin/sh".into()),
+            shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
         },
@@ -1126,10 +1333,10 @@ async fn spawn_env_reaches_child_process() {
         &mut buf,
         2,
         Request::Spawn {
-            cwd: "/tmp".into(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
-            shell: Some("/bin/sh".into()),
+            shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![
                 ("OXIMUX_WORKSPACE_ID".into(), "WS_ENV_MARKER_42".into()),
@@ -1149,7 +1356,10 @@ async fn spawn_env_reaches_child_process() {
         3,
         Request::Write {
             pty_id: pty_id.clone(),
-            bytes: b"echo \"$OXIMUX_WORKSPACE_ID|$OXIMUX_SURFACE_ID\"\nexit\n".to_vec(),
+            bytes: lines(&[
+                &echo_two_vars("OXIMUX_WORKSPACE_ID", "OXIMUX_SURFACE_ID"),
+                "exit",
+            ]),
         },
     )
     .await;
@@ -1179,13 +1389,13 @@ async fn spawn_args_reach_child_process() {
         &mut buf,
         2,
         Request::Spawn {
-            cwd: "/tmp".into(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
-            // Run echo directly (not a shell) so the marker can ONLY come
-            // from argv, never from a typed/echoed command line.
-            shell: Some("/bin/echo".into()),
-            args: vec!["ARG_REACHES_CHILD_123".into()],
+            // Run echo directly (not an interactive shell) so the marker can
+            // ONLY come from argv, never from a typed/echoed command line.
+            shell: Some(echo_program("ARG_REACHES_CHILD_123").0),
+            args: echo_program("ARG_REACHES_CHILD_123").1,
             env: Vec::new(),
         },
     )
@@ -1222,10 +1432,10 @@ async fn replay_returns_the_ring_without_adding_an_attachment() {
         &mut buf,
         2,
         Request::Spawn {
-            cwd: "/tmp".into(),
+            cwd: cwd(),
             cols: 80,
             rows: 24,
-            shell: Some("/bin/sh".into()),
+            shell: Some(test_shell()),
             args: Vec::new(),
             env: vec![],
         },
@@ -1245,7 +1455,7 @@ async fn replay_returns_the_ring_without_adding_an_attachment() {
         3,
         Request::Write {
             pty_id: pty_id.clone(),
-            bytes: b"echo marker\n".to_vec(),
+            bytes: lines(&["echo marker"]),
         },
     )
     .await;

@@ -166,8 +166,8 @@ pub(super) fn paint_match_row(
         .hover(|s| s.bg(theme.hover_overlay))
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |me, _: &MouseDownEvent, _window, _cx| {
-                me.open_match(&click_path);
+            cx.listener(move |me, _: &MouseDownEvent, _window, cx| {
+                me.open_match(&click_path, cx);
             }),
         )
         .child(

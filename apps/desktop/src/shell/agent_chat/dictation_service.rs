@@ -69,13 +69,11 @@ pub enum StartDecision {
 
 /// Same per-user data dir as the settings TOMLs; models live under
 /// `speech-models/`.
-const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
 const MODELS_SUBDIR: &str = "speech-models";
 
 fn models_dir() -> PathBuf {
-    dirs::data_dir()
+    crate::app_paths::data_dir()
         .unwrap_or_else(std::env::temp_dir)
-        .join(APP_DATA_SUBDIR)
         .join(MODELS_SUBDIR)
 }
 

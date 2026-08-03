@@ -17,9 +17,12 @@ fn ready(state: &PollState) -> &oximux_core::GitState {
 }
 
 const FAST_TICK: Duration = Duration::from_millis(40);
-// Generous wait so CI scheduling jitter doesn't flake; small enough that the
-// suite stays well under a second per test.
-const RECV_BUDGET: Duration = Duration::from_millis(750);
+// Generous wait so CI scheduling jitter doesn't flake. A ceiling, not a sleep
+// — green runs never wait it out — so it is sized for the worst platform:
+// the failure-threshold test needs THREE serial git children after `.git`
+// vanishes, and a Windows spawn behind an AV scan costs 100-300 ms apiece,
+// which overran the earlier 750 ms budget.
+const RECV_BUDGET: Duration = Duration::from_secs(5);
 
 async fn git(repo: &std::path::Path, args: &[&str]) {
     GitCmd::new(repo)

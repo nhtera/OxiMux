@@ -32,7 +32,7 @@ use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt
 use crate::shell::left_rail::{LatestStatusMap, RailAgentTarget, WorkspaceAgentList};
 use crate::shell::pane_group::FocusedRailAgent;
 use crate::shell::workspace_dialog::{WorkspaceDialogMode, WorkspaceDialogSubmit};
-use crate::workspace_root::{APP_DATA_SUBDIR, WorkspaceRoot};
+use crate::workspace_root::WorkspaceRoot;
 
 /// A back/forward history entry: a workspace identified by its owning project
 /// id plus its workspace id. Refs (not full `Workspace` clones) so navigation
@@ -423,13 +423,12 @@ pub(crate) fn refocus_active_pane(
 }
 
 /// Compose the worktree dir path:
-/// `<app_data>/dev.nhtera.oximux/projects/<project_id>/worktrees/<slug>`.
-/// Returns `None` when `dirs::data_dir()` is unavailable (sandbox or
+/// `<app_data>/projects/<project_id>/worktrees/<slug>`.
+/// Returns `None` when the app data directory is unavailable (sandbox or
 /// unset `$HOME`) — caller surfaces this as a create failure.
 fn worktree_path(project_id: &str, slug: &str) -> Option<PathBuf> {
     Some(
-        dirs::data_dir()?
-            .join(APP_DATA_SUBDIR)
+        crate::app_paths::data_dir()?
             .join("projects")
             .join(project_id)
             .join("worktrees")
@@ -462,13 +461,17 @@ async fn run_cleanup_bounded(worktree_path: &Path, timeout: std::time::Duration)
     };
     let cleanup = cleanup.to_string();
     let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg("-lc")
-        .arg(&cleanup)
-        .current_dir(worktree_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
+    {
+        use oximux_no_window::NoWindow as _;
+        cmd.arg("-lc")
+            .arg(&cleanup)
+            .current_dir(worktree_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .no_window()
+            .kill_on_drop(true);
+    }
     let wt = worktree_path.display();
     match tokio::time::timeout(timeout, cmd.status()).await {
         Ok(Ok(status)) if status.success() => {
@@ -799,11 +802,15 @@ impl WorkspaceRoot {
         // sidebar's status poller so only the active project polls git —
         // otherwise every cached sidebar would keep ticking its own
         // `git status` in the background.
+        //
+        // No sidebar yet means this is the window's FIRST activation (boot
+        // builds no sidebar — see `WorkspaceRoot::new`), so the default is the
+        // long-standing "default-collapsed on app boot", not open.
         let prior_open = self
             .right_sidebar
             .as_ref()
             .map(|s| s.read(cx).open)
-            .unwrap_or(true);
+            .unwrap_or(false);
         if let Some(outgoing_sidebar) = self.right_sidebar.as_ref() {
             outgoing_sidebar.read(cx).set_polling_focused(false);
         }
@@ -879,12 +886,14 @@ impl WorkspaceRoot {
                 let typography = this.typography.clone();
                 // Carry the previous sidebar's open/collapsed state across
                 // the rebuild — the right column must stay where the user
-                // left it, not snap back open on every project switch.
+                // left it, not snap back open on every project switch. No
+                // sidebar yet = first activation of this window, which starts
+                // collapsed (the "default-collapsed on app boot" behavior).
                 let prior_open = this
                     .right_sidebar
                     .as_ref()
                     .map(|s| s.read(cx).open)
-                    .unwrap_or(true);
+                    .unwrap_or(false);
                 let weak = cx.weak_entity();
                 let on_open =
                     crate::workspace_root::WorkspaceRoot::build_on_open_file_callback(weak.clone());
@@ -2212,16 +2221,22 @@ impl WorkspaceRoot {
         cx.notify();
     }
 
-    /// Open the project's root directory in the macOS Finder. Best-effort:
-    /// a spawn failure is logged, never surfaced as a hard error, because
-    /// "reveal" is a convenience action with no state to keep consistent.
+    /// Open the project's root directory in the system file manager.
+    /// Best-effort: a spawn failure is logged, never surfaced as a hard error,
+    /// because "reveal" is a convenience action with no state to keep
+    /// consistent.
     pub(crate) fn reveal_project_in_finder(&self, project: &Project) {
         #[cfg(target_os = "macos")]
-        if let Err(err) = std::process::Command::new("open")
+        let launcher = "open";
+        #[cfg(windows)]
+        let launcher = "explorer";
+
+        #[cfg(any(target_os = "macos", windows))]
+        if let Err(err) = std::process::Command::new(launcher)
             .arg(&project.root_path)
             .spawn()
         {
-            tracing::warn!(?err, path = %project.root_path, "reveal_project_in_finder: open failed");
+            tracing::warn!(?err, path = %project.root_path, "reveal_project_in_finder: {launcher} failed");
         }
     }
 

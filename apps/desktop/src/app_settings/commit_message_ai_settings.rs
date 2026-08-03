@@ -22,16 +22,13 @@ use notify_debouncer_full::{
 use oximux_settings::CommitMessageAiSettings;
 use tokio::sync::mpsc;
 
-/// Mirror of `terminal_settings.rs::APP_DATA_SUBDIR` — kept in
-/// lockstep so all settings land in the same per-user data dir.
-const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
 
 /// Debounce window for settings edits. A save can fire several
 /// FSEvents; one reload per burst is plenty.
 const DEBOUNCE_MS: u64 = 250;
 
 fn data_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join(APP_DATA_SUBDIR))
+    crate::app_paths::data_dir()
 }
 
 fn settings_path() -> Option<PathBuf> {

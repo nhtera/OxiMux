@@ -380,7 +380,7 @@ fn build_row_card(
         density,
         typography.clone(),
         cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-            spawn_reveal(&reveal_path);
+            cx.reveal_path(&reveal_path);
             this.close(cx);
         }),
     ));
@@ -491,22 +491,6 @@ fn relative_path_string(path: &std::path::Path, project_root: Option<&PathBuf>) 
     rel.filter(|s| !s.is_empty())
 }
 
-/// Reveal a path in Finder via `open -R`. Shells out asynchronously
-/// (spawn + drop the handle); any error is logged but never bubbles up
-/// to the UI because Finder failures are not actionable for the user.
-fn spawn_reveal(path: &std::path::Path) {
-    if let Err(err) = std::process::Command::new("open")
-        .arg("-R")
-        .arg(path)
-        .spawn()
-    {
-        tracing::warn!(
-            ?err,
-            path = %path.display(),
-            "reveal in finder failed"
-        );
-    }
-}
 
 fn separator(theme: Theme) -> impl IntoElement {
     div().h(px(1.0)).my(px(4.0)).bg(theme.border_inactive)

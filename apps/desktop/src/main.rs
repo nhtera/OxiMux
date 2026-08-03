@@ -10,8 +10,21 @@
 //! then runtime — is intentional: GPUI returns from `app.run`, the guard
 //! exits the runtime, then the runtime itself shuts down gracefully.
 
+// Windows decides at link time whether a process gets a console, and there is
+// no way to ask for one later that does not flash an empty black window first.
+// A released build must not: double-clicking OxiMux would open a console behind
+// it that stays for the session and closes the app when closed.
+//
+// Debug builds keep the console on purpose. It is where `tracing` goes, and the
+// subsystem is the difference between `cargo run` printing logs and printing
+// nothing at all. Release builds lose stdout entirely — anything that must
+// survive a packaged run has to reach a file or the event log, not `eprintln!`.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use gpui::{
@@ -26,16 +39,12 @@ use oximux_app::relay_supervisor::{RelaySupervisor, SupervisorError};
 use oximux_app::shell::terminal_view::install_shared_backend;
 use oximux_app::state;
 use oximux_app::window_factory::{open_workspace_window, open_workspace_window_with};
-use oximux_git::Repository;
 use oximux_pty::TerminalBackend;
 use oximux_relay_client::{RelayBackend, RelayClient};
 use oximux_storage::Db;
 use tracing_subscriber::EnvFilter;
 
-/// macOS bundle identifier — anchors the on-disk data directory under
-/// `~/Library/Application Support`. Must stay in lockstep with
-/// `CFBundleIdentifier` in `assets/Info.plist`.
-const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
+use oximux_app::app_paths;
 /// Scope for the remote-control host key. The host is process-wide (it serves every
 /// workspace's sessions from one registry), so it uses ONE app-level identity rather
 /// than `HostIdentity`'s per-workspace keying.
@@ -44,6 +53,22 @@ const DB_FILE_NAME: &str = "oximux.db";
 
 fn main() {
     init_tracing();
+
+    // Before anything resolves a data path: seven modules used to pick their
+    // own directory, which on Windows put them in the roaming profile while
+    // the rest of the app used the local one. They now all go through
+    // `app_paths`, so whatever those builds already wrote has to be adopted
+    // or it is simply abandoned — including the screen-control grant store.
+    // Move-if-absent, so this is a no-op on every platform where the two
+    // directories were the same and on every run after the first.
+    let adopted = oximux_app::app_paths::migrate_legacy_data();
+    if !adopted.is_empty() {
+        tracing::info!(
+            count = adopted.len(),
+            files = ?adopted,
+            "adopted app data left in the legacy roaming directory"
+        );
+    }
 
     // Before the runtime, and before anything spawns: launched from inside a
     // Claude Code session, the process inherits session markers that make
@@ -54,6 +79,10 @@ fn main() {
     // Before the runtime, and before anything spawns: a double-clicked app
     // inherits only launchd's four directories, and every agent CLI installs
     // outside them. Must precede the first thread — it writes the environment.
+    //
+    // Windows has no equivalent gap: a process started from Explorer gets the
+    // machine and user PATH out of the registry, the same one a console gets.
+    #[cfg(unix)]
     oximux_app::platform::login_path::adopt_login_shell_path();
 
     // Boot the tokio runtime that every git op + status poller relies on.
@@ -134,16 +163,13 @@ fn main() {
     // launch that bows out cannot wipe the live instance's grants.
     oximux_app::clear_stale_screen_control_grants();
 
-    // Best-effort: open the repo at cwd. If we're not in a git tree, render
-    // without the git column — the rest of the shell still works.
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let repo = match rt.block_on(Repository::open(&cwd)) {
-        Ok(r) => Some(r),
-        Err(err) => {
-            tracing::info!(?err, "no git repository at cwd; git column hidden");
-            None
-        }
-    };
+    // boot: repo open is post-paint. No `Repository::open` here on purpose —
+    // it spawns `git`, and on the packaged Windows (GUI-subsystem) build the
+    // process's FIRST console-child spawn can block for seconds inside
+    // CreateProcess's console-host setup, which used to sit on the first-paint
+    // path and made every launch feel slow. The git sidebar is instead built
+    // by `set_active_project`'s async arm, which opens the active project's
+    // repo off the UI thread after the window is already up.
 
     // Open SQLite + hydrate boot state. A failure here means every later
     // write would fail too, so we surface the error loudly via eprintln +
@@ -192,6 +218,15 @@ fn main() {
     // Per-tab attach/spawn no longer happens pre-paint — see
     // `spawn_attach_reconcile` — so this timing line plus the panes-build
     // and reconcile lines bracket the whole boot cost story.
+    //
+    // Windows cold-boot caveat: with the git open moved post-paint, the
+    // daemon spawn here is the process's FIRST child spawn, and a GUI-
+    // subsystem parent's first console-child CreateProcess can pay a
+    // multi-second console-host init on some machines. Warm boots (daemon
+    // already running — the common case, since it survives app restarts)
+    // skip the spawn entirely. Making this handshake non-blocking needs
+    // the shared-backend install to stop being a boot-time-once event
+    // first; see `CliRuntime::with_shared_backend`'s captured Option.
     let relay_boot_started = std::time::Instant::now();
     let _relay_rt = boot_relay_supervisor(app_state.pane_relay_id_repo().clone());
     tracing::info!(
@@ -212,6 +247,16 @@ fn main() {
 
     app.run(move |cx| {
         gpui_component::init(cx);
+        // Before anything paints: registers bundled Lilex, which is what stands
+        // between a font that fails to resolve and a proportional face pinned to
+        // a monospace grid. See `assets::load_fonts`.
+        if let Err(err) = oximux_app::assets::load_fonts(cx) {
+            tracing::error!(
+                %err,
+                "failed to register embedded fonts; a font miss will now fall back \
+                 to a proportional face and the terminal grid will look ragged"
+            );
+        }
         // Replace gpui's default `NullHttpClient` (fails every request) with a
         // file:// reader so markdown-preview images that resolve to local repo
         // paths actually load — the image element fetches every URL through the
@@ -288,12 +333,23 @@ fn main() {
         // follow an update?" — which has to be read before the recorded
         // version is overwritten, so it is settled here and announced once a
         // window exists to announce it in.
+        // The answer is only acted on where there is an updater to have
+        // performed the upgrade; the settings install itself still has to run.
+        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
         let upgraded_this_boot = oximux_app::auto_update_settings::install(cx);
-        // The menu-bar indicator that appears while an agent can drive the
-        // screen. Watches the grant table rather than the approval path,
-        // because the enforcement hook grants from its own process — see the
-        // module docs. Idle cost is one `metadata()` call per second.
-        oximux_app::agent_glue::screen_control_watch::install(cx);
+        // The indicator that appears while an agent can drive the screen — a
+        // menu-bar item on macOS, a notification-area icon on Windows. Watches
+        // the grant table rather than the approval path, because the
+        // enforcement hook grants from its own process — see the module docs.
+        // Idle cost is one `metadata()` call per second.
+        //
+        // Unconditional on purpose. This line carried its own copy of the
+        // platform predicate, and when screen control was turned on for Windows
+        // only the module's copy was updated — so the tray code was compiled,
+        // correct, and never called, and an agent drove the screen with nothing
+        // on display saying so. Nothing failed, which is why it survived a full
+        // test run. The predicate now lives once, beside the module.
+        oximux_app::agent_glue::install_screen_control_watch(cx);
         // Resolve the reduced-motion preference once and install the Motion
         // global before any window opens, so the first animated surface reads
         // the right durations.
@@ -332,8 +388,7 @@ fn main() {
         // paired phone dials — would change on every restart and silently break
         // every existing pairing. A key that can't be loaded degrades to an
         // ephemeral identity rather than blocking boot.
-        if let Some(data_dir) = dirs::data_dir() {
-            let key_dir = data_dir.join(APP_DATA_SUBDIR);
+        if let Some(key_dir) = app_paths::data_dir() {
             match oximux_remote_host::HostIdentity::load_or_generate(&key_dir, HOST_IDENTITY_SCOPE)
             {
                 Ok(identity) => {
@@ -451,9 +506,12 @@ fn main() {
         // Auto-update: recovers from an interrupted swap, sweeps crash
         // leftovers, then checks periodically. Staging only — the swap itself
         // happens at quit, so the running workspace is never disturbed.
-        oximux_app::updater::install(cx);
-        if upgraded_this_boot {
-            oximux_app::updater::announce_update(cx);
+        #[cfg(target_os = "macos")]
+        {
+            oximux_app::updater::install(cx);
+            if upgraded_this_boot {
+                oximux_app::updater::announce_update(cx);
+            }
         }
         // Install the full keymap (registry defaults ⊕ keybindings.toml
         // overrides) — this covers the menu-action chords too, and MUST run
@@ -487,7 +545,7 @@ fn main() {
         // subsequent window is opened by that same handler through the shared
         // `open_workspace_window` factory, so each gets an independent
         // `WorkspaceRoot` and the quit / close paths treat them uniformly.
-        install_app_lifecycle(cx, repo.clone(), app_state.clone());
+        install_app_lifecycle(cx, app_state.clone());
 
         // Reopen the windows that were open at the last quit. An empty /
         // absent manifest (fresh install, or data from before multi-window)
@@ -509,7 +567,7 @@ fn main() {
             if oximux_app::shell::onboarding::should_show_onboarding(true, onboarded) {
                 oximux_app::shell::onboarding::set_pending();
             }
-            open_workspace_window(cx, repo, app_state);
+            open_workspace_window(cx, app_state);
         } else {
             if !onboarded {
                 let _ = app_state
@@ -524,7 +582,6 @@ fn main() {
             for entry in manifest.windows {
                 open_workspace_window_with(
                     cx,
-                    repo.clone(),
                     app_state.clone(),
                     entry.window_id,
                     entry.project_id,
@@ -539,20 +596,15 @@ fn main() {
 /// is what makes multi-window correct: a SINGLE quit observer iterates every
 /// tracked window, and a SINGLE window-closed observer decides "last window →
 /// quit the app" vs. "dismiss just this window".
-fn install_app_lifecycle(
-    cx: &mut gpui::App,
-    repo: Option<Repository>,
-    app_state: oximux_app::state::AppState,
-) {
+fn install_app_lifecycle(cx: &mut gpui::App, app_state: oximux_app::state::AppState) {
     use oximux_app::window_registry;
 
     // Cmd+N → open another independent workspace window. Handled globally
     // (not on `WorkspaceRoot`) because opening a window needs `&mut App`.
     {
-        let repo = repo.clone();
         let app_state = app_state.clone();
         cx.on_action::<NewWindow>(move |_, cx| {
-            open_workspace_window(cx, repo.clone(), app_state.clone());
+            open_workspace_window(cx, app_state.clone());
         });
     }
 
@@ -587,13 +639,16 @@ fn install_app_lifecycle(
         // session is already captured, so a swap that somehow stalls cannot
         // cost the user their workspace. The swap itself is one rename —
         // it is the re-verification either side of it that takes the time.
-        let swap_started = std::time::Instant::now();
-        let from_signal = SHUTDOWN_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
-        if oximux_app::updater::apply_pending_at_quit(cx, from_signal) {
-            tracing::info!(
-                elapsed_ms = swap_started.elapsed().as_millis() as u64,
-                "quit: applied staged update"
-            );
+        #[cfg(target_os = "macos")]
+        {
+            let swap_started = std::time::Instant::now();
+            let from_signal = SHUTDOWN_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+            if oximux_app::updater::apply_pending_at_quit(cx, from_signal) {
+                tracing::info!(
+                    elapsed_ms = swap_started.elapsed().as_millis() as u64,
+                    "quit: applied staged update"
+                );
+            }
         }
         async {}
     })
@@ -650,6 +705,7 @@ static SHUTDOWN_SIGNAL: AtomicBool = AtomicBool::new(false);
 /// Count of shutdown signals received. The first drives the graceful
 /// `cx.quit()` path; the second escalates to a hard kill so a wedged
 /// foreground executor can never leave the app un-quittable.
+#[cfg(unix)]
 static SHUTDOWN_SIGNAL_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// How long the graceful `cx.quit()` path gets after the first shutdown
@@ -661,6 +717,7 @@ const SHUTDOWN_GRACE_DEADLINE: Duration = Duration::from_secs(3);
 /// is the number of signals seen BEFORE this one: the first (0) drives the
 /// graceful path; any repeat (>= 1) means graceful is likely wedged, so we
 /// restore the default disposition and re-raise.
+#[cfg(unix)]
 fn signal_should_force_exit(prior_count: u32) -> bool {
     prior_count >= 1
 }
@@ -676,6 +733,7 @@ fn signal_should_force_exit(prior_count: u32) -> bool {
 /// the SECOND signal we restore the default disposition and re-raise,
 /// letting the kernel terminate us immediately. `signal` + `raise` are
 /// both async-signal-safe.
+#[cfg(unix)]
 extern "C" fn handle_shutdown_signal(sig: libc::c_int) {
     SHUTDOWN_SIGNAL.store(true, Ordering::SeqCst);
     if signal_should_force_exit(SHUTDOWN_SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst)) {
@@ -691,6 +749,12 @@ extern "C" fn handle_shutdown_signal(sig: libc::c_int) {
 /// quit from inside the GPUI event loop is what makes on_app_quit fire
 /// — a bare process exit (e.g. SIGKILL) cannot be rescued.
 fn install_signal_watchdog(cx: &mut gpui::App) {
+    // Windows has no signal model, and the console-control and end-session
+    // paths that replace it are their own piece of work. Nothing flips
+    // `SHUTDOWN_SIGNAL` there yet, so the poll loop below simply never fires —
+    // and there is nothing for it to preserve either, the relay daemon having
+    // no Windows transport to hold PTYs across.
+    #[cfg(unix)]
     // SAFETY: libc::signal is async-signal-safe for installing a
     // handler. We pass a plain extern "C" fn with no captured state.
     unsafe {
@@ -710,7 +774,12 @@ fn install_signal_watchdog(cx: &mut gpui::App) {
             if SHUTDOWN_SIGNAL.load(Ordering::SeqCst) {
                 std::thread::sleep(SHUTDOWN_GRACE_DEADLINE);
                 // Still running ⇒ graceful quit stalled. 130 = 128 + SIGINT.
-                unsafe { libc::_exit(130) };
+                #[cfg(unix)]
+                unsafe {
+                    libc::_exit(130)
+                };
+                #[cfg(not(unix))]
+                std::process::exit(130);
             }
             std::thread::sleep(Duration::from_millis(100));
         })
@@ -768,6 +837,9 @@ fn run_editor_spike() {
     let app = gpui_platform::application().with_assets(CompositeAssets);
     app.run(move |cx| {
         gpui_component::init(cx);
+        // Same font registration as the production path — a spike that renders
+        // in a different face is not showing you what ships.
+        let _ = oximux_app::assets::load_fonts(cx);
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
         {
             let palette = oximux_settings::Theme::charcoal();
@@ -837,6 +909,7 @@ fn run_file_tree_spike() {
     let app = gpui_platform::application().with_assets(CompositeAssets);
     app.run(move |cx| {
         gpui_component::init(cx);
+        let _ = oximux_app::assets::load_fonts(cx);
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
         // Keep the spike's input chrome in step with the production init
         // blocks above — debugging input styling in the spike must show
@@ -900,11 +973,10 @@ fn enforce_single_instance() -> Option<oximux_app::single_instance::SingleInstan
     use oximux_app::single_instance::{
         AcquireOutcome, activate_existing_instance, lock_path_in, try_acquire,
     };
-    let Some(data_dir) = dirs::data_dir() else {
+    let Some(dir) = app_paths::data_dir() else {
         tracing::warn!("no data_dir; skipping single-instance guard");
         return None;
     };
-    let dir = data_dir.join(APP_DATA_SUBDIR);
     if let Err(err) = std::fs::create_dir_all(&dir) {
         tracing::warn!(?err, "cannot create data dir; skipping single-instance guard");
         return None;
@@ -937,14 +1009,13 @@ fn enforce_single_instance() -> Option<oximux_app::single_instance::SingleInstan
 /// path is fatal — `eprintln` + `exit(1)` rather than panic so the user
 /// sees a one-line message instead of a Rust backtrace.
 fn open_db_or_exit() -> Db {
-    let Some(data_dir) = dirs::data_dir() else {
+    let Some(db_dir) = app_paths::data_dir() else {
         eprintln!(
-            "oximux: cannot resolve Application Support directory; \
+            "oximux: cannot resolve the application data directory; \
              try setting $HOME or running outside a restrictive sandbox"
         );
         std::process::exit(1);
     };
-    let db_dir = data_dir.join(APP_DATA_SUBDIR);
     if let Err(err) = std::fs::create_dir_all(&db_dir) {
         eprintln!(
             "oximux: cannot create data directory {}: {err}",
@@ -987,14 +1058,11 @@ fn run_notify_cli(rt: &tokio::runtime::Runtime) -> i32 {
             return 1;
         }
     };
-    let (Some(data_dir), Some(home)) = (dirs::data_dir(), dirs::home_dir()) else {
+    let (Some(data_dir), Some(log_dir)) = (app_paths::data_dir(), app_paths::log_dir()) else {
         eprintln!("oximux notify: cannot resolve application data directory");
         return 1;
     };
-    let supervisor = RelaySupervisor::new(
-        data_dir.join(APP_DATA_SUBDIR),
-        home.join("Library/Logs").join(APP_DATA_SUBDIR),
-    );
+    let supervisor = RelaySupervisor::new(data_dir, log_dir);
     let socket = supervisor.socket_path();
     let token = match std::fs::read_to_string(supervisor.token_path()) {
         Ok(t) => t.trim().to_owned(),
@@ -1116,14 +1184,11 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
         message.as_deref(),
     );
 
-    let (Some(data_dir), Some(home)) = (dirs::data_dir(), dirs::home_dir()) else {
+    let (Some(data_dir), Some(log_dir)) = (app_paths::data_dir(), app_paths::log_dir()) else {
         eprintln!("oximux agent-status: cannot resolve application data directory");
         return 1;
     };
-    let supervisor = RelaySupervisor::new(
-        data_dir.join(APP_DATA_SUBDIR),
-        home.join("Library/Logs").join(APP_DATA_SUBDIR),
-    );
+    let supervisor = RelaySupervisor::new(data_dir, log_dir);
     let socket = supervisor.socket_path();
     let token = match std::fs::read_to_string(supervisor.token_path()) {
         Ok(t) => t.trim().to_owned(),
@@ -1172,17 +1237,14 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
 fn boot_relay_supervisor(
     pane_relay_id_repo: oximux_storage::PaneRelayIdRepo,
 ) -> Option<tokio::runtime::Runtime> {
-    let Some(data_dir) = dirs::data_dir() else {
+    let Some(runtime_dir) = app_paths::data_dir() else {
         tracing::warn!("no data_dir; skipping relay supervisor");
         return None;
     };
-    let runtime_dir = data_dir.join(APP_DATA_SUBDIR);
-    let Some(home) = dirs::home_dir() else {
-        tracing::warn!("no home_dir; skipping relay supervisor");
+    let Some(log_dir) = app_paths::log_dir() else {
+        tracing::warn!("no log_dir; skipping relay supervisor");
         return None;
     };
-    // macOS convention: per-app logs live under ~/Library/Logs.
-    let log_dir = home.join("Library/Logs").join(APP_DATA_SUBDIR);
 
     // Dedicated runtime for the relay client's reader/writer tasks and
     // every later `block_on`. Two workers is plenty: the socket I/O is
@@ -1478,6 +1540,10 @@ mod tests {
     // shutdown signal must take the graceful `cx.quit()` path, and any
     // REPEAT must hard-escalate (restore SIG_DFL + re-raise) so a wedged
     // foreground executor can't leave the app un-quittable.
+    //
+    // Gated with the code under test: `signal_should_force_exit` is the unix
+    // signal path, and Windows has no counterpart to escalate through yet.
+    #[cfg(unix)]
     #[test]
     fn first_shutdown_signal_is_graceful_repeats_escalate() {
         assert!(

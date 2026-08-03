@@ -9,6 +9,21 @@
 //! observed hanging outright), while the kernel property under test — an open
 //! vnode surviving rename/unlink of its directory — is identical for any open
 //! file.
+//!
+//! # Unix only, and not merely because of the fixture
+//!
+//! The property this proves is a POSIX one. An open vnode outliving the
+//! rename and unlink of its directory entry is exactly what Windows does
+//! **not** do: without `FILE_SHARE_DELETE`, which Rust's `File` does not
+//! request, the OS refuses to rename or delete a file that any process holds
+//! open.
+//!
+//! So the installer's core assumption — swap the bundle underneath a running
+//! daemon and leave it undisturbed — does not carry to Windows, and Phase 3 of
+//! `plans/260801-0157-windows-computer-use/` must not inherit it. A Windows
+//! installer has to expect the swap to fail while the daemon is up, which is a
+//! different design rather than the same one recompiled.
+#![cfg(unix)]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

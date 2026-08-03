@@ -19,9 +19,9 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
 use super::connection::{
-    control_response_json, question_answer_json, set_permission_mode_json, user_message_json,
-    user_message_json_with_images, AgentCapabilities, AgentConnection, EffortChoice, ModeChoice,
-    ModelChoice,
+    control_response_json, interrupt_json, question_answer_json, set_permission_mode_json,
+    user_message_json, user_message_json_with_images, AgentCapabilities, AgentConnection,
+    EffortChoice, ModeChoice, ModelChoice,
 };
 use super::entry::ChatImage;
 use super::mcp_server_spec::{to_claude_mcp_config, McpServerSpec};
@@ -239,14 +239,26 @@ pub fn build_args_with_resume(
 }
 
 pub struct ClaudeStreamJsonConnection {
-    stdin: Mutex<ChildStdin>,
+    // `Option` so `cancel_and_wait` can close the pipe: `claude` reads its input
+    // as a stream and exits at EOF, which is how a session is asked to end
+    // gracefully on both platforms. `None` means the session is on its way out
+    // and further writes are refused rather than panicking.
+    stdin: Mutex<Option<ChildStdin>>,
     child: Mutex<Child>,
+    // Windows stand-in for the process group `claude` would otherwise be killed
+    // through. `claude` runs tools as its own children — a `bash` tool can be
+    // holding a build or a dev server — and `Child::kill` ends only `claude`
+    // itself, leaving those with no parent to account for them. Held for the
+    // connection's life: the job's kill-on-close limit means an app crash reaps
+    // the tree instead of stranding it.
+    #[cfg(windows)]
+    job: Option<oximux_job_object::JobObject>,
 }
 
 impl ClaudeStreamJsonConnection {
     /// Spawn `claude` in `cwd` and start streaming decoded events.
     pub fn spawn(cwd: &Path, model: Option<&str>) -> Result<(Self, Receiver<ThreadEvent>)> {
-        let mut cmd = Command::new("claude");
+        let mut cmd = Command::new(crate::cli::program_for_spawn("claude"));
         cmd.args(build_args(model)).current_dir(cwd);
         Self::spawn_command(cmd)
     }
@@ -263,7 +275,7 @@ impl ClaudeStreamJsonConnection {
         effort: Option<&str>,
         host: &HostInjection<'_>,
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
-        let mut cmd = Command::new("claude");
+        let mut cmd = Command::new(crate::cli::program_for_spawn("claude"));
         cmd.args(build_args_with_resume(
             model,
             session_id,
@@ -278,9 +290,13 @@ impl ClaudeStreamJsonConnection {
     /// Spawn an already-built command (the real `claude` command, or a fake in
     /// tests) and wire stdout → `decode_line` → the returned receiver.
     pub fn spawn_command(mut cmd: Command) -> Result<(Self, Receiver<ThreadEvent>)> {
+        use oximux_no_window::NoWindow as _;
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // All I/O is these pipes — never let Windows conjure a console
+            // window for the CLI's whole (long) lifetime.
+            .no_window();
         let mut child = cmd.spawn().context("spawn agent process")?;
         let stdout = child.stdout.take().context("agent stdout missing")?;
         let stdin = child.stdin.take().context("agent stdin missing")?;
@@ -328,10 +344,25 @@ impl ClaudeStreamJsonConnection {
             // Reject.
         });
 
+        // Adopted before the connection is handed out, so every later kill path
+        // has a tree to end. A failure here is logged rather than fatal: the
+        // agent still works, and what is lost is the guarantee about its tool
+        // children, not the session.
+        #[cfg(windows)]
+        let job = match oximux_job_object::JobObject::adopt(&child) {
+            Ok(job) => Some(job),
+            Err(e) => {
+                tracing::warn!(?e, "could not put claude in a job object");
+                None
+            }
+        };
+
         Ok((
             Self {
-                stdin: Mutex::new(stdin),
+                stdin: Mutex::new(Some(stdin)),
                 child: Mutex::new(child),
+                #[cfg(windows)]
+                job,
             },
             rx,
         ))
@@ -340,10 +371,13 @@ impl ClaudeStreamJsonConnection {
     fn write_line(&self, v: &Value) -> Result<()> {
         // Avoid `.expect()` on the lock (poison would panic the caller); map to
         // a recoverable error instead.
-        let mut stdin = self
+        let mut guard = self
             .stdin
             .lock()
             .map_err(|_| anyhow!("agent stdin lock poisoned"))?;
+        let stdin = guard
+            .as_mut()
+            .ok_or_else(|| anyhow!("agent session is shutting down"))?;
         writeln!(stdin, "{v}").context("write to agent stdin")?;
         stdin.flush().context("flush agent stdin")?;
         Ok(())
@@ -513,48 +547,41 @@ impl AgentConnection for ClaudeStreamJsonConnection {
         Some(DEFAULT_EFFORT.to_string())
     }
 
-    /// Interrupt the in-flight turn by sending SIGINT to the child. `claude`
-    /// ends the turn gracefully, checkpoints the session server-side, then
-    /// exits (stdout EOF) — so the transcript stays consistent and the next send
-    /// can `--resume` the same session cleanly. SIGINT (not a hard kill) is what
-    /// keeps that checkpoint intact; the caller owns the resume-on-next-send.
-    #[cfg(unix)]
+    /// Interrupt the in-flight turn with a stdin `control_request`.
+    ///
+    /// `claude` ends the turn, checkpoints the session, and — unlike the SIGINT
+    /// this replaced — **stays alive**, so the next send continues the same
+    /// process instead of respawning it with `--resume`. One code path on every
+    /// platform: the signal version had no Windows counterpart, and the hard
+    /// kill standing in for it there destroyed the very checkpoint that makes a
+    /// session resumable.
     fn cancel(&self) -> Result<()> {
-        let child = self
-            .child
-            .lock()
-            .map_err(|_| anyhow!("agent child lock poisoned"))?;
-        let pid = child.id() as libc::pid_t;
-        // SAFETY: `pid` is our own spawned child; `kill(2)` with a real signal
-        // number is sound and simply delivers the signal (or returns an errno).
-        let rc = unsafe { libc::kill(pid, libc::SIGINT) };
-        if rc != 0 {
-            return Err(anyhow!(
-                "failed to interrupt agent: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(())
+        self.write_line(&interrupt_json())
     }
 
-    #[cfg(not(unix))]
-    fn cancel(&self) -> Result<()> {
-        let mut child = self
-            .child
-            .lock()
-            .map_err(|_| anyhow!("agent child lock poisoned"))?;
-        child.kill().context("interrupt agent")?;
-        Ok(())
-    }
-
-    /// SIGINT, then poll `try_wait` until the child is reaped (its transcript
-    /// file is fully flushed once the process is gone). Escalates to a hard
-    /// kill after 5s in case the CLI wedges on the way down. Blocking — the
-    /// rewind flow runs this on a background thread.
+    /// Interrupt, then block until the child is actually reaped.
+    ///
+    /// Callers use this before reading the agent's on-disk session file
+    /// (rewind's truncate-fork), so "the turn ended" is not enough — the
+    /// transcript is only certainly flushed once the process is gone.
+    ///
+    /// Which is why closing stdin is part of this and not of `cancel`: the
+    /// interrupt deliberately leaves the process running, so something has to
+    /// ask it to leave. `claude` reads its input as a stream and exits at EOF,
+    /// so dropping the pipe is the graceful way to say so — and it works on
+    /// both platforms, where a signal did not.
     fn cancel_and_wait(&self) -> Result<()> {
-        // Best-effort SIGINT first; if the process already exited this errors
-        // (ESRCH) and the reap below still succeeds, so don't bail on it.
+        // Best-effort: if the turn already ended, or the pipe is already gone,
+        // the reap below still does its job — so neither step bails.
         let _ = self.cancel();
+        {
+            let mut stdin = self
+                .stdin
+                .lock()
+                .map_err(|_| anyhow!("agent stdin lock poisoned"))?;
+            // Dropping the writer closes the pipe; the child sees EOF and exits.
+            let _ = stdin.take();
+        }
         let mut child = self
             .child
             .lock()
@@ -567,6 +594,13 @@ impl AgentConnection for ClaudeStreamJsonConnection {
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
+                // `kill` ends `claude` alone; on Windows the tools it launched
+                // are separate processes that outlive it, so the tree has to be
+                // ended explicitly.
+                #[cfg(windows)]
+                if let Some(job) = &self.job {
+                    let _ = job.kill();
+                }
                 return Ok(());
             }
             thread::sleep(std::time::Duration::from_millis(50));
@@ -582,6 +616,12 @@ impl AgentConnection for ClaudeStreamJsonConnection {
         };
         let _ = child.kill();
         let _ = child.wait();
+        // Same reason as the escalation above: killing `claude` says nothing
+        // about the tools it started.
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            let _ = job.kill();
+        }
     }
 }
 
@@ -771,7 +811,8 @@ mod tests {
     #[test]
     fn claude_vocab_matches_expected() {
         let (conn, _rx) =
-            ClaudeStreamJsonConnection::spawn_command(Command::new("true")).expect("spawn");
+            ClaudeStreamJsonConnection::spawn_command(crate::thread::sh_fixture::sh_script(":"))
+                .expect("spawn");
         let models: Vec<String> = conn.models().into_iter().map(|m| m.wire).collect();
         assert_eq!(models, vec!["opus", "fable", "sonnet", "haiku"]);
         // Every blurb leads with the versioned name, which is the only place the
@@ -847,7 +888,7 @@ mod tests {
     /// clear. The ring keeps only a bounded tail.
     #[test]
     fn large_stderr_does_not_block_child() {
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         // 200 KiB to stderr, one stream-json result line to stdout, then exit.
         cmd.arg("-c").arg(
             "yes ERRORLINE | head -c 200000 1>&2; \
@@ -874,7 +915,7 @@ mod tests {
         let l2 = serde_json::json!({"type":"result","subtype":"success",
             "result":"done","total_cost_usd":0.0})
         .to_string();
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(format!("printf '%s\\n' '{l1}' '{l2}'"));
 
         let (_conn, rx) = ClaudeStreamJsonConnection::spawn_command(cmd).expect("spawn fake");

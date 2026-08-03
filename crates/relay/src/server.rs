@@ -1,24 +1,27 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use interprocess::local_socket::ListenerOptions;
+use interprocess::local_socket::tokio::Stream;
+use interprocess::local_socket::tokio::prelude::*;
+use interprocess::local_socket::{GenericFilePath, GenericNamespaced, ToFsName, ToNsName};
 use oximux_relay_proto::{
-    ErrCode, Frame, HelloAck, Notification, PROTOCOL_VERSION, Request, Response,
+    Endpoint, ErrCode, Frame, HelloAck, HelloChallenge, NONCE_LEN, Nonce, Notification,
+    PROTOCOL_VERSION, Request, Response, client_proof, endpoint_for, proofs_match, server_proof,
 };
-use tokio::net::{UnixListener, UnixStream};
+use rand::RngCore;
+use rand::rngs::OsRng;
 use tokio::sync::{Notify, mpsc};
 use uuid::Uuid;
 
 use crate::checkpoint::CheckpointStore;
 use crate::codec::{CodecError, read_frame, write_frame};
 use crate::registry::{PtyRegistry, RegistryError, SUBSCRIBER_QUEUE, SpawnArgs};
+use crate::server_config::ServerConfig;
 
-// Daemon self-exit if no clients attached and no PTYs alive for this
-// long. Plan's "Locked decisions": 24h. Configurable for tests via
-// `ServerConfig.idle_timeout`.
-pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60 * 24);
 const DEFAULT_IDLE_TICK: Duration = Duration::from_secs(60);
 
 // Disk-checkpoint cadence: each tick persists every PTY's replay ring
@@ -30,42 +33,13 @@ const CHECKPOINT_TICK: Duration = Duration::from_secs(5);
 // dropped from every layout while no daemon was around to clean up).
 const CHECKPOINT_GC_MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 7);
 
-pub struct ServerConfig {
-    pub socket_path: PathBuf,
-    pub token_file: PathBuf,
-    // None skips PID-file writing (useful for in-process tests).
-    pub pid_path: Option<PathBuf>,
-    // None disables idle GC. Tests override with short values to
-    // exercise the auto-exit path without sleeping for a day.
-    pub idle_timeout: Option<Duration>,
-    // None uses `DEFAULT_IDLE_TICK`. Tests can pick a sub-second tick
-    // so the idle timer reaches its threshold quickly.
-    pub idle_tick_interval: Option<Duration>,
-    // Root directory for per-PTY disk scrollback checkpoints. None
-    // disables checkpointing entirely (in-process tests).
-    pub checkpoint_dir: Option<PathBuf>,
-    // None uses `CHECKPOINT_TICK`. Tests pick sub-second ticks so a
-    // checkpoint lands without multi-second sleeps.
-    pub checkpoint_tick_interval: Option<Duration>,
-}
-
-impl ServerConfig {
-    pub fn idle_disabled(socket_path: PathBuf, token_file: PathBuf) -> Self {
-        Self {
-            socket_path,
-            token_file,
-            pid_path: None,
-            idle_timeout: None,
-            idle_tick_interval: None,
-            checkpoint_dir: None,
-            checkpoint_tick_interval: None,
-        }
-    }
-}
-
 // Drop guard: removes the bound socket path on drop so a crashed
 // relay can be replaced by a fresh spawn without manual cleanup.
+// Unix only — a named pipe is a kernel object with no filesystem entry,
+// and vanishes with the last handle to it.
+#[cfg(unix)]
 struct SocketGuard(PathBuf);
+#[cfg(unix)]
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -93,9 +67,13 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
 
     // Best-effort: clean a stale socket left by a previous crash. If
     // the path is held by a *live* daemon, bind() will fail loudly.
+    // No analogue on Windows: there is no filesystem entry to go stale,
+    // and a name still held by a live daemon must fail rather than be
+    // cleared away (see `bind_listener`).
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&cfg.socket_path);
-    let listener = UnixListener::bind(&cfg.socket_path)
-        .with_context(|| format!("bind {}", cfg.socket_path.display()))?;
+    let listener = bind_listener(&cfg.socket_path)?;
+    #[cfg(unix)]
     let _socket_guard = SocketGuard(cfg.socket_path.clone());
 
     let _pid_guard = if let Some(pid_path) = &cfg.pid_path {
@@ -149,7 +127,7 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
                 break;
             }
             accept_res = listener.accept() => {
-                let (stream, _addr) = match accept_res {
+                let stream = match accept_res {
                     Ok(v) => v,
                     Err(e) => {
                         tracing::warn!(?e, "accept failed");
@@ -157,16 +135,40 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
                     }
                 };
                 let registry = Arc::clone(&registry);
+                let registry_for_flush = Arc::clone(&registry);
                 let token = token.clone();
                 let session_id = session_id.clone();
                 let shutdown = Arc::clone(&shutdown);
                 let active_sessions = Arc::clone(&active_sessions);
+                let checkpointing = checkpoints.is_some();
                 tokio::spawn(async move {
-                    let _session_guard = SessionGuard::new(active_sessions);
-                    if let Err(e) =
-                        session_loop(stream, registry, token, session_id, shutdown).await
                     {
-                        tracing::debug!(?e, "session ended");
+                        let _session_guard = SessionGuard::new(Arc::clone(&active_sessions));
+                        if let Err(e) =
+                            session_loop(stream, registry, token, session_id, shutdown).await
+                        {
+                            tracing::debug!(?e, "session ended");
+                        }
+                    } // guard drops here, so the count below excludes us
+
+                    // Losing the last client is this daemon's best proxy for the
+                    // user logging out or shutting down. The signal handlers that
+                    // would say so directly are wired but unproven for a detached
+                    // process with no console, and the periodic tick can be up to
+                    // its full interval stale — which is scrollback the next launch
+                    // would cold-restore without.
+                    //
+                    // Racing with another session ending is fine in both
+                    // directions: two departures can both observe zero and flush
+                    // twice, which is idempotent, and whoever decrements last
+                    // always reads its own decrement, so the flush cannot be
+                    // skipped by both.
+                    if checkpointing && active_sessions.load(Ordering::SeqCst) == 0 {
+                        tracing::debug!("last client disconnected; checkpointing");
+                        let _ = tokio::task::spawn_blocking(move || {
+                            registry_for_flush.checkpoint_all()
+                        })
+                        .await;
                     }
                 });
             }
@@ -185,6 +187,50 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
     Ok(())
 }
 
+/// Bind the local socket both the GUI and this daemon agree on.
+///
+/// The two platforms differ in what "the name is already taken" means, and the
+/// difference is load-bearing:
+///
+/// **Unix** binds a socket file. The caller has already unlinked a stale one,
+/// and the containing directory is what keeps other accounts out.
+///
+/// **Windows** binds a name in the machine-wide `\\.\pipe\` namespace, where
+/// whoever calls `CreateNamedPipe` first owns the name — so a hostile process
+/// that guesses it and gets there first would have every GUI in the session
+/// handing it keystrokes. `FILE_FLAG_FIRST_PIPE_INSTANCE`, which the listener
+/// sets on its first instance, is the defence: creating an already-claimed name
+/// fails instead of joining it, and this function propagates that failure so
+/// the daemon exits and the GUI surfaces it. Failing to start is the correct
+/// outcome; attaching to a squatter's pipe is not.
+///
+/// That flag settles who may *create* the name. An owner-only descriptor
+/// settles who may connect to it, and is applied below.
+fn bind_listener(socket_path: &Path) -> Result<interprocess::local_socket::tokio::Listener> {
+    let name = match endpoint_for(socket_path) {
+        Endpoint::FsPath(path) => path.to_fs_name::<GenericFilePath>().with_context(|| {
+            format!("socket path is not a usable name: {}", socket_path.display())
+        })?,
+        Endpoint::Namespaced(name) => name
+            .to_ns_name::<GenericNamespaced>()
+            .context("derived pipe name is not a usable name")?,
+    };
+
+    let options = ListenerOptions::new().name(name);
+
+    // `?` rather than a fallback: if the descriptor cannot be built we must not
+    // fall through to a pipe anyone can reach. See `pipe_security`.
+    #[cfg(windows)]
+    let options = {
+        use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
+        options.security_descriptor(crate::pipe_security::owner_only_descriptor()?)
+    };
+
+    options
+        .create_tokio()
+        .with_context(|| format!("bind {}", socket_path.display()))
+}
+
 // Periodic disk-checkpoint driver. Runs for the daemon's lifetime —
 // process exit reaps it with the runtime.
 fn spawn_checkpoint_tick(registry: Arc<PtyRegistry>, tick: Duration) {
@@ -197,18 +243,23 @@ fn spawn_checkpoint_tick(registry: Arc<PtyRegistry>, tick: Duration) {
     });
 }
 
-// Ref-counted "is anyone attached?" tracker for the idle GC. Increments
-// on session start, decrements on drop — covers panic-unwind exits too.
+// Ref-counted "is anyone attached?" tracker for the idle GC, and for the
+// flush the last departing session runs. Increments on session start,
+// decrements on drop — covers panic-unwind exits too.
+//
+// `SeqCst` rather than `Relaxed`: the accept loop reads this counter straight
+// after dropping a guard to decide whether it was the last one out, and that
+// decision has to see every other session's decrement.
 struct SessionGuard(Arc<AtomicUsize>);
 impl SessionGuard {
     fn new(counter: Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::Relaxed);
+        counter.fetch_add(1, Ordering::SeqCst);
         Self(counter)
     }
 }
 impl Drop for SessionGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -251,55 +302,85 @@ fn write_pid_file(path: &std::path::Path) -> Result<()> {
         .open(path)
         .with_context(|| format!("open pid file {}", path.display()))?;
     write!(&mut f, "{}", std::process::id()).context("write pid")?;
+    drop(f);
+    // Not a secret — the supervisor only reads this to poll whether the daemon
+    // is still alive, so the worst a reader learns is a PID. It is restricted
+    // anyway so that "everything the relay writes beside its socket is
+    // owner-only" holds without exceptions to remember, and so a tampered value
+    // cannot drive the supervisor's liveness check.
+    oximux_owner_only::restrict_file(path)
+        .with_context(|| format!("restrict pid file {}", path.display()))?;
     Ok(())
 }
 
-// Wire SIGTERM + SIGINT to the shared shutdown notify. tokio's signal
-// driver requires a multi-thread runtime to be active, which `main.rs`
-// guarantees. SIGINT is included for foreground dev runs (ctrl-c).
+// Wire the platform's "you are going away" signals to the shared shutdown
+// notify, which is what gets a final scrollback checkpoint onto disk. tokio's
+// signal driver requires a multi-thread runtime to be active, which `main.rs`
+// guarantees.
 fn install_signal_handler(shutdown: Arc<Notify>) {
     tokio::spawn(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{SignalKind, signal};
-            let mut sigterm = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(?e, "install SIGTERM failed");
-                    return;
-                }
-            };
-            let mut sigint = match signal(SignalKind::interrupt()) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(?e, "install SIGINT failed");
-                    return;
-                }
-            };
-            tokio::select! {
-                _ = sigterm.recv() => tracing::info!("SIGTERM received"),
-                _ = sigint.recv() => tracing::info!("SIGINT received"),
-            }
-            shutdown.notify_waiters();
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = shutdown;
-        }
+        wait_for_shutdown_signal().await;
+        shutdown.notify_waiters();
     });
+}
+
+// SIGTERM is the host reboot/logout path; SIGINT covers foreground dev runs.
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (mut sigterm, mut sigint) = match (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) {
+        (Ok(term), Ok(int)) => (term, int),
+        (term, int) => {
+            let e = term.err().or(int.err());
+            tracing::error!(?e, "install shutdown signal handler failed");
+            return;
+        }
+    };
+    tokio::select! {
+        _ = sigterm.recv() => tracing::info!("SIGTERM received"),
+        _ = sigint.recv() => tracing::info!("SIGINT received"),
+    }
+}
+
+// Windows has no SIGTERM. The nearest equivalents are console control events,
+// and the daemon is spawned detached with no console — so `ctrl_shutdown` and
+// `ctrl_logoff` may never be delivered here at all. They are wired up because
+// when they *do* arrive they are the only warning we get, but nothing may
+// depend on them: the periodic checkpoint tick, and a flush when the last GUI
+// disconnects, are what actually bound scrollback loss on this platform.
+#[cfg(windows)]
+async fn wait_for_shutdown_signal() {
+    use tokio::signal::windows::{ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown};
+    let (mut c, mut close, mut logoff, mut sd) =
+        match (ctrl_c(), ctrl_close(), ctrl_logoff(), ctrl_shutdown()) {
+            (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+            _ => {
+                tracing::error!("install console control handlers failed");
+                return;
+            }
+        };
+    tokio::select! {
+        _ = c.recv() => tracing::info!("Ctrl-C received"),
+        _ = close.recv() => tracing::info!("console close received"),
+        _ = logoff.recv() => tracing::info!("logoff received"),
+        _ = sd.recv() => tracing::info!("system shutdown received"),
+    }
 }
 
 // Per-connection logic. Hello first; reject anything else until a
 // valid Hello arrives. After Hello, dispatch Request → Response and
 // forward subscriber Notifications to the outbound writer.
 async fn session_loop(
-    stream: UnixStream,
+    stream: Stream,
     registry: Arc<PtyRegistry>,
     token: String,
     session_id: String,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
-    let (mut read_half, mut write_half) = stream.into_split();
+    let (mut read_half, mut write_half) = stream.split();
     let mut buf = Vec::with_capacity(8 * 1024);
 
     // === Hello handshake (must be the first frame) ============================
@@ -328,13 +409,42 @@ async fn session_loop(
         let _ = write_frame(&mut write_half, &resp).await;
         bail!("version mismatch");
     }
-    if hello.token != token {
-        let resp = err_response(request_id, ErrCode::AuthFailed, "bad token");
+
+    // Answer with our own nonce and a proof that we hold the token. This goes
+    // out before the client has proved anything: an impostor cannot produce it,
+    // so the client learns it dialled the wrong thing while it still has
+    // nothing to lose by hanging up. Proving ourselves to an unauthenticated
+    // caller costs nothing — the proof is worthless without the token, and a
+    // caller that already has the token is the one we are talking to.
+    let mut server_nonce: Nonce = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut server_nonce);
+    let challenge = Frame::Response {
+        request_id,
+        response: Response::HelloChallenge(HelloChallenge {
+            server_protocol_version: PROTOCOL_VERSION,
+            server_nonce,
+            server_proof: server_proof(&token, &server_nonce, &hello.client_nonce),
+        }),
+    };
+    write_frame(&mut write_half, &challenge).await?;
+
+    let second = read_frame(&mut read_half, &mut buf).await?;
+    let Frame::Request {
+        request_id: proof_request_id,
+        request: Request::HelloProof(proof),
+    } = second
+    else {
+        bail!("client did not answer the challenge with HelloProof");
+    };
+    let expected = client_proof(&token, &server_nonce, &hello.client_nonce);
+    if !proofs_match(&proof.client_proof, &expected) {
+        let resp = err_response(proof_request_id, ErrCode::AuthFailed, "bad token");
         let _ = write_frame(&mut write_half, &resp).await;
         bail!("bad token");
     }
+
     let ack = Frame::Response {
-        request_id,
+        request_id: proof_request_id,
         response: Response::HelloAck(HelloAck {
             server_protocol_version: PROTOCOL_VERSION,
             session_id: session_id.clone(),
@@ -486,7 +596,10 @@ async fn handle_request(
     request: Request,
 ) -> Response {
     match request {
-        Request::Hello(_) => Response::Err {
+        // Both handshake frames are single-use. Re-sending either after the
+        // session is up is not a client we recognise, so neither gets a second
+        // chance to re-run auth on an already-authenticated connection.
+        Request::Hello(_) | Request::HelloProof(_) => Response::Err {
             code: ErrCode::AuthFailed,
             message: "Hello already completed".into(),
         },

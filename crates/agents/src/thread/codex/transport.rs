@@ -54,7 +54,7 @@ impl RpcClient {
     /// Spawn `codex app-server` in `cwd`, start the reader thread, and return the
     /// client, the [`Inbound`] receiver, and the child (for reaping).
     pub fn spawn(cwd: &Path) -> Result<(RpcClient, Receiver<Inbound>, Child)> {
-        let mut cmd = Command::new("codex");
+        let mut cmd = Command::new(crate::cli::program_for_spawn("codex"));
         cmd.arg("app-server")
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -66,7 +66,8 @@ impl RpcClient {
     /// Spawn an already-built command (the real `codex`, or a fake in tests) and
     /// wire its stdout into the reader/router.
     pub fn spawn_command(mut cmd: Command) -> Result<(RpcClient, Receiver<Inbound>, Child)> {
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        use oximux_no_window::NoWindow as _;
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).no_window();
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -242,7 +243,7 @@ printf '{"id":1,"result":{"ok":true}}\n'
 printf '{"method":"turn/started","params":{"turn":{"id":"t1"}}}\n'
 sleep 0.2
 "#;
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         let (rpc, inbound, _child) = RpcClient::spawn_command(cmd).expect("spawn fake");
         let res = rpc
@@ -264,7 +265,7 @@ sleep 0.2
         // A fake that reads the request then exits WITHOUT responding. The
         // pending request must fail via the EOF drain (fast) rather than waiting
         // out its timeout, and is_alive() must flip false.
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg("read line; exit 0");
         let (rpc, _inbound, mut child) = RpcClient::spawn_command(cmd).expect("spawn fake");
         assert!(rpc.is_alive());
@@ -288,7 +289,7 @@ printf 'not json at all\n'
 printf '{"id":1,"result":42}\n'
 sleep 0.2
 "#;
-        let mut cmd = Command::new("sh");
+        let mut cmd = crate::thread::sh_fixture::sh_command();
         cmd.arg("-c").arg(script);
         let (rpc, _inbound, _child) = RpcClient::spawn_command(cmd).expect("spawn fake");
         let res = rpc

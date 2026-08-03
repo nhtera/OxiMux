@@ -16,19 +16,38 @@
 //! Restart is always the user's move. An ignored update simply applies on
 //! the next natural quit.
 
+//! ## Platform split
+//!
+//! The state machine, the release feed, and version comparison are plain data
+//! work and compile everywhere. Everything that touches the *shape of an
+//! install* — `.app` bundles, DMG mounting, codesign pinning, the same-volume
+//! exchange — is macOS-only and gated as such. Windows gets its own staging and
+//! trust path (versioned directories, Authenticode) built on the same neutral
+//! core; until then a Windows build carries the types but not the pipeline.
+
 pub mod bundle;
 pub mod feed;
+#[cfg(target_os = "macos")]
 pub mod pipeline;
+#[cfg(target_os = "macos")]
 pub mod staging;
 pub mod version;
 
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "macos")]
 use std::sync::{mpsc, Arc};
+#[cfg(target_os = "macos")]
 use std::thread::JoinHandle;
 
-pub use bundle::{eligibility, InstalledApp, UnsupportedReason};
+pub use bundle::UnsupportedReason;
+#[cfg(target_os = "macos")]
+pub use bundle::{eligibility, InstalledApp};
+#[cfg(target_os = "macos")]
 pub use oximux_macos_trust::{DiskShortfall, SignaturePolicy, TrustError};
+#[cfg(target_os = "macos")]
 pub use staging::{boot_sweep, PendingUpdate};
 pub use version::Version;
 
@@ -103,6 +122,7 @@ pub enum UpdateError {
     #[error("download exceeded its declared size ({declared} bytes declared, {received} received)")]
     Oversize { declared: u64, received: u64 },
 
+    #[cfg(target_os = "macos")]
     #[error("not enough disk space: need ~{} MB, {} MB free", .0.needed_mb, .0.free_mb)]
     DiskSpace(DiskShortfall),
 
@@ -115,6 +135,7 @@ pub enum UpdateError {
     #[error("{detail}")]
     Staging { detail: String },
 
+    #[cfg(target_os = "macos")]
     #[error(transparent)]
     Gate(#[from] TrustError),
 
@@ -130,6 +151,7 @@ pub enum UpdateError {
 
 /// Everything a pipeline run needs, resolved once by the host app.
 #[derive(Debug, Clone)]
+#[cfg(target_os = "macos")]
 pub struct UpdaterConfig {
     pub current_version: Version,
     /// Captured at boot — see [`bundle::InstalledApp`] on why never later.
@@ -144,11 +166,14 @@ pub struct UpdaterConfig {
 /// than a status read: the 6h ticker firing while a slow download is still in
 /// flight must be rejected here, atomically — two pipelines would race the
 /// same staging area.
+#[cfg(target_os = "macos")]
 static CHECKING: AtomicBool = AtomicBool::new(false);
 
 /// Releases the process-wide lock even if the pipeline panics.
+#[cfg(target_os = "macos")]
 struct RunGuard;
 
+#[cfg(target_os = "macos")]
 impl Drop for RunGuard {
     fn drop(&mut self) {
         CHECKING.store(false, Ordering::SeqCst);
@@ -157,9 +182,11 @@ impl Drop for RunGuard {
 
 /// What a caller holds while a check runs: the status stream to render, and
 /// the join handle whose final status is authoritative.
+#[cfg(target_os = "macos")]
 pub type RunningCheck = (mpsc::Receiver<UpdateStatus>, JoinHandle<UpdateStatus>);
 
 /// Start a check on a dedicated thread, or refuse if one is in flight.
+#[cfg(target_os = "macos")]
 pub fn spawn_check(
     config: UpdaterConfig,
     trigger: CheckTrigger,
@@ -216,6 +243,11 @@ mod tests {
         .is_terminal());
     }
 
+    // The single-flight lock guards the macOS pipeline, and every type this
+    // needs to build a config — the bundle, the codesign pin — describes a
+    // `.app`. Windows gets its own staging path; when it lands, this test's
+    // counterpart goes with it.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_second_spawn_while_one_runs_is_rejected() {
         // Claim the lock by hand to simulate an in-flight check without any

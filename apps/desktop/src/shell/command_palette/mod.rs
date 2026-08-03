@@ -784,11 +784,26 @@ mod tests {
 
     #[test]
     fn resolve_index_path_joins_relative_against_root() {
-        use std::path::Path;
+        use std::path::{Path, PathBuf};
         // The core Quick Open contract: `rg --files` emits relative paths; the
         // editor open action needs them absolute.
-        let abs = resolve_index_path(Some(Path::new("/home/u/proj")), "src/main.rs");
-        assert_eq!(abs, "/home/u/proj/src/main.rs");
+        //
+        // Asserted as properties rather than one expected string. The old
+        // literal `/home/u/proj/src/main.rs` baked in both a Unix-absolute root
+        // and `/` as the separator, so on Windows `join` correctly produced
+        // `\`-joined output and the comparison failed on formatting. Properties
+        // say what the contract actually is, and `Path::ends_with` /
+        // `starts_with` are component-wise, so they hold either way.
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\home\u\proj")
+        } else {
+            PathBuf::from("/home/u/proj")
+        };
+        let joined = resolve_index_path(Some(&root), "src/main.rs");
+        let joined = Path::new(&joined);
+        assert!(joined.is_absolute(), "must resolve to absolute: {joined:?}");
+        assert!(joined.starts_with(&root), "{joined:?}");
+        assert!(joined.ends_with("src/main.rs"), "{joined:?}");
     }
 
     #[test]

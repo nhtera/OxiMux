@@ -18,7 +18,15 @@ mod background_tasks_panel;
 mod bubble;
 mod companion_sync;
 mod composer;
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) mod computer_use;
+// Where computer use does not exist, these three keep their names and answer
+// accordingly — see the module's own header for why that beats cfg-ing ~35
+// call sites through the transcript renderer.
+#[cfg(not(any(target_os = "macos", windows)))]
+mod screen_control_absent;
+#[cfg(not(any(target_os = "macos", windows)))]
+use screen_control_absent::{computer_use, screen_card, screen_consent};
 mod composer_history;
 mod acp_terminal_host;
 mod context_meter;
@@ -44,7 +52,9 @@ mod remote_turn;
 mod turn_summary_card;
 mod rewind_menu;
 mod session_persistence;
+#[cfg(any(target_os = "macos", windows))]
 mod screen_card;
+#[cfg(any(target_os = "macos", windows))]
 mod screen_consent;
 mod session_detail;
 mod roster;
@@ -2846,11 +2856,17 @@ impl AgentChatView {
         cx.notify();
     }
 
-    /// Interrupt the streaming turn (the composer's Stop button). SIGINTs the
-    /// child, finalizes the transcript, and fail-closes any pending approval,
-    /// then marks the session **resumable-idle**: the next send respawns via
-    /// `--resume`. Not marked `disconnected` — the stop was intentional, so no
-    /// error banner is shown.
+    /// Interrupt the streaming turn (the composer's Stop button). Asks the agent
+    /// to end the turn over its own protocol, finalizes the transcript, and
+    /// fail-closes any pending approval, then marks the session
+    /// **resumable-idle**: the next send respawns via `--resume`. Not marked
+    /// `disconnected` — the stop was intentional, so no error banner is shown.
+    ///
+    /// The respawn is now belt-and-braces rather than required: a protocol
+    /// interrupt leaves the process alive and the session usable, so a later
+    /// change could send straight into the live child and skip it. Left in place
+    /// because dropping it changes the resume path for every backend, not just
+    /// Claude.
     fn stop_turn(&mut self, cx: &mut Context<Self>) {
         if !self.thread.turn_active {
             return; // nothing is streaming
@@ -2923,8 +2939,10 @@ impl AgentChatView {
         cx: &mut Context<Self>,
     ) {
         // Reap the old connection before replacing it — `Child`'s Drop neither
-        // kills nor waits, so after a Stop this harvests the already-dead child
-        // (and hard-kills it if somehow still alive).
+        // kills nor waits. A Stop now interrupts the turn over the protocol
+        // rather than signalling the process, so after one the child is still
+        // *alive* and this is what ends it; it also harvests a child that died
+        // on its own.
         if let Some(old) = self.connection.take() {
             old.shutdown();
         }
@@ -3636,7 +3654,7 @@ impl AgentChatView {
         // builds is already the consent one. Purely a classification — whether
         // it is *allowed* is the policy's business, below.
         if let ThreadEvent::PermissionRequested { tool_name, kind, .. } = &mut ev
-            && oximux_computer_use::is_computer_use_tool(tool_name)
+            && oximux_agent_core::screen_tools::is_computer_use_tool(tool_name)
         {
             *kind = oximux_agents::thread::PermissionKind::Screen;
         }
@@ -3712,7 +3730,7 @@ impl AgentChatView {
             // The worker produced the sign-in URL (Codex) → open it in the system
             // browser. The card stays pending until `AuthOutcome` resolves it.
             ThreadEvent::AuthUrl { url } => {
-                crate::shell::open_url::open_url(url);
+                crate::shell::open_url::open_url(url, cx);
             }
             // A browser OAuth sign-in resolved (Codex). Success → drop the card so
             // the composer re-enables (it's disabled while `self.auth.is_some()`)

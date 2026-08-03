@@ -85,28 +85,19 @@ fn entry_for_path(path: &Path) -> Option<ServerEntry> {
 /// Resolve `program` against `$PATH`. If it already contains a path separator
 /// it's used verbatim (when it exists). Returns the absolute path string, or
 /// `None` when no executable is found — the caller then skips LSP for the file.
+///
+/// The `which` crate rather than a hand-rolled walk, because "is this file
+/// runnable" is not one question across platforms: Unix asks about the
+/// executable bit, Windows asks whether the extension is in `PATHEXT`. A walk
+/// written against the first answer silently fails to find `rust-analyzer.exe`
+/// when asked for `rust-analyzer`.
 fn resolve_on_path(program: &str) -> Option<String> {
-    if program.contains('/') {
-        let p = Path::new(program);
-        return is_executable_file(p).then(|| program.to_string());
-    }
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(program);
-        if is_executable_file(&candidate) {
-            return Some(candidate.to_string_lossy().into_owned());
-        }
-    }
-    None
-}
-
-/// `true` when `path` is a regular file with an executable bit set.
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
-    match std::fs::metadata(path) {
-        Ok(meta) => meta.is_file() && (meta.permissions().mode() & 0o111 != 0),
-        Err(_) => false,
-    }
+    let resolved = if program.contains(std::path::is_separator) {
+        which::which(Path::new(program))
+    } else {
+        which::which(program)
+    };
+    resolved.ok().map(|p| p.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]

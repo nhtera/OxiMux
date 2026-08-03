@@ -9,6 +9,37 @@
 //! recovery story is not "kill orphaned daemons" but "revoke the sessions we
 //! opened and never closed". The ledger exists because that has to survive a
 //! `kill -9`, which runs no `Drop` and no quit handler.
+//!
+//! # Why this is not simplified on Windows
+//!
+//! The obligation above assumes sessions **outlive** the `mcp` proxy, against a
+//! daemon that keeps running. If Windows instead ran a per-agent runtime, that
+//! state would die with the proxy and reconciliation would have nothing to do.
+//!
+//! The driver's CLI says it does not: `--direct` is documented as "own the
+//! runtime in this MCP process", so the default proxy path does not, and the
+//! daemon it launches outlives it. That matches macOS, for an unrelated reason
+//! — Session 0 isolation rather than TCC attribution (see [`crate::daemon`]).
+//!
+//! But that is read off `--help`, not observed. Confirming it means launching
+//! `cua-driver mcp`, which starts something that can drive the screen, and that
+//! is not a thing to do incidentally.
+//!
+//! So this stays as-is, deliberately, and the asymmetry is what decides it. If
+//! sessions really do die with the proxy, reconciling anyway costs a few
+//! `revoke` calls against ids that no longer exist. Those land in
+//! [`Reconciliation::failed`] rather than `revoked` if the driver exits
+//! non-zero for an unknown id — a reporting wrinkle, not a leak, because
+//! [`reconcile`] clears the ledger either way and will not retry them forever.
+//!
+//! The opposite mistake costs a live session nobody can see and nothing will
+//! clean up. A no-op reconcile that *looks* like it cleans up would be worse
+//! than none at all.
+//!
+//! Worth measuring when the posture is confirmed: if `revoke` on an unknown id
+//! does exit non-zero, a Windows user could see a startup report of "failed to
+//! revoke" for sessions that were never leaked. That is a cosmetic fix to make
+//! *then*, against a known exit code, rather than a guess to encode now.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -316,10 +347,11 @@ mod tests {
     fn reconcile_reports_revoked_sessions() {
         let (_dir, ledger) = ledger();
         ledger.record(&SessionId::for_agent("live")).expect("record");
-        // /usr/bin/true accepts any arguments and exits 0, standing in for a
+        // A program that accepts any arguments and exits 0, standing in for a
         // driver that revoked successfully.
-        let result = reconcile(Path::new("/usr/bin/true"), &ledger, Duration::from_secs(5))
-            .expect("reconcile");
+        let stub = crate::fixtures::always_succeeds();
+        let result =
+            reconcile(&stub, &ledger, Duration::from_secs(5)).expect("reconcile");
         assert_eq!(result.revoked.len(), 1);
         assert!(result.failed.is_empty());
         assert!(ledger.outstanding().expect("read").is_empty());

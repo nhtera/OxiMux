@@ -8,3 +8,6 @@ pub mod tab_context_menu;
 pub mod toast;
 pub mod top_bar;
 pub mod whats_new;
+// Windows-only custom caption buttons (min/max/close) for the frameless
+// title bar; compiled everywhere, rendered only when `cfg!(windows)`.
+pub mod window_controls;
