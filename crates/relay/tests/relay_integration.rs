@@ -55,7 +55,28 @@ async fn boot_relay() -> TestRelay {
     boot_relay_with(|_cfg| {}).await
 }
 
+/// Route the in-process daemon's tracing to stderr, once per test binary.
+///
+/// These tests are the only place the daemon's own account of its decisions is
+/// available, and a failure on a CI runner is the only place it is needed. To
+/// stderr rather than a captured writer on purpose: the daemon works on tokio
+/// worker threads, and libtest's capture is per-test-thread, so a captured
+/// writer would drop exactly the lines worth having. `RUST_LOG` overrides.
+fn init_daemon_tracing() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("oximux_relay=debug"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .try_init();
+    });
+}
+
 async fn boot_relay_with(tweak: impl FnOnce(&mut ServerConfig)) -> TestRelay {
+    init_daemon_tracing();
     let dir = TempDir::new().expect("tempdir");
     let socket = dir.path().join("relay-v1.sock");
     let token_file = dir.path().join("relay-v1.token");

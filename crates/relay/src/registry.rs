@@ -561,12 +561,19 @@ impl PtyRegistry {
     /// write is a small (≤ ring capacity) atomic file replace.
     pub fn checkpoint_all(&self) {
         let Some(store) = &self.checkpoints else {
+            tracing::debug!("checkpoint pass with no store configured; nothing to do");
             return;
         };
+        // Counted and logged because the interesting outcome here is a pass
+        // that writes nothing. Every reason for that is legitimate on its own
+        // — no PTYs, or none with new output — and indistinguishable from a
+        // broken flush unless the pass says which it was.
+        let (mut written, mut skipped, mut failed) = (0usize, 0usize, 0usize);
         for kv in self.entries.iter() {
             let e = kv.value();
             let seen = e.bytes_out.load(Ordering::Relaxed);
             if seen == e.checkpointed_bytes_out.load(Ordering::Relaxed) {
+                skipped += 1;
                 continue;
             }
             let bytes = e.ring.lock().expect("ring poisoned").snapshot();
@@ -580,10 +587,17 @@ impl PtyRegistry {
             match store.write_scrollback(&e.pty_id, &bytes, cols, rows, live_cwd.as_deref()) {
                 // Store the pre-snapshot counter: output that landed
                 // mid-write is picked up by the next pass.
-                Ok(()) => e.checkpointed_bytes_out.store(seen, Ordering::Relaxed),
-                Err(err) => tracing::warn!(?err, pty_id = e.pty_id, "checkpoint write failed"),
+                Ok(()) => {
+                    e.checkpointed_bytes_out.store(seen, Ordering::Relaxed);
+                    written += 1;
+                }
+                Err(err) => {
+                    failed += 1;
+                    tracing::warn!(?err, pty_id = e.pty_id, "checkpoint write failed");
+                }
             }
         }
+        tracing::debug!(written, skipped, failed, "checkpoint pass complete");
     }
 
     /// PTYs available for warm re-attach. A PTY whose child has already

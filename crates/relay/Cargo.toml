@@ -53,3 +53,8 @@ tracing-oslog = { workspace = true }
 [dev-dependencies]
 oximux-shell-env = { workspace = true, features = ["test-support"] }
 tempfile = "3"
+# Integration tests run the daemon in-process, so its own tracing is the only
+# window into why a pass decided what it decided. Without a subscriber those
+# lines go nowhere and a failure on a machine you cannot log into tells you only
+# that an expected file is absent.
+tracing-subscriber = { workspace = true }
