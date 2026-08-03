@@ -4,6 +4,33 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-08-03 — v0.1.6: working Pull/Push/Sync primary button + graph auto-refresh (`main`)
+
+Fixes the Source Control panel's primary split-button, which silently
+did nothing for every verb except Commit, and makes the commit graph
+track completed git operations on its own. Also lands the Windows-port
+groundwork merge.
+
+- **`46ad5d6`** — `fix(scm)`: the primary button's click handler gated on
+  `kind == Commit`, so a button resolved to Pull / Push / Sync / Publish /
+  Create PR no-opped with no toast or status. Every resolved kind now
+  dispatches to its standing op; Stage All is delegated to the panel via a
+  new `StageAllRequested` event (the panel owns the unstaged-path list).
+  Live-verified: a repo 2 behind upstream showed "Pull 2", one click
+  fast-forwarded it.
+- **`fb7fefd`** — `feat(scm)`: every commit/remote op success now emits
+  `OperationCompleted` from `apply_result`, and the panel responds with the
+  same stale-while-revalidate `commit_graph.refresh` as the manual toolbar
+  button — the graph reflects moved history without a manual refresh click.
+- **`94d3b6b`** — Windows-port merge (PR #1, `feat/windows`): portable PTY
+  backend (ConPTY), named-pipe relay transport, owner-only credential
+  storage, Windows shell resolution, and a `windows-latest` CI lane.
+
+**Touches**: `apps/desktop/src/shell/source_control/{commit_area,mod}.rs`,
+plus the Windows-port tree under `crates/`.
+
+---
+
 ### 2026-07-31 — v0.1.5: title-bar Update pill + What's New release notes (`main`)
 
 The staged auto-updater (v0.1.4) gets a visible front door: a blue **Update**

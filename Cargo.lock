@@ -6894,7 +6894,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-agent-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -6903,7 +6903,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-agents"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -6937,7 +6937,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-app"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aes",
  "anyhow",
@@ -7012,7 +7012,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-auto-update"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "oximux-macos-trust",
  "rand 0.8.6",
@@ -7027,7 +7027,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-computer-use"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64",
  "fd-lock",
@@ -7048,7 +7048,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -7056,7 +7056,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-dictation"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "cpal",
@@ -7074,7 +7074,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-editor"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "gpui",
@@ -7096,7 +7096,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-git"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "futures",
  "oximux-core",
@@ -7112,14 +7112,14 @@ dependencies = [
 
 [[package]]
 name = "oximux-job-object"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "oximux-macos-trust"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "libc",
  "tempfile",
@@ -7128,7 +7128,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-mobile-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7148,14 +7148,14 @@ dependencies = [
 
 [[package]]
 name = "oximux-no-window"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "oximux-owner-only"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "tempfile",
  "widestring",
@@ -7164,14 +7164,14 @@ dependencies = [
 
 [[package]]
 name = "oximux-proc-cwd"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "oximux-pty"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -7183,7 +7183,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-relay"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -7211,7 +7211,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-relay-client"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -7230,7 +7230,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-relay-proto"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bincode 2.0.1",
  "hmac",
@@ -7241,7 +7241,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-remote-host"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7268,7 +7268,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-remote-iroh"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7285,7 +7285,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-remote-proto"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "base64",
@@ -7301,7 +7301,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-remote-session"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7319,7 +7319,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-settings"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "dunce",
@@ -7331,7 +7331,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-shell-env"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "portable-pty",
  "which 6.0.3",
@@ -7339,7 +7339,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-storage"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7353,7 +7353,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-ui"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "gpui",
  "gpui-component",
@@ -13414,7 +13414,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "anyhow",
  "image",
