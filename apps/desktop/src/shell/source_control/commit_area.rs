@@ -120,6 +120,10 @@ pub enum CommitAreaEvent {
     /// state (unstaged path list) and the GitPanel entity, so staging
     /// is delegated up rather than duplicated here.
     StageAllRequested,
+    /// A commit or remote op finished successfully — history and/or
+    /// refs may have moved, so the panel should revalidate the commit
+    /// graph instead of waiting for a manual refresh click.
+    OperationCompleted,
 }
 
 pub struct CommitArea {
@@ -526,6 +530,7 @@ impl CommitArea {
                     // observer is suppressed during set_value.
                     self.schedule_draft_save(String::new(), cx);
                 }
+                cx.emit(CommitAreaEvent::OperationCompleted);
             }
             Err((label, error)) => {
                 // Transient cross-surface alert in addition to the inline

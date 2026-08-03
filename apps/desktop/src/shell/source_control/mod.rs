@@ -437,6 +437,12 @@ impl SourceControlPanel {
                             .update(cx, |gp, cx| gp.stage_paths_bulk(paths, cx));
                     }
                 }
+                // Stale-while-revalidate: previous commits stay painted
+                // while the fresh page loads, same as the manual refresh
+                // buttons in the toolbar and graph header.
+                commit_area::CommitAreaEvent::OperationCompleted => {
+                    panel.commit_graph.update(cx, |g, cx| g.refresh(cx));
+                }
             },
         );
 
