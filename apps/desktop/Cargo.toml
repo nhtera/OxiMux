@@ -32,6 +32,8 @@ async-trait = { workspace = true }
 oximux-relay-client = { workspace = true }
 oximux-relay-supervisor = { workspace = true }
 oximux-relay-terminals = { workspace = true }
+# The shared Claude session-marker scrub (one list, three consumers).
+oximux-shell-env = { workspace = true }
 oximux-relay-proto = { workspace = true }
 # Owner-only access on the relay auth token this process writes.
 oximux-owner-only = { workspace = true }

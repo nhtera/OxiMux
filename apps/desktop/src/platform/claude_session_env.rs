@@ -23,48 +23,17 @@
 //! (`crates/relay/src/main.rs`) because it outlives the app that started it
 //! and is the direct parent of every terminal PTY.
 
-/// Variables Claude Code sets on child processes to mark them as part of a
-/// running session. Identity-of-launch only — never user configuration, so
-/// dropping them cannot lose a setting the user chose.
-const SESSION_MARKERS: [&str; 12] = [
-    // Makes a spawned `claude` treat itself as a nested child session and
-    // disable transcript saving.
-    "CLAUDE_CODE_CHILD_SESSION",
-    // The generic "running inside Claude Code" flags; the CLI and other
-    // tools change behavior when they detect nesting through them, and some
-    // versions refuse to start at all ("cannot be launched inside another
-    // session").
-    "CLAUDECODE",
-    "CLAUDE_CODE",
-    // The outer session's identity: which session, its parent, its bridge,
-    // how it was started, and which binary runs it — all meaningless once
-    // inherited across an app boundary.
-    "CLAUDE_CODE_SESSION_ID",
-    "CLAUDE_CODE_PARENT_SESSION_ID",
-    "CLAUDE_CODE_BRIDGE_SESSION_ID",
-    "CLAUDE_CODE_HOST_SESSION_ID",
-    "CLAUDE_CODE_ENTRYPOINT",
-    "CLAUDE_CODE_EXECPATH",
-    "CLAUDE_CODE_SSE_PORT",
-    "CLAUDE_AGENT_SDK_VERSION",
-    // An inherited "already sandboxed" claim makes `claude` skip its folder
-    // trust prompt — a security gate, not just bookkeeping.
-    "CLAUDE_CODE_SANDBOXED",
-];
-
 /// Remove inherited Claude Code session markers from this process.
 ///
-/// Call before any thread exists — see the `unsafe` note below.
+/// The marker list and the scrub itself live in `oximux-shell-env` — one
+/// list, three consumers (this app, the relay daemon, `oximux serve`) — so a
+/// marker Claude Code adds later is fixed in one place. This wrapper keeps
+/// the app-side logging.
+///
+/// Call before any thread exists — env mutation is only sound while the
+/// process is single-threaded (the shared fn documents the same contract).
 pub fn scrub_inherited_claude_session_markers() {
-    for name in SESSION_MARKERS {
-        if std::env::var_os(name).is_none() {
-            continue;
-        }
-        // SAFETY: called from the top of `main`, before the tokio runtime and
-        // the GPUI executor exist, so no other thread can be reading the
-        // environment. `remove_var` is only unsound when it races a
-        // concurrent read.
-        unsafe { std::env::remove_var(name) };
-        tracing::info!(marker = name, "dropped an inherited Claude Code session marker");
+    for marker in oximux_shell_env::scrub_inherited_claude_session_markers() {
+        tracing::info!(marker, "dropped an inherited Claude Code session marker");
     }
 }
