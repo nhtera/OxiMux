@@ -129,6 +129,17 @@ pub struct ConnectSpec {
     /// Tool names to strip from the agent's surface (`--disallowedTools`).
     /// Claude-only for the same reason.
     pub disallowed_tools: Vec<String>,
+    /// An id the caller picked for this new session rather than waiting to be
+    /// told one (Claude's `--session-id`). `None` leaves the agent to name its
+    /// own, which is what every interactive launch does.
+    ///
+    /// Set by a headless host, which has no one to wait for — see
+    /// [`HostInjection::fresh_session_id`] for why waiting deadlocks. Read only
+    /// by the `StreamJson` arm; a transport that cannot be told an id ignores
+    /// this and announces its own as before.
+    ///
+    /// [`HostInjection::fresh_session_id`]: super::claude_stream_json::HostInjection::fresh_session_id
+    pub fresh_session_id: Option<String>,
 }
 
 impl ConnectSpec {
@@ -167,6 +178,7 @@ impl ConnectSpec {
             mcp_servers: Vec::new(),
             settings_json: None,
             disallowed_tools: Vec::new(),
+            fresh_session_id: None,
         }
     }
 }
@@ -188,6 +200,7 @@ pub fn connect(spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<
                     mcp_servers: &spec.mcp_servers,
                     settings: spec.settings_json.as_deref(),
                     disallowed_tools: &spec.disallowed_tools,
+                    fresh_session_id: spec.fresh_session_id.as_deref(),
                 },
                 &spec.env,
             )?;
@@ -320,6 +333,7 @@ mod tests {
             mcp_servers: vec![],
             settings_json: None,
             disallowed_tools: vec![],
+            fresh_session_id: None,
         };
         // Can't `expect_err` — the Ok payload (`Box<dyn AgentConnection>`) isn't
         // `Debug`; match instead.
@@ -353,6 +367,7 @@ mod tests {
             mcp_servers: vec![],
             settings_json: None,
             disallowed_tools: vec![],
+            fresh_session_id: None,
         };
         let err = probe_catalog(spec).expect_err("probe must fail without a command");
         assert!(err.to_string().contains("acp_command"), "unexpected error: {err}");

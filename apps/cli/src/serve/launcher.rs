@@ -27,10 +27,20 @@ use super::blob::ChatBlob;
 use super::catalog::SessionIndex;
 use super::pump::{self, PumpSet, PumpSpec};
 
-/// How long to wait for a fresh agent's `SessionInit` (which carries the
-/// session id this RPC must return). Generous — a cold agent CLI can take a
-/// while to boot — but bounded so a wedged one cannot park the RPC forever.
-const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a fresh spawn is given to announce a session id of its own before
+/// the host settles on the one it picked at spawn.
+///
+/// Deliberately short, because it no longer bounds "how long may an agent take
+/// to boot" — the host names the session itself now (see `create` below), so
+/// there is nothing this wait is required to produce. It bounds only "might
+/// this backend name itself instead", and one that does says so in its first
+/// line, immediately.
+///
+/// It was sixty seconds, sized for a cold CLI boot, and against Claude Code
+/// that was a deadlock rather than a slow path: the CLI emits no `system/init`
+/// until it has been given a first prompt, and this host sent no prompt until
+/// it had seen the init. Every launch spent the full minute and then failed.
+const ANNOUNCE_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Map a requested agent id onto a transport this headless host can spawn.
 ///
@@ -116,43 +126,54 @@ struct Spawned {
     session_id: String,
 }
 
-/// Spawn the agent and wait for its `SessionInit`. Blocking (process spawn +
-/// a bounded recv loop) — run under `spawn_blocking`.
-fn spawn_and_wait_for_init(spec: ConnectSpec) -> Result<Spawned, LaunchError> {
+/// Spawn the agent and settle which id its session is registered under.
+///
+/// `chosen` is the id handed to the agent at spawn, and the answer unless the
+/// backend announces one of its own within [`ANNOUNCE_GRACE`]. An announcement
+/// wins where it happens: not every transport can be told an id, and for those
+/// the agent's own word is the only truth. Claude, which can be told, echoes
+/// `chosen` straight back — so the two agree rather than compete.
+///
+/// Blocking (process spawn + a bounded recv loop) — run under `spawn_blocking`.
+fn spawn_and_settle_id(spec: ConnectSpec, chosen: String) -> Result<Spawned, LaunchError> {
     let (conn, events) = connect(spec).map_err(|err| {
         // Spawn errors routinely carry host paths; log, return the category.
         tracing::warn!(%err, "headless agent spawn failed");
         LaunchError::Failed
     })?;
-    let deadline = std::time::Instant::now() + INIT_TIMEOUT;
+    let deadline = std::time::Instant::now() + ANNOUNCE_GRACE;
     let mut buffered = Vec::new();
     loop {
-        let remaining = deadline
-            .checked_duration_since(std::time::Instant::now())
-            .ok_or(LaunchError::Failed)?;
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            return Ok(Spawned { conn, events, buffered, session_id: chosen });
+        };
         match events.recv_timeout(remaining) {
             Ok(event) => {
-                let init_id = match &event {
+                let announced = match &event {
                     ThreadEvent::SessionInit { session_id, .. } => Some(session_id.clone()),
                     ThreadEvent::Error(err) => {
-                        tracing::warn!(%err, "agent errored before session init");
+                        tracing::warn!(%err, "agent errored before it was registered");
                         None
                     }
                     _ => None,
                 };
                 buffered.push(event);
-                if let Some(session_id) = init_id
-                    && !session_id.is_empty()
-                {
+                if let Some(session_id) = announced.filter(|s| !s.is_empty()) {
                     return Ok(Spawned { conn, events, buffered, session_id });
                 }
             }
+            // The quiet path, and the normal one for Claude Code: nothing to
+            // announce until the agent is asked something. The id chosen at
+            // spawn stands, and the prompt that follows is what draws out the
+            // `SessionInit` — which the pump folds like any other event.
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                tracing::warn!("agent did not reach session init in time");
-                return Err(LaunchError::Failed);
+                return Ok(Spawned { conn, events, buffered, session_id: chosen });
             }
+            // Distinct from quiet: the process is gone. Registering a session
+            // whose agent has already exited would hand back an id that can
+            // never answer.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                tracing::warn!("agent exited before session init");
+                tracing::warn!("agent exited before it could be registered");
                 return Err(LaunchError::Failed);
             }
         }
@@ -175,15 +196,24 @@ impl SessionLauncher for HeadlessLauncher {
             None,
             None,
         );
+        // Named here rather than waited for. A headless host has no one to ask:
+        // it must hand this RPC a session id, and the agent it is about to spawn
+        // will not volunteer one until it has a prompt to answer — which cannot
+        // be sent until this call returns. Choosing the id breaks that circle,
+        // and `--session-id` means the agent adopts it rather than being renamed
+        // behind its back.
+        let chosen = uuid::Uuid::new_v4().to_string();
+        spec.fresh_session_id = Some(chosen.clone());
         // Granted before the child exists, so the very first `oximux` call it
         // makes is already confined. The handle is scoped to nothing until the
-        // rebind below — a spawn that dies before `SessionInit` therefore
+        // rebind below — a spawn that dies before it is registered therefore
         // leaves a credential that reaches no session at all.
         let label = credential_label();
         let secret = self.local.grant_session(&label);
         spec.env = credential_env(&label, &secret);
 
-        let spawned = match tokio::task::spawn_blocking(move || spawn_and_wait_for_init(spec)).await
+        let spawned = match tokio::task::spawn_blocking(move || spawn_and_settle_id(spec, chosen))
+            .await
         {
             Ok(Ok(spawned)) => spawned,
             // Nothing will ever bind or revoke this credential, so drop it here

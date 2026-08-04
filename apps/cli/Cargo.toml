@@ -83,6 +83,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # `pair-new`'s terminal QR. The bitmap-only build — no image/svg renderers.
 qrcode = { workspace = true }
+# Session ids the headless launcher picks itself, so a spawn never has to wait
+# to be told one.
+uuid = { workspace = true }
 
 # The SCM service wrapper: `oximux serve --install-service` registers a real
 # Windows service whose STOP maps onto serve's drain, and the job object is
