@@ -43,14 +43,18 @@ pub async fn run(client: &Client, args: RunArgs, json_mode: bool) -> Result<(Val
     let project_cwd = resolve_cwd(args.cwd)?;
 
     // `--worktree`: mint the worktree first; the session then opens inside it.
-    // The cwd names the project; the host derives the worktree's real path.
+    // The cwd names the project — resolved to the root the host knows, so
+    // invoking from a subdirectory works; the host derives the worktree's
+    // real path and still validates the root itself.
     let (cwd, worktree) = match &args.worktree {
         Some(slug) => {
+            let project_path = super::worktree::resolve_project_root(
+                client,
+                std::path::PathBuf::from(&project_cwd),
+            )
+            .await;
             let reply = client
-                .call(Request::CreateWorktree {
-                    project_path: project_cwd.clone(),
-                    slug: slug.clone(),
-                })
+                .call(Request::CreateWorktree { project_path, slug: slug.clone() })
                 .await?;
             match reply {
                 Response::WorktreeCreated(row) => (row.path.clone(), Some(row)),

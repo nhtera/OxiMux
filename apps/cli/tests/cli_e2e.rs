@@ -477,6 +477,125 @@ fn worktree_verbs_follow_the_scope_split() {
     }
 }
 
+/// A provider listing exactly one project — enough for the client-side
+/// project-root walk to have something to match against.
+struct StubProjects(String);
+
+#[async_trait::async_trait]
+impl oximux_remote_host::ProjectProvider for StubProjects {
+    async fn projects(&self) -> Vec<oximux_remote_proto::messages::ProjectSummaryWire> {
+        vec![oximux_remote_proto::messages::ProjectSummaryWire {
+            name: "proj".into(),
+            path: self.0.clone(),
+        }]
+    }
+}
+
+/// A host that lists one project and echoes worktree creates, serving on a
+/// fresh runtime dir until the runtime drops.
+fn serve_worktree_host(rt: &tokio::runtime::Runtime, runtime_dir: &Path, project_root: &Path) {
+    let registry = Arc::new(SessionRegistry::new());
+    let dispatcher = Arc::new(
+        Dispatcher::new(registry, Arc::new(AuthStore::new()))
+            .with_worktrees(Arc::new(StubWorktrees))
+            .with_projects(Arc::new(StubProjects(project_root.to_string_lossy().into_owned()))),
+    );
+    let listener = {
+        let _guard = rt.enter();
+        LocalControlListener::bind(runtime_dir, &generate_token()).unwrap()
+    };
+    rt.spawn(async move {
+        loop {
+            let pending = match listener.accept_pending().await {
+                Ok(pending) => pending,
+                Err(err) => {
+                    eprintln!("test host: accept failed, stopping: {err}");
+                    return;
+                }
+            };
+            let dispatcher = dispatcher.clone();
+            tokio::spawn(async move {
+                let Ok((transport, claim)) = pending.authenticate().await else {
+                    return;
+                };
+                let scope = match claim {
+                    LocalClaim::Operator => LocalScope::Full,
+                    LocalClaim::Session(id) => LocalScope::Session(id.into()),
+                };
+                dispatcher.serve_local(transport.as_ref(), scope).await;
+            });
+        }
+    });
+}
+
+/// Running worktree verbs from inside a project's subdirectory names the
+/// project root the host actually knows — via the client-side ancestor walk
+/// against `ListProjects` — while a directory outside every listed project
+/// still passes through verbatim for the host's own exact-match validation
+/// (the stub echoes `project_path` back, which is what makes each case
+/// observable).
+#[test]
+fn worktree_create_resolves_the_project_from_a_subdirectory() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("host");
+    // Canonicalized, as the desktop's own project rows are — macOS tempdirs
+    // live behind the /var → /private/var symlink and the invoking process's
+    // cwd always reads back physical.
+    let project_root = {
+        let p = dir.path().join("proj");
+        std::fs::create_dir_all(&p).unwrap();
+        p.canonicalize().unwrap()
+    };
+    let subdir = project_root.join("src").join("deep");
+    std::fs::create_dir_all(&subdir).unwrap();
+    serve_worktree_host(&rt, &runtime_dir, &project_root);
+
+    // From the subdirectory, no --project: the walk finds the root.
+    let out = bin(&runtime_dir)
+        .args(["--json", "worktree", "create", "feat-sub"])
+        .current_dir(&subdir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        json_stdout(&out)["data"]["project_path"],
+        project_root.to_string_lossy().as_ref(),
+        "the subdirectory resolved to its project root"
+    );
+
+    // The same walk serves an explicit --project pointing at a subdirectory,
+    // and `run --worktree` invoked from one.
+    let out = bin(&runtime_dir)
+        .args(["--json", "worktree", "create", "feat-flag"])
+        .args(["--project", subdir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        json_stdout(&out)["data"]["project_path"],
+        project_root.to_string_lossy().as_ref()
+    );
+
+    // A directory outside every listed project passes through verbatim — the
+    // host's exact-match validation stays the deciding boundary.
+    let elsewhere = dir.path().join("elsewhere").canonicalize().unwrap_or_else(|_| {
+        std::fs::create_dir_all(dir.path().join("elsewhere")).unwrap();
+        dir.path().join("elsewhere").canonicalize().unwrap()
+    });
+    let out = bin(&runtime_dir)
+        .args(["--json", "worktree", "create", "feat-out"])
+        .args(["--project", elsewhere.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "the stub host accepts any root");
+    assert_eq!(
+        json_stdout(&out)["data"]["project_path"],
+        elsewhere.to_string_lossy().as_ref(),
+        "an unlisted directory is not rewritten"
+    );
+}
+
 /// A firer that registers a stub-backed session per fire — the ticker's whole
 /// fire/record path without spawning any agent CLI.
 struct StubFirer {
