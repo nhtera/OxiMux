@@ -2,6 +2,10 @@
 //! carry frames both ways — and the two-factor refusals (no token file,
 //! wrong token) that back the CLI's exit-code contract.
 
+#[cfg(unix)]
+use interprocess::local_socket::ToFsName as _;
+#[cfg(unix)]
+use interprocess::local_socket::traits::tokio::Stream as _;
 use oximux_remote_local::{
     DialError, LocalClaim, LocalControlListener, dial, generate_token, token_path,
     write_token_file,
@@ -151,4 +155,91 @@ async fn rebind_over_a_stale_socket_node() {
     assert!(oximux_remote_local::socket_path(&runtime_dir).exists());
     let _second = LocalControlListener::bind(&runtime_dir, &token)
         .expect("rebind over the stale node");
+}
+
+/// A listener dropped AFTER a successor has rebound the same path must leave the
+/// successor's socket node alone.
+///
+/// This is not hypothetical ordering. The desktop's handle aborts its accept task
+/// to shut a listener down, and an abort is asynchronous — the task's `Arc` on the
+/// listener is released whenever the runtime next drops that future, which can be
+/// after a toggle-off/toggle-on has already rebound. An unconditional unlink there
+/// deletes the LIVE listener's node: it keeps serving on its fd with no directory
+/// entry, so every dial fails ENOENT while the UI still reads "enabled".
+#[cfg(unix)]
+#[tokio::test]
+async fn a_late_drop_does_not_unlink_a_successors_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("runtime");
+    let token = generate_token();
+    let socket = oximux_remote_local::socket_path(&runtime_dir);
+
+    let first = LocalControlListener::bind(&runtime_dir, &token).unwrap();
+    // The successor unlinks the stale node and creates its own in its place.
+    let second = LocalControlListener::bind(&runtime_dir, &token).unwrap();
+    assert!(socket.exists(), "the successor bound a node");
+
+    // The predecessor's drop lands late, as a cancelled accept task's would.
+    drop(first);
+    assert!(
+        socket.exists(),
+        "a late drop must not unlink the node a later bind created"
+    );
+
+    // And the successor still serves through it: the node is not merely present,
+    // it is the one a caller reaches.
+    let server = async {
+        let (_transport, claim) = second.accept().await.unwrap();
+        assert_eq!(claim, LocalClaim::Operator);
+    };
+    let client = async {
+        dial(&runtime_dir).await.expect("the surviving listener is dialable");
+    };
+    tokio::join!(server, client);
+
+    // The successor's own drop still cleans up after itself.
+    drop(second);
+    assert!(!socket.exists(), "a listener unlinks the node it bound");
+}
+
+/// A peer that connects and then says nothing must not hold the accept path.
+///
+/// `accept_pending` returns as soon as the connection exists, before any peer
+/// input, so the handshake — the first I/O an unauthenticated caller controls —
+/// runs in a task of the host's choosing. When it ran inside `accept`, one silent
+/// process wedged local CLI access for every later caller until the app restarted.
+///
+/// Unix-only for its plumbing, not its subject: the silent peer is a raw stream,
+/// and naming the endpoint takes the filesystem spelling. The behaviour under
+/// test is platform-independent.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_silent_peer_does_not_block_the_accept_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("runtime");
+    let token = generate_token();
+    let listener = LocalControlListener::bind(&runtime_dir, &token).unwrap();
+
+    let server = async {
+        // The silent caller is accepted...
+        let stalled = listener.accept_pending().await.expect("accept the silent peer");
+        // ...and the NEXT caller is served without it having said a word. Holding
+        // `stalled` across this is the whole point: it stands in for a peer that
+        // never sends its hello.
+        let (_transport, claim) = listener.accept().await.expect("accept the real caller");
+        assert_eq!(claim, LocalClaim::Operator, "a later caller is served regardless");
+        drop(stalled);
+    };
+    let clients = async {
+        // Connects and sends nothing, staying alive for the duration.
+        let _silent = interprocess::local_socket::tokio::Stream::connect(
+            oximux_remote_local::socket_path(&runtime_dir)
+                .to_fs_name::<interprocess::local_socket::GenericFilePath>()
+                .unwrap(),
+        )
+        .await
+        .expect("the silent peer connects");
+        dial(&runtime_dir).await.expect("a real caller still gets through");
+    };
+    tokio::join!(server, clients);
 }

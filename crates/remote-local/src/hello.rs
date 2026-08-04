@@ -96,6 +96,11 @@ pub enum HelloError {
     /// The caller could not prove it holds the token.
     #[error("the caller could not prove it holds the control token")]
     Denied,
+    /// The caller connected but did not finish the handshake in time. Its own
+    /// failure, never the listener's: the deadline exists so a silent peer
+    /// cannot hold a slot the next caller needs.
+    #[error("the caller did not complete the handshake in time")]
+    HandshakeTimeout,
 }
 
 fn nonce() -> Nonce {
@@ -173,10 +178,13 @@ pub(crate) async fn server_handshake(
 
 /// A throwaway secret for the unknown-label path — never stored, never
 /// matched.
+///
+/// The crate's own token minter rather than a second copy of it: this value has
+/// to be as unguessable as a real credential, and two independent definitions of
+/// "a fresh secret" would let one be strengthened while the other quietly was
+/// not.
 fn unguessable_secret() -> String {
-    let mut raw = [0u8; 32];
-    OsRng.fill_bytes(&mut raw);
-    raw.iter().map(|b| format!("{b:02x}")).collect()
+    crate::generate_token()
 }
 
 #[cfg(test)]

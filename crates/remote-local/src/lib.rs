@@ -21,16 +21,23 @@
 //!
 //! # Threat boundary
 //!
-//! Agent processes get a per-session secret in their environment at spawn, so
-//! an agent that misuses the protocol — asking for operator scope, or naming
-//! another session — is refused. What this does **not** stop is an agent that
-//! goes around the protocol: it runs as the same OS user as the desktop, so it
-//! can read the operator token file and present that instead. File permissions
-//! cannot separate two processes of one user, and closing this needs OS-level
-//! isolation for agent children (a macOS sandbox profile, a separate uid, or a
-//! namespace). That work is not in this crate; treat local access as a surface
-//! that assumes the agents the desktop spawns are not actively hostile to their
-//! own host.
+//! **No host wires the per-session credential yet, so no agent is confined
+//! today.** The mechanism below is complete and tested; the desktop does not
+//! call [`LocalControlListener::grant_session`] or inject
+//! [`SESSION_TOKEN_ENV_VAR`] at agent spawn, so an agent that runs `oximux`
+//! takes the operator path and is served full scope. Anyone reading this to
+//! decide whether local access is safe to enable should read it as: enabling it
+//! gives every agent this desktop spawns the operator's authority.
+//!
+//! What the mechanism buys once a host does wire it: an agent handed a
+//! per-session secret and asked to misuse the protocol — naming operator scope,
+//! or another session — is refused, because scope follows the secret proved
+//! rather than the label claimed. What it will still **not** stop is an agent
+//! that goes around the protocol: it runs as the same OS user as the desktop, so
+//! it can read the operator token file and present that instead. File
+//! permissions cannot separate two processes of one user, and closing that needs
+//! OS-level isolation for agent children (a macOS sandbox profile, a separate
+//! uid, or a namespace). That work is not in this crate.
 
 mod dial;
 mod hello;
@@ -41,7 +48,7 @@ mod transport;
 pub use dial::{DialError, credential, dial, dial_as};
 pub use hello::{LocalClaim, LocalIdentity};
 pub use secure::{generate_token, read_token_file, write_token_file};
-pub use serve::LocalControlListener;
+pub use serve::{LocalControlListener, PendingConnection};
 pub use transport::{LocalSocketTransport, MAX_FRAME};
 
 use std::path::{Path, PathBuf};

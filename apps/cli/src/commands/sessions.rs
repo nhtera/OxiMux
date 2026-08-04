@@ -3,22 +3,14 @@
 use oximux_remote_proto::proto::{Request, Response};
 use serde_json::{Value, json};
 
-use crate::client::{Client, rpc_failure};
+use crate::client::{Client, rpc_failure, unexpected_reply};
 use crate::output::Failure;
-
-fn unexpected(what: &str, got: &Response) -> Failure {
-    Failure::new(
-        "protocol",
-        crate::cli::exit::ERROR,
-        format!("unexpected reply to {what}: {got:?}"),
-    )
-}
 
 pub async fn ls(client: &Client) -> Result<(Value, String), Failure> {
     let rows = match client.call(Request::ListSessions).await? {
         Response::Sessions(rows) => rows,
         Response::Error(e) => return Err(rpc_failure(e)),
-        other => return Err(unexpected("ListSessions", &other)),
+        other => return Err(unexpected_reply("ListSessions", &other)),
     };
     let data = json!(rows
         .iter()
@@ -49,7 +41,7 @@ pub async fn projects_ls(client: &Client) -> Result<(Value, String), Failure> {
     let rows = match client.call(Request::ListProjects).await? {
         Response::Projects(rows) => rows,
         Response::Error(e) => return Err(rpc_failure(e)),
-        other => return Err(unexpected("ListProjects", &other)),
+        other => return Err(unexpected_reply("ListProjects", &other)),
     };
     let data = json!(rows
         .iter()

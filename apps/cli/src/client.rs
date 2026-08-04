@@ -2,16 +2,17 @@
 //! host, so `--help`, `version` and `agent-context` never touch the socket.
 //!
 //! Every connection claims a scope: `OXIMUX_SESSION_ID` in the environment
-//! (injected into agent-spawned processes) narrows the connection to that one
-//! session; its absence is an operator at their own keyboard. The host
-//! enforces the claim — this side merely never omits it.
+//! narrows the connection to that one session; its absence is an operator at
+//! their own keyboard. The host enforces the claim — this side merely never
+//! omits it.
+//!
+//! No host injects those variables yet, so in practice every invocation today
+//! takes the operator path. See `oximux-remote-local`'s threat-boundary docs.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use oximux_remote_local::{
-    DialError, LocalSocketTransport, SESSION_ENV_VAR, SESSION_TOKEN_ENV_VAR, dial,
-};
+use oximux_remote_local::{DialError, LocalSocketTransport, SESSION_ENV_VAR, dial};
 use oximux_remote_proto::Transport;
 use oximux_remote_proto::messages::HelloReq;
 use oximux_remote_proto::proto::{
@@ -46,11 +47,15 @@ pub fn runtime_dir(dir: Option<PathBuf>) -> Result<PathBuf, Failure> {
     )
 }
 
-/// Whether this invocation is running inside an agent session — used only to
-/// word errors helpfully. The credential itself (and therefore the scope) is
-/// chosen inside `remote-local`, from what this process can actually prove.
-fn looks_agent_scoped() -> bool {
-    std::env::var(SESSION_ENV_VAR).is_ok_and(|v| !v.trim().is_empty())
+/// A reply that does not answer the request that was sent. One helper so every
+/// verb reports a protocol fault under the same code and exit class — `ls` and
+/// `status` used to build this separately and could drift apart.
+pub fn unexpected_reply(what: &str, got: &Response) -> Failure {
+    Failure::new(
+        "protocol",
+        exit::ERROR,
+        format!("unexpected reply to {what}: {got:?}"),
+    )
 }
 
 impl Client {
@@ -63,14 +68,16 @@ impl Client {
             .await
             .map_err(|_| timed_out("connecting to the host"))?;
         let transport = dialed.map_err(|e| match e {
-            DialError::Unreachable { .. } if looks_agent_scoped() => {
-                Failure::new("unreachable", exit::UNREACHABLE, e.to_string()).with_steps([
-                    format!(
-                        "this looks like an agent session but ${SESSION_TOKEN_ENV_VAR} is unset — \
-                         only the host that spawned the agent can supply it"
-                    ),
-                ])
-            }
+            // An access failure, so exit 5 like every other refusal — the host
+            // may be running perfectly well. Reporting it as `unreachable` sent
+            // a retrying wrapper into a loop no retry could resolve.
+            DialError::NoCredential(_) => Failure::new("denied", exit::DENIED, e.to_string())
+                .with_steps([
+                    "only the host that spawned this agent can supply its credential".into(),
+                    "to run as the operator instead, clear the session variables from \
+                     the environment"
+                        .into(),
+                ]),
             DialError::Unreachable { .. } => Failure::new("unreachable", exit::UNREACHABLE, e.to_string())
                 .with_steps([
                     "open the OxiMux desktop app and enable local CLI access (Settings → Remote)"

@@ -72,25 +72,39 @@ pub fn start(
         let mut conns = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
-                accepted = listener.accept() => match accepted {
-                    Ok((transport, claim)) => {
+                accepted = listener.accept_pending() => match accepted {
+                    Ok(pending) => {
                         let dispatcher = dispatcher.clone();
-                        // The claim arriving here is already the verdict of a
-                        // proof against a registered credential — the handshake
-                        // grants the scope of the secret presented, not one the
-                        // caller asked for. This maps that verdict onto the
-                        // dispatcher's vocabulary and nothing more.
-                        let scope = match claim {
-                            LocalClaim::Operator => LocalScope::Full,
-                            LocalClaim::Session(id) => LocalScope::Session(id),
-                        };
+                        // Authenticate INSIDE the per-connection task, never on
+                        // the accept path. The handshake is the first I/O the
+                        // peer controls, so a caller that connects and then says
+                        // nothing would otherwise hold this loop and starve every
+                        // later `oximux` invocation until the app restarted.
                         conns.spawn(async move {
+                            let (transport, claim) = match pending.authenticate().await {
+                                Ok(authenticated) => authenticated,
+                                // A failed handshake (wrong token, torn
+                                // connection, a peer that went quiet) ends that
+                                // caller only, never the listener.
+                                Err(err) => {
+                                    tracing::debug!(%err, "local control connection refused");
+                                    return;
+                                }
+                            };
+                            // The claim arriving here is already the verdict of a
+                            // proof against a registered credential — the handshake
+                            // grants the scope of the secret presented, not one the
+                            // caller asked for. This maps that verdict onto the
+                            // dispatcher's vocabulary and nothing more.
+                            let scope = match claim {
+                                LocalClaim::Operator => LocalScope::Full,
+                                LocalClaim::Session(id) => LocalScope::Session(id.into()),
+                            };
                             dispatcher.serve_local(transport.as_ref(), scope).await;
                         });
                     }
-                    // A failed handshake (wrong token, torn connection) ends
-                    // that caller only, never the listener.
-                    Err(err) => tracing::debug!(%err, "local control connection refused"),
+                    // The accept itself failed; the listener stays up.
+                    Err(err) => tracing::debug!(%err, "local control accept failed"),
                 },
                 // Reap finished connections so the set does not grow for the
                 // listener's lifetime.

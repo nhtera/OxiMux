@@ -39,7 +39,13 @@ fn describe(cmd: &clap::Command) -> Value {
                 "name": a.get_id().as_str(),
                 "long": a.get_long(),
                 "help": a.get_help().map(|h| h.to_string()),
-                "takes_value": a.get_num_args().is_some_and(|n| n.takes_values()),
+                // From the action, not `get_num_args()`. `Cli::command()` hands
+                // back an UNBUILT tree, and clap fills an argument's value range
+                // during the build it never runs — so `get_num_args()` is `None`
+                // for every argument here and this field read `false` even for
+                // `--dir` and `--timeout`. An agent driving this CLI from the
+                // dump would then omit their values.
+                "takes_value": a.get_action().takes_values(),
                 "global": a.is_global_set(),
             })
         })
@@ -88,6 +94,24 @@ mod tests {
         for flag in ["json", "dir", "timeout"] {
             assert!(globals.contains(&flag), "global --{flag} missing from {globals:?}");
         }
+        // Whether a flag takes a value is the one field a caller cannot guess,
+        // and the whole audience for this dump is a machine composing argv from
+        // it. `--dir X` and `--timeout N` take values; `--json` is a bare
+        // switch. Asserted because reading this off clap's unbuilt tree used to
+        // report `false` for all three.
+        let takes_value = |name: &str| -> bool {
+            dump["command"]["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["name"] == name)
+                .unwrap_or_else(|| panic!("--{name} missing from the dump"))["takes_value"]
+                .as_bool()
+                .expect("takes_value is a bool")
+        };
+        assert!(takes_value("dir"), "--dir takes a directory");
+        assert!(takes_value("timeout"), "--timeout takes a number of seconds");
+        assert!(!takes_value("json"), "--json is a bare switch");
         assert_eq!(dump["exit_codes"]["access_denied"], 5);
         assert_eq!(dump["exit_codes"]["host_unreachable"], 3);
         assert_eq!(dump["command"]["name"], "oximux", "users type `oximux`");

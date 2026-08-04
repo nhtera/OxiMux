@@ -9,6 +9,8 @@
 //! forget to consider the local case, because the local case is not a separate
 //! code path.
 
+use std::sync::Arc;
+
 use super::AppPubkey;
 
 /// What a local caller may reach.
@@ -19,10 +21,15 @@ use super::AppPubkey;
 /// confined to it exactly as a session-scoped paired device would be: it may
 /// read and write that conversation, and nothing else — no other sessions, no
 /// terminals, no schedules, no creating its way out of the box.
+///
+/// `Arc<str>` rather than `String` because a [`Peer`] is re-derived from this
+/// on every RPC *and* every forwarded live frame, and each of those cloned the
+/// scope. On a busy session that was an allocation per streamed event on the
+/// forwarding path; a refcount bump costs nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalScope {
     Full,
-    Session(String),
+    Session(Arc<str>),
 }
 
 impl LocalScope {
@@ -31,7 +38,7 @@ impl LocalScope {
     pub(super) fn allows(&self, session_id: &str) -> bool {
         match self {
             LocalScope::Full => true,
-            LocalScope::Session(id) => id == session_id,
+            LocalScope::Session(id) => &**id == session_id,
         }
     }
 

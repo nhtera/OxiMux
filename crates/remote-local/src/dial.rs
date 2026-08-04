@@ -19,6 +19,15 @@ pub enum DialError {
     /// host, or the host is not running.
     #[error("the host is not reachable at {runtime_dir}: {reason}")]
     Unreachable { runtime_dir: String, reason: String },
+    /// This process cannot present a usable credential — an agent session whose
+    /// per-session secret never arrived, most of all.
+    ///
+    /// Separate from [`Unreachable`](Self::Unreachable) because it is an ACCESS
+    /// failure, and the host may well be running and healthy. Folding the two
+    /// together told a caller to check whether the app was up, and left a
+    /// retry-on-unreachable wrapper retrying a credential problem forever.
+    #[error("{0}")]
+    NoCredential(String),
     /// The handshake refused us (bad/stale token) — or we refused the host
     /// (it could not prove the token; a squatter or a half-rotated state).
     #[error("{0}")]
@@ -78,9 +87,18 @@ pub fn credential(runtime_dir: &Path) -> Result<(LocalIdentity, String), std::io
 /// credential this process holds. The scope granted follows from that
 /// credential — this side cannot ask for more than it can prove.
 pub async fn dial(runtime_dir: &Path) -> Result<Arc<LocalSocketTransport>, DialError> {
-    let (identity, token) = credential(runtime_dir).map_err(|e| DialError::Unreachable {
-        runtime_dir: runtime_dir.display().to_string(),
-        reason: format!("no control credential ({e})"),
+    let (identity, token) = credential(runtime_dir).map_err(|e| {
+        // A missing per-session secret is `PermissionDenied` from `credential`,
+        // and it stays an access failure here. Only a missing/unreadable token
+        // file means "no host has ever served from this directory".
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            DialError::NoCredential(e.to_string())
+        } else {
+            DialError::Unreachable {
+                runtime_dir: runtime_dir.display().to_string(),
+                reason: format!("no control credential ({e})"),
+            }
+        }
     })?;
     dial_as(runtime_dir, identity, &token).await
 }
@@ -122,47 +140,8 @@ pub async fn dial_as(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `std::env` is process-global, so the three cases run under one lock
-    /// inside a single test rather than racing each other. No await here —
-    /// this is pure environment parsing.
-    #[test]
-    fn credential_follows_the_environment_and_never_falls_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let runtime_dir = dir.path();
-        crate::write_token_file(&crate::token_path(runtime_dir), "operator-secret").unwrap();
-
-        let clear = || unsafe {
-            std::env::remove_var(crate::SESSION_ENV_VAR);
-            std::env::remove_var(crate::SESSION_TOKEN_ENV_VAR);
-        };
-
-        // No agent variables: the operator credential from the token file.
-        clear();
-        let (identity, secret) = credential(runtime_dir).unwrap();
-        assert_eq!(identity, LocalIdentity::Operator);
-        assert_eq!(secret, "operator-secret");
-
-        // Both agent variables: that session's credential, never the file's.
-        unsafe {
-            std::env::set_var(crate::SESSION_ENV_VAR, "sess-7");
-            std::env::set_var(crate::SESSION_TOKEN_ENV_VAR, "session-secret");
-        }
-        let (identity, secret) = credential(runtime_dir).unwrap();
-        assert_eq!(identity, LocalIdentity::Session("sess-7".into()));
-        assert_eq!(secret, "session-secret");
-
-        // Session id without its secret: refused outright. Falling back to the
-        // operator token here would hand an agent the operator's authority
-        // whenever its credential failed to arrive.
-        unsafe { std::env::remove_var(crate::SESSION_TOKEN_ENV_VAR) };
-        let err = credential(runtime_dir).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
-        assert!(err.to_string().contains(crate::SESSION_TOKEN_ENV_VAR));
-
-        clear();
-    }
-}
+// The environment-driven half of `credential` is covered by
+// `tests/credential_env.rs`, which is a test binary of its own. It cannot live
+// here: `std::env::set_var` mutates process-global state, and libtest runs the
+// tests in one binary on concurrent threads, so it would race the `getenv`
+// inside every `tempfile::tempdir()` call this crate's other unit tests make.

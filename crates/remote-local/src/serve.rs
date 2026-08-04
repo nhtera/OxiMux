@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use interprocess::local_socket::traits::tokio::{Listener as _, Stream as _};
@@ -14,6 +15,18 @@ use oximux_relay_proto::endpoint::{Endpoint, endpoint_for};
 use crate::hello::{HelloError, LocalClaim, LocalIdentity, server_handshake};
 use crate::secure;
 use crate::transport::LocalSocketTransport;
+
+/// How long a caller has to finish the credential handshake after connecting.
+///
+/// The handshake is the first I/O an unauthenticated peer controls, so it needs
+/// a deadline of its own: without one a process that connects and then says
+/// nothing holds its slot forever. Generous enough that no honest local caller
+/// can reach it — this is a socket on the same machine.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The identity → secret table, shared with each connection being
+/// authenticated so the handshake can run off the accept path.
+type Credentials = Arc<Mutex<HashMap<LocalIdentity, String>>>;
 
 /// A bound control-socket listener and the credentials it authenticates
 /// against. Dropping it closes the socket; the socket file is removed so a
@@ -31,9 +44,13 @@ pub struct LocalControlListener {
     /// per-session credentials are added by [`grant_session`] as agents spawn.
     ///
     /// [`grant_session`]: Self::grant_session
-    credentials: Mutex<HashMap<LocalIdentity, String>>,
+    credentials: Credentials,
     /// `Some` on unix (the file to unlink on drop); Windows pipes have no node.
     socket_file: Option<PathBuf>,
+    /// The (device, inode) that path carried at bind, so [`Drop`] can tell the
+    /// node this listener created from one a later bind put in its place.
+    #[cfg(unix)]
+    socket_node: Option<(u64, u64)>,
 }
 
 impl LocalControlListener {
@@ -62,7 +79,14 @@ impl LocalControlListener {
                 .to_ns_name::<interprocess::local_socket::GenericNamespaced>()
                 .context("derived pipe name unusable")?,
         };
-        let options = ListenerOptions::new().name(name);
+        // Name reclamation OFF, so this listener never unlinks the socket on its
+        // own. `interprocess` enables it by default and would delete whatever
+        // node sits at the path when the listener drops — including one a LATER
+        // bind put there, since a listener can outlive its owner (an aborted
+        // accept task is dropped whenever the runtime gets to it). Unlinking is
+        // this crate's job instead, and `Drop` only removes a node it can still
+        // identify as its own. No-op on Windows: a pipe has no name to reclaim.
+        let options = ListenerOptions::new().name(name).reclaim_name(false);
         // `?`, never a fallback: an unprotected pipe must not exist at all.
         #[cfg(windows)]
         let options = {
@@ -79,10 +103,16 @@ impl LocalControlListener {
 
         let credentials =
             HashMap::from([(LocalIdentity::Operator, token.to_string())]);
+        // Taken after the bind that created the node, so it identifies OUR
+        // socket rather than whatever happened to be at the path before.
+        #[cfg(unix)]
+        let socket_node = node_identity(&socket_path);
         Ok(Self {
             listener,
-            credentials: Mutex::new(credentials),
+            credentials: Arc::new(Mutex::new(credentials)),
             socket_file: cfg!(unix).then(|| socket_path),
+            #[cfg(unix)]
+            socket_node,
         })
     }
 
@@ -112,35 +142,95 @@ impl LocalControlListener {
             .remove(&LocalIdentity::Session(session_id.to_string()));
     }
 
-    /// Accept one connection and run the credential handshake. `Ok` hands back
-    /// the framed transport and the scope **the proven credential earns**; a
-    /// caller that fails the proof is answered and dropped, surfacing as
-    /// `Err(Denied)` for the host's log — never a panic, never a served
-    /// connection.
-    pub async fn accept(&self) -> Result<(Arc<LocalSocketTransport>, LocalClaim), HelloError> {
+    /// Accept one connection **without** authenticating it.
+    ///
+    /// The handshake deliberately does not run here. It is the first I/O the
+    /// peer controls, so running it on the accept path lets one
+    /// connected-but-silent caller hold the listener and starve every later
+    /// one. The returned value owns everything the handshake needs, so a host
+    /// serving concurrent callers finishes it in a per-connection task.
+    pub async fn accept_pending(&self) -> Result<PendingConnection, HelloError> {
         let stream = self
             .listener
             .accept()
             .await
             .map_err(|e| HelloError::Transport(e.to_string()))?;
         let (recv, send) = stream.split();
-        let transport = Arc::new(LocalSocketTransport::new(send, recv));
+        Ok(PendingConnection {
+            transport: Arc::new(LocalSocketTransport::new(send, recv)),
+            credentials: Arc::clone(&self.credentials),
+        })
+    }
+
+    /// Accept one connection and run the credential handshake on it. `Ok` hands
+    /// back the framed transport and the scope **the proven credential earns**;
+    /// a caller that fails the proof is answered and dropped, surfacing as
+    /// `Err(Denied)` for the host's log — never a panic, never a served
+    /// connection.
+    ///
+    /// Both steps in one await, for callers that serve one connection at a time.
+    /// A host that serves callers concurrently wants
+    /// [`accept_pending`](Self::accept_pending) instead, so a stalled handshake
+    /// cannot block the next accept.
+    pub async fn accept(&self) -> Result<(Arc<LocalSocketTransport>, LocalClaim), HelloError> {
+        self.accept_pending().await?.authenticate().await
+    }
+}
+
+/// A connected but not yet authenticated caller.
+///
+/// Carries its own handle on the credential table so the handshake can run in a
+/// task of its own, away from the accept path.
+pub struct PendingConnection {
+    transport: Arc<LocalSocketTransport>,
+    credentials: Credentials,
+}
+
+impl PendingConnection {
+    /// Run the credential handshake, bounded by [`HANDSHAKE_TIMEOUT`]. Returns
+    /// the framed transport and the scope the proven credential earns.
+    pub async fn authenticate(
+        self,
+    ) -> Result<(Arc<LocalSocketTransport>, LocalClaim), HelloError> {
+        let Self { transport, credentials } = self;
         // The lookup is a snapshot per call, so a credential revoked between
         // connections is gone for the next one.
-        let claim = server_handshake(transport.as_ref(), |identity| {
-            self.credentials.lock().unwrap().get(identity).cloned()
-        })
-        .await?;
+        let handshake = server_handshake(transport.as_ref(), |identity| {
+            credentials.lock().unwrap().get(identity).cloned()
+        });
+        let claim = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+            .await
+            .map_err(|_| HelloError::HandshakeTimeout)??;
         Ok((transport, claim))
     }
 }
 
 impl Drop for LocalControlListener {
     fn drop(&mut self) {
-        if let Some(path) = &self.socket_file {
-            let _ = std::fs::remove_file(path);
+        let Some(path) = &self.socket_file else {
+            return;
+        };
+        // Unlink only the node this listener bound. A handle owning this
+        // listener aborts its accept task asynchronously, so this drop can land
+        // after a later bind has already replaced the socket at the same path —
+        // and removing THAT node would leave a live listener with no filesystem
+        // entry, so every dial fails with ENOENT while the toggle reads on.
+        #[cfg(unix)]
+        if self.socket_node.is_none() || self.socket_node != node_identity(path) {
+            return;
         }
+        let _ = std::fs::remove_file(path);
     }
+}
+
+/// The (device, inode) pair naming a filesystem node, or `None` if it is gone.
+/// Two listeners that bound the same path in turn get different pairs, which is
+/// what lets a late `Drop` tell its own node from a successor's.
+#[cfg(unix)]
+fn node_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
 }
 
 /// Owner-only security descriptor for the Windows pipe — one definition of

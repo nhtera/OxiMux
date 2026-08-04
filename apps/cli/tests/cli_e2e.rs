@@ -57,19 +57,31 @@ fn serve_host(rt: &tokio::runtime::Runtime, runtime_dir: &Path) -> String {
     let agent_secret = listener.grant_session("sess-1");
     rt.spawn(async move {
         loop {
-            match listener.accept().await {
-                Ok((transport, claim)) => {
-                    let dispatcher = dispatcher.clone();
-                    let scope = match claim {
-                        LocalClaim::Operator => LocalScope::Full,
-                        LocalClaim::Session(id) => LocalScope::Session(id),
-                    };
-                    tokio::spawn(async move {
-                        dispatcher.serve_local(transport.as_ref(), scope).await;
-                    });
+            // Authenticate inside the per-connection task, as the desktop does:
+            // a stalled handshake must not hold the accept path.
+            let pending = match listener.accept_pending().await {
+                Ok(pending) => pending,
+                // Bail rather than retry. A `continue` here spins at full speed
+                // on any error that does not clear (EMFILE, say, which this
+                // suite can reach by spawning the binary repeatedly), starving
+                // the very subprocesses the assertions are waiting on and
+                // surfacing as an unrelated timeout.
+                Err(err) => {
+                    eprintln!("test host: accept failed, stopping: {err}");
+                    return;
                 }
-                Err(_) => continue,
-            }
+            };
+            let dispatcher = dispatcher.clone();
+            tokio::spawn(async move {
+                let Ok((transport, claim)) = pending.authenticate().await else {
+                    return;
+                };
+                let scope = match claim {
+                    LocalClaim::Operator => LocalScope::Full,
+                    LocalClaim::Session(id) => LocalScope::Session(id.into()),
+                };
+                dispatcher.serve_local(transport.as_ref(), scope).await;
+            });
         }
     });
     agent_secret
@@ -136,8 +148,12 @@ fn status_ls_and_scope_against_a_live_host() {
         .env(oximux_remote_local::SESSION_ENV_VAR, "sess-1")
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(3), "no fallback to operator scope");
+    // Exit 5, not 3: this is an access failure, and the host is running fine.
+    // Reporting it as "unreachable" told a wrapper to keep retrying something
+    // no retry can fix.
+    assert_eq!(out.status.code(), Some(5), "no fallback to operator scope");
     let v = json_stdout(&out);
+    assert_eq!(v["error"]["code"], "denied");
     assert!(
         v["error"]["message"]
             .as_str()
