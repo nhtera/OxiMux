@@ -290,3 +290,64 @@ fn an_expired_window_redeems_nothing() {
         drop(client);
     }));
 }
+
+/// The success criterion behind `--read-only` verbatim: the enrollment can
+/// list sessions but cannot send a prompt. Asserted over the remote path with
+/// a device minted through a read-only ticket — the whole chain, not just the
+/// ACL predicate.
+#[test]
+fn a_read_only_enrollment_lists_but_cannot_prompt() {
+    use oximux_agents::thread::StubConnection;
+    use oximux_remote_proto::messages::SendPromptReq;
+
+    let auth = Arc::new(AuthStore::new());
+    // Mint a read-only window as the operator would.
+    let dispatcher = dispatcher(auth.clone());
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve_local(&server, LocalScope::Full);
+    let ticket = block_on(async {
+        let script = async {
+            let Response::PairingIssued(issued) =
+                call(&client, Request::PairNew { read_only: true }).await
+            else {
+                panic!("the operator may mint");
+            };
+            drop(client);
+            issued.ticket
+        };
+        join(serve, script).await.1
+    });
+    let ticket = PairingTicket::decode(&ticket).unwrap();
+
+    // A registry with one live session, so the read has something to answer.
+    let registry = Arc::new(SessionRegistry::new());
+    registry.register("sess-1".into(), Arc::new(StubConnection::default()));
+    let dispatcher = Dispatcher::new(registry, auth)
+        .with_pairing_endpoint(ENDPOINT)
+        .with_clock(clock);
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    block_on(join(serve, async {
+        let device = test_pubkey();
+        let reply =
+            call(&client, Request::Register(register_with(&ticket.handshake_secret, device)))
+                .await;
+        assert!(matches!(reply, Response::Registered { .. }));
+        let Response::Sessions(rows) = call(&client, Request::ListSessions).await else {
+            panic!("a read-only enrollment may list sessions");
+        };
+        assert_eq!(rows.len(), 1);
+        let prompt = Request::SendPrompt(SendPromptReq {
+            session_id: "sess-1".into(),
+            text: "act".into(),
+            images: vec![],
+            corr_id: 1,
+        });
+        assert_eq!(
+            call(&client, prompt).await,
+            Response::Error(RpcError::Unauthorized),
+            "a read-only enrollment must not act"
+        );
+        drop(client);
+    }));
+}
