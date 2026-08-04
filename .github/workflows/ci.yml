@@ -127,6 +127,7 @@ jobs:
           -p oximux-relay-client
           -p oximux-relay-supervisor
           -p oximux-relay-terminals
+          -p oximux-single-instance
           -p oximux-remote-proto
           -p oximux-remote-host
           -p oximux-remote-session

@@ -1,0 +1,21 @@
+[package]
+name = "oximux-single-instance"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# A non-blocking exclusive advisory file lock that decides which process owns
+# a per-data-directory role — extracted from the desktop app's GUI guard so
+# `oximux serve` can contend for the same roles (the GUI itself, the schedule
+# ticker) with identical semantics on unix and Windows. The OS releases the
+# lock on process exit, crash or SIGKILL included, so a dead holder never
+# strands a stale lock the way a bare pidfile does.
+
+[dependencies]
+fd-lock = "4"
+
+[dev-dependencies]
+tempfile = { workspace = true }

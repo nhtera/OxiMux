@@ -100,9 +100,9 @@ two-face = { version = "0.5.1", default-features = false, features = ["syntect-f
 # methods (open/close/is_devtools_open) exist in release too — wry only turns
 # them on automatically under debug_assertions, which broke release builds.
 wry = { version = "0.55", features = ["devtools"] }
-# Single-instance guard: one non-blocking exclusive file lock over `flock` and
-# `LockFileEx`, with contention normalised to `WouldBlock` on both.
-fd-lock = "4"
+# Single-instance guard: the data-dir role lock (GUI instance, schedule
+# ticker), shared with `oximux serve` so both hosts contend identically.
+oximux-single-instance = { workspace = true }
 
 # Relay supervisor's `pre_exec` calls libc::umask so the bundled
 # socket/token files come out 0600. libc is already in the transitive

@@ -7036,7 +7036,6 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "embed-resource",
- "fd-lock",
  "futures",
  "gpui",
  "gpui-component",
@@ -7077,6 +7076,7 @@ dependencies = [
  "oximux-remote-proto",
  "oximux-settings",
  "oximux-shell-env",
+ "oximux-single-instance",
  "oximux-storage",
  "oximux-ui",
  "pbkdf2",
@@ -7510,6 +7510,14 @@ version = "0.1.6"
 dependencies = [
  "portable-pty",
  "which 6.0.3",
+]
+
+[[package]]
+name = "oximux-single-instance"
+version = "0.1.6"
+dependencies = [
+ "fd-lock",
+ "tempfile",
 ]
 
 [[package]]

@@ -25,6 +25,7 @@ members = [
     "crates/relay-client",
     "crates/relay-supervisor",
     "crates/relay-terminals",
+    "crates/single-instance",
     "crates/remote-proto",
     "crates/remote-host",
     "crates/remote-session",
@@ -85,6 +86,9 @@ oximux-relay-supervisor = { path = "crates/relay-supervisor" }
 # remote-host's TerminalSource over the relay daemon — shared by the desktop
 # and `oximux serve` for the same reason the supervisor is.
 oximux-relay-terminals = { path = "crates/relay-terminals" }
+# The advisory data-dir role lock (GUI instance, schedule ticker) — its own
+# crate because both hosts contend for the same roles.
+oximux-single-instance = { path = "crates/single-instance" }
 oximux-remote-proto = { path = "crates/remote-proto" }
 oximux-remote-host = { path = "crates/remote-host" }
 oximux-remote-session = { path = "crates/remote-session" }
