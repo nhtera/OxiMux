@@ -21,7 +21,7 @@ mod host;
 mod transport;
 
 pub use connector::IrohConnector;
-pub use endpoint::{accept, bind_client, bind_host};
+pub use endpoint::{accept, bind_client, bind_host, endpoint_id_of};
 #[cfg(feature = "host")]
 pub use host::{HostHandle, serve_host, start_host};
 pub use transport::{IrohTransport, MAX_FRAME};

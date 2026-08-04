@@ -174,6 +174,48 @@ pub enum Command {
         #[command(subcommand)]
         command: ProjectsCommand,
     },
+    /// Run this machine as a headless OxiMux host.
+    ///
+    /// Boots the same session/terminal/storage stack the desktop app hosts —
+    /// minus every window — then serves the local CLI socket and the paired-
+    /// device endpoint until SIGTERM/Ctrl+C, draining in-flight agent turns
+    /// before exiting. Stdout carries exactly one readiness JSON line; logs go
+    /// to stderr. Pair devices at runtime with `pair-new` (never a boot flag,
+    /// so no ticket ever lands in a journal).
+    #[command(verbatim_doc_comment)]
+    Serve {
+        /// The data directory (default: this machine's OxiMux data dir, shared
+        /// with the desktop app so sessions and pairings are one set).
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+        /// A project root to offer as a new-session target (repeatable; also
+        /// read from <data-dir>/projects.toml).
+        #[arg(long = "project", value_name = "DIR")]
+        projects: Vec<PathBuf>,
+    },
+    /// Mint a one-time, short-lived pairing ticket on the running host.
+    ///
+    /// Prints the ticket (and its QR) to an interactive terminal ONLY — it is
+    /// a bearer credential, and a journal that captured it would stay
+    /// redeemable for its window. The enrollment it mints has full write
+    /// access unless --read-only opts it down.
+    #[command(verbatim_doc_comment)]
+    PairNew {
+        /// Mint a read-only enrollment (it can watch, never act).
+        #[arg(long)]
+        read_only: bool,
+        /// Print the ticket even though stdout is not a terminal. You are
+        /// taking responsibility for where it lands.
+        #[arg(long)]
+        force_non_tty: bool,
+    },
+    /// List the host's paired devices, tier and revocation included.
+    PairLs,
+    /// Erase one device's enrollment (it may pair again with a fresh ticket).
+    PairRm {
+        /// The device's public key, as `pair-ls` printed it (64 hex chars).
+        pubkey: String,
+    },
     /// Print this CLI's build and protocol versions (offline).
     Version,
     /// Print the full command schema as JSON, for agents driving this CLI

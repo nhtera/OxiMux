@@ -9,6 +9,7 @@ mod client;
 mod commands;
 mod output;
 mod render;
+mod serve;
 
 use clap::Parser as _;
 use serde_json::json;
@@ -45,6 +46,12 @@ fn main() -> std::process::ExitCode {
             let human = serde_json::to_string_pretty(&data).expect("static json");
             render(args.json, Ok((data, human)))
         }
+        // Serve owns its own (multi-thread) runtime and its own output
+        // contract — one readiness line on stdout, logs on stderr.
+        Command::Serve { data_dir, projects } => serve::run(serve::ServeArgs {
+            data_dir: data_dir.clone(),
+            projects: projects.clone(),
+        }),
         // Host verbs: build the runtime, connect lazily, run the verb.
         _ => host_verb(args),
     };
@@ -152,8 +159,16 @@ fn host_verb(args: Cli) -> u8 {
                     }
                     WorktreeCommand::Rm { id } => commands::worktree::rm(&client, &id).await,
                 },
-                // Offline verbs are dispatched in `main`; unreachable here.
-                Command::Version | Command::AgentContext => unreachable!("offline verb"),
+                Command::PairNew { read_only, force_non_tty } => {
+                    commands::pair::pair_new(&client, read_only, force_non_tty, json_mode).await
+                }
+                Command::PairLs => commands::pair::pair_ls(&client).await,
+                Command::PairRm { pubkey } => commands::pair::pair_rm(&client, &pubkey).await,
+                // Offline verbs and `serve` are dispatched in `main`;
+                // unreachable here.
+                Command::Version | Command::AgentContext | Command::Serve { .. } => {
+                    unreachable!("dispatched in main")
+                }
             }
         }
         .await;

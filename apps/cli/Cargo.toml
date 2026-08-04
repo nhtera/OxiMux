@@ -27,17 +27,34 @@ oximux-remote-proto = { workspace = true }
 # The ThreadEvent/ThreadEntry vocabulary the renderer folds — gpui-free by
 # construction (it is what remote-proto itself carries).
 oximux-agent-core = { workspace = true }
+# `oximux serve`: the same dispatcher/registry/relay/storage stack the desktop
+# hosts, minus every view. All gpui-free (asserted by the dep-tree test).
+oximux-remote-host = { workspace = true }
+oximux-agents = { workspace = true }
+oximux-storage = { workspace = true }
+oximux-owner-only = { workspace = true }
+oximux-shell-env = { workspace = true }
+toml = { workspace = true }
+oximux-relay-supervisor = { workspace = true }
+oximux-relay-terminals = { workspace = true }
+oximux-relay-client = { workspace = true }
+# `host` explicitly: the workspace declaration is default-features = false so
+# the mobile core can't inherit the accept loop; serve is exactly the consumer
+# that wants it.
+oximux-remote-iroh = { workspace = true, features = ["host"] }
 clap = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+# Serve's stderr logging (stdout is the readiness contract and nothing else).
+tracing-subscriber = { workspace = true }
+# `pair-new`'s terminal QR. The bitmap-only build — no image/svg renderers.
+qrcode = { workspace = true }
 
 [dev-dependencies]
-# The E2E suite stands up a real dispatcher behind a real socket and drives
-# the compiled binary against it.
-oximux-remote-host = { workspace = true }
-oximux-agents = { workspace = true }
-async-trait = { workspace = true }
 tempfile = { workspace = true }

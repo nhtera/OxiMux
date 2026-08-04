@@ -125,6 +125,8 @@ jobs:
           -p oximux-relay-proto
           -p oximux-relay
           -p oximux-relay-client
+          -p oximux-relay-supervisor
+          -p oximux-relay-terminals
           -p oximux-remote-proto
           -p oximux-remote-host
           -p oximux-remote-session
@@ -173,6 +175,18 @@ jobs:
 
       - name: cargo test (oximux CLI end-to-end)
         run: cargo test -p oximux-cli
+
+      # The serve binary's dependency hygiene, as a hard gate: the CLI must
+      # never link the GUI toolkit or the desktop-only capability stacks. A
+      # `cargo tree` scan rather than a compile failure because these leak in
+      # transitively — a compile would happily succeed with gpui in tree.
+      - name: cli dependency-tree gate (no gpui / dictation / computer-use)
+        run: |
+          cargo tree -p oximux-cli -e normal > /tmp/cli-tree.txt
+          if grep -E '(^| )(gpui|gpui_platform|oximux-dictation|oximux-computer-use|oximux-ui|oximux-editor)( |$)' /tmp/cli-tree.txt; then
+            echo "forbidden dependency in the oximux-cli tree (see matches above)"
+            exit 1
+          fi
 
   # Permanent gate for the Windows port. macOS is still the only shipping
   # target; this job stops a macOS-only API from landing on a shared path
