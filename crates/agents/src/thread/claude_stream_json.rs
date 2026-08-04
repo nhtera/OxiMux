@@ -274,6 +274,7 @@ impl ClaudeStreamJsonConnection {
         permission_mode: Option<&str>,
         effort: Option<&str>,
         host: &HostInjection<'_>,
+        env: &[(String, String)],
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
         let mut cmd = Command::new(crate::cli::program_for_spawn("claude"));
         cmd.args(build_args_with_resume(
@@ -283,7 +284,11 @@ impl ClaudeStreamJsonConnection {
             effort,
             host,
         ))
-        .current_dir(cwd);
+        .current_dir(cwd)
+        // Overrides on top of the inherited environment — the host's own
+        // variables for this one child (its local-control credential), which
+        // must reach the agent and no sibling process.
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         Self::spawn_command(cmd)
     }
 

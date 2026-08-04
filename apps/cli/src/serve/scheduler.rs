@@ -27,11 +27,15 @@ impl ScheduleFirer for ServeFirer {
     async fn fire(&self, schedule: &Schedule, target: &ScheduleTarget) -> FireOutcome {
         match target {
             ScheduleTarget::NewSession => {}
-            ScheduleTarget::ExistingSession(_) => {
-                return FireOutcome::Failed {
-                    session_id: None,
-                    detail: "firing into an existing session is not supported yet".into(),
-                };
+            // A heartbeat: nudge the live session instead of spawning. Shared
+            // with the desktop firer — nothing about waking an already-open
+            // session is host-specific.
+            ScheduleTarget::ExistingSession(session_id) => {
+                return oximux_agents::schedule::nudge_existing_session(
+                    &self.registry,
+                    schedule,
+                    session_id,
+                );
             }
         }
         let session_id =

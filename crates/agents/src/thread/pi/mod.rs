@@ -116,6 +116,7 @@ impl PiRpcConnection {
         program: Option<&str>,
         posture: PiPosture,
         resume: Option<&str>,
+        env: &[(String, String)],
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
         let args = self::build_args(model, &posture, resume)?;
         let program = resolve_pi_binary(program)?;
@@ -124,6 +125,9 @@ impl PiRpcConnection {
             cmd.args(args).current_dir(cwd);
             // pi inherits the parent environment on purpose: it resolves provider
             // credentials from it. Upstream's own client spawns with `process.env`.
+            // The host's own overrides (this child's local-control credential)
+            // go on top.
+            cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
             cmd
         };
         let err = match Self::spawn_with_posture(build(args), posture.clone()) {
@@ -1559,6 +1563,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             fake.to_str(),
             PiPosture::default(),
             Some("gone"),
+            &[],
         )
         .expect("an unresumable id must fall back, not fail");
         assert_eq!(conn.session_id().as_deref(), Some("brand-new"), "a genuinely new session");
@@ -1587,9 +1592,10 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
             "#!/bin/sh\necho 'pi: no credentials found' >&2\nexit 1\n",
             "[Console]::Error.WriteLine('pi: no credentials found')\nexit 1\n",
         );
-        let err = PiRpcConnection::spawn(&dir, None, fake.to_str(), PiPosture::default(), Some("sess-1"))
-            .err()
-            .expect("a credentials failure must not be retried as a fresh session");
+        let err =
+            PiRpcConnection::spawn(&dir, None, fake.to_str(), PiPosture::default(), Some("sess-1"), &[])
+                .err()
+                .expect("a credentials failure must not be retried as a fresh session");
         assert!(format!("{err:#}").contains("no credentials found"), "got {err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }

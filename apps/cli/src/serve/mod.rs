@@ -146,6 +146,18 @@ async fn serve(
     let endpoint_id = oximux_remote_iroh::endpoint_id_of(&endpoint_secret);
     let auth = Arc::new(AuthStore::with_store(Arc::new(StorageDeviceStore::new(device_repo))));
 
+    // ---- local socket, bound before anything can spawn an agent ----
+    // Bound this early because the launcher mints each agent's confined
+    // credential from it: an agent spawned before the socket existed would have
+    // no credential to be confined by, and would fall back to the operator
+    // path. Binding is also the single-host check, so failing here fails fast.
+    // The accept loop starts later, once the dispatcher exists to serve it.
+    let local_listener = Arc::new(
+        LocalControlListener::bind(&data_dir, &oximux_remote_local::generate_token()).context(
+            "bind the local control socket (is another OxiMux host already serving here?)",
+        )?,
+    );
+
     // ---- registry + headless seams + dispatcher ----
     let registry = Arc::new(SessionRegistry::new());
     let pumps = pump::PumpSet::new();
@@ -158,6 +170,7 @@ async fn serve(
         pumps.clone(),
         draining.clone(),
         index.clone(),
+        local_listener.clone(),
     ));
     let catalog = Arc::new(catalog::HeadlessCatalog::scan(
         registry.clone(),
@@ -165,6 +178,7 @@ async fn serve(
         pumps.clone(),
         draining.clone(),
         index,
+        local_listener.clone(),
     ));
     let provider = Arc::new(projects::StaticProjects::load(args.projects, &data_dir));
 
@@ -246,13 +260,36 @@ async fn serve(
         }
     };
 
+    // ---- team runs: settle the roles a restart orphaned ----
+    // The restart-survival property, and the reason a run is host state: a role
+    // whose session survived keeps running; one whose session is gone is closed
+    // with a reason, so the run converges instead of waiting forever on an
+    // agent that no longer exists.
+    let teams = Arc::new(oximux_agents::team::TeamStore::new(db.conn()));
+    {
+        let settings = settings.clone();
+        let exists = move |sid: &str| {
+            settings.get(&blob::chat_settings_key(sid)).ok().flatten().is_some()
+        };
+        match teams.recover_open_roles(chrono::Local::now(), exists) {
+            Ok(settled) if settled.is_empty() => {}
+            Ok(settled) => {
+                tracing::info!(roles = settled.len(), "settled team roles orphaned by a restart")
+            }
+            Err(err) => tracing::warn!(%err, "team-run recovery failed"),
+        }
+    }
+    let coord = Arc::new(oximux_agents::coord::CoordStore::new(db.conn()));
+
     let mut dispatcher = Dispatcher::new(registry.clone(), auth.clone())
         .with_launcher(launcher)
         .with_catalog(catalog)
         .with_projects(provider)
         .with_pairing_endpoint(endpoint_id)
         .with_schedule_store(Arc::new(schedule_store))
-        .with_schedule_events(schedule_events);
+        .with_schedule_events(schedule_events)
+        .with_team_store(teams)
+        .with_coord_store(coord);
     if let Some(runner) = schedule_runner {
         dispatcher = dispatcher.with_schedule_runner(runner);
     }
@@ -264,9 +301,8 @@ async fn serve(
     // answers `Unsupported` (or its documented refusal) rather than pretending.
     let dispatcher = Arc::new(dispatcher);
 
-    // ---- local socket (the CLI on this box) ----
-    let local = start_local_listener(dispatcher.clone(), data_dir.clone())
-        .context("bind the local control socket (is another OxiMux host already serving here?)")?;
+    // ---- local socket: start accepting on the listener bound above ----
+    let local = serve_local_connections(dispatcher.clone(), local_listener);
 
     // ---- iroh endpoint (paired devices) ----
     // Bound in the background: `start_host` waits until the endpoint is
@@ -372,12 +408,10 @@ impl Drop for LocalHandle {
     }
 }
 
-fn start_local_listener(
+fn serve_local_connections(
     dispatcher: Arc<Dispatcher>,
-    runtime_dir: PathBuf,
-) -> anyhow::Result<LocalHandle> {
-    let token = oximux_remote_local::generate_token();
-    let listener = Arc::new(LocalControlListener::bind(&runtime_dir, &token)?);
+    listener: Arc<LocalControlListener>,
+) -> LocalHandle {
     let task = tokio::spawn(async move {
         let mut conns = tokio::task::JoinSet::new();
         loop {
@@ -405,7 +439,7 @@ fn start_local_listener(
             }
         }
     });
-    Ok(LocalHandle { task })
+    LocalHandle { task }
 }
 
 /// Resolve when the platform asks this process to stop.

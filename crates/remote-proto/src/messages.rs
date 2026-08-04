@@ -573,3 +573,151 @@ pub enum RunOutcomeWire {
     Ok,
     Failed,
 }
+
+// ---- v18: automation primitives ----
+
+/// Arm a heartbeat — a recurring wake-up inside a session that already exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateHeartbeatReq {
+    /// The session to wake, or `None` for "the one this connection IS".
+    ///
+    /// `None` is the confined-agent case and the reason this is optional at
+    /// all: an agent knows it wants to wake *itself* but does not necessarily
+    /// know its own session id (its credential names a handle, not an id). The
+    /// host resolves it from the connection's proven scope, which is the only
+    /// value it could honestly supply.
+    pub session_id: Option<String>,
+    /// A name for the wake-up, shown in listings and quoted in the preamble the
+    /// agent receives, so a fired heartbeat says which one it was.
+    pub name: String,
+    /// What to send when it fires. Delivered under a preamble marking it as a
+    /// timer rather than a person, so the agent acts instead of replying.
+    pub prompt: String,
+    pub recurrence: RecurrenceWire,
+}
+
+/// One armed heartbeat.
+///
+/// Its own type rather than a field appended to [`ScheduleWire`]: postcard
+/// structs are positional, so appending there would misparse every later
+/// element of a `Vec<ScheduleWire>` on any client built before the change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeartbeatWire {
+    pub id: String,
+    /// The session this wakes.
+    pub session_id: String,
+    pub name: String,
+    pub prompt: String,
+    pub recurrence: RecurrenceWire,
+    pub enabled: bool,
+    /// RFC-3339 next-fire instant in the **host's** local zone.
+    pub next_fire_at: String,
+    /// The host's own human phrasing of the recurrence, carried rather than
+    /// re-derived so every surface reads identically.
+    pub summary: String,
+}
+
+/// Open a team run: one session per role, all in one call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRunCreateReq {
+    /// A name for the run, shown in listings.
+    pub name: String,
+    /// The project root every role's session opens in (or the base for its
+    /// worktree). Validated by the host exactly as `CreateSession`'s cwd is.
+    pub cwd: String,
+    /// Which configured agent runs every role. `None` = the host's default.
+    pub agent_id: Option<String>,
+    /// Give each role its own worktree under the project, so roles editing the
+    /// same files do not collide. The host derives each path from the run and
+    /// role names — never the client.
+    pub worktree_each: bool,
+    /// The roles, in order. At least one; the host caps how many.
+    pub roles: Vec<TeamRoleSpecWire>,
+}
+
+/// One role's name and opening instruction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRoleSpecWire {
+    pub name: String,
+    pub prompt: String,
+}
+
+/// A team run and every role in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRunWire {
+    pub id: String,
+    pub name: String,
+    pub cwd: String,
+    /// RFC-3339 creation instant, host-local.
+    pub created_at: String,
+    /// `true` once every role has reported. Derived host-side so two clients
+    /// cannot disagree about whether a run is finished.
+    pub closed: bool,
+    pub roles: Vec<TeamRoleWire>,
+}
+
+/// One role's live state within a run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRoleWire {
+    pub name: String,
+    /// The session working this role, when one started. `None` means the
+    /// session could not be opened — the role's status says why.
+    pub session_id: Option<String>,
+    pub status: TeamRoleStatusWire,
+    /// What the role reported, or why it could not start.
+    pub summary: Option<String>,
+    /// RFC-3339 instant the role last changed state, host-local.
+    pub updated_at: String,
+}
+
+/// Where a role stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TeamRoleStatusWire {
+    /// Session open, no report yet.
+    Running,
+    /// The role reported success.
+    Done,
+    /// The role reported failure, or never started.
+    Failed,
+}
+
+/// Write one coordination key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateSetReq {
+    pub key: String,
+    /// The value, as a JSON string. A string rather than a `Value` because the
+    /// postcard envelope carries no self-describing types — the same convention
+    /// the transcript and event payloads already follow.
+    pub value_json: String,
+    /// Optimistic concurrency: write only if the stored version is exactly
+    /// this. `Some(0)` means "only if absent". `None` overwrites.
+    pub if_version: Option<u64>,
+}
+
+/// One coordination entry as stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateEntryWire {
+    pub key: String,
+    pub value_json: String,
+    /// Incremented on every write. A caller passes the version it read back as
+    /// `if_version` to make its next write conditional on nothing having
+    /// changed underneath it.
+    pub version: u64,
+    /// RFC-3339 last-write instant, host-local.
+    pub updated_at: String,
+}
+
+/// A role settling its own row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamReportReq {
+    pub run_id: String,
+    /// Which role is reporting. Named rather than inferred from the calling
+    /// session so an operator can settle a role whose agent died — otherwise a
+    /// crashed role would hold its run open with nothing able to close it.
+    pub role: String,
+    /// `true` for done, `false` for failed. A bool rather than the status enum
+    /// because `Running` is not something a report can set: a role reporting is
+    /// by definition finished.
+    pub ok: bool,
+    pub summary: Option<String>,
+}

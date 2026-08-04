@@ -63,12 +63,37 @@ pub use crate::messages::*;
 /// that asked), a push reaches peers that never opted in, and an older decoder
 /// meeting the unknown ordinal would drop the whole connection.
 ///
+/// v18: appended the automation surface — **heartbeats** (`CreateHeartbeat`,
+/// `ListHeartbeats`, `DeleteHeartbeat` and the `Heartbeats` reply), a session's
+/// own recurring wake-ups, which are schedules aimed at an existing session
+/// rather than at a fresh spawn; **team runs** (`TeamRunCreate`, `TeamReport`,
+/// `TeamStatus`, `TeamList` and the `TeamRun`/`TeamRuns` replies), a restart-
+/// surviving record of a multi-role fan-out; and the **coordination state KV**
+/// (`StateGet`, `StateSet`, `StateDelete`, `StateWatch` with the `StateValue`/
+/// `StateSnapshot`/`StateChanged`/`StateConflict` frames), a small versioned
+/// blackboard agents share without going through a transcript.
+///
+/// Heartbeats get their own list verb and their own `HeartbeatWire` rather than
+/// riding [`Response::Schedules`]: `ScheduleWire` is a postcard struct, so it
+/// is as positional as an enum and a field appended to it would misparse every
+/// element after the first on an older client. The same reasoning keeps
+/// heartbeats out of `ListSchedules` entirely — a v17 phone must not receive
+/// rows whose target it has no field to see.
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
+
+/// The oldest peer that can decode [`Response::StateChanged`]. Like
+/// [`SCHEDULE_PUSH_MIN_VERSION`], this exists because a push reaches a peer
+/// that never asked for it — but unlike that one, a peer only ever receives
+/// `StateChanged` after sending [`Request::StateWatch`], which a pre-v18 peer
+/// cannot do. Stated anyway so the gate is a property of the push rather than
+/// an inference about who could have subscribed.
+pub const STATE_PUSH_MIN_VERSION: u32 = 18;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the
@@ -489,6 +514,71 @@ pub enum Request {
     /// A host whose scheduling is owned by another process (the ticker lock
     /// lost) answers [`RpcError::Unsupported`].
     RunScheduleNow { schedule_id: String },
+
+    // ---- v18: automation primitives ----
+    /// Arm a recurring wake-up **inside an existing session** — a heartbeat.
+    ///
+    /// Unlike [`Request::CreateSchedule`], which spawns a fresh session per
+    /// fire, this delivers its prompt into a conversation that is already open,
+    /// with all the context that conversation has built. That is what makes it
+    /// useful to the agent living there, and it is why the gate is
+    /// **session-scoped, not full-scope**: a heartbeat is a deferred
+    /// `SendPrompt` into one session, so anyone who may prompt that session
+    /// may arm one. A read-only device may not; a session-confined agent may,
+    /// for its own session only.
+    ///
+    /// `session_id` is `None` for a caller that IS a session (the confined
+    /// agent case) — the host resolves it from the connection's own scope,
+    /// which is the only value it could legitimately name. An operator must
+    /// name one.
+    ///
+    /// Capped per session host-side; the overflow refusal is a
+    /// [`RpcError::BadRequest`] naming the limit.
+    CreateHeartbeat(CreateHeartbeatReq),
+    /// The heartbeats armed for a session. `None` means the calling session,
+    /// as in [`Request::CreateHeartbeat`]. A read (scope-checked, read-only
+    /// devices welcome).
+    ListHeartbeats { session_id: Option<String> },
+    /// Disarm one heartbeat by id. Idempotent — deleting one already gone is
+    /// success. Same write gate as arming it, checked against the session the
+    /// heartbeat actually targets rather than one the caller names, so a
+    /// confined agent cannot delete another session's wake-ups.
+    DeleteHeartbeat { id: String },
+    /// Open a team run: one row per role, each with a session started for it.
+    ///
+    /// The run outlives the process that created it — a host restart
+    /// re-associates live sessions to open runs rather than losing them, which
+    /// is the whole reason this is host state and not a client-side script's
+    /// bookkeeping. Full write scope, like [`Request::CreateSession`]: it
+    /// starts sessions, several at once.
+    TeamRunCreate(TeamRunCreateReq),
+    /// A role reporting its own outcome — called by the agent working that
+    /// role, from inside its session. Scope-checked against **that role's
+    /// session**, so a confined agent can settle its own row and no other.
+    TeamReport(TeamReportReq),
+    /// One run's roles and their statuses. A read; full scope, since a run
+    /// spans sessions and a confined caller has no defensible narrowing.
+    TeamStatus { run_id: String },
+    /// Every team run this host holds, newest first. Same read gate as
+    /// [`Request::TeamStatus`].
+    TeamList,
+    /// Read one coordination key. Absent is a normal answer
+    /// ([`Response::StateValue`] with `entry: None`), not an error.
+    StateGet { key: String },
+    /// Write one coordination key.
+    ///
+    /// `if_version` is optimistic concurrency: `Some(v)` writes only if the
+    /// stored version is exactly `v` (`Some(0)` means "only if absent"), and a
+    /// mismatch is refused with the *current* entry so the caller can merge and
+    /// retry rather than guess. `None` overwrites unconditionally.
+    StateSet(StateSetReq),
+    /// Delete one coordination key. Idempotent.
+    StateDelete { key: String },
+    /// Subscribe to coordination-state changes, optionally narrowed to keys
+    /// with `prefix`. The reply is the matching entries as they stand now;
+    /// [`Response::StateChanged`] frames follow for every later write or
+    /// delete, so a watcher never has to poll and never misses the baseline.
+    StateWatch { prefix: Option<String> },
 }
 
 /// Host → client.
@@ -646,6 +736,41 @@ pub enum Response {
     /// [`Request::GetScheduleRuns`]. Only sent to peers that declared
     /// ≥ [`SCHEDULE_PUSH_MIN_VERSION`] in their `Hello`.
     ScheduleRunsChanged(ScheduleRunWire),
+
+    // ---- v18: automation primitives ----
+    /// Reply to [`Request::CreateHeartbeat`] — the armed wake-up.
+    HeartbeatCreated(HeartbeatWire),
+    /// Reply to [`Request::ListHeartbeats`]. Empty is normal.
+    Heartbeats(Vec<HeartbeatWire>),
+    /// Reply to [`Request::TeamRunCreate`] and [`Request::TeamStatus`] — one
+    /// run with every role's current state.
+    TeamRun(TeamRunWire),
+    /// Reply to [`Request::TeamList`], newest run first.
+    TeamRuns(Vec<TeamRunWire>),
+    /// Reply to [`Request::StateGet`], and to a [`Request::StateSet`] that
+    /// **wrote**: the entry as it now stands, or `None` for a key that does not
+    /// exist. A refused conditional write answers
+    /// [`Response::StateConflict`] instead.
+    StateValue(Option<StateEntryWire>),
+    /// Reply to [`Request::StateWatch`] — the entries matching the prefix as
+    /// they stand at subscribe time, before any pushed change.
+    StateSnapshot(Vec<StateEntryWire>),
+    /// One coordination-state write or delete **pushed** to a watcher,
+    /// unsolicited. A delete carries `entry: None` under the deleted key.
+    /// Never sent to a peer below [`STATE_PUSH_MIN_VERSION`].
+    StateChanged { key: String, entry: Option<StateEntryWire> },
+    /// A conditional [`Request::StateSet`] lost: the stored version was not the
+    /// one the caller expected. Carries the entry it lost to (`None` when the
+    /// caller expected a value and the key is absent), so a losing writer can
+    /// merge and retry without a second round trip.
+    ///
+    /// Its own variant rather than a `StateValue` carrying the current entry:
+    /// those two are indistinguishable whenever the winning write happens to
+    /// leave the value the loser was trying to store, and a caller that
+    /// mistakes a refusal for a success is exactly the lost update this whole
+    /// mechanism exists to prevent. Not an [`RpcError`] either — nothing is
+    /// wrong, the caller simply lost a race it asked to be told about.
+    StateConflict(Option<StateEntryWire>),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

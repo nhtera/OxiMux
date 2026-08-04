@@ -56,6 +56,12 @@ pub(super) enum Live {
     /// Forwarded as [`Response::ScheduleRunsChanged`] behind a per-frame
     /// `may_read_schedules` recheck.
     ScheduleRun(oximux_remote_proto::messages::ScheduleRunWire),
+    /// A coordination key was written or deleted (`None` is a delete). Carries
+    /// the entry for the same reason [`Live::ScheduleRun`] does — there is no
+    /// cheap snapshot to recompute, and it is one small row. Prefix filtering
+    /// happens in the stream, not at forward time, because the prefix belongs
+    /// to *this* subscription rather than to the peer.
+    StateChange(String, Option<oximux_remote_proto::messages::StateEntryWire>),
 }
 
 /// Turn a session's broadcast receiver into a `'static` stream of [`LiveFrame`]s.
@@ -148,6 +154,35 @@ fn schedule_runs_stream(
         loop {
             match rx.recv().await {
                 Ok(run) => return Some((Live::ScheduleRun(run), rx)),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
+    .boxed()
+}
+
+/// One `StateWatch`'s change stream, narrowed to its prefix.
+///
+/// Lag **skips** the dropped writes rather than ending, like the run stream —
+/// but the consequence differs and is worth naming: a watcher that lagged has a
+/// stale view of the keys it missed, and its recovery is a `StateGet` (or a
+/// re-`StateWatch`), not the transcript-style resync a session stream gets. The
+/// versioned write path is what makes that safe: a caller acting on a stale
+/// value loses its conditional write rather than clobbering.
+fn state_changes_stream(
+    rx: broadcast::Receiver<(String, Option<oximux_remote_proto::messages::StateEntryWire>)>,
+    prefix: Option<String>,
+) -> BoxStream<'static, Live> {
+    stream::unfold((rx, prefix), |(mut rx, prefix)| async move {
+        loop {
+            match rx.recv().await {
+                Ok((key, entry)) => {
+                    if prefix.as_ref().is_some_and(|p| !key.starts_with(p.as_str())) {
+                        continue;
+                    }
+                    return Some((Live::StateChange(key, entry), (rx, prefix)));
+                }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
@@ -343,6 +378,40 @@ impl Dispatcher {
     /// protocol version — an older peer cannot decode the push frame.
     pub(super) fn schedule_runs_push_stream(&self) -> Option<BoxStream<'static, Live>> {
         Some(schedule_runs_stream(self.schedule_events.as_ref()?.subscribe()))
+    }
+
+    /// The coordination-change push stream for one `StateWatch`, narrowed to
+    /// its own prefix. Filtered here rather than at forward time because two
+    /// watches on one connection may hold different prefixes — a peer-level
+    /// check has nothing to filter against.
+    pub(super) fn state_push_stream(
+        &self,
+        prefix: Option<String>,
+    ) -> Option<BoxStream<'static, Live>> {
+        Some(state_changes_stream(self.state_events.as_ref()?.subscribe(), prefix))
+    }
+
+    /// Push one coordination change, behind the same per-frame authorization
+    /// recheck every live surface applies. Returns whether the transport is
+    /// still writable.
+    pub(super) async fn forward_state_change(
+        &self,
+        peer: &Peer,
+        transport: &dyn Transport,
+        key: String,
+        entry: Option<oximux_remote_proto::messages::StateEntryWire>,
+    ) -> bool {
+        if !self.auth.may_read_state(peer) {
+            return true;
+        }
+        transport
+            .send(
+                Response::StateChanged { key, entry }
+                    .to_bytes()
+                    .expect("response is always encodable"),
+            )
+            .await
+            .is_ok()
     }
 
     /// Push one recorded run, behind the same per-frame authorization recheck

@@ -16,7 +16,10 @@ fn value_bearing_event() -> ThreadEvent {
 /// documented wire change, so an accidental edit fails here.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 17, "v17 = RunScheduleNow + the schedule-run push");
+    assert_eq!(
+        PROTOCOL_VERSION, 18,
+        "v18 = the automation surface (heartbeats, team runs, coordination state)"
+    );
 }
 
 /// The floor moves only on a genuinely breaking change, never merely because
@@ -372,4 +375,82 @@ fn early_variants_keep_their_literal_ordinals() {
     };
     assert_eq!(Response::ScheduleRunRecorded(run.clone()).to_bytes().expect("encode")[0], 36);
     assert_eq!(Response::ScheduleRunsChanged(run).to_bytes().expect("encode")[0], 37);
+    // The v18 automation tail, appended in one batch after `RunScheduleNow`:
+    // `CreateHeartbeat` (50), `ListHeartbeats` (51), `DeleteHeartbeat` (52),
+    // `TeamRunCreate` (53), `TeamReport` (54), `TeamStatus` (55), `TeamList`
+    // (56, a unit variant), `StateGet` (57), `StateSet` (58), `StateDelete`
+    // (59), `StateWatch` (60).
+    let heartbeat = Request::CreateHeartbeat(CreateHeartbeatReq {
+        session_id: None,
+        name: String::new(),
+        prompt: String::new(),
+        recurrence: RecurrenceWire::EveryMinutes { minutes: 5 },
+    });
+    assert_eq!(heartbeat.to_bytes().expect("encode")[0], 50);
+    assert_eq!(
+        Request::ListHeartbeats { session_id: None }.to_bytes().expect("encode")[0],
+        51
+    );
+    let delete_hb = Request::DeleteHeartbeat { id: String::new() };
+    assert_eq!(delete_hb.to_bytes().expect("encode")[0], 52);
+    let team_create = Request::TeamRunCreate(TeamRunCreateReq {
+        name: String::new(),
+        cwd: String::new(),
+        agent_id: None,
+        worktree_each: false,
+        roles: vec![],
+    });
+    assert_eq!(team_create.to_bytes().expect("encode")[0], 53);
+    let report = Request::TeamReport(TeamReportReq {
+        run_id: String::new(),
+        role: String::new(),
+        ok: true,
+        summary: None,
+    });
+    assert_eq!(report.to_bytes().expect("encode")[0], 54);
+    let status = Request::TeamStatus { run_id: String::new() };
+    assert_eq!(status.to_bytes().expect("encode")[0], 55);
+    assert_eq!(Request::TeamList.to_bytes().expect("encode"), vec![56]);
+    let state_get = Request::StateGet { key: String::new() };
+    assert_eq!(state_get.to_bytes().expect("encode")[0], 57);
+    let state_set = Request::StateSet(StateSetReq {
+        key: String::new(),
+        value_json: String::new(),
+        if_version: None,
+    });
+    assert_eq!(state_set.to_bytes().expect("encode")[0], 58);
+    let state_del = Request::StateDelete { key: String::new() };
+    assert_eq!(state_del.to_bytes().expect("encode")[0], 59);
+    let state_watch = Request::StateWatch { prefix: None };
+    assert_eq!(state_watch.to_bytes().expect("encode")[0], 60);
+    // Their replies, in the same batch: `HeartbeatCreated` (38), `Heartbeats`
+    // (39), `TeamRun` (40), `TeamRuns` (41), `StateValue` (42),
+    // `StateSnapshot` (43), `StateChanged` (44).
+    let hb = HeartbeatWire {
+        id: String::new(),
+        session_id: String::new(),
+        name: String::new(),
+        prompt: String::new(),
+        recurrence: RecurrenceWire::EveryMinutes { minutes: 5 },
+        enabled: true,
+        next_fire_at: String::new(),
+        summary: String::new(),
+    };
+    assert_eq!(Response::HeartbeatCreated(hb).to_bytes().expect("encode")[0], 38);
+    assert_eq!(Response::Heartbeats(vec![]).to_bytes().expect("encode")[0], 39);
+    let team = TeamRunWire {
+        id: String::new(),
+        name: String::new(),
+        cwd: String::new(),
+        created_at: String::new(),
+        closed: false,
+        roles: vec![],
+    };
+    assert_eq!(Response::TeamRun(team).to_bytes().expect("encode")[0], 40);
+    assert_eq!(Response::TeamRuns(vec![]).to_bytes().expect("encode")[0], 41);
+    assert_eq!(Response::StateValue(None).to_bytes().expect("encode")[0], 42);
+    assert_eq!(Response::StateSnapshot(vec![]).to_bytes().expect("encode")[0], 43);
+    let changed = Response::StateChanged { key: String::new(), entry: None };
+    assert_eq!(changed.to_bytes().expect("encode")[0], 44);
+    assert_eq!(Response::StateConflict(None).to_bytes().expect("encode")[0], 45);
 }

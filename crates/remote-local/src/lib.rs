@@ -21,23 +21,25 @@
 //!
 //! # Threat boundary
 //!
-//! **No host wires the per-session credential yet, so no agent is confined
-//! today.** The mechanism below is complete and tested; the desktop does not
-//! call [`LocalControlListener::grant_session`] or inject
-//! [`SESSION_TOKEN_ENV_VAR`] at agent spawn, so an agent that runs `oximux`
-//! takes the operator path and is served full scope. Anyone reading this to
-//! decide whether local access is safe to enable should read it as: enabling it
-//! gives every agent this desktop spawns the operator's authority.
+//! **`oximux serve` confines its agents; the desktop app does not yet.** Serve
+//! calls [`LocalControlListener::grant_session`] and injects
+//! [`SESSION_TOKEN_ENV_VAR`] for every agent it spawns or resumes, so an agent
+//! there reaches its own conversation and nothing else. The desktop's agents
+//! are spawned by its chat views, which do not mint a credential, so an agent
+//! that runs `oximux` on the desktop takes the operator path and is served full
+//! scope. Anyone reading this to decide whether to enable the desktop's local
+//! access should read it as: enabling it gives every agent that desktop spawns
+//! the operator's authority.
 //!
-//! What the mechanism buys once a host does wire it: an agent handed a
-//! per-session secret and asked to misuse the protocol — naming operator scope,
-//! or another session — is refused, because scope follows the secret proved
-//! rather than the label claimed. What it will still **not** stop is an agent
-//! that goes around the protocol: it runs as the same OS user as the desktop, so
-//! it can read the operator token file and present that instead. File
-//! permissions cannot separate two processes of one user, and closing that needs
-//! OS-level isolation for agent children (a macOS sandbox profile, a separate
-//! uid, or a namespace). That work is not in this crate.
+//! What the mechanism buys where it *is* wired: an agent handed a per-session
+//! secret and asked to misuse the protocol — naming operator scope, or another
+//! session — is refused, because scope follows the secret proved rather than
+//! the label claimed. What it will still **not** stop is an agent that goes
+//! around the protocol: it runs as the same OS user as the host, so it can read
+//! the operator token file and present that instead. File permissions cannot
+//! separate two processes of one user, and closing that needs OS-level
+//! isolation for agent children (a macOS sandbox profile, a separate uid, or a
+//! namespace). That work is not in this crate.
 
 mod dial;
 mod hello;
@@ -58,15 +60,23 @@ use std::path::{Path, PathBuf};
 pub const SOCKET_FILENAME: &str = "control-v1.sock";
 pub const TOKEN_FILENAME: &str = "control-v1.token";
 
-/// The environment variable an agent-spawned process carries to identify its
-/// session. Part of the naming contract: the injector (the host spawning
-/// agents) and the CLI must agree on it.
+/// The environment variable an agent-spawned process carries to name **which
+/// credential it holds**. Part of the naming contract: the injector (the host
+/// spawning agents) and the CLI must agree on it.
 ///
 /// This names the identity; it grants nothing on its own. The authority comes
 /// from [`SESSION_TOKEN_ENV_VAR`], and setting this alone reaches exactly
 /// nothing — which is the point. An earlier design took this variable as the
 /// scope claim itself, which meant any process able to set an environment
 /// variable could pick its own confinement (or opt out of it).
+///
+/// **Its value is not necessarily a session id.** A host resuming a session
+/// already has the id and uses it; a host spawning a *fresh* agent does not
+/// (the id arrives with the agent's own `SessionInit`, after the environment is
+/// fixed) and injects an opaque handle instead, re-pointing the credential at
+/// the real session with [`LocalControlListener::bind_session`] when it lands.
+/// An agent that needs its own session id should read it from `oximux ls`,
+/// which a confined caller sees exactly one row of.
 pub const SESSION_ENV_VAR: &str = "OXIMUX_SESSION_ID";
 
 /// The per-session secret injected beside [`SESSION_ENV_VAR`] at agent spawn.

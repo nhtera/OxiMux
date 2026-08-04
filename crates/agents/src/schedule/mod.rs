@@ -22,4 +22,7 @@ pub mod ticker;
 
 pub use recurrence::{Recurrence, RecurrenceError, describe};
 pub use store::{NewSchedule, Schedule, ScheduleRun, ScheduleStore, ScheduleTarget, RunOutcome};
-pub use ticker::{FireOutcome, RunNowError, ScheduleFirer, TICK, TICKER_LOCK_FILENAME, Ticker};
+pub use ticker::{
+    FireOutcome, RunNowError, ScheduleFirer, TICK, TICKER_LOCK_FILENAME, Ticker,
+    nudge_existing_session,
+};

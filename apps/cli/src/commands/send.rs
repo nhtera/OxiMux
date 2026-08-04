@@ -11,6 +11,30 @@ use crate::cli::exit;
 use crate::client::{Client, rpc_failure, unexpected_reply};
 use crate::output::Failure;
 
+/// The verb as dispatched, `--output-schema` included.
+///
+/// Split from [`run`] so the schema loop can send its corrections through the
+/// plain path: a correction that re-entered the checking path would recurse
+/// once per retry instead of being bounded by the retry counter.
+pub async fn run_checked(
+    client: &Client,
+    session: &str,
+    prompt: &str,
+    output_schema: Option<&str>,
+    no_wait: bool,
+    json_mode: bool,
+) -> Result<(Value, String), Failure> {
+    // Compiled before the prompt is sent: a bad schema must not cost an agent
+    // turn.
+    let schema = output_schema.map(crate::output_schema::OutputSchema::load).transpose()?;
+    let (mut base, human) = run(client, session, prompt, no_wait, json_mode).await?;
+    let Some(schema) = schema else { return Ok((base, human)) };
+    let value = crate::output_schema::enforce(client, session, &schema, json_mode).await?;
+    let human = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+    base["output"] = value;
+    Ok((base, human))
+}
+
 pub async fn run(
     client: &Client,
     session: &str,
@@ -39,6 +63,8 @@ pub async fn run(
         other => return Err(unexpected_reply("SendPrompt", &other)),
     }
     let base = json!({ "session_id": session, "accepted": true });
+    // `run_checked` mutates this into the schema-validated output; a plain send
+    // returns it untouched.
     if no_wait {
         return Ok((
             base,

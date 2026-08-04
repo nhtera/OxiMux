@@ -216,6 +216,11 @@ pub struct RemoteControl {
     /// phone creates is the same row the desktop's ticker fires and its Settings
     /// pane lists.
     schedules: Option<Arc<oximux_agents::schedule::ScheduleStore>>,
+    /// The host's team runs and coordination blackboard, when installed. Both
+    /// are plain SQLite stores (gpui-free, no process spawn), so they need no
+    /// view-layer seam — the same reasoning as `schedules`.
+    teams: Option<Arc<oximux_agents::team::TeamStore>>,
+    coord: Option<Arc<oximux_agents::coord::CoordStore>>,
     /// The desktop's speech-to-text engine, when one is installed. `None` answers
     /// `TranscribeAudio` with `Unauthorized`, as `launcher` does. Shares the
     /// composer's own model manager, so a model downloaded in Settings › Voice is
@@ -289,6 +294,8 @@ impl RemoteControl {
             launcher: None,
             rewinder: None,
             schedules: None,
+            teams: None,
+            coord: None,
             transcriber: None,
             projects: None,
             worktrees: None,
@@ -333,6 +340,18 @@ impl RemoteControl {
     /// the same rows.
     pub fn set_schedule_store(&mut self, schedules: Arc<oximux_agents::schedule::ScheduleStore>) {
         self.schedules = Some(schedules);
+    }
+
+    /// Install the team-run and coordination stores the host serves. Called
+    /// once at boot against the same database `oximux serve` would use, so a
+    /// run opened from one host is visible from the other.
+    pub fn set_automation_stores(
+        &mut self,
+        teams: Arc<oximux_agents::team::TeamStore>,
+        coord: Arc<oximux_agents::coord::CoordStore>,
+    ) {
+        self.teams = Some(teams);
+        self.coord = Some(coord);
     }
 
     /// Install the transcriber the host serves. Called once at boot with a
@@ -491,6 +510,12 @@ impl RemoteControl {
         }
         if let Some(worktrees) = &self.worktrees {
             dispatcher = dispatcher.with_worktrees(Arc::clone(worktrees));
+        }
+        if let Some(teams) = &self.teams {
+            dispatcher = dispatcher.with_team_store(Arc::clone(teams));
+        }
+        if let Some(coord) = &self.coord {
+            dispatcher = dispatcher.with_coord_store(Arc::clone(coord));
         }
         if let Some(runner) = &self.schedule_runner {
             dispatcher = dispatcher.with_schedule_runner(Arc::clone(runner));

@@ -9,7 +9,18 @@ use crate::cli::exit;
 use crate::client::{Client, rpc_failure, unexpected_reply};
 use crate::output::Failure;
 
-pub async fn run(client: &Client, session: &str) -> Result<(Value, String), Failure> {
+/// A whole transcript, reassembled. `--output-schema` reads the same pages the
+/// `transcript` verb prints, so "what the agent finally said" means one thing.
+pub struct Transcript {
+    pub entries: Vec<Value>,
+    /// The fold cursor the last page reported.
+    pub seq: u64,
+    pub model: Option<String>,
+    pub pages: u64,
+}
+
+/// Page the whole folded transcript into one vector.
+pub async fn fetch_entries(client: &Client, session: &str) -> Result<Transcript, Failure> {
     let mut entries: Vec<Value> = Vec::new();
     let mut cursor = 0u64;
     let mut seq;
@@ -40,10 +51,16 @@ pub async fn run(client: &Client, session: &str) -> Result<(Value, String), Fail
             None => break,
         }
     }
-    let human = if entries.is_empty() {
+    Ok(Transcript { entries, seq, model, pages })
+}
+
+pub async fn run(client: &Client, session: &str) -> Result<(Value, String), Failure> {
+    let transcript = fetch_entries(client, session).await?;
+    let human = if transcript.entries.is_empty() {
         "empty transcript".to_string()
     } else {
-        entries
+        transcript
+            .entries
             .iter()
             .filter_map(crate::render::render_entry)
             .collect::<Vec<_>>()
@@ -51,10 +68,10 @@ pub async fn run(client: &Client, session: &str) -> Result<(Value, String), Fail
     };
     let data = json!({
         "session_id": session,
-        "seq": seq,
-        "model": model,
-        "pages": pages,
-        "entries": entries,
+        "seq": transcript.seq,
+        "model": transcript.model,
+        "pages": transcript.pages,
+        "entries": transcript.entries,
     });
     Ok((data, human))
 }

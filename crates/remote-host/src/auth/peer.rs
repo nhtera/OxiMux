@@ -96,4 +96,23 @@ impl Peer {
             PeerKind::Local(_) => None,
         }
     }
+
+    /// The session this caller IS, when it is a confined agent.
+    ///
+    /// The one place a scope is read as a *value* rather than asked a yes/no
+    /// question, and it exists for a single reason: a heartbeat targets "the
+    /// session that armed it", and a confined agent cannot name its own session
+    /// id (its credential names an opaque handle). Resolving it from the proven
+    /// scope is therefore the only honest source — and, unlike a client-supplied
+    /// id, one that cannot be aimed anywhere else.
+    ///
+    /// `None` for an operator and for every remote device: both must name the
+    /// session they mean, and a remote device's `DeviceScope::Sessions` can hold
+    /// several, so there is no "the" session to resolve.
+    pub(crate) fn own_session(&self) -> Option<&str> {
+        match &self.0 {
+            PeerKind::Local(LocalScope::Session(id)) => Some(id),
+            PeerKind::Local(LocalScope::Full) | PeerKind::Remote(_) => None,
+        }
+    }
 }

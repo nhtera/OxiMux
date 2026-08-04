@@ -40,6 +40,9 @@ use crate::remote_control::launch_bridge::BridgeLauncher;
 pub struct DesktopFirer {
     launcher: BridgeLauncher,
     store: ScheduleStore,
+    /// Live sessions, for the heartbeat arm: waking an already-open session is
+    /// a prompt into its registry handle, not a tab to open.
+    registry: Arc<oximux_agents::session_registry::SessionRegistry>,
     /// Injected rather than reached for via [`crate::agent_awake::global`] so the
     /// reconcile logic can be tested against a mock backend instead of real power
     /// management.
@@ -50,8 +53,13 @@ pub struct DesktopFirer {
 }
 
 impl DesktopFirer {
-    pub fn new(launcher: BridgeLauncher, store: ScheduleStore, awake_source: Arc<AgentAwake>) -> Self {
-        Self { launcher, store, awake_source, awake: Mutex::new(None) }
+    pub fn new(
+        launcher: BridgeLauncher,
+        store: ScheduleStore,
+        awake_source: Arc<AgentAwake>,
+        registry: Arc<oximux_agents::session_registry::SessionRegistry>,
+    ) -> Self {
+        Self { launcher, store, registry, awake_source, awake: Mutex::new(None) }
     }
 
     /// Take the keep-awake hold when any schedule is enabled, release it when none
@@ -95,11 +103,16 @@ impl ScheduleFirer for DesktopFirer {
     async fn fire(&self, schedule: &Schedule, target: &ScheduleTarget) -> FireOutcome {
         match target {
             ScheduleTarget::NewSession => {}
-            ScheduleTarget::ExistingSession(_) => {
-                return FireOutcome::Failed {
-                    session_id: None,
-                    detail: "firing into an existing session is not supported yet".into(),
-                };
+            // A heartbeat: nudge the live session instead of opening a tab. No
+            // bridge hop — the registry entry is reachable from any thread, and
+            // the chat view renders the prompt through its remote-prompt sink
+            // exactly as it does for one sent from the phone.
+            ScheduleTarget::ExistingSession(session_id) => {
+                return oximux_agents::schedule::nudge_existing_session(
+                    &self.registry,
+                    schedule,
+                    session_id,
+                );
             }
         }
         match self
@@ -145,6 +158,7 @@ impl ScheduleFirer for DesktopFirer {
 pub fn install(
     store: ScheduleStore,
     launcher: BridgeLauncher,
+    registry: Arc<oximux_agents::session_registry::SessionRegistry>,
     data_dir: Option<std::path::PathBuf>,
     run_events: tokio::sync::broadcast::Sender<ScheduleRunWire>,
     session_exists: impl Fn(&str) -> bool,
@@ -199,8 +213,12 @@ pub fn install(
         Err(err) => tracing::warn!(%err, "schedule ticker: orphaned-schedule sweep failed"),
     }
 
-    let firer =
-        DesktopFirer::new(launcher, store.clone(), crate::agent_awake::global().clone());
+    let firer = DesktopFirer::new(
+        launcher,
+        store.clone(),
+        crate::agent_awake::global().clone(),
+        registry,
+    );
     let ticker = Arc::new(Ticker::new(store, Arc::new(firer)).with_recorded_hook(Arc::new(
         move |run| {
             // No subscriber is normal (remote off, no CLI attached).
@@ -268,12 +286,20 @@ mod tests {
     /// can count how many assertions were ever created. The bridge's receiver
     /// is dropped — these tests never fire.
     fn firer() -> (DesktopFirer, Arc<MockBackend>, Arc<AgentAwake>) {
+        firer_with_registry(Arc::new(oximux_agents::session_registry::SessionRegistry::new()))
+    }
+
+    /// The same firer over a caller-supplied registry, so a heartbeat test can
+    /// put a live session in it first.
+    fn firer_with_registry(
+        registry: Arc<oximux_agents::session_registry::SessionRegistry>,
+    ) -> (DesktopFirer, Arc<MockBackend>, Arc<AgentAwake>) {
         let db = oximux_storage::db::open_memory().expect("open in-memory db");
         let backend = Arc::new(MockBackend::default());
         let awake = Arc::new(AgentAwake::with_backend(backend.clone(), true));
         let store = ScheduleStore::new(db.conn());
         let (launcher, _rx) = crate::remote_control::launch_bridge::launch_bridge();
-        (DesktopFirer::new(launcher, store, awake.clone()), backend, awake)
+        (DesktopFirer::new(launcher, store, awake.clone(), registry), backend, awake)
     }
 
     fn a_schedule(name: &str) -> NewSchedule {
@@ -355,19 +381,51 @@ mod tests {
         assert!(awake.asserted());
     }
 
-    /// A schedule aimed at an existing session is refused with a stable reason
-    /// until the capability lands — never silently spawned as a fresh session.
+    /// A heartbeat wakes the live session it names — no tab opens, so the
+    /// launch bridge (whose receiver is dropped here, making any launch fail)
+    /// is never touched. That the fire succeeds at all is the proof.
     #[tokio::test]
-    async fn an_existing_session_target_is_refused_for_now() {
+    async fn a_heartbeat_wakes_the_live_session_instead_of_spawning() {
+        let registry = Arc::new(oximux_agents::session_registry::SessionRegistry::new());
+        registry.register(
+            "sess-1".into(),
+            Arc::new(oximux_agents::thread::StubConnection::default()),
+        );
+        let (firer, _backend, _awake) = firer_with_registry(registry);
+        let made = firer.store.create(a_schedule("morning"), Local::now()).expect("create");
+
+        match firer.fire(&made, &ScheduleTarget::ExistingSession("sess-1".into())).await {
+            FireOutcome::Completed { session_id } => {
+                assert_eq!(session_id.as_deref(), Some("sess-1"))
+            }
+            other => panic!("must nudge the session, got {:?}", outcome_name(&other)),
+        }
+    }
+
+    /// A heartbeat whose session is not live records a failure rather than
+    /// declining: `NotNow` would leave it due forever, and a dormant session's
+    /// agent is not coming back on its own.
+    #[tokio::test]
+    async fn a_heartbeat_on_a_dead_session_fails_rather_than_deferring() {
         let (firer, _backend, _awake) = firer();
         let made = firer.store.create(a_schedule("morning"), Local::now()).expect("create");
-        let target = ScheduleTarget::ExistingSession("sess-1".into());
 
-        match firer.fire(&made, &target).await {
-            FireOutcome::Failed { detail, .. } => {
-                assert!(detail.contains("not supported yet"), "says why: {detail}")
+        match firer.fire(&made, &ScheduleTarget::ExistingSession("sess-gone".into())).await {
+            FireOutcome::Failed { detail, session_id } => {
+                assert_eq!(session_id.as_deref(), Some("sess-gone"), "name where to look");
+                assert!(detail.contains("not running"), "says why: {detail}");
             }
-            _ => panic!("must refuse, not spawn"),
+            other => panic!("must record a failure, got {:?}", outcome_name(&other)),
+        }
+    }
+
+    /// Test-only: `FireOutcome` carries no `Debug`, and a panic message that
+    /// cannot name what it got is a panic you have to re-run to understand.
+    fn outcome_name(outcome: &FireOutcome) -> &'static str {
+        match outcome {
+            FireOutcome::Completed { .. } => "Completed",
+            FireOutcome::Failed { .. } => "Failed",
+            FireOutcome::NotNow => "NotNow",
         }
     }
 

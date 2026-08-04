@@ -8,6 +8,7 @@ mod cli;
 mod client;
 mod commands;
 mod output;
+mod output_schema;
 mod render;
 mod serve;
 
@@ -15,8 +16,9 @@ use clap::Parser as _;
 use serde_json::json;
 
 use cli::{
-    Cli, Command, GitCommand, ModeCommand, ModelCommand, PermitCommand, ProjectsCommand,
-    ScheduleCommand, TermCommand, WorktreeCommand,
+    Cli, Command, GitCommand, HeartbeatCommand, ModeCommand, ModelCommand, PermitCommand,
+    ProjectsCommand, ScheduleCommand, StateCommand, TeamCommand, TeamReportStatus, TermCommand,
+    WorktreeCommand,
 };
 use client::Client;
 use output::render;
@@ -133,16 +135,31 @@ fn host_verb(args: Cli) -> u8 {
                     }
                     ScheduleCommand::Rm { id } => commands::schedule::rm(&client, &id).await,
                 },
-                Command::Run { prompt, agent, model, cwd, worktree, bg } => {
-                    let run_args =
-                        commands::run::RunArgs { prompt, agent, model, cwd, worktree, bg };
+                Command::Run { prompt, agent, model, cwd, worktree, output_schema, bg } => {
+                    let run_args = commands::run::RunArgs {
+                        prompt,
+                        agent,
+                        model,
+                        cwd,
+                        worktree,
+                        output_schema,
+                        bg,
+                    };
                     commands::run::run(&client, run_args, json_mode).await
                 }
                 Command::Attach { session, from } => {
                     commands::attach::run(&client, &session, from, json_mode).await
                 }
-                Command::Send { session, prompt, no_wait } => {
-                    commands::send::run(&client, &session, &prompt, no_wait, json_mode).await
+                Command::Send { session, prompt, output_schema, no_wait } => {
+                    commands::send::run_checked(
+                        &client,
+                        &session,
+                        &prompt,
+                        output_schema.as_deref(),
+                        no_wait,
+                        json_mode,
+                    )
+                    .await
                 }
                 Command::Wait { session, until } => {
                     commands::wait::run(&client, &session, until, timeout, json_mode).await
@@ -208,6 +225,43 @@ fn host_verb(args: Cli) -> u8 {
                         commands::worktree::ls(&client, project).await
                     }
                     WorktreeCommand::Rm { id } => commands::worktree::rm(&client, &id).await,
+                },
+                Command::Heartbeat { command } => match command {
+                    HeartbeatCommand::Create { prompt, name, cron, session } => {
+                        commands::heartbeat::create(&client, session, name, &cron, prompt).await
+                    }
+                    HeartbeatCommand::Ls { session } => {
+                        commands::heartbeat::ls(&client, session).await
+                    }
+                    HeartbeatCommand::Rm { id } => commands::heartbeat::rm(&client, &id).await,
+                },
+                Command::Team { command } => match command {
+                    TeamCommand::Run { name, roles, cwd, agent, worktree_each } => {
+                        let args = commands::team::RunArgs {
+                            name,
+                            roles,
+                            cwd,
+                            agent,
+                            worktree_each,
+                        };
+                        commands::team::run(&client, args).await
+                    }
+                    TeamCommand::Report { run, role, status, summary } => {
+                        let ok = status == TeamReportStatus::Done;
+                        commands::team::report(&client, &run, &role, ok, summary).await
+                    }
+                    TeamCommand::Status { run } => commands::team::status(&client, &run).await,
+                    TeamCommand::Ls => commands::team::ls(&client).await,
+                },
+                Command::State { command } => match command {
+                    StateCommand::Get { key } => commands::state::get(&client, &key).await,
+                    StateCommand::Set { key, value, if_version } => {
+                        commands::state::set(&client, &key, &value, if_version).await
+                    }
+                    StateCommand::Delete { key } => commands::state::delete(&client, &key).await,
+                    StateCommand::Watch { prefix } => {
+                        commands::state::watch(&client, prefix, json_mode).await
+                    }
                 },
                 Command::PairNew { read_only, force_non_tty } => {
                     commands::pair::pair_new(&client, read_only, force_non_tty, json_mode).await

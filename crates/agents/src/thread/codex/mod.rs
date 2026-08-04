@@ -152,8 +152,9 @@ impl CodexAppServerConnection {
         resume_session_id: Option<&str>,
         effort: Option<&str>,
         posture: Option<(&str, &str)>,
+        env: &[(String, String)],
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
-        let (rpc, inbound_rx, child) = RpcClient::spawn(cwd)?;
+        let (rpc, inbound_rx, child) = RpcClient::spawn(cwd, env)?;
         let (event_tx, event_rx) = mpsc::channel::<ThreadEvent>();
         let (out_tx, out_rx) = mpsc::channel::<Outbound>();
         let state = Arc::new(Mutex::new(CodexState::default()));

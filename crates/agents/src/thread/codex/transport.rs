@@ -53,13 +53,16 @@ pub struct RpcClient {
 impl RpcClient {
     /// Spawn `codex app-server` in `cwd`, start the reader thread, and return the
     /// client, the [`Inbound`] receiver, and the child (for reaping).
-    pub fn spawn(cwd: &Path) -> Result<(RpcClient, Receiver<Inbound>, Child)> {
+    pub fn spawn(cwd: &Path, env: &[(String, String)]) -> Result<(RpcClient, Receiver<Inbound>, Child)> {
         let mut cmd = Command::new(crate::cli::program_for_spawn("codex"));
         cmd.arg("app-server")
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Overrides on top of the inherited environment — the host's own
+            // variables for this one child (its local-control credential).
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         Self::spawn_command(cmd)
     }
 

@@ -43,7 +43,11 @@ pub enum LocalIdentity {
 }
 
 impl LocalIdentity {
-    /// The scope a successfully-proven identity earns.
+    /// The scope a freshly-registered credential for this identity starts at.
+    /// A session credential can later be re-pointed at the real session id
+    /// (see [`LocalControlListener::bind_session`]); the operator's never moves.
+    ///
+    /// [`LocalControlListener::bind_session`]: crate::LocalControlListener::bind_session
     pub(crate) fn granted_claim(&self) -> LocalClaim {
         match self {
             LocalIdentity::Operator => LocalClaim::Operator,
@@ -143,37 +147,52 @@ pub(crate) async fn client_handshake(
     if verdict.granted { Ok(()) } else { Err(HelloError::Denied) }
 }
 
-/// Host half: look up the secret for the named identity, prove it first, then
-/// verify the caller's proof. Returns the scope **that identity is registered
-/// for** — never a scope the caller asked for. On a bad proof the caller is
-/// told (`granted: false`) and refused.
+/// Host half: look up the credential for the named identity, prove it first,
+/// then verify the caller's proof. Returns the scope **that credential is
+/// registered for** — never a scope the caller asked for. On a bad proof the
+/// caller is told (`granted: false`) and refused.
 ///
-/// `secret_for` returns `None` for an unregistered label. That case still runs
-/// the full exchange against a random secret rather than short-circuiting: an
-/// unauthenticated caller must not be able to enumerate which sessions have
+/// `credential_for` returns `None` for an unregistered label. That case still
+/// runs the full exchange against a random secret rather than short-circuiting:
+/// an unauthenticated caller must not be able to enumerate which sessions have
 /// credentials by timing or by a distinct error.
+///
+/// The lookup hands back the claim alongside the secret rather than deriving it
+/// from the label, because a label and the session it maps to are not always
+/// the same string: an agent's credential is minted *before* its session exists
+/// (the id only arrives with the agent's own `SessionInit`), so the host
+/// registers an opaque handle and re-points its claim at the real session id
+/// once it knows it. Deriving the claim from the label here would have frozen
+/// that mapping at mint time.
 pub(crate) async fn server_handshake(
     t: &dyn Transport,
-    secret_for: impl Fn(&LocalIdentity) -> Option<String>,
+    credential_for: impl Fn(&LocalIdentity) -> Option<(String, LocalClaim)>,
 ) -> Result<LocalClaim, HelloError> {
     let hello: ClientHello = recv_msg(t).await?;
-    let known = secret_for(&hello.identity);
+    let known = credential_for(&hello.identity);
     // An unknown label proves with a value the caller cannot possibly hold,
     // so it fails at exactly the same step a wrong secret would.
-    let token = known.clone().unwrap_or_else(unguessable_secret);
+    let token = known
+        .as_ref()
+        .map(|(secret, _)| secret.clone())
+        .unwrap_or_else(unguessable_secret);
     let server_nonce = nonce();
     let proof = server_proof(&token, &server_nonce, &hello.client_nonce);
     send_msg(t, &ServerChallenge { server_nonce, server_proof: proof }).await?;
     let client: ClientProof = recv_msg(t).await?;
     let expected = client_proof(&token, &server_nonce, &hello.client_nonce);
-    if known.is_none() || !proofs_match(&client.client_proof, &expected) {
+    let Some((_, claim)) = known else {
+        send_msg(t, &ServerVerdict { granted: false }).await?;
+        return Err(HelloError::Denied);
+    };
+    if !proofs_match(&client.client_proof, &expected) {
         send_msg(t, &ServerVerdict { granted: false }).await?;
         return Err(HelloError::Denied);
     }
     send_msg(t, &ServerVerdict { granted: true }).await?;
-    // The scope comes from the identity that just PROVED itself, not from
+    // The scope comes from the credential that just PROVED itself, not from
     // anything the caller said it wanted.
-    Ok(hello.identity.granted_claim())
+    Ok(claim)
 }
 
 /// A throwaway secret for the unknown-label path — never stored, never
@@ -197,10 +216,18 @@ mod tests {
     const TOKEN: &str = "0011223344556677";
     const SESSION_SECRET: &str = "8899aabbccddeeff";
 
+    /// A registry entry registered at the identity's own default scope — what
+    /// [`LocalControlListener`](crate::LocalControlListener) writes at mint
+    /// time, before any rebinding.
+    fn at_default_scope(identity: LocalIdentity, secret: &str) -> Option<(String, LocalClaim)> {
+        let claim = identity.granted_claim();
+        Some((secret.to_string(), claim))
+    }
+
     /// A registry of exactly one operator credential.
-    fn operator_only(identity: &LocalIdentity) -> Option<String> {
+    fn operator_only(identity: &LocalIdentity) -> Option<(String, LocalClaim)> {
         match identity {
-            LocalIdentity::Operator => Some(TOKEN.to_string()),
+            LocalIdentity::Operator => at_default_scope(LocalIdentity::Operator, TOKEN),
             LocalIdentity::Session(_) => None,
         }
     }
@@ -222,8 +249,10 @@ mod tests {
     #[test]
     fn proving_a_session_credential_grants_that_session() {
         let registry = |identity: &LocalIdentity| match identity {
-            LocalIdentity::Session(id) if id == "sess-9" => Some(SESSION_SECRET.to_string()),
-            LocalIdentity::Operator => Some(TOKEN.to_string()),
+            LocalIdentity::Session(id) if id == "sess-9" => {
+                at_default_scope(identity.clone(), SESSION_SECRET)
+            }
+            LocalIdentity::Operator => at_default_scope(LocalIdentity::Operator, TOKEN),
             _ => None,
         };
         let (client, server) = duplex_pair();
@@ -235,6 +264,27 @@ mod tests {
         assert_eq!(server_out.unwrap(), LocalClaim::Session("sess-9".into()));
     }
 
+    /// The credential's registered scope wins over its label. This is the shape
+    /// an agent credential takes between spawn and `SessionInit`: minted under
+    /// an opaque handle, then re-pointed at the session the agent turned out to
+    /// be. Proving the handle must grant the *session*, not the handle.
+    #[test]
+    fn a_rebound_credential_grants_the_session_not_the_label() {
+        let registry = |identity: &LocalIdentity| match identity {
+            LocalIdentity::Session(label) if label == "launch-abc" => {
+                Some((SESSION_SECRET.to_string(), LocalClaim::Session("sess-real".into())))
+            }
+            _ => None,
+        };
+        let (client, server) = duplex_pair();
+        let (client_out, server_out) = block_on(join(
+            client_handshake(&client, SESSION_SECRET, LocalIdentity::Session("launch-abc".into())),
+            server_handshake(&server, registry),
+        ));
+        client_out.expect("client granted");
+        assert_eq!(server_out.unwrap(), LocalClaim::Session("sess-real".into()));
+    }
+
     /// THE containment property: an agent holding only its own session secret
     /// cannot reach operator scope by naming the operator identity, and cannot
     /// reach another session by naming that one. It is refused at the proof,
@@ -242,9 +292,13 @@ mod tests {
     #[test]
     fn a_session_holder_cannot_name_its_way_to_another_scope() {
         let registry = |identity: &LocalIdentity| match identity {
-            LocalIdentity::Operator => Some(TOKEN.to_string()),
-            LocalIdentity::Session(id) if id == "sess-9" => Some(SESSION_SECRET.to_string()),
-            LocalIdentity::Session(id) if id == "sess-other" => Some("othersecret".to_string()),
+            LocalIdentity::Operator => at_default_scope(LocalIdentity::Operator, TOKEN),
+            LocalIdentity::Session(id) if id == "sess-9" => {
+                at_default_scope(identity.clone(), SESSION_SECRET)
+            }
+            LocalIdentity::Session(id) if id == "sess-other" => {
+                at_default_scope(identity.clone(), "othersecret")
+            }
             _ => None,
         };
         for target in [

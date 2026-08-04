@@ -24,9 +24,15 @@ use crate::transport::LocalSocketTransport;
 /// can reach it — this is a socket on the same machine.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The identity → secret table, shared with each connection being
+/// The identity → credential table, shared with each connection being
 /// authenticated so the handshake can run off the accept path.
-type Credentials = Arc<Mutex<HashMap<LocalIdentity, String>>>;
+///
+/// The value carries the scope as well as the secret because a session
+/// credential outlives the label it was minted under: an agent is handed its
+/// credential at spawn, before its session id exists, so the entry is created
+/// under an opaque handle and re-pointed at the real id by
+/// [`LocalControlListener::bind_session`] once the agent announces it.
+type Credentials = Arc<Mutex<HashMap<LocalIdentity, (String, LocalClaim)>>>;
 
 /// A bound control-socket listener and the credentials it authenticates
 /// against. Dropping it closes the socket; the socket file is removed so a
@@ -101,8 +107,10 @@ impl LocalControlListener {
         #[cfg(unix)]
         secure::restrict_socket(&socket_path)?;
 
-        let credentials =
-            HashMap::from([(LocalIdentity::Operator, token.to_string())]);
+        let credentials = HashMap::from([(
+            LocalIdentity::Operator,
+            (token.to_string(), LocalClaim::Operator),
+        )]);
         // Taken after the bind that created the node, so it identifies OUR
         // socket rather than whatever happened to be at the path before.
         #[cfg(unix)]
@@ -116,7 +124,7 @@ impl LocalControlListener {
         })
     }
 
-    /// Mint and register a credential confining its holder to `session_id`,
+    /// Mint and register a credential confining its holder to `label`,
     /// returning the secret to hand that one agent process at spawn (via its
     /// environment — never a file, which every same-UID process could read).
     ///
@@ -124,22 +132,42 @@ impl LocalControlListener {
     /// reach the scope of the secret it was given, because operator scope
     /// requires the operator secret and nothing it can say substitutes for
     /// holding it.
-    pub fn grant_session(&self, session_id: &str) -> String {
+    ///
+    /// `label` is whatever the host will also put in the agent's environment.
+    /// A host that already knows the session id may pass it directly; one
+    /// spawning a *fresh* agent does not yet have an id to use (it arrives with
+    /// the agent's own `SessionInit`), so it mints an opaque handle here and
+    /// calls [`bind_session`](Self::bind_session) when the id lands. Until then
+    /// the credential is scoped to the handle, which matches no session — a
+    /// deliberate fail-closed window rather than a wide-open one.
+    pub fn grant_session(&self, label: &str) -> String {
         let secret = crate::generate_token();
-        self.credentials
-            .lock()
-            .unwrap()
-            .insert(LocalIdentity::Session(session_id.to_string()), secret.clone());
+        let identity = LocalIdentity::Session(label.to_string());
+        let claim = identity.granted_claim();
+        self.credentials.lock().unwrap().insert(identity, (secret.clone(), claim));
         secret
     }
 
-    /// Drop a session's credential when its agent ends, so a leaked secret
-    /// stops working with the process it was minted for.
-    pub fn revoke_session(&self, session_id: &str) {
-        self.credentials
-            .lock()
-            .unwrap()
-            .remove(&LocalIdentity::Session(session_id.to_string()));
+    /// Point an already-granted credential at the session it turned out to
+    /// belong to. Connections authenticated *after* this call get the new
+    /// scope; ones already open keep the scope they proved, which is the
+    /// fail-closed direction (the handle scope reaches nothing).
+    ///
+    /// A no-op for an unknown label, so a session that ended before its agent
+    /// announced itself cannot resurrect a credential.
+    pub fn bind_session(&self, label: &str, session_id: &str) {
+        if let Some((_, claim)) =
+            self.credentials.lock().unwrap().get_mut(&LocalIdentity::Session(label.to_string()))
+        {
+            *claim = LocalClaim::Session(session_id.to_string());
+        }
+    }
+
+    /// Drop a credential when its agent ends, so a leaked secret stops working
+    /// with the process it was minted for. Keyed on the mint-time label, not
+    /// the session id — the label is what the agent's environment carries.
+    pub fn revoke_session(&self, label: &str) {
+        self.credentials.lock().unwrap().remove(&LocalIdentity::Session(label.to_string()));
     }
 
     /// Accept one connection **without** authenticating it.

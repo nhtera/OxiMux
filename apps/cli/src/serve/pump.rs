@@ -93,6 +93,11 @@ pub struct PumpSpec {
     /// launcher just minted (or whose title/model evolved) lists correctly
     /// the moment its agent dies.
     pub index: Arc<SessionIndex>,
+    /// Run once when the pump ends, however it ends (agent exit or drain).
+    /// The launcher uses it to revoke the agent's local-control credential:
+    /// a secret outliving the process it was minted for is a secret nothing
+    /// is watching.
+    pub on_end: Option<Box<dyn FnOnce() + Send>>,
 }
 
 /// Start one session's pump. Returns immediately; the pump runs until the
@@ -103,7 +108,17 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
     let mut finalize = pumps.finalize.subscribe();
     let pumps_for_end = pumps.clone();
 
-    let PumpSpec { session_id, handle, events, buffered, seed, settings, registry, index } = spec;
+    let PumpSpec {
+        session_id,
+        handle,
+        events,
+        buffered,
+        seed,
+        settings,
+        registry,
+        index,
+        on_end,
+    } = spec;
 
     // Bridge the transports' std receiver onto the async world. The blocking
     // thread dies with the channel; nothing joins it.
@@ -201,6 +216,9 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
             }
         }
         pumps_for_end.remove(&session_id);
+        if let Some(on_end) = on_end {
+            on_end();
+        }
     });
 }
 
@@ -309,6 +327,11 @@ mod tests {
         let index = Arc::new(SessionIndex::default());
         let pumps = PumpSet::new();
         let (tx, rx) = std::sync::mpsc::channel();
+        // The credential-revoking hook the launcher installs, stubbed: what
+        // matters here is that a dead agent runs it at all, since a credential
+        // that outlives its process is the leak this hook exists to close.
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended_flag = ended.clone();
 
         start(
             PumpSpec {
@@ -320,6 +343,9 @@ mod tests {
                 settings: settings.clone(),
                 registry: registry.clone(),
                 index: index.clone(),
+                on_end: Some(Box::new(move || {
+                    ended_flag.store(true, std::sync::atomic::Ordering::SeqCst)
+                })),
             },
             pumps.clone(),
         );
@@ -337,6 +363,10 @@ mod tests {
             "a dead agent's session leaves the registry"
         );
         assert!(wait_until(5_000, || pumps.live_pumps() == 0), "the pump ends");
+        assert!(
+            wait_until(5_000, || ended.load(std::sync::atomic::Ordering::SeqCst)),
+            "the end hook runs, so the agent's credential is revoked with it"
+        );
         // The final state reached disk, interruption marked (turn no longer
         // active in the persisted fold), and the index still knows the row.
         let blob = blob::load(&settings, "s-1").expect("final state persisted");

@@ -72,6 +72,11 @@ pub struct HeadlessCatalog {
     draining: Arc<AtomicBool>,
     gate: OpenGate,
     index: Arc<SessionIndex>,
+    /// The local socket, for confining a resumed session's agent exactly as a
+    /// freshly launched one is. A resume is the easy half of that job: the
+    /// session id already exists, so the credential is granted under it
+    /// directly and never needs rebinding.
+    local: Arc<oximux_remote_local::LocalControlListener>,
 }
 
 impl HeadlessCatalog {
@@ -83,6 +88,7 @@ impl HeadlessCatalog {
         pumps: Arc<PumpSet>,
         draining: Arc<AtomicBool>,
         index: Arc<SessionIndex>,
+        local: Arc<oximux_remote_local::LocalControlListener>,
     ) -> Self {
         match settings.list_prefixed(CHAT_KEY_PREFIX) {
             Ok(rows) => {
@@ -106,7 +112,7 @@ impl HeadlessCatalog {
             Err(err) => tracing::warn!(%err, "chat blob scan failed; catalog starts empty"),
         }
         tracing::info!(sessions = index.rows.lock().unwrap().len(), "session catalog scanned");
-        Self { registry, settings, pumps, draining, gate: OpenGate::new(), index }
+        Self { registry, settings, pumps, draining, gate: OpenGate::new(), index, local }
     }
 
     /// The resume path: reconnect the persisted session's agent and pump it.
@@ -141,14 +147,25 @@ impl HeadlessCatalog {
         );
         spec.codex_posture = blob.codex_posture.clone();
         spec.pi_posture = blob.pi_posture.clone();
+        // The resumed agent is confined to the session it is resuming. The id
+        // is known here, so the credential is granted under it and is correctly
+        // scoped from its very first use.
+        let secret = self.local.grant_session(session_id);
+        spec.env = super::launcher::credential_env(session_id, &secret);
         // `connect` spawns a process: off the async reactor.
-        let (conn, events) = tokio::task::spawn_blocking(move || connect(spec))
-            .await
-            .map_err(|_| "the resume task failed".to_string())?
-            .map_err(|err| {
+        let spawned = tokio::task::spawn_blocking(move || connect(spec)).await;
+        let (conn, events) = match spawned {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(err)) => {
+                self.local.revoke_session(session_id);
                 tracing::warn!(%err, session_id, "headless resume spawn failed");
-                "the session could not be reopened".to_string()
-            })?;
+                return Err("the session could not be reopened".to_string());
+            }
+            Err(_) => {
+                self.local.revoke_session(session_id);
+                return Err("the resume task failed".to_string());
+            }
+        };
         let handle = self.registry.register(session_id.to_string(), conn);
         self.index.note(
             session_id,
@@ -169,6 +186,11 @@ impl HeadlessCatalog {
                 settings: self.settings.clone(),
                 registry: self.registry.clone(),
                 index: self.index.clone(),
+                on_end: Some({
+                    let local = self.local.clone();
+                    let session_id = session_id.to_string();
+                    Box::new(move || local.revoke_session(&session_id))
+                }),
             },
             self.pumps.clone(),
         );

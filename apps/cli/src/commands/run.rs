@@ -36,10 +36,21 @@ pub struct RunArgs {
     pub model: Option<String>,
     pub cwd: Option<PathBuf>,
     pub worktree: Option<String>,
+    /// A JSON Schema the final answer must satisfy (clap refuses it with
+    /// `--bg`, which has no final answer to hold).
+    pub output_schema: Option<String>,
     pub bg: bool,
 }
 
 pub async fn run(client: &Client, args: RunArgs, json_mode: bool) -> Result<(Value, String), Failure> {
+    // Compiled BEFORE anything is spawned: a bad schema is the caller's typo,
+    // and finding it after an agent has already started work would leave a
+    // live session behind for a usage error.
+    let schema = args
+        .output_schema
+        .as_deref()
+        .map(crate::output_schema::OutputSchema::load)
+        .transpose()?;
     let project_cwd = resolve_cwd(args.cwd)?;
 
     // `--worktree`: mint the worktree first; the session then opens inside it.
@@ -107,7 +118,7 @@ pub async fn run(client: &Client, args: RunArgs, json_mode: bool) -> Result<(Val
         other => return Err(unexpected_reply("SendPrompt", &other)),
     }
 
-    let base = json!({
+    let mut base = json!({
         "session_id": session_id,
         "cwd": cwd,
         "worktree": worktree.as_ref().map(|w| json!({ "id": w.id, "path": w.path, "branch": w.branch })),
@@ -128,7 +139,17 @@ pub async fn run(client: &Client, args: RunArgs, json_mode: bool) -> Result<(Val
     match stream_session(client, &session_id, Some(0), json_mode, false, Stop::TurnEnded, None)
         .await?
     {
-        StreamEnd::TurnEnded { is_error: false } => Ok((base, "✓ done".into())),
+        StreamEnd::TurnEnded { is_error: false } => match schema {
+            Some(schema) => {
+                let value =
+                    crate::output_schema::enforce(client, &session_id, &schema, json_mode).await?;
+                let human = serde_json::to_string_pretty(&value)
+                    .unwrap_or_else(|_| value.to_string());
+                base["output"] = value;
+                Ok((base, human))
+            }
+            None => Ok((base, "✓ done".into())),
+        },
         StreamEnd::TurnEnded { is_error: true } => Err(Failure::new(
             "turn-error",
             exit::ERROR,

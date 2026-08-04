@@ -24,7 +24,15 @@ use super::Dispatcher;
 use crate::auth::Peer;
 
 impl Dispatcher {
-    /// Every schedule the desktop holds. A full-scope read; empty is normal.
+    /// Every **spawning** schedule the desktop holds. A full-scope read; empty
+    /// is normal.
+    ///
+    /// Heartbeats share this table but are deliberately excluded. `ScheduleWire`
+    /// has no target field and cannot grow one (it rides inside a `Vec` in a
+    /// reply older clients already ask for, where postcard would misparse every
+    /// element after an appended field), so a heartbeat listed here would show
+    /// as an ordinary schedule offering edits — change the cwd, change the agent
+    /// — that mean nothing for a session already open. They have their own verb.
     pub(super) fn list_schedules(&self, peer: &Peer) -> Response {
         if !self.auth.may_read_schedules(peer) {
             return Response::Error(RpcError::Unauthorized);
@@ -34,7 +42,7 @@ impl Dispatcher {
             // schedules is not something an unauthorized client should probe.
             return Response::Error(RpcError::Unauthorized);
         };
-        match store.list() {
+        match store.list_spawning() {
             Ok(rows) => Response::Schedules(rows.iter().map(to_wire).collect()),
             Err(e) => {
                 tracing::warn!(error = %e, "listing schedules failed");
@@ -182,7 +190,8 @@ impl Dispatcher {
 
     /// The tick clock as a local datetime, derived from the injected `now_secs`
     /// so tests stay deterministic rather than reading the system clock here.
-    fn now_local(&self) -> DateTime<Local> {
+    /// Shared with the heartbeat and team handlers, which need the same clock.
+    pub(super) fn now_local(&self) -> DateTime<Local> {
         Local
             .timestamp_opt((self.now_secs)() as i64, 0)
             .single()

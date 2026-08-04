@@ -2,12 +2,13 @@
 //! host, so `--help`, `version` and `agent-context` never touch the socket.
 //!
 //! Every connection claims a scope: `OXIMUX_SESSION_ID` in the environment
-//! narrows the connection to that one session; its absence is an operator at
-//! their own keyboard. The host enforces the claim — this side merely never
-//! omits it.
+//! names the per-session credential this process holds, narrowing it to that
+//! one session; its absence is an operator at their own keyboard. The host
+//! enforces the claim — this side merely never omits it.
 //!
-//! No host injects those variables yet, so in practice every invocation today
-//! takes the operator path. See `oximux-remote-local`'s threat-boundary docs.
+//! `oximux serve` injects those variables into every agent it spawns; the
+//! desktop app does not yet, so an agent there runs as the operator. See
+//! `oximux-remote-local`'s threat-boundary docs.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -219,8 +220,18 @@ pub fn rpc_failure(err: oximux_remote_proto::proto::RpcError) -> Failure {
             ])
         }
         RpcError::UnknownSession => {
+            let mut steps = vec!["run `oximux ls` to list sessions".to_string()];
+            // The one wrong guess worth naming: an agent reaching for its own
+            // id finds the credential handle in its environment, which is not
+            // a session id and never resolves to one.
+            if std::env::var_os(SESSION_ENV_VAR).is_some() {
+                steps.push(format!(
+                    "${SESSION_ENV_VAR} names this process's credential, not a session — \
+                     `oximux ls` shows the one session it can reach"
+                ));
+            }
             Failure::new("unknown-session", exit::ERROR, "no such session on this host")
-                .with_steps(["run `oximux ls` to list sessions".into()])
+                .with_steps(steps)
         }
         RpcError::Unsupported => Failure::new(
             "unsupported",

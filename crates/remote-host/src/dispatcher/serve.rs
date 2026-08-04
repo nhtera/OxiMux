@@ -169,6 +169,9 @@ impl Dispatcher {
                                 Live::ScheduleRun(run) => {
                                     self.forward_schedule_run(&peer, transport, run).await
                                 }
+                                Live::StateChange(key, entry) => {
+                                    self.forward_state_change(&peer, transport, key, entry).await
+                                }
                             };
                             if !alive {
                                 break;
@@ -457,6 +460,37 @@ impl Dispatcher {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
             let response = self.run_schedule_now(&peer, &schedule_id).await;
+            return self.send(transport, response).await;
+        }
+        // Opening a team run starts a session per role (and, with
+        // `--worktree-each`, a worktree per role), so it is async for the same
+        // reason `CreateSession` is. Its handler applies the team gate on top
+        // of this authentication check.
+        if let Request::TeamRunCreate(req) = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.team_run_create(&peer, req).await;
+            return self.send(transport, response).await;
+        }
+        // `StateWatch`, like `Subscribe`, answers with a baseline AND opens a
+        // live stream, so it is handled here rather than in the sync `dispatch`.
+        if let Request::StateWatch { prefix } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.state_snapshot(&peer, prefix.as_deref());
+            // Only open the stream when the baseline was actually served: a
+            // refused watch must not go on receiving pushes. A second watch on
+            // one connection re-snapshots and adds a second stream, which is
+            // deliberate — the prefixes may differ, and the frames are
+            // idempotent for a client that gets both.
+            if matches!(response, Response::StateSnapshot(_))
+                && state.peer_version >= oximux_remote_proto::proto::STATE_PUSH_MIN_VERSION
+                && let Some(stream) = self.state_push_stream(prefix)
+            {
+                streams.push(stream);
+            }
             return self.send(transport, response).await;
         }
         // Transcription runs a CPU-heavy ONNX decode, so its handler is async (it

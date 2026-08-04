@@ -81,6 +81,64 @@ async fn a_session_credential_earns_only_its_session() {
     tokio::join!(server, client);
 }
 
+/// The spawn-order property: a credential minted before its session existed is
+/// re-pointed at the real id, and the holder — whose environment still carries
+/// the mint-time handle — earns the SESSION's scope, not the handle's.
+///
+/// This is what makes agent confinement possible at all: an agent's id arrives
+/// with its own `SessionInit`, long after the environment it was spawned with
+/// was fixed.
+#[tokio::test]
+async fn a_rebound_credential_earns_the_session_it_was_bound_to() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("runtime");
+    let listener = LocalControlListener::bind(&runtime_dir, &generate_token()).unwrap();
+    let secret = listener.grant_session("launch-abc");
+    listener.bind_session("launch-abc", "sess-real");
+
+    let server = async {
+        let (_transport, claim) = listener.accept().await.unwrap();
+        assert_eq!(claim, LocalClaim::Session("sess-real".into()));
+    };
+    let client = async {
+        oximux_remote_local::dial_as(
+            &runtime_dir,
+            oximux_remote_local::LocalIdentity::Session("launch-abc".into()),
+            &secret,
+        )
+        .await
+        .expect("the handle still names the credential");
+    };
+    tokio::join!(server, client);
+}
+
+/// Revocation is keyed on the mint-time handle, and binding an unknown handle
+/// creates nothing — a session that ended before its agent announced itself
+/// must not be able to resurrect a credential.
+#[tokio::test]
+async fn a_revoked_handle_stops_working_and_binding_it_back_does_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("runtime");
+    let listener = LocalControlListener::bind(&runtime_dir, &generate_token()).unwrap();
+    let secret = listener.grant_session("launch-abc");
+    listener.revoke_session("launch-abc");
+    listener.bind_session("launch-abc", "sess-real");
+
+    let server = async {
+        assert!(listener.accept().await.is_err(), "a revoked handle grants nothing");
+    };
+    let client = async {
+        let denied = oximux_remote_local::dial_as(
+            &runtime_dir,
+            oximux_remote_local::LocalIdentity::Session("launch-abc".into()),
+            &secret,
+        )
+        .await;
+        assert!(denied.is_err(), "the secret died with the credential");
+    };
+    tokio::join!(server, client);
+}
+
 /// The containment property end-to-end: an agent holding a session secret
 /// cannot reach operator scope by naming the operator identity. It fails at
 /// the host proof — the label it named is bound to a secret it does not hold.

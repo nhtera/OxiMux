@@ -272,6 +272,114 @@ impl AuthStore {
         }
     }
 
+    /// May this caller arm or disarm a heartbeat on `session_id`?
+    ///
+    /// Deliberately [`may_write`](Self::may_write) and **not** the full-scope
+    /// `may_manage_schedules` gate its sibling verbs use. A heartbeat is a
+    /// deferred `SendPrompt` into one already-open session, so it grants exactly
+    /// what the caller can already do by hand — whereas an ordinary schedule is
+    /// a deferred *spawn*, which a session-scoped caller could use to create its
+    /// way out of the box. The narrowing that stops a confined agent reaching
+    /// another session is the same one that stops it prompting one.
+    pub fn may_manage_heartbeats(&self, peer: &Peer, session_id: &str) -> bool {
+        self.may_write(peer, session_id)
+    }
+
+    /// May this caller see the heartbeats armed on `session_id`? Reading
+    /// changes nothing, so this is the plain session scope — a read-only device
+    /// watching a session may see its wake-ups.
+    pub fn may_read_heartbeats(&self, peer: &Peer, session_id: &str) -> bool {
+        self.is_allowed_for(peer, session_id)
+    }
+
+    /// May this caller attempt a heartbeat write *before* a target is known?
+    ///
+    /// The coarse gate an **idempotent** delete needs. Deleting a heartbeat is
+    /// authorized against the session it targets, read from the store — but a
+    /// row that does not exist names no session, and answering "already gone"
+    /// without any check at all would let a read-only device skip the tier
+    /// check entirely by naming an id that never existed. So the tier is
+    /// consulted first, and the per-target scope check still runs the moment a
+    /// row IS found.
+    ///
+    /// Deliberately coarse: it must admit a session-confined caller, since
+    /// deleting its own wake-up is exactly what that caller is for.
+    pub fn may_attempt_heartbeat_writes(&self, peer: &Peer) -> bool {
+        match peer.kind() {
+            PeerKind::Local(_) => true,
+            PeerKind::Remote(pubkey) => {
+                let st = self.inner.lock().unwrap();
+                matches!(st.devices.get(pubkey), Some(d) if !d.revoked && !d.read_only)
+            }
+        }
+    }
+
+    /// May this caller open a team run?
+    ///
+    /// The same two gates as [`may_create_sessions`](Self::may_create_sessions),
+    /// because that is literally what it does — several times over. A
+    /// session-scoped caller is refused outright: a run spans sessions by
+    /// definition, so serving a narrowed one would hand it the escape hatch the
+    /// narrowing exists to close.
+    pub fn may_manage_teams(&self, peer: &Peer) -> bool {
+        self.may_create_sessions(peer)
+    }
+
+    /// May this caller read a team run whose roles occupy `sessions`?
+    ///
+    /// Full scope reads any run. A session-confined caller reads only a run it
+    /// is *in* — which is what lets a role check whether its teammates have
+    /// finished without being able to enumerate the host's other work.
+    pub fn may_read_team_run(&self, peer: &Peer, sessions: &[String]) -> bool {
+        match peer.kind() {
+            PeerKind::Local(scope) => {
+                scope.is_full() || sessions.iter().any(|s| scope.allows(s))
+            }
+            PeerKind::Remote(pubkey) => {
+                let st = self.inner.lock().unwrap();
+                match st.devices.get(pubkey) {
+                    Some(d) if !d.revoked => match &d.scope {
+                        DeviceScope::Full => true,
+                        DeviceScope::Sessions(scoped) => {
+                            sessions.iter().any(|s| scoped.contains(s))
+                        }
+                    },
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    /// May this caller read the coordination blackboard?
+    ///
+    /// Any authorized caller, at any scope. **This is the one surface a
+    /// session-confined caller shares host-wide**, and it is deliberate: a
+    /// blackboard narrowed to one session coordinates nothing, which is the
+    /// entire feature. What keeps that defensible is that the board holds only
+    /// what agents deliberately put on it — no host paths, no credentials, no
+    /// session contents — so it is a channel between agents rather than a
+    /// window into the host.
+    pub fn may_read_state(&self, peer: &Peer) -> bool {
+        match peer.kind() {
+            PeerKind::Local(_) => true,
+            PeerKind::Remote(pubkey) => self.is_authorized(pubkey),
+        }
+    }
+
+    /// May this caller write the coordination blackboard? Same reach as
+    /// [`may_read_state`](Self::may_read_state), minus the read-only tier: a
+    /// device that may only watch must not be able to steer agents by editing
+    /// what they coordinate on.
+    pub fn may_write_state(&self, peer: &Peer) -> bool {
+        match peer.kind() {
+            PeerKind::Local(_) => true,
+            PeerKind::Remote(pubkey) => {
+                let st = self.inner.lock().unwrap();
+                matches!(st.devices.get(pubkey), Some(d) if !d.revoked && !d.read_only)
+            }
+        }
+    }
+
     /// Move a device between the read-write and read-only tiers. Takes effect on
     /// the next RPC (the dispatcher rechecks per call, so an open connection is
     /// downgraded mid-session) and is written through to durable storage.

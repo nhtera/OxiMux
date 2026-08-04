@@ -18,10 +18,13 @@ mod forge;
 mod git;
 mod handlers;
 mod handshake;
+mod heartbeats;
 mod pairing_admin;
 mod schedules;
 mod serve;
+mod state;
 mod stream;
+mod team;
 mod transcribe;
 mod transcript_page;
 mod worktree_rpcs;
@@ -141,6 +144,22 @@ pub struct Dispatcher {
     schedule_events: Option<tokio::sync::broadcast::Sender<
         oximux_remote_proto::messages::ScheduleRunWire,
     >>,
+    /// The host's team runs, when it keeps them. `None` answers an
+    /// **authorized** caller `Unsupported`, like `worktrees` — a host without
+    /// the table should say so rather than look like a refusal.
+    teams: Option<Arc<oximux_agents::team::TeamStore>>,
+    /// The coordination blackboard, when the host keeps one. Same
+    /// `Unsupported`-for-authorized shape as `teams`.
+    coord: Option<Arc<oximux_agents::coord::CoordStore>>,
+    /// Coordination writes, fanned out to `StateWatch` subscribers. The
+    /// dispatcher owns this one (unlike `schedule_events`, which the host's
+    /// ticker feeds) because every writer goes through these handlers.
+    state_events: Option<
+        tokio::sync::broadcast::Sender<(
+            String,
+            Option<oximux_remote_proto::messages::StateEntryWire>,
+        )>,
+    >,
     /// Wall clock (Unix seconds), injectable so tests are deterministic.
     now_secs: fn() -> u64,
 }
@@ -161,6 +180,9 @@ impl Dispatcher {
             pairing_endpoint: None,
             schedule_runner: None,
             schedule_events: None,
+            teams: None,
+            coord: None,
+            state_events: None,
             now_secs: system_now_secs,
         }
     }
@@ -246,6 +268,22 @@ impl Dispatcher {
         events: tokio::sync::broadcast::Sender<oximux_remote_proto::messages::ScheduleRunWire>,
     ) -> Self {
         self.schedule_events = Some(events);
+        self
+    }
+
+    /// Expose the host's team runs over this dispatcher.
+    pub fn with_team_store(mut self, teams: Arc<oximux_agents::team::TeamStore>) -> Self {
+        self.teams = Some(teams);
+        self
+    }
+
+    /// Expose the coordination blackboard, and open the channel its watchers
+    /// ride. Created here rather than passed in: every writer is a handler on
+    /// this dispatcher, so nothing outside it has a reason to hold the sender.
+    pub fn with_coord_store(mut self, coord: Arc<oximux_agents::coord::CoordStore>) -> Self {
+        self.coord = Some(coord);
+        let (tx, _) = tokio::sync::broadcast::channel(64);
+        self.state_events = Some(tx);
         self
     }
 
@@ -344,6 +382,20 @@ impl Dispatcher {
             Request::PairNew { read_only } => self.pair_new(peer, read_only),
             Request::PairList => self.pair_list(peer),
             Request::PairRemove { pubkey } => self.pair_remove(peer, &pubkey),
+            // v18: the automation surface. `TeamRunCreate` is async (it starts
+            // sessions) and is intercepted in `serve`; the rest are store reads
+            // and writes, synchronous like the schedule verbs.
+            Request::CreateHeartbeat(r) => self.create_heartbeat(peer, r),
+            Request::ListHeartbeats { session_id } => {
+                self.list_heartbeats(peer, session_id.as_deref())
+            }
+            Request::DeleteHeartbeat { id } => self.delete_heartbeat(peer, &id),
+            Request::TeamReport(r) => self.team_report(peer, r),
+            Request::TeamStatus { run_id } => self.team_status(peer, &run_id),
+            Request::TeamList => self.team_list(peer),
+            Request::StateGet { key } => self.state_get(peer, &key),
+            Request::StateSet(r) => self.state_set(peer, r),
+            Request::StateDelete { key } => self.state_delete(peer, &key),
             // Handshake variants (handled before auth) and `Subscribe` (intercepted
             // in `serve`) never reach here.
             _ => Response::Error(RpcError::BadRequest("unexpected request".into())),

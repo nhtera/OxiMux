@@ -10,6 +10,7 @@ pub mod cli;
 pub mod command_envelope;
 pub mod commit_message;
 pub mod commit_message_heuristic;
+pub mod coord;
 pub mod osc_sideband;
 pub mod poll_helpers;
 pub mod registry;
@@ -20,6 +21,7 @@ pub mod runtime_impl;
 pub mod session_log;
 pub mod status_machine;
 pub mod tab_title;
+pub mod team;
 pub mod thread;
 
 pub use agent_title::{agent_label_from_title, classify_agent_title};

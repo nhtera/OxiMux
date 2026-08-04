@@ -1,6 +1,15 @@
 //! The headless [`SessionLauncher`]: spawn an agent, learn its session id from
 //! `SessionInit`, register it, and hand the stream to a pump. No tab, no view
 //! — the pump is the whole "UI".
+//!
+//! **Every agent this host spawns is confined to its own session.** Before the
+//! child exists it is granted a local-control credential and handed it in its
+//! environment, so the `oximux` CLI it runs reaches that one conversation
+//! rather than the whole host. The ordering is the awkward part: a session's id
+//! arrives with the agent's own `SessionInit`, *after* the environment is
+//! fixed, so the credential is minted under an opaque handle and re-pointed at
+//! the real id the moment it lands. The window in between is fail-closed — the
+//! handle matches no session, so a call made in it reaches nothing.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,6 +18,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use oximux_agents::session_registry::SessionRegistry;
 use oximux_agents::thread::{ConnectSpec, ThreadEvent, Transport, connect};
 use oximux_remote_host::{LaunchError, SessionLauncher};
+use oximux_remote_local::{
+    LocalControlListener, SESSION_ENV_VAR, SESSION_TOKEN_ENV_VAR, generate_token,
+};
 use oximux_storage::SettingsRepo;
 
 use super::blob::ChatBlob;
@@ -58,6 +70,28 @@ pub struct HeadlessLauncher {
     /// The shared list-row index — a minted session is noted immediately, so
     /// it lists even if its agent dies before the pump's first persist.
     index: Arc<SessionIndex>,
+    /// The local socket, for minting each agent's own confined credential.
+    local: Arc<LocalControlListener>,
+}
+
+/// The environment an agent carries: which credential it holds, and the secret
+/// proving it. Both or neither — a token with no label names nothing to look
+/// up, and a label with no token proves nothing.
+pub fn credential_env(label: &str, secret: &str) -> Vec<(String, String)> {
+    vec![
+        (SESSION_ENV_VAR.to_string(), label.to_string()),
+        (SESSION_TOKEN_ENV_VAR.to_string(), secret.to_string()),
+    ]
+}
+
+/// An opaque handle naming one spawn's credential.
+///
+/// Minted with the credential generator even though a label is not itself a
+/// secret: it is the lookup key a caller must name to be *offered* the proof,
+/// and a predictable key would let any same-user process aim the handshake at
+/// a specific agent's credential instead of having to guess both halves.
+fn credential_label() -> String {
+    format!("agent-{}", generate_token())
 }
 
 impl HeadlessLauncher {
@@ -67,8 +101,9 @@ impl HeadlessLauncher {
         pumps: Arc<PumpSet>,
         draining: Arc<AtomicBool>,
         index: Arc<SessionIndex>,
+        local: Arc<LocalControlListener>,
     ) -> Self {
-        Self { registry, settings, pumps, draining, index }
+        Self { registry, settings, pumps, draining, index, local }
     }
 }
 
@@ -132,7 +167,7 @@ impl SessionLauncher for HeadlessLauncher {
         }
         let cwd = usable_working_directory(cwd)?;
         let transport = transport_for(agent_id)?;
-        let spec = ConnectSpec::for_backend(
+        let mut spec = ConnectSpec::for_backend(
             &oximux_agents::thread::ChatBackend::from(transport),
             cwd.clone(),
             None,
@@ -140,9 +175,30 @@ impl SessionLauncher for HeadlessLauncher {
             None,
             None,
         );
-        let spawned = tokio::task::spawn_blocking(move || spawn_and_wait_for_init(spec))
-            .await
-            .map_err(|_| LaunchError::Failed)??;
+        // Granted before the child exists, so the very first `oximux` call it
+        // makes is already confined. The handle is scoped to nothing until the
+        // rebind below — a spawn that dies before `SessionInit` therefore
+        // leaves a credential that reaches no session at all.
+        let label = credential_label();
+        let secret = self.local.grant_session(&label);
+        spec.env = credential_env(&label, &secret);
+
+        let spawned = match tokio::task::spawn_blocking(move || spawn_and_wait_for_init(spec)).await
+        {
+            Ok(Ok(spawned)) => spawned,
+            // Nothing will ever bind or revoke this credential, so drop it here
+            // rather than leaking a live secret for a process that never
+            // started.
+            Ok(Err(err)) => {
+                self.local.revoke_session(&label);
+                return Err(err);
+            }
+            Err(_) => {
+                self.local.revoke_session(&label);
+                return Err(LaunchError::Failed);
+            }
+        };
+        self.local.bind_session(&label, &spawned.session_id);
 
         let handle = self.registry.register(spawned.session_id.clone(), spawned.conn);
         self.index.note(
@@ -167,6 +223,10 @@ impl SessionLauncher for HeadlessLauncher {
                 settings: self.settings.clone(),
                 registry: self.registry.clone(),
                 index: self.index.clone(),
+                on_end: Some({
+                    let local = self.local.clone();
+                    Box::new(move || local.revoke_session(&label))
+                }),
             },
             self.pumps.clone(),
         );

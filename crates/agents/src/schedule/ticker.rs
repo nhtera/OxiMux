@@ -79,6 +79,59 @@ pub trait ScheduleFirer: Send + Sync {
 /// failure) — the seam a host uses to push run results to subscribers.
 pub type RecordedHook = Arc<dyn Fn(&ScheduleRun) + Send + Sync>;
 
+/// Fire a schedule into a session that is already open — the heartbeat path.
+///
+/// Shared by every host because there is nothing host-specific about it: the
+/// session is already live in the registry, so no tab opens and no process
+/// spawns. That is the whole point of the [`ScheduleTarget::ExistingSession`]
+/// arm — an agent asking to be woken inside its own conversation, with the
+/// context it has already built, rather than in a fresh one that knows nothing.
+///
+/// A session that is not live is a **failure**, not a [`FireOutcome::NotNow`]:
+/// `NotNow` means "I expect to be able to shortly", and a dormant session's
+/// agent is not coming back on its own. Recording it arms the next slot, so a
+/// heartbeat on a closed session reports once per cadence instead of spinning.
+/// A target whose session is gone for good is disabled by
+/// [`ScheduleStore::sweep_orphaned_targets`] at boot.
+pub fn nudge_existing_session(
+    registry: &crate::session_registry::SessionRegistry,
+    schedule: &Schedule,
+    session_id: &str,
+) -> FireOutcome {
+    let Some(handle) = registry.get(session_id) else {
+        return FireOutcome::Failed {
+            session_id: Some(session_id.to_string()),
+            detail: "that session is not running, so there was nothing to wake".into(),
+        };
+    };
+    match handle.send_prompt(&heartbeat_prompt(schedule), &[]) {
+        Ok(()) => FireOutcome::Completed { session_id: Some(session_id.to_string()) },
+        Err(err) => {
+            tracing::warn!(%err, session_id, "heartbeat prompt could not be delivered");
+            FireOutcome::Failed {
+                session_id: Some(session_id.to_string()),
+                detail: "the session is running but the prompt could not be delivered".into(),
+            }
+        }
+    }
+}
+
+/// The prompt a heartbeat delivers: the schedule's own text under a preamble
+/// naming where it came from.
+///
+/// The preamble is load-bearing, not decoration. Without it the agent reads a
+/// wake-up as the user having typed something, and answers the *person* —
+/// asking what they meant, or apologising for the interruption. Saying plainly
+/// that this is a timer the agent itself armed is what makes it act instead.
+fn heartbeat_prompt(schedule: &Schedule) -> String {
+    format!(
+        "[oximux heartbeat: {}] This is a scheduled wake-up, delivered by the host on \
+         the cadence set for this session. Nobody typed it. Act on it directly and \
+         reply only with what the instruction below asks for.\n\n{}",
+        schedule.name, schedule.prompt
+    )
+}
+
 /// Why a manual run-now was refused.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RunNowError {

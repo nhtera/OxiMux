@@ -452,6 +452,13 @@ fn main() {
         // handed over directly rather than through a bridge, unlike the launcher
         // and rewinder above.
         remote_control.set_schedule_store(std::sync::Arc::new(app_state.schedule_store()));
+        // Team runs and the coordination blackboard: the same database `oximux
+        // serve` opens, so a run started against either host is one run. Both
+        // are plain SQLite stores, handed over directly like the schedules.
+        remote_control.set_automation_stores(
+            std::sync::Arc::new(app_state.team_store()),
+            std::sync::Arc::new(app_state.coord_store()),
+        );
         // The scheduled-run ticker. Installed unconditionally when this process
         // wins the data dir's ticker lock: with no schedules it costs one
         // indexed read every tick and takes no keep-awake hold, and gating it
@@ -479,6 +486,7 @@ fn main() {
             if let Some(ticker) = oximux_app::scheduler::install(
                 app_state.schedule_store(),
                 bridge_launcher,
+                remote_control.registry(),
                 app_paths::data_dir(),
                 schedule_events,
                 session_exists,

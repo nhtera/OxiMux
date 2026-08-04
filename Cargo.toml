@@ -142,6 +142,12 @@ async-trait = "0.1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `oximux run --output-schema`: hold an agent's final answer to a JSON Schema.
+# `default-features = false` drops the bundled HTTP resolver (and reqwest with
+# it) — a CLI validating a schema the operator handed it must never fetch a
+# remote `$ref`, which would turn a validation run into a network call against
+# a URL the schema author chose.
+jsonschema = { version = "0.35", default-features = false }
 # Phase 5 relay wire format. v2 has the cleaner config API but its
 # byte layout is not ABI-stable across point releases — the workspace
 # pin is the authoritative version both app + daemon agree on.

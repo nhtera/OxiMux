@@ -13,6 +13,15 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::recurrence::Recurrence;
 
+/// How many heartbeats one session may arm.
+///
+/// Low on purpose. A heartbeat is usually created *by* the agent living in the
+/// session, so the failure mode is not a user with too many reminders — it is
+/// an agent that arms one on every wake-up and compounds. Five is more than any
+/// deliberate use needs and small enough that the runaway case hits a wall
+/// within minutes.
+pub const MAX_HEARTBEATS_PER_SESSION: usize = 5;
+
 /// What a schedule fires INTO.
 ///
 /// The discriminant is settled now so the fire contract never reopens, even
@@ -99,13 +108,52 @@ impl ScheduleStore {
         Self { conn }
     }
 
-    /// Create a schedule, computing its first fire from `now`.
+    /// Create a schedule that spawns a fresh session per fire.
     pub fn create(&self, new: NewSchedule, now: DateTime<Local>) -> Result<Schedule> {
+        self.create_targeted(new, ScheduleTarget::NewSession, now)
+    }
+
+    /// Create a **heartbeat**: a schedule that wakes an existing session rather
+    /// than opening a new one.
+    ///
+    /// Capped per session, because the caller is typically the agent living in
+    /// that session and a runaway loop of self-arming wake-ups is the obvious
+    /// way for this to go wrong. The cap counts rows, not enabled rows: a paused
+    /// heartbeat is still one the agent chose to keep, and letting pauses buy
+    /// headroom would make the ceiling meaningless.
+    pub fn create_heartbeat(
+        &self,
+        new: NewSchedule,
+        session_id: &str,
+        now: DateTime<Local>,
+    ) -> Result<Schedule> {
+        let existing = self.for_session(session_id)?.len();
+        if existing >= MAX_HEARTBEATS_PER_SESSION {
+            anyhow::bail!(
+                "this session already has {existing} heartbeats \
+                 (the limit is {MAX_HEARTBEATS_PER_SESSION}); delete one first"
+            );
+        }
+        self.create_targeted(new, ScheduleTarget::ExistingSession(session_id.to_string()), now)
+    }
+
+    /// Create a schedule with an explicit target, computing its first fire from
+    /// `now`.
+    pub fn create_targeted(
+        &self,
+        new: NewSchedule,
+        target: ScheduleTarget,
+        now: DateTime<Local>,
+    ) -> Result<Schedule> {
+        let target_session_id = match &target {
+            ScheduleTarget::NewSession => None,
+            ScheduleTarget::ExistingSession(id) => Some(id.clone()),
+        };
         let schedule = Schedule {
             // Random rather than sequential: ids appear in run history and cross
             // the wire, and a guessable counter invites a client to address a
             // schedule it was never told about.
-            id: format!("sch-{}", uuid_like()),
+            id: format!("sch-{}", random_id()),
             name: new.name,
             cwd: new.cwd,
             prompt: new.prompt,
@@ -113,7 +161,7 @@ impl ScheduleStore {
             recurrence: new.recurrence,
             enabled: true,
             next_fire_at: new.recurrence.next_after(now),
-            target: ScheduleTarget::NewSession,
+            target,
         };
         let (kind, interval, hour, minute, weekday) = decompose(&schedule.recurrence);
         self.conn
@@ -121,8 +169,9 @@ impl ScheduleStore {
             .unwrap()
             .execute(
                 "INSERT INTO schedules (id, name, cwd, prompt, agent_id, kind, \
-                 interval_minutes, hour, minute, weekday, enabled, next_fire_at, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12)",
+                 interval_minutes, hour, minute, weekday, enabled, next_fire_at, created_at, \
+                 target_session_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13)",
                 params![
                     schedule.id,
                     schedule.name,
@@ -136,13 +185,38 @@ impl ScheduleStore {
                     weekday,
                     schedule.next_fire_at.to_rfc3339(),
                     now.to_rfc3339(),
+                    target_session_id,
                 ],
             )
             .context("insert schedule")?;
         Ok(schedule)
     }
 
-    /// Every schedule, newest fire first.
+    /// The heartbeats armed for one session, next fire first.
+    pub fn for_session(&self, session_id: &str) -> Result<Vec<Schedule>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|s| s.target == ScheduleTarget::ExistingSession(session_id.to_string()))
+            .collect())
+    }
+
+    /// Schedules that spawn a fresh session per fire — what "the schedule list"
+    /// has always meant.
+    ///
+    /// Heartbeats are deliberately excluded: they are an agent's own wake-ups,
+    /// belonging to one conversation rather than to the host, and a client that
+    /// listed them among ordinary schedules would offer edits (change the cwd,
+    /// change the agent) that mean nothing for a target that is already open.
+    pub fn list_spawning(&self) -> Result<Vec<Schedule>> {
+        Ok(self
+            .list()?
+            .into_iter()
+            .filter(|s| s.target == ScheduleTarget::NewSession)
+            .collect())
+    }
+
+    /// Every schedule, heartbeats included, newest fire first.
     pub fn list(&self) -> Result<Vec<Schedule>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
@@ -564,7 +638,7 @@ fn parse_local(s: &str) -> Option<DateTime<Local>> {
 }
 
 /// A random id, without pulling in a uuid dependency for one call site.
-fn uuid_like() -> String {
+pub(crate) fn random_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     // Mixed with the address of a fresh allocation so two schedules created in
@@ -959,5 +1033,111 @@ mod tests {
             })
             .collect();
         assert_eq!(ids.len(), 50, "every id is distinct");
+    }
+
+    /// A heartbeat is stored with its target, and the fire path reads it back —
+    /// the column is what makes the `ExistingSession` arm reachable at all.
+    #[test]
+    fn a_heartbeat_stores_and_reads_back_its_target() {
+        let store = store();
+        let now = at("2026-07-21 08:00:00");
+        let made = store
+            .create_heartbeat(
+                new_schedule(Recurrence::every_minutes(15).unwrap()),
+                "sess-1",
+                now,
+            )
+            .expect("create");
+        assert_eq!(made.target, ScheduleTarget::ExistingSession("sess-1".into()));
+
+        let back = store.get(&made.id).unwrap().expect("found");
+        assert_eq!(
+            back.target,
+            ScheduleTarget::ExistingSession("sess-1".into()),
+            "the target survived the round trip"
+        );
+    }
+
+    /// Heartbeats and spawning schedules share a table but not a list. A client
+    /// asking for "schedules" must not be handed rows whose target it has no
+    /// field to see — and `for_session` must not hand back another session's.
+    #[test]
+    fn the_two_listings_do_not_bleed_into_each_other() {
+        let store = store();
+        let now = at("2026-07-21 08:00:00");
+        let spawning =
+            store.create(new_schedule(Recurrence::daily_at(9, 0).unwrap()), now).expect("create");
+        let mine = store
+            .create_heartbeat(new_schedule(Recurrence::every_minutes(15).unwrap()), "sess-1", now)
+            .expect("create");
+        store
+            .create_heartbeat(new_schedule(Recurrence::every_minutes(20).unwrap()), "sess-2", now)
+            .expect("create");
+
+        let spawning_ids: Vec<String> =
+            store.list_spawning().unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(spawning_ids, vec![spawning.id], "heartbeats stay out of the schedule list");
+
+        let mine_ids: Vec<String> =
+            store.for_session("sess-1").unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(mine_ids, vec![mine.id], "one session sees only its own");
+        assert!(store.for_session("sess-none").unwrap().is_empty());
+    }
+
+    /// The runaway guard: an agent that arms a heartbeat on every wake-up hits
+    /// a wall instead of compounding.
+    #[test]
+    fn a_session_cannot_arm_more_than_the_cap() {
+        let store = store();
+        let now = at("2026-07-21 08:00:00");
+        for i in 0..MAX_HEARTBEATS_PER_SESSION {
+            store
+                .create_heartbeat(
+                    new_schedule(Recurrence::every_minutes(15).unwrap()),
+                    "sess-1",
+                    now,
+                )
+                .unwrap_or_else(|e| panic!("heartbeat {i} should fit: {e}"));
+        }
+        let err = store
+            .create_heartbeat(new_schedule(Recurrence::every_minutes(15).unwrap()), "sess-1", now)
+            .expect_err("over the cap");
+        assert!(err.to_string().contains("limit"), "names the limit: {err}");
+        // Another session is unaffected — the cap is per session, not global.
+        store
+            .create_heartbeat(new_schedule(Recurrence::every_minutes(15).unwrap()), "sess-2", now)
+            .expect("a different session has its own headroom");
+    }
+
+    /// A paused heartbeat still occupies a slot: letting a pause buy headroom
+    /// would make the ceiling meaningless.
+    #[test]
+    fn a_paused_heartbeat_still_counts_against_the_cap() {
+        let store = store();
+        let now = at("2026-07-21 08:00:00");
+        let mut ids = Vec::new();
+        for _ in 0..MAX_HEARTBEATS_PER_SESSION {
+            ids.push(
+                store
+                    .create_heartbeat(
+                        new_schedule(Recurrence::every_minutes(15).unwrap()),
+                        "sess-1",
+                        now,
+                    )
+                    .expect("create")
+                    .id,
+            );
+        }
+        store.set_enabled(&ids[0], false, now).expect("pause");
+        assert!(
+            store
+                .create_heartbeat(
+                    new_schedule(Recurrence::every_minutes(15).unwrap()),
+                    "sess-1",
+                    now
+                )
+                .is_err(),
+            "pausing one does not free a slot"
+        );
     }
 }

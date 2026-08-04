@@ -103,8 +103,14 @@ impl SettingsModal {
     /// Reload the schedule list + recent runs from the store. Called at `open()`
     /// and after every create/delete/toggle so the pane reflects the store the
     /// scheduler ticker is also reading.
+    ///
+    /// `list_spawning`, not `list`: heartbeats share this table but are an
+    /// agent's own wake-ups inside one conversation, and every control this pane
+    /// offers (edit the cwd, pick the agent, delete) is meaningless or harmful
+    /// for a session that is already open. The remote surface narrows the same
+    /// way — see `Dispatcher::list_schedules`.
     pub(super) fn reload_schedules(&mut self) {
-        let schedules = self.schedule_store.list().unwrap_or_else(|err| {
+        let schedules = self.schedule_store.list_spawning().unwrap_or_else(|err| {
             tracing::warn!(%err, "settings: could not list schedules");
             Vec::new()
         });
