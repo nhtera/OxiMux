@@ -38,6 +38,14 @@ pub enum SwapError {
     /// A rename failed and the rollback failed too. This is the one state
     /// worth shouting about, because a human has to look.
     Inconsistent { path: PathBuf, detail: String, backups: Vec<PathBuf> },
+    /// Making a staged binary executable failed.
+    ///
+    /// unix-only, and gated so it says so: the mode bits are the only thing
+    /// [`make_executable`] touches, and its Windows counterpart is a no-op
+    /// because Windows has no execute bit. Left ungated, this variant is
+    /// unreachable there — which `-D warnings` turns into a dead-code build
+    /// failure on the one platform a macOS developer never compiles for.
+    #[cfg(unix)]
     Io { path: PathBuf, detail: String },
 }
 
@@ -56,6 +64,7 @@ impl std::fmt::Display for SwapError {
                 path.display(),
                 backups.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
             ),
+            #[cfg(unix)]
             Self::Io { path, detail } => write!(f, "{}: {detail}", path.display()),
         }
     }
@@ -65,26 +74,32 @@ impl SwapError {
     /// What to tell the user. A permission failure on the install directory is
     /// the overwhelmingly common case and has a specific answer.
     pub fn next_steps(&self) -> Vec<String> {
-        match self {
-            Self::Inconsistent { .. } => vec![
-                "Restore the binaries listed above by renaming them back, then reinstall."
-                    .to_string(),
-                format!("Or reinstall from scratch: {}", crate::update::INSTALL_HINT),
-            ],
-            Self::RolledBack { path, detail } | Self::Io { path, detail } => {
-                let mut steps = Vec::new();
-                if detail.to_lowercase().contains("permission") {
-                    steps.push(format!(
-                        "You do not have write access to {}. Reinstall to a directory you own \
-                         (the installer defaults to ~/.local/bin), or update with the same \
-                         account that installed it.",
-                        path.parent().unwrap_or(path).display()
-                    ));
-                }
-                steps.push(format!("Reinstall instead: {}", crate::update::INSTALL_HINT));
-                steps
+        // The failing path and reason are bound first rather than matched in
+        // one or-pattern, because `Io` is unix-only and an or-pattern cannot
+        // carry a `#[cfg]` on just one of its alternatives.
+        let (path, detail) = match self {
+            Self::Inconsistent { .. } => {
+                return vec![
+                    "Restore the binaries listed above by renaming them back, then reinstall."
+                        .to_string(),
+                    format!("Or reinstall from scratch: {}", crate::update::INSTALL_HINT),
+                ];
             }
+            Self::RolledBack { path, detail } => (path, detail),
+            #[cfg(unix)]
+            Self::Io { path, detail } => (path, detail),
+        };
+        let mut steps = Vec::new();
+        if detail.to_lowercase().contains("permission") {
+            steps.push(format!(
+                "You do not have write access to {}. Reinstall to a directory you own \
+                 (the installer defaults to ~/.local/bin), or update with the same \
+                 account that installed it.",
+                path.parent().unwrap_or(path).display()
+            ));
         }
+        steps.push(format!("Reinstall instead: {}", crate::update::INSTALL_HINT));
+        steps
     }
 }
 

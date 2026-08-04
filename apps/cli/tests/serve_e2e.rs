@@ -12,7 +12,12 @@
 use std::io::BufRead as _;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// Only the `#[cfg(unix)]` readiness wait uses a deadline; importing it
+// unconditionally is an unused import on Windows, where `-D warnings` makes
+// that a hard error rather than a nit.
+#[cfg(unix)]
+use std::time::Instant;
 
 fn bin() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximux-cli"));

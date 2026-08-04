@@ -274,8 +274,7 @@ mod tests {
     /// user typed nothing wrong, so nothing should fail.
     #[test]
     fn a_dangling_default_falls_back_to_local() {
-        let mut hosts = HostsFile::default();
-        hosts.default = Some("ghost".into());
+        let hosts = HostsFile { default: Some("ghost".into()), ..Default::default() };
         assert!(hosts.resolve(None, None).unwrap().is_none());
     }
 

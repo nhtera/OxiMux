@@ -308,6 +308,61 @@ pub fn is_push(resp: &Response) -> bool {
     )
 }
 
+/// A version mismatch either side cannot bridge, named from both ends.
+fn skew_failure(host_version: u32, host_min: u32) -> Failure {
+    Failure::new(
+        "incompatible",
+        exit::ERROR,
+        format!(
+            "host speaks protocol v{host_version} (min v{host_min}); \
+             this CLI speaks v{PROTOCOL_VERSION} (min v{MIN_COMPATIBLE_VERSION})"
+        ),
+    )
+    .with_steps(["update the older side so both speak a compatible protocol".into()])
+}
+
+fn timed_out(what: &str) -> Failure {
+    Failure::new("timeout", exit::TIMEOUT, format!("timed out {what}")).with_steps([
+        "the host may be busy — retry, or raise --timeout".into(),
+    ])
+}
+
+/// Map a protocol-level error into the exit-code contract. Shared by every
+/// verb so `Unauthorized` is always exit 5 and never a generic failure.
+pub fn rpc_failure(err: oximux_remote_proto::proto::RpcError) -> Failure {
+    use oximux_remote_proto::proto::RpcError;
+    match err {
+        RpcError::Unauthorized => {
+            Failure::new("denied", exit::DENIED, "the host refused this call").with_steps([
+                format!(
+                    "agent-scoped invocations (${SESSION_ENV_VAR} set) reach only their own session"
+                ),
+                "operator access covers everything — run without the session variable".into(),
+            ])
+        }
+        RpcError::UnknownSession => {
+            let mut steps = vec!["run `oximux ls` to list sessions".to_string()];
+            // The one wrong guess worth naming: an agent reaching for its own
+            // id finds the credential handle in its environment, which is not
+            // a session id and never resolves to one.
+            if std::env::var_os(SESSION_ENV_VAR).is_some() {
+                steps.push(format!(
+                    "${SESSION_ENV_VAR} names this process's credential, not a session — \
+                     `oximux ls` shows the one session it can reach"
+                ));
+            }
+            Failure::new("unknown-session", exit::ERROR, "no such session on this host")
+                .with_steps(steps)
+        }
+        RpcError::Unsupported => Failure::new(
+            "unsupported",
+            exit::ERROR,
+            "this host does not offer that capability",
+        ),
+        other => Failure::new("rpc", exit::ERROR, format!("host error: {other:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,60 +417,5 @@ mod tests {
     fn the_local_target_labels_itself() {
         assert_eq!(HostTarget::Local.label(), "local");
         assert_eq!(HostTarget::Remote("prod".into()).label(), "prod");
-    }
-}
-
-/// A version mismatch either side cannot bridge, named from both ends.
-fn skew_failure(host_version: u32, host_min: u32) -> Failure {
-    Failure::new(
-        "incompatible",
-        exit::ERROR,
-        format!(
-            "host speaks protocol v{host_version} (min v{host_min}); \
-             this CLI speaks v{PROTOCOL_VERSION} (min v{MIN_COMPATIBLE_VERSION})"
-        ),
-    )
-    .with_steps(["update the older side so both speak a compatible protocol".into()])
-}
-
-fn timed_out(what: &str) -> Failure {
-    Failure::new("timeout", exit::TIMEOUT, format!("timed out {what}")).with_steps([
-        "the host may be busy — retry, or raise --timeout".into(),
-    ])
-}
-
-/// Map a protocol-level error into the exit-code contract. Shared by every
-/// verb so `Unauthorized` is always exit 5 and never a generic failure.
-pub fn rpc_failure(err: oximux_remote_proto::proto::RpcError) -> Failure {
-    use oximux_remote_proto::proto::RpcError;
-    match err {
-        RpcError::Unauthorized => {
-            Failure::new("denied", exit::DENIED, "the host refused this call").with_steps([
-                format!(
-                    "agent-scoped invocations (${SESSION_ENV_VAR} set) reach only their own session"
-                ),
-                "operator access covers everything — run without the session variable".into(),
-            ])
-        }
-        RpcError::UnknownSession => {
-            let mut steps = vec!["run `oximux ls` to list sessions".to_string()];
-            // The one wrong guess worth naming: an agent reaching for its own
-            // id finds the credential handle in its environment, which is not
-            // a session id and never resolves to one.
-            if std::env::var_os(SESSION_ENV_VAR).is_some() {
-                steps.push(format!(
-                    "${SESSION_ENV_VAR} names this process's credential, not a session — \
-                     `oximux ls` shows the one session it can reach"
-                ));
-            }
-            Failure::new("unknown-session", exit::ERROR, "no such session on this host")
-                .with_steps(steps)
-        }
-        RpcError::Unsupported => Failure::new(
-            "unsupported",
-            exit::ERROR,
-            "this host does not offer that capability",
-        ),
-        other => Failure::new("rpc", exit::ERROR, format!("host error: {other:?}")),
     }
 }

@@ -36,8 +36,7 @@ fn read(relative: &str) -> String {
 fn key_from_packaging(raw: &str) -> &str {
     raw.lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .next_back()
+        .rfind(|line| !line.is_empty() && !line.starts_with('#'))
         .expect("packaging/release-pubkey.txt carries a key line")
 }
 

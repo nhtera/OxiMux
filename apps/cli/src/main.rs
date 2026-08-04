@@ -123,52 +123,6 @@ fn required_version(command: &Command) -> Option<(u32, &'static str)> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn command_of(argv: &[&str]) -> Command {
-        Cli::try_parse_from(argv).expect("parses").command
-    }
-
-    /// The gate covers exactly the appended surfaces, and nothing else. A verb
-    /// wrongly listed here would refuse a host that can serve it perfectly
-    /// well; one wrongly omitted would send an ordinal an old host answers by
-    /// dropping the connection.
-    #[test]
-    fn only_appended_verbs_declare_a_version_floor() {
-        for (argv, expected) in [
-            (vec!["oximux", "heartbeat", "ls"], Some(18)),
-            (vec!["oximux", "team", "ls"], Some(18)),
-            (vec!["oximux", "state", "get", "k"], Some(18)),
-            (vec!["oximux", "schedule", "run-once", "sch-1"], Some(17)),
-            (vec!["oximux", "worktree", "ls"], Some(16)),
-            (vec!["oximux", "transcript", "s1"], Some(16)),
-            (vec!["oximux", "pair-ls"], Some(16)),
-            // The long-standing surface every host has spoken since v1–v12.
-            (vec!["oximux", "ls"], None),
-            (vec!["oximux", "status"], None),
-            (vec!["oximux", "send", "s1", "hi"], None),
-            (vec!["oximux", "schedule", "ls"], None),
-        ] {
-            let needed = required_version(&command_of(&argv)).map(|(v, _)| v);
-            assert_eq!(needed, expected, "{argv:?}");
-        }
-    }
-
-    /// `schedule` is the one family split across versions: only the manual fire
-    /// is v17, and gating the whole family would strand a v10 host's list.
-    #[test]
-    fn only_run_once_gates_the_schedule_family() {
-        assert!(required_version(&command_of(&["oximux", "schedule", "ls"])).is_none());
-        assert!(required_version(&command_of(&["oximux", "schedule", "rm", "s"])).is_none());
-        assert_eq!(
-            required_version(&command_of(&["oximux", "schedule", "run-once", "s"])).map(|(v, _)| v),
-            Some(17)
-        );
-    }
-}
-
 fn host_verb(args: Cli) -> u8 {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -405,4 +359,50 @@ fn host_verb(args: Cli) -> u8 {
         .await;
         render(json_mode, outcome)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command_of(argv: &[&str]) -> Command {
+        Cli::try_parse_from(argv).expect("parses").command
+    }
+
+    /// The gate covers exactly the appended surfaces, and nothing else. A verb
+    /// wrongly listed here would refuse a host that can serve it perfectly
+    /// well; one wrongly omitted would send an ordinal an old host answers by
+    /// dropping the connection.
+    #[test]
+    fn only_appended_verbs_declare_a_version_floor() {
+        for (argv, expected) in [
+            (vec!["oximux", "heartbeat", "ls"], Some(18)),
+            (vec!["oximux", "team", "ls"], Some(18)),
+            (vec!["oximux", "state", "get", "k"], Some(18)),
+            (vec!["oximux", "schedule", "run-once", "sch-1"], Some(17)),
+            (vec!["oximux", "worktree", "ls"], Some(16)),
+            (vec!["oximux", "transcript", "s1"], Some(16)),
+            (vec!["oximux", "pair-ls"], Some(16)),
+            // The long-standing surface every host has spoken since v1–v12.
+            (vec!["oximux", "ls"], None),
+            (vec!["oximux", "status"], None),
+            (vec!["oximux", "send", "s1", "hi"], None),
+            (vec!["oximux", "schedule", "ls"], None),
+        ] {
+            let needed = required_version(&command_of(&argv)).map(|(v, _)| v);
+            assert_eq!(needed, expected, "{argv:?}");
+        }
+    }
+
+    /// `schedule` is the one family split across versions: only the manual fire
+    /// is v17, and gating the whole family would strand a v10 host's list.
+    #[test]
+    fn only_run_once_gates_the_schedule_family() {
+        assert!(required_version(&command_of(&["oximux", "schedule", "ls"])).is_none());
+        assert!(required_version(&command_of(&["oximux", "schedule", "rm", "s"])).is_none());
+        assert_eq!(
+            required_version(&command_of(&["oximux", "schedule", "run-once", "s"])).map(|(v, _)| v),
+            Some(17)
+        );
+    }
 }

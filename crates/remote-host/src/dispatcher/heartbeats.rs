@@ -37,7 +37,7 @@ impl Dispatcher {
         // The session must exist *here*, or a heartbeat would sit armed against
         // an id that will never resolve, failing once per cadence forever.
         if self.registry.get(&session_id).is_none()
-            && !self.catalog.as_ref().is_some_and(|c| c.transcript(&session_id).is_some())
+            && self.catalog.as_ref().is_none_or(|c| c.transcript(&session_id).is_none())
         {
             return Response::Error(RpcError::UnknownSession);
         }

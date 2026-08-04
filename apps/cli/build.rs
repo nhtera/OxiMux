@@ -60,8 +60,7 @@ fn release_pubkey(path: &std::path::Path) -> String {
     };
     raw.lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .next_back()
+        .rfind(|line| !line.is_empty() && !line.starts_with('#'))
         .unwrap_or("UNSET")
         .to_string()
 }

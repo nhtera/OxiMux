@@ -113,9 +113,17 @@ jobs:
       # `oximux-settings` is deliberately missing from this list: with default
       # features it links gpui, which is exactly what a headless consumer must
       # not do. It gets its own gpui-free step below.
+      #
+      # `oximux-cli` IS here, and belongs here: this crate set existed to prove
+      # the CLI's dependencies build headless, but the binary on top of them was
+      # never itself compiled for Linux — so its own code (the self-update
+      # module, build.rs, the serve wiring) had no Linux gate at all until a
+      # release tried to build it. Discovering that at release time means a red
+      # release job; discovering it here means a red PR.
       - name: cargo check (CLI crate set)
         run: >
           cargo check --all-targets
+          -p oximux-cli
           -p oximux-core
           -p oximux-pty
           -p oximux-git

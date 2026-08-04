@@ -56,13 +56,13 @@ pub async fn dial(
     let endpoint = tokio::time::timeout_at(deadline, oximux_remote_iroh::bind_client())
         .await
         .map_err(|_| unreachable("timed out binding a local endpoint"))?
-        .map_err(|e| unreachable(e))?;
+        .map_err(unreachable)?;
     let connector = oximux_remote_iroh::IrohConnector::new(endpoint, endpoint_id)
-        .map_err(|e| unreachable(e))?;
+        .map_err(unreachable)?;
     tokio::time::timeout_at(deadline, connector.connect())
         .await
         .map_err(|_| unreachable("timed out dialling"))?
-        .map_err(|e| unreachable(e))
+        .map_err(unreachable)
 }
 
 /// The instant a connect attempt must be finished by: dial, version exchange,
@@ -93,11 +93,11 @@ async fn call(
     tokio::time::timeout_at(deadline, transport.send(bytes))
         .await
         .map_err(|_| unreachable("timed out sending"))?
-        .map_err(|e| unreachable(e))?;
+        .map_err(unreachable)?;
     let frame = tokio::time::timeout_at(deadline, transport.recv())
         .await
         .map_err(|_| unreachable("timed out waiting for a reply"))?
-        .map_err(|e| unreachable(e))?
+        .map_err(unreachable)?
         .ok_or_else(|| unreachable("the host closed the connection"))?;
     Response::from_bytes(&frame)
         .map_err(|e| Failure::new("decode", exit::ERROR, format!("undecodable host reply: {e}")))
