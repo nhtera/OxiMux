@@ -212,6 +212,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The Windows bootstrap installer is PowerShell, so this is the only job
+      # that can tell whether it even parses — and it is the one script no
+      # developer on macOS or Linux can run before shipping it. A parse error
+      # here would first surface to a user running the published one-liner.
+      #
+      # Parse-only: the script downloads a release and writes to PATH, so
+      # executing it is not something CI should do.
+      - name: Parse-check the Windows installer
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/install-cli.ps1), [ref]$null, [ref]$errors) | Out-Null
+          if ($errors -and $errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host "$($_.Extent.StartLineNumber): $($_.Message)" }
+            throw "scripts/install-cli.ps1 has $($errors.Count) parse error(s)"
+          }
+          Write-Host 'scripts/install-cli.ps1 parses'
+
       - name: Install Rust toolchain
         run: |
           rustup show

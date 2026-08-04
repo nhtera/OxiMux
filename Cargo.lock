@@ -958,6 +958,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "blake3"
 version = "1.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5864,6 +5873,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "minisign-verify"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e"
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7206,15 +7221,22 @@ version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
+ "blake2",
  "chrono",
  "clap",
  "crossterm",
  "dirs 5.0.1",
+ "ed25519-dalek 2.2.0",
+ "flate2",
  "futures",
  "jsonschema",
+ "minisign-verify",
  "oximux-agent-core",
  "oximux-agents",
+ "oximux-auto-update",
  "oximux-job-object",
+ "oximux-macos-trust",
  "oximux-owner-only",
  "oximux-relay-client",
  "oximux-relay-supervisor",
@@ -7232,11 +7254,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tar",
  "tempfile",
  "tokio",
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "ureq",
+ "url",
  "windows-service",
 ]
 

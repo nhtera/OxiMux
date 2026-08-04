@@ -4,6 +4,7 @@
 //! touch the socket: the client is constructed lazily, only when a verb needs
 //! the host. The tokio runtime is likewise built only for host verbs.
 
+mod build_info;
 mod cli;
 mod client;
 mod client_identity;
@@ -14,9 +15,9 @@ mod output_schema;
 mod remote_client;
 mod render;
 mod serve;
+mod update;
 
 use clap::Parser as _;
-use serde_json::json;
 
 use cli::{
     Cli, Command, GitCommand, HeartbeatCommand, HostsCommand, ModeCommand, ModelCommand,
@@ -30,20 +31,28 @@ fn main() -> std::process::ExitCode {
     // Usage errors exit 2 here, printing clap's own message — before any I/O.
     let args = Cli::parse();
 
+    // Completes an update that could not delete the binaries it replaced
+    // because they were still running. That is the norm on Windows, where an
+    // image mapped into a live process cannot be unlinked, and the exception on
+    // unix — where the swap deletes its own backups and this finds nothing
+    // unless one of those deletions failed, the one case nothing else cleans
+    // up. Cheap (one readdir), silent, and unconditional: the very next
+    // invocation after an update is the first chance to finish it.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        update::swap::sweep_backups(dir);
+    }
+
     let code = match &args.command {
         // Offline: no runtime, no socket, no database.
         Command::Version => {
-            let data = json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "protocol_version": oximux_remote_proto::proto::PROTOCOL_VERSION,
-            });
-            let human = format!(
-                "oximux {} (protocol v{})",
-                env!("CARGO_PKG_VERSION"),
-                oximux_remote_proto::proto::PROTOCOL_VERSION
-            );
+            let (data, human) = commands::update::version();
             render(args.json, Ok((data, human)))
         }
+        // Talks to the release server and nothing else — no host, no runtime.
+        // That is what lets it repair a machine whose own host is wedged.
+        Command::Update { check } => render(args.json, commands::update::run(*check)),
         Command::AgentContext => {
             // Schema output is FOR machines; both modes print JSON, `--json`
             // merely wraps it in the standard envelope.
@@ -386,6 +395,7 @@ fn host_verb(args: Cli) -> u8 {
                 // Offline verbs and `serve` are dispatched in `main`; the
                 // host-book and fleet verbs a few lines above. Unreachable.
                 Command::Version
+                | Command::Update { .. }
                 | Command::AgentContext
                 | Command::Serve { .. }
                 | Command::Pair { .. }

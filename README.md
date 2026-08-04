@@ -71,6 +71,43 @@ cargo check --workspace --all-targets --exclude oximux-macos-trust
 cargo build -p oximux-relay -p oximux-app
 ```
 
+## The `oximux` CLI
+
+`oximux` is the scriptable client of a running host — the desktop app, or
+`oximux serve` on a headless machine. It drives sessions, agents, schedules, git,
+and worktrees from a shell or a CI job, locally or over a paired remote link.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nhtera/OxiMux/main/scripts/install-cli.sh | sh
+```
+
+```powershell
+irm https://raw.githubusercontent.com/nhtera/OxiMux/main/scripts/install-cli.ps1 | iex
+```
+
+Installs `oximux` and `oximux-relay` into `~/.local/bin` (macOS/Linux) or
+`%LOCALAPPDATA%\Programs\oximux` (Windows). Both binaries, always: they speak a
+handshake versioned in lockstep, so one without the other cannot talk to itself.
+
+Afterwards it updates itself:
+
+```bash
+oximux update --check   # what's available, changes nothing
+oximux update           # verify signature, then replace both binaries
+```
+
+Updates are verified against a maintainer signature over the release manifest,
+checked before any checksum in that manifest is believed, using a key compiled
+into the binary. A build with no key refuses to update rather than falling back
+to checksum-only trust. The installers are the one weaker step — they run before
+there is a verified binary to run — and take `--require-signature`
+(`-RequireSignature`) to close that gap when `minisign` is available. See
+[docs/release-signing.md](docs/release-signing.md).
+
+Installed through Homebrew instead? `oximux update` will tell you to use
+`brew upgrade oximux` — two things owning one set of files is a state neither
+can reason about.
+
 ## Repo layout
 
 `apps/` holds the shippable product surfaces; `crates/` holds the libraries and

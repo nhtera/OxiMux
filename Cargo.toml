@@ -255,6 +255,20 @@ hound = "3.5"
 ureq = "2.12"
 sha2 = "0.10"
 
+# CLI self-update. `minisign-verify` is the independent trust root: a
+# zero-dependency verifier for the maintainer signature over a release
+# manifest, checked before any checksum *inside* that manifest is believed —
+# the manifest and the artifacts it describes ship from the same GitHub
+# Release, so a checksum alone falls to whoever can publish one.
+# `flate2`/`tar` unpack the release archive in-process rather than shelling
+# out, which is what makes the extraction path testable against hostile
+# archives. `blake2` is dev-only: minisign prehashes with Blake2b-512, so
+# minting real signatures in tests needs it (the verifier does not).
+minisign-verify = "0.2"
+flate2 = "1"
+tar = "0.4"
+blake2 = "0.10"
+
 # Phase 5 step 3 — file tree backend. `ignore` is the gitignore-aware
 # walker ripgrep uses; `WalkBuilder::max_depth(Some(1))` gives lazy
 # single-level enumeration. `notify-debouncer-full` drives FSEvents on

@@ -19,5 +19,6 @@ pub mod status;
 pub mod team;
 pub mod term;
 pub mod transcript;
+pub mod update;
 pub mod wait;
 pub mod worktree;

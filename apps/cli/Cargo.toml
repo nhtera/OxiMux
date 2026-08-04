@@ -63,6 +63,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # `--output-schema`'s validator.
 jsonschema = { workspace = true }
+# Self-update. `minisign-verify` is the trust root: a zero-dependency verifier
+# for the maintainer signature over the release manifest, checked before any
+# checksum in that manifest is believed.
+minisign-verify = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+ureq = { workspace = true }
+url = { workspace = true }
+# One definition of "is this an upgrade", shared with the desktop updater so
+# the two cannot drift on what counts as a downgrade. `Version` is the only
+# thing taken from it — if that grows, extract the type instead.
+oximux-auto-update = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
@@ -75,9 +87,22 @@ qrcode = { workspace = true }
 # The SCM service wrapper: `oximux serve --install-service` registers a real
 # Windows service whose STOP maps onto serve's drain, and the job object is
 # what guarantees agent children die with a hard-killed service.
+# The additive self-update gate: a Developer ID-signed installation may only
+# be replaced by a binary from the same team. Pointless off macOS, so it is
+# not carried there.
+[target.'cfg(target_os = "macos")'.dependencies]
+oximux-macos-trust = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.8"
 oximux-job-object = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Mint real minisign signatures in tests. The verifier is a third-party crate,
+# so fixtures it produced itself would prove nothing — these build the wire
+# format `minisign -S` writes (prehashed Blake2b-512, plus the second
+# signature over the trusted comment) from the other side.
+base64 = { workspace = true }
+blake2 = { workspace = true }
+ed25519-dalek = { workspace = true }

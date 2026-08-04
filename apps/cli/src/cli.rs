@@ -324,6 +324,19 @@ pub enum Command {
     },
     /// Print this CLI's build and protocol versions (offline).
     Version,
+    /// Replace this installation with the latest signed release.
+    ///
+    /// Fetches the release manifest, verifies it against the signing key built
+    /// into this binary, refuses anything that is not strictly newer, and
+    /// swaps the CLI and the relay together — a version split between the two
+    /// breaks their handshake. Contacts the release server and nothing else,
+    /// so it works even when this machine's host is down. A running
+    /// `oximux serve` keeps working and is never restarted for you.
+    Update {
+        /// Report what a release offers and exit without changing anything.
+        #[arg(long)]
+        check: bool,
+    },
     /// Print the full command schema as JSON, for agents driving this CLI
     /// (offline — never touches the host).
     AgentContext,
