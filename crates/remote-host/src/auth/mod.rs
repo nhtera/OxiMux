@@ -16,6 +16,11 @@
 //! is already open.
 
 mod acl;
+/// Every ACL predicate against every caller class, as one table. Separate from
+/// [`tests`] because it proves a different thing: that module covers pairing
+/// and revocation, this one covers who may do what afterwards.
+#[cfg(test)]
+mod acl_matrix;
 mod pairing;
 mod peer;
 mod persistence;

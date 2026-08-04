@@ -106,3 +106,16 @@ tempfile = { workspace = true }
 base64 = { workspace = true }
 blake2 = { workspace = true }
 ed25519-dalek = { workspace = true }
+
+# The agent-spawn suite's Windows arm resolves Git-for-Windows' `sh` to run the
+# fake-agent fixture; unix reaches the same script through a shebang and needs
+# no lookup, so this stays off that platform's dependency graph entirely.
+[target.'cfg(windows)'.dev-dependencies]
+which = { workspace = true }
+
+# The recovery suite needs SIGTERM specifically — `Child::kill` is SIGKILL, and
+# the drain contract only runs on the polite signal. Same crate and feature
+# `oximux-pty` already uses for its own SIGTERM step, rather than adding a
+# second way to send one signal.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.25", features = ["signal"] }

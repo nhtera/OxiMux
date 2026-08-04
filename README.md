@@ -77,6 +77,10 @@ cargo build -p oximux-relay -p oximux-app
 `oximux serve` on a headless machine. It drives sessions, agents, schedules, git,
 and worktrees from a shell or a CI job, locally or over a paired remote link.
 
+See [docs/cli-reference.md](docs/cli-reference.md) for every command and flag.
+It's generated straight from the parser (`scripts/gen-cli-docs.sh`), so it
+can't drift from what the binary actually accepts.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nhtera/OxiMux/main/scripts/install-cli.sh | sh
 ```
@@ -115,6 +119,9 @@ sidecars they consume.
 
 ```
 apps/
+├── cli/          Scriptable client of a running host + `oximux serve`
+│                 (headless host), bin `oximux-cli` (package `oximux-cli`),
+│                 installed on PATH as `oximux` — see docs/cli-reference.md
 ├── desktop/      GPUI host shell, bin `oximux` (package `oximux-app`):
 │                 panes/tabs/splits, SCM, diff viewer, command palette,
 │                 agent chat. Modules are foldered by concern

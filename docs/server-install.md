@@ -145,9 +145,9 @@ Register-ScheduledTask -TaskName "OxiMux Serve" -Action $action -Trigger $trigge
 ## Verifying an install
 
 ```bash
-oximux status            # reaches the local socket, prints versions + counts
-oximux ls                # sessions persisted on this host (dormant included)
-oximux run --bg "hello"  # spawns a real agent session (agent CLI required)
+oximux version  # this CLI's own build + protocol versions — offline, no host needed
+oximux status   # reaches the booted host over the local socket; versions + counts
+oximux ls       # the host answers with its session list (empty is fine; no reply is not)
 ```
 
 The readiness line's `endpointId` matches what every pairing ticket names, so

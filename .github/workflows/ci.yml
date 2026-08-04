@@ -182,8 +182,33 @@ jobs:
       - name: cargo test (local control socket)
         run: cargo test -p oximux-remote-local
 
+      # Covers every suite under apps/cli/tests, including the four that boot a
+      # real `serve` and spawn a real agent through a `claude` shim on PATH
+      # (agent_spawn / recovery / security / serve). Those are the only tests
+      # anywhere that cross a process boundary into a spawned agent, which is
+      # where the confinement credential and the inherited-environment scrub
+      # are the only observable.
       - name: cargo test (oximux CLI end-to-end)
         run: cargo test -p oximux-cli
+
+      # `docs/cli-reference.md` is generated from the CLI's own clap tree, so it
+      # can only be wrong by being stale. Regenerating and diffing is what makes
+      # "committed" mean "current" — without this the file is a snapshot of
+      # whenever someone last remembered, which is worse than no reference at
+      # all, since a reader cannot tell which half to trust.
+      #
+      # Linux only, deliberately: the document has no platform-specific content,
+      # so running it three times would only add two ways for the same check to
+      # flake.
+      - name: docs/cli-reference.md is not stale
+        run: |
+          ./scripts/gen-cli-docs.sh > /tmp/cli-reference.md
+          if ! diff -u docs/cli-reference.md /tmp/cli-reference.md; then
+            echo
+            echo "docs/cli-reference.md no longer matches the CLI's command tree."
+            echo "Regenerate it:  ./scripts/gen-cli-docs.sh > docs/cli-reference.md"
+            exit 1
+          fi
 
       # The serve binary's dependency hygiene, as a hard gate: the CLI must
       # never link the GUI toolkit or the desktop-only capability stacks. A

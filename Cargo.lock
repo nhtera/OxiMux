@@ -7232,6 +7232,7 @@ dependencies = [
  "futures",
  "jsonschema",
  "minisign-verify",
+ "nix 0.25.1",
  "oximux-agent-core",
  "oximux-agents",
  "oximux-auto-update",
@@ -7262,6 +7263,7 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "url",
+ "which 6.0.3",
  "windows-service",
 ]
 
