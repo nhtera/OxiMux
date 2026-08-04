@@ -12,5 +12,8 @@ pub mod git_state_cache;
 pub mod persisted_chat;
 pub mod persisted_terminals;
 pub mod relay_cold_restore;
-pub mod relay_supervisor;
+// Extracted to its own crate so `oximux serve` can supervise the same daemon;
+// re-exported under the old module path so every existing consumer keeps
+// compiling unchanged.
+pub use oximux_relay_supervisor as relay_supervisor;
 pub(crate) mod restore_fallback;

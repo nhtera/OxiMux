@@ -23,6 +23,7 @@ members = [
     "crates/relay-proto",
     "crates/relay",
     "crates/relay-client",
+    "crates/relay-supervisor",
     "crates/remote-proto",
     "crates/remote-host",
     "crates/remote-session",
@@ -76,6 +77,10 @@ oximux-settings = { path = "crates/settings" }
 oximux-relay-proto = { path = "crates/relay-proto" }
 oximux-relay    = { path = "crates/relay" }
 oximux-relay-client = { path = "crates/relay-client" }
+# Spawns/adopts the relay daemon and hands back a connected client. Its own
+# crate because BOTH hosts need it — the desktop app and `oximux serve` — and
+# apps/desktop has no [lib] target for the CLI to depend on.
+oximux-relay-supervisor = { path = "crates/relay-supervisor" }
 oximux-remote-proto = { path = "crates/remote-proto" }
 oximux-remote-host = { path = "crates/remote-host" }
 oximux-remote-session = { path = "crates/remote-session" }

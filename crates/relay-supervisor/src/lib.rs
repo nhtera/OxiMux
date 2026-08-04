@@ -1,23 +1,24 @@
-// RelaySupervisor — ensures an `oximux-relay` daemon is alive and
-// returns a connected `RelayClient`. On every app launch:
-//
-// 1. Try a quick socket-connect to the canonical path. If the
-//    handshake succeeds, an existing daemon is alive — reuse it.
-// 2. Else, unlink the (possibly stale) socket, generate a fresh
-//    token, spawn the daemon detached, then poll-connect until it
-//    starts listening.
-//
-// Detach recipe (Unix): `process_group(0)` (own session group, so
-// SIGHUP on the app's PG doesn't reach the daemon) + redirect stdio
-// to /dev/null + log file + `mem::forget(child)` so the kernel
-// reparents to PID 1 when the app dies. No `waitpid` — no zombie.
-//
-// Detach recipe (Windows): `CREATE_NO_WINDOW` and nothing else. A child
-// there already outlives its parent by default — there is no reparenting
-// and no zombie to avoid, because the two processes were never linked in
-// the first place (that link only exists if someone puts them in a shared
-// Job Object, which we do not). `mem::forget(child)` is still correct, but
-// it is now leaking a handle rather than dodging a `waitpid`.
+//! RelaySupervisor — ensures an `oximux-relay` daemon is alive and
+//! returns a connected `RelayClient`. On every host launch (the desktop app
+//! or `oximux serve` — both consume this one crate):
+//!
+//! 1. Try a quick socket-connect to the canonical path. If the
+//!    handshake succeeds, an existing daemon is alive — reuse it.
+//! 2. Else, unlink the (possibly stale) socket, generate a fresh
+//!    token, spawn the daemon detached, then poll-connect until it
+//!    starts listening.
+//!
+//! Detach recipe (Unix): `process_group(0)` (own session group, so
+//! SIGHUP on the app's PG doesn't reach the daemon) + redirect stdio
+//! to /dev/null + log file + `mem::forget(child)` so the kernel
+//! reparents to PID 1 when the app dies. No `waitpid` — no zombie.
+//!
+//! Detach recipe (Windows): `CREATE_NO_WINDOW` and nothing else. A child
+//! there already outlives its parent by default — there is no reparenting
+//! and no zombie to avoid, because the two processes were never linked in
+//! the first place (that link only exists if someone puts them in a shared
+//! Job Object, which we do not). `mem::forget(child)` is still correct, but
+//! it is now leaking a handle rather than dodging a `waitpid`.
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;

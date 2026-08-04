@@ -7069,6 +7069,7 @@ dependencies = [
  "oximux-pty",
  "oximux-relay-client",
  "oximux-relay-proto",
+ "oximux-relay-supervisor",
  "oximux-remote-host",
  "oximux-remote-iroh",
  "oximux-remote-local",
@@ -7346,6 +7347,23 @@ dependencies = [
  "serde",
  "sha2 0.10.9",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "oximux-relay-supervisor"
+version = "0.1.6"
+dependencies = [
+ "anyhow",
+ "libc",
+ "oximux-no-window",
+ "oximux-owner-only",
+ "oximux-relay-client",
+ "oximux-relay-proto",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
