@@ -10,11 +10,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use oximux_agent_core::thread::ThreadEvent;
-use oximux_agents::session_registry::{RemotePrompt, SessionHandle, SessionMeta};
+use oximux_agents::session_registry::{RemotePrompt, SessionHandle, SessionMeta, SessionRegistry};
 use oximux_agents::thread::ChatThread;
 use oximux_storage::SettingsRepo;
 
 use super::blob::{self, ChatBlob};
+use super::catalog::SessionIndex;
 
 /// How often a dirty fold is written even mid-turn, so a long turn's transcript
 /// survives a crash reasonably intact.
@@ -84,6 +85,14 @@ pub struct PumpSpec {
     /// The persisted state to rehydrate from (a resume), else a fresh blob.
     pub seed: ChatBlob,
     pub settings: SettingsRepo,
+    /// To unregister the session when its agent dies, so it returns to the
+    /// dormant set (listable, resumable) instead of being stranded as
+    /// live-looking-but-dead until the whole host restarts.
+    pub registry: Arc<SessionRegistry>,
+    /// The shared list-row index, refreshed on every persist so a session the
+    /// launcher just minted (or whose title/model evolved) lists correctly
+    /// the moment its agent dies.
+    pub index: Arc<SessionIndex>,
 }
 
 /// Start one session's pump. Returns immediately; the pump runs until the
@@ -94,7 +103,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
     let mut finalize = pumps.finalize.subscribe();
     let pumps_for_end = pumps.clone();
 
-    let PumpSpec { session_id, handle, events, buffered, seed, settings } = spec;
+    let PumpSpec { session_id, handle, events, buffered, seed, settings, registry, index } = spec;
 
     // Bridge the transports' std receiver onto the async world. The blocking
     // thread dies with the channel; nothing joins it.
@@ -124,7 +133,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
         );
         fold.session_meta = seed.session_meta.clone();
         let mut blob = seed;
-        let mut persist = Persist::new(settings, &fold);
+        let mut persist = Persist::new(settings, index, &fold);
         // A resumed session publishes its history immediately — `--resume`
         // replays nothing, so without this the transcript RPCs would answer
         // empty until the first new turn.
@@ -149,6 +158,11 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                         }
                         let _ = turn_tx.send(false);
                         persist.save_now(&handle, &mut blob, &fold);
+                        // Back to dormant: with the registry entry gone the
+                        // catalog lists it again and `open()` resumes it
+                        // fresh, instead of "already live" answering for a
+                        // corpse until the host restarts.
+                        registry.unregister(&session_id);
                         break;
                     };
                     let settled = matches!(
@@ -224,13 +238,14 @@ fn apply(
 /// actually changed since the last write.
 struct Persist {
     settings: SettingsRepo,
+    index: Arc<SessionIndex>,
     last_saved_revision: u64,
 }
 
 impl Persist {
-    fn new(settings: SettingsRepo, fold: &ChatThread) -> Self {
+    fn new(settings: SettingsRepo, index: Arc<SessionIndex>, fold: &ChatThread) -> Self {
         // Start one behind so the initial save always runs.
-        Self { settings, last_saved_revision: fold.revision().wrapping_sub(1) }
+        Self { settings, index, last_saved_revision: fold.revision().wrapping_sub(1) }
     }
 
     fn maybe_save(&mut self, handle: &SessionHandle, blob: &mut ChatBlob, fold: &ChatThread) {
@@ -253,5 +268,83 @@ impl Persist {
         // conversation and this task owns no latency contract — there is no
         // UI thread here to protect.
         blob::save(&self.settings, blob);
+        // Keep the shared list-row index as fresh as the blob, so the session
+        // lists correctly the moment it goes dormant.
+        self.index.note(
+            &blob.session_id,
+            fold.title.clone().or_else(|| blob.derived_title()),
+            fold.model.clone(),
+            blob.session_meta.cwd.clone().map(std::path::PathBuf::from),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oximux_agents::thread::StubConnection;
+
+    fn wait_until(deadline_ms: u64, mut probe: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(deadline_ms);
+        while std::time::Instant::now() < deadline {
+            if probe() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// The bug a review caught before it shipped: an agent whose stream closes
+    /// must return its session to the dormant set — final state persisted,
+    /// registry entry gone (so `open()` can resume it fresh), and the shared
+    /// index still listing it. Without the unregister, one agent crash
+    /// stranded the session as live-looking-but-dead until a host restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dead_agent_returns_its_session_to_dormant() {
+        let registry = Arc::new(SessionRegistry::new());
+        let handle = registry.register("s-1".into(), Arc::new(StubConnection::default()));
+        let db = oximux_storage::open_memory().unwrap();
+        let settings = SettingsRepo::new(db);
+        let index = Arc::new(SessionIndex::default());
+        let pumps = PumpSet::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        start(
+            PumpSpec {
+                session_id: "s-1".into(),
+                handle: handle.clone(),
+                events: rx,
+                buffered: vec![ThreadEvent::UserMessage { text: "hi".into(), images: vec![] }],
+                seed: ChatBlob::new("s-1".into()),
+                settings: settings.clone(),
+                registry: registry.clone(),
+                index: index.clone(),
+            },
+            pumps.clone(),
+        );
+
+        // A turn starts, then the agent dies mid-turn.
+        tx.send(ThreadEvent::AssistantText("working…".into())).unwrap();
+        assert!(
+            wait_until(5_000, || pumps.active_turns() == 1),
+            "the pump tracks the in-flight turn"
+        );
+        drop(tx);
+
+        assert!(
+            wait_until(5_000, || registry.get("s-1").is_none()),
+            "a dead agent's session leaves the registry"
+        );
+        assert!(wait_until(5_000, || pumps.live_pumps() == 0), "the pump ends");
+        // The final state reached disk, interruption marked (turn no longer
+        // active in the persisted fold), and the index still knows the row.
+        let blob = blob::load(&settings, "s-1").expect("final state persisted");
+        assert!(!blob.entries.is_empty(), "the fold reached disk");
+        assert_eq!(
+            index.title_of("s-1"),
+            Some(Some("hi".into())),
+            "the index lists the now-dormant session"
+        );
     }
 }

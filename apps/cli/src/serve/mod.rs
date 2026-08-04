@@ -133,17 +133,21 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let registry = Arc::new(SessionRegistry::new());
     let pumps = pump::PumpSet::new();
     let draining = Arc::new(AtomicBool::new(false));
+    // One index, three writers: the boot scan, the launcher, and every pump.
+    let index = Arc::new(catalog::SessionIndex::default());
     let launcher = Arc::new(launcher::HeadlessLauncher::new(
         registry.clone(),
         settings.clone(),
         pumps.clone(),
         draining.clone(),
+        index.clone(),
     ));
     let catalog = Arc::new(catalog::HeadlessCatalog::scan(
         registry.clone(),
         settings.clone(),
         pumps.clone(),
         draining.clone(),
+        index,
     ));
     let provider = Arc::new(projects::StaticProjects::load(args.projects, &data_dir));
     let mut dispatcher = Dispatcher::new(registry.clone(), auth.clone())
@@ -218,7 +222,11 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
     // ---- drain: stop taking work, let in-flight turns finish, persist ----
     draining.store(true, Ordering::SeqCst);
-    drop(local); // cuts the local listener and every CLI connection
+    // Cuts the local listener AND aborts every in-flight local RPC task (the
+    // JoinSet dies with the accept loop). Deliberate: a drain's contract is
+    // about agent turns, not about answering one last `ls` — and a client
+    // sees the same "host closed the connection" a crash would produce.
+    drop(local);
     let bound_host = host.lock().await.take();
     if let Some(mut handle) = bound_host {
         handle.shutdown(); // stops accepting remote connections

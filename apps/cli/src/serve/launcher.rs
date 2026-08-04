@@ -12,6 +12,7 @@ use oximux_remote_host::{LaunchError, SessionLauncher};
 use oximux_storage::SettingsRepo;
 
 use super::blob::ChatBlob;
+use super::catalog::SessionIndex;
 use super::pump::{self, PumpSet, PumpSpec};
 
 /// How long to wait for a fresh agent's `SessionInit` (which carries the
@@ -54,6 +55,9 @@ pub struct HeadlessLauncher {
     pumps: Arc<PumpSet>,
     /// Set at drain: a host that is shutting down refuses new work.
     draining: Arc<AtomicBool>,
+    /// The shared list-row index — a minted session is noted immediately, so
+    /// it lists even if its agent dies before the pump's first persist.
+    index: Arc<SessionIndex>,
 }
 
 impl HeadlessLauncher {
@@ -62,8 +66,9 @@ impl HeadlessLauncher {
         settings: SettingsRepo,
         pumps: Arc<PumpSet>,
         draining: Arc<AtomicBool>,
+        index: Arc<SessionIndex>,
     ) -> Self {
-        Self { registry, settings, pumps, draining }
+        Self { registry, settings, pumps, draining, index }
     }
 }
 
@@ -140,6 +145,12 @@ impl SessionLauncher for HeadlessLauncher {
             .map_err(|_| LaunchError::Failed)??;
 
         let handle = self.registry.register(spawned.session_id.clone(), spawned.conn);
+        self.index.note(
+            &spawned.session_id,
+            None,
+            None,
+            Some(cwd.clone()),
+        );
         let mut seed = ChatBlob::new(spawned.session_id.clone());
         seed.provider = transport;
         seed.session_meta.cwd = Some(cwd.to_string_lossy().into_owned());
@@ -154,6 +165,8 @@ impl SessionLauncher for HeadlessLauncher {
                 buffered: spawned.buffered,
                 seed,
                 settings: self.settings.clone(),
+                registry: self.registry.clone(),
+                index: self.index.clone(),
             },
             self.pumps.clone(),
         );

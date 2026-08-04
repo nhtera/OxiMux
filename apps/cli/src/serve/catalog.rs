@@ -31,13 +31,47 @@ struct IndexRow {
     cwd: Option<PathBuf>,
 }
 
+/// The shared session index: every session known to this host, live or not.
+///
+/// Shared (rather than owned by the catalog) because THREE parties write it —
+/// the boot scan, the launcher when it mints a session, and each pump as its
+/// fold evolves — and a session the index never learned would vanish from the
+/// list the moment its agent died. Reads stay a map clone, which is what
+/// keeps `dormant()` at its contract's cheapest-possible cost.
+#[derive(Default)]
+pub struct SessionIndex {
+    rows: Mutex<HashMap<String, IndexRow>>,
+}
+
+impl SessionIndex {
+    /// One session's recorded title — test-only observability.
+    #[cfg(test)]
+    pub fn title_of(&self, session_id: &str) -> Option<Option<String>> {
+        self.rows.lock().unwrap().get(session_id).map(|r| r.title.clone())
+    }
+
+    /// Record (or refresh) one session's list-row facts.
+    pub fn note(
+        &self,
+        session_id: &str,
+        title: Option<String>,
+        model: Option<String>,
+        cwd: Option<PathBuf>,
+    ) {
+        self.rows
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), IndexRow { title, model, cwd });
+    }
+}
+
 pub struct HeadlessCatalog {
     registry: Arc<SessionRegistry>,
     settings: SettingsRepo,
     pumps: Arc<PumpSet>,
     draining: Arc<AtomicBool>,
     gate: OpenGate,
-    index: Mutex<HashMap<String, IndexRow>>,
+    index: Arc<SessionIndex>,
 }
 
 impl HeadlessCatalog {
@@ -48,8 +82,8 @@ impl HeadlessCatalog {
         settings: SettingsRepo,
         pumps: Arc<PumpSet>,
         draining: Arc<AtomicBool>,
+        index: Arc<SessionIndex>,
     ) -> Self {
-        let mut index = HashMap::new();
         match settings.list_prefixed(CHAT_KEY_PREFIX) {
             Ok(rows) => {
                 for (key, value) in rows {
@@ -61,36 +95,18 @@ impl HeadlessCatalog {
                         tracing::warn!(session_id, "unreadable chat blob skipped from catalog");
                         continue;
                     };
-                    index.insert(
-                        session_id,
-                        IndexRow {
-                            title: blob.derived_title(),
-                            model: blob.model.clone(),
-                            cwd: blob.session_meta.cwd.clone().map(PathBuf::from),
-                        },
+                    index.note(
+                        &session_id,
+                        blob.derived_title(),
+                        blob.model.clone(),
+                        blob.session_meta.cwd.clone().map(PathBuf::from),
                     );
                 }
             }
             Err(err) => tracing::warn!(%err, "chat blob scan failed; catalog starts empty"),
         }
-        tracing::info!(sessions = index.len(), "session catalog scanned");
-        Self {
-            registry,
-            settings,
-            pumps,
-            draining,
-            gate: OpenGate::new(),
-            index: Mutex::new(index),
-        }
-    }
-
-    /// Serve's own writes keep the index current (the launcher calls this for
-    /// new sessions; resumes refresh their row on open).
-    pub fn note_session(&self, session_id: &str, title: Option<String>, model: Option<String>, cwd: Option<PathBuf>) {
-        self.index
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), IndexRow { title, model, cwd });
+        tracing::info!(sessions = index.rows.lock().unwrap().len(), "session catalog scanned");
+        Self { registry, settings, pumps, draining, gate: OpenGate::new(), index }
     }
 
     /// The resume path: reconnect the persisted session's agent and pump it.
@@ -134,7 +150,7 @@ impl HeadlessCatalog {
                 "the session could not be reopened".to_string()
             })?;
         let handle = self.registry.register(session_id.to_string(), conn);
-        self.note_session(
+        self.index.note(
             session_id,
             blob.derived_title(),
             blob.model.clone(),
@@ -151,6 +167,8 @@ impl HeadlessCatalog {
                 buffered: Vec::new(),
                 seed: blob,
                 settings: self.settings.clone(),
+                registry: self.registry.clone(),
+                index: self.index.clone(),
             },
             self.pumps.clone(),
         );
@@ -162,6 +180,7 @@ impl HeadlessCatalog {
 impl SessionCatalog for HeadlessCatalog {
     fn dormant(&self) -> Vec<DormantSession> {
         self.index
+            .rows
             .lock()
             .unwrap()
             .iter()
