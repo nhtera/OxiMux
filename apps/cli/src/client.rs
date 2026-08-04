@@ -192,6 +192,7 @@ pub fn is_push(resp: &Response) -> bool {
         resp,
         Response::Event(_)
             | Response::SessionsChanged(_)
+            | Response::ScheduleRunsChanged(_)
             | Response::TermOutput { .. }
             | Response::TermGapped { .. }
             | Response::TermExited { .. }

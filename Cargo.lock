@@ -7123,6 +7123,7 @@ version = "0.1.6"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "clap",
  "crossterm",
  "futures",
@@ -7137,6 +7138,7 @@ dependencies = [
  "oximux-remote-local",
  "oximux-remote-proto",
  "oximux-shell-env",
+ "oximux-single-instance",
  "oximux-storage",
  "qrcode",
  "serde",

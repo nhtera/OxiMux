@@ -174,6 +174,16 @@ pub enum Command {
         #[command(subcommand)]
         command: ProjectsCommand,
     },
+    /// Scheduled agent runs: create, list, pause, and fire them on the host.
+    ///
+    /// A schedule sends its prompt into a fresh session on a cadence. It fires
+    /// only while a host is running (the desktop app or `oximux serve`);
+    /// missed occurrences are skipped forward, never replayed in a burst.
+    #[command(verbatim_doc_comment)]
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
+    },
     /// Run this machine as a headless OxiMux host.
     ///
     /// Boots the same session/terminal/storage stack the desktop app hosts —
@@ -393,4 +403,64 @@ pub enum WorktreeCommand {
 pub enum ProjectsCommand {
     /// List the projects the host offers as new-session targets.
     Ls,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ScheduleCommand {
+    /// Create a schedule. Exactly one cadence flag is required.
+    Create {
+        /// The prompt each fire sends into its fresh session.
+        prompt: String,
+        /// A name for the schedule (shown in lists).
+        #[arg(long)]
+        name: String,
+        /// Working directory for each run's session (default: the current
+        /// directory).
+        #[arg(long, value_name = "DIR")]
+        cwd: Option<PathBuf>,
+        /// Which configured agent runs it (default: the host's default agent).
+        #[arg(long, value_name = "AGENT_ID")]
+        agent: Option<String>,
+        /// Fire every N minutes (minimum 5).
+        #[arg(long, value_name = "MINUTES", conflicts_with_all = ["daily", "weekly"])]
+        every: Option<u32>,
+        /// Fire daily at this local time, e.g. 09:00.
+        #[arg(long, value_name = "HH:MM", conflicts_with = "weekly")]
+        daily: Option<String>,
+        /// Fire weekly at this day and local time, e.g. "mon 09:00".
+        #[arg(long, value_name = "DAY HH:MM")]
+        weekly: Option<String>,
+    },
+    /// List schedules with cadence, next fire, and state.
+    Ls,
+    /// A schedule's recent run history, newest first.
+    Logs {
+        /// The schedule id (from `schedule ls`).
+        id: String,
+        /// How many runs to show.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    /// Pause a schedule (it keeps its history; resume re-arms from now).
+    Pause {
+        /// The schedule id (from `schedule ls`).
+        id: String,
+    },
+    /// Resume a paused schedule — armed forward from now, no catch-up fire.
+    Resume {
+        /// The schedule id (from `schedule ls`).
+        id: String,
+    },
+    /// Fire a schedule immediately. Its cadence is untouched: the next
+    /// scheduled occurrence still fires on time. Waits for the run to start
+    /// (or fail to) and reports the recorded outcome.
+    RunOnce {
+        /// The schedule id (from `schedule ls`).
+        id: String,
+    },
+    /// Delete a schedule and its run history.
+    Rm {
+        /// The schedule id (from `schedule ls`).
+        id: String,
+    },
 }

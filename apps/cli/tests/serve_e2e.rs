@@ -285,3 +285,65 @@ fn serve_boots_under_a_minimal_environment() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// The single-ticker contract on one data dir: with the ticker role already
+/// held (as a running desktop would hold it), a booting serve still reaches
+/// readiness and serves every schedule read and write — it just declines to
+/// tick, says so once on stderr, and answers run-once with `Unsupported`.
+#[test]
+fn a_contended_ticker_declines_but_schedules_stay_editable() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+
+    // Hold the role, as the other host would.
+    let lock_path = data_dir.join(oximux_agents::schedule::TICKER_LOCK_FILENAME);
+    let _held = match oximux_single_instance::try_acquire(&lock_path).unwrap() {
+        oximux_single_instance::AcquireOutcome::Acquired(guard) => guard,
+        oximux_single_instance::AcquireOutcome::AlreadyRunning { .. } => {
+            panic!("fresh dir must acquire")
+        }
+    };
+
+    let mut serve = boot_serve(&data_dir);
+    // Collect stderr from here on; the decline line was already written by
+    // readiness time, but the pipe holds it.
+    let stderr = serve.child.stderr.take().expect("piped stderr");
+    let collected = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut buf = String::new();
+        let _ = std::io::BufReader::new(stderr).read_to_string(&mut buf);
+        buf
+    });
+
+    // Schedule writes and reads still work on the non-ticking host.
+    let out = client(&data_dir)
+        .args([
+            "--json", "schedule", "create", "check the builds", "--name", "nightly", "--cwd",
+            "/tmp", "--every", "30",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let id = json_stdout(&out)["data"]["id"].as_str().unwrap().to_string();
+
+    let out = client(&data_dir).args(["--json", "schedule", "ls"]).output().unwrap();
+    assert_eq!(json_stdout(&out)["data"].as_array().map(Vec::len), Some(1));
+
+    // But firing is the lock holder's job, and this host says so.
+    let out = client(&data_dir).args(["--json", "schedule", "run-once", &id]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(json_stdout(&out)["error"]["code"], "unsupported");
+
+    serve.stop_hard();
+    let stderr_text = collected.join().unwrap();
+    assert!(
+        stderr_text.contains("owns scheduling for this data dir"),
+        "the decline is one clear line, got:\n{stderr_text}"
+    );
+    assert_eq!(
+        stderr_text.matches("owns scheduling for this data dir").count(),
+        1,
+        "said once, not per tick"
+    );
+}

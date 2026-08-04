@@ -16,7 +16,7 @@ use serde_json::json;
 
 use cli::{
     Cli, Command, GitCommand, ModeCommand, ModelCommand, PermitCommand, ProjectsCommand,
-    TermCommand, WorktreeCommand,
+    ScheduleCommand, TermCommand, WorktreeCommand,
 };
 use client::Client;
 use output::render;
@@ -83,6 +83,34 @@ fn host_verb(args: Cli) -> u8 {
                 Command::Projects { command: ProjectsCommand::Ls } => {
                     commands::sessions::projects_ls(&client).await
                 }
+                Command::Schedule { command } => match command {
+                    ScheduleCommand::Create { prompt, name, cwd, agent, every, daily, weekly } => {
+                        let create_args = commands::schedule::CreateArgs {
+                            prompt,
+                            name,
+                            cwd,
+                            agent,
+                            every,
+                            daily,
+                            weekly,
+                        };
+                        commands::schedule::create(&client, create_args).await
+                    }
+                    ScheduleCommand::Ls => commands::schedule::ls(&client).await,
+                    ScheduleCommand::Logs { id, limit } => {
+                        commands::schedule::logs(&client, &id, limit).await
+                    }
+                    ScheduleCommand::Pause { id } => {
+                        commands::schedule::set_enabled(&client, &id, false).await
+                    }
+                    ScheduleCommand::Resume { id } => {
+                        commands::schedule::set_enabled(&client, &id, true).await
+                    }
+                    ScheduleCommand::RunOnce { id } => {
+                        commands::schedule::run_once(&client, &id).await
+                    }
+                    ScheduleCommand::Rm { id } => commands::schedule::rm(&client, &id).await,
+                },
                 Command::Run { prompt, agent, model, cwd, worktree, bg } => {
                     let run_args =
                         commands::run::RunArgs { prompt, agent, model, cwd, worktree, bg };

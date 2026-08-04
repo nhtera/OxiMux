@@ -18,6 +18,7 @@ mod catalog;
 mod launcher;
 mod projects;
 mod pump;
+mod scheduler;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -150,18 +151,101 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         index,
     ));
     let provider = Arc::new(projects::StaticProjects::load(args.projects, &data_dir));
+
+    // ---- schedules: reads/writes always; the TICKER only if we own it ----
+    // The advisory role lock decides which process fires this data dir's
+    // schedules — on a box also running the desktop app, whoever booted first.
+    // The loser keeps serving every schedule read and write; run-now answers
+    // `Unsupported` there, naming the honest reason.
+    let schedule_store =
+        oximux_agents::schedule::ScheduleStore::new(db.conn());
+    let (schedule_events, _) = tokio::sync::broadcast::channel(64);
+    // Held (never read) for the whole serve lifetime; dropped — releasing the
+    // role — only when serve exits.
+    let mut _ticker_lock = None;
+    let schedule_runner = {
+        use oximux_agents::schedule::{TICK, TICKER_LOCK_FILENAME, Ticker};
+        match oximux_single_instance::try_acquire(&data_dir.join(TICKER_LOCK_FILENAME)) {
+            Ok(oximux_single_instance::AcquireOutcome::Acquired(guard)) => {
+                // Held in serve()'s scope for the process lifetime.
+                _ticker_lock = Some(guard);
+                // Only the lock holder recovers: settling claims another
+                // process is actively firing would fail live runs.
+                match schedule_store.recover_interrupted(chrono::Local::now()) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(runs = n, "settled interrupted schedule runs"),
+                    Err(err) => tracing::warn!(%err, "could not recover interrupted runs"),
+                }
+                // Orphan sweep: a schedule aimed at a session this host no
+                // longer has is disabled and surfaced, not silently skipped.
+                let exists = {
+                    let settings = settings.clone();
+                    move |sid: &str| {
+                        settings.get(&blob::chat_settings_key(sid)).ok().flatten().is_some()
+                    }
+                };
+                match schedule_store.sweep_orphaned_targets(chrono::Local::now(), exists) {
+                    Ok(ids) if ids.is_empty() => {}
+                    Ok(ids) => {
+                        tracing::warn!(?ids, "disabled schedules whose target sessions are gone")
+                    }
+                    Err(err) => tracing::warn!(%err, "orphaned-schedule sweep failed"),
+                }
+                let firer =
+                    scheduler::ServeFirer::new(launcher.clone(), registry.clone());
+                let events = schedule_events.clone();
+                let ticker = Arc::new(
+                    Ticker::new(schedule_store.clone(), Arc::new(firer)).with_recorded_hook(
+                        Arc::new(move |run| {
+                            // No subscriber is normal (nobody attached).
+                            let _ = events.send(oximux_remote_host::schedule_run_to_wire(run));
+                        }),
+                    ),
+                );
+                let loop_ticker = ticker.clone();
+                tokio::spawn(async move {
+                    loop {
+                        loop_ticker.tick(chrono::Local::now()).await;
+                        tokio::time::sleep(TICK).await;
+                    }
+                });
+                Some(Arc::new(oximux_remote_host::TickerRunner(ticker)))
+            }
+            Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder_pid }) => {
+                // One line, once — this is the expected state beside a running
+                // desktop, not an error to nag about.
+                let holder = holder_pid
+                    .map(|p| format!("process {p}"))
+                    .unwrap_or_else(|| "another OxiMux process".into());
+                tracing::info!(
+                    "schedule ticker: {holder} owns scheduling for this data dir; \
+                     schedules will fire from there"
+                );
+                None
+            }
+            Err(err) => {
+                tracing::warn!(%err, "schedule ticker lock failed; schedules will not fire here");
+                None
+            }
+        }
+    };
+
     let mut dispatcher = Dispatcher::new(registry.clone(), auth.clone())
         .with_launcher(launcher)
         .with_catalog(catalog)
         .with_projects(provider)
-        .with_pairing_endpoint(endpoint_id);
+        .with_pairing_endpoint(endpoint_id)
+        .with_schedule_store(Arc::new(schedule_store))
+        .with_schedule_events(schedule_events);
+    if let Some(runner) = schedule_runner {
+        dispatcher = dispatcher.with_schedule_runner(runner);
+    }
     if let Some(relay) = relay {
         dispatcher =
             dispatcher.with_terminals(Arc::new(oximux_relay_terminals::RelayTerminals::new(relay)));
     }
     // No transcriber, no rewinder, no worktree service: each of those RPCs
-    // answers `Unsupported` (or its documented refusal) rather than
-    // pretending. Schedules arrive with the phase-5 single-owner lock.
+    // answers `Unsupported` (or its documented refusal) rather than pretending.
     let dispatcher = Arc::new(dispatcher);
 
     // ---- local socket (the CLI on this box) ----

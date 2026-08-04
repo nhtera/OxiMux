@@ -8,6 +8,7 @@ pub mod model;
 pub mod pair;
 pub mod permit;
 pub mod run;
+pub mod schedule;
 pub mod send;
 pub mod session_ctl;
 pub mod sessions;

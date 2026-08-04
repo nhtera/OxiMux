@@ -476,3 +476,162 @@ fn worktree_verbs_follow_the_scope_split() {
         assert_eq!(json_stdout(&out)["error"]["code"], "denied");
     }
 }
+
+/// A firer that registers a stub-backed session per fire — the ticker's whole
+/// fire/record path without spawning any agent CLI.
+struct StubFirer {
+    registry: Arc<SessionRegistry>,
+    counter: AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl oximux_agents::schedule::ScheduleFirer for StubFirer {
+    async fn fire(
+        &self,
+        _schedule: &oximux_agents::schedule::Schedule,
+        _target: &oximux_agents::schedule::ScheduleTarget,
+    ) -> oximux_agents::schedule::FireOutcome {
+        let id = format!("fire-{}", self.counter.fetch_add(1, Ordering::SeqCst) + 1);
+        self.registry.register(id.clone(), Arc::new(StubConnection::default()));
+        oximux_agents::schedule::FireOutcome::Completed { session_id: Some(id) }
+    }
+}
+
+/// A host with a real schedule store — and, when `with_runner`, a real ticker
+/// behind the run-now RPC (its fires land in the shared registry as stub
+/// sessions).
+fn serve_schedule_host(
+    rt: &tokio::runtime::Runtime,
+    runtime_dir: &Path,
+    with_runner: bool,
+) -> oximux_agents::schedule::ScheduleStore {
+    let registry = Arc::new(SessionRegistry::new());
+    let db = oximux_storage::db::open_memory().unwrap();
+    let store = oximux_agents::schedule::ScheduleStore::new(db.conn());
+    let (events, _) = tokio::sync::broadcast::channel(16);
+    let mut dispatcher = Dispatcher::new(registry.clone(), Arc::new(AuthStore::new()))
+        .with_schedule_store(Arc::new(store.clone()))
+        .with_schedule_events(events.clone());
+    if with_runner {
+        let ticker = Arc::new(
+            oximux_agents::schedule::Ticker::new(
+                store.clone(),
+                Arc::new(StubFirer { registry: registry.clone(), counter: AtomicU32::new(0) }),
+            )
+            .with_recorded_hook(Arc::new(move |run| {
+                let _ = events.send(oximux_remote_host::schedule_run_to_wire(run));
+            })),
+        );
+        dispatcher = dispatcher.with_schedule_runner(Arc::new(
+            oximux_remote_host::TickerRunner(ticker),
+        ));
+    }
+    let dispatcher = Arc::new(dispatcher);
+    let listener = {
+        let _guard = rt.enter();
+        LocalControlListener::bind(runtime_dir, &generate_token()).unwrap()
+    };
+    rt.spawn(async move {
+        loop {
+            let pending = match listener.accept_pending().await {
+                Ok(pending) => pending,
+                Err(err) => {
+                    eprintln!("test host: accept failed, stopping: {err}");
+                    return;
+                }
+            };
+            let dispatcher = dispatcher.clone();
+            tokio::spawn(async move {
+                let Ok((transport, claim)) = pending.authenticate().await else {
+                    return;
+                };
+                let scope = match claim {
+                    LocalClaim::Operator => LocalScope::Full,
+                    LocalClaim::Session(id) => LocalScope::Session(id.into()),
+                };
+                dispatcher.serve_local(transport.as_ref(), scope).await;
+            });
+        }
+    });
+    store
+}
+
+/// The whole schedule lifecycle through the compiled binary — and the run-once
+/// contract: the manual fire is recorded, names its session, and leaves
+/// `next_fire_at` exactly where it was.
+#[test]
+fn schedule_lifecycle_and_run_once_keeps_cadence() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("host");
+    let _store = serve_schedule_host(&rt, &runtime_dir, true);
+
+    let out = bin(&runtime_dir)
+        .args([
+            "--json", "schedule", "create", "check the builds", "--name", "nightly", "--cwd",
+            "/tmp", "--daily", "09:00",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let created = json_stdout(&out);
+    let id = created["data"]["id"].as_str().expect("an id").to_string();
+    let armed = created["data"]["next_fire_at"].as_str().expect("a next fire").to_string();
+
+    // run-once: recorded ok, fired into a session, cadence untouched.
+    let out = bin(&runtime_dir).args(["--json", "schedule", "run-once", &id]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let run = json_stdout(&out);
+    assert_eq!(run["data"]["outcome"], "ok");
+    assert_eq!(run["data"]["session_id"], "fire-1");
+
+    let out = bin(&runtime_dir).args(["--json", "schedule", "ls"]).output().unwrap();
+    let rows = json_stdout(&out);
+    assert_eq!(rows["data"].as_array().map(Vec::len), Some(1));
+    assert_eq!(rows["data"][0]["next_fire_at"], armed.as_str(), "run-once must not advance cadence");
+
+    let out = bin(&runtime_dir).args(["--json", "schedule", "logs", &id]).output().unwrap();
+    let logs = json_stdout(&out);
+    assert_eq!(logs["data"].as_array().map(Vec::len), Some(1), "the manual run is history");
+    assert_eq!(logs["data"][0]["outcome"], "ok");
+
+    // Pause / resume round-trip.
+    let out = bin(&runtime_dir).args(["--json", "schedule", "pause", &id]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let out = bin(&runtime_dir).args(["--json", "schedule", "ls"]).output().unwrap();
+    assert_eq!(json_stdout(&out)["data"][0]["enabled"], false);
+    let out = bin(&runtime_dir).args(["--json", "schedule", "resume", &id]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let out = bin(&runtime_dir).args(["--json", "schedule", "ls"]).output().unwrap();
+    assert_eq!(json_stdout(&out)["data"][0]["enabled"], true);
+
+    let out = bin(&runtime_dir).args(["--json", "schedule", "rm", &id]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let out = bin(&runtime_dir).args(["--json", "schedule", "ls"]).output().unwrap();
+    assert_eq!(json_stdout(&out)["data"].as_array().map(Vec::len), Some(0));
+}
+
+/// A host that serves schedule reads/writes but does not own the ticker
+/// answers run-once with `Unsupported` — the schedules fire from the process
+/// that holds the lock, and this host says so instead of racing it.
+#[test]
+fn run_once_without_the_ticker_is_unsupported() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("host");
+    let _store = serve_schedule_host(&rt, &runtime_dir, false);
+
+    let out = bin(&runtime_dir)
+        .args([
+            "--json", "schedule", "create", "check the builds", "--name", "nightly", "--cwd",
+            "/tmp", "--every", "30",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "creates still work here");
+    let id = json_stdout(&out)["data"]["id"].as_str().unwrap().to_string();
+
+    let out = bin(&runtime_dir).args(["--json", "schedule", "run-once", &id]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(json_stdout(&out)["error"]["code"], "unsupported");
+}
