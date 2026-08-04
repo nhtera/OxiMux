@@ -1118,10 +1118,16 @@ pub(super) fn entries(
             "Stop it idle-sleeping, so a paired device can still reach it. Sleeping with the lid closed is unaffected.",
             keep_awake_toggle(theme, cx),
         ),
+        // Deliberately names who else can reach it. The socket is owner-only,
+        // which is easy to read as "only me" — but every program running as this
+        // account qualifies, agents included, and that is the part worth knowing
+        // before leaving it on. Kept to roughly the length of the descriptions
+        // above: this row renders in a flex row without `min_w_0`, so prose that
+        // outgrows its neighbours is the kind that stops wrapping cleanly.
         entry(
             "Allow local CLI access",
-            "Let the oximux command on this machine view and drive sessions over an \
-             owner-only local socket. Nothing is published to the network.",
+            "Let the oximux command view and drive sessions over a local socket, never \
+             the network. Any program running as you — agents included — can use it too.",
             local_toggle(theme, cx),
         ),
     ]

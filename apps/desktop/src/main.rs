@@ -516,15 +516,18 @@ fn main() {
         if remote_was_on {
             oximux_app::remote_control::RemoteControl::resume_at_launch(cx);
         }
-        // Local CLI access resumes on the same reasoning, under its own key:
-        // a scripted workflow must survive an app restart without someone
-        // reopening Settings. Default off — absent key binds nothing.
-        let local_was_on = app_state
+        // Local CLI access resumes on the same reasoning, under its own key: a
+        // scripted workflow must survive an app restart without someone
+        // reopening Settings. Unlike remote, an absent key means ON — see
+        // `local_access_enabled`, which owns that decision and the reasoning
+        // behind it. An explicit "false" still keeps it off.
+        let stored_local = app_state
             .settings_repo()
             .get(oximux_app::remote_control::LOCAL_ENABLED_SETTING)
             .ok()
-            .flatten()
-            .is_some_and(|v| v == "true");
+            .flatten();
+        let local_was_on =
+            oximux_app::remote_control::local_access_enabled(stored_local.as_deref());
         if local_was_on {
             oximux_app::remote_control::RemoteControl::start_local(cx);
         }

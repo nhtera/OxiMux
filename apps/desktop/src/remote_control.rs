@@ -36,9 +36,30 @@ pub const ENABLED_SETTING: &str = "remote.enabled";
 pub const KEEP_AWAKE_SETTING: &str = "remote.keep_awake";
 
 /// Settings key for local CLI access — the owner-only control socket the
-/// `oximux` CLI dials. Its own switch, **default off**: enabling remote access
-/// for a phone must not silently open a local control surface, and vice versa.
+/// `oximux` CLI dials. Its own switch, independent of remote in both
+/// directions: pairing a phone must not open a local control surface, and
+/// turning local access off must not cut a paired phone.
+///
+/// **Default ON** — see [`local_access_enabled`]. A CLI that does nothing until
+/// someone finds a settings toggle is a CLI most people never discover works.
 pub const LOCAL_ENABLED_SETTING: &str = "local.enabled";
+
+/// Should local CLI access be running, given whatever is stored under
+/// [`LOCAL_ENABLED_SETTING`]?
+///
+/// Absent means ON. This is a *default*, not a coercion: an explicit `"false"`
+/// keeps it off across restarts, so a user who turns it off stays turned off.
+///
+/// What the default admits, stated where the decision is made: the socket is a
+/// 0700 directory and a 0600 node, and a caller must still prove a token it can
+/// only have by reading that file. But any program running as this user can read
+/// it — including the agents this desktop spawns — so on-by-default means an
+/// agent that goes looking can drive every session and terminal. The per-session
+/// credential in `oximux-remote-local` exists to close exactly that and is not
+/// yet wired at spawn; until it is, the toggle's own copy is what tells the user.
+pub fn local_access_enabled(stored: Option<&str>) -> bool {
+    stored.is_none_or(|v| v == "true")
+}
 
 /// How long an opened pairing window stays redeemable.
 ///
@@ -660,11 +681,25 @@ impl RemoteControl {
     /// spawner to inject into that process's environment. `None` when local
     /// access is off — there is no listener to honor it, and an agent that
     /// receives no credential simply cannot reach the control socket.
+    ///
+    /// **Nothing calls this yet, and the confinement is therefore not in force:**
+    /// an agent that runs `oximux` reads the operator token file (it is the same
+    /// OS user) and is served full scope. Wiring it is not a matter of finding
+    /// the spawn site. A chat's `remote_session_id` starts as a placeholder and
+    /// is REKEYED once the agent reports its own id
+    /// (`rekey_remote_session_if_needed`), while a child's environment is fixed
+    /// at spawn and cannot be revised afterwards — so either the credential is
+    /// minted against a spawn-time identity the listener then re-maps on rekey,
+    /// or the id has to be known before the process exists. That choice belongs
+    /// with the phase that wires it, not here.
+    #[allow(dead_code, reason = "the agent spawner does not inject credentials yet")]
     pub fn grant_agent_credential(&self, session_id: &str) -> Option<String> {
         self.local.lock().unwrap().as_ref().map(|h| h.grant_session(session_id))
     }
 
-    /// Drop an agent's credential when its session ends.
+    /// Drop an agent's credential when its session ends. Unused for as long as
+    /// [`grant_agent_credential`](Self::grant_agent_credential) is.
+    #[allow(dead_code, reason = "the agent spawner does not inject credentials yet")]
     pub fn revoke_agent_credential(&self, session_id: &str) {
         if let Some(handle) = self.local.lock().unwrap().as_ref() {
             handle.revoke_session(session_id);
@@ -864,7 +899,29 @@ mod tests {
         assert_ne!(first, second, "a stale pairing code must not stay valid across enables");
     }
 
-    /// Disabled is the default and binds nothing — the per-event path stays free.
+    /// Local CLI access is on unless the user turned it off.
+    ///
+    /// The absent case is the one that matters: a fresh install has no stored
+    /// value and must still bind, or the CLI silently does nothing on the
+    /// machine it was installed for. The explicit `"false"` case matters just as
+    /// much in the other direction — a default that overrode a user's choice
+    /// would turn the surface back on at every launch.
+    #[test]
+    fn local_access_defaults_on_but_respects_an_explicit_no() {
+        assert!(local_access_enabled(None), "a fresh install runs the CLI socket");
+        assert!(local_access_enabled(Some("true")));
+        assert!(!local_access_enabled(Some("false")), "an explicit no must survive a restart");
+        // Anything else is not a yes. The value is written by this app, so a
+        // stray one means corruption or a hand edit, and the safe reading of
+        // "I cannot tell" for a control surface is off.
+        assert!(!local_access_enabled(Some("")), "an empty value is not consent");
+        assert!(!local_access_enabled(Some("TRUE")), "only the value this app writes counts");
+    }
+
+    /// Disabled is the struct-level default and binds nothing — the per-event
+    /// path stays free. Note this is about a freshly constructed
+    /// `RemoteControl`, NOT about what a real launch does: the app turns local
+    /// access on from `local_access_enabled` before any session binds.
     #[test]
     fn disabled_binds_nothing() {
         let rc = RemoteControl::new();
