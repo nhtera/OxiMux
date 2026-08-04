@@ -15,6 +15,7 @@
 pub mod launch_bridge;
 pub mod local_listener;
 pub mod project_provider;
+pub mod worktree_service;
 pub mod rewind_bridge;
 pub mod session_catalog;
 pub mod relay_terminals;
@@ -225,6 +226,10 @@ pub struct RemoteControl {
     /// list — an authorized client simply sees no quick-start projects, which is
     /// honest for a desktop with none; the create path stays gated regardless.
     projects: Option<Arc<dyn ProjectProvider>>,
+    /// The desktop's worktree management, when it is installed. `None` answers
+    /// the worktree RPCs with `Unsupported` for an authorized full-scope caller
+    /// (the dispatcher still answers `Unauthorized` first for anyone else).
+    worktrees: Option<Arc<dyn oximux_remote_host::WorktreeService>>,
     /// The index of persisted-but-unbuilt sessions, so a client is not limited to
     /// the projects the desktop has happened to show this run.
     catalog: Option<Arc<dyn oximux_remote_host::catalog::SessionCatalog>>,
@@ -277,6 +282,7 @@ impl RemoteControl {
             schedules: None,
             transcriber: None,
             projects: None,
+            worktrees: None,
             catalog: None,
             auth: Mutex::new(None),
             awake: Mutex::new(None),
@@ -334,6 +340,16 @@ impl RemoteControl {
     /// quick-start projects match what the desktop shows.
     pub fn set_project_provider(&mut self, projects: Arc<dyn ProjectProvider>) {
         self.projects = Some(projects);
+    }
+
+    /// Install the worktree service the host serves. Called once at boot,
+    /// backed by the same project + workspace repos and path scheme the
+    /// desktop's own New-Worktree flow uses.
+    pub fn set_worktree_service(
+        &mut self,
+        worktrees: Arc<dyn oximux_remote_host::WorktreeService>,
+    ) {
+        self.worktrees = Some(worktrees);
     }
 
     /// Let the host see and open sessions whose views have not been built.
@@ -448,6 +464,9 @@ impl RemoteControl {
         }
         if let Some(catalog) = &self.catalog {
             dispatcher = dispatcher.with_catalog(Arc::clone(catalog));
+        }
+        if let Some(worktrees) = &self.worktrees {
+            dispatcher = dispatcher.with_worktrees(Arc::clone(worktrees));
         }
         dispatcher
     }

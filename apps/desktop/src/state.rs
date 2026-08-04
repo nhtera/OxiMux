@@ -106,6 +106,13 @@ impl AppState {
     pub fn project_repo(&self) -> ProjectRepo {
         self.project_repo.clone()
     }
+
+    /// The workspace repository, shared for the remote-control worktree service
+    /// so a CLI-created worktree is the same row the desktop's sidebar lists.
+    /// Clones the handle (shared `Db`), not a second connection.
+    pub fn workspace_repo(&self) -> WorkspaceRepo {
+        self.workspace_repo.clone()
+    }
 }
 
 /// Load recent projects + their workspaces, then mark every alive-at-

@@ -426,7 +426,7 @@ pub(crate) fn refocus_active_pane(
 /// `<app_data>/projects/<project_id>/worktrees/<slug>`.
 /// Returns `None` when the app data directory is unavailable (sandbox or
 /// unset `$HOME`) — caller surfaces this as a create failure.
-fn worktree_path(project_id: &str, slug: &str) -> Option<PathBuf> {
+pub(crate) fn worktree_path(project_id: &str, slug: &str) -> Option<PathBuf> {
     Some(
         crate::app_paths::data_dir()?
             .join("projects")
@@ -448,7 +448,7 @@ const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// `kill_on_drop` ensures a hung child is killed when the timeout future is
 /// dropped (the force-remove escape). Output is discarded; this is a captured
 /// subprocess, distinct from the interactive "Run cleanup" terminal tab.
-async fn run_cleanup_before_remove(worktree_path: &Path) {
+pub(crate) async fn run_cleanup_before_remove(worktree_path: &Path) {
     run_cleanup_bounded(worktree_path, CLEANUP_TIMEOUT).await;
 }
 
