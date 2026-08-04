@@ -37,9 +37,16 @@ pub struct Cli {
     pub json: bool,
 
     /// The host's runtime directory (where its control socket lives).
-    /// Defaults to this machine's OxiMux data directory.
+    /// Defaults to this machine's OxiMux data directory. Local hosts only.
     #[arg(long, global = true, value_name = "DIR")]
     pub dir: Option<PathBuf>,
+
+    /// Talk to a paired remote host instead of this machine (see
+    /// `oximux hosts ls`). Also read from $OXIMUX_HOST; a recorded default
+    /// applies when neither is set. With no hosts paired, everything talks to
+    /// this machine — no configuration needed.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub host: Option<String>,
 
     /// Seconds to wait for a host reply before giving up (exit 4). For `wait`,
     /// this is the overall bound on the wait itself.
@@ -55,7 +62,16 @@ pub enum Command {
     /// Is a host reachable, and what is it running? (versions, session counts)
     Status,
     /// List the host's agent sessions.
-    Ls,
+    Ls {
+        /// List every paired host's sessions, and this machine's, in one table
+        /// with a host column. An unreachable host becomes a warning row and
+        /// the rest still print (exit 0); --strict makes that exit 3 instead.
+        #[arg(long)]
+        all_hosts: bool,
+        /// Fail (exit 3) if any host could not be reached.
+        #[arg(long, requires = "all_hosts")]
+        strict: bool,
+    },
     /// Start an agent session and send it a prompt.
     ///
     /// Async contract: the host acknowledges when it ACCEPTS the prompt, not
@@ -196,6 +212,27 @@ pub enum Command {
     Schedule {
         #[command(subcommand)]
         command: ScheduleCommand,
+    },
+    /// Enroll this machine with a remote host from its pairing ticket.
+    ///
+    /// Paste the whole `oximux://connect?ticket=…` link or the ticket alone.
+    /// The first host you pair becomes the default, so `--host` is only needed
+    /// once there is more than one.
+    #[command(verbatim_doc_comment)]
+    Pair {
+        /// The pairing ticket (link or bare), from the host's `pair-new`.
+        ticket: String,
+        /// What to call this host (default: the endpoint id's first 8 chars).
+        #[arg(long)]
+        name: Option<String>,
+        /// Make this the host every verb uses when none is named.
+        #[arg(long)]
+        default: bool,
+    },
+    /// The remote hosts this machine is paired with.
+    Hosts {
+        #[command(subcommand)]
+        command: HostsCommand,
     },
     /// A session's own recurring wake-ups.
     ///
@@ -462,6 +499,36 @@ pub enum WorktreeCommand {
 pub enum ProjectsCommand {
     /// List the projects the host offers as new-session targets.
     Ls,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HostsCommand {
+    /// Enroll with a host and name it — `pair` with the name first.
+    Add {
+        /// What to call it.
+        name: String,
+        /// The pairing ticket (link or bare).
+        ticket: String,
+        /// Make this the host every verb uses when none is named.
+        #[arg(long)]
+        default: bool,
+    },
+    /// List paired hosts. The default is marked `*`.
+    Ls {
+        /// Ping each host and show whether it answers right now.
+        #[arg(long)]
+        probe: bool,
+    },
+    /// Forget a host: unpair from it (best effort) and erase its local key.
+    Rm {
+        /// The host's name.
+        name: String,
+    },
+    /// Choose the host every verb uses when none is named.
+    Default {
+        /// The host's name.
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]

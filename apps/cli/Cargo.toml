@@ -24,6 +24,15 @@ path = "src/main.rs"
 [dependencies]
 oximux-remote-local = { workspace = true }
 oximux-remote-proto = { workspace = true }
+# The client half of remote control: `ClientSigner` (the enrollment identity)
+# and the `Connector` seam the iroh dial implements. The session/demux layer
+# above it is the phone's; every CLI verb drives one framed transport directly.
+oximux-remote-session = { workspace = true }
+# Where the CLI keeps its own hosts file and per-host client keys — client-side
+# state, so deliberately not under any one host's data directory.
+dirs = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
 # The ThreadEvent/ThreadEntry vocabulary the renderer folds — gpui-free by
 # construction (it is what remote-proto itself carries).
 oximux-agent-core = { workspace = true }

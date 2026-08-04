@@ -5,6 +5,7 @@ pub mod agent_context;
 pub mod attach;
 pub mod git;
 pub mod heartbeat;
+pub mod hosts;
 pub mod model;
 pub mod pair;
 pub mod permit;

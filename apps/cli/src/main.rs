@@ -6,9 +6,12 @@
 
 mod cli;
 mod client;
+mod client_identity;
 mod commands;
+mod hosts_store;
 mod output;
 mod output_schema;
+mod remote_client;
 mod render;
 mod serve;
 
@@ -16,9 +19,9 @@ use clap::Parser as _;
 use serde_json::json;
 
 use cli::{
-    Cli, Command, GitCommand, HeartbeatCommand, ModeCommand, ModelCommand, PermitCommand,
-    ProjectsCommand, ScheduleCommand, StateCommand, TeamCommand, TeamReportStatus, TermCommand,
-    WorktreeCommand,
+    Cli, Command, GitCommand, HeartbeatCommand, HostsCommand, ModeCommand, ModelCommand,
+    PermitCommand, ProjectsCommand, ScheduleCommand, StateCommand, TeamCommand, TeamReportStatus,
+    TermCommand, WorktreeCommand,
 };
 use client::Client;
 use output::render;
@@ -82,6 +85,81 @@ fn main() -> std::process::ExitCode {
     std::process::ExitCode::from(code)
 }
 
+/// The protocol version a verb needs, and the name to say when a host is too
+/// old for it.
+///
+/// Only verbs whose RPCs were *appended* appear here. That is the point of the
+/// gate: an old host serves everything below its own version perfectly well, so
+/// refusing wholesale would break the compatibility this protocol is designed
+/// for. What it must not do is send an ordinal the host cannot decode — postcard
+/// answers that by dropping the connection, which surfaces to the user as "the
+/// host closed the connection" with nothing to act on.
+fn required_version(command: &Command) -> Option<(u32, &'static str)> {
+    match command {
+        // v18: the automation surface.
+        Command::Heartbeat { .. } => Some((18, "heartbeat")),
+        Command::Team { .. } => Some((18, "team")),
+        Command::State { .. } => Some((18, "state")),
+        // v17: the manual fire. The rest of `schedule` is v10.
+        Command::Schedule { command: ScheduleCommand::RunOnce { .. } } => {
+            Some((17, "schedule run-once"))
+        }
+        // v16: the worktree surface, paginated transcripts, pairing admin.
+        Command::Worktree { .. } => Some((16, "worktree")),
+        Command::Transcript { .. } => Some((16, "transcript")),
+        Command::PairNew { .. } | Command::PairLs | Command::PairRm { .. } => {
+            Some((16, "pairing administration"))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command_of(argv: &[&str]) -> Command {
+        Cli::try_parse_from(argv).expect("parses").command
+    }
+
+    /// The gate covers exactly the appended surfaces, and nothing else. A verb
+    /// wrongly listed here would refuse a host that can serve it perfectly
+    /// well; one wrongly omitted would send an ordinal an old host answers by
+    /// dropping the connection.
+    #[test]
+    fn only_appended_verbs_declare_a_version_floor() {
+        for (argv, expected) in [
+            (vec!["oximux", "heartbeat", "ls"], Some(18)),
+            (vec!["oximux", "team", "ls"], Some(18)),
+            (vec!["oximux", "state", "get", "k"], Some(18)),
+            (vec!["oximux", "schedule", "run-once", "sch-1"], Some(17)),
+            (vec!["oximux", "worktree", "ls"], Some(16)),
+            (vec!["oximux", "transcript", "s1"], Some(16)),
+            (vec!["oximux", "pair-ls"], Some(16)),
+            // The long-standing surface every host has spoken since v1–v12.
+            (vec!["oximux", "ls"], None),
+            (vec!["oximux", "status"], None),
+            (vec!["oximux", "send", "s1", "hi"], None),
+            (vec!["oximux", "schedule", "ls"], None),
+        ] {
+            let needed = required_version(&command_of(&argv)).map(|(v, _)| v);
+            assert_eq!(needed, expected, "{argv:?}");
+        }
+    }
+
+    /// `schedule` is the one family split across versions: only the manual fire
+    /// is v17, and gating the whole family would strand a v10 host's list.
+    #[test]
+    fn only_run_once_gates_the_schedule_family() {
+        assert!(required_version(&command_of(&["oximux", "schedule", "ls"])).is_none());
+        assert!(required_version(&command_of(&["oximux", "schedule", "rm", "s"])).is_none());
+        assert_eq!(
+            required_version(&command_of(&["oximux", "schedule", "run-once", "s"])).map(|(v, _)| v),
+            Some(17)
+        );
+    }
+}
+
 fn host_verb(args: Cli) -> u8 {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -98,12 +176,49 @@ fn host_verb(args: Cli) -> u8 {
     };
     let json_mode = args.json;
     let timeout = args.timeout;
+    let dir = args.dir.clone();
+    let host = args.host.clone();
     rt.block_on(async {
         let outcome = async {
-            let client = Client::connect(args.dir.clone(), timeout).await?;
+            // Verbs that talk to no host, or to several, are dispatched before
+            // a single client is built: `pair` has nothing to connect to yet,
+            // `hosts` reads local files, and `ls --all-hosts` fans out.
+            match args.command {
+                Command::Pair { ticket, name, default } => {
+                    return commands::hosts::pair(&ticket, name, default, timeout).await;
+                }
+                Command::Hosts { command } => {
+                    return match command {
+                        HostsCommand::Add { name, ticket, default } => {
+                            commands::hosts::pair(&ticket, Some(name), default, timeout).await
+                        }
+                        HostsCommand::Ls { probe } => commands::hosts::ls(probe, timeout).await,
+                        HostsCommand::Rm { name } => commands::hosts::rm(&name, timeout).await,
+                        HostsCommand::Default { name } => commands::hosts::set_default(&name),
+                    };
+                }
+                Command::Ls { all_hosts: true, strict } => {
+                    return commands::hosts::fleet_ls(strict, timeout, dir).await;
+                }
+                _ => {}
+            }
+            let client = Client::resolve_and_connect(
+                client::HostSelection { flag: host, dir },
+                timeout,
+            )
+            .await?;
+            // The compat gate. `Hello` already refused a host outside the
+            // mutually-compatible range; this catches the narrower case of a
+            // host inside it that predates a specific verb — where postcard
+            // would answer an appended ordinal by dropping the connection
+            // rather than erroring. Only the verbs that need a floor are
+            // gated, so reads a v15 host can still serve keep working.
+            if let Some((needed, verb)) = required_version(&args.command) {
+                client.require_version(needed, verb)?;
+            }
             match args.command {
                 Command::Status => commands::status::run(&client).await,
-                Command::Ls => commands::sessions::ls(&client).await,
+                Command::Ls { .. } => commands::sessions::ls(&client).await,
                 Command::Projects { command: ProjectsCommand::Ls } => {
                     commands::sessions::projects_ls(&client).await
                 }
@@ -268,11 +383,13 @@ fn host_verb(args: Cli) -> u8 {
                 }
                 Command::PairLs => commands::pair::pair_ls(&client).await,
                 Command::PairRm { pubkey } => commands::pair::pair_rm(&client, &pubkey).await,
-                // Offline verbs and `serve` are dispatched in `main`;
-                // unreachable here.
-                Command::Version | Command::AgentContext | Command::Serve { .. } => {
-                    unreachable!("dispatched in main")
-                }
+                // Offline verbs and `serve` are dispatched in `main`; the
+                // host-book and fleet verbs a few lines above. Unreachable.
+                Command::Version
+                | Command::AgentContext
+                | Command::Serve { .. }
+                | Command::Pair { .. }
+                | Command::Hosts { .. } => unreachable!("dispatched earlier"),
             }
         }
         .await;
