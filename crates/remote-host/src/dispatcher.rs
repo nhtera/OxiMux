@@ -18,6 +18,7 @@ mod forge;
 mod git;
 mod handlers;
 mod handshake;
+mod pairing_admin;
 mod schedules;
 mod serve;
 mod stream;
@@ -124,6 +125,10 @@ pub struct Dispatcher {
     /// while an unauthorized or under-scoped caller still gets `Unauthorized`
     /// first, so the capability is not probeable without the scope to use it.
     worktrees: Option<Arc<dyn crate::worktrees::WorktreeService>>,
+    /// The endpoint id pairing tickets name, when this host has one bound. A
+    /// `PairNew` on a host with no endpoint answers `Unsupported` — a ticket
+    /// nobody can dial is not worth minting.
+    pairing_endpoint: Option<[u8; 32]>,
     /// Wall clock (Unix seconds), injectable so tests are deterministic.
     now_secs: fn() -> u64,
 }
@@ -141,6 +146,7 @@ impl Dispatcher {
             transcriber: None,
             catalog: None,
             worktrees: None,
+            pairing_endpoint: None,
             now_secs: system_now_secs,
         }
     }
@@ -200,6 +206,12 @@ impl Dispatcher {
         worktrees: Arc<dyn crate::worktrees::WorktreeService>,
     ) -> Self {
         self.worktrees = Some(worktrees);
+        self
+    }
+
+    /// Name the endpoint pairing tickets dial, enabling `PairNew`.
+    pub fn with_pairing_endpoint(mut self, endpoint_id: [u8; 32]) -> Self {
+        self.pairing_endpoint = Some(endpoint_id);
         self
     }
 
@@ -295,6 +307,9 @@ impl Dispatcher {
                     "a local connection is not paired; disable local CLI access in the desktop settings instead".into(),
                 )),
             },
+            Request::PairNew { read_only } => self.pair_new(peer, read_only),
+            Request::PairList => self.pair_list(peer),
+            Request::PairRemove { pubkey } => self.pair_remove(peer, &pubkey),
             // Handshake variants (handled before auth) and `Subscribe` (intercepted
             // in `serve`) never reach here.
             _ => Response::Error(RpcError::BadRequest("unexpected request".into())),

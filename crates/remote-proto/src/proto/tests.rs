@@ -343,4 +343,20 @@ fn early_variants_keep_their_literal_ordinals() {
     // inside the error enum, which rides behind `Error`'s own ordinal (8).
     let err = Response::Error(RpcError::Unsupported);
     assert_eq!(err.to_bytes().expect("encode"), vec![8, 6]);
+    // The v16 pairing-administration tail: `PairNew` (index 46), `PairList`
+    // (47, a unit variant), `PairRemove` (48).
+    let pair_new = Request::PairNew { read_only: false };
+    assert_eq!(pair_new.to_bytes().expect("encode")[0], 46);
+    assert_eq!(Request::PairList.to_bytes().expect("encode"), vec![47]);
+    let pair_rm = Request::PairRemove { pubkey: [0u8; 32] };
+    assert_eq!(pair_rm.to_bytes().expect("encode")[0], 48);
+    // Their replies: `PairingIssued` is the 35th Response variant (index 34),
+    // `PairedDeviceList` the 36th (35).
+    let issued = Response::PairingIssued(PairingIssuedWire {
+        ticket: String::new(),
+        expires_at: 0,
+        read_only: false,
+    });
+    assert_eq!(issued.to_bytes().expect("encode")[0], 34);
+    assert_eq!(Response::PairedDeviceList(vec![]).to_bytes().expect("encode")[0], 35);
 }

@@ -70,6 +70,10 @@ impl AuthStore {
                 Some(session_id) => DeviceScope::Sessions(HashSet::from([session_id.clone()])),
                 None => DeviceScope::Full,
             };
+            // The tier the ticket was minted at: full write by default (the
+            // recorded product decision), read-only when the opener opted the
+            // enrollment down (`pair-new --read-only`).
+            let read_only = slot.read_only;
             if slot.one_time {
                 st.pairing.as_mut().expect("checked above").used = true;
             }
@@ -79,9 +83,7 @@ impl AuthStore {
                     name: req.device_name.clone(),
                     revoked: false,
                     scope,
-                    // Pairing grants full access (the confirmed default);
-                    // read-only is an explicit opt-down afterwards.
-                    read_only: false,
+                    read_only,
                     // A device that has just paired has, by definition, just
                     // authenticated.
                     last_seen: Some(now_secs),
@@ -93,7 +95,7 @@ impl AuthStore {
                 name: req.device_name.clone(),
                 sessions: bound.map(|s| vec![s]),
                 revoked: false,
-                read_only: false,
+                read_only,
                 last_seen: Some(now_secs),
             };
             (token, stored)

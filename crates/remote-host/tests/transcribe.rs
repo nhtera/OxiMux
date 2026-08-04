@@ -236,10 +236,13 @@ async fn engine_error_kinds_map_to_the_right_code() {
     }
 }
 
-/// A host with no transcriber answers `Unauthorized`, indistinguishable from a
-/// device that lacks the scope — capability is not something to leak.
+/// A host with no transcriber tells an AUTHENTICATED caller the truth —
+/// `Unsupported` — so a headless host's missing speech engine renders as "not
+/// available here" rather than looking like a revocation. Nothing is probeable
+/// through this: an unauthenticated caller is refused by the serve loop before
+/// the handler runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_host_without_a_transcriber_refuses() {
+async fn a_host_without_a_transcriber_is_unsupported_for_the_authenticated() {
     // No `.with_transcriber(...)`.
     let dispatcher =
         Dispatcher::new(Arc::new(SessionRegistry::new()), open_auth()).with_clock(clock);
@@ -252,7 +255,7 @@ async fn a_host_without_a_transcriber_refuses() {
             panic!("expected Registered");
         };
         let reply = call(&client, transcribe_req(&[1, 2, 3, 4], 16_000)).await;
-        assert_eq!(reply, Response::Error(RpcError::Unauthorized));
+        assert_eq!(reply, Response::Error(RpcError::Unsupported));
         drop(client);
     };
     futures::future::join(serve, script).await;

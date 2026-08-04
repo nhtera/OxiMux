@@ -213,6 +213,22 @@ impl AuthStore {
         }
     }
 
+    /// May this caller administer pairing — mint tickets, list enrollments,
+    /// erase one?
+    ///
+    /// **The strictest gate on this protocol: local operator only.** A paired
+    /// device that could mint tickets could enroll further devices — lateral
+    /// movement from one compromised phone to a standing fleet — so even a
+    /// full-scope, write-capable remote device is refused. Only a caller the
+    /// host's own owner-only socket authenticated at full scope qualifies,
+    /// which is the same person the desktop's pairing pane already obeys.
+    pub fn may_administer_pairing(&self, peer: &Peer) -> bool {
+        match peer.kind() {
+            PeerKind::Local(scope) => scope.is_full(),
+            PeerKind::Remote(_) => false,
+        }
+    }
+
     /// Every recorded device — the data behind the paired-devices list, its
     /// revoke/forget actions, and its read-only toggle.
     ///

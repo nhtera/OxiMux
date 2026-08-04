@@ -241,6 +241,40 @@ pub struct WorktreeWire {
     pub path: String,
 }
 
+/// A freshly-minted pairing window — the
+/// [`Response::PairingIssued`](crate::proto::Response::PairingIssued) payload.
+///
+/// `ticket` is the [`PairingTicket`](crate::pairing::PairingTicket) in its
+/// canonical `base64url` form — the exact string a QR encodes — so the CLI
+/// renders it without re-deriving the encoding. A bearer credential with a
+/// short life: `expires_at` (unix seconds) is the host's own deadline, and the
+/// window is one-time — the first successful registration spends it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingIssuedWire {
+    pub ticket: String,
+    pub expires_at: u64,
+    /// Whether the enrollment this ticket mints is read-only (the opt-down) —
+    /// echoed so the operator sees which tier they just offered.
+    pub read_only: bool,
+}
+
+/// One enrolled device — the
+/// [`Response::PairedDeviceList`](crate::proto::Response::PairedDeviceList)
+/// payload row. Mirrors what the desktop's paired-devices pane shows, tier
+/// included, so a mistaken full-write pairing is visible from the CLI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairedDeviceWire {
+    pub pubkey: [u8; 32],
+    pub name: String,
+    pub read_only: bool,
+    /// Tombstoned but still listed — erasing it is the only way that device
+    /// can ever pair again.
+    pub revoked: bool,
+    /// Unix seconds of the last successful authentication; `None` for a device
+    /// that paired but never reconnected.
+    pub last_seen: Option<u64>,
+}
+
 /// One terminal the phone can list and attach to.
 ///
 /// `cwd` is the terminal's working directory as a display string, not a path to

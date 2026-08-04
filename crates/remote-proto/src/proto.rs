@@ -50,6 +50,10 @@ pub use crate::messages::*;
 /// `RemoveWorktree` and the `WorktreeCreated`/`Worktrees` replies), and
 /// [`RpcError::Unsupported`] so a host without an optional capability can say
 /// so to an *authorized* caller instead of miscategorizing it as a refusal.
+/// v16 also carries the local-operator pairing administration a headless host
+/// needs (`PairNew`/`PairList`/`PairRemove` and the `PairingIssued`/
+/// `PairedDeviceList` replies) — runtime commands, never boot flags, so a
+/// bearer ticket is minted on demand instead of reprinted into a journal.
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
@@ -436,6 +440,30 @@ pub enum Request {
     /// [`Request::CreateWorktree`]'s gate. Removing one already gone is not an
     /// error.
     RemoveWorktree { id: String },
+    /// Open a pairing window and mint its ticket — the runtime `pair-new`
+    /// command a headless host takes instead of a boot flag (a flag would
+    /// reprint the bearer ticket into the journal on every restart).
+    ///
+    /// **Local-operator only** — the strictest gate on this protocol. A paired
+    /// device that could mint tickets could enroll further devices (lateral
+    /// movement), so even full-scope remote devices are refused; only a caller
+    /// on the host's own owner-only socket may ask. The reply carries a bearer
+    /// credential: the CLI prints it to an interactive TTY only, and the host
+    /// must never log it. Tickets are one-time and short-lived by construction.
+    ///
+    /// `read_only` opts the resulting enrollment down to the read tier;
+    /// the default mints full write, per the recorded product decision.
+    PairNew { read_only: bool },
+    /// The host's paired devices — tier, revocation, last-seen — so a mistaken
+    /// enrollment is visible. Same local-operator gate as
+    /// [`Request::PairNew`]: the device list is admin surface, not device
+    /// surface.
+    PairList,
+    /// Erase one device's enrollment by pubkey (the host-side counterpart of
+    /// the desktop's Forget). Idempotent; same local-operator gate. Erasure
+    /// rather than revocation, so the device may pair again with a fresh
+    /// ticket — revocation stays a desktop-UI act.
+    PairRemove { pubkey: [u8; 32] },
 }
 
 /// Host → client.
@@ -577,6 +605,12 @@ pub enum Response {
     /// Reply to [`Request::ListWorktrees`]. Empty is a normal answer — a
     /// project with no worktrees is the common case, not a failure.
     Worktrees(Vec<WorktreeWire>),
+    /// Reply to [`Request::PairNew`] — the encoded ticket and its window.
+    /// **Contains a bearer credential**: hosts never log it, and the CLI
+    /// refuses to print it anywhere but an interactive terminal.
+    PairingIssued(PairingIssuedWire),
+    /// Reply to [`Request::PairList`].
+    PairedDeviceList(Vec<PairedDeviceWire>),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.
