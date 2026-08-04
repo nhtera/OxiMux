@@ -202,6 +202,20 @@ pub enum Command {
         /// read from <data-dir>/projects.toml).
         #[arg(long = "project", value_name = "DIR")]
         projects: Vec<PathBuf>,
+        /// Run under the Service Control Manager. Set by the installed
+        /// service's own command line; not for interactive use.
+        #[cfg(windows)]
+        #[arg(long, hide = true)]
+        service: bool,
+        /// Register `oximux serve` as a Windows service (requires an elevated
+        /// prompt and an explicit --data-dir; start it with `sc start`).
+        #[cfg(windows)]
+        #[arg(long, conflicts_with_all = ["service", "uninstall_service"])]
+        install_service: bool,
+        /// Stop (best-effort) and remove the Windows service.
+        #[cfg(windows)]
+        #[arg(long, conflicts_with = "service")]
+        uninstall_service: bool,
     },
     /// Mint a one-time, short-lived pairing ticket on the running host.
     ///

@@ -110,9 +110,30 @@ projects = ["/home/dev/work/repo-a", "/home/dev/work/repo-b"]
 
 ## Windows
 
-Serve handles the console-close and OS-shutdown notifications as its drain
-signal, so the supported headless path is a **Scheduled Task** (runs at logon
-or at startup with stored credentials):
+The supported headless path is the **SCM service**. From an elevated prompt:
+
+```powershell
+oximux serve --install-service --data-dir C:\OxiMux\data --project C:\work\repo-a
+sc start OxiMuxServe
+```
+
+`--data-dir` is required at install (not defaulted): the service runs as
+LocalSystem, whose per-user default data directory is not yours. Repoint the
+service at a user account afterwards via `services.msc` or `sc config` when
+agents need that user's toolchains and credentials.
+
+Stopping (`sc stop OxiMuxServe`, or system shutdown) maps
+`SERVICE_CONTROL_STOP` onto the same drain the unix SIGTERM path takes: the
+service reports `STOP_PENDING` with a 45-second wait hint — above serve's
+20-second drain deadline plus its transcript flush — lets in-flight agent
+turns finish, marks stragglers interrupted, and reports `STOPPED`. At start
+the service adopts itself into a kill-on-close job object, so even a hard
+kill (`taskkill /f`, a crash) takes every agent child and grandchild with the
+process — nothing orphans. Remove with `oximux serve --uninstall-service`.
+
+A **Scheduled Task** still works where installing a service is not an option
+(serve treats console-close and OS-shutdown notifications as its drain
+signal), but a hard task kill has no job-object guarantee there:
 
 ```powershell
 $action  = New-ScheduledTaskAction -Execute "C:\Program Files\OxiMux\oximux.exe" `
@@ -120,12 +141,6 @@ $action  = New-ScheduledTaskAction -Execute "C:\Program Files\OxiMux\oximux.exe"
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 Register-ScheduledTask -TaskName "OxiMux Serve" -Action $action -Trigger $trigger
 ```
-
-Stopping the task delivers the close notification and serve drains exactly as
-under systemd. Agent children are console children of serve; the job-object
-teardown that guarantees no orphaned tree on a hard kill ships with the SCM
-service wrapper, which is tracked as a follow-up — until then a hard task
-kill can leave an agent process behind (a drain-stop does not).
 
 ## Verifying an install
 

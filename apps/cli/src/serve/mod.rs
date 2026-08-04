@@ -19,6 +19,8 @@ mod launcher;
 mod projects;
 mod pump;
 mod scheduler;
+#[cfg(windows)]
+pub mod service_windows;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,6 +46,17 @@ pub struct ServeArgs {
 /// Boot and run until a shutdown signal, then drain. The process exit code is
 /// the verb's result: 0 after a clean drain, 1 on a boot failure.
 pub fn run(args: ServeArgs) -> u8 {
+    run_with_shutdown(args, None)
+}
+
+/// Like [`run`], with the shutdown signal injectable: `None` waits on the
+/// platform's console/OS notifications; `Some` waits on the channel instead —
+/// the SCM service wrapper's control handler fires it on `SERVICE_CONTROL_STOP`
+/// so a service stop drains exactly as a console signal does.
+pub(crate) fn run_with_shutdown(
+    args: ServeArgs,
+    external_shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> u8 {
     // Before any thread exists: an inherited Claude session marker would
     // switch transcript saving off in every agent this host ever spawns.
     for marker in oximux_shell_env::scrub_inherited_claude_session_markers() {
@@ -65,7 +78,7 @@ pub fn run(args: ServeArgs) -> u8 {
             return 1;
         }
     };
-    match rt.block_on(serve(args)) {
+    match rt.block_on(serve(args, external_shutdown)) {
         Ok(()) => 0,
         Err(err) => {
             eprintln!("serve: {err:#}");
@@ -74,7 +87,10 @@ pub fn run(args: ServeArgs) -> u8 {
     }
 }
 
-async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+async fn serve(
+    args: ServeArgs,
+    external_shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
     // ---- data root, hardened before anything writes into it ----
@@ -301,7 +317,15 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     tracing::info!(data_dir = %data_dir.display(), endpoint = %endpoint_hex, "serve ready");
 
     // ---- run until asked to stop ----
-    wait_for_shutdown().await;
+    match external_shutdown {
+        // The SCM control handler owns the signal; a closed channel (the
+        // handler was torn down) reads as a stop rather than serving forever
+        // with nothing able to stop it.
+        Some(rx) => {
+            let _ = rx.await;
+        }
+        None => wait_for_shutdown().await,
+    }
     tracing::info!("shutdown requested; draining");
 
     // ---- drain: stop taking work, let in-flight turns finish, persist ----

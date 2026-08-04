@@ -61,5 +61,12 @@ tracing-subscriber = { workspace = true }
 # `pair-new`'s terminal QR. The bitmap-only build — no image/svg renderers.
 qrcode = { workspace = true }
 
+# The SCM service wrapper: `oximux serve --install-service` registers a real
+# Windows service whose STOP maps onto serve's drain, and the job object is
+# what guarantees agent children die with a hard-killed service.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+oximux-job-object = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }

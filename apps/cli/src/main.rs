@@ -48,10 +48,32 @@ fn main() -> std::process::ExitCode {
         }
         // Serve owns its own (multi-thread) runtime and its own output
         // contract — one readiness line on stdout, logs on stderr.
+        #[cfg(not(windows))]
         Command::Serve { data_dir, projects } => serve::run(serve::ServeArgs {
             data_dir: data_dir.clone(),
             projects: projects.clone(),
         }),
+        // Windows adds the SCM modes: install/uninstall are one-shot admin
+        // helpers, --service hands the process to the service dispatcher, and
+        // the plain invocation serves on the console exactly as unix does.
+        #[cfg(windows)]
+        Command::Serve { data_dir, projects, service, install_service, uninstall_service } => {
+            if *install_service {
+                serve::service_windows::install(data_dir.clone(), projects)
+            } else if *uninstall_service {
+                serve::service_windows::uninstall()
+            } else {
+                let serve_args = serve::ServeArgs {
+                    data_dir: data_dir.clone(),
+                    projects: projects.clone(),
+                };
+                if *service {
+                    serve::service_windows::run_service(serve_args)
+                } else {
+                    serve::run(serve_args)
+                }
+            }
+        }
         // Host verbs: build the runtime, connect lazily, run the verb.
         _ => host_verb(args),
     };
