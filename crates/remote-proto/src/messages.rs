@@ -193,6 +193,54 @@ pub struct SessionTranscriptWire {
     pub model: Option<String>,
 }
 
+/// One page of a folded transcript — the
+/// [`Response::TranscriptPage`](crate::proto::Response::TranscriptPage) payload.
+///
+/// `entries_json` is a JSON **array slice** of the folded `Vec<ThreadEntry>` —
+/// the entries `[cursor, next_cursor)` of the full snapshot, each identical to
+/// what [`SessionTranscriptWire`] would have carried at that position. The
+/// client concatenates page arrays in order to rebuild the full fold.
+/// `next_cursor` is the index to request next, `None` on the last page; `total`
+/// is the snapshot's full entry count, constant across its pages. `seq` is the
+/// fold cursor of the whole snapshot (not the page), so live resume works from
+/// any completed paging pass.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptPageWire {
+    pub session_id: String,
+    pub seq: u64,
+    pub entries_json: String,
+    pub next_cursor: Option<u64>,
+    pub total: u64,
+    pub model: Option<String>,
+}
+
+/// One worktree (workspace) row — the
+/// [`Response::WorktreeCreated`](crate::proto::Response::WorktreeCreated) /
+/// [`Response::Worktrees`](crate::proto::Response::Worktrees) payload.
+///
+/// `id` is the stable handle
+/// [`Request::RemoveWorktree`](crate::proto::Request::RemoveWorktree) takes —
+/// removal is by id, never by path. `path` is the worktree's absolute host
+/// path, exposed for the same reason [`ProjectSummaryWire::path`] is: it is
+/// what a client hands to
+/// [`Request::CreateSession`](crate::proto::Request::CreateSession), and the
+/// surface is gated on full scope so a confined device never sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeWire {
+    pub id: String,
+    /// The owning project's root path, matching a
+    /// [`ProjectSummaryWire::path`].
+    pub project_path: String,
+    /// Human label (the desktop's workspace name).
+    pub name: String,
+    pub slug: String,
+    /// The branch the worktree was created on (`oximux/<slug>` for rows the
+    /// desktop minted).
+    pub branch: String,
+    /// Absolute host path of the worktree directory.
+    pub path: String,
+}
+
 /// One terminal the phone can list and attach to.
 ///
 /// `cwd` is the terminal's working directory as a display string, not a path to

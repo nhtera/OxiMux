@@ -43,14 +43,20 @@ pub use crate::messages::*;
 /// the host's projects (name + path) so a client can start a session in one
 /// without typing its path. v15: appended `Unpair` — a device drops its own
 /// enrollment, so forgetting a desktop on the phone also clears the phone from
-/// the desktop's paired-devices list.
+/// the desktop's paired-devices list. v16: appended the CLI working set — the
+/// paginated transcript fetch (`FetchTranscriptPage` + its `TranscriptPage`
+/// reply; the v13 `FetchTranscript` is untouched as the legacy unpaginated
+/// path), the worktree surface (`CreateWorktree`/`ListWorktrees`/
+/// `RemoveWorktree` and the `WorktreeCreated`/`Worktrees` replies), and
+/// [`RpcError::Unsupported`] so a host without an optional capability can say
+/// so to an *authorized* caller instead of miscategorizing it as a refusal.
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// The oldest peer version this build still speaks. **Raise this only on a
 /// genuinely breaking change** — a reordered/removed variant or an altered
@@ -116,6 +122,14 @@ pub enum RpcError {
     /// do (upgrade the phone) instead of reporting a bare connection failure.
     /// Appended last to keep the enum's ordinal encoding append-only.
     IncompatibleVersion { host_version: u32, host_min_compatible: u32 },
+    /// The host understood the call but does not offer the capability — a
+    /// headless host with no speech engine, a build without worktrees. Distinct
+    /// from [`RpcError::Unauthorized`] **only for an authorized caller**: the
+    /// unauthorized answer stays `Unauthorized` so a capability cannot be probed
+    /// without a credential. Clients render "this host cannot do that" rather
+    /// than "you may not do that", which would send the user to the wrong fix.
+    /// Appended last to keep the enum's ordinal encoding append-only (v16).
+    Unsupported,
 }
 
 /// Client → host. Append-only; see the module note.
@@ -383,6 +397,45 @@ pub enum Request {
     /// the authorization gate before this handler runs, so it cannot clear its own
     /// tombstone and re-pair.
     Unpair,
+    /// One page of a session's folded transcript — the paginated successor to
+    /// [`Request::FetchTranscript`], which is **left untouched** as the legacy
+    /// unpaginated path (changing its reply shape would break every v15 phone;
+    /// postcard payloads are positional and may never be reshaped).
+    ///
+    /// `cursor` is the folded-entry index to start from (0 for the first page);
+    /// `limit` caps how many entries this page may carry. The host additionally
+    /// enforces a byte budget so a page always fits one transport frame — a
+    /// client must treat a short page as normal and keep paging by
+    /// `next_cursor`, never assume `limit` entries arrived. Read-only;
+    /// scope-checked like the other session RPCs. Appended for v16.
+    FetchTranscriptPage { session_id: String, cursor: u64, limit: u32 },
+    /// Create a git worktree (a workspace) under a project.
+    ///
+    /// **The target path is host-derived, never client-supplied**: the host
+    /// composes it from its own data directory, the project's id, and the
+    /// sanitized slug — exactly as the desktop's own New-Worktree flow does. The
+    /// client only picks *which* project, by the absolute root path a
+    /// [`Response::Projects`] row already handed it; a path matching no known
+    /// project is refused, so this cannot be aimed at an arbitrary repository.
+    ///
+    /// A **write to the filesystem and the repository** (new worktree + new
+    /// branch), and it names no session — so it is gated on a dedicated
+    /// full-scope, non-read-only check, the same shape as
+    /// [`Request::CreateSession`]: a session-scoped device could otherwise mint
+    /// itself a directory outside its confinement.
+    CreateWorktree { project_path: String, slug: String },
+    /// List a project's worktrees (or every project's, when `project_path` is
+    /// `None`). A **read**, but a full-scope one: worktree rows carry host
+    /// paths and branch names across all projects, which a session-scoped
+    /// device must not enumerate. A read-only full device may list — seeing
+    /// worktrees changes nothing.
+    ListWorktrees { project_path: Option<String> },
+    /// Remove a worktree by the id a [`Response::Worktrees`] row carried —
+    /// **never by path**, so there is no path for a client to aim. Destructive
+    /// (deletes the worktree directory and its branch), so it shares
+    /// [`Request::CreateWorktree`]'s gate. Removing one already gone is not an
+    /// error.
+    RemoveWorktree { id: String },
 }
 
 /// Host → client.
@@ -510,6 +563,20 @@ pub enum Response {
     /// [`Request::CreateSession`]. May be empty (no projects, or the host exposes
     /// none).
     Projects(Vec<ProjectSummaryWire>),
+    /// One page of a folded transcript — the reply to
+    /// [`Request::FetchTranscriptPage`]. Carries the page's entries plus the
+    /// cursor to continue from (`None` when this was the last page). The `seq`
+    /// is the fold cursor of the **whole** snapshot, identical on every page,
+    /// so a client subscribes from it after the final page exactly as it would
+    /// after a [`Response::SessionTranscript`]. Appended for v16.
+    TranscriptPage(TranscriptPageWire),
+    /// Reply to [`Request::CreateWorktree`] — the created row, so the client
+    /// can start a session in it (`path` feeds
+    /// [`Request::CreateSession`]'s cwd) without re-listing.
+    WorktreeCreated(WorktreeWire),
+    /// Reply to [`Request::ListWorktrees`]. Empty is a normal answer — a
+    /// project with no worktrees is the common case, not a failure.
+    Worktrees(Vec<WorktreeWire>),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

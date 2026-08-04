@@ -16,7 +16,7 @@ fn value_bearing_event() -> ThreadEvent {
 /// documented wire change, so an accidental edit fails here.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 15, "v15 = the appended self-unpair");
+    assert_eq!(PROTOCOL_VERSION, 16, "v16 = the appended CLI working set");
 }
 
 /// The floor moves only on a genuinely breaking change, never merely because
@@ -303,4 +303,44 @@ fn early_variants_keep_their_literal_ordinals() {
     // `SessionTranscript`.
     let projects = Response::Projects(vec![]);
     assert_eq!(projects.to_bytes().expect("encode")[0], 30);
+    // The v15 self-unpair appended after the project tail: `Unpair` is the 42nd
+    // Request variant (index 41, a unit variant, so its whole encoding is that
+    // single ordinal byte).
+    assert_eq!(Request::Unpair.to_bytes().expect("encode"), vec![41]);
+    // The v16 CLI working set appended after the unpair tail, in this order:
+    // `FetchTranscriptPage` (index 42), `CreateWorktree` (43), `ListWorktrees`
+    // (44), `RemoveWorktree` (45). Pin each discriminant; payloads follow.
+    let page = Request::FetchTranscriptPage { session_id: String::new(), cursor: 0, limit: 0 };
+    assert_eq!(page.to_bytes().expect("encode")[0], 42);
+    let create = Request::CreateWorktree { project_path: String::new(), slug: String::new() };
+    assert_eq!(create.to_bytes().expect("encode")[0], 43);
+    let list = Request::ListWorktrees { project_path: None };
+    assert_eq!(list.to_bytes().expect("encode")[0], 44);
+    let remove = Request::RemoveWorktree { id: String::new() };
+    assert_eq!(remove.to_bytes().expect("encode")[0], 45);
+    // The matching v16 Response tail: `TranscriptPage` is the 32nd Response
+    // variant (index 31), `WorktreeCreated` 33rd (32), `Worktrees` 34th (33).
+    let page = Response::TranscriptPage(TranscriptPageWire {
+        session_id: String::new(),
+        seq: 0,
+        entries_json: "[]".into(),
+        next_cursor: None,
+        total: 0,
+        model: None,
+    });
+    assert_eq!(page.to_bytes().expect("encode")[0], 31);
+    let wt = WorktreeWire {
+        id: String::new(),
+        project_path: String::new(),
+        name: String::new(),
+        slug: String::new(),
+        branch: String::new(),
+        path: String::new(),
+    };
+    assert_eq!(Response::WorktreeCreated(wt).to_bytes().expect("encode")[0], 32);
+    assert_eq!(Response::Worktrees(vec![]).to_bytes().expect("encode")[0], 33);
+    // `RpcError::Unsupported` appended after `IncompatibleVersion`: index 6
+    // inside the error enum, which rides behind `Error`'s own ordinal (8).
+    let err = Response::Error(RpcError::Unsupported);
+    assert_eq!(err.to_bytes().expect("encode"), vec![8, 6]);
 }
