@@ -7070,6 +7070,7 @@ dependencies = [
  "oximux-relay-client",
  "oximux-relay-proto",
  "oximux-relay-supervisor",
+ "oximux-relay-terminals",
  "oximux-remote-host",
  "oximux-remote-iroh",
  "oximux-remote-local",
@@ -7364,6 +7365,19 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "oximux-relay-terminals"
+version = "0.1.6"
+dependencies = [
+ "async-trait",
+ "oximux-relay-client",
+ "oximux-relay-proto",
+ "oximux-remote-host",
+ "oximux-remote-proto",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

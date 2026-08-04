@@ -31,6 +31,7 @@ oximux-pty = { workspace = true }
 async-trait = { workspace = true }
 oximux-relay-client = { workspace = true }
 oximux-relay-supervisor = { workspace = true }
+oximux-relay-terminals = { workspace = true }
 oximux-relay-proto = { workspace = true }
 # Owner-only access on the relay auth token this process writes.
 oximux-owner-only = { workspace = true }
