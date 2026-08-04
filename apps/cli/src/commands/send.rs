@@ -1,0 +1,62 @@
+//! `oximux send` — a prompt into an existing session. Accepted ≠ finished:
+//! the Ack means the host took the prompt (queueing mid-turn is normal); the
+//! default mode then streams the turn, `--no-wait` returns immediately.
+
+use oximux_remote_proto::messages::SendPromptReq;
+use oximux_remote_proto::proto::{Request, Response};
+use serde_json::{Value, json};
+
+use super::attach::{Stop, StreamEnd, stream_session};
+use crate::cli::exit;
+use crate::client::{Client, rpc_failure, unexpected_reply};
+use crate::output::Failure;
+
+pub async fn run(
+    client: &Client,
+    session: &str,
+    prompt: &str,
+    no_wait: bool,
+    json_mode: bool,
+) -> Result<(Value, String), Failure> {
+    // Capture the live edge BEFORE sending, so the follow stream replays this
+    // prompt's own turn from its first event rather than joining mid-turn.
+    let from = match client.call(Request::GetSessionInfo { session_id: session.into() }).await? {
+        Response::SessionInfo(info) => info.summary.last_seq,
+        Response::Error(e) => return Err(rpc_failure(e)),
+        other => return Err(unexpected_reply("GetSessionInfo", &other)),
+    };
+    match client
+        .call(Request::SendPrompt(SendPromptReq {
+            session_id: session.into(),
+            text: prompt.into(),
+            images: vec![],
+            corr_id: u64::from(std::process::id()) << 16 | 1,
+        }))
+        .await?
+    {
+        Response::Ack => {}
+        Response::Error(e) => return Err(rpc_failure(e)),
+        other => return Err(unexpected_reply("SendPrompt", &other)),
+    }
+    let base = json!({ "session_id": session, "accepted": true });
+    if no_wait {
+        return Ok((
+            base,
+            format!("accepted — watch with `oximux attach {session}` or `oximux wait {session} --until done`"),
+        ));
+    }
+    match stream_session(client, session, Some(from), json_mode, false, Stop::TurnEnded, None)
+        .await?
+    {
+        StreamEnd::TurnEnded { is_error: false } => Ok((base, "✓ done".into())),
+        StreamEnd::TurnEnded { is_error: true } => Err(Failure::new(
+            "turn-error",
+            exit::ERROR,
+            format!("the turn ended with an error (session {session})"),
+        )),
+        StreamEnd::Detached => {
+            Ok((base, format!("detached — the agent keeps running (session {session})")))
+        }
+        _ => Err(Failure::new("protocol", exit::ERROR, "the stream ended unexpectedly")),
+    }
+}

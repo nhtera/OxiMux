@@ -129,32 +129,73 @@ impl Client {
         Ok(client)
     }
 
-    /// One request → one response, bounded by the global timeout.
+    /// One request → one response, bounded by the global timeout. Any pushed
+    /// frame that interleaves (a live event on a subscribed connection) is
+    /// silently dropped — verbs that subscribe must use
+    /// [`call_streaming`](Self::call_streaming) instead, or lose events.
     pub async fn call(&self, req: Request) -> Result<Response, Failure> {
+        self.call_streaming(req, |_| {}).await
+    }
+
+    /// One request → one response, feeding every pushed frame that interleaves
+    /// to `on_push` instead of dropping it. The per-frame wait is bounded by
+    /// the global timeout; a chatty stream cannot starve the reply, because
+    /// every frame either IS the reply or goes to `on_push`.
+    pub async fn call_streaming(
+        &self,
+        req: Request,
+        mut on_push: impl FnMut(Response),
+    ) -> Result<Response, Failure> {
         let bytes = req.to_bytes().map_err(|e| {
             Failure::new("encode", exit::ERROR, format!("could not encode request: {e}"))
         })?;
-        let exchange = async {
-            self.transport
-                .send(bytes)
-                .await
-                .map_err(|e| Failure::new("transport", exit::UNREACHABLE, e.to_string()))?;
-            let frame = self
-                .transport
-                .recv()
-                .await
-                .map_err(|e| Failure::new("transport", exit::UNREACHABLE, e.to_string()))?
-                .ok_or_else(|| {
-                    Failure::new("closed", exit::UNREACHABLE, "the host closed the connection")
-                })?;
-            Response::from_bytes(&frame).map_err(|e| {
-                Failure::new("decode", exit::ERROR, format!("undecodable host reply: {e}"))
-            })
-        };
-        tokio::time::timeout(self.timeout, exchange)
+        tokio::time::timeout(self.timeout, self.transport.send(bytes))
             .await
-            .map_err(|_| timed_out("waiting for the host's reply"))?
+            .map_err(|_| timed_out("sending to the host"))?
+            .map_err(|e| Failure::new("transport", exit::UNREACHABLE, e.to_string()))?;
+        loop {
+            let frame = tokio::time::timeout(self.timeout, self.recv_frame())
+                .await
+                .map_err(|_| timed_out("waiting for the host's reply"))??;
+            if is_push(&frame) {
+                on_push(frame);
+                continue;
+            }
+            return Ok(frame);
+        }
     }
+
+    /// The next frame from the host — push or reply, undistinguished. No
+    /// timeout: an idle live stream is normal, and liveness is the socket
+    /// itself. Streaming loops (attach/wait/term) sit on this.
+    pub async fn recv_frame(&self) -> Result<Response, Failure> {
+        let frame = self
+            .transport
+            .recv()
+            .await
+            .map_err(|e| Failure::new("transport", exit::UNREACHABLE, e.to_string()))?
+            .ok_or_else(|| {
+                Failure::new("closed", exit::UNREACHABLE, "the host closed the connection")
+            })?;
+        Response::from_bytes(&frame).map_err(|e| {
+            Failure::new("decode", exit::ERROR, format!("undecodable host reply: {e}"))
+        })
+    }
+}
+
+/// Whether a frame is an unsolicited push (live stream traffic) rather than
+/// the reply to an outstanding request. The variant IS the demux key — the
+/// protocol deliberately uses distinct variants for pushes (`Event` vs the
+/// `Events` reply, `SessionsChanged` vs `Sessions`) for exactly this test.
+pub fn is_push(resp: &Response) -> bool {
+    matches!(
+        resp,
+        Response::Event(_)
+            | Response::SessionsChanged(_)
+            | Response::TermOutput { .. }
+            | Response::TermGapped { .. }
+            | Response::TermExited { .. }
+    )
 }
 
 fn timed_out(what: &str) -> Failure {
@@ -180,6 +221,11 @@ pub fn rpc_failure(err: oximux_remote_proto::proto::RpcError) -> Failure {
             Failure::new("unknown-session", exit::ERROR, "no such session on this host")
                 .with_steps(["run `oximux ls` to list sessions".into()])
         }
+        RpcError::Unsupported => Failure::new(
+            "unsupported",
+            exit::ERROR,
+            "this host does not offer that capability",
+        ),
         other => Failure::new("rpc", exit::ERROR, format!("host error: {other:?}")),
     }
 }

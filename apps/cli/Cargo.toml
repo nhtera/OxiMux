@@ -24,7 +24,11 @@ path = "src/main.rs"
 [dependencies]
 oximux-remote-local = { workspace = true }
 oximux-remote-proto = { workspace = true }
+# The ThreadEvent/ThreadEntry vocabulary the renderer folds — gpui-free by
+# construction (it is what remote-proto itself carries).
+oximux-agent-core = { workspace = true }
 clap = { workspace = true }
+crossterm = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -35,4 +39,5 @@ anyhow = { workspace = true }
 # the compiled binary against it.
 oximux-remote-host = { workspace = true }
 oximux-agents = { workspace = true }
+async-trait = { workspace = true }
 tempfile = { workspace = true }
