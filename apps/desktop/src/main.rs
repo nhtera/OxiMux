@@ -462,11 +462,26 @@ fn main() {
         {
             let (schedule_events, _) = tokio::sync::broadcast::channel(64);
             remote_control.set_schedule_events(schedule_events.clone());
+            // The orphan-sweep predicate: what this desktop's storage counts
+            // as an existing session — a persisted tab in the primary
+            // window's layout OR a transcript blob (a serve-created session
+            // in the shared data dir leaves only the blob).
+            let sweep_settings = app_state.settings_repo().clone();
+            let sweep_projects = app_state.project_repo();
+            let session_exists = move |sid: &str| {
+                oximux_app::remote_control::session_catalog::session_known_in_storage(
+                    &sweep_settings,
+                    &sweep_projects,
+                    oximux_app::window_registry::PRIMARY_WINDOW_ID,
+                    sid,
+                )
+            };
             if let Some(ticker) = oximux_app::scheduler::install(
                 app_state.schedule_store(),
                 bridge_launcher,
                 app_paths::data_dir(),
                 schedule_events,
+                session_exists,
                 cx,
             ) {
                 remote_control.set_schedule_runner(std::sync::Arc::new(

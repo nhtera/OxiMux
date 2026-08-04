@@ -147,6 +147,7 @@ pub fn install(
     launcher: BridgeLauncher,
     data_dir: Option<std::path::PathBuf>,
     run_events: tokio::sync::broadcast::Sender<ScheduleRunWire>,
+    session_exists: impl Fn(&str) -> bool,
     cx: &mut gpui::App,
 ) -> Option<Arc<Ticker>> {
     // In practice always present — storage opened from this same directory
@@ -186,6 +187,16 @@ pub fn install(
         Ok(0) => {}
         Ok(n) => tracing::info!(runs = n, "schedule ticker: settled interrupted runs from last boot"),
         Err(err) => tracing::warn!(%err, "schedule ticker: could not recover interrupted runs"),
+    }
+    // Same lock-holder rule for the orphan sweep: a schedule aimed at a
+    // session this host no longer has is disabled and surfaced in its run
+    // history, never silently skipped every tick.
+    match store.sweep_orphaned_targets(Local::now(), session_exists) {
+        Ok(ids) if ids.is_empty() => {}
+        Ok(ids) => {
+            tracing::warn!(?ids, "schedule ticker: disabled schedules whose target sessions are gone")
+        }
+        Err(err) => tracing::warn!(%err, "schedule ticker: orphaned-schedule sweep failed"),
     }
 
     let firer =
