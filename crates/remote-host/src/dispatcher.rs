@@ -22,6 +22,8 @@ mod schedules;
 mod serve;
 mod stream;
 mod transcribe;
+mod transcript_page;
+mod worktree_rpcs;
 
 use std::sync::Arc;
 
@@ -116,6 +118,12 @@ pub struct Dispatcher {
     /// That is a degradation rather than a refusal — the sessions it can see all
     /// work — so unlike `launcher` this has no `Unauthorized` answer.
     catalog: Option<Arc<dyn crate::catalog::SessionCatalog>>,
+    /// The host's worktree management, when it exposes one. `None` answers an
+    /// **authorized** full-scope caller with `Unsupported` — a host that cannot
+    /// manage worktrees should say so rather than masquerade as a refusal —
+    /// while an unauthorized or under-scoped caller still gets `Unauthorized`
+    /// first, so the capability is not probeable without the scope to use it.
+    worktrees: Option<Arc<dyn crate::worktrees::WorktreeService>>,
     /// Wall clock (Unix seconds), injectable so tests are deterministic.
     now_secs: fn() -> u64,
 }
@@ -132,6 +140,7 @@ impl Dispatcher {
             schedules: None,
             transcriber: None,
             catalog: None,
+            worktrees: None,
             now_secs: system_now_secs,
         }
     }
@@ -182,6 +191,15 @@ impl Dispatcher {
         transcriber: Arc<dyn crate::transcribe::AudioTranscriber>,
     ) -> Self {
         self.transcriber = Some(transcriber);
+        self
+    }
+
+    /// Let this dispatcher manage the host's worktrees.
+    pub fn with_worktrees(
+        mut self,
+        worktrees: Arc<dyn crate::worktrees::WorktreeService>,
+    ) -> Self {
+        self.worktrees = Some(worktrees);
         self
     }
 
@@ -237,6 +255,9 @@ impl Dispatcher {
             Request::ListSessions => self.list_sessions(peer),
             Request::GetSessionInfo { session_id } => self.session_info(peer, &session_id),
             Request::FetchTranscript { session_id } => self.fetch_transcript(peer, &session_id),
+            Request::FetchTranscriptPage { session_id, cursor, limit } => {
+                self.fetch_transcript_page(peer, &session_id, cursor, limit)
+            }
             Request::SendPrompt(r) => self.send_prompt(peer, r),
             Request::ResolvePermission(r) => self.resolve_permission(peer, r),
             Request::AnswerQuestion(r) => self.answer_question(peer, r),

@@ -411,6 +411,30 @@ impl Dispatcher {
                 self.rewind_session(&peer, &session_id, ordinal as usize, include_files).await;
             return self.send(transport, response).await;
         }
+        // The worktree RPCs delegate to the app's service, which shells out to
+        // git — async and awaited here, exactly as the git RPCs are. Their own
+        // handlers apply the dedicated full-scope worktree gates.
+        if let Request::CreateWorktree { project_path, slug } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.create_worktree(&peer, &project_path, &slug).await;
+            return self.send(transport, response).await;
+        }
+        if let Request::ListWorktrees { project_path } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.list_worktrees(&peer, project_path.as_deref()).await;
+            return self.send(transport, response).await;
+        }
+        if let Request::RemoveWorktree { id } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.remove_worktree(&peer, &id).await;
+            return self.send(transport, response).await;
+        }
         // Transcription runs a CPU-heavy ONNX decode, so its handler is async (it
         // `spawn_blocking`s the decode) and is awaited here rather than in the
         // sync `dispatch`. Gated on the authenticated connection alone — it names

@@ -169,6 +169,50 @@ impl AuthStore {
         }
     }
 
+    /// May this device list a project's worktrees?
+    ///
+    /// Full scope, for the reason [`may_read_schedules`](Self::may_read_schedules)
+    /// requires it: a worktree names no session, so a session-scoped device has
+    /// nothing to be narrowed against, and worktree rows carry host paths and
+    /// branch names across every project — precisely what a confined device must
+    /// not enumerate. Reading changes nothing, so a read-only full device is
+    /// admitted.
+    pub fn may_read_worktrees(&self, peer: &Peer) -> bool {
+        match peer.kind() {
+            PeerKind::Local(scope) => scope.is_full(),
+            PeerKind::Remote(pubkey) => {
+                let st = self.inner.lock().unwrap();
+                matches!(
+                    st.devices.get(pubkey),
+                    Some(d) if !d.revoked && matches!(d.scope, DeviceScope::Full)
+                )
+            }
+        }
+    }
+
+    /// May this device create or remove a worktree?
+    ///
+    /// The same two gates as [`may_create_sessions`](Self::may_create_sessions),
+    /// and deliberately **never** routed through [`may_write`](Self::may_write):
+    /// these RPCs name no session, so the session-scoped gate would have nothing
+    /// to narrow against and the check would hold only by accident of a
+    /// sentinel. Creating a worktree writes the filesystem and the repository
+    /// (a directory plus a branch), and removing one is destructive — full
+    /// scope stops a session-scoped device from minting itself a directory
+    /// outside its confinement; not-read-only stops a watcher from writing.
+    pub fn may_manage_worktrees(&self, peer: &Peer) -> bool {
+        match peer.kind() {
+            PeerKind::Local(scope) => scope.is_full(),
+            PeerKind::Remote(pubkey) => {
+                let st = self.inner.lock().unwrap();
+                matches!(
+                    st.devices.get(pubkey),
+                    Some(d) if !d.revoked && !d.read_only && matches!(d.scope, DeviceScope::Full)
+                )
+            }
+        }
+    }
+
     /// Every recorded device — the data behind the paired-devices list, its
     /// revoke/forget actions, and its read-only toggle.
     ///

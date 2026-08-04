@@ -23,6 +23,7 @@ pub mod rewind;
 pub mod terminals;
 pub mod transcribe;
 pub mod transcript_budget;
+pub mod worktrees;
 
 pub use auth::{
     AppPubkey, AuthStore, DeviceInfo, DeviceStore, LocalScope, PairedDevice, PairingEvent,
@@ -35,3 +36,4 @@ pub use projects::ProjectProvider;
 pub use rewind::{RewindError, RewindService};
 pub use terminals::{TerminalAttach, TerminalError, TerminalFrame, TerminalSource};
 pub use transcribe::{AudioTranscriber, TranscribeError};
+pub use worktrees::{WorktreeError, WorktreeService};
