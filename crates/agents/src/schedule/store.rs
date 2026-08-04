@@ -299,6 +299,15 @@ impl ScheduleStore {
     /// fire's row (its `fired_at` is a wall-clock instant, not the armed slot)
     /// leaves the cadence alone, exactly as its success would have.
     ///
+    /// The scheduled-vs-manual distinction is that timestamp equality, not a
+    /// stored discriminator. The one ambiguous case — a manual fire whose
+    /// wall-clock instant landed *exactly* on the armed slot — is recovered as
+    /// if scheduled, which is the safe reading either way: the schedule is
+    /// armed forward rather than left claimed-but-due, and the alternative
+    /// error (a real scheduled crash misread as manual) would wedge it. A
+    /// `kind` column becomes worth its migration only if manual fires ever
+    /// need distinct recovery semantics.
+    ///
     /// **Only the process that owns the ticker lock may call this** — a second
     /// host recovering rows the lock holder is actively firing would fail runs
     /// that are merely in progress.

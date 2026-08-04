@@ -129,7 +129,16 @@ impl ScheduleFirer for DesktopFirer {
 
 /// Contend for the ticker lock and, on winning, recover interrupted runs and
 /// start the tick loop. Returns the ticker (for the run-now RPC seam), or
-/// `None` when another process owns this data dir's scheduling.
+/// `None` when this process does not own this data dir's scheduling.
+///
+/// **No lock, no ticker — ever.** The tempting degraded mode ("tick unguarded
+/// when the lock errors") is wrong twice over: with another host actually
+/// holding the lock, an unguarded recovery would rewrite that host's in-flight
+/// runs to failed and advance their cadence out from under it; and an
+/// unguarded ticker *without* recovery would leave a crashed boot's `'running'`
+/// claims unsettled forever, wedging those schedules (always due, always
+/// "already ran"). So a lock error declines loudly, exactly like losing the
+/// contest — the same posture `oximux serve` takes.
 ///
 /// Ticks before the first sleep so a schedule that came due while the app was
 /// closed fires at boot rather than one [`TICK`] later.
@@ -140,38 +149,39 @@ pub fn install(
     run_events: tokio::sync::broadcast::Sender<ScheduleRunWire>,
     cx: &mut gpui::App,
 ) -> Option<Arc<Ticker>> {
-    // The lock decides who ticks. No data dir (an already-degraded boot) means
-    // no lock to take — proceed unguarded, matching the GUI guard's own
-    // degradation, rather than silently never scheduling.
-    let lock = match &data_dir {
-        Some(dir) => match oximux_single_instance::try_acquire(&dir.join(TICKER_LOCK_FILENAME)) {
-            Ok(oximux_single_instance::AcquireOutcome::Acquired(guard)) => Some(guard),
-            Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder_pid }) => {
-                // One line, once — a repeating warning would train users to
-                // ignore it, and this is the *expected* state on a machine
-                // running both hosts.
-                let holder = holder_pid
-                    .map(|p| format!("process {p}"))
-                    .unwrap_or_else(|| "another OxiMux process".into());
-                tracing::info!(
-                    "schedule ticker: {holder} owns scheduling for this data dir; \
-                     schedules will fire from there"
-                );
-                return None;
-            }
-            Err(err) => {
-                tracing::warn!(%err, "schedule ticker: lock failed; ticking unguarded");
-                None
-            }
-        },
-        None => {
-            tracing::warn!("schedule ticker: no data dir; ticking unguarded");
-            None
+    // In practice always present — storage opened from this same directory
+    // earlier in boot — but the signature is honest about the platform API.
+    let Some(dir) = &data_dir else {
+        tracing::warn!("schedule ticker: no data dir; schedules will not fire from this process");
+        return None;
+    };
+    let lock = match oximux_single_instance::try_acquire(&dir.join(TICKER_LOCK_FILENAME)) {
+        Ok(oximux_single_instance::AcquireOutcome::Acquired(guard)) => guard,
+        Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder_pid }) => {
+            // One line, once — a repeating warning would train users to
+            // ignore it, and this is the *expected* state on a machine
+            // running both hosts.
+            let holder = holder_pid
+                .map(|p| format!("process {p}"))
+                .unwrap_or_else(|| "another OxiMux process".into());
+            tracing::info!(
+                "schedule ticker: {holder} owns scheduling for this data dir; \
+                 schedules will fire from there"
+            );
+            return None;
+        }
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                "schedule ticker: lock failed; schedules will not fire from this process"
+            );
+            return None;
         }
     };
 
     // Only the lock holder may recover: failing a run another process is
-    // actively firing would be worse than leaving it.
+    // actively firing would be worse than leaving it. Reached only with the
+    // lock in hand — see the doc comment.
     match store.recover_interrupted(Local::now()) {
         Ok(0) => {}
         Ok(n) => tracing::info!(runs = n, "schedule ticker: settled interrupted runs from last boot"),
