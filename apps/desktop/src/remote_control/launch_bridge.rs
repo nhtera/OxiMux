@@ -20,6 +20,10 @@ use tokio::sync::{mpsc, oneshot};
 pub struct LaunchRequest {
     pub cwd: String,
     pub agent_id: Option<String>,
+    /// Sent as the session's first message once it opens. Remote launches pass
+    /// `None` (an empty session for the phone to type into); the scheduler
+    /// passes its schedule's prompt.
+    pub initial_prompt: Option<String>,
     /// The new session's id, or why it could not be opened.
     ///
     /// A oneshot rather than a fire-and-forget send because the RPC contract
@@ -36,9 +40,39 @@ pub struct LaunchRequest {
 /// honest: the desktop is not keeping up.
 const QUEUE: usize = 4;
 
-/// The dispatcher's end of the bridge.
+/// The dispatcher's end of the bridge. Cloneable so the scheduler's firer can
+/// share the same queue the remote launcher uses — one GPUI drain loop serves
+/// both.
+#[derive(Clone)]
 pub struct BridgeLauncher {
     tx: mpsc::Sender<LaunchRequest>,
+}
+
+impl BridgeLauncher {
+    /// Open a session, optionally seeding its first message — the scheduler's
+    /// entry point. The plain [`SessionLauncher::create`] delegates here with
+    /// no prompt.
+    pub async fn create_with_prompt(
+        &self,
+        cwd: &str,
+        agent_id: Option<&str>,
+        initial_prompt: Option<String>,
+    ) -> Result<String, LaunchError> {
+        let (reply, answer) = oneshot::channel();
+        let request = LaunchRequest {
+            cwd: cwd.to_string(),
+            agent_id: agent_id.map(str::to_string),
+            initial_prompt,
+            reply,
+        };
+        // `try_send` rather than `send`: a full queue or a dropped receiver
+        // should fail now, not park the caller forever. The caller gets an
+        // answer either way.
+        self.tx.try_send(request).map_err(|_| LaunchError::Unavailable)?;
+        // A dropped sender means the UI side gave up without replying — treat it
+        // as a failure rather than hanging, since nothing else will ever answer.
+        answer.await.map_err(|_| LaunchError::Unavailable)?
+    }
 }
 
 /// Build both ends. The receiver is drained by the GPUI side; dropping it makes
@@ -52,19 +86,7 @@ pub fn launch_bridge() -> (BridgeLauncher, mpsc::Receiver<LaunchRequest>) {
 #[async_trait::async_trait]
 impl SessionLauncher for BridgeLauncher {
     async fn create(&self, cwd: &str, agent_id: Option<&str>) -> Result<String, LaunchError> {
-        let (reply, answer) = oneshot::channel();
-        let request = LaunchRequest {
-            cwd: cwd.to_string(),
-            agent_id: agent_id.map(str::to_string),
-            reply,
-        };
-        // `try_send` rather than `send`: a full queue or a dropped receiver
-        // should fail now, not park this RPC forever holding the connection's
-        // request slot. The client gets an answer either way.
-        self.tx.try_send(request).map_err(|_| LaunchError::Unavailable)?;
-        // A dropped sender means the UI side gave up without replying — treat it
-        // as a failure rather than hanging, since nothing else will ever answer.
-        answer.await.map_err(|_| LaunchError::Unavailable)?
+        self.create_with_prompt(cwd, agent_id, None).await
     }
 }
 
@@ -116,10 +138,9 @@ pub fn serve_launches(rx: tokio::sync::mpsc::Receiver<LaunchRequest>, cx: &mut g
             // for is already open either way.
             // Split before sending: `send` consumes the reply channel, so the
             // request cannot still be borrowed by the closure at that point.
-            let LaunchRequest { cwd, agent_id, reply } = request;
-            // Remote launches open an empty session; only the scheduler seeds a
-            // first prompt.
-            let opened = cx.update(|cx| open_session(&cwd, agent_id.as_deref(), None, cx));
+            let LaunchRequest { cwd, agent_id, initial_prompt, reply } = request;
+            let opened =
+                cx.update(|cx| open_session(&cwd, agent_id.as_deref(), initial_prompt, cx));
             let _ = reply.send(opened);
         }
     })

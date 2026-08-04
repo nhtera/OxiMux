@@ -230,6 +230,15 @@ pub struct RemoteControl {
     /// the worktree RPCs with `Unsupported` for an authorized full-scope caller
     /// (the dispatcher still answers `Unauthorized` first for anyone else).
     worktrees: Option<Arc<dyn oximux_remote_host::WorktreeService>>,
+    /// The manual-fire path, installed only when this desktop won the ticker
+    /// lock. `None` answers `RunScheduleNow` with `Unsupported` for an
+    /// authorized caller — the schedules still fire, just from the process
+    /// that owns them.
+    schedule_runner: Option<Arc<dyn oximux_remote_host::ScheduleRunner>>,
+    /// Recorded schedule runs, fanned out to session-list subscribers. The
+    /// sender is shared with the ticker's recorded-run hook.
+    schedule_events:
+        Option<tokio::sync::broadcast::Sender<oximux_remote_proto::messages::ScheduleRunWire>>,
     /// The index of persisted-but-unbuilt sessions, so a client is not limited to
     /// the projects the desktop has happened to show this run.
     catalog: Option<Arc<dyn oximux_remote_host::catalog::SessionCatalog>>,
@@ -283,6 +292,8 @@ impl RemoteControl {
             transcriber: None,
             projects: None,
             worktrees: None,
+            schedule_runner: None,
+            schedule_events: None,
             catalog: None,
             auth: Mutex::new(None),
             awake: Mutex::new(None),
@@ -350,6 +361,19 @@ impl RemoteControl {
         worktrees: Arc<dyn oximux_remote_host::WorktreeService>,
     ) {
         self.worktrees = Some(worktrees);
+    }
+
+    /// Serve `RunScheduleNow` — installed only by the ticker-lock winner.
+    pub fn set_schedule_runner(&mut self, runner: Arc<dyn oximux_remote_host::ScheduleRunner>) {
+        self.schedule_runner = Some(runner);
+    }
+
+    /// Fan recorded schedule runs out to session-list subscribers.
+    pub fn set_schedule_events(
+        &mut self,
+        events: tokio::sync::broadcast::Sender<oximux_remote_proto::messages::ScheduleRunWire>,
+    ) {
+        self.schedule_events = Some(events);
     }
 
     /// Let the host see and open sessions whose views have not been built.
@@ -467,6 +491,12 @@ impl RemoteControl {
         }
         if let Some(worktrees) = &self.worktrees {
             dispatcher = dispatcher.with_worktrees(Arc::clone(worktrees));
+        }
+        if let Some(runner) = &self.schedule_runner {
+            dispatcher = dispatcher.with_schedule_runner(Arc::clone(runner));
+        }
+        if let Some(events) = &self.schedule_events {
+            dispatcher = dispatcher.with_schedule_events(events.clone());
         }
         dispatcher
     }

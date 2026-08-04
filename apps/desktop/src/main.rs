@@ -429,11 +429,15 @@ fn main() {
         // its id. Installed unconditionally — a host that never enables remote
         // access simply never receives a request, and wiring it later would mean
         // remote could be switched on before the launcher existed.
-        {
+        let bridge_launcher = {
             let (launcher, requests) = oximux_app::remote_control::launch_bridge::launch_bridge();
+            // A clone of the same queue for the scheduler's firer below — one
+            // GPUI drain loop serves phone launches and scheduled fires alike.
+            let for_scheduler = launcher.clone();
             remote_control.set_launcher(std::sync::Arc::new(launcher));
             oximux_app::remote_control::launch_bridge::serve_launches(requests, cx);
-        }
+            for_scheduler
+        };
         // The same inbound shape for rewinds: the request crosses to this loop,
         // which finds the tab holding that session and starts its rewind.
         // Installed unconditionally, for the same reason as the launcher.
@@ -448,6 +452,28 @@ fn main() {
         // handed over directly rather than through a bridge, unlike the launcher
         // and rewinder above.
         remote_control.set_schedule_store(std::sync::Arc::new(app_state.schedule_store()));
+        // The scheduled-run ticker. Installed unconditionally when this process
+        // wins the data dir's ticker lock: with no schedules it costs one
+        // indexed read every tick and takes no keep-awake hold, and gating it
+        // on "are there any schedules" would mean the first one created never
+        // fires until the next launch. Losing the lock (a headless host is
+        // serving this data dir) means schedules fire from there instead, and
+        // run-now correctly answers Unsupported here.
+        {
+            let (schedule_events, _) = tokio::sync::broadcast::channel(64);
+            remote_control.set_schedule_events(schedule_events.clone());
+            if let Some(ticker) = oximux_app::scheduler::install(
+                app_state.schedule_store(),
+                bridge_launcher,
+                app_paths::data_dir(),
+                schedule_events,
+                cx,
+            ) {
+                remote_control.set_schedule_runner(std::sync::Arc::new(
+                    oximux_remote_host::TickerRunner(ticker),
+                ));
+            }
+        }
         // Projects the phone can start a session in without typing a path: the same
         // recent-projects store the desktop sidebar lists, read directly (no UI hop)
         // since it is durable data, not live view state.
@@ -540,11 +566,9 @@ fn main() {
         if local_was_on {
             oximux_app::remote_control::RemoteControl::start_local(cx);
         }
-        // Start the scheduled-run ticker. Installed unconditionally: with no
-        // schedules it costs one indexed read every tick and takes no keep-awake
-        // hold, and gating it on "are there any schedules" would mean the first
-        // one created never fires until the next launch.
-        oximux_app::scheduler::Scheduler::install(app_state.schedule_store(), cx);
+        // (The scheduled-run ticker is installed above, beside the launch
+        // bridge it fires through — before `remote_control` is frozen into a
+        // global, so the run-now seam could be wired into it.)
         // Auto-update: recovers from an interrupted swap, sweeps crash
         // leftovers, then checks periodically. Staging only — the swap itself
         // happens at quit, so the running workspace is never disturbed.

@@ -50,6 +50,12 @@ pub(super) enum Live {
     /// events. Low-frequency and coalesced by the registry's generation counter, so
     /// it never floods the merge the way a full-screen terminal repaint would.
     SessionList,
+    /// A schedule run was recorded (scheduled or manual, success or failure).
+    /// Carries the run itself: unlike [`Live::SessionList`] there is no cheap
+    /// snapshot to recompute at forward time, and the payload is one small row.
+    /// Forwarded as [`Response::ScheduleRunsChanged`] behind a per-frame
+    /// `may_read_schedules` recheck.
+    ScheduleRun(oximux_remote_proto::messages::ScheduleRunWire),
 }
 
 /// Turn a session's broadcast receiver into a `'static` stream of [`LiveFrame`]s.
@@ -126,6 +132,25 @@ fn sessions_stream(rx: watch::Receiver<u64>) -> BoxStream<'static, Live> {
         match rx.changed().await {
             Ok(()) => Some((Live::SessionList, rx)),
             Err(_) => None,
+        }
+    })
+    .boxed()
+}
+
+/// Turn a recorded-runs broadcast receiver into a `'static` stream of
+/// [`Live::ScheduleRun`]s. Lag skips the dropped runs rather than ending —
+/// they are still in run history, and `schedule logs` is the resync path. The
+/// stream ends when the host drops the sender.
+fn schedule_runs_stream(
+    rx: broadcast::Receiver<oximux_remote_proto::messages::ScheduleRunWire>,
+) -> BoxStream<'static, Live> {
+    stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(run) => return Some((Live::ScheduleRun(run), rx)),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
         }
     })
     .boxed()
@@ -306,6 +331,36 @@ impl Dispatcher {
         transport
             .send(
                 Response::SessionsChanged(snapshot)
+                    .to_bytes()
+                    .expect("response is always encodable"),
+            )
+            .await
+            .is_ok()
+    }
+
+    /// The recorded-runs push stream for one connection, when this host has a
+    /// schedule-events channel at all. The caller gates on the peer's declared
+    /// protocol version — an older peer cannot decode the push frame.
+    pub(super) fn schedule_runs_push_stream(&self) -> Option<BoxStream<'static, Live>> {
+        Some(schedule_runs_stream(self.schedule_events.as_ref()?.subscribe()))
+    }
+
+    /// Push one recorded run, behind the same per-frame authorization recheck
+    /// every live surface applies: a device that may not read schedules gets
+    /// silence, not a filtered-out error. Returns whether the transport is
+    /// still writable.
+    pub(super) async fn forward_schedule_run(
+        &self,
+        peer: &Peer,
+        transport: &dyn Transport,
+        run: oximux_remote_proto::messages::ScheduleRunWire,
+    ) -> bool {
+        if !self.auth.may_read_schedules(peer) {
+            return true;
+        }
+        transport
+            .send(
+                Response::ScheduleRunsChanged(run)
                     .to_bytes()
                     .expect("response is always encodable"),
             )

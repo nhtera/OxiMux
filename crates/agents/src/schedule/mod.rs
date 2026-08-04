@@ -16,6 +16,8 @@
 
 pub mod recurrence;
 pub mod store;
+pub mod ticker;
 
 pub use recurrence::{Recurrence, RecurrenceError, describe};
-pub use store::{NewSchedule, Schedule, ScheduleRun, ScheduleStore, RunOutcome};
+pub use store::{NewSchedule, Schedule, ScheduleRun, ScheduleStore, ScheduleTarget, RunOutcome};
+pub use ticker::{FireOutcome, RunNowError, ScheduleFirer, TICK, TICKER_LOCK_FILENAME, Ticker};

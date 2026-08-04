@@ -129,6 +129,18 @@ pub struct Dispatcher {
     /// `PairNew` on a host with no endpoint answers `Unsupported` — a ticket
     /// nobody can dial is not worth minting.
     pairing_endpoint: Option<[u8; 32]>,
+    /// The host's manual-fire path, when this process owns the ticker.
+    /// `None` answers an **authorized** caller with `Unsupported` — on a
+    /// desktop+serve box only the ticker-lock holder can fire, and the loser
+    /// saying so beats it pretending.
+    schedule_runner: Option<Arc<dyn crate::schedule_runner::ScheduleRunner>>,
+    /// Recorded schedule runs, fanned out to session-list subscribers as
+    /// [`Response::ScheduleRunsChanged`] pushes. The channel is created by the
+    /// host and shared with its ticker's recorded-run hook; `None` simply
+    /// pushes nothing.
+    schedule_events: Option<tokio::sync::broadcast::Sender<
+        oximux_remote_proto::messages::ScheduleRunWire,
+    >>,
     /// Wall clock (Unix seconds), injectable so tests are deterministic.
     now_secs: fn() -> u64,
 }
@@ -147,6 +159,8 @@ impl Dispatcher {
             catalog: None,
             worktrees: None,
             pairing_endpoint: None,
+            schedule_runner: None,
+            schedule_events: None,
             now_secs: system_now_secs,
         }
     }
@@ -212,6 +226,26 @@ impl Dispatcher {
     /// Name the endpoint pairing tickets dial, enabling `PairNew`.
     pub fn with_pairing_endpoint(mut self, endpoint_id: [u8; 32]) -> Self {
         self.pairing_endpoint = Some(endpoint_id);
+        self
+    }
+
+    /// Let this dispatcher fire schedules on demand — only the process that
+    /// owns the ticker lock installs one.
+    pub fn with_schedule_runner(
+        mut self,
+        runner: Arc<dyn crate::schedule_runner::ScheduleRunner>,
+    ) -> Self {
+        self.schedule_runner = Some(runner);
+        self
+    }
+
+    /// Fan recorded schedule runs out to session-list subscribers. The host
+    /// keeps the sender and feeds it from its ticker's recorded-run hook.
+    pub fn with_schedule_events(
+        mut self,
+        events: tokio::sync::broadcast::Sender<oximux_remote_proto::messages::ScheduleRunWire>,
+    ) -> Self {
+        self.schedule_events = Some(events);
         self
     }
 

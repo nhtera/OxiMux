@@ -166,6 +166,9 @@ impl Dispatcher {
                                 Live::SessionList => {
                                     self.forward_sessions(&peer, transport).await
                                 }
+                                Live::ScheduleRun(run) => {
+                                    self.forward_schedule_run(&peer, transport, run).await
+                                }
                             };
                             if !alive {
                                 break;
@@ -248,9 +251,20 @@ impl Dispatcher {
             let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
+            let fresh = !*sessions_subscribed;
             let (response, stream) = self.begin_subscribe_sessions(&peer, sessions_subscribed);
             if let Some(stream) = stream {
                 streams.push(stream);
+            }
+            // Recorded schedule runs ride the session-list subscription — but
+            // only for peers that declared a version that can decode the push
+            // frame; an older subscriber would drop the whole connection on
+            // the unknown ordinal. Opened once, like the sessions stream.
+            if fresh
+                && state.peer_version >= oximux_remote_proto::proto::SCHEDULE_PUSH_MIN_VERSION
+                && let Some(runs) = self.schedule_runs_push_stream()
+            {
+                streams.push(runs);
             }
             return self.send(transport, response).await;
         }
@@ -433,6 +447,16 @@ impl Dispatcher {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
             let response = self.remove_worktree(&peer, &id).await;
+            return self.send(transport, response).await;
+        }
+        // A manual fire spawns a session and waits for it to start, so it is
+        // async and awaited here like `CreateSession`. Its handler applies the
+        // schedule write gate on top of this authentication check.
+        if let Request::RunScheduleNow { schedule_id } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.run_schedule_now(&peer, &schedule_id).await;
             return self.send(transport, response).await;
         }
         // Transcription runs a CPU-heavy ONNX decode, so its handler is async (it

@@ -54,13 +54,26 @@ pub use crate::messages::*;
 /// needs (`PairNew`/`PairList`/`PairRemove` and the `PairingIssued`/
 /// `PairedDeviceList` replies) — runtime commands, never boot flags, so a
 /// bearer ticket is minted on demand instead of reprinted into a journal.
+/// v17: appended `RunScheduleNow` (a manual fire that never advances cadence
+/// accounting) with its `ScheduleRunRecorded` reply, and the
+/// `ScheduleRunsChanged` push — a recorded schedule run delivered to
+/// session-list subscribers so run results arrive without polling. The push is
+/// gated host-side on the peer having declared ≥ v17
+/// ([`SCHEDULE_PUSH_MIN_VERSION`]): unlike a new *reply* (only sent to a peer
+/// that asked), a push reaches peers that never opted in, and an older decoder
+/// meeting the unknown ordinal would drop the whole connection.
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 16;
+pub const PROTOCOL_VERSION: u32 = 17;
+
+/// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
+/// must not push it to a connection whose declared version is older — see the
+/// v17 note above for why pushes, uniquely, need this gate.
+pub const SCHEDULE_PUSH_MIN_VERSION: u32 = 17;
 
 /// The oldest peer version this build still speaks. **Raise this only on a
 /// genuinely breaking change** — a reordered/removed variant or an altered
@@ -464,6 +477,18 @@ pub enum Request {
     /// rather than revocation, so the device may pair again with a fresh
     /// ticket — revocation stays a desktop-UI act.
     PairRemove { pubkey: [u8; 32] },
+    /// Fire one schedule immediately, recording the run **without advancing
+    /// cadence accounting** — `next_fire_at` is untouched and the scheduled
+    /// occurrence still fires on time. Works on paused schedules too: an
+    /// explicit run-now outranks the pause, which only silences the clock.
+    ///
+    /// Same write gate as [`Request::CreateSchedule`] (full scope, not
+    /// read-only): this spawns a session. The reply is
+    /// [`Response::ScheduleRunRecorded`] with the settled run — the RPC waits
+    /// for the fire to start (or fail to), not for the agent turn to finish.
+    /// A host whose scheduling is owned by another process (the ticker lock
+    /// lost) answers [`RpcError::Unsupported`].
+    RunScheduleNow { schedule_id: String },
 }
 
 /// Host → client.
@@ -611,6 +636,16 @@ pub enum Response {
     PairingIssued(PairingIssuedWire),
     /// Reply to [`Request::PairList`].
     PairedDeviceList(Vec<PairedDeviceWire>),
+    /// Reply to [`Request::RunScheduleNow`] — the manual run as recorded,
+    /// success or failure (the failure detail rides in the run itself; an
+    /// `Error` reply is reserved for refusals, not fires that ran and failed).
+    ScheduleRunRecorded(ScheduleRunWire),
+    /// A schedule run **pushed** to session-list subscribers the moment it is
+    /// recorded, unsolicited — scheduled and manual fires alike, so a phone or
+    /// CLI watching the host learns a run's outcome without polling
+    /// [`Request::GetScheduleRuns`]. Only sent to peers that declared
+    /// ≥ [`SCHEDULE_PUSH_MIN_VERSION`] in their `Hello`.
+    ScheduleRunsChanged(ScheduleRunWire),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

@@ -179,6 +179,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "schedules",
         sql: include_str!("../migrations/V021__schedules.sql"),
     },
+    // V022 adds `schedules.target_session_id` — NULL fires a fresh session,
+    // a session id fires into that existing one. Additive, no backfill.
+    Migration {
+        version: 22,
+        name: "schedules_target_session",
+        sql: include_str!("../migrations/V022__schedules_target_session.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.

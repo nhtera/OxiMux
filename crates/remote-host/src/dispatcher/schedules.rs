@@ -16,12 +16,8 @@
 
 use chrono::{DateTime, Local, TimeZone};
 
-use oximux_agents::schedule::{
-    NewSchedule, Recurrence, RunOutcome, Schedule, ScheduleRun, describe,
-};
-use oximux_remote_proto::messages::{
-    RecurrenceWire, RunOutcomeWire, ScheduleRunWire, ScheduleWire,
-};
+use oximux_agents::schedule::{NewSchedule, Recurrence, Schedule, ScheduleRun, describe};
+use oximux_remote_proto::messages::{RecurrenceWire, ScheduleRunWire, ScheduleWire};
 use oximux_remote_proto::proto::{Response, RpcError};
 
 use super::Dispatcher;
@@ -128,6 +124,40 @@ impl Dispatcher {
         }
     }
 
+    /// Fire one schedule right now, without touching its cadence.
+    ///
+    /// Authorization first (the same write tier as creating a schedule — this
+    /// spawns a session), capability second: only the process holding the
+    /// ticker lock installs a runner, so on a desktop+serve box the loser
+    /// answers `Unsupported` to an *authorized* caller rather than racing the
+    /// owner. Refusals are `Error`s; a fire that ran and failed is a normal
+    /// [`Response::ScheduleRunRecorded`] whose run says what went wrong.
+    pub(super) async fn run_schedule_now(&self, peer: &Peer, schedule_id: &str) -> Response {
+        use crate::schedule_runner::RunNowError;
+
+        if !self.auth.may_manage_schedules(peer) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(runner) = self.schedule_runner.as_ref() else {
+            return Response::Error(RpcError::Unsupported);
+        };
+        match runner.run_now(schedule_id).await {
+            Ok(run) => Response::ScheduleRunRecorded(run),
+            Err(RunNowError::NoSuchSchedule) => {
+                Response::Error(RpcError::BadRequest("no such schedule".into()))
+            }
+            Err(RunNowError::AlreadyFiring) => {
+                Response::Error(RpcError::BadRequest("that schedule is already firing".into()))
+            }
+            Err(RunNowError::Unavailable) => Response::Error(RpcError::Internal(
+                "the host cannot start a session right now".into(),
+            )),
+            Err(RunNowError::Failed) => {
+                Response::Error(RpcError::Internal("could not record the run".into()))
+            }
+        }
+    }
+
     /// A schedule's recent run history, most recent first. A full-scope read.
     pub(super) fn schedule_runs(
         &self,
@@ -179,16 +209,7 @@ fn to_wire(s: &Schedule) -> ScheduleWire {
 }
 
 fn run_to_wire(r: &ScheduleRun) -> ScheduleRunWire {
-    ScheduleRunWire {
-        schedule_id: r.schedule_id.clone(),
-        fired_at: r.fired_at.to_rfc3339(),
-        outcome: match r.outcome {
-            RunOutcome::Ok => RunOutcomeWire::Ok,
-            RunOutcome::Failed => RunOutcomeWire::Failed,
-        },
-        session_id: r.session_id.clone(),
-        detail: r.detail.clone(),
-    }
+    crate::schedule_runner::schedule_run_to_wire(r)
 }
 
 fn recurrence_to_wire(r: &Recurrence) -> RecurrenceWire {

@@ -16,7 +16,7 @@ fn value_bearing_event() -> ThreadEvent {
 /// documented wire change, so an accidental edit fails here.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 16, "v16 = the appended CLI working set");
+    assert_eq!(PROTOCOL_VERSION, 17, "v17 = RunScheduleNow + the schedule-run push");
 }
 
 /// The floor moves only on a genuinely breaking change, never merely because
@@ -359,4 +359,17 @@ fn early_variants_keep_their_literal_ordinals() {
     });
     assert_eq!(issued.to_bytes().expect("encode")[0], 34);
     assert_eq!(Response::PairedDeviceList(vec![]).to_bytes().expect("encode")[0], 35);
+    // The v17 schedule tail: `RunScheduleNow` (index 49); its reply
+    // `ScheduleRunRecorded` (36) and the `ScheduleRunsChanged` push (37).
+    let run_now = Request::RunScheduleNow { schedule_id: "sch-1".into() };
+    assert_eq!(run_now.to_bytes().expect("encode")[0], 49);
+    let run = ScheduleRunWire {
+        schedule_id: String::new(),
+        fired_at: String::new(),
+        outcome: RunOutcomeWire::Ok,
+        session_id: None,
+        detail: None,
+    };
+    assert_eq!(Response::ScheduleRunRecorded(run.clone()).to_bytes().expect("encode")[0], 36);
+    assert_eq!(Response::ScheduleRunsChanged(run).to_bytes().expect("encode")[0], 37);
 }

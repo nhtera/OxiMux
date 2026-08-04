@@ -390,7 +390,11 @@ fn a_v15_peer_still_gets_the_legacy_transcript_fetch() {
         else {
             panic!("expected HelloAck");
         };
-        assert_eq!(ack.protocol_version, 16, "the host announces v16");
+        assert_eq!(
+            ack.protocol_version,
+            oximux_remote_proto::proto::PROTOCOL_VERSION,
+            "the host announces its current version"
+        );
         assert_eq!(ack.min_compatible, 1, "and still serves back to v1");
         let Response::SessionTranscript(t) =
             call(&client, Request::FetchTranscript { session_id: "s".into() }).await
