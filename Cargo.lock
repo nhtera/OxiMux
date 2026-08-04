@@ -7080,7 +7080,7 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "oximux-agent-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -7089,7 +7089,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-agents"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -7123,7 +7123,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-app"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "aes",
  "anyhow",
@@ -7202,7 +7202,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-auto-update"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "oximux-macos-trust",
  "rand 0.8.6",
@@ -7217,7 +7217,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-cli"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7267,7 +7267,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-computer-use"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "base64",
  "fd-lock",
@@ -7288,7 +7288,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -7296,7 +7296,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-dictation"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "cpal",
@@ -7314,7 +7314,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-editor"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "gpui",
@@ -7336,7 +7336,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-git"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "futures",
  "oximux-core",
@@ -7352,14 +7352,14 @@ dependencies = [
 
 [[package]]
 name = "oximux-job-object"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "oximux-macos-trust"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "libc",
  "tempfile",
@@ -7368,7 +7368,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-mobile-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7388,14 +7388,14 @@ dependencies = [
 
 [[package]]
 name = "oximux-no-window"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "oximux-owner-only"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "tempfile",
  "widestring",
@@ -7404,7 +7404,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-proc-cwd"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "libc",
  "tempfile",
@@ -7412,7 +7412,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-pty"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -7424,7 +7424,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-relay"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -7452,7 +7452,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-relay-client"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -7471,7 +7471,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-relay-proto"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bincode 2.0.1",
  "hmac",
@@ -7482,7 +7482,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-relay-supervisor"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "libc",
@@ -7499,7 +7499,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-relay-terminals"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "oximux-relay-client",
@@ -7512,7 +7512,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-remote-host"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7539,7 +7539,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-remote-iroh"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7556,7 +7556,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-remote-local"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7577,7 +7577,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-remote-proto"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base64",
@@ -7593,7 +7593,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-remote-session"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7611,7 +7611,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-settings"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "dunce",
@@ -7623,7 +7623,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-shell-env"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "portable-pty",
  "which 6.0.3",
@@ -7631,7 +7631,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-single-instance"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "fd-lock",
  "tempfile",
@@ -7639,7 +7639,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-storage"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7653,7 +7653,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-ui"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "gpui",
  "gpui-component",
@@ -13779,7 +13779,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "image",

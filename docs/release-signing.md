@@ -135,8 +135,30 @@ there is no way to check the signature without minisign installed.
 ## Homebrew
 
 `scripts/gen-homebrew-formula.sh` generates the formula from the signed
-manifest, and the release workflow attaches `oximux.rb` to the release.
-Publishing it to a tap is a manual copy for now.
+manifest, and `release-manifest` attaches `oximux.rb` to the release.
+`.github/workflows/publish-tap.yml` then commits it to `nhtera/homebrew-tap`.
+
+**That second workflow fires on `release: published`, not when the release is
+built.** `release.yml` produces a *draft*, and GitHub serves none of a draft's
+assets — `releases/latest/download/...` skips drafts entirely, and the per-tag
+URLs 404 for everyone but the author. A formula pushed at build time would
+point at files nobody could download. Publishing the draft is therefore the
+event that makes the formula's URLs real, which is exactly when it should land.
+
+It needs a secret `GITHUB_TOKEN` cannot stand in for, because that token is
+scoped to this repository alone:
+
+    TAP_PUSH_TOKEN   a fine-grained PAT with Contents: read and write on
+                     nhtera/homebrew-tap ONLY
+
+Scope it to that one repository. It exists to commit a single `.rb` file, and
+anything wider is reachable by any workflow run in this repo. Without the
+secret the job warns and succeeds, and the formula stays a manual copy:
+
+```bash
+gh release download v0.1.7 --pattern oximux.rb
+# then commit oximux.rb to nhtera/homebrew-tap
+```
 
 Homebrew has no notion of the minisign signature. What it inherits is that the
 digests in the formula were signed at release time rather than recomputed later

@@ -532,8 +532,9 @@ jobs:
 
       # Attached to the release rather than committed: every field but the name
       # is release-specific, so a checked-in formula is stale the moment it is
-      # written. Publishing it to the tap is still a manual copy — see
-      # docs/release-signing.md.
+      # written. publish-tap.yml commits it to the tap when this release is
+      # PUBLISHED — not here, because a draft's assets are not downloadable and
+      # the formula's URLs would 404 until someone published it by hand.
       - name: Generate the Homebrew formula
         run: |
           set -euo pipefail
