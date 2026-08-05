@@ -251,6 +251,38 @@ fn removing_an_unreachable_host_still_clears_it_locally_and_says_so() {
     assert!(!toml.contains("default"), "the default was cleared: {toml}");
 }
 
+/// The config directory and the hosts file are owner-only after a write.
+///
+/// Same reason `oximux serve` hardens its data dir, and the same deployment:
+/// a shared server is exactly where other accounts exist. The signing keys
+/// beside this file were already 0600 and readback-verified, so what an open
+/// directory leaked was not the credential but the fleet — which hosts this
+/// account is paired with, under what names, at which endpoint ids.
+///
+/// `create_dir_all` applies the umask, which on a typical box leaves 0755, so
+/// this only holds because the write path restricts it explicitly.
+#[cfg(unix)]
+#[test]
+fn the_config_directory_and_hosts_file_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config");
+    write_unreachable_host(&config, "offsite", true);
+
+    // A verb that WRITES the hosts file — the seeding helper above uses plain
+    // `fs::write`, so asserting before this would test the fixture, not the code.
+    let out = bin(&config, dir.path()).args(["--json", "hosts", "rm", "offsite"]).output().unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+
+    let dir_mode = std::fs::metadata(&config).unwrap().permissions().mode() & 0o777;
+    assert_eq!(dir_mode, 0o700, "config dir is {dir_mode:o}, want 700");
+
+    let file = config.join("hosts.toml");
+    let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+    assert_eq!(file_mode & 0o077, 0, "hosts.toml is {file_mode:o} — readable off-owner");
+}
+
 #[test]
 fn removing_a_host_that_was_never_paired_is_a_usage_error() {
     let dir = tempfile::tempdir().unwrap();

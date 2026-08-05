@@ -94,10 +94,29 @@ impl HostsFile {
 
     pub fn save(&self, dir: &Path) -> Result<(), Failure> {
         std::fs::create_dir_all(dir).map_err(|e| read_error("create", dir, e))?;
+        // Owner-only, for the same reason `oximux serve` hardens its data dir:
+        // a shared server is exactly where other accounts exist. `create_dir_all`
+        // above applies the umask, which on a typical box leaves this 0755.
+        //
+        // The signing keys beside this file are already 0600 and readback-
+        // verified, so what an open directory exposes is not the credential but
+        // the fleet: which hosts this account is paired with, under what names,
+        // at which endpoint ids. Worth closing, and cheap.
+        //
+        // Best-effort: a config directory that cannot be restricted must not
+        // stop the CLI from working, unlike a key file, where the same failure
+        // is fatal by design.
+        if let Err(err) = oximux_owner_only::prepare_owner_only_dir(dir) {
+            tracing::debug!(%err, dir = %dir.display(), "could not restrict the config directory");
+        }
         let path = dir.join(HOSTS_FILE);
         let text = toml::to_string_pretty(self)
             .map_err(|e| read_error("encode", &path, e))?;
-        std::fs::write(&path, text).map_err(|e| read_error("write", &path, e))
+        std::fs::write(&path, text).map_err(|e| read_error("write", &path, e))?;
+        if let Err(err) = oximux_owner_only::restrict_file(&path) {
+            tracing::debug!(%err, file = %path.display(), "could not restrict the hosts file");
+        }
+        Ok(())
     }
 
     pub fn get(&self, name: &str) -> Option<&HostEntry> {
