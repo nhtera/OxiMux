@@ -269,6 +269,23 @@ impl ServeUnderTest {
     }
 }
 
+/// The backstop, for every test that never reaches its explicit stop.
+///
+/// `kill_hard`/`stop_gracefully` are the last line of a test body, so an
+/// assertion failure, a panic, or an interrupted `cargo test` skipped them and
+/// orphaned a live `oximux serve` — one holding a socket and a SQLite handle
+/// against a temp dir already deleted. CI hides it (fresh container per job);
+/// developer machines collected them, seven alive on one, the oldest 11 hours.
+///
+/// Idempotent with the explicit stops: `Child::kill` is a no-op once the child
+/// has been waited on, so this cannot signal a recycled pid.
+impl Drop for ServeUnderTest {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// A client invocation against `runtime_dir`, in JSON mode.
 pub fn cli(runtime_dir: &Path) -> Command {
     let mut cmd = bin();

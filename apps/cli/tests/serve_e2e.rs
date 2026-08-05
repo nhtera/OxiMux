@@ -118,6 +118,25 @@ impl ServeUnderTest {
     }
 }
 
+/// The backstop. Every test below ends with an explicit `stop_hard` or
+/// `stop_gracefully` — but those are the LAST line of each test body, so a
+/// failed assertion, a panic, or a Ctrl+C'd `cargo test` skipped them entirely
+/// and left a real `oximux serve` running forever, holding a socket and a
+/// SQLite handle against a temp dir that had already been deleted.
+///
+/// CI never noticed (each job is a fresh container); developer machines
+/// accumulated them — seven were found alive on one, the oldest 11 hours.
+///
+/// Safe to run after an explicit stop: `Child::kill` is a no-op once the child
+/// has been waited on (std records the status and will not signal a pid it no
+/// longer owns), so the double-stop cannot reach a recycled pid.
+impl Drop for ServeUnderTest {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// Seed the storage a desktop-created session leaves behind: one chat blob
 /// under the settings key the catalog scans.
 fn seed_session(data_dir: &Path, session_id: &str) {
