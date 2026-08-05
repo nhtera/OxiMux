@@ -280,6 +280,16 @@ jobs:
             # glibc it was linked against or newer, so the OLDEST supported
             # runner is the one that reaches the most machines.
             os: ubuntu-22.04
+          # ARM64 Linux is not optional: `scripts/install-cli.sh` resolves
+          # `uname -m` of aarch64/arm64 to exactly this triple, so without it
+          # the documented one-line install downloads a 404 on Graviton,
+          # Ampere, Oracle's ARM tier and a Pi — which is precisely the cheap
+          # always-on box a headless `oximux serve` belongs on. Native runner
+          # (free for public repos) rather than cross: the CLI links rusqlite's
+          # bundled sqlite and ring, both of which want a real target toolchain.
+          # Same oldest-glibc reasoning as the x86_64 arm above.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:

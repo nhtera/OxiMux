@@ -52,8 +52,10 @@ block_for() {
 macos_arm="$(block_for aarch64-apple-darwin '      ' || true)"
 macos_intel="$(block_for x86_64-apple-darwin '      ' || true)"
 linux_intel="$(block_for x86_64-unknown-linux-gnu '      ' || true)"
+linux_arm="$(block_for aarch64-unknown-linux-gnu '      ' || true)"
 
-if [ -z "$macos_arm" ] && [ -z "$macos_intel" ] && [ -z "$linux_intel" ]; then
+if [ -z "$macos_arm" ] && [ -z "$macos_intel" ] && [ -z "$linux_intel" ] \
+    && [ -z "$linux_arm" ]; then
     echo "error: the release has no Homebrew-installable target" >&2
     exit 1
 fi
@@ -85,11 +87,22 @@ if [ -n "$macos_arm" ] || [ -n "$macos_intel" ]; then
     echo
 fi
 
-if [ -n "$linux_intel" ]; then
+if [ -n "$linux_intel" ] || [ -n "$linux_arm" ]; then
     echo "  on_linux do"
-    echo "    on_intel do"
-    echo "$linux_intel"
-    echo "    end"
+    if [ -n "$linux_intel" ]; then
+        echo "    on_intel do"
+        echo "$linux_intel"
+        echo "    end"
+    fi
+    # Homebrew's own Linux/ARM support is unofficial, so this block may simply
+    # never be selected. It costs one stanza and it is generated from the same
+    # signed manifest as the rest; omitting it would make the generator warn
+    # about a build that does exist, which is the misleading direction.
+    if [ -n "$linux_arm" ]; then
+        echo "    on_arm do"
+        echo "$linux_arm"
+        echo "    end"
+    fi
     echo "  end"
     echo
 fi
