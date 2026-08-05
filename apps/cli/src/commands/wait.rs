@@ -45,6 +45,18 @@ fn scan(frames: &[oximux_remote_proto::messages::HostEvent]) -> ScanState {
     ScanState { done, last_seq }
 }
 
+/// Is a decision still outstanding on this session?
+///
+/// One `GetSessionInfo`, used only to settle the second half of `--until idle`
+/// after the stream has settled the first.
+async fn still_awaiting(client: &Client, session: &str) -> Result<bool, Failure> {
+    match client.call(Request::GetSessionInfo { session_id: session.into() }).await? {
+        Response::SessionInfo(info) => Ok(info.summary.awaiting_permission),
+        Response::Error(e) => Err(rpc_failure(e)),
+        other => Err(unexpected_reply("GetSessionInfo", &other)),
+    }
+}
+
 pub async fn run(
     client: &Client,
     session: &str,
@@ -102,6 +114,26 @@ pub async fn run(
     )
     .await?
     {
+        // `idle` is BOTH halves: done, and nothing awaiting a decision. The
+        // stream stops on the turn ending, which settles only the first — so
+        // the second is re-read here rather than assumed. Without this, a
+        // session carrying a pending request into the turn that just ended
+        // would be reported idle while a decision is still outstanding, and a
+        // script gated on `--until idle` would proceed against a blocked agent.
+        StreamEnd::TurnEnded { .. } if until == WaitUntil::Idle => {
+            if still_awaiting(client, session).await? {
+                return Err(Failure::new(
+                    "not-idle",
+                    exit::ERROR,
+                    "the turn ended but the session is awaiting a decision",
+                )
+                .with_steps([
+                    format!("`oximux permit ls {session}` shows what is pending"),
+                    "decide it, then wait again".into(),
+                ]));
+            }
+            reached("stream")
+        }
         StreamEnd::TurnEnded { .. } | StreamEnd::NeedsApproval => reached("stream"),
         StreamEnd::Deadline => Err(Failure::new(
             "timeout",
