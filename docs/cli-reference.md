@@ -113,7 +113,7 @@ Interrupt a session's in-flight turn. The session stays open
 
 ### `oximux steer`
 
-Redirect a mid-turn agent with additional guidance
+Redirect a mid-turn agent with additional guidance. Needs a backend with a mid-turn message queue; claude and codex have none and refuse it, so on those use `stop` and then `send`
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |

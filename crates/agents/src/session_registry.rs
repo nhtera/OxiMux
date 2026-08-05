@@ -32,8 +32,8 @@ use oximux_agent_core::redact::{scrub_transcript, ScreenshotFilter};
 use tokio::sync::{broadcast, watch};
 
 use crate::thread::{
-    AgentConnection, AskQuestion, ChatImage, ModeChoice, ModelChoice, PermissionDecision,
-    QuestionAnswers, ThreadEvent,
+    AgentCapabilities, AgentConnection, AskQuestion, ChatImage, ModeChoice, ModelChoice,
+    PermissionDecision, QuestionAnswers, ThreadEvent,
 };
 
 /// Session identity — the same `session_id` the transcript persists under.
@@ -354,6 +354,14 @@ impl SessionHandle {
     /// otherwise. Same transport as the desktop composer's steer.
     pub fn steer(&self, text: &str) -> Result<()> {
         self.conn().steer(text)
+    }
+
+    /// What this session's backend can do. Read before offering a capability-gated
+    /// verb, so a refusal is a stated "this backend cannot" rather than a generic
+    /// internal error — the desktop already gates its steer affordance on
+    /// `supports_steer` this way.
+    pub fn capabilities(&self) -> AgentCapabilities {
+        self.conn().capabilities()
     }
 
     /// Interrupt the current turn.

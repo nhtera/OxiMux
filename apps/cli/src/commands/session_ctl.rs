@@ -19,6 +19,31 @@ pub async fn stop(client: &Client, session: &str) -> Result<(Value, String), Fai
     }
 }
 
+/// `Unsupported` from `Steer` has exactly one cause — the session's backend has no
+/// mid-turn queue — so say that, and say what to do instead.
+///
+/// The same shape as `term`'s own mapper: a verb with a single knowable cause supplies
+/// its own sentence, while the shared [`rpc_failure`] stays generic for every verb that
+/// has no such certainty.
+fn steer_failure(err: oximux_remote_proto::proto::RpcError) -> Failure {
+    use oximux_remote_proto::proto::RpcError;
+    if matches!(err, RpcError::Unsupported) {
+        return Failure::new(
+            "unsupported",
+            crate::cli::exit::ERROR,
+            "this session's agent cannot take guidance mid-turn",
+        )
+        .with_steps([
+            "wait for the turn to end, then use `oximux send`".into(),
+            "or `oximux stop` to interrupt it and send a fresh prompt".into(),
+            "mid-turn steering needs a backend with a message queue (pi); \
+             claude and codex have none"
+                .into(),
+        ]);
+    }
+    rpc_failure(err)
+}
+
 pub async fn steer(client: &Client, session: &str, text: &str) -> Result<(Value, String), Failure> {
     match client
         .call(Request::Steer { session_id: session.into(), text: text.into() })
@@ -28,7 +53,7 @@ pub async fn steer(client: &Client, session: &str, text: &str) -> Result<(Value,
             json!({ "session_id": session, "steered": true }),
             format!("guidance sent to {session}"),
         )),
-        Response::Error(e) => Err(rpc_failure(e)),
+        Response::Error(e) => Err(steer_failure(e)),
         other => Err(unexpected_reply("Steer", &other)),
     }
 }

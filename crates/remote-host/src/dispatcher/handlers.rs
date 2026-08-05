@@ -502,8 +502,40 @@ impl Dispatcher {
         }
     }
 
+    /// Inject mid-turn guidance — refused as a **capability gap** where the backend
+    /// has no mid-turn queue.
+    ///
+    /// Separate from [`Self::scoped`] for the same reason [`Self::set_choice`] is:
+    /// the generic "session command failed" is right for a genuine internal fault,
+    /// and wrong here. Only `pi` advertises `supports_steer`; claude, codex and ACP
+    /// all reach the default `AgentConnection::steer`, which bails. Routed through
+    /// `scoped` that became `Internal("session command failed")` — a transient-looking
+    /// error for a permanent, knowable property, with the actual reason reaching only
+    /// the host's log.
+    ///
+    /// `Unsupported` is a fixed variant carrying no host-authored text, so this states
+    /// the cause without reopening the leak `set_choice` documents.
+    pub(super) fn steer(&self, peer: &Peer, session_id: &str, text: &str) -> Response {
+        if !self.auth.may_write(peer, session_id) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(handle) = self.registry.get(session_id) else {
+            return Response::Error(RpcError::UnknownSession);
+        };
+        if !handle.capabilities().supports_steer {
+            return Response::Error(RpcError::Unsupported);
+        }
+        match handle.steer(text) {
+            Ok(()) => Response::Ack,
+            Err(e) => {
+                tracing::warn!(error = %e, session = %session_id, "steer failed");
+                Response::Error(RpcError::Internal("session command failed".into()))
+            }
+        }
+    }
+
     /// Run a session **command** behind the per-RPC ACL/authz recheck. `pub(super)`
-    /// so the dispatcher's router can use it for the trivial Steer/Cancel arms.
+    /// so the dispatcher's router can use it for the trivial Cancel arm.
     ///
     /// Every caller of this is state-changing (prompt/steer/cancel), so the gate is
     /// `may_write` — a read-only device is refused here even though it may read the

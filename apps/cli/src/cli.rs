@@ -169,7 +169,9 @@ pub enum Command {
         /// The session id (see `oximux ls`).
         session: String,
     },
-    /// Redirect a mid-turn agent with additional guidance.
+    /// Redirect a mid-turn agent with additional guidance. Needs a backend with a
+    /// mid-turn message queue; claude and codex have none and refuse it, so on those
+    /// use `stop` and then `send`
     Steer {
         /// The session id (see `oximux ls`).
         session: String,

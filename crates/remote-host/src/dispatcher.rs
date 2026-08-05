@@ -345,9 +345,7 @@ impl Dispatcher {
             Request::SendPrompt(r) => self.send_prompt(peer, r),
             Request::ResolvePermission(r) => self.resolve_permission(peer, r),
             Request::AnswerQuestion(r) => self.answer_question(peer, r),
-            Request::Steer { session_id, text } => {
-                self.scoped(peer, &session_id, |h| h.steer(&text))
-            }
+            Request::Steer { session_id, text } => self.steer(peer, &session_id, &text),
             Request::Cancel { session_id } => self.scoped(peer, &session_id, |h| h.cancel()),
             Request::ListChoices { session_id } => self.list_choices(peer, &session_id),
             Request::EventsSince { session_id, after_seq } => {
