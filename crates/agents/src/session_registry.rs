@@ -192,6 +192,25 @@ pub struct SessionHandle {
     /// (title/model or the awaiting-permission flag) so a session-list subscriber
     /// re-snapshots. Coalescing, so a burst wakes the subscriber once.
     changed: watch::Sender<u64>,
+    /// Serializes "a prompt is delivered" against "a backend event is folded", so a
+    /// reply can never be recorded ahead of the prompt that caused it.
+    ///
+    /// The window it closes: [`Self::send_prompt`] writes to the backend *before*
+    /// recording the user's own bubble — deliberately, so a failed send leaves no
+    /// bubble implying the agent received something it never did. A fast agent
+    /// answers inside that window, and its reply reaches the fold first. The
+    /// transcript then reads answer-then-question, and it is persisted that way, so
+    /// a later reader cannot tell it from a real ordering.
+    ///
+    /// Downstream merging cannot fix this — the ordering is already lost by the time
+    /// the two paths meet — so the fix has to be here, at the only point where both
+    /// are known. A consumer that folds backend events takes this around the handoff
+    /// (see `with_prompt_order`); the write stays before the record, so the failed-send
+    /// property is untouched.
+    ///
+    /// Its own lock, not `conn`: a connection swap must never wait behind a backend
+    /// call, which is why `conn` is cloned out rather than held.
+    prompt_order: Mutex<()>,
     /// Drops screen captures from events on their way into the backlog.
     ///
     /// Placed here rather than in the remote host because everything a paired
@@ -328,6 +347,9 @@ impl SessionHandle {
     /// optimistic-echo correlation the view/phone use to dedup the arriving stream
     /// copy against their local echo (threaded through once the surfaces echo).
     pub fn send_prompt(&self, text: &str, images: &[ChatImage]) -> Result<()> {
+        // Held across the write and both records: a reply produced by this write
+        // cannot be folded until the user's bubble has been. See `prompt_order`.
+        let _order = self.prompt_order.lock().unwrap();
         self.conn().send_user_message_with_images(text, images)?;
         // No backend echoes the user's own message back, so without this the
         // remote transcript would show replies to prompts it never displayed.
@@ -354,6 +376,23 @@ impl SessionHandle {
     /// otherwise. Same transport as the desktop composer's steer.
     pub fn steer(&self, text: &str) -> Result<()> {
         self.conn().steer(text)
+    }
+
+    /// Run `f` — the handoff of one backend event towards whatever folds it — with
+    /// prompt delivery held off.
+    ///
+    /// The other half of [`prompt_order`]: a consumer that moves backend events into
+    /// its fold wraps that move in this, and a reply produced by an in-flight
+    /// `send_prompt` then cannot overtake the bubble for the prompt that caused it.
+    ///
+    /// Keep `f` to the handoff itself. It must not fold, persist, or block on
+    /// anything a prompt could be waiting for — this serializes against every send
+    /// on the session.
+    ///
+    /// [`prompt_order`]: SessionHandle::prompt_order
+    pub fn with_prompt_order<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _order = self.prompt_order.lock().unwrap();
+        f()
     }
 
     /// What this session's backend can do. Read before offering a capability-gated
@@ -646,6 +685,7 @@ impl SessionRegistry {
             remote_prompt_tx: Mutex::new(None),
             remote_choice_tx: Mutex::new(None),
             changed: self.changed.clone(),
+            prompt_order: Mutex::new(()),
             screenshots: Mutex::new(ScreenshotFilter::new()),
         });
         self.sessions.lock().unwrap().insert(id, handle.clone());
@@ -777,6 +817,76 @@ mod tests {
         assert!(
             matches!(&ev, ThreadEvent::UserMessage { text, .. } if text == "hello"),
             "saw {ev:?}",
+        );
+    }
+
+    /// A backend that has taken the write and not yet returned — the window in which
+    /// `send_prompt` has told the agent but has not yet recorded the user's bubble.
+    /// A real agent can answer inside it; the dawdle just makes the window wide
+    /// enough for a test to be decisive rather than lucky.
+    struct SlowWriteConn {
+        written: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl AgentConnection for SlowWriteConn {
+        fn send_user_message(&self, _text: &str) -> Result<()> {
+            self.written.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok(())
+        }
+        fn resolve_permission(&self, _: &str, _: PermissionDecision) -> Result<()> {
+            Ok(())
+        }
+        fn shutdown(&self) {}
+    }
+
+    /// A reply produced while a prompt is still being delivered is recorded **after**
+    /// that prompt, never before it.
+    ///
+    /// The bug this pins: `send_prompt` writes to the backend before recording the
+    /// bubble — deliberately, so a failed send leaves no bubble implying the agent
+    /// received something it never did — and a fast agent answers inside that window.
+    /// The reply then reached the fold first and the transcript was persisted
+    /// answer-then-question, indistinguishable to a later reader from a real ordering.
+    ///
+    /// Asserted through the backlog because that is the order every consumer inherits:
+    /// seq assignment, retention and live fan-out all happen under one lock, so
+    /// whatever order lands here is the order the phone streams and the transcript
+    /// keeps.
+    #[test]
+    fn a_reply_produced_during_a_send_is_recorded_after_the_prompt() {
+        let reg = SessionRegistry::new();
+        let written = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle =
+            reg.register("s1".into(), Arc::new(SlowWriteConn { written: written.clone() }));
+
+        // Stands in for the consumer that folds backend events — serve's pump bridge.
+        // From the instant the write lands, the agent could answer, so this races to
+        // put the reply in first. `with_prompt_order` is what makes it lose.
+        let racer = {
+            let handle = handle.clone();
+            std::thread::spawn(move || {
+                while !written.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                handle.with_prompt_order(|| {
+                    handle.ingest(ThreadEvent::AssistantText("reply".into()))
+                });
+            })
+        };
+
+        handle.send_prompt("ask", &[]).unwrap();
+        racer.join().expect("the racer thread");
+
+        let order: Vec<ThreadEvent> =
+            handle.events_since(0).into_iter().map(|(_, e)| e).collect();
+        assert!(
+            matches!(
+                order.as_slice(),
+                [ThreadEvent::UserMessage { text, .. }, ThreadEvent::AssistantText(reply)]
+                    if text == "ask" && reply == "reply"
+            ),
+            "the question must precede its answer, saw {order:?}",
         );
     }
 

@@ -122,12 +122,24 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
 
     // Bridge the transports' std receiver onto the async world. The blocking
     // thread dies with the channel; nothing joins it.
+    //
+    // The handoff runs under the session's prompt order, so a reply cannot enter
+    // this channel while the prompt that caused it is still being recorded. The
+    // wait is bounded by one `send_prompt` — a pipe write plus two records — and
+    // nothing is dropped meanwhile: `events` is unbounded, so the reader thread
+    // keeps draining the child's stdout regardless of what this thread is doing.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let bridge_handle = handle.clone();
     std::thread::Builder::new()
         .name(format!("pump-{session_id}"))
         .spawn(move || {
             while let Ok(event) = events.recv() {
-                if event_tx.send(event).is_err() {
+                // `is_ok()` inside the closure, not a `Result` out of it: the send
+                // error carries the whole event back, and a 200-byte `Err` is what
+                // `clippy::result_large_err` exists to catch. Only whether it landed
+                // matters — a closed channel means the pump is gone.
+                let delivered = bridge_handle.with_prompt_order(|| event_tx.send(event).is_ok());
+                if !delivered {
                     break;
                 }
             }
@@ -164,6 +176,26 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
         loop {
             tokio::select! {
                 event = event_rx.recv() => {
+                    // Fold any prompt that is already queued before this event.
+                    //
+                    // The two arrive on separate channels, so `select!` alone gives
+                    // no order between them, and a reply that overtakes its own
+                    // prompt is persisted answer-then-question. `send_prompt` holds
+                    // the session's prompt order across the backend write, and the
+                    // bridge takes it before handing an event over, so a queued
+                    // prompt is always the earlier of the two — draining here is
+                    // what turns that guarantee into fold order.
+                    //
+                    // A drain here, and not a `biased` arm polled ahead of this
+                    // one: such an arm goes on returning `Ready(None)` once the
+                    // sink is gone, so the loop spins at full tilt and never
+                    // reaches the channel-closed branch below — measured at ~900%
+                    // CPU on a host with a dozen sessions. Draining cannot do that;
+                    // it stops on empty and on terminated alike.
+                    while let Ok(prompt) = prompt_rx.try_recv() {
+                        fold.push_user_message_with_images(prompt.text, prompt.images);
+                        let _ = turn_tx.send(true);
+                    }
                     let Some(event) = event else {
                         // The agent's stream closed: the child exited. An
                         // in-flight turn can never finish now — mark it so
