@@ -274,6 +274,56 @@ async fn a_session_scoped_device_is_refused_terminals() {
     futures::future::join(serve, script).await;
 }
 
+/// A host with NO terminal source answers `Unsupported`, not `Unauthorized`.
+///
+/// The distinction is the whole diagnosis. A headless `oximux serve` that could
+/// not start a relay serves everything except terminals — documented as normal
+/// in `docs/server-install.md` — and it used to report that as an access
+/// refusal, which the CLI renders with next-steps about `$OXIMUX_SESSION_ID`.
+/// An operator on a fresh server hits this on their first `term ls` and goes
+/// hunting for a credential problem that does not exist.
+///
+/// Asserted for a FULL-access peer specifically: with anything narrower the
+/// authorization tier above would refuse first and this would pass without
+/// testing anything. Every other optional service on the dispatcher (team,
+/// heartbeats, worktrees, schedules, state, pairing admin) already answers
+/// absence this way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_without_terminals_reports_unsupported_not_unauthorized() {
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    // The one difference from `harness()`: no `.with_terminals(…)` at all.
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), Arc::clone(&auth))
+        .with_clock(clock);
+    let pubkey = [0x33; 32];
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req(pubkey, None))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        for (what, req) in [
+            ("list", Request::ListTerminals),
+            ("attach", Request::TermAttach { pty_id: "pty-1".into() }),
+            ("input", Request::TermInput { pty_id: "pty-1".into(), bytes: b"x".to_vec() }),
+            ("resize", Request::TermResize { pty_id: "pty-1".into(), cols: 80, rows: 24 }),
+        ] {
+            assert_eq!(
+                call(&client, req).await,
+                Response::Error(RpcError::Unsupported),
+                "terminal {what} on a host with no terminal source is a capability \
+                 answer, not an access refusal",
+            );
+        }
+    };
+
+    futures::future::join(serve, script).await;
+}
+
 /// A gap is forwarded rather than swallowed, so the client knows to re-attach.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dropped_frame_reaches_the_client_as_a_gap() {

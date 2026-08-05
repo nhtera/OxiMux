@@ -444,8 +444,12 @@ impl Dispatcher {
         if !self.auth.may_use_terminals(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
+        // No terminal source wired is a CAPABILITY fact, not an access one: a
+        // headless host without a relay serves everything except terminals, and
+        // that is documented as normal. Reporting it as `Unauthorized` sent
+        // operators hunting for a credential problem that does not exist.
         let Some(source) = &self.terminals else {
-            return Response::Error(RpcError::Unauthorized);
+            return Response::Error(RpcError::Unsupported);
         };
         match source.list().await {
             Ok(rows) => Response::Terminals(rows),
@@ -473,8 +477,9 @@ impl Dispatcher {
         if !self.auth.may_use_terminals(peer) {
             return (Response::Error(RpcError::Unauthorized), None);
         }
+        // Capability, not access — see `list_terminals`.
         let Some(source) = &self.terminals else {
-            return (Response::Error(RpcError::Unauthorized), None);
+            return (Response::Error(RpcError::Unsupported), None);
         };
         let (attach, rx) = match source.attach(pty_id).await {
             Ok(v) => v,
@@ -507,8 +512,9 @@ impl Dispatcher {
         if !self.auth.may_drive_terminals(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
+        // Capability, not access — see `list_terminals`.
         let Some(source) = &self.terminals else {
-            return Response::Error(RpcError::Unauthorized);
+            return Response::Error(RpcError::Unsupported);
         };
         match source.input(pty_id, bytes).await {
             Ok(()) => Response::Ack,
@@ -534,8 +540,9 @@ impl Dispatcher {
         if !self.auth.may_drive_terminals(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
+        // Capability, not access — see `list_terminals`.
         let Some(source) = &self.terminals else {
-            return Response::Error(RpcError::Unauthorized);
+            return Response::Error(RpcError::Unsupported);
         };
         // A zero dimension is nonsense a PTY layer may accept and then divide by.
         // Rejected here rather than clamped: a client asking for a 0-column grid

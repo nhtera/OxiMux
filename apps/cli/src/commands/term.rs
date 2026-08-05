@@ -18,10 +18,38 @@ use crate::output::Failure;
 /// types routinely.
 const DETACH: u8 = 0x1d;
 
+/// Map a terminal RPC failure, naming the one cause a generic `Unsupported`
+/// cannot: the host has no relay.
+///
+/// A host serves terminals only when it could start `oximux-relay`, and a
+/// headless `oximux serve` that could not still serves everything else — so
+/// this is the expected state on a server where the relay is missing from the
+/// install, not an exotic one. `rpc_failure` renders `Unsupported` correctly
+/// but with no follow-up, and "does not offer that capability" alone does not
+/// tell an operator which binary to go find.
+fn term_failure(err: oximux_remote_proto::proto::RpcError) -> Failure {
+    use oximux_remote_proto::proto::RpcError;
+    if matches!(err, RpcError::Unsupported) {
+        return Failure::new(
+            "unsupported",
+            exit::ERROR,
+            "this host serves no terminals (it has no relay)",
+        )
+        .with_steps([
+            "put `oximux-relay` next to the `oximux` binary — the installer does \
+             this, and the release archive carries both"
+                .into(),
+            "or point the host at one with $OXIMUX_RELAY_BINARY, then restart it".into(),
+            "the host logs the reason at startup (`relay unavailable`)".into(),
+        ]);
+    }
+    rpc_failure(err)
+}
+
 pub async fn ls(client: &Client) -> Result<(Value, String), Failure> {
     let rows = match client.call(Request::ListTerminals).await? {
         Response::Terminals(rows) => rows,
-        Response::Error(e) => return Err(rpc_failure(e)),
+        Response::Error(e) => return Err(term_failure(e)),
         other => return Err(unexpected_reply("ListTerminals", &other)),
     };
     let human = if rows.is_empty() {
@@ -71,7 +99,7 @@ pub async fn attach(client: &Client, pty: &str) -> Result<(Value, String), Failu
     let (replay, _cols, _rows) =
         match client.call(Request::TermAttach { pty_id: pty.into() }).await? {
             Response::TermAttached { replay, cols, rows } => (replay, cols, rows),
-            Response::Error(e) => return Err(rpc_failure(e)),
+            Response::Error(e) => return Err(term_failure(e)),
             other => return Err(unexpected_reply("TermAttach", &other)),
         };
     // The notice goes to stderr before raw mode, so it never lands inside the
@@ -133,7 +161,7 @@ pub async fn attach(client: &Client, pty: &str) -> Result<(Value, String), Failu
                     }
                     // The guard's Drop restores the terminal on this path too.
                     if let Response::Error(e) = reply {
-                        return Err(rpc_failure(e));
+                        return Err(term_failure(e));
                     }
                 }
                 if detach.is_some() {
@@ -208,7 +236,7 @@ async fn reattach(client: &Client, pty: &str) -> Result<(), Failure> {
             write_raw(&replay);
             Ok(())
         }
-        Response::Error(e) => Err(rpc_failure(e)),
+        Response::Error(e) => Err(term_failure(e)),
         other => Err(unexpected_reply("TermAttach", &other)),
     }
 }
