@@ -53,6 +53,38 @@ fn main() -> std::process::ExitCode {
         // Talks to the release server and nothing else — no host, no runtime.
         // That is what lets it repair a machine whose own host is wedged.
         Command::Update { check } => render(args.json, commands::update::run(*check)),
+        // Offline, and deliberately NOT wrapped in the `--json` envelope: the
+        // output is a shell script destined for a file, and a JSON wrapper
+        // would make `oximux completions zsh > _oximux` write something no
+        // shell can source.
+        Command::Completions { shell } => {
+            use clap::CommandFactory as _;
+            use std::io::Write as _;
+            let mut cmd = Cli::command();
+            // Into a buffer, not straight to stdout: `clap_complete` PANICS if
+            // its writer errors, and the writer errors the moment a reader goes
+            // away — so `oximux completions zsh | head` printed a Rust panic and
+            // a backtrace note. Piping a 150 KB script into a pager or `head` is
+            // an ordinary thing to do while checking it.
+            let mut script = Vec::new();
+            // `oximux`, not the cargo target name `oximux-cli` — the completion
+            // has to match what users actually type.
+            clap_complete::generate(*shell, &mut cmd, "oximux", &mut script);
+            match std::io::stdout().write_all(&script) {
+                Ok(()) => cli::exit::OK,
+                // A closed pipe is the reader's choice, not this command's
+                // failure: exit 0, silently, as `cat` and `yes` do.
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => cli::exit::OK,
+                Err(e) => render(
+                    args.json,
+                    Err(output::Failure::new(
+                        "io",
+                        cli::exit::ERROR,
+                        format!("could not write the completion script: {e}"),
+                    )),
+                ),
+            }
+        }
         Command::AgentContext => {
             // Schema output is FOR machines; both modes print JSON, `--json`
             // merely wraps it in the standard envelope.
@@ -123,7 +155,48 @@ fn required_version(command: &Command) -> Option<(u32, &'static str)> {
     }
 }
 
-fn host_verb(args: Cli) -> u8 {
+/// Usage checks and stdin resolution, done BEFORE a socket is touched.
+///
+/// Both of these are the caller's mistake, and both used to be discovered too
+/// late to say so: they sat past `resolve_and_connect`, so on a machine with no
+/// host running the answer was "the host is not reachable" (exit 3) — a
+/// diagnosis about the environment for a problem in the argv. A usage error
+/// must not depend on a host being up.
+///
+/// Resolving `-` here also gives it one home. The verbs receive a prompt that
+/// is already text, so neither has to know stdin exists.
+fn precheck(command: &mut Command, json_mode: bool) -> Result<(), output::Failure> {
+    // `term attach` streams the remote screen's raw bytes to stdout — that IS
+    // its output — so a JSON envelope appended afterwards leaves a stream no
+    // parser can read. Refuse rather than emit the corrupt mixture.
+    if json_mode
+        && let Command::Term { command: TermCommand::Attach { .. } } = command
+    {
+        return Err(output::Failure::new(
+            "unsupported-in-json",
+            cli::exit::USAGE,
+            "`term attach` cannot be used with --json: it streams raw terminal bytes to stdout",
+        )
+        .with_steps([
+            "drop --json to attach interactively".into(),
+            "for machine-readable terminal state, use `oximux --json term ls`".into(),
+        ]));
+    }
+    match command {
+        Command::Run { prompt, .. } | Command::Send { prompt, .. } => {
+            *prompt = commands::resolve_prompt(std::mem::take(prompt))?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn host_verb(mut args: Cli) -> u8 {
+    // Before the runtime, before the socket: a usage error costs nothing and
+    // must not be reported as an unreachable host.
+    if let Err(failure) = precheck(&mut args.command, args.json) {
+        return render(args.json, Err(failure));
+    }
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
         Err(e) => {
@@ -233,7 +306,7 @@ fn host_verb(args: Cli) -> u8 {
                     commands::send::run_checked(
                         &client,
                         &session,
-                        &prompt,
+                        prompt,
                         output_schema.as_deref(),
                         no_wait,
                         json_mode,
@@ -294,6 +367,7 @@ fn host_verb(args: Cli) -> u8 {
                 },
                 Command::Term { command } => match command {
                     TermCommand::Ls => commands::term::ls(&client).await,
+                    // `--json` is refused in `precheck`, before any connection.
                     TermCommand::Attach { pty } => commands::term::attach(&client, &pty).await,
                 },
                 Command::Worktree { command } => match command {
@@ -352,6 +426,7 @@ fn host_verb(args: Cli) -> u8 {
                 Command::Version
                 | Command::Update { .. }
                 | Command::AgentContext
+                | Command::Completions { .. }
                 | Command::Serve { .. }
                 | Command::Pair { .. }
                 | Command::Hosts { .. } => unreachable!("dispatched earlier"),
@@ -417,6 +492,48 @@ mod tests {
             panic!("`run` parses");
         };
         assert_eq!(mode, None, "no --mode means the backend default, not a guess");
+    }
+
+    /// `--json` with `term attach` is refused as a usage error, with no host.
+    ///
+    /// The placement is the point. This check used to sit past
+    /// `resolve_and_connect`, so on a machine with no host running it never
+    /// ran — the caller got "the host is not reachable" (exit 3), a diagnosis
+    /// about the environment for a mistake in the argv. `precheck` takes no
+    /// client for exactly that reason, so this test cannot pass by accident on
+    /// a machine that happens to have a host up.
+    #[test]
+    fn json_with_term_attach_is_a_usage_error_before_any_connection() {
+        let mut command = command_of(&["oximux", "term", "attach", "pty-1"]);
+        let failure = precheck(&mut command, true).expect_err("refused under --json");
+        assert_eq!(failure.exit, cli::exit::USAGE);
+        assert_eq!(failure.code, "unsupported-in-json");
+        assert!(!failure.next_steps.is_empty(), "and says what to do instead");
+
+        // Without --json it is an ordinary interactive attach.
+        let mut command = command_of(&["oximux", "term", "attach", "pty-1"]);
+        assert!(precheck(&mut command, false).is_ok());
+        // And the guard is scoped to attach — `term ls` is machine-readable.
+        let mut command = command_of(&["oximux", "term", "ls"]);
+        assert!(precheck(&mut command, true).is_ok(), "`term ls` must still serve --json");
+    }
+
+    /// A literal prompt survives `precheck` unchanged, on both verbs.
+    ///
+    /// The stdin path needs a pipe and so is covered end-to-end rather than
+    /// here; what this pins is that the common case is not disturbed by the
+    /// resolution step now sitting in front of it.
+    #[test]
+    fn precheck_leaves_an_ordinary_prompt_alone() {
+        let mut command = command_of(&["oximux", "run", "do the thing"]);
+        precheck(&mut command, false).expect("ok");
+        let Command::Run { prompt, .. } = &command else { panic!("run") };
+        assert_eq!(prompt, "do the thing");
+
+        let mut command = command_of(&["oximux", "send", "s1", "do the thing"]);
+        precheck(&mut command, false).expect("ok");
+        let Command::Send { prompt, .. } = &command else { panic!("send") };
+        assert_eq!(prompt, "do the thing");
     }
 
     /// `schedule` is the one family split across versions: only the manual fire

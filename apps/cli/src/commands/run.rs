@@ -24,12 +24,6 @@ fn resolve_cwd(cwd: Option<PathBuf>) -> Result<String, Failure> {
     Ok(dir.to_string_lossy().into_owned())
 }
 
-/// A correlation id for the prompt. Uniqueness within one process's sends is
-/// all the field promises; the pid seed keeps two concurrent CLIs distinct.
-fn corr_id() -> u64 {
-    u64::from(std::process::id()) << 16
-}
-
 /// Refuse a permission-mode id this session's backend does not advertise.
 ///
 /// The `Ack` is not evidence the mode took. The host answers
@@ -96,9 +90,11 @@ pub struct RunArgs {
 }
 
 pub async fn run(client: &Client, args: RunArgs, json_mode: bool) -> Result<(Value, String), Failure> {
-    // Compiled BEFORE anything is spawned: a bad schema is the caller's typo,
-    // and finding it after an agent has already started work would leave a
+    // The prompt arrives already resolved (`-` became stdin text in `precheck`,
+    // before any connection). The schema is compiled BEFORE anything is
+    // spawned: finding a bad one after an agent has started work would leave a
     // live session behind for a usage error.
+    let prompt = args.prompt;
     let schema = args
         .output_schema
         .as_deref()
@@ -186,9 +182,9 @@ pub async fn run(client: &Client, args: RunArgs, json_mode: bool) -> Result<(Val
     match client
         .call(Request::SendPrompt(SendPromptReq {
             session_id: session_id.clone(),
-            text: args.prompt.clone(),
+            text: prompt.clone(),
             images: vec![],
-            corr_id: corr_id(),
+            corr_id: super::next_corr_id(),
         }))
         .await?
     {

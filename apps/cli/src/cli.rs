@@ -80,7 +80,7 @@ pub enum Command {
     /// immediately — pair it with `wait` or `attach`.
     #[command(verbatim_doc_comment)]
     Run {
-        /// The prompt to send.
+        /// The prompt to send, or `-` to read it from stdin.
         prompt: String,
         /// Which configured agent to start (default: the host's default agent).
         #[arg(long, value_name = "AGENT_ID")]
@@ -138,7 +138,7 @@ pub enum Command {
     Send {
         /// The session id (see `oximux ls`).
         session: String,
-        /// The prompt to send.
+        /// The prompt to send, or `-` to read it from stdin.
         prompt: String,
         /// Hold the final answer to a JSON Schema — a file path, or the schema
         /// itself as inline JSON. The agent is re-prompted with the validation
@@ -348,6 +348,20 @@ pub enum Command {
     /// Print the full command schema as JSON, for agents driving this CLI
     /// (offline — never touches the host).
     AgentContext,
+    /// Print a shell completion script on stdout (offline).
+    ///
+    /// Generated from this binary's own command tree, so it cannot describe a
+    /// verb the parser does not accept. Install it where your shell looks:
+    ///
+    ///   bash  oximux completions bash > /etc/bash_completion.d/oximux
+    ///   zsh   oximux completions zsh  > "${fpath[1]}/_oximux"
+    ///   fish  oximux completions fish > ~/.config/fish/completions/oximux.fish
+    #[command(verbatim_doc_comment)]
+    Completions {
+        /// Which shell to emit for.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 /// The states `wait --until` accepts.

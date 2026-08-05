@@ -19,15 +19,16 @@ use crate::output::Failure;
 pub async fn run_checked(
     client: &Client,
     session: &str,
-    prompt: &str,
+    prompt: String,
     output_schema: Option<&str>,
     no_wait: bool,
     json_mode: bool,
 ) -> Result<(Value, String), Failure> {
-    // Compiled before the prompt is sent: a bad schema must not cost an agent
-    // turn.
+    // The prompt arrives already resolved (`-` became stdin text in `precheck`).
+    // The schema is compiled before the prompt is sent: a bad one must not cost
+    // an agent turn.
     let schema = output_schema.map(crate::output_schema::OutputSchema::load).transpose()?;
-    let (mut base, human) = run(client, session, prompt, no_wait, json_mode).await?;
+    let (mut base, human) = run(client, session, &prompt, no_wait, json_mode).await?;
     let Some(schema) = schema else { return Ok((base, human)) };
     let value = crate::output_schema::enforce(client, session, &schema, json_mode).await?;
     let human = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
@@ -54,7 +55,7 @@ pub async fn run(
             session_id: session.into(),
             text: prompt.into(),
             images: vec![],
-            corr_id: u64::from(std::process::id()) << 16 | 1,
+            corr_id: super::next_corr_id(),
         }))
         .await?
     {
