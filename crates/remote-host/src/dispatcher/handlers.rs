@@ -452,6 +452,37 @@ impl Dispatcher {
             return Response::Error(RpcError::UnknownSession);
         };
         let what = kind.noun();
+
+        // Refuse an id this session does not offer, BEFORE handing it down.
+        //
+        // Backends accept an unrecognised pick silently — the setter returns
+        // `Ok`, nothing changes, and this used to answer `Ack`. So
+        // `mode set <session> nonsense` printed "mode set to nonsense" and
+        // exited 0 while the session stayed on its default: the caller was told
+        // the switch happened. For a scripted run that is worse than an error,
+        // because the next turn then behaves as the OLD value dictates —
+        // parking on a permission request nobody is there to answer.
+        //
+        // Same class as the schedule pause/resume no-op: an operation with no
+        // existence check, reported as success.
+        //
+        // An EMPTY list is not evidence of a bad id. A backend advertises its
+        // choices only once it has reported, and a session can be switched
+        // before then; rejecting on an empty list would refuse correct calls on
+        // timing alone. Validate only against a list that exists.
+        let offered: Vec<String> = match kind {
+            ChoiceKind::Model => handle.models().into_iter().map(|m| m.wire).collect(),
+            ChoiceKind::PermissionMode => {
+                handle.permission_modes().into_iter().map(|m| m.wire).collect()
+            }
+        };
+        if !offered.is_empty() && !offered.iter().any(|id| id == value) {
+            return Response::Error(RpcError::BadRequest(format!(
+                "no such {what} for this session; it offers: {}",
+                offered.join(", ")
+            )));
+        }
+
         let outcome = match kind {
             ChoiceKind::Model => handle.set_model(value).await,
             ChoiceKind::PermissionMode => handle.set_permission_mode(value).await,

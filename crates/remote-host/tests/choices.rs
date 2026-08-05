@@ -111,6 +111,113 @@ async fn a_device_lists_the_catalog_and_switches_model() {
     );
 }
 
+/// An id the session does not offer is refused, and never reaches the backend.
+///
+/// Backends accept an unrecognised pick silently — the setter returns `Ok`,
+/// nothing changes — so this used to answer `Ack`:
+/// `oximux mode set <session> nonsense` printed "mode set to nonsense" and
+/// exited 0 while the session stayed on its default. Worse than a plain error
+/// for a scripted run, because the next turn then behaves as the OLD value
+/// dictates — parking on a permission request nobody is there to answer.
+///
+/// The backend assertion is the load-bearing half: a reply that refused on the
+/// wire while still forwarding the change would look identical from the client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_id_the_session_does_not_offer_is_refused_and_never_forwarded() {
+    let (registry, conn) = switchable_registry();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock);
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32]))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        // The catalog is opus-5/sonnet-5 and the single mode `plan`.
+        for (what, req, offered) in [
+            (
+                "model",
+                Request::SetModel { session_id: "sess-1".into(), model: "gpt-9".into() },
+                "opus-5, sonnet-5",
+            ),
+            (
+                "permission mode",
+                Request::SetPermissionMode {
+                    session_id: "sess-1".into(),
+                    mode: "acceptEdit".into(), // the real id is `plan`
+                },
+                "plan",
+            ),
+        ] {
+            let Response::Error(RpcError::BadRequest(msg)) = call(&client, req).await else {
+                panic!("an unoffered {what} must be refused, not acknowledged");
+            };
+            assert!(
+                msg.contains(offered),
+                "the refusal names what the session does offer, got: {msg}",
+            );
+        }
+
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+
+    let sent = conn.sent();
+    assert!(
+        !sent.iter().any(|v| v["type"] == "set_model" || v["type"] == "set_mode"),
+        "a refused pick must not reach the backend, saw {sent:?}",
+    );
+}
+
+/// A backend that has not advertised its catalog yet still accepts a switch.
+///
+/// The guard above validates against the offered list, and an EMPTY list is not
+/// evidence of a bad id — a dynamic-catalog backend advertises only once its
+/// handshake completes, and a session can be switched before then. Rejecting on
+/// an empty list would refuse correct calls on timing alone, which is the
+/// obvious wrong way to implement that check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backend_with_no_catalog_yet_is_not_second_guessed() {
+    // Switchable, but advertising nothing — the pre-handshake state.
+    let conn = Arc::new(StubConnection::default().with_switchable(vec![], vec![]));
+    let registry = Arc::new(SessionRegistry::new());
+    registry.register("sess-1".into(), conn.clone());
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(registry, auth).with_clock(clock);
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32]))).await
+        else {
+            panic!("expected Registered");
+        };
+        assert_eq!(
+            call(
+                &client,
+                Request::SetModel { session_id: "sess-1".into(), model: "anything".into() },
+            )
+            .await,
+            Response::Ack,
+            "an empty catalog means nothing to check against, not a bad id",
+        );
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+
+    assert!(
+        conn.sent().iter().any(|v| v["type"] == "set_model"),
+        "and the change still reaches the backend",
+    );
+}
+
 /// A fix-at-spawn backend with no desktop view attached must fail loudly.
 ///
 /// The recovery for such a backend is a respawn, which only a bound view can

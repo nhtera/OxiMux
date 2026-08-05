@@ -370,6 +370,13 @@ pub fn rpc_failure(err: oximux_remote_proto::proto::RpcError) -> Failure {
             exit::ERROR,
             "this host does not offer that capability",
         ),
+        // The host authored this string for a person to read — "no such
+        // permission mode for this session; it offers: …" — so print it, not a
+        // Debug rendering of the variant wrapping it. Through the catch-all
+        // below it surfaced as `host error: BadRequest("no such permission
+        // mode …")`, which buries the sentence that actually helps inside Rust
+        // syntax the reader did not ask for.
+        RpcError::BadRequest(message) => Failure::new("bad-request", exit::ERROR, message),
         other => Failure::new("rpc", exit::ERROR, format!("host error: {other:?}")),
     }
 }
@@ -422,6 +429,28 @@ mod tests {
     #[test]
     fn a_host_at_exactly_the_required_version_passes() {
         assert!(client_at(18, HostTarget::Local).require_version(18, "state").is_ok());
+    }
+
+    /// A `BadRequest` reaches the user as the sentence the host wrote.
+    ///
+    /// These carry the host's own actionable text — the list of ids a session
+    /// actually offers, for instance — and the catch-all arm used to wrap them
+    /// in `host error: BadRequest("…")`, putting Rust syntax around the only
+    /// part worth reading.
+    #[test]
+    fn a_bad_request_surfaces_the_hosts_own_words() {
+        use oximux_remote_proto::proto::RpcError;
+        let failure = rpc_failure(RpcError::BadRequest(
+            "no such permission mode for this session; it offers: default, plan".into(),
+        ));
+        assert_eq!(failure.exit, exit::ERROR);
+        assert_eq!(failure.code, "bad-request");
+        assert_eq!(
+            failure.message,
+            "no such permission mode for this session; it offers: default, plan",
+            "verbatim — no Debug wrapper, no prefix"
+        );
+        assert!(!failure.message.contains("BadRequest"), "{}", failure.message);
     }
 
     #[test]
