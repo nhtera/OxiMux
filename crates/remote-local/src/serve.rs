@@ -59,6 +59,34 @@ pub struct LocalControlListener {
     socket_node: Option<(u64, u64)>,
 }
 
+/// The usable bytes in `sockaddr_un.sun_path`, including its NUL terminator.
+///
+/// 104 on the BSDs and macOS, 108 on Linux. Taking the smaller of the two on
+/// any other unix is the safe direction: a false rejection is a clear message,
+/// a false acceptance is the opaque bind failure this exists to prevent.
+#[cfg(unix)]
+const SUN_PATH_CAPACITY: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
+
+/// Refuse a socket path the kernel cannot hold, naming the real constraint.
+#[cfg(unix)]
+fn check_socket_path_length(socket_path: &Path) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let len = socket_path.as_os_str().as_bytes().len();
+    // `<` not `<=`: the stored path is NUL-terminated, so the last byte is
+    // spoken for.
+    if len < SUN_PATH_CAPACITY {
+        return Ok(());
+    }
+    let budget = SUN_PATH_CAPACITY - 1 - crate::SOCKET_FILENAME.len() - 1; // '/' + NUL
+    anyhow::bail!(
+        "the data directory path is too long for a unix socket: `{}` needs {len} bytes and \
+         the kernel allows {}. Use a data directory of at most {budget} characters \
+         (`--data-dir`), or a shorter path to the same place.",
+        socket_path.display(),
+        SUN_PATH_CAPACITY - 1,
+    )
+}
+
 impl LocalControlListener {
     /// Prepare the runtime directory (owner-only, readback-verified), write
     /// `token` beside the socket (owner-only, readback-verified), and bind.
@@ -68,10 +96,26 @@ impl LocalControlListener {
     /// where a caller can connect against a token that is not yet the one on
     /// disk.
     pub fn bind(runtime_dir: &Path, token: &str) -> Result<Self> {
+        let socket_path = crate::socket_path(runtime_dir);
+        // Checked BEFORE anything is created, because the failure it prevents is
+        // unrecognisable from the other side.
+        //
+        // `sockaddr_un.sun_path` is a fixed 104 bytes on macOS and 108 on Linux,
+        // and a data dir long enough to push the socket past it fails the bind
+        // with "local socket name length exceeds capacity of sun_path" — wrapped
+        // by the caller in "is another OxiMux host already serving here?", which
+        // sends the reader hunting for a conflicting process that does not
+        // exist. Plausible on a server, where a data dir like
+        // `/var/lib/oximux/instances/<customer>/<env>/data` is ordinary.
+        //
+        // Named here rather than left to the OS so the message says the thing
+        // the operator can act on: the path is too long, by this much.
+        #[cfg(unix)]
+        check_socket_path_length(&socket_path)?;
+
         secure::prepare_runtime_dir(runtime_dir)?;
         secure::write_token_file(&crate::token_path(runtime_dir), token)?;
 
-        let socket_path = crate::socket_path(runtime_dir);
         // A stale node from a crashed host would make bind fail with
         // AddrInUse; nothing can be listening on it (we are the host).
         #[cfg(unix)]

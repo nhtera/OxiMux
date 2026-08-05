@@ -152,10 +152,15 @@ async fn serve(
     // no credential to be confined by, and would fall back to the operator
     // path. Binding is also the single-host check, so failing here fails fast.
     // The accept loop starts later, once the dispatcher exists to serve it.
+    // The context asserts no cause. It used to read "(is another OxiMux host
+    // already serving here?)", which leads every reader toward a conflicting
+    // process — wrong, and expensively so, for the path-too-long case, where
+    // the fix is a shorter `--data-dir`. The underlying errors already say
+    // which it is: "Address already in use" for a real conflict, and an
+    // explicit path-length refusal for the other.
     let local_listener = Arc::new(
-        LocalControlListener::bind(&data_dir, &oximux_remote_local::generate_token()).context(
-            "bind the local control socket (is another OxiMux host already serving here?)",
-        )?,
+        LocalControlListener::bind(&data_dir, &oximux_remote_local::generate_token())
+            .context("bind the local control socket")?,
     );
 
     // ---- registry + headless seams + dispatcher ----
