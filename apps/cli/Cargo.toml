@@ -60,6 +60,7 @@ oximux-relay-client = { workspace = true }
 # that wants it.
 oximux-remote-iroh = { workspace = true, features = ["host"] }
 clap = { workspace = true }
+clap_complete = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }

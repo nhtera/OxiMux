@@ -230,6 +230,10 @@ dirs = { version = "5", default-features = false }
 # CLI arg parsing — derive is the single source of truth for parse/help/
 # completions and the `agent-context` schema dump.
 clap = { version = "4", features = ["derive"] }
+# `oximux completions <shell>`. Generated from the same derive tree as `--help`
+# and `agent-context`, so a 29-verb surface cannot grow a command the
+# completions do not know about.
+clap_complete = "4"
 # Raw-mode terminal control for the CLI's `term attach` (and only that): raw
 # stdin, size probes, cross-platform including the Windows console. The CLI
 # renders everything else with plain prints — no TUI framework rides in here.

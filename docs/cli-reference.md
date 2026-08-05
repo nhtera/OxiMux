@@ -57,7 +57,7 @@ Start an agent session and send it a prompt.
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
-| `<PROMPT>` | yes | The prompt to send |
+| `<PROMPT>` | yes | The prompt to send, or `-` to read it from stdin |
 | `--agent` | yes | Which configured agent to start (default: the host's default agent) |
 | `--model` | yes | Switch the session to this model before sending the prompt |
 | `--mode` | yes | Switch the session to this permission mode before sending the prompt (ids from `model ls`). Without it the session starts in the backend's default, which for most agents asks before each tool — and an unattended `run` then streams up to the request and waits there, since only a decision can end that turn. `acceptEdits` is the usual choice for a scripted run |
@@ -82,7 +82,7 @@ Send a prompt into an existing session.
 | Argument | Takes a value | Description |
 | --- | --- | --- |
 | `<SESSION>` | yes | The session id (see `oximux ls`) |
-| `<PROMPT>` | yes | The prompt to send |
+| `<PROMPT>` | yes | The prompt to send, or `-` to read it from stdin |
 | `--output-schema` | yes | Hold the final answer to a JSON Schema — a file path, or the schema itself as inline JSON. The agent is re-prompted with the validation errors up to twice; a still-invalid answer exits 1. Prints the validated JSON. Needs the turn, so it cannot be combined with --no-wait |
 | `--no-wait` | no | Return as soon as the host accepts the prompt |
 
@@ -600,4 +600,12 @@ Replace this installation with the latest signed release
 Print the full command schema as JSON, for agents driving this CLI (offline — never touches the host)
 
 _No arguments._
+
+### `oximux completions`
+
+Print a shell completion script on stdout (offline).
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<SHELL>` | yes | Which shell to emit for |
 
