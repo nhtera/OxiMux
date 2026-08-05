@@ -9,7 +9,7 @@
 # The host inherits its environment into us, so the test hands over what we
 # need through it:
 #
-#   OXIMUX_FAKE_AGENT_SESSION  the session id to announce
+#   OXIMUX_FAKE_AGENT_SESSION  the session id to announce, when the host names none
 #   OXIMUX_FAKE_AGENT_REPORT   file to append findings to
 #   OXIMUX_FAKE_AGENT_CLI      path to the oximux binary, for the confinement probe
 #   OXIMUX_FAKE_AGENT_DIR      the host's runtime dir, for --dir
@@ -28,6 +28,33 @@ report="${OXIMUX_FAKE_AGENT_REPORT:-}"
 cli="${OXIMUX_FAKE_AGENT_CLI:-}"
 dir="${OXIMUX_FAKE_AGENT_DIR:-}"
 sid="${OXIMUX_FAKE_AGENT_SESSION:-fake-session-1}"
+
+# Adopt the id the host named, exactly as the CLI we stand in for does.
+#
+# `--session-id` on a fresh launch, `--resume` on a restore; either way the
+# real Claude answers with that id in its `system/init` rather than minting
+# one. Ignoring them — announcing the env var regardless — modelled a backend
+# that does not exist, and made the session id a race: the host waits a
+# bounded moment for an announcement and otherwise keeps the id it chose, so
+# under load the suite saw the host's id where it asserted ours. That is a
+# fixture bug wearing a product bug's clothes, and it made three tests flaky.
+#
+# The env var stays as the fallback for a host that names nothing, which is
+# what keeps this script runnable on its own.
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --session-id | --resume)
+        if [ $# -gt 1 ] && [ -n "${2:-}" ]; then
+            sid="$2"
+            shift
+        fi
+        ;;
+    --session-id=* | --resume=*)
+        sid="${1#*=}"
+        ;;
+    esac
+    shift
+done
 
 note() {
     if [ -n "$report" ]; then

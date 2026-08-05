@@ -27,6 +27,7 @@ use serde_json::Value;
 
 use common::{
     AgentBehaviour, ServeUnderTest, boot_serve, cli, install_claude_shim, json_of, run_prompt,
+    session_of,
 };
 
 /// Wait for the fixture to record that it has taken the prompt and is holding
@@ -62,22 +63,23 @@ fn await_awaiting_permission(runtime_dir: &Path, session: &str) {
     panic!("the host never registered the pending permission: {last}");
 }
 
-/// Boot a host, start a turn, and hold it in flight.
-fn stalled_turn(dir: &Path, session: &str) -> (PathBuf, ServeUnderTest) {
+/// Boot a host, start a turn, and hold it in flight. Returns the session the run
+/// created — the host names it and the fixture adopts that name, so it is read
+/// back rather than assumed.
+fn stalled_turn(dir: &Path, name: &str) -> (PathBuf, String, ServeUnderTest) {
     let data_dir = dir.join("data");
     let shim_dir = dir.join("shim");
     let report = dir.join("report.txt");
     install_claude_shim(&shim_dir);
-    let serve =
-        boot_serve(&data_dir, &shim_dir, &report, session, AgentBehaviour::stalling());
+    let serve = boot_serve(&data_dir, &shim_dir, &report, name, AgentBehaviour::stalling());
 
     let cwd = dir.join("work");
     std::fs::create_dir_all(&cwd).unwrap();
-    run_prompt(&data_dir, &cwd, "think about it");
+    let session = session_of(&run_prompt(&data_dir, &cwd, "think about it"));
 
     await_stalling(&report);
-    await_awaiting_permission(&data_dir, session);
-    (data_dir, serve)
+    await_awaiting_permission(&data_dir, &session);
+    (data_dir, session, serve)
 }
 
 /// Reboot on the same data dir, with a fresh report so the second host's agent
@@ -98,8 +100,8 @@ fn reboot(dir: &Path, data_dir: &Path, session: &str) -> ServeUnderTest {
 #[test]
 fn a_turn_in_flight_at_shutdown_is_settled_not_truncated() {
     let dir = tempfile::tempdir().unwrap();
-    let session = "recovery-drained";
-    let (data_dir, serve) = stalled_turn(dir.path(), session);
+    let (data_dir, session, serve) = stalled_turn(dir.path(), "recovery-drained");
+    let session = session.as_str();
 
     serve.stop_gracefully();
 
@@ -158,8 +160,8 @@ fn a_turn_in_flight_at_shutdown_is_settled_not_truncated() {
 #[test]
 fn a_hard_kill_mid_turn_still_boots_clean() {
     let dir = tempfile::tempdir().unwrap();
-    let session = "recovery-killed";
-    let (data_dir, serve) = stalled_turn(dir.path(), session);
+    let (data_dir, session, serve) = stalled_turn(dir.path(), "recovery-killed");
+    let session = session.as_str();
 
     serve.kill_hard();
 

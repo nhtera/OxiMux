@@ -319,6 +319,20 @@ pub fn run_prompt(runtime_dir: &Path, cwd: &Path, prompt: &str) -> Value {
     json_of(&out)
 }
 
+/// The session id a `run` reply names.
+///
+/// The id is the **host's** to choose and the client's to read back — asserting
+/// against a constant the test passed in only worked while the fixture ignored
+/// the id it was handed, which no real backend does. Taking it from the reply is
+/// both what a scripted caller does and the thing that makes these suites
+/// deterministic: there is no announcement race left to lose.
+pub fn session_of(run: &Value) -> String {
+    run["data"]["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a run reply names its session: {run}"))
+        .to_string()
+}
+
 /// Where the fixture writes its `ls` output — `<report>.ls`, spelled the same
 /// way the script spells it.
 pub fn probe_output(report: &Path) -> PathBuf {
