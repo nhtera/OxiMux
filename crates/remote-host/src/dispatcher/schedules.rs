@@ -120,6 +120,20 @@ impl Dispatcher {
         let Some(store) = self.schedules.as_ref() else {
             return Response::Error(RpcError::Unauthorized);
         };
+        // Resolve first. `set_enabled` is an UPDATE with no row check, so an id
+        // that matches nothing is a silent no-op it reports as success — and a
+        // caller told "paused" about a schedule that does not exist has been
+        // lied to. Deleting is idempotent on purpose (the goal state is reached
+        // either way); pausing has no such reading, so it refuses by name,
+        // exactly as `run_schedule_now` already does.
+        match store.get(id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Response::Error(RpcError::BadRequest("no such schedule".into())),
+            Err(e) => {
+                tracing::warn!(error = %e, "resolving schedule before toggle failed");
+                return Response::Error(RpcError::Internal("could not update the schedule".into()));
+            }
+        }
         // Re-enabling recomputes the next fire from now, so a schedule paused for a
         // week does not wake up owing a week of missed runs — the store owns that
         // arithmetic, which is why `now` is passed rather than assumed.

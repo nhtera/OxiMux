@@ -352,3 +352,60 @@ fn a_contended_ticker_declines_but_schedules_stay_editable() {
         "said once, not per tick"
     );
 }
+
+/// Pausing something that is not there is not success.
+///
+/// `set_enabled` is an UPDATE with no row check, so an unknown id used to be a
+/// silent no-op the CLI reported as `paused <id>` with exit 0 — a script that
+/// typo'd an id, or held a stale one, was told its schedule was paused while
+/// it kept firing. Deleting stays idempotent on purpose (the goal state is
+/// reached either way); pausing has no such reading.
+#[test]
+fn pausing_or_resuming_an_unknown_schedule_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let serve = boot_serve(&data_dir);
+
+    for verb in ["pause", "resume"] {
+        let out = client(&data_dir)
+            .args(["--json", "schedule", verb, "sch-does-not-exist"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "`schedule {verb}` on an unknown id must fail, not report success"
+        );
+        let v = json_stdout(&out);
+        assert_eq!(v["ok"], false);
+        assert!(
+            v["error"]["message"].as_str().unwrap_or_default().contains("no such schedule"),
+            "the refusal must name the reason, got: {v}"
+        );
+    }
+
+    // A real schedule still toggles, both ways.
+    let out = client(&data_dir)
+        .args([
+            "--json", "schedule", "create", "check the builds", "--name", "nightly", "--cwd",
+            "/tmp", "--every", "30",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let id = json_stdout(&out)["data"]["id"].as_str().unwrap().to_string();
+
+    for (verb, want_enabled) in [("pause", false), ("resume", true)] {
+        let out = client(&data_dir).args(["--json", "schedule", verb, &id]).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "`schedule {verb}` on a real id must work");
+        let out = client(&data_dir).args(["--json", "schedule", "ls"]).output().unwrap();
+        assert_eq!(
+            json_stdout(&out)["data"][0]["enabled"],
+            want_enabled,
+            "`{verb}` did not take effect"
+        );
+    }
+
+    serve.stop_hard();
+}
