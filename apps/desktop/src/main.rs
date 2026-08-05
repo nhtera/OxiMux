@@ -506,12 +506,18 @@ fn main() {
         // Worktrees the CLI can create, list, and remove: the same repos and
         // host-derived path scheme the desktop's New-Worktree flow uses, so a
         // remotely-created worktree is exactly the row the sidebar lists.
-        remote_control.set_worktree_service(std::sync::Arc::new(
-            oximux_app::remote_control::worktree_service::RepoWorktrees::new(
-                app_state.project_repo(),
-                app_state.workspace_repo(),
-            ),
-        ));
+        // Skipped only when this platform reports no data directory — there is
+        // nowhere to derive a worktree path under, and the RPC answering
+        // `Unsupported` beats one that fails at every create.
+        if let Some(data_dir) = oximux_app::app_paths::data_dir() {
+            remote_control.set_worktree_service(std::sync::Arc::new(
+                oximux_app::remote_control::worktree_service::RepoWorktrees::new(
+                    app_state.project_repo(),
+                    app_state.workspace_repo(),
+                    data_dir,
+                ),
+            ));
+        }
         // Sessions the desktop has persisted but not built views for. The registry
         // only holds a session once its chat view exists, and views are built per
         // project as each is first shown — so without this a client sees only the

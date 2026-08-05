@@ -7177,6 +7177,7 @@ dependencies = [
  "oximux-single-instance",
  "oximux-storage",
  "oximux-ui",
+ "oximux-worktree-ops",
  "pbkdf2",
  "qrcode",
  "regex",
@@ -7250,6 +7251,7 @@ dependencies = [
  "oximux-shell-env",
  "oximux-single-instance",
  "oximux-storage",
+ "oximux-worktree-ops",
  "qrcode",
  "rand 0.8.6",
  "serde",
@@ -7622,6 +7624,7 @@ dependencies = [
  "serde",
  "tempfile",
  "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]
@@ -7661,6 +7664,23 @@ dependencies = [
  "gpui",
  "gpui-component",
  "oximux-settings",
+]
+
+[[package]]
+name = "oximux-worktree-ops"
+version = "0.1.7"
+dependencies = [
+ "async-trait",
+ "oximux-core",
+ "oximux-git",
+ "oximux-no-window",
+ "oximux-remote-host",
+ "oximux-remote-proto",
+ "oximux-settings",
+ "oximux-storage",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

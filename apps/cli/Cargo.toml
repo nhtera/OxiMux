@@ -41,6 +41,9 @@ oximux-agent-core = { workspace = true }
 oximux-remote-host = { workspace = true }
 oximux-agents = { workspace = true }
 oximux-storage = { workspace = true }
+# The worktree lifecycle, shared with the desktop so `oximux worktree create`
+# on a headless host produces the row the sidebar lists.
+oximux-worktree-ops = { workspace = true }
 # The data-dir role lock: serve contends for the schedule ticker exactly as
 # the desktop does, so one process per data dir fires schedules.
 oximux-single-instance = { workspace = true }

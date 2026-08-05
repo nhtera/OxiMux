@@ -36,8 +36,20 @@ struct ServeUnderTest {
 }
 
 fn boot_serve(data_dir: &Path) -> ServeUnderTest {
+    boot_serve_with_projects(data_dir, &[])
+}
+
+/// Boot serve offering `projects` as new-session targets. Worktree creation
+/// resolves a client-named root against these, so a suite that exercises it
+/// has to hand them over at boot exactly as an operator would.
+fn boot_serve_with_projects(data_dir: &Path, projects: &[&Path]) -> ServeUnderTest {
+    let mut args = vec!["serve".to_string(), "--data-dir".into(), data_dir.to_str().unwrap().into()];
+    for project in projects {
+        args.push("--project".into());
+        args.push(project.to_str().unwrap().to_string());
+    }
     let mut child = bin()
-        .args(["serve", "--data-dir", data_dir.to_str().unwrap()])
+        .args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -351,6 +363,92 @@ fn a_contended_ticker_declines_but_schedules_stay_editable() {
         1,
         "said once, not per tick"
     );
+}
+
+fn git(cwd: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("git on PATH");
+    assert!(status.success(), "git {args:?} failed in {cwd:?}");
+}
+
+/// A one-commit repo, the smallest thing `git worktree add` will branch from.
+fn init_repo(root: &Path) {
+    std::fs::create_dir_all(root).unwrap();
+    git(root, &["init", "-q", "-b", "main"]);
+    std::fs::write(root.join("README.md"), "hi\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-qm", "init"]);
+}
+
+/// Worktrees on a headless host.
+///
+/// This is the regression that mattered: serve wired no worktree service at
+/// all, so `worktree create`, `run --worktree`, and `team run --worktree-each`
+/// each answered `Unsupported` — most of the reason to run a headless host in
+/// the first place. The CLI suite missed it because its dispatcher is built
+/// with a stub service, which cannot fail this way. So this one drives the
+/// real binary and checks git, not just the reply.
+#[test]
+fn serve_creates_and_removes_worktrees_for_its_configured_projects() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let project = dir.path().join("proj");
+    init_repo(&project);
+    // The host canonicalizes its roots, and resolution is exact-match, so the
+    // client has to name the same string `projects ls` would hand it.
+    let canonical = project.canonicalize().unwrap();
+
+    let serve = boot_serve_with_projects(&data_dir, &[&project]);
+
+    let out = client(&data_dir)
+        .args(["--json", "worktree", "create", "feat-x", "--project", canonical.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "worktree create must work on a headless host\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let created = json_stdout(&out);
+    let path = created["data"]["path"].as_str().expect("the reply carries the host-derived path");
+    assert!(
+        Path::new(path).is_dir(),
+        "the reply named a path that does not exist on disk: {path}"
+    );
+    // Derived under the host's OWN data dir, not the desktop's — the whole
+    // reason the path scheme takes a data dir rather than resolving one.
+    // Compared against the dir as serve was given it: serve derives from that
+    // string verbatim, and on macOS canonicalizing would prepend `/private`
+    // and never match.
+    assert!(
+        Path::new(path).starts_with(&data_dir),
+        "worktree landed outside this host's data dir ({}): {path}",
+        data_dir.display()
+    );
+    assert_eq!(created["data"]["branch"], "oximux/feat-x");
+
+    let out = client(&data_dir).args(["--json", "worktree", "ls"]).output().unwrap();
+    let rows = json_stdout(&out);
+    let rows = rows["data"].as_array().expect("a list");
+    assert_eq!(rows.len(), 1, "the created worktree must be listed back: {rows:?}");
+    let id = rows[0]["id"].as_str().unwrap().to_string();
+
+    let out = client(&data_dir).args(["--json", "worktree", "rm", &id]).output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(!Path::new(path).exists(), "rm left the checkout behind: {path}");
+
+    serve.stop_hard();
 }
 
 /// Pausing something that is not there is not success.

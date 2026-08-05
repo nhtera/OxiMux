@@ -71,6 +71,31 @@ impl ProjectScripts {
     }
 }
 
+/// Load the lifecycle scripts for `project_root` (or a worktree of it — the
+/// `.oximux/` dir is committed, so a worktree carries the same file). Reads
+/// `<project_root>/.oximux/scripts.toml`. Never panics; returns the default
+/// on a missing or malformed file.
+///
+/// Lives beside the type rather than in the desktop because the worktree
+/// teardown path needs it too, and that path is shared with `oximux serve`.
+pub fn load_for_project(project_root: &std::path::Path) -> ProjectScripts {
+    let path = project_root.join(".oximux").join(FILE_NAME);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match ProjectScripts::from_toml_str(&text) {
+            Ok(scripts) => scripts,
+            Err(err) => {
+                tracing::warn!(
+                    ?path,
+                    %err,
+                    "scripts.toml parse failed; ignoring per-project lifecycle scripts"
+                );
+                ProjectScripts::default()
+            }
+        },
+        Err(_) => ProjectScripts::default(), // absent file → silent default
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +175,38 @@ future_field = "ignored"
         assert_eq!(ScriptKind::Setup.as_str(), "setup");
         assert_eq!(ScriptKind::Run.as_str(), "run");
         assert_eq!(ScriptKind::Cleanup.as_str(), "cleanup");
+    }
+
+    fn write_scripts(root: &std::path::Path, content: &str) {
+        let dir = root.join(".oximux");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(FILE_NAME), content).unwrap();
+    }
+
+    #[test]
+    fn missing_file_returns_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(load_for_project(tmp.path()), ProjectScripts::default());
+    }
+
+    #[test]
+    fn valid_file_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_scripts(
+            tmp.path(),
+            "auto_setup = true\nsetup = \"pnpm i\"\nrun = \"pnpm dev\"\n",
+        );
+        let scripts = load_for_project(tmp.path());
+        assert!(scripts.auto_setup);
+        assert_eq!(scripts.script(ScriptKind::Setup), Some("pnpm i"));
+        assert_eq!(scripts.script(ScriptKind::Run), Some("pnpm dev"));
+        assert_eq!(scripts.script(ScriptKind::Cleanup), None);
+    }
+
+    #[test]
+    fn malformed_file_returns_default_without_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_scripts(tmp.path(), "setup = [[[broken");
+        assert_eq!(load_for_project(tmp.path()), ProjectScripts::default());
     }
 }

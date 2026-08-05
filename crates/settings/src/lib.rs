@@ -40,7 +40,7 @@ pub use dictation::{DictationMode, DictationSettings, ModelUnloadTimeout};
 pub use dictation_languages::{WHISPER_LANGUAGES, display_name as language_display_name};
 pub use keybindings::KeybindingOverrides;
 pub use motion::{Motion, ease_out_spring};
-pub use project_scripts::{ProjectScripts, ScriptKind};
+pub use project_scripts::{ProjectScripts, ScriptKind, load_for_project};
 pub use terminal::{BellStyle, TerminalSettings};
 #[cfg(feature = "gpui")]
 pub use theme::{GitDecorations, Theme};

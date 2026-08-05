@@ -41,6 +41,7 @@ oximux-owner-only = { workspace = true }
 # SessionRegistry to paired phones, its transport-agnostic dispatcher/auth, and
 # the shared wire types (PairingTicket).
 oximux-remote-host = { workspace = true }
+oximux-worktree-ops = { workspace = true }
 oximux-remote-iroh = { workspace = true, features = ["host"] }
 # The owner-only control socket the `oximux` CLI dials (opt-in listener).
 oximux-remote-local = { workspace = true }

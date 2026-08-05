@@ -182,6 +182,32 @@ async fn serve(
     ));
     let provider = Arc::new(projects::StaticProjects::load(args.projects, &data_dir));
 
+    // ---- worktrees ----
+    // Creating one resolves a client-named root to a `projects` row, so the
+    // configured roots are registered as rows before the service is wired.
+    // `insert_or_touch` is idempotent, which is what makes this safe to run on
+    // every boot and safe against the desktop having already added the same
+    // path — a shared data dir means both hosts see one set of projects, and a
+    // worktree either creates is the row the other lists.
+    let project_repo = oximux_storage::ProjectRepo::new(db.clone());
+    for root in provider.roots() {
+        let path = root.to_string_lossy();
+        let name = root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone().into_owned());
+        // `main` matches what the desktop's own project picker records; the
+        // real HEAD is read from git when a worktree is actually branched.
+        if let Err(err) = project_repo.insert_or_touch(&name, &path, "main") {
+            tracing::warn!(%err, path = %path, "could not register project root; worktrees there will be refused");
+        }
+    }
+    let worktrees = Arc::new(oximux_worktree_ops::RepoWorktrees::new(
+        project_repo,
+        oximux_storage::WorkspaceRepo::new(db.clone()),
+        data_dir.clone(),
+    ));
+
     // ---- schedules: reads/writes always; the TICKER only if we own it ----
     // The advisory role lock decides which process fires this data dir's
     // schedules — on a box also running the desktop app, whoever booted first.
@@ -289,7 +315,8 @@ async fn serve(
         .with_schedule_store(Arc::new(schedule_store))
         .with_schedule_events(schedule_events)
         .with_team_store(teams)
-        .with_coord_store(coord);
+        .with_coord_store(coord)
+        .with_worktrees(worktrees);
     if let Some(runner) = schedule_runner {
         dispatcher = dispatcher.with_schedule_runner(runner);
     }
@@ -297,8 +324,8 @@ async fn serve(
         dispatcher =
             dispatcher.with_terminals(Arc::new(oximux_relay_terminals::RelayTerminals::new(relay)));
     }
-    // No transcriber, no rewinder, no worktree service: each of those RPCs
-    // answers `Unsupported` (or its documented refusal) rather than pretending.
+    // No transcriber and no rewinder: both of those RPCs answer `Unsupported`
+    // (or their documented refusal) rather than pretending.
     let dispatcher = Arc::new(dispatcher);
 
     // ---- local socket: start accepting on the listener bound above ----

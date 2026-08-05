@@ -1,0 +1,36 @@
+[package]
+name = "oximux-worktree-ops"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# The worktree lifecycle — the host-derived path scheme, create-with-rollback,
+# the pre-remove cleanup script — plus remote-host's `WorktreeService` seam
+# implemented over them.
+#
+# Extracted from the desktop (zero gpui imports) for the same reason
+# `relay-terminals` was: `oximux serve` has to create the SAME worktree the
+# sidebar lists, and a second implementation would drift on the parts that are
+# easy to get subtly wrong — the rollback ladder when the DB insert fails after
+# git already made the worktree, and the refusal to remove a row that points at
+# the project root.
+
+[dependencies]
+oximux-core = { workspace = true }
+oximux-git = { workspace = true }
+oximux-storage = { workspace = true }
+oximux-settings = { workspace = true }
+oximux-remote-host = { workspace = true }
+oximux-remote-proto = { workspace = true }
+# `no_window` on the cleanup subprocess: a teardown script must not flash a
+# console on Windows.
+oximux-no-window = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

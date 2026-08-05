@@ -41,6 +41,14 @@ impl StaticProjects {
             .collect();
         Self { roots }
     }
+
+    /// The canonical roots this host serves. Worktree creation needs them as
+    /// `projects` rows (it resolves a client-named root to a project id), and
+    /// those rows are written from here rather than discovered — same list,
+    /// one source.
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
 }
 
 #[derive(serde::Deserialize)]
