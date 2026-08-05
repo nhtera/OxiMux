@@ -162,18 +162,29 @@ impl Client {
                      the environment"
                         .into(),
                 ]),
+            // Both hosts are named, headless first. This is the error a server
+            // operator hits most, and advice to open a GUI that is not installed
+            // is worse than no advice — it sends them looking for the wrong
+            // thing. The remote path (`remote_client.rs`) has always said both.
             DialError::Unreachable { .. } => Failure::new("unreachable", exit::UNREACHABLE, e.to_string())
                 .with_steps([
-                    "open the OxiMux desktop app and enable local CLI access (Settings → Remote)"
+                    "start a host here with `oximux serve` (see docs/server-install.md)".into(),
+                    "or, on a desktop: open the OxiMux app and enable local CLI \
+                     access (Settings → Remote)"
                         .into(),
-                    "if it is enabled, check the app is running".into(),
+                    "if a host should already be running, check it is still up".into(),
                 ]),
             DialError::Denied(_) => Failure::new("denied", exit::DENIED, e.to_string()).with_steps([
-                "the control credential rotated — toggle local CLI access off and on, then retry"
+                "the control credential rotated — restart `oximux serve`, or toggle \
+                 local CLI access off and on in the desktop app, then retry"
                     .into(),
             ]),
             DialError::Handshake(_) => Failure::new("handshake", exit::UNREACHABLE, e.to_string())
-                .with_steps(["retry; if it persists, restart the desktop app".into()]),
+                .with_steps([
+                    "retry; if it persists, restart the host (`oximux serve`, or the \
+                     desktop app)"
+                        .into(),
+                ]),
         })?;
 
         let mut client = Self {

@@ -20,10 +20,10 @@ pub mod exit {
 
 /// Drive a running OxiMux host from the command line.
 ///
-/// Commands that talk to a host need local CLI access enabled in the desktop
-/// app (Settings → Remote). Async contract: sending a prompt or command is
-/// acknowledged when the host ACCEPTS it, not when the agent finishes — watch
-/// the session for completion.
+/// A host is either `oximux serve` (headless — a server, over SSH) or the
+/// desktop app with local CLI access enabled (Settings → Remote). Async
+/// contract: sending a prompt or command is acknowledged when the host ACCEPTS
+/// it, not when the agent finishes — watch the session for completion.
 ///
 /// Exit codes: 0 ok · 1 error · 2 usage · 3 host unreachable · 4 timed out ·
 /// 5 access denied.
