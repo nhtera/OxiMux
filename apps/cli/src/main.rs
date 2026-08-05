@@ -213,11 +213,12 @@ fn host_verb(args: Cli) -> u8 {
                     }
                     ScheduleCommand::Rm { id } => commands::schedule::rm(&client, &id).await,
                 },
-                Command::Run { prompt, agent, model, cwd, worktree, output_schema, bg } => {
+                Command::Run { prompt, agent, model, mode, cwd, worktree, output_schema, bg } => {
                     let run_args = commands::run::RunArgs {
                         prompt,
                         agent,
                         model,
+                        mode,
                         cwd,
                         worktree,
                         output_schema,
@@ -392,6 +393,30 @@ mod tests {
             let needed = required_version(&command_of(&argv)).map(|(v, _)| v);
             assert_eq!(needed, expected, "{argv:?}");
         }
+    }
+
+    /// `run --mode` reaches the parser, and is absent when not given.
+    ///
+    /// A wiring guard rather than a parser test: the flag exists so a scripted
+    /// `run` can start a session in a mode that does not stop on every tool.
+    /// Dropped anywhere between clap and `RunArgs` it would fail silently — the
+    /// session would simply take the backend default and the run would park on
+    /// the first permission request, which is the failure this flag exists to
+    /// prevent and is indistinguishable from a slow agent.
+    #[test]
+    fn run_carries_the_permission_mode_through_to_its_args() {
+        let Command::Run { mode, model, .. } =
+            command_of(&["oximux", "run", "hi", "--mode", "acceptEdits"])
+        else {
+            panic!("`run` parses");
+        };
+        assert_eq!(mode.as_deref(), Some("acceptEdits"));
+        assert_eq!(model, None, "--mode must not be confused with --model");
+
+        let Command::Run { mode, .. } = command_of(&["oximux", "run", "hi"]) else {
+            panic!("`run` parses");
+        };
+        assert_eq!(mode, None, "no --mode means the backend default, not a guess");
     }
 
     /// `schedule` is the one family split across versions: only the manual fire

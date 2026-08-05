@@ -60,6 +60,7 @@ Start an agent session and send it a prompt.
 | `<PROMPT>` | yes | The prompt to send |
 | `--agent` | yes | Which configured agent to start (default: the host's default agent) |
 | `--model` | yes | Switch the session to this model before sending the prompt |
+| `--mode` | yes | Switch the session to this permission mode before sending the prompt (ids from `model ls`). Without it the session starts in the backend's default, which for most agents asks before each tool — and an unattended `run` then streams up to the request and waits there, since only a decision can end that turn. `acceptEdits` is the usual choice for a scripted run |
 | `--cwd` | yes | Working directory for the session (default: the current directory) |
 | `--worktree` | yes | Create a worktree with this slug under the project first, and start the session inside it. The project is the `--cwd` (or current) directory, which must be a project the host knows |
 | `--output-schema` | yes | Hold the final answer to a JSON Schema — a file path, or the schema itself as inline JSON. The agent is re-prompted with the validation errors up to twice; a still-invalid answer exits 1. Prints the validated JSON. Needs the turn, so it cannot be combined with --bg |

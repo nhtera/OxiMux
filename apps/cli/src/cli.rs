@@ -88,6 +88,14 @@ pub enum Command {
         /// Switch the session to this model before sending the prompt.
         #[arg(long, value_name = "MODEL_ID")]
         model: Option<String>,
+        /// Switch the session to this permission mode before sending the
+        /// prompt (ids from `model ls`). Without it the session starts in the
+        /// backend's default, which for most agents asks before each tool —
+        /// and an unattended `run` then streams up to the request and waits
+        /// there, since only a decision can end that turn. `acceptEdits` is
+        /// the usual choice for a scripted run.
+        #[arg(long, value_name = "MODE_ID")]
+        mode: Option<String>,
         /// Working directory for the session (default: the current directory).
         #[arg(long, value_name = "DIR")]
         cwd: Option<PathBuf>,

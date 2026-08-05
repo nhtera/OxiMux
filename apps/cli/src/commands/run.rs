@@ -30,10 +30,63 @@ fn corr_id() -> u64 {
     u64::from(std::process::id()) << 16
 }
 
+/// Refuse a permission-mode id this session's backend does not advertise.
+///
+/// The `Ack` is not evidence the mode took. The host answers
+/// `SetPermissionMode` with `Ack` whenever the backend's own call returned
+/// `Ok`, and a backend that ignores an id it does not recognise returns `Ok` —
+/// so `--mode acceptEdit` reports a successful switch, keeps the default, and
+/// then parks on the first permission request. That is precisely the hang this
+/// flag exists to prevent, arriving through a typo instead.
+///
+/// Checks MEMBERSHIP in the advertised list, deliberately not the applied
+/// state. A backend applies the change asynchronously, so `current_mode` read
+/// straight after the `Ack` still shows the old value and a state comparison
+/// fails for correct input — measured, not theorised. Membership answers the
+/// question actually being asked ("is this a real mode?") and cannot race.
+///
+/// Silent when the backend has not advertised yet: an empty list means "nothing
+/// to check against", not "the mode is wrong". The session is created moments
+/// before this runs, so failing on an empty list would reject correct
+/// invocations on timing alone.
+async fn confirm_mode(client: &Client, session_id: &str, want: &str) -> Result<(), Failure> {
+    let choices = match client
+        .call(Request::ListChoices { session_id: session_id.into() })
+        .await?
+    {
+        Response::Choices(c) => c,
+        // Unreadable choices are not evidence of a wrong mode; the prompt still
+        // goes out, and a real refusal would already have surfaced above.
+        _ => return Ok(()),
+    };
+    if choices.modes.is_empty() || choices.modes.iter().any(|m| m.id == want) {
+        return Ok(());
+    }
+    let known: Vec<&str> = choices.modes.iter().map(|m| m.id.as_str()).collect();
+    Err(Failure::new(
+        "unknown-mode",
+        exit::ERROR,
+        format!("`{want}` is not a permission mode this session offers"),
+    )
+    .with_steps([
+        format!("this session accepts: {}", known.join(", ")),
+        format!(
+            "the session {session_id} exists and is idle — retry with \
+             `oximux send {session_id} …` after `oximux mode set`"
+        ),
+    ]))
+}
+
 pub struct RunArgs {
     pub prompt: String,
     pub agent: Option<String>,
     pub model: Option<String>,
+    /// The permission mode to switch to before prompting. The reason this
+    /// exists on `run` at all: `mode set` needs a session, and `run` is what
+    /// creates one — so without it the first turn of a scripted run always
+    /// takes the backend's default, and a default that asks per tool leaves an
+    /// unattended `run` waiting on a decision nobody is there to make.
+    pub mode: Option<String>,
     pub cwd: Option<PathBuf>,
     pub worktree: Option<String>,
     /// A JSON Schema the final answer must satisfy (clap refuses it with
@@ -102,6 +155,32 @@ pub async fn run(client: &Client, args: RunArgs, json_mode: bool) -> Result<(Val
             }
             other => return Err(unexpected_reply("SetModel", &other)),
         }
+    }
+
+    // Same rule for the permission mode, and for a sharper reason: proceeding
+    // on the default after the caller asked for something more permissive is
+    // how an unattended run ends up parked on a permission request forever.
+    if let Some(mode) = &args.mode {
+        match client
+            .call(Request::SetPermissionMode {
+                session_id: session_id.clone(),
+                mode: mode.clone(),
+            })
+            .await?
+        {
+            Response::Ack => {}
+            Response::Error(e) => {
+                return Err(rpc_failure(e).with_steps([
+                    format!(
+                        "the session {session_id} was created but keeps its default \
+                         permission mode"
+                    ),
+                    format!("`oximux model ls {session_id}` lists the modes it accepts"),
+                ]));
+            }
+            other => return Err(unexpected_reply("SetPermissionMode", &other)),
+        }
+        confirm_mode(client, &session_id, mode).await?;
     }
 
     match client
