@@ -12,7 +12,7 @@ the desktop.
   ever. A journal that captures stdout can never capture a secret:
 
   ```json
-  {"type":"oximux_serve_ready","schemaVersion":1,"protocolVersion":16,"localSocket":"…","endpointId":"<64 hex>"}
+  {"type":"oximux_serve_ready","schemaVersion":1,"protocolVersion":18,"localSocket":"…","endpointId":"<64 hex>"}
   ```
 
 - **Logs go to stderr** (`RUST_LOG` filters them; default `info`).
