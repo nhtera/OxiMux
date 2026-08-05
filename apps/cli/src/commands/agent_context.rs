@@ -7,9 +7,25 @@ use serde_json::{Value, json};
 
 use crate::cli::{Cli, exit};
 
+/// The shape of this dump, so a consumer that caches or codegens against it can
+/// tell when the shape moved under it — the same contract `serve`'s readiness
+/// line carries.
+///
+/// Bump ONLY for a change that breaks a reader of the previous version:
+/// renaming or removing a top-level key, or changing the meaning or type of an
+/// existing field. Adding a command, a flag, or a new top-level key does not
+/// bump it — the tree is *expected* to grow, and a reader that broke on growth
+/// would break on every release.
+///
+/// This cannot be usefully retrofitted: a consumer already parsing an
+/// unversioned dump has no field to check, so the field only helps if it was
+/// there first.
+const SCHEMA_VERSION: u32 = 1;
+
 pub fn dump() -> Value {
     let cmd = Cli::command();
     json!({
+        "schemaVersion": SCHEMA_VERSION,
         "command": describe(&cmd),
         "exit_codes": {
             "ok": exit::OK,
@@ -115,5 +131,22 @@ mod tests {
         assert_eq!(dump["exit_codes"]["access_denied"], 5);
         assert_eq!(dump["exit_codes"]["host_unreachable"], 3);
         assert_eq!(dump["command"]["name"], "oximux", "users type `oximux`");
+    }
+
+    /// The dump declares its own shape. Without this a consumer that cached or
+    /// codegened from it has no way to notice the shape changed — and this is
+    /// the one command whose entire audience is such a consumer.
+    #[test]
+    fn the_dump_declares_its_schema_version() {
+        let dump = dump();
+        assert_eq!(
+            dump["schemaVersion"], SCHEMA_VERSION,
+            "agent-context must carry the version of its own shape"
+        );
+        assert!(
+            dump["schemaVersion"].is_u64(),
+            "a number, so a consumer can compare it: {:?}",
+            dump["schemaVersion"]
+        );
     }
 }
