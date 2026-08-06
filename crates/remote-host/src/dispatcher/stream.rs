@@ -61,7 +61,12 @@ pub(super) enum Live {
     /// cheap snapshot to recompute, and it is one small row. Prefix filtering
     /// happens in the stream, not at forward time, because the prefix belongs
     /// to *this* subscription rather than to the peer.
-    StateChange(String, Option<oximux_remote_proto::messages::StateEntryWire>),
+    /// `with_cursor` is a property of THIS subscription, not of the peer: one
+    /// connection may hold a v18 `StateWatch` and a v19 `StateWatchFrom` at
+    /// once, and a peer-level flag has no way to tell them apart. Sending the
+    /// cursor-bearing ordinal to the cursor-less watcher would drop its whole
+    /// connection, since it has no decoder for it.
+    StateChange { change: oximux_remote_proto::messages::StateChangeWire, with_cursor: bool },
 }
 
 /// Turn a session's broadcast receiver into a `'static` stream of [`LiveFrame`]s.
@@ -171,17 +176,18 @@ fn schedule_runs_stream(
 /// versioned write path is what makes that safe: a caller acting on a stale
 /// value loses its conditional write rather than clobbering.
 fn state_changes_stream(
-    rx: broadcast::Receiver<(String, Option<oximux_remote_proto::messages::StateEntryWire>)>,
+    rx: broadcast::Receiver<oximux_remote_proto::messages::StateChangeWire>,
     prefix: Option<String>,
+    with_cursor: bool,
 ) -> BoxStream<'static, Live> {
-    stream::unfold((rx, prefix), |(mut rx, prefix)| async move {
+    stream::unfold((rx, prefix), move |(mut rx, prefix)| async move {
         loop {
             match rx.recv().await {
-                Ok((key, entry)) => {
-                    if prefix.as_ref().is_some_and(|p| !key.starts_with(p.as_str())) {
+                Ok(change) => {
+                    if prefix.as_ref().is_some_and(|p| !change.key.starts_with(p.as_str())) {
                         continue;
                     }
-                    return Some((Live::StateChange(key, entry), (rx, prefix)));
+                    return Some((Live::StateChange { change, with_cursor }, (rx, prefix)));
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => return None,
@@ -387,8 +393,9 @@ impl Dispatcher {
     pub(super) fn state_push_stream(
         &self,
         prefix: Option<String>,
+        with_cursor: bool,
     ) -> Option<BoxStream<'static, Live>> {
-        Some(state_changes_stream(self.state_events.as_ref()?.subscribe(), prefix))
+        Some(state_changes_stream(self.state_events.as_ref()?.subscribe(), prefix, with_cursor))
     }
 
     /// Push one coordination change, behind the same per-frame authorization
@@ -398,18 +405,22 @@ impl Dispatcher {
         &self,
         peer: &Peer,
         transport: &dyn Transport,
-        key: String,
-        entry: Option<oximux_remote_proto::messages::StateEntryWire>,
+        change: oximux_remote_proto::messages::StateChangeWire,
+        with_cursor: bool,
     ) -> bool {
         if !self.auth.may_read_state(peer) {
             return true;
         }
+        // The cursor-less shape is not a legacy path to be migrated off: a v18
+        // watcher subscribed with `StateWatch` and has a decoder for exactly
+        // one of these two ordinals.
+        let response = if with_cursor {
+            Response::StateChangedAt(change)
+        } else {
+            Response::StateChanged { key: change.key, entry: change.entry }
+        };
         transport
-            .send(
-                Response::StateChanged { key, entry }
-                    .to_bytes()
-                    .expect("response is always encodable"),
-            )
+            .send(response.to_bytes().expect("response is always encodable"))
             .await
             .is_ok()
     }

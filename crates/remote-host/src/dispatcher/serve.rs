@@ -169,8 +169,9 @@ impl Dispatcher {
                                 Live::ScheduleRun(run) => {
                                     self.forward_schedule_run(&peer, transport, run).await
                                 }
-                                Live::StateChange(key, entry) => {
-                                    self.forward_state_change(&peer, transport, key, entry).await
+                                Live::StateChange { change, with_cursor } => {
+                                    self.forward_state_change(&peer, transport, change, with_cursor)
+                                        .await
                                 }
                             };
                             if !alive {
@@ -487,7 +488,24 @@ impl Dispatcher {
             // idempotent for a client that gets both.
             if matches!(response, Response::StateSnapshot(_))
                 && state.peer_version >= oximux_remote_proto::proto::STATE_PUSH_MIN_VERSION
-                && let Some(stream) = self.state_push_stream(prefix)
+                && let Some(stream) = self.state_push_stream(prefix, /* with_cursor */ false)
+            {
+                streams.push(stream);
+            }
+            return self.send(transport, response).await;
+        }
+        // The v19 cursor-aware watch. Same shape as `StateWatch` above — a
+        // reply plus a live stream — differing only in what the reply carries
+        // and which push ordinal the stream emits.
+        if let Request::StateWatchFrom { prefix, since_seq } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.state_watch_from(&peer, prefix.as_deref(), since_seq);
+            if matches!(response, Response::StateWatchStarted(_))
+                && state.peer_version
+                    >= oximux_remote_proto::proto::STATE_CURSOR_PUSH_MIN_VERSION
+                && let Some(stream) = self.state_push_stream(prefix, /* with_cursor */ true)
             {
                 streams.push(stream);
             }

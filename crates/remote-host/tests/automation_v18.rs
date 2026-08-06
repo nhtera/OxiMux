@@ -639,3 +639,142 @@ fn an_older_peer_is_never_pushed_a_state_change() {
         drop(client);
     });
 }
+
+/// v19: a cursor-aware watcher is told whether it missed anything.
+///
+/// The two answers a resume can give are the point of the whole surface, and
+/// they must be distinguishable: a `replay` means the gap was covered exactly,
+/// a `baseline` means it was not and transitions were lost. v18's `StateWatch`
+/// returned the board either way, so a reconnecting watcher had no way to tell
+/// a clean resume from a lossy one — it just looked current.
+///
+/// Note the frame draining: once a watch is open its pushes share the transport
+/// with every later reply, and their interleaving is not ordered. A test that
+/// assumed the next frame was its reply would pass or fail on timing.
+#[test]
+fn a_cursor_aware_watcher_replays_a_covered_gap_and_resyncs_an_uncovered_one() {
+    let db = db();
+    let (dispatcher, _sched, _teams) = host(&db);
+
+    talk(&dispatcher, LocalScope::Full, |client| async move {
+        call(&client, Request::Hello(HelloReq { protocol_version: PROTOCOL_VERSION })).await;
+
+        /// Send a watch and read frames until its reply arrives, skipping any
+        /// push that overtakes it. Bounded, so a missing reply fails rather
+        /// than hangs.
+        async fn watch_from(
+            client: &dyn Transport,
+            since_seq: Option<u64>,
+        ) -> oximux_remote_proto::messages::StateWatchStartedWire {
+            client
+                .send(
+                    Request::StateWatchFrom { prefix: Some("team/".into()), since_seq }
+                        .to_bytes()
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            for _ in 0..8 {
+                let frame = client.recv().await.unwrap().expect("a frame");
+                if let Response::StateWatchStarted(s) = Response::from_bytes(&frame).unwrap() {
+                    return s;
+                }
+            }
+            panic!("no StateWatchStarted arrived");
+        }
+
+        // Two writes first, while nothing is subscribed, so the replies cannot
+        // interleave with pushes.
+        for (key, value) in [("team/a", "1"), ("team/b", "2")] {
+            call(
+                &client,
+                Request::StateSet(StateSetReq {
+                    key: key.into(),
+                    value_json: value.into(),
+                    if_version: None,
+                }),
+            )
+            .await;
+        }
+
+        // A fresh watch: the board, plus the cursor to resume from.
+        let started = watch_from(&client, None).await;
+        assert_eq!(started.seq, 2, "two writes have happened");
+        assert_eq!(started.baseline.expect("a fresh watch is a baseline").len(), 2);
+        assert!(started.replay.is_empty());
+
+        // Resuming from before them replays exactly the gap, and says so by
+        // sending no baseline.
+        let resumed = watch_from(&client, Some(0)).await;
+        assert!(resumed.baseline.is_none(), "a covered gap is replayed, not resynced");
+        assert_eq!(
+            resumed.replay.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(),
+            vec!["team/a", "team/b"],
+        );
+        assert_eq!(resumed.seq, 2, "the cursor names the newest change");
+
+        // Caught up: an empty replay, NOT a resync. "Nothing happened" and "you
+        // may have missed something" are different answers.
+        let current = watch_from(&client, Some(2)).await;
+        assert!(current.baseline.is_none(), "a caught-up watcher is not resynced");
+        assert!(current.replay.is_empty());
+
+        // A cursor from a previous boot of this host — the counter lives in
+        // memory, so a number above the head cannot be honoured. It resyncs
+        // rather than delivering nothing while looking current.
+        let stale = watch_from(&client, Some(9_999)).await;
+        assert_eq!(stale.baseline.expect("an unhonourable cursor resyncs").len(), 2);
+        drop(client);
+    });
+}
+
+/// A cursor-aware watcher receives the cursor-bearing push, not the v18 one.
+///
+/// The two ordinals are not interchangeable: a v18 watcher has no decoder for
+/// `StateChangedAt`, and sending it would drop the whole connection. Since the
+/// choice is per-subscription rather than per-peer, it is worth pinning that
+/// the right one comes back.
+#[test]
+fn a_cursor_aware_watcher_is_pushed_the_cursor_bearing_frame() {
+    let db = db();
+    let (dispatcher, _sched, _teams) = host(&db);
+
+    talk(&dispatcher, LocalScope::Full, |client| async move {
+        call(&client, Request::Hello(HelloReq { protocol_version: PROTOCOL_VERSION })).await;
+        match call(&client, Request::StateWatchFrom { prefix: None, since_seq: None }).await {
+            Response::StateWatchStarted(_) => {}
+            other => panic!("expected a cursor-aware start, got {other:?}"),
+        }
+        client
+            .send(
+                Request::StateSet(StateSetReq {
+                    key: "k".into(),
+                    value_json: "1".into(),
+                    if_version: None,
+                })
+                .to_bytes()
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut pushed = None;
+        for _ in 0..4 {
+            let frame = client.recv().await.unwrap().expect("a frame");
+            match Response::from_bytes(&frame).unwrap() {
+                Response::StateChangedAt(change) => {
+                    pushed = Some(change);
+                    break;
+                }
+                Response::StateChanged { .. } => {
+                    panic!("a cursor-aware watcher must not get the cursor-less push")
+                }
+                _ => {}
+            }
+        }
+        let change = pushed.expect("a pushed change");
+        assert_eq!(change.key, "k");
+        assert_eq!(change.seq, 1, "the push carries the position to resume from");
+        drop(client);
+    });
+}

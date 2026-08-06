@@ -155,11 +155,12 @@ pub struct Dispatcher {
     /// dispatcher owns this one (unlike `schedule_events`, which the host's
     /// ticker feeds) because every writer goes through these handlers.
     state_events: Option<
-        tokio::sync::broadcast::Sender<(
-            String,
-            Option<oximux_remote_proto::messages::StateEntryWire>,
-        )>,
+        tokio::sync::broadcast::Sender<oximux_remote_proto::messages::StateChangeWire>,
     >,
+    /// Recent coordination changes, so a `StateWatchFrom` can replay a gap
+    /// instead of resyncing. Always present: it is a bounded in-memory ring, so
+    /// a host with no watchers pays a `VecDeque` for it and nothing else.
+    state_log: state::StateLog,
     /// Wall clock (Unix seconds), injectable so tests are deterministic.
     now_secs: fn() -> u64,
 }
@@ -183,6 +184,7 @@ impl Dispatcher {
             teams: None,
             coord: None,
             state_events: None,
+            state_log: state::StateLog::default(),
             now_secs: system_now_secs,
         }
     }
