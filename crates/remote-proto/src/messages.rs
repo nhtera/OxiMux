@@ -707,6 +707,46 @@ pub struct StateEntryWire {
     pub updated_at: String,
 }
 
+/// One coordination change, carrying the cursor position that produced it.
+///
+/// The `seq` is a host-wide counter over *changes*, not the per-key `version`
+/// in [`StateEntryWire`]: a watcher needs one ordering across every key it
+/// watches, and per-key versions give no way to tell whether something it never
+/// saw happened in between.
+///
+/// It counts from the host's boot, and a restart resets it. That is why a
+/// resume answers with a fresh baseline whenever the cursor cannot be honoured
+/// rather than trusting the number — a stale cursor from a previous boot would
+/// otherwise silently look like a valid recent one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateChangeWire {
+    pub seq: u64,
+    pub key: String,
+    /// `None` is a delete — the key no longer exists.
+    pub entry: Option<StateEntryWire>,
+}
+
+/// What a cursor-aware `StateWatchFrom` starts a watcher with.
+///
+/// Exactly one of `baseline`/`replay` carries anything, and which one is the
+/// answer to "did I miss something?": a `baseline` means the watcher's cursor
+/// could not be honoured and it is being resynced from scratch, a `replay`
+/// means the gap was covered exactly. That distinction is the whole point of
+/// the cursor — the pre-v19 `StateWatch` returned the board either way, so a
+/// watcher could not tell a clean reconnect from a lossy one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateWatchStartedWire {
+    /// The cursor to resume from next time: the newest change the host has
+    /// issued, whether or not this watcher received it.
+    pub seq: u64,
+    /// The board as it stands — sent for a fresh watch, and for a resume whose
+    /// cursor had aged out of the host's ring (or predates its boot).
+    pub baseline: Option<Vec<StateEntryWire>>,
+    /// The changes since the caller's cursor, when the ring still covered them.
+    /// Empty is a normal answer: nothing happened while the watcher was away.
+    pub replay: Vec<StateChangeWire>,
+}
+
 /// A role settling its own row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamReportReq {

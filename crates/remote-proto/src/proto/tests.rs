@@ -17,8 +17,8 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 18,
-        "v18 = the automation surface (heartbeats, team runs, coordination state)"
+        PROTOCOL_VERSION, 19,
+        "v19 = the coordination watch cursor (StateWatchFrom + StateWatchStarted/StateChangedAt)"
     );
 }
 
@@ -453,4 +453,23 @@ fn early_variants_keep_their_literal_ordinals() {
     let changed = Response::StateChanged { key: String::new(), entry: None };
     assert_eq!(changed.to_bytes().expect("encode")[0], 44);
     assert_eq!(Response::StateConflict(None).to_bytes().expect("encode")[0], 45);
+
+    // v19, appended after the v18 batch: `StateWatchFrom` (61) and its replies
+    // `StateWatchStarted` (46), `StateChangedAt` (47). The cursor-less
+    // `StateWatch` (60) / `StateChanged` (44) keep their ordinals — a v18 peer
+    // must go on speaking exactly what it already spoke.
+    let watch_from = Request::StateWatchFrom { prefix: None, since_seq: None };
+    assert_eq!(watch_from.to_bytes().expect("encode")[0], 61);
+    let started = Response::StateWatchStarted(StateWatchStartedWire {
+        seq: 0,
+        baseline: None,
+        replay: vec![],
+    });
+    assert_eq!(started.to_bytes().expect("encode")[0], 46);
+    let changed_at = Response::StateChangedAt(StateChangeWire {
+        seq: 0,
+        key: String::new(),
+        entry: None,
+    });
+    assert_eq!(changed_at.to_bytes().expect("encode")[0], 47);
 }

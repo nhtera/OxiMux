@@ -80,12 +80,25 @@ pub use crate::messages::*;
 /// heartbeats out of `ListSchedules` entirely — a v17 phone must not receive
 /// rows whose target it has no field to see.
 ///
+/// v19: appended the **coordination watch cursor** (`StateWatchFrom` with the
+/// `StateWatchStarted`/`StateChangedAt` frames). v18's `StateWatch` answers the
+/// board and then pushes every change, which is enough to stay current but not
+/// to know whether you *are*: a watcher whose connection dropped, or whose
+/// receiver lagged, got no signal that it had missed transitions, and the
+/// stream carried no position it could resume from. The cursor version replays
+/// the gap when the host's ring still covers it and otherwise resyncs with a
+/// fresh baseline — the same "recover, and say so" contract session events have
+/// had since v1, rather than silent staleness.
+///
+/// `StateWatch` is untouched and still served: a v18 peer keeps working exactly
+/// as before, and gets the cursor-less push it has a decoder for.
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 18;
+pub const PROTOCOL_VERSION: u32 = 19;
 
 /// The oldest peer that can decode [`Response::StateChanged`]. Like
 /// [`SCHEDULE_PUSH_MIN_VERSION`], this exists because a push reaches a peer
@@ -94,6 +107,13 @@ pub const PROTOCOL_VERSION: u32 = 18;
 /// cannot do. Stated anyway so the gate is a property of the push rather than
 /// an inference about who could have subscribed.
 pub const STATE_PUSH_MIN_VERSION: u32 = 18;
+
+/// The oldest peer that can decode [`Response::StateChangedAt`]. Same reasoning
+/// as [`STATE_PUSH_MIN_VERSION`], one version on: only a peer that sent
+/// [`Request::StateWatchFrom`] ever receives it, and only a v19 peer can send
+/// that — but the gate is stated so it is a property of the push rather than an
+/// inference about who could have subscribed.
+pub const STATE_CURSOR_PUSH_MIN_VERSION: u32 = 19;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the
@@ -579,6 +599,20 @@ pub enum Request {
     /// [`Response::StateChanged`] frames follow for every later write or
     /// delete, so a watcher never has to poll and never misses the baseline.
     StateWatch { prefix: Option<String> },
+    // ---- v19: the coordination watch cursor ----
+    /// Subscribe to coordination-state changes **with a cursor**, so a watcher
+    /// that reconnects can tell whether it missed anything.
+    ///
+    /// `since_seq: None` is a fresh watch and answers with a baseline, exactly
+    /// like [`Request::StateWatch`] but carrying the cursor to resume from.
+    /// `Some(n)` resumes after change `n`: the reply replays the gap when the
+    /// host's ring still covers it, and otherwise sends a fresh baseline —
+    /// which is the watcher's signal that it lost transitions.
+    ///
+    /// A separate variant rather than a field on `StateWatch` because postcard
+    /// encodes a struct-like variant positionally: widening the existing one
+    /// would misparse on every peer that predates the change.
+    StateWatchFrom { prefix: Option<String>, since_seq: Option<u64> },
 }
 
 /// Host → client.
@@ -771,6 +805,18 @@ pub enum Response {
     /// mechanism exists to prevent. Not an [`RpcError`] either — nothing is
     /// wrong, the caller simply lost a race it asked to be told about.
     StateConflict(Option<StateEntryWire>),
+    // ---- v19: the coordination watch cursor ----
+    /// Reply to [`Request::StateWatchFrom`] — the cursor to resume from, plus
+    /// either a fresh baseline or the replayed gap. See
+    /// [`StateWatchStartedWire`] for which means what.
+    StateWatchStarted(StateWatchStartedWire),
+    /// One coordination change pushed to a **cursor-aware** watcher. Identical
+    /// in meaning to [`Response::StateChanged`], plus the `seq` that lets the
+    /// watcher resume. Never sent to a peer below
+    /// [`STATE_CURSOR_PUSH_MIN_VERSION`], and never to a watcher that
+    /// subscribed with the cursor-less [`Request::StateWatch`] — that peer has
+    /// no decoder for this ordinal.
+    StateChangedAt(StateChangeWire),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.
