@@ -137,6 +137,12 @@ fn main() -> std::process::ExitCode {
 /// host closed the connection" with nothing to act on.
 fn required_version(command: &Command) -> Option<(u32, &'static str)> {
     match command {
+        // v19: the watch cursor. `state watch` sends `StateWatchFrom`, an
+        // ordinal a v18 host answers by dropping the connection — so it needs
+        // its own floor above the rest of its family, exactly as
+        // `schedule run-once` does. Must stay ABOVE the catch-all `State` arm
+        // below, which would otherwise match it first and claim v18.
+        Command::State { command: StateCommand::Watch { .. } } => Some((19, "state watch")),
         // v18: the automation surface.
         Command::Heartbeat { .. } => Some((18, "heartbeat")),
         Command::Team { .. } => Some((18, "team")),
@@ -441,8 +447,8 @@ fn host_verb(mut args: Cli) -> u8 {
                         commands::state::set(&client, &key, &value, if_version).await
                     }
                     StateCommand::Delete { key } => commands::state::delete(&client, &key).await,
-                    StateCommand::Watch { prefix } => {
-                        commands::state::watch(&client, prefix, json_mode).await
+                    StateCommand::Watch { prefix, since } => {
+                        commands::state::watch(&client, prefix, since, json_mode).await
                     }
                 },
                 Command::PairNew { read_only, force_non_tty } => {
@@ -481,6 +487,12 @@ mod tests {
     #[test]
     fn only_appended_verbs_declare_a_version_floor() {
         for (argv, expected) in [
+            // v19 sits above its own family: only `state watch` sends the
+            // cursor request, and gating the whole family would strand a v18
+            // host's perfectly serviceable get/set/delete.
+            (vec!["oximux", "state", "watch"], Some(19)),
+            (vec!["oximux", "state", "set", "k", "1"], Some(18)),
+            (vec!["oximux", "state", "delete", "k"], Some(18)),
             (vec!["oximux", "heartbeat", "ls"], Some(18)),
             (vec!["oximux", "team", "ls"], Some(18)),
             (vec!["oximux", "state", "get", "k"], Some(18)),

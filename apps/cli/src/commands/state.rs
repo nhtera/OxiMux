@@ -95,33 +95,75 @@ pub async fn set(
 
 pub async fn delete(client: &Client, key: &str) -> Result<(Value, String), Failure> {
     match client.call(Request::StateDelete { key: key.into() }).await? {
-        Response::Ack => Ok((json!({ "deleted": key }), format!("deleted {key}"))),
+        // `Ack` carries no did-anything-happen bit — a SQL DELETE of zero rows
+        // is `Ok` — so report the postcondition, never the action. Claiming
+        // `deleted <key>` for a key that was never set is an assertion this
+        // reply cannot support. The idempotence itself is deliberate host-side
+        // design (`dispatcher/state.rs`), and stays.
+        Response::Ack => Ok((
+            json!({ "key": key, "state": "absent" }),
+            format!("no `{key}` remains"),
+        )),
         Response::Error(e) => Err(rpc_failure(e)),
         other => Err(unexpected_reply("StateDelete", &other)),
     }
 }
 
-/// Stream changes until Ctrl+C. The baseline (every matching key as it stands
-/// now) is printed first, so a watcher never has to `get` before it watches.
+/// Stream changes until Ctrl+C, carrying a cursor so a reconnect can say
+/// whether it missed anything.
+///
+/// Every line carries the `seq` it was delivered at; passing the last one back
+/// as `--since` resumes there. The host replays the gap when its ring still
+/// covers it and otherwise resyncs with a fresh baseline — and says which, so a
+/// watcher is never quietly stale. That distinction is the whole reason the
+/// cursor exists, and it is why `resynced` is printed rather than inferred.
 pub async fn watch(
     client: &Client,
     prefix: Option<String>,
+    since: Option<u64>,
     json_mode: bool,
 ) -> Result<(Value, String), Failure> {
     use std::io::Write as _;
 
-    let reply = client.call(Request::StateWatch { prefix: prefix.clone() }).await?;
-    let baseline = match reply {
-        Response::StateSnapshot(entries) => entries,
+    let reply = client
+        .call(Request::StateWatchFrom { prefix: prefix.clone(), since_seq: since })
+        .await?;
+    let started = match reply {
+        Response::StateWatchStarted(started) => started,
         Response::Error(e) => return Err(rpc_failure(e)),
-        other => return Err(unexpected_reply("StateWatch", &other)),
+        other => return Err(unexpected_reply("StateWatchFrom", &other)),
     };
-    for entry in &baseline {
+    let mut cursor = started.seq;
+
+    // A resync after an explicit `--since` is the one thing a watcher must not
+    // miss: it means transitions happened that it will never see. Marked on
+    // stdout in both modes — in JSON because a consumer has to branch on it,
+    // and in human form because a person reading a board wants to know their
+    // history has a hole in it. Not marked for a fresh watch: there is no gap
+    // to have missed when you asked for none.
+    let resynced = started.baseline.is_some() && since.is_some();
+    if resynced {
         if json_mode {
-            println!("{}", json!({ "baseline": true, "entry": entry_json(entry) }));
+            println!("{}", json!({ "resynced": true, "since": since, "seq": cursor }));
         } else {
-            println!("{}", entry_line(entry));
+            println!("— resynced: the host could not replay from {} —", since.unwrap_or(0));
         }
+    }
+    if let Some(baseline) = &started.baseline {
+        for entry in baseline {
+            if json_mode {
+                println!(
+                    "{}",
+                    json!({ "baseline": true, "seq": cursor, "entry": entry_json(entry) })
+                );
+            } else {
+                println!("{}", entry_line(entry));
+            }
+        }
+    }
+    for change in &started.replay {
+        cursor = cursor.max(change.seq);
+        emit_change(change.seq, &change.key, change.entry.as_ref(), json_mode, true);
     }
     let _ = std::io::stdout().flush();
 
@@ -132,22 +174,45 @@ pub async fn watch(
         };
         // Replies cannot arrive here — nothing else was sent — but a push for
         // some other subscription could, so filter on the variant rather than
-        // assuming.
-        let Response::StateChanged { key, entry } = frame else {
+        // assuming. Only the cursor-bearing push is expected: this subscribed
+        // with `StateWatchFrom`, and the host answers that with `StateChangedAt`.
+        let Response::StateChangedAt(change) = frame else {
             if !is_push(&frame) {
-                return Err(unexpected_reply("StateWatch", &frame));
+                return Err(unexpected_reply("StateWatchFrom", &frame));
             }
             continue;
         };
-        match (&entry, json_mode) {
-            (Some(entry), true) => {
-                println!("{}", json!({ "entry": entry_json(entry) }));
-            }
-            (Some(entry), false) => println!("{}", entry_line(entry)),
-            (None, true) => println!("{}", json!({ "key": key, "deleted": true })),
-            (None, false) => println!("{key}  (deleted)"),
-        }
+        cursor = cursor.max(change.seq);
+        emit_change(change.seq, &change.key, change.entry.as_ref(), json_mode, false);
         let _ = std::io::stdout().flush();
     }
-    Ok((json!({ "watched": prefix, "detached": true }), "detached".into()))
+    // The cursor comes back in the result so a script can `--since` it next
+    // time without having to parse the stream it just printed.
+    Ok((
+        json!({ "watched": prefix, "detached": true, "seq": cursor, "resynced": resynced }),
+        format!("detached at seq {cursor}"),
+    ))
+}
+
+/// One change line, in either mode. `replayed` marks the catch-up ones so a
+/// reader can tell what happened while they were away from what is happening
+/// now.
+fn emit_change(
+    seq: u64,
+    key: &str,
+    entry: Option<&oximux_remote_proto::messages::StateEntryWire>,
+    json_mode: bool,
+    replayed: bool,
+) {
+    match (entry, json_mode) {
+        (Some(entry), true) => println!(
+            "{}",
+            json!({ "seq": seq, "replayed": replayed, "entry": entry_json(entry) })
+        ),
+        (Some(entry), false) => println!("{}", entry_line(entry)),
+        (None, true) => {
+            println!("{}", json!({ "seq": seq, "replayed": replayed, "key": key, "deleted": true }))
+        }
+        (None, false) => println!("{key}  (deleted)"),
+    }
 }

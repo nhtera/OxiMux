@@ -733,16 +733,33 @@ pub enum StateCommand {
         #[arg(long, value_name = "VERSION")]
         if_version: Option<u64>,
     },
-    /// Delete one key. Idempotent.
+    /// Delete one key.
+    ///
+    /// Idempotent: a key that was never set succeeds, because the goal state is
+    /// reached either way. Exit 0 therefore does NOT mean the key existed — a
+    /// mistyped key succeeds too. Read it back with `state get` if you need to
+    /// know that it was there.
+    #[command(verbatim_doc_comment)]
     Delete {
         /// The key.
         key: String,
     },
     /// Print every matching key, then stream changes until Ctrl+C.
+    ///
+    /// Every line carries the `seq` it arrived at, and the final result carries
+    /// the last one. Pass it back as `--since` to resume: the host replays what
+    /// you missed if it still can, and otherwise re-sends the whole board and
+    /// says `resynced` — so a watcher always knows whether its history has a
+    /// hole in it.
+    #[command(verbatim_doc_comment)]
     Watch {
         /// Only keys starting with this (default: every key).
         #[arg(long, value_name = "PREFIX")]
         prefix: Option<String>,
+        /// Resume after this sequence number (from a previous watch's `seq`).
+        /// Without it the watch starts from the board as it stands now.
+        #[arg(long, value_name = "SEQ")]
+        since: Option<u64>,
     },
 }
 
