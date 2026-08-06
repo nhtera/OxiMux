@@ -6,7 +6,7 @@ use oximux_remote_proto::messages::SendPromptReq;
 use oximux_remote_proto::proto::{Request, Response};
 use serde_json::{Value, json};
 
-use super::attach::{Stop, StreamEnd, stream_session};
+use super::attach::{Stop, StreamEnd, StreamOpts, stream_session};
 use crate::cli::exit;
 use crate::client::{Client, rpc_failure, unexpected_reply};
 use crate::output::Failure;
@@ -16,20 +16,32 @@ use crate::output::Failure;
 /// Split from [`run`] so the schema loop can send its corrections through the
 /// plain path: a correction that re-entered the checking path would recurse
 /// once per retry instead of being bounded by the retry counter.
+/// What one `send` invocation was asked to do, past the session and prompt.
+///
+/// Grouped because the verb accumulated four independent bounds and switches,
+/// and a call site reading `(…, None, false, None, None, true)` communicates
+/// none of them.
+pub struct SendArgs<'a> {
+    pub output_schema: Option<&'a str>,
+    pub no_wait: bool,
+    pub turn_timeout: Option<u64>,
+    pub stalled_after: Option<u64>,
+    pub json_mode: bool,
+}
+
 pub async fn run_checked(
     client: &Client,
     session: &str,
     prompt: String,
-    output_schema: Option<&str>,
-    no_wait: bool,
-    turn_timeout: Option<u64>,
-    json_mode: bool,
+    args: SendArgs<'_>,
 ) -> Result<(Value, String), Failure> {
+    let SendArgs { output_schema, no_wait, turn_timeout, stalled_after, json_mode } = args;
     // The prompt arrives already resolved (`-` became stdin text in `precheck`).
     // The schema is compiled before the prompt is sent: a bad one must not cost
     // an agent turn.
     let schema = output_schema.map(crate::output_schema::OutputSchema::load).transpose()?;
-    let (mut base, human) = run(client, session, &prompt, no_wait, turn_timeout, json_mode).await?;
+    let (mut base, human) =
+        run(client, session, &prompt, no_wait, turn_timeout, stalled_after, json_mode).await?;
     let Some(schema) = schema else { return Ok((base, human)) };
     let value =
         crate::output_schema::enforce(client, session, &schema, turn_timeout, json_mode).await?;
@@ -44,6 +56,7 @@ pub async fn run(
     prompt: &str,
     no_wait: bool,
     turn_timeout: Option<u64>,
+    stalled_after: Option<u64>,
     json_mode: bool,
 ) -> Result<(Value, String), Failure> {
     // Capture the live edge BEFORE sending, so the follow stream replays this
@@ -75,17 +88,15 @@ pub async fn run(
             format!("accepted — watch with `oximux attach {session}` or `oximux wait {session} --until done`"),
         ));
     }
-    match stream_session(
-        client,
-        session,
-        Some(from),
+    let opts = StreamOpts {
+        from: Some(from),
         json_mode,
-        false,
-        Stop::TurnEnded,
-        super::turn_deadline(turn_timeout),
-    )
-    .await?
-    {
+        quiet: false,
+        stop: Stop::TurnEnded,
+        deadline: super::turn_deadline(turn_timeout),
+        stall_after: stalled_after.map(std::time::Duration::from_secs),
+    };
+    match stream_session(client, session, opts).await? {
         StreamEnd::TurnEnded { is_error: false } => Ok((base, "✓ done".into())),
         StreamEnd::TurnEnded { is_error: true } => Err(Failure::new(
             "turn-error",
@@ -99,6 +110,9 @@ pub async fn run(
         // deadline to pass.
         StreamEnd::Deadline => {
             Err(super::turn_timeout_failure(session, turn_timeout.unwrap_or_default()))
+        }
+        StreamEnd::Stalled { quiet_secs, last_seq } => {
+            Err(super::stall_failure(session, quiet_secs, last_seq))
         }
         _ => Err(Failure::new("protocol", exit::ERROR, "the stream ended unexpectedly")),
     }

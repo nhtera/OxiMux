@@ -7,7 +7,7 @@ use oximux_agent_core::thread::ThreadEvent;
 use oximux_remote_proto::proto::{Request, Response};
 use serde_json::{Value, json};
 
-use super::attach::{Stop, StreamEnd, stream_session};
+use super::attach::{Stop, StreamEnd, StreamOpts, stream_session};
 use crate::cli::{WaitUntil, exit};
 use crate::client::{Client, rpc_failure, unexpected_reply};
 use crate::output::Failure;
@@ -62,6 +62,7 @@ pub async fn run(
     session: &str,
     until: WaitUntil,
     timeout_secs: u64,
+    stalled_after: Option<u64>,
     json_mode: bool,
 ) -> Result<(Value, String), Failure> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs.max(1));
@@ -103,17 +104,15 @@ pub async fn run(
         WaitUntil::NeedsApproval => Stop::NeedsApproval,
         WaitUntil::Done | WaitUntil::Idle => Stop::TurnEnded,
     };
-    match stream_session(
-        client,
-        session,
-        Some(state.last_seq),
+    let opts = StreamOpts {
+        from: Some(state.last_seq),
         json_mode,
-        true,
+        quiet: true,
         stop,
-        Some(deadline),
-    )
-    .await?
-    {
+        deadline: Some(deadline),
+        stall_after: stalled_after.map(std::time::Duration::from_secs),
+    };
+    match stream_session(client, session, opts).await? {
         // `idle` is BOTH halves: done, and nothing awaiting a decision. The
         // stream stops on the turn ending, which settles only the first — so
         // the second is re-read here rather than assumed. Without this, a
@@ -135,12 +134,48 @@ pub async fn run(
             reached("stream")
         }
         StreamEnd::TurnEnded { .. } | StreamEnd::NeedsApproval => reached("stream"),
+        // A deadline is not always a slow agent. A turn parked on a permission
+        // request ends only when something decides it, so "raise --timeout" is
+        // advice that cannot work — waiting longer on a session nobody is
+        // deciding for produces the same timeout, forever. Measured against a
+        // real agent: `--until idle` burned all 180s while the session sat on a
+        // `Bash` request, and returned in 7s once it was approved.
+        //
+        // One `GetSessionInfo` on the failure path only, so the common timeout
+        // costs nothing extra. If that call itself fails, the plain timeout is
+        // still the honest answer — hence the `unwrap_or(false)` rather than
+        // surfacing a diagnostic error in place of the real one.
+        StreamEnd::Deadline if still_awaiting(client, session).await.unwrap_or(false) => {
+            Err(Failure::new(
+                "timeout",
+                exit::TIMEOUT,
+                format!(
+                    "timed out after {timeout_secs}s — the session is awaiting a decision, \
+                     which only a decision ends"
+                ),
+            )
+            .with_steps([
+                format!("`oximux permit ls {session}` shows what is pending"),
+                format!("decide it with `oximux permit allow|deny|answer {session}`"),
+                "raising --timeout alone will not help while nothing is deciding".into(),
+            ]))
+        }
         StreamEnd::Deadline => Err(Failure::new(
             "timeout",
             exit::TIMEOUT,
             format!("timed out waiting for the session to reach that state ({timeout_secs}s)"),
         )
         .with_steps(["raise --timeout, or check the session with `oximux attach`".into()])),
+        // Deliberately a different `code` on the same exit. The number is the
+        // contract scripts branch on and stays 4 — this is still "gave up on
+        // time" — but "stalled" and "timeout" call for different reactions:
+        // a timeout invites a longer budget, a stall says the budget is not
+        // the problem.
+        // Same shape as `run`/`send`, from the shared helper: one silence,
+        // one diagnosis, whichever verb was watching.
+        StreamEnd::Stalled { quiet_secs, last_seq } => {
+            Err(super::stall_failure(session, quiet_secs, last_seq))
+        }
         StreamEnd::Detached => Err(Failure::new(
             "detached",
             exit::ERROR,

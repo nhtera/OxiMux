@@ -8,7 +8,7 @@ use oximux_remote_proto::messages::SendPromptReq;
 use oximux_remote_proto::proto::{Request, Response};
 use serde_json::{Value, json};
 
-use super::attach::{Stop, StreamEnd, stream_session};
+use super::attach::{Stop, StreamEnd, StreamOpts, stream_session};
 use crate::cli::exit;
 use crate::client::{Client, rpc_failure, unexpected_reply};
 use crate::output::Failure;
@@ -86,6 +86,9 @@ pub struct RunArgs {
     /// A JSON Schema the final answer must satisfy (clap refuses it with
     /// `--bg`, which has no final answer to hold).
     pub output_schema: Option<String>,
+    /// Seconds of no output after which the turn is called stalled. Bounds
+    /// progress; `turn_timeout` bounds the turn.
+    pub stalled_after: Option<u64>,
     /// Seconds to wait for the turn before giving up (clap refuses it with
     /// `--bg`, which never waits for one).
     pub turn_timeout: Option<u64>,
@@ -214,17 +217,15 @@ pub async fn run(client: &Client, args: RunArgs, json_mode: bool) -> Result<(Val
     }
     // Follow from seq 0: the session is brand new, so the backlog IS the whole
     // history and the synthesized user bubble comes through too.
-    match stream_session(
-        client,
-        &session_id,
-        Some(0),
+    let opts = StreamOpts {
+        from: Some(0),
         json_mode,
-        false,
-        Stop::TurnEnded,
-        super::turn_deadline(args.turn_timeout),
-    )
-    .await?
-    {
+        quiet: false,
+        stop: Stop::TurnEnded,
+        deadline: super::turn_deadline(args.turn_timeout),
+        stall_after: args.stalled_after.map(std::time::Duration::from_secs),
+    };
+    match stream_session(client, &session_id, opts).await? {
         StreamEnd::TurnEnded { is_error: false } => match schema {
             Some(schema) => {
                 let value = crate::output_schema::enforce(
@@ -258,6 +259,9 @@ pub async fn run(client: &Client, args: RunArgs, json_mode: bool) -> Result<(Val
             &session_id,
             args.turn_timeout.unwrap_or_default(),
         )),
+        StreamEnd::Stalled { quiet_secs, last_seq } => {
+            Err(super::stall_failure(&session_id, quiet_secs, last_seq))
+        }
         _ => Err(Failure::new("protocol", exit::ERROR, "the stream ended unexpectedly")),
     }
 }

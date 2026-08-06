@@ -312,6 +312,7 @@ fn host_verb(mut args: Cli) -> u8 {
                     worktree,
                     output_schema,
                     turn_timeout,
+                    stalled_after,
                     bg,
                 } => {
                     let run_args = commands::run::RunArgs {
@@ -323,6 +324,7 @@ fn host_verb(mut args: Cli) -> u8 {
                         worktree,
                         output_schema,
                         turn_timeout,
+                        stalled_after,
                         bg,
                     };
                     commands::run::run(&client, run_args, json_mode).await
@@ -330,20 +332,33 @@ fn host_verb(mut args: Cli) -> u8 {
                 Command::Attach { session, from } => {
                     commands::attach::run(&client, &session, from, json_mode).await
                 }
-                Command::Send { session, prompt, output_schema, turn_timeout, no_wait } => {
-                    commands::send::run_checked(
-                        &client,
-                        &session,
-                        prompt,
-                        output_schema.as_deref(),
+                Command::Send {
+                    session,
+                    prompt,
+                    output_schema,
+                    turn_timeout,
+                    stalled_after,
+                    no_wait,
+                } => {
+                    let send_args = commands::send::SendArgs {
+                        output_schema: output_schema.as_deref(),
                         no_wait,
                         turn_timeout,
+                        stalled_after,
+                        json_mode,
+                    };
+                    commands::send::run_checked(&client, &session, prompt, send_args).await
+                }
+                Command::Wait { session, until, stalled_after } => {
+                    commands::wait::run(
+                        &client,
+                        &session,
+                        until,
+                        timeout,
+                        stalled_after,
                         json_mode,
                     )
                     .await
-                }
-                Command::Wait { session, until } => {
-                    commands::wait::run(&client, &session, until, timeout, json_mode).await
                 }
                 Command::Transcript { session } => {
                     commands::transcript::run(&client, &session).await

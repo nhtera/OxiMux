@@ -36,6 +36,37 @@ pub enum StreamEnd {
     Detached,
     /// The caller's deadline passed before the condition was met.
     Deadline,
+    /// No event arrived for [`StreamOpts::stall_after`]. Distinct from
+    /// `Deadline`: a deadline says "I am out of patience", a stall says
+    /// "nothing is happening" — and only the second tells a supervisor that
+    /// waiting longer is unlikely to help.
+    Stalled { quiet_secs: u64, last_seq: u64 },
+}
+
+/// What a streaming loop is asked to do.
+///
+/// A struct rather than six positional arguments: the loop is composed by four
+/// verbs with different combinations, and `stream_session(c, s, None, true,
+/// false, Stop::TurnEnded, None, None)` says nothing about which `None` is
+/// which.
+pub struct StreamOpts {
+    /// Replay retained events after this sequence number; `None` attaches at
+    /// the live edge.
+    pub from: Option<u64>,
+    pub json_mode: bool,
+    /// Watch without rendering (`wait` needs the condition, not the output).
+    pub quiet: bool,
+    pub stop: Stop,
+    /// Overall bound on the wait.
+    pub deadline: Option<tokio::time::Instant>,
+    /// Give up if no event arrives for this long, reporting [`StreamEnd::Stalled`].
+    ///
+    /// Opt-in, and deliberately separate from `deadline`. A turn that is merely
+    /// slow and a turn that is wedged both end in the same silence, and a bound
+    /// on *total* time cannot separate them: raise it and a wedged agent burns
+    /// the lot, lower it and a thinking one gets cut off. A bound on *progress*
+    /// distinguishes them directly.
+    pub stall_after: Option<std::time::Duration>,
 }
 
 /// How long a stream may be silent before it says it is still there.
@@ -47,7 +78,7 @@ pub enum StreamEnd {
 /// turn produces no keepalives at all.
 const KEEPALIVE_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Say the stream is alive, on **stderr**.
+/// Say the stream is alive, on **stderr**, and say what it is blocked on.
 ///
 /// Never stdout: `--json` promises stdout is the event stream and then one
 /// result object, and a liveness line is neither. A caller that wants these
@@ -55,18 +86,79 @@ const KEEPALIVE_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
 ///
 /// Emitted regardless of `quiet`, which is the point — `wait` renders no events
 /// at all, so it is the verb whose silence is least distinguishable from a hang.
-fn emit_keepalive(json_mode: bool, session: &str, waited: std::time::Duration) {
+///
+/// `awaiting` is the difference between a slow agent and a stopped one. A turn
+/// parked on a permission request ends only when something decides it, so a
+/// keepalive that just counts seconds is describing a wait that cannot end on
+/// its own as though it merely needs patience. Measured against a real agent:
+/// `wait --until idle` sat for the full 180 s reporting "no events" while the
+/// session was parked on a `Bash` request the whole time.
+///
+/// The elapsed figure is time since the *stream opened*, not since the last
+/// event — deliberately, so a reader sees total elapsed rather than "15s" over
+/// and over. That is also why it must not be paired with a bare "no events":
+/// events may well have arrived, just not in the last [`KEEPALIVE_AFTER`].
+fn emit_keepalive(json_mode: bool, session: &str, waited: std::time::Duration, awaiting: bool) {
     let secs = waited.as_secs();
     if json_mode {
-        eprintln!("{}", json!({ "type": "keepalive", "session_id": session, "waited_secs": secs }));
+        eprintln!(
+            "{}",
+            json!({
+                "type": "keepalive",
+                "session_id": session,
+                "waited_secs": secs,
+                "awaiting_decision": awaiting,
+            })
+        );
+    } else if awaiting {
+        eprintln!(
+            "· still waiting on {session} ({secs}s) — a decision is pending; \
+             `oximux permit ls {session}`"
+        );
     } else {
-        eprintln!("· still waiting on {session} ({secs}s, no events)");
+        eprintln!("· still waiting on {session} ({secs}s, quiet for {}s)", KEEPALIVE_AFTER.as_secs());
+    }
+}
+
+/// Ask the host whether a decision is outstanding, without losing events.
+///
+/// Uses `call_streaming`, not `call`: this runs on a subscribed connection, and
+/// `call` drops any frame that interleaves with the reply. Pushed events are
+/// appended to `queue` so the next drain renders them in order — a liveness
+/// probe that silently ate the very events it was checking for would be a
+/// strictly worse bug than the one it fixes.
+///
+/// `None` on any failure, so the caller keeps whatever it already believed: a
+/// keepalive is not worth turning a live stream into an error.
+async fn probe_awaiting(
+    client: &Client,
+    session: &str,
+    queue: &mut std::collections::VecDeque<HostEvent>,
+) -> Option<bool> {
+    let reply = client
+        .call_streaming(Request::GetSessionInfo { session_id: session.into() }, |push| {
+            if let Response::Event(frame) = push
+                && frame.session_id == session
+            {
+                queue.push_back(frame);
+            }
+        })
+        .await
+        .ok()?;
+    match reply {
+        Response::SessionInfo(info) => Some(info.summary.awaiting_permission),
+        _ => None,
     }
 }
 
 /// Print one event — a compact line for humans, one NDJSON line under
 /// `--json`. `quiet` suppresses output entirely (`wait` watches, not renders).
-fn emit(json_mode: bool, quiet: bool, frame: &HostEvent) {
+fn emit(
+    json_mode: bool,
+    quiet: bool,
+    frame: &HostEvent,
+    lines: &mut crate::render::LineRenderer,
+) {
     if quiet {
         return;
     }
@@ -74,7 +166,10 @@ fn emit(json_mode: bool, quiet: bool, frame: &HostEvent) {
         Ok(event) => {
             if json_mode {
                 // ThreadEvent serializes losslessly, so the NDJSON line carries
-                // the full event, not the compact human digest.
+                // the full event, not the compact human digest. Deliberately
+                // NOT routed through `LineRenderer`: that collapses a tool
+                // call's two announcements for readability, and this stream's
+                // contract is that nothing is collapsed.
                 let line = json!({
                     "seq": frame.seq,
                     "session_id": frame.session_id,
@@ -82,8 +177,10 @@ fn emit(json_mode: bool, quiet: bool, frame: &HostEvent) {
                     "event": serde_json::to_value(&event).unwrap_or(Value::Null),
                 });
                 println!("{line}");
-            } else if let Some(line) = crate::render::render_event(&event) {
-                println!("{line}");
+            } else {
+                for line in lines.lines(&event) {
+                    println!("{line}");
+                }
             }
         }
         // A newer host may stream an event vocabulary this build predates.
@@ -191,12 +288,9 @@ async fn resync_from_transcript(
 pub async fn stream_session(
     client: &Client,
     session: &str,
-    from: Option<u64>,
-    json_mode: bool,
-    quiet: bool,
-    stop: Stop,
-    deadline: Option<tokio::time::Instant>,
+    opts: StreamOpts,
 ) -> Result<StreamEnd, Failure> {
+    let StreamOpts { from, json_mode, quiet, stop, deadline, stall_after } = opts;
     // The resume point: an explicit cursor, else the live edge as the host
     // reports it now.
     let after_seq = match from {
@@ -242,6 +336,16 @@ pub async fn stream_session(
     // Wall-clock since the stream opened, reported by the keepalive so a reader
     // sees total elapsed rather than "15s" over and over.
     let started = std::time::Instant::now();
+    // Every frame carries the session's status, so the keepalive can name what
+    // the stream is blocked on without spending an RPC to ask.
+    let mut awaiting = false;
+    // Carries the across-frames memory the human line stream needs; the JSON
+    // stream never consults it.
+    let mut lines = crate::render::LineRenderer::default();
+    // When the stream last produced anything. The stall budget is measured from
+    // here, not from the stream opening, so a turn that is working steadily can
+    // run for hours under a tight `--stalled-after`.
+    let mut last_event_at = tokio::time::Instant::now();
 
     loop {
         // Drain everything already in hand before blocking on the socket.
@@ -296,7 +400,9 @@ pub async fn stream_session(
                 }
             }
             last_seen = frame.seq;
-            emit(json_mode, quiet, &frame);
+            awaiting = frame.status.awaiting_permission;
+            last_event_at = tokio::time::Instant::now();
+            emit(json_mode, quiet, &frame, &mut lines);
             let event = frame.event().ok();
             if let Some(end) = stop_reached(stop, &frame, event.as_ref()) {
                 return Ok(end);
@@ -317,8 +423,28 @@ pub async fn stream_session(
                     None => std::future::pending().await,
                 }
             } => return Ok(StreamEnd::Deadline),
+            // Absolute, so it survives the keepalive arm re-entering the loop:
+            // a relative sleep would restart every 15s and never fire.
+            _ = async {
+                match stall_after {
+                    Some(budget) => tokio::time::sleep_until(last_event_at + budget).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                return Ok(StreamEnd::Stalled {
+                    quiet_secs: last_event_at.elapsed().as_secs(),
+                    last_seq: last_seen,
+                });
+            }
             _ = tokio::time::sleep(KEEPALIVE_AFTER) => {
-                emit_keepalive(json_mode, session, started.elapsed());
+                // Ask rather than assume. `awaiting` is only as fresh as the
+                // last frame this stream saw, and the case that matters most —
+                // a session parked on a decision before we attached — sends no
+                // frames at all, so tracking alone reports `false` for exactly
+                // the wait it is meant to explain. One RPC per 15s of silence
+                // is nothing, and silence is when the answer is worth having.
+                awaiting = probe_awaiting(client, session, &mut queue).await.unwrap_or(awaiting);
+                emit_keepalive(json_mode, session, started.elapsed(), awaiting);
                 continue;
             }
         };
@@ -340,7 +466,17 @@ pub async fn run(
     if !json_mode {
         println!("attached to {session} — Ctrl+C detaches (the agent keeps running)");
     }
-    match stream_session(client, session, from, json_mode, false, Stop::Never, None).await? {
+    // No stall budget: `attach` follows until Ctrl+C by definition, and a quiet
+    // agent is something the watcher can see for themselves.
+    let opts = StreamOpts {
+        from,
+        json_mode,
+        quiet: false,
+        stop: Stop::Never,
+        deadline: None,
+        stall_after: None,
+    };
+    match stream_session(client, session, opts).await? {
         StreamEnd::Detached => Ok((
             json!({ "session_id": session, "detached": true }),
             "detached — the agent keeps running".into(),

@@ -30,7 +30,107 @@ fn input_summary(input: &Value) -> String {
     }
     match input {
         Value::Null => String::new(),
+        // An input that carries nothing has nothing to summarise. A just-opened
+        // tool block arrives as `{}` — printing that literally gave `→ Read {}`,
+        // which reads like the tool was called with an empty argument rather
+        // than like its arguments had not streamed in yet.
+        Value::Object(map) if map.is_empty() => String::new(),
+        Value::Array(items) if items.is_empty() => String::new(),
+        Value::String(s) if s.is_empty() => String::new(),
         other => one_line(&other.to_string()),
+    }
+}
+
+/// Renders the human line stream, collapsing a tool call's two announcements
+/// into one.
+///
+/// A real `claude` opens a tool block before its arguments have streamed
+/// (`ToolCallStarted { input: {} }`), sends the arguments as `ToolInputDelta`
+/// fragments, then re-announces the *same id* with the input complete. Rendering
+/// each frame independently — which is what a stateless renderer must do —
+/// printed every tool twice:
+///
+/// ```text
+/// → Read
+/// → Read src/main.rs
+/// ```
+///
+/// The persisted transcript never showed this, because `ChatThread`'s fold
+/// treats the second announcement as an update to the first. Only the live
+/// stream lacked that memory, and only against a real backend — the test
+/// fixture emits no partial messages, which is why no test caught it.
+///
+/// So hold an argument-less start back rather than printing it, and let the
+/// completing announcement supply the line. If none ever comes, the call is
+/// flushed bare when its result arrives or the turn ends — the rule never drops
+/// a tool call, which would be a worse failure than repeating one.
+///
+/// `--json` does NOT go through this: that stream is the lossless one, and a
+/// consumer folding events itself needs every frame, partials included.
+#[derive(Default)]
+pub struct LineRenderer {
+    /// Tool calls announced with no arguments yet, by id → display name.
+    deferred: Vec<(String, String)>,
+    /// Tool calls already printed, so a re-announcement stays silent.
+    printed: std::collections::HashSet<String>,
+}
+
+impl LineRenderer {
+    /// The lines this event contributes, in order. Usually zero or one; two
+    /// when a deferred tool call is flushed ahead of the event that flushed it.
+    pub fn lines(&mut self, event: &ThreadEvent) -> Vec<String> {
+        match event {
+            ThreadEvent::ToolCallStarted { id, name, input } => {
+                if self.printed.contains(id) {
+                    return Vec::new();
+                }
+                if input_summary(input).is_empty() {
+                    if !self.deferred.iter().any(|(held, _)| held == id) {
+                        self.deferred.push((id.clone(), name.clone()));
+                    }
+                    return Vec::new();
+                }
+                self.printed.insert(id.clone());
+                self.drop_deferred(id);
+                render_event(event).into_iter().collect()
+            }
+            // A result settles its call: whatever we were holding for that id
+            // will never be completed, so print it now, ahead of the result.
+            ThreadEvent::ToolResult { tool_use_id, .. } => {
+                let mut lines = self.flush(tool_use_id);
+                lines.extend(render_event(event));
+                lines
+            }
+            ThreadEvent::TurnEnded { .. } => {
+                let mut lines = self.flush_all();
+                lines.extend(render_event(event));
+                lines
+            }
+            _ => render_event(event).into_iter().collect(),
+        }
+    }
+
+    fn drop_deferred(&mut self, id: &str) {
+        self.deferred.retain(|(held, _)| held != id);
+    }
+
+    fn flush(&mut self, id: &str) -> Vec<String> {
+        let Some(pos) = self.deferred.iter().position(|(held, _)| held == id) else {
+            return Vec::new();
+        };
+        let (held, name) = self.deferred.remove(pos);
+        self.printed.insert(held);
+        vec![format!("→ {name}")]
+    }
+
+    fn flush_all(&mut self) -> Vec<String> {
+        let held = std::mem::take(&mut self.deferred);
+        held.into_iter()
+            .map(|(id, name)| {
+                self.printed.insert(id);
+                format!("→ {name}")
+            })
+            .collect()
     }
 }
 
@@ -317,5 +417,110 @@ mod tests {
         let line = one_line(&long);
         assert!(line.chars().count() <= LINE_CAP + 1);
         assert!(line.ends_with('…'));
+    }
+
+    fn started(id: &str, name: &str, input: Value) -> ThreadEvent {
+        ThreadEvent::ToolCallStarted { id: id.into(), name: name.into(), input }
+    }
+
+    fn result_for(id: &str) -> ThreadEvent {
+        ThreadEvent::ToolResult {
+            tool_use_id: id.into(),
+            content: "ok".into(),
+            is_error: false,
+            structured: None,
+        }
+    }
+
+    fn turn_end() -> ThreadEvent {
+        ThreadEvent::TurnEnded { result: None, usage: None, is_error: false, turn_diff: None }
+    }
+
+    /// An input that carries nothing has nothing to summarise.
+    ///
+    /// `{}` used to fall through to the compact-head arm and print literally,
+    /// so a tool block that had only just opened rendered as `→ Read {}`.
+    #[test]
+    fn an_empty_input_summarises_to_nothing_rather_than_to_braces() {
+        for empty in [json!({}), json!([]), json!(""), Value::Null] {
+            assert_eq!(input_summary(&empty), "", "{empty:?}");
+        }
+        assert_eq!(input_summary(&json!({"file_path": "/tmp/a"})), "/tmp/a");
+    }
+
+    /// The real claude sequence renders one line, and it is the informative one.
+    ///
+    /// Replays what a live backend actually sends: the block opens with no
+    /// arguments, the arguments stream as deltas, then the *same id* is
+    /// re-announced complete. Rendered frame-by-frame this printed the tool
+    /// twice. The persisted transcript never did, because the thread fold
+    /// treats the second announcement as an update — this is the live stream
+    /// catching up to that.
+    #[test]
+    fn a_tool_announced_twice_renders_once_with_its_arguments() {
+        let mut r = LineRenderer::default();
+        assert!(r.lines(&started("t1", "Read", json!({}))).is_empty(), "held, not printed");
+        assert!(
+            r.lines(&ThreadEvent::ToolInputDelta {
+                tool_call_id: String::new(),
+                partial_json: "{\"file_path\":\"/tmp/a.rs\"".into(),
+            })
+            .is_empty()
+        );
+        assert_eq!(
+            r.lines(&started("t1", "Read", json!({"file_path": "/tmp/a.rs"}))),
+            vec!["→ Read /tmp/a.rs".to_string()],
+        );
+        // The result adds nothing of its own on success, and must not re-flush.
+        assert!(r.lines(&result_for("t1")).is_empty());
+    }
+
+    /// A held call is still printed when nothing ever completes it.
+    ///
+    /// The rule must never *drop* a tool call — that would be a worse failure
+    /// than the duplicate it replaces, because a reader would have no sign the
+    /// agent touched anything at all.
+    #[test]
+    fn a_call_that_never_completes_is_flushed_bare_by_its_result() {
+        let mut r = LineRenderer::default();
+        assert!(r.lines(&started("t1", "Read", json!({}))).is_empty());
+        assert_eq!(r.lines(&result_for("t1")), vec!["→ Read".to_string()]);
+        // Flushed once, not again.
+        assert!(r.lines(&result_for("t1")).is_empty());
+    }
+
+    /// …and by the turn ending, for a call whose result never arrives either.
+    #[test]
+    fn a_turn_ending_flushes_anything_still_held() {
+        let mut r = LineRenderer::default();
+        assert!(r.lines(&started("t1", "Bash", json!({}))).is_empty());
+        let lines = r.lines(&turn_end());
+        assert_eq!(lines.first().map(String::as_str), Some("→ Bash"));
+        assert!(lines.len() > 1, "the turn's own line still follows: {lines:?}");
+    }
+
+    /// A call that arrives complete first time prints immediately, and a
+    /// re-announcement of it stays silent.
+    #[test]
+    fn a_complete_call_prints_once_and_its_repeat_is_silent() {
+        let mut r = LineRenderer::default();
+        assert_eq!(
+            r.lines(&started("t1", "Bash", json!({"command": "ls"}))),
+            vec!["→ Bash ls".to_string()],
+        );
+        assert!(r.lines(&started("t1", "Bash", json!({"command": "ls"}))).is_empty());
+    }
+
+    /// Two tools in flight at once do not flush each other.
+    #[test]
+    fn concurrent_calls_are_tracked_independently() {
+        let mut r = LineRenderer::default();
+        assert!(r.lines(&started("t1", "Read", json!({}))).is_empty());
+        assert!(r.lines(&started("t2", "Grep", json!({}))).is_empty());
+        assert_eq!(r.lines(&result_for("t2")), vec!["→ Grep".to_string()]);
+        assert_eq!(
+            r.lines(&started("t1", "Read", json!({"file_path": "/tmp/a"}))),
+            vec!["→ Read /tmp/a".to_string()],
+        );
     }
 }

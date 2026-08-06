@@ -252,7 +252,8 @@ pub async fn enforce(
         // The correction is an ordinary turn: send it and stream to its end,
         // exactly as `send` does, so a mid-turn queue or a permission prompt
         // behaves the same way it would for a human's follow-up.
-        crate::commands::send::run(client, session, &prompt, false, turn_timeout, json_mode).await?;
+        crate::commands::send::run(client, session, &prompt, false, turn_timeout, None, json_mode)
+            .await?;
     }
 }
 

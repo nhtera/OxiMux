@@ -41,6 +41,37 @@ pub fn turn_timeout_failure(session: &str, secs: u64) -> Failure {
     .with_data(serde_json::json!({ "session_id": session }))
 }
 
+/// A turn that stopped producing anything, as distinct from one that merely
+/// ran long.
+///
+/// Same exit code as a timeout — this is still "gave up on the clock", and the
+/// numeric taxonomy is what scripts branch on, so it does not grow a seventh
+/// member for a shade of meaning. The `code` string is what carries the shade,
+/// and it is a useful one: a timeout invites a larger budget, whereas a stall
+/// says the budget was never the problem. Without the distinction the two are
+/// the same silence, and "is it thinking or is it wedged?" has no answer that
+/// waiting can supply.
+///
+/// `last_seq` rides in both the prose and `data` so the caller can attach
+/// exactly where the stream went quiet rather than replaying the whole turn.
+pub fn stall_failure(session: &str, quiet_secs: u64, last_seq: u64) -> Failure {
+    Failure::new(
+        "stalled",
+        exit::TIMEOUT,
+        format!("the agent produced nothing for {quiet_secs}s (--stalled-after); it is still running"),
+    )
+    .with_steps([
+        format!("`oximux permit ls {session}` — a silent turn is often waiting on a decision"),
+        format!("`oximux attach {session} --from {last_seq}` to watch from where it went quiet"),
+        format!("`oximux stop {session}` interrupts the turn if the agent is genuinely wedged"),
+    ])
+    .with_data(serde_json::json!({
+        "session_id": session,
+        "quiet_secs": quiet_secs,
+        "last_seq": last_seq,
+    }))
+}
+
 /// A correlation id for a prompt: unique per send, within and across processes.
 ///
 /// The pid seeds the high bits so two concurrent CLIs never collide; a counter
@@ -169,3 +200,39 @@ pub mod transcript;
 pub mod update;
 pub mod wait;
 pub mod worktree;
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+
+    /// A stall and a timeout share the exit code but not the diagnosis.
+    ///
+    /// The number is the contract scripts branch on, so a stall stays exit 4
+    /// rather than growing a seventh code for a shade of meaning. What must
+    /// differ is the `code` string and the advice: a timeout invites a larger
+    /// budget, a stall says the budget was never the problem. If these ever
+    /// collapse into one message, `wait` is back to being unable to tell a
+    /// thinking agent from a wedged one, which is the whole point of the flag.
+    #[test]
+    fn a_stall_is_exit_4_but_reads_differently_from_a_timeout() {
+        let stalled = stall_failure("s-1", 90, 42);
+        let timed_out = turn_timeout_failure("s-1", 90);
+
+        assert_eq!(stalled.exit, exit::TIMEOUT);
+        assert_eq!(timed_out.exit, exit::TIMEOUT, "same numeric class");
+        assert_ne!(stalled.code, timed_out.code, "different string codes");
+        assert_eq!(stalled.code, "stalled");
+
+        // The resume point is machine-readable, not only in the prose: a
+        // supervisor should attach where it went quiet without parsing English.
+        let data = stalled.data.as_ref().expect("a stall carries machine-readable data");
+        assert_eq!(data["last_seq"], 42);
+        assert_eq!(data["quiet_secs"], 90);
+        assert_eq!(data["session_id"], "s-1");
+        assert!(
+            stalled.next_steps.iter().any(|s| s.contains("--from 42")),
+            "and the suggested attach carries it: {:?}",
+            stalled.next_steps
+        );
+    }
+}

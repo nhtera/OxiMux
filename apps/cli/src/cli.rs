@@ -125,6 +125,14 @@ pub enum Command {
         /// it bounds one host reply.
         #[arg(long, value_name = "SECS", conflicts_with = "bg")]
         turn_timeout: Option<u64>,
+        /// Give up if the agent produces nothing for this many seconds (exit
+        /// 4). This bounds PROGRESS, not total time: a turn working steadily
+        /// runs as long as it needs, while a wedged one is caught in seconds.
+        /// `--turn-timeout` cannot tell those apart — raise it and a wedged
+        /// agent burns the lot, lower it and a thinking one is cut off. Use
+        /// both: a generous turn budget with a tight stall budget.
+        #[arg(long, value_name = "SECS", conflicts_with = "bg")]
+        stalled_after: Option<u64>,
         /// Print the session id and exit instead of staying attached.
         #[arg(long)]
         bg: bool,
@@ -175,17 +183,34 @@ pub enum Command {
         /// it bounds one host reply.
         #[arg(long, value_name = "SECS", conflicts_with = "no_wait")]
         turn_timeout: Option<u64>,
+        /// Give up if the agent produces nothing for this many seconds (exit
+        /// 4). This bounds PROGRESS, not total time: a turn working steadily
+        /// runs as long as it needs, while a wedged one is caught in seconds.
+        /// `--turn-timeout` cannot tell those apart — raise it and a wedged
+        /// agent burns the lot, lower it and a thinking one is cut off. Use
+        /// both: a generous turn budget with a tight stall budget.
+        #[arg(long, value_name = "SECS", conflicts_with = "no_wait")]
+        stalled_after: Option<u64>,
         /// Return as soon as the host accepts the prompt.
         #[arg(long)]
         no_wait: bool,
     },
     /// Block until a session reaches a state (or --timeout expires, exit 4).
+    ///
+    /// A session that goes quiet is ambiguous: it may be thinking, or wedged.
+    /// `--timeout` cannot separate those — both end in the same silence. Add
+    /// `--stalled-after` to bound PROGRESS as well, and the two are told apart.
+    #[command(verbatim_doc_comment)]
     Wait {
         /// The session id (see `oximux ls`).
         session: String,
         /// The state to wait for.
         #[arg(long, value_enum)]
         until: WaitUntil,
+        /// Give up if the session produces nothing for this many seconds
+        /// (exit 4, distinct message). Bounds progress, not total time.
+        #[arg(long, value_name = "SECS")]
+        stalled_after: Option<u64>,
     },
     /// Fetch a session's full transcript (paged under the hood).
     Transcript {
