@@ -206,15 +206,25 @@ fn a_hard_kill_mid_turn_still_boots_clean() {
     serve.kill_hard();
 }
 
-/// Two hosts, one data directory. The second must decline the schedule ticker
-/// rather than fire every schedule twice — and must still come up and serve,
-/// because declining the ticker is not a reason to refuse to run.
+/// Two hosts, one data directory. The second must **refuse to boot**.
 ///
-/// `serve_e2e` proves the declining side against a desktop-shaped holder; this
-/// proves it between two `serve` processes, which is the deployment the
-/// single-owner lock was actually written for.
+/// `docs/server-install.md` states it — "Only one host can hold the local
+/// socket at a time" — and `serve/mod.rs` leans on it: the bind *is* the
+/// single-host check, and the confined credential every agent gets is minted
+/// from that listener. Two live hosts on one data directory means two session
+/// registries over one database, and clients silently reaching whichever bound
+/// last.
+///
+/// This test used to assert the opposite — that both come up — and passed on
+/// unix only because `bind` unlinked the socket node unconditionally, stealing
+/// it from the live owner. Windows, where a pipe name cannot be taken out from
+/// under its owner, refused and failed the suite. Windows was right.
+///
+/// The ticker's own contended case is not this: it is desktop + serve, proven
+/// by `serve_e2e::a_contended_ticker_declines_but_schedules_stay_editable`
+/// against an in-process holder.
 #[test]
-fn a_second_serve_on_the_same_data_dir_declines_the_ticker() {
+fn a_second_serve_on_the_same_data_dir_refuses_to_boot() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
     let shim_dir = dir.path().join("shim");
@@ -227,25 +237,42 @@ fn a_second_serve_on_the_same_data_dir_declines_the_ticker() {
         "lock-first",
         AgentBehaviour::default(),
     );
-    let second = boot_serve(
-        &data_dir,
-        &shim_dir,
-        &dir.path().join("r2.txt"),
-        "lock-second",
-        AgentBehaviour::default(),
+
+    // Not `boot_serve`: that waits for a readiness line this one must never
+    // print. Run to completion instead — the refusal is expected to be prompt,
+    // and a hang here is itself the failure.
+    let second = common::bin()
+        .args(["serve", "--data-dir", data_dir.to_str().unwrap()])
+        .env("PATH", common::path_with(&shim_dir))
+        .output()
+        .expect("spawn the second serve");
+
+    assert_eq!(
+        second.status.code(),
+        Some(1),
+        "the second host must exit 1, not serve beside the first\nstderr: {}",
+        String::from_utf8_lossy(&second.stderr),
+    );
+    assert!(
+        second.stdout.is_empty(),
+        "a host that never came up must not print a readiness line: {:?}",
+        String::from_utf8_lossy(&second.stdout),
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("already serving"),
+        "the refusal must name the conflict an operator can act on: {stderr}",
     );
 
-    // Both are serving: the second answered its readiness line (asserted inside
-    // `boot_serve`) and answers RPCs too.
+    // And the first is untouched — still bound, still answering.
     let out = cli(&data_dir).arg("status").output().expect("status");
     assert_eq!(
         out.status.code(),
         Some(0),
-        "a host that declined the ticker still serves\nstderr: {}",
+        "the incumbent must keep serving after a refused second boot\nstderr: {}",
         String::from_utf8_lossy(&out.stderr),
     );
     assert_eq!(json_of(&out)["ok"], true);
 
-    second.kill_hard();
     first.kill_hard();
 }
