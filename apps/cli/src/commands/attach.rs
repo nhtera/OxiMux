@@ -38,6 +38,32 @@ pub enum StreamEnd {
     Deadline,
 }
 
+/// How long a stream may be silent before it says it is still there.
+///
+/// A blocking verb that prints nothing is indistinguishable from a wedged one,
+/// and the callers most likely to be watching are supervisors that give up on
+/// quiet children — Claude Code backgrounds a subprocess after roughly two
+/// minutes of silence. Well under that, and long enough that an ordinary agent
+/// turn produces no keepalives at all.
+const KEEPALIVE_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Say the stream is alive, on **stderr**.
+///
+/// Never stdout: `--json` promises stdout is the event stream and then one
+/// result object, and a liveness line is neither. A caller that wants these
+/// reads stderr; a caller that does not is unaffected by them existing.
+///
+/// Emitted regardless of `quiet`, which is the point — `wait` renders no events
+/// at all, so it is the verb whose silence is least distinguishable from a hang.
+fn emit_keepalive(json_mode: bool, session: &str, waited: std::time::Duration) {
+    let secs = waited.as_secs();
+    if json_mode {
+        eprintln!("{}", json!({ "type": "keepalive", "session_id": session, "waited_secs": secs }));
+    } else {
+        eprintln!("· still waiting on {session} ({secs}s, no events)");
+    }
+}
+
 /// Print one event — a compact line for humans, one NDJSON line under
 /// `--json`. `quiet` suppresses output entirely (`wait` watches, not renders).
 fn emit(json_mode: bool, quiet: bool, frame: &HostEvent) {
@@ -213,6 +239,10 @@ pub async fn stream_session(
     let mut queue: std::collections::VecDeque<HostEvent> = backlog.into();
     queue.extend(pending.drain(..));
 
+    // Wall-clock since the stream opened, reported by the keepalive so a reader
+    // sees total elapsed rather than "15s" over and over.
+    let started = std::time::Instant::now();
+
     loop {
         // Drain everything already in hand before blocking on the socket.
         while let Some(frame) = queue.pop_front() {
@@ -273,7 +303,10 @@ pub async fn stream_session(
             }
         }
 
-        // Block for the next live frame, the deadline, or a detach.
+        // Block for the next live frame, the deadline, a keepalive tick, or a
+        // detach. The keepalive `sleep` is created fresh each time round, so it
+        // measures silence since the last frame rather than time since the
+        // stream opened — a busy turn never trips it.
         let frame = tokio::select! {
             frame = client.recv_frame() => frame?,
             _ = tokio::signal::ctrl_c() => return Ok(StreamEnd::Detached),
@@ -284,6 +317,10 @@ pub async fn stream_session(
                     None => std::future::pending().await,
                 }
             } => return Ok(StreamEnd::Deadline),
+            _ = tokio::time::sleep(KEEPALIVE_AFTER) => {
+                emit_keepalive(json_mode, session, started.elapsed());
+                continue;
+            }
         };
         match frame {
             Response::Event(event) if event.session_id == session => queue.push_back(event),

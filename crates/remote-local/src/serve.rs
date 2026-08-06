@@ -68,8 +68,12 @@ pub struct LocalControlListener {
 const SUN_PATH_CAPACITY: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
 
 /// Refuse a socket path the kernel cannot hold, naming the real constraint.
+///
+/// `pub(crate)` so [`crate::check_data_dir`] can offer the same refusal to a
+/// host that has not committed to the directory yet. One implementation, so the
+/// early answer and the bind's cannot disagree.
 #[cfg(unix)]
-fn check_socket_path_length(socket_path: &Path) -> Result<()> {
+pub(crate) fn check_socket_path_length(socket_path: &Path) -> Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
     let len = socket_path.as_os_str().as_bytes().len();
     // `<` not `<=`: the stored path is NUL-terminated, so the last byte is

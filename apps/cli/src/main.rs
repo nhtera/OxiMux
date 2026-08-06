@@ -286,7 +286,17 @@ fn host_verb(mut args: Cli) -> u8 {
                     }
                     ScheduleCommand::Rm { id } => commands::schedule::rm(&client, &id).await,
                 },
-                Command::Run { prompt, agent, model, mode, cwd, worktree, output_schema, bg } => {
+                Command::Run {
+                    prompt,
+                    agent,
+                    model,
+                    mode,
+                    cwd,
+                    worktree,
+                    output_schema,
+                    turn_timeout,
+                    bg,
+                } => {
                     let run_args = commands::run::RunArgs {
                         prompt,
                         agent,
@@ -295,6 +305,7 @@ fn host_verb(mut args: Cli) -> u8 {
                         cwd,
                         worktree,
                         output_schema,
+                        turn_timeout,
                         bg,
                     };
                     commands::run::run(&client, run_args, json_mode).await
@@ -302,13 +313,14 @@ fn host_verb(mut args: Cli) -> u8 {
                 Command::Attach { session, from } => {
                     commands::attach::run(&client, &session, from, json_mode).await
                 }
-                Command::Send { session, prompt, output_schema, no_wait } => {
+                Command::Send { session, prompt, output_schema, turn_timeout, no_wait } => {
                     commands::send::run_checked(
                         &client,
                         &session,
                         prompt,
                         output_schema.as_deref(),
                         no_wait,
+                        turn_timeout,
                         json_mode,
                     )
                     .await
@@ -492,6 +504,47 @@ mod tests {
             panic!("`run` parses");
         };
         assert_eq!(mode, None, "no --mode means the backend default, not a guess");
+    }
+
+    /// `--turn-timeout` reaches both streaming verbs, and is refused on the two
+    /// flags that never wait for a turn.
+    ///
+    /// The refusal matters more than the plumbing. `--bg` and `--no-wait` return
+    /// before a turn exists, so accepting a turn budget alongside them would
+    /// take an argument and silently do nothing — the precise failure this flag
+    /// was added to end. Clap's `conflicts_with` makes it exit 2 instead.
+    #[test]
+    fn turn_timeout_reaches_both_verbs_and_is_refused_where_no_turn_is_awaited() {
+        let Command::Run { turn_timeout, .. } =
+            command_of(&["oximux", "run", "hi", "--turn-timeout", "30"])
+        else {
+            panic!("`run` parses");
+        };
+        assert_eq!(turn_timeout, Some(30));
+
+        let Command::Send { turn_timeout, .. } =
+            command_of(&["oximux", "send", "s1", "hi", "--turn-timeout", "30"])
+        else {
+            panic!("`send` parses");
+        };
+        assert_eq!(turn_timeout, Some(30));
+
+        // Absent by default: the stream stays unbounded unless asked, so an
+        // interactive `run` behind a thinking agent is not cut off.
+        let Command::Run { turn_timeout, .. } = command_of(&["oximux", "run", "hi"]) else {
+            panic!("`run` parses");
+        };
+        assert_eq!(turn_timeout, None);
+
+        for argv in [
+            ["oximux", "run", "hi", "--bg", "--turn-timeout", "30"].as_slice(),
+            ["oximux", "send", "s1", "hi", "--no-wait", "--turn-timeout", "30"].as_slice(),
+        ] {
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "a turn budget alongside a verb that awaits no turn must be refused: {argv:?}",
+            );
+        }
     }
 
     /// `--json` with `term attach` is refused as a usage error, with no host.

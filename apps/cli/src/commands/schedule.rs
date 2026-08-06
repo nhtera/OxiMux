@@ -222,9 +222,17 @@ pub async fn run_once(client: &Client, id: &str) -> Result<(Value, String), Fail
     }
 }
 
+/// Idempotent, and the `Ack` says nothing about whether a row was there — the
+/// store's `DELETE` reports success for zero rows. Stated as the postcondition
+/// for the same reason [`super::worktree::rm`] is. Note the deliberate contrast
+/// with `pause`/`resume`, which *do* refuse an unknown id: they change a
+/// schedule's behaviour, so there has to be one to change.
 pub async fn rm(client: &Client, id: &str) -> Result<(Value, String), Failure> {
     match client.call(Request::DeleteSchedule { id: id.into() }).await? {
-        Response::Ack => Ok((json!({ "removed": id }), format!("removed {id}"))),
+        Response::Ack => Ok((
+            json!({ "id": id, "state": "absent" }),
+            format!("no schedule `{id}` remains"),
+        )),
         Response::Error(e) => Err(rpc_failure(e)),
         other => Err(unexpected_reply("DeleteSchedule", &other)),
     }

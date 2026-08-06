@@ -86,6 +86,9 @@ pub struct RunArgs {
     /// A JSON Schema the final answer must satisfy (clap refuses it with
     /// `--bg`, which has no final answer to hold).
     pub output_schema: Option<String>,
+    /// Seconds to wait for the turn before giving up (clap refuses it with
+    /// `--bg`, which never waits for one).
+    pub turn_timeout: Option<u64>,
     pub bg: bool,
 }
 
@@ -211,13 +214,27 @@ pub async fn run(client: &Client, args: RunArgs, json_mode: bool) -> Result<(Val
     }
     // Follow from seq 0: the session is brand new, so the backlog IS the whole
     // history and the synthesized user bubble comes through too.
-    match stream_session(client, &session_id, Some(0), json_mode, false, Stop::TurnEnded, None)
-        .await?
+    match stream_session(
+        client,
+        &session_id,
+        Some(0),
+        json_mode,
+        false,
+        Stop::TurnEnded,
+        super::turn_deadline(args.turn_timeout),
+    )
+    .await?
     {
         StreamEnd::TurnEnded { is_error: false } => match schema {
             Some(schema) => {
-                let value =
-                    crate::output_schema::enforce(client, &session_id, &schema, json_mode).await?;
+                let value = crate::output_schema::enforce(
+                    client,
+                    &session_id,
+                    &schema,
+                    args.turn_timeout,
+                    json_mode,
+                )
+                .await?;
                 let human = serde_json::to_string_pretty(&value)
                     .unwrap_or_else(|_| value.to_string());
                 base["output"] = value;
@@ -233,6 +250,13 @@ pub async fn run(client: &Client, args: RunArgs, json_mode: bool) -> Result<(Val
         StreamEnd::Detached => Ok((
             base,
             format!("detached — the agent keeps running (session {session_id})"),
+        )),
+        // Only reachable with `--turn-timeout`; without it the stream carries no
+        // deadline to pass. The session id is already in `base`, so a caller
+        // that timed out can still reach the agent it started.
+        StreamEnd::Deadline => Err(super::turn_timeout_failure(
+            &session_id,
+            args.turn_timeout.unwrap_or_default(),
         )),
         _ => Err(Failure::new("protocol", exit::ERROR, "the stream ended unexpectedly")),
     }

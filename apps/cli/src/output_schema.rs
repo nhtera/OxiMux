@@ -207,10 +207,15 @@ pub fn last_assistant_text(entries: &[Value]) -> Option<String> {
 /// error — the one the caller's script has to act on. Streaming of the
 /// correction turns goes through the same renderer as the original, so a human
 /// watching sees the retries happen rather than a silent pause.
+/// `turn_timeout` is the caller's `--turn-timeout`, carried through so it bounds
+/// each correction turn too. Applying it only to the first turn would let a
+/// bounded `run` hang here instead — the retries are ordinary turns and can park
+/// on a permission request exactly as the first one can.
 pub async fn enforce(
     client: &Client,
     session: &str,
     schema: &OutputSchema,
+    turn_timeout: Option<u64>,
     json_mode: bool,
 ) -> Result<Value, Failure> {
     let mut attempt = 0usize;
@@ -247,7 +252,7 @@ pub async fn enforce(
         // The correction is an ordinary turn: send it and stream to its end,
         // exactly as `send` does, so a mid-turn queue or a permission prompt
         // behaves the same way it would for a human's follow-up.
-        crate::commands::send::run(client, session, &prompt, false, json_mode).await?;
+        crate::commands::send::run(client, session, &prompt, false, turn_timeout, json_mode).await?;
     }
 }
 

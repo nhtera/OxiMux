@@ -219,11 +219,10 @@ impl ServeUnderTest {
     /// The runtime directory the CLI wants for `--dir`.
     ///
     /// Read back from the readiness line rather than assumed, so this asserts
-    /// the contract a scripted caller depends on. The field is named
-    /// `localSocket` but carries the *directory* the socket lives in — which is
-    /// what `--dir` takes, so piping one into the other works despite the name.
+    /// the contract a scripted caller depends on: `dataDir` is the directory the
+    /// socket lives in, which is exactly what `--dir` takes.
     pub fn runtime_dir(&self) -> PathBuf {
-        PathBuf::from(self.ready["localSocket"].as_str().expect("localSocket"))
+        PathBuf::from(self.ready["dataDir"].as_str().expect("dataDir"))
     }
 
     pub fn ready(&self) -> &Value {

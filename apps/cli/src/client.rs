@@ -174,11 +174,32 @@ impl Client {
                         .into(),
                     "if a host should already be running, check it is still up".into(),
                 ]),
-            DialError::Denied(_) => Failure::new("denied", exit::DENIED, e.to_string()).with_steps([
-                "the control credential rotated — restart `oximux serve`, or toggle \
-                 local CLI access off and on in the desktop app, then retry"
-                    .into(),
-            ]),
+            // Two callers reach this, and only one of them can act on operator
+            // advice. A confined agent holds a credential it was handed and
+            // cannot restart the host it runs inside — telling it to is both
+            // impossible and wrong about the cause, which for an agent is
+            // almost always its own session having ended or been revoked. The
+            // `NoCredential` arm above already makes this distinction; this one
+            // did not, and gave every caller the operator's answer.
+            DialError::Denied(_) => {
+                let steps = if std::env::var_os(SESSION_ENV_VAR).is_some() {
+                    vec![
+                        "this agent's session credential is no longer honoured — its \
+                         session most likely ended, or the host restarted"
+                            .to_string(),
+                        "nothing to retry, and nothing this process can fix: a new \
+                         credential only comes from a host spawning a new session"
+                            .to_string(),
+                    ]
+                } else {
+                    vec![
+                        "the control credential rotated — restart `oximux serve`, or \
+                         toggle local CLI access off and on in the desktop app, then retry"
+                            .to_string(),
+                    ]
+                };
+                Failure::new("denied", exit::DENIED, e.to_string()).with_steps(steps)
+            }
             DialError::Handshake(_) => Failure::new("handshake", exit::UNREACHABLE, e.to_string())
                 .with_steps([
                     "retry; if it persists, restart the host (`oximux serve`, or the \

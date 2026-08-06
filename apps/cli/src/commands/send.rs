@@ -22,15 +22,17 @@ pub async fn run_checked(
     prompt: String,
     output_schema: Option<&str>,
     no_wait: bool,
+    turn_timeout: Option<u64>,
     json_mode: bool,
 ) -> Result<(Value, String), Failure> {
     // The prompt arrives already resolved (`-` became stdin text in `precheck`).
     // The schema is compiled before the prompt is sent: a bad one must not cost
     // an agent turn.
     let schema = output_schema.map(crate::output_schema::OutputSchema::load).transpose()?;
-    let (mut base, human) = run(client, session, &prompt, no_wait, json_mode).await?;
+    let (mut base, human) = run(client, session, &prompt, no_wait, turn_timeout, json_mode).await?;
     let Some(schema) = schema else { return Ok((base, human)) };
-    let value = crate::output_schema::enforce(client, session, &schema, json_mode).await?;
+    let value =
+        crate::output_schema::enforce(client, session, &schema, turn_timeout, json_mode).await?;
     let human = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
     base["output"] = value;
     Ok((base, human))
@@ -41,6 +43,7 @@ pub async fn run(
     session: &str,
     prompt: &str,
     no_wait: bool,
+    turn_timeout: Option<u64>,
     json_mode: bool,
 ) -> Result<(Value, String), Failure> {
     // Capture the live edge BEFORE sending, so the follow stream replays this
@@ -72,8 +75,16 @@ pub async fn run(
             format!("accepted — watch with `oximux attach {session}` or `oximux wait {session} --until done`"),
         ));
     }
-    match stream_session(client, session, Some(from), json_mode, false, Stop::TurnEnded, None)
-        .await?
+    match stream_session(
+        client,
+        session,
+        Some(from),
+        json_mode,
+        false,
+        Stop::TurnEnded,
+        super::turn_deadline(turn_timeout),
+    )
+    .await?
     {
         StreamEnd::TurnEnded { is_error: false } => Ok((base, "✓ done".into())),
         StreamEnd::TurnEnded { is_error: true } => Err(Failure::new(
@@ -83,6 +94,11 @@ pub async fn run(
         )),
         StreamEnd::Detached => {
             Ok((base, format!("detached — the agent keeps running (session {session})")))
+        }
+        // Only reachable with `--turn-timeout`; without it the stream carries no
+        // deadline to pass.
+        StreamEnd::Deadline => {
+            Err(super::turn_timeout_failure(session, turn_timeout.unwrap_or_default()))
         }
         _ => Err(Failure::new("protocol", exit::ERROR, "the stream ended unexpectedly")),
     }

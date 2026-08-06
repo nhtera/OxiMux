@@ -119,6 +119,28 @@ pub fn token_path(runtime_dir: &Path) -> PathBuf {
     runtime_dir.join(TOKEN_FILENAME)
 }
 
+/// Whether this directory could hold a control socket at all.
+///
+/// The same refusal [`LocalControlListener::bind`] makes, hoisted so a host can
+/// ask *before* it commits to a data directory. `bind` sits behind the database,
+/// the identity key and a detached relay spawn, so a boot that is impossible on
+/// unix — the socket path exceeding `sockaddr_un.sun_path` — otherwise took
+/// seconds to refuse and left a migrated database, a token and a host key
+/// behind. Nothing about that answer needs any of them.
+///
+/// Always `Ok` on Windows: a named pipe name has no equivalent ceiling.
+pub fn check_data_dir(runtime_dir: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        crate::serve::check_socket_path_length(&socket_path(runtime_dir))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = runtime_dir;
+    }
+    Ok(())
+}
+
 /// Where a host keeps its control socket by default: the desktop app's data
 /// root. Lives here — the naming-contract crate — so the CLI's dial and the
 /// desktop's bind cannot drift apart; the desktop's own `app_paths::data_dir`

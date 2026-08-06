@@ -120,9 +120,18 @@ pub async fn ls(client: &Client, project: Option<PathBuf>) -> Result<(Value, Str
     Ok((json!(rows.iter().map(wire_json).collect::<Vec<_>>()), human))
 }
 
+/// Removal is idempotent by design — the service treats an id that is already
+/// gone as the caller's goal state reached — and the `Ack` is the same either
+/// way, so this cannot report *whether* anything was there. It therefore states
+/// the postcondition rather than claiming an action: `removed {id}` was an
+/// affirmative claim about a worktree that may never have existed, which made a
+/// typo'd slug indistinguishable from a real cleanup for anything scripting it.
 pub async fn rm(client: &Client, id: &str) -> Result<(Value, String), Failure> {
     match client.call(Request::RemoveWorktree { id: id.into() }).await? {
-        Response::Ack => Ok((json!({ "removed": id }), format!("removed {id}"))),
+        Response::Ack => Ok((
+            json!({ "id": id, "state": "absent" }),
+            format!("no worktree `{id}` remains"),
+        )),
         Response::Error(e) => Err(rpc_failure(e)),
         other => Err(unexpected_reply("RemoveWorktree", &other)),
     }

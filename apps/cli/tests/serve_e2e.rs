@@ -183,9 +183,9 @@ fn serve_lists_persisted_sessions_across_restarts() {
 
     let serve = boot_serve(&data_dir);
     assert_eq!(
-        serve.ready["localSocket"].as_str().unwrap(),
+        serve.ready["dataDir"].as_str().unwrap(),
         data_dir.to_str().unwrap(),
-        "readiness names the socket dir"
+        "readiness names the data directory — the socket is a file inside it"
     );
 
     let out = client(&data_dir).args(["--json", "ls"]).output().unwrap();
@@ -466,6 +466,48 @@ fn serve_creates_and_removes_worktrees_for_its_configured_projects() {
     let out = client(&data_dir).args(["--json", "worktree", "rm", &id]).output().unwrap();
     assert_eq!(out.status.code(), Some(0), "stderr: {}", String::from_utf8_lossy(&out.stderr));
     assert!(!Path::new(path).exists(), "rm left the checkout behind: {path}");
+
+    serve.stop_hard();
+}
+
+/// An idempotent delete may succeed, but it may not claim it removed anything.
+///
+/// The other half of `pausing_or_resuming_an_unknown_schedule_is_refused`. That
+/// one fixed the verbs with no idempotent reading; `rm` keeps its — the goal
+/// state is reached either way, and `worktree-ops`' service says so in as many
+/// words — but the CLI still answered `removed <id>` / `{"removed": id}` for an
+/// id that never existed. Same failure as the pause bug in a milder key: a
+/// script that typo'd a slug was told it had cleaned something up. The `Ack` is
+/// identical either way, so the only honest answer is the postcondition.
+#[test]
+fn removing_something_that_was_never_there_succeeds_without_claiming_a_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let serve = boot_serve(&data_dir);
+
+    for verb in ["schedule", "worktree"] {
+        let out = client(&data_dir)
+            .args(["--json", verb, "rm", "never-existed"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "`{verb} rm` stays idempotent — the goal state is reached either way"
+        );
+        let v = json_stdout(&out);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["error"], serde_json::Value::Null);
+        assert!(
+            v["data"]["removed"].is_null(),
+            "`{verb} rm` must not assert it removed something it never saw: {v}",
+        );
+        assert_eq!(
+            v["data"]["state"], "absent",
+            "the reply states the postcondition instead: {v}",
+        );
+    }
 
     serve.stop_hard();
 }

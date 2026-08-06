@@ -31,8 +31,8 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    AgentBehaviour, await_report, bin, boot_serve, install_claude_shim, probe_output,
-    report_value, run_prompt, session_of,
+    AgentBehaviour, await_report, bin, boot_serve, cli, install_claude_shim, json_of,
+    probe_output, report_value, run_prompt, session_of,
 };
 
 /// **The suite's reason to exist.**
@@ -199,6 +199,144 @@ fn an_unknown_agent_id_is_refused_rather_than_defaulted() {
     assert!(
         report_value(&report, "session_id").is_none(),
         "nothing should have been spawned for an unknown agent id",
+    );
+
+    serve.kill_hard();
+}
+
+/// A long, silent wait says it is still alive — on stderr, never stdout.
+///
+/// Both halves are the test. A blocking verb that prints nothing for minutes is
+/// indistinguishable from a wedged one, and supervisors give up on quiet
+/// children; that is why the keepalive exists. But stdout under `--json` is a
+/// contract — event lines, then exactly one result object — and a liveness line
+/// on it would break every consumer that parses the last line, or the whole
+/// stream. So this asserts the signal is present *and* that it landed on the
+/// other stream.
+///
+/// Needs a real wedged backend for the same reason the turn-timeout pin does: a
+/// stub's stream is never silent for long enough to trip anything.
+#[test]
+fn a_silent_wait_reports_liveness_on_stderr_and_never_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let shim_dir = dir.path().join("shim");
+    let report = dir.path().join("report.txt");
+
+    install_claude_shim(&shim_dir);
+    let serve =
+        boot_serve(&data_dir, &shim_dir, &report, "fake-session-quiet", AgentBehaviour::stalling());
+
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let session = session_of(&run_prompt(&data_dir, &cwd, "hello"));
+
+    // Built without the `cli()` helper, which pins `--timeout 60`: clap refuses
+    // the flag twice rather than quietly picking one, so the budget has to be
+    // set once, here. Longer than one keepalive interval, short enough not to
+    // dominate the run.
+    let out = bin()
+        .args(["--dir", data_dir.to_str().unwrap(), "--json"])
+        .args(["--timeout", "20", "wait", &session, "--until", "idle"])
+        .output()
+        .expect("wait");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    assert_eq!(out.status.code(), Some(4), "the wait should have timed out\nstderr: {stderr}");
+    assert!(
+        stderr.contains("keepalive"),
+        "a 20s silent wait must report liveness at least once: {stderr}",
+    );
+    assert!(
+        !stdout.contains("keepalive"),
+        "liveness must never reach stdout — it is the machine-readable stream: {stdout}",
+    );
+    // And stdout still parses as exactly what the contract promises.
+    let last = stdout.lines().rfind(|l| !l.trim().is_empty()).unwrap_or_default();
+    let parsed: serde_json::Value = serde_json::from_str(last)
+        .unwrap_or_else(|e| panic!("stdout's last line must be the result object ({e}): {stdout}"));
+    assert_eq!(parsed["ok"], false, "a timed-out wait reports failure: {parsed}");
+
+    serve.kill_hard();
+}
+
+/// `--turn-timeout` bounds a turn that never ends.
+///
+/// This suite is the only place the claim can be made. A turn ends when a real
+/// backend says so, and every other suite stubs the launcher — so "the stream
+/// stops on its own" is true there for reasons that have nothing to do with a
+/// deadline. The stalling fixture takes the prompt, asks a permission and
+/// answers nothing, which is exactly the shape that used to hang forever:
+/// nobody is there to decide, so the turn cannot end by itself.
+///
+/// Regression pin. Before this, `run` and `send` passed `None` as the stream
+/// deadline while the *global* `--timeout` sat in their help text looking like a
+/// bound — so an unattended run had none at all. Note the global `--timeout 60`
+/// that `cli()` sets is still in play here and is deliberately far larger than
+/// the `--turn-timeout`: the assertion below is that the turn budget is what
+/// fires, and the two are not the same clock.
+#[test]
+fn a_turn_that_never_ends_is_bounded_by_turn_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let shim_dir = dir.path().join("shim");
+    let report = dir.path().join("report.txt");
+
+    install_claude_shim(&shim_dir);
+    let serve = boot_serve(
+        &data_dir,
+        &shim_dir,
+        &report,
+        "fake-session-wedged",
+        AgentBehaviour::stalling(),
+    );
+
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    // Waited on with an explicit wall-clock bound rather than `output()`. The
+    // regression this pins is an *unbounded* wait, so a broken deadline makes
+    // the child never exit — and `output()` would hang the whole suite instead
+    // of reporting, which is the one outcome a regression pin must not have.
+    // The bound is generous on purpose: it asserts the deadline fired at all,
+    // not its precision. A loaded CI runner takes seconds to get anywhere.
+    let mut child = cli(&data_dir)
+        .args(["run", "hello", "--cwd", cwd.to_str().unwrap(), "--turn-timeout", "3"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run");
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
+    let status = loop {
+        match child.try_wait().expect("wait on run") {
+            Some(status) => break Some(status),
+            None if std::time::Instant::now() >= deadline => break None,
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        serve.kill_hard();
+        panic!("`run --turn-timeout 3` never returned — the turn deadline is not being applied");
+    };
+
+    assert_eq!(
+        status.code(),
+        Some(4),
+        "a bounded turn that never ends must exit 4 (timeout)",
+    );
+
+    // The agent is left alone — the CLI stopped waiting, it did not stop the
+    // work. Anything else would make `--turn-timeout` unsafe to reach for.
+    let listed = cli(&data_dir).args(["ls"]).output().expect("ls");
+    let rows = json_of(&listed);
+    assert_eq!(
+        rows["data"].as_array().map(Vec::len),
+        Some(1),
+        "the session must survive its own turn timing out: {rows}",
     );
 
     serve.kill_hard();

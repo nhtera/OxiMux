@@ -12,8 +12,13 @@ the desktop.
   ever. A journal that captures stdout can never capture a secret:
 
   ```json
-  {"type":"oximux_serve_ready","schemaVersion":1,"protocolVersion":18,"localSocket":"…","endpointId":"<64 hex>"}
+  {"type":"oximux_serve_ready","schemaVersion":1,"protocolVersion":18,"dataDir":"/var/lib/oximux","endpointId":"<64 hex>"}
   ```
+
+  `dataDir` is the directory, not the socket — pass it straight back as
+  `oximux --dir`. The socket itself is `<dataDir>/control-v1.sock`. Shown with a
+  real path on purpose: this example used to elide the value as `"…"`, and while
+  it did, the field was called `localSocket` and nothing here could contradict it.
 
 - **Logs go to stderr** (`RUST_LOG` filters them; default `info`).
 - **Exit codes**: 0 after a clean drain, 1 on a boot failure.

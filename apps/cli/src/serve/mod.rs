@@ -99,6 +99,13 @@ async fn serve(
         None => oximux_remote_local::default_runtime_dir()
             .context("this platform reports no local data directory; pass --data-dir")?,
     };
+    // Asked before the directory is even created. This boot may be impossible
+    // on unix — a data dir long enough to push `control-v1.sock` past
+    // `sockaddr_un.sun_path` cannot be served at all — and the bind that used to
+    // discover it sits behind the database, the identity key and a detached
+    // relay spawn. That refused ~5 s in and left a migrated 192 KB database, a
+    // token and a host key behind, none of which the answer depended on.
+    oximux_remote_local::check_data_dir(&data_dir)?;
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir {}", data_dir.display()))?;
     // A server is the deployment where other accounts on the box are most
@@ -414,6 +421,13 @@ async fn serve(
     }
 
     // ---- readiness: the one stdout line ----
+    //
+    // `dataDir`, not `localSocket`. The value has always been the directory —
+    // the socket is `<dir>/control-v1.sock` — and the old name sent readers to
+    // connect to a path that is not a socket. It is also exactly what a caller
+    // does with it: hand it back as `--dir`. Renamed while the field still has
+    // no consumers outside this repo; after a release it could only be added
+    // beside the lie, never instead of it.
     let endpoint_hex: String = endpoint_id.iter().map(|b| format!("{b:02x}")).collect();
     println!(
         "{}",
@@ -421,7 +435,7 @@ async fn serve(
             "type": "oximux_serve_ready",
             "schemaVersion": 1,
             "protocolVersion": oximux_remote_proto::proto::PROTOCOL_VERSION,
-            "localSocket": data_dir.to_string_lossy(),
+            "dataDir": data_dir.to_string_lossy(),
             "endpointId": endpoint_hex,
         })
     );

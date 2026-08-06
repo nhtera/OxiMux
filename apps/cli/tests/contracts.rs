@@ -242,7 +242,7 @@ fn the_agent_context_dump_describes_arguments_completely() {
     let dump = dump();
 
     assert_eq!(dump["command"]["name"], "oximux", "the dump names the command users type");
-    for key in ["json_flag", "async_contract", "session_scope"] {
+    for key in ["json_flag", "async_contract", "session_scope", "turn_bound"] {
         assert!(
             dump["conventions"][key].as_str().is_some_and(|s| !s.is_empty()),
             "the `{key}` convention is missing from the dump",

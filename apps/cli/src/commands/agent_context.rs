@@ -36,8 +36,12 @@ pub fn dump() -> Value {
             "access_denied": exit::DENIED,
         },
         "conventions": {
-            "json_flag": "--json prints {\"ok\":true,\"data\":…} or {\"ok\":false,\"error\":{code,message,next_steps}} on stdout",
+            "json_flag": "--json prints {\"ok\":true,\"data\":…} or {\"ok\":false,\"error\":{code,message,next_steps}} on stdout; `error.data` is present only when a failure leaves something addressable behind (e.g. session_id on a turn timeout)",
             "async_contract": "send-style verbs return when the host ACCEPTS the work, not when the agent finishes",
+            // Spelled out because an agent reading this dump is exactly the
+            // caller that gets stranded by the distinction: --timeout is global,
+            // so it appears on run/send and reads like a bound on the turn.
+            "turn_bound": "--timeout bounds one host reply, never an agent's turn; run/send stream unbounded unless given --turn-timeout <SECS> (exit 4), which stops the wait and leaves the agent running",
             "session_scope": format!(
                 "when {} is set, this CLI reaches only that session",
                 oximux_remote_local::SESSION_ENV_VAR

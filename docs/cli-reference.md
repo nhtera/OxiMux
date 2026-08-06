@@ -19,7 +19,7 @@ differs from what is committed.
 
 ## Conventions
 
-- **JSON output** — --json prints {"ok":true,"data":…} or {"ok":false,"error":{code,message,next_steps}} on stdout
+- **JSON output** — --json prints {"ok":true,"data":…} or {"ok":false,"error":{code,message,next_steps}} on stdout; `error.data` is present only when a failure leaves something addressable behind (e.g. session_id on a turn timeout)
 - **Async contract** — send-style verbs return when the host ACCEPTS the work, not when the agent finishes
 - **Session scope** — when OXIMUX_SESSION_ID is set, this CLI reaches only that session
 
@@ -32,7 +32,7 @@ These apply to every command.
 | `--json` | no | Emit machine-readable JSON on stdout (one convention, every verb). Streaming verbs (run/send/attach/wait) emit NDJSON event lines, then a final result object |
 | `--dir` | yes | The host's runtime directory (where its control socket lives). Defaults to this machine's OxiMux data directory. Local hosts only |
 | `--host` | yes | Talk to a paired remote host instead of this machine (see `oximux hosts ls`). Also read from $OXIMUX_HOST; a recorded default applies when neither is set. With no hosts paired, everything talks to this machine — no configuration needed |
-| `--timeout` | yes | Seconds to wait for a host reply before giving up (exit 4). For `wait`, this is the overall bound on the wait itself |
+| `--timeout` | yes | Seconds to wait for a host reply before giving up (exit 4). For `wait`, this is the overall bound on the wait itself. It does NOT bound an agent's turn: `run`/`send` stream until the turn ends, and `attach` until Ctrl+C. Bound a turn with `run`/`send --turn-timeout` |
 
 ## Commands
 
@@ -64,6 +64,7 @@ Start an agent session and send it a prompt.
 | `--cwd` | yes | Working directory for the session (default: the current directory) |
 | `--worktree` | yes | Create a worktree with this slug under the project first, and start the session inside it. The project is the `--cwd` (or current) directory, which must be a project the host knows |
 | `--output-schema` | yes | Hold the final answer to a JSON Schema — a file path, or the schema itself as inline JSON. The agent is re-prompted with the validation errors up to twice; a still-invalid answer exits 1. Prints the validated JSON. Needs the turn, so it cannot be combined with --bg |
+| `--turn-timeout` | yes | Give up on the turn after this many seconds (exit 4). The agent is left running — only this command stops waiting. Without it the stream is unbounded, which is right for a terminal and wrong for a CI job, since a turn parked on a permission request ends only when something decides it. The global --timeout does NOT bound the turn; it bounds one host reply |
 | `--bg` | no | Print the session id and exit instead of staying attached |
 
 ### `oximux attach`
@@ -84,6 +85,7 @@ Send a prompt into an existing session.
 | `<SESSION>` | yes | The session id (see `oximux ls`) |
 | `<PROMPT>` | yes | The prompt to send, or `-` to read it from stdin |
 | `--output-schema` | yes | Hold the final answer to a JSON Schema — a file path, or the schema itself as inline JSON. The agent is re-prompted with the validation errors up to twice; a still-invalid answer exits 1. Prints the validated JSON. Needs the turn, so it cannot be combined with --no-wait |
+| `--turn-timeout` | yes | Give up on the turn after this many seconds (exit 4). The agent is left running — only this command stops waiting. Without it the stream is unbounded, which is right for a terminal and wrong for a CI job, since a turn parked on a permission request ends only when something decides it. The global --timeout does NOT bound the turn; it bounds one host reply |
 | `--no-wait` | no | Return as soon as the host accepts the prompt |
 
 ### `oximux wait`
@@ -298,7 +300,7 @@ List worktrees (all projects unless --project narrows it)
 
 #### `oximux worktree rm`
 
-Remove a worktree by id (see `worktree ls`). Refused (not forced) when the worktree has uncommitted changes
+Remove a worktree by id (see `worktree ls`). Refused (not forced) when the worktree has uncommitted changes.
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
@@ -377,7 +379,7 @@ Fire a schedule immediately. Its cadence is untouched: the next scheduled occurr
 
 #### `oximux schedule rm`
 
-Delete a schedule and its run history
+Delete a schedule and its run history.
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |

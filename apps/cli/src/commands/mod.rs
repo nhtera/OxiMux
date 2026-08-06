@@ -4,6 +4,43 @@
 use crate::cli::exit;
 use crate::output::Failure;
 
+/// The deadline a streaming verb stops waiting at, or `None` for no bound.
+///
+/// Deliberately separate from the global `--timeout`, which bounds one host
+/// reply. A turn is not a reply: an agent legitimately thinks for minutes, so a
+/// 10-second RPC budget applied to the stream would abort ordinary interactive
+/// work. Bounding a turn is therefore opt-in, and the flag that does it says so
+/// in its own name.
+///
+/// `max(1)` mirrors `wait`: a zero here is a caller asking for a bound, and the
+/// only bound that cannot be met is one that has already expired.
+pub fn turn_deadline(secs: Option<u64>) -> Option<tokio::time::Instant> {
+    secs.map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s.max(1)))
+}
+
+/// The failure a `--turn-timeout` expiry produces.
+///
+/// Exit 4 like every other timeout, and the steps name the two real options:
+/// the agent may simply need longer, or it may be parked on a decision no one
+/// is there to make — which is the common cause for an unattended run and is
+/// invisible from the stream alone.
+/// The session id rides in `data` as well as the prose, because this failure
+/// leaves a live agent behind: for `run` the id is otherwise known only to the
+/// command that just failed, and recovering it from a sentence is not something
+/// a script should have to do.
+pub fn turn_timeout_failure(session: &str, secs: u64) -> Failure {
+    Failure::new(
+        "turn-timeout",
+        exit::TIMEOUT,
+        format!("the turn did not finish within --turn-timeout ({secs}s); the agent is still running"),
+    )
+    .with_steps([
+        format!("`oximux permit ls {session}` — a turn parks here when it needs a decision"),
+        format!("`oximux attach {session}` to keep watching, or raise --turn-timeout"),
+    ])
+    .with_data(serde_json::json!({ "session_id": session }))
+}
+
 /// A correlation id for a prompt: unique per send, within and across processes.
 ///
 /// The pid seeds the high bits so two concurrent CLIs never collide; a counter

@@ -49,7 +49,9 @@ pub struct Cli {
     pub host: Option<String>,
 
     /// Seconds to wait for a host reply before giving up (exit 4). For `wait`,
-    /// this is the overall bound on the wait itself.
+    /// this is the overall bound on the wait itself. It does NOT bound an
+    /// agent's turn: `run`/`send` stream until the turn ends, and `attach`
+    /// until Ctrl+C. Bound a turn with `run`/`send --turn-timeout`.
     #[arg(long, global = true, default_value_t = 10, value_name = "SECS")]
     pub timeout: u64,
 
@@ -78,6 +80,11 @@ pub enum Command {
     /// when the agent finishes. By default this stays attached and streams the
     /// turn to completion; `--bg` prints the new session id and exits
     /// immediately — pair it with `wait` or `attach`.
+    ///
+    /// That stream is UNBOUNDED by default, and the global `--timeout` does not
+    /// change it: `--timeout` bounds one host reply, and a turn is not a reply.
+    /// Use `--turn-timeout` to bound the turn itself (exit 4). Scripts want it —
+    /// a turn parked on a permission request ends only when something decides.
     #[command(verbatim_doc_comment)]
     Run {
         /// The prompt to send, or `-` to read it from stdin.
@@ -110,6 +117,14 @@ pub enum Command {
         /// validated JSON. Needs the turn, so it cannot be combined with --bg.
         #[arg(long, value_name = "FILE|JSON", conflicts_with = "bg")]
         output_schema: Option<String>,
+        /// Give up on the turn after this many seconds (exit 4). The agent is
+        /// left running — only this command stops waiting. Without it the
+        /// stream is unbounded, which is right for a terminal and wrong for a
+        /// CI job, since a turn parked on a permission request ends only when
+        /// something decides it. The global --timeout does NOT bound the turn;
+        /// it bounds one host reply.
+        #[arg(long, value_name = "SECS", conflicts_with = "bg")]
+        turn_timeout: Option<u64>,
         /// Print the session id and exit instead of staying attached.
         #[arg(long)]
         bg: bool,
@@ -134,6 +149,11 @@ pub enum Command {
     /// when the agent finishes. By default this stays attached and streams the
     /// turn to completion; `--no-wait` returns right after the acknowledgment —
     /// pair it with `wait` or `attach`.
+    ///
+    /// That stream is UNBOUNDED by default, and the global `--timeout` does not
+    /// change it: `--timeout` bounds one host reply, and a turn is not a reply.
+    /// Use `--turn-timeout` to bound the turn itself (exit 4). Scripts want it —
+    /// a turn parked on a permission request ends only when something decides.
     #[command(verbatim_doc_comment)]
     Send {
         /// The session id (see `oximux ls`).
@@ -147,6 +167,14 @@ pub enum Command {
         /// --no-wait.
         #[arg(long, value_name = "FILE|JSON", conflicts_with = "no_wait")]
         output_schema: Option<String>,
+        /// Give up on the turn after this many seconds (exit 4). The agent is
+        /// left running — only this command stops waiting. Without it the
+        /// stream is unbounded, which is right for a terminal and wrong for a
+        /// CI job, since a turn parked on a permission request ends only when
+        /// something decides it. The global --timeout does NOT bound the turn;
+        /// it bounds one host reply.
+        #[arg(long, value_name = "SECS", conflicts_with = "no_wait")]
+        turn_timeout: Option<u64>,
         /// Return as soon as the host accepts the prompt.
         #[arg(long)]
         no_wait: bool,
@@ -526,6 +554,12 @@ pub enum WorktreeCommand {
     },
     /// Remove a worktree by id (see `worktree ls`). Refused (not forced) when
     /// the worktree has uncommitted changes.
+    ///
+    /// Idempotent: an id that is already gone succeeds, because the goal state
+    /// is reached either way. Exit 0 therefore does NOT mean the worktree
+    /// existed — a mistyped id succeeds too. Check `worktree ls` if you need to
+    /// know that it was there.
+    #[command(verbatim_doc_comment)]
     Rm {
         /// The worktree id (from `worktree ls`).
         id: String,
@@ -748,6 +782,12 @@ pub enum ScheduleCommand {
         id: String,
     },
     /// Delete a schedule and its run history.
+    ///
+    /// Idempotent: an id that is already gone succeeds. Exit 0 therefore does
+    /// NOT mean the schedule existed — a mistyped id succeeds too. Unlike
+    /// `pause`/`resume`, which refuse an unknown id because they need a
+    /// schedule to act on.
+    #[command(verbatim_doc_comment)]
     Rm {
         /// The schedule id (from `schedule ls`).
         id: String,
