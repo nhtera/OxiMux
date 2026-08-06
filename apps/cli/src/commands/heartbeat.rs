@@ -14,6 +14,7 @@
 //! outside the mappable set is refused by name rather than silently rounded to
 //! something near it — see [`parse_cron`].
 
+use oximux_agents::schedule::recurrence::MIN_INTERVAL_MINUTES;
 use oximux_remote_proto::messages::{CreateHeartbeatReq, HeartbeatWire, RecurrenceWire};
 use oximux_remote_proto::proto::{Request, Response};
 use serde_json::{Value, json};
@@ -27,6 +28,14 @@ use crate::output::Failure;
 /// rejecting.
 const SUPPORTED_CRON: &str = "supported: \"*/N * * * *\" (every N minutes, N ≥ 5), \
      \"M H * * *\" (daily at H:M), \"M H * * DOW\" (weekly)";
+
+/// The `N ≥ 5` above is written out in prose, which a `const &str` cannot
+/// interpolate — so pin it here instead of letting the help text drift away
+/// from the rule it claims to teach.
+const _: () = assert!(
+    MIN_INTERVAL_MINUTES == 5,
+    "the interval floor moved; update the `N ≥ 5` in SUPPORTED_CRON to match",
+);
 
 /// Parse a five-field cron expression into the host's recurrence vocabulary.
 ///
@@ -60,6 +69,19 @@ pub fn parse_cron(expr: &str) -> Result<RecurrenceWire, Failure> {
         let minutes: u32 = step
             .parse()
             .map_err(|_| refuse(format!("`{step}` is not a number of minutes")))?;
+        // The floor is checked here as well as on the host, because the two
+        // answer different questions. The host's check is the authority and
+        // stays: a client cannot be trusted to enforce an invariant. This one
+        // decides the *class* of the mistake — `*/3` is wrong in the argv, the
+        // same way `7 3 5 * *` is, and a caller that branches on exit 2 ("fix
+        // the arguments") versus exit 1 ("the host refused") was getting the
+        // wrong answer for the one cron shape whose rejection needed a round
+        // trip. It also reaches the refusal that quotes the supported set.
+        if minutes < MIN_INTERVAL_MINUTES {
+            return Err(refuse(format!(
+                "`*/{minutes}` fires too often; the floor is {MIN_INTERVAL_MINUTES} minutes"
+            )));
+        }
         return Ok(RecurrenceWire::EveryMinutes { minutes });
     }
     if minute == "*" {
@@ -233,6 +255,8 @@ mod tests {
             "0 9-17 * * *",    // range
             "*/15 9 * * *",    // stepped minute with a constrained hour
             "0 9 * *",         // four fields
+            "*/3 * * * *",     // under the interval floor
+            "*/0 * * * *",     // zero
         ] {
             let err = parse_cron(expr).expect_err(expr);
             assert_eq!(err.exit, exit::USAGE, "{expr}");
@@ -247,5 +271,31 @@ mod tests {
     fn out_of_range_times_are_refused() {
         assert!(parse_cron("60 9 * * *").is_err());
         assert!(parse_cron("0 24 * * *").is_err());
+    }
+
+    /// A cadence under the floor is a usage error, not a host refusal.
+    ///
+    /// This is about the exit *class*, which is the part a script acts on.
+    /// `*/3` used to parse cleanly here and be rejected by the host, so it came
+    /// back as exit 1 (`bad-request`) with no next steps — while every other
+    /// malformed value of the same flag was exit 2 with the supported set
+    /// attached. A caller that treats exit 2 as "fix the arguments" and exit 1
+    /// as "the host said no, maybe retry" got the wrong answer for the one
+    /// shape whose rejection needed a round trip. The host still enforces the
+    /// floor; this only classifies it.
+    #[test]
+    fn a_cadence_under_the_floor_is_refused_as_usage_not_as_a_host_error() {
+        let err = parse_cron("*/3 * * * *").expect_err("under the floor");
+        assert_eq!(err.exit, exit::USAGE);
+        assert!(
+            err.next_steps.iter().any(|s| s.contains("supported:")),
+            "and it teaches the supported set"
+        );
+        // The floor itself still parses, so the check is a floor and not an
+        // off-by-one that moved the whole cadence range.
+        assert_eq!(
+            parse_cron("*/5 * * * *").unwrap(),
+            RecurrenceWire::EveryMinutes { minutes: MIN_INTERVAL_MINUTES }
+        );
     }
 }

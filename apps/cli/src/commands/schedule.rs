@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 
+use oximux_agents::schedule::recurrence::MIN_INTERVAL_MINUTES;
 use oximux_remote_proto::messages::{
     RecurrenceWire, RunOutcomeWire, ScheduleRunWire, ScheduleWire,
 };
@@ -24,6 +25,16 @@ fn parse_recurrence(
 ) -> Result<RecurrenceWire, Failure> {
     let usage = |msg: &str| Failure::new("usage", exit::USAGE, msg.to_string());
     match (every, daily, weekly) {
+        // The floor is checked here as well as on the host. The host's check is
+        // the authority and stays — a client cannot be trusted to enforce an
+        // invariant. This one decides the *class*: every other bad cadence
+        // value (`--daily 25:00`, `--weekly "funday 09:00"`) is a usage error
+        // caught without a host, and `--every 3` is wrong in exactly the same
+        // way. Leaving it to the round trip made it exit 1 ("the host refused",
+        // which a script may retry) instead of exit 2 ("fix the arguments").
+        (Some(minutes), None, None) if minutes < MIN_INTERVAL_MINUTES => Err(usage(&format!(
+            "--every wants at least {MIN_INTERVAL_MINUTES} minutes; each fire spawns an agent"
+        ))),
         (Some(minutes), None, None) => Ok(RecurrenceWire::EveryMinutes { minutes }),
         (None, Some(time), None) => {
             let (hour, minute) = parse_hhmm(&time)
@@ -270,5 +281,27 @@ mod tests {
             exit::USAGE
         );
         assert_eq!(parse_recurrence(None, None, Some("mon".into())).unwrap_err().exit, exit::USAGE);
+    }
+
+    /// `--every` under the floor joins them, rather than being the one cadence
+    /// value whose rejection needs a host.
+    ///
+    /// The test above already fixes the class for every *other* malformed
+    /// cadence. `--every 3` was the exception: it parsed here and was refused
+    /// on the wire, so it surfaced as exit 1 (`bad-request`) — the code a
+    /// script reads as "the host refused, this may be worth retrying" — for an
+    /// argument that can never be right. The host's own check is the authority
+    /// and is unchanged; this only decides which exit code the caller sees.
+    #[test]
+    fn an_interval_under_the_floor_is_a_usage_error_like_every_other_bad_cadence() {
+        for minutes in [0, 1, MIN_INTERVAL_MINUTES - 1] {
+            let err = parse_recurrence(Some(minutes), None, None).unwrap_err();
+            assert_eq!(err.exit, exit::USAGE, "--every {minutes}");
+        }
+        // The floor is a floor, not an off-by-one.
+        assert_eq!(
+            parse_recurrence(Some(MIN_INTERVAL_MINUTES), None, None).unwrap(),
+            RecurrenceWire::EveryMinutes { minutes: MIN_INTERVAL_MINUTES }
+        );
     }
 }
