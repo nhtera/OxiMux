@@ -106,6 +106,51 @@ async fn serve(
     oximux_owner_only::prepare_owner_only_dir(&data_dir)
         .with_context(|| format!("restrict data dir {}", data_dir.display()))?;
 
+    // ---- single holder, decided before anything else is written ----
+    //
+    // `docs/server-install.md` promises one host per data directory, and the
+    // rest of this function assumes it: the bind is where each agent's confined
+    // credential is minted from, and two hosts would run two session registries
+    // over one database.
+    //
+    // Checked here rather than at the bind because *where* matters as much as
+    // whether. `LocalControlListener::bind` writes the token file on its way to
+    // the socket, so a second boot that got that far — and every Windows one
+    // did, since a pipe name in use cannot be taken over — replaced the
+    // credential the incumbent's live listener authenticates against. The first
+    // host stayed up and answering while every client it had was denied. The
+    // refusal has to land before the first destructive step, not at the last
+    // one.
+    //
+    // And it has to be a lock rather than a probe of the socket: one process
+    // rebinding over its own live listener is legitimate (the desktop's
+    // Settings → Remote toggle does exactly that), and on unix that is
+    // indistinguishable from a second host by looking at the socket alone.
+    let _host_lock = match oximux_single_instance::try_acquire(
+        &data_dir.join(oximux_remote_local::HOST_LOCK_FILENAME),
+    ) {
+        Ok(oximux_single_instance::AcquireOutcome::Acquired(guard)) => guard,
+        Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder_pid }) => {
+            let who = holder_pid
+                .map(|pid| format!(" (PID {pid})"))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "another OxiMux host is already serving {}{who}. Stop it first, \
+                 or use a different --data-dir.",
+                data_dir.display(),
+            );
+        }
+        // A lock that cannot be evaluated must not silently authorise a second
+        // host — the whole point is that the incumbent survives contact with
+        // one.
+        Err(err) => {
+            return Err(anyhow::Error::new(err).context(format!(
+                "could not determine whether another host holds {}",
+                data_dir.display()
+            )));
+        }
+    };
+
     // ---- storage (the desktop's own database and migration ladder) ----
     let db_path = data_dir.join("oximux.db");
     let db = oximux_storage::open(&db_path)

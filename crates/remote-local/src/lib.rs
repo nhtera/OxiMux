@@ -60,6 +60,27 @@ use std::path::{Path, PathBuf};
 pub const SOCKET_FILENAME: &str = "control-v1.sock";
 pub const TOKEN_FILENAME: &str = "control-v1.token";
 
+/// The role lock naming **which process may hold the control socket** for a
+/// data directory.
+///
+/// Not enforced by the bind itself, and deliberately so. One process legitimately
+/// rebinds over its own live listener — the desktop's Settings → Remote toggle
+/// aborts the accept task asynchronously, so a toggle-off/toggle-on can bind
+/// while the previous listener is still alive, which is what
+/// [`LocalControlListener`]'s node-identity `Drop` exists to survive. A check
+/// inside `bind` cannot tell that from a second host arriving, because on unix
+/// both look like "something is listening at this path".
+///
+/// An advisory lock can tell them apart: it is held per process, released by the
+/// OS on exit — crash and SIGKILL included — and a process contends only with
+/// *other* processes. Taking it is the host's job, before it writes anything,
+/// so a refused boot leaves the incumbent's socket and token untouched.
+///
+/// Lives here rather than in the CLI because the desktop host binds the same
+/// socket and must contend for the same lock; two spellings of this name would
+/// be two hosts that cannot see each other.
+pub const HOST_LOCK_FILENAME: &str = "control-v1.host.lock";
+
 /// The environment variable an agent-spawned process carries to name **which
 /// credential it holds**. Part of the naming contract: the injector (the host
 /// spawning agents) and the CLI must agree on it.

@@ -87,64 +87,6 @@ fn check_socket_path_length(socket_path: &Path) -> Result<()> {
     )
 }
 
-/// Claim the socket (unix) or the pipe name (Windows).
-///
-/// Split out because the two platforms have to call it at different points:
-/// unix probes for an incumbent first and binds after the token write, Windows
-/// has nothing to probe and so the bind itself *is* the incumbent check, which
-/// must happen before that write. One body either way, so the security
-/// descriptor and the reclamation setting cannot drift between them.
-fn create_listener(socket_path: &Path) -> Result<interprocess::local_socket::tokio::Listener> {
-    let name = match endpoint_for(socket_path) {
-        Endpoint::FsPath(path) => path
-            .to_fs_name::<interprocess::local_socket::GenericFilePath>()
-            .with_context(|| format!("socket path unusable: {}", socket_path.display()))?,
-        Endpoint::Namespaced(name) => name
-            .to_ns_name::<interprocess::local_socket::GenericNamespaced>()
-            .context("derived pipe name unusable")?,
-    };
-    // Name reclamation OFF, so this listener never unlinks the socket on its
-    // own. `interprocess` enables it by default and would delete whatever
-    // node sits at the path when the listener drops — including one a LATER
-    // bind put there, since a listener can outlive its owner (an aborted
-    // accept task is dropped whenever the runtime gets to it). Unlinking is
-    // this crate's job instead, and `Drop` only removes a node it can still
-    // identify as its own. No-op on Windows: a pipe has no name to reclaim.
-    let options = ListenerOptions::new().name(name).reclaim_name(false);
-    // `?`, never a fallback: an unprotected pipe must not exist at all.
-    #[cfg(windows)]
-    let options = {
-        use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
-        options.security_descriptor(owner_only_descriptor()?)
-    };
-    // The conflict reaches here only on Windows — unix has already refused at
-    // the probe. Same sentence either way: an operator hitting a documented
-    // rule should not have to recognise two spellings of it, one of which is a
-    // bare OS error.
-    match options.create_tokio() {
-        Ok(listener) => Ok(listener),
-        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            anyhow::bail!(already_serving(socket_path))
-        }
-        Err(err) => {
-            Err(anyhow::Error::new(err).context(format!("bind {}", socket_path.display())))
-        }
-    }
-}
-
-/// The one sentence for "someone else holds this data directory".
-///
-/// Both platforms detect the conflict differently — unix by probing the node,
-/// Windows by the bind returning `AddrInUse` — and an operator should read the
-/// same rule from either.
-fn already_serving(socket_path: &Path) -> String {
-    format!(
-        "another OxiMux host is already serving this data directory (`{}` has a live \
-         listener). Stop it first, or use a different --data-dir.",
-        socket_path.display(),
-    )
-}
-
 impl LocalControlListener {
     /// Prepare the runtime directory (owner-only, readback-verified), write
     /// `token` beside the socket (owner-only, readback-verified), and bind.
@@ -172,49 +114,38 @@ impl LocalControlListener {
         check_socket_path_length(&socket_path)?;
 
         secure::prepare_runtime_dir(runtime_dir)?;
-
-        // The incumbent check, BEFORE the token write below — and that ordering
-        // is the whole point.
-        //
-        // A stale node from a crashed host would make bind fail with AddrInUse,
-        // so it has to go; but unlinking it unconditionally (which this did) let
-        // a SECOND host replace a LIVE host's socket node and serve beside it.
-        // Both processes stayed up and every later client silently reached the
-        // newcomer — the exact split-brain the single-holder rule exists to
-        // prevent. `docs/server-install.md` promises the opposite, and Windows
-        // delivered it, since a pipe name cannot be unlinked out from under its
-        // owner. The two platforms disagreed on a documented contract.
-        //
-        // Refusing at the bind is not enough on its own, because by then the
-        // token file has already been rewritten: a second boot that goes on to
-        // fail still swaps the credential the incumbent's live listener is
-        // authenticating against, and every subsequent client gets `denied`. A
-        // doomed boot must leave the running host untouched, so nothing
-        // destructive may happen before we know we are alone.
-        //
-        // Connecting is the only way to tell a live node from a stale one: a
-        // node with no listener refuses, a live one accepts. The probe is the
-        // pre-handshake connect and nothing more — it proves a listener exists
-        // and hangs up.
-        #[cfg(unix)]
-        if socket_path.exists() {
-            if std::os::unix::net::UnixStream::connect(&socket_path).is_ok() {
-                anyhow::bail!(already_serving(&socket_path));
-            }
-            let _ = std::fs::remove_file(&socket_path);
-        }
-        // Windows has no node to probe — the conflict surfaces as `AddrInUse`
-        // from `create_tokio()` below. Binding before the token write would
-        // invert the invariant this function's doc states, so the pipe is
-        // claimed first and the token written immediately after, with the
-        // listener held but not yet accepting.
-        #[cfg(windows)]
-        let listener = create_listener(&socket_path)?;
-
         secure::write_token_file(&crate::token_path(runtime_dir), token)?;
 
+        // A stale node from a crashed host would make bind fail with
+        // AddrInUse; nothing can be listening on it (we are the host).
         #[cfg(unix)]
-        let listener = create_listener(&socket_path)?;
+        let _ = std::fs::remove_file(&socket_path);
+
+        let name = match endpoint_for(&socket_path) {
+            Endpoint::FsPath(path) => path
+                .to_fs_name::<interprocess::local_socket::GenericFilePath>()
+                .with_context(|| format!("socket path unusable: {}", socket_path.display()))?,
+            Endpoint::Namespaced(name) => name
+                .to_ns_name::<interprocess::local_socket::GenericNamespaced>()
+                .context("derived pipe name unusable")?,
+        };
+        // Name reclamation OFF, so this listener never unlinks the socket on its
+        // own. `interprocess` enables it by default and would delete whatever
+        // node sits at the path when the listener drops — including one a LATER
+        // bind put there, since a listener can outlive its owner (an aborted
+        // accept task is dropped whenever the runtime gets to it). Unlinking is
+        // this crate's job instead, and `Drop` only removes a node it can still
+        // identify as its own. No-op on Windows: a pipe has no name to reclaim.
+        let options = ListenerOptions::new().name(name).reclaim_name(false);
+        // `?`, never a fallback: an unprotected pipe must not exist at all.
+        #[cfg(windows)]
+        let options = {
+            use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
+            options.security_descriptor(owner_only_descriptor()?)
+        };
+        let listener = options
+            .create_tokio()
+            .with_context(|| format!("bind {}", socket_path.display()))?;
 
         // Bind creates the node; restrict it and take the readback receipt.
         #[cfg(unix)]
