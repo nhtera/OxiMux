@@ -271,6 +271,22 @@ pub struct RemoteControl {
     /// accept loop AND every in-flight CLI connection — the local analogue of
     /// dropping the iroh `HostHandle`.
     local: Mutex<Option<local_listener::LocalHandle>>,
+    /// Proof that this process, and no other, is the host for the data
+    /// directory — the same advisory lock `oximux serve` takes.
+    ///
+    /// Both hosts bind the same socket and write the same token file, and the
+    /// desktop's data dir *is* serve's default, so an app with local access on
+    /// plus a bare `oximux serve` is two hosts over one database: on unix the
+    /// newcomer replaced the live socket node, and on both platforms it swapped
+    /// the credential the incumbent's listener authenticates against, leaving
+    /// every client of the first host denied.
+    ///
+    /// Held per process rather than per bind, which is what makes it safe here:
+    /// an advisory lock contends with *another* process, but a second one taken
+    /// on the same file from this one would be refused too — and Settings →
+    /// Remote legitimately rebinds over our own live listener. Taking it only
+    /// when it is not already held keeps that path working.
+    host_lock: Mutex<Option<oximux_single_instance::SingleInstanceGuard>>,
 }
 
 impl Global for RemoteControl {}
@@ -307,6 +323,7 @@ impl RemoteControl {
             endpoint_secret: None,
             local_enabled: AtomicBool::new(false),
             local: Mutex::new(None),
+            host_lock: Mutex::new(None),
         }
     }
 
@@ -742,12 +759,58 @@ impl RemoteControl {
             tracing::warn!("no tokio runtime; local control socket not bound");
             return;
         };
+        // Claim the data directory before binding anything into it. Skipped when
+        // we already hold it: that is Settings → Remote toggled back on, and the
+        // lock would contend with itself.
+        if !rc.claim_host_role(&dir) {
+            return;
+        }
         match local_listener::start(dispatcher, dir, rt) {
             Ok(handle) => *rc.local.lock().unwrap() = Some(handle),
             // The flag stays on so the UI reflects the user's choice, but with
             // nothing bound the CLI reports the host unreachable — which is
             // true, and better than a toggle that looks on and answers nothing.
             Err(err) => tracing::warn!(%err, "local control socket failed to bind"),
+        }
+    }
+
+    /// Take the data directory's host role, or report that someone else has it.
+    ///
+    /// `true` means bind; `false` means another process is the host and we must
+    /// not touch its socket or token. Idempotent — already holding the lock is
+    /// success, which is what lets a rebind over our own listener through.
+    ///
+    /// A lock that cannot be evaluated refuses, matching `serve`: an unreadable
+    /// answer is not permission to become a second host.
+    fn claim_host_role(&self, dir: &std::path::Path) -> bool {
+        let mut held = self.host_lock.lock().unwrap();
+        if held.is_some() {
+            return true;
+        }
+        let path = dir.join(oximux_remote_local::HOST_LOCK_FILENAME);
+        match oximux_single_instance::try_acquire(&path) {
+            Ok(oximux_single_instance::AcquireOutcome::Acquired(guard)) => {
+                *held = Some(guard);
+                true
+            }
+            Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder_pid }) => {
+                tracing::warn!(
+                    holder_pid = ?holder_pid,
+                    dir = %dir.display(),
+                    "another OxiMux host is already serving this data directory; \
+                     local CLI access not bound",
+                );
+                false
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    dir = %dir.display(),
+                    "could not determine whether another host holds this data directory; \
+                     local CLI access not bound",
+                );
+                false
+            }
         }
     }
 
@@ -784,7 +847,11 @@ impl RemoteControl {
     /// in-flight CLI connection go down with the handle. Idempotent.
     pub fn stop_local(&self) {
         self.set_local_enabled(false);
+        // Listener first, then the role. Releasing the lock while our socket is
+        // still bound would let a waiting `serve` win the role and unlink a live
+        // node — the exact race the lock exists to prevent, run backwards.
         self.local.lock().unwrap().take();
+        self.host_lock.lock().unwrap().take();
     }
 }
 
@@ -1040,5 +1107,40 @@ mod tests {
 
         binding.unregister("agent-1");
         assert!(rc.registry().get("agent-1").is_none(), "unregister evicts the session");
+    }
+
+    /// The host role is one per data directory, and re-taking our own is free.
+    ///
+    /// Both halves matter, and the second is the one with teeth. An advisory
+    /// lock refuses a second acquisition from the *same* process just as it does
+    /// from another, so a claim taken per bind rather than per process would
+    /// break Settings → Remote toggled back on — the app would decline to bind
+    /// against itself, and local CLI access would silently stop working after
+    /// one toggle. Asserting that the second claim succeeds pins the reuse.
+    #[test]
+    fn the_host_role_is_taken_once_per_process_and_reused_by_a_rebind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let rc = RemoteControl::new();
+        assert!(rc.claim_host_role(dir.path()), "an unheld data dir is claimable");
+        assert!(
+            rc.claim_host_role(dir.path()),
+            "re-claiming a role we already hold must succeed — a rebind depends on it",
+        );
+
+        // A second host over the same directory is refused while the first holds
+        // it. Standing in for `oximux serve`, which takes this identical lock.
+        let other = RemoteControl::new();
+        assert!(
+            !other.claim_host_role(dir.path()),
+            "a second host must not be allowed to bind over a live one",
+        );
+
+        // And the role is released with the listener, so a successor can take it.
+        rc.stop_local();
+        assert!(
+            other.claim_host_role(dir.path()),
+            "the role must be claimable again once the holder stops hosting",
+        );
     }
 }
