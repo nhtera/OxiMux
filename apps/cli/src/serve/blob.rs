@@ -90,20 +90,33 @@ impl ChatBlob {
     /// line. The blob stores no title (the desktop keeps titles in its tab
     /// layout), so this is the best durable approximation.
     pub fn derived_title(&self) -> Option<String> {
-        self.entries.iter().find_map(|entry| match entry {
-            ThreadEntry::User { text, .. } => {
-                let line = text.lines().next().unwrap_or("").trim();
-                (!line.is_empty()).then(|| {
-                    let mut line = line.to_string();
-                    if line.chars().count() > 60 {
-                        line = line.chars().take(60).collect::<String>() + "…";
-                    }
-                    line
-                })
-            }
-            _ => None,
-        })
+        derived_title(&self.entries)
     }
+}
+
+/// The list-row label rule, over whatever holds the entries.
+///
+/// A free function rather than a method because the live pump must apply the
+/// same rule to the *fold* — and applying it in only one of the two places is
+/// exactly the bug this shape prevents. `oximux ls` used to show a live session
+/// as its own UUID and the same session as "Summarise what a.txt contains"
+/// after a host restart, because the persistence path had the fallback and the
+/// registry path did not. Restarting the host improved the listing, which is
+/// the wrong way round.
+pub fn derived_title(entries: &[ThreadEntry]) -> Option<String> {
+    entries.iter().find_map(|entry| match entry {
+        ThreadEntry::User { text, .. } => {
+            let line = text.lines().next().unwrap_or("").trim();
+            (!line.is_empty()).then(|| {
+                let mut line = line.to_string();
+                if line.chars().count() > 60 {
+                    line = line.chars().take(60).collect::<String>() + "…";
+                }
+                line
+            })
+        }
+        _ => None,
+    })
 }
 
 /// Load one blob. `None` when absent or unreadable — corrupt history degrades

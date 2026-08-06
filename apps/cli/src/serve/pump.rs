@@ -268,14 +268,25 @@ fn apply(
     fold.apply(event);
     let _ = turn_tx.send(fold.turn_active);
     // Keep the registry's list-row metadata current on the events that change it.
+    //
+    // `UserMessage` is in the list because it is what makes a title derivable:
+    // these backends never send `TitleUpdated`, so without it `fold.title` stays
+    // `None` for the whole life of a live session and `oximux ls` falls back to
+    // printing the session's own UUID as its title — for every row, which is
+    // precisely when a list stops being usable. A resumed session emits no
+    // `SessionInit` either, so this is also the only trigger it has.
     if matches!(
         event,
         ThreadEvent::SessionInit { .. }
             | ThreadEvent::TitleUpdated { .. }
             | ThreadEvent::ModeChanged { .. }
+            | ThreadEvent::UserMessage { .. }
     ) {
         handle.set_meta(SessionMeta {
-            title: fold.title.clone(),
+            // Same fallback the persistence path already applied. Having it on
+            // only one of the two is what made a host restart *improve* the
+            // listing.
+            title: fold.title.clone().or_else(|| super::blob::derived_title(&fold.entries)),
             model: fold.model.clone(),
             permission_mode: fold.permission_mode.clone(),
             cwd: fold.session_meta.cwd.clone().map(std::path::PathBuf::from),
@@ -408,5 +419,55 @@ mod tests {
             Some(Some("hi".into())),
             "the index lists the now-dormant session"
         );
+    }
+
+    /// A LIVE session lists by its prompt, not by its own UUID.
+    ///
+    /// The registry row is what `oximux ls` reads while a session is running,
+    /// and it used to publish `fold.title` alone. These backends never send
+    /// `TitleUpdated`, so that stayed `None` for the session's whole life and
+    /// the wire fell back to the session id — every row reading
+    /// `<project> · <uuid>`, with the uuid already in the id column. Measured
+    /// against a real `claude`: three live sessions were three indistinguishable
+    /// rows, and *restarting the host* fixed them, because only the persistence
+    /// path applied the derived-title fallback.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_session_lists_by_its_prompt_rather_than_its_own_id() {
+        let registry = Arc::new(SessionRegistry::new());
+        let handle = registry.register("s-2".into(), Arc::new(StubConnection::default()));
+        let db = oximux_storage::open_memory().unwrap();
+        let settings = SettingsRepo::new(db);
+        let index = Arc::new(SessionIndex::default());
+        let pumps = PumpSet::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        start(
+            PumpSpec {
+                session_id: "s-2".into(),
+                handle: handle.clone(),
+                events: rx,
+                buffered: vec![ThreadEvent::UserMessage {
+                    text: "Summarise what a.txt contains".into(),
+                    images: vec![],
+                }],
+                seed: ChatBlob::new("s-2".into()),
+                settings,
+                registry: registry.clone(),
+                index,
+                on_end: None,
+            },
+            pumps.clone(),
+        );
+
+        // Still live — this is the registry row, not the dormant index.
+        assert!(
+            wait_until(5_000, || registry
+                .get("s-2")
+                .and_then(|h| h.meta_snapshot().title)
+                .is_some_and(|t| t == "Summarise what a.txt contains")),
+            "a live session's list row carries the derived title, got {:?}",
+            registry.get("s-2").and_then(|h| h.meta_snapshot().title),
+        );
+        drop(tx);
     }
 }
