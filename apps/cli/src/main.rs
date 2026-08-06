@@ -182,6 +182,17 @@ fn precheck(command: &mut Command, json_mode: bool) -> Result<(), output::Failur
             "for machine-readable terminal state, use `oximux --json term ls`".into(),
         ]));
     }
+    // A malformed `--input` is a mistake in the argv, so it must be caught
+    // here rather than inside the verb: by the time `permit allow` runs, a
+    // client has already been built, and on a machine with no host up the
+    // caller was told "the host is not reachable" (exit 3) for bad JSON they
+    // could have been shown without any host at all. Parsed twice — once to
+    // validate, once for real — because the rule lives in one function and a
+    // few bytes of JSON is not worth threading state through the dispatcher to
+    // avoid.
+    if let Command::Permit { command: PermitCommand::Allow { input: Some(raw), .. } } = command {
+        commands::permit::parse_input_override(raw)?;
+    }
     match command {
         Command::Run { prompt, .. } | Command::Send { prompt, .. } => {
             *prompt = commands::resolve_prompt(std::mem::take(prompt))?;
@@ -337,8 +348,14 @@ fn host_verb(mut args: Cli) -> u8 {
                 }
                 Command::Permit { command } => match command {
                     PermitCommand::Ls { session } => commands::permit::ls(&client, &session).await,
-                    PermitCommand::Allow { session, request } => {
-                        commands::permit::allow(&client, &session, request.as_deref()).await
+                    PermitCommand::Allow { session, request, input } => {
+                        commands::permit::allow(
+                            &client,
+                            &session,
+                            request.as_deref(),
+                            input.as_deref(),
+                        )
+                        .await
                     }
                     PermitCommand::Deny { session, request, message } => {
                         commands::permit::deny(&client, &session, request.as_deref(), &message)
@@ -569,6 +586,31 @@ mod tests {
         // And the guard is scoped to attach — `term ls` is machine-readable.
         let mut command = command_of(&["oximux", "term", "ls"]);
         assert!(precheck(&mut command, true).is_ok(), "`term ls` must still serve --json");
+    }
+
+    /// A malformed `--input` is refused before any connection.
+    ///
+    /// Same placement rule as the `--json term attach` guard above, and the
+    /// same reason: `permit allow` runs only after a client is built, so on a
+    /// machine with no host up the caller was told "the host is not reachable"
+    /// (exit 3) for JSON that could have been rejected without any host at all.
+    #[test]
+    fn a_malformed_permit_input_is_a_usage_error_before_any_connection() {
+        for bad in ["not json", "[\"a\"]", "42"] {
+            let mut command =
+                command_of(&["oximux", "permit", "allow", "s1", "--input", bad]);
+            let failure = precheck(&mut command, false).expect_err(bad);
+            assert_eq!(failure.exit, cli::exit::USAGE, "{bad}");
+            assert_eq!(failure.code, "bad-input", "{bad}");
+        }
+
+        // A well-formed object passes through to the host, as does no flag.
+        let mut command = command_of(&[
+            "oximux", "permit", "allow", "s1", "--input", "{\"command\":\"ls\"}",
+        ]);
+        assert!(precheck(&mut command, false).is_ok());
+        let mut command = command_of(&["oximux", "permit", "allow", "s1"]);
+        assert!(precheck(&mut command, false).is_ok());
     }
 
     /// A literal prompt survives `precheck` unchanged, on both verbs.

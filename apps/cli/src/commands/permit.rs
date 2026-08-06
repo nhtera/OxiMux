@@ -94,11 +94,17 @@ pub async fn ls(client: &Client, session: &str) -> Result<(Value, String), Failu
     let rows: Vec<Value> = list
         .iter()
         .map(|p| match p {
-            Pending::Permission { request_id, tool_name, description, .. } => json!({
+            Pending::Permission { request_id, tool_name, description, input } => json!({
                 "kind": "permission",
                 "request_id": request_id,
                 "tool": tool_name,
                 "description": description,
+                // The arguments the agent proposed. JSON only: the human line
+                // is a scannable index, and a tool input can be a multi-line
+                // patch. It is here because `permit allow --input` edits from
+                // it — without it an operator narrowing an over-broad call
+                // would have to guess the tool's own field names.
+                "input": input,
             }),
             Pending::Question { request_id, questions } => json!({
                 "kind": "question",
@@ -155,7 +161,14 @@ pub async fn allow(
     client: &Client,
     session: &str,
     request: Option<&str>,
+    edited_input: Option<&str>,
 ) -> Result<(Value, String), Failure> {
+    // Parse the override BEFORE touching the host. It is a mistake in the argv
+    // that no host can fix, and checking it after the lookup meant a malformed
+    // `--input` was reported as "no such session" whenever the session was also
+    // wrong — a diagnosis about the environment for a problem in the arguments.
+    let override_input = edited_input.map(parse_input_override).transpose()?;
+
     let list = pending(client, session).await?;
     let picked = pick(&list, request)?;
     let Pending::Permission { request_id, input, .. } = picked else {
@@ -165,10 +178,48 @@ pub async fn allow(
             "that request is a question — answer it with `oximux permit answer`",
         ));
     };
-    // An allow MUST echo the tool input (the CLI's contract); this is the
-    // unmodified approval, not an edit.
-    let decision = PermissionDecision::Allow { updated_input: input.clone() };
+    // An allow always carries the input the tool will run with. Without
+    // `--input` that is the agent's own, echoed unmodified — the plain
+    // approval. With it, the operator's replaces it: the agent is told the call
+    // was permitted and runs these arguments, which is how an over-broad
+    // command gets narrowed instead of denied and re-prompted for.
+    //
+    // Replacement, not a merge. A merge would have to guess whether an absent
+    // key means "leave it" or "remove it", and guessing wrong on a tool call
+    // the operator is explicitly correcting is the one outcome this flag must
+    // not have.
+    let decision =
+        PermissionDecision::Allow { updated_input: override_input.unwrap_or_else(|| input.clone()) };
     resolve(client, session, request_id, &decision).await
+}
+
+/// Parse `--input`, refusing anything a tool could not receive.
+///
+/// A usage error, not a host error: the argument is wrong in the argv and no
+/// host can make it right. Objects only — every tool's input is a named-field
+/// object, and a bare array or string would reach the backend as something it
+/// cannot destructure, failing far from the mistake.
+pub fn parse_input_override(raw: &str) -> Result<Value, Failure> {
+    let usage = |msg: String| {
+        Failure::new("bad-input", exit::USAGE, msg).with_steps([
+            "`oximux permit ls <session> --json` prints the proposed input to edit from".into(),
+            "pass a complete JSON object, e.g. --input '{\"command\":\"ls -la\"}'".into(),
+        ])
+    };
+    let value: Value = serde_json::from_str(raw)
+        .map_err(|e| usage(format!("--input is not valid JSON: {e}")))?;
+    if !value.is_object() {
+        return Err(usage(format!(
+            "--input must be a JSON object; got {}",
+            match &value {
+                Value::Array(_) => "an array",
+                Value::String(_) => "a string",
+                Value::Null => "null",
+                _ => "a scalar",
+            }
+        )));
+    }
+    Ok(value)
 }
 
 pub async fn deny(
@@ -312,5 +363,39 @@ pub async fn answer(
         )),
         Response::Error(e) => Err(rpc_failure(e)),
         other => Err(unexpected_reply("AnswerQuestion", &other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--input` replaces the tool's arguments; anything a tool could not
+    /// receive is refused in the argv, not on the wire.
+    ///
+    /// The object check is the load-bearing half. Every tool input is a
+    /// named-field object, so a bare array or string would reach the backend as
+    /// something it cannot destructure — failing inside the agent, far from the
+    /// mistake, on a call the operator was in the middle of correcting.
+    #[test]
+    fn an_input_override_must_be_a_json_object() {
+        let ok = parse_input_override(r#"{"command":"ls -la"}"#).expect("an object");
+        assert_eq!(ok, serde_json::json!({"command": "ls -la"}));
+
+        for bad in [r#"["ls"]"#, r#""ls""#, "42", "null", "{not json"] {
+            let err = parse_input_override(bad).expect_err(bad);
+            assert_eq!(err.exit, exit::USAGE, "{bad}");
+            assert!(
+                err.next_steps.iter().any(|s| s.contains("permit ls")),
+                "{bad} must point at where the input comes from"
+            );
+        }
+    }
+
+    /// An empty object is a legitimate override — some tools take no arguments,
+    /// and refusing it would make the flag unusable for exactly those.
+    #[test]
+    fn an_empty_object_is_a_valid_override() {
+        assert_eq!(parse_input_override("{}").unwrap(), serde_json::json!({}));
     }
 }

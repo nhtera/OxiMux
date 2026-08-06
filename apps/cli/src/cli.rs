@@ -414,11 +414,29 @@ pub enum PermitCommand {
         session: String,
     },
     /// Approve a pending permission request.
+    ///
+    /// By default the tool runs with exactly the input the agent proposed.
+    /// `--input` replaces that input before approving — the agent is told the
+    /// call was allowed, and runs YOUR arguments instead of its own. Use it to
+    /// narrow an over-broad command rather than denying and re-prompting.
+    #[command(verbatim_doc_comment)]
     Allow {
         /// The session id (see `oximux ls`).
         session: String,
         /// The request id (from `permit ls`; default: the latest pending).
         request: Option<String>,
+        /// Replace the tool's input with this JSON object before approving.
+        /// `permit ls --json` prints the proposed input to edit from. The
+        /// object is passed through as given, so it must carry every field the
+        /// tool needs — it replaces the input, it does not merge into it.
+        ///
+        /// CAVEAT: the transcript records what the agent ASKED for, not what
+        /// you allowed — the protocol has no event for a substituted input. So
+        /// a reader of `oximux transcript` sees the agent's original arguments
+        /// and cannot tell they were edited. Keep your own record if the
+        /// substitution matters for audit.
+        #[arg(long, value_name = "JSON")]
+        input: Option<String>,
     },
     /// Deny a pending permission request.
     Deny {
