@@ -649,6 +649,10 @@ pub enum HeartbeatCommand {
         session: Option<String>,
     },
     /// Disarm a heartbeat by id (see `heartbeat ls`).
+    ///
+    /// Idempotent: an id that is already gone succeeds. Exit 0 therefore does
+    /// NOT mean the heartbeat existed — a mistyped id succeeds too.
+    #[command(verbatim_doc_comment)]
     Rm {
         /// The heartbeat id.
         id: String,

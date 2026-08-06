@@ -173,7 +173,14 @@ pub async fn ls(client: &Client, session: Option<String>) -> Result<(Value, Stri
 
 pub async fn rm(client: &Client, id: &str) -> Result<(Value, String), Failure> {
     match client.call(Request::DeleteHeartbeat { id: id.into() }).await? {
-        Response::Ack => Ok((json!({ "removed": id }), format!("disarmed {id}"))),
+        // `Ack` carries no did-anything-happen bit, and the host answers one
+        // already gone with the same `Ack` on purpose
+        // (`dispatcher/heartbeats.rs`). So state the postcondition rather than
+        // claiming a disarm that may never have had anything to disarm.
+        Response::Ack => Ok((
+            json!({ "id": id, "state": "absent" }),
+            format!("no heartbeat `{id}` remains"),
+        )),
         Response::Error(e) => Err(rpc_failure(e)),
         other => Err(unexpected_reply("DeleteHeartbeat", &other)),
     }

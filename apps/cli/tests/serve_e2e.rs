@@ -479,6 +479,12 @@ fn serve_creates_and_removes_worktrees_for_its_configured_projects() {
 /// id that never existed. Same failure as the pause bug in a milder key: a
 /// script that typo'd a slug was told it had cleaned something up. The `Ack` is
 /// identical either way, so the only honest answer is the postcondition.
+///
+/// Covers all four idempotent removers together, because the first round of
+/// this fix reached only two of them: `state delete` and `heartbeat rm` kept
+/// answering `{"deleted": key}` / `{"removed": id}` for targets that were never
+/// there. Enumerating the family in one test is what makes the next one that
+/// grows a fifth member fail here rather than ship the same claim again.
 #[test]
 fn removing_something_that_was_never_there_succeeds_without_claiming_a_removal() {
     let dir = tempfile::tempdir().unwrap();
@@ -486,23 +492,32 @@ fn removing_something_that_was_never_there_succeeds_without_claiming_a_removal()
     std::fs::create_dir_all(&data_dir).unwrap();
     let serve = boot_serve(&data_dir);
 
-    for verb in ["schedule", "worktree"] {
+    for argv in [
+        ["schedule", "rm", "never-existed"],
+        ["worktree", "rm", "never-existed"],
+        ["heartbeat", "rm", "never-existed"],
+        ["state", "delete", "never-existed"],
+    ] {
+        let verb = format!("{} {}", argv[0], argv[1]);
         let out = client(&data_dir)
-            .args(["--json", verb, "rm", "never-existed"])
+            .args(["--json"])
+            .args(argv)
             .output()
             .unwrap();
         assert_eq!(
             out.status.code(),
             Some(0),
-            "`{verb} rm` stays idempotent — the goal state is reached either way"
+            "`{verb}` stays idempotent — the goal state is reached either way"
         );
         let v = json_stdout(&out);
         assert_eq!(v["ok"], true);
         assert_eq!(v["error"], serde_json::Value::Null);
-        assert!(
-            v["data"]["removed"].is_null(),
-            "`{verb} rm` must not assert it removed something it never saw: {v}",
-        );
+        for claim in ["removed", "deleted"] {
+            assert!(
+                v["data"][claim].is_null(),
+                "`{verb}` must not assert it {claim} something it never saw: {v}",
+            );
+        }
         assert_eq!(
             v["data"]["state"], "absent",
             "the reply states the postcondition instead: {v}",
