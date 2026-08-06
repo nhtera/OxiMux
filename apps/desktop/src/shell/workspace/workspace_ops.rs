@@ -19,7 +19,7 @@ use oximux_core::{AgentAdapter, AgentSession, Project, Workspace};
 use crate::shell::agent_presentation::AmbientAgent;
 use oximux_git::{Repository, derive_slug, validate_slug};
 use oximux_settings::{Density, ScriptKind, Theme, Typography};
-use oximux_storage::{AgentSessionRepo, ProjectRepo, StorageError, WorkspaceRepo};
+use oximux_storage::{AgentSessionRepo, ProjectRepo, WorkspaceRepo};
 
 use crate::shell::left_rail::row_menu::ScriptAvail;
 
@@ -140,30 +140,13 @@ pub(crate) fn build_add_project_dialog(
     cx.new(|cx| AddProjectDialog::new(theme, density, typography, project_repo, on_pick, cx))
 }
 
-/// Outcome of a create flow. Distinguishes user-visible failures (which
-/// require explicit handling at the call site) from the silent success
-/// path. The `RollbackFailed` variant is reached only when the rollback
-/// path itself errors — caller should escalate visibility (e.g. surface
-/// a "manual cleanup required" hint).
-#[derive(Debug)]
-pub enum CreateOutcome {
-    /// Workspace row inserted; worktree + branch live on disk.
-    Created(Workspace),
-    /// The git step failed before any rollback was needed. The repo is
-    /// in a clean state.
-    GitFailed(String),
-    /// Storage insert failed and the rollback (`remove_worktree` +
-    /// `delete_branch`) ran cleanly — repo + DB consistent again, but
-    /// the user's request failed.
-    StorageFailedRollbackClean(StorageError),
-    /// Storage insert failed AND the rollback itself failed. The repo
-    /// has an orphan worktree or branch; surface the original error and
-    /// the rollback error.
-    StorageFailedRollbackDirty {
-        insert_error: StorageError,
-        rollback_error: String,
-    },
-}
+// The worktree lifecycle itself lives in `oximux-worktree-ops`, so
+// `oximux serve` creates the same worktree this flow does rather than a
+// second implementation of the same rollback ladder. Re-exported here
+// because this module is the desktop's door to it.
+pub use oximux_worktree_ops::{
+    CreateOutcome, create_workspace_with_rollback, run_cleanup_before_remove,
+};
 
 /// Body of [`WorkspaceRoot::workspaces_with_primary`] as a free function so
 /// the rail gather can run it on the background executor (SQLite + a
@@ -289,72 +272,6 @@ fn gather_rail_db_data(
     )
 }
 
-/// Open the project repo, create a new worktree on branch `oximux/<slug>`,
-/// and insert the workspace row. On storage failure, runs the rollback
-/// (force-remove worktree + force-delete branch) so that the next
-/// `list_recent_workspaces` reflects the on-disk truth.
-///
-/// `name` is the human label (caller has already trimmed); `slug` MUST
-/// pre-validate via `validate_slug` upstream — this function assumes the
-/// slug is safe to pass to `git worktree add -b oximux/<slug>`.
-pub async fn create_workspace_with_rollback(
-    project_root: &Path,
-    project_id: &str,
-    name: &str,
-    slug: &str,
-    worktree_path: &Path,
-    linked_issue: Option<&str>,
-    workspace_repo: &WorkspaceRepo,
-) -> CreateOutcome {
-    let branch = format!("oximux/{slug}");
-    let repo = match Repository::open(project_root).await {
-        Ok(r) => r,
-        Err(err) => return CreateOutcome::GitFailed(format!("open project repo: {err}")),
-    };
-    if let Err(err) = repo.add_worktree(worktree_path, slug).await {
-        return CreateOutcome::GitFailed(format!("add_worktree: {err}"));
-    }
-    let path_str = worktree_path.to_string_lossy().to_string();
-    match workspace_repo.insert(project_id, name, slug, &branch, &path_str) {
-        Ok(mut workspace) => {
-            // Best-effort metadata write — the worktree + row already exist, so
-            // a failure here only loses the issue badge, not the workspace. The
-            // in-memory field is set ONLY on a confirmed write.
-            if let Some(issue) = linked_issue {
-                match workspace_repo.set_linked_issue(&workspace.id, Some(issue)) {
-                    Ok(()) => workspace.linked_issue = Some(issue.to_string()),
-                    Err(err) => {
-                        tracing::warn!(?err, workspace_id = %workspace.id, "set_linked_issue failed")
-                    }
-                }
-            }
-            CreateOutcome::Created(workspace)
-        }
-        Err(insert_error) => {
-            // Rollback: best-effort. If either step errors, we surface
-            // a dirty-state outcome so the call site can log loudly.
-            let mut rollback_err = None;
-            if let Err(err) = repo.remove_worktree(worktree_path, true).await {
-                rollback_err = Some(format!("remove_worktree: {err}"));
-            }
-            if let Err(err) = repo.delete_branch(&branch, true).await {
-                let chained = match rollback_err {
-                    Some(prev) => format!("{prev}; delete_branch: {err}"),
-                    None => format!("delete_branch: {err}"),
-                };
-                rollback_err = Some(chained);
-            }
-            match rollback_err {
-                Some(err) => CreateOutcome::StorageFailedRollbackDirty {
-                    insert_error,
-                    rollback_error: err,
-                },
-                None => CreateOutcome::StorageFailedRollbackClean(insert_error),
-            }
-        }
-    }
-}
-
 /// Outcome the *New Agent in a fresh worktree* flow hands back to the chat view.
 /// The host resolves the worktree create as a first-class `Workspace` (DB row +
 /// git worktree via [`create_workspace_with_rollback`]) and maps its richer
@@ -422,71 +339,19 @@ pub(crate) fn refocus_active_pane(
     });
 }
 
-/// Compose the worktree dir path:
-/// `<app_data>/projects/<project_id>/worktrees/<slug>`.
+/// Compose the worktree dir path under the desktop's own data root.
 /// Returns `None` when the app data directory is unavailable (sandbox or
 /// unset `$HOME`) — caller surfaces this as a create failure.
-fn worktree_path(project_id: &str, slug: &str) -> Option<PathBuf> {
-    Some(
-        crate::app_paths::data_dir()?
-            .join("projects")
-            .join(project_id)
-            .join("worktrees")
-            .join(slug),
-    )
-}
-
-/// Max time to wait for a per-project `cleanup` teardown before forcing the
-/// worktree removal anyway.
-const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Run the project's `cleanup` script (from `.oximux/scripts.toml`) to
-/// completion at `worktree_path` BEFORE the worktree is removed, bounded by
-/// [`CLEANUP_TIMEOUT`]. Best-effort and non-blocking to deletion: a missing
-/// script, a non-zero exit, an exec failure, or a timeout are each logged and
-/// then ignored — teardown must never trap the user behind a failed remove.
-/// `kill_on_drop` ensures a hung child is killed when the timeout future is
-/// dropped (the force-remove escape). Output is discarded; this is a captured
-/// subprocess, distinct from the interactive "Run cleanup" terminal tab.
-async fn run_cleanup_before_remove(worktree_path: &Path) {
-    run_cleanup_bounded(worktree_path, CLEANUP_TIMEOUT).await;
-}
-
-/// Inner implementation with an injectable timeout so the force-escape (a hung
-/// cleanup must not block removal) can be unit-tested with a short bound.
-async fn run_cleanup_bounded(worktree_path: &Path, timeout: std::time::Duration) {
-    let scripts = crate::project_scripts_loader::load_for_project(worktree_path);
-    let Some(cleanup) = scripts.script(ScriptKind::Cleanup) else {
-        return;
-    };
-    let cleanup = cleanup.to_string();
-    let mut cmd = tokio::process::Command::new("sh");
-    {
-        use oximux_no_window::NoWindow as _;
-        cmd.arg("-lc")
-            .arg(&cleanup)
-            .current_dir(worktree_path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .no_window()
-            .kill_on_drop(true);
-    }
-    let wt = worktree_path.display();
-    match tokio::time::timeout(timeout, cmd.status()).await {
-        Ok(Ok(status)) if status.success() => {
-            tracing::info!(worktree = %wt, "cleanup script completed before removal");
-        }
-        Ok(Ok(status)) => {
-            tracing::warn!(worktree = %wt, ?status, "cleanup script exited non-zero; removing anyway");
-        }
-        Ok(Err(err)) => {
-            tracing::warn!(worktree = %wt, ?err, "cleanup script failed to start; removing anyway");
-        }
-        Err(_) => {
-            tracing::warn!(worktree = %wt, "cleanup script timed out; killed, removing anyway");
-        }
-    }
+///
+/// The derivation itself is shared with `oximux serve`, which supplies its
+/// own `--data-dir` instead; this wrapper is only the desktop's answer to
+/// "which root?".
+pub(crate) fn worktree_path(project_id: &str, slug: &str) -> Option<PathBuf> {
+    Some(oximux_worktree_ops::worktree_path(
+        &crate::app_paths::data_dir()?,
+        project_id,
+        slug,
+    ))
 }
 
 impl Focusable for WorkspaceRoot {
@@ -2501,52 +2366,5 @@ mod nav_history_tests {
             workspace_path_for_ambient_terminal("/outside", &workspaces),
             None
         );
-    }
-}
-
-#[cfg(test)]
-mod cleanup_tests {
-    use super::run_cleanup_bounded;
-    use std::io::Write;
-    use std::time::{Duration, Instant};
-
-    fn write_cleanup(dir: &std::path::Path, body: &str) {
-        let oximux = dir.join(".oximux");
-        std::fs::create_dir_all(&oximux).unwrap();
-        let mut f = std::fs::File::create(oximux.join("scripts.toml")).unwrap();
-        writeln!(f, "cleanup = {body:?}").unwrap();
-    }
-
-    // The force-escape: a hung cleanup must not block beyond the timeout.
-    #[tokio::test]
-    async fn hung_cleanup_is_bounded_by_timeout() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_cleanup(tmp.path(), "sleep 60");
-        let start = Instant::now();
-        run_cleanup_bounded(tmp.path(), Duration::from_millis(200)).await;
-        // Without the timeout this would block ~60s; the bound + kill_on_drop
-        // must return it well under that.
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "cleanup should be killed at the timeout, took {:?}",
-            start.elapsed()
-        );
-    }
-
-    #[tokio::test]
-    async fn no_cleanup_script_returns_immediately() {
-        let tmp = tempfile::tempdir().unwrap();
-        // No .oximux/scripts.toml → no-op, no panic, near-instant.
-        let start = Instant::now();
-        run_cleanup_bounded(tmp.path(), Duration::from_secs(30)).await;
-        assert!(start.elapsed() < Duration::from_secs(2));
-    }
-
-    #[tokio::test]
-    async fn fast_cleanup_completes_normally() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_cleanup(tmp.path(), "true");
-        // Should complete (success arm) well within the timeout.
-        run_cleanup_bounded(tmp.path(), Duration::from_secs(10)).await;
     }
 }

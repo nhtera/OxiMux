@@ -16,13 +16,20 @@
 //! is already open.
 
 mod acl;
+/// Every ACL predicate against every caller class, as one table. Separate from
+/// [`tests`] because it proves a different thing: that module covers pairing
+/// and revocation, this one covers who may do what afterwards.
+#[cfg(test)]
+mod acl_matrix;
 mod pairing;
+mod peer;
 mod persistence;
 mod reconnect;
 #[cfg(test)]
 mod tests;
 
 pub use acl::DeviceInfo;
+pub use peer::{LocalScope, Peer};
 pub use persistence::{DeviceStore, StorageDeviceStore, StoredDevice};
 // The registration proof is a wire invariant shared with the client, so it lives
 // in `remote-proto`; re-exported here for the host's callers + tests.
@@ -46,6 +53,12 @@ pub type AppPubkey = [u8; 32];
 /// The maximum clock skew tolerated on a registration proof, each way.
 const REGISTRATION_WINDOW_SECS: u64 = 60;
 
+/// How long a runtime-minted pairing window stays redeemable. Short by design:
+/// one-time + this expiry + TTY-only printing are the three properties that
+/// carry the weight of the write-by-default enrollment tier, so none of them
+/// may be relaxed without revisiting that decision.
+pub const PAIRING_WINDOW_SECS: u64 = 120;
+
 /// A QR pairing secret the host is currently advertising.
 pub struct PairingSlot {
     pub secret: [u8; 16],
@@ -54,6 +67,11 @@ pub struct PairingSlot {
     pub session_id: Option<String>,
     /// One-time tickets self-invalidate after a successful `Register`.
     pub one_time: bool,
+    /// The enrollment this slot mints starts read-only — the `--read-only`
+    /// opt-down at pairing time, rather than a post-pairing toggle the operator
+    /// has to remember. Default `false`: pairing grants full write, per the
+    /// recorded product decision.
+    read_only: bool,
     used: bool,
     /// Unix seconds after which the secret stops being redeemable, if the opener
     /// bounded it. `None` leaves it live until used or replaced.
@@ -67,7 +85,7 @@ pub struct PairingSlot {
 
 impl PairingSlot {
     pub fn new(secret: [u8; 16], session_id: Option<String>, one_time: bool) -> Self {
-        Self { secret, session_id, one_time, used: false, expires_at: None }
+        Self { secret, session_id, one_time, read_only: false, used: false, expires_at: None }
     }
 
     /// A slot that stops being redeemable at `expires_at` (unix seconds).
@@ -78,6 +96,12 @@ impl PairingSlot {
         expires_at: u64,
     ) -> Self {
         Self { expires_at: Some(expires_at), ..Self::new(secret, session_id, one_time) }
+    }
+
+    /// Mint the resulting enrollment at the read-only tier.
+    pub fn with_read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
     }
 
     /// Spent — either redeemed (one-time) or past its window.

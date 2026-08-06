@@ -17,6 +17,7 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "gpui")]
 use gpui::Global;
 
 /// Animation durations for the disciplined sub-200ms motion vocabulary.
@@ -94,6 +95,7 @@ impl Default for Motion {
     }
 }
 
+#[cfg(feature = "gpui")]
 impl Global for Motion {}
 
 /// Spring-tail easing for overlay/palette OPEN animations only —

@@ -2,7 +2,7 @@ use ed25519_dalek::SigningKey;
 use oximux_remote_proto::RpcError;
 use oximux_remote_proto::messages::RegisterReq;
 
-use super::{AppPubkey, AuthStore, PairingEvent, PairingSlot, registration_proof};
+use super::{AppPubkey, AuthStore, PairingEvent, PairingSlot, Peer, registration_proof};
 
 fn slot(secret: [u8; 16]) -> PairingSlot {
     PairingSlot::new(secret, None, true)
@@ -161,8 +161,8 @@ fn session_bound_ticket_restricts_the_acl() {
         session_id: Some("sess-1".into()),
     };
     store.register(&req, ts).expect("register");
-    assert!(store.is_allowed_for(&pubkey, "sess-1"), "allowed on its bound session");
-    assert!(!store.is_allowed_for(&pubkey, "sess-2"), "denied on other sessions");
+    assert!(store.is_allowed_for(&Peer::remote(pubkey), "sess-1"), "allowed on its bound session");
+    assert!(!store.is_allowed_for(&Peer::remote(pubkey), "sess-2"), "denied on other sessions");
 }
 
 /// Register `pubkey` against a fresh store, optionally session-bound.
@@ -191,19 +191,19 @@ fn read_only_device_may_read_but_not_write() {
     let (store, pubkey) = registered(None);
 
     // Pairing grants full access, so a fresh device may write.
-    assert!(store.may_write(&pubkey, "sess-1"), "pairing default is read-write");
+    assert!(store.may_write(&Peer::remote(pubkey), "sess-1"), "pairing default is read-write");
     assert!(store.devices().iter().all(|d| !d.read_only), "fresh device is not read-only");
 
     store.set_read_only(&pubkey, true);
 
-    assert!(store.is_allowed_for(&pubkey, "sess-1"), "reads still served");
+    assert!(store.is_allowed_for(&Peer::remote(pubkey), "sess-1"), "reads still served");
     assert!(store.is_authorized(&pubkey), "read-only is not revocation");
-    assert!(!store.may_write(&pubkey, "sess-1"), "writes refused");
+    assert!(!store.may_write(&Peer::remote(pubkey), "sess-1"), "writes refused");
     assert!(store.devices().iter().any(|d| d.pubkey == pubkey && d.read_only), "the tier shows in the device list the UI reads");
 
     // The opt-down is reversible.
     store.set_read_only(&pubkey, false);
-    assert!(store.may_write(&pubkey, "sess-1"), "restored to read-write");
+    assert!(store.may_write(&Peer::remote(pubkey), "sess-1"), "restored to read-write");
 }
 
 /// Read-only and session-scoping are independent dimensions.
@@ -212,10 +212,10 @@ fn read_only_composes_with_session_scope() {
     let (store, pubkey) = registered(Some("sess-1"));
     store.set_read_only(&pubkey, true);
 
-    assert!(store.is_allowed_for(&pubkey, "sess-1"), "in-scope read allowed");
-    assert!(!store.may_write(&pubkey, "sess-1"), "in-scope write refused when read-only");
-    assert!(!store.may_write(&pubkey, "sess-2"), "out-of-scope write refused");
-    assert!(!store.is_allowed_for(&pubkey, "sess-2"), "out-of-scope read still refused");
+    assert!(store.is_allowed_for(&Peer::remote(pubkey), "sess-1"), "in-scope read allowed");
+    assert!(!store.may_write(&Peer::remote(pubkey), "sess-1"), "in-scope write refused when read-only");
+    assert!(!store.may_write(&Peer::remote(pubkey), "sess-2"), "out-of-scope write refused");
+    assert!(!store.is_allowed_for(&Peer::remote(pubkey), "sess-2"), "out-of-scope read still refused");
 }
 
 /// Revocation outranks the tier — a revoked device writes nothing.
@@ -224,7 +224,7 @@ fn revoked_device_may_not_write() {
     let (store, pubkey) = registered(None);
     store.revoke(&pubkey);
 
-    assert!(!store.may_write(&pubkey, "sess-1"));
+    assert!(!store.may_write(&Peer::remote(pubkey), "sess-1"));
 }
 
 /// A one-time code is spent by the first device: a second scan of the SAME code
@@ -496,9 +496,9 @@ fn a_device_forgetting_itself_is_announced_before_the_name_is_lost() {
 fn a_session_scoped_device_gets_no_terminal_access() {
     let (store, pubkey) = registered(Some("sess-1"));
 
-    assert!(store.is_allowed_for(&pubkey, "sess-1"), "its own session still works");
-    assert!(!store.may_use_terminals(&pubkey), "terminals are not in a narrowed scope");
-    assert!(!store.may_drive_terminals(&pubkey), "and certainly not writable");
+    assert!(store.is_allowed_for(&Peer::remote(pubkey), "sess-1"), "its own session still works");
+    assert!(!store.may_use_terminals(&Peer::remote(pubkey)), "terminals are not in a narrowed scope");
+    assert!(!store.may_drive_terminals(&Peer::remote(pubkey)), "and certainly not writable");
 }
 
 /// A full-scope device can watch terminals; read-only stops it typing.
@@ -509,15 +509,15 @@ fn a_session_scoped_device_gets_no_terminal_access() {
 #[test]
 fn read_only_lets_a_device_watch_a_terminal_but_not_type() {
     let (store, pubkey) = registered(None);
-    assert!(store.may_drive_terminals(&pubkey), "full access types by default");
+    assert!(store.may_drive_terminals(&Peer::remote(pubkey)), "full access types by default");
 
     store.set_read_only(&pubkey, true);
 
-    assert!(store.may_use_terminals(&pubkey), "still allowed to watch");
-    assert!(!store.may_drive_terminals(&pubkey), "but not to type or resize");
+    assert!(store.may_use_terminals(&Peer::remote(pubkey)), "still allowed to watch");
+    assert!(!store.may_drive_terminals(&Peer::remote(pubkey)), "but not to type or resize");
 
     store.set_read_only(&pubkey, false);
-    assert!(store.may_drive_terminals(&pubkey), "the opt-down is reversible");
+    assert!(store.may_drive_terminals(&Peer::remote(pubkey)), "the opt-down is reversible");
 }
 
 /// Revocation outranks everything, including terminal read access.
@@ -526,6 +526,6 @@ fn a_revoked_device_loses_terminals_entirely() {
     let (store, pubkey) = registered(None);
     store.revoke(&pubkey);
 
-    assert!(!store.may_use_terminals(&pubkey));
-    assert!(!store.may_drive_terminals(&pubkey));
+    assert!(!store.may_use_terminals(&Peer::remote(pubkey)));
+    assert!(!store.may_drive_terminals(&Peer::remote(pubkey)));
 }

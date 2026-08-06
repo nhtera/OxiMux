@@ -7,12 +7,21 @@ license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
 
+# `gpui` is a feature so headless consumers (the CLI, `oximux serve`) can read
+# and write the same settings files without linking the UI toolkit. Default ON:
+# the desktop app and the UI crates keep their `Global` impls, theme tokens and
+# typography scale without touching their manifests.
+[features]
+default = ["gpui"]
+gpui = ["dep:gpui"]
+
 [dependencies]
-gpui = { workspace = true }
+gpui = { workspace = true, optional = true }
 serde = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }
 dunce = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 # Only to give the project-coverage tests a real directory to canonicalize —

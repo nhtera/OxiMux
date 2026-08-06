@@ -1,0 +1,48 @@
+[package]
+name = "oximux-remote-local"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# The same-machine control transport: how the `oximux` CLI reaches the desktop
+# app (and, later, `oximux serve`) over an owner-only unix socket / named pipe.
+# Both halves live here — the listener the host binds and the dial the CLI
+# makes — behind remote-proto's `Transport` seam, so the RPC dispatcher cannot
+# tell this socket from an iroh QUIC stream.
+#
+# Its own crate for the relay's reason: the CLI, the desktop app and the serve
+# host share no other dependency that could carry it, and the naming/handshake
+# conventions MUST be one definition — two copies that drift produce "host
+# unreachable" errors that are really "we named it differently".
+
+[dependencies]
+oximux-remote-proto = { workspace = true }
+# Endpoint naming (unix path vs Windows namespaced pipe) and the HMAC-over-
+# nonces token proof, shared with the relay daemon rather than re-derived: the
+# local control socket has exactly the relay's trust problem, so it uses the
+# relay's proven answer.
+oximux-relay-proto = { workspace = true }
+oximux-owner-only = { workspace = true }
+interprocess = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+postcard = { workspace = true }
+rand = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+dirs = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Hands the pipe's owner-only security descriptor to interprocess, exactly as
+# the relay does.
+widestring = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The in-memory loopback pair, for driving the handshake with no socket.
+oximux-remote-proto = { workspace = true, features = ["testing"] }

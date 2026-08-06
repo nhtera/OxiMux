@@ -18,7 +18,12 @@ pub mod keybindings;
 pub mod motion;
 pub mod project_scripts;
 pub mod terminal;
+// Theme and typography carry gpui types (`Hsla`, `Font`) in their public
+// structs, so unlike the settings modules — where only the `Global` impl is
+// gated — the whole module goes with the feature.
+#[cfg(feature = "gpui")]
 pub mod theme;
+#[cfg(feature = "gpui")]
 pub mod typography;
 
 pub use agent_launch::{
@@ -35,7 +40,9 @@ pub use dictation::{DictationMode, DictationSettings, ModelUnloadTimeout};
 pub use dictation_languages::{WHISPER_LANGUAGES, display_name as language_display_name};
 pub use keybindings::KeybindingOverrides;
 pub use motion::{Motion, ease_out_spring};
-pub use project_scripts::{ProjectScripts, ScriptKind};
+pub use project_scripts::{ProjectScripts, ScriptKind, load_for_project};
 pub use terminal::{BellStyle, TerminalSettings};
+#[cfg(feature = "gpui")]
 pub use theme::{GitDecorations, Theme};
+#[cfg(feature = "gpui")]
 pub use typography::Typography;

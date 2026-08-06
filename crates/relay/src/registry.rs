@@ -30,6 +30,13 @@ pub const SUBSCRIBER_QUEUE: usize = 1024;
 /// because a full queue — the only way a gap occurs — has no room to carry
 /// the notice at the moment it is needed.
 struct Subscriber {
+    /// The attachment this sender belongs to, so `detach` can drop it by name.
+    ///
+    /// Without it the only thing that ever removed a subscriber was `fan_out`
+    /// noticing a closed receiver — which requires the PTY to produce output.
+    /// A client that leaves while its shell sits quietly at a prompt would
+    /// otherwise leave its sender in here indefinitely.
+    attachment_id: u64,
     tx: Sender<Notification>,
     gapped: bool,
 }
@@ -390,12 +397,18 @@ impl PtyRegistry {
                 code,
             });
         }
-        subs.push(Subscriber { tx: sub, gapped: false });
+        // Allocated before the push so the subscriber carries the same id as
+        // the attachment it belongs to; `detach` removes them as a pair.
+        let attachment_id = self.next_attachment_id.fetch_add(1, Ordering::Relaxed);
+        subs.push(Subscriber {
+            attachment_id,
+            tx: sub,
+            gapped: false,
+        });
         drop(subs);
         drop(ring);
         let cols = *entry.cols.lock().expect("cols poisoned");
         let rows = *entry.rows.lock().expect("rows poisoned");
-        let attachment_id = self.next_attachment_id.fetch_add(1, Ordering::Relaxed);
         entry
             .attachments
             .lock()
@@ -510,6 +523,23 @@ impl PtyRegistry {
             .expect("attachments poisoned")
             .remove(&attachment_id)
             .is_some();
+        // Drop this attachment's notification sender too, not just its share of
+        // the size accounting.
+        //
+        // The session that owned it cannot finish until every clone of its
+        // `notif_tx` is gone: its pump task ends when the channel closes, its
+        // writer ends when the pump drops the last outbound sender, and
+        // `session_loop` awaits both before returning. Leaving the sender here
+        // therefore does not merely leak a channel — it strands the whole
+        // session task, so the daemon never counts the client as gone and the
+        // last-client checkpoint flush never runs. `fan_out` used to be the only
+        // thing that reaped these, which made the cleanup conditional on the PTY
+        // happening to produce more output after the client had already left.
+        entry
+            .subscribers
+            .lock()
+            .expect("subs poisoned")
+            .retain(|s| s.attachment_id != attachment_id);
         if removed {
             apply_effective_size(&entry)?;
         }
@@ -561,12 +591,19 @@ impl PtyRegistry {
     /// write is a small (≤ ring capacity) atomic file replace.
     pub fn checkpoint_all(&self) {
         let Some(store) = &self.checkpoints else {
+            tracing::debug!("checkpoint pass with no store configured; nothing to do");
             return;
         };
+        // Counted and logged because the interesting outcome here is a pass
+        // that writes nothing. Every reason for that is legitimate on its own
+        // — no PTYs, or none with new output — and indistinguishable from a
+        // broken flush unless the pass says which it was.
+        let (mut written, mut skipped, mut failed) = (0usize, 0usize, 0usize);
         for kv in self.entries.iter() {
             let e = kv.value();
             let seen = e.bytes_out.load(Ordering::Relaxed);
             if seen == e.checkpointed_bytes_out.load(Ordering::Relaxed) {
+                skipped += 1;
                 continue;
             }
             let bytes = e.ring.lock().expect("ring poisoned").snapshot();
@@ -580,10 +617,17 @@ impl PtyRegistry {
             match store.write_scrollback(&e.pty_id, &bytes, cols, rows, live_cwd.as_deref()) {
                 // Store the pre-snapshot counter: output that landed
                 // mid-write is picked up by the next pass.
-                Ok(()) => e.checkpointed_bytes_out.store(seen, Ordering::Relaxed),
-                Err(err) => tracing::warn!(?err, pty_id = e.pty_id, "checkpoint write failed"),
+                Ok(()) => {
+                    e.checkpointed_bytes_out.store(seen, Ordering::Relaxed);
+                    written += 1;
+                }
+                Err(err) => {
+                    failed += 1;
+                    tracing::warn!(?err, pty_id = e.pty_id, "checkpoint write failed");
+                }
             }
         }
+        tracing::debug!(written, skipped, failed, "checkpoint pass complete");
     }
 
     /// PTYs available for warm re-attach. A PTY whose child has already
@@ -931,6 +975,59 @@ fn pty_id_of(notif: &Notification) -> &str {
 }
 
 #[cfg(test)]
+mod detach_tests {
+    use super::*;
+
+    /// Detaching must drop the attachment's notification sender, not only its
+    /// share of the size accounting.
+    ///
+    /// The session task holding the other end cannot finish while a clone of
+    /// its sender is parked here: its pump ends when the channel closes, its
+    /// writer ends when the pump drops the last outbound sender, and
+    /// `session_loop` awaits both. So a sender left behind does not leak a
+    /// channel, it strands the session — the daemon never counts that client as
+    /// gone, and the last-client checkpoint flush never fires.
+    ///
+    /// This went unnoticed because `fan_out` also reaps closed receivers, which
+    /// hid it anywhere the PTY kept talking after the client left. On a shell
+    /// that goes quiet at a prompt, nothing ever reaped it.
+    #[tokio::test]
+    async fn detach_drops_the_subscribers_sender_without_waiting_for_output() {
+        let reg = PtyRegistry::new();
+        let pty_id = reg
+            .spawn(SpawnArgs {
+                cwd: oximux_shell_env::test_support::test_cwd(),
+                cols: 80,
+                rows: 24,
+                shell: Some(oximux_shell_env::test_support::test_shell()),
+                args: Vec::new(),
+                env: Vec::new(),
+            })
+            .expect("spawn");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let (_replay, _cols, _rows, attachment_id) = reg.attach(&pty_id, tx).expect("attach");
+        {
+            let entry = reg.entries.get(&pty_id).expect("entry");
+            let subs = entry.subscribers.lock().expect("subs poisoned");
+            assert_eq!(subs.len(), 1, "the attach should have registered one");
+        }
+
+        reg.detach(&pty_id, attachment_id).expect("detach");
+
+        let entry = reg.entries.get(&pty_id).expect("entry");
+        assert!(
+            entry
+                .subscribers
+                .lock()
+                .expect("subs poisoned")
+                .is_empty(),
+            "detach must remove the subscriber, with no output needed to reap it"
+        );
+    }
+}
+
+#[cfg(test)]
 mod fan_out_tests {
     use super::*;
 
@@ -952,7 +1049,11 @@ mod fan_out_tests {
     fn subscribers(cap: usize) -> (Subs, tokio::sync::mpsc::Receiver<Notification>) {
         let (tx, rx) = tokio::sync::mpsc::channel(cap);
         (
-            Arc::new(Mutex::new(vec![Subscriber { tx, gapped: false }])),
+            Arc::new(Mutex::new(vec![Subscriber {
+                attachment_id: 0,
+                tx,
+                gapped: false,
+            }])),
             rx,
         )
     }

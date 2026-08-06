@@ -39,6 +39,7 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "gpui")]
 use gpui::Global;
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +79,7 @@ pub struct ComputerUseSettings {
     pub allowed_apps: Vec<AppGrant>,
 }
 
+#[cfg(feature = "gpui")]
 impl Global for ComputerUseSettings {}
 
 /// A path in the form both sides of a comparison can agree on.

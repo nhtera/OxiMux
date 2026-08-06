@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "apps/cli",
     "apps/desktop",
     "crates/ui",
     "crates/core",
@@ -22,18 +23,23 @@ members = [
     "crates/relay-proto",
     "crates/relay",
     "crates/relay-client",
+    "crates/relay-supervisor",
+    "crates/relay-terminals",
+    "crates/single-instance",
     "crates/remote-proto",
     "crates/remote-host",
     "crates/remote-session",
     "crates/remote-iroh",
+    "crates/remote-local",
     "crates/mobile-core",
     "crates/proc-cwd",
+    "crates/worktree-ops",
     "xtask",
 ]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.6"
+version = "0.1.7"
 authors = ["nhtera"]
 license = "Apache-2.0"
 publish = false
@@ -42,6 +48,7 @@ rust-version = "1.89"
 [workspace.dependencies]
 # Internal crates
 oximux-app      = { path = "apps/desktop" }
+oximux-cli      = { path = "apps/cli" }
 oximux-ui       = { path = "crates/ui" }
 oximux-core     = { path = "crates/core" }
 # Owner-only access for the secrets we write to disk. Its own crate because the
@@ -69,18 +76,34 @@ oximux-macos-trust = { path = "crates/macos-trust" }
 oximux-auto-update = { path = "crates/auto-update" }
 oximux-editor   = { path = "crates/editor" }
 oximux-storage  = { path = "crates/storage" }
-oximux-settings = { path = "crates/settings" }
+# `gpui` is opt-in rather than default so a headless consumer cannot inherit the
+# UI toolkit by omission — `oximux-worktree-ops` sits on the path from
+# `oximux-cli` to here and needs only `project_scripts`. Consumers with `Global`
+# impls, theme tokens or typography ask for it with `features = ["gpui"]`.
+oximux-settings = { path = "crates/settings", default-features = false }
 oximux-relay-proto = { path = "crates/relay-proto" }
 oximux-relay    = { path = "crates/relay" }
 oximux-relay-client = { path = "crates/relay-client" }
+# Spawns/adopts the relay daemon and hands back a connected client. Its own
+# crate because BOTH hosts need it — the desktop app and `oximux serve` — and
+# apps/desktop has no [lib] target for the CLI to depend on.
+oximux-relay-supervisor = { path = "crates/relay-supervisor" }
+# remote-host's TerminalSource over the relay daemon — shared by the desktop
+# and `oximux serve` for the same reason the supervisor is.
+oximux-relay-terminals = { path = "crates/relay-terminals" }
+# The advisory data-dir role lock (GUI instance, schedule ticker) — its own
+# crate because both hosts contend for the same roles.
+oximux-single-instance = { path = "crates/single-instance" }
 oximux-remote-proto = { path = "crates/remote-proto" }
 oximux-remote-host = { path = "crates/remote-host" }
+oximux-worktree-ops = { path = "crates/worktree-ops" }
 oximux-remote-session = { path = "crates/remote-session" }
 # `host` is opt-in rather than default so the mobile core cannot inherit the
 # desktop accept loop (and, through it, the PTY stack) by omission. Desktop
 # consumers ask for it explicitly with `features = ["host"]`.
 oximux-remote-iroh = { path = "crates/remote-iroh", default-features = false }
 oximux-mobile-core = { path = "crates/mobile-core" }
+oximux-remote-local = { path = "crates/remote-local" }
 oximux-proc-cwd = { path = "crates/proc-cwd" }
 
 # GPUI — see docs/gpui-pins.md. We deliberately do NOT pin `rev` here. The
@@ -125,6 +148,12 @@ async-trait = "0.1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# `oximux run --output-schema`: hold an agent's final answer to a JSON Schema.
+# `default-features = false` drops the bundled HTTP resolver (and reqwest with
+# it) — a CLI validating a schema the operator handed it must never fetch a
+# remote `$ref`, which would turn a validation run into a network call against
+# a URL the schema author chose.
+jsonschema = { version = "0.35", default-features = false }
 # Phase 5 relay wire format. v2 has the cleaner config API but its
 # byte layout is not ABI-stable across point releases — the workspace
 # pin is the authoritative version both app + daemon agree on.
@@ -202,6 +231,17 @@ url = "2"
 # default-features off: we only need `data_dir()` on macOS; the default
 # features pull in Windows/X11 helpers we never call.
 dirs = { version = "5", default-features = false }
+# CLI arg parsing — derive is the single source of truth for parse/help/
+# completions and the `agent-context` schema dump.
+clap = { version = "4", features = ["derive"] }
+# `oximux completions <shell>`. Generated from the same derive tree as `--help`
+# and `agent-context`, so a 29-verb surface cannot grow a command the
+# completions do not know about.
+clap_complete = "4"
+# Raw-mode terminal control for the CLI's `term attach` (and only that): raw
+# stdin, size probes, cross-platform including the Windows console. The CLI
+# renders everything else with plain prints — no TUI framework rides in here.
+crossterm = "0.28"
 # Native folder picker — wraps NSOpenPanel on macOS via objc2. We use
 # `AsyncFileDialog` from the GPUI `cx.spawn` task so the OxiMux window
 # stays responsive while the panel is open. default-features off:
@@ -224,6 +264,20 @@ cpal = "0.18"
 hound = "3.5"
 ureq = "2.12"
 sha2 = "0.10"
+
+# CLI self-update. `minisign-verify` is the independent trust root: a
+# zero-dependency verifier for the maintainer signature over a release
+# manifest, checked before any checksum *inside* that manifest is believed —
+# the manifest and the artifacts it describes ship from the same GitHub
+# Release, so a checksum alone falls to whoever can publish one.
+# `flate2`/`tar` unpack the release archive in-process rather than shelling
+# out, which is what makes the extraction path testable against hostile
+# archives. `blake2` is dev-only: minisign prehashes with Blake2b-512, so
+# minting real signatures in tests needs it (the verifier does not).
+minisign-verify = "0.2"
+flate2 = "1"
+tar = "0.4"
+blake2 = "0.10"
 
 # Phase 5 step 3 — file tree backend. `ignore` is the gitignore-aware
 # walker ripgrep uses; `WalkBuilder::max_depth(Some(1))` gives lazy

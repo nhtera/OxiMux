@@ -9,6 +9,7 @@
 //! The model still has to be downloaded before the mic works — the setting only
 //! records *which* model, not that it is present on disk.
 
+#[cfg(feature = "gpui")]
 use gpui::Global;
 use serde::{Deserialize, Serialize};
 
@@ -178,6 +179,7 @@ impl Default for DictationSettings {
 /// not depend on the engine crate, so the constant is duplicated).
 pub const DEFAULT_WORD_CORRECTION_THRESHOLD: f64 = 0.18;
 
+#[cfg(feature = "gpui")]
 impl Global for DictationSettings {}
 
 impl DictationSettings {

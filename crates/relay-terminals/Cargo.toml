@@ -1,0 +1,22 @@
+[package]
+name = "oximux-relay-terminals"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# remote-host's TerminalSource seam implemented over the relay daemon —
+# extracted from the desktop (zero gpui imports) so `oximux serve` exposes the
+# same terminals the same way, gap semantics included, instead of forking 200
+# lines of subtle queue/backpressure logic.
+
+[dependencies]
+oximux-relay-client = { workspace = true }
+oximux-relay-proto = { workspace = true }
+oximux-remote-host = { workspace = true }
+oximux-remote-proto = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

@@ -13,7 +13,9 @@
 //! [`AgentChatView`]: crate::shell::agent_chat
 
 pub mod launch_bridge;
+pub mod local_listener;
 pub mod project_provider;
+pub mod worktree_service;
 pub mod rewind_bridge;
 pub mod session_catalog;
 pub mod relay_terminals;
@@ -33,6 +35,32 @@ pub const ENABLED_SETTING: &str = "remote.enabled";
 /// governing the other would make turning off a notification setting stop a
 /// paired phone from reaching this Mac.
 pub const KEEP_AWAKE_SETTING: &str = "remote.keep_awake";
+
+/// Settings key for local CLI access — the owner-only control socket the
+/// `oximux` CLI dials. Its own switch, independent of remote in both
+/// directions: pairing a phone must not open a local control surface, and
+/// turning local access off must not cut a paired phone.
+///
+/// **Default ON** — see [`local_access_enabled`]. A CLI that does nothing until
+/// someone finds a settings toggle is a CLI most people never discover works.
+pub const LOCAL_ENABLED_SETTING: &str = "local.enabled";
+
+/// Should local CLI access be running, given whatever is stored under
+/// [`LOCAL_ENABLED_SETTING`]?
+///
+/// Absent means ON. This is a *default*, not a coercion: an explicit `"false"`
+/// keeps it off across restarts, so a user who turns it off stays turned off.
+///
+/// What the default admits, stated where the decision is made: the socket is a
+/// 0700 directory and a 0600 node, and a caller must still prove a token it can
+/// only have by reading that file. But any program running as this user can read
+/// it — including the agents this desktop spawns — so on-by-default means an
+/// agent that goes looking can drive every session and terminal. The per-session
+/// credential in `oximux-remote-local` exists to close exactly that and is not
+/// yet wired at spawn; until it is, the toggle's own copy is what tells the user.
+pub fn local_access_enabled(stored: Option<&str>) -> bool {
+    stored.is_none_or(|v| v == "true")
+}
 
 /// How long an opened pairing window stays redeemable.
 ///
@@ -188,6 +216,11 @@ pub struct RemoteControl {
     /// phone creates is the same row the desktop's ticker fires and its Settings
     /// pane lists.
     schedules: Option<Arc<oximux_agents::schedule::ScheduleStore>>,
+    /// The host's team runs and coordination blackboard, when installed. Both
+    /// are plain SQLite stores (gpui-free, no process spawn), so they need no
+    /// view-layer seam — the same reasoning as `schedules`.
+    teams: Option<Arc<oximux_agents::team::TeamStore>>,
+    coord: Option<Arc<oximux_agents::coord::CoordStore>>,
     /// The desktop's speech-to-text engine, when one is installed. `None` answers
     /// `TranscribeAudio` with `Unauthorized`, as `launcher` does. Shares the
     /// composer's own model manager, so a model downloaded in Settings › Voice is
@@ -198,6 +231,19 @@ pub struct RemoteControl {
     /// list — an authorized client simply sees no quick-start projects, which is
     /// honest for a desktop with none; the create path stays gated regardless.
     projects: Option<Arc<dyn ProjectProvider>>,
+    /// The desktop's worktree management, when it is installed. `None` answers
+    /// the worktree RPCs with `Unsupported` for an authorized full-scope caller
+    /// (the dispatcher still answers `Unauthorized` first for anyone else).
+    worktrees: Option<Arc<dyn oximux_remote_host::WorktreeService>>,
+    /// The manual-fire path, installed only when this desktop won the ticker
+    /// lock. `None` answers `RunScheduleNow` with `Unsupported` for an
+    /// authorized caller — the schedules still fire, just from the process
+    /// that owns them.
+    schedule_runner: Option<Arc<dyn oximux_remote_host::ScheduleRunner>>,
+    /// Recorded schedule runs, fanned out to session-list subscribers. The
+    /// sender is shared with the ticker's recorded-run hook.
+    schedule_events:
+        Option<tokio::sync::broadcast::Sender<oximux_remote_proto::messages::ScheduleRunWire>>,
     /// The index of persisted-but-unbuilt sessions, so a client is not limited to
     /// the projects the desktop has happened to show this run.
     catalog: Option<Arc<dyn oximux_remote_host::catalog::SessionCatalog>>,
@@ -217,6 +263,30 @@ pub struct RemoteControl {
     /// id — and since a paired phone dials by that id, every restart would silently
     /// invalidate every pairing. `None` = ephemeral identity (tests).
     endpoint_secret: Option<[u8; 32]>,
+    /// Local CLI access — a second, independent switch beside `enabled`. Either
+    /// one populates the session registry; both off keeps the tested
+    /// `disabled_binds_nothing` invariant: no registry rows, no socket, no token.
+    local_enabled: AtomicBool,
+    /// The running local listener, once bound. Dropping the handle aborts the
+    /// accept loop AND every in-flight CLI connection — the local analogue of
+    /// dropping the iroh `HostHandle`.
+    local: Mutex<Option<local_listener::LocalHandle>>,
+    /// Proof that this process, and no other, is the host for the data
+    /// directory — the same advisory lock `oximux serve` takes.
+    ///
+    /// Both hosts bind the same socket and write the same token file, and the
+    /// desktop's data dir *is* serve's default, so an app with local access on
+    /// plus a bare `oximux serve` is two hosts over one database: on unix the
+    /// newcomer replaced the live socket node, and on both platforms it swapped
+    /// the credential the incumbent's listener authenticates against, leaving
+    /// every client of the first host denied.
+    ///
+    /// Held per process rather than per bind, which is what makes it safe here:
+    /// an advisory lock contends with *another* process, but a second one taken
+    /// on the same file from this one would be refused too — and Settings →
+    /// Remote legitimately rebinds over our own live listener. Taking it only
+    /// when it is not already held keeps that path working.
+    host_lock: Mutex<Option<oximux_single_instance::SingleInstanceGuard>>,
 }
 
 impl Global for RemoteControl {}
@@ -240,12 +310,20 @@ impl RemoteControl {
             launcher: None,
             rewinder: None,
             schedules: None,
+            teams: None,
+            coord: None,
             transcriber: None,
             projects: None,
+            worktrees: None,
+            schedule_runner: None,
+            schedule_events: None,
             catalog: None,
             auth: Mutex::new(None),
             awake: Mutex::new(None),
             endpoint_secret: None,
+            local_enabled: AtomicBool::new(false),
+            local: Mutex::new(None),
+            host_lock: Mutex::new(None),
         }
     }
 
@@ -281,6 +359,18 @@ impl RemoteControl {
         self.schedules = Some(schedules);
     }
 
+    /// Install the team-run and coordination stores the host serves. Called
+    /// once at boot against the same database `oximux serve` would use, so a
+    /// run opened from one host is visible from the other.
+    pub fn set_automation_stores(
+        &mut self,
+        teams: Arc<oximux_agents::team::TeamStore>,
+        coord: Arc<oximux_agents::coord::CoordStore>,
+    ) {
+        self.teams = Some(teams);
+        self.coord = Some(coord);
+    }
+
     /// Install the transcriber the host serves. Called once at boot with a
     /// transcriber that shares the composer's model manager, so both dictation
     /// surfaces decode with the same model.
@@ -297,6 +387,29 @@ impl RemoteControl {
     /// quick-start projects match what the desktop shows.
     pub fn set_project_provider(&mut self, projects: Arc<dyn ProjectProvider>) {
         self.projects = Some(projects);
+    }
+
+    /// Install the worktree service the host serves. Called once at boot,
+    /// backed by the same project + workspace repos and path scheme the
+    /// desktop's own New-Worktree flow uses.
+    pub fn set_worktree_service(
+        &mut self,
+        worktrees: Arc<dyn oximux_remote_host::WorktreeService>,
+    ) {
+        self.worktrees = Some(worktrees);
+    }
+
+    /// Serve `RunScheduleNow` — installed only by the ticker-lock winner.
+    pub fn set_schedule_runner(&mut self, runner: Arc<dyn oximux_remote_host::ScheduleRunner>) {
+        self.schedule_runner = Some(runner);
+    }
+
+    /// Fan recorded schedule runs out to session-list subscribers.
+    pub fn set_schedule_events(
+        &mut self,
+        events: tokio::sync::broadcast::Sender<oximux_remote_proto::messages::ScheduleRunWire>,
+    ) {
+        self.schedule_events = Some(events);
     }
 
     /// Let the host see and open sessions whose views have not been built.
@@ -326,6 +439,14 @@ impl RemoteControl {
 
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Release);
+    }
+
+    pub fn local_enabled(&self) -> bool {
+        self.local_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn set_local_enabled(&self, on: bool) {
+        self.local_enabled.store(on, Ordering::Release);
     }
 
     /// Assemble a fresh dispatcher + CSPRNG seed for a host bind. Serves
@@ -403,6 +524,21 @@ impl RemoteControl {
         }
         if let Some(catalog) = &self.catalog {
             dispatcher = dispatcher.with_catalog(Arc::clone(catalog));
+        }
+        if let Some(worktrees) = &self.worktrees {
+            dispatcher = dispatcher.with_worktrees(Arc::clone(worktrees));
+        }
+        if let Some(teams) = &self.teams {
+            dispatcher = dispatcher.with_team_store(Arc::clone(teams));
+        }
+        if let Some(coord) = &self.coord {
+            dispatcher = dispatcher.with_coord_store(Arc::clone(coord));
+        }
+        if let Some(runner) = &self.schedule_runner {
+            dispatcher = dispatcher.with_schedule_runner(Arc::clone(runner));
+        }
+        if let Some(events) = &self.schedule_events {
+            dispatcher = dispatcher.with_schedule_events(events.clone());
         }
         dispatcher
     }
@@ -575,14 +711,147 @@ impl RemoteControl {
         .detach();
     }
 
-    /// Register `id`→`conn` and return the binding **iff remote is enabled**;
-    /// `None` when disabled, so the caller does no work and holds no binding.
+    /// Register `id`→`conn` and return the binding **iff some control surface
+    /// is enabled** — remote, local CLI, or both. `None` with both off, so the
+    /// caller does no work and holds no binding: population is gated, never
+    /// unconditional, which is what keeps `disabled_binds_nothing` true for
+    /// users who enabled neither.
     pub fn bind(&self, id: &str, conn: Arc<dyn AgentConnection>) -> Option<RemoteBinding> {
-        if !self.enabled() {
+        if !(self.enabled() || self.local_enabled()) {
             return None;
         }
         let handle = self.registry.register(id.to_string(), conn);
         Some(RemoteBinding { registry: self.registry.clone(), handle })
+    }
+
+    /// Assemble the dispatcher a local listener serves. Shares the live host's
+    /// auth store when one is bound (so the paired-device ACL the UI edits is
+    /// the one a hypothetical remote check consults), else builds one seeded
+    /// from durable storage WITHOUT retaining it — `self.auth` means "the live
+    /// remote host's store" to the pairing UI, and the local listener must not
+    /// impersonate that.
+    fn prepare_local(&self) -> Arc<Dispatcher> {
+        let auth = self.auth.lock().unwrap().clone().unwrap_or_else(|| {
+            Arc::new(match &self.devices {
+                Some(devices) => AuthStore::with_store(devices.clone()),
+                None => AuthStore::new(),
+            })
+        });
+        Arc::new(self.dispatcher(auth))
+    }
+
+    /// Flip local CLI access on and bind the control socket. The flag and the
+    /// bind travel together for the reason [`resume_at_launch`] documents; a
+    /// missing tokio runtime or data dir is a warn-and-degrade, not a panic.
+    ///
+    /// [`resume_at_launch`]: Self::resume_at_launch
+    pub fn start_local(cx: &mut gpui::App) {
+        let Some(rc) = cx.try_global::<RemoteControl>() else {
+            return;
+        };
+        rc.set_local_enabled(true);
+        let dispatcher = rc.prepare_local();
+        let Some(dir) = crate::app_paths::data_dir() else {
+            tracing::warn!("no data dir; local control socket not bound");
+            return;
+        };
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("no tokio runtime; local control socket not bound");
+            return;
+        };
+        // Claim the data directory before binding anything into it. Skipped when
+        // we already hold it: that is Settings → Remote toggled back on, and the
+        // lock would contend with itself.
+        if !rc.claim_host_role(&dir) {
+            return;
+        }
+        match local_listener::start(dispatcher, dir, rt) {
+            Ok(handle) => *rc.local.lock().unwrap() = Some(handle),
+            // The flag stays on so the UI reflects the user's choice, but with
+            // nothing bound the CLI reports the host unreachable — which is
+            // true, and better than a toggle that looks on and answers nothing.
+            Err(err) => tracing::warn!(%err, "local control socket failed to bind"),
+        }
+    }
+
+    /// Take the data directory's host role, or report that someone else has it.
+    ///
+    /// `true` means bind; `false` means another process is the host and we must
+    /// not touch its socket or token. Idempotent — already holding the lock is
+    /// success, which is what lets a rebind over our own listener through.
+    ///
+    /// A lock that cannot be evaluated refuses, matching `serve`: an unreadable
+    /// answer is not permission to become a second host.
+    fn claim_host_role(&self, dir: &std::path::Path) -> bool {
+        let mut held = self.host_lock.lock().unwrap();
+        if held.is_some() {
+            return true;
+        }
+        let path = dir.join(oximux_remote_local::HOST_LOCK_FILENAME);
+        match oximux_single_instance::try_acquire(&path) {
+            Ok(oximux_single_instance::AcquireOutcome::Acquired(guard)) => {
+                *held = Some(guard);
+                true
+            }
+            Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder_pid }) => {
+                tracing::warn!(
+                    holder_pid = ?holder_pid,
+                    dir = %dir.display(),
+                    "another OxiMux host is already serving this data directory; \
+                     local CLI access not bound",
+                );
+                false
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    dir = %dir.display(),
+                    "could not determine whether another host holds this data directory; \
+                     local CLI access not bound",
+                );
+                false
+            }
+        }
+    }
+
+    /// Mint a credential confining one agent process to `session_id`, for the
+    /// spawner to inject into that process's environment. `None` when local
+    /// access is off — there is no listener to honor it, and an agent that
+    /// receives no credential simply cannot reach the control socket.
+    ///
+    /// **Nothing calls this yet, and the confinement is therefore not in force:**
+    /// an agent that runs `oximux` reads the operator token file (it is the same
+    /// OS user) and is served full scope. Wiring it is not a matter of finding
+    /// the spawn site. A chat's `remote_session_id` starts as a placeholder and
+    /// is REKEYED once the agent reports its own id
+    /// (`rekey_remote_session_if_needed`), while a child's environment is fixed
+    /// at spawn and cannot be revised afterwards — so either the credential is
+    /// minted against a spawn-time identity the listener then re-maps on rekey,
+    /// or the id has to be known before the process exists. That choice belongs
+    /// with the phase that wires it, not here.
+    #[allow(dead_code, reason = "the agent spawner does not inject credentials yet")]
+    pub fn grant_agent_credential(&self, session_id: &str) -> Option<String> {
+        self.local.lock().unwrap().as_ref().map(|h| h.grant_session(session_id))
+    }
+
+    /// Drop an agent's credential when its session ends. Unused for as long as
+    /// [`grant_agent_credential`](Self::grant_agent_credential) is.
+    #[allow(dead_code, reason = "the agent spawner does not inject credentials yet")]
+    pub fn revoke_agent_credential(&self, session_id: &str) {
+        if let Some(handle) = self.local.lock().unwrap().as_ref() {
+            handle.revoke_session(session_id);
+        }
+    }
+
+    /// Flip local CLI access off: the listener, its socket file, and every
+    /// in-flight CLI connection go down with the handle. Idempotent.
+    pub fn stop_local(&self) {
+        self.set_local_enabled(false);
+        // Listener first, then the role. Releasing the lock while our socket is
+        // still bound would let a waiting `serve` win the role and unlink a live
+        // node — the exact race the lock exists to prevent, run backwards.
+        self.local.lock().unwrap().take();
+        self.host_lock.lock().unwrap().take();
     }
 }
 
@@ -771,13 +1040,52 @@ mod tests {
         assert_ne!(first, second, "a stale pairing code must not stay valid across enables");
     }
 
-    /// Disabled is the default and binds nothing — the per-event path stays free.
+    /// Local CLI access is on unless the user turned it off.
+    ///
+    /// The absent case is the one that matters: a fresh install has no stored
+    /// value and must still bind, or the CLI silently does nothing on the
+    /// machine it was installed for. The explicit `"false"` case matters just as
+    /// much in the other direction — a default that overrode a user's choice
+    /// would turn the surface back on at every launch.
+    #[test]
+    fn local_access_defaults_on_but_respects_an_explicit_no() {
+        assert!(local_access_enabled(None), "a fresh install runs the CLI socket");
+        assert!(local_access_enabled(Some("true")));
+        assert!(!local_access_enabled(Some("false")), "an explicit no must survive a restart");
+        // Anything else is not a yes. The value is written by this app, so a
+        // stray one means corruption or a hand edit, and the safe reading of
+        // "I cannot tell" for a control surface is off.
+        assert!(!local_access_enabled(Some("")), "an empty value is not consent");
+        assert!(!local_access_enabled(Some("TRUE")), "only the value this app writes counts");
+    }
+
+    /// Disabled is the struct-level default and binds nothing — the per-event
+    /// path stays free. Note this is about a freshly constructed
+    /// `RemoteControl`, NOT about what a real launch does: the app turns local
+    /// access on from `local_access_enabled` before any session binds.
     #[test]
     fn disabled_binds_nothing() {
         let rc = RemoteControl::new();
         assert!(!rc.enabled());
+        assert!(!rc.local_enabled(), "local CLI access defaults off too");
         assert!(rc.bind("agent-1", a_conn()).is_none());
         assert!(rc.registry().is_empty(), "no session registered while disabled");
+    }
+
+    /// Local CLI access alone populates the registry — the gate is widened to
+    /// either switch, not moved: with remote still off, sessions register for
+    /// the local listener to serve.
+    #[test]
+    fn local_access_alone_binds_sessions() {
+        let rc = RemoteControl::new();
+        rc.set_local_enabled(true);
+        assert!(!rc.enabled(), "remote stays off");
+        assert!(rc.bind("agent-1", a_conn()).is_some());
+        assert!(!rc.registry().is_empty());
+        // And turning it off again restores the empty-gate behavior for NEW
+        // sessions (live bindings are cut by the listener teardown, not here).
+        rc.stop_local();
+        assert!(rc.bind("agent-2", a_conn()).is_none());
     }
 
     /// Enabled binds a session whose teed events reach a live subscriber in order.
@@ -799,5 +1107,40 @@ mod tests {
 
         binding.unregister("agent-1");
         assert!(rc.registry().get("agent-1").is_none(), "unregister evicts the session");
+    }
+
+    /// The host role is one per data directory, and re-taking our own is free.
+    ///
+    /// Both halves matter, and the second is the one with teeth. An advisory
+    /// lock refuses a second acquisition from the *same* process just as it does
+    /// from another, so a claim taken per bind rather than per process would
+    /// break Settings → Remote toggled back on — the app would decline to bind
+    /// against itself, and local CLI access would silently stop working after
+    /// one toggle. Asserting that the second claim succeeds pins the reuse.
+    #[test]
+    fn the_host_role_is_taken_once_per_process_and_reused_by_a_rebind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let rc = RemoteControl::new();
+        assert!(rc.claim_host_role(dir.path()), "an unheld data dir is claimable");
+        assert!(
+            rc.claim_host_role(dir.path()),
+            "re-claiming a role we already hold must succeed — a rebind depends on it",
+        );
+
+        // A second host over the same directory is refused while the first holds
+        // it. Standing in for `oximux serve`, which takes this identical lock.
+        let other = RemoteControl::new();
+        assert!(
+            !other.claim_host_role(dir.path()),
+            "a second host must not be allowed to bind over a live one",
+        );
+
+        // And the role is released with the listener, so a successor can take it.
+        rc.stop_local();
+        assert!(
+            other.claim_host_role(dir.path()),
+            "the role must be claimable again once the holder stops hosting",
+        );
     }
 }

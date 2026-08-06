@@ -54,6 +54,24 @@ const DB_FILE_NAME: &str = "oximux.db";
 fn main() {
     init_tracing();
 
+    // Before anything writes into the data directory — including the migration
+    // immediately below, which creates it. Everything in there is private to
+    // this account, and until this call existed none of it was closed to the
+    // other accounts on the machine.
+    //
+    // A warning rather than a fatal: the app is still usable when its data
+    // directory cannot be restricted (an exotic filesystem, a network home),
+    // and refusing to start would be a worse outcome than a boot that says so.
+    // Secrets have their own per-file restriction with its own hard failure, so
+    // this degrading does not silently downgrade the token or the host key.
+    if let Err(err) = oximux_app::app_paths::harden_data_dir() {
+        tracing::warn!(
+            ?err,
+            "could not restrict the app data directory to this account; \
+             transcripts and settings may be readable by other users"
+        );
+    }
+
     // Before anything resolves a data path: seven modules used to pick their
     // own directory, which on Windows put them in the roaming profile while
     // the rest of the app used the local one. They now all go through
@@ -411,11 +429,15 @@ fn main() {
         // its id. Installed unconditionally — a host that never enables remote
         // access simply never receives a request, and wiring it later would mean
         // remote could be switched on before the launcher existed.
-        {
+        let bridge_launcher = {
             let (launcher, requests) = oximux_app::remote_control::launch_bridge::launch_bridge();
+            // A clone of the same queue for the scheduler's firer below — one
+            // GPUI drain loop serves phone launches and scheduled fires alike.
+            let for_scheduler = launcher.clone();
             remote_control.set_launcher(std::sync::Arc::new(launcher));
             oximux_app::remote_control::launch_bridge::serve_launches(requests, cx);
-        }
+            for_scheduler
+        };
         // The same inbound shape for rewinds: the request crosses to this loop,
         // which finds the tab holding that session and starts its rewind.
         // Installed unconditionally, for the same reason as the launcher.
@@ -430,12 +452,72 @@ fn main() {
         // handed over directly rather than through a bridge, unlike the launcher
         // and rewinder above.
         remote_control.set_schedule_store(std::sync::Arc::new(app_state.schedule_store()));
+        // Team runs and the coordination blackboard: the same database `oximux
+        // serve` opens, so a run started against either host is one run. Both
+        // are plain SQLite stores, handed over directly like the schedules.
+        remote_control.set_automation_stores(
+            std::sync::Arc::new(app_state.team_store()),
+            std::sync::Arc::new(app_state.coord_store()),
+        );
+        // The scheduled-run ticker. Installed unconditionally when this process
+        // wins the data dir's ticker lock: with no schedules it costs one
+        // indexed read every tick and takes no keep-awake hold, and gating it
+        // on "are there any schedules" would mean the first one created never
+        // fires until the next launch. Losing the lock (a headless host is
+        // serving this data dir) means schedules fire from there instead, and
+        // run-now correctly answers Unsupported here.
+        {
+            let (schedule_events, _) = tokio::sync::broadcast::channel(64);
+            remote_control.set_schedule_events(schedule_events.clone());
+            // The orphan-sweep predicate: what this desktop's storage counts
+            // as an existing session — a persisted tab in the primary
+            // window's layout OR a transcript blob (a serve-created session
+            // in the shared data dir leaves only the blob).
+            let sweep_settings = app_state.settings_repo().clone();
+            let sweep_projects = app_state.project_repo();
+            let session_exists = move |sid: &str| {
+                oximux_app::remote_control::session_catalog::session_known_in_storage(
+                    &sweep_settings,
+                    &sweep_projects,
+                    oximux_app::window_registry::PRIMARY_WINDOW_ID,
+                    sid,
+                )
+            };
+            if let Some(ticker) = oximux_app::scheduler::install(
+                app_state.schedule_store(),
+                bridge_launcher,
+                remote_control.registry(),
+                app_paths::data_dir(),
+                schedule_events,
+                session_exists,
+                cx,
+            ) {
+                remote_control.set_schedule_runner(std::sync::Arc::new(
+                    oximux_remote_host::TickerRunner(ticker),
+                ));
+            }
+        }
         // Projects the phone can start a session in without typing a path: the same
         // recent-projects store the desktop sidebar lists, read directly (no UI hop)
         // since it is durable data, not live view state.
         remote_control.set_project_provider(std::sync::Arc::new(
             oximux_app::remote_control::project_provider::RepoProjects::new(app_state.project_repo()),
         ));
+        // Worktrees the CLI can create, list, and remove: the same repos and
+        // host-derived path scheme the desktop's New-Worktree flow uses, so a
+        // remotely-created worktree is exactly the row the sidebar lists.
+        // Skipped only when this platform reports no data directory — there is
+        // nowhere to derive a worktree path under, and the RPC answering
+        // `Unsupported` beats one that fails at every create.
+        if let Some(data_dir) = oximux_app::app_paths::data_dir() {
+            remote_control.set_worktree_service(std::sync::Arc::new(
+                oximux_app::remote_control::worktree_service::RepoWorktrees::new(
+                    app_state.project_repo(),
+                    app_state.workspace_repo(),
+                    data_dir,
+                ),
+            ));
+        }
         // Sessions the desktop has persisted but not built views for. The registry
         // only holds a session once its chat view exists, and views are built per
         // project as each is first shown — so without this a client sees only the
@@ -498,11 +580,24 @@ fn main() {
         if remote_was_on {
             oximux_app::remote_control::RemoteControl::resume_at_launch(cx);
         }
-        // Start the scheduled-run ticker. Installed unconditionally: with no
-        // schedules it costs one indexed read every tick and takes no keep-awake
-        // hold, and gating it on "are there any schedules" would mean the first
-        // one created never fires until the next launch.
-        oximux_app::scheduler::Scheduler::install(app_state.schedule_store(), cx);
+        // Local CLI access resumes on the same reasoning, under its own key: a
+        // scripted workflow must survive an app restart without someone
+        // reopening Settings. Unlike remote, an absent key means ON — see
+        // `local_access_enabled`, which owns that decision and the reasoning
+        // behind it. An explicit "false" still keeps it off.
+        let stored_local = app_state
+            .settings_repo()
+            .get(oximux_app::remote_control::LOCAL_ENABLED_SETTING)
+            .ok()
+            .flatten();
+        let local_was_on =
+            oximux_app::remote_control::local_access_enabled(stored_local.as_deref());
+        if local_was_on {
+            oximux_app::remote_control::RemoteControl::start_local(cx);
+        }
+        // (The scheduled-run ticker is installed above, beside the launch
+        // bridge it fires through — before `remote_control` is frozen into a
+        // global, so the run-now seam could be wired into it.)
         // Auto-update: recovers from an interrupted swap, sweeps crash
         // leftovers, then checks periodically. Staging only — the swap itself
         // happens at quit, so the running workspace is never disturbed.
@@ -1024,7 +1119,7 @@ fn open_db_or_exit() -> Db {
         std::process::exit(1);
     }
     let db_path = db_dir.join(DB_FILE_NAME);
-    match oximux_storage::open(&db_path) {
+    let db = match oximux_storage::open(&db_path) {
         Ok(db) => db,
         Err(err) => {
             eprintln!(
@@ -1033,6 +1128,45 @@ fn open_db_or_exit() -> Db {
                 db_path.display()
             );
             std::process::exit(1);
+        }
+    };
+    restrict_db_files(&db_path);
+    db
+}
+
+/// Restrict the database and its WAL sidecars to this account.
+///
+/// Belt to the data directory's braces, and on Windows not merely that. There,
+/// bypass-traverse-checking is granted to Everyone by default, so a restrictive
+/// descriptor on the directory does not stop anyone who knows the path to a
+/// file inside it; the directory's ACE is inheritable, which covers files
+/// created from now on but never a database that pre-dates the upgrade. On unix
+/// `0700` on the directory is already sufficient and this is pure defence in
+/// depth — the position the relay's token takes for the same reason.
+///
+/// The `-wal` and `-shm` sidecars matter as much as the database: recent
+/// transactions live in the WAL, so protecting only the main file would leave
+/// the newest transcripts readable. They exist only while a connection is open,
+/// hence after the open above rather than before it.
+///
+/// Best-effort by design. A database that cannot be restricted is still a
+/// working database, and this runs on a path whose every other failure is
+/// fatal — turning a permissions hiccup into a refusal to start would trade a
+/// real regression for a hypothetical one.
+fn restrict_db_files(db_path: &std::path::Path) {
+    let mut name = db_path.as_os_str().to_os_string();
+    name.push("-wal");
+    let wal = std::path::PathBuf::from(name);
+    let mut name = db_path.as_os_str().to_os_string();
+    name.push("-shm");
+    let shm = std::path::PathBuf::from(name);
+
+    for path in [db_path, wal.as_path(), shm.as_path()] {
+        if !path.exists() {
+            continue;
+        }
+        if let Err(err) = oximux_owner_only::restrict_file(path) {
+            tracing::warn!(?err, path = %path.display(), "could not restrict database file");
         }
     }
 }

@@ -46,6 +46,28 @@ impl SettingsRepo {
         Ok(())
     }
 
+    /// Every `(key, value)` whose key starts with `prefix`, unordered.
+    ///
+    /// Exists for the headless host's session catalog, which enumerates the
+    /// `agent_chat:` transcript blobs — the settings table is the only index
+    /// of persisted chat sessions, and without a prefix scan a headless host
+    /// would need a second bookkeeping table that could drift from the blobs.
+    /// `LIKE` with the trailing `%` uses the primary-key index; `\\` escapes
+    /// the two LIKE metacharacters so a literal `%`/`_` in a prefix cannot
+    /// widen the scan.
+    pub fn list_prefixed(&self, prefix: &str) -> Result<Vec<(String, String)>, StorageError> {
+        let escaped = prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let rows = self.db.with_conn(|c| {
+            let mut stmt =
+                c.prepare("SELECT key, value FROM settings WHERE key LIKE ?1 ESCAPE '\\'")?;
+            let rows = stmt
+                .query_map([format!("{escaped}%")], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<Result<Vec<(String, String)>, _>>()?;
+            Ok(rows)
+        })?;
+        Ok(rows)
+    }
+
     pub fn delete(&self, key: &str) -> Result<(), StorageError> {
         self.db.with_conn(|c| {
             c.execute("DELETE FROM settings WHERE key = ?1", [key])

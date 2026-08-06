@@ -11,7 +11,8 @@ use oximux_remote_proto::Transport;
 use oximux_remote_proto::proto::{Request, Response, RpcError};
 
 use super::stream::{Live, forward_terminal};
-use super::{ConnState, Dispatcher, authorized_pubkey};
+use super::{ConnAuthn, ConnState, Dispatcher, authorized_peer};
+use crate::auth::LocalScope;
 
 /// What this turn of the serve loop picked to process. `Live` is boxed — a
 /// [`LiveFrame`] is far larger than a request frame. A `Request(None)` means the
@@ -63,8 +64,28 @@ impl Dispatcher {
     /// Serve one connection until the peer closes or a send fails. A request
     /// yields exactly one response frame; a live subscription pushes many
     /// [`Response::Event`] frames unsolicited between requests.
+    ///
+    /// The connection starts unauthenticated and earns its authority over the
+    /// wire (pairing proof, token, or challenge) — the remote entry point.
     pub async fn serve(&self, transport: &dyn Transport) {
-        let mut state = ConnState::default();
+        self.serve_conn(transport, ConnState::default()).await
+    }
+
+    /// Serve one **local** connection — a caller the desktop's own socket
+    /// listener already authenticated against the local bearer token.
+    ///
+    /// The connection starts in [`ConnAuthn::LocalAuthed`] with the scope the
+    /// listener assigned, and the remote handshake RPCs are refused on it (see
+    /// [`Dispatcher::dispatch`]). This is the **only** constructor of local
+    /// authority: nothing a remote peer sends can reach this entry point, so no
+    /// wire request can mint a local peer.
+    pub async fn serve_local(&self, transport: &dyn Transport, scope: LocalScope) {
+        let state = ConnState { authn: ConnAuthn::LocalAuthed { scope }, ..Default::default() };
+        self.serve_conn(transport, state).await
+    }
+
+    /// The shared per-connection loop behind both entry points.
+    async fn serve_conn(&self, transport: &dyn Transport, mut state: ConnState) {
         // Active live subscriptions, merged so any one that produces an event wakes
         // the loop. Empty until the first accepted `Subscribe`.
         let mut streams: SelectAll<BoxStream<'static, Live>> = SelectAll::new();
@@ -130,20 +151,27 @@ impl Dispatcher {
                 // Transport closed or errored.
                 Picked::Request(None) => break,
                 Picked::Live(Some(frame)) => {
-                    // Re-derive the still-authorized pubkey per frame; a revoked
+                    // Re-derive the still-authorized peer per frame; a revoked
                     // connection forwards nothing.
-                    match authorized_pubkey(&state.authn, &self.auth) {
-                        Some(pubkey) => {
+                    match authorized_peer(&state.authn, &self.auth) {
+                        Some(peer) => {
                             let alive = match *frame {
                                 Live::Session(f) => {
-                                    self.forward_live(&pubkey, &mut cursors, transport, f).await
+                                    self.forward_live(&peer, &mut cursors, transport, f).await
                                 }
                                 Live::Terminal { pty_id, frame } => {
-                                    forward_terminal(&self.auth, &pubkey, transport, pty_id, frame)
+                                    forward_terminal(&self.auth, &peer, transport, pty_id, frame)
                                         .await
                                 }
                                 Live::SessionList => {
-                                    self.forward_sessions(&pubkey, transport).await
+                                    self.forward_sessions(&peer, transport).await
+                                }
+                                Live::ScheduleRun(run) => {
+                                    self.forward_schedule_run(&peer, transport, run).await
+                                }
+                                Live::StateChange { change, with_cursor } => {
+                                    self.forward_state_change(&peer, transport, change, with_cursor)
+                                        .await
                                 }
                             };
                             if !alive {
@@ -202,8 +230,8 @@ impl Dispatcher {
         if let Some(session_id) = session_to_build(&req)
             && self.registry.get(session_id).is_none()
             && let Some(catalog) = &self.catalog
-            && let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth)
-            && self.auth.is_allowed_for(&pubkey, session_id)
+            && let Some(peer) = authorized_peer(&state.authn, &self.auth)
+            && self.auth.is_allowed_for(&peer, session_id)
             && let Err(err) = catalog.open(session_id).await
         {
             tracing::warn!(session_id, %err, "could not open a session a client asked for");
@@ -211,11 +239,11 @@ impl Dispatcher {
         // `Subscribe` is the one request that also opens a live stream, so it is
         // handled in the serve loop rather than the sync `dispatch`.
         if let Request::Subscribe { session_id, after_seq } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
             let (response, stream) =
-                self.begin_subscribe(&pubkey, &session_id, after_seq.unwrap_or(0), cursors);
+                self.begin_subscribe(&peer, &session_id, after_seq.unwrap_or(0), cursors);
             if let Some(stream) = stream {
                 streams.push(stream.map(Live::Session).boxed());
             }
@@ -224,46 +252,57 @@ impl Dispatcher {
         // `SubscribeSessions`, like `Subscribe`, also opens a live stream, so it is
         // handled here rather than in the sync `dispatch`.
         if let Request::SubscribeSessions = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let (response, stream) = self.begin_subscribe_sessions(&pubkey, sessions_subscribed);
+            let fresh = !*sessions_subscribed;
+            let (response, stream) = self.begin_subscribe_sessions(&peer, sessions_subscribed);
             if let Some(stream) = stream {
                 streams.push(stream);
+            }
+            // Recorded schedule runs ride the session-list subscription — but
+            // only for peers that declared a version that can decode the push
+            // frame; an older subscriber would drop the whole connection on
+            // the unknown ordinal. Opened once, like the sessions stream.
+            if fresh
+                && state.peer_version >= oximux_remote_proto::proto::SCHEDULE_PUSH_MIN_VERSION
+                && let Some(runs) = self.schedule_runs_push_stream()
+            {
+                streams.push(runs);
             }
             return self.send(transport, response).await;
         }
         // The terminal RPCs are async (the PTY layer is), so they are awaited
         // here rather than in the sync `dispatch`, exactly as the git ones are.
         if let Request::ListTerminals = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let response = self.list_terminals(&pubkey).await;
+            let response = self.list_terminals(&peer).await;
             return self.send(transport, response).await;
         }
         if let Request::TermAttach { pty_id } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let (response, stream) = self.begin_term_attach(&pubkey, &pty_id, attached).await;
+            let (response, stream) = self.begin_term_attach(&peer, &pty_id, attached).await;
             if let Some(stream) = stream {
                 streams.push(stream);
             }
             return self.send(transport, response).await;
         }
         if let Request::TermInput { pty_id, bytes } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let response = self.term_input(&pubkey, &pty_id, &bytes).await;
+            let response = self.term_input(&peer, &pty_id, &bytes).await;
             return self.send(transport, response).await;
         }
         if let Request::TermResize { pty_id, cols, rows } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let response = self.term_resize(&pubkey, &pty_id, cols, rows).await;
+            let response = self.term_resize(&peer, &pty_id, cols, rows).await;
             return self.send(transport, response).await;
         }
         if let Request::TermDetach { pty_id } = req {
@@ -276,81 +315,81 @@ impl Dispatcher {
         }
         // `GitStatus` is the one authenticated request whose handler is async (it
         // shells out to git), so it is awaited here rather than in the sync
-        // `dispatch`. Authorization is identical: an authenticated pubkey, then the
+        // `dispatch`. Authorization is identical: an authenticated peer, then the
         // handler's own per-session ACL recheck.
         if let Request::GitStatus { session_id } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let response = self.git_status(&pubkey, &session_id).await;
+            let response = self.git_status(&peer, &session_id).await;
             return self.send(transport, response).await;
         }
         if let Request::GitDiff { session_id, path, staged, untracked } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let response = self.git_diff(&pubkey, &session_id, &path, staged, untracked).await;
+            let response = self.git_diff(&peer, &session_id, &path, staged, untracked).await;
             return self.send(transport, response).await;
         }
         // The git writes are async for the same reason as the reads (they shell
         // out), so they are awaited here too. Their own handlers apply the
         // `may_write` gate on top of this authentication check.
         if let Request::GitStage { session_id, paths } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let response = self.git_stage(&pubkey, &session_id, &paths).await;
+            let response = self.git_stage(&peer, &session_id, &paths).await;
             return self.send(transport, response).await;
         }
         if let Request::GitUnstage { session_id, paths } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let response = self.git_unstage(&pubkey, &session_id, &paths).await;
+            let response = self.git_unstage(&peer, &session_id, &paths).await;
             return self.send(transport, response).await;
         }
         if let Request::GitCommit { session_id, message } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let response = self.git_commit(&pubkey, &session_id, &message).await;
+            let response = self.git_commit(&peer, &session_id, &message).await;
             return self.send(transport, response).await;
         }
         // Launching is async (it round-trips to the desktop's UI thread), so it
         // is awaited here rather than in the sync `dispatch`, like the git RPCs.
         if let Request::CreateSession { cwd, agent_id } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let response = self.create_session(&pubkey, &cwd, agent_id.as_deref()).await;
+            let response = self.create_session(&peer, &cwd, agent_id.as_deref()).await;
             return self.send(transport, response).await;
         }
         // Switching a model or permission mode is async for the same reason: a
         // backend that fixes the value at spawn can only change it by respawning,
         // which the desktop view performs on its own thread.
         if let Request::SetModel { session_id, model } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
             let response =
-                self.set_choice(&pubkey, &session_id, ChoiceKind::Model, &model).await;
+                self.set_choice(&peer, &session_id, ChoiceKind::Model, &model).await;
             return self.send(transport, response).await;
         }
         if let Request::SetPermissionMode { session_id, mode } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
             let response =
-                self.set_choice(&pubkey, &session_id, ChoiceKind::PermissionMode, &mode).await;
+                self.set_choice(&peer, &session_id, ChoiceKind::PermissionMode, &mode).await;
             return self.send(transport, response).await;
         }
         // Listing projects reads the desktop's recent-projects snapshot off its UI
         // thread, so it is async and awaited here beside its create-session sibling.
         if let Request::ListProjects = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let response = self.list_projects(&pubkey).await;
+            let response = self.list_projects(&peer).await;
             return self.send(transport, response).await;
         }
         // The forge RPCs shell out to `gh`/`glab`, so they are awaited here for
@@ -360,34 +399,116 @@ impl Dispatcher {
         // scope here, and shadowing it inside this arm would be a trap for the
         // next edit.
         if let Request::ListForgeItems { session_id, kind, state: item_state, mine } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
             let response =
-                self.list_forge_items(&pubkey, &session_id, kind, item_state, mine).await;
+                self.list_forge_items(&peer, &session_id, kind, item_state, mine).await;
             return self.send(transport, response).await;
         }
         if let Request::GetForgeItemDetail { session_id, kind, number } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let response = self.forge_item_detail(&pubkey, &session_id, kind, number).await;
+            let response = self.forge_item_detail(&peer, &session_id, kind, number).await;
             return self.send(transport, response).await;
         }
         if let Request::ListForgeChecks { session_id } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let response = self.list_forge_checks(&pubkey, &session_id).await;
+            let response = self.list_forge_checks(&peer, &session_id).await;
             return self.send(transport, response).await;
         }
         // Rewinding round-trips to the desktop's UI thread like launching does.
         if let Request::RewindSession { session_id, ordinal, include_files } = req {
-            let Some(pubkey) = authorized_pubkey(&state.authn, &self.auth) else {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
             let response =
-                self.rewind_session(&pubkey, &session_id, ordinal as usize, include_files).await;
+                self.rewind_session(&peer, &session_id, ordinal as usize, include_files).await;
+            return self.send(transport, response).await;
+        }
+        // The worktree RPCs delegate to the app's service, which shells out to
+        // git — async and awaited here, exactly as the git RPCs are. Their own
+        // handlers apply the dedicated full-scope worktree gates.
+        if let Request::CreateWorktree { project_path, slug } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.create_worktree(&peer, &project_path, &slug).await;
+            return self.send(transport, response).await;
+        }
+        if let Request::ListWorktrees { project_path } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.list_worktrees(&peer, project_path.as_deref()).await;
+            return self.send(transport, response).await;
+        }
+        if let Request::RemoveWorktree { id } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.remove_worktree(&peer, &id).await;
+            return self.send(transport, response).await;
+        }
+        // A manual fire spawns a session and waits for it to start, so it is
+        // async and awaited here like `CreateSession`. Its handler applies the
+        // schedule write gate on top of this authentication check.
+        if let Request::RunScheduleNow { schedule_id } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.run_schedule_now(&peer, &schedule_id).await;
+            return self.send(transport, response).await;
+        }
+        // Opening a team run starts a session per role (and, with
+        // `--worktree-each`, a worktree per role), so it is async for the same
+        // reason `CreateSession` is. Its handler applies the team gate on top
+        // of this authentication check.
+        if let Request::TeamRunCreate(req) = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.team_run_create(&peer, req).await;
+            return self.send(transport, response).await;
+        }
+        // `StateWatch`, like `Subscribe`, answers with a baseline AND opens a
+        // live stream, so it is handled here rather than in the sync `dispatch`.
+        if let Request::StateWatch { prefix } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.state_snapshot(&peer, prefix.as_deref());
+            // Only open the stream when the baseline was actually served: a
+            // refused watch must not go on receiving pushes. A second watch on
+            // one connection re-snapshots and adds a second stream, which is
+            // deliberate — the prefixes may differ, and the frames are
+            // idempotent for a client that gets both.
+            if matches!(response, Response::StateSnapshot(_))
+                && state.peer_version >= oximux_remote_proto::proto::STATE_PUSH_MIN_VERSION
+                && let Some(stream) = self.state_push_stream(prefix, /* with_cursor */ false)
+            {
+                streams.push(stream);
+            }
+            return self.send(transport, response).await;
+        }
+        // The v19 cursor-aware watch. Same shape as `StateWatch` above — a
+        // reply plus a live stream — differing only in what the reply carries
+        // and which push ordinal the stream emits.
+        if let Request::StateWatchFrom { prefix, since_seq } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.state_watch_from(&peer, prefix.as_deref(), since_seq);
+            if matches!(response, Response::StateWatchStarted(_))
+                && state.peer_version
+                    >= oximux_remote_proto::proto::STATE_CURSOR_PUSH_MIN_VERSION
+                && let Some(stream) = self.state_push_stream(prefix, /* with_cursor */ true)
+            {
+                streams.push(stream);
+            }
             return self.send(transport, response).await;
         }
         // Transcription runs a CPU-heavy ONNX decode, so its handler is async (it
@@ -395,7 +516,7 @@ impl Dispatcher {
         // sync `dispatch`. Gated on the authenticated connection alone — it names
         // no session and mutates nothing.
         if let Request::TranscribeAudio { audio_base64, sample_rate } = req {
-            if authorized_pubkey(&state.authn, &self.auth).is_none() {
+            if authorized_peer(&state.authn, &self.auth).is_none() {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             }
             let response = self.transcribe_audio(&audio_base64, sample_rate).await;

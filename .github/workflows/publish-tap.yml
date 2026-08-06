@@ -1,0 +1,131 @@
+# Publish the Homebrew formula to nhtera/homebrew-tap.
+#
+# **Triggered on `release: published`, deliberately — not from the release
+# build.** `release.yml` creates a DRAFT release, and GitHub does not serve a
+# draft's assets: `releases/latest/download/...` skips it entirely, and the
+# per-tag asset URLs 404 for anyone who is not the author. A formula pushed at
+# build time would therefore point at files nobody can download, and would stay
+# broken until someone remembered to publish the draft. Firing when the release
+# is actually published means the formula lands exactly when its URLs start
+# working — and re-publishing an edited release republishes the formula.
+#
+# Cross-repo pushes need a credential `GITHUB_TOKEN` cannot provide: that token
+# is scoped to this repository alone. The PAT below is the same mechanism the
+# SnapForge release uses to push its appcast into a second repo.
+#
+# Required repository secret:
+#
+#   TAP_PUSH_TOKEN   a fine-grained PAT with Contents: read and write on
+#                    nhtera/homebrew-tap ONLY. Scope it to that one repository
+#                    — it exists to commit a single .rb file, and anything
+#                    wider is reachable by any workflow run in this repo.
+#
+# Without the secret the job logs what to do and succeeds, so a fork (or a
+# release cut before the token exists) is not a red build.
+
+name: publish-tap
+
+on:
+  release:
+    types: [published]
+  # Re-run for a release that was published before this workflow existed, or
+  # after fixing the tap by hand.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish the formula from (e.g. v0.1.7)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish-formula:
+    name: Push oximux.rb to the tap
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Resolve the tag
+        id: tag
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${EVENT_TAG:-$INPUT_TAG}"
+          if [[ -z "$TAG" ]]; then
+            echo "no tag to publish from" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "publishing the formula from $TAG"
+
+      # The formula is an asset of the release rather than something rebuilt
+      # here: it was generated from the manifest that was SIGNED at build time,
+      # so its checksums are the ones the release actually attested to.
+      # Regenerating from whatever the URLs serve now would quietly launder a
+      # substituted artifact into a "verified" formula.
+      - name: Download the generated formula
+        id: fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Ask what the release HAS before trying to fetch, so "this release
+          # carries no formula" (fine, skip) stays distinguishable from "the
+          # download failed" (not fine, fail loudly). A single `download ||
+          # skip` would swallow the second as the first.
+          assets="$(gh release view "$TAG" --repo "${{ github.repository }}" \
+                      --json assets --jq '.assets[].name')"
+          if ! grep -qx 'oximux.rb' <<<"$assets"; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG carries no oximux.rb — a desktop-only release. Nothing to publish."
+            exit 0
+          fi
+          gh release download "$TAG" --repo "${{ github.repository }}" \
+            --pattern oximux.rb --dir .
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "--- formula ---"
+          cat oximux.rb
+
+      # Ruby is preinstalled on the runner. A formula that does not parse would
+      # break `brew` for everyone who has the tap, and it is far cheaper to
+      # catch that here than in someone's terminal.
+      - name: Check the formula parses
+        if: steps.fetch.outputs.found == 'true'
+        run: ruby -c oximux.rb
+
+      - name: Commit it to the tap
+        if: steps.fetch.outputs.found == 'true'
+        env:
+          TAP_PUSH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TAP_PUSH_TOKEN}" ]]; then
+            echo "::warning::TAP_PUSH_TOKEN is not set — skipping the tap push."
+            echo "Publish by hand:  gh release download $TAG --pattern oximux.rb"
+            echo "then commit oximux.rb to nhtera/homebrew-tap."
+            exit 0
+          fi
+
+          TAP_DIR="$RUNNER_TEMP/homebrew-tap"
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_PUSH_TOKEN}@github.com/nhtera/homebrew-tap.git" \
+            "$TAP_DIR"
+          cp oximux.rb "$TAP_DIR/oximux.rb"
+
+          cd "$TAP_DIR"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add oximux.rb
+          # Re-publishing an unchanged release is a no-op, not a failure.
+          if git diff --cached --quiet; then
+            echo "the tap already carries this formula — nothing to do"
+            exit 0
+          fi
+          git commit -m "oximux ${TAG}"
+          git push origin HEAD:main
+          echo "pushed oximux.rb (${TAG}) to nhtera/homebrew-tap"

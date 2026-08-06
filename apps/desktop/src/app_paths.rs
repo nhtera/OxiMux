@@ -30,6 +30,37 @@ pub fn data_dir() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join(APP_DATA_SUBDIR))
 }
 
+/// Close the data root to every other account on the machine, on every boot.
+///
+/// Everything [`data_dir`] holds is private to the person running the app:
+/// `oximux.db` is every transcript of every project, `computer-use-grants.json`
+/// records which agent may drive this desktop, and the relay's token is a live
+/// credential. None of it was ever meant to be world-readable, but until this
+/// existed none of it was closed either — the directory was created with the
+/// process umask and left that way, so a default install published its
+/// transcripts to every other user on the machine.
+///
+/// Deliberately unconditional and deliberately early. The restriction used to
+/// happen only as a side effect of enabling local CLI access, which is
+/// default-off — so the exposed state was the *default* state, and the one
+/// install least likely to be hardened was the one that had turned nothing on.
+///
+/// Returns the error rather than logging it: the caller decides whether an
+/// unprotectable data directory is worth continuing past, and it is not this
+/// module's business to decide that quietly. `Ok(())` with nothing done when
+/// the platform has no data directory to resolve — there is no directory to
+/// protect, and failing here would block boot over a hypothetical.
+///
+/// `oximux serve` (headless) must make the same call on its own data root; it
+/// cannot reach this module, so it calls
+/// [`oximux_owner_only::prepare_owner_only_dir`] directly.
+pub fn harden_data_dir() -> std::io::Result<()> {
+    let Some(dir) = data_dir() else {
+        return Ok(());
+    };
+    oximux_owner_only::prepare_owner_only_dir(&dir)
+}
+
 /// Scratch space: downloaded updates, model archives mid-extraction. Anything
 /// here must be safe for the OS to delete between runs.
 pub fn cache_dir() -> Option<PathBuf> {
@@ -145,6 +176,53 @@ mod tests {
             Some(APP_DATA_SUBDIR),
             "settings, the database, and the relay's token all resolve from \
              this; a changed leaf silently orphans an existing install"
+        );
+    }
+
+    /// The CLI dials where the desktop binds: `remote-local` carries its own
+    /// copy of this path (the CLI cannot depend on the app), and a drift
+    /// between the two reads as "host unreachable" with both sides healthy.
+    #[test]
+    fn control_socket_convention_matches_the_data_dir() {
+        assert_eq!(data_dir(), oximux_remote_local::default_runtime_dir());
+    }
+
+    /// A cold start with local CLI access **disabled** still leaves the data
+    /// root closed to other accounts.
+    ///
+    /// This is the regression the whole change exists for. Hardening used to
+    /// ride along on `LocalControlListener::bind`, which only runs when local
+    /// access is enabled — default-off — so the shipped default was a
+    /// world-readable directory holding every transcript. The assertion that
+    /// matters is the one made *without* a listener anywhere in sight, which is
+    /// why this test starts no socket and touches no setting.
+    #[test]
+    fn a_cold_start_without_local_access_still_closes_the_data_root() {
+        let base = tempfile::tempdir().expect("tempdir");
+        // Stand in for the real data root: an existing directory left
+        // world-readable by an older build, holding the file that matters.
+        let dir = base.path().join(APP_DATA_SUBDIR);
+        std::fs::create_dir_all(&dir).expect("seed dir");
+        std::fs::write(dir.join("oximux.db"), b"transcripts").expect("seed db");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+                .expect("widen to the pre-fix state");
+        }
+
+        // Exactly what `harden_data_dir` does, against a directory a test may
+        // own — it resolves the real profile path, which a test must not touch.
+        oximux_owner_only::prepare_owner_only_dir(&dir).expect("harden");
+
+        assert!(
+            oximux_owner_only::is_dir_restricted_to_owner(&dir).expect("read back"),
+            "the data root must be owner-only with no listener ever bound"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("oximux.db")).expect("db survives"),
+            b"transcripts".to_vec(),
+            "hardening must not disturb existing state"
         );
     }
 

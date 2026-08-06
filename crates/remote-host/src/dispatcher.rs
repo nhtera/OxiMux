@@ -18,10 +18,16 @@ mod forge;
 mod git;
 mod handlers;
 mod handshake;
+mod heartbeats;
+mod pairing_admin;
 mod schedules;
 mod serve;
+mod state;
 mod stream;
+mod team;
 mod transcribe;
+mod transcript_page;
+mod worktree_rpcs;
 
 use std::sync::Arc;
 
@@ -31,7 +37,7 @@ use oximux_remote_proto::proto::{
     RpcError, is_compatible,
 };
 
-use crate::auth::{AppPubkey, AuthStore};
+use crate::auth::{AppPubkey, AuthStore, LocalScope, Peer};
 
 /// One connection's mutable state: what it has proven, and which protocol
 /// version it speaks.
@@ -59,6 +65,12 @@ enum ConnAuthn {
     PendingChallenge { app_pubkey: AppPubkey, nonce: [u8; 32] },
     /// Authenticated as this device.
     Authed { app_pubkey: AppPubkey },
+    /// A caller on the desktop's local socket, authenticated by the listener
+    /// against the local bearer token **before** this connection reached the
+    /// dispatcher. Enters only through [`Dispatcher::serve_local`] — no wire
+    /// request constructs it, which is what keeps local authority unreachable
+    /// from any remote transport.
+    LocalAuthed { scope: LocalScope },
 }
 
 /// Serves RPCs for connections, backed by one [`SessionRegistry`] + [`AuthStore`].
@@ -110,6 +122,45 @@ pub struct Dispatcher {
     /// That is a degradation rather than a refusal — the sessions it can see all
     /// work — so unlike `launcher` this has no `Unauthorized` answer.
     catalog: Option<Arc<dyn crate::catalog::SessionCatalog>>,
+    /// The host's worktree management, when it exposes one. `None` answers an
+    /// **authorized** full-scope caller with `Unsupported` — a host that cannot
+    /// manage worktrees should say so rather than masquerade as a refusal —
+    /// while an unauthorized or under-scoped caller still gets `Unauthorized`
+    /// first, so the capability is not probeable without the scope to use it.
+    worktrees: Option<Arc<dyn crate::worktrees::WorktreeService>>,
+    /// The endpoint id pairing tickets name, when this host has one bound. A
+    /// `PairNew` on a host with no endpoint answers `Unsupported` — a ticket
+    /// nobody can dial is not worth minting.
+    pairing_endpoint: Option<[u8; 32]>,
+    /// The host's manual-fire path, when this process owns the ticker.
+    /// `None` answers an **authorized** caller with `Unsupported` — on a
+    /// desktop+serve box only the ticker-lock holder can fire, and the loser
+    /// saying so beats it pretending.
+    schedule_runner: Option<Arc<dyn crate::schedule_runner::ScheduleRunner>>,
+    /// Recorded schedule runs, fanned out to session-list subscribers as
+    /// [`Response::ScheduleRunsChanged`] pushes. The channel is created by the
+    /// host and shared with its ticker's recorded-run hook; `None` simply
+    /// pushes nothing.
+    schedule_events: Option<tokio::sync::broadcast::Sender<
+        oximux_remote_proto::messages::ScheduleRunWire,
+    >>,
+    /// The host's team runs, when it keeps them. `None` answers an
+    /// **authorized** caller `Unsupported`, like `worktrees` — a host without
+    /// the table should say so rather than look like a refusal.
+    teams: Option<Arc<oximux_agents::team::TeamStore>>,
+    /// The coordination blackboard, when the host keeps one. Same
+    /// `Unsupported`-for-authorized shape as `teams`.
+    coord: Option<Arc<oximux_agents::coord::CoordStore>>,
+    /// Coordination writes, fanned out to `StateWatch` subscribers. The
+    /// dispatcher owns this one (unlike `schedule_events`, which the host's
+    /// ticker feeds) because every writer goes through these handlers.
+    state_events: Option<
+        tokio::sync::broadcast::Sender<oximux_remote_proto::messages::StateChangeWire>,
+    >,
+    /// Recent coordination changes, so a `StateWatchFrom` can replay a gap
+    /// instead of resyncing. Always present: it is a bounded in-memory ring, so
+    /// a host with no watchers pays a `VecDeque` for it and nothing else.
+    state_log: state::StateLog,
     /// Wall clock (Unix seconds), injectable so tests are deterministic.
     now_secs: fn() -> u64,
 }
@@ -126,6 +177,14 @@ impl Dispatcher {
             schedules: None,
             transcriber: None,
             catalog: None,
+            worktrees: None,
+            pairing_endpoint: None,
+            schedule_runner: None,
+            schedule_events: None,
+            teams: None,
+            coord: None,
+            state_events: None,
+            state_log: state::StateLog::default(),
             now_secs: system_now_secs,
         }
     }
@@ -179,6 +238,57 @@ impl Dispatcher {
         self
     }
 
+    /// Let this dispatcher manage the host's worktrees.
+    pub fn with_worktrees(
+        mut self,
+        worktrees: Arc<dyn crate::worktrees::WorktreeService>,
+    ) -> Self {
+        self.worktrees = Some(worktrees);
+        self
+    }
+
+    /// Name the endpoint pairing tickets dial, enabling `PairNew`.
+    pub fn with_pairing_endpoint(mut self, endpoint_id: [u8; 32]) -> Self {
+        self.pairing_endpoint = Some(endpoint_id);
+        self
+    }
+
+    /// Let this dispatcher fire schedules on demand — only the process that
+    /// owns the ticker lock installs one.
+    pub fn with_schedule_runner(
+        mut self,
+        runner: Arc<dyn crate::schedule_runner::ScheduleRunner>,
+    ) -> Self {
+        self.schedule_runner = Some(runner);
+        self
+    }
+
+    /// Fan recorded schedule runs out to session-list subscribers. The host
+    /// keeps the sender and feeds it from its ticker's recorded-run hook.
+    pub fn with_schedule_events(
+        mut self,
+        events: tokio::sync::broadcast::Sender<oximux_remote_proto::messages::ScheduleRunWire>,
+    ) -> Self {
+        self.schedule_events = Some(events);
+        self
+    }
+
+    /// Expose the host's team runs over this dispatcher.
+    pub fn with_team_store(mut self, teams: Arc<oximux_agents::team::TeamStore>) -> Self {
+        self.teams = Some(teams);
+        self
+    }
+
+    /// Expose the coordination blackboard, and open the channel its watchers
+    /// ride. Created here rather than passed in: every writer is a handler on
+    /// this dispatcher, so nothing outside it has a reason to hold the sender.
+    pub fn with_coord_store(mut self, coord: Arc<oximux_agents::coord::CoordStore>) -> Self {
+        self.coord = Some(coord);
+        let (tx, _) = tokio::sync::broadcast::channel(64);
+        self.state_events = Some(tx);
+        self
+    }
+
     /// Override the clock (tests).
     pub fn with_clock(mut self, now_secs: fn() -> u64) -> Self {
         self.now_secs = now_secs;
@@ -201,12 +311,24 @@ impl Dispatcher {
         match req {
             Request::Hello(h) => self.handle_hello(state, h),
             Request::Ping => Response::Pong,
+            // A local connection is already authenticated; letting the remote
+            // handshake run on it would overwrite `LocalAuthed` with whatever
+            // state the handshake reaches — a downgrade at best, and at worst a
+            // path for a local caller to smuggle itself into the paired-device
+            // world. Refused outright.
+            Request::Register(_) | Request::Connect(_) | Request::AuthProve(_)
+                if matches!(state.authn, ConnAuthn::LocalAuthed { .. }) =>
+            {
+                Response::Error(RpcError::BadRequest(
+                    "a local connection does not pair; it is already authenticated".into(),
+                ))
+            }
             Request::Register(r) => self.handle_register(&mut state.authn, r),
             Request::Connect(c) => self.handle_connect(&mut state.authn, c),
             Request::AuthProve(a) => self.handle_auth_prove(&mut state.authn, &a.signature),
-            // Everything below requires an authenticated, still-authorized device.
-            other => match authorized_pubkey(&state.authn, &self.auth) {
-                Some(pubkey) => self.handle_session_rpc(&pubkey, other),
+            // Everything below requires an authenticated, still-authorized caller.
+            other => match authorized_peer(&state.authn, &self.auth) {
+                Some(peer) => self.handle_session_rpc(&peer, other),
                 None => Response::Error(RpcError::Unauthorized),
             },
         }
@@ -214,41 +336,66 @@ impl Dispatcher {
 
     /// Route an authenticated request to its handler (in [`handlers`]). `Subscribe`
     /// never reaches here — the serve loop intercepts it to open the live stream.
-    fn handle_session_rpc(&self, pubkey: &AppPubkey, req: Request) -> Response {
+    fn handle_session_rpc(&self, peer: &Peer, req: Request) -> Response {
         match req {
-            Request::ListSessions => self.list_sessions(pubkey),
-            Request::GetSessionInfo { session_id } => self.session_info(pubkey, &session_id),
-            Request::FetchTranscript { session_id } => self.fetch_transcript(pubkey, &session_id),
-            Request::SendPrompt(r) => self.send_prompt(pubkey, r),
-            Request::ResolvePermission(r) => self.resolve_permission(pubkey, r),
-            Request::AnswerQuestion(r) => self.answer_question(pubkey, r),
-            Request::Steer { session_id, text } => {
-                self.scoped(pubkey, &session_id, |h| h.steer(&text))
+            Request::ListSessions => self.list_sessions(peer),
+            Request::GetSessionInfo { session_id } => self.session_info(peer, &session_id),
+            Request::FetchTranscript { session_id } => self.fetch_transcript(peer, &session_id),
+            Request::FetchTranscriptPage { session_id, cursor, limit } => {
+                self.fetch_transcript_page(peer, &session_id, cursor, limit)
             }
-            Request::Cancel { session_id } => self.scoped(pubkey, &session_id, |h| h.cancel()),
-            Request::ListChoices { session_id } => self.list_choices(pubkey, &session_id),
+            Request::SendPrompt(r) => self.send_prompt(peer, r),
+            Request::ResolvePermission(r) => self.resolve_permission(peer, r),
+            Request::AnswerQuestion(r) => self.answer_question(peer, r),
+            Request::Steer { session_id, text } => self.steer(peer, &session_id, &text),
+            Request::Cancel { session_id } => self.scoped(peer, &session_id, |h| h.cancel()),
+            Request::ListChoices { session_id } => self.list_choices(peer, &session_id),
             Request::EventsSince { session_id, after_seq } => {
-                self.events_since(pubkey, &session_id, after_seq)
+                self.events_since(peer, &session_id, after_seq)
             }
-            Request::ListSchedules => self.list_schedules(pubkey),
+            Request::ListSchedules => self.list_schedules(peer),
             Request::CreateSchedule { name, cwd, prompt, agent_id, recurrence } => {
-                self.create_schedule(pubkey, name, cwd, prompt, agent_id, recurrence)
+                self.create_schedule(peer, name, cwd, prompt, agent_id, recurrence)
             }
-            Request::DeleteSchedule { id } => self.delete_schedule(pubkey, &id),
+            Request::DeleteSchedule { id } => self.delete_schedule(peer, &id),
             Request::SetScheduleEnabled { id, enabled } => {
-                self.set_schedule_enabled(pubkey, &id, enabled)
+                self.set_schedule_enabled(peer, &id, enabled)
             }
             Request::GetScheduleRuns { schedule_id, limit } => {
-                self.schedule_runs(pubkey, &schedule_id, limit)
+                self.schedule_runs(peer, &schedule_id, limit)
             }
             // Un-enrolling itself. Gated on the authenticated connection alone: it
             // only ever narrows the caller's own access, so neither full scope nor
             // write access is the right thing to ask for — a session-scoped,
-            // read-only device may still stop being paired.
-            Request::Unpair => {
-                self.auth.forget_self(pubkey);
-                Response::Ack
+            // read-only device may still stop being paired. A local caller has no
+            // enrollment to drop; its lifetime is the desktop's toggle, so it is
+            // pointed there instead of being told a no-op succeeded.
+            Request::Unpair => match peer.remote_pubkey() {
+                Some(pubkey) => {
+                    self.auth.forget_self(pubkey);
+                    Response::Ack
+                }
+                None => Response::Error(RpcError::BadRequest(
+                    "a local connection is not paired; disable local CLI access in the desktop settings instead".into(),
+                )),
+            },
+            Request::PairNew { read_only } => self.pair_new(peer, read_only),
+            Request::PairList => self.pair_list(peer),
+            Request::PairRemove { pubkey } => self.pair_remove(peer, &pubkey),
+            // v18: the automation surface. `TeamRunCreate` is async (it starts
+            // sessions) and is intercepted in `serve`; the rest are store reads
+            // and writes, synchronous like the schedule verbs.
+            Request::CreateHeartbeat(r) => self.create_heartbeat(peer, r),
+            Request::ListHeartbeats { session_id } => {
+                self.list_heartbeats(peer, session_id.as_deref())
             }
+            Request::DeleteHeartbeat { id } => self.delete_heartbeat(peer, &id),
+            Request::TeamReport(r) => self.team_report(peer, r),
+            Request::TeamStatus { run_id } => self.team_status(peer, &run_id),
+            Request::TeamList => self.team_list(peer),
+            Request::StateGet { key } => self.state_get(peer, &key),
+            Request::StateSet(r) => self.state_set(peer, r),
+            Request::StateDelete { key } => self.state_delete(peer, &key),
             // Handshake variants (handled before auth) and `Subscribe` (intercepted
             // in `serve`) never reach here.
             _ => Response::Error(RpcError::BadRequest("unexpected request".into())),
@@ -256,12 +403,18 @@ impl Dispatcher {
     }
 }
 
-/// The device this connection is authenticated as, if it is still authorized.
+/// The caller this connection is authenticated as, if it is still authorized.
 /// Returns `None` for an unauthenticated OR revoked connection — the per-RPC (and
-/// per-live-frame) revocation gate. `pub(super)` so the serve loop shares it.
-fn authorized_pubkey(state: &ConnAuthn, auth: &AuthStore) -> Option<AppPubkey> {
+/// per-live-frame) revocation gate. A local connection was authenticated by the
+/// listener when it accepted the socket; its "revocation" is the desktop tearing
+/// the listener (and every open local connection) down when the toggle goes off.
+/// `pub(super)` so the serve loop shares it.
+fn authorized_peer(state: &ConnAuthn, auth: &AuthStore) -> Option<Peer> {
     match state {
-        ConnAuthn::Authed { app_pubkey } if auth.is_authorized(app_pubkey) => Some(*app_pubkey),
+        ConnAuthn::Authed { app_pubkey } if auth.is_authorized(app_pubkey) => {
+            Some(Peer::remote(*app_pubkey))
+        }
+        ConnAuthn::LocalAuthed { scope } => Some(Peer::local(scope.clone())),
         _ => None,
     }
 }

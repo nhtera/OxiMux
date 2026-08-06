@@ -1,0 +1,25 @@
+# The minisign public key that signs OxiMux release manifests.
+#
+# This is the self-update trust root. `oximux update` verifies
+# `manifest.json.minisig` against this key BEFORE it trusts any sha256 the
+# manifest carries — because the manifest and the artifacts come from the same
+# GitHub Release, a checksum alone proves only that the download matches what
+# the publisher said, which a compromised publish token defeats entirely.
+#
+# Three places must carry the same key, and `packaging_key_parity` (in
+# apps/cli/tests/update_e2e.rs) fails the build if they drift:
+#
+#   1. this file          — compiled into the binary by apps/cli/build.rs
+#   2. scripts/install-cli.sh
+#   3. scripts/install-cli.ps1
+#
+# Format: one line, the base64 body of a minisign `.pub` file (the second line
+# of what `minisign -G` writes — NOT the "untrusted comment:" header).
+#
+# Rotation, and what to do if the secret leaks: docs/release-signing.md.
+#
+# UNSET means no key has been minted yet: `oximux update` refuses to run at
+# all rather than falling back to checksum-only trust, and the release
+# workflow refuses to publish an unsigned manifest. Run
+# `scripts/gen-release-key.sh` once to mint the real pair.
+RWQ4owMUFazkg7fHezLB688BjTGDGJBBQ4EPLVbLDp8baal1VsMJ71FJ

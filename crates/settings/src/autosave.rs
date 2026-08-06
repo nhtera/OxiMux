@@ -9,6 +9,7 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "gpui")]
 use gpui::Global;
 
 /// Lower bound on the debounce — below this autosave starts to thrash on fast
@@ -50,6 +51,7 @@ impl AutosaveSettings {
     }
 }
 
+#[cfg(feature = "gpui")]
 impl Global for AutosaveSettings {}
 
 #[cfg(test)]

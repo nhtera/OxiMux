@@ -73,10 +73,18 @@ pub struct ConnectSpec {
     pub acp_command: Option<String>,
     /// argv appended after `acp_command` (only read by the `Acp` arm).
     pub acp_args: Vec<String>,
-    /// Extra environment overrides for the spawned ACP subprocess (only read by
-    /// the `Acp` arm). Carries the EnvVar-auth credentials the user typed, so a
-    /// respawned agent reads them at launch. Held only in-flight — never written
-    /// to the persisted chat blob. Empty for every non-EnvVar launch.
+    /// Extra environment overrides for the spawned agent, applied on top of the
+    /// inherited environment by **every** transport.
+    ///
+    /// Two producers today: the EnvVar-auth respawn puts the credentials the
+    /// user typed here so the relaunched agent reads them (ACP only, since that
+    /// is the only protocol with an EnvVar auth method), and a host that
+    /// confines its agents puts this child's local-control credential here.
+    /// The second is why this is no longer ACP-only — an agent's confinement
+    /// cannot depend on which adapter it happens to run under.
+    ///
+    /// Held only in-flight — never written to the persisted chat blob. Empty
+    /// for a launch that declares neither.
     pub env: Vec<(String, String)>,
     /// An auth method to `authenticate` once, automatically, right after an
     /// env-carrying respawn still reports `AuthRequired` — the "set env, then
@@ -121,6 +129,17 @@ pub struct ConnectSpec {
     /// Tool names to strip from the agent's surface (`--disallowedTools`).
     /// Claude-only for the same reason.
     pub disallowed_tools: Vec<String>,
+    /// An id the caller picked for this new session rather than waiting to be
+    /// told one (Claude's `--session-id`). `None` leaves the agent to name its
+    /// own, which is what every interactive launch does.
+    ///
+    /// Set by a headless host, which has no one to wait for — see
+    /// [`HostInjection::fresh_session_id`] for why waiting deadlocks. Read only
+    /// by the `StreamJson` arm; a transport that cannot be told an id ignores
+    /// this and announces its own as before.
+    ///
+    /// [`HostInjection::fresh_session_id`]: super::claude_stream_json::HostInjection::fresh_session_id
+    pub fresh_session_id: Option<String>,
 }
 
 impl ConnectSpec {
@@ -159,6 +178,7 @@ impl ConnectSpec {
             mcp_servers: Vec::new(),
             settings_json: None,
             disallowed_tools: Vec::new(),
+            fresh_session_id: None,
         }
     }
 }
@@ -180,7 +200,9 @@ pub fn connect(spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<
                     mcp_servers: &spec.mcp_servers,
                     settings: spec.settings_json.as_deref(),
                     disallowed_tools: &spec.disallowed_tools,
+                    fresh_session_id: spec.fresh_session_id.as_deref(),
                 },
+                &spec.env,
             )?;
             Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
@@ -195,6 +217,7 @@ pub fn connect(spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<
                 spec.resume_session_id.as_deref(),
                 spec.effort.as_deref(),
                 posture,
+                &spec.env,
             )?;
             Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
@@ -228,6 +251,7 @@ pub fn connect(spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<
                 spec.pi_command.as_deref(),
                 posture,
                 spec.resume_session_id.as_deref(),
+                &spec.env,
             )?;
             Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
@@ -309,6 +333,7 @@ mod tests {
             mcp_servers: vec![],
             settings_json: None,
             disallowed_tools: vec![],
+            fresh_session_id: None,
         };
         // Can't `expect_err` — the Ok payload (`Box<dyn AgentConnection>`) isn't
         // `Debug`; match instead.
@@ -342,6 +367,7 @@ mod tests {
             mcp_servers: vec![],
             settings_json: None,
             disallowed_tools: vec![],
+            fresh_session_id: None,
         };
         let err = probe_catalog(spec).expect_err("probe must fail without a command");
         assert!(err.to_string().contains("acp_command"), "unexpected error: {err}");

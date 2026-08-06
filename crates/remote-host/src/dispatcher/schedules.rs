@@ -16,21 +16,25 @@
 
 use chrono::{DateTime, Local, TimeZone};
 
-use oximux_agents::schedule::{
-    NewSchedule, Recurrence, RunOutcome, Schedule, ScheduleRun, describe,
-};
-use oximux_remote_proto::messages::{
-    RecurrenceWire, RunOutcomeWire, ScheduleRunWire, ScheduleWire,
-};
+use oximux_agents::schedule::{NewSchedule, Recurrence, Schedule, ScheduleRun, describe};
+use oximux_remote_proto::messages::{RecurrenceWire, ScheduleRunWire, ScheduleWire};
 use oximux_remote_proto::proto::{Response, RpcError};
 
 use super::Dispatcher;
-use crate::auth::AppPubkey;
+use crate::auth::Peer;
 
 impl Dispatcher {
-    /// Every schedule the desktop holds. A full-scope read; empty is normal.
-    pub(super) fn list_schedules(&self, pubkey: &AppPubkey) -> Response {
-        if !self.auth.may_read_schedules(pubkey) {
+    /// Every **spawning** schedule the desktop holds. A full-scope read; empty
+    /// is normal.
+    ///
+    /// Heartbeats share this table but are deliberately excluded. `ScheduleWire`
+    /// has no target field and cannot grow one (it rides inside a `Vec` in a
+    /// reply older clients already ask for, where postcard would misparse every
+    /// element after an appended field), so a heartbeat listed here would show
+    /// as an ordinary schedule offering edits — change the cwd, change the agent
+    /// — that mean nothing for a session already open. They have their own verb.
+    pub(super) fn list_schedules(&self, peer: &Peer) -> Response {
+        if !self.auth.may_read_schedules(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(store) = self.schedules.as_ref() else {
@@ -38,7 +42,7 @@ impl Dispatcher {
             // schedules is not something an unauthorized client should probe.
             return Response::Error(RpcError::Unauthorized);
         };
-        match store.list() {
+        match store.list_spawning() {
             Ok(rows) => Response::Schedules(rows.iter().map(to_wire).collect()),
             Err(e) => {
                 tracing::warn!(error = %e, "listing schedules failed");
@@ -55,14 +59,14 @@ impl Dispatcher {
     /// frame could, and the store must not be the last line of defence.
     pub(super) fn create_schedule(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         name: String,
         cwd: String,
         prompt: String,
         agent_id: Option<String>,
         recurrence: RecurrenceWire,
     ) -> Response {
-        if !self.auth.may_manage_schedules(pubkey) {
+        if !self.auth.may_manage_schedules(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(store) = self.schedules.as_ref() else {
@@ -87,8 +91,8 @@ impl Dispatcher {
     }
 
     /// Delete a schedule. Idempotent — deleting one already gone is success.
-    pub(super) fn delete_schedule(&self, pubkey: &AppPubkey, id: &str) -> Response {
-        if !self.auth.may_manage_schedules(pubkey) {
+    pub(super) fn delete_schedule(&self, peer: &Peer, id: &str) -> Response {
+        if !self.auth.may_manage_schedules(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(store) = self.schedules.as_ref() else {
@@ -106,16 +110,30 @@ impl Dispatcher {
     /// Enable or disable a schedule without deleting it.
     pub(super) fn set_schedule_enabled(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         id: &str,
         enabled: bool,
     ) -> Response {
-        if !self.auth.may_manage_schedules(pubkey) {
+        if !self.auth.may_manage_schedules(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(store) = self.schedules.as_ref() else {
             return Response::Error(RpcError::Unauthorized);
         };
+        // Resolve first. `set_enabled` is an UPDATE with no row check, so an id
+        // that matches nothing is a silent no-op it reports as success — and a
+        // caller told "paused" about a schedule that does not exist has been
+        // lied to. Deleting is idempotent on purpose (the goal state is reached
+        // either way); pausing has no such reading, so it refuses by name,
+        // exactly as `run_schedule_now` already does.
+        match store.get(id) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Response::Error(RpcError::BadRequest("no such schedule".into())),
+            Err(e) => {
+                tracing::warn!(error = %e, "resolving schedule before toggle failed");
+                return Response::Error(RpcError::Internal("could not update the schedule".into()));
+            }
+        }
         // Re-enabling recomputes the next fire from now, so a schedule paused for a
         // week does not wake up owing a week of missed runs — the store owns that
         // arithmetic, which is why `now` is passed rather than assumed.
@@ -128,14 +146,48 @@ impl Dispatcher {
         }
     }
 
+    /// Fire one schedule right now, without touching its cadence.
+    ///
+    /// Authorization first (the same write tier as creating a schedule — this
+    /// spawns a session), capability second: only the process holding the
+    /// ticker lock installs a runner, so on a desktop+serve box the loser
+    /// answers `Unsupported` to an *authorized* caller rather than racing the
+    /// owner. Refusals are `Error`s; a fire that ran and failed is a normal
+    /// [`Response::ScheduleRunRecorded`] whose run says what went wrong.
+    pub(super) async fn run_schedule_now(&self, peer: &Peer, schedule_id: &str) -> Response {
+        use crate::schedule_runner::RunNowError;
+
+        if !self.auth.may_manage_schedules(peer) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(runner) = self.schedule_runner.as_ref() else {
+            return Response::Error(RpcError::Unsupported);
+        };
+        match runner.run_now(schedule_id).await {
+            Ok(run) => Response::ScheduleRunRecorded(run),
+            Err(RunNowError::NoSuchSchedule) => {
+                Response::Error(RpcError::BadRequest("no such schedule".into()))
+            }
+            Err(RunNowError::AlreadyFiring) => {
+                Response::Error(RpcError::BadRequest("that schedule is already firing".into()))
+            }
+            Err(RunNowError::Unavailable) => Response::Error(RpcError::Internal(
+                "the host cannot start a session right now".into(),
+            )),
+            Err(RunNowError::Failed) => {
+                Response::Error(RpcError::Internal("could not record the run".into()))
+            }
+        }
+    }
+
     /// A schedule's recent run history, most recent first. A full-scope read.
     pub(super) fn schedule_runs(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         schedule_id: &str,
         limit: u32,
     ) -> Response {
-        if !self.auth.may_read_schedules(pubkey) {
+        if !self.auth.may_read_schedules(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
         let Some(store) = self.schedules.as_ref() else {
@@ -152,7 +204,8 @@ impl Dispatcher {
 
     /// The tick clock as a local datetime, derived from the injected `now_secs`
     /// so tests stay deterministic rather than reading the system clock here.
-    fn now_local(&self) -> DateTime<Local> {
+    /// Shared with the heartbeat and team handlers, which need the same clock.
+    pub(super) fn now_local(&self) -> DateTime<Local> {
         Local
             .timestamp_opt((self.now_secs)() as i64, 0)
             .single()
@@ -179,16 +232,7 @@ fn to_wire(s: &Schedule) -> ScheduleWire {
 }
 
 fn run_to_wire(r: &ScheduleRun) -> ScheduleRunWire {
-    ScheduleRunWire {
-        schedule_id: r.schedule_id.clone(),
-        fired_at: r.fired_at.to_rfc3339(),
-        outcome: match r.outcome {
-            RunOutcome::Ok => RunOutcomeWire::Ok,
-            RunOutcome::Failed => RunOutcomeWire::Failed,
-        },
-        session_id: r.session_id.clone(),
-        detail: r.detail.clone(),
-    }
+    crate::schedule_runner::schedule_run_to_wire(r)
 }
 
 fn recurrence_to_wire(r: &Recurrence) -> RecurrenceWire {

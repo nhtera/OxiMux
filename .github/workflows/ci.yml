@@ -85,6 +85,143 @@ jobs:
       - name: xtask icon --check
         run: cargo run -p xtask -- icon --check
 
+  # Linux leg of the portability gate, added ahead of the CLI/serve work: the
+  # crate set below is exactly what the `oximux` CLI and `oximux serve` reuse,
+  # and "Windows-CI-proven, therefore probably Linux-clean" is an assumption
+  # until a Linux runner says so. GPUI, dictation, computer-use, macos-trust,
+  # auto-update, editor and ui stay out on purpose — the CLI does not link
+  # them, and keeping them out is what lets this job run on a plain ubuntu
+  # image with no GUI system libraries.
+  linux-check:
+    name: linux cli-crate gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
+
+      # `oximux-settings` is deliberately missing from this list: with default
+      # features it links gpui, which is exactly what a headless consumer must
+      # not do. It gets its own gpui-free step below.
+      #
+      # `oximux-cli` IS here, and belongs here: this crate set existed to prove
+      # the CLI's dependencies build headless, but the binary on top of them was
+      # never itself compiled for Linux — so its own code (the self-update
+      # module, build.rs, the serve wiring) had no Linux gate at all until a
+      # release tried to build it. Discovering that at release time means a red
+      # release job; discovering it here means a red PR.
+      - name: cargo check (CLI crate set)
+        run: >
+          cargo check --all-targets
+          -p oximux-cli
+          -p oximux-core
+          -p oximux-pty
+          -p oximux-git
+          -p oximux-agent-core
+          -p oximux-agents
+          -p oximux-storage
+          -p oximux-relay-proto
+          -p oximux-relay
+          -p oximux-relay-client
+          -p oximux-relay-supervisor
+          -p oximux-relay-terminals
+          -p oximux-single-instance
+          -p oximux-remote-proto
+          -p oximux-remote-host
+          -p oximux-remote-session
+          -p oximux-remote-iroh
+          -p oximux-shell-env
+          -p oximux-owner-only
+          -p oximux-proc-cwd
+          -p oximux-job-object
+          -p oximux-no-window
+          -p oximux-remote-local
+          -p oximux-cli
+
+      # The step above already builds remote-iroh's accept-loop half: selected
+      # via `-p`, the crate's OWN `default = ["host"]` applies (the opt-in
+      # lives in the workspace dependency alias, which sets
+      # `default-features = false`). What that step never builds is the
+      # client-only shape — the one the mobile core consumes today and the
+      # CLI's remote client will — so that is the variant checked here.
+      # `--lib`, not `--all-targets`: the integration tests under tests/
+      # exercise the accept loop and only compile with `host` on.
+      - name: cargo check (remote-iroh client half, host off)
+        run: cargo check --lib -p oximux-remote-iroh --no-default-features
+
+      # The build the CLI will actually use: settings with the UI toolkit
+      # absent from the dependency tree entirely.
+      - name: cargo check (settings without gpui)
+        run: cargo check --all-targets -p oximux-settings --no-default-features
+
+      # Separate test steps, not one `-p a -p b --test t` invocation: cargo
+      # applies `--test` across every `-p` given and silently skips a package
+      # without that target, so proc-cwd's unit tests would never run.
+      - name: cargo test (proc-cwd Linux arm)
+        run: cargo test -p oximux-proc-cwd
+
+      # The only end-to-end coverage of PTY spawn/attach/replay on Linux —
+      # same rationale as the Windows job's step of the same name.
+      - name: cargo test (relay daemon end-to-end)
+        run: cargo test -p oximux-relay --test relay_integration
+
+      # The CLI's trust factors are filesystem facts (0700 dir, 0600 socket
+      # and token, readback-asserted), so the only Linux that ever checks
+      # them is this runner. The CLI E2E drives the compiled binary against
+      # a live dispatcher over a real socket — exit codes are the contract.
+      - name: cargo test (local control socket)
+        run: cargo test -p oximux-remote-local
+
+      # Covers every suite under apps/cli/tests, including the four that boot a
+      # real `serve` and spawn a real agent through a `claude` shim on PATH
+      # (agent_spawn / recovery / security / serve). Those are the only tests
+      # anywhere that cross a process boundary into a spawned agent, which is
+      # where the confinement credential and the inherited-environment scrub
+      # are the only observable.
+      - name: cargo test (oximux CLI end-to-end)
+        run: cargo test -p oximux-cli
+
+      # `docs/cli-reference.md` is generated from the CLI's own clap tree, so it
+      # can only be wrong by being stale. Regenerating and diffing is what makes
+      # "committed" mean "current" — without this the file is a snapshot of
+      # whenever someone last remembered, which is worse than no reference at
+      # all, since a reader cannot tell which half to trust.
+      #
+      # Linux only, deliberately: the document has no platform-specific content,
+      # so running it three times would only add two ways for the same check to
+      # flake.
+      - name: docs/cli-reference.md is not stale
+        run: |
+          ./scripts/gen-cli-docs.sh > /tmp/cli-reference.md
+          if ! diff -u docs/cli-reference.md /tmp/cli-reference.md; then
+            echo
+            echo "docs/cli-reference.md no longer matches the CLI's command tree."
+            echo "Regenerate it:  ./scripts/gen-cli-docs.sh > docs/cli-reference.md"
+            exit 1
+          fi
+
+      # The serve binary's dependency hygiene, as a hard gate: the CLI must
+      # never link the GUI toolkit or the desktop-only capability stacks. A
+      # `cargo tree` scan rather than a compile failure because these leak in
+      # transitively — a compile would happily succeed with gpui in tree.
+      - name: cli dependency-tree gate (no gpui / dictation / computer-use)
+        run: |
+          cargo tree -p oximux-cli -e normal > /tmp/cli-tree.txt
+          if grep -E '(^| )(gpui|gpui_platform|oximux-dictation|oximux-computer-use|oximux-ui|oximux-editor)( |$)' /tmp/cli-tree.txt; then
+            echo "forbidden dependency in the oximux-cli tree (see matches above)"
+            exit 1
+          fi
+
   # Permanent gate for the Windows port. macOS is still the only shipping
   # target; this job stops a macOS-only API from landing on a shared path
   # unnoticed, which is exactly the class of breakage that made the port
@@ -108,19 +245,74 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The Windows bootstrap installer is PowerShell, so this is the only job
+      # that can tell whether it even parses — and it is the one script no
+      # developer on macOS or Linux can run before shipping it. A parse error
+      # here would first surface to a user running the published one-liner.
+      #
+      # Parse-only: the script downloads a release and writes to PATH, so
+      # executing it is not something CI should do.
+      - name: Parse-check the Windows installer
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/install-cli.ps1), [ref]$null, [ref]$errors) | Out-Null
+          if ($errors -and $errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host "$($_.Extent.StartLineNumber): $($_.Message)" }
+            throw "scripts/install-cli.ps1 has $($errors.Count) parse error(s)"
+          }
+          Write-Host 'scripts/install-cli.ps1 parses'
+
       - name: Install Rust toolchain
         run: |
           rustup show
           rustup target add x86_64-pc-windows-msvc
 
+      # Same one-entry rule as the macOS job, and for the same reason — this
+      # job was left out of that fix and hit it: `cargs.lib` (a sherpa-onnx
+      # prebuilt) went missing on a restored cache and the desktop suite died
+      # at link time with `LNK1181: cannot open input file`, which reads as a
+      # broken dependency rather than as a download that never happened.
+      # sherpa-rs-sys puts the Windows libraries under %LOCALAPPDATA%, outside
+      # `target`, and bakes that path into its build-script output; caching
+      # `target` alone restores the fingerprint without the files it names.
+      #
+      # Key bumped to v2 so entries saved under the old layout cannot satisfy
+      # the new one.
       - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/AppData/Local/sherpa-rs
             target
-          key: ${{ runner.os }}-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+
+      # The macOS counterpart of this step, transposed: any cache that comes
+      # back with the build-script output but without the libraries would link
+      # against a path that is not there, so drop the output and let cargo
+      # re-run the build script that downloads them.
+      #
+      # Must never be the step that fails the build — every lookup tolerates a
+      # missing directory and the step exits 0 regardless.
+      - name: Ensure the dictation libraries are present
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $prebuilts = Join-Path $env:LOCALAPPDATA 'sherpa-rs'
+          $lib = Get-ChildItem -Path $prebuilts -Recurse -Filter 'cargs.lib' `
+              -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($lib) {
+            Write-Host "sherpa-onnx prebuilts present: $($lib.FullName)"
+          } else {
+            Write-Host "sherpa-onnx prebuilts absent - forcing sherpa-rs-sys to re-run"
+            Get-ChildItem -Path target -Recurse -Directory -Filter 'sherpa-rs-sys-*' `
+                -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          exit 0
 
       # `macos-trust` is macOS-shaped by construction: it wraps codesign and
       # spctl. Note what the exclusion does and does not buy. Its library is
@@ -153,6 +345,9 @@ jobs:
       # OSC 7 drive-letter handling, and settings covers the screen-control
       # opt-in's path matching — where "absolute" and "the same directory under
       # another name" both mean something different than they do on Unix.
+      # remote-local earns its place now that preparing the runtime directory
+      # stamps an inheritable DACL there instead of being a Unix-only chmod: the
+      # workspace check compiles that arm, and only this step runs it.
       #
       # Kept as separate steps rather than one combined invocation: cargo
       # applies `--lib`/`--test` across every `-p` given and silently skips a
@@ -166,6 +361,7 @@ jobs:
           -p oximux-shell-env
           -p oximux-pty
           -p oximux-settings
+          -p oximux-remote-local
 
       # The desktop crate's unit suite passes in full on Windows as of the
       # single-instance fix and the fixture ports alongside it, so it graduates
@@ -223,6 +419,17 @@ jobs:
 
       - name: cargo test (relay checkpoint lifecycle)
         run: cargo test --target x86_64-pc-windows-msvc -p oximux-relay --test checkpoint_lifecycle
+
+      # Windows is a full-parity CLI target, and the named pipe carries an
+      # explicit owner-only DACL instead of directory permissions — a claim
+      # only a real windows-msvc host can verify. The `--lib` sweep below
+      # reaches the unit tests; these two reach the integration suites under
+      # tests/, which it cannot.
+      - name: cargo test (local control socket)
+        run: cargo test --target x86_64-pc-windows-msvc -p oximux-remote-local
+
+      - name: cargo test (oximux CLI end-to-end)
+        run: cargo test --target x86_64-pc-windows-msvc -p oximux-cli
 
       # Blocking as of the port of the last macOS-shaped fixtures: this was the
       # informational sweep, kept non-blocking to produce the list of what

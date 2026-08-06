@@ -9,6 +9,7 @@
 //! "what's new" notice, then rewrites it. Empty means first run ever — which
 //! shows nothing, because there is no upgrade to announce.
 
+#[cfg(feature = "gpui")]
 use gpui::Global;
 use serde::{Deserialize, Serialize};
 
@@ -52,6 +53,7 @@ impl AutoUpdateSettings {
     }
 }
 
+#[cfg(feature = "gpui")]
 impl Global for AutoUpdateSettings {}
 
 #[cfg(test)]

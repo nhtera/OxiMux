@@ -41,9 +41,21 @@ const RESERVED: &[(&str, &str)] = &[
 const OWNER: &str = "apps/desktop/src/app_paths.rs";
 
 /// Repo-relative paths of files that may still name them, with a reason.
-/// Empty, and meant to stay that way — a new entry needs an argument for why
+/// Short, and meant to stay that way — a new entry needs an argument for why
 /// this particular file gets to decide a location for itself.
-const ALLOW: &[(&str, &str)] = &[];
+// The one exception, and why it is not the thing this lint exists to stop: the
+// control socket's location has to be known by BOTH the desktop that binds it
+// and the `oximux` CLI that dials it, and the CLI cannot depend on
+// apps/desktop. `remote-local` is the naming contract those two share, so it is
+// the only place the path can be stated for both. It is not a module choosing a
+// location for itself — it is the second half of `app_paths`' choice, and
+// `app_paths`' own `control_socket_convention_matches_the_data_dir` test fails
+// the moment the two disagree. A drift here is caught; it is just caught by a
+// test rather than by this lint.
+const ALLOW: &[(&str, &str)] = &[(
+    "crates/remote-local/src/lib.rs",
+    "the CLI/desktop naming contract; agreement with app_paths is asserted by test",
+)];
 
 pub fn run(sources: &[PathBuf], root: &Path) -> Result<(), Box<dyn Error>> {
     let mut hits: Vec<String> = Vec::new();

@@ -12,3 +12,8 @@ path = "src/lib.rs"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# The spawn-a-child test needs a directory that exists, is disposable, and
+# is not the test runner's own cwd.
+tempfile = { workspace = true }

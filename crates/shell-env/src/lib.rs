@@ -322,3 +322,51 @@ pub mod test_support {
         }
     }
 }
+
+/// Variables Claude Code stamps on child processes to mark them as part of a
+/// running session — identity-of-launch only, never user configuration, so
+/// dropping them cannot lose a setting the user chose.
+///
+/// One list, three consumers (the desktop app, the relay daemon, and
+/// `oximux serve`): each is a process that spawns agent CLIs and terminals,
+/// and an inherited `CLAUDE_CODE_CHILD_SESSION` makes a spawned `claude`
+/// treat itself as a nested child and switch transcript saving off — the
+/// exact history the hosts exist to keep.
+pub const CLAUDE_SESSION_MARKERS: [&str; 12] = [
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDECODE",
+    "CLAUDE_CODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_PARENT_SESSION_ID",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID",
+    "CLAUDE_CODE_HOST_SESSION_ID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_AGENT_SDK_VERSION",
+    // An inherited "already sandboxed" claim makes `claude` skip its folder
+    // trust prompt — a security gate, not just bookkeeping.
+    "CLAUDE_CODE_SANDBOXED",
+];
+
+/// Remove inherited Claude Code session markers from this process, returning
+/// the names that were actually present (for the caller to log with its own
+/// subscriber — this crate stays logging-free).
+///
+/// # Safety contract (why this is not `unsafe fn`)
+///
+/// Call from the top of `main`, **before any thread exists**: `remove_var` is
+/// only unsound when it races a concurrent environment read, and at that
+/// point in a process's life there is nothing to race.
+pub fn scrub_inherited_claude_session_markers() -> Vec<&'static str> {
+    let mut dropped = Vec::new();
+    for name in CLAUDE_SESSION_MARKERS {
+        if std::env::var_os(name).is_none() {
+            continue;
+        }
+        // SAFETY: single-threaded by the documented contract above.
+        unsafe { std::env::remove_var(name) };
+        dropped.push(name);
+    }
+    dropped
+}

@@ -99,9 +99,9 @@ export function ScheduleFormSheet({
 
       {/* The load-bearing disclaimer — see the component doc. */}
       <ThemedText type="small" style={styles.warning}>
-        Runs only while the desktop app is open. OxiMux can keep the Mac awake,
-        but it cannot wake a sleeping Mac or reopen a quit app, so a run scheduled
-        for a time the app was closed will not happen.
+        Runs only while an OxiMux host is running — the desktop app or a
+        server. OxiMux cannot wake a sleeping machine or relaunch a quit host,
+        so a run scheduled for a time no host was up will not happen.
       </ThemedText>
 
       {error ? <ErrorBanner message={error} /> : null}

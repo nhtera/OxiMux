@@ -20,20 +20,22 @@ pub mod identity;
 pub mod launcher;
 pub mod projects;
 pub mod rewind;
+pub mod schedule_runner;
 pub mod terminals;
 pub mod transcribe;
 pub mod transcript_budget;
+pub mod worktrees;
 
 pub use auth::{
-    AppPubkey, AuthStore, DeviceInfo, DeviceStore, PairedDevice, PairingEvent, PairingSlot,
-    StorageDeviceStore,
-    StoredDevice,
-    mint_pairing_secret, registration_proof,
+    AppPubkey, AuthStore, DeviceInfo, DeviceStore, LocalScope, PairedDevice, PairingEvent,
+    PairingSlot, StorageDeviceStore, StoredDevice, mint_pairing_secret, registration_proof,
 };
 pub use dispatcher::Dispatcher;
 pub use identity::HostIdentity;
 pub use launcher::{LaunchError, SessionLauncher};
 pub use projects::ProjectProvider;
 pub use rewind::{RewindError, RewindService};
+pub use schedule_runner::{RunNowError, ScheduleRunner, TickerRunner, schedule_run_to_wire};
 pub use terminals::{TerminalAttach, TerminalError, TerminalFrame, TerminalSource};
 pub use transcribe::{AudioTranscriber, TranscribeError};
+pub use worktrees::{WorktreeError, WorktreeService};

@@ -10,6 +10,7 @@
 //! so applies to newly-opened panes (resizing a live grid's history is left
 //! to a future pass).
 
+#[cfg(feature = "gpui")]
 use gpui::Global;
 use serde::{Deserialize, Serialize};
 
@@ -103,6 +104,7 @@ impl Default for TerminalSettings {
     }
 }
 
+#[cfg(feature = "gpui")]
 impl Global for TerminalSettings {}
 
 impl TerminalSettings {

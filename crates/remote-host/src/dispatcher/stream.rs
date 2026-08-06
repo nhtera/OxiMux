@@ -23,7 +23,7 @@ use oximux_remote_proto::{HostEvent, Transport};
 use tokio::sync::{broadcast, watch};
 
 use super::Dispatcher;
-use crate::auth::AppPubkey;
+use crate::auth::Peer;
 
 /// One live event as it leaves the merged subscription stream, tagged with the
 /// session it belongs to (the merge erases which stream produced it).
@@ -50,6 +50,23 @@ pub(super) enum Live {
     /// events. Low-frequency and coalesced by the registry's generation counter, so
     /// it never floods the merge the way a full-screen terminal repaint would.
     SessionList,
+    /// A schedule run was recorded (scheduled or manual, success or failure).
+    /// Carries the run itself: unlike [`Live::SessionList`] there is no cheap
+    /// snapshot to recompute at forward time, and the payload is one small row.
+    /// Forwarded as [`Response::ScheduleRunsChanged`] behind a per-frame
+    /// `may_read_schedules` recheck.
+    ScheduleRun(oximux_remote_proto::messages::ScheduleRunWire),
+    /// A coordination key was written or deleted (`None` is a delete). Carries
+    /// the entry for the same reason [`Live::ScheduleRun`] does — there is no
+    /// cheap snapshot to recompute, and it is one small row. Prefix filtering
+    /// happens in the stream, not at forward time, because the prefix belongs
+    /// to *this* subscription rather than to the peer.
+    /// `with_cursor` is a property of THIS subscription, not of the peer: one
+    /// connection may hold a v18 `StateWatch` and a v19 `StateWatchFrom` at
+    /// once, and a peer-level flag has no way to tell them apart. Sending the
+    /// cursor-bearing ordinal to the cursor-less watcher would drop its whole
+    /// connection, since it has no decoder for it.
+    StateChange { change: oximux_remote_proto::messages::StateChangeWire, with_cursor: bool },
 }
 
 /// Turn a session's broadcast receiver into a `'static` stream of [`LiveFrame`]s.
@@ -131,6 +148,55 @@ fn sessions_stream(rx: watch::Receiver<u64>) -> BoxStream<'static, Live> {
     .boxed()
 }
 
+/// Turn a recorded-runs broadcast receiver into a `'static` stream of
+/// [`Live::ScheduleRun`]s. Lag skips the dropped runs rather than ending —
+/// they are still in run history, and `schedule logs` is the resync path. The
+/// stream ends when the host drops the sender.
+fn schedule_runs_stream(
+    rx: broadcast::Receiver<oximux_remote_proto::messages::ScheduleRunWire>,
+) -> BoxStream<'static, Live> {
+    stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(run) => return Some((Live::ScheduleRun(run), rx)),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
+    .boxed()
+}
+
+/// One `StateWatch`'s change stream, narrowed to its prefix.
+///
+/// Lag **skips** the dropped writes rather than ending, like the run stream —
+/// but the consequence differs and is worth naming: a watcher that lagged has a
+/// stale view of the keys it missed, and its recovery is a `StateGet` (or a
+/// re-`StateWatch`), not the transcript-style resync a session stream gets. The
+/// versioned write path is what makes that safe: a caller acting on a stale
+/// value loses its conditional write rather than clobbering.
+fn state_changes_stream(
+    rx: broadcast::Receiver<oximux_remote_proto::messages::StateChangeWire>,
+    prefix: Option<String>,
+    with_cursor: bool,
+) -> BoxStream<'static, Live> {
+    stream::unfold((rx, prefix), move |(mut rx, prefix)| async move {
+        loop {
+            match rx.recv().await {
+                Ok(change) => {
+                    if prefix.as_ref().is_some_and(|p| !change.key.starts_with(p.as_str())) {
+                        continue;
+                    }
+                    return Some((Live::StateChange { change, with_cursor }, (rx, prefix)));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    })
+    .boxed()
+}
+
 /// Encode the retained backlog after `after_seq` into wire frames, returning the
 /// frames and the highest `seq` seen (the initial dedup cursor). `Err(())` on an
 /// encode failure. Each frame carries the session's current coarse status.
@@ -168,12 +234,12 @@ impl Dispatcher {
     /// Returns the immediate response and, only on the first subscribe, the stream.
     pub(super) fn begin_subscribe(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         session_id: &str,
         after_seq: u64,
         cursors: &mut HashMap<SessionId, Seq>,
     ) -> (Response, Option<BoxStream<'static, LiveFrame>>) {
-        if !self.auth.is_allowed_for(pubkey, session_id) {
+        if !self.auth.is_allowed_for(peer, session_id) {
             return (Response::Error(RpcError::Unauthorized), None);
         }
         let Some(handle) = self.registry.get(session_id) else {
@@ -238,14 +304,14 @@ impl Dispatcher {
     /// transport is still writable (`false` → the serve loop should stop).
     pub(super) async fn forward_live(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         cursors: &mut HashMap<SessionId, Seq>,
         transport: &dyn Transport,
         frame: LiveFrame,
     ) -> bool {
         // Revocation / scope bites the live stream too: suppress silently but keep
         // the connection open (other sessions may still be permitted).
-        if !self.auth.is_allowed_for(pubkey, &frame.session_id) {
+        if !self.auth.is_allowed_for(peer, &frame.session_id) {
             return true;
         }
         // Never re-send a `seq` already covered by the backlog batch (or an
@@ -282,18 +348,18 @@ impl Dispatcher {
     /// life and double every push.
     pub(super) fn begin_subscribe_sessions(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         already: &mut bool,
     ) -> (Response, Option<BoxStream<'static, Live>>) {
         if *already {
-            return (Response::Sessions(self.snapshot_sessions(pubkey)), None);
+            return (Response::Sessions(self.snapshot_sessions(peer)), None);
         }
         // Receiver before snapshot so a change landing in the gap fires a tick
         // rather than being missed — an extra identical push is harmless. The
         // immediate reply is a plain `Sessions` (routed to the client's RPC slot);
         // only the later change pushes are `SessionsChanged`.
         let rx = self.registry.subscribe_changes();
-        let snapshot = self.snapshot_sessions(pubkey);
+        let snapshot = self.snapshot_sessions(peer);
         *already = true;
         (Response::Sessions(snapshot), Some(sessions_stream(rx)))
     }
@@ -301,11 +367,80 @@ impl Dispatcher {
     /// Push the current session list, recomputed per change so the per-device scope
     /// filter is honoured on every push — mirroring `forward_live`'s per-frame
     /// recheck. Returns whether the transport is still writable.
-    pub(super) async fn forward_sessions(&self, pubkey: &AppPubkey, transport: &dyn Transport) -> bool {
-        let snapshot = self.snapshot_sessions(pubkey);
+    pub(super) async fn forward_sessions(&self, peer: &Peer, transport: &dyn Transport) -> bool {
+        let snapshot = self.snapshot_sessions(peer);
         transport
             .send(
                 Response::SessionsChanged(snapshot)
+                    .to_bytes()
+                    .expect("response is always encodable"),
+            )
+            .await
+            .is_ok()
+    }
+
+    /// The recorded-runs push stream for one connection, when this host has a
+    /// schedule-events channel at all. The caller gates on the peer's declared
+    /// protocol version — an older peer cannot decode the push frame.
+    pub(super) fn schedule_runs_push_stream(&self) -> Option<BoxStream<'static, Live>> {
+        Some(schedule_runs_stream(self.schedule_events.as_ref()?.subscribe()))
+    }
+
+    /// The coordination-change push stream for one `StateWatch`, narrowed to
+    /// its own prefix. Filtered here rather than at forward time because two
+    /// watches on one connection may hold different prefixes — a peer-level
+    /// check has nothing to filter against.
+    pub(super) fn state_push_stream(
+        &self,
+        prefix: Option<String>,
+        with_cursor: bool,
+    ) -> Option<BoxStream<'static, Live>> {
+        Some(state_changes_stream(self.state_events.as_ref()?.subscribe(), prefix, with_cursor))
+    }
+
+    /// Push one coordination change, behind the same per-frame authorization
+    /// recheck every live surface applies. Returns whether the transport is
+    /// still writable.
+    pub(super) async fn forward_state_change(
+        &self,
+        peer: &Peer,
+        transport: &dyn Transport,
+        change: oximux_remote_proto::messages::StateChangeWire,
+        with_cursor: bool,
+    ) -> bool {
+        if !self.auth.may_read_state(peer) {
+            return true;
+        }
+        // The cursor-less shape is not a legacy path to be migrated off: a v18
+        // watcher subscribed with `StateWatch` and has a decoder for exactly
+        // one of these two ordinals.
+        let response = if with_cursor {
+            Response::StateChangedAt(change)
+        } else {
+            Response::StateChanged { key: change.key, entry: change.entry }
+        };
+        transport
+            .send(response.to_bytes().expect("response is always encodable"))
+            .await
+            .is_ok()
+    }
+
+    /// Push one recorded run, behind the same per-frame authorization recheck
+    /// every live surface applies: a device that may not read schedules gets
+    /// silence, not a filtered-out error. Returns whether the transport is
+    /// still writable.
+    pub(super) async fn forward_schedule_run(
+        &self,
+        peer: &Peer,
+        transport: &dyn Transport,
+        run: oximux_remote_proto::messages::ScheduleRunWire,
+    ) -> bool {
+        if !self.auth.may_read_schedules(peer) {
+            return true;
+        }
+        transport
+            .send(
+                Response::ScheduleRunsChanged(run)
                     .to_bytes()
                     .expect("response is always encodable"),
             )
@@ -316,12 +451,16 @@ impl Dispatcher {
 
 impl Dispatcher {
     /// List the terminals this device may see.
-    pub(super) async fn list_terminals(&self, pubkey: &AppPubkey) -> Response {
-        if !self.auth.may_use_terminals(pubkey) {
+    pub(super) async fn list_terminals(&self, peer: &Peer) -> Response {
+        if !self.auth.may_use_terminals(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
+        // No terminal source wired is a CAPABILITY fact, not an access one: a
+        // headless host without a relay serves everything except terminals, and
+        // that is documented as normal. Reporting it as `Unauthorized` sent
+        // operators hunting for a credential problem that does not exist.
         let Some(source) = &self.terminals else {
-            return Response::Error(RpcError::Unauthorized);
+            return Response::Error(RpcError::Unsupported);
         };
         match source.list().await {
             Ok(rows) => Response::Terminals(rows),
@@ -342,15 +481,16 @@ impl Dispatcher {
     /// repeatable rather than something a client is punished for.
     pub(super) async fn begin_term_attach(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         pty_id: &str,
         attached: &mut HashMap<String, tokio::sync::oneshot::Sender<()>>,
     ) -> (Response, Option<BoxStream<'static, Live>>) {
-        if !self.auth.may_use_terminals(pubkey) {
+        if !self.auth.may_use_terminals(peer) {
             return (Response::Error(RpcError::Unauthorized), None);
         }
+        // Capability, not access — see `list_terminals`.
         let Some(source) = &self.terminals else {
-            return (Response::Error(RpcError::Unauthorized), None);
+            return (Response::Error(RpcError::Unsupported), None);
         };
         let (attach, rx) = match source.attach(pty_id).await {
             Ok(v) => v,
@@ -379,12 +519,13 @@ impl Dispatcher {
 
     /// Type into a terminal. The gate here is the write tier, not merely
     /// terminal visibility — this is arbitrary code execution on the desktop.
-    pub(super) async fn term_input(&self, pubkey: &AppPubkey, pty_id: &str, bytes: &[u8]) -> Response {
-        if !self.auth.may_drive_terminals(pubkey) {
+    pub(super) async fn term_input(&self, peer: &Peer, pty_id: &str, bytes: &[u8]) -> Response {
+        if !self.auth.may_drive_terminals(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
+        // Capability, not access — see `list_terminals`.
         let Some(source) = &self.terminals else {
-            return Response::Error(RpcError::Unauthorized);
+            return Response::Error(RpcError::Unsupported);
         };
         match source.input(pty_id, bytes).await {
             Ok(()) => Response::Ack,
@@ -402,16 +543,17 @@ impl Dispatcher {
     /// other attachment including the desktop's own window.
     pub(super) async fn term_resize(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         pty_id: &str,
         cols: u16,
         rows: u16,
     ) -> Response {
-        if !self.auth.may_drive_terminals(pubkey) {
+        if !self.auth.may_drive_terminals(peer) {
             return Response::Error(RpcError::Unauthorized);
         }
+        // Capability, not access — see `list_terminals`.
         let Some(source) = &self.terminals else {
-            return Response::Error(RpcError::Unauthorized);
+            return Response::Error(RpcError::Unsupported);
         };
         // A zero dimension is nonsense a PTY layer may accept and then divide by.
         // Rejected here rather than clamped: a client asking for a 0-column grid
@@ -466,7 +608,7 @@ fn term_stream(
 /// Forward one terminal frame. Returns whether the transport is still writable.
 pub(super) async fn forward_terminal(
     auth: &crate::auth::AuthStore,
-    pubkey: &AppPubkey,
+    peer: &Peer,
     transport: &dyn Transport,
     pty_id: String,
     frame: crate::terminals::TerminalFrame,
@@ -474,7 +616,7 @@ pub(super) async fn forward_terminal(
     // Per-frame recheck, matching the session path: a device revoked or
     // downgraded mid-stream stops seeing a terminal it was already watching.
     // Read access is the right gate here — this direction never types.
-    if !auth.may_use_terminals(pubkey) {
+    if !auth.may_use_terminals(peer) {
         return true;
     }
     let response = match frame {

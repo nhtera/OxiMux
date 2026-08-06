@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(feature = "gpui")]
 use gpui::Global;
 use serde::{Deserialize, Serialize};
 
@@ -258,6 +259,7 @@ impl Default for AgentLaunchSettings {
     }
 }
 
+#[cfg(feature = "gpui")]
 impl Global for AgentLaunchSettings {}
 
 impl AgentLaunchSettings {

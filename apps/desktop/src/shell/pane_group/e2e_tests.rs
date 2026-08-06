@@ -15,6 +15,15 @@
 //! because `spawn_local_pty` falls through to it when the relay shared
 //! backend is not installed. Keeping the tab count small (≤ 3 shells) caps
 //! CI resource use.
+//!
+//! Which is why every `open_terminal_tab` call here asserts its return value.
+//! It is an `Option`, `None` when the PTY spawn failed, and a spawn can fail on
+//! a loaded machine for reasons that have nothing to do with the code under
+//! test. Discarding it does not make the test pass — it makes the test fail
+//! somewhere else, several assertions later, as a tab that is simply absent.
+//! That cost real diagnosis time once: a CI run reported
+//! `["Terminal 1"] != ["Terminal 1", "Terminal 2"]` from a restore-ordering
+//! assertion, which reads as a reordering bug and was a failed spawn.
 
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool};
@@ -71,13 +80,10 @@ async fn open_terminal_tab_increments_tab_count(cx: &mut TestAppContext) {
 
     // Open one terminal tab. spawn_local_pty falls back to PortablePtyBackend
     // since install_shared_backend is not called in tests.
-    let spawned = window
+    window
         .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
-        .expect("window update ok");
-    assert!(
-        spawned.is_some(),
-        "open_terminal_tab must succeed (PTY fallback)"
-    );
+        .expect("window update ok")
+        .expect("open_terminal_tab must succeed (PTY fallback)");
 
     cx.run_until_parked();
 
@@ -105,7 +111,8 @@ async fn add_tab_to_leaf_grows_leaf_tab_count(cx: &mut TestAppContext) {
     // Open first group tab (creates one terminal leaf with 1 per-pane tab).
     window
         .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
-        .expect("window update ok");
+        .expect("window update ok")
+        .expect("PTY spawn must succeed, or the tab this test needs is missing");
     cx.run_until_parked();
 
     // Add a second per-pane tab to leaf 0.
@@ -143,7 +150,8 @@ async fn close_tab_cascade_closes_per_pane_tab_before_group_tab(cx: &mut TestApp
     // Build the state: one group tab, leaf 0 has 2 per-pane tabs.
     window
         .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
-        .expect("window update ok");
+        .expect("window update ok")
+        .expect("PTY spawn must succeed, or the tab this test needs is missing");
     cx.run_until_parked();
     window
         .update(cx, |group, win, cx| group.add_tab_to_leaf(0, win, cx))
@@ -220,7 +228,8 @@ async fn clean_exit_auto_closes_lone_terminal_tab(cx: &mut TestAppContext) {
     let (window, _dir) = make_group(cx);
     window
         .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
-        .expect("window update ok");
+        .expect("window update ok")
+        .expect("PTY spawn must succeed, or the tab this test needs is missing");
     cx.run_until_parked();
 
     let (view, session) = active_lone_view(&window, cx);
@@ -256,7 +265,8 @@ async fn clean_exit_closes_split_leaf_keeps_tab(cx: &mut TestAppContext) {
     let (window, _dir) = make_group(cx);
     window
         .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
-        .expect("window update ok");
+        .expect("window update ok")
+        .expect("PTY spawn must succeed, or the tab this test needs is missing");
     cx.run_until_parked();
     // Split → the tab now hosts two live sub-panes (leaves).
     window
@@ -301,7 +311,8 @@ async fn clean_exit_closes_stacked_leaf_tab_keeps_tab(cx: &mut TestAppContext) {
     let (window, _dir) = make_group(cx);
     window
         .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
-        .expect("window update ok");
+        .expect("window update ok")
+        .expect("PTY spawn must succeed, or the tab this test needs is missing");
     cx.run_until_parked();
     // Add a second per-pane tab stacked in the same leaf (no split).
     window
@@ -348,7 +359,8 @@ async fn split_sub_pane_right_creates_second_live_pane(cx: &mut TestAppContext) 
     // One group tab → one leaf.
     window
         .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
-        .expect("window update ok");
+        .expect("window update ok")
+        .expect("PTY spawn must succeed, or the tab this test needs is missing");
     cx.run_until_parked();
 
     // Split the active leaf horizontally.
@@ -567,7 +579,8 @@ async fn keymap_cmd_w_closes_per_pane_tab_first(cx: &mut TestAppContext) {
     // Set up: one group tab whose active leaf has two per-pane tabs.
     window
         .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
-        .expect("window update ok");
+        .expect("window update ok")
+        .expect("PTY spawn must succeed, or the tab this test needs is missing");
     cx.run_until_parked();
     window
         .update(cx, |group, win, cx| group.add_tab_to_leaf(0, win, cx))
@@ -608,7 +621,8 @@ async fn keymap_apply_live_moves_a_binding_and_kills_the_old_chord(cx: &mut Test
     // Two per-pane tabs so each close has an observable effect.
     window
         .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
-        .expect("window update ok");
+        .expect("window update ok")
+        .expect("PTY spawn must succeed, or the tab this test needs is missing");
     cx.run_until_parked();
     window
         .update(cx, |group, win, cx| group.add_tab_to_leaf(0, win, cx))
@@ -687,7 +701,8 @@ async fn move_appended_tab_lands_at_requested_slot(cx: &mut TestAppContext) {
     for _ in 0..3 {
         window
             .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
-            .expect("window update ok");
+            .expect("window update ok")
+            .expect("PTY spawn must succeed, or the tab this test needs is missing");
     }
     cx.run_until_parked();
 
@@ -734,7 +749,8 @@ async fn move_into_pinned_cluster_clamps_to_unpinned_zone(cx: &mut TestAppContex
     for _ in 0..3 {
         window
             .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
-            .expect("window update ok");
+            .expect("window update ok")
+            .expect("PTY spawn must succeed, or the tab this test needs is missing");
     }
     cx.run_until_parked();
 
@@ -907,7 +923,8 @@ async fn restored_tabs_settle_into_saved_order_and_cosmetics(cx: &mut TestAppCon
     for _ in 0..2 {
         window
             .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
-            .expect("window update ok");
+            .expect("window update ok")
+            .expect("PTY spawn must succeed, or the tab this test needs is missing");
     }
     cx.run_until_parked();
     cx.read(|app| {
@@ -977,7 +994,8 @@ async fn active_terminal_tab_drains_fast_background_throttles(cx: &mut TestAppCo
     for _ in 0..2 {
         window
             .update(cx, |group, win, cx| group.open_terminal_tab(win, cx))
-            .expect("window update ok");
+            .expect("window update ok")
+            .expect("PTY spawn must succeed, or the tab this test needs is missing");
     }
     cx.run_until_parked();
 

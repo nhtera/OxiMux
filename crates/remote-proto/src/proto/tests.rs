@@ -16,7 +16,10 @@ fn value_bearing_event() -> ThreadEvent {
 /// documented wire change, so an accidental edit fails here.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 15, "v15 = the appended self-unpair");
+    assert_eq!(
+        PROTOCOL_VERSION, 19,
+        "v19 = the coordination watch cursor (StateWatchFrom + StateWatchStarted/StateChangedAt)"
+    );
 }
 
 /// The floor moves only on a genuinely breaking change, never merely because
@@ -303,4 +306,170 @@ fn early_variants_keep_their_literal_ordinals() {
     // `SessionTranscript`.
     let projects = Response::Projects(vec![]);
     assert_eq!(projects.to_bytes().expect("encode")[0], 30);
+    // The v15 self-unpair appended after the project tail: `Unpair` is the 42nd
+    // Request variant (index 41, a unit variant, so its whole encoding is that
+    // single ordinal byte).
+    assert_eq!(Request::Unpair.to_bytes().expect("encode"), vec![41]);
+    // The v16 CLI working set appended after the unpair tail, in this order:
+    // `FetchTranscriptPage` (index 42), `CreateWorktree` (43), `ListWorktrees`
+    // (44), `RemoveWorktree` (45). Pin each discriminant; payloads follow.
+    let page = Request::FetchTranscriptPage { session_id: String::new(), cursor: 0, limit: 0 };
+    assert_eq!(page.to_bytes().expect("encode")[0], 42);
+    let create = Request::CreateWorktree { project_path: String::new(), slug: String::new() };
+    assert_eq!(create.to_bytes().expect("encode")[0], 43);
+    let list = Request::ListWorktrees { project_path: None };
+    assert_eq!(list.to_bytes().expect("encode")[0], 44);
+    let remove = Request::RemoveWorktree { id: String::new() };
+    assert_eq!(remove.to_bytes().expect("encode")[0], 45);
+    // The matching v16 Response tail: `TranscriptPage` is the 32nd Response
+    // variant (index 31), `WorktreeCreated` 33rd (32), `Worktrees` 34th (33).
+    let page = Response::TranscriptPage(TranscriptPageWire {
+        session_id: String::new(),
+        seq: 0,
+        entries_json: "[]".into(),
+        next_cursor: None,
+        total: 0,
+        model: None,
+    });
+    assert_eq!(page.to_bytes().expect("encode")[0], 31);
+    let wt = WorktreeWire {
+        id: String::new(),
+        project_path: String::new(),
+        name: String::new(),
+        slug: String::new(),
+        branch: String::new(),
+        path: String::new(),
+    };
+    assert_eq!(Response::WorktreeCreated(wt).to_bytes().expect("encode")[0], 32);
+    assert_eq!(Response::Worktrees(vec![]).to_bytes().expect("encode")[0], 33);
+    // `RpcError::Unsupported` appended after `IncompatibleVersion`: index 6
+    // inside the error enum, which rides behind `Error`'s own ordinal (8).
+    let err = Response::Error(RpcError::Unsupported);
+    assert_eq!(err.to_bytes().expect("encode"), vec![8, 6]);
+    // The v16 pairing-administration tail: `PairNew` (index 46), `PairList`
+    // (47, a unit variant), `PairRemove` (48).
+    let pair_new = Request::PairNew { read_only: false };
+    assert_eq!(pair_new.to_bytes().expect("encode")[0], 46);
+    assert_eq!(Request::PairList.to_bytes().expect("encode"), vec![47]);
+    let pair_rm = Request::PairRemove { pubkey: [0u8; 32] };
+    assert_eq!(pair_rm.to_bytes().expect("encode")[0], 48);
+    // Their replies: `PairingIssued` is the 35th Response variant (index 34),
+    // `PairedDeviceList` the 36th (35).
+    let issued = Response::PairingIssued(PairingIssuedWire {
+        ticket: String::new(),
+        expires_at: 0,
+        read_only: false,
+    });
+    assert_eq!(issued.to_bytes().expect("encode")[0], 34);
+    assert_eq!(Response::PairedDeviceList(vec![]).to_bytes().expect("encode")[0], 35);
+    // The v17 schedule tail: `RunScheduleNow` (index 49); its reply
+    // `ScheduleRunRecorded` (36) and the `ScheduleRunsChanged` push (37).
+    let run_now = Request::RunScheduleNow { schedule_id: "sch-1".into() };
+    assert_eq!(run_now.to_bytes().expect("encode")[0], 49);
+    let run = ScheduleRunWire {
+        schedule_id: String::new(),
+        fired_at: String::new(),
+        outcome: RunOutcomeWire::Ok,
+        session_id: None,
+        detail: None,
+    };
+    assert_eq!(Response::ScheduleRunRecorded(run.clone()).to_bytes().expect("encode")[0], 36);
+    assert_eq!(Response::ScheduleRunsChanged(run).to_bytes().expect("encode")[0], 37);
+    // The v18 automation tail, appended in one batch after `RunScheduleNow`:
+    // `CreateHeartbeat` (50), `ListHeartbeats` (51), `DeleteHeartbeat` (52),
+    // `TeamRunCreate` (53), `TeamReport` (54), `TeamStatus` (55), `TeamList`
+    // (56, a unit variant), `StateGet` (57), `StateSet` (58), `StateDelete`
+    // (59), `StateWatch` (60).
+    let heartbeat = Request::CreateHeartbeat(CreateHeartbeatReq {
+        session_id: None,
+        name: String::new(),
+        prompt: String::new(),
+        recurrence: RecurrenceWire::EveryMinutes { minutes: 5 },
+    });
+    assert_eq!(heartbeat.to_bytes().expect("encode")[0], 50);
+    assert_eq!(
+        Request::ListHeartbeats { session_id: None }.to_bytes().expect("encode")[0],
+        51
+    );
+    let delete_hb = Request::DeleteHeartbeat { id: String::new() };
+    assert_eq!(delete_hb.to_bytes().expect("encode")[0], 52);
+    let team_create = Request::TeamRunCreate(TeamRunCreateReq {
+        name: String::new(),
+        cwd: String::new(),
+        agent_id: None,
+        worktree_each: false,
+        roles: vec![],
+    });
+    assert_eq!(team_create.to_bytes().expect("encode")[0], 53);
+    let report = Request::TeamReport(TeamReportReq {
+        run_id: String::new(),
+        role: String::new(),
+        ok: true,
+        summary: None,
+    });
+    assert_eq!(report.to_bytes().expect("encode")[0], 54);
+    let status = Request::TeamStatus { run_id: String::new() };
+    assert_eq!(status.to_bytes().expect("encode")[0], 55);
+    assert_eq!(Request::TeamList.to_bytes().expect("encode"), vec![56]);
+    let state_get = Request::StateGet { key: String::new() };
+    assert_eq!(state_get.to_bytes().expect("encode")[0], 57);
+    let state_set = Request::StateSet(StateSetReq {
+        key: String::new(),
+        value_json: String::new(),
+        if_version: None,
+    });
+    assert_eq!(state_set.to_bytes().expect("encode")[0], 58);
+    let state_del = Request::StateDelete { key: String::new() };
+    assert_eq!(state_del.to_bytes().expect("encode")[0], 59);
+    let state_watch = Request::StateWatch { prefix: None };
+    assert_eq!(state_watch.to_bytes().expect("encode")[0], 60);
+    // Their replies, in the same batch: `HeartbeatCreated` (38), `Heartbeats`
+    // (39), `TeamRun` (40), `TeamRuns` (41), `StateValue` (42),
+    // `StateSnapshot` (43), `StateChanged` (44).
+    let hb = HeartbeatWire {
+        id: String::new(),
+        session_id: String::new(),
+        name: String::new(),
+        prompt: String::new(),
+        recurrence: RecurrenceWire::EveryMinutes { minutes: 5 },
+        enabled: true,
+        next_fire_at: String::new(),
+        summary: String::new(),
+    };
+    assert_eq!(Response::HeartbeatCreated(hb).to_bytes().expect("encode")[0], 38);
+    assert_eq!(Response::Heartbeats(vec![]).to_bytes().expect("encode")[0], 39);
+    let team = TeamRunWire {
+        id: String::new(),
+        name: String::new(),
+        cwd: String::new(),
+        created_at: String::new(),
+        closed: false,
+        roles: vec![],
+    };
+    assert_eq!(Response::TeamRun(team).to_bytes().expect("encode")[0], 40);
+    assert_eq!(Response::TeamRuns(vec![]).to_bytes().expect("encode")[0], 41);
+    assert_eq!(Response::StateValue(None).to_bytes().expect("encode")[0], 42);
+    assert_eq!(Response::StateSnapshot(vec![]).to_bytes().expect("encode")[0], 43);
+    let changed = Response::StateChanged { key: String::new(), entry: None };
+    assert_eq!(changed.to_bytes().expect("encode")[0], 44);
+    assert_eq!(Response::StateConflict(None).to_bytes().expect("encode")[0], 45);
+
+    // v19, appended after the v18 batch: `StateWatchFrom` (61) and its replies
+    // `StateWatchStarted` (46), `StateChangedAt` (47). The cursor-less
+    // `StateWatch` (60) / `StateChanged` (44) keep their ordinals — a v18 peer
+    // must go on speaking exactly what it already spoke.
+    let watch_from = Request::StateWatchFrom { prefix: None, since_seq: None };
+    assert_eq!(watch_from.to_bytes().expect("encode")[0], 61);
+    let started = Response::StateWatchStarted(StateWatchStartedWire {
+        seq: 0,
+        baseline: None,
+        replay: vec![],
+    });
+    assert_eq!(started.to_bytes().expect("encode")[0], 46);
+    let changed_at = Response::StateChangedAt(StateChangeWire {
+        seq: 0,
+        key: String::new(),
+        entry: None,
+    });
+    assert_eq!(changed_at.to_bytes().expect("encode")[0], 47);
 }

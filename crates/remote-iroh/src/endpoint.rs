@@ -33,6 +33,13 @@ pub async fn bind_host(secret: Option<[u8; 32]>) -> anyhow::Result<Endpoint> {
     Ok(builder.bind().await?)
 }
 
+/// The endpoint id `secret` produces — derivable without binding anything, so
+/// a host can name its own dialable identity (a pairing ticket's
+/// `endpoint_id`) before the endpoint is up, or while it is binding.
+pub fn endpoint_id_of(secret: &[u8; 32]) -> [u8; 32] {
+    *iroh::SecretKey::from_bytes(secret).public().as_bytes()
+}
+
 /// Await one inbound connection on `endpoint`, accept its bi-stream, and wrap it
 /// as a framed transport. `Ok(None)` once the endpoint stops accepting (closed).
 pub async fn accept(endpoint: &Endpoint) -> anyhow::Result<Option<IrohTransport>> {

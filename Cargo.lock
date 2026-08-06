@@ -109,7 +109,9 @@ checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
 dependencies = [
  "cfg-if",
  "const-random",
+ "getrandom 0.3.4",
  "once_cell",
+ "serde",
  "version_check",
  "zerocopy",
 ]
@@ -204,10 +206,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "anstream"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "824a212faf96e9acacdbd09febd34438f8f711fb84e09a8916013cd7815ca28d"
+dependencies = [
+ "anstyle",
+ "anstyle-parse",
+ "anstyle-query",
+ "anstyle-wincon",
+ "colorchoice",
+ "is_terminal_polyfill",
+ "utf8parse",
+]
+
+[[package]]
 name = "anstyle"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
+
+[[package]]
+name = "anstyle-parse"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52ce7f38b242319f7cabaa6813055467063ecdc9d355bbb4ce0c68908cd8130e"
+dependencies = [
+ "utf8parse",
+]
+
+[[package]]
+name = "anstyle-query"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "anstyle-wincon"
+version = "3.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
+dependencies = [
+ "anstyle",
+ "once_cell_polyfill",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "anyhow"
@@ -912,6 +958,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest 0.10.7",
+]
+
+[[package]]
 name = "blake3"
 version = "1.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -981,6 +1036,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "borrow-or-share"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc0b364ead1874514c8c2855ab558056ebfeb775653e7ae45ff72f28f8f3166c"
+
+[[package]]
 name = "borsh"
 version = "1.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1020,6 +1081,12 @@ name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d20789868f4b01b2f2caec9f5c4e0213b41e3e5702a50157d699ae31ced2fcb"
+
+[[package]]
+name = "bytecount"
+version = "0.6.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "175812e0be2bccb6abe50bb8d566126198344f707e304f45c648fd8f2cc0365e"
 
 [[package]]
 name = "bytemuck"
@@ -1318,9 +1385,19 @@ version = "4.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f09628afdcc538b57f3c6341e9c8e9970f18e4a481690a64974d7023bd33548b"
 dependencies = [
+ "anstream",
  "anstyle",
  "clap_lex",
  "strsim",
+]
+
+[[package]]
+name = "clap_complete"
+version = "4.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f84a88507dbd05c695f2cb5e8558e747179134005e9893882dec964190ed89"
+dependencies = [
+ "clap",
 ]
 
 [[package]]
@@ -1450,6 +1527,12 @@ name = "color_quant"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d7b894f5411737b7867f4827955924d7c254fc9f4d91a6aad6b097804b1018b"
+
+[[package]]
+name = "colorchoice"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "combine"
@@ -1863,6 +1946,31 @@ name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+
+[[package]]
+name = "crossterm"
+version = "0.28.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
+dependencies = [
+ "bitflags 2.11.1",
+ "crossterm_winapi",
+ "mio",
+ "parking_lot",
+ "rustix 0.38.44",
+ "signal-hook",
+ "signal-hook-mio",
+ "winapi",
+]
+
+[[package]]
+name = "crossterm_winapi"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acdd7c62a3665c7f6830a51635d9ac9b23ed385797f70a83bb8bafe9c572ab2b"
+dependencies = [
+ "winapi",
+]
 
 [[package]]
 name = "crunchy"
@@ -2490,6 +2598,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
+name = "email_address"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e079f19b08ca6239f47f8ba8509c11cf3ea30095831f7fed61441475edd8c449"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "embed-resource"
 version = "3.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2866,6 +2983,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluent-uri"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc74ac4d8359ae70623506d512209619e5cf8f347124910440dbc221714b328e"
+dependencies = [
+ "borrow-or-share",
+ "ref-cast",
+ "serde",
+]
+
+[[package]]
 name = "flume"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2961,6 +3089,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fraction"
+version = "0.15.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e076045bb43dac435333ed5f04caf35c7463631d0dae2deb2638d94dd0a5b872"
+dependencies = [
+ "lazy_static",
+ "num",
 ]
 
 [[package]]
@@ -5042,6 +5180,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "is_terminal_polyfill"
+version = "1.70.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
 name = "itertools"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5191,6 +5335,33 @@ dependencies = [
  "futures-util",
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "jsonschema"
+version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0303b14f91cbac17c64aaf2ef60ab71fe5f34c3867cedcbca72c9dd15f5040fe"
+dependencies = [
+ "ahash",
+ "base64",
+ "bytecount",
+ "email_address",
+ "fancy-regex",
+ "fraction",
+ "getrandom 0.3.4",
+ "idna",
+ "itoa",
+ "num-cmp",
+ "num-traits",
+ "percent-encoding",
+ "referencing",
+ "regex",
+ "regex-syntax",
+ "serde",
+ "serde_json",
+ "unicode-general-category",
+ "uuid-simd",
 ]
 
 [[package]]
@@ -5455,7 +5626,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53353550a17c04ac46c585feb189c2db82154fc84b79c7a66c96c2c644f66071"
 dependencies = [
  "bitflags 1.3.2",
- "fluent-uri",
+ "fluent-uri 0.1.4",
  "serde",
  "serde_json",
  "serde_repr",
@@ -5709,6 +5880,12 @@ name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
+name = "minisign-verify"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e"
 
 [[package]]
 name = "miniz_oxide"
@@ -6245,6 +6422,12 @@ dependencies = [
  "smallvec",
  "zeroize",
 ]
+
+[[package]]
+name = "num-cmp"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63335b2e2c34fae2fb0aa2cecfd9f0832a1e24b3b32ecec612c3426d46dc8aaa"
 
 [[package]]
 name = "num-complex"
@@ -6810,6 +6993,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "once_cell_polyfill"
+version = "1.70.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
 name = "oo7"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6893,8 +7082,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "outref"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
+
+[[package]]
 name = "oximux-agent-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -6903,7 +7098,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-agents"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -6937,7 +7132,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-app"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "aes",
  "anyhow",
@@ -6948,7 +7143,6 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "embed-resource",
- "fd-lock",
  "futures",
  "gpui",
  "gpui-component",
@@ -6981,12 +7175,18 @@ dependencies = [
  "oximux-pty",
  "oximux-relay-client",
  "oximux-relay-proto",
+ "oximux-relay-supervisor",
+ "oximux-relay-terminals",
  "oximux-remote-host",
  "oximux-remote-iroh",
+ "oximux-remote-local",
  "oximux-remote-proto",
  "oximux-settings",
+ "oximux-shell-env",
+ "oximux-single-instance",
  "oximux-storage",
  "oximux-ui",
+ "oximux-worktree-ops",
  "pbkdf2",
  "qrcode",
  "regex",
@@ -7012,7 +7212,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-auto-update"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "oximux-macos-trust",
  "rand 0.8.6",
@@ -7026,8 +7226,63 @@ dependencies = [
 ]
 
 [[package]]
+name = "oximux-cli"
+version = "0.1.7"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "blake2",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "crossterm",
+ "dirs 5.0.1",
+ "ed25519-dalek 2.2.0",
+ "flate2",
+ "futures",
+ "jsonschema",
+ "minisign-verify",
+ "nix 0.25.1",
+ "oximux-agent-core",
+ "oximux-agents",
+ "oximux-auto-update",
+ "oximux-job-object",
+ "oximux-macos-trust",
+ "oximux-owner-only",
+ "oximux-relay-client",
+ "oximux-relay-supervisor",
+ "oximux-relay-terminals",
+ "oximux-remote-host",
+ "oximux-remote-iroh",
+ "oximux-remote-local",
+ "oximux-remote-proto",
+ "oximux-remote-session",
+ "oximux-shell-env",
+ "oximux-single-instance",
+ "oximux-storage",
+ "oximux-worktree-ops",
+ "qrcode",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+ "url",
+ "uuid",
+ "which 6.0.3",
+ "windows-service",
+]
+
+[[package]]
 name = "oximux-computer-use"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "base64",
  "fd-lock",
@@ -7048,7 +7303,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
@@ -7056,7 +7311,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-dictation"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "cpal",
@@ -7074,7 +7329,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-editor"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "gpui",
@@ -7096,7 +7351,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-git"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "futures",
  "oximux-core",
@@ -7112,14 +7367,14 @@ dependencies = [
 
 [[package]]
 name = "oximux-job-object"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "oximux-macos-trust"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "libc",
  "tempfile",
@@ -7128,7 +7383,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-mobile-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7148,14 +7403,14 @@ dependencies = [
 
 [[package]]
 name = "oximux-no-window"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "oximux-owner-only"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "tempfile",
  "widestring",
@@ -7164,14 +7419,15 @@ dependencies = [
 
 [[package]]
 name = "oximux-proc-cwd"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "libc",
+ "tempfile",
 ]
 
 [[package]]
 name = "oximux-pty"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -7183,7 +7439,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-relay"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -7211,7 +7467,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-relay-client"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -7230,7 +7486,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-relay-proto"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bincode 2.0.1",
  "hmac",
@@ -7240,8 +7496,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "oximux-relay-supervisor"
+version = "0.1.7"
+dependencies = [
+ "anyhow",
+ "libc",
+ "oximux-no-window",
+ "oximux-owner-only",
+ "oximux-relay-client",
+ "oximux-relay-proto",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "oximux-relay-terminals"
+version = "0.1.7"
+dependencies = [
+ "async-trait",
+ "oximux-relay-client",
+ "oximux-relay-proto",
+ "oximux-remote-host",
+ "oximux-remote-proto",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "oximux-remote-host"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7268,7 +7554,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-remote-iroh"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7284,8 +7570,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "oximux-remote-local"
+version = "0.1.7"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dirs 5.0.1",
+ "futures",
+ "interprocess",
+ "oximux-owner-only",
+ "oximux-relay-proto",
+ "oximux-remote-proto",
+ "postcard",
+ "rand 0.8.6",
+ "serde",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "widestring",
+]
+
+[[package]]
 name = "oximux-remote-proto"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base64",
@@ -7301,7 +7608,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-remote-session"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7319,7 +7626,7 @@ dependencies = [
 
 [[package]]
 name = "oximux-settings"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "dunce",
@@ -7327,19 +7634,28 @@ dependencies = [
  "serde",
  "tempfile",
  "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]
 name = "oximux-shell-env"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "portable-pty",
  "which 6.0.3",
 ]
 
 [[package]]
+name = "oximux-single-instance"
+version = "0.1.7"
+dependencies = [
+ "fd-lock",
+ "tempfile",
+]
+
+[[package]]
 name = "oximux-storage"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7353,11 +7669,28 @@ dependencies = [
 
 [[package]]
 name = "oximux-ui"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "gpui",
  "gpui-component",
  "oximux-settings",
+]
+
+[[package]]
+name = "oximux-worktree-ops"
+version = "0.1.7"
+dependencies = [
+ "async-trait",
+ "oximux-core",
+ "oximux-git",
+ "oximux-no-window",
+ "oximux-remote-host",
+ "oximux-remote-proto",
+ "oximux-settings",
+ "oximux-storage",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -8463,6 +8796,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "referencing"
+version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22d0d0665043906aacf1d83bea9d61e5134f8f437815b84320e7facf8ff4e9c2"
+dependencies = [
+ "ahash",
+ "fluent-uri 0.4.1",
+ "getrandom 0.3.4",
+ "hashbrown 0.16.1",
+ "parking_lot",
+ "percent-encoding",
+ "serde_json",
+]
+
+[[package]]
 name = "refineable"
 version = "0.1.0"
 source = "git+https://github.com/zed-industries/zed#3bd9d13b63fc5a5ffa39326597bc4fd91adc82d1"
@@ -9484,6 +9832,17 @@ checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
 dependencies = [
  "libc",
  "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-mio"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
+dependencies = [
+ "libc",
+ "mio",
+ "signal-hook",
 ]
 
 [[package]]
@@ -11261,6 +11620,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ce61d488bcdc9bc8b5d1772c404828b17fc481c0a582b5581e95fb233aef503e"
 
 [[package]]
+name = "unicode-general-category"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b993bddc193ae5bd0d623b49ec06ac3e9312875fdae725a975c51db1cc1677f"
+
+[[package]]
 name = "unicode-id"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11534,6 +11899,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
+name = "utf8parse"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+
+[[package]]
 name = "util"
 version = "0.1.0"
 source = "git+https://github.com/zed-industries/zed#3bd9d13b63fc5a5ffa39326597bc4fd91adc82d1"
@@ -11593,6 +11964,16 @@ dependencies = [
  "serde_core",
  "sha1_smol",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "uuid-simd"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b082222b4f6619906941c17eb2297fff4c2fb96cb60164170522942a200bd8"
+dependencies = [
+ "outref",
+ "vsimd",
 ]
 
 [[package]]
@@ -11708,6 +12089,12 @@ name = "virtue"
 version = "0.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
+
+[[package]]
+name = "vsimd"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c3082ca00d5a5ef149bb8b555a72ae84c9c59f7250f013ac822ac2e49b19c64"
 
 [[package]]
 name = "vswhom"
@@ -12663,6 +13050,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "windows-service"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "857224b3b211c6f3616921f081ee54721ee3ad2ace2fac6a6337e032f7b4dcf2"
+dependencies = [
+ "bitflags 2.11.1",
+ "widestring",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "windows-strings"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13414,7 +13812,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "image",

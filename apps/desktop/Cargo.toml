@@ -30,6 +30,10 @@ oximux-proc-cwd = { workspace = true }
 oximux-pty = { workspace = true }
 async-trait = { workspace = true }
 oximux-relay-client = { workspace = true }
+oximux-relay-supervisor = { workspace = true }
+oximux-relay-terminals = { workspace = true }
+# The shared Claude session-marker scrub (one list, three consumers).
+oximux-shell-env = { workspace = true }
 oximux-relay-proto = { workspace = true }
 # Owner-only access on the relay auth token this process writes.
 oximux-owner-only = { workspace = true }
@@ -37,9 +41,12 @@ oximux-owner-only = { workspace = true }
 # SessionRegistry to paired phones, its transport-agnostic dispatcher/auth, and
 # the shared wire types (PairingTicket).
 oximux-remote-host = { workspace = true }
+oximux-worktree-ops = { workspace = true }
 oximux-remote-iroh = { workspace = true, features = ["host"] }
+# The owner-only control socket the `oximux` CLI dials (opt-in listener).
+oximux-remote-local = { workspace = true }
 oximux-remote-proto = { workspace = true }
-oximux-settings = { workspace = true }
+oximux-settings = { workspace = true, features = ["gpui"] }
 oximux-storage = { workspace = true }
 oximux-ui = { workspace = true }
 
@@ -94,9 +101,9 @@ two-face = { version = "0.5.1", default-features = false, features = ["syntect-f
 # methods (open/close/is_devtools_open) exist in release too — wry only turns
 # them on automatically under debug_assertions, which broke release builds.
 wry = { version = "0.55", features = ["devtools"] }
-# Single-instance guard: one non-blocking exclusive file lock over `flock` and
-# `LockFileEx`, with contention normalised to `WouldBlock` on both.
-fd-lock = "4"
+# Single-instance guard: the data-dir role lock (GUI instance, schedule
+# ticker), shared with `oximux serve` so both hosts contend identically.
+oximux-single-instance = { workspace = true }
 
 # Relay supervisor's `pre_exec` calls libc::umask so the bundled
 # socket/token files come out 0600. libc is already in the transitive

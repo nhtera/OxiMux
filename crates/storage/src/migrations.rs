@@ -179,6 +179,27 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "schedules",
         sql: include_str!("../migrations/V021__schedules.sql"),
     },
+    // V022 adds `schedules.target_session_id` — NULL fires a fresh session,
+    // a session id fires into that existing one. Additive, no backfill.
+    Migration {
+        version: 22,
+        name: "schedules_target_session",
+        sql: include_str!("../migrations/V022__schedules_target_session.sql"),
+    },
+    // V023 adds the team-run tables — a multi-role fan-out that survives a
+    // host restart, which is only possible because the run is host state.
+    Migration {
+        version: 23,
+        name: "team_runs",
+        sql: include_str!("../migrations/V023__team_runs.sql"),
+    },
+    // V024 adds the coordination blackboard: a versioned key/value store agents
+    // share, with optimistic concurrency so concurrent writers cannot clobber.
+    Migration {
+        version: 24,
+        name: "coord_state",
+        sql: include_str!("../migrations/V024__coord_state.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.

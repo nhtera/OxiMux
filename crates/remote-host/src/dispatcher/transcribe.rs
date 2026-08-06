@@ -34,9 +34,13 @@ impl Dispatcher {
     /// nothing is mutated.
     pub(super) async fn transcribe_audio(&self, audio_base64: &str, sample_rate: u32) -> Response {
         let Some(transcriber) = self.transcriber.as_ref() else {
-            // Same answer a device lacking scope gets: whether this desktop can
-            // transcribe is not something an unauthorized client should probe.
-            return Response::Error(RpcError::Unauthorized);
+            // The caller is already authenticated (the serve loop checked), so
+            // the honest answer is "this host cannot transcribe" — a headless
+            // host has no speech engine, and `Unauthorized` here rendered on
+            // the phone as an unpairing rather than a missing capability. The
+            // unauthenticated case never reaches this handler, so nothing is
+            // probeable through the distinction.
+            return Response::Error(RpcError::Unsupported);
         };
         let bytes = match STANDARD.decode(audio_base64) {
             Ok(bytes) => bytes,

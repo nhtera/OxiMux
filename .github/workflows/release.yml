@@ -248,3 +248,326 @@ jobs:
           gh release upload $tag $zip.FullName --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed with exit code $LASTEXITCODE" }
           Write-Host "uploaded $($zip.Name) to $tag"
+
+  # ---------------------------------------------------------------------------
+  # The `oximux` CLI, for every platform it runs on.
+  #
+  # This is what `oximux update` and the two bootstrap installers consume, and
+  # its output contract is exact: one flat `<name>.tar.gz` per target holding
+  # `oximux` and `oximux-relay` (plus `.exe` on Windows) at the archive root.
+  # apps/cli/src/update/archive.rs extracts by allow-list against precisely
+  # those two names, so an archive with a leading directory installs nothing.
+  #
+  # The pair is non-negotiable: the CLI and the relay speak a handshake that is
+  # versioned in lockstep, and an update that lands one without the other
+  # leaves an installation that cannot talk to itself.
+  release-cli:
+    name: CLI ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      # One platform failing must not cancel the others — a re-run of a single
+      # target is far cheaper than a re-run of the matrix.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            # Deliberately not ubuntu-latest: a glibc build runs only on the
+            # glibc it was linked against or newer, so the OLDEST supported
+            # runner is the one that reaches the most machines.
+            os: ubuntu-22.04
+          # ARM64 Linux is not optional: `scripts/install-cli.sh` resolves
+          # `uname -m` of aarch64/arm64 to exactly this triple, so without it
+          # the documented one-line install downloads a 404 on Graviton,
+          # Ampere, Oracle's ARM tier and a Pi — which is precisely the cheap
+          # always-on box a headless `oximux serve` belongs on. Native runner
+          # (free for public repos) rather than cross: the CLI links rusqlite's
+          # bundled sqlite and ring, both of which want a real target toolchain.
+          # Same oldest-glibc reasoning as the x86_64 arm above.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-cli-v1-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      # Same reasoning as the other jobs: catch a tag that disagrees with
+      # Cargo.toml before paying for the build, not after.
+      - name: Verify tag matches Cargo.toml version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [[ "${GITHUB_REF_NAME}" != "v${CARGO_VERSION}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml v${CARGO_VERSION}" >&2
+            exit 1
+          fi
+
+      # OXIMUX_BUILD_CHANNEL is what `oximux version` reports and what a future
+      # channel-aware update would follow. build.rs defaults a release profile
+      # to `stable` anyway; setting it here makes the release the thing that
+      # decides, rather than the profile.
+      - name: Build the CLI and the relay
+        shell: bash
+        env:
+          OXIMUX_BUILD_CHANNEL: stable
+        run: cargo build --release --target ${{ matrix.target }} -p oximux-cli -p oximux-relay
+
+      # macOS only, and only when the certificate secret is configured — a fork
+      # without one still produces a working (ad-hoc signed) artifact.
+      #
+      # This is what gives the update-time team pin its teeth: an installation
+      # signed by a real Developer ID team may only be replaced by a binary from
+      # the same team, and an ad-hoc signature (what every unsigned build gets)
+      # pins nothing at all. Skipping this would not fail anything loudly; it
+      # would quietly make that gate a no-op.
+      - name: Sign the macOS binaries
+        if: runner.os == 'macOS'
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # The secret is checked HERE rather than in the step's `if`: a step's
+          # own `env:` block is not visible to its own `if` condition, so that
+          # form silently evaluates to '' and skips signing on every run.
+          if [[ -z "${MACOS_CERT_P12_BASE64}" ]]; then
+            echo "no signing certificate configured — leaving the binaries ad-hoc signed."
+            echo "The update-time team pin is a no-op for this build (see update/mod.rs)."
+            exit 0
+          fi
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          KEYCHAIN="$RUNNER_TEMP/cli.keychain-db"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
+          [[ -n "$IDENTITY" ]] || { echo "no Developer ID identity in the .p12" >&2; exit 1; }
+
+          for bin in oximux-cli oximux-relay; do
+            codesign --force --timestamp --options runtime \
+              --sign "$IDENTITY" "target/${{ matrix.target }}/release/$bin"
+            codesign --verify --strict --verbose=2 "target/${{ matrix.target }}/release/$bin"
+          done
+
+      # The cargo bin is `oximux-cli` because apps/desktop owns the bin name
+      # `oximux`; the command users type is `oximux`, so the rename happens
+      # here — the archive is the contract, not the cargo target name.
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          TARGET="${{ matrix.target }}"
+          EXE=""
+          [[ "$TARGET" == *windows* ]] && EXE=".exe"
+
+          STAGE="$(mktemp -d)"
+          cp "target/${TARGET}/release/oximux-cli${EXE}" "${STAGE}/oximux${EXE}"
+          cp "target/${TARGET}/release/oximux-relay${EXE}" "${STAGE}/oximux-relay${EXE}"
+          chmod 755 "${STAGE}/oximux${EXE}" "${STAGE}/oximux-relay${EXE}"
+
+          mkdir -p dist
+          ARCHIVE="oximux-${VERSION}-${TARGET}.tar.gz"
+          # -C so the two binaries sit at the archive root, flat.
+          tar -czf "dist/${ARCHIVE}" -C "$STAGE" "oximux${EXE}" "oximux-relay${EXE}"
+
+          # Prove the contract rather than trusting the tar invocation: a
+          # leading directory here installs nothing, and the extractor's
+          # allow-list would report it as "the archive does not contain oximux".
+          listing="$(tar -tzf "dist/${ARCHIVE}" | sort | tr '\n' ' ')"
+          expected="oximux${EXE} oximux-relay${EXE} "
+          if [[ "$listing" != "$expected" ]]; then
+            echo "archive layout is wrong: got [${listing}] want [${expected}]" >&2
+            exit 1
+          fi
+          echo "packaged dist/${ARCHIVE}"
+
+      - name: Upload the archive for the manifest job
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Delete the build keychain
+        if: always() && runner.os == 'macOS'
+        run: |
+          if [[ -n "${KEYCHAIN:-}" && -f "$KEYCHAIN" ]]; then
+            security delete-keychain "$KEYCHAIN"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # The signed manifest — the trust root every `oximux update` starts from.
+  #
+  # This runs only after every CLI target has produced an archive, because the
+  # manifest describes all of them at once and a partial manifest would tell
+  # users on the missing platform that their platform does not exist.
+  #
+  # The signature is made here, over bytes assembled here, with a key that lives
+  # only in repository secrets. That is the point: the manifest and the archives
+  # travel together from one GitHub Release, so a checksum inside the manifest
+  # proves nothing a stolen publish token could not also forge. The signature is
+  # checked against a key compiled into the binary, which that token cannot
+  # reach.
+  release-manifest:
+    name: Signed release manifest
+    runs-on: ubuntu-22.04
+    needs: release-cli
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download every CLI archive
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          path: incoming
+          merge-multiple: true
+
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+
+      # Refuse to publish an unsigned manifest. `oximux update` treats a missing
+      # signature as a hard failure — never as "verification is optional" — so a
+      # release published without one is a release nobody can update to, and it
+      # is better to fail the workflow than to ship that.
+      - name: Build and sign the manifest
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MINISIGN_SECRET_KEY}" ]]; then
+            echo "MINISIGN_SECRET_KEY is not configured — refusing to publish an unsigned" >&2
+            echo "manifest. Run scripts/gen-release-key.sh and add the secret." >&2
+            exit 1
+          fi
+          PUBKEY="$(grep -v '^[[:space:]]*#' packaging/release-pubkey.txt \
+                    | grep -v '^[[:space:]]*$' | tail -1)"
+          if [[ "$PUBKEY" == "UNSET" ]]; then
+            echo "packaging/release-pubkey.txt is UNSET — every built binary refuses to" >&2
+            echo "update at all. Run scripts/gen-release-key.sh before releasing." >&2
+            exit 1
+          fi
+
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+
+          # Derive each target from its archive name rather than restating the
+          # matrix: oximux-<version>-<target>.tar.gz. A target that failed to
+          # build is simply absent, and the updater's "no build for <triple>
+          # (it has: ...)" is the honest thing for a user on that platform to
+          # read.
+          targets='{}'
+          shopt -s nullglob
+          for archive in incoming/oximux-"${VERSION}"-*.tar.gz; do
+            name="$(basename "$archive")"
+            target="${name#oximux-${VERSION}-}"
+            target="${target%.tar.gz}"
+            sha="$(sha256sum "$archive" | awk '{print $1}')"
+            size="$(stat -c%s "$archive")"
+            targets="$(jq -c --arg t "$target" --arg a "$name" \
+                             --argjson s "$size" --arg h "$sha" \
+                          '.[$t] = {archive: $a, size: $s, sha256: $h}' <<<"$targets")"
+            echo "  ${target}  ${sha}  ${size} bytes"
+          done
+          if [[ "$(jq 'length' <<<"$targets")" -eq 0 ]]; then
+            echo "no CLI archives were produced — nothing to publish" >&2
+            exit 1
+          fi
+
+          # Compact, single line: the POSIX installer reads it with awk, and
+          # the Rust parser does not care either way.
+          jq -cn --arg v "$VERSION" --argjson t "$targets" \
+            '{schemaVersion: 1, version: $v, channel: "stable", targets: $t}' \
+            > manifest.json
+          echo "manifest: $(cat manifest.json)"
+
+          # `awk NF` drops blank lines, which makes this robust to how the
+          # secret was set: `gh secret set < file` keeps the file's trailing
+          # newline in the value, and printf then adds a second one. A minisign
+          # key file is exactly two non-empty lines, so normalising here beats
+          # depending on whoever uploaded the secret having trimmed it.
+          printf '%s\n' "$MINISIGN_SECRET_KEY" | awk 'NF' > "$RUNNER_TEMP/minisign.key"
+          chmod 600 "$RUNNER_TEMP/minisign.key"
+          if [[ "$(wc -l < "$RUNNER_TEMP/minisign.key")" -ne 2 ]]; then
+            echo "MINISIGN_SECRET_KEY is not a two-line minisign key file — re-set the secret" >&2
+            echo "with: gh secret set MINISIGN_SECRET_KEY < oximux-release.key" >&2
+            exit 1
+          fi
+          # </dev/null so a password-protected key fails immediately instead of
+          # blocking on a prompt no runner can answer. gen-release-key.sh mints
+          # an unencrypted key (-W) precisely because CI has no terminal.
+          minisign -S -s "$RUNNER_TEMP/minisign.key" \
+            -m manifest.json -x manifest.json.minisig </dev/null
+          rm -f "$RUNNER_TEMP/minisign.key"
+
+          # Verify with the key that is actually COMPILED INTO the binaries this
+          # release ships. If the CI secret and the committed public key have
+          # drifted, every client would refuse the update — catching that here
+          # costs one command and turns a silent dead release into a red build.
+          printf 'untrusted comment: oximux release key\n%s\n' "$PUBKEY" > release.pub
+          minisign -V -p release.pub -x manifest.json.minisig -m manifest.json
+          echo "manifest verifies against the key compiled into this release"
+
+      # Attached to the release rather than committed: every field but the name
+      # is release-specific, so a checked-in formula is stale the moment it is
+      # written. publish-tap.yml commits it to the tap when this release is
+      # PUBLISHED — not here, because a draft's assets are not downloadable and
+      # the formula's URLs would 404 until someone published it by hand.
+      - name: Generate the Homebrew formula
+        run: |
+          set -euo pipefail
+          ./scripts/gen-homebrew-formula.sh manifest.json > oximux.rb
+          cat oximux.rb
+
+      - name: Upload the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            TAG="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --generate-notes --title "$TAG" \
+              || echo "release already created by another job"
+          fi
+          # The manifest and its signature go up LAST. `latest/download` serves
+          # whatever is attached now, so a manifest that lands before the
+          # archives it describes is a window in which `oximux update` fetches a
+          # verified manifest and then 404s on the download it points to.
+          gh release upload "$TAG" incoming/*.tar.gz oximux.rb --clobber
+          gh release upload "$TAG" manifest.json manifest.json.minisig --clobber
+          echo "uploaded the CLI archives, the formula, and the signed manifest to $TAG"

@@ -1,7 +1,7 @@
 # OxiMux — System Architecture
 
-**Updated**: 2026-07-31  
-**Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open, lifecycle scripts, Create PR + CI, floating PiP terminal, markdown preview) shipped; external-CLI auto-provisioning (bundled ripgrep + one-click verified `cua-driver` install) shipped; desktop auto-update shipped
+**Updated**: 2026-08-05  
+**Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open, lifecycle scripts, Create PR + CI, floating PiP terminal, markdown preview) shipped; external-CLI auto-provisioning (bundled ripgrep + one-click verified `cua-driver` install) shipped; desktop auto-update shipped; `oximux` CLI + `oximux serve` (headless host) shipped
 
 ---
 
@@ -69,22 +69,62 @@ backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
 | `core` | `oximux-core` | `src/lib.rs` | shared domain types, no deps |
 | `pty` | `oximux-pty` | `src/lib.rs` | `TerminalBackend` + `PortablePtyBackend` |
 | `proc-cwd` | `oximux-proc-cwd` | `src/lib.rs` | resolve a process's working dir |
+| `owner-only` | `oximux-owner-only` | `src/lib.rs` | restrict a file or directory to the account that created it — `0600`/`0700` on unix, a stated *protected* DACL on Windows; shared by the desktop app, relay daemon, and remote host so the SID lookup exists once |
+| `no-window` | `oximux-no-window` | `src/lib.rs` | `CREATE_NO_WINDOW` for every child spawned on Windows, so a console-subsystem child (git, rg, an agent CLI's node) doesn't flash an empty console; a no-op applied unconditionally on every other platform |
+| `job-object` | `oximux-job-object` | `src/lib.rs` | Windows-only child-tree kill via a Job Object (`KILL_ON_JOB_CLOSE`) — terminating or crash-losing the host reaps every descendant, the tree semantics a unix process-group signal already gives for free; compiles to nothing off Windows |
+| `single-instance` | `oximux-single-instance` | `src/lib.rs` | non-blocking advisory file lock (`flock` / `LockFileEx` via `fd-lock`) deciding which process owns a per-data-directory role — extracted from the desktop's GUI singleton guard so `oximux serve` contends for the same roles (GUI singleton, schedule ticker) with identical semantics |
+| `shell-env` | `oximux-shell-env` | `src/lib.rs` | the default shell to spawn a new terminal with, and what its environment needs — shared by `oximux-pty`'s in-process backend and the relay daemon so the rule exists once, not twice out of sync |
 | `computer-use` | `oximux-computer-use` | `src/lib.rs` | `cua-driver` discovery/verify, permission gate, MCP declaration, one-click installer (`install/`) — never starts/supervises the daemon |
 | `macos-trust` | `oximux-macos-trust` | `src/lib.rs` | shared codesign/spctl verification + crash-safe `renamex_np` bundle swap, extracted from `computer-use` so it and `auto-update` don't fork their own copies |
 | `auto-update` | `oximux-auto-update` | `src/lib.rs` | desktop app self-update: GitHub release feed, download/mount/stage/verify pipeline, `UpdateStatus` state machine — swap is staged only, never live |
 | `git` | `oximux-git` | `src/lib.rs` | `Repository`, `StatusPoller`, git ops, `GhCmd` |
 | `agent-core` | `oximux-agent-core` | `src/lib.rs` | portable `ThreadEvent` vocabulary + stream-json decoder + `ChatThread` fold (serde/serde_json/tracing only, no pty/rusqlite/ACP/gpui/tokio — mobile-portable); re-exported by `agents` under `crate::thread::*` |
 | `agents` | `oximux-agents` | `src/lib.rs` | `AgentRuntime` trait, `CliRuntime`, `StatusMachine`; `SessionRegistry` (gpui-free session event bus + command surface, built for Remote Control, not yet wired into the view) |
-| `remote-proto` | `oximux-remote-proto` | `src/lib.rs` | transport-free Remote Control wire vocabulary — postcard RPC envelope, `HostEvent` stream frame, `PairingTicket` codec, `Transport` trait seam; no host/client wired to it yet |
+| `remote-proto` | `oximux-remote-proto` | `src/lib.rs` | transport-free Remote Control wire vocabulary — postcard RPC envelope, `HostEvent` stream frame, `PairingTicket` codec, `Transport` trait seam; `remote-host`, `remote-session`, `remote-iroh`, and the `oximux` CLI all speak it |
+| `remote-local` | `oximux-remote-local` | `src/lib.rs` | the same-machine control transport: the owner-only unix socket / named pipe the `oximux` CLI uses to reach a host (desktop app or `oximux serve`), behind `remote-proto`'s `Transport` seam — both the listener a host binds and the dial the CLI makes live here |
+| `remote-host` | `oximux-remote-host` | `src/lib.rs` | the remote-control host core: transport-agnostic RPC dispatcher, two-key pairing/auth handshake + ACL, host identity; serves `agents`' `SessionRegistry` over `remote-proto`. Used by both hosts (`apps/desktop` and `apps/cli`'s `serve`) — never ships to mobile |
+| `remote-session` | `oximux-remote-session` | `src/lib.rs` | the client-side remote-control session (the phone's Rust core) — pure Rust, no FFI, unit-testable over the in-memory loopback against the real `remote-host` dispatcher; `mobile-core` wraps it |
+| `remote-iroh` | `oximux-remote-iroh` | `src/lib.rs` | the production iroh P2P (QUIC) `Transport`/`Connector` impls beneath `remote-session` and `remote-host`; its `host` feature — off by default in this workspace alias, opted into by both hosts (`apps/desktop` and `apps/cli`) — adds the accept loop, so the mobile core never links the PTY-spawning code |
+| `mobile-core` | `oximux-mobile-core` | `src/lib.rs` | uniffi binding wrapping `remote-session` + `remote-iroh` into a typed async + streamed-callback surface for the React Native app; builds `cdylib` (Android) / `staticlib` (iOS) alongside a normal `lib` |
 | `editor` | `oximux-editor` | `src/lib.rs` | gpui-component editor wrapper + LSP glue |
+| `dictation` | `oximux-dictation` | `src/lib.rs` | offline voice dictation: cpal mic capture → 16kHz resample → sherpa-onnx decode (Whisper for Vietnamese, Parakeet for English); channel-based `DictationController`, no GPUI dependency |
 | `storage` | `oximux-storage` | `src/lib.rs` | SQLite + migration ladder + CI guard |
 | `settings` | `oximux-settings` | `src/lib.rs` | theme tokens, density, typography, TOML config |
 | `relay-proto` | `oximux-relay-proto` | `src/lib.rs` | wire protocol shared by daemon + client |
 | `relay` | `oximux-relay` | `src/lib.rs` + `src/main.rs` | out-of-process PTY relay daemon |
 | `relay-client` | `oximux-relay-client` | `src/lib.rs` | in-app client for the relay daemon |
+| `relay-supervisor` | `oximux-relay-supervisor` | `src/lib.rs` | ensures an `oximux-relay` daemon is alive and hands back a connected `RelayClient` — extracted from the desktop app so `oximux serve` supervises the same daemon with identical detach recipes and version-mismatch handling |
+| `relay-terminals` | `oximux-relay-terminals` | `src/lib.rs` | `remote-host`'s `TerminalSource` seam implemented over the relay daemon — extracted from the desktop so `oximux serve` exposes the same terminals the same way, gap semantics included |
 | `ui` | `oximux-ui` | `src/lib.rs` | app-agnostic widgets (`FloatingSurface`, buttons, `ConfirmDialog`); re-exported as `crate::ui` |
-| `app` | `oximux-app` | `src/lib.rs` + `src/main.rs` | GPUI cockpit; all views (the 73%-LOC crate) |
 | `xtask/` | `xtask` | `src/main.rs` | repo lint orchestrator (`file-size-lint` etc.) |
+
+### Apps (`apps/<dir>/` → package → bin → purpose)
+
+| App dir | Package | Cargo bin | Installed as | Purpose |
+|---|---|---|---|---|
+| `desktop` | `oximux-app` | `oximux` | `oximux` | GPUI cockpit; all views (the 73%-LOC crate) |
+| `cli` | `oximux-cli` | `oximux-cli` | `oximux` | scriptable client of a running host (desktop app or `oximux serve`) — every verb, plus `oximux serve` itself and self-update |
+
+The cargo bin target and the installed command name differ for `apps/cli`
+deliberately: `apps/desktop` already owns the bin name `oximux`, and two
+packages producing one bin name would make `cargo build --workspace`
+overwrite whichever built second. The installer still places `apps/cli`'s
+binary on `PATH` under the name users actually type, `oximux`.
+
+### `oximux serve` topology (headless host)
+
+`apps/cli/src/serve/` runs the same `Dispatcher` / `SessionRegistry` /
+storage / relay stack the desktop app hosts, minus every view. It binds two
+listeners: the owner-only local control socket (`remote-local`) the `oximux`
+CLI dials, and the iroh endpoint (`remote-iroh`) paired devices reach.
+
+Stdout carries exactly one line, the readiness JSON, and nothing else — all
+logging goes to stderr. By default serve shares the desktop app's data
+directory, so sessions, transcripts, and pairings are one set regardless of
+which host is running, and it contends for a single-owner advisory lock
+(`single-instance`) so only one process fires the data dir's schedule ticker.
+Each agent serve spawns is granted its own session-scoped local credential,
+confining it to its own conversation instead of the operator's full scope.
 
 ### `apps/desktop/src/` — top-level (non-view)
 

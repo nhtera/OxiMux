@@ -193,6 +193,88 @@ pub struct SessionTranscriptWire {
     pub model: Option<String>,
 }
 
+/// One page of a folded transcript — the
+/// [`Response::TranscriptPage`](crate::proto::Response::TranscriptPage) payload.
+///
+/// `entries_json` is a JSON **array slice** of the folded `Vec<ThreadEntry>` —
+/// the entries `[cursor, next_cursor)` of the full snapshot, each identical to
+/// what [`SessionTranscriptWire`] would have carried at that position. The
+/// client concatenates page arrays in order to rebuild the full fold.
+/// `next_cursor` is the index to request next, `None` on the last page; `total`
+/// is the snapshot's full entry count, constant across its pages. `seq` is the
+/// fold cursor of the whole snapshot (not the page), so live resume works from
+/// any completed paging pass.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TranscriptPageWire {
+    pub session_id: String,
+    pub seq: u64,
+    pub entries_json: String,
+    pub next_cursor: Option<u64>,
+    pub total: u64,
+    pub model: Option<String>,
+}
+
+/// One worktree (workspace) row — the
+/// [`Response::WorktreeCreated`](crate::proto::Response::WorktreeCreated) /
+/// [`Response::Worktrees`](crate::proto::Response::Worktrees) payload.
+///
+/// `id` is the stable handle
+/// [`Request::RemoveWorktree`](crate::proto::Request::RemoveWorktree) takes —
+/// removal is by id, never by path. `path` is the worktree's absolute host
+/// path, exposed for the same reason [`ProjectSummaryWire::path`] is: it is
+/// what a client hands to
+/// [`Request::CreateSession`](crate::proto::Request::CreateSession), and the
+/// surface is gated on full scope so a confined device never sees it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeWire {
+    pub id: String,
+    /// The owning project's root path, matching a
+    /// [`ProjectSummaryWire::path`].
+    pub project_path: String,
+    /// Human label (the desktop's workspace name).
+    pub name: String,
+    pub slug: String,
+    /// The branch the worktree was created on (`oximux/<slug>` for rows the
+    /// desktop minted).
+    pub branch: String,
+    /// Absolute host path of the worktree directory.
+    pub path: String,
+}
+
+/// A freshly-minted pairing window — the
+/// [`Response::PairingIssued`](crate::proto::Response::PairingIssued) payload.
+///
+/// `ticket` is the [`PairingTicket`](crate::pairing::PairingTicket) in its
+/// canonical `base64url` form — the exact string a QR encodes — so the CLI
+/// renders it without re-deriving the encoding. A bearer credential with a
+/// short life: `expires_at` (unix seconds) is the host's own deadline, and the
+/// window is one-time — the first successful registration spends it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingIssuedWire {
+    pub ticket: String,
+    pub expires_at: u64,
+    /// Whether the enrollment this ticket mints is read-only (the opt-down) —
+    /// echoed so the operator sees which tier they just offered.
+    pub read_only: bool,
+}
+
+/// One enrolled device — the
+/// [`Response::PairedDeviceList`](crate::proto::Response::PairedDeviceList)
+/// payload row. Mirrors what the desktop's paired-devices pane shows, tier
+/// included, so a mistaken full-write pairing is visible from the CLI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairedDeviceWire {
+    pub pubkey: [u8; 32],
+    pub name: String,
+    pub read_only: bool,
+    /// Tombstoned but still listed — erasing it is the only way that device
+    /// can ever pair again.
+    pub revoked: bool,
+    /// Unix seconds of the last successful authentication; `None` for a device
+    /// that paired but never reconnected.
+    pub last_seen: Option<u64>,
+}
+
 /// One terminal the phone can list and attach to.
 ///
 /// `cwd` is the terminal's working directory as a display string, not a path to
@@ -490,4 +572,192 @@ pub struct ScheduleRunWire {
 pub enum RunOutcomeWire {
     Ok,
     Failed,
+}
+
+// ---- v18: automation primitives ----
+
+/// Arm a heartbeat — a recurring wake-up inside a session that already exists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateHeartbeatReq {
+    /// The session to wake, or `None` for "the one this connection IS".
+    ///
+    /// `None` is the confined-agent case and the reason this is optional at
+    /// all: an agent knows it wants to wake *itself* but does not necessarily
+    /// know its own session id (its credential names a handle, not an id). The
+    /// host resolves it from the connection's proven scope, which is the only
+    /// value it could honestly supply.
+    pub session_id: Option<String>,
+    /// A name for the wake-up, shown in listings and quoted in the preamble the
+    /// agent receives, so a fired heartbeat says which one it was.
+    pub name: String,
+    /// What to send when it fires. Delivered under a preamble marking it as a
+    /// timer rather than a person, so the agent acts instead of replying.
+    pub prompt: String,
+    pub recurrence: RecurrenceWire,
+}
+
+/// One armed heartbeat.
+///
+/// Its own type rather than a field appended to [`ScheduleWire`]: postcard
+/// structs are positional, so appending there would misparse every later
+/// element of a `Vec<ScheduleWire>` on any client built before the change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeartbeatWire {
+    pub id: String,
+    /// The session this wakes.
+    pub session_id: String,
+    pub name: String,
+    pub prompt: String,
+    pub recurrence: RecurrenceWire,
+    pub enabled: bool,
+    /// RFC-3339 next-fire instant in the **host's** local zone.
+    pub next_fire_at: String,
+    /// The host's own human phrasing of the recurrence, carried rather than
+    /// re-derived so every surface reads identically.
+    pub summary: String,
+}
+
+/// Open a team run: one session per role, all in one call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRunCreateReq {
+    /// A name for the run, shown in listings.
+    pub name: String,
+    /// The project root every role's session opens in (or the base for its
+    /// worktree). Validated by the host exactly as `CreateSession`'s cwd is.
+    pub cwd: String,
+    /// Which configured agent runs every role. `None` = the host's default.
+    pub agent_id: Option<String>,
+    /// Give each role its own worktree under the project, so roles editing the
+    /// same files do not collide. The host derives each path from the run and
+    /// role names — never the client.
+    pub worktree_each: bool,
+    /// The roles, in order. At least one; the host caps how many.
+    pub roles: Vec<TeamRoleSpecWire>,
+}
+
+/// One role's name and opening instruction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRoleSpecWire {
+    pub name: String,
+    pub prompt: String,
+}
+
+/// A team run and every role in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRunWire {
+    pub id: String,
+    pub name: String,
+    pub cwd: String,
+    /// RFC-3339 creation instant, host-local.
+    pub created_at: String,
+    /// `true` once every role has reported. Derived host-side so two clients
+    /// cannot disagree about whether a run is finished.
+    pub closed: bool,
+    pub roles: Vec<TeamRoleWire>,
+}
+
+/// One role's live state within a run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRoleWire {
+    pub name: String,
+    /// The session working this role, when one started. `None` means the
+    /// session could not be opened — the role's status says why.
+    pub session_id: Option<String>,
+    pub status: TeamRoleStatusWire,
+    /// What the role reported, or why it could not start.
+    pub summary: Option<String>,
+    /// RFC-3339 instant the role last changed state, host-local.
+    pub updated_at: String,
+}
+
+/// Where a role stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TeamRoleStatusWire {
+    /// Session open, no report yet.
+    Running,
+    /// The role reported success.
+    Done,
+    /// The role reported failure, or never started.
+    Failed,
+}
+
+/// Write one coordination key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateSetReq {
+    pub key: String,
+    /// The value, as a JSON string. A string rather than a `Value` because the
+    /// postcard envelope carries no self-describing types — the same convention
+    /// the transcript and event payloads already follow.
+    pub value_json: String,
+    /// Optimistic concurrency: write only if the stored version is exactly
+    /// this. `Some(0)` means "only if absent". `None` overwrites.
+    pub if_version: Option<u64>,
+}
+
+/// One coordination entry as stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateEntryWire {
+    pub key: String,
+    pub value_json: String,
+    /// Incremented on every write. A caller passes the version it read back as
+    /// `if_version` to make its next write conditional on nothing having
+    /// changed underneath it.
+    pub version: u64,
+    /// RFC-3339 last-write instant, host-local.
+    pub updated_at: String,
+}
+
+/// One coordination change, carrying the cursor position that produced it.
+///
+/// The `seq` is a host-wide counter over *changes*, not the per-key `version`
+/// in [`StateEntryWire`]: a watcher needs one ordering across every key it
+/// watches, and per-key versions give no way to tell whether something it never
+/// saw happened in between.
+///
+/// It counts from the host's boot, and a restart resets it. That is why a
+/// resume answers with a fresh baseline whenever the cursor cannot be honoured
+/// rather than trusting the number — a stale cursor from a previous boot would
+/// otherwise silently look like a valid recent one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateChangeWire {
+    pub seq: u64,
+    pub key: String,
+    /// `None` is a delete — the key no longer exists.
+    pub entry: Option<StateEntryWire>,
+}
+
+/// What a cursor-aware `StateWatchFrom` starts a watcher with.
+///
+/// Exactly one of `baseline`/`replay` carries anything, and which one is the
+/// answer to "did I miss something?": a `baseline` means the watcher's cursor
+/// could not be honoured and it is being resynced from scratch, a `replay`
+/// means the gap was covered exactly. That distinction is the whole point of
+/// the cursor — the pre-v19 `StateWatch` returned the board either way, so a
+/// watcher could not tell a clean reconnect from a lossy one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateWatchStartedWire {
+    /// The cursor to resume from next time: the newest change the host has
+    /// issued, whether or not this watcher received it.
+    pub seq: u64,
+    /// The board as it stands — sent for a fresh watch, and for a resume whose
+    /// cursor had aged out of the host's ring (or predates its boot).
+    pub baseline: Option<Vec<StateEntryWire>>,
+    /// The changes since the caller's cursor, when the ring still covered them.
+    /// Empty is a normal answer: nothing happened while the watcher was away.
+    pub replay: Vec<StateChangeWire>,
+}
+
+/// A role settling its own row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamReportReq {
+    pub run_id: String,
+    /// Which role is reporting. Named rather than inferred from the calling
+    /// session so an operator can settle a role whose agent died — otherwise a
+    /// crashed role would hold its run open with nothing able to close it.
+    pub role: String,
+    /// `true` for done, `false` for failed. A bool rather than the status enum
+    /// because `Running` is not something a report can set: a role reporting is
+    /// by definition finished.
+    pub ok: bool,
+    pub summary: Option<String>,
 }

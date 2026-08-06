@@ -43,14 +43,82 @@ pub use crate::messages::*;
 /// the host's projects (name + path) so a client can start a session in one
 /// without typing its path. v15: appended `Unpair` — a device drops its own
 /// enrollment, so forgetting a desktop on the phone also clears the phone from
-/// the desktop's paired-devices list.
+/// the desktop's paired-devices list. v16: appended the CLI working set — the
+/// paginated transcript fetch (`FetchTranscriptPage` + its `TranscriptPage`
+/// reply; the v13 `FetchTranscript` is untouched as the legacy unpaginated
+/// path), the worktree surface (`CreateWorktree`/`ListWorktrees`/
+/// `RemoveWorktree` and the `WorktreeCreated`/`Worktrees` replies), and
+/// [`RpcError::Unsupported`] so a host without an optional capability can say
+/// so to an *authorized* caller instead of miscategorizing it as a refusal.
+/// v16 also carries the local-operator pairing administration a headless host
+/// needs (`PairNew`/`PairList`/`PairRemove` and the `PairingIssued`/
+/// `PairedDeviceList` replies) — runtime commands, never boot flags, so a
+/// bearer ticket is minted on demand instead of reprinted into a journal.
+/// v17: appended `RunScheduleNow` (a manual fire that never advances cadence
+/// accounting) with its `ScheduleRunRecorded` reply, and the
+/// `ScheduleRunsChanged` push — a recorded schedule run delivered to
+/// session-list subscribers so run results arrive without polling. The push is
+/// gated host-side on the peer having declared ≥ v17
+/// ([`SCHEDULE_PUSH_MIN_VERSION`]): unlike a new *reply* (only sent to a peer
+/// that asked), a push reaches peers that never opted in, and an older decoder
+/// meeting the unknown ordinal would drop the whole connection.
+///
+/// v18: appended the automation surface — **heartbeats** (`CreateHeartbeat`,
+/// `ListHeartbeats`, `DeleteHeartbeat` and the `Heartbeats` reply), a session's
+/// own recurring wake-ups, which are schedules aimed at an existing session
+/// rather than at a fresh spawn; **team runs** (`TeamRunCreate`, `TeamReport`,
+/// `TeamStatus`, `TeamList` and the `TeamRun`/`TeamRuns` replies), a restart-
+/// surviving record of a multi-role fan-out; and the **coordination state KV**
+/// (`StateGet`, `StateSet`, `StateDelete`, `StateWatch` with the `StateValue`/
+/// `StateSnapshot`/`StateChanged`/`StateConflict` frames), a small versioned
+/// blackboard agents share without going through a transcript.
+///
+/// Heartbeats get their own list verb and their own `HeartbeatWire` rather than
+/// riding [`Response::Schedules`]: `ScheduleWire` is a postcard struct, so it
+/// is as positional as an enum and a field appended to it would misparse every
+/// element after the first on an older client. The same reasoning keeps
+/// heartbeats out of `ListSchedules` entirely — a v17 phone must not receive
+/// rows whose target it has no field to see.
+///
+/// v19: appended the **coordination watch cursor** (`StateWatchFrom` with the
+/// `StateWatchStarted`/`StateChangedAt` frames). v18's `StateWatch` answers the
+/// board and then pushes every change, which is enough to stay current but not
+/// to know whether you *are*: a watcher whose connection dropped, or whose
+/// receiver lagged, got no signal that it had missed transitions, and the
+/// stream carried no position it could resume from. The cursor version replays
+/// the gap when the host's ring still covers it and otherwise resyncs with a
+/// fresh baseline — the same "recover, and say so" contract session events have
+/// had since v1, rather than silent staleness.
+///
+/// `StateWatch` is untouched and still served: a v18 peer keeps working exactly
+/// as before, and gets the cursor-less push it has a decoder for.
 ///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 19;
+
+/// The oldest peer that can decode [`Response::StateChanged`]. Like
+/// [`SCHEDULE_PUSH_MIN_VERSION`], this exists because a push reaches a peer
+/// that never asked for it — but unlike that one, a peer only ever receives
+/// `StateChanged` after sending [`Request::StateWatch`], which a pre-v18 peer
+/// cannot do. Stated anyway so the gate is a property of the push rather than
+/// an inference about who could have subscribed.
+pub const STATE_PUSH_MIN_VERSION: u32 = 18;
+
+/// The oldest peer that can decode [`Response::StateChangedAt`]. Same reasoning
+/// as [`STATE_PUSH_MIN_VERSION`], one version on: only a peer that sent
+/// [`Request::StateWatchFrom`] ever receives it, and only a v19 peer can send
+/// that — but the gate is stated so it is a property of the push rather than an
+/// inference about who could have subscribed.
+pub const STATE_CURSOR_PUSH_MIN_VERSION: u32 = 19;
+
+/// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
+/// must not push it to a connection whose declared version is older — see the
+/// v17 note above for why pushes, uniquely, need this gate.
+pub const SCHEDULE_PUSH_MIN_VERSION: u32 = 17;
 
 /// The oldest peer version this build still speaks. **Raise this only on a
 /// genuinely breaking change** — a reordered/removed variant or an altered
@@ -116,6 +184,14 @@ pub enum RpcError {
     /// do (upgrade the phone) instead of reporting a bare connection failure.
     /// Appended last to keep the enum's ordinal encoding append-only.
     IncompatibleVersion { host_version: u32, host_min_compatible: u32 },
+    /// The host understood the call but does not offer the capability — a
+    /// headless host with no speech engine, a build without worktrees. Distinct
+    /// from [`RpcError::Unauthorized`] **only for an authorized caller**: the
+    /// unauthorized answer stays `Unauthorized` so a capability cannot be probed
+    /// without a credential. Clients render "this host cannot do that" rather
+    /// than "you may not do that", which would send the user to the wrong fix.
+    /// Appended last to keep the enum's ordinal encoding append-only (v16).
+    Unsupported,
 }
 
 /// Client → host. Append-only; see the module note.
@@ -383,6 +459,160 @@ pub enum Request {
     /// the authorization gate before this handler runs, so it cannot clear its own
     /// tombstone and re-pair.
     Unpair,
+    /// One page of a session's folded transcript — the paginated successor to
+    /// [`Request::FetchTranscript`], which is **left untouched** as the legacy
+    /// unpaginated path (changing its reply shape would break every v15 phone;
+    /// postcard payloads are positional and may never be reshaped).
+    ///
+    /// `cursor` is the folded-entry index to start from (0 for the first page);
+    /// `limit` caps how many entries this page may carry. The host additionally
+    /// enforces a byte budget so a page always fits one transport frame — a
+    /// client must treat a short page as normal and keep paging by
+    /// `next_cursor`, never assume `limit` entries arrived. Read-only;
+    /// scope-checked like the other session RPCs. Appended for v16.
+    FetchTranscriptPage { session_id: String, cursor: u64, limit: u32 },
+    /// Create a git worktree (a workspace) under a project.
+    ///
+    /// **The target path is host-derived, never client-supplied**: the host
+    /// composes it from its own data directory, the project's id, and the
+    /// sanitized slug — exactly as the desktop's own New-Worktree flow does. The
+    /// client only picks *which* project, by the absolute root path a
+    /// [`Response::Projects`] row already handed it; a path matching no known
+    /// project is refused, so this cannot be aimed at an arbitrary repository.
+    ///
+    /// A **write to the filesystem and the repository** (new worktree + new
+    /// branch), and it names no session — so it is gated on a dedicated
+    /// full-scope, non-read-only check, the same shape as
+    /// [`Request::CreateSession`]: a session-scoped device could otherwise mint
+    /// itself a directory outside its confinement.
+    CreateWorktree { project_path: String, slug: String },
+    /// List a project's worktrees (or every project's, when `project_path` is
+    /// `None`). A **read**, but a full-scope one: worktree rows carry host
+    /// paths and branch names across all projects, which a session-scoped
+    /// device must not enumerate. A read-only full device may list — seeing
+    /// worktrees changes nothing.
+    ListWorktrees { project_path: Option<String> },
+    /// Remove a worktree by the id a [`Response::Worktrees`] row carried —
+    /// **never by path**, so there is no path for a client to aim. Destructive
+    /// (deletes the worktree directory and its branch), so it shares
+    /// [`Request::CreateWorktree`]'s gate. Removing one already gone is not an
+    /// error.
+    RemoveWorktree { id: String },
+    /// Open a pairing window and mint its ticket — the runtime `pair-new`
+    /// command a headless host takes instead of a boot flag (a flag would
+    /// reprint the bearer ticket into the journal on every restart).
+    ///
+    /// **Local-operator only** — the strictest gate on this protocol. A paired
+    /// device that could mint tickets could enroll further devices (lateral
+    /// movement), so even full-scope remote devices are refused; only a caller
+    /// on the host's own owner-only socket may ask. The reply carries a bearer
+    /// credential: the CLI prints it to an interactive TTY only, and the host
+    /// must never log it. Tickets are one-time and short-lived by construction.
+    ///
+    /// `read_only` opts the resulting enrollment down to the read tier;
+    /// the default mints full write, per the recorded product decision.
+    PairNew { read_only: bool },
+    /// The host's paired devices — tier, revocation, last-seen — so a mistaken
+    /// enrollment is visible. Same local-operator gate as
+    /// [`Request::PairNew`]: the device list is admin surface, not device
+    /// surface.
+    PairList,
+    /// Erase one device's enrollment by pubkey (the host-side counterpart of
+    /// the desktop's Forget). Idempotent; same local-operator gate. Erasure
+    /// rather than revocation, so the device may pair again with a fresh
+    /// ticket — revocation stays a desktop-UI act.
+    PairRemove { pubkey: [u8; 32] },
+    /// Fire one schedule immediately, recording the run **without advancing
+    /// cadence accounting** — `next_fire_at` is untouched and the scheduled
+    /// occurrence still fires on time. Works on paused schedules too: an
+    /// explicit run-now outranks the pause, which only silences the clock.
+    ///
+    /// Same write gate as [`Request::CreateSchedule`] (full scope, not
+    /// read-only): this spawns a session. The reply is
+    /// [`Response::ScheduleRunRecorded`] with the settled run — the RPC waits
+    /// for the fire to start (or fail to), not for the agent turn to finish.
+    /// A host whose scheduling is owned by another process (the ticker lock
+    /// lost) answers [`RpcError::Unsupported`].
+    RunScheduleNow { schedule_id: String },
+
+    // ---- v18: automation primitives ----
+    /// Arm a recurring wake-up **inside an existing session** — a heartbeat.
+    ///
+    /// Unlike [`Request::CreateSchedule`], which spawns a fresh session per
+    /// fire, this delivers its prompt into a conversation that is already open,
+    /// with all the context that conversation has built. That is what makes it
+    /// useful to the agent living there, and it is why the gate is
+    /// **session-scoped, not full-scope**: a heartbeat is a deferred
+    /// `SendPrompt` into one session, so anyone who may prompt that session
+    /// may arm one. A read-only device may not; a session-confined agent may,
+    /// for its own session only.
+    ///
+    /// `session_id` is `None` for a caller that IS a session (the confined
+    /// agent case) — the host resolves it from the connection's own scope,
+    /// which is the only value it could legitimately name. An operator must
+    /// name one.
+    ///
+    /// Capped per session host-side; the overflow refusal is a
+    /// [`RpcError::BadRequest`] naming the limit.
+    CreateHeartbeat(CreateHeartbeatReq),
+    /// The heartbeats armed for a session. `None` means the calling session,
+    /// as in [`Request::CreateHeartbeat`]. A read (scope-checked, read-only
+    /// devices welcome).
+    ListHeartbeats { session_id: Option<String> },
+    /// Disarm one heartbeat by id. Idempotent — deleting one already gone is
+    /// success. Same write gate as arming it, checked against the session the
+    /// heartbeat actually targets rather than one the caller names, so a
+    /// confined agent cannot delete another session's wake-ups.
+    DeleteHeartbeat { id: String },
+    /// Open a team run: one row per role, each with a session started for it.
+    ///
+    /// The run outlives the process that created it — a host restart
+    /// re-associates live sessions to open runs rather than losing them, which
+    /// is the whole reason this is host state and not a client-side script's
+    /// bookkeeping. Full write scope, like [`Request::CreateSession`]: it
+    /// starts sessions, several at once.
+    TeamRunCreate(TeamRunCreateReq),
+    /// A role reporting its own outcome — called by the agent working that
+    /// role, from inside its session. Scope-checked against **that role's
+    /// session**, so a confined agent can settle its own row and no other.
+    TeamReport(TeamReportReq),
+    /// One run's roles and their statuses. A read; full scope, since a run
+    /// spans sessions and a confined caller has no defensible narrowing.
+    TeamStatus { run_id: String },
+    /// Every team run this host holds, newest first. Same read gate as
+    /// [`Request::TeamStatus`].
+    TeamList,
+    /// Read one coordination key. Absent is a normal answer
+    /// ([`Response::StateValue`] with `entry: None`), not an error.
+    StateGet { key: String },
+    /// Write one coordination key.
+    ///
+    /// `if_version` is optimistic concurrency: `Some(v)` writes only if the
+    /// stored version is exactly `v` (`Some(0)` means "only if absent"), and a
+    /// mismatch is refused with the *current* entry so the caller can merge and
+    /// retry rather than guess. `None` overwrites unconditionally.
+    StateSet(StateSetReq),
+    /// Delete one coordination key. Idempotent.
+    StateDelete { key: String },
+    /// Subscribe to coordination-state changes, optionally narrowed to keys
+    /// with `prefix`. The reply is the matching entries as they stand now;
+    /// [`Response::StateChanged`] frames follow for every later write or
+    /// delete, so a watcher never has to poll and never misses the baseline.
+    StateWatch { prefix: Option<String> },
+    // ---- v19: the coordination watch cursor ----
+    /// Subscribe to coordination-state changes **with a cursor**, so a watcher
+    /// that reconnects can tell whether it missed anything.
+    ///
+    /// `since_seq: None` is a fresh watch and answers with a baseline, exactly
+    /// like [`Request::StateWatch`] but carrying the cursor to resume from.
+    /// `Some(n)` resumes after change `n`: the reply replays the gap when the
+    /// host's ring still covers it, and otherwise sends a fresh baseline —
+    /// which is the watcher's signal that it lost transitions.
+    ///
+    /// A separate variant rather than a field on `StateWatch` because postcard
+    /// encodes a struct-like variant positionally: widening the existing one
+    /// would misparse on every peer that predates the change.
+    StateWatchFrom { prefix: Option<String>, since_seq: Option<u64> },
 }
 
 /// Host → client.
@@ -510,6 +740,83 @@ pub enum Response {
     /// [`Request::CreateSession`]. May be empty (no projects, or the host exposes
     /// none).
     Projects(Vec<ProjectSummaryWire>),
+    /// One page of a folded transcript — the reply to
+    /// [`Request::FetchTranscriptPage`]. Carries the page's entries plus the
+    /// cursor to continue from (`None` when this was the last page). The `seq`
+    /// is the fold cursor of the **whole** snapshot, identical on every page,
+    /// so a client subscribes from it after the final page exactly as it would
+    /// after a [`Response::SessionTranscript`]. Appended for v16.
+    TranscriptPage(TranscriptPageWire),
+    /// Reply to [`Request::CreateWorktree`] — the created row, so the client
+    /// can start a session in it (`path` feeds
+    /// [`Request::CreateSession`]'s cwd) without re-listing.
+    WorktreeCreated(WorktreeWire),
+    /// Reply to [`Request::ListWorktrees`]. Empty is a normal answer — a
+    /// project with no worktrees is the common case, not a failure.
+    Worktrees(Vec<WorktreeWire>),
+    /// Reply to [`Request::PairNew`] — the encoded ticket and its window.
+    /// **Contains a bearer credential**: hosts never log it, and the CLI
+    /// refuses to print it anywhere but an interactive terminal.
+    PairingIssued(PairingIssuedWire),
+    /// Reply to [`Request::PairList`].
+    PairedDeviceList(Vec<PairedDeviceWire>),
+    /// Reply to [`Request::RunScheduleNow`] — the manual run as recorded,
+    /// success or failure (the failure detail rides in the run itself; an
+    /// `Error` reply is reserved for refusals, not fires that ran and failed).
+    ScheduleRunRecorded(ScheduleRunWire),
+    /// A schedule run **pushed** to session-list subscribers the moment it is
+    /// recorded, unsolicited — scheduled and manual fires alike, so a phone or
+    /// CLI watching the host learns a run's outcome without polling
+    /// [`Request::GetScheduleRuns`]. Only sent to peers that declared
+    /// ≥ [`SCHEDULE_PUSH_MIN_VERSION`] in their `Hello`.
+    ScheduleRunsChanged(ScheduleRunWire),
+
+    // ---- v18: automation primitives ----
+    /// Reply to [`Request::CreateHeartbeat`] — the armed wake-up.
+    HeartbeatCreated(HeartbeatWire),
+    /// Reply to [`Request::ListHeartbeats`]. Empty is normal.
+    Heartbeats(Vec<HeartbeatWire>),
+    /// Reply to [`Request::TeamRunCreate`] and [`Request::TeamStatus`] — one
+    /// run with every role's current state.
+    TeamRun(TeamRunWire),
+    /// Reply to [`Request::TeamList`], newest run first.
+    TeamRuns(Vec<TeamRunWire>),
+    /// Reply to [`Request::StateGet`], and to a [`Request::StateSet`] that
+    /// **wrote**: the entry as it now stands, or `None` for a key that does not
+    /// exist. A refused conditional write answers
+    /// [`Response::StateConflict`] instead.
+    StateValue(Option<StateEntryWire>),
+    /// Reply to [`Request::StateWatch`] — the entries matching the prefix as
+    /// they stand at subscribe time, before any pushed change.
+    StateSnapshot(Vec<StateEntryWire>),
+    /// One coordination-state write or delete **pushed** to a watcher,
+    /// unsolicited. A delete carries `entry: None` under the deleted key.
+    /// Never sent to a peer below [`STATE_PUSH_MIN_VERSION`].
+    StateChanged { key: String, entry: Option<StateEntryWire> },
+    /// A conditional [`Request::StateSet`] lost: the stored version was not the
+    /// one the caller expected. Carries the entry it lost to (`None` when the
+    /// caller expected a value and the key is absent), so a losing writer can
+    /// merge and retry without a second round trip.
+    ///
+    /// Its own variant rather than a `StateValue` carrying the current entry:
+    /// those two are indistinguishable whenever the winning write happens to
+    /// leave the value the loser was trying to store, and a caller that
+    /// mistakes a refusal for a success is exactly the lost update this whole
+    /// mechanism exists to prevent. Not an [`RpcError`] either — nothing is
+    /// wrong, the caller simply lost a race it asked to be told about.
+    StateConflict(Option<StateEntryWire>),
+    // ---- v19: the coordination watch cursor ----
+    /// Reply to [`Request::StateWatchFrom`] — the cursor to resume from, plus
+    /// either a fresh baseline or the replayed gap. See
+    /// [`StateWatchStartedWire`] for which means what.
+    StateWatchStarted(StateWatchStartedWire),
+    /// One coordination change pushed to a **cursor-aware** watcher. Identical
+    /// in meaning to [`Response::StateChanged`], plus the `seq` that lets the
+    /// watcher resume. Never sent to a peer below
+    /// [`STATE_CURSOR_PUSH_MIN_VERSION`], and never to a watcher that
+    /// subscribed with the cursor-less [`Request::StateWatch`] — that peer has
+    /// no decoder for this ordinal.
+    StateChangedAt(StateChangeWire),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

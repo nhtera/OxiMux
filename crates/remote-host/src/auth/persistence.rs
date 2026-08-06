@@ -235,6 +235,7 @@ fn hex_to_pubkey(hex: &str) -> Option<AppPubkey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Peer;
     use crate::registration_proof;
     use ed25519_dalek::SigningKey;
     use oximux_remote_proto::messages::RegisterReq;
@@ -394,8 +395,8 @@ mod tests {
         });
         let auth = AuthStore::with_store(store);
         assert!(auth.is_authorized(&pubkey), "seeded device is authorized");
-        assert!(auth.is_allowed_for(&pubkey, "sess-1"), "seeded scope restored");
-        assert!(!auth.is_allowed_for(&pubkey, "sess-2"), "seeded scope is not Full");
+        assert!(auth.is_allowed_for(&Peer::remote(pubkey), "sess-1"), "seeded scope restored");
+        assert!(!auth.is_allowed_for(&Peer::remote(pubkey), "sess-2"), "seeded scope is not Full");
     }
 
     #[test]
@@ -415,8 +416,8 @@ mod tests {
         {
             let auth = AuthStore::with_store(Arc::new(StorageDeviceStore::new(repo.clone())));
             assert!(auth.is_authorized(&pubkey), "device survived the restart");
-            assert!(auth.is_allowed_for(&pubkey, "sess-1"), "scope survived");
-            assert!(!auth.is_allowed_for(&pubkey, "sess-2"));
+            assert!(auth.is_allowed_for(&Peer::remote(pubkey), "sess-1"), "scope survived");
+            assert!(!auth.is_allowed_for(&Peer::remote(pubkey), "sess-2"));
             // A revoked device stays known → re-Register is still blocked post-restart.
             auth.revoke(&pubkey);
         }

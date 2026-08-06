@@ -163,12 +163,26 @@ pub async fn run_server(cfg: ServerConfig) -> Result<()> {
                     // twice, which is idempotent, and whoever decrements last
                     // always reads its own decrement, so the flush cannot be
                     // skipped by both.
-                    if checkpointing && active_sessions.load(Ordering::SeqCst) == 0 {
+                    let remaining = active_sessions.load(Ordering::SeqCst);
+                    if checkpointing && remaining == 0 {
                         tracing::debug!("last client disconnected; checkpointing");
-                        let _ = tokio::task::spawn_blocking(move || {
+                        // Panics inside the blocking pool land here as a join
+                        // error. Swallowing it silently would make a failed
+                        // flush indistinguishable from one that had nothing to
+                        // write, which is the hardest kind of bug to see.
+                        if let Err(err) = tokio::task::spawn_blocking(move || {
                             registry_for_flush.checkpoint_all()
                         })
-                        .await;
+                        .await
+                        {
+                            tracing::warn!(?err, "checkpoint flush task did not complete");
+                        }
+                    } else {
+                        tracing::debug!(
+                            remaining,
+                            checkpointing,
+                            "session ended; not the last client, or checkpointing is off"
+                        );
                     }
                 });
             }

@@ -100,11 +100,30 @@ impl AppState {
         oximux_agents::schedule::ScheduleStore::new(self.db.conn())
     }
 
+    /// The team-run store, shared with remote control so a run opened from the
+    /// CLI is the same run the desktop's host reports on.
+    pub fn team_store(&self) -> oximux_agents::team::TeamStore {
+        oximux_agents::team::TeamStore::new(self.db.conn())
+    }
+
+    /// The coordination blackboard, shared for the same reason — the board only
+    /// coordinates if every host reads one set of keys.
+    pub fn coord_store(&self) -> oximux_agents::coord::CoordStore {
+        oximux_agents::coord::CoordStore::new(self.db.conn())
+    }
+
     /// The project repository, shared for the remote-control project provider so a
     /// paired phone lists the same projects the desktop does. Clones the handle
     /// (shared `Db`), not a second connection — SQLite serializes writers.
     pub fn project_repo(&self) -> ProjectRepo {
         self.project_repo.clone()
+    }
+
+    /// The workspace repository, shared for the remote-control worktree service
+    /// so a CLI-created worktree is the same row the desktop's sidebar lists.
+    /// Clones the handle (shared `Db`), not a second connection.
+    pub fn workspace_repo(&self) -> WorkspaceRepo {
+        self.workspace_repo.clone()
     }
 }
 

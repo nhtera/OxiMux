@@ -145,6 +145,20 @@ pub struct HostInjection<'a> {
     /// Tool names for `--disallowedTools`, which removes them from the agent's
     /// surface in every permission mode and outranks a user's `permissions.allow`.
     pub disallowed_tools: &'a [String],
+    /// An id the *caller* picked for a brand-new conversation, passed as
+    /// `--session-id`.
+    ///
+    /// Exists because the CLI does not announce a session until it has been
+    /// given something to do: with stdin held open and no user message it emits
+    /// its `SessionStart` hook traffic and then nothing at all — no
+    /// `system/init`. A host that waits for that announcement before sending the
+    /// first prompt, and a CLI that withholds it until the first prompt arrives,
+    /// wait on each other forever. Naming the session up front removes the
+    /// question: there is nothing left to wait for.
+    ///
+    /// Mutually exclusive with the `resume_session_id` argument — one names a
+    /// conversation that already exists, the other one about to.
+    pub fresh_session_id: Option<&'a str>,
 }
 
 /// Same as [`build_args`], plus `--resume <session_id>` when restoring a
@@ -214,6 +228,11 @@ pub fn build_args_with_resume(
     if let Some(sid) = resume_session_id.map(str::trim).filter(|s| !s.is_empty()) {
         args.push("--resume".to_string());
         args.push(sid.to_string());
+    } else if let Some(sid) = host.fresh_session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        // Only when not resuming: `--resume` already names the conversation, and
+        // passing both would be one session under two ids.
+        args.push("--session-id".to_string());
+        args.push(sid.to_string());
     }
     // Host-declared MCP servers, passed as an inline JSON string (the CLI takes
     // "JSON files or strings"). `None` for the empty case, so no flag is added.
@@ -274,6 +293,7 @@ impl ClaudeStreamJsonConnection {
         permission_mode: Option<&str>,
         effort: Option<&str>,
         host: &HostInjection<'_>,
+        env: &[(String, String)],
     ) -> Result<(Self, Receiver<ThreadEvent>)> {
         let mut cmd = Command::new(crate::cli::program_for_spawn("claude"));
         cmd.args(build_args_with_resume(
@@ -283,7 +303,11 @@ impl ClaudeStreamJsonConnection {
             effort,
             host,
         ))
-        .current_dir(cwd);
+        .current_dir(cwd)
+        // Overrides on top of the inherited environment — the host's own
+        // variables for this one child (its local-control credential), which
+        // must reach the agent and no sibling process.
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         Self::spawn_command(cmd)
     }
 
@@ -656,6 +680,41 @@ mod tests {
         assert!(!build_args(Some("  ")).iter().any(|x| x == "--model"));
     }
 
+    /// A fresh session is *named* at spawn, and only when there is no `--resume`
+    /// to name it instead.
+    ///
+    /// This is what lets a headless host answer a create RPC without waiting to
+    /// be told an id — and the CLI never volunteers one until it is given a
+    /// prompt, which cannot be sent until that RPC has answered. Drop the flag
+    /// and the two wait on each other until the launch times out.
+    #[test]
+    fn build_args_names_a_fresh_session_but_never_alongside_resume() {
+        let fresh = HostInjection { fresh_session_id: Some("sid-fresh"), ..Default::default() };
+        let a = build_args_with_resume(None, None, None, None, &fresh);
+        let i = a.iter().position(|x| x == "--session-id").expect("--session-id present");
+        assert_eq!(a[i + 1], "sid-fresh");
+
+        // Resuming names the conversation already; both flags would be one
+        // session under two ids.
+        let both = build_args_with_resume(None, Some("sid-old"), None, None, &fresh);
+        assert!(both.iter().any(|x| x == "--resume"));
+        assert!(!both.iter().any(|x| x == "--session-id"));
+
+        // Blank is not a name.
+        let blank = HostInjection { fresh_session_id: Some("  "), ..Default::default() };
+        assert!(
+            !build_args_with_resume(None, None, None, None, &blank)
+                .iter()
+                .any(|x| x == "--session-id")
+        );
+        // An unset injection stays byte-identical to the pre-seam invocation.
+        assert!(
+            !build_args_with_resume(None, None, None, None, &HostInjection::default())
+                .iter()
+                .any(|x| x == "--session-id")
+        );
+    }
+
     #[test]
     fn build_args_appends_resume_when_session_id_set() {
         let a = build_args_with_resume(None, Some("sid-123"), None, None, &HostInjection::default());
@@ -753,6 +812,7 @@ mod tests {
                 mcp_servers: std::slice::from_ref(&spec),
                 settings: Some("{}"),
                 disallowed_tools: &tools,
+                ..Default::default()
             },
         );
         let i = a

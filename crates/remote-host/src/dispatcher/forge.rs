@@ -28,7 +28,7 @@ use oximux_remote_proto::messages::{
 use oximux_remote_proto::proto::{Response, RpcError};
 
 use super::Dispatcher;
-use crate::auth::AppPubkey;
+use crate::auth::Peer;
 
 impl Dispatcher {
     /// The session's working directory behind the read gate.
@@ -40,11 +40,11 @@ impl Dispatcher {
     /// Returns the bare [`RpcError`] rather than a whole `Response`: every
     /// failure here is one, and `Response` is a much larger type to move on an
     /// error path the callers immediately re-wrap anyway.
-    fn session_cwd(&self, pubkey: &AppPubkey, session_id: &str) -> Result<PathBuf, RpcError> {
+    fn session_cwd(&self, peer: &Peer, session_id: &str) -> Result<PathBuf, RpcError> {
         // A read, so `is_allowed_for` rather than `may_write` — nothing on this
         // surface mutates. PR create and merge are deliberately not here; a
         // merge is effectively irreversible and wants its own decision.
-        if !self.auth.is_allowed_for(pubkey, session_id) {
+        if !self.auth.is_allowed_for(peer, session_id) {
             return Err(RpcError::Unauthorized);
         }
         let Some(handle) = self.registry.get(session_id) else {
@@ -59,13 +59,13 @@ impl Dispatcher {
     /// Issues or pull requests for the session's repository.
     pub(super) async fn list_forge_items(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         session_id: &str,
         kind: ForgeItemKindWire,
         state: ForgeStateWire,
         mine: bool,
     ) -> Response {
-        let cwd = match self.session_cwd(pubkey, session_id) {
+        let cwd = match self.session_cwd(peer, session_id) {
             Ok(cwd) => cwd,
             Err(e) => return Response::Error(e),
         };
@@ -85,12 +85,12 @@ impl Dispatcher {
     /// Body + author of one issue/PR.
     pub(super) async fn forge_item_detail(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         session_id: &str,
         kind: ForgeItemKindWire,
         number: u64,
     ) -> Response {
-        let cwd = match self.session_cwd(pubkey, session_id) {
+        let cwd = match self.session_cwd(peer, session_id) {
             Ok(cwd) => cwd,
             Err(e) => return Response::Error(e),
         };
@@ -104,10 +104,10 @@ impl Dispatcher {
     /// CI check runs for the current branch's pull request.
     pub(super) async fn list_forge_checks(
         &self,
-        pubkey: &AppPubkey,
+        peer: &Peer,
         session_id: &str,
     ) -> Response {
-        let cwd = match self.session_cwd(pubkey, session_id) {
+        let cwd = match self.session_cwd(peer, session_id) {
             Ok(cwd) => cwd,
             Err(e) => return Response::Error(e),
         };

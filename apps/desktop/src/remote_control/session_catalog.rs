@@ -134,6 +134,51 @@ impl DesktopSessionCatalog {
     }
 }
 
+/// Whether `session_id` exists as far as this desktop's storage can tell —
+/// the predicate the schedule orphan sweep runs against.
+///
+/// Two sources, either sufficient, matching how each host defines existence:
+/// a **persisted tab** naming the session (this catalog's own notion — the
+/// transcript blob is contents and may legitimately be missing for a chat
+/// that never settled a turn), or an `agent_chat:` **blob** under the id (a
+/// session a headless host created in the shared data dir leaves no tab
+/// here, and disabling a schedule aimed at it would be the sweep firing on
+/// its own blind spot). Erring toward existence is the right bias for a
+/// safety net: a false "exists" merely defers to the fire path's own error,
+/// while a false "gone" silently disables a working schedule.
+pub fn session_known_in_storage(
+    settings: &oximux_storage::SettingsRepo,
+    projects: &oximux_storage::ProjectRepo,
+    window_id: &str,
+    session_id: &str,
+) -> bool {
+    if settings
+        .get(&crate::persisted_chat::chat_settings_key(session_id))
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return true;
+    }
+    let Ok(rows) = projects.list_ordered(usize::from(u8::MAX)) else {
+        // Unreadable storage must not read as "every session is gone".
+        return true;
+    };
+    rows.into_iter().any(|project| {
+        match crate::project_panes_factory::load_persisted_tabs(settings, &project.id, window_id) {
+            crate::project_panes_factory::LoadedTabs::Snapshot(snapshot) => {
+                snapshot.tabs.iter().any(|tab| {
+                    matches!(
+                        &tab.kind,
+                        PersistedTabKind::AgentChat { session_id: Some(id), .. } if id == session_id
+                    )
+                })
+            }
+            _ => false,
+        }
+    })
+}
+
 fn model_choice(choice: oximux_agents::thread::ModelChoice) -> DormantChoice {
     DormantChoice { id: choice.wire, label: choice.label, description: choice.description }
 }
@@ -481,5 +526,53 @@ mod tests {
         let registry = SessionRegistry::new();
         let outcome = registration_outcome(&registry, "s1", || None);
         assert_eq!(outcome, Err("the session's agent could not be started".into()));
+    }
+
+    /// The orphan-sweep predicate must honour BOTH notions of existence: a
+    /// tab with no blob (a desktop chat that never settled a turn), and a
+    /// blob with no tab (a session a headless host created in the shared
+    /// data dir). Only a session with neither is gone.
+    #[test]
+    fn session_known_covers_tab_only_and_blob_only_sessions() {
+        let db = oximux_storage::open_memory().expect("memory db");
+        let settings = oximux_storage::SettingsRepo::new(db.clone());
+        let projects = oximux_storage::ProjectRepo::new(db);
+        let project = projects.insert("thing", "/repo/thing", "main").expect("project");
+
+        // Tab-only: names a session id, saves no transcript beside it.
+        let snapshot = PersistedTabs {
+            tabs: vec![PersistedTab {
+                label: "Fresh chat".into(),
+                kind: PersistedTabKind::AgentChat {
+                    cwd: "/repo/thing".into(),
+                    model: None,
+                    session_id: Some("tab-only".into()),
+                    draft: None,
+                    queued: vec![],
+                    unbound: false,
+                },
+                ..PersistedTab::default()
+            }],
+            ..PersistedTabs::default()
+        };
+        crate::project_panes_factory::save_persisted_tabs(&settings, &project.id, WINDOW, &snapshot);
+
+        // Blob-only: the settings key a headless host writes, no tab anywhere.
+        settings
+            .set(&crate::persisted_chat::chat_settings_key("blob-only"), "{}")
+            .expect("seed blob");
+
+        assert!(
+            session_known_in_storage(&settings, &projects, WINDOW, "tab-only"),
+            "a never-settled chat's tab is its existence"
+        );
+        assert!(
+            session_known_in_storage(&settings, &projects, WINDOW, "blob-only"),
+            "a serve-created session in the shared data dir must not read as gone"
+        );
+        assert!(
+            !session_known_in_storage(&settings, &projects, WINDOW, "neither"),
+            "a session with no tab and no blob is genuinely gone"
+        );
     }
 }
