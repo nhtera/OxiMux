@@ -14,7 +14,7 @@ oximux-core = { workspace = true }
 oximux-no-window = { workspace = true }
 # Autosave cadence (debounce/enabled) is read from `AutosaveSettings`, a GPUI
 # global installed by the app. Settings is a leaf crate — no dependency cycle.
-oximux-settings = { workspace = true }
+oximux-settings = { workspace = true, features = ["gpui"] }
 
 # GPUI shell + editor primitive. gpui-component already wraps tree-sitter
 # (rust/ts/js/go/json/markdown/...) and exposes the `Input` widget plus

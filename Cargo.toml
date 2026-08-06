@@ -76,7 +76,11 @@ oximux-macos-trust = { path = "crates/macos-trust" }
 oximux-auto-update = { path = "crates/auto-update" }
 oximux-editor   = { path = "crates/editor" }
 oximux-storage  = { path = "crates/storage" }
-oximux-settings = { path = "crates/settings" }
+# `gpui` is opt-in rather than default so a headless consumer cannot inherit the
+# UI toolkit by omission — `oximux-worktree-ops` sits on the path from
+# `oximux-cli` to here and needs only `project_scripts`. Consumers with `Global`
+# impls, theme tokens or typography ask for it with `features = ["gpui"]`.
+oximux-settings = { path = "crates/settings", default-features = false }
 oximux-relay-proto = { path = "crates/relay-proto" }
 oximux-relay    = { path = "crates/relay" }
 oximux-relay-client = { path = "crates/relay-client" }

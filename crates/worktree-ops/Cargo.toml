@@ -22,6 +22,10 @@ rust-version.workspace = true
 oximux-core = { workspace = true }
 oximux-git = { workspace = true }
 oximux-storage = { workspace = true }
+# Deliberately without `features = ["gpui"]`: this crate reads only
+# `project_scripts` (`ScriptKind`, `load_for_project`), which is not gated on
+# it. Asking for gpui here would pull the UI toolkit into `oximux-cli` through
+# this edge — the headless host is exactly the consumer the feature spares.
 oximux-settings = { workspace = true }
 oximux-remote-host = { workspace = true }
 oximux-remote-proto = { workspace = true }

@@ -46,7 +46,7 @@ oximux-remote-iroh = { workspace = true, features = ["host"] }
 # The owner-only control socket the `oximux` CLI dials (opt-in listener).
 oximux-remote-local = { workspace = true }
 oximux-remote-proto = { workspace = true }
-oximux-settings = { workspace = true }
+oximux-settings = { workspace = true, features = ["gpui"] }
 oximux-storage = { workspace = true }
 oximux-ui = { workspace = true }
 
