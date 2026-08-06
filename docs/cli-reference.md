@@ -65,6 +65,7 @@ Start an agent session and send it a prompt.
 | `--worktree` | yes | Create a worktree with this slug under the project first, and start the session inside it. The project is the `--cwd` (or current) directory, which must be a project the host knows |
 | `--output-schema` | yes | Hold the final answer to a JSON Schema — a file path, or the schema itself as inline JSON. The agent is re-prompted with the validation errors up to twice; a still-invalid answer exits 1. Prints the validated JSON. Needs the turn, so it cannot be combined with --bg |
 | `--turn-timeout` | yes | Give up on the turn after this many seconds (exit 4). The agent is left running — only this command stops waiting. Without it the stream is unbounded, which is right for a terminal and wrong for a CI job, since a turn parked on a permission request ends only when something decides it. The global --timeout does NOT bound the turn; it bounds one host reply |
+| `--stalled-after` | yes | Give up if the agent produces nothing for this many seconds (exit 4). This bounds PROGRESS, not total time: a turn working steadily runs as long as it needs, while a wedged one is caught in seconds. `--turn-timeout` cannot tell those apart — raise it and a wedged agent burns the lot, lower it and a thinking one is cut off. Use both: a generous turn budget with a tight stall budget |
 | `--bg` | no | Print the session id and exit instead of staying attached |
 
 ### `oximux attach`
@@ -86,16 +87,18 @@ Send a prompt into an existing session.
 | `<PROMPT>` | yes | The prompt to send, or `-` to read it from stdin |
 | `--output-schema` | yes | Hold the final answer to a JSON Schema — a file path, or the schema itself as inline JSON. The agent is re-prompted with the validation errors up to twice; a still-invalid answer exits 1. Prints the validated JSON. Needs the turn, so it cannot be combined with --no-wait |
 | `--turn-timeout` | yes | Give up on the turn after this many seconds (exit 4). The agent is left running — only this command stops waiting. Without it the stream is unbounded, which is right for a terminal and wrong for a CI job, since a turn parked on a permission request ends only when something decides it. The global --timeout does NOT bound the turn; it bounds one host reply |
+| `--stalled-after` | yes | Give up if the agent produces nothing for this many seconds (exit 4). This bounds PROGRESS, not total time: a turn working steadily runs as long as it needs, while a wedged one is caught in seconds. `--turn-timeout` cannot tell those apart — raise it and a wedged agent burns the lot, lower it and a thinking one is cut off. Use both: a generous turn budget with a tight stall budget |
 | `--no-wait` | no | Return as soon as the host accepts the prompt |
 
 ### `oximux wait`
 
-Block until a session reaches a state (or --timeout expires, exit 4)
+Block until a session reaches a state (or --timeout expires, exit 4).
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
 | `<SESSION>` | yes | The session id (see `oximux ls`) |
 | `--until` | yes | The state to wait for |
+| `--stalled-after` | yes | Give up if the session produces nothing for this many seconds (exit 4, distinct message). Bounds progress, not total time |
 
 ### `oximux transcript`
 
@@ -138,12 +141,13 @@ List a session's pending permission requests and questions
 
 #### `oximux permit allow`
 
-Approve a pending permission request
+Approve a pending permission request.
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
 | `<SESSION>` | yes | The session id (see `oximux ls`) |
 | `<REQUEST>` | yes | The request id (from `permit ls`; default: the latest pending) |
+| `--input` | yes | Replace the tool's input with this JSON object before approving. `permit ls --json` prints the proposed input to edit from. The object is passed through as given, so it must carry every field the tool needs — it replaces the input, it does not merge into it |
 
 #### `oximux permit deny`
 
@@ -462,7 +466,7 @@ List a session's heartbeats
 
 #### `oximux heartbeat rm`
 
-Disarm a heartbeat by id (see `heartbeat ls`)
+Disarm a heartbeat by id (see `heartbeat ls`).
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
@@ -537,7 +541,7 @@ Write one key. The value must be JSON
 
 #### `oximux state delete`
 
-Delete one key. Idempotent
+Delete one key.
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
@@ -545,11 +549,12 @@ Delete one key. Idempotent
 
 #### `oximux state watch`
 
-Print every matching key, then stream changes until Ctrl+C
+Print every matching key, then stream changes until Ctrl+C.
 
 | Argument | Takes a value | Description |
 | --- | --- | --- |
 | `--prefix` | yes | Only keys starting with this (default: every key) |
+| `--since` | yes | Resume after this sequence number (from a previous watch's `seq`). Without it the watch starts from the board as it stands now |
 
 ### `oximux serve`
 
