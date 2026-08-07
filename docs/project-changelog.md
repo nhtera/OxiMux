@@ -7,17 +7,22 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 ### 2026-08-08 — v0.1.8: live list titles, safer typo tips, installer polish (`main`)
 
 A small release whose second purpose is to be the first *upgrade*: v0.1.7
-installs prove `oximux update`'s positive swap path against it.
+installs prove `oximux update`'s positive swap path against it. Proven on
+release day — a public 0.1.7 install detected 0.1.8, swapped `oximux` and
+`oximux-relay` together, and left no backup debris. The release workflow
+went green on its first run, and the Homebrew tap updated automatically
+on publish.
 
 - **`8019894`** — `serve` titles a live session row when the prompt arrives
   over the protocol. Backends that announce before the first prompt lands —
   and every resumed session — previously listed as their own UUID for the
   session's whole life.
-- A typo is no longer nudged toward a destructive verb (`rm`, `delete`,
-  `pair-rm`) unless it is a single edit away; harmless suggestions keep
-  clap's own looser rule.
-- Both installers resolve a relative `--dir`/`-Dir` to an absolute path
-  before writing PATH advice (sh) or the persistent user PATH (PowerShell).
+- **`c54906a`** — a typo is no longer nudged toward a destructive verb
+  (`rm`, `delete`, `pair-rm`) unless it is a single edit away; harmless
+  suggestions keep clap's own looser rule.
+- **`c54906a`** — both installers resolve a relative `--dir`/`-Dir` to an
+  absolute path before writing PATH advice (sh) or the persistent user
+  PATH (PowerShell).
 
 ---
 

@@ -6,13 +6,31 @@ CLI socket, and the paired-device endpoint — everything the desktop app hosts,
 minus every window. A phone or laptop pairs with it exactly as it pairs with
 the desktop.
 
+## Installing and updating
+
+```bash
+curl -sSL https://raw.githubusercontent.com/nhtera/OxiMux/main/scripts/install-cli.sh | sh
+```
+
+The installer resolves the platform, verifies the release manifest's minisign
+signature before trusting any checksum, and lands `oximux` + `oximux-relay`
+together (`--dir <DIR>` overrides the destination; PowerShell:
+`scripts/install-cli.ps1`). macOS/Linuxbrew alternatively:
+`brew install nhtera/tap/oximux`.
+
+Update in place with `oximux update` (`--check` to only ask). It verifies the
+same signed manifest with a key built into the binary, refuses anything not
+newer, swaps both binaries together, and **never restarts a running serve** —
+restart it yourself to pick the new version up. A Homebrew-managed install is
+refused by the updater; use `brew upgrade oximux` there.
+
 ## Contract
 
 - **stdout carries exactly one line**, the readiness JSON, and nothing else —
   ever. A journal that captures stdout can never capture a secret:
 
   ```json
-  {"type":"oximux_serve_ready","schemaVersion":1,"protocolVersion":18,"dataDir":"/var/lib/oximux","endpointId":"<64 hex>"}
+  {"type":"oximux_serve_ready","schemaVersion":1,"protocolVersion":19,"dataDir":"/var/lib/oximux","endpointId":"<64 hex>"}
   ```
 
   `dataDir` is the directory, not the socket — pass it straight back as

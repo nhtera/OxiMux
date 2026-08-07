@@ -156,7 +156,7 @@ anything wider is reachable by any workflow run in this repo. Without the
 secret the job warns and succeeds, and the formula stays a manual copy:
 
 ```bash
-gh release download v0.1.7 --pattern oximux.rb
+gh release download v0.1.8 --pattern oximux.rb   # substitute the tag being shipped
 # then commit oximux.rb to nhtera/homebrew-tap
 ```
 
