@@ -194,6 +194,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                     // it stops on empty and on terminated alike.
                     while let Ok(prompt) = prompt_rx.try_recv() {
                         fold.push_user_message_with_images(prompt.text, prompt.images);
+                        refresh_meta(&handle, &fold);
                         let _ = turn_tx.send(true);
                     }
                     let Some(event) = event else {
@@ -226,6 +227,7 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                 prompt = futures::StreamExt::next(&mut prompt_rx) => {
                     if let Some(prompt) = prompt {
                         fold.push_user_message_with_images(prompt.text, prompt.images);
+                        refresh_meta(&handle, &fold);
                         let _ = turn_tx.send(true);
                     }
                 }
@@ -274,7 +276,10 @@ fn apply(
     // `None` for the whole life of a live session and `oximux ls` falls back to
     // printing the session's own UUID as its title — for every row, which is
     // precisely when a list stops being usable. A resumed session emits no
-    // `SessionInit` either, so this is also the only trigger it has.
+    // `SessionInit` either, so this is also the only trigger it has — but a
+    // protocol-injected prompt never comes through here as an event at all (no
+    // backend echoes the user's half), so the pump's prompt arms must call
+    // `refresh_meta` themselves after pushing the user message into the fold.
     if matches!(
         event,
         ThreadEvent::SessionInit { .. }
@@ -282,16 +287,26 @@ fn apply(
             | ThreadEvent::ModeChanged { .. }
             | ThreadEvent::UserMessage { .. }
     ) {
-        handle.set_meta(SessionMeta {
-            // Same fallback the persistence path already applied. Having it on
-            // only one of the two is what made a host restart *improve* the
-            // listing.
-            title: fold.title.clone().or_else(|| super::blob::derived_title(&fold.entries)),
-            model: fold.model.clone(),
-            permission_mode: fold.permission_mode.clone(),
-            cwd: fold.session_meta.cwd.clone().map(std::path::PathBuf::from),
-        });
+        refresh_meta(handle, fold);
     }
+}
+
+/// Publish the fold's list-row metadata to the registry. One function for every
+/// path that can make a title derivable — the event path (`apply`) and the two
+/// protocol-prompt arms in the pump loop — because applying the derived-title
+/// fallback on only some of them is exactly the bug that made `oximux ls` show
+/// a live session as its own UUID whenever the backend announced before the
+/// first prompt landed (and always, for a resumed session).
+fn refresh_meta(handle: &SessionHandle, fold: &ChatThread) {
+    handle.set_meta(SessionMeta {
+        // Same fallback the persistence path already applied. Having it on
+        // only one of the two is what made a host restart *improve* the
+        // listing.
+        title: fold.title.clone().or_else(|| super::blob::derived_title(&fold.entries)),
+        model: fold.model.clone(),
+        permission_mode: fold.permission_mode.clone(),
+        cwd: fold.session_meta.cwd.clone().map(std::path::PathBuf::from),
+    });
 }
 
 /// Revision-gated persistence: publish the fold to the registry (for the
@@ -467,6 +482,66 @@ mod tests {
                 .is_some_and(|t| t == "Summarise what a.txt contains")),
             "a live session's list row carries the derived title, got {:?}",
             registry.get("s-2").and_then(|h| h.meta_snapshot().title),
+        );
+        drop(tx);
+    }
+
+    /// The order the buffered-event test cannot see: the backend announces
+    /// BEFORE the first prompt lands, and the prompt arrives over the protocol
+    /// (`send_prompt` → relay sink), never as a `ThreadEvent` — no backend
+    /// echoes the user's half. The `SessionInit` trigger then fires on an empty
+    /// fold, and if the prompt arms skip the meta refresh the row shows the
+    /// session's own UUID for the session's whole life. A resumed session hits
+    /// the same hole unconditionally, having no `SessionInit` at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prompt_injected_over_the_protocol_still_titles_the_live_row() {
+        let registry = Arc::new(SessionRegistry::new());
+        let handle = registry.register("s-3".into(), Arc::new(StubConnection::default()));
+        let db = oximux_storage::open_memory().unwrap();
+        let settings = SettingsRepo::new(db);
+        let index = Arc::new(SessionIndex::default());
+        let pumps = PumpSet::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        start(
+            PumpSpec {
+                session_id: "s-3".into(),
+                handle: handle.clone(),
+                events: rx,
+                // The backend has already announced; the fold holds no user
+                // entry when the SessionInit trigger fires.
+                buffered: vec![ThreadEvent::SessionInit {
+                    session_id: "s-3".into(),
+                    model: "fake".into(),
+                    permission_mode: "default".into(),
+                    slash_commands: vec![],
+                    meta: Default::default(),
+                }],
+                seed: ChatBlob::new("s-3".into()),
+                settings,
+                registry: registry.clone(),
+                index,
+                on_end: None,
+            },
+            pumps.clone(),
+        );
+        assert!(
+            wait_until(5_000, || registry
+                .get("s-3")
+                .map(|h| h.meta_snapshot().model.as_deref() == Some("fake"))
+                .unwrap_or(false)),
+            "the pump applied the buffered SessionInit",
+        );
+
+        handle.send_prompt("Fix the flaky test", &[]).unwrap();
+
+        assert!(
+            wait_until(5_000, || registry
+                .get("s-3")
+                .and_then(|h| h.meta_snapshot().title)
+                .is_some_and(|t| t == "Fix the flaky test")),
+            "a protocol-injected prompt titles the live row, got {:?}",
+            registry.get("s-3").and_then(|h| h.meta_snapshot().title),
         );
         drop(tx);
     }
