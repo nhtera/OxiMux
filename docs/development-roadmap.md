@@ -45,6 +45,7 @@ commit SHAs). This file tracks *status and what is next*, not history.
 | v0.1.6 | 2026-08-03 | Pull/Push/Sync, graph auto-refresh; first tag after the Windows merge |
 | v0.1.7 | 2026-08-07 | **first CLI release**: `oximux` + `serve` + signed self-update, 5 targets, brew tap |
 | v0.1.8 | 2026-08-08 | live list titles, destructive-typo guard, installer polish; **first real `oximux update` swap, proven** |
+| v0.1.9 | 2026-08-08 | **proto v20**: edited approvals recorded in the transcript; wire-skew CI; honest bounds (`truncated`, serve exit 6); **musl target** (6 targets) |
 
 ---
 
@@ -56,10 +57,11 @@ commit SHAs). This file tracks *status and what is next*, not history.
    allow, and peers below v20 get a Notice downgrade in the same seq.
 2. ~~Dual-build wire-skew test~~ **DONE 2026-08-08** — `wire_skew_e2e` drives the released
    binary against the current tree in both directions; CI downloads the latest release.
-3. `truncated: true` audit on bounded read verbs; distinct `serve` exit code for
-   "data dir held by another host" (systemd `RestartPreventExitStatus` fodder).
-4. `x86_64-unknown-linux-musl` release target (Alpine; only `gen-homebrew-formula.sh`
-   hardcodes triples).
+3. ~~Bounded-read audit + serve exit code~~ **DONE 2026-08-08** — `schedule logs` signals
+   `truncated: true` (the other bounded reads already signaled); `serve` exits 6 on a held
+   data dir, excluded by `RestartPreventExitStatus=6` in the reference unit.
+4. ~~musl release target~~ **DONE 2026-08-08** — static-pie `x86_64-unknown-linux-musl` in
+   v0.1.9 (6 targets); installer auto-picks it on musl systems. aarch64-musl not built.
 
 **Verification debt**
 - Clean-VM installs (Linux, Windows); `install-cli.ps1` has run only under CI parse-check.
