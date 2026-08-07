@@ -192,15 +192,51 @@ jobs:
           rustup target add x86_64-pc-windows-msvc
 
       # Same layout and key style as the windows-check job in ci.yml, versioned
-      # separately so a release-only cache problem can be invalidated on its own.
+      # separately so a release-only cache problem can be invalidated on its
+      # own. The sherpa-rs entry is not optional, and this job proved it by
+      # being left out when windows-check was fixed: sherpa-rs-sys puts the
+      # Windows prebuilts under %LOCALAPPDATA%, outside `target`, and bakes
+      # that path into its build-script output. Caching `target` alone restores
+      # a fingerprint naming files that are not there, so the first run to
+      # populate the cache succeeds and the next one dies at link on
+      # `cargs.lib` — which reads as a broken dependency rather than as a
+      # download that never happened.
+      #
+      # Key bumped to v2 so entries saved under the old layout cannot satisfy
+      # the new one.
       - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/AppData/Local/sherpa-rs
             target
-          key: ${{ runner.os }}-cargo-release-v1-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-release-v2-${{ hashFiles('**/Cargo.lock') }}
+
+      # Belt to the cache's braces, transposed from windows-check: a cache that
+      # comes back with the build-script output but without the libraries would
+      # link against a path that is not there, so drop the output and let cargo
+      # re-run the build script that downloads them.
+      #
+      # Must never be the step that fails the build — every lookup tolerates a
+      # missing directory and the step exits 0 regardless.
+      - name: Ensure the dictation libraries are present
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $prebuilts = Join-Path $env:LOCALAPPDATA 'sherpa-rs'
+          $lib = Get-ChildItem -Path $prebuilts -Recurse -Filter 'cargs.lib' `
+              -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($lib) {
+            Write-Host "sherpa-onnx prebuilts present: $($lib.FullName)"
+          } else {
+            Write-Host "sherpa-onnx prebuilts absent - forcing sherpa-rs-sys to re-run"
+            Get-ChildItem -Path target -Recurse -Directory -Filter 'sherpa-rs-sys-*' `
+                -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          exit 0
 
       # Same reasoning as the macOS job's version check: catch a tag that
       # disagrees with Cargo.toml before paying for the build, not after.
