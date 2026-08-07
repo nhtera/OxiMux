@@ -27,9 +27,69 @@ use cli::{
 use client::Client;
 use output::render;
 
+/// Leaf verbs that erase something. A typo is never nudged toward one of
+/// these unless it is a single edit away: "delet" plainly meant `delete`,
+/// but "dele" reading as a tip to run `state delete` is a nudge no
+/// destructive verb should get. Non-destructive suggestions keep clap's own
+/// looser similarity rule.
+const DESTRUCTIVE_VERBS: &[&str] = &["rm", "delete", "pair-rm"];
+
+/// Levenshtein distance, the plain O(n·m) row-rolling form. Inputs are
+/// subcommand-sized (a dozen bytes), so clarity beats cleverness here.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut row = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let subst = prev[j] + usize::from(ca != cb);
+            row.push(subst.min(prev[j + 1] + 1).min(row[j] + 1));
+        }
+        prev = row;
+    }
+    prev[b.len()]
+}
+
+/// Drop a did-you-mean that points at a destructive verb the user was not
+/// one edit away from typing. The rest of the error — including looser
+/// suggestions toward non-destructive verbs — is clap's own and unchanged.
+fn tighten_destructive_suggestions(mut err: clap::Error) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue};
+    if err.kind() != clap::error::ErrorKind::InvalidSubcommand {
+        return err;
+    }
+    let Some(ContextValue::String(typed)) = err.get(ContextKind::InvalidSubcommand) else {
+        return err;
+    };
+    let typed = typed.clone();
+    let Some(ContextValue::Strings(suggested)) = err.get(ContextKind::SuggestedSubcommand) else {
+        return err;
+    };
+    let kept: Vec<String> = suggested
+        .iter()
+        .filter(|s| !DESTRUCTIVE_VERBS.contains(&s.as_str()) || edit_distance(&typed, s) <= 1)
+        .cloned()
+        .collect();
+    if kept.len() != suggested.len() {
+        // An emptied list must clear the context, not shrink it: clap renders
+        // both `Strings(vec![])` and `None` as a dangling "tip:" line.
+        if kept.is_empty() {
+            err.remove(ContextKind::SuggestedSubcommand);
+        } else {
+            err.insert(ContextKind::SuggestedSubcommand, ContextValue::Strings(kept));
+        }
+    }
+    err
+}
+
 fn main() -> std::process::ExitCode {
     // Usage errors exit 2 here, printing clap's own message — before any I/O.
-    let args = Cli::parse();
+    let args = match Cli::try_parse() {
+        Ok(args) => args,
+        // `exit()` keeps clap's own behavior: usage errors print to stderr and
+        // exit 2, while `--help`/`--version` print to stdout and exit 0.
+        Err(err) => tighten_destructive_suggestions(err).exit(),
+    };
 
     // Completes an update that could not delete the binaries it replaced
     // because they were still running. That is the norm on Windows, where an
@@ -668,5 +728,46 @@ mod tests {
             required_version(&command_of(&["oximux", "schedule", "run-once", "s"])).map(|(v, _)| v),
             Some(17)
         );
+    }
+
+    /// A typo two edits from a destructive verb is not nudged toward it —
+    /// "dele" must not read as an invitation to `state delete` — while one
+    /// edit away ("delet") plainly meant it and keeps the tip.
+    #[test]
+    fn a_loose_typo_is_not_nudged_toward_a_destructive_verb() {
+        let err = Cli::try_parse_from(["oximux", "state", "dele"]).unwrap_err();
+        let msg = tighten_destructive_suggestions(err).to_string();
+        assert!(
+            !msg.contains("delete"),
+            "two edits from `delete` must not suggest it, got:\n{msg}"
+        );
+        assert!(!msg.contains("tip:"), "an emptied tip renders as no tip at all, got:\n{msg}");
+
+        let err = Cli::try_parse_from(["oximux", "state", "delet"]).unwrap_err();
+        let msg = tighten_destructive_suggestions(err).to_string();
+        assert!(msg.contains("delete"), "one edit away keeps the tip, got:\n{msg}");
+    }
+
+    /// The filter only tightens destructive tips: everything else — other
+    /// error kinds, suggestions toward harmless verbs — is clap's own,
+    /// untouched.
+    #[test]
+    fn non_destructive_suggestions_keep_claps_own_rule() {
+        let err = Cli::try_parse_from(["oximux", "state", "watc"]).unwrap_err();
+        let msg = tighten_destructive_suggestions(err).to_string();
+        assert!(msg.contains("watch"), "harmless tips stay loose, got:\n{msg}");
+
+        let err = Cli::try_parse_from(["oximux", "run"]).unwrap_err();
+        let before = err.to_string();
+        assert_eq!(tighten_destructive_suggestions(err).to_string(), before);
+    }
+
+    #[test]
+    fn edit_distance_is_levenshtein() {
+        assert_eq!(edit_distance("dele", "delete"), 2);
+        assert_eq!(edit_distance("delet", "delete"), 1);
+        assert_eq!(edit_distance("rm", "rm"), 0);
+        assert_eq!(edit_distance("", "rm"), 2);
+        assert_eq!(edit_distance("rn", "rm"), 1);
     }
 }

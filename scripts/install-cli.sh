@@ -242,6 +242,11 @@ done
 
 mkdir -p "$INSTALL_DIR" || die "could not create ${INSTALL_DIR}"
 
+# Absolute from here on: the PATH check and the advice at the end interpolate
+# this into an `export PATH=…` line, and a relative `--dir` would land there
+# literally — advice that breaks the moment the user changes directory.
+INSTALL_DIR=$(CDPATH= cd "$INSTALL_DIR" && pwd) || die "could not resolve ${INSTALL_DIR}"
+
 # Both binaries move together, or neither does.
 #
 # The CLI and the relay speak a handshake versioned in lockstep: an install that

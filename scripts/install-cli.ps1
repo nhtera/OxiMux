@@ -175,6 +175,11 @@ try {
 
     New-Item -ItemType Directory -Path $Dir -Force | Out-Null
 
+    # Absolute from here on: the PATH block below writes this into the user's
+    # persistent Path, and a relative -Dir would land there literally — an
+    # entry that resolves differently from every working directory.
+    $Dir = (Resolve-Path -LiteralPath $Dir).Path
+
     # Both binaries move together, or neither does.
     #
     # The CLI and the relay speak a handshake versioned in lockstep: an install
