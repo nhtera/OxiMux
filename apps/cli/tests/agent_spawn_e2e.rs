@@ -114,8 +114,13 @@ fn a_spawned_agent_is_confined_to_the_session_it_announced() {
     );
 
     // 4: the wall. A session-less, full-host verb is refused outright.
+    //
+    // Waited for rather than read: the fixture writes `ls_exit`, then spawns a
+    // whole second CLI process for `projects ls`, and only then writes
+    // `projects_exit`. Reading the moment `ls_exit` lands races that subprocess
+    // and reports the key as absent — which asserts nothing about the wall.
     assert_eq!(
-        report_value(&report, "projects_exit").as_deref(),
+        await_report(&report, "projects_exit", Duration::from_secs(30)).as_deref(),
         Some("5"),
         "a confined agent must be denied the session-less surface (exit 5)",
     );
