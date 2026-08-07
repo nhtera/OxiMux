@@ -114,7 +114,19 @@ detect_target() {
             ;;
         Linux)
             case "$arch" in
-                x86_64|amd64) echo "x86_64-unknown-linux-gnu" ;;
+                x86_64|amd64)
+                    # A gnu binary needs glibc; on musl systems (Alpine and
+                    # friends) pick the static musl build instead. `ldd
+                    # --version` prints "musl" on musl and exits nonzero, so
+                    # the probe reads its combined output rather than its
+                    # status.
+                    if [ -f /etc/alpine-release ] \
+                        || ldd --version 2>&1 | grep -qi musl; then
+                        echo "x86_64-unknown-linux-musl"
+                    else
+                        echo "x86_64-unknown-linux-gnu"
+                    fi
+                    ;;
                 aarch64|arm64) echo "aarch64-unknown-linux-gnu" ;;
                 *) die "unsupported Linux architecture: $arch" ;;
             esac

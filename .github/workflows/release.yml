@@ -326,6 +326,12 @@ jobs:
           # Same oldest-glibc reasoning as the x86_64 arm above.
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-22.04-arm
+          # Static against musl: covers Alpine and any glibc older than the
+          # gnu build's floor. The output does not inherit the host's libc, so
+          # this one may ride the newest runner. Proven per-push by ci.yml's
+          # "musl build gate" — this job must never be its first execution.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
@@ -336,6 +342,10 @@ jobs:
         run: |
           rustup show
           rustup target add ${{ matrix.target }}
+
+      - name: Install the musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -366,6 +376,10 @@ jobs:
         shell: bash
         env:
           OXIMUX_BUILD_CHANNEL: stable
+          # Target-scoped, so inert on every non-musl leg: cargo consults them
+          # only when building x86_64-unknown-linux-musl.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build --release --target ${{ matrix.target }} -p oximux-cli -p oximux-relay
 
       # macOS only, and only when the certificate secret is configured — a fork

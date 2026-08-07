@@ -203,6 +203,20 @@ jobs:
       - name: cargo check (remote-iroh client half, host off)
         run: cargo check --lib -p oximux-remote-iroh --no-default-features
 
+      # The musl leg of the release matrix, proven HERE first: release jobs run
+      # only on tags, so without this the first execution of the musl build
+      # would be a release attempt — the exact never-executed-step class that
+      # cost v0.1.7 five runs. A debug build is enough: linking against musl is
+      # where this breaks, and debug links the same libraries.
+      - name: musl build gate (release parity)
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          cargo build --target x86_64-unknown-linux-musl -p oximux-cli -p oximux-relay
+
       # The build the CLI will actually use: settings with the UI toolkit
       # absent from the dependency tree entirely.
       - name: cargo check (settings without gpui)
