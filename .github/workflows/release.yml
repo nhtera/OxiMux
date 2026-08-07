@@ -405,8 +405,14 @@ jobs:
           # Prove the contract rather than trusting the tar invocation: a
           # leading directory here installs nothing, and the extractor's
           # allow-list would report it as "the archive does not contain oximux".
+          # Both sides sorted, by the same `sort`. Writing the expectation out
+          # by hand is only ever right on one platform: `oximux` sorts before
+          # `oximux-relay`, but `oximux-relay.exe` sorts before `oximux.exe`,
+          # because the `-` falls under the `.` once a suffix follows the
+          # common prefix. Order is not part of the contract here — the
+          # extractor matches by name — so compare the sets, not a literal.
           listing="$(tar -tzf "dist/${ARCHIVE}" | sort | tr '\n' ' ')"
-          expected="oximux${EXE} oximux-relay${EXE} "
+          expected="$(printf '%s\n' "oximux${EXE}" "oximux-relay${EXE}" | sort | tr '\n' ' ')"
           if [[ "$listing" != "$expected" ]]; then
             echo "archive layout is wrong: got [${listing}] want [${expected}]" >&2
             exit 1
