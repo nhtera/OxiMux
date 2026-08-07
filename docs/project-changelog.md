@@ -4,6 +4,23 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-08-08 — v0.1.8: live list titles, safer typo tips, installer polish (`main`)
+
+A small release whose second purpose is to be the first *upgrade*: v0.1.7
+installs prove `oximux update`'s positive swap path against it.
+
+- **`8019894`** — `serve` titles a live session row when the prompt arrives
+  over the protocol. Backends that announce before the first prompt lands —
+  and every resumed session — previously listed as their own UUID for the
+  session's whole life.
+- A typo is no longer nudged toward a destructive verb (`rm`, `delete`,
+  `pair-rm`) unless it is a single edit away; harmless suggestions keep
+  clap's own looser rule.
+- Both installers resolve a relative `--dir`/`-Dir` to an absolute path
+  before writing PATH advice (sh) or the persistent user PATH (PowerShell).
+
+---
+
 ### 2026-08-07 — v0.1.7: the `oximux` CLI, a headless host, and self-update (`main`)
 
 Ships `oximux` as a standalone command-line client and host — installable on a
