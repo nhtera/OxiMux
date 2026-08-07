@@ -81,6 +81,26 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-targets
 
+      # Two builds of the protocol against each other: the current tree vs the
+      # binary actually released. The version pins prove this build agrees
+      # with itself; only this step proves it against a peer that no longer
+      # exists in the tree — the released CLI drives the new host (and must
+      # survive its full stream, downgrades included), and the new CLI drives
+      # the released serve. The suite self-skips without OXIMUX_SKEW_CLI, so
+      # the plain `cargo test` above stays hermetic.
+      - name: wire-skew vs latest release
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/skew-manifest.json \
+            https://github.com/${{ github.repository }}/releases/latest/download/manifest.json
+          ARCHIVE="$(jq -r '.targets["aarch64-apple-darwin"].archive' /tmp/skew-manifest.json)"
+          VERSION="$(jq -r '.version' /tmp/skew-manifest.json)"
+          echo "skew peer: ${VERSION} (${ARCHIVE})"
+          mkdir -p /tmp/skew-old
+          curl -fsSL "https://github.com/${{ github.repository }}/releases/latest/download/${ARCHIVE}" \
+            | tar -xz -C /tmp/skew-old
+          OXIMUX_SKEW_CLI=/tmp/skew-old/oximux cargo test -p oximux-cli --test wire_skew_e2e
+
       - name: xtask file-size-lint
         run: cargo run -p xtask -- file-size-lint
 

@@ -51,10 +51,11 @@ commit SHAs). This file tracks *status and what is next*, not history.
 ## Next
 
 **CLI/serve (small, concrete)**
-1. Protocol event recording an edited permission approval (`permit allow --input`) so the
-   transcript shows what was *allowed*, not only what was asked.
-2. Dual-build wire-skew test (current tree vs last release tag, both directions) locking the
-   append-only protocol discipline before v20.
+1. ~~Protocol event recording an edited permission approval~~ **DONE 2026-08-08** —
+   `ThreadEvent::PermissionEdited` (proto v20); the transcript carries both the ask and the
+   allow, and peers below v20 get a Notice downgrade in the same seq.
+2. ~~Dual-build wire-skew test~~ **DONE 2026-08-08** — `wire_skew_e2e` drives the released
+   binary against the current tree in both directions; CI downloads the latest release.
 3. `truncated: true` audit on bounded read verbs; distinct `serve` exit code for
    "data dir held by another host" (systemd `RestartPreventExitStatus` fodder).
 4. `x86_64-unknown-linux-musl` release target (Alpine; only `gen-homebrew-formula.sh`
