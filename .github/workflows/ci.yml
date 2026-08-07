@@ -91,6 +91,24 @@ jobs:
       - name: xtask icon --check
         run: cargo run -p xtask -- icon --check
 
+      # The app bundle carries its version by hand, and every release commit
+      # has had to remember to bump it alongside Cargo.toml. `make-dmg.sh`
+      # already refuses a bundle whose version disagrees — but it says so an
+      # hour into a release build, after the whole workspace has compiled and
+      # been signed. The same comparison costs nothing here, where a bump that
+      # forgot the plist is still a one-line fix.
+      - name: assets/Info.plist agrees with Cargo.toml
+        run: |
+          CARGO="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          for key in CFBundleShortVersionString CFBundleVersion; do
+            got="$(/usr/libexec/PlistBuddy -c "Print :$key" assets/Info.plist)"
+            if [[ "$got" != "$CARGO" ]]; then
+              echo "assets/Info.plist $key is $got but Cargo.toml says $CARGO" >&2
+              exit 1
+            fi
+          done
+          echo "Info.plist and Cargo.toml agree at $CARGO"
+
   # Linux leg of the portability gate, added ahead of the CLI/serve work: the
   # crate set below is exactly what the `oximux` CLI and `oximux serve` reuse,
   # and "Windows-CI-proven, therefore probably Linux-clean" is an assumption
