@@ -4,6 +4,25 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-08-08 — v0.1.9: recorded approvals (proto v20), honest bounds, Alpine (`main`)
+
+- **`04565ec`** — protocol v20: `permit allow --input` edits are recorded.
+  `ThreadEvent::PermissionEdited` puts the ask and the allow side by side in
+  the transcript (`approved_input` on the tool card); peers below v20 receive
+  the same seq as a Notice, so old clients neither break nor gap.
+- **`f9a9e05`** — the wire-skew suite: CI now runs the released binary against
+  the current tree in both directions on every push.
+- `schedule logs` says when `--limit` cut the listing (`truncated: true` +
+  a human trailer) instead of letting "the last 20" read as "all of them".
+- `serve` exits **6** when another host already holds the data directory —
+  the one boot failure a supervisor must not retry; the reference systemd
+  unit excludes it with `RestartPreventExitStatus=6`.
+- `x86_64-unknown-linux-musl` joins the release matrix (static; Alpine and
+  pre-floor glibc), proven by a per-push CI gate before any tag, and the
+  installer picks it on musl systems.
+
+---
+
 ### 2026-08-08 — v0.1.8: live list titles, safer typo tips, installer polish (`main`)
 
 A small release whose second purpose is to be the first *upgrade*: v0.1.7

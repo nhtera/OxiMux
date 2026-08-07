@@ -39,7 +39,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.1.8"
+version = "0.1.9"
 authors = ["nhtera"]
 license = "Apache-2.0"
 publish = false
