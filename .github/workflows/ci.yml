@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Run it by hand. Webhook delivery is not guaranteed: during a platform
+  # incident it was throttled to a fraction of events, so a push and a pull
+  # request both created no run at all — and with only the two triggers above,
+  # there was no way to gate a merge until delivery recovered. `release.yml`
+  # already carries this for the same class of reason.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
