@@ -6,6 +6,10 @@ A Rust-native, multi-agent development cockpit for macOS. Open a repo → spawn 
 - **Status**: Working cockpit, in active development. Dogfoodable for day-to-day repo work; pre-1.0, so expect rough edges.
 - **Platform**: macOS-only in v1 (13.0+).
 
+![The OxiMux cockpit — projects and agents in the rail, agent chat tabs in the center, Git changes and commit graph on the right](apps/landing/src/assets/shots/cockpit.png)
+
+![Claude Code and Codex running side by side in an isolated worktree, with the Git panel tracking changes](apps/landing/src/assets/shots/worktrees.png)
+
 ## Quick start
 
 ```bash
