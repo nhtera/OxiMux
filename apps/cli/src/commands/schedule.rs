@@ -173,20 +173,36 @@ pub async fn ls(client: &Client) -> Result<(Value, String), Failure> {
 }
 
 pub async fn logs(client: &Client, id: &str, limit: u32) -> Result<(Value, String), Failure> {
+    // One extra row is the truncation probe: the reply carries no has-more bit
+    // (its postcard shape is frozen), so ask for limit+1 and show limit — a
+    // full probe row proves older runs exist, and without it "20 of 20" and
+    // "20 of 200" are the same listing.
+    let probe = limit.saturating_add(1);
     let reply = client
-        .call(Request::GetScheduleRuns { schedule_id: id.into(), limit })
+        .call(Request::GetScheduleRuns { schedule_id: id.into(), limit: probe })
         .await?;
-    let rows = match reply {
+    let mut rows = match reply {
         Response::ScheduleRuns(rows) => rows,
         Response::Error(e) => return Err(rpc_failure(e)),
         other => return Err(unexpected_reply("GetScheduleRuns", &other)),
     };
-    let human = if rows.is_empty() {
+    let truncated = probe != limit && rows.len() as u32 > limit;
+    rows.truncate(limit as usize);
+    let mut human = if rows.is_empty() {
         "no runs yet".to_string()
     } else {
         rows.iter().map(run_line).collect::<Vec<_>>().join("\n")
     };
-    Ok((json!(rows.iter().map(run_json).collect::<Vec<_>>()), human))
+    if truncated {
+        human.push_str(&format!("\n… older runs exist beyond these {limit} — raise --limit"));
+    }
+    Ok((
+        json!({
+            "runs": rows.iter().map(run_json).collect::<Vec<_>>(),
+            "truncated": truncated,
+        }),
+        human,
+    ))
 }
 
 pub async fn set_enabled(

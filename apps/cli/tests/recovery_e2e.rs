@@ -247,10 +247,13 @@ fn a_second_serve_on_the_same_data_dir_refuses_to_boot() {
         .output()
         .expect("spawn the second serve");
 
+    // Exit 6, not 1: this is the one boot failure a supervisor must not
+    // blindly retry (the incumbent is healthy), and systemd can only exclude
+    // it from Restart= if it is distinguishable — RestartPreventExitStatus=6.
     assert_eq!(
         second.status.code(),
-        Some(1),
-        "the second host must exit 1, not serve beside the first\nstderr: {}",
+        Some(6),
+        "the held-data-dir refusal has its own exit code\nstderr: {}",
         String::from_utf8_lossy(&second.stderr),
     );
     assert!(

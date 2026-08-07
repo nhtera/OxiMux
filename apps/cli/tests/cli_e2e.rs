@@ -711,8 +711,18 @@ fn schedule_lifecycle_and_run_once_keeps_cadence() {
 
     let out = bin(&runtime_dir).args(["--json", "schedule", "logs", &id]).output().unwrap();
     let logs = json_stdout(&out);
-    assert_eq!(logs["data"].as_array().map(Vec::len), Some(1), "the manual run is history");
-    assert_eq!(logs["data"][0]["outcome"], "ok");
+    assert_eq!(logs["data"]["runs"].as_array().map(Vec::len), Some(1), "the manual run is history");
+    assert_eq!(logs["data"]["runs"][0]["outcome"], "ok");
+    assert_eq!(logs["data"]["truncated"], false, "one run under a 20-row limit is complete");
+
+    // The truncation probe: a limit below the history must say so, and a
+    // history exactly at the limit must NOT cry wolf. One run exists, so
+    // --limit 1 is the boundary case — complete, not truncated.
+    let out =
+        bin(&runtime_dir).args(["--json", "schedule", "logs", &id, "--limit", "1"]).output().unwrap();
+    let logs = json_stdout(&out);
+    assert_eq!(logs["data"]["runs"].as_array().map(Vec::len), Some(1));
+    assert_eq!(logs["data"]["truncated"], false, "exactly-at-limit is not truncation");
 
     // Pause / resume round-trip.
     let out = bin(&runtime_dir).args(["--json", "schedule", "pause", &id]).output().unwrap();

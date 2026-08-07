@@ -39,7 +39,11 @@ refused by the updater; use `brew upgrade oximux` there.
   it did, the field was called `localSocket` and nothing here could contradict it.
 
 - **Logs go to stderr** (`RUST_LOG` filters them; default `info`).
-- **Exit codes**: 0 after a clean drain, 1 on a boot failure.
+- **Exit codes**: 0 after a clean drain, 1 on a boot failure — and **6** when
+  another host already holds the data directory. 6 is the one failure a
+  supervisor must *not* retry: the incumbent is healthy, and a restart loop
+  would hammer it forever. The unit below excludes it with
+  `RestartPreventExitStatus=6`.
 - **Shutdown drains**: on SIGTERM/SIGINT (Windows: Ctrl+C, console close, OS
   shutdown) serve stops accepting work, waits up to 20 s for in-flight agent
   turns, marks any stragglers *interrupted* in the transcript (never silently
@@ -114,6 +118,9 @@ Environment=RUST_LOG=info
 KillMode=mixed
 TimeoutStopSec=30
 Restart=on-failure
+# Exit 6 = another host already holds the data dir. The incumbent is healthy,
+# so restarting this unit would never succeed — it would just hammer the lock.
+RestartPreventExitStatus=6
 
 [Install]
 WantedBy=multi-user.target

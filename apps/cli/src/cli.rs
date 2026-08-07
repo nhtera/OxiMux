@@ -337,6 +337,10 @@ pub enum Command {
     /// before exiting. Stdout carries exactly one readiness JSON line; logs go
     /// to stderr. Pair devices at runtime with `pair-new` (never a boot flag,
     /// so no ticket ever lands in a journal).
+    ///
+    /// Exit codes: 0 after a clean drain, 1 on a boot failure, 6 when another
+    /// host already holds the data directory — the one failure a supervisor
+    /// must not retry (systemd: RestartPreventExitStatus=6).
     #[command(verbatim_doc_comment)]
     Serve {
         /// The data directory (default: this machine's OxiMux data dir, shared
@@ -821,6 +825,10 @@ pub enum ScheduleCommand {
     /// List schedules with cadence, next fire, and state.
     Ls,
     /// A schedule's recent run history, newest first.
+    ///
+    /// A listing cut off by --limit says so: the JSON carries
+    /// `truncated: true` and the human output ends with a marker line, so
+    /// "the last 20" is never mistaken for "all of them".
     Logs {
         /// The schedule id (from `schedule ls`).
         id: String,

@@ -43,8 +43,40 @@ pub struct ServeArgs {
     pub projects: Vec<PathBuf>,
 }
 
+/// The exit code for "another host already holds this data directory" —
+/// distinct from the generic boot failure (1) because it is the one refusal a
+/// supervisor must NOT blindly retry: the incumbent is healthy, and a restart
+/// loop would hammer it forever. A systemd unit excludes it with
+/// `RestartPreventExitStatus=6` (see `docs/server-install.md`). Outside the
+/// client verbs' 0–5 taxonomy on purpose, so the two never collide.
+pub const EXIT_HELD_BY_ANOTHER_HOST: u8 = 6;
+
+/// The typed form of that refusal, so `run_with_shutdown` can map it to
+/// [`EXIT_HELD_BY_ANOTHER_HOST`] by downcast rather than by matching message
+/// text.
+#[derive(Debug)]
+struct HeldByAnotherHost {
+    data_dir: std::path::PathBuf,
+    holder_pid: Option<u32>,
+}
+
+impl std::fmt::Display for HeldByAnotherHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let who = self.holder_pid.map(|pid| format!(" (PID {pid})")).unwrap_or_default();
+        write!(
+            f,
+            "another OxiMux host is already serving {}{who}. Stop it first, \
+             or use a different --data-dir.",
+            self.data_dir.display()
+        )
+    }
+}
+
+impl std::error::Error for HeldByAnotherHost {}
+
 /// Boot and run until a shutdown signal, then drain. The process exit code is
-/// the verb's result: 0 after a clean drain, 1 on a boot failure.
+/// the verb's result: 0 after a clean drain, 1 on a boot failure — except the
+/// held-data-dir refusal, which exits [`EXIT_HELD_BY_ANOTHER_HOST`].
 pub fn run(args: ServeArgs) -> u8 {
     run_with_shutdown(args, None)
 }
@@ -82,7 +114,11 @@ pub(crate) fn run_with_shutdown(
         Ok(()) => 0,
         Err(err) => {
             eprintln!("serve: {err:#}");
-            1
+            if err.downcast_ref::<HeldByAnotherHost>().is_some() {
+                EXIT_HELD_BY_ANOTHER_HOST
+            } else {
+                1
+            }
         }
     }
 }
@@ -138,14 +174,10 @@ async fn serve(
     ) {
         Ok(oximux_single_instance::AcquireOutcome::Acquired(guard)) => guard,
         Ok(oximux_single_instance::AcquireOutcome::AlreadyRunning { holder_pid }) => {
-            let who = holder_pid
-                .map(|pid| format!(" (PID {pid})"))
-                .unwrap_or_default();
-            anyhow::bail!(
-                "another OxiMux host is already serving {}{who}. Stop it first, \
-                 or use a different --data-dir.",
-                data_dir.display(),
-            );
+            return Err(anyhow::Error::new(HeldByAnotherHost {
+                data_dir: data_dir.clone(),
+                holder_pid,
+            }));
         }
         // A lock that cannot be evaluated must not silently authorise a second
         // host — the whole point is that the incumbent survives contact with
