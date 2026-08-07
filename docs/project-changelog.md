@@ -4,6 +4,43 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-08-07 — v0.1.7: the `oximux` CLI, a headless host, and self-update (`main`)
+
+Ships `oximux` as a standalone command-line client and host — installable on a
+server, driven over SSH, and able to run and steer agent sessions with no GUI
+present. It reaches the host over an owner-only local control socket and
+updates itself from a signed release manifest.
+
+- **`27b8f93`** — PR #2 (`feat/oximux-cli`, 71 commits): the CLI itself —
+  session verbs, `serve` as a headless host, worktrees, the scheduler,
+  coordination state, permission mediation, and `oximux update` with a
+  minisign-signed manifest as its trust root. This is the first release to
+  build and ship the CLI at all.
+- **`7a6123d`**, **`f01a46f`**, **`e93c84f`** — protocol v19: a resume cursor
+  for the coordination watch, served from a bounded in-memory change ring. A
+  reconnecting watcher is told whether its gap was replayed or whether it
+  resynced, so it can never go quietly stale. Append-only on the wire, so no
+  migration and no older peer breaks.
+- **`4bf78d8`** — `feat(cli)`: a turn renders once rather than twice, and the
+  blocking verbs are bounded by *progress* (`--stalled-after`) rather than
+  only by wall-clock. A wait that ends at its deadline now distinguishes a
+  slow turn from one parked on a decision nobody answered.
+- **`bd22066`** — `feat(cli)`: `permit allow --input` edits a tool call before
+  approving it, rather than forcing allow-as-proposed or deny.
+- **`db2fca0`**, **`670dd58`** — `fix(release)`: the Windows CLI archive was
+  built correctly and then rejected by its own layout check, which sorted the
+  real listing but compared it against an unsorted literal; and the manifest
+  was signed on a runner whose distro has never packaged minisign. Neither
+  step had ever executed before this release.
+- **`fc295e3`** — `test(cli)`: the agent-confinement probe waited for the
+  wrong key, so the wall it pins read as passing on a fast runner and failed
+  on a contended one.
+
+**Touches**: `apps/cli/`, `crates/remote-proto/`, `crates/remote-host/`,
+`.github/workflows/{ci,release}.yml`, `assets/Info.plist`.
+
+---
+
 ### 2026-08-03 — v0.1.6: working Pull/Push/Sync primary button + graph auto-refresh (`main`)
 
 Fixes the Source Control panel's primary split-button, which silently
