@@ -449,7 +449,13 @@ jobs:
   # reach.
   release-manifest:
     name: Signed release manifest
-    runs-on: ubuntu-22.04
+    # NOT pinned to 22.04 like the build jobs: minisign is first packaged for
+    # Ubuntu in 24.04, so `apt-get install minisign` cannot succeed on jammy.
+    # The oldest-glibc reasoning that pins those jobs is about the binaries
+    # they link, and this job builds nothing and ships no binary — it hashes
+    # archives, signs a JSON document, and uploads. Moving it forward costs
+    # nothing and is the only way to get the signing tool from the distro.
+    runs-on: ubuntu-24.04
     needs: release-cli
     timeout-minutes: 20
     steps:
