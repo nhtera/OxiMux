@@ -497,6 +497,23 @@ impl ChatThread {
                     }
                 }
             }
+            ThreadEvent::PermissionEdited { request_id, tool_use_id, approved_input } => {
+                // Annotate the card with what was actually allowed. The card is
+                // found by its tool_use_id when the request named one, else by
+                // the request_id its awaiting status carries — the same two
+                // join keys `PermissionRequested` used to attach it. Status is
+                // deliberately untouched: the backend's own follow-ups drive
+                // it, exactly as they do for an unedited approval. An unknown
+                // id is dropped (no card to annotate), like `ToolKind`.
+                let by_id = tool_use_id.as_deref().and_then(|id| self.tool_call_mut(id));
+                let card = match by_id {
+                    Some(tc) => Some(tc),
+                    None => self.tool_call_awaiting_mut(request_id),
+                };
+                if let Some(tc) = card {
+                    tc.approved_input = Some(approved_input.clone());
+                }
+            }
             ThreadEvent::TurnSummary { detail, .. } => {
                 self.last_summary = Some(detail.clone());
                 self.end_assistant_window();
@@ -855,6 +872,20 @@ impl ChatThread {
         }
     }
 
+    /// The tool call whose awaiting status carries `request_id` — the fallback
+    /// join for a decision event when the request named no `tool_use_id`.
+    fn tool_call_awaiting_mut(&mut self, request_id: &str) -> Option<&mut ToolCall> {
+        self.entries.iter_mut().rev().find_map(|e| match e {
+            ThreadEntry::ToolCall(tc) => match &tc.status {
+                ToolCallStatus::WaitingForConfirmation(req) if req.request_id == request_id => {
+                    Some(tc)
+                }
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
     /// The pending permission request (if any) awaiting a decision.
     pub fn pending_permission(&self) -> Option<(&str, &PermissionRequest)> {
         self.entries.iter().find_map(|e| match e {
@@ -1151,6 +1182,65 @@ mod tests {
         // deny → rejected, no longer pending
         t.set_tool_status("toolu_9", ToolCallStatus::Rejected);
         assert!(t.pending_permission().is_none());
+    }
+
+    /// An edited approval annotates the card with what was ALLOWED while
+    /// `input` keeps what the agent asked for — both survive in the entry, so
+    /// a transcript reader can tell the call was narrowed. Status is left to
+    /// the backend's own follow-ups, exactly as for an unedited approval.
+    #[test]
+    fn an_edited_approval_annotates_the_card_without_touching_status() {
+        let mut t = ChatThread::new();
+        t.push_user_message("clean up");
+        t.apply(&ThreadEvent::ToolCallStarted {
+            id: "toolu_rm".into(), name: "Bash".into(),
+            input: json!({"command": "rm -f f.txt && ls"}) });
+        t.apply(&ThreadEvent::PermissionRequested {
+            request_id: "rid-e".into(), tool_use_id: Some("toolu_rm".into()),
+            tool_name: "Bash".into(), input: json!({"command": "rm -f f.txt && ls"}),
+            description: "".into(), suggestions: vec![], kind: PermissionKind::Tool });
+
+        t.apply(&ThreadEvent::PermissionEdited {
+            request_id: "rid-e".into(), tool_use_id: Some("toolu_rm".into()),
+            approved_input: json!({"command": "ls"}) });
+
+        match &t.entries[1] {
+            ThreadEntry::ToolCall(tc) => {
+                assert_eq!(tc.input, json!({"command": "rm -f f.txt && ls"}), "the ask survives");
+                assert_eq!(tc.approved_input, Some(json!({"command": "ls"})), "the allow is recorded");
+                assert!(
+                    matches!(tc.status, ToolCallStatus::WaitingForConfirmation(_)),
+                    "status is the backend's to advance"
+                );
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    /// A decision event with no `tool_use_id` still finds its card through the
+    /// request_id its awaiting status carries — the same fallback join
+    /// `PermissionRequested` itself uses. An unknown id annotates nothing.
+    #[test]
+    fn an_edited_approval_joins_by_request_id_when_no_tool_use_id() {
+        let mut t = ChatThread::new();
+        t.push_user_message("go");
+        t.apply(&ThreadEvent::PermissionRequested {
+            request_id: "rid-f".into(), tool_use_id: None,
+            tool_name: "Bash".into(), input: json!({"command": "x"}),
+            description: "".into(), suggestions: vec![], kind: PermissionKind::Tool });
+
+        t.apply(&ThreadEvent::PermissionEdited {
+            request_id: "rid-f".into(), tool_use_id: None,
+            approved_input: json!({"command": "y"}) });
+        t.apply(&ThreadEvent::PermissionEdited {
+            request_id: "rid-GHOST".into(), tool_use_id: None,
+            approved_input: json!({"command": "z"}) });
+
+        let annotated: Vec<_> = t.entries.iter().filter_map(|e| match e {
+            ThreadEntry::ToolCall(tc) => tc.approved_input.clone(),
+            _ => None,
+        }).collect();
+        assert_eq!(annotated, vec![json!({"command": "y"})], "rid-f annotated, ghost dropped");
     }
 
     #[test]

@@ -204,6 +204,7 @@ fn backlog_frames(
     handle: &SessionHandle,
     session_id: &str,
     after_seq: u64,
+    peer_version: u32,
 ) -> Result<(Vec<HostEvent>, Seq), ()> {
     let status = handle.status_snapshot();
     let wire = SessionStatusWire {
@@ -213,7 +214,8 @@ fn backlog_frames(
     let mut frames = Vec::new();
     let mut cursor = after_seq;
     for (seq, event) in handle.events_since(after_seq) {
-        let frame = HostEvent::new(session_id, seq, &event, wire.clone()).map_err(|_| ())?;
+        let frame = HostEvent::new_for_peer(session_id, seq, &event, wire.clone(), peer_version)
+            .map_err(|_| ())?;
         cursor = cursor.max(seq);
         frames.push(frame);
     }
@@ -238,6 +240,7 @@ impl Dispatcher {
         session_id: &str,
         after_seq: u64,
         cursors: &mut HashMap<SessionId, Seq>,
+        peer_version: u32,
     ) -> (Response, Option<BoxStream<'static, LiveFrame>>) {
         if !self.auth.is_allowed_for(peer, session_id) {
             return (Response::Error(RpcError::Unauthorized), None);
@@ -249,7 +252,7 @@ impl Dispatcher {
         // Already streaming this session on this connection → backlog only,
         // idempotent, cursor preserved.
         if cursors.contains_key(session_id) {
-            return match backlog_frames(&handle, session_id, after_seq) {
+            return match backlog_frames(&handle, session_id, after_seq, peer_version) {
                 Ok((frames, _)) => (Response::Events(frames), None),
                 Err(()) => (Response::Error(RpcError::Internal("event encode failed".into())), None),
             };
@@ -258,7 +261,7 @@ impl Dispatcher {
         // First subscribe: receiver before snapshot so an event landing in the gap
         // is caught live and deduped by the cursor, never dropped.
         let rx = handle.subscribe();
-        match backlog_frames(&handle, session_id, after_seq) {
+        match backlog_frames(&handle, session_id, after_seq, peer_version) {
             Ok((frames, cursor)) => {
                 cursors.insert(session_id.to_string(), cursor);
                 (Response::Events(frames), Some(live_stream(session_id.to_string(), rx)))
@@ -308,6 +311,7 @@ impl Dispatcher {
         cursors: &mut HashMap<SessionId, Seq>,
         transport: &dyn Transport,
         frame: LiveFrame,
+        peer_version: u32,
     ) -> bool {
         // Revocation / scope bites the live stream too: suppress silently but keep
         // the connection open (other sessions may still be permitted).
@@ -331,7 +335,13 @@ impl Dispatcher {
             last_seq: status.last_seq,
             awaiting_permission: status.awaiting_permission,
         };
-        let host_event = match HostEvent::new(&frame.session_id, frame.seq, &frame.event, wire) {
+        let host_event = match HostEvent::new_for_peer(
+            &frame.session_id,
+            frame.seq,
+            &frame.event,
+            wire,
+            peer_version,
+        ) {
             Ok(e) => e,
             Err(_) => return true, // can't encode this one; keep the stream alive
         };

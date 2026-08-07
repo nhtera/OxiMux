@@ -1361,7 +1361,9 @@ impl AgentChatView {
             // desktop shows the user's own bubble, not just the reply.
             let (tx, rx) = futures::channel::mpsc::unbounded();
             binding.set_prompt_sink(tx);
-            remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, cx));
+            let (event_tx, event_rx) = futures::channel::mpsc::unbounded();
+            binding.set_event_sink(event_tx);
+            remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, event_rx, cx));
             // Complete model/mode picks the backend fixes at spawn, which only
             // this view can carry out (it owns the respawn).
             let (choice_tx, choice_rx) = futures::channel::mpsc::unbounded();
@@ -3996,10 +3998,12 @@ impl AgentChatView {
                 self.publish_remote_transcript();
                 // Re-arm the remote-prompt echo relay against the new binding.
                 let (tx, rx) = futures::channel::mpsc::unbounded();
+                let (event_tx, event_rx) = futures::channel::mpsc::unbounded();
                 if let Some(binding) = &self.remote {
                     binding.set_prompt_sink(tx);
+                    binding.set_event_sink(event_tx);
                 }
-                self._remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, cx));
+                self._remote_prompt_task = Some(Self::spawn_remote_prompt_relay(rx, event_rx, cx));
                 // Point the *existing* choice relay at the new binding rather than
                 // starting a fresh one. This path runs inside `change_model` →
                 // `respawn`, so the relay is mid-flight on the very pick that

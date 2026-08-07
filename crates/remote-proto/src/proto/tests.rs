@@ -17,8 +17,9 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 19,
-        "v19 = the coordination watch cursor (StateWatchFrom + StateWatchStarted/StateChangedAt)"
+        PROTOCOL_VERSION, 20,
+        "v20 = ThreadEvent::PermissionEdited (operator-edited approvals recorded in the \
+         transcript; older peers get the Notice downgrade)"
     );
 }
 

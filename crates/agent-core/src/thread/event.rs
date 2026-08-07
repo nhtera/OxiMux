@@ -239,6 +239,21 @@ pub enum ThreadEvent {
         tool_use_id: Option<String>,
         questions: Vec<AskQuestion>,
     },
+    /// A pending permission was approved with an operator-edited input: the
+    /// decision's `updated_input` differed from what the agent proposed.
+    /// Synthesized by the session registry at resolve time — no backend echoes
+    /// decisions — so the transcript records what was actually ALLOWED, not
+    /// only what was asked. Not emitted for ordinary approvals, denies, or
+    /// question answers; peers below protocol v20 receive it downgraded to a
+    /// [`Notice`](Self::Notice) so their decoder never sees an unknown variant.
+    PermissionEdited {
+        request_id: String,
+        /// The tool call the permission gated, when the request named one —
+        /// the fold's join key back to the card.
+        tool_use_id: Option<String>,
+        /// The input the operator actually approved.
+        approved_input: Value,
+    },
     /// One-line turn summary (`system/post_turn_summary`).
     TurnSummary {
         detail: String,

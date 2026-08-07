@@ -63,6 +63,15 @@ pub struct ToolCall {
     /// loadable.
     #[serde(default)]
     pub kind: Option<String>,
+    /// The input an operator actually approved when the permission decision
+    /// edited it (`permit allow --input`, or any surface sending an
+    /// `updated_input` that differs from the proposal). `input` above keeps
+    /// what the agent ASKED for; this records what was ALLOWED — without it a
+    /// transcript reader sees the original proposal and cannot tell it was
+    /// narrowed. `None` for the overwhelmingly common unedited decision.
+    /// `#[serde(default)]` keeps older persisted blobs loadable.
+    #[serde(default)]
+    pub approved_input: Option<Value>,
     /// This call asked a question the backend flagged `isSecret`, so whatever it
     /// reports back echoes a credential the user typed. Set when the answer is
     /// sent (the only moment the secret-ness is known — the awaiting status that
@@ -108,6 +117,7 @@ impl ToolCall {
             structured: None,
             images: Vec::new(),
             redact_result: false,
+            approved_input: None,
             terminal_id: None,
             kind: None,
             partial_input: String::new(),

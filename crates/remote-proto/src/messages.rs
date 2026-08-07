@@ -328,6 +328,32 @@ impl HostEvent {
     pub fn event(&self) -> Result<ThreadEvent, WireError> {
         Ok(serde_json::from_str(&self.event_json)?)
     }
+
+    /// Build a frame for a specific peer, downgrading any event that peer's
+    /// decoder predates (see
+    /// [`PERMISSION_EDITED_MIN_VERSION`](crate::proto::PERMISSION_EDITED_MIN_VERSION)).
+    /// The one constructor every host-side frame builder should use — building
+    /// with [`Self::new`] sends a vocabulary the peer never declared it speaks,
+    /// and the downgrade keeps the seq occupied so a resync cannot loop on it.
+    pub fn new_for_peer(
+        session_id: impl Into<String>,
+        seq: u64,
+        event: &ThreadEvent,
+        status: SessionStatusWire,
+        peer_version: u32,
+    ) -> Result<Self, WireError> {
+        if peer_version < crate::proto::PERMISSION_EDITED_MIN_VERSION
+            && let ThreadEvent::PermissionEdited { request_id, .. } = event
+        {
+            let notice = ThreadEvent::Notice(format!(
+                "an approval edited the tool input (request {request_id}) — \
+                 this build shows the original proposal; the approved input needs \
+                 a newer client"
+            ));
+            return Self::new(session_id, seq, &notice, status);
+        }
+        Self::new(session_id, seq, event, status)
+    }
 }
 
 /// Index-side (staged) status of a path, mirroring porcelain v2's X column.
@@ -760,4 +786,62 @@ pub struct TeamReportReq {
     /// by definition finished.
     pub ok: bool,
     pub summary: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status() -> SessionStatusWire {
+        SessionStatusWire { last_seq: 7, awaiting_permission: false }
+    }
+
+    fn edited() -> ThreadEvent {
+        ThreadEvent::PermissionEdited {
+            request_id: "req-1".into(),
+            tool_use_id: None,
+            approved_input: serde_json::json!({"command": "ls"}),
+        }
+    }
+
+    /// A peer below the floor gets the SAME seq as a `Notice` its decoder has
+    /// always known — never the unknown variant (a dead subscription) and never
+    /// a skipped seq (a resync loop, since every resync replays the same event).
+    #[test]
+    fn an_old_peer_gets_a_notice_in_the_same_seq() {
+        let frame = HostEvent::new_for_peer(
+            "s1",
+            8,
+            &edited(),
+            status(),
+            crate::proto::PERMISSION_EDITED_MIN_VERSION - 1,
+        )
+        .unwrap();
+        assert_eq!(frame.seq, 8, "the seq stays occupied");
+        match frame.event().expect("decodable by any build") {
+            ThreadEvent::Notice(text) => {
+                assert!(text.contains("req-1"), "the notice still names the request: {text}")
+            }
+            other => panic!("expected the downgrade Notice, got {other:?}"),
+        }
+    }
+
+    /// A peer at the floor gets the structured event, and every other event
+    /// passes through untouched at any version.
+    #[test]
+    fn a_current_peer_gets_the_structured_event() {
+        let frame = HostEvent::new_for_peer(
+            "s1",
+            8,
+            &edited(),
+            status(),
+            crate::proto::PERMISSION_EDITED_MIN_VERSION,
+        )
+        .unwrap();
+        assert!(matches!(frame.event().unwrap(), ThreadEvent::PermissionEdited { .. }));
+
+        let plain = ThreadEvent::AssistantText("hi".into());
+        let frame = HostEvent::new_for_peer("s1", 9, &plain, status(), 1).unwrap();
+        assert_eq!(frame.event().unwrap(), plain);
+    }
 }

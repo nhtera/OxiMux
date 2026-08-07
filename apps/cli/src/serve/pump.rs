@@ -150,6 +150,12 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
     // relay sink — no backend echoes the user's half.
     let (prompt_tx, mut prompt_rx) = futures::channel::mpsc::unbounded::<RemotePrompt>();
     handle.set_remote_prompt_sink(prompt_tx);
+    // Host-synthesized events (an operator-edited approval) reach the fold the
+    // same way: the registry's ingest covers remote subscribers, this covers
+    // the transcript this pump owns. Folded through `apply` with ingest=false —
+    // re-ingesting would give the event a second seq.
+    let (event_sink_tx, mut synth_rx) = futures::channel::mpsc::unbounded::<ThreadEvent>();
+    handle.set_remote_event_sink(event_sink_tx);
 
     tokio::spawn(async move {
         let mut fold = ChatThread::rehydrated(
@@ -173,6 +179,11 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
 
         let mut save_tick = tokio::time::interval(SAVE_INTERVAL);
         save_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // A relay arm whose sender is gone returns `Ready(None)` on every poll —
+        // the select then spins hot (the 900%-CPU class a `biased` reorder once
+        // hit). Serve never rebinds a sink, so these only flip on teardown, but
+        // the guard costs nothing and removes the trap.
+        let (mut prompt_open, mut synth_open) = (true, true);
         loop {
             tokio::select! {
                 event = event_rx.recv() => {
@@ -224,11 +235,23 @@ pub fn start(spec: PumpSpec, pumps: Arc<PumpSet>) {
                         persist.save_now(&handle, &mut blob, &fold);
                     }
                 }
-                prompt = futures::StreamExt::next(&mut prompt_rx) => {
-                    if let Some(prompt) = prompt {
-                        fold.push_user_message_with_images(prompt.text, prompt.images);
-                        refresh_meta(&handle, &fold);
-                        let _ = turn_tx.send(true);
+                prompt = futures::StreamExt::next(&mut prompt_rx), if prompt_open => {
+                    match prompt {
+                        Some(prompt) => {
+                            fold.push_user_message_with_images(prompt.text, prompt.images);
+                            refresh_meta(&handle, &fold);
+                            let _ = turn_tx.send(true);
+                        }
+                        None => prompt_open = false,
+                    }
+                }
+                synth = futures::StreamExt::next(&mut synth_rx), if synth_open => {
+                    match synth {
+                        Some(event) => {
+                            apply(&handle, &mut fold, &event, &turn_tx, /* ingest */ false);
+                            persist.maybe_save(&handle, &mut blob, &fold);
+                        }
+                        None => synth_open = false,
                     }
                 }
                 _ = save_tick.tick() => {

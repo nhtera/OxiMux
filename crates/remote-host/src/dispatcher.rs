@@ -328,7 +328,7 @@ impl Dispatcher {
             Request::AuthProve(a) => self.handle_auth_prove(&mut state.authn, &a.signature),
             // Everything below requires an authenticated, still-authorized caller.
             other => match authorized_peer(&state.authn, &self.auth) {
-                Some(peer) => self.handle_session_rpc(&peer, other),
+                Some(peer) => self.handle_session_rpc(&peer, other, state.peer_version),
                 None => Response::Error(RpcError::Unauthorized),
             },
         }
@@ -336,7 +336,7 @@ impl Dispatcher {
 
     /// Route an authenticated request to its handler (in [`handlers`]). `Subscribe`
     /// never reaches here — the serve loop intercepts it to open the live stream.
-    fn handle_session_rpc(&self, peer: &Peer, req: Request) -> Response {
+    fn handle_session_rpc(&self, peer: &Peer, req: Request, peer_version: u32) -> Response {
         match req {
             Request::ListSessions => self.list_sessions(peer),
             Request::GetSessionInfo { session_id } => self.session_info(peer, &session_id),
@@ -351,7 +351,7 @@ impl Dispatcher {
             Request::Cancel { session_id } => self.scoped(peer, &session_id, |h| h.cancel()),
             Request::ListChoices { session_id } => self.list_choices(peer, &session_id),
             Request::EventsSince { session_id, after_seq } => {
-                self.events_since(peer, &session_id, after_seq)
+                self.events_since(peer, &session_id, after_seq, peer_version)
             }
             Request::ListSchedules => self.list_schedules(peer),
             Request::CreateSchedule { name, cwd, prompt, agent_id, recurrence } => {

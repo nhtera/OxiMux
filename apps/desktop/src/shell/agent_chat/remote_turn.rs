@@ -25,16 +25,37 @@ use oximux_agents::thread::ThreadEvent;
 use super::{AgentChatView, FOLLOW_FRAMES};
 
 impl AgentChatView {
-    /// Drain relayed remote prompts (phone sends) and fold each as a user bubble.
-    /// Mirrors `spawn_drain` but for the prompt-echo channel the registry feeds
-    /// on a remote `send_prompt`. Ends when the sender drops (rebind/teardown).
+    /// Drain relayed remote prompts (phone sends) and fold each as a user bubble,
+    /// and host-synthesized events (an operator-edited approval) into the fold.
+    /// One task for both channels — they share a lifetime (bound and re-bound
+    /// together) and folding them from one place keeps ordering trivial. Ends
+    /// when both senders drop (rebind/teardown).
     pub(super) fn spawn_remote_prompt_relay(
-        mut rx: futures::channel::mpsc::UnboundedReceiver<RemotePrompt>,
+        rx: futures::channel::mpsc::UnboundedReceiver<RemotePrompt>,
+        events_rx: futures::channel::mpsc::UnboundedReceiver<ThreadEvent>,
         cx: &mut Context<Self>,
     ) -> Task<()> {
+        enum Relayed {
+            Prompt(RemotePrompt),
+            Event(ThreadEvent),
+        }
+        let mut merged = futures::stream::select(
+            rx.map(Relayed::Prompt),
+            events_rx.map(Relayed::Event),
+        );
         cx.spawn(async move |this: WeakEntity<Self>, cx| {
-            while let Some(prompt) = rx.next().await {
-                if this.update(cx, |view, cx| view.push_remote_user_bubble(prompt, cx)).is_err() {
+            while let Some(item) = merged.next().await {
+                let folded = this.update(cx, |view, cx| match item {
+                    Relayed::Prompt(prompt) => view.push_remote_user_bubble(prompt, cx),
+                    Relayed::Event(event) => {
+                        // Through the fold's own apply — the registry already
+                        // ingested it for remote subscribers; this is the copy
+                        // for the transcript this view owns.
+                        view.thread.apply(&event);
+                        cx.notify();
+                    }
+                });
+                if folded.is_err() {
                     return; // view dropped
                 }
             }

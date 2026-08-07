@@ -163,6 +163,14 @@ impl RemoteBinding {
         self.handle.set_remote_prompt_sink(tx);
     }
 
+    /// Register the sink that carries host-synthesized events (an operator-edited
+    /// approval) into the view's fold — the decision's edit is on no backend
+    /// stream, and without this the desktop transcript would keep showing only
+    /// what the agent asked for.
+    pub fn set_event_sink(&self, tx: mpsc::UnboundedSender<oximux_agents::thread::ThreadEvent>) {
+        self.handle.set_remote_event_sink(tx);
+    }
+
     /// Register the sink that carries a model/permission-mode change the backend
     /// refused in-session to the view, which completes it by respawning the child
     /// resumed on the new pick — the same recovery the desktop's own picker does.

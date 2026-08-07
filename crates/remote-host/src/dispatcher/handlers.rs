@@ -256,7 +256,13 @@ impl Dispatcher {
         }
     }
 
-    pub(super) fn events_since(&self, peer: &Peer, session_id: &str, after_seq: u64) -> Response {
+    pub(super) fn events_since(
+        &self,
+        peer: &Peer,
+        session_id: &str,
+        after_seq: u64,
+        peer_version: u32,
+    ) -> Response {
         if !self.auth.is_allowed_for(peer, session_id) {
             return Response::Error(RpcError::Unauthorized);
         }
@@ -270,7 +276,7 @@ impl Dispatcher {
         };
         let mut frames = Vec::new();
         for (seq, event) in handle.events_since(after_seq) {
-            match HostEvent::new(session_id, seq, &event, wire.clone()) {
+            match HostEvent::new_for_peer(session_id, seq, &event, wire.clone(), peer_version) {
                 Ok(frame) => frames.push(frame),
                 Err(_) => return Response::Error(RpcError::Internal("event encode failed".into())),
             }

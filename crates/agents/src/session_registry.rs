@@ -109,6 +109,18 @@ pub struct RemotePrompt {
     pub images: Vec<ChatImage>,
 }
 
+/// What a pending permission asked for, kept until it is decided so the
+/// decision can be compared against the proposal — an approval whose
+/// `updated_input` differs is an operator edit worth recording in the
+/// transcript ([`ThreadEvent::PermissionEdited`]).
+#[derive(Clone, Debug)]
+struct PendingPermission {
+    /// The tool call the request gated, when it named one.
+    tool_use_id: Option<String>,
+    /// The input the agent proposed.
+    input: serde_json::Value,
+}
+
 /// Which picker a [`RemoteChoice`] carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChoiceKind {
@@ -169,8 +181,11 @@ pub struct SessionHandle {
     /// Request-ids that have been decided. Insertion is the atomic gate: the
     /// caller whose `insert` returns `true` is the one that fires the transport.
     decided: Mutex<HashSet<String>>,
-    /// Request-ids currently awaiting a decision (drives `awaiting_permission`).
-    pending: Mutex<HashSet<String>>,
+    /// Requests currently awaiting a decision (drives `awaiting_permission`),
+    /// keyed by request-id. The value keeps what the agent ASKED for — the
+    /// join key and proposal a later decision is compared against, so an
+    /// operator-edited approval can be recorded as such.
+    pending: Mutex<HashMap<String, PendingPermission>>,
     status_tx: watch::Sender<SessionStatus>,
     /// Display metadata published by the desktop view (title/model).
     meta: Mutex<SessionMeta>,
@@ -182,6 +197,11 @@ pub struct SessionHandle {
     /// the user's own bubble. `None` when no view is bound (remote disabled, or a
     /// headless host); the prompt still reaches the backend and other subscribers.
     remote_prompt_tx: Mutex<Option<mpsc::UnboundedSender<RemotePrompt>>>,
+    /// Relays a host-synthesized event (an operator-edited approval) to the bound
+    /// view's fold, which no backend stream carries. Same shape and rationale as
+    /// [`Self::remote_prompt_tx`]: the ingest reaches remote subscribers, this
+    /// reaches the fold that owns the transcript. `None` when no view is bound.
+    remote_event_tx: Mutex<Option<mpsc::UnboundedSender<ThreadEvent>>>,
     /// Relays a model/permission-mode change the backend refused in-session to the
     /// bound desktop view, which completes it by respawning. `None` when no view is
     /// bound, and then a refused change stays refused — there is nothing that could
@@ -236,9 +256,13 @@ impl SessionHandle {
     /// append ahead of it — reordering the backlog `events_since` promises is
     /// ascending.
     pub fn ingest(&self, mut event: ThreadEvent) -> Seq {
-        // Track outstanding permission requests for the coarse status snapshot.
-        if let ThreadEvent::PermissionRequested { request_id, .. } = &event {
-            self.pending.lock().unwrap().insert(request_id.clone());
+        // Track outstanding permission requests for the coarse status snapshot —
+        // and keep the proposal, so a decision that edits it can be recorded.
+        if let ThreadEvent::PermissionRequested { request_id, tool_use_id, input, .. } = &event {
+            self.pending.lock().unwrap().insert(
+                request_id.clone(),
+                PendingPermission { tool_use_id: tool_use_id.clone(), input: input.clone() },
+            );
         }
 
         // Before anything retains or broadcasts it. A screen capture is a
@@ -296,18 +320,47 @@ impl SessionHandle {
         if !newly_decided {
             return Ok(false);
         }
+        // Read before the decision is moved into the transport: an approval's
+        // `updated_input` is compared against the proposal below.
+        let approved = match &decision {
+            PermissionDecision::Allow { updated_input }
+            | PermissionDecision::AllowWithSuggestion { updated_input, .. } => {
+                Some(updated_input.clone())
+            }
+            PermissionDecision::Deny { .. } => None,
+        };
         if let Err(err) = self.conn().resolve_permission(request_id, decision) {
             // Undo the gate so the request isn't permanently locked as "decided"
             // by a transient transport failure.
             self.decided.lock().unwrap().remove(request_id);
             return Err(err);
         }
-        self.pending.lock().unwrap().remove(request_id);
-        // Resolving isn't an ingest — it must NOT advance `last_seq` (deriving it
-        // from `next_seq` here can read a counter already bumped by a concurrent
+        let asked = self.pending.lock().unwrap().remove(request_id);
+        // Resolving is not itself an ingest — it must NOT advance `last_seq` (deriving
+        // it from `next_seq` here can read a counter already bumped by a concurrent
         // ingest whose event isn't in the backlog yet, publishing a resume cursor
         // ahead of the durable store). Refresh only the awaiting flag.
         self.update_status(None);
+        // An approval that EDITED the proposal is recorded in the transcript —
+        // without this, a reader sees what the agent asked for and cannot tell
+        // the operator narrowed it. A real event through the normal ingest
+        // (remote subscribers, backlog, seq), plus the view relay for whichever
+        // fold owns this session — the same dual path `send_prompt` walks,
+        // because no backend echoes decisions either.
+        if let (Some(approved), Some(asked)) = (approved, asked)
+            && !approved.is_null()
+            && approved != asked.input
+        {
+            let event = ThreadEvent::PermissionEdited {
+                request_id: request_id.to_string(),
+                tool_use_id: asked.tool_use_id,
+                approved_input: approved,
+            };
+            self.ingest(event.clone());
+            if let Some(tx) = self.remote_event_tx.lock().unwrap().as_ref() {
+                let _ = tx.unbounded_send(event);
+            }
+        }
         Ok(true)
     }
 
@@ -542,6 +595,13 @@ impl SessionHandle {
         *self.remote_prompt_tx.lock().unwrap() = Some(tx);
     }
 
+    /// Register the sink that relays host-synthesized events (an operator-edited
+    /// approval) to the owning view's fold. Replaces any prior sink, like
+    /// [`Self::set_remote_prompt_sink`].
+    pub fn set_remote_event_sink(&self, tx: mpsc::UnboundedSender<ThreadEvent>) {
+        *self.remote_event_tx.lock().unwrap() = Some(tx);
+    }
+
     /// Publish the folded transcript for remote clients. Pairs the entries with the
     /// registry's current last-assigned `seq` (0 before any event) so a subscriber
     /// resumes the live stream from exactly the point the snapshot already covers —
@@ -678,11 +738,12 @@ impl SessionRegistry {
             backlog_cap: backlog_cap.max(1),
             live,
             decided: Mutex::new(HashSet::new()),
-            pending: Mutex::new(HashSet::new()),
+            pending: Mutex::new(HashMap::new()),
             status_tx,
             meta: Mutex::new(SessionMeta::default()),
             transcript: Mutex::new(None),
             remote_prompt_tx: Mutex::new(None),
+            remote_event_tx: Mutex::new(None),
             remote_choice_tx: Mutex::new(None),
             changed: self.changed.clone(),
             prompt_order: Mutex::new(()),
@@ -903,6 +964,63 @@ mod tests {
 
         let prompt = rx.try_recv().expect("relay sent a prompt");
         assert_eq!(prompt.text, "hi from phone");
+    }
+
+    /// An approval whose `updated_input` differs from the proposal is recorded:
+    /// one `PermissionEdited` through the normal ingest (subscribers, backlog,
+    /// seq) and one copy to the view sink — the `send_prompt` dual path, because
+    /// no backend echoes decisions either. An approval echoing the proposal
+    /// unchanged records nothing, preserving resolve's no-ingest rule for the
+    /// overwhelmingly common case.
+    #[test]
+    fn an_edited_approval_is_recorded_and_an_unedited_one_is_not() {
+        let reg = SessionRegistry::new();
+        let handle = reg.register("s1".into(), Arc::new(RecordingConn::default()));
+        let (tx, mut rx) = mpsc::unbounded();
+        handle.set_remote_event_sink(tx);
+        let request = |id: &str| ThreadEvent::PermissionRequested {
+            request_id: id.into(),
+            tool_use_id: Some(format!("toolu_{id}")),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({"command": "rm -rf x"}),
+            description: String::new(),
+            suggestions: vec![],
+            kind: crate::thread::PermissionKind::Tool,
+        };
+
+        reg.ingest("s1", request("req-1"));
+        let seq_before = handle.status().borrow().last_seq;
+        reg.resolve_permission(
+            "s1",
+            "req-1",
+            PermissionDecision::Allow { updated_input: serde_json::json!({"command": "ls x"}) },
+        )
+        .unwrap();
+
+        let recorded = handle.events_since(seq_before);
+        match recorded.as_slice() {
+            [(_, ThreadEvent::PermissionEdited { request_id, tool_use_id, approved_input })] => {
+                assert_eq!(request_id, "req-1");
+                assert_eq!(tool_use_id.as_deref(), Some("toolu_req-1"));
+                assert_eq!(approved_input, &serde_json::json!({"command": "ls x"}));
+            }
+            other => panic!("expected exactly one PermissionEdited, got {other:?}"),
+        }
+        assert!(
+            matches!(rx.try_recv(), Ok(ThreadEvent::PermissionEdited { .. })),
+            "the owning fold gets its copy"
+        );
+
+        reg.ingest("s1", request("req-2"));
+        let seq_before = handle.status().borrow().last_seq;
+        reg.resolve_permission(
+            "s1",
+            "req-2",
+            PermissionDecision::Allow { updated_input: serde_json::json!({"command": "rm -rf x"}) },
+        )
+        .unwrap();
+        assert!(handle.events_since(seq_before).is_empty(), "an unedited allow records nothing");
+        assert!(rx.try_recv().is_err(), "and relays nothing");
     }
 
     /// A send that never reached the agent must not leave a bubble implying it

@@ -98,7 +98,18 @@ pub use crate::messages::*;
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
+
+/// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
+///
+/// Events cross the wire as JSON, so an *unknown variant* is not a postcard
+/// framing break — but the shared client fold still refuses it, and a refused
+/// frame kills that subscription. Rather than skip the seq (a permanent gap:
+/// the same event comes back out of every resync), the host DOWNGRADES the
+/// event to a [`ThreadEvent::Notice`] for older peers — same seq, decodable
+/// everywhere, and it still says in prose what the edit was about. Peers at or
+/// above this version get the structured event.
+pub const PERMISSION_EDITED_MIN_VERSION: u32 = 20;
 
 /// The oldest peer that can decode [`Response::StateChanged`]. Like
 /// [`SCHEDULE_PUSH_MIN_VERSION`], this exists because a push reaches a peer

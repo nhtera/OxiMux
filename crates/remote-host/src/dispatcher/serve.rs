@@ -157,7 +157,7 @@ impl Dispatcher {
                         Some(peer) => {
                             let alive = match *frame {
                                 Live::Session(f) => {
-                                    self.forward_live(&peer, &mut cursors, transport, f).await
+                                    self.forward_live(&peer, &mut cursors, transport, f, state.peer_version).await
                                 }
                                 Live::Terminal { pty_id, frame } => {
                                     forward_terminal(&self.auth, &peer, transport, pty_id, frame)
@@ -243,7 +243,7 @@ impl Dispatcher {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
             let (response, stream) =
-                self.begin_subscribe(&peer, &session_id, after_seq.unwrap_or(0), cursors);
+                self.begin_subscribe(&peer, &session_id, after_seq.unwrap_or(0), cursors, state.peer_version);
             if let Some(stream) = stream {
                 streams.push(stream.map(Live::Session).boxed());
             }

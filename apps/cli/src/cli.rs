@@ -455,11 +455,11 @@ pub enum PermitCommand {
         /// object is passed through as given, so it must carry every field the
         /// tool needs — it replaces the input, it does not merge into it.
         ///
-        /// CAVEAT: the transcript records what the agent ASKED for, not what
-        /// you allowed — the protocol has no event for a substituted input. So
-        /// a reader of `oximux transcript` sees the agent's original arguments
-        /// and cannot tell they were edited. Keep your own record if the
-        /// substitution matters for audit.
+        /// The substitution is recorded: the transcript keeps both what the
+        /// agent asked for and what you allowed (the tool call's
+        /// `approved_input`). A host older than protocol v20 does not record
+        /// it — the edit still applies, but its transcript shows only the
+        /// proposal; keep your own record there if it matters for audit.
         #[arg(long, value_name = "JSON")]
         input: Option<String>,
     },

@@ -98,7 +98,16 @@ impl SessionSubscription {
         if frame.seq > self.last_seq + 1 {
             return Ok(FoldOutcome::Gap { resume_from: self.last_seq });
         }
-        let event = frame.event().map_err(|e| SessionError::Wire(e.to_string()))?;
+        // An event this build cannot decode is a vocabulary this build predates
+        // (the host gates known-new variants by peer version, but a still-newer
+        // host may ship ones it cannot know to gate). Skip it and ADVANCE — a
+        // resync would deliver the same undecodable event again, so failing or
+        // gapping here turns one unknown variant into a dead subscription. The
+        // CLI's attach stream marks these the same way.
+        let Ok(event) = frame.event() else {
+            self.last_seq = frame.seq;
+            return Ok(FoldOutcome::Applied { seq: frame.seq });
+        };
         self.thread.apply(&event);
         self.last_seq = frame.seq;
         Ok(FoldOutcome::Applied { seq: frame.seq })

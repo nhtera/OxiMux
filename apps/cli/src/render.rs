@@ -161,6 +161,9 @@ pub fn render_event(event: &ThreadEvent) -> Option<String> {
                 one_line(&what)
             ))
         }
+        ThreadEvent::PermissionEdited { request_id, .. } => Some(format!(
+            "· approval edited the tool input (request {request_id}) — the transcript records what was allowed"
+        )),
         ThreadEvent::QuestionAsked { request_id, questions, .. } => {
             let head = questions
                 .first()
@@ -381,6 +384,14 @@ mod tests {
             (ThreadEvent::AssistantTextDelta("par".into()), None),
             (ThreadEvent::Error("decode failed".into()), Some("✗ decode failed")),
             (ThreadEvent::Rewound { ordinal: 2 }, Some("— rewound to turn 2 —")),
+            (
+                ThreadEvent::PermissionEdited {
+                    request_id: "req-9".into(),
+                    tool_use_id: None,
+                    approved_input: serde_json::json!({"command": "ls"}),
+                },
+                Some("· approval edited the tool input (request req-9) — the transcript records what was allowed"),
+            ),
         ];
         for (event, expected) in cases {
             assert_eq!(render_event(&event).as_deref(), expected, "event: {event:?}");
