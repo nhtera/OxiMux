@@ -1,5 +1,6 @@
 ---
 import { Icon } from "astro-icon/components";
+import CliInstallDialog from "./cli-install-dialog.astro";
 import ShotFrame from "../shot-frame.astro";
 import { SITE, AGENT_MARKS } from "../../consts";
 import cockpit from "../../assets/shots/cockpit.png";
@@ -73,6 +74,13 @@ import cockpit from "../../assets/shots/cockpit.png";
             Soon
           </span>
         </span>
+
+        <!--
+          The CLI's door into the page: an icon-only trigger that opens the
+          install dialog. Icon-sized like the GitHub button beside it — the
+          hero keeps one primary action, and these two stay secondary.
+        -->
+        <CliInstallDialog />
 
         <a
           href={SITE.repo}

@@ -22,6 +22,18 @@ export const SITE = {
 } as const;
 
 /**
+ * The CLI install path, surfaced in the hero dialog. The command is the same
+ * line the README documents — one source of truth, nothing invented. The docs
+ * link points at the generated reference, which is produced from the parser
+ * itself and so cannot drift from what the binary accepts.
+ */
+export const CLI = {
+  install:
+    "curl -fsSL https://raw.githubusercontent.com/nhtera/OxiMux/main/scripts/install-cli.sh | sh",
+  docs: "https://github.com/nhtera/OxiMux/blob/main/docs/cli-reference.md",
+} as const;
+
+/**
  * Agents OxiMux can drive today. Sourced from the README capability list and
  * crates/agents (AgentRuntime trait plus provider adapters).
  *

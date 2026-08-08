@@ -1,0 +1,169 @@
+---
+import { Icon } from "astro-icon/components";
+import { CLI } from "../../consts";
+---
+
+<!--
+  Trigger + dialog as one unit so the hero cannot render one without the other.
+
+  The trigger is an anchor to the CLI reference, not a bare button: with no JS
+  (or before it loads) the click still lands the reader somewhere real, and the
+  script upgrades it into opening the dialog. Same safety ordering as the
+  reveal script in the layout — enhancement only ever adds.
+-->
+<a
+  href={CLI.docs}
+  data-cli-open
+  aria-haspopup="dialog"
+  aria-label="Install the CLI on a server"
+  title="Install the CLI on a server"
+  class="press inline-flex items-center justify-center rounded-[--radius-control] border border-edge bg-panel p-3 text-fg hover:border-edge-strong hover:bg-panel-alt"
+>
+  <Icon name="ph:terminal-window" class="size-4" aria-hidden="true" />
+</a>
+
+<dialog
+  data-cli-dialog
+  class="m-auto w-[min(40rem,calc(100vw-2.5rem))] rounded-[--radius-control] border border-edge bg-panel p-0 text-fg backdrop:bg-black/60"
+>
+  <div class="p-6 sm:p-8">
+    <h2 class="font-mono text-lg font-semibold tracking-tight text-fg">
+      Run agents on a remote machine
+    </h2>
+    <!--
+      Spaces around inline <code> are written with explicit expressions:
+      Astro collapses the whitespace a source line break leaves next to an
+      element boundary, and "startoximux serve" is what shipping that looks
+      like.
+    -->
+    <p class="mt-3 text-sm leading-relaxed text-fg-muted">
+      The <code class="text-fg">oximux</code> CLI is the scriptable client of a
+      running host. Install it on a headless machine, start{" "}<code
+        class="text-fg">oximux serve</code
+      >, and drive sessions, schedules, git, and worktrees from a shell or a CI
+      job — locally or over SSH.
+    </p>
+
+    <div
+      class="mt-5 flex items-center gap-3 rounded-[--radius-control] border border-edge bg-canvas px-4 py-3"
+    >
+      <!--
+        Wrapped, not scrolled: the whole command stays visible, and a
+        non-overflowing element is one Chrome will not treat as focusable —
+        which is what made showModal paint a ring around this block.
+      -->
+      <code
+        class="min-w-0 flex-1 font-mono text-[13px] break-all whitespace-pre-wrap text-fg"
+        data-cli-command>$ {CLI.install}</code
+      >
+      <!--
+        `autofocus` steers showModal's initial focus here instead of the
+        scrollable command block — Chrome treats an overflowing element as
+        focusable and paints a heavy ring around the whole command on open.
+      -->
+      <button
+        type="button"
+        data-cli-copy
+        autofocus
+        aria-label="Copy install command"
+        class="press shrink-0 rounded-[--radius-chip] border border-edge bg-panel-alt p-2 text-fg-muted hover:border-edge-strong hover:text-fg"
+      >
+        <Icon name="ph:copy" class="size-4" data-cli-copy-idle aria-hidden="true" />
+        <Icon
+          name="ph:check"
+          class="hidden size-4"
+          data-cli-copy-done
+          aria-hidden="true"
+        />
+      </button>
+    </div>
+
+    <p class="mt-4 text-[13px] leading-relaxed text-fg-subtle">
+      Installs <code>oximux</code> and <code>oximux-relay</code>, verified
+      against a signed release manifest. macOS and Linux, glibc and musl alike;
+      on Windows use <code>install-cli.ps1</code>. It keeps itself current
+      with{" "}<code>oximux update</code>.{" "}
+      <a
+        href={CLI.docs}
+        class="text-fg-muted underline decoration-edge-strong underline-offset-4 hover:text-fg"
+        >CLI reference</a
+      >
+    </p>
+  </div>
+</dialog>
+
+<!--
+  is:global because the selector must match <html>, and Astro's default
+  scoping would pin the rule to elements rendered by this component.
+-->
+<style is:global>
+  /* The gutter is reserved at all times, not just while the modal is open:
+     the lock below removes the scrollbar, and on classic (non-overlay)
+     scrollbars that reclaimed strip re-widens the page mid-open — a visible
+     layout shift. A permanently reserved gutter is invisible on this
+     full-bleed dark page, and overlay-scrollbar platforms have no gutter to
+     reserve either way. */
+  html {
+    scrollbar-gutter: stable;
+  }
+
+  /* Freeze the page behind the modal. Also part of the scroll-jump defense
+     below: with the document unscrollable there is nothing for showModal's
+     focus/reveal heuristics to move. */
+  html:has(dialog[data-cli-dialog][open]) {
+    overflow: hidden;
+  }
+</style>
+
+<script is:inline>
+  /* Native <dialog> does Escape and focus containment on its own; the script
+     only wires open, backdrop-click close, and the copy button. Guarded so a
+     browser without showModal keeps the anchor's plain link behaviour. */
+  (() => {
+    const trigger = document.querySelector("[data-cli-open]");
+    const dialog = document.querySelector("[data-cli-dialog]");
+    if (!trigger || !dialog || typeof dialog.showModal !== "function") return;
+
+    trigger.addEventListener("click", (event) => {
+      event.preventDefault();
+      /* Chrome scrolls the document to the dialog's position in the flow
+         when it enters the top layer, and does so on a later frame — a
+         synchronous restore alone loses the race. Restore now and again on
+         the next frame; the global overflow lock covers anything later. */
+      const scrollX = window.scrollX;
+      const scrollY = window.scrollY;
+      dialog.showModal();
+      window.scrollTo(scrollX, scrollY);
+      requestAnimationFrame(() => window.scrollTo(scrollX, scrollY));
+    });
+
+    /* A click on the backdrop reports the dialog element itself as target;
+       clicks inside land on descendants. */
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) dialog.close();
+    });
+
+    const copy = dialog.querySelector("[data-cli-copy]");
+    const command = dialog.querySelector("[data-cli-command]");
+    if (!copy || !command || !navigator.clipboard) return;
+
+    let resetTimer;
+    copy.addEventListener("click", async () => {
+      /* The rendered text carries the `$ ` prompt; the clipboard must not,
+         or pasting it into a shell breaks. */
+      const text = command.textContent.replace(/^\$\s*/, "");
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        return;
+      }
+      copy.querySelector("[data-cli-copy-idle]").classList.add("hidden");
+      copy.querySelector("[data-cli-copy-done]").classList.remove("hidden");
+      clearTimeout(resetTimer);
+      resetTimer = setTimeout(() => {
+        copy.querySelector("[data-cli-copy-idle]").classList.remove("hidden");
+        copy.querySelector("[data-cli-copy-done]").classList.add("hidden");
+      }, 2000);
+    });
+  })();
+</script>
