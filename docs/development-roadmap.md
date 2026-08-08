@@ -33,8 +33,8 @@ commit SHAs). This file tracks *status and what is next*, not history.
 | Remote Control + mobile | Pairing (QR + NaCl box), `SessionRegistry` visibility boundary, read-only device tier, self-unpair, projects quick-add; **React Native client in-repo** (`apps/mobile`): chat + git screens, session-list sync, connection recovery, dictation bar, EAS preview deploys | 2026-07 → 2026-08 |
 | Computer use | Semantic-first driver, separate gate process, consent UX, per-project opt-in, parallel agents proven; PreToolUse hook (not `can_use_tool`) is the enforcement point | phases 1–5 complete |
 | Windows port | Full desktop port (ConPTY, shell integration, frameless chrome, relay via named pipes); `windows-latest` CI is the only thing executing Windows code | merged to `main` 2026-08-03 (PR #1) |
-| `oximux` CLI + `serve` | Headless host, ~35 command groups, 6-code exit taxonomy, permission `ls/allow/deny/answer` (+`--input` edit-then-approve), `--stalled-after`, schedules + heartbeats, coordination state with v19 resume cursor, worktrees, teams, signed self-update | phases 3–8, protocol v16→v19; released 2026-08-07 |
-| Distribution | Styled DMG + notarization, desktop auto-update (swap at quit), first-run onboarding wizard, external-CLI auto-provisioning, CLI: 5-target release + minisign-signed manifest + Homebrew tap + curl installer | v0.1.3 → v0.1.8 |
+| `oximux` CLI + `serve` | Headless host, ~35 command groups, 6-code exit taxonomy (+ serve exit 6 on a held data dir), permission `ls/allow/deny/answer` (+`--input` edit-then-approve, recorded in the transcript since v20), `--stalled-after`, schedules + heartbeats (`logs` signals truncation), coordination state with v19 resume cursor, worktrees, teams, signed self-update | phases 3–8, protocol v16→v20; released 2026-08-07 |
+| Distribution | Styled DMG + notarization, desktop auto-update (swap at quit), first-run onboarding wizard, external-CLI auto-provisioning, CLI: 6-target release (incl. static musl) + minisign-signed manifest + Homebrew tap + curl installer | v0.1.3 → v0.1.9 |
 
 ## Release train
 

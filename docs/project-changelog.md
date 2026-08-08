@@ -20,6 +20,10 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 - `x86_64-unknown-linux-musl` joins the release matrix (static; Alpine and
   pre-floor glibc), proven by a per-push CI gate before any tag, and the
   installer picks it on musl systems.
+- Released same day: workflow green on the first run (second release in a
+  row), all 6 tarballs verified against the signed manifest before publish,
+  the musl binary confirmed static-pie, and the 0.1.8 → 0.1.9 `oximux update`
+  swap proven — the updated binary reports protocol v20.
 
 ---
 
