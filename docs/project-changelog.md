@@ -4,6 +4,19 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-08-08 — v0.1.10: Alpine on ARM (`main`)
+
+- **`669a5f8`** — `aarch64-unknown-linux-musl` joins the release matrix.
+  v0.1.9 gave Alpine a static musl build for x86_64 only; on aarch64 the
+  installer guessed gnu and handed Alpine-on-ARM — Graviton, Ampere, a Pi —
+  a glibc binary that cannot exec. The installer now runs the same musl
+  probe on both architectures, the build rides the native ARM runner, and
+  a per-push CI gate (`linux arm musl gate`) proves the leg before any tag.
+  Against a release without the asset the installer refuses by name
+  instead of installing a binary that cannot run.
+
+---
+
 ### 2026-08-08 — v0.1.9: recorded approvals (proto v20), honest bounds, Alpine (`main`)
 
 - **`04565ec`** — protocol v20: `permit allow --input` edits are recorded.
