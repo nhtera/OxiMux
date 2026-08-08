@@ -127,7 +127,19 @@ detect_target() {
                         echo "x86_64-unknown-linux-gnu"
                     fi
                     ;;
-                aarch64|arm64) echo "aarch64-unknown-linux-gnu" ;;
+                aarch64|arm64)
+                    # Same probe as x86_64: a gnu binary on musl cannot even
+                    # exec, so guessing gnu here handed Alpine-on-ARM a broken
+                    # install. If the release predates the aarch64 musl asset
+                    # the manifest lookup below refuses by name, which is the
+                    # honest failure.
+                    if [ -f /etc/alpine-release ] \
+                        || ldd --version 2>&1 | grep -qi musl; then
+                        echo "aarch64-unknown-linux-musl"
+                    else
+                        echo "aarch64-unknown-linux-gnu"
+                    fi
+                    ;;
                 *) die "unsupported Linux architecture: $arch" ;;
             esac
             ;;

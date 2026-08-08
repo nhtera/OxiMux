@@ -280,6 +280,40 @@ jobs:
             exit 1
           fi
 
+  # The ARM twin of linux-check's "musl build gate": aarch64-unknown-linux-musl
+  # joins the release matrix, so its first execution must not be a release
+  # attempt. Its own job rather than a step in linux-check because musl-gcc
+  # emits the host's architecture — a native aarch64 runner is the toolchain,
+  # not a preference. Debug build for the same reason as the x86_64 gate:
+  # linking against musl is where this breaks, and debug links the same
+  # libraries.
+  linux-arm-musl-check:
+    name: linux arm musl gate
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-arm-musl-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: musl build gate (release parity, aarch64)
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup target add aarch64-unknown-linux-musl
+          cargo build --target aarch64-unknown-linux-musl -p oximux-cli -p oximux-relay
+
   # Permanent gate for the Windows port. macOS is still the only shipping
   # target; this job stops a macOS-only API from landing on a shared path
   # unnoticed, which is exactly the class of breakage that made the port

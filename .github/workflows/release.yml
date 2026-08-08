@@ -332,6 +332,13 @@ jobs:
           # "musl build gate" — this job must never be its first execution.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-24.04
+          # The ARM half of the same musl story: Alpine on Graviton, Ampere,
+          # and a Pi — the cheap always-on boxes named above, running the one
+          # distro the gnu build cannot serve. Native ARM runner because
+          # musl-gcc emits the host's architecture. Proven per-push by
+          # ci.yml's "musl build gate (arm)".
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
@@ -377,9 +384,11 @@ jobs:
         env:
           OXIMUX_BUILD_CHANNEL: stable
           # Target-scoped, so inert on every non-musl leg: cargo consults them
-          # only when building x86_64-unknown-linux-musl.
+          # only when building the matching musl target.
           CC_x86_64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: cargo build --release --target ${{ matrix.target }} -p oximux-cli -p oximux-relay
 
       # macOS only, and only when the certificate secret is configured — a fork
