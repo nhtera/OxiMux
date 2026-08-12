@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 pub use oximux_single_instance::{AcquireOutcome, SingleInstanceGuard, try_acquire};
 
 /// Lock file name under the app data directory. Sits alongside the relay
-/// `relay-v8.{sock,pid,token}` files — same placement convention.
+/// `relay-v9.{sock,pid,token}` files — same placement convention.
 pub const LOCK_FILENAME: &str = "oximux-gui.lock";
 
 /// Resolve the GUI lock path inside a given data directory.

@@ -194,7 +194,7 @@ async fn wait_for_first_output(
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline - tokio::time::Instant::now();
         match timeout(remaining, read_frame(stream, buf)).await {
-            Ok(Ok(Frame::Notification(Notification::Output { pty_id: id, bytes })))
+            Ok(Ok(Frame::Notification(Notification::Output { pty_id: id, bytes, .. })))
                 if id == pty_id && !bytes.is_empty() =>
             {
                 return true;
@@ -224,10 +224,10 @@ async fn collect_output(
             _ => break,
         };
         match f {
-            Frame::Notification(Notification::Output { pty_id: id, bytes }) if id == pty_id => {
+            Frame::Notification(Notification::Output { pty_id: id, bytes, .. }) if id == pty_id => {
                 out.extend_from_slice(&bytes);
             }
-            Frame::Notification(Notification::Exit { pty_id: id, code }) if id == pty_id => {
+            Frame::Notification(Notification::Exit { pty_id: id, code, .. }) if id == pty_id => {
                 exit = Some(code);
                 break;
             }
@@ -602,7 +602,7 @@ async fn agent_status_fans_out_osc_output_to_subscribers() {
                 request_id: 3,
                 response: Response::Ok,
             })) => got_ok = true,
-            Ok(Ok(Frame::Notification(Notification::Output { pty_id: p, bytes })))
+            Ok(Ok(Frame::Notification(Notification::Output { pty_id: p, bytes, .. })))
                 if p == pty_id && bytes.windows(6).any(|w| w == b"]9999;") =>
             {
                 // Exact OSC framing: ESC ] 9999 ; <payload> BEL.

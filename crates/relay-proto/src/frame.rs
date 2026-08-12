@@ -291,14 +291,17 @@ mod tests {
     #[test]
     fn round_trip_notifications() {
         round_trip(Frame::Notification(Notification::Output {
+            attachment_id: 0,
             pty_id: "p".into(),
             bytes: vec![0xff; 1024],
         }));
         round_trip(Frame::Notification(Notification::Exit {
+            attachment_id: 0,
             pty_id: "p".into(),
             code: Some(1),
         }));
         round_trip(Frame::Notification(Notification::Exit {
+            attachment_id: 0,
             pty_id: "p".into(),
             code: None,
         }));
@@ -378,6 +381,7 @@ mod tests {
         // not buf.len(). Caller's read loop relies on this to slice off the
         // frame and keep parsing the next one from the remainder.
         let frame = Frame::Notification(Notification::Exit {
+            attachment_id: 0,
             pty_id: "p".into(),
             code: None,
         });

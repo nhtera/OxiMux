@@ -32,12 +32,14 @@ pub struct RelayTerminals {
     /// Needed because `Resize` is addressed to an *attachment*, not a PTY: the
     /// daemon runs each PTY at the smallest size any attachment asks for, so it
     /// has to know which one is changing its mind.
-    attachments: Mutex<HashMap<String, u64>>,
+    /// Shared so the per-attachment forwarding task can retire its own entry
+    /// when it ends, without racing a newer attach that has already replaced it.
+    attachments: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl RelayTerminals {
     pub fn new(client: Arc<RelayClient>) -> Self {
-        Self { client, attachments: Mutex::new(HashMap::new()) }
+        Self { client, attachments: Arc::new(Mutex::new(HashMap::new())) }
     }
 
     async fn request(&self, req: Request) -> Result<Response, TerminalError> {
@@ -82,10 +84,18 @@ impl TerminalSource for RelayTerminals {
         // routed to us until the attach lands.
         let (sub_id, mut notifications) = self.client.subscribe_pty(pty_id);
 
-        let attached = match self.request(Request::Attach { pty_id: pty_id.to_owned() }).await {
+        // The attachment id travels with the forwarding task: it is what the
+        // task must hand back to the daemon when it ends.
+        let (attached, mine) = match self.request(Request::Attach { pty_id: pty_id.to_owned() }).await
+        {
             Ok(Response::AttachOk { replay, cols, rows, attachment_id }) => {
+                // Bind before anything else reads the stream: until the
+                // subscription knows its attachment, it receives every copy the
+                // daemon fans for this PTY — including the ones addressed to a
+                // desktop pane watching the same terminal.
+                self.client.bind_attachment(pty_id, sub_id, attachment_id);
                 self.attachments.lock().unwrap().insert(pty_id.to_owned(), attachment_id);
-                TerminalAttach { replay, cols, rows }
+                (TerminalAttach { replay, cols, rows }, attachment_id)
             }
             Ok(Response::Err { code: oximux_relay_proto::ErrCode::PtyNotFound, .. }) => {
                 self.client.unsubscribe_pty(pty_id, sub_id);
@@ -104,6 +114,7 @@ impl TerminalSource for RelayTerminals {
 
         let (tx, rx) = mpsc::channel(FRAME_QUEUE);
         let client = Arc::clone(&self.client);
+        let attachments = Arc::clone(&self.attachments);
         let owned_pty = pty_id.to_owned();
         tokio::spawn(async move {
             // A gap the remote client has not been told about yet. Same shape as
@@ -147,6 +158,30 @@ impl TerminalSource for RelayTerminals {
                 }
             }
             client.unsubscribe_pty(&owned_pty, sub_id);
+            // Release the daemon's attachment too, not just our local subscriber.
+            //
+            // These are two different things and only one of them used to be
+            // cleaned up. The daemon fans output out once per *attachment*, and
+            // sizes the PTY to the `min` across them — so an attachment that is
+            // never released keeps a share of both. A phone that opens the same
+            // terminal N times therefore made the host send N copies of every
+            // byte (one keystroke echoing back N times), and pinned the PTY to
+            // the smallest grid any of those dead attachments had asked for,
+            // which survived the phone disconnecting and even the app being
+            // killed — nothing was left that could ever release it.
+            //
+            // Best-effort: the connection may already be gone, in which case the
+            // daemon reaps the attachment with the connection anyway.
+            let _ = client
+                .request(Request::Detach { pty_id: owned_pty.clone(), attachment_id: mine })
+                .await;
+            // Retire the routing entry only if it is still ours. A newer attach
+            // for the same PTY has already overwritten it, and clearing that
+            // would leave the live attachment unaddressable by `Resize`.
+            let mut map = attachments.lock().unwrap();
+            if map.get(&owned_pty) == Some(&mine) {
+                map.remove(&owned_pty);
+            }
         });
 
         Ok((attached, rx))

@@ -45,7 +45,7 @@ pub fn endpoint_for(socket_path: &Path) -> Endpoint {
 /// Build the flat-namespace pipe name for `socket_path`.
 ///
 /// Shape: `<file stem>-<16 hex digits of the parent directory>`, e.g.
-/// `relay-v8-3a9f21c8b40de756`. The stem keeps the name recognizable in Process
+/// `relay-v9-3a9f21c8b40de756`. The stem keeps the name recognizable in Process
 /// Explorer and in logs; the digest of the parent directory makes it per-user,
 /// since the supervisor roots that directory under the user's local app-data.
 ///
@@ -113,7 +113,7 @@ mod tests {
         // Existing installs have this exact path in supervisor state; changing
         // the mapping would strand every live daemon.
         if !cfg!(windows) {
-            let path = socket_path(&["/Users", "me", "runtime"], "relay-v8.sock");
+            let path = socket_path(&["/Users", "me", "runtime"], "relay-v9.sock");
             assert_eq!(endpoint_for(&path), Endpoint::FsPath(path));
         }
     }
@@ -121,30 +121,30 @@ mod tests {
     #[test]
     fn windows_maps_to_a_namespaced_name() {
         if cfg!(windows) {
-            let path = socket_path(&["C:\\Users", "me", "AppData", "Local"], "relay-v8.sock");
+            let path = socket_path(&["C:\\Users", "me", "AppData", "Local"], "relay-v9.sock");
             assert!(matches!(endpoint_for(&path), Endpoint::Namespaced(_)));
         }
     }
 
     #[test]
     fn name_keeps_the_stem_so_it_stays_recognizable() {
-        let path = socket_path(&["home", "me", "app"], "relay-v8.sock");
+        let path = socket_path(&["home", "me", "app"], "relay-v9.sock");
         let name = namespaced_name(&path);
-        assert!(name.starts_with("relay-v8-"), "got {name}");
+        assert!(name.starts_with("relay-v9-"), "got {name}");
     }
 
     #[test]
     fn different_users_get_different_names() {
         // The whole reason the parent directory is in the digest: two accounts
         // must not land on one pipe and fight over FIRST_PIPE_INSTANCE.
-        let a = namespaced_name(&socket_path(&["home", "alice", "app"], "relay-v8.sock"));
-        let b = namespaced_name(&socket_path(&["home", "bob", "app"], "relay-v8.sock"));
+        let a = namespaced_name(&socket_path(&["home", "alice", "app"], "relay-v9.sock"));
+        let b = namespaced_name(&socket_path(&["home", "bob", "app"], "relay-v9.sock"));
         assert_ne!(a, b);
     }
 
     #[test]
     fn the_same_path_always_derives_the_same_name() {
-        let path = socket_path(&["home", "me", "app"], "relay-v8.sock");
+        let path = socket_path(&["home", "me", "app"], "relay-v9.sock");
         assert_eq!(namespaced_name(&path), namespaced_name(&path));
     }
 
@@ -152,8 +152,8 @@ mod tests {
     fn directory_case_does_not_change_the_name() {
         // Windows paths compare case-insensitively, so two call sites spelling
         // the same directory differently must still meet on one pipe.
-        let lower = namespaced_name(&socket_path(&["home", "me", "app"], "relay-v8.sock"));
-        let upper = namespaced_name(&socket_path(&["Home", "Me", "App"], "relay-v8.sock"));
+        let lower = namespaced_name(&socket_path(&["home", "me", "app"], "relay-v9.sock"));
+        let upper = namespaced_name(&socket_path(&["Home", "Me", "App"], "relay-v9.sock"));
         assert_eq!(lower, upper);
     }
 

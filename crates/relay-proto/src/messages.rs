@@ -48,7 +48,17 @@ use crate::error::ErrCode;
 // `HelloProof`. Both proofs cover both nonces — see `crate::auth` for why each
 // piece is there. Wire break in both directions, so the endpoint bumps to
 // `relay-v8`.
-pub const PROTOCOL_VERSION: u32 = 8;
+//
+// v9: per-subscriber notifications carry the `attachment_id` they were fanned
+// to. The daemon already sent one copy per attachment, but `Output`/`Exit`/
+// `Gapped` named only the PTY — so a client holding two attachments to one PTY
+// (a desktop pane plus a remote peer watching the same terminal) received two
+// identical notifications over its one connection and had no way to tell them
+// apart. It delivered both to every local subscriber, and each rendered every
+// byte twice. Addressing the notification is what makes the client's routing
+// exact. Field added to three variants ⇒ wire break ⇒ socket bumps to
+// `relay-v9`.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
@@ -239,14 +249,30 @@ pub enum Response {
     },
 }
 
+/// A notification pushed to a client.
+///
+/// **Addressing.** The daemon fans output out once per *attachment*, and a
+/// single connection may hold several attachments to the same PTY. So the
+/// per-attachment variants carry the `attachment_id` they were sent to, and a
+/// client must deliver each one to that attachment's subscriber alone. Routing
+/// on `pty_id` instead hands every copy to every subscriber, which renders each
+/// byte once per attachment the connection happens to hold.
+///
+/// The daemon stamps the id in `fan_out`; producers leave it unset.
+/// [`Attention`](Notification::Attention) is deliberately unaddressed — it is a
+/// pane-level signal that belongs to every viewer of the PTY.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Notification {
     Output {
         pty_id: String,
+        /// The attachment this copy is for. See the type's "Addressing" note.
+        attachment_id: u64,
         bytes: Vec<u8>,
     },
     Exit {
         pty_id: String,
+        /// The attachment this copy is for. See the type's "Addressing" note.
+        attachment_id: u64,
         code: Option<i32>,
     },
     /// Explicit attention raised via `Request::Notify`. The client maps
@@ -270,5 +296,42 @@ pub enum Notification {
     /// queue space that is already exhausted.
     Gapped {
         pty_id: String,
+        /// The attachment that fell behind. See the type's "Addressing" note —
+        /// a gap belongs to one subscriber, so telling the others would send
+        /// them re-attaching over a stream that never had a hole in it.
+        attachment_id: u64,
     },
+}
+
+/// The id producers use before [`fan_out`] stamps the real one.
+///
+/// Notifications are built once and cloned per subscriber, so the address is
+/// not knowable at construction. Zero is never a live attachment id — the
+/// daemon's counter starts at one.
+pub const UNROUTED_ATTACHMENT: u64 = 0;
+
+impl Notification {
+    /// The attachment this notification is addressed to, if any.
+    ///
+    /// `None` means "every subscriber on this PTY" rather than "nobody": an
+    /// unaddressed notification is a broadcast.
+    pub fn attachment_id(&self) -> Option<u64> {
+        match self {
+            Notification::Output { attachment_id, .. }
+            | Notification::Exit { attachment_id, .. }
+            | Notification::Gapped { attachment_id, .. } => Some(*attachment_id),
+            Notification::Attention { .. } => None,
+        }
+    }
+
+    /// This notification addressed to one attachment.
+    pub fn addressed_to(mut self, id: u64) -> Self {
+        match &mut self {
+            Notification::Output { attachment_id, .. }
+            | Notification::Exit { attachment_id, .. }
+            | Notification::Gapped { attachment_id, .. } => *attachment_id = id,
+            Notification::Attention { .. } => {}
+        }
+        self
+    }
 }

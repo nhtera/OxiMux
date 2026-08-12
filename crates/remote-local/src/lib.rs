@@ -55,7 +55,7 @@ pub use transport::{LocalSocketTransport, MAX_FRAME};
 
 use std::path::{Path, PathBuf};
 
-/// Versioned like the relay's `relay-v8.*`: a wire or handshake change bumps
+/// Versioned like the relay's `relay-v9.*`: a wire or handshake change bumps
 /// the name so an old CLI dials nothing rather than a socket it misreads.
 pub const SOCKET_FILENAME: &str = "control-v1.sock";
 pub const TOKEN_FILENAME: &str = "control-v1.token";

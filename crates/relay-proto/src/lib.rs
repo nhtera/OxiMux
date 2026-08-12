@@ -13,5 +13,5 @@ pub use error::{ErrCode, ProtoError};
 pub use frame::{Frame, FrameKind, MAX_FRAME_SIZE, decode_frame, encode_frame};
 pub use messages::{
     Hello, HelloAck, HelloChallenge, HelloProof, Notification, PROTOCOL_VERSION, PtyDescriptor,
-    PtyStats, Request, Response,
+    PtyStats, Request, Response, UNROUTED_ATTACHMENT,
 };

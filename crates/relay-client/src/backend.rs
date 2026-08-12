@@ -228,6 +228,11 @@ impl RelayBackend {
         let id = self.mint_id();
         let generation = Arc::new(AtomicU64::new(1));
         let (sub_id, notif_rx) = self.client.subscribe_pty(relay_pty_id);
+        // Address this subscription. Without it the pane also receives the
+        // copies the daemon fans to every OTHER attachment on the same PTY — a
+        // paired phone watching this terminal is enough to make the pane render
+        // every byte twice.
+        self.client.bind_attachment(relay_pty_id, sub_id, attachment_id);
         let pump = self.spawn_pump(
             id,
             relay_pty_id.to_owned(),
@@ -512,6 +517,9 @@ impl TerminalBackend for RelayBackend {
         }
         let generation = Arc::new(AtomicU64::new(1));
         let (sub_id, notif_rx) = self.client.subscribe_pty(&relay_pty_id);
+        // Spawn auto-attaches, so this session owns an attachment from the
+        // start — address its subscription the same way `attach_relay_pty` does.
+        self.client.bind_attachment(&relay_pty_id, sub_id, attachment_id);
         let pump = self.spawn_pump(
             id,
             relay_pty_id.to_owned(),
@@ -1071,6 +1079,7 @@ mod tests {
             &generation,
             1,
             Notification::Output {
+                attachment_id: 0,
                 pty_id: "p".into(),
                 bytes: b"boom".to_vec(),
             },
@@ -1098,6 +1107,7 @@ mod tests {
             &generation,
             1,
             Notification::Output {
+                attachment_id: 0,
                 pty_id: "q".into(),
                 bytes: b"hi".to_vec(),
             },
@@ -1125,6 +1135,7 @@ mod tests {
             &generation,
             1,
             Notification::Output {
+                attachment_id: 0,
                 pty_id: "p".into(),
                 bytes: b"hi".to_vec(),
             },
@@ -1141,6 +1152,7 @@ mod tests {
             &generation,
             1,
             Notification::Output {
+                attachment_id: 0,
                 pty_id: "p".into(),
                 bytes: b"XX".to_vec(),
             },
@@ -1171,6 +1183,7 @@ mod tests {
             &generation,
             1,
             Notification::Output {
+                attachment_id: 0,
                 pty_id: "p".into(),
                 bytes: vec![0x07], // BEL
             },
@@ -1203,6 +1216,7 @@ mod tests {
             &generation,
             1,
             Notification::Exit {
+                attachment_id: 0,
                 pty_id: "p".into(),
                 code: Some(0),
             },
@@ -1269,6 +1283,7 @@ mod tests {
             &generation,
             1, // this pump captured the old generation
             Notification::Output {
+                attachment_id: 0,
                 pty_id: "p".into(),
                 bytes: vec![0x07], // BEL — would set the bell flag IF advanced
             },

@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use dashmap::DashMap;
-use oximux_relay_proto::{ErrCode, Notification, PtyDescriptor, PtyStats};
+use oximux_relay_proto::{
+    ErrCode, Notification, PtyDescriptor, PtyStats, UNROUTED_ATTACHMENT,
+};
 use oximux_shell_env::{clear_inherited_colour_suppression, seed_utf8_locale};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc::Sender;
@@ -387,6 +389,12 @@ impl PtyRegistry {
         // push so `reader_loop`'s own one-shot fan-out (if it is still in
         // flight) can't also reach this sender; a benign duplicate is harmless
         // (the client treats Exit idempotently).
+        // Allocated before the push so the subscriber carries the same id as
+        // the attachment it belongs to; `detach` removes them as a pair. Taken
+        // before the replayed `Exit` below rather than after, so that one can be
+        // addressed to this attachment like every other notification — a client
+        // routes on the id, and an unaddressed `Exit` would reach no one.
+        let attachment_id = self.next_attachment_id.fetch_add(1, Ordering::Relaxed);
         if entry.child_exited.load(Ordering::Acquire) {
             let raw = entry.exit_code.load(Ordering::Acquire);
             let code = (raw != EXIT_CODE_NONE).then_some(raw);
@@ -394,12 +402,10 @@ impl PtyRegistry {
             // just created by the attaching client so it is empty.
             let _ = sub.try_send(Notification::Exit {
                 pty_id: pty_id.to_owned(),
+                attachment_id,
                 code,
             });
         }
-        // Allocated before the push so the subscriber carries the same id as
-        // the attachment it belongs to; `detach` removes them as a pair.
-        let attachment_id = self.next_attachment_id.fetch_add(1, Ordering::Relaxed);
         subs.push(Subscriber {
             attachment_id,
             tx: sub,
@@ -475,6 +481,7 @@ impl PtyRegistry {
             &entry.subscribers,
             Notification::Output {
                 pty_id: pty_id.to_owned(),
+                attachment_id: UNROUTED_ATTACHMENT,
                 bytes,
             },
         );
@@ -868,6 +875,7 @@ fn reader_loop(
             &subscribers,
             Notification::Output {
                 pty_id: pty_id.clone(),
+                attachment_id: UNROUTED_ATTACHMENT,
                 bytes: bytes.to_vec(),
             },
         );
@@ -922,6 +930,7 @@ fn reader_loop(
         &subscribers,
         Notification::Exit {
             pty_id: pty_id.clone(),
+            attachment_id: UNROUTED_ATTACHMENT,
             code,
         },
     );
@@ -943,6 +952,7 @@ fn fan_out(subscribers: &Arc<Mutex<Vec<Subscriber>>>, notif: Notification) {
         if sub.gapped {
             match sub.tx.try_send(Notification::Gapped {
                 pty_id: pty_id_of(&notif).to_owned(),
+                attachment_id: sub.attachment_id,
             }) {
                 Ok(()) => sub.gapped = false,
                 // Still backed up. Keep the flag and try again next time
@@ -951,7 +961,11 @@ fn fan_out(subscribers: &Arc<Mutex<Vec<Subscriber>>>, notif: Notification) {
                 Err(TrySendError::Closed(_)) => return false,
             }
         }
-        match sub.tx.try_send(notif.clone()) {
+        // Address each copy to the attachment it is going to. The daemon
+        // already sent one per attachment; naming it is what lets a client
+        // holding several on one PTY route them to the right subscriber
+        // instead of showing every byte once per attachment it holds.
+        match sub.tx.try_send(notif.clone().addressed_to(sub.attachment_id)) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => {
                 tracing::warn!("subscriber queue full; dropping notification");
@@ -970,7 +984,7 @@ fn pty_id_of(notif: &Notification) -> &str {
         Notification::Output { pty_id, .. }
         | Notification::Exit { pty_id, .. }
         | Notification::Attention { pty_id, .. }
-        | Notification::Gapped { pty_id } => pty_id,
+        | Notification::Gapped { pty_id, .. } => pty_id,
     }
 }
 
@@ -1033,6 +1047,7 @@ mod fan_out_tests {
 
     fn output(n: u8) -> Notification {
         Notification::Output {
+            attachment_id: 0,
             pty_id: "pty-1".into(),
             bytes: vec![n],
         }
@@ -1041,7 +1056,51 @@ mod fan_out_tests {
     fn gapped() -> Notification {
         Notification::Gapped {
             pty_id: "pty-1".into(),
+            attachment_id: 0,
         }
+    }
+
+    /// Every copy must name the attachment it went to.
+    ///
+    /// The daemon has always sent one copy per attachment; before v9 they were
+    /// indistinguishable on the wire, so a client holding two attachments to one
+    /// PTY received two identical frames, handed both to every local subscriber,
+    /// and rendered each byte twice.
+    #[tokio::test]
+    async fn fan_out_addresses_each_copy_to_its_own_attachment() {
+        let (tx_a, mut rx_a) = tokio::sync::mpsc::channel(4);
+        let (tx_b, mut rx_b) = tokio::sync::mpsc::channel(4);
+        let subs: Subs = Arc::new(Mutex::new(vec![
+            Subscriber { attachment_id: 7, tx: tx_a, gapped: false },
+            Subscriber { attachment_id: 9, tx: tx_b, gapped: false },
+        ]));
+
+        fan_out(&subs, output(1));
+
+        assert_eq!(rx_a.recv().await.unwrap().attachment_id(), Some(7));
+        assert_eq!(rx_b.recv().await.unwrap().attachment_id(), Some(9));
+    }
+
+    /// A gap belongs to the subscriber that fell behind, so its notice has to
+    /// carry that subscriber's id — telling the others would send them
+    /// re-attaching over a stream that never had a hole in it.
+    #[tokio::test]
+    async fn a_gap_notice_names_the_attachment_that_fell_behind() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let subs: Subs = Arc::new(Mutex::new(vec![Subscriber {
+            attachment_id: 42,
+            tx,
+            gapped: false,
+        }]));
+
+        fan_out(&subs, output(1)); // fills the single slot
+        fan_out(&subs, output(2)); // dropped — the gap opens
+        assert_eq!(rx.recv().await.unwrap().attachment_id(), Some(42));
+        fan_out(&subs, output(3)); // room again: the notice goes first
+
+        let notice = rx.recv().await.unwrap();
+        assert!(matches!(notice, Notification::Gapped { .. }), "got {notice:?}");
+        assert_eq!(notice.attachment_id(), Some(42));
     }
 
     type Subs = Arc<Mutex<Vec<Subscriber>>>;

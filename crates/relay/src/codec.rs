@@ -80,10 +80,12 @@ mod tests {
     async fn round_trip_two_frames_back_to_back() {
         let (mut a, mut b) = duplex(4096);
         let f1 = Frame::Notification(Notification::Exit {
+            attachment_id: 0,
             pty_id: "x".into(),
             code: Some(0),
         });
         let f2 = Frame::Notification(Notification::Output {
+            attachment_id: 0,
             pty_id: "x".into(),
             bytes: vec![1, 2, 3, 4],
         });

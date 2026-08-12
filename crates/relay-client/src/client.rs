@@ -64,7 +64,24 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 // because the daemon's fan_out already back-pressures at the socket and the
 // client must surface every byte to the renderer.
 type SubId = u64;
-type PtySubscribers = Arc<DashMap<String, Vec<(SubId, mpsc::UnboundedSender<Notification>)>>>;
+
+/// One local subscription to a daemon PTY.
+///
+/// `attachment_id` is set by [`RelayClient::bind_attachment`] once `AttachOk`
+/// names it, and is what makes routing exact: the daemon sends one copy of
+/// every notification per attachment, so a connection holding two attachments
+/// to one PTY receives two identical frames and must give each to the
+/// subscriber it belongs to. Delivering both to both is how every byte ended up
+/// rendered twice.
+struct PtySub {
+    sub_id: SubId,
+    /// `None` until `AttachOk` lands — see [`fan_to_subscriber`] for why that
+    /// window still has to receive.
+    attachment_id: Option<u64>,
+    tx: mpsc::UnboundedSender<Notification>,
+}
+
+type PtySubscribers = Arc<DashMap<String, Vec<PtySub>>>;
 
 /// Open the byte stream to the daemon and hand back its two halves. The only
 /// platform-specific step in the client — everything above it is framing.
@@ -298,6 +315,23 @@ impl RelayClient {
         (sub_id, rx)
     }
 
+    /// Name the attachment a subscription belongs to, once `AttachOk` reports
+    /// it.
+    ///
+    /// Until this is called the subscription is unbound and receives anything
+    /// on the PTY that no bound subscriber claims — the daemon can fan output
+    /// before the attach response reaches the caller. After it, the
+    /// subscription receives exactly its own attachment's copies, which is what
+    /// stops a second attachment on the same connection from doubling the
+    /// stream.
+    pub fn bind_attachment(&self, pty_id: &str, sub_id: SubId, attachment_id: u64) {
+        if let Some(mut subs) = self.pty_subscribers.get_mut(pty_id)
+            && let Some(sub) = subs.iter_mut().find(|s| s.sub_id == sub_id)
+        {
+            sub.attachment_id = Some(attachment_id);
+        }
+    }
+
     pub fn unsubscribe_pty(&self, pty_id: &str, sub_id: SubId) {
         unsubscribe_from(&self.pty_subscribers, pty_id, sub_id);
     }
@@ -335,10 +369,24 @@ fn subscribe_into(
 ) -> mpsc::UnboundedReceiver<Notification> {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut entry = subscribers.entry(pty_id.to_owned()).or_default();
-    entry.push((sub_id, tx));
+    entry.push(PtySub { sub_id, attachment_id: None, tx });
     // Coexisting subscribers on one PTY are now handled, but they're still
     // unusual — surface it so a stuck "shows content, can't type" pane can be
     // traced to the attachment that would previously have been clobbered.
+    //
+    // ⚠️ KNOWN DEFECT while more than one is live. The daemon fans output out
+    // once per *attachment*, but `Notification::Output` carries only `pty_id` —
+    // so a connection holding two attachments to one PTY (a desktop pane plus a
+    // remote peer watching the same terminal) receives two identical
+    // notifications and delivers BOTH to every subscriber here. Each one then
+    // renders every byte twice. Measured on device 2026-08-13: one keystroke,
+    // one attachment minted, two frames forwarded under the same
+    // `(attachment_id, sub_id)`.
+    //
+    // The fix is to route by subscription identity rather than by PTY: carry the
+    // attachment id on the notification and deliver to the one subscriber that
+    // owns it. That is a relay-proto wire change, so it needs the handshake
+    // version bump the daemon and client share.
     if entry.len() > 1 {
         tracing::debug!(pty_id, subscribers = entry.len(), "multiple attachments on one PTY");
     }
@@ -351,7 +399,7 @@ fn subscribe_into(
 /// so a `subscribe` that raced in between is never clobbered.
 fn unsubscribe_from(subscribers: &PtySubscribers, pty_id: &str, sub_id: SubId) {
     if let Some(mut subs) = subscribers.get_mut(pty_id) {
-        subs.retain(|(id, _)| *id != sub_id);
+        subs.retain(|sub| sub.sub_id != sub_id);
     }
     subscribers.remove_if(pty_id, |_, subs| subs.is_empty());
 }
@@ -407,15 +455,44 @@ fn fan_to_subscriber(subscribers: &PtySubscribers, notif: Notification) {
         Notification::Output { pty_id, .. }
         | Notification::Exit { pty_id, .. }
         | Notification::Attention { pty_id, .. }
-        | Notification::Gapped { pty_id } => pty_id.clone(),
+        | Notification::Gapped { pty_id, .. } => pty_id.clone(),
     };
+    let addressed_to = notif.attachment_id();
     let had_entry = if let Some(mut subs) = subscribers.get_mut(&pty_id) {
-        // Deliver to EVERY attachment on this PTY, dropping any whose
-        // receiver has gone away. Cloning per-subscriber is cheap next to
-        // the socket read that produced this frame, and there is rarely
-        // more than one. The RefMut is released at the end of this block
-        // so the `remove_if` below can take the shard lock.
-        subs.retain(|(_, tx)| tx.send(notif.clone()).is_ok());
+        // Route by attachment, not by PTY.
+        //
+        // The daemon sends one copy per attachment. Handing every copy to every
+        // subscriber is therefore not "belt and braces" — it multiplies the
+        // stream by however many attachments this connection holds, and a
+        // desktop pane watching the same terminal as a paired phone is enough
+        // to make both render every byte twice.
+        //
+        // An unaddressed notification (`Attention`) is a genuine broadcast and
+        // still goes to all.
+        let deliver_to_all = match addressed_to {
+            None => true,
+            // Nothing claims this id yet: the daemon starts fanning the moment
+            // `Attach` lands, which can beat the `AttachOk` that tells us our
+            // own id. Falling back to the still-unbound subscribers covers
+            // exactly that window instead of dropping live bytes on the floor.
+            Some(id) => !subs.iter().any(|s| s.attachment_id == Some(id)),
+        };
+        subs.retain(|sub| {
+            let wanted = match addressed_to {
+                None => true,
+                Some(id) => {
+                    sub.attachment_id == Some(id)
+                        || (deliver_to_all && sub.attachment_id.is_none())
+                }
+            };
+            if !wanted {
+                return true;
+            }
+            // Drop a subscriber whose receiver has gone away. The RefMut is
+            // released at the end of this block so `remove_if` below can take
+            // the shard lock.
+            sub.tx.send(notif.clone()).is_ok()
+        });
         true
     } else {
         false
@@ -434,8 +511,25 @@ mod tests {
 
     fn output(pty: &str, bytes: &[u8]) -> Notification {
         Notification::Output {
+            attachment_id: 0,
             pty_id: pty.to_owned(),
             bytes: bytes.to_vec(),
+        }
+    }
+
+    fn output_for(pty: &str, attachment_id: u64, bytes: &[u8]) -> Notification {
+        Notification::Output {
+            attachment_id,
+            pty_id: pty.to_owned(),
+            bytes: bytes.to_vec(),
+        }
+    }
+
+    fn bind(subs: &PtySubscribers, pty_id: &str, sub_id: SubId, attachment_id: u64) {
+        if let Some(mut list) = subs.get_mut(pty_id)
+            && let Some(s) = list.iter_mut().find(|s| s.sub_id == sub_id)
+        {
+            s.attachment_id = Some(attachment_id);
         }
     }
 
@@ -447,6 +541,9 @@ mod tests {
     // output. The previous single-Sender map overwrote the first subscriber,
     // so an earlier still-rendered pane went deaf to live output while input
     // kept reaching the shell — i.e. "shows content, can't type".
+    //
+    // Unbound here on purpose: before `AttachOk` names an attachment, a
+    // subscription has no address and must still receive.
     #[test]
     fn two_attachments_to_same_pty_both_receive_output() {
         let subs = fresh_subs();
@@ -457,6 +554,69 @@ mod tests {
 
         assert!(matches!(a.try_recv(), Ok(Notification::Output { .. })));
         assert!(matches!(b.try_recv(), Ok(Notification::Output { .. })));
+    }
+
+    /// Once bound, each attachment receives ONLY its own copy.
+    ///
+    /// The daemon sends one per attachment. Giving every copy to every
+    /// subscriber is what made a desktop pane and a paired phone watching the
+    /// same terminal each render every byte twice.
+    #[test]
+    fn a_bound_attachment_receives_only_its_own_copy() {
+        let subs = fresh_subs();
+        let mut pane = subscribe_into(&subs, 1, "pty-X");
+        let mut phone = subscribe_into(&subs, 2, "pty-X");
+        bind(&subs, "pty-X", 1, 7);
+        bind(&subs, "pty-X", 2, 9);
+
+        // The daemon fans one copy per attachment; both arrive on this one
+        // connection.
+        fan_to_subscriber(&subs, output_for("pty-X", 7, b"hi"));
+        fan_to_subscriber(&subs, output_for("pty-X", 9, b"hi"));
+
+        assert!(matches!(pane.try_recv(), Ok(Notification::Output { .. })));
+        assert!(pane.try_recv().is_err(), "pane saw the phone's copy too");
+        assert!(matches!(phone.try_recv(), Ok(Notification::Output { .. })));
+        assert!(phone.try_recv().is_err(), "phone saw the pane's copy too");
+    }
+
+    /// The daemon starts fanning the moment `Attach` lands, which can beat the
+    /// `AttachOk` that names the attachment. Those bytes must reach the
+    /// subscription that is still waiting to learn its id, not be dropped.
+    #[test]
+    fn output_for_an_unclaimed_attachment_reaches_the_unbound_subscriber() {
+        let subs = fresh_subs();
+        let mut bound = subscribe_into(&subs, 1, "pty-X");
+        let mut pending = subscribe_into(&subs, 2, "pty-X");
+        bind(&subs, "pty-X", 1, 7);
+
+        fan_to_subscriber(&subs, output_for("pty-X", 9, b"early"));
+
+        assert!(matches!(pending.try_recv(), Ok(Notification::Output { .. })));
+        assert!(bound.try_recv().is_err(), "a bound sub took another's bytes");
+    }
+
+    /// Attention is a pane-level signal with no attachment, so it is a genuine
+    /// broadcast — every viewer of the PTY should raise it.
+    #[test]
+    fn attention_still_reaches_every_subscriber() {
+        let subs = fresh_subs();
+        let mut a = subscribe_into(&subs, 1, "pty-X");
+        let mut b = subscribe_into(&subs, 2, "pty-X");
+        bind(&subs, "pty-X", 1, 7);
+        bind(&subs, "pty-X", 2, 9);
+
+        fan_to_subscriber(
+            &subs,
+            Notification::Attention {
+                pty_id: "pty-X".into(),
+                title: "t".into(),
+                body: "b".into(),
+            },
+        );
+
+        assert!(matches!(a.try_recv(), Ok(Notification::Attention { .. })));
+        assert!(matches!(b.try_recv(), Ok(Notification::Attention { .. })));
     }
 
     // Tearing down one attachment must leave its PTY siblings live. The old
