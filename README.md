@@ -158,7 +158,9 @@ crates/
 ├── remote-session/  client-side remote session (the phone's Rust core)
 ├── remote-iroh/  iroh P2P (QUIC) transport for remote control
 ├── mobile-core/  uniffi binding over remote-session for the RN app
-└── proc-cwd/     resolve a process's cwd from its pid
+├── proc-cwd/     resolve a process's cwd from its pid
+└── proc-tree/    walk a process's descendants, to name the agent CLI a
+                  terminal is running
 xtask/            repo lint orchestrator (file-size cap etc.)
 docs/
 ├── design-guidelines.md   palette, density, typography (the contract)

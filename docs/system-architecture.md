@@ -69,6 +69,7 @@ backend crates (`core`/`git`/`agents`/`pty`/…); GPUI views live in
 | `core` | `oximux-core` | `src/lib.rs` | shared domain types, no deps |
 | `pty` | `oximux-pty` | `src/lib.rs` | `TerminalBackend` + `PortablePtyBackend` |
 | `proc-cwd` | `oximux-proc-cwd` | `src/lib.rs` | resolve a process's working dir |
+| `proc-tree` | `oximux-proc-tree` | `src/lib.rs` | walk a process's descendants and read their argument vectors — how a plain terminal is known to be running an agent CLI (see *Ambient agent detection*). Sibling of `proc-cwd` for the same reason: dependency-light kernel introspection (`proc_listpids` + `KERN_PROCARGS2` on macOS, `/proc` on Linux, a Toolhelp snapshot on Windows) whose consumers share nothing else |
 | `owner-only` | `oximux-owner-only` | `src/lib.rs` | restrict a file or directory to the account that created it — `0600`/`0700` on unix, a stated *protected* DACL on Windows; shared by the desktop app, relay daemon, and remote host so the SID lookup exists once |
 | `no-window` | `oximux-no-window` | `src/lib.rs` | `CREATE_NO_WINDOW` for every child spawned on Windows, so a console-subsystem child (git, rg, an agent CLI's node) doesn't flash an empty console; a no-op applied unconditionally on every other platform |
 | `job-object` | `oximux-job-object` | `src/lib.rs` | Windows-only child-tree kill via a Job Object (`KILL_ON_JOB_CLOSE`) — terminating or crash-losing the host reaps every descendant, the tree semantics a unix process-group signal already gives for free; compiles to nothing off Windows |
@@ -310,6 +311,34 @@ CliRuntime (AgentRuntime impl)
 The status channel carries `AgentSnapshot { status: AgentStatus, detail: Option<SidebandDetail> }` (not a bare `AgentStatus`): the regex `StatusMachine` path publishes `detail: None`, while an OSC-9999 sideband event (`osc_sideband::AgentOscScanner`) attaches structured `tool` / `tool_input` / `msg` detail. This closes the Codex/Aider `EMPTY_PATTERNS` blindness — an agent (or hook) emitting `ESC]9999;{"v":1,"state":"needs_approval",...}BEL` drives status with no regex pattern needed. `current_status()` still returns a bare `AgentStatus` for the common lifecycle-only consumer.
 
 Future ACP runtime (v1.1) will be a sibling `AgentRuntime` impl with identical `watch::Receiver<AgentSnapshot>` contract — UI code subscribes to the trait, not the impl.
+
+### Ambient agent detection (a hand-typed agent in a plain terminal)
+
+An agent the user launched by typing `claude`/`codex`/… into an ordinary terminal has no `AgentRuntime`. Three signals combine to give it a rail row anyway, and they answer **different** questions — conflating them is what made this Claude-only and streaming-only:
+
+| Signal | Answers | Covers | Lives for |
+|---|---|---|---|
+| Process tree (`oximux-proc-tree` → `agents::agent_process`) | *which* CLI is running, and *that* one is | every CLI | as long as the process |
+| OSC-9999 sideband (`ambient_agent_scan`) | what it is doing, in detail | only CLIs OxiMux installs hooks for (Claude Code) | one event, 30-min TTL |
+| OSC 0/2 title (`agents::agent_title`) | what it is doing, coarsely | only CLIs that write a title — several do not by default | one event |
+
+**Presence is the process, never the output.** `PaneGroup::ambient_agents` treats a live agent process as the row's existence and lets the other two refine its status; an agent that has reported nothing is `Idle`, which is the common case (a CLI waiting at its prompt emits no hook, and most write no title). `TerminalView::poll_agent_process` runs the walk ahead of `tick`'s no-output early return — an idle agent produces no events, so a check downstream of that return could never see one arrive or leave — and `cx.notify()`s on change, which is what carries the row into the rail (rebuilt from the top of the workspace render).
+
+**Identity is `argv[0]`, never the executable name.** Two measurements forced this. The kernel names a process for the binary it *resolved*, so a CLI installed as a symlink is named for the link's target — Claude Code's points at a file named for its version, which matches nothing. And the executable name was observed reporting an agent's name for a process whose arguments showed it was a search tool. `argv[0]` keeps the invoked path, and carries a script CLI's identity through its interpreter (`node …/gemini`). The executable name is the fallback only where arguments cannot be read (Windows, where the symlink convention does not apply either).
+
+**What an agent SAID needs the agent's own hooks.** Presence and coarse activity come from the process and the title, but only the agent can report its reply — which is why a Codex row read `Codex · Idle` where a Claude row carried the actual answer. Codex has the same kind of lifecycle hooks as Claude, in `$CODEX_HOME/hooks.json`, in the same `{matcher?, hooks:[{type, command}]}` shape, delivering event JSON on stdin — so `oximux agent-status` serves both and only the field names differ (`crate::codex_status_hooks`, selected with `--format codex`).
+
+Two constraints shape that install, both learned the hard way:
+* Codex's `notify` config is deliberately **not** used. It is a single program rather than a list, so writing it would replace whatever the user already has there; `hooks.json` is a separate file with per-event arrays that ours can merge into.
+* A Codex hook entry carries **no bookkeeping marker and no `async`** — Codex rejects fields it does not define, and a rejected file would silence the user's own hooks along with ours. With nothing to stamp, our entries are found again by their command (`agent_hooks_global::Dialect`), which is also how the reference cockpit does it. Claude's file keeps its marker: it tolerates unknown keys, and a marker can never mistake a hand-written hook that calls the same CLI for one of ours.
+
+Hook **trust** is left to Codex, which holds a hashed ledger and asks the user to approve a new hook in its own TUI. Writing the file is a request, not a side effect: until the user says yes, nothing fires and the rail behaves exactly as it did before.
+
+`agent_title::AGENT_LABELS` is the single naming vocabulary both detectors draw from, so a process-detected and a title-detected agent resolve to the same icon and adapter slug rather than rendering as two differently-styled rows for one agent.
+
+**Where a detected agent is drawn.** A *single*-agent workspace is named on the card itself; a multi-agent one defers to the `N agents` disclosure below it (`project_group.rs`, gated on `rows.len() > 1`), which renders in both card layouts. The disclosure's collapsed chips and expanded sub-rows both draw one mark per row's `adapter_id`, so a worktree running three different CLIs shows three different brands rather than three copies of one.
+
+The unit throughout is the **pane**, not the tab: `ambient_agents` yields one row per PTY, so a tab split into two panes running two agents is two agents. `ambient_agent_count` counts panes for the same reason — counting tabs made the status bar say "1 agent" under a rail that listed two rows. The catch is the **compact** layout: it drops line 2 to fit one row, and line 2 is where `Codex · Ready` would be — leaving the status dot as the only agent signal, and a dot says how an agent is doing, never which one it is. `workspace_card::compact_agent_glyph` fills that gap with the CLI's brand mark beside the name (generic glyph when no mark is bundled), so identity survives compact without duplicating what detailed and the disclosure already say.
 
 ---
 
