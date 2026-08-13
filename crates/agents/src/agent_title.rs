@@ -23,12 +23,29 @@ const IDLE_MARKER: char = '\u{2733}';
 /// prompt. Agent-specific and rare in shell titles, so it stands alone.
 const PERMISSION_GLYPH: char = '\u{270B}';
 
-/// Known interactive agent CLI binary names. Matched as whole tokens (see
-/// [`token_present`]) so `opencode-helper` does not match `opencode`. Used
-/// only to gate the keyword fallback — the glyph markers above are
-/// agent-agnostic and need no token to be trusted.
-const AGENT_TOKENS: &[&str] = &[
-    "claude", "codex", "gemini", "aider", "opencode", "copilot", "grok", "cursor", "droid", "amp",
+/// Known interactive agent CLIs, as (name token, display label).
+///
+/// Single source of truth for naming an agent: the title heuristic below
+/// matches these tokens, and [`crate::agent_process`] resolves the labels for
+/// agents it recognises by process instead. Two detectors that disagreed about
+/// what to call the same CLI would render as two differently-styled rows for
+/// one agent.
+///
+/// Tokens are matched whole (see [`token_present`]) so `opencode-helper` does
+/// not match `opencode`. Order decides a title naming two agents; the most
+/// specific names come first and the most common CLI last.
+pub(crate) const AGENT_LABELS: &[(&str, &str)] = &[
+    ("gemini", "Gemini CLI"),
+    ("codex", "Codex"),
+    ("copilot", "GitHub Copilot"),
+    ("grok", "Grok"),
+    ("opencode", "OpenCode"),
+    ("aider", "Aider"),
+    ("cursor", "Cursor"),
+    ("droid", "Droid"),
+    ("pi", "Pi"),
+    ("amp", "Amp"),
+    ("claude", "Claude Code"),
 ];
 
 /// True when the title contains a glyph from the Braille Patterns block
@@ -68,7 +85,9 @@ fn token_present(haystack: &str, token: &str) -> bool {
 }
 
 fn contains_agent_token(lower: &str) -> bool {
-    AGENT_TOKENS.iter().any(|tok| token_present(lower, tok))
+    AGENT_LABELS
+        .iter()
+        .any(|(tok, _)| token_present(lower, tok))
 }
 
 /// Classify a terminal title into a live agent status, or `None` when the
@@ -128,34 +147,16 @@ pub fn classify_agent_title(title: &str) -> Option<AgentStatus> {
 pub fn agent_label_from_title(title: &str) -> Option<&'static str> {
     let lower = title.to_ascii_lowercase();
 
-    // Symbol-distinct agents and explicit name tokens first.
-    if title.contains('\u{2726}') || title.contains('\u{23F2}') || token_present(&lower, "gemini")
-    {
+    // Gemini's own marks carry no name token, so they are checked ahead of
+    // the shared table.
+    if title.contains('\u{2726}') || title.contains('\u{23F2}') {
         return Some("Gemini CLI");
     }
-    if token_present(&lower, "codex") {
-        return Some("Codex");
-    }
-    if token_present(&lower, "copilot") {
-        return Some("GitHub Copilot");
-    }
-    if token_present(&lower, "grok") {
-        return Some("Grok");
-    }
-    if token_present(&lower, "opencode") {
-        return Some("OpenCode");
-    }
-    if token_present(&lower, "aider") {
-        return Some("Aider");
-    }
-    if token_present(&lower, "cursor") {
-        return Some("Cursor");
-    }
-    if token_present(&lower, "droid") {
-        return Some("Droid");
-    }
-    if token_present(&lower, "claude") {
-        return Some("Claude Code");
+    if let Some((_, label)) = AGENT_LABELS
+        .iter()
+        .find(|(tok, _)| token_present(&lower, tok))
+    {
+        return Some(label);
     }
 
     // A bare spinner glyph or idle marker with no other token is most

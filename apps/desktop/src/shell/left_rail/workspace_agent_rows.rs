@@ -669,6 +669,38 @@ mod tests {
     }
 
     #[test]
+    fn a_collapsed_chip_keeps_each_agents_own_adapter() {
+        // Three DIFFERENT CLIs sharing one status bucket. The chip draws one
+        // mark per adapter slug, so collapsing them into a single slug (or
+        // defaulting them all to the same one) would show three copies of one
+        // agent's brand where three different agents are running.
+        let theme = Theme::default();
+        let mut rows = vec![
+            row(true, AgentStatus::Idle, None),
+            row(true, AgentStatus::Idle, None),
+            row(true, AgentStatus::Idle, None),
+        ];
+        for (r, adapter) in rows.iter_mut().zip(["claude-code", "codex", "gemini"]) {
+            r.adapter_id = adapter.into();
+        }
+
+        let chips = collapsed_state_chips(&rows, theme);
+        assert_eq!(chips.len(), 1, "same status → one bucket");
+        assert_eq!(chips[0].adapters, vec!["claude-code", "codex", "gemini"]);
+        // Every slug must resolve to a drawable mark: an agent the cockpit
+        // ships no brand for falls back to the generic glyph rather than
+        // painting nothing.
+        for adapter in &chips[0].adapters {
+            assert!(adapter_icon_path(adapter).ends_with(".svg"));
+        }
+        assert_eq!(
+            adapter_icon_path("gemini"),
+            "icons/sparkles.svg",
+            "no gemini mark is bundled yet — it must still draw something"
+        );
+    }
+
+    #[test]
     fn collapsed_chips_skip_empty_buckets() {
         let theme = Theme::default();
         // All idle → a single muted chip carrying both agents, no empty buckets.

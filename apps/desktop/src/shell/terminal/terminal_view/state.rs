@@ -2,6 +2,12 @@ use super::*;
 
 impl TerminalView {
     pub(super) fn tick(&mut self, cx: &mut Context<Self>) {
+        // Ahead of the no-events early return below, on purpose: whether an
+        // agent CLI is running here is a fact about the process tree, not
+        // about anything the agent prints. An agent idle at its prompt emits
+        // nothing, so a check that only ran on output would never notice one
+        // arriving — and, having noticed, would never notice it leave.
+        self.poll_agent_process(cx);
         // Use the per-session drain so panes can't steal each other's
         // events from a shared backend (e.g., the relay). The global
         // `drain_events` is reserved for tests + cleanup paths.
@@ -252,6 +258,43 @@ impl TerminalView {
 
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    /// Re-walk this terminal's process tree if the scan is due, and repaint
+    /// when the answer changed.
+    ///
+    /// The scan is moved out for the call because it resolves the root pid
+    /// through a closure over `self` — and that resolution is worth keeping
+    /// lazy: on the relay path `os_pid` falls back to reading the daemon's
+    /// checkpoint file, which should not happen on a cadence once a live root
+    /// is known.
+    ///
+    /// The repaint is what carries a change to the rail: the sidebar is
+    /// rebuilt from the top of the workspace render, so an agent that appears
+    /// or exits without printing would otherwise not be drawn until something
+    /// else happened to invalidate the window.
+    fn poll_agent_process(&mut self, cx: &mut Context<Self>) {
+        let before = self.proc_scan.current();
+        let mut scan = std::mem::take(&mut self.proc_scan);
+        scan.poll(std::time::Instant::now(), || self.os_pid());
+        let changed = scan.current() != before;
+        self.proc_scan = scan;
+        if changed {
+            tracing::debug!(
+                agent = ?self.proc_scan.current(),
+                "terminal agent presence changed"
+            );
+            cx.notify();
+        }
+    }
+
+    /// The agent CLI running in this terminal, named from its process tree, or
+    /// `None` when it is running something else. Unlike the sideband and the
+    /// title, this covers every agent and holds while one sits idle, so the
+    /// ambient aggregation uses it to decide *whether* an agent is here and
+    /// leaves the other two to say what it is doing.
+    pub fn agent_process(&self) -> Option<&'static str> {
+        self.proc_scan.current()
     }
 
     /// Hook-derived agent status for this terminal, decoded from the OSC-9999

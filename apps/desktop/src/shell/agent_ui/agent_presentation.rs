@@ -133,6 +133,13 @@ pub fn adapter_id_for_label(label: &str) -> &'static str {
         "Codex" => "codex",
         "Aider" => "aider",
         "Gemini CLI" => "gemini",
+        "OpenCode" => "opencode",
+        "GitHub Copilot" => "copilot",
+        "Cursor" => "cursor",
+        "Pi" => "pi",
+        "Amp" => "amp",
+        "Grok" => "grok",
+        "Droid" => "droid",
         _ => "agent",
     }
 }
@@ -141,7 +148,15 @@ pub fn adapter_id_for_label(label: &str) -> &'static str {
 /// show the CLI's mark instead of a generic dot. Unknown ids fall back to the
 /// generic sparkles glyph shared with the Agents nav entry.
 pub fn adapter_icon_path(adapter_id: &str) -> &'static str {
-    match adapter_id {
+    adapter_brand_icon(adapter_id).unwrap_or("icons/sparkles.svg")
+}
+
+/// The bundled brand glyph for an adapter, or `None` when the cockpit ships no
+/// mark for it. Callers that want a different stand-in than the generic agent
+/// sparkle (a tab chip prefers the terminal glyph) branch on the `None`
+/// themselves, so there is still only one list of which agents have a mark.
+pub fn adapter_brand_icon(adapter_id: &str) -> Option<&'static str> {
+    Some(match adapter_id {
         "claude-code" => "icons/claude-code.svg",
         "codex" => "icons/codex.svg",
         "aider" => "icons/aider.svg",
@@ -150,8 +165,8 @@ pub fn adapter_icon_path(adapter_id: &str) -> &'static str {
         "pi" => "icons/pi.svg",
         "cursor" => "icons/cursor.svg",
         "amp" => "icons/amp.svg",
-        _ => "icons/sparkles.svg",
-    }
+        _ => return None,
+    })
 }
 
 /// Attention rank for an ambient (title-derived) status, used to pick the

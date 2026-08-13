@@ -691,4 +691,136 @@ mod tests {
             ["hi 1", "hi 2", "hi 3"].iter().map(|s| s.to_string()).collect()
         );
     }
+
+    /// A row for an agent found by its process rather than by a hook: it has a
+    /// status and a name, but no sideband detail to draw a title from. This is
+    /// the common shape now — most CLIs emit no hook at all, and an agent idle
+    /// at its prompt emits nothing even when it can.
+    fn process_row(pty: &str, worktree: &str, label: &'static str) -> AmbientRow {
+        AmbientRow {
+            pty_id: pty.to_string(),
+            worktree_path: worktree.to_string(),
+            agent: AmbientAgent {
+                status: AgentStatus::Idle,
+                label: Some(label),
+                detail: None,
+            },
+        }
+    }
+
+    #[test]
+    fn different_agents_in_one_workspace_keep_their_own_names_and_icons() {
+        // The multi-agent shape the cockpit has to show: three DIFFERENT CLIs
+        // side by side in one worktree. Each row must carry its own label and
+        // adapter slug — the slug is what picks the brand mark, so a shared or
+        // defaulted one would render three identical-looking rows for three
+        // different agents.
+        let wbp = HashMap::from([("proj-1".to_string(), vec![ws("ws-a")])]);
+        let mut out =
+            build_workspace_agent_lists(&wbp, &HashMap::new(), &LiveAgentMap::new(), None, NOW);
+
+        append_ambient_agent_rows(
+            &wbp,
+            &[
+                process_row("pty-1", "/tmp", "Claude Code"),
+                process_row("pty-2", "/tmp", "Codex"),
+                process_row("pty-3", "/tmp", "Gemini CLI"),
+            ],
+            &mut out,
+        );
+
+        let rows = out.get("ws-a").expect("ambient rows create list");
+        assert_eq!(rows.len(), 3);
+        let mut named: Vec<(String, String)> = rows
+            .iter()
+            .map(|r| (r.label.to_string(), r.adapter_id.clone()))
+            .collect();
+        named.sort();
+        assert_eq!(
+            named,
+            vec![
+                ("Claude Code".to_string(), "claude-code".to_string()),
+                ("Codex".to_string(), "codex".to_string()),
+                ("Gemini CLI".to_string(), "gemini".to_string()),
+            ]
+        );
+        assert!(
+            rows.len() > 1,
+            "more than one row is what opens the `N agents` disclosure"
+        );
+    }
+
+    #[test]
+    fn a_process_detected_agent_needs_no_hook_detail_to_get_a_row() {
+        // An agent that has never emitted a hook still belongs in the rail: it
+        // simply has no prompt to show as a title. Dropping such a row (or
+        // demanding a title) would put us back to listing only the one CLI
+        // that reports hooks.
+        let wbp = HashMap::from([("proj-1".to_string(), vec![ws("ws-a")])]);
+        let mut out =
+            build_workspace_agent_lists(&wbp, &HashMap::new(), &LiveAgentMap::new(), None, NOW);
+
+        append_ambient_agent_rows(&wbp, &[process_row("pty-1", "/tmp", "Codex")], &mut out);
+
+        let rows = out.get("ws-a").expect("ambient row creates list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].label, "Codex");
+        assert_eq!(rows[0].persisted_title, None, "no hook, so no prompt title");
+        assert_eq!(rows[0].effective_status(), AgentStatus::Idle);
+        assert!(rows[0].is_live, "a running process is a live agent");
+        assert!(rows[0].is_focusable());
+    }
+
+    #[test]
+    fn hand_launched_agents_list_alongside_a_tracked_session() {
+        // A worktree can hold both at once: one agent OxiMux spawned (a DB
+        // session) and others typed into terminals. All of them belong to the
+        // same workspace list, and together they cross the threshold that
+        // opens the disclosure.
+        let wbp = HashMap::from([("proj-1".to_string(), vec![ws("ws-a")])]);
+        let sessions = HashMap::from([(
+            "ws-a".to_string(),
+            vec![db("sess-1", AgentStatus::Idle, "2026-06-23T23:00:00Z", None)],
+        )]);
+        // Held for the test's lifetime: dropping the sender closes the watch
+        // channel and the row stops reading as live.
+        let (_tx, rx) = live_rx(AgentStatus::Running);
+        let mut live = LiveAgentMap::new();
+        live.insert("sess-1".into(), entry("ws-a", rx, "2026-06-23T23:00:00Z"));
+        let mut out = build_workspace_agent_lists(&wbp, &sessions, &live, None, NOW);
+        assert_eq!(out.get("ws-a").map(Vec::len), Some(1), "the tracked session");
+
+        append_ambient_agent_rows(
+            &wbp,
+            &[
+                process_row("pty-1", "/tmp", "Codex"),
+                process_row("pty-2", "/tmp", "Pi"),
+            ],
+            &mut out,
+        );
+
+        let rows = out.get("ws-a").expect("rows");
+        assert_eq!(rows.len(), 3, "one tracked + two hand-launched");
+        assert_eq!(
+            rows.iter().filter(|r| r.db_id.starts_with("ambient:")).count(),
+            2
+        );
+    }
+
+    #[test]
+    fn an_ambient_agent_outside_every_workspace_is_dropped() {
+        // A terminal `cd`'d somewhere unrelated has no workspace to hang from;
+        // inventing one would put a row under the wrong project.
+        let wbp = HashMap::from([("proj-1".to_string(), vec![ws("ws-a")])]);
+        let mut out =
+            build_workspace_agent_lists(&wbp, &HashMap::new(), &LiveAgentMap::new(), None, NOW);
+
+        append_ambient_agent_rows(
+            &wbp,
+            &[process_row("pty-1", "/somewhere/else", "Codex")],
+            &mut out,
+        );
+
+        assert!(out.is_empty(), "no workspace matched, so no row");
+    }
 }

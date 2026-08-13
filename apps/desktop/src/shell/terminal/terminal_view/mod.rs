@@ -671,6 +671,12 @@ pub struct TerminalView {
     /// unchanged status doesn't re-hit SQLite every output frame. `None` until
     /// the first agent reading (a plain shell never writes).
     last_persisted_ambient: Option<crate::shell::ambient_agent_scan::AmbientSideband>,
+    /// Names the agent CLI running in this terminal by walking the shell's
+    /// process tree. The sideband above covers only the CLI OxiMux installs
+    /// hooks for, and both it and the title are events — this is the presence
+    /// signal that holds while an agent sits idle. Read by
+    /// [`agent_process`](Self::agent_process).
+    proc_scan: crate::shell::agent_process_scan::AgentProcessScan,
 }
 
 mod input;

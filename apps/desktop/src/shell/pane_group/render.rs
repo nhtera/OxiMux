@@ -402,10 +402,15 @@ struct TabAgent {
     status: oximux_core::AgentStatus,
 }
 
-/// Detect an agent in a *plain* terminal tab from the active view's OSC title.
-/// `None` for non-terminal tabs, terminals with no title, or titles that don't
-/// classify as agent activity. Spawned `Agent` tabs are left to their own
-/// `status_rx`-driven chip.
+/// Detect an agent in a *plain* terminal tab from the active view's process
+/// tree, falling back to its OSC title. `None` for non-terminal tabs and for
+/// terminals running something that is not an agent. Spawned `Agent` tabs are
+/// left to their own `status_rx`-driven chip.
+///
+/// The process is the presence test — matching the rail — so a Codex or Pi tab
+/// chips up like a Claude one instead of staying blank until (and only while)
+/// the CLI happens to write a title. The title still supplies the status when
+/// it carries one; an agent that is saying nothing is idle.
 fn detect_tab_agent(tab: &PaneGroupTab, cx: &App) -> Option<TabAgent> {
     if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
         return None;
@@ -413,9 +418,19 @@ fn detect_tab_agent(tab: &PaneGroupTab, cx: &App) -> Option<TabAgent> {
     let PaneContent::Terminal(tree) = &tab.content else {
         return None;
     };
-    let title = tree.active_view()?.read(cx).title()?;
-    let status = oximux_agents::classify_agent_title(title)?;
-    let label = oximux_agents::agent_label_from_title(title)?;
+    let view = tree.active_view()?.read(cx);
+    let title = view.title();
+    let title_status = title.and_then(oximux_agents::classify_agent_title);
+    let label = view
+        .agent_process()
+        .or_else(|| title.and_then(oximux_agents::agent_label_from_title))?;
+    // A title-only reading still needs the title to have classified: a shell
+    // sitting in a directory named after an agent is not one.
+    let status = match (view.agent_process().is_some(), title_status) {
+        (_, Some(status)) => status,
+        (true, None) => oximux_core::AgentStatus::Idle,
+        (false, None) => return None,
+    };
     Some(TabAgent {
         label,
         adapter_id: crate::shell::agent_presentation::adapter_id_for_label(label),
@@ -476,16 +491,13 @@ fn agent_status_for(kind: &PaneGroupTabKind) -> Option<oximux_core::AgentStatus>
     }
 }
 
-/// Per-adapter brand glyph for an agent tab. Slugs match the agent
-/// registry; unknown / custom adapters fall back to the generic terminal
-/// glyph so a tab always has an icon.
+/// Per-adapter brand glyph for an agent tab. Slugs match the agent registry;
+/// an adapter the cockpit ships no mark for falls back to the generic terminal
+/// glyph — the chip already sits in a tab strip, where a terminal reads better
+/// than the rail's agent sparkle — so a tab always has an icon.
 fn agent_icon(adapter_id: &str) -> &'static str {
-    match adapter_id {
-        "claude-code" => "icons/claude-code.svg",
-        "codex" => "icons/codex.svg",
-        "aider" => "icons/aider.svg",
-        _ => "icons/square-terminal.svg",
-    }
+    crate::shell::agent_presentation::adapter_brand_icon(adapter_id)
+        .unwrap_or("icons/square-terminal.svg")
 }
 
 /// True when any sub-pane terminal in this tab has a pending attention

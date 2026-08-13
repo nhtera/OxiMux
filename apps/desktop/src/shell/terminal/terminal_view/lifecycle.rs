@@ -166,6 +166,7 @@ impl TerminalView {
             exited: None,
             agent_scan: crate::shell::ambient_agent_scan::AmbientAgentScan::new(),
             last_persisted_ambient: None,
+            proc_scan: crate::shell::agent_process_scan::AgentProcessScan::new(),
         }
     }
 
@@ -233,6 +234,10 @@ impl TerminalView {
         // exit banner so a swap (e.g. post-attach reconcile) never leaves the
         // "process exited" marker over a now-running shell.
         self.exited = None;
+        // The pid the scan was rooted at belongs to the previous session; drop
+        // it so the next poll walks the new shell instead of waiting out the
+        // old root's liveness check.
+        self.proc_scan.reset();
         // Drop any interaction state that belonged to the placeholder grid:
         // a selection / hover / in-flight scrollbar drag painted over the old
         // content would otherwise leak onto the unrelated live session.
@@ -378,6 +383,7 @@ impl TerminalView {
             exited: None,
             agent_scan: crate::shell::ambient_agent_scan::AmbientAgentScan::new(),
             last_persisted_ambient: None,
+            proc_scan: crate::shell::agent_process_scan::AgentProcessScan::new(),
         }
     }
 
@@ -424,6 +430,10 @@ impl TerminalView {
         }
         // The shell is alive again at the dormant cwd — clear any exit marker.
         self.exited = None;
+        // The pid the scan was rooted at belongs to the previous session; drop
+        // it so the next poll walks the new shell instead of waiting out the
+        // old root's liveness check.
+        self.proc_scan.reset();
         self._poll_task = Some(Self::start_poll_task(cx));
         cx.notify();
     }

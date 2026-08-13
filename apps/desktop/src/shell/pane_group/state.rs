@@ -397,9 +397,12 @@ impl PaneGroup {
                 let now = std::time::Instant::now();
                 let v = view.read(cx);
                 // Only a terminal actually running an agent gets a rail row to
-                // light; a plain shell does not. Hook sideband or an agent title
-                // is the same presence test the rail uses to group it.
-                let is_agent = v.ambient_agent(now).is_some()
+                // light; a plain shell does not. A live agent process, a hook
+                // sideband, or an agent title — the same presence test the rail
+                // uses to group it, so focus can never light a row that is not
+                // there (or miss one that is).
+                let is_agent = v.agent_process().is_some()
+                    || v.ambient_agent(now).is_some()
                     || v.title().and_then(classify_agent_title).is_some();
                 // Key the focused row by the terminal's PTY id, the same per-pane
                 // identity the rail rows carry. No PTY id (pending view) → nothing
@@ -481,21 +484,38 @@ impl PaneGroup {
                 let view = view.read(cx);
                 let title = view.title();
                 let title_status = title.and_then(classify_agent_title);
-                // Hook sideband (rich + stable) is preferred; the title is the
-                // immediate-presence fallback for an agent that has not yet
-                // emitted a hook. Neither → not an agent.
+                // A live agent process is what makes this terminal an agent —
+                // it covers every CLI and holds while one sits idle. The
+                // sideband and the title only ever *add* to that: they say
+                // what the agent is doing, and each covers a subset of CLIs.
+                let by_process = view.agent_process();
+                // Naming, best evidence first: the process is the CLI, so it
+                // wins over a title that merely mentions one.
+                let label = by_process.or_else(|| title.and_then(agent_label_from_title));
                 let Some(agent) = (match view.ambient_agent(now) {
                     Some(sb) => Some(AmbientAgent {
                         status: sb.status,
-                        // The hook tells us the state, not the CLI; the title
-                        // names it when set, otherwise default to the only CLI
-                        // we install global hooks for.
-                        label: title.and_then(agent_label_from_title).or(Some("Claude Code")),
+                        // A hook reports state, never which CLI sent it. On a
+                        // platform with no process walk and a title that names
+                        // nothing, the sender can still be pinned down: hooks
+                        // are only ever installed for the one CLI.
+                        label: label.or(Some("Claude Code")),
                         detail: Some(sb.detail),
                     }),
+                    // A running agent that has reported nothing is idle. This
+                    // is the case the sideband and the title both miss, and it
+                    // is the common one: an agent waiting at its prompt emits
+                    // no hook, and most CLIs write no title at all.
+                    None if by_process.is_some() => Some(AmbientAgent {
+                        status: title_status.unwrap_or(oximux_core::AgentStatus::Idle),
+                        label,
+                        detail: None,
+                    }),
+                    // No process reading (an unsupported platform, or a pid we
+                    // could not resolve) — fall back to the title alone.
                     None => title_status.map(|status| AmbientAgent {
                         status,
-                        label: title.and_then(agent_label_from_title),
+                        label,
                         detail: None,
                     }),
                 }) else {
@@ -535,25 +555,37 @@ impl PaneGroup {
         None
     }
 
-    /// Count of plain-terminal tabs running a recognizable agent (any view's
-    /// title classifies). Feeds the status-bar "N agents" total alongside
-    /// spawned `Agent` tabs, so a hand-launched agent registers there too.
+    /// Count of plain-terminal *panes* running a recognizable agent (the view
+    /// has a live agent process, a hook reading, or a title that classifies).
+    /// Feeds the status-bar "N agents" total alongside spawned `Agent` tabs,
+    /// so a hand-launched agent registers there too.
+    ///
+    /// Counted per pane, not per tab, so it agrees with [`ambient_agents`],
+    /// which yields one rail row per PTY. A tab split into two panes running
+    /// two different agents is two agents; counting tabs called it one, and
+    /// the rail listed two rows beneath a status bar that said "1 agent".
+    ///
+    /// [`ambient_agents`]: Self::ambient_agents
     pub fn ambient_agent_count(&self, cx: &gpui::App) -> usize {
         let now = std::time::Instant::now();
         self.tabs
             .iter()
             .filter(|tab| matches!(tab.kind, PaneGroupTabKind::Terminal))
-            .filter(|tab| {
-                let PaneContent::Terminal(tree) = &tab.content else {
-                    return false;
-                };
-                tree.iter_all_views().any(|(_, _, view)| {
-                    let view = view.read(cx);
-                    view.ambient_agent(now).is_some()
-                        || view.title().and_then(classify_agent_title).is_some()
-                })
+            .filter_map(|tab| match &tab.content {
+                PaneContent::Terminal(tree) => Some(tree),
+                _ => None,
             })
-            .count()
+            .map(|tree| {
+                tree.iter_all_views()
+                    .filter(|(_, _, view)| {
+                        let view = view.read(cx);
+                        view.agent_process().is_some()
+                            || view.ambient_agent(now).is_some()
+                            || view.title().and_then(classify_agent_title).is_some()
+                    })
+                    .count()
+            })
+            .sum()
     }
 
     /// Worktree path of the agent tab matching `tab_id`, if this group

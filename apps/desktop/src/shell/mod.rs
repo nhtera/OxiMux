@@ -48,8 +48,8 @@ pub mod openable_text_file;
 // after folding loose modules into concern folders. Consumers (including
 // external integration tests via `oximux_app::shell::<name>`) resolve unchanged.
 pub use agent_ui::{
-    agent_presentation, agent_session_persistence, agent_status_badge, agent_status_task,
-    agent_tab_label, ambient_agent_scan, ambient_state, session_live_store,
+    agent_presentation, agent_process_scan, agent_session_persistence, agent_status_badge,
+    agent_status_task, agent_tab_label, ambient_agent_scan, ambient_state, session_live_store,
 };
 pub use chrome::{divider, rename_tab_dialog, status_bar, tab_context_menu, toast, top_bar};
 pub use file_explorer::{file_tree_context_menu, file_tree_view};

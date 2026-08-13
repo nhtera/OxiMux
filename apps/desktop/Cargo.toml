@@ -27,6 +27,10 @@ oximux-git = { workspace = true }
 # console window per console-subsystem child.
 oximux-no-window = { workspace = true }
 oximux-proc-cwd = { workspace = true }
+# Names the agent CLI a plain terminal is running, by walking its shell's
+# descendants — the one presence signal that covers every agent and outlives
+# an idle one, since it depends on nothing the agent chooses to emit.
+oximux-proc-tree = { workspace = true }
 oximux-pty = { workspace = true }
 async-trait = { workspace = true }
 oximux-relay-client = { workspace = true }

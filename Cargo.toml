@@ -33,6 +33,7 @@ members = [
     "crates/remote-local",
     "crates/mobile-core",
     "crates/proc-cwd",
+    "crates/proc-tree",
     "crates/worktree-ops",
     "xtask",
 ]
@@ -105,6 +106,10 @@ oximux-remote-iroh = { path = "crates/remote-iroh", default-features = false }
 oximux-mobile-core = { path = "crates/mobile-core" }
 oximux-remote-local = { path = "crates/remote-local" }
 oximux-proc-cwd = { path = "crates/proc-cwd" }
+# Which program a terminal is actually running, by walking its shell's
+# descendants. Its own crate for the same reason proc-cwd is: dependency-light
+# kernel introspection whose consumers share nothing else.
+oximux-proc-tree = { path = "crates/proc-tree" }
 
 # GPUI — see docs/gpui-pins.md. We deliberately do NOT pin `rev` here. The
 # upstream `longbridge/gpui-component` workspace pins `gpui` to the default

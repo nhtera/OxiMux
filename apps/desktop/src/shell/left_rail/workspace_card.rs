@@ -5,7 +5,7 @@
 //! under the 200-LOC soft cap.
 //!
 //! Layout (two lines):
-//!   Line 1: [dot] [name] [primary badge] [branch chip]
+//!   Line 1: [dot] [name] [agent glyph, compact only] [primary badge] [branch chip]
 //!   Line 2: [agent verb (colored)] [+A −B diff chip]
 //!
 //! Card height is documented as a local exception in `design-guidelines.md`
@@ -55,6 +55,30 @@ const CARD_HEIGHT_MULT: f32 = 2.2;
 /// vocabulary: this is a one-shot "you are here" locator that must linger
 /// long enough to catch an eye that's still travelling from the button.
 const LOCATE_GLOW_MS: u64 = 1500;
+
+/// The brand glyph a workspace card shows to name the agent running on it, or
+/// `None` when something else already names it.
+///
+/// Only the compact layout needs one. Detailed spells the agent out on line 2
+/// (`Codex · Ready`), and compact drops that line to fit a single row — which
+/// left the status dot as the card's only agent signal, and a dot says how an
+/// agent is doing, never which one it is. A multi-agent workspace needs none
+/// either: its disclosure renders below the card in both layouts and names
+/// every agent.
+///
+/// An agent with no bundled mark falls back to the generic glyph rather than
+/// showing nothing — that an agent is there is the more important half.
+fn compact_agent_glyph(
+    compact: bool,
+    has_agent_disclosure: bool,
+    agent_name: Option<&str>,
+) -> Option<&'static str> {
+    if !compact || has_agent_disclosure {
+        return None;
+    }
+    let adapter = crate::shell::agent_presentation::adapter_id_for_label(agent_name?);
+    Some(crate::shell::agent_presentation::adapter_icon_path(adapter))
+}
 
 /// Render the rich two-line workspace card.
 ///
@@ -180,6 +204,22 @@ pub fn render_workspace_card(
             .child("Folder")
     });
 
+    // Agent brand glyph — names the agent when the layout has nowhere else to.
+    // See [`compact_agent_glyph`] for when that is.
+    let agent_glyph = compact_agent_glyph(
+        compact,
+        suppress_agent_summary,
+        plan.agent_name.as_deref(),
+    )
+    .map(|icon| {
+        svg()
+            .path(icon)
+            .size(px(12.0))
+            .flex_shrink_0()
+            // An svg with no explicit text color paints nothing.
+            .text_color(theme.fg_muted)
+    });
+
     // Pin glyph — a small marker on pinned rows. Sits right after the name so
     // it reads as a property of the row, distinct from the leading status dot.
     let pin_indicator = plan.pinned.then(|| {
@@ -245,6 +285,7 @@ pub fn render_workspace_card(
         .items_center()
         .gap(px(density.gap_inline))
         .child(name_element)
+        .children(agent_glyph)
         .children(pin_indicator)
         .children(primary_badge)
         .children(branch_chip)
@@ -570,4 +611,49 @@ pub(crate) fn locate_glow_overlay(
                 .with_easing(gpui::ease_out_quint()),
             move |el, delta| el.border_color(Hsla { a: 1.0 - delta, ..ring }),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compact_agent_glyph;
+
+    #[test]
+    fn a_compact_card_names_its_agent_with_a_brand_glyph() {
+        assert_eq!(
+            compact_agent_glyph(true, false, Some("Codex")),
+            Some("icons/codex.svg")
+        );
+        assert_eq!(
+            compact_agent_glyph(true, false, Some("Claude Code")),
+            Some("icons/claude-code.svg")
+        );
+    }
+
+    #[test]
+    fn an_agent_with_no_bundled_mark_still_shows_that_it_is_there() {
+        // Gemini/Grok/Droid ship no glyph yet; a missing brand must not read
+        // as a missing agent.
+        assert_eq!(
+            compact_agent_glyph(true, false, Some("Gemini CLI")),
+            Some("icons/sparkles.svg")
+        );
+    }
+
+    #[test]
+    fn the_detailed_layout_needs_no_glyph() {
+        // Line 2 already reads `Codex · Ready` there.
+        assert_eq!(compact_agent_glyph(false, false, Some("Codex")), None);
+    }
+
+    #[test]
+    fn a_workspace_with_a_disclosure_needs_no_glyph() {
+        // The disclosure renders below the card in BOTH layouts and names
+        // every agent; a single glyph beside the name would contradict it.
+        assert_eq!(compact_agent_glyph(true, true, Some("Codex")), None);
+    }
+
+    #[test]
+    fn a_workspace_with_no_agent_shows_no_glyph() {
+        assert_eq!(compact_agent_glyph(true, false, None), None);
+    }
 }
