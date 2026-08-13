@@ -101,4 +101,19 @@ pub trait TerminalSource: Send + Sync {
         cols: u16,
         rows: u16,
     ) -> Result<(), TerminalError>;
+
+    /// Release an attachment.
+    ///
+    /// Must be called when a client stops watching — dropping the frame receiver
+    /// is not enough on its own. An attachment holds a standing size vote, and a
+    /// host that runs the terminal at the smallest vote keeps honouring a
+    /// departed viewer's until it is withdrawn. A phone that shrinks a terminal
+    /// and then closes the screen would otherwise leave the desktop's window
+    /// narrow, with nothing left anywhere that could widen it again.
+    ///
+    /// Infallible by design: every caller is on a teardown path, where there is
+    /// nothing useful to do with a failure and nothing that may be skipped
+    /// because of one. Implementations log instead. Idempotent — releasing an
+    /// attachment twice, or one the host has already reaped, is a no-op.
+    async fn detach(&self, pty_id: &str, attachment: AttachmentId);
 }

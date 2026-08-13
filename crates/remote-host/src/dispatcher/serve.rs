@@ -185,6 +185,28 @@ impl Dispatcher {
                 Picked::Live(None) => continue,
             }
         }
+
+        // The connection is over. Hand back every attachment it still holds.
+        //
+        // Reached by every exit above, because a dropped connection is the
+        // COMMON way a client stops watching — a phone that loses signal or is
+        // swiped away never gets to send `TermDetach`. Without this the
+        // terminal would go on being sized for a device that is no longer
+        // there, and nothing left in the process could ever widen it again.
+        for (pty_id, entry) in std::mem::take(&mut attached) {
+            self.release_terminal(&pty_id, entry).await;
+        }
+    }
+
+    /// Give one attachment back to the terminal host.
+    ///
+    /// Takes the record by value so the caller has to have removed it first:
+    /// releasing an attachment while leaving it listed would let a later resize
+    /// address one the host has already reaped.
+    async fn release_terminal(&self, pty_id: &str, entry: super::stream::Attached) {
+        if let Some(source) = &self.terminals {
+            source.detach(pty_id, entry.attachment).await;
+        }
     }
 
     /// Handle one request frame: decode, special-case `Subscribe` (it also opens a
@@ -313,7 +335,13 @@ impl Dispatcher {
             // connection holds is never a privilege. Dropping the cancel sender
             // is what actually stops it — `SelectAll` cannot remove a stream, so
             // merely forgetting the entry would leave it forwarding forever.
-            attached.remove(&pty_id);
+            //
+            // Stopping the stream is only half of it: the attachment behind it
+            // has to be handed back too, or the terminal keeps honouring the
+            // size vote of a client that has stopped watching.
+            if let Some(entry) = attached.remove(&pty_id) {
+                self.release_terminal(&pty_id, entry).await;
+            }
             return self.send(transport, Response::Ack).await;
         }
         // `GitStatus` is the one authenticated request whose handler is async (it

@@ -650,6 +650,8 @@ impl oximux_remote_host::TerminalSource for ScriptedTerminals {
     ) -> Result<(), oximux_remote_host::TerminalError> {
         Ok(())
     }
+
+    async fn detach(&self, _pty_id: &str, _attachment: oximux_remote_host::AttachmentId) {}
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -789,6 +791,8 @@ impl oximux_remote_host::TerminalSource for ReattachableTerminals {
     ) -> Result<(), oximux_remote_host::TerminalError> {
         Ok(())
     }
+
+    async fn detach(&self, _pty_id: &str, _attachment: oximux_remote_host::AttachmentId) {}
 }
 
 /// A reconnect must restore an attached terminal, not silently strand it.

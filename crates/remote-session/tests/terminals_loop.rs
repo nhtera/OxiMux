@@ -85,6 +85,8 @@ impl TerminalSource for FakeTerminals {
     ) -> Result<(), TerminalError> {
         Ok(())
     }
+
+    async fn detach(&self, _pty_id: &str, _attachment: AttachmentId) {}
 }
 
 /// Attach, receive pushed output, and — the point — issue an RPC *while* the

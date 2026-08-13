@@ -527,26 +527,34 @@ impl Dispatcher {
                 return (Response::Error(RpcError::Internal("terminals unavailable".into())), None);
             }
         };
+        let minted = attach.attachment;
         let response = Response::TermAttached {
             replay: attach.replay,
             cols: attach.cols,
             rows: attach.rows,
         };
         if attached.contains_key(pty_id) {
-            // Already streaming: `rx` drops here, which detaches the duplicate
-            // attachment rather than leaving it fanning into nothing.
+            // Already streaming. Serve the replay again, then give the
+            // attachment this call just minted straight back.
             //
-            // The recorded attachment stays the OLD one for the same reason —
-            // it is the one still feeding this connection's stream, so it is the
-            // one whose grid the client is actually looking at. Overwriting it
-            // would point every later resize at an attachment being torn down.
+            // Dropping `rx` is not enough on its own. A host learns a stream is
+            // unwanted from its own send failing, which needs output that may
+            // never come — and until then the duplicate holds a size vote taken
+            // at the size in force when it attached. Re-attaching IS the
+            // documented gap recovery, so on a quiet terminal a single gap
+            // would otherwise pin the terminal at its current grid and the
+            // client could never grow it again.
+            //
+            // The recorded attachment stays the OLD one: it is the one still
+            // feeding this connection's stream, so it is the one whose grid the
+            // client is looking at. Overwriting it would point every later
+            // resize at an attachment that is being torn down.
+            drop(rx);
+            source.detach(pty_id, minted).await;
             return (response, None);
         }
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-        attached.insert(
-            pty_id.to_owned(),
-            Attached { attachment: attach.attachment, cancel: cancel_tx },
-        );
+        attached.insert(pty_id.to_owned(), Attached { attachment: minted, cancel: cancel_tx });
         (response, Some(term_stream(pty_id.to_owned(), rx, cancel_rx)))
     }
 

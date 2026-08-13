@@ -136,6 +136,52 @@ async fn two_attachments_each_hold_their_own_size_vote() {
     );
 }
 
+/// Leaving a QUIET terminal still withdraws the departed device's size vote.
+///
+/// The quiet is the whole point. Notifications are addressed to an attachment,
+/// so once a client stops watching, the only thing that could tell its
+/// forwarding task to unwind is more output for that same attachment — and a
+/// terminal sitting at a prompt produces none. Dropping the frame receiver is
+/// therefore not a signal anything can observe: the task parks, the attachment
+/// is never handed back, and the terminal keeps being sized for a device that
+/// has gone. `detach` is what makes leaving observable.
+///
+/// The sleep is load-bearing. A resize provokes a redraw from the shell, and
+/// those bytes arriving after the client left would wake the task by accident
+/// and hide exactly the case under test — which is how this went unnoticed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn leaving_a_quiet_terminal_releases_its_size_vote() {
+    let relay = boot_relay().await;
+    let observer = RelayClient::connect(&relay.socket, &relay.token).await.expect("connect");
+    let pty = spawn_pty(&observer, 80, 24).await;
+
+    let host = terminals(&relay.socket, &relay.token).await;
+    let (a, a_frames) = host.attach(&pty).await.expect("phone attaches");
+    host.resize(&pty, a.attachment, 40, 12).await.expect("phone shrinks");
+    assert_eq!(effective_size(&observer, &pty).await, (40, 12));
+
+    // Let the redraw the resize provoked land and be forwarded, so what follows
+    // is genuine silence rather than a stream that happens to still be flowing.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // The phone closes the screen: its frames go, and the host gives the
+    // attachment back.
+    drop(a_frames);
+    host.detach(&pty, a.attachment).await;
+
+    for _ in 0..200 {
+        if effective_size(&observer, &pty).await == (80, 24) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "the terminal is still {:?} — a departed device is holding it small \
+         with nothing left that could widen it",
+        effective_size(&observer, &pty).await,
+    );
+}
+
 /// Releasing one attachment withdraws that attachment's vote and no other.
 ///
 /// The other half of the same property: with A gone the terminal stops being
@@ -157,15 +203,9 @@ async fn a_departed_device_stops_holding_the_terminal_small() {
     host.resize(&pty, a.attachment, 40, 12).await.expect("A shrinks");
     assert_eq!(effective_size(&observer, &pty).await, (40, 12));
 
-    // A leaves. Dropping the frame receiver is what a client disconnecting looks
-    // like from here; the forwarding task notices on its next send and hands the
-    // attachment back. Waking it needs one byte of output, which is why the
-    // shell is asked to produce some.
+    // A leaves.
     drop(a_frames);
-    observer
-        .request(Request::Write { pty_id: pty.clone(), bytes: b"\n".to_vec() })
-        .await
-        .expect("nudge the shell so the forwarding task wakes and detaches");
+    host.detach(&pty, a.attachment).await;
 
     let mut released = false;
     for _ in 0..200 {

@@ -42,6 +42,8 @@ struct FakeTerminals {
     /// Every resize with the attachment it named, so "each device resized its
     /// own" is asserted against what the PTY layer was actually told.
     resizes: Arc<Mutex<Vec<(AttachmentId, u16, u16)>>>,
+    /// Attachments handed back, in order.
+    released: Arc<Mutex<Vec<AttachmentId>>>,
 }
 
 #[async_trait::async_trait]
@@ -102,6 +104,10 @@ impl TerminalSource for FakeTerminals {
         self.resizes.lock().await.push((attachment, cols, rows));
         Ok(())
     }
+
+    async fn detach(&self, _pty_id: &str, attachment: AttachmentId) {
+        self.released.lock().await.push(attachment);
+    }
 }
 
 async fn call(client: &dyn Transport, req: Request) -> Response {
@@ -125,6 +131,7 @@ struct Harness {
     auth: Arc<AuthStore>,
     typed: Arc<Mutex<Vec<Vec<u8>>>>,
     resizes: Arc<Mutex<Vec<(AttachmentId, u16, u16)>>>,
+    released: Arc<Mutex<Vec<AttachmentId>>>,
     tx: mpsc::Sender<TerminalFrame>,
 }
 
@@ -132,6 +139,7 @@ fn harness(pairing_session: Option<&str>) -> Harness {
     let (tx, rx) = mpsc::channel(8);
     let typed = Arc::new(Mutex::new(Vec::new()));
     let resizes = Arc::new(Mutex::new(Vec::new()));
+    let released = Arc::new(Mutex::new(Vec::new()));
     let terminals = Arc::new(FakeTerminals {
         frames: Mutex::new(Some(rx)),
         typed: Arc::clone(&typed),
@@ -139,13 +147,14 @@ fn harness(pairing_session: Option<&str>) -> Harness {
         reattached: Mutex::new(Some(mpsc::channel(8).1)),
         next_attachment: Mutex::new(0),
         resizes: Arc::clone(&resizes),
+        released: Arc::clone(&released),
     });
     let auth = Arc::new(AuthStore::new());
     auth.set_pairing(PairingSlot::new(SECRET, pairing_session.map(Into::into), false));
     let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), Arc::clone(&auth))
         .with_clock(clock)
         .with_terminals(terminals);
-    Harness { dispatcher, auth, typed, resizes, tx }
+    Harness { dispatcher, auth, typed, resizes, released, tx }
 }
 
 /// The happy path: list, attach with replay, receive pushed output, and type.
@@ -402,6 +411,7 @@ async fn re_attaching_after_a_detach_does_not_double_the_output() {
         reattached: Mutex::new(Some(rx_b)),
         next_attachment: Mutex::new(0),
         resizes: Arc::new(Mutex::new(Vec::new())),
+        released: Arc::new(Mutex::new(Vec::new())),
     });
     let auth = Arc::new(AuthStore::new());
     auth.set_pairing(PairingSlot::new(SECRET, None, false));
@@ -553,4 +563,122 @@ async fn a_resize_without_an_attachment_is_refused() {
 
     futures::future::join(serve, script).await;
     assert!(resizes.lock().await.is_empty(), "nothing reached the PTY layer");
+}
+
+/// Detaching hands the attachment back, rather than only stopping the stream.
+///
+/// Those are two different resources. The stream is this connection's view; the
+/// attachment is a claim on the terminal itself, including a standing vote on
+/// its size. A host that runs a terminal at the smallest size any attachment
+/// asks for goes on honouring a departed viewer's vote until it is withdrawn —
+/// so a phone that shrank a terminal and then closed the screen would leave the
+/// desktop's window narrow with nothing left that could widen it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn detaching_hands_the_attachment_back() {
+    let h = harness(None);
+    let released = Arc::clone(&h.released);
+    let (client, server) = duplex_pair();
+    let serve = h.dispatcher.serve(&server);
+
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32], None))).await
+        else {
+            panic!("expected Registered");
+        };
+        let Response::TermAttached { .. } =
+            call(&client, Request::TermAttach { pty_id: "pty-1".into() }).await
+        else {
+            panic!("expected TermAttached");
+        };
+        assert_eq!(
+            call(&client, Request::TermDetach { pty_id: "pty-1".into() }).await,
+            Response::Ack,
+        );
+    };
+
+    futures::future::join(serve, script).await;
+    assert_eq!(
+        released.lock().await.as_slice(),
+        [AttachmentId(1)],
+        "the attachment this connection opened was given back",
+    );
+}
+
+/// A repeat attach gives back the attachment it just minted.
+///
+/// Re-attaching is the documented gap recovery, so it has to stay cheap — it
+/// serves the replay again without opening a second stream. But the host mints a
+/// fresh attachment for every attach, and the discarded one carries a size vote
+/// taken at whatever grid was in force. Left behind on a quiet terminal, that
+/// vote pins the terminal there: the client recovers from one gap and then
+/// cannot grow its window again, with nothing on screen to explain why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_repeat_attach_gives_back_the_attachment_it_minted() {
+    let h = harness(None);
+    let released = Arc::clone(&h.released);
+    let (client, server) = duplex_pair();
+    let serve = h.dispatcher.serve(&server);
+
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32], None))).await
+        else {
+            panic!("expected Registered");
+        };
+        for _ in 0..2 {
+            let Response::TermAttached { .. } =
+                call(&client, Request::TermAttach { pty_id: "pty-1".into() }).await
+            else {
+                panic!("a repeat attach still serves the replay");
+            };
+        }
+        drop(client);
+    };
+
+    futures::future::join(serve, script).await;
+    // The second attach (2) goes back immediately; the first (1) goes back when
+    // the connection ends. The order is the assertion — 2 must not be waiting on
+    // anything to notice it was discarded.
+    assert_eq!(
+        released.lock().await.as_slice(),
+        [AttachmentId(2), AttachmentId(1)],
+        "the duplicate was released at once, not left holding a size vote",
+    );
+}
+
+/// A connection that simply goes away still hands its attachments back.
+///
+/// This is the COMMON exit, not the tidy one: a phone that loses signal or gets
+/// swiped away never sends `TermDetach`. If only the explicit path released,
+/// every lost connection would leave a terminal sized for a device that is no
+/// longer there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_connection_hands_back_what_it_still_held() {
+    let h = harness(None);
+    let released = Arc::clone(&h.released);
+    let (client, server) = duplex_pair();
+    let serve = h.dispatcher.serve(&server);
+
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32], None))).await
+        else {
+            panic!("expected Registered");
+        };
+        let Response::TermAttached { .. } =
+            call(&client, Request::TermAttach { pty_id: "pty-1".into() }).await
+        else {
+            panic!("expected TermAttached");
+        };
+        // No detach, no goodbye — the connection just ends.
+        drop(client);
+    };
+
+    futures::future::join(serve, script).await;
+    assert_eq!(
+        released.lock().await.as_slice(),
+        [AttachmentId(1)],
+        "the attachment did not outlive the connection that opened it",
+    );
 }
