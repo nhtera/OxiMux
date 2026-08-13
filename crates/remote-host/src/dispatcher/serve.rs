@@ -96,7 +96,7 @@ impl Dispatcher {
         // recovery, so it has to stay cheap and repeatable — and a detach must
         // actually stop the old one, or the next attach stacks a second stream
         // beside it and every byte arrives twice.
-        let mut attached: HashMap<String, tokio::sync::oneshot::Sender<()>> = HashMap::new();
+        let mut attached: HashMap<String, super::stream::Attached> = HashMap::new();
         // Whether this connection holds a session-list subscription. A repeat
         // `SubscribeSessions` re-snapshots without opening a second stream.
         let mut sessions_subscribed = false;
@@ -203,7 +203,7 @@ impl Dispatcher {
         state: &mut ConnState,
         streams: &mut SelectAll<BoxStream<'static, Live>>,
         cursors: &mut HashMap<SessionId, Seq>,
-        attached: &mut HashMap<String, tokio::sync::oneshot::Sender<()>>,
+        attached: &mut HashMap<String, super::stream::Attached>,
         sessions_subscribed: &mut bool,
         transport: &dyn Transport,
         frame: Vec<u8>,
@@ -302,7 +302,10 @@ impl Dispatcher {
             let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let response = self.term_resize(&peer, &pty_id, cols, rows).await;
+            // The attachment comes from THIS connection's own record. Resolving
+            // it from the PTY instead would hand every device's resize to
+            // whichever one attached last.
+            let response = self.term_resize(&peer, &pty_id, attached, cols, rows).await;
             return self.send(transport, response).await;
         }
         if let Request::TermDetach { pty_id } = req {

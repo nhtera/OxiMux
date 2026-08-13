@@ -7517,10 +7517,13 @@ name = "oximux-relay-terminals"
 version = "0.1.10"
 dependencies = [
  "async-trait",
+ "oximux-relay",
  "oximux-relay-client",
  "oximux-relay-proto",
  "oximux-remote-host",
  "oximux-remote-proto",
+ "oximux-shell-env",
+ "tempfile",
  "tokio",
  "tracing",
 ]

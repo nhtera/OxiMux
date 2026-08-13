@@ -20,3 +20,11 @@ oximux-remote-proto = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+# The size-vote contract this crate translates lives in the daemon, not here, so
+# the tests boot a real one in-process rather than asserting against a stand-in
+# that would agree with whatever this file happened to do.
+[dev-dependencies]
+oximux-relay = { workspace = true }
+oximux-shell-env = { workspace = true, features = ["test-support"] }
+tempfile = "3"

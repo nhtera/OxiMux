@@ -627,6 +627,7 @@ impl oximux_remote_host::TerminalSource for ScriptedTerminals {
                 replay: b"prompt$ ".to_vec(),
                 cols: 80,
                 rows: 24,
+                attachment: oximux_remote_host::AttachmentId(1),
             },
             rx,
         ))
@@ -643,6 +644,7 @@ impl oximux_remote_host::TerminalSource for ScriptedTerminals {
     async fn resize(
         &self,
         _pty_id: &str,
+        _attachment: oximux_remote_host::AttachmentId,
         _cols: u16,
         _rows: u16,
     ) -> Result<(), oximux_remote_host::TerminalError> {
@@ -764,6 +766,7 @@ impl oximux_remote_host::TerminalSource for ReattachableTerminals {
                 replay: b"prompt$ ".to_vec(),
                 cols: 80,
                 rows: 24,
+                attachment: oximux_remote_host::AttachmentId(1),
             },
             rx,
         ))
@@ -780,6 +783,7 @@ impl oximux_remote_host::TerminalSource for ReattachableTerminals {
     async fn resize(
         &self,
         _pty_id: &str,
+        _attachment: oximux_remote_host::AttachmentId,
         _cols: u16,
         _rows: u16,
     ) -> Result<(), oximux_remote_host::TerminalError> {

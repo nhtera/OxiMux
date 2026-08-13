@@ -17,7 +17,7 @@ use futures::executor::block_on;
 use futures::future::join3;
 use oximux_agents::session_registry::SessionRegistry;
 use oximux_remote_host::{
-    AuthStore, Dispatcher, PairingSlot, TerminalAttach, TerminalError, TerminalFrame,
+    AttachmentId, AuthStore, Dispatcher, PairingSlot, TerminalAttach, TerminalError, TerminalFrame,
     TerminalSource,
 };
 use oximux_remote_proto::PairingTicket;
@@ -61,14 +61,28 @@ impl TerminalSource for FakeTerminals {
             return Err(TerminalError::NotFound);
         }
         let rx = self.frames.lock().unwrap().take().ok_or(TerminalError::Unavailable)?;
-        Ok((TerminalAttach { replay: b"prompt$ ".to_vec(), cols: 80, rows: 24 }, rx))
+        Ok((
+            TerminalAttach {
+                replay: b"prompt$ ".to_vec(),
+                cols: 80,
+                rows: 24,
+                attachment: AttachmentId(1),
+            },
+            rx,
+        ))
     }
 
     async fn input(&self, _pty_id: &str, _bytes: &[u8]) -> Result<(), TerminalError> {
         Ok(())
     }
 
-    async fn resize(&self, _pty_id: &str, _cols: u16, _rows: u16) -> Result<(), TerminalError> {
+    async fn resize(
+        &self,
+        _pty_id: &str,
+        _attachment: AttachmentId,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<(), TerminalError> {
         Ok(())
     }
 }

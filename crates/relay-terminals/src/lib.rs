@@ -7,12 +7,13 @@
 //! so every relay concept (attachment ids, the Unix-socket request/response
 //! shape, the notification fan-out) is translated here and nowhere else.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use oximux_relay_client::RelayClient;
 use oximux_relay_proto::{Notification, Request, Response};
-use oximux_remote_host::{TerminalAttach, TerminalError, TerminalFrame, TerminalSource};
+use oximux_remote_host::{
+    AttachmentId, TerminalAttach, TerminalError, TerminalFrame, TerminalSource,
+};
 use oximux_remote_proto::messages::TerminalSummary;
 use tokio::sync::mpsc;
 
@@ -25,21 +26,21 @@ use tokio::sync::mpsc;
 const FRAME_QUEUE: usize = 256;
 
 /// Terminals served from the relay daemon.
+///
+/// Holds no per-PTY attachment state, deliberately. One of these is shared by
+/// every paired device, so anything keyed by PTY here would be one device's
+/// entry overwriting another's — and `Resize` is addressed to an *attachment*,
+/// not a PTY, because the daemon runs each PTY at the smallest size any
+/// attachment asks for. The attachment id therefore rides back to the caller in
+/// [`TerminalAttach`] and returns with the resize, so each connection keeps
+/// naming the attachment it opened.
 pub struct RelayTerminals {
     client: Arc<RelayClient>,
-    /// Attachment ids the daemon minted for us, per PTY.
-    ///
-    /// Needed because `Resize` is addressed to an *attachment*, not a PTY: the
-    /// daemon runs each PTY at the smallest size any attachment asks for, so it
-    /// has to know which one is changing its mind.
-    /// Shared so the per-attachment forwarding task can retire its own entry
-    /// when it ends, without racing a newer attach that has already replaced it.
-    attachments: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl RelayTerminals {
     pub fn new(client: Arc<RelayClient>) -> Self {
-        Self { client, attachments: Arc::new(Mutex::new(HashMap::new())) }
+        Self { client }
     }
 
     async fn request(&self, req: Request) -> Result<Response, TerminalError> {
@@ -84,18 +85,14 @@ impl TerminalSource for RelayTerminals {
         // routed to us until the attach lands.
         let (sub_id, mut notifications) = self.client.subscribe_pty(pty_id);
 
-        // The attachment id travels with the forwarding task: it is what the
-        // task must hand back to the daemon when it ends.
-        let (attached, mine) = match self.request(Request::Attach { pty_id: pty_id.to_owned() }).await
-        {
+        let attached = match self.request(Request::Attach { pty_id: pty_id.to_owned() }).await {
             Ok(Response::AttachOk { replay, cols, rows, attachment_id }) => {
                 // Bind before anything else reads the stream: until the
                 // subscription knows its attachment, it receives every copy the
                 // daemon fans for this PTY — including the ones addressed to a
                 // desktop pane watching the same terminal.
                 self.client.bind_attachment(pty_id, sub_id, attachment_id);
-                self.attachments.lock().unwrap().insert(pty_id.to_owned(), attachment_id);
-                (TerminalAttach { replay, cols, rows }, attachment_id)
+                TerminalAttach { replay, cols, rows, attachment: AttachmentId(attachment_id) }
             }
             Ok(Response::Err { code: oximux_relay_proto::ErrCode::PtyNotFound, .. }) => {
                 self.client.unsubscribe_pty(pty_id, sub_id);
@@ -114,8 +111,10 @@ impl TerminalSource for RelayTerminals {
 
         let (tx, rx) = mpsc::channel(FRAME_QUEUE);
         let client = Arc::clone(&self.client);
-        let attachments = Arc::clone(&self.attachments);
         let owned_pty = pty_id.to_owned();
+        // The attachment id travels with the forwarding task: it is what the
+        // task must hand back to the daemon when it ends.
+        let mine = attached.attachment.0;
         tokio::spawn(async move {
             // A gap the remote client has not been told about yet. Same shape as
             // the daemon's own subscriber flag, and for the same reason: the
@@ -172,16 +171,8 @@ impl TerminalSource for RelayTerminals {
             //
             // Best-effort: the connection may already be gone, in which case the
             // daemon reaps the attachment with the connection anyway.
-            let _ = client
-                .request(Request::Detach { pty_id: owned_pty.clone(), attachment_id: mine })
-                .await;
-            // Retire the routing entry only if it is still ours. A newer attach
-            // for the same PTY has already overwritten it, and clearing that
-            // would leave the live attachment unaddressable by `Resize`.
-            let mut map = attachments.lock().unwrap();
-            if map.get(&owned_pty) == Some(&mine) {
-                map.remove(&owned_pty);
-            }
+            let _ =
+                client.request(Request::Detach { pty_id: owned_pty, attachment_id: mine }).await;
         });
 
         Ok((attached, rx))
@@ -203,16 +194,20 @@ impl TerminalSource for RelayTerminals {
         }
     }
 
-    async fn resize(&self, pty_id: &str, cols: u16, rows: u16) -> Result<(), TerminalError> {
-        // Without an attachment id there is nothing to resize: the daemon tracks
-        // requested sizes per attachment. A resize before attach is a client bug,
-        // reported as "no such terminal" rather than silently resizing whatever
-        // attachment happened to be first.
-        let Some(attachment_id) = self.attachments.lock().unwrap().get(pty_id).copied() else {
-            return Err(TerminalError::NotFound);
-        };
+    async fn resize(
+        &self,
+        pty_id: &str,
+        attachment: AttachmentId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), TerminalError> {
         match self
-            .request(Request::Resize { pty_id: pty_id.to_owned(), attachment_id, cols, rows })
+            .request(Request::Resize {
+                pty_id: pty_id.to_owned(),
+                attachment_id: attachment.0,
+                cols,
+                rows,
+            })
             .await?
         {
             Response::Ok => Ok(()),

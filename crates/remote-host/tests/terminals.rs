@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use oximux_agents::session_registry::SessionRegistry;
 use oximux_remote_host::{
-    AuthStore, Dispatcher, PairingSlot, TerminalAttach, TerminalError, TerminalFrame,
+    AttachmentId, AuthStore, Dispatcher, PairingSlot, TerminalAttach, TerminalError, TerminalFrame,
     TerminalSource, registration_proof,
 };
 use oximux_remote_proto::Transport;
@@ -37,6 +37,11 @@ struct FakeTerminals {
     /// Frames handed to a *second* attach, so a detach/re-attach cycle can be
     /// driven without the fake running out of receivers.
     reattached: Mutex<Option<mpsc::Receiver<TerminalFrame>>>,
+    /// Mints a distinct attachment per attach, like a real host does.
+    next_attachment: Mutex<u64>,
+    /// Every resize with the attachment it named, so "each device resized its
+    /// own" is asserted against what the PTY layer was actually told.
+    resizes: Arc<Mutex<Vec<(AttachmentId, u16, u16)>>>,
 }
 
 #[async_trait::async_trait]
@@ -63,8 +68,18 @@ impl TerminalSource for FakeTerminals {
             Some(rx) => rx,
             None => self.reattached.lock().await.take().ok_or(TerminalError::Unavailable)?,
         };
+        let attachment = {
+            let mut next = self.next_attachment.lock().await;
+            *next += 1;
+            AttachmentId(*next)
+        };
         Ok((
-            TerminalAttach { replay: b"$ echo hi\r\nhi\r\n".to_vec(), cols: 80, rows: 24 },
+            TerminalAttach {
+                replay: b"$ echo hi\r\nhi\r\n".to_vec(),
+                cols: 80,
+                rows: 24,
+                attachment,
+            },
             rx,
         ))
     }
@@ -77,7 +92,14 @@ impl TerminalSource for FakeTerminals {
         Ok(())
     }
 
-    async fn resize(&self, _pty_id: &str, _cols: u16, _rows: u16) -> Result<(), TerminalError> {
+    async fn resize(
+        &self,
+        _pty_id: &str,
+        attachment: AttachmentId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), TerminalError> {
+        self.resizes.lock().await.push((attachment, cols, rows));
         Ok(())
     }
 }
@@ -102,23 +124,28 @@ struct Harness {
     dispatcher: Dispatcher,
     auth: Arc<AuthStore>,
     typed: Arc<Mutex<Vec<Vec<u8>>>>,
+    resizes: Arc<Mutex<Vec<(AttachmentId, u16, u16)>>>,
     tx: mpsc::Sender<TerminalFrame>,
 }
 
 fn harness(pairing_session: Option<&str>) -> Harness {
     let (tx, rx) = mpsc::channel(8);
     let typed = Arc::new(Mutex::new(Vec::new()));
+    let resizes = Arc::new(Mutex::new(Vec::new()));
     let terminals = Arc::new(FakeTerminals {
         frames: Mutex::new(Some(rx)),
         typed: Arc::clone(&typed),
-        reattached: Mutex::new(None),
+        // A second receiver so two devices can attach to the one terminal.
+        reattached: Mutex::new(Some(mpsc::channel(8).1)),
+        next_attachment: Mutex::new(0),
+        resizes: Arc::clone(&resizes),
     });
     let auth = Arc::new(AuthStore::new());
     auth.set_pairing(PairingSlot::new(SECRET, pairing_session.map(Into::into), false));
     let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), Arc::clone(&auth))
         .with_clock(clock)
         .with_terminals(terminals);
-    Harness { dispatcher, auth, typed, tx }
+    Harness { dispatcher, auth, typed, resizes, tx }
 }
 
 /// The happy path: list, attach with replay, receive pushed output, and type.
@@ -373,6 +400,8 @@ async fn re_attaching_after_a_detach_does_not_double_the_output() {
         frames: Mutex::new(Some(rx_a)),
         typed: Arc::clone(&typed),
         reattached: Mutex::new(Some(rx_b)),
+        next_attachment: Mutex::new(0),
+        resizes: Arc::new(Mutex::new(Vec::new())),
     });
     let auth = Arc::new(AuthStore::new());
     auth.set_pairing(PairingSlot::new(SECRET, None, false));
@@ -439,4 +468,89 @@ async fn re_attaching_after_a_detach_does_not_double_the_output() {
     };
 
     futures::future::join(serve, script).await;
+}
+
+/// Two devices watching ONE terminal each resize the attachment they opened.
+///
+/// The host runs a shared PTY at the smallest grid any attachment asks for, so a
+/// resize is a statement about one viewer's window. Nothing in the request names
+/// which — the terminal id is the same for both — so the attachment has to come
+/// from the connection's own record. Resolving it from the PTY instead (a map
+/// keyed by terminal, in a source shared by every paired device) makes the last
+/// device to attach the owner of every later resize: the second phone to open a
+/// terminal silently drives the first one's window, and the first phone's own
+/// attachment keeps whatever size it had forever, because nothing addresses it
+/// again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_devices_on_one_terminal_each_resize_their_own_attachment() {
+    let h = harness(None);
+    let resizes = Arc::clone(&h.resizes);
+    let auth = Arc::clone(&h.auth);
+    let (client_a, server_a) = duplex_pair();
+    let (client_b, server_b) = duplex_pair();
+    let serve_a = h.dispatcher.serve(&server_a);
+    let serve_b = h.dispatcher.serve(&server_b);
+
+    let script = async move {
+        // Two paired devices, two connections, one terminal. A attaches first,
+        // so the fake mints it attachment 1 and B attachment 2.
+        // Both keys have to be valid curve points — registration rejects a
+        // structurally invalid pubkey before it ever reaches the pairing proof.
+        for (client, pubkey) in [(&client_a, [0x33; 32]), (&client_b, [0x55; 32])] {
+            // A pairing slot is consumed by the device that uses it, so the
+            // second phone pairs through its own window — as it does in reality.
+            auth.set_pairing(PairingSlot::new(SECRET, None, false));
+            let registered = call(client, Request::Register(register_req(pubkey, None))).await;
+            let Response::Registered { .. } = registered else {
+                panic!("expected Registered, got {registered:?}");
+            };
+            let Response::TermAttached { .. } =
+                call(client, Request::TermAttach { pty_id: "pty-1".into() }).await
+            else {
+                panic!("expected TermAttached");
+            };
+        }
+
+        for (client, cols, rows) in [(&client_a, 40, 12), (&client_b, 100, 30)] {
+            assert_eq!(
+                call(client, Request::TermResize { pty_id: "pty-1".into(), cols, rows }).await,
+                Response::Ack,
+            );
+        }
+    };
+
+    futures::future::join3(serve_a, serve_b, script).await;
+    assert_eq!(
+        resizes.lock().await.as_slice(),
+        [(AttachmentId(1), 40, 12), (AttachmentId(2), 100, 30)],
+        "each resize named the attachment its own connection opened",
+    );
+}
+
+/// Resizing a terminal this connection never attached to is refused.
+///
+/// There is nothing to name yet, and the alternative is worse than an error: a
+/// resize resolved from the PTY would land on some *other* device's attachment
+/// and shrink a window nobody asked to shrink.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resize_without_an_attachment_is_refused() {
+    let h = harness(None);
+    let resizes = Arc::clone(&h.resizes);
+    let (client, server) = duplex_pair();
+    let serve = h.dispatcher.serve(&server);
+
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32], None))).await
+        else {
+            panic!("expected Registered");
+        };
+        assert_eq!(
+            call(&client, Request::TermResize { pty_id: "pty-1".into(), cols: 40, rows: 12 }).await,
+            Response::Error(RpcError::UnknownSession),
+        );
+    };
+
+    futures::future::join(serve, script).await;
+    assert!(resizes.lock().await.is_empty(), "nothing reached the PTY layer");
 }

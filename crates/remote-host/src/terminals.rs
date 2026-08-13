@@ -29,8 +29,23 @@ pub enum TerminalFrame {
     Exited(Option<i32>),
 }
 
-/// What an attach returns before the live frames start: the replay ring and the
-/// dims it was drawn at.
+/// Identifies one attachment to a terminal, minted by the host.
+///
+/// Opaque here on purpose: this crate does not know how the PTY layer numbers
+/// its attachments, only that resizing has to name one. A host may run a single
+/// PTY at the smallest grid any of its attachments asked for, so a resize is a
+/// statement about *this* viewer's window rather than about the terminal — and
+/// with several devices watching one terminal, nothing else in a resize request
+/// distinguishes them.
+///
+/// Never crosses the remote wire. It is minted by the host when a connection
+/// attaches and handed back by that same connection, so a client cannot name an
+/// attachment belonging to someone else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct AttachmentId(pub u64);
+
+/// What an attach returns before the live frames start: the replay ring, the
+/// dims it was drawn at, and the attachment those belong to.
 ///
 /// The dims are not decoration. Replay bytes carry absolute-position escape
 /// sequences that only land correctly in a grid of the size that produced them,
@@ -40,6 +55,8 @@ pub struct TerminalAttach {
     pub replay: Vec<u8>,
     pub cols: u16,
     pub rows: u16,
+    /// The attachment this call opened — the handle a later resize must name.
+    pub attachment: AttachmentId,
 }
 
 /// Errors a terminal operation can fail with. Deliberately coarse: the detail a
@@ -70,6 +87,18 @@ pub trait TerminalSource: Send + Sync {
     /// not be reachable from a read-only device.
     async fn input(&self, pty_id: &str, bytes: &[u8]) -> Result<(), TerminalError>;
 
-    /// Resize the terminal's grid.
-    async fn resize(&self, pty_id: &str, cols: u16, rows: u16) -> Result<(), TerminalError>;
+    /// Resize the grid of one attachment.
+    ///
+    /// The attachment is named explicitly rather than looked up from the PTY,
+    /// because a terminal can have several — two paired phones and the desktop's
+    /// own window — and each votes on the size separately. Keying that lookup by
+    /// PTY inside an implementation makes the last device to attach the owner of
+    /// every subsequent resize, whoever sent it.
+    async fn resize(
+        &self,
+        pty_id: &str,
+        attachment: AttachmentId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), TerminalError>;
 }

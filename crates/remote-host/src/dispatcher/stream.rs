@@ -459,6 +459,21 @@ impl Dispatcher {
     }
 }
 
+/// One terminal this connection is streaming.
+///
+/// Per-connection on purpose. The attachment is what a resize has to name, and
+/// a host shared by several paired devices has one of these per device for the
+/// same PTY — so the lookup belongs to the connection that opened it, not to a
+/// map keyed by terminal.
+pub(super) struct Attached {
+    pub(super) attachment: crate::terminals::AttachmentId,
+    /// Dropping this ends the live stream. Held for its `Drop`, never sent on:
+    /// `SelectAll` cannot remove a stream, so forgetting the entry without
+    /// dropping this would leave it forwarding for the life of the connection.
+    #[allow(dead_code)]
+    pub(super) cancel: tokio::sync::oneshot::Sender<()>,
+}
+
 impl Dispatcher {
     /// List the terminals this device may see.
     pub(super) async fn list_terminals(&self, peer: &Peer) -> Response {
@@ -493,7 +508,7 @@ impl Dispatcher {
         &self,
         peer: &Peer,
         pty_id: &str,
-        attached: &mut HashMap<String, tokio::sync::oneshot::Sender<()>>,
+        attached: &mut HashMap<String, Attached>,
     ) -> (Response, Option<BoxStream<'static, Live>>) {
         if !self.auth.may_use_terminals(peer) {
             return (Response::Error(RpcError::Unauthorized), None);
@@ -520,10 +535,18 @@ impl Dispatcher {
         if attached.contains_key(pty_id) {
             // Already streaming: `rx` drops here, which detaches the duplicate
             // attachment rather than leaving it fanning into nothing.
+            //
+            // The recorded attachment stays the OLD one for the same reason —
+            // it is the one still feeding this connection's stream, so it is the
+            // one whose grid the client is actually looking at. Overwriting it
+            // would point every later resize at an attachment being torn down.
             return (response, None);
         }
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-        attached.insert(pty_id.to_owned(), cancel_tx);
+        attached.insert(
+            pty_id.to_owned(),
+            Attached { attachment: attach.attachment, cancel: cancel_tx },
+        );
         (response, Some(term_stream(pty_id.to_owned(), rx, cancel_rx)))
     }
 
@@ -555,6 +578,7 @@ impl Dispatcher {
         &self,
         peer: &Peer,
         pty_id: &str,
+        attached: &HashMap<String, Attached>,
         cols: u16,
         rows: u16,
     ) -> Response {
@@ -571,7 +595,14 @@ impl Dispatcher {
         if cols == 0 || rows == 0 {
             return Response::Error(RpcError::BadRequest("terminal size must be non-zero".into()));
         }
-        match source.resize(pty_id, cols, rows).await {
+        // Only an attachment this connection opened can be resized. A resize
+        // arriving before the attach lands has nothing to name yet — reported as
+        // unknown rather than applied to some other device's attachment, which
+        // is what resolving by PTY alone would do.
+        let Some(entry) = attached.get(pty_id) else {
+            return Response::Error(RpcError::UnknownSession);
+        };
+        match source.resize(pty_id, entry.attachment, cols, rows).await {
             Ok(()) => Response::Ack,
             Err(crate::terminals::TerminalError::NotFound) => {
                 Response::Error(RpcError::UnknownSession)
