@@ -4,6 +4,41 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-08-14 — v0.1.11: every agent in the rail, and what it said (`main`)
+
+- **`2819688`** — a terminal's agent is now detected from its process tree.
+  Ambient detection could only see an agent that volunteered evidence: the
+  OSC-9999 sideband, which exists only where OxiMux installs hooks (Claude
+  alone), or an OSC window title, which several CLIs never write — Codex's is
+  an opt-in setup flow. Both are events, so an agent sitting idle at its
+  prompt vanished from the rail even after being seen. Presence now comes
+  from the process tree (`oximux-proc-tree`), which holds for as long as the
+  agent runs and covers every CLI; the sideband and the title keep their real
+  job of saying what it is *doing*, and an agent that has reported nothing is
+  idle. Identity is `argv[0]`, never the executable name — the kernel names a
+  process for the binary it resolved, so a CLI installed as a symlink reports
+  its target, and Claude Code's is a bare version number that matches nothing.
+  Carries three fixes downstream of the same gap: a compact rail card now
+  shows the agent's brand mark (compact drops the line its name was on),
+  ambient agents are counted per pane rather than per tab (one split tab
+  running two agents read "1 agent" above two rows), and both detectors draw
+  their names from one table so they cannot disagree.
+
+- **`deaf629`** — a Codex agent reports its last message through its own
+  hooks. A Codex row showed a bare status verb where a Claude row showed the
+  reply, because only the agent can report what it said. Codex has the same
+  kind of lifecycle hooks in `$CODEX_HOME/hooks.json`, in the same shape and
+  on stdin, so `oximux agent-status` serves both behind `--format codex`.
+  Codex's `notify` is deliberately unused: it is a single program rather than
+  a list, so writing it would replace whatever is already there. A Codex entry
+  carries no marker and no `async` — Codex rejects fields it does not define,
+  and a rejected file would silence the user's own hooks along with ours — so
+  ours are found again by their command, and they carry a timeout because
+  Codex waits on them. Trust stays Codex's to grant in its own TUI: writing
+  the file is a request, and until it is approved nothing fires.
+
+---
+
 ### 2026-08-08 — v0.1.10: Alpine on ARM (`main`)
 
 - **`669a5f8`** — `aarch64-unknown-linux-musl` joins the release matrix.
