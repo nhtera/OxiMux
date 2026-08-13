@@ -8,6 +8,7 @@
 pub mod agent_awake;
 pub mod agent_hooks_global;
 pub mod agent_status_hooks;
+pub mod codex_status_hooks;
 #[cfg(any(target_os = "macos", windows))]
 pub mod screen_control_watch;
 
