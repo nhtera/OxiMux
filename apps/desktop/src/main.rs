@@ -1262,13 +1262,12 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
             _ => {}
         }
     }
-    let codex = match format.as_str() {
-        "claude" => false,
-        "codex" => true,
-        other => {
-            eprintln!("oximux agent-status: --format must be claude|codex (got {other:?})");
-            return 1;
-        }
+    let Some(dialect) = oximux_app::agent_hook_dialects::dialect_for_slug(&format) else {
+        eprintln!(
+            "oximux agent-status: --format must be {} (got {format:?})",
+            oximux_app::agent_hook_dialects::known_slugs()
+        );
+        return 1;
     };
     let state = match state.as_str() {
         "working" | "needs_approval" | "idle" => state,
@@ -1297,38 +1296,27 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
         // Not a permission prompt — clean no-op so the hook never fails the agent.
         return 0;
     }
-    let tool = stdin_json.as_deref().and_then(|json| {
-        if codex {
-            oximux_app::codex_status_hooks::codex_tool_name(json)
-        } else {
-            oximux_app::agent_status_hooks::tool_name_from_hook_json(json)
-        }
-    });
-    // A `UserPromptSubmit` event carries the user's prompt (no tool); other
-    // working events carry a tool (no prompt). Both are read from the same
-    // stdin JSON — one of them is `None` for any given hook.
-    let prompt = stdin_json.as_deref().and_then(|json| {
-        if codex {
-            oximux_app::codex_status_hooks::codex_prompt(json)
-        } else {
-            oximux_app::agent_status_hooks::prompt_from_hook_json(json)
-        }
-    });
-    // On `Stop` (idle) read the transcript for the agent's last reply — the
-    // row's secondary text for a finished turn (the reference cockpit's
-    // `lastAssistantMessage`). Only on Stop: it fires once per turn, whereas a
-    // per-tool transcript read would be wasteful.
-    // Codex hands the reply over directly on its `Stop` payload; Claude's hook
-    // carries only a transcript path, which the reader below opens and folds.
-    // Same destination either way, so a Codex row reads like a Claude one.
+    let tool = stdin_json
+        .as_deref()
+        .and_then(oximux_app::agent_hook_dialects::tool_name);
+    // A turn-start event carries the user's prompt (no tool); other working
+    // events carry a tool (no prompt). Both are read from the same stdin JSON —
+    // one of them is `None` for any given hook.
+    let prompt = stdin_json
+        .as_deref()
+        .and_then(oximux_app::agent_hook_dialects::prompt);
+    // On the turn-end event (idle) read the agent's last reply — the row's
+    // secondary text for a finished turn. Only there: it fires once per turn,
+    // whereas a per-tool read would be wasteful.
+    //
+    // The agents split on how they hand it over — some put the reply straight
+    // on the payload, others only a transcript path to chase — which is what
+    // the dialect settles. Same destination either way, so one agent's row
+    // reads like another's.
     let message = if state == "idle" {
-        stdin_json.as_deref().and_then(|json| {
-            if codex {
-                oximux_app::codex_status_hooks::codex_last_message(json)
-            } else {
-                oximux_app::agent_status_hooks::last_assistant_message_from_hook_json(json)
-            }
-        })
+        stdin_json
+            .as_deref()
+            .and_then(|json| oximux_app::agent_hook_dialects::last_message(dialect, json))
     } else {
         None
     };

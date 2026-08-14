@@ -86,7 +86,7 @@ fn build_settings_json_with(user_hooks: Option<Value>, binary_path: &Path) -> St
     json!({ "hooks": hooks }).to_string()
 }
 
-/// One status hook: which Claude event drives it, an optional tool matcher, and
+/// One status hook: which agent event drives it, an optional tool matcher, and
 /// the `oximux agent-status` command line it runs.
 pub(crate) struct HookSpec {
     pub event: &'static str,
@@ -94,51 +94,20 @@ pub(crate) struct HookSpec {
     pub command: String,
 }
 
-/// The four status hooks wiring Claude events to the `oximux agent-status` CLI.
+/// The status hooks wiring Claude's events to the `oximux agent-status` CLI.
 ///
 /// The single source of truth for both the per-spawn `--settings` JSON and the
 /// global `~/.claude/settings.json` install — so the COMMAND STRINGS are
 /// byte-identical and Claude's command-string hook dedup makes a picker-launched
 /// agent (which sees both) fire each hook exactly once.
+///
+/// Claude's events and command shape live in [`crate::agent_hook_dialects`]
+/// alongside every other agent's, so the two installs cannot drift apart: this
+/// is one row of that table, read back out.
 pub(crate) fn status_hook_specs(binary_path: &Path) -> Vec<HookSpec> {
-    // The command single-quotes the binary path (an installed app bundle path
-    // can contain spaces, e.g. "Application Support") then appends the CLI
-    // subcommand. Escape any embedded single quote (`'` → `'\''`) so a home dir
-    // like `/Users/O'X` can't break out of the quoting into shell injection.
-    let quoted = binary_path.display().to_string().replace('\'', "'\\''");
-    let cmd = |state: &str| format!("'{quoted}' agent-status --state {state}");
-    vec![
-        HookSpec {
-            event: "PreToolUse",
-            matcher: Some("*"),
-            command: cmd("working"),
-        },
-        // `UserPromptSubmit` fires the instant the user submits a prompt —
-        // whether typed into the agent's own TUI or sent from OxiMux. It carries
-        // the prompt text, captured as the agent's rail title, and flips the dot
-        // to working immediately (a text-only reply that calls no tool would
-        // otherwise look idle for its whole turn). No matcher (like `Stop`).
-        HookSpec {
-            event: "UserPromptSubmit",
-            matcher: None,
-            command: cmd("working"),
-        },
-        // `Notification` (no matcher — like `Stop`) is the event Claude actually
-        // fires for a tool-permission prompt; `PermissionRequest` is a dead name
-        // in current Claude. `--filter-notification` gates the emit on the
-        // payload's `notification_type` so only a real permission ask reports
-        // needs_approval.
-        HookSpec {
-            event: "Notification",
-            matcher: None,
-            command: format!("'{quoted}' agent-status --state needs_approval --filter-notification"),
-        },
-        HookSpec {
-            event: "Stop",
-            matcher: None,
-            command: cmd("idle"),
-        },
-    ]
+    let claude = crate::agent_hook_dialects::dialect_for_slug("claude")
+        .expect("the Claude dialect is a compile-time table entry");
+    crate::agent_hook_dialects::hook_specs(claude, binary_path)
 }
 
 /// Append one `{matcher?, hooks:[{type:command, command, async}]}` entry to the
@@ -296,10 +265,29 @@ pub fn last_assistant_message_from_hook_json(stdin_json: &str) -> Option<String>
     {
         return Some(msg);
     }
-    // 2. Fallback: scan the transcript tail. `str::lines()` is double-ended, so
-    // `.rev()` walks newest-first without allocating a Vec; we stop at the first
-    // assistant line that has text.
+    // 2. Fallback: the transcript the payload points at.
     let path = value.get("transcript_path")?.as_str()?;
+    last_assistant_from_transcript(Path::new(path))
+}
+
+/// The newest assistant reply in a JSONL transcript, or `None` when the file is
+/// unreadable, unparseable, or holds no assistant text.
+///
+/// `str::lines()` is double-ended, so `.rev()` walks newest-first without
+/// allocating a Vec; the walk stops at the first assistant line that has text.
+///
+/// Three line shapes are recognised, because the agents that hand over only a
+/// path do not agree on one and each was measured from a real transcript:
+///
+/// * `{"type":"assistant","message":{"content":[{"type":"text",…}]}}`
+/// * `{"type":"message","message":{"role":"assistant","content":[…]}}`
+/// * `{"type":"assistant.message","data":{"content":"…"}}` — content is a
+///   plain string here, not an array of parts.
+///
+/// Trying all three per line rather than selecting by agent is deliberate: the
+/// shapes are disjoint (no line satisfies two), so a wrong guess is impossible,
+/// and an agent that changes which one it writes keeps working.
+pub(crate) fn last_assistant_from_transcript(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     for line in text.lines().rev() {
         let line = line.trim();
@@ -309,20 +297,38 @@ pub fn last_assistant_message_from_hook_json(stdin_json: &str) -> Option<String>
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if entry.get("type").and_then(Value::as_str) != Some("assistant") {
-            continue;
-        }
-        let content = entry.get("message").and_then(|m| m.get("content"));
-        if let Some(msg) = assistant_text_from_content(content) {
+        if let Some(msg) = assistant_text_from_entry(&entry) {
             return Some(msg);
         }
     }
     None
 }
 
+/// The assistant text in one transcript line, whichever shape it is written in.
+fn assistant_text_from_entry(entry: &Value) -> Option<String> {
+    let kind = entry.get("type").and_then(Value::as_str)?;
+    match kind {
+        // A line that names the role in its type.
+        "assistant" => assistant_text_from_content(entry.get("message")?.get("content")),
+        // A generic message line that names the role inside.
+        "message" => {
+            let message = entry.get("message")?;
+            if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                return None;
+            }
+            assistant_text_from_content(message.get("content"))
+        }
+        // A dotted event stream, where the reply is one flat string.
+        "assistant.message" => {
+            normalize_message(entry.get("data")?.get("content")?.as_str()?)
+        }
+        _ => None,
+    }
+}
+
 /// Collapse whitespace to a single line and cap at [`MAX_MSG_LEN`] chars.
 /// `None` when nothing is left after trimming.
-fn normalize_message(raw: &str) -> Option<String> {
+pub(crate) fn normalize_message(raw: &str) -> Option<String> {
     let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         return None;

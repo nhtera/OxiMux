@@ -67,18 +67,16 @@ pub fn save(settings: &AgentLaunchSettings) -> std::io::Result<()> {
 }
 
 fn apply(cx: &mut App, settings: AgentLaunchSettings) {
-    // Mirror the toggle into each agent's own global hooks file so a hand-typed
-    // `claude`/`codex` in any pane reports status too (picker agents already get
+    // Mirror the toggle into every agent's own global hooks file so an agent
+    // typed by hand in any pane reports status too (picker agents already get
     // the same hooks via `--settings`; the command strings match, so Claude's
-    // hook dedup keeps them firing once). Runs at boot and on every live edit,
-    // so flipping the toggle installs or removes the global hooks without a
-    // restart. The env override force-enables it like the per-spawn path does.
+    // hook dedup keeps them firing once). This is what turns those rows from a
+    // bare status verb into the agent's actual reply. Runs at boot and on every
+    // live edit, so flipping the toggle installs or removes the global hooks
+    // without a restart. The env override force-enables it like the per-spawn
+    // path does.
     let hooks_on = settings.status_hooks_enabled || crate::agent_status_hooks::env_forced();
     crate::agent_hooks_global::sync_global_status_hooks(hooks_on);
-    // Codex is what turns its rail rows from a bare status verb into the
-    // agent's actual reply. Gated on the same toggle, and Codex still asks the
-    // user to trust the hook before it runs any of it.
-    crate::agent_hooks_global::sync_global_codex_hooks(hooks_on);
     cx.set_global(settings);
 }
 
