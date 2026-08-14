@@ -4,6 +4,57 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-08-14 — unreleased: the rest of the agents report what they said (`main`)
+
+- **`7631b3f`** — status hooks for every agent CLI OxiMux names, not just two.
+  Codex closed the gap for one agent; the same gap was open for the other six,
+  because presence and activity can be inferred from outside an agent but only
+  the agent can say what it SAID. The two hand-written installs are now one
+  table (`agent_hook_dialects`): the file's path, how one entry is spelled in
+  it, the event names, and the key carrying the reply are data, so an agent is
+  a row rather than a module. Seven agents install into a hooks file — Claude,
+  Codex, Droid, GitHub Copilot, Gemini, Cursor, Grok — and each brought a
+  difference that would have installed cleanly and never fired: Gemini counts
+  its timeout in **milliseconds** where the rest count seconds, Grok's tool
+  matcher is a **regular expression** so the `*` everyone else uses matches
+  nothing, and Copilot's and Cursor's entries are **flat** — a nested group
+  written into one of those parses as an entry with no command at all.
+  Copilot and Grok read a *directory* of hook files, so OxiMux writes its own
+  and deletes it to uninstall rather than merging into the user's.
+
+  Pi has no hooks file: its extension point is an in-process TypeScript API, so
+  OxiMux writes a small extension that subscribes to Pi's own events and shells
+  out to the same `oximux agent-status` CLI as everything else, composing its
+  payload in Claude's key names so nothing downstream is Pi-shaped. Pi emits
+  the reply *before* the turn ends and fires two events at each end of a turn,
+  so the extension holds the reply until `agent_end` and drops a report
+  identical to the one before it. It is inert outside an OxiMux pane.
+
+  The sweep also turned up a leak already in the field. Our entries were found
+  again only by the `_oximux_managed` marker, so any written before that marker
+  existed were invisible and never pruned — a real `~/.claude/settings.json`
+  held sixteen of them across four superseded binary paths, and Claude was
+  running five copies of the hook on every event with one more due at each new
+  path. The command an entry runs now identifies it as ours too, so the next
+  sync collects them.
+
+  Two rules the sweep made necessary. **An agent's home is never created** —
+  syncing eight files would otherwise drop `~/.cursor`, `~/.grok` and the rest
+  on a user who has installed none of them, so a hooks file is written only
+  into a directory the agent already made. And the turn-end reply now comes
+  from a transcript reader that recognises three line shapes rather than
+  Claude's alone, because Copilot and Droid hand over only a path and neither
+  writes Claude's schema.
+
+  Verified live where an account allowed it: Copilot ran a full turn through
+  all six of its events, and Pi reported prompt, tool and reply end to end.
+  Droid's own hook log shows our entries matched, executed and accepted, but
+  its account has no active subscription so no turn completes. Gemini, Cursor
+  and Grok are unverified against a running agent. Amp and OpenCode need a
+  plugin source of their own and are not attempted; Aider has no hook surface.
+
+---
+
 ### 2026-08-14 — v0.1.11: every agent in the rail, and what it said (`main`)
 
 - **`2819688`** — a terminal's agent is now detected from its process tree.
