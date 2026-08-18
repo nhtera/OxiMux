@@ -280,6 +280,85 @@ jobs:
             exit 1
           fi
 
+  # The only job that measures anything at runtime. Every other job here is
+  # check/test/package: they prove the code compiles and behaves, and say
+  # nothing at all about what it retains — which is how a residency regression
+  # ships. `scripts/mem-smoke.sh` boots a real `oximux serve`, streams real
+  # agent partials at it through a fixture built for the purpose, and samples
+  # the host's RSS at four checkpoints.
+  #
+  # Linux, and only Linux, on purpose. Not a preference — a constraint: no job
+  # in this file boots a GPUI window, so the GUI half of residency (sprite
+  # atlas, decoded images, the transcript's render caches) is out of reach of
+  # CI entirely. What IS reachable is the engine half, which is where this
+  # plan's allocations live, and `oximux serve` is exactly that half with no
+  # window attached. Read a green run as "the headless surface did not
+  # regress", never as "memory is fine" — the script's own header says which
+  # macOS commands to reach for when a user report disagrees with this gate.
+  #
+  # Thresholds are deliberately loose and live in the script. They exist to
+  # catch the class of regression this plan is about (retention in the tens of
+  # multiples, a monotonic idle ratchet), not to police single-digit percent
+  # drift on a shared runner. Tighten them from numbers this job has actually
+  # produced across several runs — a flaky gate gets ignored, which is worse
+  # than a loose one.
+  mem-smoke:
+    name: memory smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      # Shares linux-check's cache key on purpose: that job builds the same
+      # crate set with the same profile, so whichever runs first warms the
+      # other. A separate key would double the cache for no benefit.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: cargo build (oximux-cli)
+        run: cargo build -p oximux-cli
+
+      # `--check` turns the thresholds on; without it the script only reports.
+      # The JSON is uploaded rather than only printed so a later phase can diff
+      # its numbers against this run's without re-reading a log.
+      - name: mem-smoke
+        run: ./scripts/mem-smoke.sh --check --json mem-smoke.json
+        env:
+          OXIMUX_MEM_CLI: target/debug/oximux-cli
+          # Set HERE rather than inherited from the script's defaults, and set
+          # wide, because no Linux number for this workload exists yet — the
+          # script's defaults come from a macOS band (8.1x-9.5x steady-state
+          # retention, release profile) and glibc is not obliged to land in the
+          # same place. A first run that goes red on an uncalibrated threshold
+          # blocks merges and teaches everyone to ignore this job.
+          #
+          # These are calibration values with one job: catch the class of
+          # regression this plan is about. Tighten them to the observed Linux
+          # band once several runs exist, record that band in the script header
+          # next to the macOS one, and then drop these overrides so the
+          # defaults are the single source of truth.
+          OXIMUX_MEM_MAX_RETENTION_MULTIPLE: 20
+          OXIMUX_MEM_MAX_IDLE_GROWTH_KB: 32768
+          OXIMUX_MEM_MAX_REOPEN_MS: 8000
+
+      # `always()`, because the run that FAILED a threshold is the one whose
+      # numbers someone needs to read.
+      - name: Upload mem-smoke numbers
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mem-smoke-${{ github.run_id }}
+          path: mem-smoke.json
+          if-no-files-found: warn
+
   # The ARM twin of linux-check's "musl build gate": aarch64-unknown-linux-musl
   # joins the release matrix, so its first execution must not be a release
   # attempt. Its own job rather than a step in linux-check because musl-gcc
