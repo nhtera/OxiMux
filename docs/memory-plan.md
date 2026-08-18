@@ -132,6 +132,72 @@ measured "no", not a "we didn't try".
   numbers.
 - This document.
 
+## 4a. GPUI asset release at the pinned rev — available, no fork needed
+
+Recorded because the transcript work planned around the opposite answer.
+
+The pinned GPUI **does** expose everything needed to give an image back:
+
+| API | What it frees |
+|---|---|
+| `Image::get_render_image(self: Arc<Self>, window, cx)` | (reads) the decoded `Arc<RenderImage>` from the asset cache |
+| `App::drop_image(Arc<RenderImage>, Option<&mut Window>)` | the GPU **sprite-atlas tile**, on every window |
+| `Image::remove_asset(self: Arc<Self>, cx)` | the decoded bitmap in the **asset cache** |
+
+Order matters: `drop_image` needs the `Arc<RenderImage>`, and the only public
+route to it is asking the asset cache — so it must happen *before*
+`remove_asset` evicts the entry that answer comes from.
+`apps/desktop/src/shell/agent_chat/image_cache.rs::release` does exactly this.
+
+Two things worth knowing before trusting a cache eviction to reclaim memory:
+
+- **Three copies, not one.** An attached image is resident as encoded bytes
+  (ours), a decoded RGBA `RenderImage` (GPUI's asset cache), and an atlas tile
+  (GPU). A ~2MB screenshot decodes to ~33MB. Dropping only our `Arc` reclaims
+  the *smallest* of the three, which is how an eviction can look implemented and
+  free almost nothing.
+- **`App::remove_asset` alone does not free the tile.** It removes the entry
+  from `loading_assets` and nothing else. An eviction path that calls only
+  `remove_asset` leaves the GPU allocation behind.
+
+## 4b. Phase 2 — the publish path, and why a revision gate was the wrong tool
+
+`AgentChatView::publish_remote_transcript` re-serialized the whole fold on every
+settled batch, so a turn making twenty tool calls re-serialized the entire
+conversation twenty times, each pass O(all entries ever).
+
+The planned fix was a revision gate, mirroring the one persistence uses
+(`crates/agent-core/src/thread/state.rs`). **It cannot skip anything here.**
+`ChatThread::apply` calls `touch()` unconditionally on entry — deliberately, its
+comment says an event that folds to nothing still bumps — and the publish is
+reached only after a non-empty non-delta batch has been applied. Every call
+therefore arrives at a fresh revision. The gate would compile, read as a fix,
+and never once skip.
+
+The same gate *does* work in the headless host (`apps/cli/src/serve/pump.rs`),
+and the difference is instructive: there it is consulted from a 10-second timer
+tick, which can fire with no intervening event. **A revision gate is only worth
+anything where the caller can arrive without a mutation.** A per-batch caller
+never can.
+
+What removes the work is coalescing, which the design already permits — the
+snapshot exists for a client *opening* the session, and one opening mid-stream
+folds live deltas from the backlog on top of it. Publishing is now throttled to
+one per 250ms with a trailing publish, so staleness stays bounded when events
+stop. Bind and rekey bypass the throttle: a freshly bound peer holds no snapshot
+at all and must not wait.
+
+**Not measurable by `scripts/mem-smoke.sh`, structurally.** Both of Phase 2's
+defects live in `apps/desktop`, which links GPUI; the harness measures
+`oximux serve`, which is `oximux-cli`, which a CI gate explicitly forbids from
+linking GPUI. There is no workload the harness can run that reaches this code.
+What Phase 2 changes is bounded analytically instead: the image cache moves from
+*unbounded* (no `remove`, `clear` or `retain` existed anywhere in the crate) to a
+64MB encoded ceiling with full three-copy release, and the publish path from
+O(transcript) per settled event to O(transcript) per 250ms. A GUI-side
+`vmmap` measurement over an image-heavy session is still owed; see section 1 for
+why CI cannot supply it.
+
 ## 5. Standing expectations for later phases
 
 Every phase from 2 onward:
@@ -147,3 +213,4 @@ Every phase from 2 onward:
 |---|---|---|---|---|---|
 | 2026-08-18 | 1 (baseline) | 19.4 MB | 73–78 MB | 8.35×–9.15× | release, macOS, 16×400KB |
 | 2026-08-18 | 1 (baseline) | 35.0 MB | 96 MB | 9.55× | debug, macOS, 16×400KB (harness default) |
+| 2026-08-19 | 2 | — | — | — | desktop-only; unmeasurable by this harness (section 4b). Image cache bounded at 64MB from unbounded; publish coalesced to 250ms |

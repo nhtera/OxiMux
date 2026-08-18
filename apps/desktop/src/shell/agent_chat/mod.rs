@@ -41,12 +41,14 @@ mod diff_card;
 mod error_card;
 mod find_bar;
 mod image_attach;
+mod image_cache;
 mod jump_menu;
 mod login_card;
 mod message_rail;
 mod pending_edit;
 mod plan_approval_card;
 mod plan_panel;
+mod publish_throttle;
 mod question_card;
 mod remote_turn;
 mod turn_summary_card;
@@ -301,7 +303,7 @@ fn fold_probe_result(
 
 /// Decoded user-attached image thumbnails, memoized by `(entry index, image
 /// index)`. Interior-mutable so the immutable `render` path can fill it lazily.
-type ImageCache = RefCell<HashMap<(usize, usize), Option<Arc<Image>>>>;
+use image_cache::ImageCache;
 
 /// Events the chat view raises for its host (the pane group) to act on.
 pub enum AgentChatEvent {
@@ -613,6 +615,11 @@ pub struct AgentChatView {
     /// the visible tab renders) or on an explicit remote open. Cleared by
     /// [`Self::ensure_connected`]; `respawn` owns the actual connect.
     dormant: bool,
+    /// Leading-edge throttle for the remote transcript snapshot. Sits beside
+    /// `last_saved_revision` because it answers the same shape of question for
+    /// the other O(transcript) publisher — but by coalescing rather than by
+    /// comparing revisions, which cannot skip here (see `publish_throttle`).
+    publish_throttle: publish_throttle::PublishThrottle,
     /// The [`ChatThread::revision`] the last committed save persisted;
     /// inequality with the live counter means the on-disk blob is stale.
     /// Set only by [`Self::commit_transcript_save`] after a write succeeds;
@@ -1406,6 +1413,7 @@ impl AgentChatView {
             // Dormant restores boot resumable-idle: a send respawns via --resume.
             interrupted: mode == ConnectMode::DormantResume,
             dormant: mode == ConnectMode::DormantResume,
+            publish_throttle: publish_throttle::PublishThrottle::new(),
             last_saved_revision: std::cell::Cell::new(u64::MAX),
             meta_dirty: std::cell::Cell::new(false),
             unbound: mode == ConnectMode::UnboundDraft,
@@ -1422,7 +1430,7 @@ impl AgentChatView {
             thinking_level: ThinkingLevel::default(),
             expanded_tool_calls: HashSet::new(),
             expanded_tool_runs: HashSet::new(),
-            image_cache: RefCell::new(HashMap::new()),
+            image_cache: ImageCache::new(),
             preview: None,
             open_tool_sheet: None,
             sheet_copied: false,
@@ -3339,6 +3347,7 @@ impl AgentChatView {
             disconnected: false,
             interrupted: false,
             dormant: false,
+            publish_throttle: publish_throttle::PublishThrottle::new(),
             last_saved_revision: std::cell::Cell::new(u64::MAX),
             meta_dirty: std::cell::Cell::new(false),
             // The test injects a live connection, so this chat is already bound.
@@ -3354,7 +3363,7 @@ impl AgentChatView {
             thinking_level: ThinkingLevel::default(),
             expanded_tool_calls: HashSet::new(),
             expanded_tool_runs: HashSet::new(),
-            image_cache: RefCell::new(HashMap::new()),
+            image_cache: ImageCache::new(),
             preview: None,
             open_tool_sheet: None,
             sheet_copied: false,
@@ -3597,8 +3606,11 @@ impl AgentChatView {
             // A settled event landed (message, tool result, turn end): refresh the
             // published transcript so a newly-opening remote client's authoritative
             // history is current. Gated with the non-delta repaint so it never runs
-            // on the per-token hot path.
-            self.publish_remote_transcript();
+            // on the per-token hot path, and coalesced on top of that — a turn
+            // making twenty tool calls otherwise re-serialized the whole fold
+            // twenty times. See `publish_throttle` for why a revision gate (the
+            // shape persistence uses) cannot skip anything here.
+            self.publish_remote_transcript_throttled(cx);
             self.notify_now(cx);
         }
     }
@@ -4093,25 +4105,6 @@ impl AgentChatView {
         }
         self.remote_tab_title = title;
         self.publish_remote_meta();
-    }
-
-    /// Publish the folded transcript to the registry so a remote client opening this
-    /// session renders full history. Called on bind (to expose a restart-restored
-    /// fold that never entered the event ring) and after each settled batch (to keep
-    /// the snapshot current). Deliberately NOT on per-token delta batches — a whole-
-    /// transcript reserialization per token would be wasteful, and a client opening
-    /// mid-stream folds those deltas from the live backlog on top of the last settled
-    /// snapshot anyway. No-op when remote is disabled or the transcript won't
-    /// serialize (a half-serialized snapshot is worse than keeping the prior one).
-    fn publish_remote_transcript(&self) {
-        let Some(binding) = &self.remote else {
-            return;
-        };
-        let Ok(entries_json) = serde_json::to_string(&self.thread.entries) else {
-            return;
-        };
-        let model = self.thread.model.clone().or_else(|| self.model.clone());
-        binding.publish_transcript(entries_json, model);
     }
 
     fn on_disconnect(&mut self, cx: &mut Context<Self>) {
@@ -4671,13 +4664,12 @@ impl AgentChatView {
     /// hold only images that can actually be opened; the gap is drawn separately
     /// by [`Self::undecodable_images`].
     fn decoded_images(&self, idx: usize, images: &[ChatImage]) -> Vec<Arc<Image>> {
-        let mut cache = self.image_cache.borrow_mut();
         let mut out = Vec::with_capacity(images.len());
         for (i, chat) in images.iter().enumerate() {
-            let decoded =
-                cache.entry((idx, i)).or_insert_with(|| image_attach::decode_render(chat));
-            if let Some(arc) = decoded {
-                out.push(arc.clone());
+            if let Some(arc) =
+                self.image_cache.get_or_decode((idx, i), || image_attach::decode_render(chat))
+            {
+                out.push(arc);
             }
         }
         out
@@ -5724,6 +5716,11 @@ impl Focusable for AgentChatView {
 
 impl Render for AgentChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Once per frame, before anything decodes: attachment images are cached
+        // by the render path, which has no `Window` to release them with, so the
+        // cache is allowed over budget until here. Overshooting by one frame of
+        // newly-visible images is the cheap direction to be wrong in.
+        self.image_cache.evict(window, cx);
         // A dormant restored chat connects on its first render — rendering is
         // the visibility signal (hidden tabs never render). Deferred off the
         // paint pass: the connect forks the agent process (plus a `codesign`
