@@ -174,6 +174,7 @@ jobs:
           -p oximux-agent-core
           -p oximux-agents
           -p oximux-storage
+          -p oximux-markdown
           -p oximux-relay-proto
           -p oximux-relay
           -p oximux-relay-client
@@ -267,6 +268,23 @@ jobs:
             echo "Regenerate it:  ./scripts/gen-cli-docs.sh > docs/cli-reference.md"
             exit 1
           fi
+
+      # `oximux-markdown` exists to be the half of markdown rendering that has
+      # no opinion about pixels, and "no GPUI dependency" is the property that
+      # makes it unit-testable in isolation. A rule nothing enforces is a rule
+      # that lasts until the first time rendering would be convenient to add
+      # here — so enforce it, the same way the CLI's tree is enforced below.
+      - name: markdown crate links no UI toolkit
+        run: |
+          cargo tree -p oximux-markdown -e normal > /tmp/md-tree.txt
+          if grep -E '(^| )(gpui|gpui_platform|gpui-component)( |$)' /tmp/md-tree.txt; then
+            echo "oximux-markdown must not depend on a UI toolkit (see matches above)"
+            exit 1
+          fi
+          echo "oximux-markdown tree is toolkit-free"
+
+      - name: cargo test (markdown parity corpus)
+        run: cargo test -p oximux-markdown
 
       # The serve binary's dependency hygiene, as a hard gate: the CLI must
       # never link the GUI toolkit or the desktop-only capability stacks. A

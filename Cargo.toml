@@ -18,6 +18,7 @@ members = [
     "crates/macos-trust",
     "crates/auto-update",
     "crates/editor",
+    "crates/markdown",
     "crates/storage",
     "crates/settings",
     "crates/relay-proto",
@@ -54,6 +55,7 @@ oximux-ui       = { path = "crates/ui" }
 oximux-core     = { path = "crates/core" }
 # Owner-only access for the secrets we write to disk. Its own crate because the
 # desktop app, the relay daemon and the remote host share no other dependency.
+oximux-markdown  = { path = "crates/markdown" }
 oximux-owner-only = { path = "crates/owner-only" }
 # Windows tree-kill for agent CLIs and terminal PTYs. Its own crate for the same
 # reason as owner-only: the relay and the agents crate share no dependency.
@@ -318,6 +320,15 @@ similar = "2.6"
 # extra build deps. Bundled syntaxes cover Rust/TS/Markdown/TOML/JSON
 # out of the box. Loaded lazily via `LazyLock` so workspace open isn't
 # blocked on the ~30 ms first-call set-load.
+# Block-level markdown parsing for the chat transcript. `into_offset_iter` is
+# the reason for this crate specifically: it reports a byte range per event, and
+# without those ranges an incremental reparse has nothing to anchor on.
+#
+# Pinned to a minor version on purpose. Range reporting and GFM specifics drift
+# between releases, and `crates/markdown/tests/parity.rs` is the only thing in
+# the tree that would catch it — so a bump is a change that must re-run that
+# corpus, not a routine dependency refresh.
+pulldown-cmark = { version = "0.13", default-features = false }
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
 
 [profile.dev]
