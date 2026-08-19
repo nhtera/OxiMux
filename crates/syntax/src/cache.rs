@@ -105,6 +105,43 @@ impl HighlightCache {
         doc
     }
 
+    /// The highlighting for `source` **only if it is already computed**.
+    ///
+    /// The half of [`Self::get`] a caller wants when it cannot afford to
+    /// tokenize on the calling thread: a UI that must return an element this
+    /// frame asks here, draws plain on a miss, and computes the result
+    /// elsewhere. Counts as a hit or a miss like `get` does, because a peek
+    /// that missed is exactly as much a miss.
+    pub fn peek(&mut self, lang: &LanguageId, source: &str) -> Option<Arc<HighlightedDocument>> {
+        let key = Self::key(lang, source);
+        self.clock += 1;
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.used = self.clock;
+            self.hits += 1;
+            return Some(Arc::clone(&entry.doc));
+        }
+        self.misses += 1;
+        None
+    }
+
+    /// Store a result computed elsewhere, under the same key [`Self::peek`]
+    /// looks up.
+    ///
+    /// Recomputing an entry that is already present would only churn the LRU,
+    /// so an existing key is left alone and merely touched.
+    pub fn insert(&mut self, lang: &LanguageId, source: &str, doc: Arc<HighlightedDocument>) {
+        let key = Self::key(lang, source);
+        self.clock += 1;
+        if let Some(entry) = self.entries.get_mut(&key) {
+            entry.used = self.clock;
+            return;
+        }
+        let spans = doc.span_count();
+        self.spans += spans;
+        self.entries.insert(key, Entry { doc, spans, used: self.clock });
+        self.evict_to_bounds();
+    }
+
     /// Hits and misses since construction, for tests and for anyone wondering
     /// whether the key is doing its job. A cache whose hit rate is near zero is
     /// worse than no cache, and this is how that becomes visible.
@@ -166,6 +203,44 @@ mod tests {
 
     fn rust() -> LanguageId {
         detect(None, Some("rust"), "").expect("rust grammar")
+    }
+
+    /// The split-`get` path: a caller that cannot tokenize on its own thread
+    /// peeks, draws plain, computes elsewhere, and inserts under the key the
+    /// next peek will look up.
+    #[test]
+    fn peek_misses_until_insert_then_hits() {
+        let mut cache = HighlightCache::default();
+        let lang = rust();
+        let src = "let x = 1;\n";
+
+        assert!(cache.peek(&lang, src).is_none(), "nothing computed yet");
+        assert_eq!(cache.stats(), (0, 1), "a peek that missed is a miss");
+
+        let doc = Arc::new(crate::highlight(&lang, src));
+        cache.insert(&lang, src, doc);
+
+        let got = cache.peek(&lang, src).expect("inserted under the peeked key");
+        assert!(got.span_count() > 0);
+        assert_eq!(cache.stats(), (1, 1));
+    }
+
+    /// Inserting the same source twice must not double-count its spans against
+    /// the retention bound — that would evict live entries to make room for a
+    /// duplicate of something already held.
+    #[test]
+    fn inserting_twice_does_not_double_count() {
+        let mut cache = HighlightCache::default();
+        let lang = rust();
+        let src = "fn main() {}\n";
+        let doc = Arc::new(crate::highlight(&lang, src));
+
+        cache.insert(&lang, src, Arc::clone(&doc));
+        let after_first = cache.retained_spans();
+        cache.insert(&lang, src, doc);
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.retained_spans(), after_first);
     }
 
     /// The point of the cache: identical source is highlighted once.

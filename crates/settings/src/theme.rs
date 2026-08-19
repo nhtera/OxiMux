@@ -94,6 +94,10 @@ pub struct Theme {
     /// Git status decoration palette — used by the workspace card status
     /// dot in the left rail and (later) the file explorer status badges.
     pub git: GitDecorations,
+
+    /// Token foregrounds for every code surface — chat fences today, the
+    /// diff body once it migrates off its bundled `.tmTheme`.
+    pub syntax: SyntaxPalette,
 }
 
 /// Per-status colors for git-decorated UI (workspace card dot,
@@ -107,6 +111,31 @@ pub struct GitDecorations {
     pub untracked: Hsla,
     pub copied: Hsla,
     pub ignored: Hsla,
+}
+
+/// Token foregrounds, one per neutral highlight kind.
+///
+/// Named for what a span *is*, never for a grammar's scope string — the
+/// highlighter hands out a small closed set of kinds precisely so a palette can
+/// be written once instead of per language. Foreground only: a syntax color that
+/// changed weight or size would change measured height, and highlighting is
+/// computed off the layout path exactly because it cannot.
+#[derive(Debug, Clone, Copy)]
+pub struct SyntaxPalette {
+    pub keyword: Hsla,
+    pub function: Hsla,
+    pub type_name: Hsla,
+    pub string: Hsla,
+    pub escape: Hsla,
+    pub number: Hsla,
+    pub comment: Hsla,
+    pub constant: Hsla,
+    pub operator: Hsla,
+    pub punctuation: Hsla,
+    pub variable: Hsla,
+    pub attribute: Hsla,
+    pub namespace: Hsla,
+    pub tag: Hsla,
 }
 
 impl Theme {
@@ -185,6 +214,32 @@ impl Theme {
                 untracked: rgb(0x9CC79A).into(),
                 copied: rgb(0x4DA8A8).into(),
                 ignored: rgb(0x6B7177).into(),
+            },
+
+            // The conventional dark-editor token hues the diff body already
+            // draws (keyword blue, string orange, comment green), lifted off
+            // the bundled `.tmTheme` and onto kinds so a palette change stops
+            // meaning a re-tokenization. Keeping the values identical is what
+            // lets a chat fence and a diff of the same file look like the same
+            // editor.
+            syntax: SyntaxPalette {
+                keyword: rgb(0x569CD6).into(),
+                function: rgb(0xDCDCAA).into(),
+                type_name: rgb(0x4EC9B0).into(),
+                string: rgb(0xCE9178).into(),
+                escape: rgb(0xD7BA7D).into(),
+                number: rgb(0xB5CEA8).into(),
+                comment: rgb(0x6A9955).into(),
+                constant: rgb(0x4FC1FF).into(),
+                // Operators and punctuation stay at the code default rather
+                // than taking a hue: coloring every `.`, `(` and `,` is what
+                // makes a highlighted block read as noise.
+                operator: rgb(0xD4D4D4).into(),
+                punctuation: rgb(0xD4D4D4).into(),
+                variable: rgb(0x9CDCFE).into(),
+                attribute: rgb(0x9CDCFE).into(),
+                namespace: rgb(0x4EC9B0).into(),
+                tag: rgb(0x569CD6).into(),
             },
         }
     }
