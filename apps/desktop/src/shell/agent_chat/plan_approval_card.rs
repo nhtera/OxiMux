@@ -29,6 +29,7 @@ pub(super) const MODE_DEFAULT: &str = "default";
 /// into ask-each-time mode, or keep planning (deny). Reuses the assistant
 /// markdown renderer for the body (`min_w_0` wrap-trap handled there).
 pub(super) fn render_plan_card(
+    md: &super::markdown_state::Markdown,
     tc: &ToolCall,
     req: &PermissionRequest,
     theme: Theme,
@@ -41,8 +42,12 @@ pub(super) fn render_plan_card(
     // Echo the request's own input (`{plan, planFilePath}`) as `updatedInput` —
     // the CLI treats a bare allow as malformed.
     let input = tc.input.clone();
-    // A stable, per-card key for the markdown renderer's internal state.
-    let md_key = tc.id.as_bytes().iter().fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(*b as usize));
+    // A stable, per-card key for the markdown renderer's internal state. Keyed
+    // on the tool call rather than on a transcript position: the card must stay
+    // addressable as entries above it come and go.
+    let md_key = super::markdown_state::MdKey::Plan(
+        tc.id.as_bytes().iter().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(*b as u64)),
+    );
 
     let heading = div()
         .flex()
@@ -57,7 +62,15 @@ pub(super) fn render_plan_card(
     let plan_body = div()
         .w_full()
         .min_w_0()
-        .child(bubble::assistant_body(md_key, req.description.trim(), typo));
+        .child(bubble::assistant_body(
+            md,
+            md_key,
+            req.description.trim(),
+            None,
+            theme,
+            density,
+            typo,
+        ));
 
     let accept_edits = {
         let (tool_id, request_id, input) = (tool_id.clone(), request_id.clone(), input.clone());

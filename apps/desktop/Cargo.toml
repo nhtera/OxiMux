@@ -51,6 +51,8 @@ oximux-remote-iroh = { workspace = true, features = ["host"] }
 oximux-remote-local = { workspace = true }
 oximux-remote-proto = { workspace = true }
 oximux-settings = { workspace = true, features = ["gpui"] }
+oximux-markdown = { workspace = true }
+oximux-syntax = { workspace = true }
 oximux-storage = { workspace = true }
 oximux-ui = { workspace = true }
 

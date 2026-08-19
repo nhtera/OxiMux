@@ -15,6 +15,9 @@ use oximux_agents::thread::{ToolCall, ToolCallStatus};
 use oximux_settings::{Density, Theme, Typography};
 use serde_json::Value;
 
+use super::markdown_render::{FindMark, MarkdownStyle};
+use super::markdown_state::{Markdown, MdKey, owned_renderer};
+
 /// A small role caption above a message ("You" / "Claude").
 pub(super) fn role_caption(label: &str, color: Hsla, typo: &Typography) -> impl IntoElement {
     div()
@@ -61,9 +64,39 @@ pub(super) fn user_body(
 /// text bubble so images and prose share the same right edge.
 pub(super) const USER_IMAGES_MAX_W: f32 = USER_BUBBLE_MAX_W;
 
-/// The assistant's visible reply, rendered as GitHub-flavored markdown. `key`
-/// discriminates the renderer's per-bubble state so two bubbles never share it.
-pub(super) fn assistant_body(key: usize, body: &str, typo: &Typography) -> AnyElement {
+/// The assistant's visible reply, rendered as GitHub-flavored markdown.
+///
+/// The one place chat chooses a markdown renderer. `key` identifies the message
+/// so the owned renderer can keep a parser for it — a streaming reply is
+/// re-rendered on every batch of tokens, and re-reading it whole each time is
+/// quadratic in its length.
+pub(super) fn assistant_body(
+    md: &Markdown,
+    key: MdKey,
+    body: &str,
+    find: Option<FindMark>,
+    theme: Theme,
+    density: Density,
+    typo: &Typography,
+) -> AnyElement {
+    if owned_renderer() {
+        let style =
+            MarkdownStyle::body(key, md.selection.clone(), theme, density, typo).with_find(find);
+        return div()
+            .w_full()
+            .min_w_0()
+            .child(md.render(key, body, &style))
+            .into_any_element();
+    }
+    legacy_assistant_body(key.seed() as usize, body, typo)
+}
+
+/// The previous renderer, one setting away.
+///
+/// Chat markdown is the most-looked-at surface in the product; keeping the path
+/// that shipped reachable for a release is worth more than the dead code costs.
+/// See [`owned_renderer`].
+fn legacy_assistant_body(key: usize, body: &str, typo: &Typography) -> AnyElement {
     // Dark-only app: pin the markdown renderer to the dark highlight theme (its
     // own default is a light code theme, which reads washed-out on the panel).
     let style = TextViewStyle {
@@ -113,6 +146,34 @@ pub(super) fn assistant_body(key: usize, body: &str, typo: &Typography) -> AnyEl
 /// source otherwise). `key` discriminates the renderer's per-block state so two
 /// thinking blocks never share it.
 pub(super) fn thinking_body(
+    md: &Markdown,
+    key: MdKey,
+    text: &str,
+    theme: Theme,
+    density: Density,
+    typo: &Typography,
+) -> AnyElement {
+    if owned_renderer() {
+        let style = MarkdownStyle::thinking(key, md.selection.clone(), theme, density, typo);
+        return thinking_frame(theme, density, typo).child(md.render(key, text, &style)).into_any_element();
+    }
+    legacy_thinking_body(key.seed() as usize, text, theme, density, typo)
+}
+
+/// The muted, left-ruled frame a thinking trace reads inside, shared by both
+/// renderers so the escape hatch changes the text and nothing around it.
+fn thinking_frame(theme: Theme, density: Density, typo: &Typography) -> gpui::Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .border_l_2()
+        .border_color(theme.border_inactive)
+        .pl(px(density.pad_panel))
+        .text_size(px(typo.t_body_sm))
+        .text_color(theme.fg_muted)
+}
+
+fn legacy_thinking_body(
     key: usize,
     text: &str,
     theme: Theme,
@@ -124,16 +185,10 @@ pub(super) fn thinking_body(
         highlight_theme: HighlightTheme::default_dark(),
         ..Default::default()
     };
-    div()
-        .w_full()
-        // Same wrap trap as `assistant_body`: markdown reports its longest
-        // unwrapped line as min-content, so zero the min-width to force wrapping.
-        .min_w_0()
-        .border_l_2()
-        .border_color(theme.border_inactive)
-        .pl(px(density.pad_panel))
-        .text_size(px(typo.t_body_sm))
-        .text_color(theme.fg_muted)
+    // Same wrap trap as the assistant body: markdown reports its longest
+    // unwrapped line as min-content, so the frame's `min_w_0` is what forces
+    // wrapping rather than overflow.
+    thinking_frame(theme, density, typo)
         .child(
             TextView::markdown(("chat-thinking-md", key), text.to_string())
                 .style(style)

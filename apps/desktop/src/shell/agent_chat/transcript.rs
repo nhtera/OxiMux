@@ -420,8 +420,14 @@ impl AgentChatView {
         };
         self.stick_to_bottom = false;
         self.scroll_to_row(child_ix);
-        self.flash_entry = Some(entry_idx);
-        self.flash_frames = FLASH_FRAMES;
+        // No flash when the find bar drove this. The flash existed to say
+        // "somewhere in this message" while the matched ranges were
+        // unreachable; the renderer marks them exactly now, and tinting the
+        // whole message on top of that only competes with the marks.
+        if self.find_bar.is_none() {
+            self.flash_entry = Some(entry_idx);
+            self.flash_frames = FLASH_FRAMES;
+        }
         cx.notify();
     }
 
@@ -657,12 +663,18 @@ impl AgentChatView {
                     if !msg.thinking.is_empty() && self.thinking_level != ThinkingLevel::Hidden {
                         let is_last = idx + 1 == self.thread.entries.len();
                         let expanded = self.thinking_expanded(idx, is_last, msg);
-                        block = block.child(thinking_block(
-                            idx, expanded, &msg.thinking, theme, density, &typo, cx,
-                        ));
+                        block = block.child(thinking_block(self, idx, expanded, &msg.thinking, cx));
                     }
                     if !msg.text.is_empty() {
-                        block = block.child(bubble::assistant_body(idx, &msg.text, &typo));
+                        block = block.child(bubble::assistant_body(
+                            &self.markdown,
+                            markdown_state::MdKey::Reply(idx),
+                            &msg.text,
+                            self.find_mark(idx),
+                            theme,
+                            density,
+                            &typo,
+                        ));
                     }
                     Some(block.into_any_element())
                 }
@@ -682,6 +694,7 @@ impl AgentChatView {
                 } else {
                     let expanded = self.expanded_tool_calls.contains(&tc.id);
                     let card = tool_card::render_tool_card(
+                        &self.markdown,
                         tc,
                         expanded,
                         self.provider_label(),
@@ -1105,6 +1118,101 @@ impl AgentChatView {
     }
 }
 
+/// A collapsible thinking disclosure: a clickable header (chevron + "Thinking")
+/// and, when expanded, the muted body. Built here rather than in `bubble` since
+/// the toggle needs a `Context` listener.
+fn thinking_block(
+    view: &AgentChatView,
+    idx: usize,
+    expanded: bool,
+    text: &str,
+    cx: &mut Context<AgentChatView>,
+) -> AnyElement {
+    let (theme, density, typo) = (view.theme, view.density, view.typography.clone());
+    let typo = &typo;
+    let chevron = if expanded { "▾" } else { "▸" };
+    let header = div()
+        .id(("agent-chat-thinking", idx))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(density.gap_inline))
+        .w_full()
+        .text_size(px(typo.t_label_xs))
+        .text_color(theme.fg_subtle)
+        .hover(|s| s.text_color(theme.fg_muted))
+        .on_click(cx.listener(move |this, _e, _window, cx| this.toggle_thinking(idx, cx)))
+        .child(SharedString::from(format!("{chevron} Thinking")));
+
+    let mut block = div().flex().flex_col().gap(px(2.0)).w_full().child(header);
+    if expanded {
+        block = block.child(bubble::thinking_body(
+            &view.markdown,
+            markdown_state::MdKey::Thinking(idx),
+            text,
+            theme,
+            density,
+            typo,
+        ));
+    }
+    block.into_any_element()
+}
+
+fn summary_line(text: &str, theme: Theme, typo: &Typography) -> AnyElement {
+    div()
+        .w_full()
+        .text_size(px(typo.t_label_xs))
+        .text_color(theme.fg_subtle)
+        .child(SharedString::from(text.to_string()))
+        .into_any_element()
+}
+
+/// A context-compaction / truncation divider — a centered muted label flanked by
+/// hairline rules, marking where imported history was summarized or capped.
+fn compaction_divider(summary: &str, theme: Theme, typo: &Typography) -> AnyElement {
+    let rule = || div().flex_1().h(px(1.0)).bg(theme.border_inactive);
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .w_full()
+        .gap(px(10.0))
+        .py(px(4.0))
+        .child(rule())
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(typo.t_label_xs))
+                .text_color(theme.fg_subtle)
+                .child(SharedString::from(summary.to_string())),
+        )
+        .child(rule())
+        .into_any_element()
+}
+
+/// The per-turn usage footer: input/output tokens, an optional context-window
+/// percentage, and cost when reported — a calm, muted caption.
+fn usage_footer(usage: &TurnUsage, theme: Theme, typo: &Typography) -> AnyElement {
+    let mut parts = vec![
+        format!("{} in", fmt_tokens(usage.input_tokens)),
+        format!("{} out", fmt_tokens(usage.output_tokens)),
+    ];
+    if let Some(window) = usage.context_window.filter(|w| *w > 0) {
+        let used = usage.input_tokens + usage.cache_read_tokens + usage.cache_creation_tokens;
+        let pct = ((used as f64 / window as f64) * 100.0).round() as u64;
+        parts.push(format!("{pct}% ctx"));
+    }
+    if let Some(cost) = usage.cost_usd.filter(|c| *c > 0.0) {
+        parts.push(format!("${cost:.3}"));
+    }
+    div()
+        .w_full()
+        .text_size(px(typo.t_label_xs))
+        .text_color(theme.fg_subtle)
+        .child(SharedString::from(parts.join(" · ")))
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1363,26 +1471,22 @@ mod tests {
     ///
     /// `scroll_to_reveal_item` resolves a downward jump by summing row heights
     /// through the target (list.rs:620), and rows the list has never laid out
-    /// are carried at an ESTIMATE: `remeasure_items` deliberately keeps the last
-    /// measurement as a hint rather than dropping to unknown, since an unknown
-    /// height blanks the scrollbar extent. So the plan's premise — wire
-    /// `remeasure_items` and jumps land correctly — does not hold. It makes the
-    /// row re-measure when next laid out; it does not fix the sum for a row that
-    /// is never laid out.
+    /// are carried at an ESTIMATE. So the first issue lands short, and what
+    /// makes it exact is re-issuing against the rows that issue caused to be
+    /// laid out — which is what `settle_pending_reveal` does.
     ///
-    /// What does fix it is re-issuing the reveal after a layout, which
-    /// `settle_pending_reveal` does. That correction runs on `on_next_frame`,
-    /// and **this harness does not drive frames** — `run_until_parked` leaves
-    /// those callbacks unrun — so what this test measures is the UNCORRECTED
-    /// landing. It therefore asserts the bound rather than exactness: the miss
-    /// must stay within one viewport, which is what proves the sums are merely
-    /// estimated rather than broken. A row model that lost track of an entry
-    /// misses by the whole transcript and fails here.
+    /// That correction rides `on_next_frame`, and **this harness does not drive
+    /// frames** — `run_until_parked` leaves those callbacks unrun — so the test
+    /// drives the loop itself. Verified to bite: stub out the re-issue and the
+    /// target lands 550px below a 503px viewport.
     ///
-    /// Verifying the correction itself needs a frame-driving harness or a
-    /// running app; it is on the phase's manual checklist.
+    /// Note what this does NOT prove. Stubbing out `remeasure_items` leaves it
+    /// passing, because the re-issue corrects the offset whether or not the
+    /// cache was marked stale. `remeasure_items` is kept for the scrollbar
+    /// extent rather than for jump accuracy, and that claim is currently
+    /// untested — see the phase notes.
     #[gpui::test]
-    async fn a_row_that_grew_off_screen_misses_a_later_jump_by_at_most_a_viewport(cx: &mut TestAppContext) {
+    async fn a_jump_past_a_row_that_grew_off_screen_still_converges(cx: &mut TestAppContext) {
         if !virtualized() {
             return;
         }
@@ -1449,32 +1553,58 @@ mod tests {
             .unwrap();
         vcx.run_until_parked();
 
-        // Jump down past it. The target must actually be on screen afterwards —
-        // "the scroll top is at or above it" would also be true of a jump that
-        // landed a thousand pixels short.
+        // Jump down past it.
+        //
+        // The first issue is expected to land short: it resolves its offset by
+        // summing heights, and the rows between here and the target were never
+        // laid out, so their heights are estimates. Re-issuing against the
+        // freshly measured rows is what makes it exact, and driving that loop
+        // by hand is what this test has to do — the correction rides
+        // `on_next_frame`, which the test harness does not run.
         window
             .update(&mut vcx.cx, |view, _window, cx| {
                 view.scroll_to_user_ordinal(12, cx);
             })
             .unwrap();
         vcx.run_until_parked();
-        window
+
+        let want = window
             .update(&mut vcx.cx, |view, _window, _cx| {
-                let want = view
-                    .thread
+                view.thread
                     .user_entry_index(12)
                     .and_then(|e| view.row_of_entry(e))
-                    .expect("the last turn has a row");
+                    .expect("the last turn has a row")
+            })
+            .unwrap();
+        for _ in 0..REVEAL_ATTEMPTS {
+            let settled = window
+                .update(&mut vcx.cx, |view, _window, _cx| {
+                    let viewport = view.scroll.list.viewport_bounds();
+                    let inside = view.scroll.list.bounds_for_item(want).is_some_and(|b| {
+                        b.top() >= viewport.top() && b.bottom() <= viewport.bottom()
+                    });
+                    if !inside {
+                        view.reveal_row_now(want);
+                    }
+                    inside
+                })
+                .unwrap();
+            if settled {
+                break;
+            }
+            vcx.run_until_parked();
+        }
+
+        window
+            .update(&mut vcx.cx, |view, _window, _cx| {
                 let viewport = view.scroll.list.viewport_bounds();
                 let bounds = view.scroll.list.bounds_for_item(want).unwrap_or_else(|| {
                     panic!("row {want} was not rendered at all after jumping to it")
                 });
-                let miss = bounds.top() - viewport.bottom();
                 assert!(
-                    bounds.top() >= viewport.top() && miss < viewport.size.height,
-                    "row {want} landed {miss:?} past the fold of {viewport:?} — \
-                     more than a viewport off means the heights are not merely \
-                     estimated, they are wrong",
+                    bounds.top() >= viewport.top() && bounds.top() < viewport.bottom(),
+                    "row {want} at {bounds:?} never converged into {viewport:?} — \
+                     the height cache is not merely estimating, it is wrong",
                 );
             })
             .unwrap();

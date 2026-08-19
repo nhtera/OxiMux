@@ -32,6 +32,7 @@ const RESULT_CHARS: usize = 4000;
 /// blocks when expanded.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_tool_card(
+    md: &super::markdown_state::Markdown,
     tc: &ToolCall,
     expanded: bool,
     provider: &str,
@@ -49,7 +50,7 @@ pub(super) fn render_tool_card(
     if let ToolCallStatus::WaitingForConfirmation(req) = &tc.status
         && req.kind == PermissionKind::Plan
     {
-        return plan_approval_card::render_plan_card(tc, req, theme, density, typo, cx);
+        return plan_approval_card::render_plan_card(md, tc, req, theme, density, typo, cx);
     }
 
     let awaiting = matches!(tc.status, ToolCallStatus::WaitingForConfirmation(_));

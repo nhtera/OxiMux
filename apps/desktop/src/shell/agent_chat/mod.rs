@@ -66,6 +66,9 @@ mod tool_bodies;
 mod tool_card;
 mod tool_sheet;
 mod tool_grouping;
+mod markdown_render;
+mod markdown_select;
+mod markdown_state;
 mod transcript;
 
 /// Install the ACP embedded-terminal host at app boot so ACP agents can drive
@@ -148,12 +151,14 @@ const AUTH_TERMINAL_KEY: &str = "__acp_auth_terminal__";
 const FOLLOW_FRAMES: u8 = 10;
 
 /// Shortest gap between transcript repaints while only streamed deltas are
-/// arriving (see [`AgentChatView::notify_throttled`]). Each repaint re-parses
-/// the whole growing markdown body, so an unthrottled fast model costs one full
-/// re-parse per token. 50 ms caps that at ~20 repaints/sec — well under a
-/// 60fps frame budget, and far faster than anyone reads, so streaming still
-/// looks continuous. Only deltas are throttled; anything the user can act on
-/// paints immediately.
+/// arriving (see [`AgentChatView::notify_throttled`]).
+///
+/// This used to guard a quadratic — every repaint re-read the whole growing
+/// reply — which the owned renderer's tail-only reparse removed. The reason
+/// that remains is plainer: a repaint lays out every visible row, and doing
+/// sixty of those a second to show text arriving faster than anyone reads it is
+/// work nobody sees. 50 ms caps it at ~20/sec, which still looks continuous.
+/// Only deltas are throttled; anything the user can act on paints immediately.
 const NOTIFY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// How many frames the jumped-to-message highlight lingers before it clears.
@@ -227,7 +232,6 @@ fn control_vocab_of(conn: Option<&dyn AgentConnection>) -> ControlVocab {
 
 pub use session_persistence::RestoredPosture;
 use session_persistence::{seed_posture_feature_values, ConnectMode};
-
 
 /// Overlay the user's optimistic feature picks onto the backend-advertised
 /// feature list so the composer reflects a toggle/select change immediately —
@@ -511,6 +515,9 @@ pub struct AgentChatView {
     /// its rows. Which half is live depends on [`transcript::virtualized`]; see
     /// [`transcript::ScrollState`].
     scroll: transcript::ScrollState,
+    /// Per-message markdown parsers, the chat's text selection, and fence
+    /// highlighting that lands after the frame that asked for it.
+    markdown: markdown_state::Markdown,
     /// Whether the transcript auto-follows the bottom. True by default and while
     /// the user stays at the end; set false when they scroll up to read history
     /// (so streaming doesn't yank them down), re-armed when they scroll back to
@@ -1321,6 +1328,7 @@ impl AgentChatView {
             flush_scheduled: false,
             focus_handle: cx.focus_handle(),
             scroll: transcript::ScrollState::new(),
+            markdown: markdown_state::Markdown::default(),
             stick_to_bottom: true,
             // Kick the follow so a restored transcript (which loads at
             // construction, not via `on_event`) is pinned to the true bottom
@@ -3253,6 +3261,7 @@ impl AgentChatView {
             probe_catalogs_live: false,
             focus_handle: cx.focus_handle(),
             scroll: transcript::ScrollState::new(),
+            markdown: markdown_state::Markdown::default(),
             stick_to_bottom: true,
             // Kick the follow so a restored transcript (which loads at
             // construction, not via `on_event`) is pinned to the true bottom
@@ -5103,6 +5112,12 @@ impl Render for AgentChatView {
         // The two transcript follow loops. Both inert unless in flight.
         self.settle_legacy_follow(window, cx);
         self.settle_pending_reveal(window, cx);
+        // Fences that missed their colors while this frame was being built.
+        // After the build, not during it: dispatching from inside the closure
+        // that decides what the frame looks like would be spawning work from
+        // the middle of a render.
+        self.markdown.retain_entries(self.thread.entries.len());
+        self.markdown.dispatch_highlighting(cx);
         // Fade out the jump highlight: the tinted bubble's alpha scales with
         // `flash_frames` in `render_transcript`, so drain the counter a frame at a
         // time (forcing a re-render each step) until it clears. A jump releases
@@ -5172,6 +5187,14 @@ impl Render for AgentChatView {
                     this.open_find(window, cx);
                 }
                 cx.stop_propagation();
+            }))
+            // ⌘C copies a transcript selection. Captured, because a focused
+            // composer would otherwise consume it first; see `copy_on_key` for
+            // why that is safe.
+            .capture_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _window, cx| {
+                if this.markdown.selection.copy_on_key(ev, cx) {
+                    cx.stop_propagation();
+                }
             }))
             // The Input context binds BOTH `enter` and `shift+enter` to the same
             // Enter{secondary:false} action, so the action alone can't tell them
@@ -5335,60 +5358,7 @@ fn diff_tab_key(diff: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
-fn summary_line(text: &str, theme: Theme, typo: &Typography) -> AnyElement {
-    div()
-        .w_full()
-        .text_size(px(typo.t_label_xs))
-        .text_color(theme.fg_subtle)
-        .child(SharedString::from(text.to_string()))
-        .into_any_element()
-}
 
-/// A context-compaction / truncation divider — a centered muted label flanked by
-/// hairline rules, marking where imported history was summarized or capped.
-fn compaction_divider(summary: &str, theme: Theme, typo: &Typography) -> AnyElement {
-    let rule = || div().flex_1().h(px(1.0)).bg(theme.border_inactive);
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .w_full()
-        .gap(px(10.0))
-        .py(px(4.0))
-        .child(rule())
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_size(px(typo.t_label_xs))
-                .text_color(theme.fg_subtle)
-                .child(SharedString::from(summary.to_string())),
-        )
-        .child(rule())
-        .into_any_element()
-}
-
-/// The per-turn usage footer: input/output tokens, an optional context-window
-/// percentage, and cost when reported — a calm, muted caption.
-fn usage_footer(usage: &TurnUsage, theme: Theme, typo: &Typography) -> AnyElement {
-    let mut parts = vec![
-        format!("{} in", fmt_tokens(usage.input_tokens)),
-        format!("{} out", fmt_tokens(usage.output_tokens)),
-    ];
-    if let Some(window) = usage.context_window.filter(|w| *w > 0) {
-        let used = usage.input_tokens + usage.cache_read_tokens + usage.cache_creation_tokens;
-        let pct = ((used as f64 / window as f64) * 100.0).round() as u64;
-        parts.push(format!("{pct}% ctx"));
-    }
-    if let Some(cost) = usage.cost_usd.filter(|c| *c > 0.0) {
-        parts.push(format!("${cost:.3}"));
-    }
-    div()
-        .w_full()
-        .text_size(px(typo.t_label_xs))
-        .text_color(theme.fg_subtle)
-        .child(SharedString::from(parts.join(" · ")))
-        .into_any_element()
-}
 
 /// Compact token count for the footer: `714`, `1.2k`, `16.7k`.
 fn fmt_tokens(n: u64) -> String {
@@ -5476,39 +5446,6 @@ fn assistant_header(
         .child(bubble::role_caption(provider, theme.fg_muted, typo))
         .child(actions)
         .into_any_element()
-}
-
-/// A collapsible thinking disclosure: a clickable header (chevron + "Thinking")
-/// and, when expanded, the muted body. Built here rather than in `bubble` since
-/// the toggle needs a `Context` listener.
-fn thinking_block(
-    idx: usize,
-    expanded: bool,
-    text: &str,
-    theme: Theme,
-    density: Density,
-    typo: &Typography,
-    cx: &mut Context<AgentChatView>,
-) -> AnyElement {
-    let chevron = if expanded { "▾" } else { "▸" };
-    let header = div()
-        .id(("agent-chat-thinking", idx))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(density.gap_inline))
-        .w_full()
-        .text_size(px(typo.t_label_xs))
-        .text_color(theme.fg_subtle)
-        .hover(|s| s.text_color(theme.fg_muted))
-        .on_click(cx.listener(move |this, _e, _window, cx| this.toggle_thinking(idx, cx)))
-        .child(SharedString::from(format!("{chevron} Thinking")));
-
-    let mut block = div().flex().flex_col().gap(px(2.0)).w_full().child(header);
-    if expanded {
-        block = block.child(bubble::thinking_body(idx, text, theme, density, typo));
-    }
-    block.into_any_element()
 }
 
 /// A hover-revealed icon action on a user message (Copy / Edit / Rewind).
