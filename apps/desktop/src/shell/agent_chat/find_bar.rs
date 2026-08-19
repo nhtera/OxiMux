@@ -120,14 +120,14 @@ impl AgentChatView {
             None => return,
         };
         // Keep only matches we can actually jump to. An entry hidden inside a
-        // collapsed >8-tool-call run has no scroll child (absent from
-        // `entry_child_ix`), so counting it would make `n/total` promise a jump
-        // that silently no-ops. v1 scope: find within the visible transcript.
+        // collapsed >8-tool-call run has no child of its own, so counting it
+        // would make `n/total` promise a jump that silently no-ops. v1 scope:
+        // find within the visible transcript.
         let matches: Vec<usize> = {
-            let child_ix = self.entry_child_ix.borrow();
+            let rendered = self.rendered_entries();
             recompute_matches(&self.thread.entries, &query)
                 .into_iter()
-                .filter(|i| child_ix.contains_key(i))
+                .filter(|i| rendered.contains(i))
                 .collect()
         };
         let first = matches.first().copied();

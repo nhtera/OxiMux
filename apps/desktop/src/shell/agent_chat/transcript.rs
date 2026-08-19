@@ -36,56 +36,83 @@ fn transcript_column(width: f32) -> gpui::Div {
     div().flex().flex_col().flex_shrink_0().w(px(width))
 }
 
-/// Compute, for each USER turn in order, its child index within the flattened
-/// transcript scroll box — the input to `ScrollHandle::scroll_to_item` for a
-/// jump. Each slice is indexed by entry position in transcript order:
-/// `produces[i]` = entry `i` rendered a direct child element; `is_user[i]` =
-/// it's a user turn; `has_expander[i]` = a collapsed-tool-run expander child is
-/// pushed right after it. Children are counted in the exact push order
-/// `render_transcript` uses, so the returned indices line up with the tracked
-/// `list_scroll` child bounds. Pure + unit-tested; render feeds it the live
-/// per-entry flags.
-fn user_turn_child_indices(produces: &[bool], is_user: &[bool], has_expander: &[bool]) -> Vec<usize> {
-    let mut child_ord = 0usize;
-    let mut out = Vec::new();
-    for (i, &produced) in produces.iter().enumerate() {
-        if produced {
-            if is_user.get(i).copied().unwrap_or(false) {
-                out.push(child_ord);
-            }
-            child_ord += 1;
-        }
-        if has_expander.get(i).copied().unwrap_or(false) {
-            child_ord += 1;
-        }
-    }
-    out
+/// One child of the transcript, in the order it is laid out.
+///
+/// Entries do **not** map one-to-one onto children, which is the entire reason
+/// this type exists. A tool call collapsed inside a long run renders nothing; a
+/// run expander renders a child with no [`ThreadEntry`] behind it at all; an
+/// assistant message that has not streamed a byte yet renders nothing either.
+/// Naming each child turns "which child is entry N" into a lookup instead of an
+/// accounting exercise over parallel flag arrays.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum TranscriptRow {
+    /// The entry at this transcript index, rendered normally.
+    Entry { entry_idx: usize },
+    /// The "N more" expander for the collapsed tool run starting at `run_start`.
+    /// No [`ThreadEntry`] corresponds to it.
+    Expander { run_start: usize },
 }
 
-/// Map every RENDERED entry's transcript index → its scroll-child index (for the
-/// in-chat find bar's jump-to-match), mirroring the push order in
-/// `render_transcript`: one child per producing row, plus one per trailing
-/// expander. Rows that produce no element are absent. Pure for unit testing.
-fn entry_child_indices(
-    entry_idx: &[usize],
-    produces: &[bool],
-    has_expander: &[bool],
-) -> Vec<(usize, usize)> {
-    let mut child_ord = 0usize;
-    let mut out = Vec::new();
-    for i in 0..produces.len() {
-        if produces[i] {
-            out.push((entry_idx[i], child_ord));
-            child_ord += 1;
-        }
-        if has_expander.get(i).copied().unwrap_or(false) {
-            child_ord += 1;
+impl TranscriptRow {
+    /// The entry behind this row, if any. `None` for an expander — which is the
+    /// distinction every reverse lookup here turns on.
+    fn entry(&self) -> Option<usize> {
+        match *self {
+            TranscriptRow::Entry { entry_idx } => Some(entry_idx),
+            TranscriptRow::Expander { .. } => None,
         }
     }
-    out
+}
+
+/// Whether an entry renders a child at all.
+///
+/// Exactly one entry kind can render nothing: an assistant message with no text
+/// streamed yet. It is spelled once and shared, because [`build_rows`] and the
+/// render loop disagreeing about it is precisely the bug the row model exists to
+/// prevent — one would count a child the other never pushed, and every jump
+/// target past that point would land a row off.
+fn produces_element(entry: &ThreadEntry) -> bool {
+    !matches!(entry, ThreadEntry::Assistant(msg) if msg.is_empty())
+}
+
+/// Flatten the transcript into the exact child sequence the render loop pushes.
+///
+/// Pure, so the ordering every jump / rail / find target resolves through is
+/// unit-testable without a window.
+pub(super) fn build_rows(entries: &[ThreadEntry], plan: &[EntryDisplay]) -> Vec<TranscriptRow> {
+    let mut rows = Vec::with_capacity(entries.len());
+    for (idx, entry) in entries.iter().enumerate() {
+        if matches!(plan[idx], EntryDisplay::Hide) {
+            continue;
+        }
+        if produces_element(entry) {
+            rows.push(TranscriptRow::Entry { entry_idx: idx });
+        }
+        // The expander trails its anchor as its own child — including when the
+        // anchor itself rendered nothing, which is what the flag-array
+        // accounting did and what keeps the two provably identical.
+        if let EntryDisplay::ShowThenExpander { run_start, .. } = plan[idx] {
+            rows.push(TranscriptRow::Expander { run_start });
+        }
+    }
+    rows
 }
 
 impl AgentChatView {
+    /// The child index of `entry_idx`, or `None` when that entry has no child —
+    /// it is hidden inside a collapsed tool run, or it is an assistant message
+    /// that has not streamed yet. Callers treat `None` as "nothing to jump to".
+    fn row_of_entry(&self, entry_idx: usize) -> Option<usize> {
+        self.rows.borrow().iter().position(|r| r.entry() == Some(entry_idx))
+    }
+
+    /// Every entry index that currently has a child, for callers that need to
+    /// test many entries at once (the find bar filtering its match list). One
+    /// pass over the rows instead of one scan per candidate.
+    pub(super) fn rendered_entries(&self) -> HashSet<usize> {
+        self.rows.borrow().iter().filter_map(|r| r.entry()).collect()
+    }
+
     /// Whether the transcript is scrolled to (within one card of) the bottom.
     /// `offset().y` is `<= 0` and reaches `-max_offset().y` at the very bottom,
     /// so their sum is the remaining scroll distance. Fresh views (no paint yet)
@@ -102,11 +129,12 @@ impl AgentChatView {
     /// turn wasn't rendered this frame. Shared primitive for the jump menu and
     /// (later) the message rail.
     pub(super) fn scroll_to_user_ordinal(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let child_ix = match self.user_child_ix.borrow().get(n) {
-            Some(&ix) => ix,
-            None => return,
-        };
         let Some(entry_idx) = self.thread.user_entry_index(n) else {
+            return;
+        };
+        // A user turn is never collapsed and always renders, so the n-th user
+        // entry is the n-th user child — no separate ordinal map to keep in step.
+        let Some(child_ix) = self.row_of_entry(entry_idx) else {
             return;
         };
         self.stick_to_bottom = false;
@@ -119,7 +147,11 @@ impl AgentChatView {
         let this = cx.entity().downgrade();
         window.on_next_frame(move |_window, cx| {
             let _ = this.update(cx, |this, cx| {
-                if let Some(&ix) = this.user_child_ix.borrow().get(n) {
+                if let Some(ix) = this
+                    .thread
+                    .user_entry_index(n)
+                    .and_then(|e| this.row_of_entry(e))
+                {
                     this.list_scroll.scroll_to_item(ix);
                 }
                 cx.notify();
@@ -131,10 +163,10 @@ impl AgentChatView {
     /// Scroll so the entry at `entry_idx` is in view and briefly flash it — the
     /// find bar's jump-to-match. Window-free (a single `scroll_to_item`, no
     /// next-frame re-measure) because it's driven from the find input's change
-    /// subscription, which has no `Window`. Reads the per-entry child map
-    /// rebuilt each render (`entry_child_ix`).
+    /// subscription, which has no `Window`. Reads the row list rebuilt each
+    /// render.
     pub(super) fn scroll_to_entry(&mut self, entry_idx: usize, cx: &mut Context<Self>) {
-        let Some(&child_ix) = self.entry_child_ix.borrow().get(&entry_idx) else {
+        let Some(child_ix) = self.row_of_entry(entry_idx) else {
             return;
         };
         self.stick_to_bottom = false;
@@ -145,16 +177,23 @@ impl AgentChatView {
     }
 
     /// The user-turn ordinal currently at (or just above) the top of the
-    /// viewport — the anchor for prev/next navigation. `user_child_ix` is sorted
-    /// ascending (child index grows with ordinal), so a binary search over it
-    /// against the top visible child maps back to an ordinal. Returns 0 when
-    /// nothing is scrolled or there are no user turns.
+    /// viewport — the anchor for prev/next navigation. Counting the user turns
+    /// at or above the top child gives the ordinal of the last one to have
+    /// scrolled past, which is the same answer the old sorted-array binary
+    /// search produced in both its hit and miss cases. Returns 0 when nothing is
+    /// scrolled or there are no user turns.
     pub(super) fn current_user_ordinal(&self) -> usize {
         let top_child = self.list_scroll.top_item();
-        match self.user_child_ix.borrow().binary_search(&top_child) {
-            Ok(i) => i,
-            Err(i) => i.saturating_sub(1),
-        }
+        let rows = self.rows.borrow();
+        rows.iter()
+            .take(top_child.saturating_add(1))
+            .filter(|r| {
+                r.entry().is_some_and(|e| {
+                    matches!(self.thread.entries.get(e), Some(ThreadEntry::User { .. }))
+                })
+            })
+            .count()
+            .saturating_sub(1)
     }
 
     /// The width every transcript child is built at: the reading measure
@@ -272,7 +311,6 @@ impl AgentChatView {
             entry_idx: usize,
             el: Option<AnyElement>,
             dimmed: bool,
-            is_user: bool,
             expander: Option<AnyElement>,
         }
         let mut rows: Vec<Row> = Vec::with_capacity(self.thread.entries.len());
@@ -280,7 +318,6 @@ impl AgentChatView {
             if matches!(group_plan[idx], EntryDisplay::Hide) {
                 continue;
             }
-            let is_user = matches!(entry, ThreadEntry::User { .. });
             let el: Option<AnyElement> = match entry {
                 ThreadEntry::User { text, images, .. } => {
                     // No "You" caption — the right-aligned bubble is the signal.
@@ -443,21 +480,19 @@ impl AgentChatView {
                 _ => None,
             };
             let dimmed = el.is_some() && self.is_pending_edit_dimmed(idx);
-            rows.push(Row { entry_idx: idx, el, dimmed, is_user, expander });
+            rows.push(Row { entry_idx: idx, el, dimmed, expander });
         }
 
-        // Pure child-index map (user ordinal → scroll child index), rebuilt every
-        // render and read by `scroll_to_user_ordinal` for jump nav / the rail.
-        let produces: Vec<bool> = rows.iter().map(|r| r.el.is_some()).collect();
-        let user_flags: Vec<bool> = rows.iter().map(|r| r.is_user).collect();
-        let expander_flags: Vec<bool> = rows.iter().map(|r| r.expander.is_some()).collect();
-        *self.user_child_ix.borrow_mut() =
-            user_turn_child_indices(&produces, &user_flags, &expander_flags);
-        // Same child accounting, but keyed by entry index across all rendered
-        // entries — the find bar jumps to any matching entry, not just user turns.
-        let rows_entry_idx: Vec<usize> = rows.iter().map(|r| r.entry_idx).collect();
-        *self.entry_child_ix.borrow_mut() =
-            entry_child_indices(&rows_entry_idx, &produces, &expander_flags).into_iter().collect();
+        // The child sequence every jump / rail / find target resolves through.
+        // Derived from the same `group_plan` the element loop above walked, so
+        // the two cannot drift; `debug_assert` below pins that to the actual
+        // elements rather than to the intent.
+        *self.rows.borrow_mut() = build_rows(&self.thread.entries, &group_plan);
+        debug_assert_eq!(
+            self.rows.borrow().len(),
+            rows.iter().map(|r| usize::from(r.el.is_some()) + usize::from(r.expander.is_some())).sum::<usize>(),
+            "build_rows must produce exactly the children render pushes",
+        );
 
         // Push each entry (then any trailing tool-run expander) as a DIRECT child
         // of the scroll box, in the exact order the index map counted, each in a
@@ -689,58 +724,100 @@ impl AgentChatView {
 mod tests {
     use super::*;
 
+    fn user(text: &str) -> ThreadEntry {
+        ThreadEntry::User { text: text.into(), images: Vec::new(), checkpoint: None }
+    }
+
+    fn assistant(text: &str) -> ThreadEntry {
+        ThreadEntry::Assistant(AssistantMessage {
+            text: text.into(),
+            thinking: String::new(),
+        })
+    }
+
+    /// `EntryDisplay` is not `Clone`, so a run of `Show` is built rather than
+    /// repeated.
+    fn all_shown(n: usize) -> Vec<EntryDisplay> {
+        (0..n).map(|_| EntryDisplay::Show).collect()
+    }
+
+    /// The straightforward case: every entry renders, so row index == entry
+    /// index and a user turn's ordinal is just its position among user rows.
     #[test]
-    fn user_child_indices_map_ordinals_to_scroll_children() {
-        // Alternating user/assistant, every entry renders a child: user turns sit
-        // at even child indices.
+    fn every_entry_that_renders_gets_its_own_row() {
+        let entries = vec![user("a"), assistant("b"), user("c"), assistant("d")];
+        let plan = all_shown(4);
         assert_eq!(
-            user_turn_child_indices(
-                &[true, true, true, true],
-                &[true, false, true, false],
-                &[false, false, false, false],
-            ),
-            vec![0, 2],
+            build_rows(&entries, &plan),
+            vec![
+                TranscriptRow::Entry { entry_idx: 0 },
+                TranscriptRow::Entry { entry_idx: 1 },
+                TranscriptRow::Entry { entry_idx: 2 },
+                TranscriptRow::Entry { entry_idx: 3 },
+            ],
         );
+    }
 
-        // An empty assistant renders no child, so it doesn't consume a child
-        // index — the following user turn shifts up by one.
+    /// An assistant message with nothing streamed yet renders no child, so it
+    /// takes no row and everything after it shifts up. This is the case that
+    /// makes entry index and child index diverge in ordinary use.
+    #[test]
+    fn an_empty_assistant_takes_no_row() {
+        let entries = vec![user("a"), assistant(""), user("c")];
+        let plan = all_shown(3);
         assert_eq!(
-            user_turn_child_indices(
-                &[true, false, true],
-                &[true, false, true],
-                &[false, false, false],
-            ),
-            vec![0, 1],
+            build_rows(&entries, &plan),
+            vec![
+                TranscriptRow::Entry { entry_idx: 0 },
+                TranscriptRow::Entry { entry_idx: 2 },
+            ],
         );
+    }
 
-        // A collapsed tool-run expander is its own extra child pushed after its
-        // anchor, so it advances the child counter without being a user turn.
+    /// A collapsed run contributes no rows for its hidden entries and one extra
+    /// row for the expander, which has no entry behind it at all.
+    #[test]
+    fn a_collapsed_run_hides_rows_and_adds_an_expander() {
+        let entries = vec![user("a"), assistant("t1"), assistant("t2"), user("b")];
+        let plan = vec![
+            EntryDisplay::Show,
+            EntryDisplay::ShowThenExpander { run_start: 1, hidden: 1 },
+            EntryDisplay::Hide,
+            EntryDisplay::Show,
+        ];
         assert_eq!(
-            user_turn_child_indices(
-                &[true, true, true, true],
-                &[true, false, false, true],
-                &[false, true, false, false],
-            ),
-            vec![0, 4],
+            build_rows(&entries, &plan),
+            vec![
+                TranscriptRow::Entry { entry_idx: 0 },
+                TranscriptRow::Entry { entry_idx: 1 },
+                TranscriptRow::Expander { run_start: 1 },
+                TranscriptRow::Entry { entry_idx: 3 },
+            ],
         );
+    }
 
-        // No entries → no user turns.
-        assert_eq!(user_turn_child_indices(&[], &[], &[]), Vec::<usize>::new());
+    /// An expander whose anchor rendered nothing still gets its row — the old
+    /// flag-array accounting advanced the child counter for the expander
+    /// independently of whether the anchor produced an element, and every index
+    /// past it depends on that.
+    #[test]
+    fn an_expander_survives_an_anchor_that_renders_nothing() {
+        let entries = vec![assistant(""), user("b")];
+        let plan = vec![
+            EntryDisplay::ShowThenExpander { run_start: 0, hidden: 2 },
+            EntryDisplay::Show,
+        ];
+        assert_eq!(
+            build_rows(&entries, &plan),
+            vec![
+                TranscriptRow::Expander { run_start: 0 },
+                TranscriptRow::Entry { entry_idx: 1 },
+            ],
+        );
     }
 
     #[test]
-    fn entry_child_indices_map_every_rendered_entry() {
-        // entry_idx per row, produces, has_expander. Row 1 (an empty assistant)
-        // produces no child; row 2 carries a trailing expander.
-        let entry_idx = [0usize, 1, 2, 3];
-        let produces = [true, false, true, true];
-        let has_expander = [false, false, true, false];
-        // Child indices: entry0→0, entry1 skipped, entry2→1 (+expander at 2),
-        // entry3→3. Keyed by entry index, not ordinal.
-        let mut got = entry_child_indices(&entry_idx, &produces, &has_expander);
-        got.sort();
-        assert_eq!(got, vec![(0, 0), (2, 1), (3, 3)]);
-        // Empty transcript → empty map.
-        assert!(entry_child_indices(&[], &[], &[]).is_empty());
+    fn an_empty_transcript_has_no_rows() {
+        assert!(build_rows(&[], &[]).is_empty());
     }
 }

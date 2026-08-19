@@ -774,16 +774,11 @@ pub struct AgentChatView {
     /// Reverts `recently_copied` to `None` a beat after a copy. Held so a rapid
     /// second copy replaces (cancels) the prior revert timer.
     _copied_clear_task: Option<Task<()>>,
-    /// Child index within the tracked scroll box for each USER turn, in order
-    /// (user ordinal → child index). Rebuilt every render so a jump can
-    /// `ScrollHandle::scroll_to_item` the exact bubble. `RefCell` because the
-    /// transcript renders behind `&self`; only touched on the main thread.
-    user_child_ix: RefCell<Vec<usize>>,
-    /// Child index within the tracked scroll box for each RENDERED entry
-    /// (`entry index → child index`), rebuilt every render. Unlike
-    /// [`Self::user_child_ix`] this covers assistant/tool entries too, so the
-    /// in-chat find bar can jump to any matching entry, not just user turns.
-    entry_child_ix: RefCell<HashMap<usize, usize>>,
+    /// The transcript's children, in layout order — the one answer to "which
+    /// child is entry N", read by the jump list, the tick rail and the find bar.
+    /// Rebuilt every render from [`transcript::build_rows`]. `RefCell` because
+    /// the transcript renders behind `&self`; only touched on the main thread.
+    rows: RefCell<Vec<transcript::TranscriptRow>>,
     /// The in-transcript find bar (Cmd+F), when open. See [`find_bar`].
     find_bar: Option<find_bar::FindBar>,
     /// Pointer is over the left tick-rail. Either this or [`Self::menu_hover`]
@@ -1392,8 +1387,7 @@ impl AgentChatView {
             flash_frames: 0,
             recently_copied: None,
             _copied_clear_task: None,
-            user_child_ix: RefCell::new(Vec::new()),
-            entry_child_ix: RefCell::new(HashMap::new()),
+            rows: RefCell::new(Vec::new()),
             find_bar: None,
             rail_hover: false,
             menu_hover: false,
@@ -3325,8 +3319,7 @@ impl AgentChatView {
             flash_frames: 0,
             recently_copied: None,
             _copied_clear_task: None,
-            user_child_ix: RefCell::new(Vec::new()),
-            entry_child_ix: RefCell::new(HashMap::new()),
+            rows: RefCell::new(Vec::new()),
             find_bar: None,
             rail_hover: false,
             menu_hover: false,
