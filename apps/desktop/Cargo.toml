@@ -94,7 +94,7 @@ cbc = "0.1"
 pbkdf2 = { version = "0.12", default-features = false }
 sha1 = "0.10"
 hmac = "0.12"
-two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
+two-face = { workspace = true }
 
 # Embedded browser-tab engine: one Rust API over the platform webview
 # (WKWebView on macOS, WebView2 on Windows). `build_as_child` attaches the

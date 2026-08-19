@@ -1,0 +1,42 @@
+[package]
+name = "oximux-syntax"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# syntect, not tree-sitter, and the reason is worth stating where someone will
+# read it before "upgrading" this.
+#
+# The goal is ONE highlighter covering both the diff view and chat, emitting
+# neutral kinds a theme resolves at paint time. Tree-sitter cannot cover the
+# diff view at all: a diff is hunk excerpts, tree-sitter wants whole documents,
+# and whole documents are not obtainable here — unstaged diffs compare against a
+# working tree the user is actively editing, untracked files are not in git, and
+# remote-served diffs carry only hunks over a wire whose payloads are frozen.
+# Building on tree-sitter would therefore have left syntect in place for diffs
+# and added a THIRD highlighter rather than removing one.
+#
+# syntect reaches both, because its per-line `ParseState` is exactly the shape a
+# diff row needs. The neutrality the plan wanted is not a tree-sitter property:
+# `ParseState` yields TextMate scope names with no theme involved, which
+# `kinds.rs` maps to `HighlightKind`. The old diff path copied literal sRGB out
+# of a bundled theme instead — that, not the engine, was the actual defect.
+#
+# Bonus that is hard to give up: `two-face` carries ~250 grammars, where
+# tree-sitter needs a pinned crate plus a `highlights.scm` per language.
+syntect = { workspace = true }
+# The grammar set (the `bat` Sublime collection). `syntect-fancy` selects the
+# pure-Rust regex engine so there is no `.a` to link, matching how the desktop
+# already depends on it.
+#
+# NOTE: bundles Sublime grammars under their own licenses;
+# `two_face::acknowledgement` exposes the attribution listing if an
+# about/licenses screen ever needs one.
+two-face = { workspace = true }

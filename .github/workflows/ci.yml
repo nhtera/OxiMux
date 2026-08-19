@@ -175,6 +175,7 @@ jobs:
           -p oximux-agents
           -p oximux-storage
           -p oximux-markdown
+          -p oximux-syntax
           -p oximux-relay-proto
           -p oximux-relay
           -p oximux-relay-client
@@ -285,6 +286,21 @@ jobs:
 
       - name: cargo test (markdown parity corpus)
         run: cargo test -p oximux-markdown
+
+      # Same rule and same reason as the markdown crate above: `oximux-syntax`
+      # emits neutral kinds precisely so no renderer is in its dependency tree,
+      # and that property survives only while something checks it.
+      - name: syntax crate links no UI toolkit
+        run: |
+          cargo tree -p oximux-syntax -e normal > /tmp/syn-tree.txt
+          if grep -E '(^| )(gpui|gpui_platform|gpui-component)( |$)' /tmp/syn-tree.txt; then
+            echo "oximux-syntax must not depend on a UI toolkit (see matches above)"
+            exit 1
+          fi
+          echo "oximux-syntax tree is toolkit-free"
+
+      - name: cargo test (syntax crate)
+        run: cargo test -p oximux-syntax
 
       # The serve binary's dependency hygiene, as a hard gate: the CLI must
       # never link the GUI toolkit or the desktop-only capability stacks. A

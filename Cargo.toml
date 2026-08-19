@@ -19,6 +19,7 @@ members = [
     "crates/auto-update",
     "crates/editor",
     "crates/markdown",
+    "crates/syntax",
     "crates/storage",
     "crates/settings",
     "crates/relay-proto",
@@ -56,6 +57,7 @@ oximux-core     = { path = "crates/core" }
 # Owner-only access for the secrets we write to disk. Its own crate because the
 # desktop app, the relay daemon and the remote host share no other dependency.
 oximux-markdown  = { path = "crates/markdown" }
+oximux-syntax    = { path = "crates/syntax" }
 oximux-owner-only = { path = "crates/owner-only" }
 # Windows tree-kill for agent CLIs and terminal PTYs. Its own crate for the same
 # reason as owner-only: the relay and the agents crate share no dependency.
@@ -330,6 +332,11 @@ similar = "2.6"
 # corpus, not a routine dependency refresh.
 pulldown-cmark = { version = "0.13", default-features = false }
 syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+# The grammar collection syntect parses with, hoisted to the workspace so the
+# desktop and `oximux-syntax` cannot end up on different sets — two grammar
+# collections in one binary would be the same duplication this work exists to
+# remove, just one level down.
+two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
 
 [profile.dev]
 opt-level = 0
