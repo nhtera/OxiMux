@@ -80,6 +80,11 @@ pub(super) struct ScrollState {
     /// A jump that is still landing. See
     /// [`AgentChatView::settle_pending_reveal`].
     pub pending_reveal: Cell<Option<PendingReveal>>,
+    /// How many rows have actually been built, ever. The whole claim of this
+    /// phase is that this stays bounded by the viewport rather than tracking the
+    /// conversation, and a claim nothing counts is a claim nothing checks.
+    #[cfg(test)]
+    pub rows_built: Cell<usize>,
 }
 
 impl ScrollState {
@@ -93,6 +98,8 @@ impl ScrollState {
             list: ListState::new(0, ListAlignment::Top, px(OVERDRAW)),
             measured_revision: Cell::new(0),
             pending_reveal: Cell::new(None),
+            #[cfg(test)]
+            rows_built: Cell::new(0),
         }
     }
 }
@@ -894,6 +901,8 @@ impl AgentChatView {
         content_w: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        #[cfg(test)]
+        self.scroll.rows_built.set(self.scroll.rows_built.get() + 1);
         let density = self.density;
         let el = match row {
             TranscriptRow::Entry { entry_idx } => self.entry_element(entry_idx, cx),
@@ -1305,6 +1314,48 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    /// The phase's actual claim: frame cost stops tracking conversation length.
+    ///
+    /// Counts rows BUILT, not rows present. A non-virtualized transcript builds
+    /// every row every frame, so this number would be the row count; virtualized
+    /// it is the viewport plus the overdraw band, whatever the conversation
+    /// does. Asserted as a ratio rather than a constant because row heights and
+    /// the overdraw band are free to change — what must not change is that the
+    /// two stop being proportional.
+    #[gpui::test]
+    async fn only_the_visible_rows_are_built(cx: &mut TestAppContext) {
+        if !virtualized() {
+            return;
+        }
+        let (window, mut vcx) = seeded_view(200, cx);
+        let (rows, built) = window
+            .update(&mut vcx.cx, |view, _window, _cx| {
+                (view.rows.borrow().len(), view.scroll.rows_built.get())
+            })
+            .unwrap();
+        assert_eq!(rows, 401, "200 turns -> 400 entry rows + the tail");
+        assert!(
+            built < rows / 4,
+            "built {built} of {rows} rows — that is not virtualized",
+        );
+
+        // And it must not grow with the conversation. Ten times the transcript,
+        // and the work per frame should barely move.
+        let before = built;
+        let (window2, mut vcx2) = seeded_view(2000, cx);
+        let (rows2, built2) = window2
+            .update(&mut vcx2.cx, |view, _window, _cx| {
+                (view.rows.borrow().len(), view.scroll.rows_built.get())
+            })
+            .unwrap();
+        assert_eq!(rows2, 4001);
+        assert!(
+            built2 < before * 3,
+            "10x the transcript ({rows} -> {rows2} rows) took {before} -> {built2} row builds; \
+             frame cost is still tracking conversation length",
+        );
     }
 
     /// How far a jump can miss when a row above the target changed height while
