@@ -16,6 +16,87 @@
 
 use super::*;
 
+use std::cell::Cell;
+use std::rc::Rc;
+use std::sync::OnceLock;
+
+use gpui::{list, FollowMode, ListAlignment, ListSizingBehavior, ListState};
+
+/// How far beyond the viewport the list keeps rows rendered, so a flick does not
+/// paint blank. Chat rows are tall and expensive, so this is deliberately about
+/// one screenful rather than the several a cheap uniform list could afford.
+const OVERDRAW: f32 = 600.0;
+
+/// The ceiling on how many frames a jump keeps correcting itself. It normally
+/// stops well before this, at the fixed point — the cap only exists so a target
+/// that never settles cannot repaint forever.
+const REVEAL_ATTEMPTS: u8 = 4;
+
+/// Whether the transcript renders through [`gpui::list`] — only visible rows
+/// materialized — or the original `overflow_y_scroll` box that builds every
+/// entry every frame.
+///
+/// An escape hatch, not a feature. Virtualizing rewrites how every jump, the
+/// rail, the find bar and auto-follow address the transcript, and
+/// `OXIMUX_LEGACY_TRANSCRIPT=1` is the way back without waiting for a release.
+/// Read once per process: the two paths keep their scroll position in different
+/// places, so flipping mid-session would land the user somewhere arbitrary.
+pub(super) fn virtualized() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OXIMUX_LEGACY_TRANSCRIPT").is_none())
+}
+
+/// A jump that has been issued and is still converging.
+#[derive(Clone, Copy)]
+pub(super) struct PendingReveal {
+    /// The row to bring on screen.
+    row: usize,
+    /// Frames left before giving up.
+    attempts: u8,
+    /// Consecutive frames on which the row has come out fully inside the
+    /// viewport. One is not enough — see [`AgentChatView::settle_pending_reveal`].
+    stable: u8,
+}
+
+/// Everything about where the transcript is scrolled.
+///
+/// Both halves exist at once because [`virtualized`] is a runtime switch, but
+/// only one is ever driven — they hold the position in incompatible terms (a
+/// pixel offset over child bounds versus a measured item index), so there is
+/// nothing to keep in step and no attempt to.
+pub(super) struct ScrollState {
+    /// The non-virtualized box's offset. Live when NOT [`virtualized`].
+    pub legacy: ScrollHandle,
+    /// Scroll position + per-row height cache for [`gpui::list`]. Rows differ
+    /// wildly in height — a one-line prompt, a screenshot, a folded diff — so
+    /// the list measures each rather than assuming a uniform row.
+    pub list: ListState,
+    /// The thread revision [`Self::list`]'s height cache was last told about.
+    /// Content changes without the row COUNT changing all the time — a reply
+    /// streaming text, a tool result arriving — and `list()` only re-measures
+    /// rows it lays out, so an off-screen row's height would otherwise go
+    /// stale. See [`AgentChatView::sync_list_state`].
+    pub measured_revision: Cell<u64>,
+    /// A jump that is still landing. See
+    /// [`AgentChatView::settle_pending_reveal`].
+    pub pending_reveal: Cell<Option<PendingReveal>>,
+}
+
+impl ScrollState {
+    pub fn new() -> Self {
+        Self {
+            legacy: ScrollHandle::new(),
+            // `Top` alignment, not `Bottom`: a conversation shorter than the
+            // viewport sits at the top, the way the scroll box always rendered
+            // it. Following the tail is `FollowMode::Tail`'s job and works
+            // under either alignment.
+            list: ListState::new(0, ListAlignment::Top, px(OVERDRAW)),
+            measured_revision: Cell::new(0),
+            pending_reveal: Cell::new(None),
+        }
+    }
+}
+
 /// One direct child of the scrolling transcript: a reading-measure column,
 /// `width` px wide. Callers pass [`AgentChatView::content_width`].
 ///
@@ -124,22 +205,188 @@ impl AgentChatView {
         self.rows.borrow().iter().filter_map(|r| r.entry()).collect()
     }
 
+    /// Reveal the row at `ix`.
+    ///
+    /// The two paths address scrolling differently — `ScrollHandle` by child
+    /// ordinal, `ListState` by measured item — but both take a row index, which
+    /// is what the row model bought.
+    fn scroll_to_row(&self, ix: usize) {
+        self.reveal_row_now(ix);
+        // One issue is not enough, and this is not a nicety — see
+        // [`Self::settle_pending_reveal`].
+        self.scroll.pending_reveal.set(Some(PendingReveal {
+            row: ix,
+            attempts: REVEAL_ATTEMPTS,
+            stable: 0,
+        }));
+    }
+
+    fn reveal_row_now(&self, ix: usize) {
+        if virtualized() {
+            self.scroll.list.scroll_to_reveal_item(ix);
+        } else {
+            self.scroll.legacy.scroll_to_item(ix);
+        }
+    }
+
+    /// The legacy path's auto-follow: re-pin to the bottom every frame while
+    /// following, and keep re-arming while the content is still growing.
+    ///
+    /// All of this is what [`FollowMode::Tail`] does inside `list()`'s own
+    /// layout — which is why the virtualized path has no counterpart and this
+    /// runs only when it is off.
+    pub(super) fn settle_legacy_follow(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if virtualized() || !self.stick_to_bottom {
+            return;
+        }
+        self.scroll.legacy.scroll_to_bottom();
+        // The async markdown layout that follows a content change does not
+        // re-run this render, so one pin lands on a too-short `content_size`.
+        // Keep re-arming the follow while the scrollable extent is still
+        // growing (the layout settling), so a slow/large reply is followed to
+        // its true bottom; once it holds steady the counter drains and the
+        // frame loop stops. Each armed frame forces a re-render that re-pins
+        // to the freshly-settled height.
+        let max_y = f32::from(self.scroll.legacy.max_offset().y);
+        if (max_y - self.last_max_offset).abs() > 0.5 {
+            self.follow_frames = FOLLOW_FRAMES;
+        }
+        self.last_max_offset = max_y;
+        if self.follow_frames > 0 {
+            self.follow_frames -= 1;
+            let this = cx.entity().downgrade();
+            window.on_next_frame(move |_window, cx| {
+                let _ = this.update(cx, |_this, cx| cx.notify());
+            });
+        }
+    }
+
+    /// Keep re-issuing a jump until the scroll position it produces stops
+    /// moving.
+    ///
+    /// A downward reveal resolves its offset by summing row heights through the
+    /// target (list.rs:620), and those heights are only real for rows the list
+    /// has laid out. Rows it has not are carried at whatever they last measured
+    /// — including rows that changed height off-screen, which `remeasure_items`
+    /// keeps as a *hint* rather than dropping to unknown (unknown would blank
+    /// the scrollbar extent). So the first issue lands approximately: near
+    /// enough that the rows around the target get measured, not near enough to
+    /// be right. Re-issuing against those fresh measurements is what makes it
+    /// exact, and each pass measures more, so it walks in.
+    ///
+    /// It stops at the fixed point — two passes agreeing on the position —
+    /// rather than the first time the target looks visible. A target landed in
+    /// view during development and then drifted 294px back out on the next
+    /// layout, because the rows above it were still being measured for the first
+    /// time; on screen this frame is no evidence about the next one, and the
+    /// position holding still is.
+    ///
+    /// This replaces a single `on_next_frame` re-issue that could not tell
+    /// whether it had worked and that the find bar, having no `Window`, never
+    /// got at all. Costs nothing when idle.
+    pub(super) fn settle_pending_reveal(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.scroll.pending_reveal.get() else {
+            return;
+        };
+        if pending.attempts == 0 || pending.row >= self.rows.borrow().len() {
+            self.scroll.pending_reveal.set(None);
+            return;
+        }
+        // The correction has to be computed AFTER this frame lays out, not here
+        // — `render` runs before layout, so the heights available now are the
+        // ones that produced the miss. Correcting from inside `render` was
+        // measured landing ~150px short and staying there however many times it
+        // repeated, because every pass read the same pre-layout tree.
+        let this = cx.entity().downgrade();
+        window.on_next_frame(move |_window, cx| {
+            let _ = this.update(cx, |this, cx| {
+                let Some(mut pending) = this.scroll.pending_reveal.get() else {
+                    return;
+                };
+                let viewport = this.scroll.list.viewport_bounds();
+                let inside = this
+                    .scroll
+                    .list
+                    .bounds_for_item(pending.row)
+                    .is_some_and(|b| b.top() >= viewport.top() && b.bottom() <= viewport.bottom());
+                // Two consecutive good frames, not one. A target landed in view
+                // and drifted back out on the very next layout: each reveal
+                // moves the viewport, which measures rows that were only
+                // estimated, which moves everything again. One good frame is a
+                // coincidence; two in a row means the heights stopped moving.
+                pending.stable = if inside { pending.stable + 1 } else { 0 };
+                if pending.stable >= 2 || pending.attempts == 0 {
+                    this.scroll.pending_reveal.set(None);
+                    return;
+                }
+                this.reveal_row_now(pending.row);
+                pending.attempts -= 1;
+                this.scroll.pending_reveal.set(Some(pending));
+                cx.notify();
+            });
+        });
+    }
+
+    /// The row at the top of the viewport.
+    fn top_row(&self) -> usize {
+        if virtualized() {
+            self.scroll.list.logical_scroll_top().item_ix
+        } else {
+            self.scroll.legacy.top_item()
+        }
+    }
+
+    /// Return to the live tail and re-arm auto-follow.
+    pub(super) fn follow_bottom(&mut self) {
+        self.stick_to_bottom = true;
+        if virtualized() {
+            // `Tail` snaps to the end AND re-pins on every later layout, including
+            // while the last row is still growing — which is the whole of what the
+            // legacy path re-arms by hand with `follow_frames`.
+            self.scroll.list.set_follow_mode(FollowMode::Tail);
+        } else {
+            self.scroll.legacy.scroll_to_bottom();
+        }
+    }
+
+    /// Whether newly-arrived content should pull the view down with it.
+    ///
+    /// Virtualized, this is the list's own follow state rather than a flag we
+    /// maintain: `list()` drops it when the user scrolls up, picks it back up
+    /// when they return to the bottom, and every `scroll_to` — so every jump —
+    /// drops it too. Duplicating that in a `bool` would only create something to
+    /// get out of step.
+    pub(super) fn following(&self) -> bool {
+        if virtualized() {
+            self.scroll.list.is_following_tail()
+        } else {
+            self.stick_to_bottom
+        }
+    }
+
     /// Whether the transcript is scrolled to (within one card of) the bottom.
     /// `offset().y` is `<= 0` and reaches `-max_offset().y` at the very bottom,
     /// so their sum is the remaining scroll distance. Fresh views (no paint yet)
     /// report `0`, i.e. "at bottom", so the first turn follows.
     pub(super) fn is_near_bottom(&self) -> bool {
-        let sh = &self.list_scroll;
+        if virtualized() {
+            // Same sum, same tolerance, different source. NOT
+            // `is_scrolled_to_end`, which is exact — this question is "close
+            // enough that the newest turn is on screen", and an exact answer
+            // would banner "jump down" at five pixels off the bottom.
+            let max = self.scroll.list.max_offset_for_scrollbar().y;
+            let off = self.scroll.list.scroll_px_offset_for_scrollbar().y;
+            return max + off <= px(160.0);
+        }
+        let sh = &self.scroll.legacy;
         sh.max_offset().y + sh.offset().y <= px(160.0)
     }
 
     /// Jump the transcript to the `n`-th user turn (0-based ordinal among user
     /// messages) and briefly highlight it. Releases auto-follow so the jump
-    /// sticks, and re-issues the scroll once next frame in case the target's
-    /// markdown height is still settling. No-op if `n` is out of range or that
-    /// turn wasn't rendered this frame. Shared primitive for the jump menu and
-    /// (later) the message rail.
-    pub(super) fn scroll_to_user_ordinal(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// sticks. No-op if `n` is out of range or that turn has no row. Shared
+    /// primitive for the jump menu and the message rail.
+    pub(super) fn scroll_to_user_ordinal(&mut self, n: usize, cx: &mut Context<Self>) {
         let Some(entry_idx) = self.thread.user_entry_index(n) else {
             return;
         };
@@ -149,25 +396,9 @@ impl AgentChatView {
             return;
         };
         self.stick_to_bottom = false;
-        self.list_scroll.scroll_to_item(child_ix);
+        self.scroll_to_row(child_ix);
         self.flash_entry = Some(entry_idx);
         self.flash_frames = FLASH_FRAMES;
-        // The target's height can settle a frame late (async markdown), which
-        // leaves a first scroll landing short when a long reply sits above it;
-        // re-issue once on the next frame against the freshly-measured bounds.
-        let this = cx.entity().downgrade();
-        window.on_next_frame(move |_window, cx| {
-            let _ = this.update(cx, |this, cx| {
-                if let Some(ix) = this
-                    .thread
-                    .user_entry_index(n)
-                    .and_then(|e| this.row_of_entry(e))
-                {
-                    this.list_scroll.scroll_to_item(ix);
-                }
-                cx.notify();
-            });
-        });
         cx.notify();
     }
 
@@ -181,7 +412,7 @@ impl AgentChatView {
             return;
         };
         self.stick_to_bottom = false;
-        self.list_scroll.scroll_to_item(child_ix);
+        self.scroll_to_row(child_ix);
         self.flash_entry = Some(entry_idx);
         self.flash_frames = FLASH_FRAMES;
         cx.notify();
@@ -194,7 +425,7 @@ impl AgentChatView {
     /// search produced in both its hit and miss cases. Returns 0 when nothing is
     /// scrolled or there are no user turns.
     pub(super) fn current_user_ordinal(&self) -> usize {
-        let top_child = self.list_scroll.top_item();
+        let top_child = self.top_row();
         let rows = self.rows.borrow();
         rows.iter()
             .take(top_child.saturating_add(1))
@@ -220,7 +451,12 @@ impl AgentChatView {
     /// let the next frame settle it. No feedback loop — the scroll box is
     /// full-width regardless of what its children ask for.
     pub(super) fn content_width(&self) -> f32 {
-        let painted = f32::from(self.list_scroll.bounds().size.width) - self.density.pad_panel * 2.0;
+        let viewport = if virtualized() {
+            self.scroll.list.viewport_bounds().size.width
+        } else {
+            self.scroll.legacy.bounds().size.width
+        };
+        let painted = f32::from(viewport) - self.density.pad_panel * 2.0;
         if painted <= 0.0 { CONTENT_MAX_W } else { painted.min(CONTENT_MAX_W) }
     }
 
@@ -236,7 +472,6 @@ impl AgentChatView {
             .id("agent-chat-list")
             .flex()
             .flex_col()
-            .items_center()
             .w_full()
             .flex_1()
             // `min_h(0)` is essential: a flex child defaults to `min-height:auto`
@@ -252,7 +487,7 @@ impl AgentChatView {
             .px(px(density.pad_panel))
             .py(px(density.pad_panel))
             .overflow_y_scroll()
-            .track_scroll(&self.list_scroll)
+            .track_scroll(&self.scroll.legacy)
             // Release auto-follow when the user scrolls UP to read history (so a
             // streaming turn doesn't yank them back down); re-arm once they
             // return to the bottom. gpui's scroll offset grows more negative as
@@ -287,17 +522,15 @@ impl AgentChatView {
             } else {
                 self.render_empty_hint(&theme, &typo)
             };
-            return self.wrap_scroll(scroll.child(body)).into_any_element();
+            // An empty transcript has nothing to virtualize, so it always takes
+            // the plain box — and the bar must be bound to THAT box, not to an
+            // idle list state.
+            return self
+                .wrap_scroll(scroll.child(body), Scrollbar::vertical(&self.scroll.legacy))
+                .into_any_element();
         }
 
-        // Flatten the transcript: each turn is a DIRECT child of the tracked
-        // scroll box (wrapped in a centered max-width column so the reading
-        // measure is unchanged) rather than sharing one inner `content` column.
-        // gpui records child bounds for direct children only, so this is what
-        // lets `ScrollHandle::scroll_to_item` reveal an exact user turn for jump
-        // navigation. The inter-turn gap moves from the old column onto the
-        // scroll box; turns breathe a little more than inline content.
-        let mut scroll = scroll.gap(px(density.pad_panel * 2.0));
+        let mut scroll = scroll;
 
         // Group long runs of tool cards: a run of >8 collapses to first-3 +
         // "N more" + last-2, with pending/failed cards always kept visible.
@@ -321,14 +554,23 @@ impl AgentChatView {
         // Unconditional, and stated here rather than inside `build_rows` so that
         // function stays about entries and its tests keep meaning what they say.
         rows.push(TranscriptRow::Tail);
+        if virtualized() {
+            self.sync_list_state(&rows);
+        }
         *self.rows.borrow_mut() = rows.clone();
 
-        // Each row is a DIRECT child of the scroll box: gpui records child bounds
-        // for direct children only, which is what lets `scroll_to_item` reveal an
-        // exact turn for jump navigation.
-        for &row in &rows {
-            scroll = scroll.child(self.render_row(row, &group_plan, &is_tool, content_w, cx));
-        }
+        let body: AnyElement = if virtualized() {
+            self.render_row_list(rows, group_plan, is_tool, content_w, cx)
+        } else {
+            // Every row is a DIRECT child of the scroll box: gpui records child
+            // bounds for direct children only, which is what lets
+            // `scroll_to_item` reveal an exact turn.
+            for (ix, &row) in rows.iter().enumerate() {
+                scroll =
+                    scroll.child(self.render_row(row, ix, &group_plan, &is_tool, content_w, cx));
+            }
+            scroll.into_any_element()
+        };
         // Compose the timeline row: the left tick-rail, the scrolling transcript,
         // and the top-left jump dropdown + hover preview as absolute overlays over
         // it. The `relative` row is the positioning context all three overlays
@@ -340,7 +582,7 @@ impl AgentChatView {
             .flex_1()
             .min_h(px(0.0))
             .children(self.render_message_rail(cx))
-            .child(self.wrap_scroll(scroll))
+            .child(self.wrap_scroll(body, self.scrollbar()))
             .children(self.render_jump_list(cx))
             .children(self.render_session_detail(cx))
             .children(self.render_find_bar(cx))
@@ -646,6 +888,7 @@ impl AgentChatView {
     fn render_row(
         &self,
         row: TranscriptRow,
+        ix: usize,
         plan: &[EntryDisplay],
         is_tool: &[bool],
         content_w: f32,
@@ -659,10 +902,24 @@ impl AgentChatView {
             }
             TranscriptRow::Tail => Some(self.tail_element(cx)),
         };
+        // The reading column is centered by a full-width row rather than by the
+        // container: a list gives its items the full width and has no
+        // `items_center` to offer, and doing it per row keeps both paths
+        // identical instead of nearly so. The leading margin reproduces the
+        // scroll box's `gap`, which is spacing BETWEEN children — hence not on
+        // the first.
+        let mut outer = div().flex().flex_row().justify_center().w_full();
+        if ix > 0 {
+            // Padding, not margin. A margin on a list item's ROOT element sits
+            // outside the box `layout_as_root` measures, so the list would cache
+            // a height short by the gap on every row and every jump would land
+            // proportionally wrong. Padding is inside the box and is measured.
+            outer = outer.pt(px(density.pad_panel * 2.0));
+        }
         // A row with no element cannot happen — `build_rows` only emits rows for
         // things that render — but an empty child beats a panic if it ever does.
         let Some(el) = el else {
-            return transcript_column(content_w).into_any_element();
+            return outer.into_any_element();
         };
         let mut wrap = transcript_column(content_w).child(el);
         if let TranscriptRow::Entry { entry_idx } = row {
@@ -679,16 +936,105 @@ impl AgentChatView {
                     .bg(self.theme.focus_ring.opacity(0.16 * a));
             }
         }
-        wrap.into_any_element()
+        outer.child(wrap).into_any_element()
     }
 
 
+    /// The scrollbar for whichever scroll state is driving the transcript.
+    fn scrollbar(&self) -> Scrollbar {
+        if virtualized() {
+            Scrollbar::vertical(&self.scroll.list)
+        } else {
+            Scrollbar::vertical(&self.scroll.legacy)
+        }
+    }
+
+    /// Tell the height cache what changed since the last frame.
+    ///
+    /// Two separate staleness problems, and missing either one puts every jump
+    /// target past the stale row at the wrong offset — `scroll_to_reveal_item`
+    /// resolves a position by summing measured heights through the target.
+    ///
+    /// **Rows moved.** Diffing against the previous list and splicing the
+    /// difference — rather than `reset`ting — is what keeps the scroll position:
+    /// `reset` drops it entirely, and rows move on every turn. The common cases
+    /// (a turn appended, a tool run folded, a rewind shrinking the list) all
+    /// fall out of the same common-prefix diff.
+    ///
+    /// **A row changed height without moving.** A reply streaming text, a tool
+    /// result landing. `list()` re-renders and re-measures every VISIBLE row on
+    /// each layout, so this is invisible until the row is off-screen — scroll up
+    /// to read history while a reply streams below and its cached height stops
+    /// tracking. Marking the range for remeasure keeps the old height as a hint,
+    /// so nothing flickers and the scrollbar extent stays sane; the row is
+    /// re-measured when it next lays out.
+    ///
+    /// The remeasure range is the whole list rather than the rows we think
+    /// changed, because the thread reports THAT it mutated and not where. It is
+    /// cheap for the same reason the staleness was invisible: an unmeasured row
+    /// outside the overdraw band is never laid out, so this only re-measures
+    /// what was going to be rendered anyway plus the overdraw.
+    fn sync_list_state(&self, rows: &[TranscriptRow]) {
+        let old = self.rows.borrow();
+        let common = old.iter().zip(rows).take_while(|(a, b)| a == b).count();
+        if common != old.len() || common != rows.len() {
+            self.scroll.list.splice(common..old.len(), rows.len() - common);
+        }
+
+        let revision = self.thread.revision();
+        if self.scroll.measured_revision.replace(revision) != revision {
+            self.scroll.list.remeasure_items(0..rows.len());
+        }
+    }
+
+    /// The virtualized transcript body: only the rows on screen (plus an
+    /// overdraw band) are ever built.
+    ///
+    /// The closure outlives this frame, so it captures the row list and the
+    /// grouping it was built against rather than reaching back for them — a row
+    /// rendered against a newer grouping than it was indexed under would draw
+    /// the wrong entry.
+    fn render_row_list(
+        &self,
+        rows: Vec<TranscriptRow>,
+        plan: Vec<EntryDisplay>,
+        is_tool: Vec<bool>,
+        content_w: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let density = self.density;
+        let weak = cx.entity().downgrade();
+        let rows = Rc::new(rows);
+        let plan = Rc::new(plan);
+        let is_tool = Rc::new(is_tool);
+        list(self.scroll.list.clone(), move |ix, _window, cx| {
+            let (Some(view), Some(&row)) = (weak.upgrade(), rows.get(ix)) else {
+                return div().into_any_element();
+            };
+            let (plan, is_tool) = (plan.clone(), is_tool.clone());
+            view.update(cx, |this, cx| {
+                this.render_row(row, ix, &plan, &is_tool, content_w, cx)
+            })
+        })
+        .with_sizing_behavior(ListSizingBehavior::Auto)
+        .size_full()
+        // Both min-* zeroings carry the same weight here as on the scroll box —
+        // see `wrap_scroll`.
+        .min_h(px(0.0))
+        .min_w_0()
+        .px(px(density.pad_panel))
+        .py(px(density.pad_panel))
+        .into_any_element()
+    }
+
     /// Wrap the scrolling transcript box in a positioned container and overlay a
-    /// fading scrollbar bound to the SAME [`ScrollHandle`]. The bar paints on the
+    /// fading scrollbar, which the caller binds to whichever scroll state is
+    /// actually driving the box — they are different types on the two paths, and
+    /// a bar bound to the idle one is a bar that never moves. It paints on the
     /// container's right edge, auto-hides when the content fits, and — being a
     /// `Normal` hitbox gated to its own 16px strip — never blocks clicks on the
     /// messages, tool cards, or Allow/Reject rows beneath it.
-    pub(super) fn wrap_scroll(&self, scroll_box: impl IntoElement) -> gpui::Div {
+    pub(super) fn wrap_scroll(&self, scroll_box: impl IntoElement, bar: Scrollbar) -> gpui::Div {
         div()
             .relative()
             .flex()
@@ -707,7 +1053,7 @@ impl AgentChatView {
             // actually has.
             .min_w_0()
             .child(scroll_box)
-            .child(Scrollbar::vertical(&self.list_scroll))
+            .child(bar)
     }
 
     pub(super) fn render_empty_hint(&self, theme: &Theme, typo: &Typography) -> AnyElement {
@@ -753,6 +1099,9 @@ impl AgentChatView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{size, TestAppContext, VisualTestContext};
+    use oximux_agents::thread::ThreadEvent;
+    use oximux_agents::thread::StubConnection;
 
     fn user(text: &str) -> ThreadEntry {
         ThreadEntry::User { text: text.into(), images: Vec::new(), checkpoint: None }
@@ -849,5 +1198,257 @@ mod tests {
     #[test]
     fn an_empty_transcript_has_no_rows() {
         assert!(build_rows(&[], &[]).is_empty());
+    }
+
+    /// A conversation deep enough that most of it is off-screen: `n` user turns,
+    /// each answered, with the reply lengths varied so no two rows share a
+    /// height. Uniform rows would let an off-by-one land on the right pixel by
+    /// luck, which is exactly the bug these assertions exist to catch.
+    fn seeded_view(
+        n: usize,
+        cx: &mut TestAppContext,
+    ) -> (gpui::WindowHandle<AgentChatView>, VisualTestContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        window
+            .update(cx, |view, _window, cx| {
+                for i in 0..n {
+                    view.thread.push_user_message_with_images(
+                        format!("question {i}"),
+                        Vec::new(),
+                    );
+                    view.on_event(
+                        ThreadEvent::AssistantText(
+                            format!("reply {i}\n").repeat(1 + i % 7),
+                        ),
+                        cx,
+                    );
+                    view.on_event(
+                        ThreadEvent::TurnEnded {
+                            result: None,
+                            usage: None,
+                            is_error: false,
+                            turn_diff: None,
+                        },
+                        cx,
+                    );
+                }
+            })
+            .unwrap();
+        let vcx = VisualTestContext::from_window(window.into(), cx);
+        // Nothing has bounds until the window lays out, and every assertion here
+        // is about measured heights.
+        vcx.simulate_resize(size(px(1000.0), px(600.0)));
+        vcx.run_until_parked();
+        (window, vcx)
+    }
+
+    /// The list is told about exactly the rows that exist. If this drifts, every
+    /// index-based assertion below is meaningless and the real UI renders blanks
+    /// past the end.
+    #[gpui::test]
+    async fn the_list_item_count_tracks_the_row_list(cx: &mut TestAppContext) {
+        if !virtualized() {
+            return;
+        }
+        let (window, mut vcx) = seeded_view(12, cx);
+        window
+            .update(&mut vcx.cx, |view, _window, _cx| {
+                assert_eq!(view.scroll.list.item_count(), view.rows.borrow().len());
+                // 12 turns -> 24 entry rows + the tail.
+                assert_eq!(view.rows.borrow().len(), 25);
+            })
+            .unwrap();
+    }
+
+    /// The point of the phase: jumping to a user turn lands on that turn's row,
+    /// not near it. `scroll_to_reveal_item` resolves a pixel offset by summing
+    /// measured heights through the target, so this fails the moment the height
+    /// cache is out of step with what is actually rendered.
+    #[gpui::test]
+    async fn a_jump_lands_on_the_target_row(cx: &mut TestAppContext) {
+        if !virtualized() {
+            return;
+        }
+        let (window, mut vcx) = seeded_view(12, cx);
+        for ordinal in [11usize, 6, 0, 9] {
+            window
+                .update(&mut vcx.cx, |view, _window, cx| {
+                    view.scroll_to_user_ordinal(ordinal, cx);
+                })
+                .unwrap();
+            vcx.run_until_parked();
+            window
+                .update(&mut vcx.cx, |view, _window, _cx| {
+                    let want = view
+                        .thread
+                        .user_entry_index(ordinal)
+                        .and_then(|e| view.row_of_entry(e))
+                        .expect("the turn has a row");
+                    let top = view.scroll.list.logical_scroll_top().item_ix;
+                    // Reveal, not scroll-to-top: a target already on screen does
+                    // not move, so the assertion is "at or above the target",
+                    // with the target within a screenful below.
+                    assert!(
+                        top <= want,
+                        "jump to user turn {ordinal} put row {want} above the viewport top {top}",
+                    );
+                })
+                .unwrap();
+        }
+    }
+
+    /// How far a jump can miss when a row above the target changed height while
+    /// off-screen — the case the plan flagged as not deferrable.
+    ///
+    /// `scroll_to_reveal_item` resolves a downward jump by summing row heights
+    /// through the target (list.rs:620), and rows the list has never laid out
+    /// are carried at an ESTIMATE: `remeasure_items` deliberately keeps the last
+    /// measurement as a hint rather than dropping to unknown, since an unknown
+    /// height blanks the scrollbar extent. So the plan's premise — wire
+    /// `remeasure_items` and jumps land correctly — does not hold. It makes the
+    /// row re-measure when next laid out; it does not fix the sum for a row that
+    /// is never laid out.
+    ///
+    /// What does fix it is re-issuing the reveal after a layout, which
+    /// `settle_pending_reveal` does. That correction runs on `on_next_frame`,
+    /// and **this harness does not drive frames** — `run_until_parked` leaves
+    /// those callbacks unrun — so what this test measures is the UNCORRECTED
+    /// landing. It therefore asserts the bound rather than exactness: the miss
+    /// must stay within one viewport, which is what proves the sums are merely
+    /// estimated rather than broken. A row model that lost track of an entry
+    /// misses by the whole transcript and fails here.
+    ///
+    /// Verifying the correction itself needs a frame-driving harness or a
+    /// running app; it is on the phase's manual checklist.
+    #[gpui::test]
+    async fn a_row_that_grew_off_screen_misses_a_later_jump_by_at_most_a_viewport(cx: &mut TestAppContext) {
+        if !virtualized() {
+            return;
+        }
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        // Turn 0 opens a tool call and leaves it pending; the turns after it
+        // push it far above the viewport.
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.push_user_message_with_images("run it", Vec::<ChatImage>::new());
+                view.on_event(
+                    ThreadEvent::ToolCallStarted {
+                        id: "t0".into(),
+                        name: "Bash".into(),
+                        input: serde_json::json!({ "command": "sleep 1" }),
+                    },
+                    cx,
+                );
+                for i in 0..12 {
+                    view.thread
+                        .push_user_message_with_images(format!("question {i}"), Vec::<ChatImage>::new());
+                    view.on_event(
+                        ThreadEvent::AssistantText(format!("reply {i}\n").repeat(1 + i % 5)),
+                        cx,
+                    );
+                }
+            })
+            .unwrap();
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.simulate_resize(size(px(1000.0), px(600.0)));
+        vcx.run_until_parked();
+
+        // Read history at the very top. The pending tool card is up here; the
+        // jump target is far below.
+        window
+            .update(&mut vcx.cx, |view, _window, cx| {
+                view.scroll_to_user_ordinal(0, cx);
+            })
+            .unwrap();
+        vcx.run_until_parked();
+
+        // Its result lands — a long one — while the row is off-screen.
+        window
+            .update(&mut vcx.cx, |view, _window, cx| {
+                view.on_event(
+                    ThreadEvent::ToolResult {
+                        tool_use_id: "t0".into(),
+                        content: "output line\n".repeat(200),
+                        is_error: false,
+                        structured: None,
+                    },
+                    cx,
+                );
+            })
+            .unwrap();
+        vcx.run_until_parked();
+
+        // Jump down past it. The target must actually be on screen afterwards —
+        // "the scroll top is at or above it" would also be true of a jump that
+        // landed a thousand pixels short.
+        window
+            .update(&mut vcx.cx, |view, _window, cx| {
+                view.scroll_to_user_ordinal(12, cx);
+            })
+            .unwrap();
+        vcx.run_until_parked();
+        window
+            .update(&mut vcx.cx, |view, _window, _cx| {
+                let want = view
+                    .thread
+                    .user_entry_index(12)
+                    .and_then(|e| view.row_of_entry(e))
+                    .expect("the last turn has a row");
+                let viewport = view.scroll.list.viewport_bounds();
+                let bounds = view.scroll.list.bounds_for_item(want).unwrap_or_else(|| {
+                    panic!("row {want} was not rendered at all after jumping to it")
+                });
+                let miss = bounds.top() - viewport.bottom();
+                assert!(
+                    bounds.top() >= viewport.top() && miss < viewport.size.height,
+                    "row {want} landed {miss:?} past the fold of {viewport:?} — \
+                     more than a viewport off means the heights are not merely \
+                     estimated, they are wrong",
+                );
+            })
+            .unwrap();
+    }
+
+    /// A rewind shrinks the row list mid-conversation. `splice` must keep the
+    /// list's item count honest — a stale count renders past the end.
+    #[gpui::test]
+    async fn shrinking_the_transcript_keeps_the_list_honest(cx: &mut TestAppContext) {
+        if !virtualized() {
+            return;
+        }
+        let (window, mut vcx) = seeded_view(12, cx);
+        window
+            .update(&mut vcx.cx, |view, _window, _cx| {
+                view.thread.entries.truncate(7);
+            })
+            .unwrap();
+        vcx.simulate_resize(size(px(1000.0), px(601.0)));
+        vcx.run_until_parked();
+        window
+            .update(&mut vcx.cx, |view, _window, _cx| {
+                assert_eq!(view.scroll.list.item_count(), view.rows.borrow().len());
+                assert_eq!(view.rows.borrow().len(), 8, "7 entries + the tail");
+            })
+            .unwrap();
     }
 }

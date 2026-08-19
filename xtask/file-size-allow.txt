@@ -17,5 +17,5 @@
 # rendering and its scroll primitives now live in `agent_chat/transcript.rs`,
 # and the budget below is the post-extraction size. That was the only exception
 # ever made to "ratchet down only", and it is now closed.
-apps/desktop/src/shell/agent_chat/mod.rs 7534
+apps/desktop/src/shell/agent_chat/mod.rs 7506
 apps/desktop/src/shell/agent_chat/composer.rs 3848

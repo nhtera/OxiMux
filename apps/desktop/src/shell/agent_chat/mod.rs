@@ -507,7 +507,10 @@ pub struct AgentChatView {
     /// submissions back via [`ComposerEvent`].
     composer: Entity<ComposerView>,
     focus_handle: FocusHandle,
-    list_scroll: ScrollHandle,
+    /// Where the transcript is scrolled, and what it knows about the height of
+    /// its rows. Which half is live depends on [`transcript::virtualized`]; see
+    /// [`transcript::ScrollState`].
+    scroll: transcript::ScrollState,
     /// Whether the transcript auto-follows the bottom. True by default and while
     /// the user stays at the end; set false when they scroll up to read history
     /// (so streaming doesn't yank them down), re-armed when they scroll back to
@@ -1317,7 +1320,7 @@ impl AgentChatView {
             last_notify: std::time::Instant::now(),
             flush_scheduled: false,
             focus_handle: cx.focus_handle(),
-            list_scroll: ScrollHandle::new(),
+            scroll: transcript::ScrollState::new(),
             stick_to_bottom: true,
             // Kick the follow so a restored transcript (which loads at
             // construction, not via `on_event`) is pinned to the true bottom
@@ -2173,8 +2176,7 @@ impl AgentChatView {
             }
         }
         // Jump to (and re-arm following of) the bottom for the new turn.
-        self.stick_to_bottom = true;
-        self.list_scroll.scroll_to_bottom();
+        self.follow_bottom();
         self.sync_composer(cx);
         cx.notify();
     }
@@ -2204,8 +2206,7 @@ impl AgentChatView {
             }
             Err(e) => self.thread.last_error = Some(format!("Steer failed: {e}")),
         }
-        self.stick_to_bottom = true;
-        self.list_scroll.scroll_to_bottom();
+        self.follow_bottom();
         self.sync_composer(cx);
         cx.notify();
     }
@@ -2297,8 +2298,7 @@ impl AgentChatView {
                 self.thread.last_error = None;
             }
         }
-        self.stick_to_bottom = true;
-        self.list_scroll.scroll_to_bottom();
+        self.follow_bottom();
         self.sync_composer(cx);
         cx.notify();
     }
@@ -2786,8 +2786,7 @@ impl AgentChatView {
         // Respawn reads the now-`None` session id → a fresh session, and clears
         // `disconnected`/`interrupted`/`last_error` itself on success.
         self.respawn(cx);
-        self.stick_to_bottom = true;
-        self.list_scroll.scroll_to_bottom();
+        self.follow_bottom();
         self.sync_composer(cx);
         cx.notify();
     }
@@ -3253,7 +3252,7 @@ impl AgentChatView {
             // The injected StubConnection is the whole point: no subprocess.
             probe_catalogs_live: false,
             focus_handle: cx.focus_handle(),
-            list_scroll: ScrollHandle::new(),
+            scroll: transcript::ScrollState::new(),
             stick_to_bottom: true,
             // Kick the follow so a restored transcript (which loads at
             // construction, not via `on_event`) is pinned to the true bottom
@@ -3710,7 +3709,7 @@ impl AgentChatView {
         // run of follow frames so the pin keeps re-asserting for a moment after
         // this event: the markdown lays out async, so its true height (and thus
         // the correct `content_size`) only lands a few frames later.
-        if self.stick_to_bottom {
+        if self.following() {
             self.follow_frames = FOLLOW_FRAMES;
         }
         // The turn's active flag may have flipped (e.g. `TurnEnded`); keep the
@@ -4154,9 +4153,8 @@ impl AgentChatView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _e, _w, cx| {
-                        this.stick_to_bottom = true;
+                        this.follow_bottom();
                         this.follow_frames = FOLLOW_FRAMES;
-                        this.list_scroll.scroll_to_bottom();
                         cx.notify();
                     }),
                 ),
@@ -5102,28 +5100,9 @@ impl Render for AgentChatView {
         // that case. Released when the user scrolls up (see the wheel handler on
         // the transcript). `scroll_to_bottom` only sets a flag consumed at paint,
         // so this is cheap.
-        if self.stick_to_bottom {
-            self.list_scroll.scroll_to_bottom();
-            // The async markdown layout that follows a content change does not
-            // re-run this render, so one pin lands on a too-short `content_size`.
-            // Keep re-arming the follow while the scrollable extent is still
-            // growing (the layout settling), so a slow/large reply is followed to
-            // its true bottom; once it holds steady the counter drains and the
-            // frame loop stops. Each armed frame forces a re-render that re-pins
-            // to the freshly-settled height.
-            let max_y = f32::from(self.list_scroll.max_offset().y);
-            if (max_y - self.last_max_offset).abs() > 0.5 {
-                self.follow_frames = FOLLOW_FRAMES;
-            }
-            self.last_max_offset = max_y;
-            if self.follow_frames > 0 {
-                self.follow_frames -= 1;
-                let this = cx.entity().downgrade();
-                window.on_next_frame(move |_window, cx| {
-                    let _ = this.update(cx, |_this, cx| cx.notify());
-                });
-            }
-        }
+        // The two transcript follow loops. Both inert unless in flight.
+        self.settle_legacy_follow(window, cx);
+        self.settle_pending_reveal(window, cx);
         // Fade out the jump highlight: the tinted bubble's alpha scales with
         // `flash_frames` in `render_transcript`, so drain the counter a frame at a
         // time (forcing a re-render each step) until it clears. A jump releases
