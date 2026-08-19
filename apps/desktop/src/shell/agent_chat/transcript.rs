@@ -55,6 +55,13 @@ pub(super) enum TranscriptRow {
     /// [`EntryDisplay::ShowThenExpander`]. No [`ThreadEntry`] corresponds to
     /// the expander itself.
     Expander { anchor_idx: usize },
+    /// Everything trailing the last entry — the pinned plan checklist, the one
+    /// live-state card, and the breathing room above the composer — as a single
+    /// child. Always present, even on a transcript with nothing to say, so the
+    /// row list has a tail of fixed length: those cards appear and disappear on
+    /// every turn boundary, and a tail that changed length would splice the list
+    /// each time.
+    Tail,
 }
 
 impl TranscriptRow {
@@ -63,7 +70,7 @@ impl TranscriptRow {
     fn entry(&self) -> Option<usize> {
         match *self {
             TranscriptRow::Entry { entry_idx } => Some(entry_idx),
-            TranscriptRow::Expander { .. } => None,
+            TranscriptRow::Expander { .. } | TranscriptRow::Tail => None,
         }
     }
 }
@@ -310,7 +317,10 @@ impl AgentChatView {
 
         // The child sequence every jump / rail / find target resolves through,
         // and the order they are pushed in — one list, so the two cannot drift.
-        let rows = build_rows(&self.thread.entries, &group_plan);
+        let mut rows = build_rows(&self.thread.entries, &group_plan);
+        // Unconditional, and stated here rather than inside `build_rows` so that
+        // function stays about entries and its tests keep meaning what they say.
+        rows.push(TranscriptRow::Tail);
         *self.rows.borrow_mut() = rows.clone();
 
         // Each row is a DIRECT child of the scroll box: gpui records child bounds
@@ -319,118 +329,6 @@ impl AgentChatView {
         for &row in &rows {
             scroll = scroll.child(self.render_row(row, &group_plan, &is_tool, content_w, cx));
         }
-        // The agent's execution plan (ACP `Plan`) as a pinned checklist at the tail
-        // of the transcript — one card, full-replaced on each `PlanUpdated`, kept
-        // across turns until cleared. Reuses the `TodoWrite` checklist renderer.
-        if let Some(entries) = self.thread.plan.as_ref().filter(|e| !e.is_empty()) {
-            scroll = scroll.child(
-                transcript_column(content_w)
-                    .child(plan_panel::render_plan_entries(entries, theme, density, &typo)),
-            );
-        }
-        // Live turn / disconnect state lives at the tail of the transcript (like
-        // a native chat), NOT above the composer — so it never resizes the input.
-        // These trail every user turn, so they never shift the child-index map.
-        if self.disconnected {
-            // A crash is terminal for this child, but the session is usually
-            // resumable — offer Retry, which respawns via `--resume` then
-            // re-sends the last prompt.
-            let msg = self
-                .thread
-                .last_error
-                .clone()
-                .unwrap_or_else(|| "Agent process exited.".to_string());
-            let retry = self.retry_button(cx);
-            scroll = scroll.child(
-                transcript_column(content_w)
-                    .child(error_card::error_card(&msg, theme, &typo, retry)),
-            );
-        } else if self.auth.is_some() {
-            // The agent needs login before a session can open — the auth card is
-            // the only actionable state, so it takes precedence over the working
-            // indicator and the plain error/signed-out cards BELOW it. (The
-            // `disconnected` error card above wins over it, but a failed
-            // EnvVar-auth respawn clears `self.auth`, so the two never coexist.)
-            let card = self.render_auth_card(cx);
-            scroll = scroll.child(
-                transcript_column(content_w).child(card),
-            );
-        } else if self.thread.turn_active {
-            // While a question card is pending, the agent isn't working — it's
-            // blocked on the user's answer — so don't show the "working…" spinner
-            // (it would also add height that pushes the card's controls down).
-            if self.thread.pending_question().is_none() {
-                // While compacting, show the specific "Compacting context…"
-                // spinner instead of the generic "…is working…" so a long
-                // compaction reads as progress, not a hang.
-                let indicator = if self.thread.compacting {
-                    compacting_indicator(theme, &typo)
-                } else {
-                    working_indicator(self.provider_label(), theme, &typo)
-                };
-                scroll = scroll.child(
-                    transcript_column(content_w).child(indicator),
-                );
-            }
-        } else if self.is_signed_out() && self.login_adapter_id().is_some() {
-            // The turn settled (or errored) on an auth failure whose fix is a
-            // terminal sign-in. Turn the dead-end reply into an action: a banner
-            // that opens a terminal running the agent CLI, where `/login` works.
-            // Takes precedence over the plain error card below since it's the
-            // actionable version of the same state.
-            let action = self.open_login_terminal_button(cx);
-            scroll = scroll.child(
-                transcript_column(content_w)
-                    .child(login_card::login_card(self.provider_label(), theme, &typo, action)),
-            );
-        } else if let Some(err) = self.thread.last_error.clone() {
-            // An idle turn that ended in error: surface it inline at the tail
-            // with a Retry. This is the ONLY place a failure after the first
-            // message becomes visible — the empty-state hint that also renders
-            // `last_error` only paints when the transcript is empty.
-            let retry = self.retry_button(cx);
-            scroll = scroll.child(
-                transcript_column(content_w)
-                    .child(error_card::error_card(&err, theme, &typo, retry)),
-            );
-        } else {
-            // A settled turn: surface its one-line summary and token/cost usage
-            // (both decoded by the backend; shown only when present).
-            if let Some(summary) = self
-                .thread
-                .last_summary
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            {
-                scroll = scroll.child(
-                    transcript_column(content_w)
-                        .child(summary_line(summary, theme, &typo)),
-                );
-            }
-            if let Some(usage) = self.thread.usage.as_ref() {
-                scroll = scroll.child(
-                    transcript_column(content_w)
-                        .child(usage_footer(usage, theme, &typo)),
-                );
-            }
-        }
-        // Trailing clearance INSIDE the scrollable content, above the composer:
-        // a plain breathing margin below the last line. It used to carry a second,
-        // much larger term estimating a reply's "under-counted tail", back when a
-        // multi-paragraph reply painted past the height it reported and
-        // `scroll_to_bottom` — which pins to gpui's `scroll_max`, derived from the
-        // measured content height — could not reach the end of it. Transcript
-        // children are now measured at the width they paint at (see
-        // [`transcript_column`]), so the measured content height is the real one
-        // and no extra reveal room is needed. A pending question keeps a roomier
-        // margin so its Allow/Reject controls clear the composer.
-        let tail_gap = if self.thread.pending_question().is_some() {
-            px(160.0)
-        } else {
-            px(density.pad_panel * 4.0)
-        };
-        scroll = scroll.child(div().flex_none().w_full().h(tail_gap));
         // Compose the timeline row: the left tick-rail, the scrolling transcript,
         // and the top-left jump dropdown + hover preview as absolute overlays over
         // it. The `relative` row is the positioning context all three overlays
@@ -633,6 +531,112 @@ impl AgentChatView {
         }
     }
 
+    /// Everything that trails the last entry: the pinned plan checklist, the one
+    /// live-state card (disconnected / auth / working / signed-out / errored /
+    /// settled), and the clearance above the composer.
+    ///
+    /// One child rather than the four it used to push, because the row list is
+    /// now the list's item count — see [`TranscriptRow::Tail`].
+    fn tail_element(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let density = self.density;
+        let typo = self.typography.clone();
+        // The same gap the scroll box put between top-level children, so folding
+        // these into one child does not change the spacing between them.
+        let mut col = div().flex().flex_col().gap(px(density.pad_panel * 2.0));
+        // The agent's execution plan (ACP `Plan`) as a pinned checklist at the tail
+        // of the transcript — one card, full-replaced on each `PlanUpdated`, kept
+        // across turns until cleared. Reuses the `TodoWrite` checklist renderer.
+        if let Some(entries) = self.thread.plan.as_ref().filter(|e| !e.is_empty()) {
+            col = col.child(plan_panel::render_plan_entries(entries, theme, density, &typo));
+        }
+        // Live turn / disconnect state lives at the tail of the transcript (like
+        // a native chat), NOT above the composer — so it never resizes the input.
+        // Exactly one of these branches renders, which is what keeps the tail a
+        // single row no matter which state the turn is in.
+        if self.disconnected {
+            // A crash is terminal for this child, but the session is usually
+            // resumable — offer Retry, which respawns via `--resume` then
+            // re-sends the last prompt.
+            let msg = self
+                .thread
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "Agent process exited.".to_string());
+            let retry = self.retry_button(cx);
+            col = col.child(error_card::error_card(&msg, theme, &typo, retry));
+        } else if self.auth.is_some() {
+            // The agent needs login before a session can open — the auth card is
+            // the only actionable state, so it takes precedence over the working
+            // indicator and the plain error/signed-out cards BELOW it. (The
+            // `disconnected` error card above wins over it, but a failed
+            // EnvVar-auth respawn clears `self.auth`, so the two never coexist.)
+            let card = self.render_auth_card(cx);
+            col = col.child(card);
+        } else if self.thread.turn_active {
+            // While a question card is pending, the agent isn't working — it's
+            // blocked on the user's answer — so don't show the "working…" spinner
+            // (it would also add height that pushes the card's controls down).
+            if self.thread.pending_question().is_none() {
+                // While compacting, show the specific "Compacting context…"
+                // spinner instead of the generic "…is working…" so a long
+                // compaction reads as progress, not a hang.
+                let indicator = if self.thread.compacting {
+                    compacting_indicator(theme, &typo)
+                } else {
+                    working_indicator(self.provider_label(), theme, &typo)
+                };
+                col = col.child(indicator);
+            }
+        } else if self.is_signed_out() && self.login_adapter_id().is_some() {
+            // The turn settled (or errored) on an auth failure whose fix is a
+            // terminal sign-in. Turn the dead-end reply into an action: a banner
+            // that opens a terminal running the agent CLI, where `/login` works.
+            // Takes precedence over the plain error card below since it's the
+            // actionable version of the same state.
+            let action = self.open_login_terminal_button(cx);
+            col = col.child(login_card::login_card(self.provider_label(), theme, &typo, action));
+        } else if let Some(err) = self.thread.last_error.clone() {
+            // An idle turn that ended in error: surface it inline at the tail
+            // with a Retry. This is the ONLY place a failure after the first
+            // message becomes visible — the empty-state hint that also renders
+            // `last_error` only paints when the transcript is empty.
+            let retry = self.retry_button(cx);
+            col = col.child(error_card::error_card(&err, theme, &typo, retry));
+        } else {
+            // A settled turn: surface its one-line summary and token/cost usage
+            // (both decoded by the backend; shown only when present).
+            if let Some(summary) = self
+                .thread
+                .last_summary
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                col = col.child(summary_line(summary, theme, &typo));
+            }
+            if let Some(usage) = self.thread.usage.as_ref() {
+                col = col.child(usage_footer(usage, theme, &typo));
+            }
+        }
+        // Trailing clearance INSIDE the scrollable content, above the composer:
+        // a plain breathing margin below the last line. It used to carry a second,
+        // much larger term estimating a reply's "under-counted tail", back when a
+        // multi-paragraph reply painted past the height it reported and
+        // `scroll_to_bottom` — which pins to gpui's `scroll_max`, derived from the
+        // measured content height — could not reach the end of it. Transcript
+        // children are now measured at the width they paint at (see
+        // [`transcript_column`]), so the measured content height is the real one
+        // and no extra reveal room is needed. A pending question keeps a roomier
+        // margin so its Allow/Reject controls clear the composer.
+        let tail_gap = if self.thread.pending_question().is_some() {
+            px(160.0)
+        } else {
+            px(density.pad_panel * 4.0)
+        };
+        col.child(div().flex_none().w_full().h(tail_gap)).into_any_element()
+    }
+
     /// One transcript row as a finished child: the element, in the centered
     /// reading column, with the staged-edit dim and jump flash applied.
     ///
@@ -653,6 +657,7 @@ impl AgentChatView {
             TranscriptRow::Expander { anchor_idx } => {
                 self.expander_element(anchor_idx, plan, is_tool, cx)
             }
+            TranscriptRow::Tail => Some(self.tail_element(cx)),
         };
         // A row with no element cannot happen — `build_rows` only emits rows for
         // things that render — but an empty child beats a panic if it ever does.
