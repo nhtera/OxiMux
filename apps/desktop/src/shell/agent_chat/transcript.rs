@@ -48,9 +48,13 @@ fn transcript_column(width: f32) -> gpui::Div {
 pub(super) enum TranscriptRow {
     /// The entry at this transcript index, rendered normally.
     Entry { entry_idx: usize },
-    /// The "N more" expander for the collapsed tool run starting at `run_start`.
-    /// No [`ThreadEntry`] corresponds to it.
-    Expander { run_start: usize },
+    /// The "N more" expander for a collapsed tool run, trailing the run's last
+    /// visible card. `anchor_idx` is that card's entry index — NOT the run's
+    /// first entry, which is what the expander is keyed by; both that key and
+    /// the hidden count live on the anchor's
+    /// [`EntryDisplay::ShowThenExpander`]. No [`ThreadEntry`] corresponds to
+    /// the expander itself.
+    Expander { anchor_idx: usize },
 }
 
 impl TranscriptRow {
@@ -91,8 +95,8 @@ pub(super) fn build_rows(entries: &[ThreadEntry], plan: &[EntryDisplay]) -> Vec<
         // The expander trails its anchor as its own child — including when the
         // anchor itself rendered nothing, which is what the flag-array
         // accounting did and what keeps the two provably identical.
-        if let EntryDisplay::ShowThenExpander { run_start, .. } = plan[idx] {
-            rows.push(TranscriptRow::Expander { run_start });
+        if matches!(plan[idx], EntryDisplay::ShowThenExpander { .. }) {
+            rows.push(TranscriptRow::Expander { anchor_idx: idx });
         }
     }
     rows
@@ -304,224 +308,16 @@ impl AgentChatView {
             .collect();
         let group_plan = plan_tool_grouping(&is_tool, &force_show, &self.expanded_tool_runs);
 
-        // Build each visible entry's element first, capturing per-entry flags so
-        // "which scroll child is which user turn" is a pure, unit-tested function
-        // (`user_turn_child_indices`) rather than logic tangled into the push loop.
-        struct Row {
-            entry_idx: usize,
-            el: Option<AnyElement>,
-            dimmed: bool,
-            expander: Option<AnyElement>,
-        }
-        let mut rows: Vec<Row> = Vec::with_capacity(self.thread.entries.len());
-        for (idx, entry) in self.thread.entries.iter().enumerate() {
-            if matches!(group_plan[idx], EntryDisplay::Hide) {
-                continue;
-            }
-            let el: Option<AnyElement> = match entry {
-                ThreadEntry::User { text, images, .. } => {
-                    // No "You" caption — the right-aligned bubble is the signal.
-                    Some(self.render_user_entry(idx, text, images, cx))
-                }
-                ThreadEntry::Assistant(msg) => {
-                    if msg.is_empty() {
-                        None
-                    } else {
-                        let group = SharedString::from(format!("chat-asst-{idx}"));
-                        let mut block = div()
-                            .group(group.clone())
-                            .flex()
-                            .flex_col()
-                            // Let the column shrink to the max-width wrapper so a
-                            // long markdown line wraps instead of overflowing the
-                            // edge (see `bubble::assistant_body`).
-                            .min_w_0()
-                            .gap(px(4.0))
-                            .w_full()
-                            .child(assistant_header(
-                                idx,
-                                self.recently_copied == Some(idx),
-                                // Regenerate is a constrained rewind: offer it only
-                                // on a settled, resumable, connected thread AND only
-                                // on a reply in the LAST turn (no user prompt after
-                                // it). Regenerating an earlier reply would silently
-                                // fork + drop every later turn in one click, with no
-                                // confirmation — so it's restricted to the tail turn,
-                                // where the only thing dropped is the reply itself.
-                                !self.thread.turn_active
-                                    && !self.disconnected
-                                    && !self.rewinding
-                                    && self.thread.session_id.is_some()
-                                    && self.backend_supports_rewind()
-                                    && !self.thread.entries[idx + 1..]
-                                        .iter()
-                                        .any(|e| matches!(e, ThreadEntry::User { .. })),
-                                group,
-                                &msg.text,
-                                self.provider_label(),
-                                theme,
-                                &typo,
-                                cx,
-                            ));
-                        // Thinking display honors the chat-wide level (see
-                        // `thinking_expanded`): Hidden drops the block; Expanded
-                        // forces it open; Auto peeks the streaming thought and
-                        // otherwise respects the user's per-entry toggle.
-                        if !msg.thinking.is_empty() && self.thinking_level != ThinkingLevel::Hidden {
-                            let is_last = idx + 1 == self.thread.entries.len();
-                            let expanded = self.thinking_expanded(idx, is_last, msg);
-                            block = block.child(thinking_block(
-                                idx, expanded, &msg.thinking, theme, density, &typo, cx,
-                            ));
-                        }
-                        if !msg.text.is_empty() {
-                            block = block.child(bubble::assistant_body(idx, &msg.text, &typo));
-                        }
-                        Some(block.into_any_element())
-                    }
-                }
-                ThreadEntry::ToolCall(tc) => {
-                    // An AskUserQuestion awaiting answers renders as the dedicated
-                    // interactive question card (reconciled into `question_cards`
-                    // before this loop); a TodoWrite as a read-only plan checklist;
-                    // every other tool call uses the generic (expandable) card.
-                    if matches!(tc.status, ToolCallStatus::AwaitingAnswer(_)) {
-                        self.question_cards.get(&tc.id).map(|c| c.clone().into_any_element())
-                    } else if question_card::is_question(tc) {
-                        // Answered/skipped question → a compact one-line summary.
-                        Some(question_card::render_settled(tc, theme, density, &typo).into_any_element())
-                    } else if plan_panel::is_plan(tc) {
-                        Some(plan_panel::render_plan_card(tc, theme, density, &typo).into_any_element())
-                    } else {
-                        let expanded = self.expanded_tool_calls.contains(&tc.id);
-                        let card = tool_card::render_tool_card(
-                            tc,
-                            expanded,
-                            self.provider_label(),
-                            self.screen_context(tc),
-                            theme,
-                            density,
-                            &typo,
-                            cx,
-                        );
-                        // Append inline result-image thumbnails (a Read of an
-                        // image, a screenshot) and/or an ACP embedded terminal
-                        // below the card. Both are optional; a plain tool renders
-                        // the bare card.
-                        let thumbs = self.render_tool_result_images(idx, &tc.images, cx);
-                        let terminal = self.render_embedded_terminal(&tc.id);
-                        if thumbs.is_some() || terminal.is_some() {
-                            let mut col = div().flex().flex_col().w_full().child(card);
-                            if let Some(thumbs) = thumbs {
-                                col = col.child(thumbs);
-                            }
-                            if let Some(terminal) = terminal {
-                                col = col.child(terminal);
-                            }
-                            Some(col.into_any_element())
-                        } else {
-                            Some(card.into_any_element())
-                        }
-                    }
-                }
-                ThreadEntry::ContextCompaction { summary } => {
-                    Some(compaction_divider(summary, theme, &typo).into_any_element())
-                }
-                // What the turn changed on disk, closing the turn. Review opens the
-                // turn's own diff; it is offered only when the backend reported
-                // one, since a derived summary has no hunks to show.
-                ThreadEntry::TurnDiff { files, diff } => {
-                    let on_review = diff.clone().map(|d| {
-                        // Key the tab by the DIFF ITSELF, not by anything
-                        // positional. An entry index is not an identity: it is
-                        // scoped to one transcript, so two chats' first editing
-                        // turn would both key "2" and one would silently
-                        // reactivate the other's tab; and rewind/edit-resend
-                        // truncate and repopulate from the same index, so a
-                        // post-rewind turn would reactivate the pre-rewind tab.
-                        // Both show the WRONG diff under the right label.
-                        //
-                        // Content-addressing makes a collision mean the content is
-                        // identical, in which case reusing the tab is correct.
-                        let key = diff_tab_key(&d);
-                        Box::new(cx.listener(move |_this, _e: &ClickEvent, _w, cx| {
-                            cx.emit(AgentChatEvent::ReviewTurnDiffRequested {
-                                key: key.clone(),
-                                diff: d.clone(),
-                            });
-                        })) as Box<_>
-                    });
-                    Some(turn_summary_card::render(files, theme, density, &typo, on_review))
-                }
-            };
-            // A collapsed tool-run expander follows its anchor entry as its own child.
-            let expander = match group_plan[idx] {
-                EntryDisplay::ShowThenExpander { run_start, hidden } => {
-                    // Summarize the cards the collapse HIDES — what's behind the
-                    // fold is exactly what the user can't see for themselves. The
-                    // run is the consecutive tool block from `run_start`, the same
-                    // extent `plan_tool_grouping` collapsed.
-                    let collapsed: Vec<GroupedTool> = (run_start..is_tool.len())
-                        .take_while(|&i| is_tool[i])
-                        .filter(|&i| matches!(group_plan[i], EntryDisplay::Hide))
-                        .filter_map(|i| match self.thread.entries.get(i) {
-                            Some(ThreadEntry::ToolCall(tc)) => Some(GroupedTool {
-                                kind: ToolDetail::classify(&tc.name, tc.kind.as_deref(), &tc.input),
-                                failed: matches!(tc.status, ToolCallStatus::Failed(_)),
-                                target: bubble::tool_target(tc),
-                                screen: screen_card::is_screen_call(&tc.name),
-                            }),
-                            _ => None,
-                        })
-                        .collect();
-                    let summary = summarize_tool_run(&collapsed);
-                    Some(self.render_tool_run_expander(run_start, hidden, summary, cx))
-                }
-                _ => None,
-            };
-            let dimmed = el.is_some() && self.is_pending_edit_dimmed(idx);
-            rows.push(Row { entry_idx: idx, el, dimmed, expander });
-        }
+        // The child sequence every jump / rail / find target resolves through,
+        // and the order they are pushed in — one list, so the two cannot drift.
+        let rows = build_rows(&self.thread.entries, &group_plan);
+        *self.rows.borrow_mut() = rows.clone();
 
-        // The child sequence every jump / rail / find target resolves through.
-        // Derived from the same `group_plan` the element loop above walked, so
-        // the two cannot drift; `debug_assert` below pins that to the actual
-        // elements rather than to the intent.
-        *self.rows.borrow_mut() = build_rows(&self.thread.entries, &group_plan);
-        debug_assert_eq!(
-            self.rows.borrow().len(),
-            rows.iter().map(|r| usize::from(r.el.is_some()) + usize::from(r.expander.is_some())).sum::<usize>(),
-            "build_rows must produce exactly the children render pushes",
-        );
-
-        // Push each entry (then any trailing tool-run expander) as a DIRECT child
-        // of the scroll box, in the exact order the index map counted, each in a
-        // centered max-width wrapper matching the old single column. The wrapper
-        // MUST be `flex().flex_col()` (not a bare block) so the max-width actually
-        // caps the child — a plain block lets a wide bubble overflow past the edge.
-        for row in rows {
-            if let Some(el) = row.el {
-                let mut wrap =
-                    transcript_column(content_w).child(el);
-                if row.dimmed {
-                    // A staged edit dims the messages it will remove on send.
-                    wrap = wrap.opacity(0.4);
-                }
-                // A jumped-to turn briefly tints its wrapper (whole-row highlight),
-                // fading with the frame counter so it settles rather than snaps.
-                if self.flash_entry == Some(row.entry_idx) {
-                    let a = (self.flash_frames as f32 / FLASH_FRAMES as f32).clamp(0.0, 1.0);
-                    wrap = wrap
-                        .rounded(px(density.r_card))
-                        .bg(theme.focus_ring.opacity(0.16 * a));
-                }
-                scroll = scroll.child(wrap);
-            }
-            if let Some(expander) = row.expander {
-                scroll = scroll.child(
-                    transcript_column(content_w).child(expander),
-                );
-            }
+        // Each row is a DIRECT child of the scroll box: gpui records child bounds
+        // for direct children only, which is what lets `scroll_to_item` reveal an
+        // exact turn for jump navigation.
+        for &row in &rows {
+            scroll = scroll.child(self.render_row(row, &group_plan, &is_tool, content_w, cx));
         }
         // The agent's execution plan (ACP `Plan`) as a pinned checklist at the tail
         // of the transcript — one card, full-replaced on each `PlanUpdated`, kept
@@ -652,6 +448,235 @@ impl AgentChatView {
             .children(self.render_find_bar(cx))
             .into_any_element()
     }
+    /// The element for one entry, or `None` when it renders nothing.
+    ///
+    /// `None` is only ever an assistant message with no text streamed yet, and
+    /// [`produces_element`] says so independently — a row exists precisely when
+    /// this returns `Some`, and the two must not be able to disagree.
+    fn entry_element(&self, idx: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let entry = self.thread.entries.get(idx)?;
+        let theme = self.theme;
+        let density = self.density;
+        let typo = self.typography.clone();
+        let el: Option<AnyElement> = match entry {
+            ThreadEntry::User { text, images, .. } => {
+                // No "You" caption — the right-aligned bubble is the signal.
+                Some(self.render_user_entry(idx, text, images, cx))
+            }
+            ThreadEntry::Assistant(msg) => {
+                if msg.is_empty() {
+                    None
+                } else {
+                    let group = SharedString::from(format!("chat-asst-{idx}"));
+                    let mut block = div()
+                        .group(group.clone())
+                        .flex()
+                        .flex_col()
+                        // Let the column shrink to the max-width wrapper so a
+                        // long markdown line wraps instead of overflowing the
+                        // edge (see `bubble::assistant_body`).
+                        .min_w_0()
+                        .gap(px(4.0))
+                        .w_full()
+                        .child(assistant_header(
+                            idx,
+                            self.recently_copied == Some(idx),
+                            // Regenerate is a constrained rewind: offer it only
+                            // on a settled, resumable, connected thread AND only
+                            // on a reply in the LAST turn (no user prompt after
+                            // it). Regenerating an earlier reply would silently
+                            // fork + drop every later turn in one click, with no
+                            // confirmation — so it's restricted to the tail turn,
+                            // where the only thing dropped is the reply itself.
+                            !self.thread.turn_active
+                                && !self.disconnected
+                                && !self.rewinding
+                                && self.thread.session_id.is_some()
+                                && self.backend_supports_rewind()
+                                && !self.thread.entries[idx + 1..]
+                                    .iter()
+                                    .any(|e| matches!(e, ThreadEntry::User { .. })),
+                            group,
+                            &msg.text,
+                            self.provider_label(),
+                            theme,
+                            &typo,
+                            cx,
+                        ));
+                    // Thinking display honors the chat-wide level (see
+                    // `thinking_expanded`): Hidden drops the block; Expanded
+                    // forces it open; Auto peeks the streaming thought and
+                    // otherwise respects the user's per-entry toggle.
+                    if !msg.thinking.is_empty() && self.thinking_level != ThinkingLevel::Hidden {
+                        let is_last = idx + 1 == self.thread.entries.len();
+                        let expanded = self.thinking_expanded(idx, is_last, msg);
+                        block = block.child(thinking_block(
+                            idx, expanded, &msg.thinking, theme, density, &typo, cx,
+                        ));
+                    }
+                    if !msg.text.is_empty() {
+                        block = block.child(bubble::assistant_body(idx, &msg.text, &typo));
+                    }
+                    Some(block.into_any_element())
+                }
+            }
+            ThreadEntry::ToolCall(tc) => {
+                // An AskUserQuestion awaiting answers renders as the dedicated
+                // interactive question card (reconciled into `question_cards`
+                // before this loop); a TodoWrite as a read-only plan checklist;
+                // every other tool call uses the generic (expandable) card.
+                if matches!(tc.status, ToolCallStatus::AwaitingAnswer(_)) {
+                    self.question_cards.get(&tc.id).map(|c| c.clone().into_any_element())
+                } else if question_card::is_question(tc) {
+                    // Answered/skipped question → a compact one-line summary.
+                    Some(question_card::render_settled(tc, theme, density, &typo).into_any_element())
+                } else if plan_panel::is_plan(tc) {
+                    Some(plan_panel::render_plan_card(tc, theme, density, &typo).into_any_element())
+                } else {
+                    let expanded = self.expanded_tool_calls.contains(&tc.id);
+                    let card = tool_card::render_tool_card(
+                        tc,
+                        expanded,
+                        self.provider_label(),
+                        self.screen_context(tc),
+                        theme,
+                        density,
+                        &typo,
+                        cx,
+                    );
+                    // Append inline result-image thumbnails (a Read of an
+                    // image, a screenshot) and/or an ACP embedded terminal
+                    // below the card. Both are optional; a plain tool renders
+                    // the bare card.
+                    let thumbs = self.render_tool_result_images(idx, &tc.images, cx);
+                    let terminal = self.render_embedded_terminal(&tc.id);
+                    if thumbs.is_some() || terminal.is_some() {
+                        let mut col = div().flex().flex_col().w_full().child(card);
+                        if let Some(thumbs) = thumbs {
+                            col = col.child(thumbs);
+                        }
+                        if let Some(terminal) = terminal {
+                            col = col.child(terminal);
+                        }
+                        Some(col.into_any_element())
+                    } else {
+                        Some(card.into_any_element())
+                    }
+                }
+            }
+            ThreadEntry::ContextCompaction { summary } => {
+                Some(compaction_divider(summary, theme, &typo).into_any_element())
+            }
+            // What the turn changed on disk, closing the turn. Review opens the
+            // turn's own diff; it is offered only when the backend reported
+            // one, since a derived summary has no hunks to show.
+            ThreadEntry::TurnDiff { files, diff } => {
+                let on_review = diff.clone().map(|d| {
+                    // Key the tab by the DIFF ITSELF, not by anything
+                    // positional. An entry index is not an identity: it is
+                    // scoped to one transcript, so two chats' first editing
+                    // turn would both key "2" and one would silently
+                    // reactivate the other's tab; and rewind/edit-resend
+                    // truncate and repopulate from the same index, so a
+                    // post-rewind turn would reactivate the pre-rewind tab.
+                    // Both show the WRONG diff under the right label.
+                    //
+                    // Content-addressing makes a collision mean the content is
+                    // identical, in which case reusing the tab is correct.
+                    let key = diff_tab_key(&d);
+                    Box::new(cx.listener(move |_this, _e: &ClickEvent, _w, cx| {
+                        cx.emit(AgentChatEvent::ReviewTurnDiffRequested {
+                            key: key.clone(),
+                            diff: d.clone(),
+                        });
+                    })) as Box<_>
+                });
+                Some(turn_summary_card::render(files, theme, density, &typo, on_review))
+            }
+        };
+        el
+    }
+
+    /// The "N more" expander that trails a collapsed tool run, if the entry at
+    /// `idx` anchors one. Needs the grouping plan and the tool mask because the
+    /// summary describes the cards the fold HIDES, which only the plan knows.
+    fn expander_element(
+        &self,
+        idx: usize,
+        plan: &[EntryDisplay],
+        is_tool: &[bool],
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        match plan[idx] {
+            EntryDisplay::ShowThenExpander { run_start, hidden } => {
+                // Summarize the cards the collapse HIDES — what's behind the
+                // fold is exactly what the user can't see for themselves. The
+                // run is the consecutive tool block from `run_start`, the same
+                // extent `plan_tool_grouping` collapsed.
+                let collapsed: Vec<GroupedTool> = (run_start..is_tool.len())
+                    .take_while(|&i| is_tool[i])
+                    .filter(|&i| matches!(plan[i], EntryDisplay::Hide))
+                    .filter_map(|i| match self.thread.entries.get(i) {
+                        Some(ThreadEntry::ToolCall(tc)) => Some(GroupedTool {
+                            kind: ToolDetail::classify(&tc.name, tc.kind.as_deref(), &tc.input),
+                            failed: matches!(tc.status, ToolCallStatus::Failed(_)),
+                            target: bubble::tool_target(tc),
+                            screen: screen_card::is_screen_call(&tc.name),
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                let summary = summarize_tool_run(&collapsed);
+                Some(self.render_tool_run_expander(run_start, hidden, summary, cx))
+            }
+            _ => None,
+        }
+    }
+
+    /// One transcript row as a finished child: the element, in the centered
+    /// reading column, with the staged-edit dim and jump flash applied.
+    ///
+    /// Deliberately the whole child and not just its contents — the wrapper is
+    /// where the reading measure lives, and a caller that built its own wrapper
+    /// would be free to get that wrong.
+    fn render_row(
+        &self,
+        row: TranscriptRow,
+        plan: &[EntryDisplay],
+        is_tool: &[bool],
+        content_w: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let density = self.density;
+        let el = match row {
+            TranscriptRow::Entry { entry_idx } => self.entry_element(entry_idx, cx),
+            TranscriptRow::Expander { anchor_idx } => {
+                self.expander_element(anchor_idx, plan, is_tool, cx)
+            }
+        };
+        // A row with no element cannot happen — `build_rows` only emits rows for
+        // things that render — but an empty child beats a panic if it ever does.
+        let Some(el) = el else {
+            return transcript_column(content_w).into_any_element();
+        };
+        let mut wrap = transcript_column(content_w).child(el);
+        if let TranscriptRow::Entry { entry_idx } = row {
+            if self.is_pending_edit_dimmed(entry_idx) {
+                // A staged edit dims the messages it will remove on send.
+                wrap = wrap.opacity(0.4);
+            }
+            // A jumped-to turn briefly tints its wrapper (whole-row highlight),
+            // fading with the frame counter so it settles rather than snaps.
+            if self.flash_entry == Some(entry_idx) {
+                let a = (self.flash_frames as f32 / FLASH_FRAMES as f32).clamp(0.0, 1.0);
+                wrap = wrap
+                    .rounded(px(density.r_card))
+                    .bg(self.theme.focus_ring.opacity(0.16 * a));
+            }
+        }
+        wrap.into_any_element()
+    }
+
 
     /// Wrap the scrolling transcript box in a positioned container and overlay a
     /// fading scrollbar bound to the SAME [`ScrollHandle`]. The bar paints on the
@@ -790,7 +815,7 @@ mod tests {
             vec![
                 TranscriptRow::Entry { entry_idx: 0 },
                 TranscriptRow::Entry { entry_idx: 1 },
-                TranscriptRow::Expander { run_start: 1 },
+                TranscriptRow::Expander { anchor_idx: 1 },
                 TranscriptRow::Entry { entry_idx: 3 },
             ],
         );
@@ -810,7 +835,7 @@ mod tests {
         assert_eq!(
             build_rows(&entries, &plan),
             vec![
-                TranscriptRow::Expander { run_start: 0 },
+                TranscriptRow::Expander { anchor_idx: 0 },
                 TranscriptRow::Entry { entry_idx: 1 },
             ],
         );
