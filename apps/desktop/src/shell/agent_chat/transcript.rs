@@ -987,9 +987,28 @@ impl AgentChatView {
     /// result landing. `list()` re-renders and re-measures every VISIBLE row on
     /// each layout, so this is invisible until the row is off-screen — scroll up
     /// to read history while a reply streams below and its cached height stops
-    /// tracking. Marking the range for remeasure keeps the old height as a hint,
-    /// so nothing flickers and the scrollbar extent stays sane; the row is
-    /// re-measured when it next lays out.
+    /// tracking.
+    ///
+    /// What `remeasure_items` buys, read from `gpui/src/elements/list.rs`: a row
+    /// in the OVERDRAW band is not re-measured. The trailing path takes
+    /// `item.size()` and lays the row out only when that is `None` (l.936-940);
+    /// the leading path reuses a `Measured` size verbatim (l.1048). Rewriting
+    /// the range to `Unmeasured` makes `size()` return `None` however good the
+    /// `size_hint` is, and that is what forces the re-measure.
+    ///
+    /// ⚠️ **Unproven here, and not for want of trying.** This comment used to
+    /// claim the call kept the scrollbar extent sane; that is false. An
+    /// `Unmeasured` item contributes its `size_hint`, and the hint is the stale
+    /// measurement, so the summary height is byte-identical either way until
+    /// the row is laid out again. Three attempts to write a test that fails
+    /// without the call all passed with it stubbed out: a walk past the row
+    /// puts it in the always-re-measured visible band, and parking it in the
+    /// overdraw band measures nothing at all because `run_until_parked` does
+    /// not drive the frame loop the way the real app does (the same limitation
+    /// that keeps `settle_pending_reveal` out of the tests). Kept because the
+    /// gpui path above is read from source rather than guessed at, and absence
+    /// of evidence from a harness that cannot lay out is not evidence of
+    /// absence. Verify against a live window before removing it.
     ///
     /// The remeasure range is the whole list rather than the rows we think
     /// changed, because the thread reports THAT it mutated and not where. It is
