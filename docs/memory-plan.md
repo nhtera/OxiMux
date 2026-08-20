@@ -214,3 +214,4 @@ Every phase from 2 onward:
 | 2026-08-18 | 1 (baseline) | 19.4 MB | 73–78 MB | 8.35×–9.15× | release, macOS, 16×400KB |
 | 2026-08-18 | 1 (baseline) | 35.0 MB | 96 MB | 9.55× | debug, macOS, 16×400KB (harness default) |
 | 2026-08-19 | 2 | — | — | — | desktop-only; unmeasurable by this harness (section 4b). Image cache bounded at 64MB from unbounded; publish coalesced to 250ms |
+| 2026-08-20 | 6 | 35.5 MB | 97.9 MB | 9.75× | debug, macOS, 16×400KB. Flat vs the 9.55× debug baseline and inside its recorded variance — expected: phase 6 swapped the chat MARKDOWN RENDERER, which is desktop-only and outside this harness by construction (section 4b). Run to prove no headless regression, not to measure the renderer |
