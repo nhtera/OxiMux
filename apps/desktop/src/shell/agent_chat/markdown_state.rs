@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, Context, EntityId, FocusHandle, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement, Styled, Window, div,
+    MouseDownEvent, MouseMoveEvent, ParentElement, SharedString, Styled, Window, div,
 };
 use oximux_markdown::{BlockTree, IncrementalParser};
 use oximux_syntax::{HighlightCache, HighlightedDocument, LanguageId};
@@ -49,6 +49,11 @@ pub(super) enum MdKey {
     Thinking(usize),
     Plan(u64),
 }
+
+/// The `part` of an undivided document, for [`Markdown::with_selection`]. Not a
+/// block index — a message rendered whole and the same message's block 0 are
+/// different elements and must not share an id.
+const WHOLE_DOCUMENT: usize = usize::MAX;
 
 impl MdKey {
     /// The transcript position this document belongs to, for pruning. `None`
@@ -101,16 +106,54 @@ impl Markdown {
 
     /// Render one message's markdown through the owned renderer.
     fn render_document(&self, key: MdKey, text: &str, style: &MarkdownStyle) -> AnyElement {
-        // The tree and the highlight handle are both taken before rendering
-        // starts, so no borrow of this state is held while the renderer runs —
-        // it reaches back into the highlight store on every fence.
-        let (tree, hl) = {
-            let mut state = self.state.borrow_mut();
-            let tree = state.tree(key, text);
-            let hl = state.highlights();
-            (tree, hl)
-        };
+        let (tree, hl) = self.tree_and_highlights(key, text);
         markdown_render::render_document(&tree, style, &hl)
+    }
+
+    /// The tree and the highlight handle, both taken before rendering starts so
+    /// no borrow of this state is held while the renderer runs — it reaches back
+    /// into the highlight store on every fence.
+    fn tree_and_highlights(&self, key: MdKey, text: &str) -> (BlockTree, CodeHighlightStore) {
+        let mut state = self.state.borrow_mut();
+        let tree = state.tree(key, text);
+        let hl = state.highlights();
+        (tree, hl)
+    }
+
+    /// How many top-level blocks this message currently has — that is, how many
+    /// transcript rows it wants.
+    ///
+    /// Asked by the row builder before anything renders, and cheap for the
+    /// reason the parser is kept per message at all: re-setting text the parser
+    /// already holds does no work, so the row builder and the renderer that
+    /// follows it parse the message once between them.
+    ///
+    /// The legacy renderer has no block tree, so it reports one block — its
+    /// whole body on a single row, which is how it drew before this existed.
+    pub fn block_count(&self, key: MdKey, text: &str) -> usize {
+        if !owned_renderer() {
+            return 1;
+        }
+        self.state.borrow_mut().tree(key, text).blocks.len()
+    }
+
+    /// One top-level block of a message, as its own element.
+    ///
+    /// Carries the same per-message mouse handling as [`Self::render`]: the
+    /// selection is scoped to the [`MdKey`], not to the element, so a drag that
+    /// starts in one block and continues into the next block of the same
+    /// message keeps extending — the moves land on a different element, but they
+    /// report the same key.
+    pub fn render_block(
+        &self,
+        key: MdKey,
+        text: &str,
+        block_ix: usize,
+        style: &MarkdownStyle,
+    ) -> Option<AnyElement> {
+        let (tree, hl) = self.tree_and_highlights(key, text);
+        let body = markdown_render::render_block_at(&tree, block_ix, style, &hl)?;
+        Some(self.with_selection(key, block_ix, body))
     }
 
     /// One message's markdown, wrapped in the mouse handling that drives its
@@ -123,11 +166,21 @@ impl Markdown {
     /// stale highlight behind.
     pub fn render(&self, key: MdKey, text: &str, style: &MarkdownStyle) -> AnyElement {
         let body = self.render_document(key, text, style);
+        self.with_selection(key, WHOLE_DOCUMENT, body)
+    }
+
+    /// Wrap one rendered piece of a message — a whole document, or one block of
+    /// it — in the mouse handling that drives the message's selection.
+    ///
+    /// `part` only disambiguates the element id; every other thing here is
+    /// keyed by [`MdKey`], which is what keeps one message's selection one
+    /// selection however many rows it is spread across.
+    fn with_selection(&self, key: MdKey, part: usize, body: AnyElement) -> AnyElement {
         let sel = self.selection.clone();
         let owner = self.owner;
         let focus = self.focus.clone();
         div()
-            .id(("chat-md", key.seed() as usize))
+            .id(SharedString::from(format!("chat-md-{}-{part}", key.seed())))
             .w_full()
             .min_w_0()
             .child(body)
@@ -156,9 +209,11 @@ impl Markdown {
                     }
                 }
             })
-            .on_mouse_down_out(move |_ev: &MouseDownEvent, _window, cx: &mut App| {
+            .on_mouse_down_out(move |ev: &MouseDownEvent, _window, cx: &mut App| {
+                // Guarded, because the sibling blocks of THIS message are
+                // "out" of this element too — see [`Selection::dismiss`].
                 if sel.is_active() {
-                    sel.clear();
+                    sel.dismiss(ev.position);
                     cx.notify(owner);
                 }
             })

@@ -60,7 +60,7 @@ pub(super) trait CodeHighlights {
 /// Paragraphs in a reply need to read as separate paragraphs without opening
 /// up as far as two *messages* do (which is `pad_panel * 2.0`, set by the
 /// transcript row).
-const BLOCK_GAP: f32 = 0.75;
+pub(super) const BLOCK_GAP: f32 = 0.75;
 
 /// Heading sizes as multiples of the body size, `h1` first.
 ///
@@ -185,9 +185,23 @@ impl MarkdownStyle {
         self.text_size * CODE_SCALE
     }
 
-    /// A copy button's id: this document, this fence.
-    fn copy_id(&self, fence: usize) -> ElementId {
-        ElementId::from(("chat-code-copy", self.key.seed() as usize ^ (fence << 48)))
+    /// A copy button's id: this document, this top-level block, this fence
+    /// within that block.
+    ///
+    /// The fence ordinal restarts at zero for every top-level block, because a
+    /// block is rendered on its own when it is its own transcript row — so the
+    /// block index has to be part of the id, or a reply whose second paragraph
+    /// also carries a fence would hand gpui the same id twice.
+    ///
+    /// Mixed rather than shifted into place: agent output is adversarial, and
+    /// `block << 48` on a reply with a few thousand blocks is an overflow panic
+    /// in the most-looked-at surface in the product.
+    fn copy_id(&self, block: usize, fence: usize) -> ElementId {
+        let mix = (block as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .rotate_left(31)
+            .wrapping_add((fence as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        ElementId::from(("chat-code-copy", (self.key.seed() ^ mix) as usize))
     }
 }
 
@@ -200,13 +214,23 @@ impl MarkdownStyle {
 struct Ctx<'a> {
     style: &'a MarkdownStyle,
     hl: &'a dyn CodeHighlights,
-    /// Fences seen so far, in document order. Ids keyed on content would
+    /// Which top-level block is being rendered. Both counters below are scoped
+    /// to it and restart at zero for the next one, so rendering a block on its
+    /// own — as a block-granularity transcript row does — produces exactly the
+    /// ids and ordinals it would have got inside the whole document.
+    block: usize,
+    /// Fences seen so far in this block, in order. Ids keyed on content would
     /// collide when a reply shows the same snippet twice, which is exactly what
     /// a before/after answer does.
     fence: Cell<usize>,
-    /// Text elements so far, in document order. This is what puts a copied
-    /// selection back together in the order it was read.
+    /// Text elements so far in this block, in order.
     text_ord: Cell<usize>,
+}
+
+impl<'a> Ctx<'a> {
+    fn new(style: &'a MarkdownStyle, hl: &'a dyn CodeHighlights, block: usize) -> Self {
+        Self { style, hl, block, fence: Cell::new(0), text_ord: Cell::new(0) }
+    }
 }
 
 impl Ctx<'_> {
@@ -215,13 +239,18 @@ impl Ctx<'_> {
     /// Every piece of text in the document goes through here, in the order it
     /// is built, and that order is the only thing that tells a copy how to
     /// reassemble what came from several elements.
+    ///
+    /// The ordinal is `(block, position within block)` rather than one running
+    /// count, and it is a pair rather than a packed integer on purpose: a
+    /// `BTreeMap` orders pairs lexicographically, which is document order, and
+    /// nothing has to pick a stride that a pathological reply could overflow.
     fn selectable(&self, plain: &str, text: StyledText) -> ChatText {
-        let ord = self.text_ord.get();
-        self.text_ord.set(ord + 1);
+        let local = self.text_ord.get();
+        self.text_ord.set(local + 1);
         let el = ChatText::new(
             text,
             self.style.key,
-            ord,
+            (self.block, local),
             self.style.selection.clone(),
             self.style.theme.selection,
         );
@@ -257,12 +286,36 @@ pub(super) fn render_document(
     style: &MarkdownStyle,
     hl: &dyn CodeHighlights,
 ) -> AnyElement {
-    let cx = Ctx { style, hl, fence: Cell::new(0), text_ord: Cell::new(0) };
     let mut col = div().flex().flex_col().w_full().min_w_0();
     for (ix, top) in tree.blocks.iter().enumerate() {
+        let cx = Ctx::new(style, hl, ix);
         col = col.child(spaced(render_block(&top.block, &cx, 0), ix, style));
     }
     col.into_any_element()
+}
+
+/// Render one top-level block by itself, for a transcript that gives each block
+/// its own row.
+///
+/// Identical output to the same block's slice of [`render_document`] — same
+/// element ids, same selection ordinals — because both go through a [`Ctx`]
+/// built for that block index. The inter-block gap is deliberately *not*
+/// applied here: as a row, the spacing between this block and the one above it
+/// belongs to the transcript, which is the thing that knows whether the row
+/// above is the rest of this message or the end of the previous one.
+///
+/// `None` when `ix` is past the end — a block row outliving its block for one
+/// frame is a real race while a reply streams, and drawing nothing is better
+/// than panicking in the transcript.
+pub(super) fn render_block_at(
+    tree: &BlockTree,
+    ix: usize,
+    style: &MarkdownStyle,
+    hl: &dyn CodeHighlights,
+) -> Option<AnyElement> {
+    let top = tree.blocks.get(ix)?;
+    let cx = Ctx::new(style, hl, ix);
+    Some(div().w_full().min_w_0().child(render_block(&top.block, &cx, 0)).into_any_element())
 }
 
 /// Put the inter-block gap on the block itself.
@@ -491,7 +544,7 @@ fn code_block(language: Option<&str>, code: &str, cx: &Ctx<'_>) -> AnyElement {
                         .text_color(style.theme.fg_subtle)
                         .children(tag.map(SharedString::from)),
                 )
-                .child(copy_button(style.copy_id(ordinal), code)),
+                .child(copy_button(style.copy_id(cx.block, ordinal), code)),
         );
     }
     card.child(lines).into_any_element()
@@ -719,7 +772,7 @@ mod tests {
     }
 
     fn ctx<'a>(style: &'a MarkdownStyle, hl: &'a dyn CodeHighlights) -> Ctx<'a> {
-        Ctx { style, hl, fence: Cell::new(0), text_ord: Cell::new(0) }
+        Ctx::new(style, hl, 0)
     }
 
     fn spans_of(md: &str) -> InlineSpans {
@@ -836,7 +889,9 @@ mod tests {
     #[test]
     fn two_identical_fences_get_different_copy_ids() {
         let style = style();
-        assert_ne!(style.copy_id(0), style.copy_id(1));
+        assert_ne!(style.copy_id(0, 0), style.copy_id(0, 1));
+        // ...nor two blocks of one reply that each open with a fence.
+        assert_ne!(style.copy_id(0, 0), style.copy_id(1, 0));
         // ...and two documents do not collide either.
         let other = MarkdownStyle::body(
             MdKey::Reply(8),
@@ -845,7 +900,7 @@ mod tests {
             Density::default(),
             &Typography::default(),
         );
-        assert_ne!(style.copy_id(0), other.copy_id(0));
+        assert_ne!(style.copy_id(0, 0), other.copy_id(0, 0));
     }
 
     /// Selection reassembles a copy from text elements in the order they were

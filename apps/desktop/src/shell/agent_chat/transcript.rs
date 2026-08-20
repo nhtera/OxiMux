@@ -27,6 +27,16 @@ use gpui::{list, FollowMode, ListAlignment, ListSizingBehavior, ListState};
 /// one screenful rather than the several a cheap uniform list could afford.
 const OVERDRAW: f32 = 600.0;
 
+/// The gap between two messages, as a multiple of `pad_panel`. What every row
+/// boundary used before a message could span several rows.
+const MESSAGE_GAP: f32 = 2.0;
+
+/// The gap between an assistant's header row and the first row of its body.
+/// Fixed pixels expressed as a fraction of nothing — it is the `gap(px(4.0))`
+/// the head column used when the body was a child of it, kept as a raw value so
+/// the header still sits as close to its first paragraph as it ever did.
+const HEAD_TO_BODY_GAP_PX: f32 = 4.0;
+
 /// The ceiling on how many frames a jump keeps correcting itself. It normally
 /// stops well before this, at the fixed point — the cap only exists so a target
 /// that never settles cannot repaint forever.
@@ -135,7 +145,22 @@ fn transcript_column(width: f32) -> gpui::Div {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum TranscriptRow {
     /// The entry at this transcript index, rendered normally.
+    ///
+    /// For an assistant message this is its *head* only — the header line and
+    /// the thinking disclosure. Its reply body follows in [`Self::Block`] rows,
+    /// which is what makes a streamed token re-render one paragraph instead of
+    /// the whole message.
     Entry { entry_idx: usize },
+    /// One top-level markdown block of the assistant reply at `entry_idx`,
+    /// trailing that entry's head row.
+    ///
+    /// `block_ix` indexes the block tree the renderer will draw from, so a row
+    /// keeps its identity across a token arriving in a *later* block — which is
+    /// the whole point: identical rows are left alone by the list's splice and
+    /// never re-measured. A reply whose last paragraph turns out to be a list
+    /// item changes that block's content without changing its index, and a
+    /// reply that opens a new block appends one row at the tail.
+    Block { entry_idx: usize, block_ix: usize },
     /// The "N more" expander for a collapsed tool run, trailing the run's last
     /// visible card. `anchor_idx` is that card's entry index — NOT the run's
     /// first entry, which is what the expander is keyed by; both that key and
@@ -157,9 +182,37 @@ impl TranscriptRow {
     /// distinction every reverse lookup here turns on.
     fn entry(&self) -> Option<usize> {
         match *self {
-            TranscriptRow::Entry { entry_idx } => Some(entry_idx),
+            TranscriptRow::Entry { entry_idx } | TranscriptRow::Block { entry_idx, .. } => {
+                Some(entry_idx)
+            }
             TranscriptRow::Expander { .. } | TranscriptRow::Tail => None,
         }
+    }
+}
+
+/// The gap above a row, in pixels.
+///
+/// Splitting a message across rows made this a question rather than a constant:
+/// the space between two blocks of one reply is not the space between two
+/// messages, and the row above no longer says which of those you have without
+/// being asked. Getting it wrong is not subtle — every paragraph of every reply
+/// would open up to the full between-messages gap.
+///
+/// Each arm reproduces the spacing that piece had when a message was one row:
+/// the head-to-body gap is the head column's own `gap`, and the block-to-block
+/// gap is the markdown renderer's, borrowed rather than re-guessed so the two
+/// cannot drift apart.
+fn gap_above(prev: Option<TranscriptRow>, row: TranscriptRow, density: Density) -> f32 {
+    use TranscriptRow::{Block, Entry};
+    let Some(prev) = prev else {
+        return 0.0;
+    };
+    match (prev, row) {
+        (Entry { entry_idx: a }, Block { entry_idx: b, .. }) if a == b => HEAD_TO_BODY_GAP_PX,
+        (Block { entry_idx: a, .. }, Block { entry_idx: b, .. }) if a == b => {
+            density.pad_panel * markdown_render::BLOCK_GAP
+        }
+        _ => density.pad_panel * MESSAGE_GAP,
     }
 }
 
@@ -178,7 +231,19 @@ fn produces_element(entry: &ThreadEntry) -> bool {
 ///
 /// Pure, so the ordering every jump / rail / find target resolves through is
 /// unit-testable without a window.
-pub(super) fn build_rows(entries: &[ThreadEntry], plan: &[EntryDisplay]) -> Vec<TranscriptRow> {
+///
+/// `body_blocks` answers, for an assistant entry, how many top-level markdown
+/// blocks its reply currently has — how many [`TranscriptRow::Block`] rows to
+/// lay after its head. It is a callback rather than a slice because the answer
+/// lives in the renderer's per-message parser, which this module has no business
+/// reaching into and which tests have no business standing up. The renderer that
+/// follows re-asks the same parser for the same text, and gets it free: setting
+/// text a parser already holds does no work.
+pub(super) fn build_rows(
+    entries: &[ThreadEntry],
+    plan: &[EntryDisplay],
+    body_blocks: &dyn Fn(usize, &str) -> usize,
+) -> Vec<TranscriptRow> {
     let mut rows = Vec::with_capacity(entries.len());
     for (idx, entry) in entries.iter().enumerate() {
         if matches!(plan[idx], EntryDisplay::Hide) {
@@ -186,6 +251,17 @@ pub(super) fn build_rows(entries: &[ThreadEntry], plan: &[EntryDisplay]) -> Vec<
         }
         if produces_element(entry) {
             rows.push(TranscriptRow::Entry { entry_idx: idx });
+            // Only an assistant reply splits. A user bubble, a tool card, a
+            // compaction rule and a turn-diff card are each one indivisible
+            // thing, and a fold expander has no entry behind it at all.
+            if let ThreadEntry::Assistant(msg) = entry
+                && !msg.text.is_empty()
+            {
+                let n = body_blocks(idx, &msg.text);
+                rows.extend(
+                    (0..n).map(|block_ix| TranscriptRow::Block { entry_idx: idx, block_ix }),
+                );
+            }
         }
         // The expander trails its anchor as its own child — including when the
         // anchor itself rendered nothing, which is what the flag-array
@@ -563,7 +639,10 @@ impl AgentChatView {
 
         // The child sequence every jump / rail / find target resolves through,
         // and the order they are pushed in — one list, so the two cannot drift.
-        let mut rows = build_rows(&self.thread.entries, &group_plan);
+        let md = self.markdown.clone();
+        let mut rows = build_rows(&self.thread.entries, &group_plan, &|idx, text| {
+            md.block_count(markdown_state::MdKey::Reply(idx), text)
+        });
         // Unconditional, and stated here rather than inside `build_rows` so that
         // function stays about entries and its tests keep meaning what they say.
         rows.push(TranscriptRow::Tail);
@@ -579,8 +658,9 @@ impl AgentChatView {
             // bounds for direct children only, which is what lets
             // `scroll_to_item` reveal an exact turn.
             for (ix, &row) in rows.iter().enumerate() {
-                scroll =
-                    scroll.child(self.render_row(row, ix, &group_plan, &is_tool, content_w, cx));
+                let prev = ix.checked_sub(1).map(|p| rows[p]);
+                scroll = scroll
+                    .child(self.render_row(row, prev, &group_plan, &is_tool, content_w, cx));
             }
             scroll.into_any_element()
         };
@@ -665,17 +745,11 @@ impl AgentChatView {
                         let expanded = self.thinking_expanded(idx, is_last, msg);
                         block = block.child(thinking_block(self, idx, expanded, &msg.thinking, cx));
                     }
-                    if !msg.text.is_empty() {
-                        block = block.child(bubble::assistant_body(
-                            &self.markdown,
-                            markdown_state::MdKey::Reply(idx),
-                            &msg.text,
-                            self.find_mark(idx),
-                            theme,
-                            density,
-                            &typo,
-                        ));
-                    }
+                    // The reply body is NOT a child here: it follows as its own
+                    // [`TranscriptRow::Block`] rows, which is what keeps a
+                    // streamed token from re-rendering the whole message. This
+                    // row is the header and the thinking disclosure — the parts
+                    // that do not grow token by token.
                     Some(block.into_any_element())
                 }
             }
@@ -755,6 +829,34 @@ impl AgentChatView {
             }
         };
         el
+    }
+
+    /// One top-level block of the assistant reply at `entry_idx`.
+    ///
+    /// `None` when the row has outrun the tree — a real race while a reply
+    /// streams, since the row list is built from a block count taken before the
+    /// list asks for any row, and a rewind can shrink the message in between.
+    /// Drawing nothing for one frame is the right answer; the next frame rebuilds
+    /// the row list.
+    fn block_element(
+        &self,
+        entry_idx: usize,
+        block_ix: usize,
+        _cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let ThreadEntry::Assistant(msg) = self.thread.entries.get(entry_idx)? else {
+            return None;
+        };
+        bubble::assistant_block(
+            &self.markdown,
+            markdown_state::MdKey::Reply(entry_idx),
+            &msg.text,
+            block_ix,
+            self.find_mark(entry_idx),
+            self.theme,
+            self.density,
+            &self.typography,
+        )
     }
 
     /// The "N more" expander that trails a collapsed tool run, if the entry at
@@ -908,7 +1010,7 @@ impl AgentChatView {
     fn render_row(
         &self,
         row: TranscriptRow,
-        ix: usize,
+        prev: Option<TranscriptRow>,
         plan: &[EntryDisplay],
         is_tool: &[bool],
         content_w: f32,
@@ -919,6 +1021,9 @@ impl AgentChatView {
         let density = self.density;
         let el = match row {
             TranscriptRow::Entry { entry_idx } => self.entry_element(entry_idx, cx),
+            TranscriptRow::Block { entry_idx, block_ix } => {
+                self.block_element(entry_idx, block_ix, cx)
+            }
             TranscriptRow::Expander { anchor_idx } => {
                 self.expander_element(anchor_idx, plan, is_tool, cx)
             }
@@ -931,12 +1036,13 @@ impl AgentChatView {
         // scroll box's `gap`, which is spacing BETWEEN children — hence not on
         // the first.
         let mut outer = div().flex().flex_row().justify_center().w_full();
-        if ix > 0 {
+        let gap = gap_above(prev, row, density);
+        if gap > 0.0 {
             // Padding, not margin. A margin on a list item's ROOT element sits
             // outside the box `layout_as_root` measures, so the list would cache
             // a height short by the gap on every row and every jump would land
             // proportionally wrong. Padding is inside the box and is measured.
-            outer = outer.pt(px(density.pad_panel * 2.0));
+            outer = outer.pt(px(gap));
         }
         // A row with no element cannot happen — `build_rows` only emits rows for
         // things that render — but an empty child beats a panic if it ever does.
@@ -944,7 +1050,10 @@ impl AgentChatView {
             return outer.into_any_element();
         };
         let mut wrap = transcript_column(content_w).child(el);
-        if let TranscriptRow::Entry { entry_idx } = row {
+        // Both dims are properties of the ENTRY, so every row of a message
+        // carries them — a reply half-dimmed by a staged edit, or flashing only
+        // its header, would read as a rendering bug.
+        if let Some(entry_idx) = row.entry() {
             if self.is_pending_edit_dimmed(entry_idx) {
                 // A staged edit dims the messages it will remove on send.
                 wrap = wrap.opacity(0.4);
@@ -1061,8 +1170,12 @@ impl AgentChatView {
                 return div().into_any_element();
             };
             let (plan, is_tool) = (plan.clone(), is_tool.clone());
+            // The row above, for the gap: a list builds rows in isolation, so
+            // the only thing that knows a row is the continuation of the message
+            // above it is the row list itself.
+            let prev = ix.checked_sub(1).and_then(|p| rows.get(p).copied());
             view.update(cx, |this, cx| {
-                this.render_row(row, ix, &plan, &is_tool, content_w, cx)
+                this.render_row(row, prev, &plan, &is_tool, content_w, cx)
             })
         })
         .with_sizing_behavior(ListSizingBehavior::Auto)
@@ -1264,21 +1377,121 @@ mod tests {
         (0..n).map(|_| EntryDisplay::Show).collect()
     }
 
-    /// The straightforward case: every entry renders, so row index == entry
-    /// index and a user turn's ordinal is just its position among user rows.
+    /// Block counts the way the renderer will really see them: the same parser,
+    /// over the same text.
+    ///
+    /// A stub answering `1` would leave every assertion below agreeing with a
+    /// renderer that split nothing — which is precisely the failure this
+    /// callback exists to make visible.
+    fn real_blocks(_idx: usize, text: &str) -> usize {
+        oximux_markdown::parse_full(text).blocks.len()
+    }
+
+    /// The head row an assistant entry always gets, followed by one row per
+    /// block of its reply. Spelled out here because it is the shape almost every
+    /// expectation below repeats.
+    fn assistant_rows(idx: usize, blocks: usize) -> Vec<TranscriptRow> {
+        std::iter::once(TranscriptRow::Entry { entry_idx: idx })
+            .chain((0..blocks).map(|block_ix| TranscriptRow::Block { entry_idx: idx, block_ix }))
+            .collect()
+    }
+
+    /// The straightforward case: every entry renders. A user turn is one row; a
+    /// one-paragraph reply is a head row and a block row.
     #[test]
     fn every_entry_that_renders_gets_its_own_row() {
         let entries = vec![user("a"), assistant("b"), user("c"), assistant("d")];
         let plan = all_shown(4);
         assert_eq!(
-            build_rows(&entries, &plan),
+            build_rows(&entries, &plan, &real_blocks),
+            [
+                vec![TranscriptRow::Entry { entry_idx: 0 }],
+                assistant_rows(1, 1),
+                vec![TranscriptRow::Entry { entry_idx: 2 }],
+                assistant_rows(3, 1),
+            ]
+            .concat(),
+        );
+    }
+
+    /// The phase in one assertion: a reply is as many rows as it has top-level
+    /// blocks, so a token landing in the last paragraph leaves every row above
+    /// it untouched.
+    #[test]
+    fn a_reply_takes_one_row_per_top_level_block() {
+        let reply = "# Title\n\nA paragraph.\n\n```rs\nfn main() {}\n```\n\n- a\n- b\n";
+        let entries = vec![user("q"), assistant(reply)];
+        let plan = all_shown(2);
+        assert_eq!(real_blocks(1, reply), 4, "heading, paragraph, fence, list");
+        assert_eq!(
+            build_rows(&entries, &plan, &real_blocks),
+            [vec![TranscriptRow::Entry { entry_idx: 0 }], assistant_rows(1, 4)].concat(),
+        );
+    }
+
+    /// Only assistant replies split. Everything else is one indivisible thing,
+    /// and a user bubble broken across rows would lose the bubble.
+    #[test]
+    fn nothing_but_an_assistant_reply_splits() {
+        let multi = "one\n\ntwo\n\nthree\n";
+        let entries = vec![
+            user(multi),
+            ThreadEntry::ContextCompaction { summary: multi.into() },
+        ];
+        let plan = all_shown(2);
+        assert_eq!(
+            build_rows(&entries, &plan, &real_blocks),
             vec![
                 TranscriptRow::Entry { entry_idx: 0 },
                 TranscriptRow::Entry { entry_idx: 1 },
-                TranscriptRow::Entry { entry_idx: 2 },
-                TranscriptRow::Entry { entry_idx: 3 },
             ],
         );
+    }
+
+    /// A reply that has only thought so far still renders — its header and its
+    /// thinking disclosure — but has no body to split.
+    #[test]
+    fn a_reply_that_is_only_thinking_has_a_head_row_and_no_blocks() {
+        let entries = vec![ThreadEntry::Assistant(AssistantMessage {
+            text: String::new(),
+            thinking: "still working\n\non it\n".into(),
+        })];
+        assert_eq!(
+            build_rows(&entries, &all_shown(1), &real_blocks),
+            vec![TranscriptRow::Entry { entry_idx: 0 }],
+        );
+    }
+
+    /// What the whole splice-don't-reset scheme rests on: growing a reply must
+    /// leave the rows above the growth **identical**, so `sync_list_state`'s
+    /// common-prefix diff splices the tail instead of rebuilding the list and
+    /// throwing away the scroll position with it.
+    #[test]
+    fn appending_to_a_reply_leaves_the_rows_above_it_untouched() {
+        let plan = all_shown(2);
+        let settled = "# Title\n\nA paragraph.\n\nAnother one";
+        let before = build_rows(
+            &[user("q"), assistant(settled)],
+            &plan,
+            &real_blocks,
+        );
+
+        // A token lands in the last block: same rows, same order, same count.
+        let mid = build_rows(
+            &[user("q"), assistant(&format!("{settled} extended"))],
+            &plan,
+            &real_blocks,
+        );
+        assert_eq!(before, mid, "a token inside the last block moved a row");
+
+        // A new block opens: the previous rows are a prefix, one row appended.
+        let after = build_rows(
+            &[user("q"), assistant(&format!("{settled}\n\nA fourth."))],
+            &plan,
+            &real_blocks,
+        );
+        assert_eq!(after.len(), before.len() + 1);
+        assert_eq!(&after[..before.len()], &before[..], "opening a block moved the rows above it");
     }
 
     /// An assistant message with nothing streamed yet renders no child, so it
@@ -1289,7 +1502,7 @@ mod tests {
         let entries = vec![user("a"), assistant(""), user("c")];
         let plan = all_shown(3);
         assert_eq!(
-            build_rows(&entries, &plan),
+            build_rows(&entries, &plan, &real_blocks),
             vec![
                 TranscriptRow::Entry { entry_idx: 0 },
                 TranscriptRow::Entry { entry_idx: 2 },
@@ -1308,11 +1521,14 @@ mod tests {
             EntryDisplay::Hide,
             EntryDisplay::Show,
         ];
+        // The expander trails the WHOLE anchor message, block rows included —
+        // it summarises what the fold hides, which sits below all of it.
         assert_eq!(
-            build_rows(&entries, &plan),
+            build_rows(&entries, &plan, &real_blocks),
             vec![
                 TranscriptRow::Entry { entry_idx: 0 },
                 TranscriptRow::Entry { entry_idx: 1 },
+                TranscriptRow::Block { entry_idx: 1, block_ix: 0 },
                 TranscriptRow::Expander { anchor_idx: 1 },
                 TranscriptRow::Entry { entry_idx: 3 },
             ],
@@ -1331,7 +1547,7 @@ mod tests {
             EntryDisplay::Show,
         ];
         assert_eq!(
-            build_rows(&entries, &plan),
+            build_rows(&entries, &plan, &real_blocks),
             vec![
                 TranscriptRow::Expander { anchor_idx: 0 },
                 TranscriptRow::Entry { entry_idx: 1 },
@@ -1341,7 +1557,34 @@ mod tests {
 
     #[test]
     fn an_empty_transcript_has_no_rows() {
-        assert!(build_rows(&[], &[]).is_empty());
+        assert!(build_rows(&[], &[], &real_blocks).is_empty());
+    }
+
+    /// The spacing a split message must not disturb.
+    ///
+    /// Every one of these gaps existed before a message could span rows; the
+    /// only thing that changed is which element carries it. If the first two
+    /// arms collapse into the third, every paragraph of every reply opens up to
+    /// the between-messages gap and the transcript reads as broken.
+    #[test]
+    fn a_split_message_is_spaced_as_one_message() {
+        use TranscriptRow::{Block, Entry};
+        let d = Density::default();
+        let head = Entry { entry_idx: 4 };
+        let b0 = Block { entry_idx: 4, block_ix: 0 };
+        let b1 = Block { entry_idx: 4, block_ix: 1 };
+
+        assert_eq!(gap_above(None, head, d), 0.0, "the first row has nothing above it");
+        assert_eq!(gap_above(Some(head), b0, d), HEAD_TO_BODY_GAP_PX);
+        assert_eq!(gap_above(Some(b0), b1, d), d.pad_panel * markdown_render::BLOCK_GAP);
+
+        // ...and a row belonging to a DIFFERENT entry is a message boundary,
+        // whichever kinds the two rows are.
+        let message_gap = d.pad_panel * MESSAGE_GAP;
+        assert_eq!(gap_above(Some(b1), Entry { entry_idx: 5 }, d), message_gap);
+        assert_eq!(gap_above(Some(b1), Block { entry_idx: 5, block_ix: 0 }, d), message_gap);
+        assert_eq!(gap_above(Some(Entry { entry_idx: 3 }), head, d), message_gap);
+        assert_eq!(gap_above(Some(b1), TranscriptRow::Tail, d), message_gap);
     }
 
     /// A conversation deep enough that most of it is off-screen: `n` user turns,
@@ -1408,8 +1651,9 @@ mod tests {
         window
             .update(&mut vcx.cx, |view, _window, _cx| {
                 assert_eq!(view.scroll.list.item_count(), view.rows.borrow().len());
-                // 12 turns -> 24 entry rows + the tail.
-                assert_eq!(view.rows.borrow().len(), 25);
+                // 12 turns -> 12 user rows + 12 replies of a head row and one
+                // one-paragraph block each + the tail.
+                assert_eq!(view.rows.borrow().len(), 37);
             })
             .unwrap();
     }
@@ -1470,7 +1714,7 @@ mod tests {
                 (view.rows.borrow().len(), view.scroll.rows_built.get())
             })
             .unwrap();
-        assert_eq!(rows, 401, "200 turns -> 400 entry rows + the tail");
+        assert_eq!(rows, 601, "200 turns -> 200 user + 400 assistant rows + the tail");
         assert!(
             built < rows / 4,
             "built {built} of {rows} rows — that is not virtualized",
@@ -1485,7 +1729,7 @@ mod tests {
                 (view.rows.borrow().len(), view.scroll.rows_built.get())
             })
             .unwrap();
-        assert_eq!(rows2, 4001);
+        assert_eq!(rows2, 6001);
         assert!(
             built2 < before * 3,
             "10x the transcript ({rows} -> {rows2} rows) took {before} -> {built2} row builds; \
@@ -1655,7 +1899,11 @@ mod tests {
         window
             .update(&mut vcx.cx, |view, _window, _cx| {
                 assert_eq!(view.scroll.list.item_count(), view.rows.borrow().len());
-                assert_eq!(view.rows.borrow().len(), 8, "7 entries + the tail");
+                assert_eq!(
+                    view.rows.borrow().len(),
+                    11,
+                    "4 user rows + 3 replies at 2 rows each + the tail",
+                );
             })
             .unwrap();
     }

@@ -39,6 +39,15 @@ use gpui::{
 
 use super::markdown_state::MdKey;
 
+/// A text element's position in its document: `(top-level block, position
+/// within that block)`.
+///
+/// A pair rather than one running count because a message's blocks are rendered
+/// independently — each is its own transcript row — so no renderer sees a
+/// document-wide running total. Lexicographic order on the pair *is* document
+/// order, which is all the copy reassembly ever wanted from it.
+pub(super) type TextOrd = (usize, usize);
+
 /// A drag in progress or a selection that has settled.
 #[derive(Clone, Copy)]
 struct Anchors {
@@ -67,11 +76,11 @@ impl Anchors {
 #[derive(Default)]
 struct State {
     anchors: Option<Anchors>,
-    /// What each text element found selected, keyed by its position in the
-    /// document so a copy reassembles in reading order. Rebuilt every paint —
-    /// an element that scrolled out of view stops contributing, which is
-    /// correct: it is no longer laid out, so what it holds is no longer known.
-    captured: BTreeMap<usize, String>,
+    /// What each text element found selected, keyed by [`TextOrd`] so a copy
+    /// reassembles in reading order. Rebuilt every paint — an element that
+    /// scrolled out of view stops contributing, which is correct: it is no
+    /// longer laid out, so what it holds is no longer known.
+    captured: BTreeMap<TextOrd, String>,
 }
 
 /// The chat view's selection, shared by handle.
@@ -105,6 +114,32 @@ impl Selection {
         let mut state = self.0.borrow_mut();
         state.anchors = None;
         state.captured.clear();
+    }
+
+    /// A mouse-down landed outside one of this document's elements: drop the
+    /// selection unless that same press is the one that just started a new one.
+    ///
+    /// The guard exists because a message is no longer a single element. Its
+    /// blocks are separate transcript rows, each carrying its own
+    /// `on_mouse_down_out`, so pressing inside block 2 is "outside" blocks 1
+    /// and 3 of the very same message — and an unguarded clear would wipe the
+    /// selection the press was in the middle of starting.
+    ///
+    /// Comparing against the press position rather than tracking dispatch order
+    /// is what makes it order-independent, and gpui does not promise an order
+    /// between a sibling's out-handler and this element's own down-handler. If
+    /// the out-handler runs first there is nothing to clear yet and
+    /// [`Self::begin`] anchors afterwards; if it runs second the anchors are
+    /// already at `at` and this returns. A press genuinely outside the message
+    /// began nothing, so its position matches no fresh anchor and the selection
+    /// goes.
+    pub fn dismiss(&self, at: Point<Pixels>) {
+        let just_begun_here =
+            self.0.borrow().anchors.is_some_and(|a| a.down == at && a.now == at);
+        if just_begun_here {
+            return;
+        }
+        self.clear();
     }
 
     /// Whether anything is actually selected — not merely whether a click
@@ -147,7 +182,7 @@ impl Selection {
         state.anchors.filter(|a| a.key == key).map(|a| a.ordered())
     }
 
-    fn capture(&self, ord: usize, text: Option<String>) {
+    fn capture(&self, ord: TextOrd, text: Option<String>) {
         let mut state = self.0.borrow_mut();
         match text {
             Some(t) => {
@@ -177,7 +212,7 @@ pub(super) struct ChatText {
     inner: StyledText,
     key: MdKey,
     /// This element's position in its document, for reassembling a copy.
-    ord: usize,
+    ord: TextOrd,
     selection: Selection,
     tint: Hsla,
     /// Find matches inside this element's own text. Computed per element, so
@@ -187,7 +222,13 @@ pub(super) struct ChatText {
 }
 
 impl ChatText {
-    pub fn new(inner: StyledText, key: MdKey, ord: usize, selection: Selection, tint: Hsla) -> Self {
+    pub fn new(
+        inner: StyledText,
+        key: MdKey,
+        ord: TextOrd,
+        selection: Selection,
+        tint: Hsla,
+    ) -> Self {
         Self { inner, key, ord, selection, tint, matches: Vec::new() }
     }
 
@@ -441,15 +482,56 @@ mod tests {
     }
 
     /// Blocks are reassembled in document order, separated the way blocks are.
+    ///
+    /// Captured out of order on purpose: block rows paint in whatever order the
+    /// list reaches them, so arrival order says nothing about reading order.
+    /// The ordinal is the only thing that does.
     #[test]
     fn a_copy_reassembles_in_document_order() {
         let sel = Selection::default();
         sel.begin(MdKey::Reply(0), p(0.0, 0.0));
-        sel.capture(2, Some("third".into()));
-        sel.capture(0, Some("first".into()));
-        sel.capture(1, Some("second".into()));
-        assert_eq!(sel.selected_text(), "first\n\nsecond\n\nthird");
+        sel.capture((1, 1), Some("fourth".into()));
+        sel.capture((0, 1), Some("second".into()));
+        sel.capture((1, 0), Some("third".into()));
+        sel.capture((0, 0), Some("first".into()));
+        assert_eq!(sel.selected_text(), "first\n\nsecond\n\nthird\n\nfourth");
         assert!(sel.is_active());
+    }
+
+    /// A press inside another block of the SAME message reaches the sibling
+    /// blocks' `on_mouse_down_out` — the selection it is starting must survive
+    /// that, whichever handler gpui happens to dispatch first.
+    #[test]
+    fn a_press_that_just_began_a_selection_is_not_dismissed_by_its_siblings() {
+        let sel = Selection::default();
+        let at = p(10.0, 20.0);
+
+        // Out-handler after the down-handler.
+        sel.begin(MdKey::Reply(0), at);
+        sel.capture((0, 0), Some("live".into()));
+        sel.dismiss(at);
+        assert!(sel.is_active(), "the press that began this selection cleared it");
+
+        // Out-handler before the down-handler: nothing to lose, and the
+        // `begin` that follows anchors normally.
+        sel.clear();
+        sel.dismiss(at);
+        sel.begin(MdKey::Reply(0), at);
+        sel.capture((0, 0), Some("live".into()));
+        assert!(sel.is_active());
+    }
+
+    /// ...but a press that began nothing still drops the selection, which is
+    /// the entire job the out-handler is there to do.
+    #[test]
+    fn a_press_elsewhere_still_dismisses_the_selection() {
+        let sel = Selection::default();
+        sel.begin(MdKey::Reply(0), p(10.0, 20.0));
+        sel.extend(MdKey::Reply(0), p(90.0, 40.0));
+        sel.capture((0, 0), Some("live".into()));
+        sel.dismiss(p(400.0, 500.0));
+        assert!(!sel.is_active());
+        assert!(sel.anchors_for(MdKey::Reply(0)).is_none());
     }
 
     /// An element that stops being selected must stop contributing, or a
@@ -458,9 +540,9 @@ mod tests {
     fn dropping_out_of_the_selection_removes_the_capture() {
         let sel = Selection::default();
         sel.begin(MdKey::Reply(0), p(0.0, 0.0));
-        sel.capture(0, Some("kept".into()));
-        sel.capture(1, Some("dropped".into()));
-        sel.capture(1, None);
+        sel.capture((0, 0), Some("kept".into()));
+        sel.capture((0, 1), Some("dropped".into()));
+        sel.capture((0, 1), None);
         assert_eq!(sel.selected_text(), "kept");
     }
 
@@ -470,7 +552,7 @@ mod tests {
     fn a_new_drag_abandons_the_previous_selection() {
         let sel = Selection::default();
         sel.begin(MdKey::Reply(0), p(0.0, 0.0));
-        sel.capture(0, Some("old".into()));
+        sel.capture((0, 0), Some("old".into()));
         sel.begin(MdKey::Reply(4), p(0.0, 0.0));
         assert!(!sel.is_active());
         assert!(sel.anchors_for(MdKey::Reply(0)).is_none());

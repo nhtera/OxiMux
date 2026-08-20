@@ -91,6 +91,38 @@ pub(super) fn assistant_body(
     legacy_assistant_body(key.seed() as usize, body, typo)
 }
 
+/// One top-level block of the assistant's reply, as its own transcript row.
+///
+/// The block-granularity path: a token appended to a long reply re-renders the
+/// block it landed in, not the message. `None` when the block index has run past
+/// the tree, which a streaming reply can do for a frame between the row list
+/// being built and this being asked for it.
+///
+/// The legacy renderer has no blocks to speak of, so it reports one block and
+/// draws its whole body here — the same single element it always drew.
+// One more argument than [`assistant_body`], and deliberately the same shape
+// otherwise: the two are read side by side, and collapsing this one's style
+// arguments into a struct would make the pair harder to compare than the arity
+// makes this one hard to call.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn assistant_block(
+    md: &Markdown,
+    key: MdKey,
+    body: &str,
+    block_ix: usize,
+    find: Option<FindMark>,
+    theme: Theme,
+    density: Density,
+    typo: &Typography,
+) -> Option<AnyElement> {
+    if !owned_renderer() {
+        return (block_ix == 0).then(|| legacy_assistant_body(key.seed() as usize, body, typo));
+    }
+    let style = MarkdownStyle::body(key, md.selection.clone(), theme, density, typo).with_find(find);
+    let block = md.render_block(key, body, block_ix, &style)?;
+    Some(div().w_full().min_w_0().child(block).into_any_element())
+}
+
 /// The previous renderer, one setting away.
 ///
 /// Chat markdown is the most-looked-at surface in the product; keeping the path
