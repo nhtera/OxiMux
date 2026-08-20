@@ -26,8 +26,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ParentElement, Styled, div,
+    AnyElement, App, Context, EntityId, FocusHandle, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ParentElement, Styled, Window, div,
 };
 use oximux_markdown::{BlockTree, IncrementalParser};
 use oximux_syntax::{HighlightCache, HighlightedDocument, LanguageId};
@@ -73,8 +73,19 @@ impl MdKey {
 /// Shared because the pieces that render markdown are free functions holding a
 /// `Context`, not methods on the view, and none of them can borrow the view
 /// while the view is rendering them. Cloning a handle is an `Rc` bump.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(super) struct Markdown {
+    /// The view to repaint when a selection changes.
+    ///
+    /// Captured once at construction, NOT read from the window inside the
+    /// handlers: `Window::current_view` is only legal during request_layout,
+    /// prepaint or paint, and a mouse callback is none of those — calling it
+    /// there aborts the process rather than returning an error.
+    owner: EntityId,
+    /// The chat's focus handle. Starting a selection focuses the chat, which is
+    /// what puts it on the dispatch path for the `Copy` action — a selection
+    /// nothing can copy is not a selection.
+    focus: FocusHandle,
     state: Rc<RefCell<MarkdownState>>,
     /// The chat's one text selection. Held here rather than on the view because
     /// the elements that paint it are built by cx-free renderers that already
@@ -83,6 +94,11 @@ pub(super) struct Markdown {
 }
 
 impl Markdown {
+    /// Bind this handle to the view that owns it.
+    pub fn new(owner: EntityId, focus: FocusHandle) -> Self {
+        Self { owner, focus, state: Rc::default(), selection: Selection::default() }
+    }
+
     /// Render one message's markdown through the owned renderer.
     fn render_document(&self, key: MdKey, text: &str, style: &MarkdownStyle) -> AnyElement {
         // The tree and the highlight handle are both taken before rendering
@@ -108,6 +124,8 @@ impl Markdown {
     pub fn render(&self, key: MdKey, text: &str, style: &MarkdownStyle) -> AnyElement {
         let body = self.render_document(key, text, style);
         let sel = self.selection.clone();
+        let owner = self.owner;
+        let focus = self.focus.clone();
         div()
             .id(("chat-md", key.seed() as usize))
             .w_full()
@@ -115,27 +133,33 @@ impl Markdown {
             .child(body)
             .on_mouse_down(MouseButton::Left, {
                 let sel = sel.clone();
-                move |ev: &MouseDownEvent, window, cx: &mut App| {
+                move |ev: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                    // Deferred, not synchronous: gpui's own post-click focus
+                    // dispatch runs after this handler and clobbers a focus set
+                    // here. Unfocused, the chat is off the dispatch path and
+                    // Copy reaches nothing.
+                    let focus = focus.clone();
+                    window.defer(cx, move |window, cx| window.focus(&focus, cx));
                     sel.begin(key, ev.position);
-                    cx.notify(window.current_view());
+                    cx.notify(owner);
                 }
             })
             .on_mouse_move({
                 let sel = sel.clone();
-                move |ev: &MouseMoveEvent, window, cx: &mut App| {
+                move |ev: &MouseMoveEvent, _window, cx: &mut App| {
                     // Only while the button is held. A bare hover crossing a
                     // settled selection must not redraw it.
                     if ev.pressed_button == Some(MouseButton::Left)
                         && sel.extend(key, ev.position)
                     {
-                        cx.notify(window.current_view());
+                        cx.notify(owner);
                     }
                 }
             })
-            .on_mouse_down_out(move |_ev: &MouseDownEvent, window, cx: &mut App| {
+            .on_mouse_down_out(move |_ev: &MouseDownEvent, _window, cx: &mut App| {
                 if sel.is_active() {
                     sel.clear();
-                    cx.notify(window.current_view());
+                    cx.notify(owner);
                 }
             })
             .into_any_element()

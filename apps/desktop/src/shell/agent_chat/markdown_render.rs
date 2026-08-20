@@ -590,7 +590,10 @@ fn list(
             Some(start) => format!("{}.", start.saturating_add(ix as u64)),
             None => "•".to_string(),
         };
-        let mut body = div().flex().flex_col().w_full().min_w_0();
+        // `flex_1`, not `w_full`: the body should take what the marker leaves,
+        // and `w_full` asks for the whole row and then relies on shrink to
+        // resolve the overflow — which compounds through a nested list.
+        let mut body = div().flex().flex_col().flex_1().min_w_0();
         for (bix, block) in item.iter().enumerate() {
             body = body.child(spaced(render_block(block, cx, depth + 1), bix, style));
         }

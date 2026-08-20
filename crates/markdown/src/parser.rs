@@ -286,6 +286,44 @@ impl<'a> Cursor<'a, '_> {
         }
     }
 
+    /// The blocks inside one list item, cursor left past its `End`.
+    ///
+    /// A **tight** list is why this cannot just loop on `next_block`. Tight
+    /// items carry their text as bare inline events with no `Paragraph` around
+    /// it, and `next_block` is right to skip stray inline events everywhere
+    /// else — at top level they are blank-line artifacts, and inventing a
+    /// paragraph around them would invent a block that is not there. Inside an
+    /// item those same events ARE the item's content, and skipping them renders
+    /// a bullet with nothing next to it.
+    fn finish_item(&mut self) -> Vec<Block> {
+        let mut blocks = Vec::new();
+        while let Some((event, _)) = self.peek() {
+            match event {
+                Event::End(_) => break,
+                // A block opener — a nested list, a fence, a loose item's own
+                // paragraph — is a block like any other.
+                Event::Start(tag) if is_block_tag(tag) => {
+                    let Some((block, _)) = self.next_block() else { break };
+                    blocks.push(block);
+                }
+                Event::Rule => {
+                    self.at += 1;
+                    blocks.push(Block::Rule);
+                }
+                // Anything else is inline: the tight item's own text.
+                _ => {
+                    let runs = self.inline_runs();
+                    if runs.is_empty() {
+                        break;
+                    }
+                    blocks.push(Block::Paragraph { runs });
+                }
+            }
+        }
+        self.expect_end();
+        blocks
+    }
+
     /// Build the block for a container whose `Start` has just been consumed,
     /// leaving the cursor past its `End`.
     fn finish_container(&mut self, tag: Tag<'a>) -> Block {
@@ -340,12 +378,7 @@ impl<'a> Cursor<'a, '_> {
                     match event {
                         Event::Start(Tag::Item) => {
                             self.at += 1;
-                            let mut blocks = Vec::new();
-                            while let Some((block, _)) = self.next_block() {
-                                blocks.push(block);
-                            }
-                            self.expect_end();
-                            items.push(blocks);
+                            items.push(self.finish_item());
                         }
                         Event::End(TagEnd::List(_)) => break,
                         _ => {
@@ -452,6 +485,11 @@ impl<'a> Cursor<'a, '_> {
         while let Some((event, _)) = self.peek().cloned() {
             match event {
                 Event::End(_) => break,
+                // A block opener ends the inline run rather than being
+                // absorbed into it. Without this, a tight item's nested list
+                // would have its text folded into the parent item's paragraph
+                // and the nesting would vanish.
+                Event::Start(ref tag) if is_block_tag(tag) => break,
                 Event::Start(tag) => {
                     self.at += 1;
                     stack.push(style.clone());
@@ -462,9 +500,6 @@ impl<'a> Cursor<'a, '_> {
                         Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
                             style.link = Some(dest_url.to_string());
                         }
-                        // A container opening inside inline context (a nested
-                        // paragraph in a tight list item) is transparent here;
-                        // its content flows into the same run sequence.
                         _ => {}
                     }
                 }
@@ -570,8 +605,101 @@ fn table_align(a: Alignment) -> TableAlign {
     }
 }
 
+/// Whether a `Start` opens a block rather than an inline span.
+///
+/// The distinction is what keeps a nested list inside a tight item from being
+/// absorbed into that item's own text.
+fn is_block_tag(tag: &Tag<'_>) -> bool {
+    matches!(
+        tag,
+        Tag::Paragraph
+            | Tag::Heading { .. }
+            | Tag::BlockQuote(_)
+            | Tag::CodeBlock(_)
+            | Tag::List(_)
+            | Tag::Item
+            | Tag::Table(_)
+            | Tag::HtmlBlock
+            | Tag::FootnoteDefinition(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    /// A **tight** list — no blank lines between items — is the shape agents
+    /// actually write, and its items carry bare inline events with no
+    /// `Paragraph` around them. Dropping those rendered every bullet with
+    /// nothing beside it, all the way to a live window, because the list
+    /// STRUCTURE was right and only the content was missing.
+    #[test]
+    fn a_tight_list_item_keeps_its_text() {
+        let tree = parse_full("- one\n- two\n- three\n");
+        let [TopBlock { block: Block::List { items, .. }, .. }] = &tree.blocks[..] else {
+            panic!("expected one list, got {:?}", tree.blocks);
+        };
+        let texts: Vec<String> = items.iter().map(|item| plain(item)).collect();
+        assert_eq!(texts, vec!["one", "two", "three"]);
+    }
+
+    /// A nested list inside a tight item must stay a nested list. Reading the
+    /// item's text with an inline reader that treats every opener as
+    /// transparent folds the child's text into the parent and loses the nesting
+    /// — the same bug wearing different clothes.
+    #[test]
+    fn a_nested_list_stays_nested_and_does_not_leak_upward() {
+        let tree = parse_full("- outer\n  - inner a\n  - inner b\n");
+        let [TopBlock { block: Block::List { items, .. }, .. }] = &tree.blocks[..] else {
+            panic!("expected one list, got {:?}", tree.blocks);
+        };
+        assert_eq!(items.len(), 1, "the nested items must not become siblings");
+        let [Block::Paragraph { runs }, Block::List { items: inner, .. }] = &items[0][..] else {
+            panic!("expected text then a nested list, got {:?}", items[0]);
+        };
+        assert_eq!(runs.iter().map(|r| r.text.as_str()).collect::<String>(), "outer");
+        assert_eq!(
+            inner.iter().map(|i| plain(i)).collect::<Vec<_>>(),
+            vec!["inner a", "inner b"],
+        );
+    }
+
+    /// An ordered list is the same shape with a different marker; a fix that
+    /// only reached bullets would leave half the lists blank.
+    #[test]
+    fn an_ordered_tight_list_keeps_its_text() {
+        let tree = parse_full("1. first\n2. second\n");
+        let [TopBlock { block: Block::List { ordered_start, items }, .. }] = &tree.blocks[..]
+        else {
+            panic!("expected one list, got {:?}", tree.blocks);
+        };
+        assert_eq!(*ordered_start, Some(1));
+        assert_eq!(items.iter().map(|i| plain(i)).collect::<Vec<_>>(), vec!["first", "second"]);
+    }
+
+    /// A loose list already wrapped its items in paragraphs, so it worked
+    /// before — pin it so the tight-list fix cannot regress it.
+    #[test]
+    fn a_loose_list_item_still_keeps_its_text() {
+        let tree = parse_full("- one\n\n- two\n");
+        let [TopBlock { block: Block::List { items, .. }, .. }] = &tree.blocks[..] else {
+            panic!("expected one list, got {:?}", tree.blocks);
+        };
+        assert_eq!(items.iter().map(|i| plain(i)).collect::<Vec<_>>(), vec!["one", "two"]);
+    }
+
+    /// The concatenated text of an item's paragraphs, for asserting on content
+    /// without spelling out the run structure each time.
+    fn plain(item: &[Block]) -> String {
+        item.iter()
+            .filter_map(|b| match b {
+                Block::Paragraph { runs } => {
+                    Some(runs.iter().map(|r| r.text.as_str()).collect::<String>())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     use super::*;
 
     #[test]

@@ -34,7 +34,7 @@ use std::rc::Rc;
 
 use gpui::{
     App, Bounds, ClipboardItem, Edges, ElementId, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, KeyDownEvent, LayoutId, Pixels, Point, StyledText, Window, point, px, quad,
+    IntoElement, LayoutId, Pixels, Point, StyledText, Window, point, px, quad,
 };
 
 use super::markdown_state::MdKey;
@@ -124,18 +124,18 @@ impl Selection {
         state.captured.values().cloned().collect::<Vec<_>>().join("\n\n")
     }
 
-    /// Copy the selection if `ev` is ⌘C over one, reporting whether it did.
+    /// Copy the selection, reporting whether there was one to copy.
     ///
-    /// Plain ⌘ only: ⌘⇧C and ⌘⌥C mean other things in other apps and must not
-    /// be quietly claimed here. Reports `false` when nothing is selected, which
-    /// is what leaves ⌘C in the composer meaning what it always did.
-    pub fn copy_on_key(&self, ev: &KeyDownEvent, cx: &mut App) -> bool {
-        let ks = &ev.keystroke;
-        let plain_cmd = ks.modifiers.platform
-            && !ks.modifiers.control
-            && !ks.modifiers.alt
-            && !ks.modifiers.shift;
-        if ks.key != "c" || !plain_cmd || !self.is_active() {
+    /// Reached by the menu's `Copy` action — Edit ▸ Copy — and **not by ⌘C**.
+    /// Measured in a live window: with the chat focused, neither a
+    /// `capture_key_down` nor an `on_action` handler fires on ⌘C, because the
+    /// Edit menu declares Copy as an `OsAction` and AppKit consumes the key
+    /// equivalent before gpui dispatches anything. Restoring ⌘C here means
+    /// either giving the transcript its own binding or dropping `OsAction`
+    /// from the menu item, which changes what ⌘C means in every other pane —
+    /// a product decision, not a rendering one.
+    pub fn copy(&self, cx: &mut App) -> bool {
+        if !self.is_active() {
             return false;
         }
         cx.write_to_clipboard(ClipboardItem::new_string(self.selected_text()));

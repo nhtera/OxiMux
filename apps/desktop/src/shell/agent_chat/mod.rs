@@ -151,14 +151,12 @@ const AUTH_TERMINAL_KEY: &str = "__acp_auth_terminal__";
 const FOLLOW_FRAMES: u8 = 10;
 
 /// Shortest gap between transcript repaints while only streamed deltas are
-/// arriving (see [`AgentChatView::notify_throttled`]).
-///
-/// This used to guard a quadratic — every repaint re-read the whole growing
-/// reply — which the owned renderer's tail-only reparse removed. The reason
-/// that remains is plainer: a repaint lays out every visible row, and doing
-/// sixty of those a second to show text arriving faster than anyone reads it is
-/// work nobody sees. 50 ms caps it at ~20/sec, which still looks continuous.
-/// Only deltas are throttled; anything the user can act on paints immediately.
+/// arriving (see [`AgentChatView::notify_throttled`]). This used to guard a
+/// quadratic — every repaint re-read the whole growing
+/// reply — which the owned renderer's tail-only reparse removed. What remains
+/// is plainer: a repaint lays out every visible row, and doing sixty of those a
+/// second to show text arriving faster than anyone reads is work nobody sees.
+/// Only deltas are throttled; anything actionable paints immediately.
 const NOTIFY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// How many frames the jumped-to-message highlight lingers before it clears.
@@ -515,8 +513,8 @@ pub struct AgentChatView {
     /// its rows. Which half is live depends on [`transcript::virtualized`]; see
     /// [`transcript::ScrollState`].
     scroll: transcript::ScrollState,
-    /// Per-message markdown parsers, the chat's text selection, and fence
-    /// highlighting that lands after the frame that asked for it.
+    /// Per-message parsers, the chat's text selection, and fence highlighting
+    /// that lands after the frame that asked for it.
     markdown: markdown_state::Markdown,
     /// Whether the transcript auto-follows the bottom. True by default and while
     /// the user stays at the end; set false when they scroll up to read history
@@ -1316,6 +1314,7 @@ impl AgentChatView {
             remote_choice_task = Some(Self::spawn_remote_choice_relay(choice_rx, cx));
         }
 
+        let focus = cx.focus_handle();
         Self {
             thread,
             connection,
@@ -1326,9 +1325,9 @@ impl AgentChatView {
             session_detail_open: false,
             last_notify: std::time::Instant::now(),
             flush_scheduled: false,
-            focus_handle: cx.focus_handle(),
+            focus_handle: focus.clone(),
             scroll: transcript::ScrollState::new(),
-            markdown: markdown_state::Markdown::default(),
+            markdown: markdown_state::Markdown::new(cx.entity_id(), focus),
             stick_to_bottom: true,
             // Kick the follow so a restored transcript (which loads at
             // construction, not via `on_event`) is pinned to the true bottom
@@ -3246,6 +3245,7 @@ impl AgentChatView {
             .try_global::<RemoteControl>()
             .and_then(|rc| rc.bind(&remote_session_id, connection.clone()));
 
+        let focus = cx.focus_handle();
         Self {
             thread: ChatThread::new(),
             connection: Some(connection),
@@ -3259,9 +3259,9 @@ impl AgentChatView {
             probed_catalogs: HashMap::new(),
             // The injected StubConnection is the whole point: no subprocess.
             probe_catalogs_live: false,
-            focus_handle: cx.focus_handle(),
+            focus_handle: focus.clone(),
             scroll: transcript::ScrollState::new(),
-            markdown: markdown_state::Markdown::default(),
+            markdown: markdown_state::Markdown::new(cx.entity_id(), focus),
             stick_to_bottom: true,
             // Kick the follow so a restored transcript (which loads at
             // construction, not via `on_event`) is pinned to the true bottom
@@ -5188,11 +5188,11 @@ impl Render for AgentChatView {
                 }
                 cx.stop_propagation();
             }))
-            // ⌘C copies a transcript selection. Captured, because a focused
-            // composer would otherwise consume it first; see `copy_on_key` for
-            // why that is safe.
-            .capture_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _window, cx| {
-                if this.markdown.selection.copy_on_key(ev, cx) {
+            // Copy a transcript selection — Edit ▸ Copy, NOT ⌘C; see
+            // [`markdown_select::Selection::copy`]. Captured, and consumed
+            // only when there is one, so a focused composer keeps its own.
+            .capture_action(cx.listener(|this, _: &crate::platform::menu::Copy, _window, cx| {
+                if this.markdown.selection.copy(cx) {
                     cx.stop_propagation();
                 }
             }))
