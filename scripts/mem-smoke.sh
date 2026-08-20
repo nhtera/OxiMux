@@ -289,7 +289,22 @@ while [ "$i" -le "$CHATS" ]; do
         # object, so the session id has to be picked out of the stream rather
         # than parsed from a single document. `session_id`, snake_case — the
         # event envelope and the final `data` object both use it.
-        FIRST_SESSION="$(printf '%s' "$out" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p' | head -1)"
+        #
+        # No pipe here, and no early-exiting reader, because BOTH halves of
+        # that combination have now broken this script. EVERY event envelope
+        # carries the id, so sed matches hundreds of lines. The original
+        # `… | sed | head -1` let head exit first, leaving sed writing into a
+        # closed pipe: GNU sed reports that and exits 4, BSD sed does not, so it
+        # passed on macOS every time and failed the first time CI ran it on
+        # Linux. Replacing `head -1` with sed's own `q` simply moved the broken
+        # pipe one stage upstream onto `printf`, which then failed on macOS too.
+        #
+        # A here-string has no writer process to signal, and letting sed read to
+        # EOF means nothing exits early; taking the first line is then a shell
+        # expansion. The input is already in memory, so reading all of it costs
+        # nothing worth a portability trap.
+        FIRST_SESSION="$(sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p' <<<"$out")"
+        FIRST_SESSION="${FIRST_SESSION%%$'\n'*}"
     fi
     echo "  chat $i/$CHATS → $(rss_kb "$SERVE_PID") kB" >&2
     i=$((i + 1))
