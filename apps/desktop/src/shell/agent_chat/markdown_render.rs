@@ -478,6 +478,21 @@ fn heading(level: u8, runs: &[InlineRun], cx: &Ctx<'_>) -> AnyElement {
 /// per-line span lists without re-deriving whole-document offsets. The fixed
 /// line height is what makes the card's height arithmetic rather than
 /// measurement.
+///
+/// **"A fence does not wrap" is a thing this function has to enforce, not a
+/// thing that is true by itself.** It used to be written here as a premise while
+/// the line's text was `w_full` and free to wrap at the column, so a line longer
+/// than the reading measure laid out as two or more visual lines inside a box
+/// exactly one line tall — and the remainder painted *on top of* the next line.
+/// Both lines became unreadable. Seen in a real transcript on a JSON fence whose
+/// `"image": "https://raw.githubusercontent.com/…"` ran long.
+///
+/// The height cannot be the thing that gives way. Highlighting arrives a frame
+/// or more after the fence is on screen and applies per-span **colours**, and at
+/// this repo's pinned gpui rev a `TextRun` colour split really does move wrap
+/// points (measured — `examples/veil_shaping_probe.rs`). So a fence that both
+/// wrapped and measured its own height would re-flow under the reader every time
+/// a highlight landed. Height stays arithmetic; the line stops wrapping instead.
 fn code_block(language: Option<&str>, code: &str, cx: &Ctx<'_>) -> AnyElement {
     let style = cx.style;
     let ordinal = cx.fence.get();
@@ -490,16 +505,46 @@ fn code_block(language: Option<&str>, code: &str, cx: &Ctx<'_>) -> AnyElement {
         let doc = cx.hl.colors(&lang, code);
         doc.map(|doc| (lang, doc))
     });
-    let mut lines = div().flex().flex_col().w_full();
+    let mut lines = div().flex().flex_col().w_full().min_w_0();
     for (ix, line) in code.lines().enumerate() {
         let spans = colors.as_ref().map(|(_, doc)| doc.line(ix)).unwrap_or_default();
         lines = lines.child(
+            // A flex ROW per line, and the text one level further in — not
+            // because the nesting is pretty, but because both levels are
+            // load-bearing:
+            //
+            // The row exists because a `whitespace_nowrap` text placed directly
+            // into a flex COLUMN lays out to nothing at all in gpui — no text,
+            // no panic, an empty fence. A flex row is the context that makes it
+            // visible.
+            //
+            // The inner div exists to carry `flex_shrink_0`, which the text
+            // element cannot: without it the line is a flex item free to be
+            // squeezed to the row's width, and the point is that it keeps its
+            // natural width and overruns.
             div()
+                .flex()
+                .flex_row()
                 .w_full()
+                // The row's width is already definite, so this only stops the
+                // long line's min-content width propagating outward and prying
+                // the card open instead of overflowing it.
+                .min_w_0()
                 // Fixed, not measured. This is the number that makes a fence's
-                // height arithmetic, which is what lets colors arrive later.
+                // height arithmetic, which is what lets colors arrive later —
+                // and it is only *true* because of the `whitespace_nowrap`
+                // below. See this function's doc comment.
                 .h(px(size * CODE_LINE_HEIGHT))
-                .child(cx.selectable(line, code_line(line, spans, &style.theme.syntax))),
+                // The whole fix. `white_space != Normal` makes gpui lay the text
+                // out with no wrap width at all (`elements/text.rs:417`), so one
+                // source line is one visual line however long it is, and the
+                // excess overruns the card — which clips it.
+                .whitespace_nowrap()
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .child(cx.selectable(line, code_line(line, spans, &style.theme.syntax))),
+                ),
         );
     }
     let mut card = div()
@@ -515,7 +560,17 @@ fn code_block(language: Option<&str>, code: &str, cx: &Ctx<'_>) -> AnyElement {
         .text_size(px(size))
         .text_color(style.theme.fg_base)
         // Code is authoritative about its own line breaks: a wrapped fence
-        // shows the reader a line the agent never wrote.
+        // shows the reader a line the agent never wrote. This clips what the
+        // `whitespace_nowrap` above lets overrun — the two are one mechanism,
+        // and this half alone did nothing, because text that wraps never
+        // overflows in the first place.
+        //
+        // Clipping rather than scrolling horizontally is deliberate. gpui only
+        // applies horizontal scroll from a horizontal trackpad delta, so a plain
+        // mouse wheel could never reach the hidden text without a per-fence
+        // scrollbar overlaid on it, and that would put a scroll region inside
+        // the transcript's own virtualized list. The copy button on the header
+        // row already hands over the untruncated source.
         .overflow_x_hidden();
     // The grammar's own display name when one resolved (`Rust`, not `rs`), and
     // otherwise whatever the author typed — a tag we did not recognise is still
