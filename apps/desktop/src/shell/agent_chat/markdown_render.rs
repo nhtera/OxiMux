@@ -33,7 +33,7 @@ use std::sync::Arc;
 use gpui::{
     AnyElement, ElementId, FontStyle, FontWeight, HighlightStyle, Hsla, InteractiveElement,
     IntoElement, ParentElement, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
-    StrikethroughStyle, StyledText, UnderlineStyle, div, px,
+    StrikethroughStyle, StyledText, UnderlineStyle, div, linear_color_stop, linear_gradient, px,
 };
 use gpui_component::clipboard::Clipboard;
 use oximux_markdown::{Block, BlockTree, InlineRun, InlineStyle, TableAlign, TopBlock};
@@ -97,6 +97,16 @@ const CODE_LINE_HEIGHT: f32 = 1.45;
 /// Code text size as a multiple of the body size. Slightly under 1.0 because
 /// monospace faces run visually larger than the UI face at equal point size.
 const CODE_SCALE: f32 = 0.92;
+
+/// Width of the fade at a scrollable fence's edge, as a multiple of the code
+/// text size — about three characters, enough to read as a soft edge rather
+/// than a bar.
+const FADE_W: f32 = 3.0;
+
+/// Where the fade reaches full strength, as a fraction of its width. Short of
+/// 1.0 so the outermost sliver is solid card colour and the glyph does not
+/// appear to be cut by a hard line.
+const FADE_STOP: f32 = 0.7;
 
 /// Indent per list nesting level, as a multiple of `pad_panel`.
 const LIST_INDENT: f32 = 1.75;
@@ -659,14 +669,64 @@ fn code_block(language: Option<&str>, code: &str, cx: &Ctx<'_>) -> AnyElement {
                 .child(copy_button(style.copy_id(cx.block, ordinal), code)),
         );
     }
-    // No scrollbar. `gpui_component::scroll::Scrollbar` was tried here — both
-    // `Hover` and `Always`, with and without a stated height on the parent — and
-    // never painted a pixel, while the scrolling underneath it worked the whole
-    // time. Rather than leave an element in the tree that claims an affordance
-    // it does not provide, it is gone; the clipped glyph at the card edge is
-    // what says the line continues. Worth revisiting with a fade-out edge of our
-    // own, which would not depend on the component at all.
-    card.child(viewport).into_any_element()
+    // The affordance: a soft edge on whichever side has more code, so a fence
+    // that runs past the card says so instead of just ending mid-glyph.
+    //
+    // Read off the scroll handle, which means read off the layout the LAST frame
+    // produced — a fence has no measured content width until it has been laid
+    // out once. In practice the frame after is free: a fence with a language tag
+    // misses the highlight cache on its first render and the colours landing
+    // notify a repaint. An unhighlighted fence may go one repaint without its
+    // fade; it scrolls perfectly well in the meantime.
+    //
+    // `gpui_component::scroll::Scrollbar` was tried here first — `Hover` and
+    // `Always`, with and without a definite height on this parent — and never
+    // painted a pixel while the scrolling under it worked. This owes it nothing.
+    let max_x = f32::from(scroll.max_offset().x);
+    // gpui counts a rightward scroll DOWN from zero, so this flips it back into
+    // "how far in are we", which is the easier thing to reason about.
+    let scrolled = -f32::from(scroll.offset().x);
+    // Half a pixel, so a fence scrolled exactly to its end does not keep a fade
+    // alive on a rounding error.
+    let body_h = px(code.lines().count() as f32 * size * CODE_LINE_HEIGHT);
+    let mut body = div().relative().w_full().min_w_0().child(viewport);
+    if scrolled > 0.5 {
+        body = body.child(edge_fade(style, body_h, false));
+    }
+    if max_x - scrolled > 0.5 {
+        body = body.child(edge_fade(style, body_h, true));
+    }
+    card.child(body).into_any_element()
+}
+
+/// The soft edge over a scrollable fence, on the `right` side or the left.
+///
+/// Height is passed in rather than taken as `h_full`: a percentage resolves
+/// against a parent with a definite size, and this one's height is still being
+/// derived from the lines inside it. The fence's height is arithmetic anyway —
+/// that is the whole point of the fixed line height — so the number is already
+/// known.
+///
+/// Deliberately inert: no id, no listeners, so gpui gives it no hitbox and it
+/// takes no clicks. Text under the fade stays selectable, it just reads as
+/// receding.
+fn edge_fade(style: &MarkdownStyle, height: gpui::Pixels, right: bool) -> AnyElement {
+    let bg = style.theme.bg_panel_alt;
+    let fade = div().absolute().top_0().h(height).w(px(style.code_size() * FADE_W));
+    // 0° points up and rotates clockwise, so 90° runs left-to-right: the stop at
+    // 0.0 is the inner edge (transparent) and the far end is solid card colour.
+    // The left-hand fade is the same gradient turned around.
+    let (angle, fade) = if right {
+        (90.0, fade.right(px(0.0)))
+    } else {
+        (270.0, fade.left(px(0.0)))
+    };
+    fade.bg(linear_gradient(
+        angle,
+        linear_color_stop(bg, FADE_STOP),
+        linear_color_stop(bg.opacity(0.0), 0.0),
+    ))
+    .into_any_element()
 }
 
 /// One-click copy for a fence.
