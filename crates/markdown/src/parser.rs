@@ -545,9 +545,15 @@ impl<'a> Cursor<'a, '_> {
                 }
             }
 
-            // Restore the style a closing tag popped. Done after the match so a
-            // `break` on `End` leaves the cursor on it for the caller.
-            if let Some((Event::End(end), _)) = self.peek()
+            // Restore the style each closing tag popped. Done after the match
+            // so a `break` on `End` leaves the cursor on it for the caller.
+            //
+            // A LOOP, not an `if`: closers arrive back to back. `***x*** rest`
+            // ends emphasis and strong at the same point, and consuming only
+            // one left the other sitting at the top of the loop, where the
+            // `End` arm breaks — silently abandoning everything after it. The
+            // same shape hides in `**a _b_** rest`, which is not exotic.
+            while let Some((Event::End(end), _)) = self.peek()
                 && closes_inline(end)
                 && let Some(prev) = stack.pop()
             {
@@ -626,6 +632,53 @@ fn is_block_tag(tag: &Tag<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Two emphasis closers land at the same point in `***x***`, and consuming
+    /// only one left the other at the top of the reader's loop, where the `End`
+    /// arm breaks — silently dropping the whole rest of the paragraph. Found by
+    /// walking 37k real agent messages and asking which source words the tree
+    /// never shows.
+    #[test]
+    fn text_after_a_doubled_emphasis_close_survives() {
+        let tree = parse_full("***Heads up*** the rest of this sentence matters\n");
+        let [TopBlock { block: Block::Paragraph { runs }, .. }] = &tree.blocks[..] else {
+            panic!("expected one paragraph, got {:?}", tree.blocks);
+        };
+        let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(text, "Heads up the rest of this sentence matters");
+        assert!(runs[0].style.bold && runs[0].style.italic, "*** is both");
+        assert!(!runs.last().unwrap().style.bold, "the tail is plain again");
+    }
+
+    /// The same shape without the triple marker — nested emphasis whose closers
+    /// happen to meet. Not exotic; it is how people write.
+    #[test]
+    fn text_after_nested_emphasis_closing_together_survives() {
+        let tree = parse_full("**bold with _inner_** and then plain text\n");
+        let [TopBlock { block: Block::Paragraph { runs }, .. }] = &tree.blocks[..] else {
+            panic!("expected one paragraph, got {:?}", tree.blocks);
+        };
+        let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(text, "bold with inner and then plain text");
+        assert!(!runs.last().unwrap().style.bold, "the tail left the bold span");
+    }
+
+    /// Three deep, closing at once. The restore has to unwind as far as it was
+    /// wound, not a fixed number of levels.
+    #[test]
+    fn a_triple_nested_close_restores_every_level() {
+        let tree = parse_full("~~***all three***~~ back to plain\n");
+        let [TopBlock { block: Block::Paragraph { runs }, .. }] = &tree.blocks[..] else {
+            panic!("expected one paragraph, got {:?}", tree.blocks);
+        };
+        let text: String = runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(text, "all three back to plain");
+        let tail = runs.last().unwrap();
+        assert!(
+            !tail.style.bold && !tail.style.italic && !tail.style.strikethrough,
+            "tail still carries {:?}", tail.style,
+        );
+    }
+
     /// A **tight** list — no blank lines between items — is the shape agents
     /// actually write, and its items carry bare inline events with no
     /// `Paragraph` around them. Dropping those rendered every bullet with
