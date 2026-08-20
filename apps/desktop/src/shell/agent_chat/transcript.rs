@@ -996,19 +996,27 @@ impl AgentChatView {
     /// the range to `Unmeasured` makes `size()` return `None` however good the
     /// `size_hint` is, and that is what forces the re-measure.
     ///
-    /// ⚠️ **Unproven here, and not for want of trying.** This comment used to
-    /// claim the call kept the scrollbar extent sane; that is false. An
-    /// `Unmeasured` item contributes its `size_hint`, and the hint is the stale
-    /// measurement, so the summary height is byte-identical either way until
-    /// the row is laid out again. Three attempts to write a test that fails
-    /// without the call all passed with it stubbed out: a walk past the row
-    /// puts it in the always-re-measured visible band, and parking it in the
-    /// overdraw band measures nothing at all because `run_until_parked` does
-    /// not drive the frame loop the way the real app does (the same limitation
-    /// that keeps `settle_pending_reveal` out of the tests). Kept because the
-    /// gpui path above is read from source rather than guessed at, and absence
-    /// of evidence from a harness that cannot lay out is not evidence of
-    /// absence. Verify against a live window before removing it.
+    /// The old comment here claimed the call kept the scrollbar extent sane.
+    /// That is false: an `Unmeasured` item contributes its `size_hint`, the
+    /// hint IS the stale measurement, and the summary height is therefore
+    /// identical either way until the row is laid out again. Forcing the
+    /// re-measure is the whole of it.
+    ///
+    /// **Proven live (A/B, 2026-08-20), because no test could.** Stream a long
+    /// reply, scroll up into history while it grows, then scroll back down
+    /// through it. With the call: one 120-unit scroll crosses the reply to its
+    /// footer. Without it: the same gesture advances the viewport by about a
+    /// PIXEL, and it takes roughly six of them to reach the end — the list is
+    /// resolving offsets against stale heights and re-converging a row at a
+    /// time as the overdraw band re-measures them.
+    ///
+    /// Three attempts to catch that in a test all passed with the call stubbed
+    /// out. Walking the viewport past the row puts it in the always-re-measured
+    /// visible band; parking it in the overdraw band measures nothing at all,
+    /// because `run_until_parked` does not drive the frame loop the way the
+    /// real app does — the same limitation that keeps `settle_pending_reveal`
+    /// untested. If this call ever looks removable, run the A/B above rather
+    /// than trusting a green suite.
     ///
     /// The remeasure range is the whole list rather than the rows we think
     /// changed, because the thread reports THAT it mutated and not where. It is
