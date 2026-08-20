@@ -35,7 +35,7 @@ use gpui::{
     SharedString, StrikethroughStyle, Styled, StyledText, UnderlineStyle, div, px,
 };
 use gpui_component::clipboard::Clipboard;
-use oximux_markdown::{Block, BlockTree, InlineRun, InlineStyle, TableAlign};
+use oximux_markdown::{Block, BlockTree, InlineRun, InlineStyle, TableAlign, TopBlock};
 use oximux_settings::{Density, SyntaxPalette, Theme, Typography};
 use oximux_syntax::{HighlightKind, HighlightedDocument, LanguageId};
 
@@ -304,18 +304,17 @@ pub(super) fn render_document(
 /// belongs to the transcript, which is the thing that knows whether the row
 /// above is the rest of this message or the end of the previous one.
 ///
-/// `None` when `ix` is past the end — a block row outliving its block for one
-/// frame is a real race while a reply streams, and drawing nothing is better
-/// than panicking in the transcript.
+/// `ix` is the block's index in its document, passed alongside the block rather
+/// than derived from it: it is what namespaces the element ids and the selection
+/// ordinals, and a block does not know where it sits.
 pub(super) fn render_block_at(
-    tree: &BlockTree,
+    top: &TopBlock,
     ix: usize,
     style: &MarkdownStyle,
     hl: &dyn CodeHighlights,
-) -> Option<AnyElement> {
-    let top = tree.blocks.get(ix)?;
+) -> AnyElement {
     let cx = Ctx::new(style, hl, ix);
-    Some(div().w_full().min_w_0().child(render_block(&top.block, &cx, 0)).into_any_element())
+    div().w_full().min_w_0().child(render_block(&top.block, &cx, 0)).into_any_element()
 }
 
 /// Put the inter-block gap on the block itself.

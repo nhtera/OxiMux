@@ -281,6 +281,36 @@ impl AgentChatView {
         self.rows.borrow().iter().position(|r| r.entry() == Some(entry_idx))
     }
 
+    /// The row a find match inside `entry_idx` actually sits on.
+    ///
+    /// An entry maps to a *range* of rows now, and its first one is its header.
+    /// Jumping there for a match forty paragraphs down would scroll the reader
+    /// to the top of a long reply and leave them hunting — so resolve the match
+    /// to the block that holds it and jump to that row.
+    ///
+    /// Deliberately the same matcher the renderer paints with
+    /// ([`markdown_select::match_ranges`]), over the same source text, so the
+    /// row this lands on is the row showing a tinted match. A query that only
+    /// exists in the *rendered* text — one spanning `**` markers, say — is found
+    /// by neither, and `None` falls back to the head row.
+    fn row_of_find_match(&self, entry_idx: usize) -> Option<usize> {
+        self.row_of_query_match(entry_idx, self.find_bar.as_ref()?.query.trim())
+    }
+
+    /// [`Self::row_of_find_match`] with the query passed in rather than read off
+    /// the bar — which is the whole of what tests can reach, since standing up a
+    /// real find bar wants a `gpui-component` root the test window has not got.
+    fn row_of_query_match(&self, entry_idx: usize, query: &str) -> Option<usize> {
+        let Some(ThreadEntry::Assistant(msg)) = self.thread.entries.get(entry_idx) else {
+            return None;
+        };
+        let at = markdown_select::match_ranges(&msg.text, query).first()?.start;
+        let block_ix =
+            self.markdown.block_of_offset(markdown_state::MdKey::Reply(entry_idx), &msg.text, at)?;
+        let want = TranscriptRow::Block { entry_idx, block_ix };
+        self.rows.borrow().iter().position(|r| *r == want)
+    }
+
     /// Every entry index that currently has a child, for callers that need to
     /// test many entries at once (the find bar filtering its match list). One
     /// pass over the rows instead of one scan per candidate.
@@ -491,7 +521,9 @@ impl AgentChatView {
     /// subscription, which has no `Window`. Reads the row list rebuilt each
     /// render.
     pub(super) fn scroll_to_entry(&mut self, entry_idx: usize, cx: &mut Context<Self>) {
-        let Some(child_ix) = self.row_of_entry(entry_idx) else {
+        let Some(child_ix) =
+            self.row_of_find_match(entry_idx).or_else(|| self.row_of_entry(entry_idx))
+        else {
             return;
         };
         self.stick_to_bottom = false;
@@ -1879,6 +1911,201 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    /// The find bar's half of block granularity: a match deep in a long reply
+    /// resolves to the row that will actually show it tinted, not to the reply's
+    /// header row far above it.
+    ///
+    /// Verified to bite: make the offset→block lookup answer `Some(0)` and this
+    /// fails on the block index rather than passing on the `hit > head` half.
+    #[gpui::test]
+    async fn a_find_match_lands_on_the_block_that_holds_it(cx: &mut TestAppContext) {
+        if !virtualized() || !markdown_state::owned_renderer() {
+            return;
+        }
+        cx.update(gpui_component::init);
+        // Ten paragraphs, and the word only in the last one.
+        let reply = {
+            let mut r = String::new();
+            for i in 0..9 {
+                r.push_str(&format!("paragraph {i} of filler prose.\n\n"));
+            }
+            r.push_str("and finally the needle sits here.\n");
+            r
+        };
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        window
+            .update(cx, |view, _window, cx| {
+                view.thread.push_user_message_with_images("q", Vec::<ChatImage>::new());
+                view.on_event(ThreadEvent::AssistantText(reply.clone()), cx);
+            })
+            .unwrap();
+        let mut vcx = VisualTestContext::from_window(window.into(), cx);
+        vcx.simulate_resize(size(px(1000.0), px(600.0)));
+        vcx.run_until_parked();
+
+        window
+            .update(&mut vcx.cx, |view, _window, _cx| {
+                assert_eq!(view.rows.borrow()[1], TranscriptRow::Entry { entry_idx: 1 });
+                let hit =
+                    view.row_of_query_match(1, "needle").expect("the match resolves to a row");
+                assert_eq!(
+                    view.rows.borrow()[hit],
+                    TranscriptRow::Block { entry_idx: 1, block_ix: 9 },
+                    "the needle is in the tenth block",
+                );
+                assert!(
+                    hit > view.row_of_entry(1).expect("the reply has a head row"),
+                    "the match resolved to the head row, which is what this exists to stop",
+                );
+            })
+            .unwrap();
+    }
+
+    /// Building the row list must not re-read the transcript.
+    ///
+    /// The row list is global — the transcript cannot place row 900 without
+    /// knowing how many rows every message above it takes — so splitting replies
+    /// into block rows made every frame ask every message how long it is. The
+    /// parser answers that by comparing the whole string, so without the row
+    /// cache a steady-state frame costs a pass over every byte of the
+    /// conversation, which is the cost this phase exists to remove.
+    ///
+    /// A hit and a miss render identically, so the counter is the only way to
+    /// see the difference. Verified to bite: make `RowCache::hit` return `None`
+    /// and the second frame probes once per assistant message.
+    #[gpui::test]
+    async fn a_settled_transcript_is_not_re_read_on_every_frame(cx: &mut TestAppContext) {
+        if !virtualized() || !markdown_state::owned_renderer() {
+            return;
+        }
+        let (window, mut vcx) = seeded_view(60, cx);
+        let probes = |vcx: &mut VisualTestContext| {
+            window.update(&mut vcx.cx, |view, _window, _cx| view.markdown.row_cache_probes()).unwrap()
+        };
+        let settled = probes(&mut vcx);
+
+        // Another frame over the same, unchanged transcript.
+        vcx.simulate_resize(size(px(1000.0), px(601.0)));
+        vcx.run_until_parked();
+        assert_eq!(
+            probes(&mut vcx),
+            settled,
+            "a frame that changed nothing re-read the transcript anyway",
+        );
+
+        // And one more, to rule out a cache that merely warms up slowly.
+        vcx.simulate_resize(size(px(1000.0), px(602.0)));
+        vcx.run_until_parked();
+        assert_eq!(probes(&mut vcx), settled);
+    }
+
+    /// The phase's claim, in the unit it is actually true in.
+    ///
+    /// Not "one row rebuilds": `list()` rebuilds every VISIBLE row on every
+    /// layout, and gpui has no way to hand a built element back to a later
+    /// frame, so no counter of rows will ever read one. What changed is the work
+    /// behind a frame. A long reply used to be a single row, so any part of it
+    /// being on screen meant building all of it — every paragraph, every fence —
+    /// on every token. Split into block rows, a frame builds the blocks in the
+    /// viewport and its overdraw band and stops.
+    ///
+    /// So the assertion is that the per-frame cost stops tracking the reply:
+    /// double the message and a token still costs the same frame. Measured at
+    /// 100 blocks in a 600px viewport, a token rebuilds **37** blocks; at 200
+    /// blocks it rebuilds 37 again.
+    ///
+    /// Verified to bite: put the body back on the head row and stop emitting
+    /// block rows — the pre-phase arrangement — and the same token rebuilds
+    /// **101 of 100** blocks, and 201 of 200.
+    #[gpui::test]
+    async fn streaming_into_a_long_reply_costs_a_screenful_not_a_message(
+        cx: &mut TestAppContext,
+    ) {
+        if !virtualized() || !markdown_state::owned_renderer() {
+            return;
+        }
+        cx.update(gpui_component::init);
+
+        /// Stream `blocks` paragraphs, then one more token, and report how many
+        /// blocks the resulting frame built.
+        async fn cost_of_a_token(blocks: usize, cx: &mut TestAppContext) -> usize {
+            let window = cx.add_window(|window, cx| {
+                AgentChatView::with_connection_for_test(
+                    Arc::new(StubConnection::default()),
+                    Theme::default(),
+                    Density::default(),
+                    Typography::default(),
+                    window,
+                    cx,
+                )
+            });
+            window
+                .update(cx, |view, _window, cx| {
+                    view.thread.push_user_message_with_images("q", Vec::<ChatImage>::new());
+                    for i in 0..blocks {
+                        view.on_event(
+                            ThreadEvent::AssistantTextDelta(format!(
+                                "paragraph {i} of the reply.\n\n"
+                            )),
+                            cx,
+                        );
+                    }
+                })
+                .unwrap();
+            let mut vcx = VisualTestContext::from_window(window.into(), cx);
+            vcx.simulate_resize(size(px(1000.0), px(600.0)));
+            vcx.run_until_parked();
+
+            window
+                .update(&mut vcx.cx, |view, _window, _cx| {
+                    assert_eq!(
+                        view.rows.borrow().len(),
+                        1 + 1 + blocks + 1,
+                        "the user turn, the reply's head, its blocks, and the tail",
+                    );
+                    view.markdown.reset_blocks_rendered();
+                })
+                .unwrap();
+
+            window
+                .update(&mut vcx.cx, |view, _window, cx| {
+                    view.on_event(ThreadEvent::AssistantTextDelta(" more".into()), cx);
+                })
+                .unwrap();
+            // This harness lays out on a resize and not on a bare `notify`, so
+            // the frame the token would have caused has to be asked for. What is
+            // counted is one frame's block-building work either way.
+            vcx.simulate_resize(size(px(1000.0), px(601.0)));
+            vcx.run_until_parked();
+
+            window
+                .update(&mut vcx.cx, |view, _window, _cx| view.markdown.blocks_rendered())
+                .unwrap()
+        }
+
+        let short = cost_of_a_token(100, cx).await;
+        let long = cost_of_a_token(200, cx).await;
+        assert!(short > 0, "the token produced no render at all — the measurement is empty");
+        assert!(
+            long <= short + short / 4,
+            "doubling the reply took a token from {short} blocks to {long}; frame cost is \
+             still tracking the length of the message",
+        );
+        assert!(
+            short < 100 / 2,
+            "a token rebuilt {short} of 100 blocks — the reply is not being split",
+        );
     }
 
     /// A rewind shrinks the row list mid-conversation. `splice` must keep the

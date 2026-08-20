@@ -29,11 +29,14 @@ use gpui::{
     AnyElement, App, Context, EntityId, FocusHandle, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, MouseMoveEvent, ParentElement, SharedString, Styled, Window, div,
 };
-use oximux_markdown::{BlockTree, IncrementalParser};
+use oximux_markdown::{BlockTree, IncrementalParser, TopBlock};
 use oximux_syntax::{HighlightCache, HighlightedDocument, LanguageId};
 
 use super::AgentChatView;
+mod row_cache;
+
 use super::markdown_render::{self, CodeHighlights, MarkdownStyle};
+use row_cache::RowCache;
 use super::markdown_select::Selection;
 
 /// Which document's markdown this is.
@@ -58,7 +61,7 @@ const WHOLE_DOCUMENT: usize = usize::MAX;
 impl MdKey {
     /// The transcript position this document belongs to, for pruning. `None`
     /// for a document that is not addressed by position.
-    fn entry(&self) -> Option<usize> {
+    pub fn entry(&self) -> Option<usize> {
         match self {
             Self::Reply(ix) | Self::Thinking(ix) => Some(*ix),
             Self::Plan(_) => None,
@@ -107,6 +110,10 @@ impl Markdown {
     /// Render one message's markdown through the owned renderer.
     fn render_document(&self, key: MdKey, text: &str, style: &MarkdownStyle) -> AnyElement {
         let (tree, hl) = self.tree_and_highlights(key, text);
+        #[cfg(test)]
+        self.state.borrow().blocks_rendered.set(
+            self.state.borrow().blocks_rendered.get() + tree.blocks.len(),
+        );
         markdown_render::render_document(&tree, style, &hl)
     }
 
@@ -134,7 +141,20 @@ impl Markdown {
         if !owned_renderer() {
             return 1;
         }
-        self.state.borrow_mut().tree(key, text).blocks.len()
+        self.state.borrow_mut().block_count(key, text)
+    }
+
+    /// Which top-level block the source byte at `offset` belongs to.
+    ///
+    /// The find bar's jump target: a match forty paragraphs into a reply should
+    /// scroll to the paragraph, not to the reply's header. `None` when the
+    /// legacy renderer is on — it has no blocks, so its whole body is one row
+    /// and the head row is already the right answer.
+    pub fn block_of_offset(&self, key: MdKey, text: &str, offset: usize) -> Option<usize> {
+        if !owned_renderer() {
+            return None;
+        }
+        block_at_offset(&self.state.borrow_mut().tree(key, text), offset)
     }
 
     /// One top-level block of a message, as its own element.
@@ -151,8 +171,19 @@ impl Markdown {
         block_ix: usize,
         style: &MarkdownStyle,
     ) -> Option<AnyElement> {
-        let (tree, hl) = self.tree_and_highlights(key, text);
-        let body = markdown_render::render_block_at(&tree, block_ix, style, &hl)?;
+        // One block, not the tree. Cloning the whole tree here would scale the
+        // per-frame cost with the length of the *message* once more — ten
+        // visible rows of a two-hundred-block reply would clone two thousand
+        // blocks a frame — which is the factor block granularity just removed.
+        let (top, hl) = {
+            let mut state = self.state.borrow_mut();
+            let top = state.block(key, text, block_ix)?;
+            let hl = state.highlights();
+            (top, hl)
+        };
+        #[cfg(test)]
+        self.state.borrow().blocks_rendered.set(self.state.borrow().blocks_rendered.get() + 1);
+        let body = markdown_render::render_block_at(&top, block_ix, style, &hl);
         Some(self.with_selection(key, block_ix, body))
     }
 
@@ -224,10 +255,41 @@ impl Markdown {
         self.state.borrow_mut().retain_entries(len);
     }
 
+    /// Lookups that fell through to the parser. Test-only — see [`RowCache`].
+    #[cfg(test)]
+    pub fn row_cache_probes(&self) -> usize {
+        self.state.borrow().rows.probes()
+    }
+
+    /// Markdown blocks turned into elements so far. Test-only, and the honest
+    /// unit for what block granularity bought: the *row* count went up, and the
+    /// work behind a frame is what went down.
+    #[cfg(test)]
+    pub fn blocks_rendered(&self) -> usize {
+        self.state.borrow().blocks_rendered.get()
+    }
+
+    /// Test-only, so a measurement can start from a known point.
+    #[cfg(test)]
+    pub fn reset_blocks_rendered(&self) {
+        self.state.borrow().blocks_rendered.set(0);
+    }
+
     pub fn dispatch_highlighting(&self, cx: &mut Context<AgentChatView>) {
         let highlights = Rc::clone(&self.state.borrow().highlights);
         MarkdownState::dispatch(highlights, cx);
     }
+}
+
+/// The first block that ends after `offset`.
+///
+/// "Ends after" rather than "contains", because a block's range covers the
+/// block and not the blank line that separates it from the next — an offset
+/// landing in that gap belongs to nothing, and answering with the block the
+/// reader is heading towards beats answering `None` and jumping to the top of
+/// the message instead.
+fn block_at_offset(tree: &BlockTree, offset: usize) -> Option<usize> {
+    tree.blocks.iter().position(|b| offset < b.range.end)
 }
 
 /// Per-view markdown state: one parser per live message, one highlight store.
@@ -235,6 +297,12 @@ impl Markdown {
 struct MarkdownState {
     parsers: HashMap<MdKey, IncrementalParser>,
     highlights: Rc<RefCell<Highlights>>,
+    /// Block counts, so building the row list does not re-read every message on
+    /// every frame. See [`RowCache`].
+    rows: RowCache,
+    /// Blocks turned into elements, for tests that measure frame cost.
+    #[cfg(test)]
+    blocks_rendered: std::cell::Cell<usize>,
 }
 
 impl MarkdownState {
@@ -244,9 +312,34 @@ impl MarkdownState {
     /// Returns a clone rather than a borrow because the caller renders while
     /// holding it, and rendering reaches back into the view.
     fn tree(&mut self, key: MdKey, text: &str) -> BlockTree {
+        self.parse(key, text).tree().clone()
+    }
+
+    /// One top-level block of `key`'s document, cloned on its own.
+    fn block(&mut self, key: MdKey, text: &str, ix: usize) -> Option<TopBlock> {
+        self.parse(key, text).tree().blocks.get(ix).cloned()
+    }
+
+    /// How many top-level blocks `key`'s document has, answered from the row
+    /// cache when the message's length says nothing can have changed.
+    ///
+    /// The cache is the whole point: this is asked for *every* message on every
+    /// frame, and the parser's own "has this changed?" is a full comparison of
+    /// the text.
+    fn block_count(&mut self, key: MdKey, text: &str) -> usize {
+        if let Some(n) = self.rows.hit(key, text.len()) {
+            return n;
+        }
+        let n = self.parse(key, text).tree().blocks.len();
+        self.rows.store(key, text.len(), n);
+        n
+    }
+
+    /// The parser for `key`, brought up to date with `text`.
+    fn parse(&mut self, key: MdKey, text: &str) -> &IncrementalParser {
         let parser = self.parsers.entry(key).or_default();
         parser.set_text(text);
-        parser.tree().clone()
+        parser
     }
 
     /// Drop parser state for messages that no longer exist.
@@ -257,6 +350,9 @@ impl MarkdownState {
     /// length keep their parsers: they are the same messages, and re-reading
     /// them from scratch is the cost this cache exists to avoid.
     fn retain_entries(&mut self, len: usize) {
+        // Eagerly, unlike the parsers below: a retained count is a wrong answer
+        // rather than a wasted allocation. See [`RowCache::retain_entries`].
+        self.rows.retain_entries(len);
         if self.parsers.len() > len.saturating_mul(2) {
             self.parsers.retain(|k, _| k.entry().is_none_or(|ix| ix < len));
         }
@@ -371,6 +467,30 @@ mod tests {
             oximux_markdown::Block::Paragraph { .. }
         ));
         assert_eq!(state.parsers.len(), 2);
+    }
+
+    /// A match deep in a long reply has to resolve to the block it is in, or
+    /// the find bar scrolls to the top of the message and the reader is left
+    /// looking for it.
+    #[test]
+    fn an_offset_resolves_to_the_block_it_falls_in() {
+        let doc = "# Title\n\nfirst para\n\nsecond para\n";
+        let tree = MarkdownState::default().tree(MdKey::Reply(0), doc);
+        assert_eq!(tree.blocks.len(), 3);
+
+        let at = |needle: &str| block_at_offset(&tree, doc.find(needle).unwrap());
+        assert_eq!(at("Title"), Some(0));
+        assert_eq!(at("first"), Some(1));
+        assert_eq!(at("second"), Some(2));
+
+        // The gap between two blocks belongs to neither; answer with the one
+        // the reader is heading towards rather than with nothing.
+        let gap = doc.find("first para").unwrap() - 1;
+        assert_eq!(block_at_offset(&tree, gap), Some(1));
+
+        // Past the end resolves to nothing rather than to the last block — the
+        // caller falls back to the message's head row, which is honest.
+        assert_eq!(block_at_offset(&tree, doc.len()), None);
     }
 
     /// The point of keeping the parser: appending to a reply must not re-read
