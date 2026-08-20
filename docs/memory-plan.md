@@ -110,8 +110,27 @@ cares about is structural, and phases 2, 5, 6 and 7 are what remove it.
 
 - macOS only. No Linux machine was available, and the published result that
   motivated the swap was measured on Linux/glibc — whose arena behaviour is not
-  libmalloc's. The CI job added in this phase runs on Linux and will produce the
-  first Linux numbers.
+  libmalloc's.
+
+  **First Linux numbers, 2026-08-21** (ubuntu-latest, debug, same 16×400KB
+  workload): boot 52.7 MB, steady state 121.9 MB, retention **10.81×**, idle
+  delta **+956 KB**, reopen 50 ms.
+
+  Read this precisely. It measures **system malloc on Linux** and therefore does
+  **not** close the gap — nobody has yet run mimalloc on Linux, which is the
+  comparison the published result actually invites. What it does do is test the
+  *mechanism* the rejection rests on. The macOS argument was that retention here
+  is live data the fold still holds rather than freed-but-unreturned pages, and
+  the evidence was a small idle delta: nothing ratcheting means no watermark for
+  a better allocator to hand back. Linux agrees — +956 KB over a 60s idle window,
+  even smaller than macOS's +1.2 MB — so the premise that the swap would help is
+  no better supported on glibc than on libmalloc. Retention runs ~13% higher than
+  macOS (10.81× against 9.38–9.55×), which is a different constant, not a
+  different regime.
+
+  The decision therefore stands, now on two platforms' worth of mechanism rather
+  than one. Wiring mimalloc into a Linux run remains the experiment that would
+  settle it outright, and is still unrun.
 - Headless host only. The GPUI desktop app's allocation profile — image decode
   churn above all — is unmeasured, and is the surface on which the largest
   allocator win was reported elsewhere.
@@ -217,3 +236,4 @@ Every phase from 2 onward:
 | 2026-08-20 | 6 | 35.5 MB | 97.9 MB | 9.75× | debug, macOS, 16×400KB. Flat vs the 9.55× debug baseline and inside its recorded variance — expected: phase 6 swapped the chat MARKDOWN RENDERER, which is desktop-only and outside this harness by construction (section 4b). Run to prove no headless regression, not to measure the renderer |
 | 2026-08-21 | 7 | 36.1 MB | 96.0 MB | 9.35× | debug, macOS, 16×400KB. Flat again, and slightly under both the 9.55× debug baseline and phase 6's 9.75×. Same reason: phase 7 split assistant replies into per-block transcript rows and added a per-message block-count cache, all of it desktop-side and outside this harness by construction (section 4b). The phase's own measurement is blocks built per frame — 37 for a token into a 100-block reply and 37 again at 200 blocks, against 101 and 201 before the split — asserted in `transcript.rs`, not here |
 | 2026-08-21 | 8 | 36.2 MB | 96.2 MB | 9.38× | debug, macOS, 16×400KB. Flat again, and for the third phase running the same reason: phase 8 replaced the transcript's follow with a velocity spring in `apps/desktop`, which this harness does not link (section 4b). Run to prove no headless regression, not to measure the spring. The phase's own measurement is layout work per streamed token — an early spelling that let the frame loop stay awake for a whole reply took it from 37 blocks to 54, which is why `StickSpring::is_idle` ignores the growth estimate |
+| 2026-08-21 | CI | 52.7 MB | 121.9 MB | 10.81× | **First Linux numbers** (ubuntu-latest, debug, 16×400KB), from the `mem-smoke` job on `abff3f38`. Same workload as every row above, different platform — so comparable to the debug macOS rows and to nothing else. Idle delta +956 KB corroborates the section-3 finding that retention is live data rather than unreturned pages. Does NOT test mimalloc on Linux; that experiment is still unrun |
