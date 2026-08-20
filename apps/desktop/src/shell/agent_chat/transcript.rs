@@ -519,11 +519,19 @@ impl AgentChatView {
         self.stick_to_bottom
     }
 
-    /// How far the view still has to travel to reach the end, in pixels.
+    /// How far the view still has to travel to reach the end, in pixels —
+    /// **as far as the list currently knows**, which near the end is exact and
+    /// at distance is not.
     ///
-    /// The only frame the spring works in, and the only one that survives a
-    /// `list()` measuring rows lazily — see [`super::stick_spring`] for why an
-    /// absolute scroll position does not.
+    /// ⚠️ Not a real distance. `max_offset_for_scrollbar` counts only rows that
+    /// have been laid out, so at the top of a long transcript this answers about
+    /// three screens no matter how many there really are (measured: 1697px
+    /// against 1201 rows — see
+    /// [`the_list_underestimates_its_own_height_until_it_lays_rows_out`]). Both
+    /// callers here ask only whether the number is *small* — "is the newest turn
+    /// on screen", and "should the pin re-engage" — and near the end the
+    /// measured band **is** the end, so both get a true answer. Anything that
+    /// wants an actual remaining distance must not use this.
     pub(super) fn remaining_to_bottom(&self) -> f32 {
         if virtualized() {
             let max = self.scroll.list.max_offset_for_scrollbar().y;
@@ -1891,6 +1899,94 @@ mod tests {
             top > rows / 2,
             "opened on row {top} of {rows} — a restored chat opened at the top",
         );
+    }
+
+    /// A `list()` does not know how tall it is until it has laid the rows out,
+    /// and that asymmetry is visible to the user.
+    ///
+    /// `list.rs`'s wheel handler clamps a downward scroll to
+    /// `items.summary().height - viewport`, and an unmeasured row contributes
+    /// **zero** to that sum. So scrolling down can never carry you past the end
+    /// of what has been laid out — the excess is discarded, not queued — while
+    /// scrolling up is clamped only at zero and everything above you is already
+    /// measured because you were just there. One flick down therefore travels
+    /// noticeably less than the same flick up, and the gap closes only as
+    /// successive layouts measure more.
+    ///
+    /// Nothing here can fix it: `splice` creates rows as
+    /// `ListItem::Unmeasured { size_hint: None }` and no public API seeds a
+    /// hint. This test exists to pin the mechanism so the next person to notice
+    /// the asymmetry does not go looking for it in the follow spring, which is
+    /// where it very much looks like it lives.
+    /// A `list()` knows only the height of what it has laid out, and that is
+    /// visible to the user as a scroll that behaves differently up and down.
+    ///
+    /// An unmeasured row contributes **zero** height, and rows are measured only
+    /// when a layout reaches them. The wheel handler clamps a downward scroll to
+    /// `items.summary().height - viewport` (`list.rs`, `new_scroll_top.min(scroll_max)`)
+    /// and **discards** the excess rather than queuing it, so one flick down can
+    /// never travel further than the band already measured. Upward has no such
+    /// ceiling: it clamps at zero, and everything above you is measured because
+    /// you were just there. Hence the same flick covers more ground going up.
+    ///
+    /// Measured here at 1201 rows: the extent reads 1697px at the top and climbs
+    /// by roughly 1740px per band visited — 1697, 3438, 5181, 6922, 8665.
+    ///
+    /// Nothing in this repo can fix it. `splice` creates rows as
+    /// `ListItem::Unmeasured { size_hint: None }` and no public API seeds a
+    /// hint, so the list cannot estimate what it has not drawn. The test exists
+    /// to pin the mechanism where the next person will find it, because the
+    /// symptom looks exactly like a fault in the follow spring.
+    #[gpui::test]
+    async fn the_list_underestimates_its_own_height_until_it_lays_rows_out(
+        cx: &mut TestAppContext,
+    ) {
+        if !virtualized() {
+            return;
+        }
+        let (window, mut vcx) = seeded_view(400, cx);
+        let rows = window.update(&mut vcx.cx, |v, _, _| v.rows.borrow().len()).unwrap();
+        let mut trace = Vec::new();
+        for (i, frac) in [0.0f32, 0.2, 0.4, 0.6, 0.8].into_iter().enumerate() {
+            window
+                .update(&mut vcx.cx, |view, _window, _cx| {
+                    // Held off on every iteration, not once. Re-engagement is by
+                    // position, so a walk that drifts inside the band would be
+                    // measuring the spring holding the tail rather than the
+                    // list — which is exactly how this test first lied, sitting
+                    // at a flat 1697 for forty iterations.
+                    view.stick_to_bottom = false;
+                    view.scroll.list.scroll_to(gpui::ListOffset {
+                        item_ix: (rows as f32 * frac) as usize,
+                        offset_in_item: px(0.0),
+                    });
+                })
+                .unwrap();
+            // Alternating heights because this harness lays out on a resize and
+            // not on a bare notify; resizing to the size it already has measures
+            // nothing.
+            vcx.simulate_resize(size(px(1000.0), px(600.0 + (i % 2) as f32)));
+            vcx.run_until_parked();
+            trace.push(
+                window
+                    .update(&mut vcx.cx, |view, _window, _cx| {
+                        f32::from(view.scroll.list.max_offset_for_scrollbar().y)
+                    })
+                    .unwrap(),
+            );
+        }
+        let (first, last) = (trace[0], *trace.last().unwrap());
+        assert!(
+            last > first * 4.0,
+            "extent went {trace:?} across the transcript; if it barely moves, the \
+             list is not underestimating and the scroll asymmetry needs another cause",
+        );
+        for pair in trace.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "extent shrank while measuring more rows: {trace:?}",
+            );
+        }
     }
 
     /// The busy loop is a release blocker, not a nit: this app is already App
