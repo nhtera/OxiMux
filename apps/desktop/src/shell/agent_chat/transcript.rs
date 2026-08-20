@@ -19,8 +19,11 @@ use super::*;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::OnceLock;
+use std::time::Instant;
 
-use gpui::{list, FollowMode, ListAlignment, ListSizingBehavior, ListState};
+use gpui::{list, ListAlignment, ListSizingBehavior, ListState};
+
+use super::stick_spring::{StickSpring, STICK_THRESHOLD_PX};
 
 /// How far beyond the viewport the list keeps rows rendered, so a flick does not
 /// paint blank. Chat rows are tall and expensive, so this is deliberately about
@@ -90,6 +93,30 @@ pub(super) struct ScrollState {
     /// A jump that is still landing. See
     /// [`AgentChatView::settle_pending_reveal`].
     pub pending_reveal: Cell<Option<PendingReveal>>,
+    /// The glide that carries the view to the tail. Live when [`virtualized`]:
+    /// the list runs in `FollowMode::Normal` so that this, rather than the
+    /// list's own layout, decides where the view sits. See
+    /// [`super::stick_spring`].
+    pub spring: StickSpring,
+    /// How far behind the end the view is deliberately being held, in pixels.
+    /// The spring's whole state as far as the transcript is concerned; see
+    /// [`super::stick_spring`] for why a lag and not a position.
+    pub lag: f32,
+    /// The end's pixel position as of the last spring tick, so growth can be
+    /// measured as the difference. `None` before the first tick and whenever
+    /// the pin is released, because a lag measured against a stale end is worse
+    /// than no lag at all.
+    pub last_end: Option<f32>,
+    /// When the spring last stepped, so it can be told how much time it is
+    /// integrating. Repaints are throttled to `NOTIFY_INTERVAL` and a stalled
+    /// window can skip far more than that, so "one frame" is never assumed.
+    pub last_tick: Option<Instant>,
+    /// How many extra frames the follow spring has asked for, ever. The busy
+    /// loop is the one failure of a spring that no assertion about the spring
+    /// itself can catch — [`StickSpring::is_idle`] can be right while the caller
+    /// ignores it — so the scheduler is counted where it is actually called.
+    #[cfg(test)]
+    pub frames_scheduled: Cell<usize>,
     /// How many rows have actually been built, ever. The whole claim of this
     /// phase is that this stays bounded by the viewport rather than tracking the
     /// conversation, and a claim nothing counts is a claim nothing checks.
@@ -103,11 +130,20 @@ impl ScrollState {
             legacy: ScrollHandle::new(),
             // `Top` alignment, not `Bottom`: a conversation shorter than the
             // viewport sits at the top, the way the scroll box always rendered
-            // it. Following the tail is `FollowMode::Tail`'s job and works
-            // under either alignment.
+            // it. The follow mode is left at its `Normal` default — see
+            // [`AgentChatView::settle_follow_spring`] for why the list's own
+            // `Tail` is not used.
             list: ListState::new(0, ListAlignment::Top, px(OVERDRAW)),
             measured_revision: Cell::new(0),
             pending_reveal: Cell::new(None),
+            spring: StickSpring::default(),
+            // Zero lag: a fresh or restored transcript wants its live end, and
+            // the first tick puts it there exactly.
+            lag: 0.0,
+            last_end: None,
+            last_tick: None,
+            #[cfg(test)]
+            frames_scheduled: Cell::new(0),
             #[cfg(test)]
             rows_built: Cell::new(0),
         }
@@ -450,13 +486,24 @@ impl AgentChatView {
     }
 
     /// Return to the live tail and re-arm auto-follow.
+    ///
+    /// Virtualized, this engages the pin and lets [`Self::settle_follow_spring`]
+    /// travel there — a jump from the middle of a long history is a long way, so
+    /// the spring's own teleport threshold covers the distance and glides the
+    /// last screen. The legacy box has no spring and goes straight there.
     pub(super) fn follow_bottom(&mut self) {
         self.stick_to_bottom = true;
         if virtualized() {
-            // `Tail` snaps to the end AND re-pins on every later layout, including
-            // while the last row is still growing — which is the whole of what the
-            // legacy path re-arms by hand with `follow_frames`.
-            self.scroll.list.set_follow_mode(FollowMode::Tail);
+            // From a standstill: whatever speed the spring carried before the
+            // user went off reading history says nothing about this journey.
+            self.scroll.spring.reset();
+            self.scroll.last_tick = None;
+            self.scroll.last_end = None;
+            // Zero lag, so the next tick lands on the end exactly. A jump from
+            // the middle of a long history is not a glide anyone wants to sit
+            // through, and the one from near the bottom is over before it reads
+            // as motion either way.
+            self.scroll.lag = 0.0;
         } else {
             self.scroll.legacy.scroll_to_bottom();
         }
@@ -464,35 +511,152 @@ impl AgentChatView {
 
     /// Whether newly-arrived content should pull the view down with it.
     ///
-    /// Virtualized, this is the list's own follow state rather than a flag we
-    /// maintain: `list()` drops it when the user scrolls up, picks it back up
-    /// when they return to the bottom, and every `scroll_to` — so every jump —
-    /// drops it too. Duplicating that in a `bool` would only create something to
-    /// get out of step.
+    /// One flag for both paths now. It used to defer to `list()`'s own
+    /// `is_following_tail` when virtualized, which was right while the list was
+    /// the thing doing the following; with the list in `FollowMode::Normal` its
+    /// answer is a constant `false`.
     pub(super) fn following(&self) -> bool {
+        self.stick_to_bottom
+    }
+
+    /// How far the view still has to travel to reach the end, in pixels.
+    ///
+    /// The only frame the spring works in, and the only one that survives a
+    /// `list()` measuring rows lazily — see [`super::stick_spring`] for why an
+    /// absolute scroll position does not.
+    pub(super) fn remaining_to_bottom(&self) -> f32 {
         if virtualized() {
-            self.scroll.list.is_following_tail()
-        } else {
-            self.stick_to_bottom
+            let max = self.scroll.list.max_offset_for_scrollbar().y;
+            let off = self.scroll.list.scroll_px_offset_for_scrollbar().y;
+            return f32::from(max + off).max(0.0);
+        }
+        let sh = &self.scroll.legacy;
+        f32::from(sh.max_offset().y + sh.offset().y).max(0.0)
+    }
+
+    /// The virtualized path's auto-follow: glide toward the tail while pinned,
+    /// and schedule the next frame only while there is still motion.
+    ///
+    /// Runs before the transcript is rebuilt, so it reads the previous frame's
+    /// layout and the scroll it commands lands in this one. That is the ordinary
+    /// one-frame lag of a scroll controller, and the spring absorbs it.
+    pub(super) fn settle_follow_spring(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !virtualized() {
+            return;
+        }
+        // Re-engage by position: the user has scrolled back into the live edge.
+        // This path only ever *engages* — breaking the pin is the wheel
+        // handler's job alone, because a controller that releases on position
+        // releases on its own scrolling and can never follow anything.
+        if !self.stick_to_bottom {
+            let remaining = self.remaining_to_bottom();
+            if remaining > STICK_THRESHOLD_PX {
+                self.scroll.last_tick = None;
+                return;
+            }
+            self.stick_to_bottom = true;
+            self.scroll.spring.reset();
+            self.scroll.last_tick = None;
+            self.scroll.last_end = None;
+            // Glide the last stretch rather than snapping it away under the
+            // hand that just scrolled there.
+            self.scroll.lag = remaining;
+        }
+
+        // Reduced motion: the point of the glide is the travel, so there is
+        // nothing here to soften — assign the end and stop, which is what the
+        // list's own `Tail` did before this. No scheduled frames either, so the
+        // pin costs nothing at rest.
+        if crate::motion_settings::active(cx).reduced {
+            self.scroll.list.scroll_to_end();
+            self.scroll.spring.reset();
+            self.scroll.lag = 0.0;
+            self.scroll.last_tick = None;
+            return;
+        }
+
+        // Re-anchor to the end by item index every frame. This is the one
+        // address that is exact with nothing measured — the layout resolves it
+        // by walking backwards — and re-deriving from it each tick is what
+        // keeps a dropped frame or a rounding error from leaving the view
+        // permanently short.
+        self.scroll.list.scroll_to_end();
+        let end = -f32::from(self.scroll.list.scroll_px_offset_for_scrollbar().y);
+        let viewport = f32::from(self.scroll.list.viewport_bounds().size.height);
+
+        let growth = self.scroll.last_end.map_or(0.0, |was| end - was);
+        self.scroll.last_end = Some(end);
+        // A jump bigger than a screen is a row being measured for the first
+        // time, not text arriving — rows above the viewport count as zero
+        // height until they are laid out once, so opening a session discovers
+        // thousands of pixels that were always there. Gliding those would bounce
+        // the view up through history it never left. Content genuinely arriving
+        // a screen at a time is past gliding anyway.
+        let growth = if growth.abs() > viewport.max(1.0) { 0.0 } else { growth };
+
+        let now = Instant::now();
+        let frames = self
+            .scroll
+            .last_tick
+            .map_or(1.0, |t| stick_spring::frames_elapsed(now.duration_since(t)));
+        self.scroll.last_tick = Some(now);
+
+        let lag = (self.scroll.lag + growth.max(0.0))
+            .min(viewport * stick_spring::GLIDE_MAX_LAG_VIEWPORTS);
+        self.scroll.lag = self.scroll.spring.step(lag, growth, frames);
+        if self.scroll.lag > 0.0 {
+            self.scroll.list.scroll_by(px(-self.scroll.lag));
+        }
+
+        // Park the moment the lag is closed. A spring that never says so
+        // repaints forever, which on this platform is not merely wasted work —
+        // see `oximux-macos-freeze-appnap-relay-runtime`. Nothing is lost by
+        // parking mid-stream: the next delta repaints the transcript by itself.
+        if self.scroll.lag > 0.0 {
+            self.schedule_follow_frame(window, cx);
         }
     }
 
-    /// Whether the transcript is scrolled to (within one card of) the bottom.
-    /// `offset().y` is `<= 0` and reaches `-max_offset().y` at the very bottom,
-    /// so their sum is the remaining scroll distance. Fresh views (no paint yet)
-    /// report `0`, i.e. "at bottom", so the first turn follows.
-    pub(super) fn is_near_bottom(&self) -> bool {
-        if virtualized() {
-            // Same sum, same tolerance, different source. NOT
-            // `is_scrolled_to_end`, which is exact — this question is "close
-            // enough that the newest turn is on screen", and an exact answer
-            // would banner "jump down" at five pixels off the bottom.
-            let max = self.scroll.list.max_offset_for_scrollbar().y;
-            let off = self.scroll.list.scroll_px_offset_for_scrollbar().y;
-            return max + off <= px(160.0);
+    /// Ask for one more frame on the follow spring's behalf, and count it.
+    fn schedule_follow_frame(&self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(test)]
+        self.scroll
+            .frames_scheduled
+            .set(self.scroll.frames_scheduled.get() + 1);
+        let this = cx.entity().downgrade();
+        window.on_next_frame(move |_window, cx| {
+            let _ = this.update(cx, |_this, cx| cx.notify());
+        });
+    }
+
+    /// Break the pin on user wheel input, and only on that.
+    ///
+    /// gpui's scroll offset grows more negative as you scroll down, so a
+    /// positive delta means "toward the top" — the same test `list()` applies
+    /// internally for its own `Tail` mode.
+    pub(super) fn on_transcript_wheel(&mut self, ev: &gpui::ScrollWheelEvent, cx: &mut Context<Self>) {
+        if ev.delta.pixel_delta(px(20.0)).y <= px(0.0) || !self.stick_to_bottom {
+            return;
         }
-        let sh = &self.scroll.legacy;
-        sh.max_offset().y + sh.offset().y <= px(160.0)
+        self.stick_to_bottom = false;
+        self.scroll.spring.reset();
+        self.scroll.lag = 0.0;
+        self.scroll.last_end = None;
+        self.scroll.last_tick = None;
+        cx.notify();
+    }
+
+    /// Whether the transcript is scrolled to (within one card of) the bottom.
+    /// Fresh views (no paint yet) report `0`, i.e. "at bottom", so the first
+    /// turn follows.
+    ///
+    /// Deliberately a wider band than [`STICK_THRESHOLD_PX`], and deliberately
+    /// not folded into it. This one answers "is the newest turn on screen", and
+    /// it gates the awaiting-approval banner — a stricter answer would banner
+    /// "jump down" at five pixels off the bottom. Re-engaging the follow is a
+    /// different question about the same number.
+    pub(super) fn is_near_bottom(&self) -> bool {
+        self.remaining_to_bottom() <= 160.0
     }
 
     /// Jump the transcript to the `n`-th user turn (0-based ordinal among user
@@ -707,7 +871,17 @@ impl AgentChatView {
             .flex_1()
             .min_h(px(0.0))
             .children(self.render_message_rail(cx))
-            .child(self.wrap_scroll(body, self.scrollbar()))
+            .child(
+                // The wheel listener rides the wrapper, not the list: `List` is
+                // `Styled` but not `InteractiveElement`, and this div is its
+                // direct parent, so a wheel over the transcript bubbles here
+                // right after `list()`'s own handler has moved the position.
+                self.wrap_scroll(body, self.scrollbar()).on_scroll_wheel(
+                    cx.listener(|this, ev: &gpui::ScrollWheelEvent, _window, cx| {
+                        this.on_transcript_wheel(ev, cx);
+                    }),
+                ),
+            )
             .children(self.render_jump_list(cx))
             .children(self.render_session_detail(cx))
             .children(self.render_find_bar(cx))
@@ -1688,6 +1862,99 @@ mod tests {
                 assert_eq!(view.rows.borrow().len(), 37);
             })
             .unwrap();
+    }
+
+    /// A restored transcript opens at its live end, not at its top.
+    ///
+    /// The regression this guards is specific to a virtualized list: a row that
+    /// has never been laid out has **zero** height, so on the first frame the
+    /// content measures as nearly nothing and every pixel-denominated answer —
+    /// "how far to the bottom" included — is `0` while the view sits on message
+    /// one. A spring told the distance is zero does nothing, forever. Only the
+    /// item-index anchor ([`Landing::Anchor`]) can reach an end nobody has
+    /// measured.
+    #[gpui::test]
+    async fn a_restored_transcript_opens_at_its_end(cx: &mut TestAppContext) {
+        if !virtualized() {
+            return;
+        }
+        let (window, mut vcx) = seeded_view(60, cx);
+        let (top, rows) = window
+            .update(&mut vcx.cx, |view, _window, _cx| {
+                (
+                    view.scroll.list.logical_scroll_top().item_ix,
+                    view.rows.borrow().len(),
+                )
+            })
+            .unwrap();
+        assert!(
+            top > rows / 2,
+            "opened on row {top} of {rows} — a restored chat opened at the top",
+        );
+    }
+
+    /// The busy loop is a release blocker, not a nit: this app is already App
+    /// Nap sensitive, and a follow that repaints forever is a follow that keeps
+    /// the machine awake to show nothing.
+    #[gpui::test]
+    async fn the_follow_spring_stops_asking_for_frames(cx: &mut TestAppContext) {
+        if !virtualized() {
+            return;
+        }
+        // `seeded_view` already runs to a standstill, so anything the landing
+        // and the glide needed has been spent by now.
+        let (window, mut vcx) = seeded_view(12, cx);
+        let settled = window
+            .update(&mut vcx.cx, |view, _window, _cx| {
+                view.scroll.frames_scheduled.get()
+            })
+            .unwrap();
+        for _ in 0..5 {
+            window.update(&mut vcx.cx, |_view, _window, cx| cx.notify()).unwrap();
+            vcx.run_until_parked();
+        }
+        let after = window
+            .update(&mut vcx.cx, |view, _window, _cx| {
+                view.scroll.frames_scheduled.get()
+            })
+            .unwrap();
+        assert_eq!(
+            settled, after,
+            "five quiet repaints asked for {} more frames; the spring is not parking",
+            after - settled,
+        );
+    }
+
+    /// The rule the whole class of follow bugs turns on. The controller scrolls
+    /// the transcript itself, every frame, while following — so a pin that
+    /// breaks on *position* breaks on its own work and can never follow
+    /// anything. Only a wheel toward the top releases it.
+    #[gpui::test]
+    async fn only_a_wheel_releases_the_pin(cx: &mut TestAppContext) {
+        if !virtualized() {
+            return;
+        }
+        let (window, mut vcx) = seeded_view(12, cx);
+        window
+            .update(&mut vcx.cx, |view, _window, cx| {
+                assert!(view.following(), "not following a settled transcript");
+                // Scrolling DOWN — the direction the follow itself moves in —
+                // must leave the pin alone however far it goes.
+                view.on_transcript_wheel(&wheel(-400.0), cx);
+                assert!(view.following(), "the follow released itself scrolling down");
+                view.on_transcript_wheel(&wheel(30.0), cx);
+                assert!(!view.following(), "a wheel toward history did not release it");
+            })
+            .unwrap();
+    }
+
+    /// A `ScrollWheelEvent` carrying `dy` pixels; positive is toward the top,
+    /// the way gpui signs it.
+    fn wheel(dy: f32) -> gpui::ScrollWheelEvent {
+        gpui::ScrollWheelEvent {
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.0), px(dy))),
+            ..Default::default()
+        }
     }
 
     /// The point of the phase: jumping to a user turn lands on that turn's row,

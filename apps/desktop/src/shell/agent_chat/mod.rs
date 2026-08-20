@@ -69,6 +69,7 @@ mod tool_grouping;
 mod markdown_render;
 mod markdown_select;
 mod markdown_state;
+mod stick_spring;
 mod transcript;
 
 /// Install the ACP embedded-terminal host at app boot so ACP agents can drive
@@ -5102,14 +5103,9 @@ impl Render for AgentChatView {
                 composer.read(cx).focus_handle(cx).focus(window, cx);
             });
         }
-        // Re-pin to the bottom every frame while following. Re-asserting each
-        // render (not just once per event) keeps the newest row glued as its
-        // height settles a frame after it arrives (markdown/diff measuring) and
-        // through the end of the turn — a single per-event scroll lands short in
-        // that case. Released when the user scrolls up (see the wheel handler on
-        // the transcript). `scroll_to_bottom` only sets a flag consumed at paint,
-        // so this is cheap.
-        // The two transcript follow loops. Both inert unless in flight.
+        // The three transcript follow loops. Each inert unless in flight, and
+        // the first two are mutually exclusive: one per `virtualized()` path.
+        self.settle_follow_spring(window, cx);
         self.settle_legacy_follow(window, cx);
         self.settle_pending_reveal(window, cx);
         // Fences that missed their colors while this frame was being built.
