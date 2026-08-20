@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use gpui::{
     AnyElement, App, Context, EntityId, FocusHandle, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ParentElement, SharedString, Styled, Window, div,
+    MouseDownEvent, MouseMoveEvent, ParentElement, ScrollHandle, SharedString, Styled, Window, div,
 };
 use oximux_markdown::{BlockTree, IncrementalParser, TopBlock};
 use oximux_syntax::{HighlightCache, HighlightedDocument, LanguageId};
@@ -35,7 +35,7 @@ use oximux_syntax::{HighlightCache, HighlightedDocument, LanguageId};
 use super::AgentChatView;
 mod row_cache;
 
-use super::markdown_render::{self, CodeHighlights, MarkdownStyle};
+use super::markdown_render::{self, CodeHighlights, FenceKey, FenceScrolls, MarkdownStyle};
 use row_cache::RowCache;
 use super::markdown_select::Selection;
 
@@ -110,11 +110,12 @@ impl Markdown {
     /// Render one message's markdown through the owned renderer.
     fn render_document(&self, key: MdKey, text: &str, style: &MarkdownStyle) -> AnyElement {
         let (tree, hl) = self.tree_and_highlights(key, text);
+        let scrolls = self.fence_scrolls();
         #[cfg(test)]
         self.state.borrow().blocks_rendered.set(
             self.state.borrow().blocks_rendered.get() + tree.blocks.len(),
         );
-        markdown_render::render_document(&tree, style, &hl)
+        markdown_render::render_document(&tree, style, &hl, &scrolls)
     }
 
     /// The tree and the highlight handle, both taken before rendering starts so
@@ -181,9 +182,10 @@ impl Markdown {
             let hl = state.highlights();
             (top, hl)
         };
+        let scrolls = self.fence_scrolls();
         #[cfg(test)]
         self.state.borrow().blocks_rendered.set(self.state.borrow().blocks_rendered.get() + 1);
-        let body = markdown_render::render_block_at(&top, block_ix, style, &hl);
+        let body = markdown_render::render_block_at(&top, block_ix, style, &hl, &scrolls);
         Some(self.with_selection(key, block_ix, body))
     }
 
@@ -255,6 +257,15 @@ impl Markdown {
         self.state.borrow_mut().retain_entries(len);
     }
 
+    /// A handle the pure renderer can ask for a fence's scroll position.
+    ///
+    /// Taken outside the `state` borrow the renderer runs under, like the
+    /// highlight store: it is its own `Rc<RefCell<_>>`, so asking it for a
+    /// handle mid-render is not a re-entrant borrow of [`MarkdownState`].
+    fn fence_scrolls(&self) -> FenceScrollStore {
+        FenceScrollStore(Rc::clone(&self.state.borrow().fence_scrolls))
+    }
+
     /// Lookups that fell through to the parser. Test-only — see [`RowCache`].
     #[cfg(test)]
     pub fn row_cache_probes(&self) -> usize {
@@ -300,6 +311,10 @@ struct MarkdownState {
     /// Block counts, so building the row list does not re-read every message on
     /// every frame. See [`RowCache`].
     rows: RowCache,
+    /// One horizontal scroll position per fence, surviving the frame that made
+    /// it. Its own `Rc` so the renderer can reach it while this struct is
+    /// borrowed — see [`Markdown::fence_scrolls`].
+    fence_scrolls: Rc<RefCell<HashMap<FenceKey, ScrollHandle>>>,
     /// Blocks turned into elements, for tests that measure frame cost.
     #[cfg(test)]
     blocks_rendered: std::cell::Cell<usize>,
@@ -353,6 +368,12 @@ impl MarkdownState {
         // Eagerly, unlike the parsers below: a retained count is a wrong answer
         // rather than a wasted allocation. See [`RowCache::retain_entries`].
         self.rows.retain_entries(len);
+        // Fence scroll positions belong to messages too, and a rewind frees the
+        // indices they are keyed under. Left behind, the next reply to land on a
+        // reused index would open its fence already scrolled sideways.
+        self.fence_scrolls
+            .borrow_mut()
+            .retain(|(key, _, _), _| key.entry().is_none_or(|ix| ix < len));
         if self.parsers.len() > len.saturating_mul(2) {
             self.parsers.retain(|k, _| k.entry().is_none_or(|ix| ix < len));
         }
@@ -401,6 +422,17 @@ struct Highlights {
     /// Fences already dispatched. Without this, a fence visible for twenty
     /// frames before its result lands is tokenized twenty times.
     in_flight: HashSet<u64>,
+}
+
+/// The renderer's view of the fence scroll positions: ask for a fence's handle
+/// and get the same one every frame, or a fresh one the first time.
+#[derive(Clone)]
+struct FenceScrollStore(Rc<RefCell<HashMap<FenceKey, ScrollHandle>>>);
+
+impl FenceScrolls for FenceScrollStore {
+    fn handle(&self, key: FenceKey) -> ScrollHandle {
+        self.0.borrow_mut().entry(key).or_default().clone()
+    }
 }
 
 /// The renderer's view of the highlight store: ask, and either get colors or

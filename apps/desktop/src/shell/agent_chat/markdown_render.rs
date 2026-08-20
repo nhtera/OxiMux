@@ -31,15 +31,16 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, ElementId, FontStyle, FontWeight, HighlightStyle, Hsla, IntoElement, ParentElement,
-    SharedString, StrikethroughStyle, Styled, StyledText, UnderlineStyle, div, px,
+    AnyElement, ElementId, FontStyle, FontWeight, HighlightStyle, Hsla, InteractiveElement,
+    IntoElement, ParentElement, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
+    StrikethroughStyle, StyledText, UnderlineStyle, div, px,
 };
 use gpui_component::clipboard::Clipboard;
 use oximux_markdown::{Block, BlockTree, InlineRun, InlineStyle, TableAlign, TopBlock};
 use oximux_settings::{Density, SyntaxPalette, Theme, Typography};
 use oximux_syntax::{HighlightKind, HighlightedDocument, LanguageId};
 
-use super::markdown_select::{ChatText, MatchBand, Selection, match_ranges};
+use super::markdown_select::{ChatText, MatchBand, Selection, TextPart, match_ranges};
 use super::markdown_state::MdKey;
 
 /// Where a fence's colors come from, if they exist yet.
@@ -53,6 +54,20 @@ use super::markdown_state::MdKey;
 /// without colors at exactly the size it will have with them.
 pub(super) trait CodeHighlights {
     fn colors(&self, lang: &LanguageId, code: &str) -> Option<Arc<HighlightedDocument>>;
+}
+
+/// Which fence, across the whole view: document, top-level block, and the
+/// fence's ordinal within that block.
+pub(super) type FenceKey = (MdKey, usize, usize);
+
+/// Where a fence's horizontal scroll position lives between frames.
+///
+/// A trait for the same reason [`CodeHighlights`] is one: this module is pure
+/// and rebuilds its elements every frame, so anything that has to *persist*
+/// belongs to [`super::markdown_state`]. A scroll offset is exactly that — lose
+/// it and every frame snaps a half-read line back to column one.
+pub(super) trait FenceScrolls {
+    fn handle(&self, key: FenceKey) -> ScrollHandle;
 }
 
 /// Vertical gap between two top-level blocks, as a multiple of `pad_panel`.
@@ -185,6 +200,12 @@ impl MarkdownStyle {
         self.text_size * CODE_SCALE
     }
 
+    /// The scrolling viewport of one fence. Distinct from [`Self::copy_id`] for
+    /// the same fence — two elements, two ids.
+    fn fence_id(&self, block: usize, fence: usize) -> ElementId {
+        ElementId::from(("chat-fence-scroll", Self::fence_salt(self.key, block, fence) as usize))
+    }
+
     /// A copy button's id: this document, this top-level block, this fence
     /// within that block.
     ///
@@ -197,11 +218,15 @@ impl MarkdownStyle {
     /// `block << 48` on a reply with a few thousand blocks is an overflow panic
     /// in the most-looked-at surface in the product.
     fn copy_id(&self, block: usize, fence: usize) -> ElementId {
+        ElementId::from(("chat-code-copy", Self::fence_salt(self.key, block, fence) as usize))
+    }
+
+    fn fence_salt(key: MdKey, block: usize, fence: usize) -> u64 {
         let mix = (block as u64)
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
             .rotate_left(31)
             .wrapping_add((fence as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
-        ElementId::from(("chat-code-copy", (self.key.seed() ^ mix) as usize))
+        key.seed() ^ mix
     }
 }
 
@@ -214,6 +239,7 @@ impl MarkdownStyle {
 struct Ctx<'a> {
     style: &'a MarkdownStyle,
     hl: &'a dyn CodeHighlights,
+    scrolls: &'a dyn FenceScrolls,
     /// Which top-level block is being rendered. Both counters below are scoped
     /// to it and restart at zero for the next one, so rendering a block on its
     /// own — as a block-granularity transcript row does — produces exactly the
@@ -228,8 +254,13 @@ struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    fn new(style: &'a MarkdownStyle, hl: &'a dyn CodeHighlights, block: usize) -> Self {
-        Self { style, hl, block, fence: Cell::new(0), text_ord: Cell::new(0) }
+    fn new(
+        style: &'a MarkdownStyle,
+        hl: &'a dyn CodeHighlights,
+        scrolls: &'a dyn FenceScrolls,
+        block: usize,
+    ) -> Self {
+        Self { style, hl, scrolls, block, fence: Cell::new(0), text_ord: Cell::new(0) }
     }
 }
 
@@ -245,12 +276,20 @@ impl Ctx<'_> {
     /// `BTreeMap` orders pairs lexicographically, which is document order, and
     /// nothing has to pick a stride that a pathological reply could overflow.
     fn selectable(&self, plain: &str, text: StyledText) -> ChatText {
+        self.selectable_as(TextPart::Prose, plain, text)
+    }
+
+    /// [`Self::selectable`] for text that is not a block of prose — today, the
+    /// lines of a fence, which a copy must rejoin with a single newline rather
+    /// than a blank line.
+    fn selectable_as(&self, part: TextPart, plain: &str, text: StyledText) -> ChatText {
         let local = self.text_ord.get();
         self.text_ord.set(local + 1);
         let el = ChatText::new(
             text,
             self.style.key,
             (self.block, local),
+            part,
             self.style.selection.clone(),
             self.style.theme.selection,
         );
@@ -285,10 +324,11 @@ pub(super) fn render_document(
     tree: &BlockTree,
     style: &MarkdownStyle,
     hl: &dyn CodeHighlights,
+    scrolls: &dyn FenceScrolls,
 ) -> AnyElement {
     let mut col = div().flex().flex_col().w_full().min_w_0();
     for (ix, top) in tree.blocks.iter().enumerate() {
-        let cx = Ctx::new(style, hl, ix);
+        let cx = Ctx::new(style, hl, scrolls, ix);
         col = col.child(spaced(render_block(&top.block, &cx, 0), ix, style));
     }
     col.into_any_element()
@@ -312,8 +352,9 @@ pub(super) fn render_block_at(
     ix: usize,
     style: &MarkdownStyle,
     hl: &dyn CodeHighlights,
+    scrolls: &dyn FenceScrolls,
 ) -> AnyElement {
-    let cx = Ctx::new(style, hl, ix);
+    let cx = Ctx::new(style, hl, scrolls, ix);
     div().w_full().min_w_0().child(render_block(&top.block, &cx, 0)).into_any_element()
 }
 
@@ -505,7 +546,11 @@ fn code_block(language: Option<&str>, code: &str, cx: &Ctx<'_>) -> AnyElement {
         let doc = cx.hl.colors(&lang, code);
         doc.map(|doc| (lang, doc))
     });
-    let mut lines = div().flex().flex_col().w_full().min_w_0();
+    // Natural width, NOT `w_full`: this is the scrolled content, and content
+    // pinned to the viewport width can never overflow it, which is the same
+    // mistake — in a different place — as the `w_full` that used to make these
+    // lines wrap.
+    let mut lines = div().flex().flex_col().flex_shrink_0();
     for (ix, line) in code.lines().enumerate() {
         let spans = colors.as_ref().map(|(_, doc)| doc.line(ix)).unwrap_or_default();
         lines = lines.child(
@@ -525,28 +570,49 @@ fn code_block(language: Option<&str>, code: &str, cx: &Ctx<'_>) -> AnyElement {
             div()
                 .flex()
                 .flex_row()
-                .w_full()
-                // The row's width is already definite, so this only stops the
-                // long line's min-content width propagating outward and prying
-                // the card open instead of overflowing it.
-                .min_w_0()
+                .flex_shrink_0()
                 // Fixed, not measured. This is the number that makes a fence's
                 // height arithmetic, which is what lets colors arrive later —
                 // and it is only *true* because of the `whitespace_nowrap`
                 // below. See this function's doc comment.
                 .h(px(size * CODE_LINE_HEIGHT))
-                // The whole fix. `white_space != Normal` makes gpui lay the text
-                // out with no wrap width at all (`elements/text.rs:417`), so one
-                // source line is one visual line however long it is, and the
-                // excess overruns the card — which clips it.
+                // `white_space != Normal` makes gpui lay the text out with no
+                // wrap width at all (`elements/text.rs:417`), so one source line
+                // is one visual line however long it is. Everything else here
+                // exists to let that line overrun and be scrolled to.
                 .whitespace_nowrap()
                 .child(
-                    div()
-                        .flex_shrink_0()
-                        .child(cx.selectable(line, code_line(line, spans, &style.theme.syntax))),
+                    div().flex_shrink_0().child(cx.selectable_as(
+                        TextPart::CodeLine { fence: ordinal },
+                        line,
+                        code_line(line, spans, &style.theme.syntax),
+                    )),
                 ),
         );
     }
+    // The viewport the lines scroll inside, and the fence's whole reason for
+    // having a scroll position at all: a line clipped at the card edge is a line
+    // the reader cannot finish.
+    let scroll = cx.scrolls.handle((style.key, cx.block, ordinal));
+    let mut viewport = div()
+        .id(style.fence_id(cx.block, ordinal))
+        .flex()
+        .flex_row()
+        .w_full()
+        .min_w_0()
+        .track_scroll(&scroll)
+        .overflow_x_scroll()
+        .child(lines);
+    // Without this, gpui feeds a VERTICAL wheel delta to the only axis that
+    // scrolls — so a plain scroll down with the pointer over a fence would pan
+    // the code sideways instead of moving the transcript. gpui's own docs on the
+    // flag describe this exact case ("a vertical list that contains
+    // horizontally-scrollable elements"), and zed sets it the same way in
+    // `ui/src/components/data_table.rs`. With it on, a vertical wheel changes
+    // nothing here and bubbles to the transcript, while a horizontal trackpad
+    // swipe — or shift+wheel, which macOS reports as horizontal — pans the code.
+    viewport.style().restrict_scroll_to_axis = Some(true);
+
     let mut card = div()
         .w_full()
         .min_w_0()
@@ -560,17 +626,9 @@ fn code_block(language: Option<&str>, code: &str, cx: &Ctx<'_>) -> AnyElement {
         .text_size(px(size))
         .text_color(style.theme.fg_base)
         // Code is authoritative about its own line breaks: a wrapped fence
-        // shows the reader a line the agent never wrote. This clips what the
-        // `whitespace_nowrap` above lets overrun — the two are one mechanism,
-        // and this half alone did nothing, because text that wraps never
-        // overflows in the first place.
-        //
-        // Clipping rather than scrolling horizontally is deliberate. gpui only
-        // applies horizontal scroll from a horizontal trackpad delta, so a plain
-        // mouse wheel could never reach the hidden text without a per-fence
-        // scrollbar overlaid on it, and that would put a scroll region inside
-        // the transcript's own virtualized list. The copy button on the header
-        // row already hands over the untruncated source.
+        // shows the reader a line the agent never wrote. The viewport below is
+        // what actually clips and scrolls; this is the backstop that keeps a
+        // stray wide child from prying the card open.
         .overflow_x_hidden();
     // The grammar's own display name when one resolved (`Rust`, not `rs`), and
     // otherwise whatever the author typed — a tag we did not recognise is still
@@ -601,7 +659,14 @@ fn code_block(language: Option<&str>, code: &str, cx: &Ctx<'_>) -> AnyElement {
                 .child(copy_button(style.copy_id(cx.block, ordinal), code)),
         );
     }
-    card.child(lines).into_any_element()
+    // No scrollbar. `gpui_component::scroll::Scrollbar` was tried here — both
+    // `Hover` and `Always`, with and without a stated height on the parent — and
+    // never painted a pixel, while the scrolling underneath it worked the whole
+    // time. Rather than leave an element in the tree that claims an affordance
+    // it does not provide, it is gone; the clipped glyph at the card edge is
+    // what says the line continues. Worth revisiting with a fade-out edge of our
+    // own, which would not depend on the component at all.
+    card.child(viewport).into_any_element()
 }
 
 /// One-click copy for a fence.
@@ -805,6 +870,16 @@ mod tests {
     use super::*;
     use oximux_markdown::parse_full;
 
+    /// Scroll positions that are never asked to persist. Every fence in a test
+    /// gets a fresh handle, which is all a test that never scrolls needs.
+    struct NoScrolls;
+
+    impl FenceScrolls for NoScrolls {
+        fn handle(&self, _key: FenceKey) -> ScrollHandle {
+            ScrollHandle::default()
+        }
+    }
+
     /// A highlighter that never has anything ready — the state every fence is
     /// in on its first frame, and the one these tests hold it in.
     struct NoColors;
@@ -826,7 +901,7 @@ mod tests {
     }
 
     fn ctx<'a>(style: &'a MarkdownStyle, hl: &'a dyn CodeHighlights) -> Ctx<'a> {
-        Ctx::new(style, hl, 0)
+        Ctx::new(style, hl, &NoScrolls, 0)
     }
 
     fn spans_of(md: &str) -> InlineSpans {
@@ -935,7 +1010,7 @@ mod tests {
         let deep = "> ".repeat(400) + "still here\n";
         let tree = parse_full(&deep);
         let style = style();
-        let _ = render_document(&tree, &style, &NoColors);
+        let _ = render_document(&tree, &style, &NoColors, &NoScrolls);
     }
 
     /// A reply that shows the same snippet twice — the shape of every
@@ -1014,6 +1089,6 @@ plain fence
         let tree = parse_full(md);
         assert!(tree.len() >= 7, "the fixture stopped covering the variants");
         let style = style();
-        let _ = render_document(&tree, &style, &NoColors);
+        let _ = render_document(&tree, &style, &NoColors, &NoScrolls);
     }
 }

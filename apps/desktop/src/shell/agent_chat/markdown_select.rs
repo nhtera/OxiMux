@@ -48,6 +48,22 @@ use super::markdown_state::MdKey;
 /// order, which is all the copy reassembly ever wanted from it.
 pub(super) type TextOrd = (usize, usize);
 
+/// What kind of text an element holds, for the one decision that depends on it:
+/// how a copy re-joins it to the piece before it.
+///
+/// Blocks of prose are separated by a blank line, because the separator between
+/// two blocks is in neither of them and pasting a heading onto its paragraph
+/// would be wrong. Lines of a fence are not: they are one thing the author
+/// wrote, and blank-lining them turns copied code into something that no longer
+/// runs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum TextPart {
+    /// A block of prose — paragraph, heading, table cell, list item.
+    Prose,
+    /// One line of the `fence`-th code fence of its block.
+    CodeLine { fence: usize },
+}
+
 /// A drag in progress or a selection that has settled.
 #[derive(Clone, Copy)]
 struct Anchors {
@@ -73,6 +89,12 @@ impl Anchors {
     }
 }
 
+/// One element's contribution to the selection.
+struct Captured {
+    text: String,
+    part: TextPart,
+}
+
 #[derive(Default)]
 struct State {
     anchors: Option<Anchors>,
@@ -80,7 +102,7 @@ struct State {
     /// reassembles in reading order. Rebuilt every paint — an element that
     /// scrolled out of view stops contributing, which is correct: it is no
     /// longer laid out, so what it holds is no longer known.
-    captured: BTreeMap<TextOrd, String>,
+    captured: BTreeMap<TextOrd, Captured>,
 }
 
 /// The chat view's selection, shared by handle.
@@ -154,9 +176,35 @@ impl Selection {
     /// Blocks are joined with a blank line rather than concatenated: the source
     /// separator between two blocks is not in either of them, and pasting a
     /// heading run into its paragraph would be wrong.
+    ///
+    /// **Consecutive lines of one fence are the exception**, and joining those
+    /// with a blank line too — which this did until it was caught — double-spaces
+    /// every copied snippet and can break the code outright, since indentation-
+    /// sensitive languages read a blank line as the end of a block. They are one
+    /// thing the author wrote, so they are rejoined with the single newline that
+    /// was between them.
+    ///
+    /// "One fence" is decided by block AND fence ordinal, not by "both are code":
+    /// two fences inside a single list item are one top-level block, and running
+    /// them together would lose the boundary.
     pub fn selected_text(&self) -> String {
         let state = self.0.borrow();
-        state.captured.values().cloned().collect::<Vec<_>>().join("\n\n")
+        let mut out = String::new();
+        let mut prev: Option<(&TextOrd, &Captured)> = None;
+        for (ord, cap) in &state.captured {
+            if let Some((prev_ord, prev_cap)) = prev {
+                let same_fence = prev_ord.0 == ord.0
+                    && matches!(
+                        (prev_cap.part, cap.part),
+                        (TextPart::CodeLine { fence: a }, TextPart::CodeLine { fence: b })
+                            if a == b
+                    );
+                out.push_str(if same_fence { "\n" } else { "\n\n" });
+            }
+            out.push_str(&cap.text);
+            prev = Some((ord, cap));
+        }
+        out
     }
 
     /// Copy the selection, reporting whether there was one to copy.
@@ -182,11 +230,11 @@ impl Selection {
         state.anchors.filter(|a| a.key == key).map(|a| a.ordered())
     }
 
-    fn capture(&self, ord: TextOrd, text: Option<String>) {
+    fn capture(&self, ord: TextOrd, part: TextPart, text: Option<String>) {
         let mut state = self.0.borrow_mut();
         match text {
-            Some(t) => {
-                state.captured.insert(ord, t);
+            Some(text) => {
+                state.captured.insert(ord, Captured { text, part });
             }
             None => {
                 state.captured.remove(&ord);
@@ -213,6 +261,8 @@ pub(super) struct ChatText {
     key: MdKey,
     /// This element's position in its document, for reassembling a copy.
     ord: TextOrd,
+    /// How a copy rejoins this element to the one before it.
+    part: TextPart,
     selection: Selection,
     tint: Hsla,
     /// Find matches inside this element's own text. Computed per element, so
@@ -226,10 +276,11 @@ impl ChatText {
         inner: StyledText,
         key: MdKey,
         ord: TextOrd,
+        part: TextPart,
         selection: Selection,
         tint: Hsla,
     ) -> Self {
-        Self { inner, key, ord, selection, tint, matches: Vec::new() }
+        Self { inner, key, ord, part, selection, tint, matches: Vec::new() }
     }
 
     pub fn with_matches(mut self, matches: Vec<MatchBand>) -> Self {
@@ -356,6 +407,7 @@ impl gpui::Element for ChatText {
         // the two differ wherever the renderer resolved something.
         self.selection.capture(
             self.ord,
+            self.part,
             selected.and_then(|(s, e)| {
                 let text = self.inner.layout().text();
                 text.get(s..e).map(str::to_string)
@@ -490,10 +542,10 @@ mod tests {
     fn a_copy_reassembles_in_document_order() {
         let sel = Selection::default();
         sel.begin(MdKey::Reply(0), p(0.0, 0.0));
-        sel.capture((1, 1), Some("fourth".into()));
-        sel.capture((0, 1), Some("second".into()));
-        sel.capture((1, 0), Some("third".into()));
-        sel.capture((0, 0), Some("first".into()));
+        sel.capture((1, 1), TextPart::Prose, Some("fourth".into()));
+        sel.capture((0, 1), TextPart::Prose, Some("second".into()));
+        sel.capture((1, 0), TextPart::Prose, Some("third".into()));
+        sel.capture((0, 0), TextPart::Prose, Some("first".into()));
         assert_eq!(sel.selected_text(), "first\n\nsecond\n\nthird\n\nfourth");
         assert!(sel.is_active());
     }
@@ -508,7 +560,7 @@ mod tests {
 
         // Out-handler after the down-handler.
         sel.begin(MdKey::Reply(0), at);
-        sel.capture((0, 0), Some("live".into()));
+        sel.capture((0, 0), TextPart::Prose, Some("live".into()));
         sel.dismiss(at);
         assert!(sel.is_active(), "the press that began this selection cleared it");
 
@@ -517,7 +569,7 @@ mod tests {
         sel.clear();
         sel.dismiss(at);
         sel.begin(MdKey::Reply(0), at);
-        sel.capture((0, 0), Some("live".into()));
+        sel.capture((0, 0), TextPart::Prose, Some("live".into()));
         assert!(sel.is_active());
     }
 
@@ -528,10 +580,58 @@ mod tests {
         let sel = Selection::default();
         sel.begin(MdKey::Reply(0), p(10.0, 20.0));
         sel.extend(MdKey::Reply(0), p(90.0, 40.0));
-        sel.capture((0, 0), Some("live".into()));
+        sel.capture((0, 0), TextPart::Prose, Some("live".into()));
         sel.dismiss(p(400.0, 500.0));
         assert!(!sel.is_active());
         assert!(sel.anchors_for(MdKey::Reply(0)).is_none());
+    }
+
+    /// Lines of one fence rejoin with a single newline, not a blank line —
+    /// double-spacing a copied snippet is at best ugly and at worst breaks the
+    /// code, since an indentation-sensitive language reads a blank line as the
+    /// end of the block.
+    ///
+    /// Two fences in ONE top-level block (a list item holding both) must still
+    /// be separated, which is why the ordinal alone cannot decide this.
+    #[test]
+    fn lines_of_one_fence_rejoin_without_a_blank_line() {
+        let sel = Selection::default();
+        sel.begin(MdKey::Reply(0), p(0.0, 0.0));
+        let code = |fence| TextPart::CodeLine { fence };
+
+        // Block 0: a paragraph, then a two-line fence, then a second fence.
+        sel.capture((0, 0), TextPart::Prose, Some("intro".into()));
+        sel.capture((0, 1), code(0), Some("fn main() {".into()));
+        sel.capture((0, 2), code(0), Some("}".into()));
+        sel.capture((0, 3), code(1), Some("second fence".into()));
+        // Block 1: prose again.
+        sel.capture((1, 0), TextPart::Prose, Some("outro".into()));
+
+        assert_eq!(
+            sel.selected_text(),
+            "intro\n\nfn main() {\n}\n\nsecond fence\n\noutro",
+        );
+    }
+
+    /// Same block, both code, but the fence ordinal differs — the boundary
+    /// survives. Guards the half of the rule that "are they both code?" misses.
+    #[test]
+    fn two_fences_in_one_block_stay_separated() {
+        let sel = Selection::default();
+        sel.begin(MdKey::Reply(0), p(0.0, 0.0));
+        sel.capture((0, 0), TextPart::CodeLine { fence: 0 }, Some("a".into()));
+        sel.capture((0, 1), TextPart::CodeLine { fence: 1 }, Some("b".into()));
+        assert_eq!(sel.selected_text(), "a\n\nb");
+    }
+
+    /// ...and the same fence ordinal in DIFFERENT blocks is two fences too.
+    #[test]
+    fn the_first_fence_of_two_blocks_is_not_one_fence() {
+        let sel = Selection::default();
+        sel.begin(MdKey::Reply(0), p(0.0, 0.0));
+        sel.capture((0, 0), TextPart::CodeLine { fence: 0 }, Some("a".into()));
+        sel.capture((1, 0), TextPart::CodeLine { fence: 0 }, Some("b".into()));
+        assert_eq!(sel.selected_text(), "a\n\nb");
     }
 
     /// An element that stops being selected must stop contributing, or a
@@ -540,9 +640,9 @@ mod tests {
     fn dropping_out_of_the_selection_removes_the_capture() {
         let sel = Selection::default();
         sel.begin(MdKey::Reply(0), p(0.0, 0.0));
-        sel.capture((0, 0), Some("kept".into()));
-        sel.capture((0, 1), Some("dropped".into()));
-        sel.capture((0, 1), None);
+        sel.capture((0, 0), TextPart::Prose, Some("kept".into()));
+        sel.capture((0, 1), TextPart::Prose, Some("dropped".into()));
+        sel.capture((0, 1), TextPart::Prose, None);
         assert_eq!(sel.selected_text(), "kept");
     }
 
@@ -552,7 +652,7 @@ mod tests {
     fn a_new_drag_abandons_the_previous_selection() {
         let sel = Selection::default();
         sel.begin(MdKey::Reply(0), p(0.0, 0.0));
-        sel.capture((0, 0), Some("old".into()));
+        sel.capture((0, 0), TextPart::Prose, Some("old".into()));
         sel.begin(MdKey::Reply(4), p(0.0, 0.0));
         assert!(!sel.is_active());
         assert!(sel.anchors_for(MdKey::Reply(0)).is_none());
