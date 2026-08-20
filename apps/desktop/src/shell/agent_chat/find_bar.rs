@@ -16,6 +16,7 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 use oximux_agents::thread::ThreadEntry;
 
+use super::markdown_render::FindMark;
 use super::{bubble, AgentChatView};
 
 /// Fixed width of the find bar.
@@ -25,6 +26,10 @@ const BAR_W: f32 = 300.0;
 /// cursor into them.
 pub(super) struct FindBar {
     pub input: Entity<InputState>,
+    /// The query `matches` was computed from. Held rather than re-read from the
+    /// input so the highlighting and the `n/total` counter can never disagree
+    /// about what was searched for.
+    pub query: String,
     pub matches: Vec<usize>,
     pub cursor: usize,
     /// Held so the query-change subscription lives as long as the bar.
@@ -85,7 +90,8 @@ impl AgentChatView {
                     this.recompute_find(cx);
                 }
             });
-            self.find_bar = Some(FindBar { input, matches: Vec::new(), cursor: 0, _sub: sub });
+            self.find_bar =
+                Some(FindBar { input, query: String::new(), matches: Vec::new(), cursor: 0, _sub: sub });
         }
         let handle = self.find_bar.as_ref().map(|f| f.input.read(cx).focus_handle(cx));
         if let Some(handle) = handle {
@@ -120,18 +126,19 @@ impl AgentChatView {
             None => return,
         };
         // Keep only matches we can actually jump to. An entry hidden inside a
-        // collapsed >8-tool-call run has no scroll child (absent from
-        // `entry_child_ix`), so counting it would make `n/total` promise a jump
-        // that silently no-ops. v1 scope: find within the visible transcript.
+        // collapsed >8-tool-call run has no child of its own, so counting it
+        // would make `n/total` promise a jump that silently no-ops. v1 scope:
+        // find within the visible transcript.
         let matches: Vec<usize> = {
-            let child_ix = self.entry_child_ix.borrow();
+            let rendered = self.rendered_entries();
             recompute_matches(&self.thread.entries, &query)
                 .into_iter()
-                .filter(|i| child_ix.contains_key(i))
+                .filter(|i| rendered.contains(i))
                 .collect()
         };
         let first = matches.first().copied();
         if let Some(f) = &mut self.find_bar {
+            f.query = query;
             f.matches = matches;
             f.cursor = 0;
         }
@@ -153,6 +160,23 @@ impl AgentChatView {
             _ => return,
         };
         self.scroll_to_entry(target, cx);
+    }
+
+    /// What the find bar wants marked inside message `entry`, if anything.
+    ///
+    /// Now that the renderer owns its text, a match is highlighted where it
+    /// actually is rather than announced by tinting the whole message — which
+    /// is what the flash was standing in for while the ranges were unreachable.
+    pub(super) fn find_mark(&self, entry: usize) -> Option<FindMark> {
+        let f = self.find_bar.as_ref()?;
+        if !f.matches.contains(&entry) {
+            return None;
+        }
+        let query = f.query.trim();
+        (!query.is_empty()).then(|| FindMark {
+            query: query.to_string().into(),
+            current: f.matches.get(f.cursor) == Some(&entry),
+        })
     }
 
     pub(super) fn find_next(&mut self, cx: &mut Context<Self>) {

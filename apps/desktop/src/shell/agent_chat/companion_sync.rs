@@ -227,8 +227,7 @@ impl AgentChatView {
                     return;
                 }
                 this.thread.append_imported(tail);
-                this.stick_to_bottom = true;
-                this.list_scroll.scroll_to_bottom();
+                this.follow_bottom();
                 // The chat's live connection loaded the session at spawn and
                 // never re-reads the log — after the terminal advanced it, the
                 // connection's in-memory context is missing those turns, and

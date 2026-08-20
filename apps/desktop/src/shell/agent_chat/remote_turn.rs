@@ -70,7 +70,7 @@ impl AgentChatView {
         self.screen_control.begin_remote_turn();
         self.thread.push_user_message_with_images(prompt.text, prompt.images);
         // Pin to the bottom so the new turn is in view, like a local send.
-        self.stick_to_bottom = true;
+        self.follow_bottom();
         self.follow_frames = FOLLOW_FRAMES;
         cx.notify();
     }

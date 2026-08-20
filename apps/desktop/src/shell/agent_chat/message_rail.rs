@@ -85,8 +85,8 @@ impl AgentChatView {
                     .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _e, window, cx| {
-                            this.scroll_to_user_ordinal(i, window, cx)
+                        cx.listener(move |this, _e, _window, cx| {
+                            this.scroll_to_user_ordinal(i, cx)
                         }),
                     )
                     .child(div().w(px(w)).h(px(h)).rounded_full().bg(color)),

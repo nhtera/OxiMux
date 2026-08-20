@@ -265,8 +265,8 @@ impl AgentChatView {
                     })
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _e, window, cx| {
-                            this.scroll_to_user_ordinal(ordinal, window, cx)
+                        cx.listener(move |this, _e, _window, cx| {
+                            this.scroll_to_user_ordinal(ordinal, cx)
                         }),
                     ),
             );
@@ -329,8 +329,7 @@ impl AgentChatView {
 
     /// Footer action: return to the live tail and re-arm auto-follow.
     pub(super) fn jump_list_to_bottom(&mut self, cx: &mut Context<Self>) {
-        self.stick_to_bottom = true;
-        self.list_scroll.scroll_to_bottom();
+        self.follow_bottom();
         cx.notify();
     }
 }

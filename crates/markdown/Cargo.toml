@@ -1,0 +1,28 @@
+[package]
+name = "oximux-markdown"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The only dependency, and deliberately the only one. This crate exists to be
+# the half of markdown rendering that has no opinion about pixels: it parses to
+# a block tree and reparses a streaming append in O(delta). Anything that draws
+# lives in the desktop app.
+#
+# `pulldown-cmark` rather than the `markdown` crate already in the graph because
+# of `into_offset_iter`: every event arrives with its byte range in the source,
+# and those ranges are what make an incremental reparse possible at all. A
+# parser that hands back an AST without source spans cannot answer "which bytes
+# do I have to re-read", which is the entire question here.
+#
+# Version-pinned to a minor, and treat a bump as a change that must re-run
+# `tests/parity.rs`: range reporting and GFM details drift between versions, and
+# the parity corpus is the only thing that would notice.
+pulldown-cmark = { workspace = true }

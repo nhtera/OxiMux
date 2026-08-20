@@ -43,6 +43,6 @@ pub use motion::{Motion, ease_out_spring};
 pub use project_scripts::{ProjectScripts, ScriptKind, load_for_project};
 pub use terminal::{BellStyle, TerminalSettings};
 #[cfg(feature = "gpui")]
-pub use theme::{GitDecorations, Theme};
+pub use theme::{GitDecorations, SyntaxPalette, Theme};
 #[cfg(feature = "gpui")]
 pub use typography::Typography;

@@ -7169,6 +7169,7 @@ dependencies = [
  "oximux-editor",
  "oximux-git",
  "oximux-macos-trust",
+ "oximux-markdown",
  "oximux-no-window",
  "oximux-owner-only",
  "oximux-proc-cwd",
@@ -7186,6 +7187,7 @@ dependencies = [
  "oximux-shell-env",
  "oximux-single-instance",
  "oximux-storage",
+ "oximux-syntax",
  "oximux-ui",
  "oximux-worktree-ops",
  "pbkdf2",
@@ -7380,6 +7382,13 @@ dependencies = [
  "libc",
  "tempfile",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "oximux-markdown"
+version = "0.1.11"
+dependencies = [
+ "pulldown-cmark",
 ]
 
 [[package]]
@@ -7678,6 +7687,14 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "oximux-syntax"
+version = "0.1.11"
+dependencies = [
+ "syntect",
+ "two-face",
 ]
 
 [[package]]
@@ -8408,6 +8425,17 @@ checksum = "645dbe486e346d9b5de3ef16ede18c26e6c70ad97418f4874b8b1889d6e761ea"
 dependencies = [
  "ar_archive_writer",
  "cc",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+dependencies = [
+ "bitflags 2.11.1",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]

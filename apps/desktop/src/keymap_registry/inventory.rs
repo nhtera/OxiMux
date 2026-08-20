@@ -26,7 +26,7 @@ use crate::actions::{
 };
 // The AppKit application menu's actions, bound only where that menu exists.
 #[cfg(target_os = "macos")]
-use crate::menu::{HideApp, HideOthers, Minimize, Quit};
+use crate::menu::{Copy, HideApp, HideOthers, Minimize, Quit};
 use oximux_editor::{EditorZoomIn, EditorZoomOut, EditorZoomReset, SaveFile};
 
 /// Shorthand for the per-entry bind fn — each closure is non-capturing so
@@ -102,6 +102,14 @@ pub const ACTIONS: &[ActionSpec] = &[
     entry!("hide_others", "Hide others", Global, "cmd-alt-h", HideOthers),
     #[cfg(target_os = "macos")]
     entry!("minimize_window", "Minimize window", Global, "cmd-m", Minimize),
+    // Copy is bound here so the keystroke reaches GPUI at all. The Edit menu
+    // declares it as an `OsAction`, and with no keymap entry AppKit owned ⌘C
+    // outright: measured in a live window, neither a key-down listener nor an
+    // action handler anywhere in the app saw it. `Global`, because Copy means
+    // copy in every pane; the transcript's handler consumes it only when there
+    // is a transcript selection and otherwise lets it through.
+    #[cfg(target_os = "macos")]
+    entry!("copy", "Copy", Global, "cmd-c", Copy),
     // ---- Tabs -------------------------------------------------------
     entry!("new_tab", "New tab", Tabs, "secondary-t", NewTab),
     entry!("new_browser_tab", "New browser tab", Tabs, "secondary-shift-b", NewBrowserTab),
