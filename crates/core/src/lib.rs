@@ -25,7 +25,10 @@ pub use agent_session::{
     AgentSession, AgentSessionId, AgentSidebandState, AgentSnapshot, AgentStatus, SidebandDetail,
 };
 pub use conflict_kind::ConflictKind;
-pub use diff_review_note::{DiffReviewNote, NoteSide};
+pub use diff_review_note::{
+    DiffReviewNote, NoteSide, anchor_text_is_checkable, anchor_text_matches,
+    normalize_anchor_text,
+};
 pub use git_diff::{
     ChangeRegion, CombinedDiff, CombinedDiffScope, DiffHunk, DiffLine, DiffLineKind, DiffStatus,
     FileDiff, FileGroup, HUNK_CONTEXT, LARGE_DIFF_LINE_THRESHOLD, change_regions,

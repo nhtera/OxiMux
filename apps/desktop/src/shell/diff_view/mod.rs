@@ -39,7 +39,9 @@ use crate::shell::diff_view::render::{FilePlan, build_render_plan};
 use crate::shell::diff_view::review_note_popover::{
     ReviewNoteCallback, ReviewNoteOutcome, ReviewNotePopover,
 };
-use crate::shell::diff_view::review_notes::{NoteAnchor, ReviewNoteStore, format_notes_markdown};
+use crate::shell::diff_view::review_notes::{
+    LineIndex, Note, NoteAnchor, ReviewNoteStore, format_notes_markdown,
+};
 use gpui::{
     App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, ListAlignment,
     ListOffset, ListState, Subscription, Task, WeakEntity, Window, px,
@@ -49,6 +51,7 @@ use oximux_core::{CombinedDiffScope, FileDiff, FileGroup, NoteSide};
 use oximux_editor::{EditorZoom, EditorZoomIn, EditorZoomOut, EditorZoomReset};
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
+use oximux_storage::DiffReviewNoteRepo;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -367,6 +370,10 @@ pub struct DiffView {
     /// Mirrored from SQLite on each `*Ready` load and written back through the
     /// process-wide `DiffReviewNoteRepo`. The prepare pass reads it to mark
     /// noted lines; empty for non-`Ready` states.
+    ///
+    /// Every load reconciles the mirrored notes against the diff as it now
+    /// reads, so a note whose line moved follows it and a note whose line is
+    /// gone stops claiming one.
     notes: ReviewNoteStore,
     /// Active compose/edit popover (per-request; `None` when idle). Mounted
     /// INSIDE this DiffView's render tree like `confirm_dialog` so it scopes
@@ -1696,7 +1703,57 @@ impl DiffView {
                 self.notes.clear();
             }
         }
+        self.reconcile_notes(&repo, &scope, &diff_ref);
         self.invalidate_prepared();
+    }
+
+    /// Re-decide each loaded note's anchor against the diff as it now reads,
+    /// and write the conclusions back.
+    ///
+    /// This runs on load rather than on save because the drift happens while
+    /// nobody is looking: the file is edited, a hunk is staged, the poller
+    /// reloads. By the time the notes are read back their line numbers have
+    /// already stopped meaning what they meant, and the load is the first
+    /// moment there is both a note and a diff to compare it against.
+    ///
+    /// Moves are persisted so the work is done once. A detached note is left
+    /// exactly as stored — its line is a record of where it was written, not
+    /// a claim about where it is, and keeping it is what lets the note
+    /// re-attach if the code comes back.
+    fn reconcile_notes(&mut self, repo: &DiffReviewNoteRepo, scope: &str, diff_ref: &str) {
+        // Checked before building anything: the context map walks a fresh
+        // render plan over every file in the diff, and a diff nobody has
+        // annotated — which is nearly all of them — must not pay for that on
+        // every poll-driven reload.
+        if self.notes.is_empty() {
+            return;
+        }
+        let outcome = self.notes.reconcile(&self.note_context_map());
+        if outcome.is_noop() {
+            return;
+        }
+        let moves: Vec<(String, NoteSide, u32, u32)> = outcome
+            .moves
+            .iter()
+            .map(|(anchor, to)| (anchor.path.clone(), anchor.side, anchor.line, *to))
+            .collect();
+        if let Err(err) = repo.reanchor(scope, diff_ref, &moves) {
+            // The in-memory store has already followed the code, so the view
+            // is right for this session; only the saved copy is stale, and the
+            // next load reconciles it again from the same evidence.
+            tracing::warn!(
+                target: "oximux_app::diff_view",
+                %err,
+                "review-note re-anchor failed"
+            );
+        }
+        tracing::debug!(
+            target: "oximux_app::diff_view",
+            moved = outcome.moves.len(),
+            detached = outcome.newly_detached,
+            reattached = outcome.reattached,
+            "review notes reconciled against the current diff"
+        );
     }
 
     /// Open the compose/edit popover anchored to `anchor`. Pre-fills with the
@@ -1752,12 +1809,16 @@ impl DiffView {
     ) {
         match outcome {
             ReviewNoteOutcome::Save(body) => {
-                self.persist_note(&anchor, Some(&body));
-                self.notes.set(anchor, body);
+                // Record the line as it reads at the moment of writing. This
+                // is the only point where the note and its subject are known
+                // to agree, and every later reconcile is measured from it.
+                let anchor_text = self.anchor_text_at(&anchor).unwrap_or_default();
+                self.persist_note(&anchor, Some(&body), &anchor_text);
+                self.notes.set(anchor, Note::new(body, anchor_text));
                 self.invalidate_prepared();
             }
             ReviewNoteOutcome::Delete => {
-                self.persist_note(&anchor, None);
+                self.persist_note(&anchor, None, "");
                 self.notes.remove(&anchor);
                 self.invalidate_prepared();
             }
@@ -1766,11 +1827,17 @@ impl DiffView {
         cx.notify();
     }
 
+    /// The current text of the diff line an anchor names, if the diff still
+    /// has that line.
+    fn anchor_text_at(&self, anchor: &NoteAnchor) -> Option<String> {
+        self.note_context_map().get(anchor).cloned()
+    }
+
     /// Write one note through to SQLite — `Some(body)` upserts, `None`
     /// deletes. No-op without a diff_ref (non-`Ready` state) or repo handle.
     /// Errors are logged, not surfaced: the in-memory store still reflects the
     /// user's edit, and the next load reconciles against the DB.
-    fn persist_note(&self, anchor: &NoteAnchor, body: Option<&str>) {
+    fn persist_note(&self, anchor: &NoteAnchor, body: Option<&str>, anchor_text: &str) {
         let Some(diff_ref) = diff_ref_for(&self.state) else {
             return;
         };
@@ -1779,7 +1846,15 @@ impl DiffView {
         };
         let scope = self.scope_key();
         let res = match body {
-            Some(b) => repo.upsert(&scope, &diff_ref, &anchor.path, anchor.side, anchor.line, b),
+            Some(b) => repo.upsert(
+                &scope,
+                &diff_ref,
+                &anchor.path,
+                anchor.side,
+                anchor.line,
+                b,
+                anchor_text,
+            ),
             None => repo.delete(&scope, &diff_ref, &anchor.path, anchor.side, anchor.line),
         };
         if let Err(err) = res {
@@ -1804,8 +1879,8 @@ impl DiffView {
     /// view-mode-independently (inline AND split, which carries no per-line
     /// anchors) and before the first render. `expanded = true` so a collapsed
     /// large-diff file still yields context for its lines.
-    fn note_context_map(&self) -> HashMap<NoteAnchor, String> {
-        let mut map = HashMap::new();
+    fn note_context_map(&self) -> LineIndex {
+        let mut map = LineIndex::new();
         let diffs = match &self.state {
             DiffViewState::Ready { diffs, .. }
             | DiffViewState::CommitReady { diffs, .. }
@@ -1858,6 +1933,21 @@ impl DiffView {
             return;
         }
         cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    /// Drop only the notes whose line is gone, in memory and in SQLite.
+    ///
+    /// The gutter is untouched by design — a detached note never had a marker
+    /// — so this repaints the toolbar's count and nothing else.
+    fn clear_detached_notes(&mut self, cx: &mut Context<Self>) {
+        let dropped = self.notes.drain_detached();
+        if dropped.is_empty() {
+            return;
+        }
+        for anchor in &dropped {
+            self.persist_note(anchor, None, "");
+        }
+        cx.notify();
     }
 
     /// Drop every note for the current scope, in memory and in SQLite.
