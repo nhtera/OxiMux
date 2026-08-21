@@ -118,11 +118,14 @@ fn render_tab_button(
 
 /// Keyboard shortcut hint for a tab, resolved live from the keymap
 /// registry so a user override shows up in the tooltip. Empty when the
-/// action is unbound (`Files` has no select action and is hidden from
-/// `visible_tabs`, so its arm is unreachable at runtime).
+/// action is unbound — `Files` (no select action, and hidden from
+/// `visible_tabs`, so its arm is unreachable at runtime) and `Ports`, which
+/// is reached by clicking either its icon or the status bar's port metric.
+/// `Ports` is deliberately unbound rather than squeezed onto a chord: the
+/// obvious mnemonic, `secondary-shift-p`, is the command palette.
 fn shortcut_hint(tab: RightTab) -> String {
     let id = match tab {
-        RightTab::Files => return String::new(),
+        RightTab::Files | RightTab::Ports => return String::new(),
         RightTab::Explorer => "select_explorer_tab",
         RightTab::Search => "select_search_tab",
         RightTab::SourceControl => "select_source_control_tab",
@@ -156,6 +159,15 @@ mod tests {
         assert_eq!(shortcut_hint(RightTab::Explorer), format!("{SEC}⇧E"));
         assert_eq!(shortcut_hint(RightTab::Search), format!("{SEC}⇧F"));
         assert_eq!(shortcut_hint(RightTab::SourceControl), format!("{SEC}⇧G"));
+    }
+
+    #[test]
+    fn a_visible_but_unbound_tab_still_gets_a_tooltip() {
+        // Ports is reachable by click only. Its tooltip must be the plain
+        // title, not "Ports ()" — the empty-hint path is live here, unlike
+        // `Files`, whose arm `visible_tabs` makes unreachable.
+        assert_eq!(shortcut_hint(RightTab::Ports), "");
+        assert_eq!(tooltip_label(RightTab::Ports), "Ports");
     }
 
     #[test]

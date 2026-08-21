@@ -716,6 +716,11 @@ impl WorkspaceRoot {
         if let Some(cached) = self.right_sidebar_by_project.get(&project.id).cloned() {
             cached.update(cx, |s, _| s.open = prior_open);
             cached.read(cx).set_polling_focused(true);
+            // Re-assert the window's ports panel. A sidebar cached before the
+            // panel existed (or one restored into a different window) would
+            // otherwise render the Ports tab empty forever.
+            let ports_panel = self.ports_panel.clone();
+            cached.update(cx, |s, cx| s.set_ports_panel(ports_panel, cx));
             self.right_sidebar = Some(cached);
             self.rewire_scm_subscriptions(window, cx);
             // RT-3: forward the new project to any open Tasks tab so the list
@@ -805,6 +810,8 @@ impl WorkspaceRoot {
                 // Cache the freshly built sidebar so a later switch back to
                 // this project reuses it (fast path above) instead of
                 // rebuilding from scratch.
+                let ports_panel = this.ports_panel.clone();
+                built.update(cx, |s, cx| s.set_ports_panel(ports_panel, cx));
                 this.right_sidebar_by_project
                     .insert(project_id_for_cache, built.clone());
                 this.right_sidebar = Some(built);

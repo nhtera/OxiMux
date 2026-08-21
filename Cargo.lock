@@ -7173,6 +7173,7 @@ dependencies = [
  "oximux-no-window",
  "oximux-owner-only",
  "oximux-proc-cwd",
+ "oximux-proc-ports",
  "oximux-proc-tree",
  "oximux-pty",
  "oximux-relay-client",
@@ -7433,6 +7434,13 @@ version = "0.1.11"
 dependencies = [
  "libc",
  "tempfile",
+]
+
+[[package]]
+name = "oximux-proc-ports"
+version = "0.1.11"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

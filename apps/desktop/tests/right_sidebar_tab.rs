@@ -3,7 +3,7 @@
 use oximux_app::shell::right_sidebar::tab::{RightTab, TabVisibility, visible_tabs};
 
 #[test]
-fn visible_tabs_with_repo_returns_explorer_search_source_control() {
+fn a_repo_project_shows_the_full_tab_row_in_order() {
     // `Files` is intentionally hidden from `visible_tabs` (see
     // tab.rs::visible_tabs doc). The variant + view code remain so the
     // editor-crate FileTree model + watcher stay reachable; the surface
@@ -16,17 +16,39 @@ fn visible_tabs_with_repo_returns_explorer_search_source_control() {
             RightTab::Explorer,
             RightTab::Search,
             RightTab::SourceControl,
-            // History is repo-independent and always trails the tab row.
+            // History and Ports are repo-independent and trail the row.
             RightTab::History,
+            RightTab::Ports,
         ]
     );
 }
 
 #[test]
-fn visible_tabs_without_repo_omits_source_control_and_files() {
+fn only_source_control_drops_when_there_is_no_repo() {
     let tabs = visible_tabs(TabVisibility { has_repo: false });
-    // Source Control drops without a repo; History stays (repo-independent).
-    assert_eq!(tabs, vec![RightTab::Explorer, RightTab::Search, RightTab::History]);
+    assert_eq!(
+        tabs,
+        vec![
+            RightTab::Explorer,
+            RightTab::Search,
+            RightTab::History,
+            RightTab::Ports
+        ]
+    );
+}
+
+#[test]
+fn ports_is_visible_whether_or_not_the_project_is_a_repo() {
+    // A dev server listens the same either way. Regression guard: Ports was
+    // added beside History precisely because both are repo-independent, and
+    // grouping it with SourceControl would silently hide it for the projects
+    // most likely to be a scratch directory with a server in it.
+    for has_repo in [true, false] {
+        assert!(
+            visible_tabs(TabVisibility { has_repo }).contains(&RightTab::Ports),
+            "Ports must survive has_repo = {has_repo}"
+        );
+    }
 }
 
 #[test]

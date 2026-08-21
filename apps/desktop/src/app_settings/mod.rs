@@ -14,5 +14,6 @@ pub mod computer_use_settings;
 pub mod dictation_settings;
 pub mod keybindings_settings;
 pub mod motion_settings;
+pub mod port_label_settings;
 pub mod scm_layout_settings;
 pub mod terminal_settings;

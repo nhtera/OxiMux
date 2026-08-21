@@ -32,6 +32,13 @@ oximux/
     │                       also SessionRegistry — gpui-free session event bus + command surface (not yet wired)
     ├── editor/             gpui-component code editor + LSP client (Phase 5 spike)
     ├── storage/            SQLite via rusqlite — Db wrapper + migrations + V001 schema + 5 typed repos (Phase 4 step 3)
+    ├── proc-cwd/           working directory of a pid
+    ├── proc-tree/          descendants of a pid — which program a terminal is really running
+    ├── proc-ports/         which local TCP ports a given pid set is listening on. Scoped to a
+    │                       caller-supplied pid set, not the machine: on Linux the socket table
+    │                       names an inode, so an unscoped answer means reading every process's
+    │                       fds. Windows GetExtendedTcpTable / Linux /proc / macOS lsof; the
+    │                       text parsers compile on every platform so their tests run everywhere
     └── settings/           TOML config, theme tokens, typography
 ```
 
@@ -91,6 +98,16 @@ src/
     │   ├── project_drag.rs drag payloads, insertion_side, paint_insertion_line (2px accent line),
     │   │                   SidebarDragPreview ghost chip, WorkspaceDragConfig, reorder_slot_value
     │   └── toolbar.rs      Add Project + settings (stubs)
+    ├── ports_panel/        Ports PANEL (right sidebar) — local ports this window's terminals serve
+    │   ├── labels.rs       pure wording shared with the status-bar metric: port_metric_label,
+    │   │                   url_for, origin_label, reach_label, project_label, row_title
+    │   ├── scan.rs         pure attribution (TreeSnapshot + ListeningPort → PortInventory
+    │   │                   grouped by project), plus gather() — the one syscall bridge,
+    │   │                   proc-tree walk + proc-ports read, run on the background executor
+    │   └── mod.rs          PortsPanel entity; Open (system browser) / Copy URL / inline Rename.
+    │                       Labels persist per project+port via app_settings/port_label_settings.
+    │                       Driven by WorkspaceRoot::run_port_scan (3s, focus-gated, kicked on
+    │                       focus regain), which owns the terminals the walk starts from
     ├── automations_view/   Automations PANE page — scheduled runs, one card each
     │   ├── labels.rs       pure wording shared with the Schedules settings pane:
     │   │                   next_fire_label, run_summary, armed_summary, home_abbrev,
@@ -195,8 +212,14 @@ src/
     │   └── fs_load.rs      async tokio read_dir; 5s timeout; symlink skip; 12-deep guard
     ├── right_sidebar/
     │   ├── mod.rs          RightSidebar entity; tab switching; hosts FileExplorer (Explorer) + SearchPanel (Search) + GitPanel+DiffView (SourceControl) + FileTreeView (Files)
-    │   ├── tab.rs          RightTab enum: Explorer | Search | SourceControl | Files; icon_path() per tab
-    │   │                   Files tab: always visible (no repo gate); hosts FileTreeView; SelectFilesTab action bound to Cmd+Shift+T
+    │   ├── tab.rs          RightTab enum: Explorer | Search | SourceControl | History | Ports | Files
+    │   │                   visible_tabs(): SourceControl is the only repo-gated tab; Files is
+    │   │                   deliberately omitted from the visible set (variant + view kept for a
+    │   │                   later LSP-aware relaunch — see the fn's own doc)
+    │   │                   Ports: hosts the window's single PortsPanel, handed over by
+    │   │                   WorkspaceRoot rather than built here (one panel per window, not per
+    │   │                   cached per-project sidebar). Click-only — no chord, because the
+    │   │                   obvious one is the command palette's
     │   ├── activity_bar.rs top tab bar (SVG icons) + persistent collapsed rail + PanelRight toggle
     │   └── layout.rs       layout constants
     ├── search_panel/       SearchPanel entity; ripgrep --json shell-out; debounced + cancellation

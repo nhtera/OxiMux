@@ -23,6 +23,7 @@ pub mod left_rail;
 pub mod onboarding;
 pub mod pane_group;
 pub mod panes;
+pub mod ports_panel;
 pub mod pr_dialog;
 pub mod project_panes;
 pub mod right_sidebar;

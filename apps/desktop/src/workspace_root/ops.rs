@@ -235,6 +235,45 @@ impl WorkspaceRoot {
         });
     }
 
+    /// Walk this window's terminals down to their listening ports and hand the
+    /// result to the ports panel.
+    ///
+    /// Two halves, split by which thread they belong on. The terminal roots
+    /// have to be read on the main thread (they live in entities); the process
+    /// walk and the socket read must not be, because on Linux they are `/proc`
+    /// IO and on the relay path resolving a shell pid can touch a checkpoint
+    /// file. So: snapshot the roots here, do the walking and reading on the
+    /// background executor, come back with a finished inventory.
+    ///
+    /// Self-guarded against overlap — a scan that is somehow slow must not
+    /// have the next tick's stacked behind it.
+    pub(crate) fn run_port_scan(&mut self, cx: &mut Context<Self>) {
+        if self.port_scan_in_flight {
+            return;
+        }
+        let mut roots: Vec<(std::path::PathBuf, u32)> = Vec::new();
+        for panes in self.project_panes_by_project.values() {
+            roots.extend(panes.read(cx).terminal_roots(cx));
+        }
+        let has_terminals = !roots.is_empty();
+        self.port_scan_in_flight = true;
+        cx.spawn(async move |weak, cx| {
+            let inventory = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::shell::ports_panel::scan::gather(roots)
+                })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                this.port_scan_in_flight = false;
+                this.ports_panel.update(cx, |panel, cx| {
+                    panel.apply(inventory, has_terminals, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
     /// Open Settings at the Schedules pane. The Automations page hands off
     /// here for creation rather than carrying a second copy of the six-field
     /// create form.

@@ -9,6 +9,8 @@ pub enum RightTab {
     SourceControl,
     /// Past agent sessions for the project — browse + reopen as a chat tab.
     History,
+    /// Local ports the window's terminals are listening on.
+    Ports,
 }
 
 /// Inputs that determine which tabs are visible.
@@ -33,24 +35,32 @@ pub struct TabVisibility {
 /// Source Control is hidden when there is no repository — avoids showing a
 /// broken panel before Phase 04 adds graceful no-repo handling.
 pub fn visible_tabs(v: TabVisibility) -> Vec<RightTab> {
-    // History is repo-independent — past sessions exist whether or not the
-    // current workspace is a git repo — so it shows in both cases.
+    // History and Ports are both repo-independent — past sessions exist, and
+    // a dev server listens, whether or not the current workspace is a git
+    // repo — so they show in both cases.
     if v.has_repo {
         vec![
             RightTab::Explorer,
             RightTab::Search,
             RightTab::SourceControl,
             RightTab::History,
+            RightTab::Ports,
         ]
     } else {
-        vec![RightTab::Explorer, RightTab::Search, RightTab::History]
+        vec![
+            RightTab::Explorer,
+            RightTab::Search,
+            RightTab::History,
+            RightTab::Ports,
+        ]
     }
 }
 
 impl RightTab {
     /// Asset path for the tab's SVG icon. Resolved by `CompositeAssets`:
-    /// gpui-component's bundle ships `file.svg` / `search.svg` / `folder.svg`;
-    /// `git-branch.svg` is shipped locally in `apps/desktop/assets/icons/`.
+    /// gpui-component's bundle ships `file.svg` / `search.svg` / `folder.svg`
+    /// / `network.svg`; `git-branch.svg` is shipped locally in
+    /// `apps/desktop/assets/icons/`.
     pub fn icon_path(self) -> &'static str {
         match self {
             RightTab::Files => "icons/folder.svg",
@@ -58,6 +68,10 @@ impl RightTab {
             RightTab::Search => "icons/search.svg",
             RightTab::SourceControl => "icons/git-branch.svg",
             RightTab::History => "icons/history.svg",
+            // Not `globe.svg`, which the browser pane tab already carries —
+            // two surfaces sharing a glyph is how an activity bar stops being
+            // scannable.
+            RightTab::Ports => "icons/network.svg",
         }
     }
 
@@ -69,6 +83,7 @@ impl RightTab {
             RightTab::Search => "S",
             RightTab::SourceControl => "G",
             RightTab::History => "H",
+            RightTab::Ports => "P",
         }
     }
 
@@ -80,6 +95,7 @@ impl RightTab {
             RightTab::Search => "Search",
             RightTab::SourceControl => "Source Control",
             RightTab::History => "Session History",
+            RightTab::Ports => "Ports",
         }
     }
 }

@@ -80,6 +80,11 @@ impl Render for WorkspaceRoot {
             .map(|p| p.read(cx).tty_count(cx))
             .unwrap_or(0);
 
+        // Listening ports, as of the last scan. Read from the panel rather
+        // than recomputed: the scan is the only thing that talks to the
+        // kernel, and a render pass must never be the second caller.
+        let port_count = self.ports_panel.read(cx).count();
+
         // Route poll state to the status bar via the RightSidebar getter.
         // Non-git projects keep their PollState pinned at Loading forever
         // (no poller exists), so gate on `has_repo` to keep the status
@@ -1593,6 +1598,7 @@ impl Render for WorkspaceRoot {
                 // `update` (not `update_in`) per the GPUI memory note.
                 let scm_for_click = scm_panel.clone();
                 let weak_for_usage = cx.entity().downgrade();
+                let weak_for_ports = cx.entity().downgrade();
                 #[cfg(target_os = "macos")]
                 let update_ready = cx
                     .try_global::<crate::updater::UpdaterState>()
@@ -1607,6 +1613,7 @@ impl Render for WorkspaceRoot {
                     pane_count,
                     tty_count,
                     agent_count,
+                    port_count,
                     git_state.as_ref(),
                     primary,
                     self.usage_state.as_ref(),
@@ -1632,6 +1639,26 @@ impl Render for WorkspaceRoot {
                                     window,
                                     cx,
                                 );
+                            });
+                        }
+                    },
+                    move |_window, cx| {
+                        // Open the sidebar if it is closed, then select Ports:
+                        // clicking a metric that says something is serving and
+                        // getting no visible change would read as a dead chip.
+                        if let Some(root) = weak_for_ports.upgrade() {
+                            root.update(cx, |this, cx| {
+                                let Some(rs) = this.right_sidebar.clone() else {
+                                    return;
+                                };
+                                rs.update(cx, |sidebar, cx| {
+                                    sidebar.open = true;
+                                    sidebar.select_tab(
+                                        crate::shell::right_sidebar::tab::RightTab::Ports,
+                                        cx,
+                                    );
+                                });
+                                cx.notify();
                             });
                         }
                     },

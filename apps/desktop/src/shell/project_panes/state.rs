@@ -210,6 +210,43 @@ impl ProjectPanes {
         self.groups.values().map(|g| g.read(cx).tty_count()).sum()
     }
 
+    /// Every terminal's shell pid, paired with the working directory of the
+    /// group it lives in. The root set the ports scan walks down from.
+    ///
+    /// The cwd rather than a group id because that is the identity a person
+    /// recognises — they started the server "in OxiMux", not "in group 2" —
+    /// and because two groups on one project should share a heading.
+    ///
+    /// Terminals whose pid cannot be resolved are skipped, not reported as
+    /// pid 0: an unresolvable pid means the shell has not spawned yet or its
+    /// relay checkpoint is unreadable, and nothing is listening under a
+    /// process that does not exist. Note that on the relay path `os_pid`
+    /// falls back to reading that checkpoint file, so this is a poll-rate
+    /// cost and not free — the caller gates it on window focus.
+    pub fn terminal_roots(&self, cx: &App) -> Vec<(PathBuf, u32)> {
+        let mut roots = Vec::new();
+        for group in self.groups.values() {
+            let group = group.read(cx);
+            let cwd = group.cwd().clone();
+            for tab in group.tabs() {
+                let PaneContent::Terminal(tree) = &tab.content else {
+                    continue;
+                };
+                for slot in tree.tree().in_order_leaves() {
+                    let Some(leaf) = tree.leaf(slot) else {
+                        continue;
+                    };
+                    for leaf_tab in leaf.tabs() {
+                        if let Some(pid) = leaf_tab.view().read(cx).os_pid() {
+                            roots.push((cwd.clone(), pid));
+                        }
+                    }
+                }
+            }
+        }
+        roots
+    }
+
     pub fn is_empty(&self, cx: &App) -> bool {
         self.tab_count(cx) == 0
     }

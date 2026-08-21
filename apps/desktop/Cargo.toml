@@ -31,6 +31,7 @@ oximux-proc-cwd = { workspace = true }
 # descendants — the one presence signal that covers every agent and outlives
 # an idle one, since it depends on nothing the agent chooses to emit.
 oximux-proc-tree = { workspace = true }
+oximux-proc-ports = { workspace = true }
 oximux-pty = { workspace = true }
 async-trait = { workspace = true }
 oximux-relay-client = { workspace = true }
