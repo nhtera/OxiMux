@@ -112,6 +112,10 @@ fn collect(rx: Option<mpsc::Receiver<String>>) -> String {
 mod tests {
     use super::*;
 
+    // Shells out to a macOS-only binary, so it can only run there. The
+    // crate is a macOS-only dependency; it stays a workspace member so it
+    // keeps compiling everywhere, which is why the gate is per-test.
+    #[cfg(target_os = "macos")]
     #[test]
     fn captures_stdout_and_exit_code() {
         let out = run_bounded(
@@ -124,6 +128,10 @@ mod tests {
         assert_eq!(out.stdout.trim(), "hello");
     }
 
+    // Shells out to a macOS-only binary, so it can only run there. The
+    // crate is a macOS-only dependency; it stays a workspace member so it
+    // keeps compiling everywhere, which is why the gate is per-test.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_hung_child_times_out_instead_of_blocking() {
         let started = Instant::now();
@@ -141,6 +149,10 @@ mod tests {
         );
     }
 
+    // Shells out to a macOS-only binary, so it can only run there. The
+    // crate is a macOS-only dependency; it stays a workspace member so it
+    // keeps compiling everywhere, which is why the gate is per-test.
+    #[cfg(target_os = "macos")]
     #[test]
     fn output_larger_than_a_pipe_buffer_does_not_deadlock() {
         // Regression guard for the drain-concurrently design: 64 KiB+ of
