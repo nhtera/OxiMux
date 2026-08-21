@@ -109,7 +109,7 @@ use crate::shell::{
         options_menu::WorkspaceOptionsMenu,
         project_menu::ProjectRowMenu,
         row_menu::WorkspaceRowMenu,
-        workspace_row::{DiffCounts, sum_numstat},
+        workspace_row::{DiffCounts, looks_like_renormalization, sum_numstat},
     },
     main_area,
     openable_text_file::is_openable_text_file,

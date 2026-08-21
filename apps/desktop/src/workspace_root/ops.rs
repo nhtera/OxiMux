@@ -89,7 +89,46 @@ impl WorkspaceRoot {
                 let counts = oximux_git::diff_numstat_head(std::path::Path::new(&path))
                     .await
                     .ok()
-                    .map(|map| sum_numstat(&map));
+                    .map(|map| {
+                        let counts = sum_numstat(&map);
+                        // Instrumentation for an unreproduced defect (see
+                        // `looks_like_renormalization`). Logged, never
+                        // suppressed: the recurrence is the thing we need, and
+                        // a silently corrected count would destroy the
+                        // evidence. Names the files because "which files did
+                        // git think changed" is the question analysis could not
+                        // answer after the fact.
+                        if looks_like_renormalization(map.len(), &counts) {
+                            let mut names: Vec<String> = map
+                                .keys()
+                                .take(20)
+                                .map(|p| p.display().to_string())
+                                .collect();
+                            names.sort();
+                            tracing::warn!(
+                                target: "oximux_app::workspace_root",
+                                worktree = %path,
+                                files = map.len(),
+                                added = counts.added,
+                                removed = counts.removed,
+                                sample = ?names,
+                                "implausible worktree diff: symmetric line counts across \
+                                 several files. Capture `git status --porcelain` and \
+                                 `git diff --stat HEAD` for this worktree now — this is the \
+                                 unreproduced phantom-diff defect recurring."
+                            );
+                        } else {
+                            tracing::debug!(
+                                target: "oximux_app::workspace_root",
+                                worktree = %path,
+                                files = map.len(),
+                                added = counts.added,
+                                removed = counts.removed,
+                                "worktree diff refreshed"
+                            );
+                        }
+                        counts
+                    });
                 (path, counts)
             });
             let _ = tx.send(futures::future::join_all(futs).await);

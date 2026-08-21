@@ -51,6 +51,28 @@ pub(crate) fn sum_numstat(
     DiffCounts { added, removed }
 }
 
+/// Line total above which a perfectly symmetric diff stops being plausible
+/// as ordinary editing. Hand edits do produce `added == removed` (a renamed
+/// symbol, a reflowed block), but they do so at small magnitudes; thousands
+/// of lines replaced one-for-one across several files is the signature of a
+/// whole-file rewrite — line-ending or encoding renormalisation — not of work.
+const RENORMALIZATION_SUSPECT_LINES: u32 = 1_000;
+
+/// Does this numstat result look like renormalisation rather than editing?
+///
+/// Exists because of an unreproduced defect: a freshly launched app painted
+/// `+35361 −35361` on a worktree whose `git status --porcelain` was empty, and
+/// cleared itself seconds later. The counts came back from a real
+/// `git diff --numstat -z HEAD`, so the bug is in what git was asked or what it
+/// saw — not in the cache that renders them. Until it reproduces there is
+/// nothing to fix, so this only *names* the shape in the log; it never
+/// suppresses a count. Suppressing would hide the recurrence we are waiting for.
+pub(crate) fn looks_like_renormalization(files: usize, counts: &DiffCounts) -> bool {
+    counts.added == counts.removed
+        && counts.added >= RENORMALIZATION_SUSPECT_LINES
+        && files >= 2
+}
+
 /// Visual tokens for one Workspace row. Pure, testable.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceRowPlan {
@@ -754,5 +776,53 @@ mod tests {
         map.insert(std::path::PathBuf::from("b.rs"), (10u32, 1u32));
         map.insert(std::path::PathBuf::from("c.rs"), (0u32, 7u32));
         assert_eq!(sum_numstat(&map), DiffCounts { added: 15, removed: 10 });
+    }
+
+    // ── looks_like_renormalization ────────────────────────────────────────────
+
+    /// The shape actually observed on 2026-08-21 against a clean tree.
+    #[test]
+    fn renormalization_flags_the_observed_shape() {
+        assert!(looks_like_renormalization(
+            59,
+            &DiffCounts { added: 35361, removed: 35361 }
+        ));
+    }
+
+    /// A big lopsided diff is someone deleting a vendored directory — real work.
+    #[test]
+    fn renormalization_ignores_asymmetric_totals() {
+        assert!(!looks_like_renormalization(
+            59,
+            &DiffCounts { added: 35361, removed: 35360 }
+        ));
+    }
+
+    /// Symmetric but small is an ordinary rename-a-symbol edit.
+    #[test]
+    fn renormalization_ignores_small_symmetric_edits() {
+        assert!(!looks_like_renormalization(
+            8,
+            &DiffCounts { added: 999, removed: 999 }
+        ));
+    }
+
+    /// One file rewritten wholesale is plausible on its own — a generated file,
+    /// a lockfile. It takes several at once to look mechanical.
+    #[test]
+    fn renormalization_ignores_a_single_file() {
+        assert!(!looks_like_renormalization(
+            1,
+            &DiffCounts { added: 5000, removed: 5000 }
+        ));
+    }
+
+    /// A clean tree must never trip the heuristic.
+    #[test]
+    fn renormalization_ignores_a_clean_tree() {
+        assert!(!looks_like_renormalization(
+            0,
+            &DiffCounts { added: 0, removed: 0 }
+        ));
     }
 }
