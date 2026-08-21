@@ -98,6 +98,18 @@ src/
     │   ├── project_drag.rs drag payloads, insertion_side, paint_insertion_line (2px accent line),
     │   │                   SidebarDragPreview ghost chip, WorkspaceDragConfig, reorder_slot_value
     │   └── toolbar.rs      Add Project + settings (stubs)
+    ├── integrations/       External CLIs OxiMux shells out to, and their health
+    │   ├── catalog.rs      Tool enum (git/gh/glab/rg): what each is for, docs link,
+    │   │                   whether it has a sign-in, and the per-platform install
+    │   │                   recipe. Pure data + pure wording. Linux deliberately has no
+    │   │                   recipe — a command that fails beats no command only in theory
+    │   ├── probe.rs        Health per tool: PATH resolution (bundled rg via tool_paths),
+    │   │                   `--version` parse, `auth status` exit code. Blocking, bounded
+    │   ├── install.rs      Package-manager child + Running/Failed state, same shape as
+    │   │                   driver_install. Failure carries the manager's own words
+    │   └── path_refresh.rs Windows only: re-reads the persisted PATH after an install.
+    │                       winget appends to the registry PATH, which a running process
+    │                       never sees — without this, a successful install looks failed
     ├── ports_panel/        Ports PANEL (right sidebar) — local ports this window's terminals serve
     │   ├── labels.rs       pure wording shared with the status-bar metric: port_metric_label,
     │   │                   url_for, origin_label, reach_label, project_label, row_title
@@ -134,13 +146,21 @@ src/
     │   │                   cache invalidated on project switch; replaces 3 hardcoded stubs
     │   ├── match_engine.rs pure scorer: prefix > consecutive > subsequence (no external crate)
     │   └── palette_modal.rs pure render: card + header chip + result list
-    ├── settings_modal/     Cmd+, / left-rail cog — five-pane settings overlay
+    ├── settings_modal/     Cmd+, / left-rail cog — settings overlay
     │   ├── mod.rs          SettingsModal entity; pane routing; open/close
-    │   ├── view.rs         top-level render: nav rail + active pane body
-    │   ├── controls.rs     shared form control helpers (toggle, text field, select)
-    │   ├── nav.rs          pane nav list (Terminal / Agents / Keybindings / Appearance / About)
+    │   ├── view.rs         top-level render: nav rail + active pane body; global search
+    │   │                   across every pane's entries()
+    │   ├── controls.rs     shared form control helpers. value_chip + toggle_switch are
+    │   │                   generic over the hosting view (Automations page uses them too)
+    │   ├── nav.rs          SettingsPane enum + SettingsGroup (AI / WORKSPACE / INTERFACE
+    │   │                   / APP). Panes sharing a group must be adjacent in ALL — the nav
+    │   │                   emits a heading on change, so an out-of-order pane repeats one
     │   ├── pane_terminal.rs terminal settings form; writes terminal.toml via save()
     │   ├── pane_agents.rs  agent settings form; writes commit_message_ai.toml via save()
+    │   ├── pane_integrations.rs external-CLI health + inline remediation. Owns the
+    │   │                   per-row install state machine (start/cancel/pump) and the copy
+    │   │                   that turns a silent degradation into a sentence and a button.
+    │   │                   Backend in shell/integrations/
     │   ├── pane_keybindings.rs read-only keybinding display
     │   └── pane_about.rs   version + license info; auto-update toggle, status line,
     │                       Check now / Restart now / Download update (reads UpdaterState)

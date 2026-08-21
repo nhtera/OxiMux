@@ -19,6 +19,7 @@ pub mod driver_install;
 pub mod file_explorer;
 pub mod forge;
 pub mod git_panel;
+pub mod integrations;
 pub mod left_rail;
 pub mod onboarding;
 pub mod pane_group;

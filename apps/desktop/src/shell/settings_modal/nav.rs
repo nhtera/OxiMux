@@ -57,6 +57,9 @@ pub enum SettingsPane {
     Notifications,
     Schedules,
     Remote,
+    /// External CLIs OxiMux shells out to — presence, sign-in, and the button
+    /// that fixes whichever is missing.
+    Integrations,
     Keybindings,
     Appearance,
     About,
@@ -79,13 +82,14 @@ impl SettingsPane {
     /// for the next person adding a pane at the end of the list, where the
     /// obvious place is the wrong one.
     #[cfg(any(target_os = "macos", windows))]
-    pub(super) const ALL: [SettingsPane; 10] = [
+    pub(super) const ALL: [SettingsPane; 11] = [
         SettingsPane::Agents,
         SettingsPane::Voice,
         SettingsPane::ScreenControl,
         SettingsPane::Terminal,
         SettingsPane::Schedules,
         SettingsPane::Remote,
+        SettingsPane::Integrations,
         SettingsPane::Appearance,
         SettingsPane::Keybindings,
         SettingsPane::Notifications,
@@ -93,12 +97,13 @@ impl SettingsPane {
     ];
 
     #[cfg(not(any(target_os = "macos", windows)))]
-    pub(super) const ALL: [SettingsPane; 9] = [
+    pub(super) const ALL: [SettingsPane; 10] = [
         SettingsPane::Agents,
         SettingsPane::Voice,
         SettingsPane::Terminal,
         SettingsPane::Schedules,
         SettingsPane::Remote,
+        SettingsPane::Integrations,
         SettingsPane::Appearance,
         SettingsPane::Keybindings,
         SettingsPane::Notifications,
@@ -111,9 +116,10 @@ impl SettingsPane {
             SettingsPane::Agents | SettingsPane::Voice | SettingsPane::ScreenControl => {
                 SettingsGroup::Ai
             }
-            SettingsPane::Terminal | SettingsPane::Schedules | SettingsPane::Remote => {
-                SettingsGroup::Workspace
-            }
+            SettingsPane::Terminal
+            | SettingsPane::Schedules
+            | SettingsPane::Remote
+            | SettingsPane::Integrations => SettingsGroup::Workspace,
             SettingsPane::Appearance
             | SettingsPane::Keybindings
             | SettingsPane::Notifications => SettingsGroup::Interface,
@@ -136,6 +142,7 @@ impl SettingsPane {
             SettingsPane::Notifications => "Notifications",
             SettingsPane::Schedules => "Schedules",
             SettingsPane::Remote => "Remote",
+            SettingsPane::Integrations => "Integrations",
             SettingsPane::Keybindings => "Keybindings",
             SettingsPane::Appearance => "Appearance",
             SettingsPane::About => "About",
@@ -154,6 +161,9 @@ impl SettingsPane {
             SettingsPane::Notifications => "icons/bell.svg",
             SettingsPane::Schedules => "icons/history.svg",
             SettingsPane::Remote => "icons/globe.svg",
+            // A plug would be the obvious glyph and the bundle has none; a
+            // wrench is what these rows are actually for — fixing something.
+            SettingsPane::Integrations => "icons/wrench.svg",
             SettingsPane::Keybindings => "icons/keyboard.svg",
             SettingsPane::Appearance => "icons/palette.svg",
             SettingsPane::About => "icons/info.svg",

@@ -25,6 +25,7 @@ mod pane_computer_use;
 #[cfg(windows)]
 mod pane_driver_trust;
 mod pane_agents_launch;
+mod pane_integrations;
 mod pane_keybindings;
 mod pane_notifications;
 mod pairing_qr;
@@ -205,6 +206,25 @@ pub struct SettingsModal {
     pub(super) sched_prompt_input: Option<Entity<InputState>>,
     /// Validation message shown under the create form, or `None` when clean.
     pub(super) schedule_form_error: Option<String>,
+
+    // ----- Integrations -----
+    /// One row per catalogued external CLI. Seeded `Checking` and re-probed on
+    /// every modal open, for the same reason `driver_status` is: "not
+    /// installed" is the answer most likely to have gone stale, because seeing
+    /// it is what sends the user off to install the thing.
+    pub(super) integrations: Vec<crate::shell::integrations::IntegrationRow>,
+    /// Per-row install state, keyed by index into `integrations`. Absent means
+    /// idle — the common case, so it is the one that costs nothing to store.
+    pub(super) integration_install:
+        std::collections::HashMap<usize, crate::shell::integrations::install::InstallUi>,
+    /// Live install handles. Kept apart from the UI state because a handle
+    /// cannot be cloned and the render only ever needs the state.
+    pub(super) integration_handles:
+        std::collections::HashMap<usize, crate::shell::integrations::install::InstallHandle>,
+    /// Row whose command was last copied, for the inline acknowledgement.
+    pub(super) integration_copied: Option<usize>,
+    /// Guards against stacking one poll loop per install click.
+    pub(super) integration_poll_running: bool,
 }
 
 /// Parse the custom-words editor field into a de-duplicated dictionary. Splits
@@ -260,6 +280,11 @@ impl SettingsModal {
             driver_install_ui: crate::shell::driver_install::DriverInstallUi::Idle,
             #[cfg(target_os = "macos")]
             driver_poll_running: false,
+            integrations: Vec::new(),
+            integration_install: std::collections::HashMap::new(),
+            integration_handles: std::collections::HashMap::new(),
+            integration_copied: None,
+            integration_poll_running: false,
             #[cfg(target_os = "macos")]
             driver_upgraded: false,
             notify,
@@ -320,6 +345,10 @@ impl SettingsModal {
             .try_global::<ComputerUseSettings>()
             .cloned()
             .unwrap_or_default();
+        // Same reasoning as the driver resolve below, for the four CLIs the
+        // Integrations pane reports on. Off the UI thread: this is a PATH walk
+        // plus a couple of short spawns per tool.
+        self.refresh_integrations(cx);
         #[cfg(target_os = "macos")]
         {
             // Re-checked per open rather than once at boot: the user may have
