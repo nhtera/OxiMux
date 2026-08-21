@@ -9,7 +9,7 @@
 //! modal never sets the global itself (that would race the debouncer).
 //! Rendering lives in [`view`]; this file owns state + persistence.
 
-mod controls;
+pub(crate) mod controls;
 mod layout;
 mod nav;
 mod segmented;

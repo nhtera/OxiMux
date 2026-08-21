@@ -7,6 +7,7 @@
 pub mod agent_chat;
 pub mod agent_ui;
 pub mod agents_dashboard;
+pub mod automations_view;
 pub mod browser_view;
 pub mod chrome;
 pub mod command_palette;

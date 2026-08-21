@@ -8,6 +8,11 @@
 //! Helpers return an owned [`AnyElement`] (rather than `impl IntoElement`)
 //! so a pane can build several of them from the same `&mut Context`
 //! without tripping Rust 2024's RPIT lifetime-capture rules.
+//!
+//! Two of them — [`value_chip`] and [`toggle_switch`] — outgrew this modal and
+//! are generic over their hosting view, so the Automations page arms a
+//! schedule with the identical switch the Schedules pane does. The rest stay
+//! modal-bound until something else needs them.
 
 use gpui::{
     AnyElement, Context, ElementId, Hsla, InteractiveElement, IntoElement, MouseButton,
@@ -17,17 +22,21 @@ use oximux_settings::{Density, Theme, Typography};
 
 use super::SettingsModal;
 
-/// A clickable value chip. Clicking fires `on_click` with a fresh
-/// `&mut SettingsModal`, so handlers read live state rather than a
-/// render-time snapshot.
-pub(super) fn value_chip(
+/// A clickable value chip. Clicking fires `on_click` with a fresh `&mut V`,
+/// so handlers read live state rather than a render-time snapshot.
+///
+/// Generic over the hosting view rather than pinned to [`SettingsModal`]: the
+/// Automations page renders the same chips against the same store, and two
+/// chips that merely *look* alike drift apart the first time either is
+/// restyled. Call sites in this module infer `V = SettingsModal` unchanged.
+pub(crate) fn value_chip<V: 'static>(
     id: impl Into<ElementId>,
     text: impl Into<SharedString>,
     theme: Theme,
     density: Density,
     typography: &Typography,
-    on_click: impl Fn(&mut SettingsModal, &mut Window, &mut Context<SettingsModal>) + 'static,
-    cx: &mut Context<SettingsModal>,
+    on_click: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
+    cx: &mut Context<V>,
 ) -> AnyElement {
     div()
         .id(id.into())
@@ -100,13 +109,14 @@ pub(super) fn toggle_chip(
 
 /// An iOS-style pill toggle. The track tints to the accent when `value` is
 /// on and the knob slides to the corresponding edge. Clicking fires
-/// `on_click` with a live `&mut SettingsModal`.
-pub(super) fn toggle_switch(
+/// `on_click` with a live `&mut V`. Generic for the same reason as
+/// [`value_chip`] — the Automations page arms schedules with this switch.
+pub(crate) fn toggle_switch<V: 'static>(
     id: impl Into<ElementId>,
     value: bool,
     theme: Theme,
-    on_click: impl Fn(&mut SettingsModal, &mut Window, &mut Context<SettingsModal>) + 'static,
-    cx: &mut Context<SettingsModal>,
+    on_click: impl Fn(&mut V, &mut Window, &mut Context<V>) + 'static,
+    cx: &mut Context<V>,
 ) -> AnyElement {
     const TRACK_W: f32 = 36.0;
     const TRACK_H: f32 = 20.0;

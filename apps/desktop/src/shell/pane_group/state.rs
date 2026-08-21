@@ -625,6 +625,7 @@ impl PaneGroup {
             | PaneContent::Diff(_)
             | PaneContent::Browser(_)
             | PaneContent::Tasks(_)
+            | PaneContent::Automations(_)
             | PaneContent::AgentChat(_) => false,
         })
     }

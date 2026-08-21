@@ -216,6 +216,38 @@ impl WorkspaceRoot {
         });
     }
 
+    /// Open (or re-activate) the singleton Automations tab in the active
+    /// project's active pane group. Called from the nav rail's Automations row.
+    ///
+    /// Automations are global — they carry their own working directory and
+    /// fire whether or not the project they mention is open — but the tab
+    /// still needs a pane group to live in, so a project must be open. As with
+    /// Tasks, a toast beats a silent no-op.
+    pub(crate) fn open_automations_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panes) = self.active_project_panes() else {
+            self.push_toast(ToastKind::Info, "Open a project to see automations.", cx);
+            return;
+        };
+        let weak_root: WeakEntity<WorkspaceRoot> = cx.weak_entity();
+        let store = self.app_state.schedule_store();
+        panes.update(cx, |p, cx| {
+            p.open_or_activate_automations_tab_in_active_group(weak_root, store, window, cx);
+        });
+    }
+
+    /// Open Settings at the Schedules pane. The Automations page hands off
+    /// here for creation rather than carrying a second copy of the six-field
+    /// create form.
+    pub(crate) fn open_schedule_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_modal.update(cx, |m, cx| {
+            m.open_to_pane(
+                crate::shell::settings_modal::SettingsPane::Schedules,
+                window,
+                cx,
+            );
+        });
+    }
+
     // `toggle_floating_terminal` and the rest of the floating-terminal host
     // logic (restore, new-tab spawn, expand-to-pane, rename) live in
     // `crate::shell::floating_terminal_host` — same split-impl pattern as

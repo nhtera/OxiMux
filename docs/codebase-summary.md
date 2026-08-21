@@ -79,10 +79,10 @@ src/
     ├── top_bar.rs          40px chrome: 56px traffic-light gutter + L/R panel toggles + wordmark
     ├── left_rail/          250px workspace + nav rail (replaces old sidebar stub)
     │   ├── mod.rs          LeftRail entity; owns WorktreePanel for state; snapshots diff_counts
-    │   ├── nav_section.rs  NavItem (Tasks/Agents/Search) + pure bg/fg helpers
-    │   │                   NOTE: there is no Automations row. Scheduled runs
-    │   │                   live in the Schedules settings pane; promoting them
-    │   │                   to a rail destination is planned, not shipped.
+    │   ├── nav_section.rs  NavItem (Tasks/Automations/Agents/Search) + pure bg/fg helpers
+    │   │                   NavItem::opens_in_pane(): Tasks + Automations open a
+    │   │                   singleton PANE tab (they need width); Agents swaps the
+    │   │                   rail body; Search is still a shell.
     │   ├── workspace_row.rs WorkspaceCardPlan + build_workspace_card_plan (pure) + sum_numstat;
     │   │                   status_dot_color delegates to agent_verb for color parity
     │   ├── workspace_card.rs render_workspace_card — two-line card painter consuming WorkspaceCardPlan;
@@ -91,6 +91,15 @@ src/
     │   ├── project_drag.rs drag payloads, insertion_side, paint_insertion_line (2px accent line),
     │   │                   SidebarDragPreview ghost chip, WorkspaceDragConfig, reorder_slot_value
     │   └── toolbar.rs      Add Project + settings (stubs)
+    ├── automations_view/   Automations PANE page — scheduled runs, one card each
+    │   ├── labels.rs       pure wording shared with the Schedules settings pane:
+    │   │                   next_fire_label, run_summary, armed_summary, home_abbrev,
+    │   │                   prompt_preview. One source of truth so two surfaces of the
+    │   │                   same store never word a schedule differently.
+    │   └── mod.rs          AutomationsView entity; reads ScheduleStore::list_spawning on
+    │                       activate/refresh/mutate; enable toggle + two-step delete
+    │                       (DeleteArm, pure + tested); creation hands off to Settings →
+    │                       Schedules rather than duplicating that form
     ├── agents_dashboard/   all-agents view rendered when the Agents nav item is active
     │   ├── model.rs        pure: AgentRow, attention_rank, sort_agent_rows, build_agent_rows,
     │   │                   widest_row_index — assembled from LeftRail's pushed-down snapshot
@@ -123,7 +132,8 @@ src/
     │                       debounce-persisted to settings repo as JSON; NOT a second OS window
     ├── welcome_view.rs     centered empty-state card (logo + wordmark + tagline + kbd hints)
     ├── main_pane.rs        pane binary-tree; split/close/focus actions; each leaf holds
-    │                       PaneContent enum (Terminal | Editor | Diff | Browser | Tasks); open_editor_in_focused_pane
+    │                       PaneContent enum (Terminal | Editor | Diff | Browser | Tasks |
+    │                       Automations | AgentChat); open_editor_in_focused_pane
     │                       replaces focused leaf content; same-path short-circuit
     ├── pane_tree.rs        pure PaneTree data structure (weight-aware)
     ├── pane_layout.rs      layout helpers

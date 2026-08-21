@@ -24,6 +24,7 @@ impl PaneGroup {
             | PaneGroupTabKind::CombinedDiff { .. }
             | PaneGroupTabKind::Browser { .. }
             | PaneGroupTabKind::Tasks
+            | PaneGroupTabKind::Automations
             | PaneGroupTabKind::AgentChat { .. } => false,
         }) else {
             return false;
@@ -77,6 +78,7 @@ impl PaneGroup {
             | PaneContent::Diff(_)
             | PaneContent::Browser(_)
             | PaneContent::Tasks(_)
+            | PaneContent::Automations(_)
             | PaneContent::AgentChat(_) => None,
         }
     }
@@ -106,6 +108,7 @@ impl PaneGroup {
                 | PaneContent::Diff(_)
                 | PaneContent::Browser(_)
                 | PaneContent::Tasks(_)
+                | PaneContent::Automations(_)
                 | PaneContent::AgentChat(_) => {
                     out.push(Vec::new())
                 }
@@ -125,6 +128,7 @@ impl PaneGroup {
                 | PaneContent::Diff(_)
                 | PaneContent::Browser(_)
                 | PaneContent::Tasks(_)
+                | PaneContent::Automations(_)
                 | PaneContent::AgentChat(_) => {
                     out.push(None)
                 }

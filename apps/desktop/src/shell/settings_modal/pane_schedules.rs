@@ -21,9 +21,9 @@
 //! stray `+ : −` expression. The working directory has a native folder picker so
 //! a path cannot be fat-fingered.
 
-use chrono::{DateTime, Local};
+use chrono::Local;
 use gpui::{
-    Anchor, AnyElement, ClickEvent, Context, Entity, Hsla, IntoElement, ParentElement, SharedString,
+    Anchor, AnyElement, ClickEvent, Context, Entity, IntoElement, ParentElement, SharedString,
     Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::button::{Button, DropdownButton};
@@ -31,9 +31,13 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::menu::PopupMenuItem;
 use gpui_component::{Icon, Sizable as _};
 use oximux_agents::schedule::{
-    NewSchedule, Recurrence, RecurrenceError, RunOutcome, Schedule, ScheduleRun, describe,
+    NewSchedule, Recurrence, RecurrenceError, Schedule, ScheduleRun, describe,
 };
 use oximux_settings::{Density, Theme, Typography};
+
+// The wording every schedule surface shares. See that module for why these
+// live beside the Automations page rather than here.
+use crate::shell::automations_view::labels::{next_fire_label, run_summary};
 
 use super::SettingsModal;
 use super::controls::{toggle_switch, value_chip};
@@ -724,23 +728,6 @@ fn run_line(run: &ScheduleRun, theme: Theme, typography: &Typography) -> AnyElem
         .into_any_element()
 }
 
-/// Dot colour + text for a run. Pure so the wording is unit-tested.
-fn run_summary(run: &ScheduleRun, theme: Theme) -> (Hsla, String) {
-    let when = run.fired_at.format("%b %-d %H:%M");
-    match run.outcome {
-        RunOutcome::Ok => (theme.status_ok, format!("{when} · ran")),
-        RunOutcome::Failed => {
-            let why = run.detail.as_deref().unwrap_or("failed");
-            (theme.status_error, format!("{when} · failed — {why}"))
-        }
-    }
-}
-
-/// "next Jul 23 at 09:00" — the schedule's armed next-fire, for a person.
-fn next_fire_label(next: DateTime<Local>) -> String {
-    format!("next {}", next.format("%b %-d at %H:%M"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,34 +770,5 @@ mod tests {
         for m in INTERVAL_CHOICES {
             assert!(Recurrence::every_minutes(m).is_ok(), "{m} is below the floor");
         }
-    }
-
-    #[test]
-    fn a_failed_run_summary_carries_its_detail() {
-        let theme = Theme::default();
-        let run = ScheduleRun {
-            schedule_id: "s".into(),
-            fired_at: Local::now(),
-            outcome: RunOutcome::Failed,
-            session_id: None,
-            detail: Some("that working directory is not usable".into()),
-        };
-        let (_dot, text) = run_summary(&run, theme);
-        assert!(text.contains("failed"), "names the failure: {text}");
-        assert!(text.contains("not usable"), "surfaces the detail: {text}");
-    }
-
-    #[test]
-    fn an_ok_run_summary_reads_as_ran() {
-        let theme = Theme::default();
-        let run = ScheduleRun {
-            schedule_id: "s".into(),
-            fired_at: Local::now(),
-            outcome: RunOutcome::Ok,
-            session_id: Some("agent-1".into()),
-            detail: None,
-        };
-        let (_dot, text) = run_summary(&run, theme);
-        assert!(text.contains("ran"), "reads as ran: {text}");
     }
 }

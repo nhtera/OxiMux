@@ -728,6 +728,68 @@ impl PaneGroup {
         new_idx
     }
 
+    /// Open or activate the singleton Automations tab (scheduled-run browser).
+    ///
+    /// Same singleton-dedup shape as the Tasks tab. The store is handed in
+    /// rather than reached for: `PaneGroup` has no `AppState`, and the store
+    /// is a handle on the shared connection, so cloning one per tab is free
+    /// and keeps this end free of app-wide reach-throughs.
+    pub fn open_or_activate_automations_tab(
+        &mut self,
+        weak_root: WeakEntity<crate::workspace_root::WorkspaceRoot>,
+        store: oximux_agents::schedule::ScheduleStore,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| matches!(&t.kind, PaneGroupTabKind::Automations))
+        {
+            // Re-activating re-reads the store: the ticker mutates it from a
+            // background task, so the list on screen is stale by definition.
+            if let PaneContent::Automations(view) = &self.tabs[idx].content {
+                let view = view.clone();
+                view.update(cx, |av, cx| av.activate(cx));
+            }
+            self.set_active(idx, window, cx);
+            return idx;
+        }
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let view = cx.new(|cx| {
+            let mut v = crate::shell::automations_view::AutomationsView::new(
+                weak_root, store, theme, density, typography, cx,
+            );
+            v.activate(cx);
+            v
+        });
+        let observer = Some(cx.observe(&view, |_this, _v, cx| cx.notify()));
+        let tab = PaneGroupTab {
+            label: SharedString::from("Automations"),
+            content: PaneContent::Automations(view),
+            kind: PaneGroupTabKind::Automations,
+            color: None,
+            custom_title: None,
+            pinned: false,
+            is_preview: false,
+            external_mutation: None,
+            restore_rank: None,
+            _observer: observer,
+            _status_task: None,
+        };
+        self.tabs.push(tab);
+        let new_idx = self.tabs.len() - 1;
+        self.tab_order.push(new_idx);
+        self.active = new_idx;
+        self.bump_mru(new_idx);
+        self.focus_active(window, cx);
+        self.pin_tab_strip_to_end();
+        cx.notify();
+        new_idx
+    }
+
     /// Open a new Agent Chat tab in this group, backed by its own headless
     /// `claude` subprocess (separate PID). Not a singleton — each chat is its
     /// own session, so a second call opens a second chat. The label is a
@@ -2066,6 +2128,10 @@ impl PaneGroup {
             PaneContent::Browser(view) => Some(cx.observe(view, |_this, _v, cx| cx.notify())),
             // Tasks tabs notify the host on list data / loading changes.
             PaneContent::Tasks(view) => Some(cx.observe(view, |_this, _v, cx| cx.notify())),
+            // Same reason as Tasks: the page repaints on store reloads.
+            PaneContent::Automations(view) => {
+                Some(cx.observe(view, |_this, _v, cx| cx.notify()))
+            }
             // Agent Chat tabs notify the host on transcript/streaming changes.
             PaneContent::AgentChat(view) => Some(cx.observe(view, |_this, _v, cx| cx.notify())),
         };
