@@ -2,7 +2,10 @@
 
 **Updated**: 2026-07-31  
 **Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open index, lifecycle scripts, Create PR + CI checks, floating PiP terminal) + Agent Chat (round-7) shipped to main; Remote Control Phase 1-2 groundwork in progress on `feat/remote-control-headless-registry` (agent-core split + SessionRegistry, not yet wired into the view); external-CLI auto-provisioning (bundled ripgrep + `cua-driver` one-click installer) shipped; desktop auto-update shipped  
-**Tests**: workspace suite green
+**Tests**: workspace suite green on macOS **and Windows**. It was macOS-only until the six
+`oximux-macos-trust` tests that shell out to `/bin/sh` and `/usr/bin/ditto` were gated to
+macOS — the crate is a macOS-only *dependency* but an unconditional *workspace member*, so
+`cargo test --workspace` had always run them everywhere and always failed off macOS.
 
 ---
 
@@ -76,7 +79,10 @@ src/
     ├── top_bar.rs          40px chrome: 56px traffic-light gutter + L/R panel toggles + wordmark
     ├── left_rail/          250px workspace + nav rail (replaces old sidebar stub)
     │   ├── mod.rs          LeftRail entity; owns WorktreePanel for state; snapshots diff_counts
-    │   ├── nav_section.rs  NavItem (Tasks/Automations/Agents/Search) + pure bg/fg helpers
+    │   ├── nav_section.rs  NavItem (Tasks/Agents/Search) + pure bg/fg helpers
+    │   │                   NOTE: there is no Automations row. Scheduled runs
+    │   │                   live in the Schedules settings pane; promoting them
+    │   │                   to a rail destination is planned, not shipped.
     │   ├── workspace_row.rs WorkspaceCardPlan + build_workspace_card_plan (pure) + sum_numstat;
     │   │                   status_dot_color delegates to agent_verb for color parity
     │   ├── workspace_card.rs render_workspace_card — two-line card painter consuming WorkspaceCardPlan;
