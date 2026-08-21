@@ -1,0 +1,55 @@
+# radius / type literal ratchet allowlist
+#
+# Files still calling `.rounded(px(N))` or `.text_size(px(N))` with a raw
+# number instead of a `Density` / `Typography` token, recorded at their current
+# count. A file may shed literals freely but fails `xtask literal-lint` the
+# moment it gains one -- so this list can only ratchet down. Drop a row once its
+# file reaches zero (the lint prints STALE to nudge).
+#
+# Every row here is a corner or a type size that will refuse to scale when UI
+# zoom lands. The goal is an empty file.
+#
+# Format: <repo-relative-path> <literal-count>
+apps/desktop/src/shell/agent_chat/auth_card.rs 1
+apps/desktop/src/shell/agent_chat/bubble.rs 1
+apps/desktop/src/shell/agent_chat/composer.rs 16
+apps/desktop/src/shell/agent_chat/context_meter.rs 2
+apps/desktop/src/shell/agent_chat/dictation_hud.rs 1
+apps/desktop/src/shell/agent_chat/error_card.rs 1
+apps/desktop/src/shell/agent_chat/find_bar.rs 2
+apps/desktop/src/shell/agent_chat/jump_menu.rs 3
+apps/desktop/src/shell/agent_chat/login_card.rs 1
+apps/desktop/src/shell/agent_chat/mod.rs 6
+apps/desktop/src/shell/agent_chat/pending_edit.rs 4
+apps/desktop/src/shell/agent_chat/question_card.rs 2
+apps/desktop/src/shell/agent_chat/rewind_menu.rs 4
+apps/desktop/src/shell/agent_chat/roster.rs 1
+apps/desktop/src/shell/agents_dashboard/mod.rs 1
+apps/desktop/src/shell/agents_dashboard/row_render.rs 1
+apps/desktop/src/shell/chrome/tab_context_menu.rs 2
+apps/desktop/src/shell/chrome/top_bar.rs 1
+apps/desktop/src/shell/command_palette/palette_modal.rs 2
+apps/desktop/src/shell/command_palette/row_render.rs 1
+apps/desktop/src/shell/diff_view/paint/view.rs 1
+apps/desktop/src/shell/file_explorer/file_tree_view.rs 1
+apps/desktop/src/shell/file_explorer/paint.rs 1
+apps/desktop/src/shell/left_rail/project_drag.rs 2
+apps/desktop/src/shell/onboarding/agent_step.rs 1
+apps/desktop/src/shell/onboarding/view.rs 2
+apps/desktop/src/shell/onboarding/view_step.rs 1
+apps/desktop/src/shell/pane_group/file_drag.rs 2
+apps/desktop/src/shell/pane_group/render.rs 6
+apps/desktop/src/shell/pane_group/tab_drag.rs 2
+apps/desktop/src/shell/right_sidebar/session_history_panel.rs 8
+apps/desktop/src/shell/search_panel/result_row.rs 1
+apps/desktop/src/shell/session_history/mod.rs 4
+apps/desktop/src/shell/settings_modal/pane_agents_launch.rs 1
+apps/desktop/src/shell/settings_modal/pane_voice.rs 3
+apps/desktop/src/shell/source_control/commit_area.rs 2
+apps/desktop/src/shell/source_control/graph_row.rs 1
+apps/desktop/src/shell/source_control/toolbar.rs 2
+apps/desktop/src/shell/terminal/terminal_search_overlay.rs 2
+apps/desktop/src/shell/terminal/terminal_view/mod.rs 6
+crates/editor/src/editor_header.rs 2
+crates/editor/src/editor_view.rs 4
+crates/editor/src/markdown_preview.rs 1

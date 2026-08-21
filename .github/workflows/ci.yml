@@ -104,6 +104,12 @@ jobs:
       - name: xtask file-size-lint
         run: cargo run -p xtask -- file-size-lint
 
+      # Radius and type sizes belong to `Density` / `Typography`. A raw
+      # `px(N)` cannot scale, which is what would break UI zoom — so the
+      # allowlist is a ratchet and this step is what keeps it going down.
+      - name: xtask literal-lint
+        run: cargo run -p xtask -- literal-lint
+
       # The Windows icon is derived from the macOS one, so it goes stale on
       # whichever machine edits `assets/AppIcon.icns` — which is this one, not
       # the Windows runner. Checking it here is what makes "regenerate the .ico"
