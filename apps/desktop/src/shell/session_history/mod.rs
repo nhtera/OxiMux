@@ -875,7 +875,7 @@ fn header_row(
                 .px(px(6.))
                 .py(px(2.))
                 .bg(theme.bg_panel_alt)
-                .rounded(px(4.))
+                .rounded(px(6.0))
                 .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_muted)
                 .child("History"),

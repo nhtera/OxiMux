@@ -163,7 +163,7 @@ pub fn paint_row(
         .mx(px(4.0))
         .pl(px(indent_px))
         .pr(px(8.0))
-        .rounded(px(4.0))
+        .rounded(px(6.0))
         .text_size(px(ctx.typography.t_body_sm))
         .text_color(fg);
     if !is_editing {

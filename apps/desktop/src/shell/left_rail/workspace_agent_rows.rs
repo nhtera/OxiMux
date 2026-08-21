@@ -270,7 +270,7 @@ pub fn render_workspace_agent_disclosure(
                 .flex_shrink_0()
                 .gap(px(2.0))
                 .px(px(3.0))
-                .rounded(px(4.0))
+                .rounded(px(density.r_xs))
                 .bg(theme.hover_overlay)
                 .child(glyph);
             for adapter in chip.adapters.iter().take(CHIP_ICONS_MAX) {

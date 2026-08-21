@@ -799,7 +799,7 @@ fn recommended_badge(theme: Theme, typography: &Typography) -> AnyElement {
         .flex_none()
         .px(px(6.0))
         .py(px(1.0))
-        .rounded(px(4.0))
+        .rounded(px(6.0))
         .bg(theme.status_ok.opacity(0.15))
         .text_size(px(typography.t_sub_label))
         .text_color(theme.status_ok)

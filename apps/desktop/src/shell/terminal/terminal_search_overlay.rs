@@ -124,7 +124,7 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
                 .bg(theme.bg_base)
                 .border_1()
                 .border_color(theme.focus_ring)
-                .rounded(px(4.0))
+                .rounded(px(6.0))
                 .font(mono.clone())
                 .text_size(px(typography.t_body_lg))
                 .child(

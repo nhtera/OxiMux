@@ -61,7 +61,7 @@ fn render_row(task: &BackgroundTask, theme: &Theme, density: &Density, typo: &Ty
             div()
                 .flex_none()
                 .px(px(density.gap_inline * 0.5))
-                .rounded(px(4.0))
+                .rounded(px(density.r_xs))
                 .bg(theme.bg_panel_alt)
                 .text_size(px(typo.t_label_xs))
                 .text_color(theme.fg_subtle)

@@ -305,9 +305,19 @@ fn main() {
             // accessibility choice some low-vision users rely on) reports
             // `false` here.
             let auto_hide_scrollbars = cx.should_auto_hide_scrollbars();
+            let component_density = oximux_settings::Density::cockpit();
             let component_theme = gpui_component::Theme::global_mut(cx);
             component_theme.colors.input = palette.border_input;
             component_theme.colors.ring = palette.focus_ring;
+            // Corner radius, bridged for the same reason the two colours above
+            // are: the library paints its own widgets and cannot see our
+            // tokens. It happens to default to 6/8 — the same scale — so this
+            // changes nothing today. It is here so the two cannot drift apart
+            // silently, which is precisely what had happened to the radii it
+            // does not own: hand-rolled chrome sat at 4 while every `Input`
+            // and `Button` beside it was already 6.
+            component_theme.radius = gpui::px(component_density.r_xs);
+            component_theme.radius_lg = gpui::px(component_density.r_card);
             // List scrollbars stay invisible until the pointer enters the
             // scroll region, then reveal thumb-only — quiet at rest, no
             // persistent rail chrome. The library default (`Scrolling`) only
@@ -938,9 +948,19 @@ fn run_editor_spike() {
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
         {
             let palette = oximux_settings::Theme::charcoal();
+            let component_density = oximux_settings::Density::cockpit();
             let component_theme = gpui_component::Theme::global_mut(cx);
             component_theme.colors.input = palette.border_input;
             component_theme.colors.ring = palette.focus_ring;
+            // Corner radius, bridged for the same reason the two colours above
+            // are: the library paints its own widgets and cannot see our
+            // tokens. It happens to default to 6/8 — the same scale — so this
+            // changes nothing today. It is here so the two cannot drift apart
+            // silently, which is precisely what had happened to the radii it
+            // does not own: hand-rolled chrome sat at 4 while every `Input`
+            // and `Button` beside it was already 6.
+            component_theme.radius = gpui::px(component_density.r_xs);
+            component_theme.radius_lg = gpui::px(component_density.r_card);
         }
         cx.activate(true);
 
@@ -1011,9 +1031,19 @@ fn run_file_tree_spike() {
         // the same borders the shipping window does.
         {
             let palette = oximux_settings::Theme::charcoal();
+            let component_density = oximux_settings::Density::cockpit();
             let component_theme = gpui_component::Theme::global_mut(cx);
             component_theme.colors.input = palette.border_input;
             component_theme.colors.ring = palette.focus_ring;
+            // Corner radius, bridged for the same reason the two colours above
+            // are: the library paints its own widgets and cannot see our
+            // tokens. It happens to default to 6/8 — the same scale — so this
+            // changes nothing today. It is here so the two cannot drift apart
+            // silently, which is precisely what had happened to the radii it
+            // does not own: hand-rolled chrome sat at 4 while every `Input`
+            // and `Button` beside it was already 6.
+            component_theme.radius = gpui::px(component_density.r_xs);
+            component_theme.radius_lg = gpui::px(component_density.r_card);
         }
         cx.activate(true);
 

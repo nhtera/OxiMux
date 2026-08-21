@@ -93,19 +93,29 @@ editor by design.
 | `h_row` | 24 | Sidebar list row, file tree row (baseline) |
 | `h_action_row` | 34 | Row hosting inline action buttons (stash entry, worktree entry) |
 | `h_overlay_item` | 30 | Item row inside floating cards (context menus, pickers) |
-| `r_card` | 8 | Panels, cards |
-| `r_xs` | 4 | Buttons, inputs |
-| `r_chip` | 3 | Inline chips, badges, toggle pills — intentionally tighter than `r_xs` |
+| `r_card` | 8 | Panels, cards (`0.8×`) |
+| `r_xs` | 6 | Buttons, inputs (`0.6×`) |
+| `r_chip` | 2 | Inline chips, badges, toggle pills — intentionally tighter than `r_xs` (`0.2×`) |
+| `r_lg` | 10 | Modals, floating sheets (`1×`) |
+| `r_xl` | 14 | Largest floating surfaces (`1.4×`) |
 | `pad_panel` | 8 | Panel inner padding |
 | `pad_overlay` | 6 | Inner padding for floating cards |
 | `pad_row` | 6 | Row left/right padding |
 | `gap_inline` | 6 | Spacing between inline siblings |
 
-**Radius scale (reference ratios).** Shipped radii predate this note; new
-surfaces that need a radius outside the table should derive it from a 10px
-base with the ratio steps sm `0.6×` (6) / md `0.8×` (8) / lg `1×` (10) /
-xl `1.4×` (14), then promote the value to a `Density` token once a second
-site appears — never inline a one-off number twice.
+**Radius scale.** Every radius derives from a 10px base with the ratio steps
+xs `0.2×` (2) / sm `0.6×` (6) / md `0.8×` (8) / lg `1×` (10) / xl `1.4×` (14).
+The table above is the whole set; `density_radius_scale` in
+`crates/settings/src/density.rs` asserts it, so a value off the scale fails the
+suite rather than shipping. A surface needing a radius not in the table takes
+the nearest step — never a one-off number, and never a second inline copy of
+one. `xtask literal-lint` enforces this at the call site: a raw
+`.rounded(px(N))` fails CI unless its file is on the shrinking ratchet in
+`xtask/literal-allow.txt`.
+
+This scale is deliberately the same one shadcn/ui's `new-york` theme uses,
+which is what the reference cockpit is built on — matching it is why OxiMux's
+chrome reads as the same family rather than an approximation of it.
 
 **Hover-only scrollbar (reference spec).** Scroll surfaces that grow custom
 scrollbars use: thumb at 28% white-alpha resting, 48% on hover, 36% while
@@ -676,7 +686,7 @@ Common drift, paired with the right fix:
 | `.text_size(px(typography.t_body_sm * 0.85))` | `.text_size(px(typography.t_sub_label))` | The arithmetic is a de-facto token without a name |
 | `.h(px(density.h_row * 1.4))` | `.h(px(density.h_action_row))` | Same: arithmetic is a token in disguise |
 | `const CARD_PADDING: f32 = 6.0;` (per-file) | `density.pad_overlay` | Eight pickers were each carrying this — one source of truth |
-| `.rounded(px(3.0))` | `.rounded(px(density.r_chip))` | The chip radius is intentional, not magic |
+| `.rounded(px(2.0))` | `.rounded(px(density.r_chip))` | The chip radius is intentional, not magic — and a literal silently stops tracking the token when the scale moves, which is exactly what stranded 21 sites at the old values when the radii were rescaled |
 | `.danger()` in a compact row | `ui::danger_ghost(...)` | Full danger weight overwhelms row hierarchy |
 | `Hsla { a: 0.22, ..theme.status_added }` | `theme.diff_added_bg()` | Alpha tints belong on `Theme`, not at call sites |
 | Two grays + a brand accent | Two grays + status hue when warranted | The brand IS the absence of accent in v1 |

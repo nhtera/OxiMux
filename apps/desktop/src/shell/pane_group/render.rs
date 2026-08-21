@@ -1773,7 +1773,7 @@ fn render_mru_hud(
             .gap(px(8.0))
             .h(px(28.0))
             .px(px(10.0))
-            .rounded(px(4.0))
+            .rounded(px(6.0))
             .bg(row_bg)
             .text_size(px(12.0))
             .text_color(row_fg)

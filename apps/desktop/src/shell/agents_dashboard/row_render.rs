@@ -171,7 +171,7 @@ pub fn render_agent_row(
             div()
                 .flex_shrink_0()
                 .px(px(4.))
-                .rounded(px(4.))
+                .rounded(px(density.r_xs))
                 .bg(theme.hover_overlay)
                 .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_muted)

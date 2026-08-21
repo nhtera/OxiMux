@@ -48,7 +48,7 @@ impl Render for FilePathDragPreview {
             .items_center()
             .h(px(28.0))
             .px(px(12.0))
-            .rounded(px(4.0))
+            .rounded(px(6.0))
             .bg(rgb(BG_PREVIEW))
             .border_1()
             .border_color(rgb(BORDER_PREVIEW))

@@ -486,7 +486,7 @@ fn default_badge(theme: Theme, typography: &Typography) -> AnyElement {
         .flex_none()
         .px(px(6.0))
         .py(px(1.0))
-        .rounded(px(3.0))
+        .rounded(px(2.0))
         .bg(Hsla { a: 0.16, ..theme.status_info })
         .text_size(px(typography.t_sub_label))
         .text_color(theme.status_info)

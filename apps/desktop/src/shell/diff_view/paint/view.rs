@@ -971,7 +971,7 @@ fn failed_state(
                 .text_color(rctx.theme.status_info)
                 .border_1()
                 .border_color(rctx.theme.border_inactive)
-                .rounded(px(4.0))
+                .rounded(px(6.0))
                 .cursor_pointer()
                 .hover(|s| s.bg(rctx.theme.hover_overlay))
                 .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| {

@@ -493,7 +493,7 @@ fn render_row(
         .mx(px(4.0))
         .pl(indent)
         .pr(px(6.0))
-        .rounded(px(4.0))
+        .rounded(px(6.0))
         .when(is_active, |s| {
             s.bg(theme.selection).text_color(theme.fg_base)
         })

@@ -132,7 +132,7 @@ impl Render for SidebarDragPreview {
             .items_center()
             .h(px(24.0))
             .px(px(10.0))
-            .rounded(px(4.0))
+            .rounded(px(6.0))
             .bg(self.theme.bg_overlay)
             .border_1()
             .border_color(self.theme.border_active)

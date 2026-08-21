@@ -623,7 +623,7 @@ impl QuestionCard {
                 .id(SharedString::from(format!("q-nav-{glyph}-{page}")))
                 .px(px(5.0))
                 .py(px(1.0))
-                .rounded(px(4.0))
+                .rounded(px(6.0))
                 .text_size(px(typo.t_body_md))
                 .text_color(if target.is_some() { theme.fg_muted } else { theme.fg_subtle })
                 .child(SharedString::from(glyph.to_string()));

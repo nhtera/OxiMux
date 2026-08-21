@@ -131,7 +131,7 @@ fn keybinding_chip(kb: &str, theme: Theme, typography: &Typography) -> impl Into
         .bg(theme.bg_panel)
         .border_1()
         .border_color(theme.border_inactive)
-        .rounded(px(4.))
+        .rounded(px(6.0))
         .text_size(px(typography.t_sub_label))
         .text_color(theme.fg_subtle)
         .child(kb.to_string())
