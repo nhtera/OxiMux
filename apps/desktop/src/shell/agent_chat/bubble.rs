@@ -8,8 +8,7 @@
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{AnyElement, Hsla, IntoElement, ParentElement, SharedString, Styled, div, px};
-use gpui_component::highlighter::HighlightTheme;
-use gpui_component::text::{TextView, TextViewStyle};
+use gpui_component::text::TextView;
 use gpui_component::{ActiveTheme, clipboard::Clipboard, h_flex};
 use oximux_agents::thread::{ToolCall, ToolCallStatus};
 use oximux_settings::{Density, Theme, Typography};
@@ -88,7 +87,7 @@ pub(super) fn assistant_body(
             .child(md.render(key, body, &style))
             .into_any_element();
     }
-    legacy_assistant_body(key.seed() as usize, body, typo)
+    legacy_assistant_body(key.seed() as usize, body, theme, typo)
 }
 
 /// One top-level block of the assistant's reply, as its own transcript row.
@@ -116,7 +115,7 @@ pub(super) fn assistant_block(
     typo: &Typography,
 ) -> Option<AnyElement> {
     if !owned_renderer() {
-        return (block_ix == 0).then(|| legacy_assistant_body(key.seed() as usize, body, typo));
+        return (block_ix == 0).then(|| legacy_assistant_body(key.seed() as usize, body, theme, typo));
     }
     let style = MarkdownStyle::body(key, md.selection.clone(), theme, density, typo).with_find(find);
     let block = md.render_block(key, body, block_ix, &style)?;
@@ -128,14 +127,8 @@ pub(super) fn assistant_block(
 /// Chat markdown is the most-looked-at surface in the product; keeping the path
 /// that shipped reachable for a release is worth more than the dead code costs.
 /// See [`owned_renderer`].
-fn legacy_assistant_body(key: usize, body: &str, typo: &Typography) -> AnyElement {
-    // Dark-only app: pin the markdown renderer to the dark highlight theme (its
-    // own default is a light code theme, which reads washed-out on the panel).
-    let style = TextViewStyle {
-        is_dark: true,
-        highlight_theme: HighlightTheme::default_dark(),
-        ..Default::default()
-    };
+fn legacy_assistant_body(key: usize, body: &str, theme: Theme, typo: &Typography) -> AnyElement {
+    let style = crate::shell::markdown_style::gfm_style(&theme);
     // Copied out so the `'static` code-block closure below can carry it: the
     // closure outlives this borrow of `typo`, but an `f32` moves in freely.
     let body_sm = typo.t_body_sm;
@@ -215,11 +208,7 @@ fn legacy_thinking_body(
     density: Density,
     typo: &Typography,
 ) -> AnyElement {
-    let style = TextViewStyle {
-        is_dark: true,
-        highlight_theme: HighlightTheme::default_dark(),
-        ..Default::default()
-    };
+    let style = crate::shell::markdown_style::gfm_style(&theme);
     // Same wrap trap as the assistant body: markdown reports its longest
     // unwrapped line as min-content, so the frame's `min_w_0` is what forces
     // wrapping rather than overflow.

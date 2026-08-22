@@ -14,8 +14,7 @@ use gpui::{
     AnyElement, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
     StatefulInteractiveElement, Styled, Window, div, px,
 };
-use gpui_component::highlighter::HighlightTheme;
-use gpui_component::text::{TextView, TextViewStyle};
+use gpui_component::text::TextView;
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{RestartToUpdate, ToggleWhatsNew};
@@ -65,14 +64,7 @@ pub fn view(
             .child("No release notes for this version.")
             .into_any_element()
     } else {
-        // Dark-only app: pin the markdown renderer to the dark highlight
-        // theme (its default is a light code theme). Same setup as the chat
-        // bubbles' markdown.
-        let style = TextViewStyle {
-            is_dark: true,
-            highlight_theme: HighlightTheme::default_dark(),
-            ..Default::default()
-        };
+        let style = crate::shell::markdown_style::gfm_style(&theme);
         div()
             .w_full()
             // Load-bearing: the markdown view reports its longest UNWRAPPED

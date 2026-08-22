@@ -37,4 +37,3 @@ apps/desktop/src/shell/terminal/terminal_view/mod.rs 6
 crates/editor/src/editor_header.rs 2
 crates/editor/src/editor_view.rs 4
 crates/editor/src/markdown_preview.rs 1
-apps/desktop/src/shell/agent_chat/bubble.rs 1

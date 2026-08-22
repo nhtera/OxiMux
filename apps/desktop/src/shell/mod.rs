@@ -21,6 +21,7 @@ pub mod forge;
 pub mod git_panel;
 pub mod integrations;
 pub mod left_rail;
+pub mod markdown_style;
 pub mod onboarding;
 pub mod pane_group;
 pub mod panes;
