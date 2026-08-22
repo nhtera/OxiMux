@@ -30,13 +30,12 @@ use gpui_component::{
 
 use crate::shell::source_control::SourceControlPanel;
 use crate::shell::source_control::scope::SourceControlScope;
-use crate::shell::source_control::style as sc_style;
 
 impl SourceControlPanel {
     pub(super) fn render_scope_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let typography = &self.typography;
-        let _ = self.density;
+        let style = self.style();
         let scopes = [SourceControlScope::All, SourceControlScope::Uncommitted];
         // Fixed height + `flex_shrink_0` keeps the row from being compressed
         // when the file list below expands (otherwise the row shrinks under
@@ -49,10 +48,10 @@ impl SourceControlPanel {
             .flex_row()
             .items_end()
             .flex_shrink_0()
-            .h(px(sc_style::TAB_H))
+            .h(px(style.tab_h))
             .border_b_1()
             .border_color(theme.border_inactive)
-            .px(px(sc_style::PAD_H));
+            .px(px(style.pad_h));
         // Count of uncommitted changed files for the "Uncommitted" tab
         // badge. Mirrors the Ignored filter from `build_primary_inputs`
         // and `partition_files`: ignored entries (`target/`, build
@@ -124,9 +123,9 @@ impl SourceControlPanel {
                 .flex()
                 .items_center()
                 .justify_center()
-                .px(px(sc_style::PAD_H))
-                .pb(px(sc_style::PAD_V))
-                .text_size(px(sc_style::BODY_TEXT))
+                .px(px(style.pad_h))
+                .pb(px(style.pad_v))
+                .text_size(px(style.body_text))
                 .font_weight(typography.w_medium)
                 .text_color(fg)
                 .cursor_pointer()
@@ -152,7 +151,7 @@ impl SourceControlPanel {
             ViewMode::Tree => ("icons/list-collapse.svg", "Switch to flat view"),
         };
         let theme = self.theme;
-        let _ = (self.density, &self.typography);
+        let style = self.style();
         let (ahead, behind, branch) = self
             .git_state
             .as_ref()
@@ -204,7 +203,7 @@ impl SourceControlPanel {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(sc_style::ICON_CLUSTER_GAP))
+            .gap(px(style.icon_cluster_gap))
             // Settings — opens the BaseRef picker. Sliders glyph reads
             // as "configure this panel" rather than as a destination.
             .child(
@@ -214,7 +213,7 @@ impl SourceControlPanel {
                     .icon(
                         Icon::default()
                             .path("icons/settings-2.svg")
-                            .size(px(sc_style::ICON)),
+                            .size(px(style.icon)),
                     )
                     .tooltip(base_ref_tooltip)
                     .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
@@ -228,7 +227,7 @@ impl SourceControlPanel {
                     .icon(
                         Icon::default()
                             .path(view_mode_icon)
-                            .size(px(sc_style::ICON)),
+                            .size(px(style.icon)),
                     )
                     .tooltip(view_mode_tooltip)
                     .on_click(cx.listener(|panel, _: &ClickEvent, _window, cx| {
@@ -245,7 +244,7 @@ impl SourceControlPanel {
                     .icon(
                         Icon::default()
                             .path("icons/refresh-cw.svg")
-                            .size(px(sc_style::ICON)),
+                            .size(px(style.icon)),
                     )
                     .tooltip(
                         match crate::keymap_registry::display_chord_for("refresh_source_control") {
@@ -263,11 +262,11 @@ impl SourceControlPanel {
             .flex_row()
             .items_center()
             .flex_shrink_0()
-            .h(px(sc_style::TOOLBAR_H))
-            .px(px(sc_style::PAD_H))
+            .h(px(style.toolbar_h))
+            .px(px(style.pad_h))
             .border_b_1()
             .border_color(theme.border_inactive)
-            .text_size(px(sc_style::BODY_TEXT))
+            .text_size(px(style.body_text))
             .text_color(theme.fg_muted)
             .child(prefix);
         if let Some(chip) = branch_chip {
@@ -350,7 +349,7 @@ impl SourceControlPanel {
     pub(super) fn render_filter_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let typography = &self.typography;
-        let _ = self.density;
+        let style = self.style();
         let has_query = !self.filter_query.is_empty();
         // Filter input rides on `t_body_sm` (11px) — the Input widget
         // ignores text-size set on its parent div, so the size must be
@@ -362,13 +361,13 @@ impl SourceControlPanel {
             .items_center()
             .flex_shrink_0()
             .gap(px(6.0))
-            .px(px(sc_style::PAD_H))
-            .py(px(sc_style::PAD_V_TIGHT))
+            .px(px(style.pad_h))
+            .py(px(style.pad_v_tight))
             .border_b_1()
             .border_color(theme.border_inactive)
             .child(
                 Icon::new(IconName::Search)
-                    .size(px(sc_style::ICON))
+                    .size(px(style.icon))
                     .text_color(theme.fg_subtle),
             )
             .child(
@@ -384,7 +383,7 @@ impl SourceControlPanel {
                 Button::new("sc-filter-clear")
                     .ghost()
                     .xsmall()
-                    .icon(Icon::default().path("icons/x.svg").size(px(sc_style::ICON)))
+                    .icon(Icon::default().path("icons/x.svg").size(px(style.icon)))
                     .tooltip("Clear filter")
                     .on_click(cx.listener(|panel, _: &ClickEvent, window, cx| {
                         panel.clear_filter(window, cx);

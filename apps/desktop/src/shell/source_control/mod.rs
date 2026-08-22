@@ -252,6 +252,15 @@ pub struct SourceControlPanel {
 }
 
 impl SourceControlPanel {
+    /// The panel's spacing and type for the appearance it currently holds.
+    ///
+    /// Resolved per call rather than cached in a field: it is fourteen floats
+    /// derived from tokens `render` has just synced, so recomputing is cheaper
+    /// than one more snapshot that can go stale.
+    pub(super) fn style(&self) -> style::ScmStyle {
+        style::ScmStyle::new(self.density, &self.typography)
+    }
+
     pub fn new(
         cfg: PanelConfig,
         state_rx: watch::Receiver<PollState>,
@@ -1195,6 +1204,7 @@ impl Render for SourceControlPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         let theme = self.theme;
+        let style = self.style();
         let action = self.resolve_primary(cx);
         // Cache for the status bar — kept at most one frame behind render.
         self.last_primary_action = Some(action.clone());
@@ -1248,6 +1258,7 @@ impl Render for SourceControlPanel {
         let conflict_card: Option<AnyElement> = conflict_banner::render_conflict_summary_card(
             conflict_count,
             theme,
+            style,
             open_all_enabled,
             move |window, app| {
                 let _ = panel_weak.update(app, |panel, cx| {
@@ -1267,6 +1278,7 @@ impl Render for SourceControlPanel {
         let operation_banner: Option<AnyElement> = conflict_banner::render_operation_banner(
             current_op,
             theme,
+            style,
             continue_enabled,
             move |_window, app| {
                 if let Some(op) = current_op {

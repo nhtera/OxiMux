@@ -31,7 +31,7 @@ use gpui_component::{
 use oximux_core::GitOperation;
 use oximux_settings::Theme;
 
-use crate::shell::source_control::style as sc_style;
+use crate::shell::source_control::style::ScmStyle;
 
 /// Plural-aware copy for the conflict-summary card. Pure for
 /// unit-test coverage.
@@ -60,6 +60,7 @@ pub fn conflict_summary_text(count: usize) -> String {
 pub fn render_conflict_summary_card<F>(
     count: usize,
     theme: Theme,
+    style: ScmStyle,
     enabled: bool,
     on_open_all: F,
 ) -> Option<impl IntoElement>
@@ -83,22 +84,22 @@ where
             .justify_between()
             .flex_shrink_0()
             .w_full()
-            .px(px(sc_style::PAD_H))
-            .py(px(sc_style::PAD_V))
+            .px(px(style.pad_h))
+            .py(px(style.pad_v))
             .border_b_1()
             .border_color(theme.status_warning)
-            .text_size(px(sc_style::BODY_TEXT))
+            .text_size(px(style.body_text))
             .text_color(theme.fg_base)
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(sc_style::PAD_V))
+                    .gap(px(style.pad_v))
                     .child(
                         Icon::default()
                             .path("icons/alert-triangle.svg")
-                            .size(px(sc_style::ICON))
+                            .size(px(style.icon))
                             .text_color(theme.status_warning),
                     )
                     .child(label),
@@ -132,6 +133,7 @@ where
 pub fn render_operation_banner<A, C>(
     op: Option<GitOperation>,
     theme: Theme,
+    style: ScmStyle,
     continue_enabled: bool,
     on_abort: A,
     on_continue: C,
@@ -155,22 +157,22 @@ where
             .justify_between()
             .flex_shrink_0()
             .w_full()
-            .px(px(sc_style::PAD_H))
-            .py(px(sc_style::PAD_V))
+            .px(px(style.pad_h))
+            .py(px(style.pad_v))
             .border_b_1()
             .border_color(theme.status_warning)
-            .text_size(px(sc_style::BODY_TEXT))
+            .text_size(px(style.body_text))
             .text_color(theme.fg_base)
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(sc_style::PAD_V))
+                    .gap(px(style.pad_v))
                     .child(
                         Icon::default()
                             .path("icons/git-merge.svg")
-                            .size(px(sc_style::ICON))
+                            .size(px(style.icon))
                             .text_color(theme.status_warning),
                     )
                     .child(op.banner_label()),
@@ -180,7 +182,7 @@ where
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(sc_style::PAD_V))
+                    .gap(px(style.pad_v))
                     .when(show_continue, |row| {
                         row.child(
                             Button::new("sc-op-continue")

@@ -332,10 +332,11 @@ impl StashPanel {
     /// reachable. Chevron points down when open, right when collapsed
     /// (matches the SCM-section convention).
     fn render_header(&self, count: usize, cx: &mut Context<Self>) -> impl IntoElement {
-        use crate::shell::source_control::style as sc_style;
+        use crate::shell::source_control::style::ScmStyle;
         let theme = self.theme;
         let density = self.density;
         let typography = &self.typography;
+        let style = ScmStyle::new(density, typography);
         let collapsed = self.collapsed;
         let chevron = if collapsed {
             "icons/chevron-right.svg"
@@ -369,7 +370,7 @@ impl StashPanel {
                     .child(
                         Icon::default()
                             .path(chevron)
-                            .size(px(sc_style::ICON))
+                            .size(px(style.icon))
                             .text_color(theme.fg_muted),
                     )
                     .child(format!("STASHES ({count})")),

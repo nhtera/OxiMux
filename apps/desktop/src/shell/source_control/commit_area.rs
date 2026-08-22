@@ -61,7 +61,7 @@ use crate::shell::source_control::dropdown_items::{
 };
 use crate::shell::source_control::primary_action::{PrimaryAction, PrimaryActionKind};
 use crate::shell::source_control::settings_persistence::load_initial_commit_draft;
-use crate::shell::source_control::style as sc_style;
+use crate::shell::source_control::style::ScmStyle;
 
 /// Last status surfaced from a commit / remote operation. Mirrors the
 /// primary-action lifecycle in the panel header so the user sees the
@@ -555,7 +555,8 @@ impl CommitArea {
         let theme = self.theme;
         let density = self.density;
         let typography = &self.typography;
-        let status_row = render_status_row(theme, typography, &self.status);
+        let style = ScmStyle::new(density, typography);
+        let status_row = render_status_row(theme, style, &self.status);
         let action_for_click = action.clone();
         let submit_label = action.label.clone();
         let submit_title = action.title.clone();
@@ -644,7 +645,7 @@ impl CommitArea {
                         .icon(
                             Icon::default()
                                 .path("icons/sparkles.svg")
-                                .size(px(sc_style::ICON)),
+                                .size(px(style.icon)),
                         )
                         .tooltip(sparkles_tooltip)
                         .disabled(sparkles_disabled)
@@ -664,18 +665,19 @@ impl CommitArea {
         let textarea = div()
             .relative()
             .w_full()
-            .h(px(sc_style::COMMIT_H))
+            .h(px(style.commit_h))
             .flex_shrink_0()
             .border_1()
             .border_color(theme.border_inactive)
             .rounded(px(density.r_xs))
             .bg(theme.bg_base)
-            .text_size(px(sc_style::BODY_TEXT))
+            .text_size(px(style.body_text))
             .child(Input::new(&self.message_state).h_full())
             .children(sparkles_button)
             .children(ai_overlay::render_ai_overlay(
                 generating,
                 theme,
+                style,
                 cx.listener(|area, _: &ClickEvent, _window, cx| {
                     area.cancel_ai_generation(cx);
                 }),
@@ -742,6 +744,7 @@ impl CommitArea {
                     &action_view,
                     &resolved_entries,
                     menu_theme,
+                    style,
                     menu_label_weight,
                 )
             });
@@ -772,7 +775,7 @@ impl CommitArea {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(sc_style::ICON_CLUSTER_GAP))
+            .gap(px(style.icon_cluster_gap))
             .w_full();
         for (idx, prefix) in COMMIT_PREFIXES.iter().enumerate() {
             let prefix_static: &'static str = prefix;
@@ -802,10 +805,10 @@ impl CommitArea {
             .flex_col()
             .flex_shrink_0()
             .w_full()
-            .px(px(sc_style::PAD_H))
-            .pt(px(sc_style::PAD_V))
-            .pb(px(sc_style::PAD_V_TIGHT))
-            .gap(px(sc_style::PAD_V_TIGHT))
+            .px(px(style.pad_h))
+            .pt(px(style.pad_v))
+            .pb(px(style.pad_v_tight))
+            .gap(px(style.pad_v_tight))
             .child(meta_row)
             .child(textarea)
             .child(primary)
@@ -853,6 +856,7 @@ fn build_commit_menu(
     view: &Entity<CommitArea>,
     entries: &[DropdownEntry],
     theme: Theme,
+    style: ScmStyle,
     label_weight: FontWeight,
 ) -> gpui_component::menu::PopupMenu {
     menu = menu.min_w(px(224.0));
@@ -875,6 +879,7 @@ fn build_commit_menu(
                     title,
                     *disabled,
                     theme,
+                    style,
                     label_weight,
                 ));
             }
@@ -904,6 +909,7 @@ fn build_menu_item(
     title: &str,
     disabled: bool,
     theme: Theme,
+    style: ScmStyle,
     label_weight: FontWeight,
 ) -> PopupMenuItem {
     let label = label.to_string();
@@ -929,7 +935,7 @@ fn build_menu_item(
                 .child(div().text_color(theme.fg_muted).child(label.clone()))
                 .child(
                     div()
-                        .text_size(px(sc_style::GRAPH_META_TEXT))
+                        .text_size(px(style.graph_meta_text))
                         .text_color(theme.fg_subtle)
                         .child(title.clone()),
                 )
@@ -1033,7 +1039,7 @@ fn primary_icon_for(
 /// appears when there's something to say.
 fn render_status_row(
     theme: Theme,
-    _typography: &Typography,
+    style: ScmStyle,
     status: &CommitStatus,
 ) -> Option<impl IntoElement> {
     let (color, msg) = match status {
@@ -1059,7 +1065,7 @@ fn render_status_row(
     };
     Some(
         div()
-            .text_size(px(sc_style::GRAPH_META_TEXT))
+            .text_size(px(style.graph_meta_text))
             .text_color(color)
             .child(msg),
     )

@@ -24,7 +24,7 @@ use oximux_settings::{Density, Theme, Typography};
 use crate::shell::source_control::graph::{CommitGraph, ShowCommitRequested};
 use crate::shell::source_control::graph_gutter::graph_gutter;
 use crate::shell::source_control::graph_layout::RowLayout;
-use crate::shell::source_control::style as sc_style;
+use crate::shell::source_control::style::ScmStyle;
 
 /// Max ref chips rendered inline per commit row before the overflow
 /// `+N` chip kicks in. Tuned for the standard sidebar width — two
@@ -49,6 +49,7 @@ pub(super) fn render_commit_row(
     show_author: bool,
     stats: Option<(u32, u32)>,
 ) -> AnyElement {
+    let style = ScmStyle::new(density, typography);
     // Single-line row: graph gutter + subject (truncates) + author + date +
     // short sha. Reference layout collapses the v1 two-line "subject /
     // author • date" into one tight row so 20+ commits stay scannable
@@ -60,7 +61,7 @@ pub(super) fn render_commit_row(
     // `graph_layout`; the gutter only paints. `is_head` accents the current
     // checkout's node.
     let is_head = c.refs.iter().any(|r| matches!(r, RefLabel::Head));
-    let gutter = graph_gutter(layout, max_lanes, sc_style::COMMIT_ROW_H, is_head, theme);
+    let gutter = graph_gutter(layout, max_lanes, style.commit_row_h, is_head, theme);
 
     // Subject flex-grows but truncates. `w_full` on the outer row gives the
     // `flex_1` child a definite width to shrink against; without it taffy
@@ -80,7 +81,7 @@ pub(super) fn render_commit_row(
         .min_w(px(80.0))
         .overflow_hidden()
         .whitespace_nowrap()
-        .text_size(px(sc_style::BODY_TEXT))
+        .text_size(px(style.body_text))
         .text_color(theme.fg_base)
         .child(c.subject.clone());
 
@@ -93,13 +94,13 @@ pub(super) fn render_commit_row(
         .max_w(px(88.0))
         .overflow_hidden()
         .whitespace_nowrap()
-        .text_size(px(sc_style::GRAPH_META_TEXT))
+        .text_size(px(style.graph_meta_text))
         .text_color(theme.fg_subtle)
         .child(c.author.clone());
 
     let date = div()
         .flex_shrink_0()
-        .text_size(px(sc_style::GRAPH_META_TEXT))
+        .text_size(px(style.graph_meta_text))
         .text_color(theme.fg_subtle)
         .child(c.short_date.clone());
 
@@ -158,8 +159,8 @@ pub(super) fn render_commit_row(
         .flex_row()
         .items_center()
         .gap(px(density.gap_inline))
-        .px(px(sc_style::PAD_H))
-        .h(px(sc_style::COMMIT_ROW_H))
+        .px(px(style.pad_h))
+        .h(px(style.commit_row_h))
         .w_full()
         .overflow_hidden()
         .cursor_pointer()
@@ -183,6 +184,7 @@ pub(super) fn render_commit_row(
                     stats,
                     theme,
                     typography.clone(),
+                    style,
                 )
             })
             .build(window, cx)
@@ -231,6 +233,7 @@ fn render_ref_chips(
     if refs.is_empty() {
         return None;
     }
+    let style = ScmStyle::new(density, typography);
     let mut row = div()
         .flex()
         .flex_row()
@@ -265,7 +268,7 @@ fn render_ref_chips(
                 .py(px(1.0))
                 .rounded(px(density.r_chip))
                 .bg(theme.bg_panel_alt)
-                .text_size(px(sc_style::SUB_LABEL_TEXT))
+                .text_size(px(style.sub_label_text))
                 .text_color(theme.fg_muted)
                 .child(overflow_text)
                 .tooltip(move |window, cx| Tooltip::new(tip_text.clone()).build(window, cx)),
@@ -284,6 +287,7 @@ fn ref_chip_for(
     density: oximux_settings::Density,
     typography: &Typography,
 ) -> gpui::Div {
+    let style = ScmStyle::new(density, typography);
     let (label, fg, bg) = match r {
         RefLabel::Head => (
             "HEAD".to_string(),
@@ -311,7 +315,7 @@ fn ref_chip_for(
         .py(px(1.0))
         .rounded(px(density.r_chip))
         .bg(bg)
-        .text_size(px(sc_style::SUB_LABEL_TEXT))
+        .text_size(px(style.sub_label_text))
         .text_color(fg)
         .child(label)
 }
@@ -346,6 +350,7 @@ pub(super) fn render_commit_tooltip(
     stats: Option<(u32, u32)>,
     theme: Theme,
     typography: Typography,
+    style: ScmStyle,
 ) -> impl IntoElement {
     // Width cap chosen so a typical 60-column body wraps once or twice
     // rather than producing a single very wide line.
@@ -355,7 +360,7 @@ pub(super) fn render_commit_tooltip(
         .flex()
         .flex_col()
         .max_w(max_width)
-        .text_size(px(sc_style::BODY_TEXT))
+        .text_size(px(style.body_text))
         .text_color(theme.fg_base)
         .child(div().font_weight(typography.w_semibold).child(subject));
 
@@ -367,7 +372,7 @@ pub(super) fn render_commit_tooltip(
         let mut body_col = div()
             .flex()
             .flex_col()
-            .pt(px(sc_style::PAD_V_TIGHT))
+            .pt(px(style.pad_v_tight))
             .text_color(theme.fg_muted);
         for line in body.lines() {
             if line.is_empty() {
@@ -385,8 +390,8 @@ pub(super) fn render_commit_tooltip(
                 .flex()
                 .flex_row()
                 .gap(px(8.0))
-                .pt(px(sc_style::PAD_V_TIGHT))
-                .text_size(px(sc_style::GRAPH_META_TEXT))
+                .pt(px(style.pad_v_tight))
+                .text_size(px(style.graph_meta_text))
                 .child(
                     div()
                         .text_color(theme.status_added)

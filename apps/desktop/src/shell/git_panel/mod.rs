@@ -32,7 +32,6 @@ use crate::git_state_cache::GitStateCache;
 use crate::shell::diff_view::DiffView;
 use crate::shell::git_panel::changed_files::{RenderCtx, partition_files, render_sections};
 use crate::shell::source_control::filter::filter_files;
-use crate::shell::source_control::style as sc_style;
 use gpui::{
     App, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
     Render, ScrollHandle, StatefulInteractiveElement, Styled, Task, Window, div, px,
@@ -600,15 +599,16 @@ fn placeholder_state(
     msg: &str,
     theme: Theme,
     density: Density,
-    _typography: &Typography,
+    typography: &Typography,
 ) -> impl IntoElement {
+    let style = crate::shell::source_control::style::ScmStyle::new(density, typography);
     div()
         .flex()
         .items_center()
         .justify_center()
         .h_full()
         .p(px(density.pad_panel))
-        .text_size(px(sc_style::BODY_TEXT))
+        .text_size(px(style.body_text))
         .text_color(theme.fg_subtle)
         .child(msg.to_string())
 }

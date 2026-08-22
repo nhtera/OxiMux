@@ -28,7 +28,6 @@ use gpui_component::{
 use crate::shell::source_control::SourceControlPanel;
 use crate::shell::source_control::commit_ops::{self, RemoteVerb};
 use crate::shell::source_control::scope::SourceControlScope;
-use crate::shell::source_control::style as sc_style;
 
 impl SourceControlPanel {
     /// Returns `true` when the tree is clean AND there's a recorded
@@ -68,6 +67,7 @@ impl SourceControlPanel {
     pub(super) fn render_empty_state(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
         let typography = self.typography.clone();
+        let style = self.style();
 
         // Three CTAs: each is a small ghost button. The cluster sits
         // inside a column with the icon + "No changes" headline so the
@@ -115,7 +115,7 @@ impl SourceControlPanel {
             .justify_center()
             .gap(px(10.0))
             .py(px(28.0))
-            .px(px(sc_style::PAD_H))
+            .px(px(style.pad_h))
             .child(
                 // Branch icon stands in for "this branch is up to date".
                 // 20px reads as a panel-level glyph without crowding the
@@ -127,7 +127,7 @@ impl SourceControlPanel {
             )
             .child(
                 div()
-                    .text_size(px(sc_style::BODY_TEXT))
+                    .text_size(px(style.body_text))
                     .text_color(theme.fg_muted)
                     .font_weight(typography.w_medium)
                     .child("No changes on this branch"),

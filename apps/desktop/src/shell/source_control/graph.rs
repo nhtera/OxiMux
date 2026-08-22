@@ -25,7 +25,7 @@ use tokio::sync::oneshot;
 use crate::scm_layout_settings;
 use crate::shell::source_control::graph_layout::{RowLayout, compute_graph, max_lanes};
 use crate::shell::source_control::graph_row::render_commit_row;
-use crate::shell::source_control::style as sc_style;
+use crate::shell::source_control::style::ScmStyle;
 
 const PAGE_SIZE: u32 = 20;
 
@@ -528,6 +528,7 @@ impl Render for CommitGraph {
         let theme = self.theme;
         let density = self.density;
         let typography = &self.typography;
+        let style = ScmStyle::new(density, typography);
 
         let (count_label, can_load_more_flag, is_refreshing) = match &self.state {
             GraphState::Ready {
@@ -550,7 +551,7 @@ impl Render for CommitGraph {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(sc_style::ICON_CLUSTER_GAP))
+            .gap(px(style.icon_cluster_gap))
             .child(
                 Button::new("graph-help")
                     .ghost()
@@ -558,7 +559,7 @@ impl Render for CommitGraph {
                     .icon(
                         Icon::default()
                             .path("icons/circle-help.svg")
-                            .size(px(sc_style::ICON)),
+                            .size(px(style.icon)),
                     )
                     .tooltip("What are graph refs? (coming soon)")
                     .disabled(true),
@@ -570,7 +571,7 @@ impl Render for CommitGraph {
                     .icon(
                         Icon::default()
                             .path("icons/refresh-cw.svg")
-                            .size(px(sc_style::ICON)),
+                            .size(px(style.icon)),
                     )
                     // `.loading(true)` swaps the icon for the upstream
                     // spinner and short-circuits clicks, so a second refresh
@@ -615,19 +616,19 @@ impl Render for CommitGraph {
             )
             .child(
                 Icon::new(chevron_icon)
-                    .size(px(sc_style::ICON))
+                    .size(px(style.icon))
                     .text_color(theme.fg_subtle),
             )
             .child("GRAPH")
             .child(
                 div()
-                    .text_size(px(sc_style::GRAPH_META_TEXT))
+                    .text_size(px(style.graph_meta_text))
                     .text_color(theme.fg_subtle)
                     .child(count_label),
             )
             .child(if can_load_more_flag {
                 div()
-                    .text_size(px(sc_style::GRAPH_META_TEXT))
+                    .text_size(px(style.graph_meta_text))
                     .text_color(theme.fg_subtle)
                     .child("+")
             } else {
@@ -638,8 +639,8 @@ impl Render for CommitGraph {
             .flex()
             .items_center()
             .h(px(density.h_tab))
-            .px(px(sc_style::PAD_H))
-            .text_size(px(sc_style::BODY_TEXT))
+            .px(px(style.pad_h))
+            .text_size(px(style.body_text))
             .font_weight(typography.w_semibold)
             .text_color(theme.fg_muted)
             .child(toggle_label)
@@ -761,8 +762,8 @@ impl Render for CommitGraph {
                         .id("graph-load-more")
                         .flex()
                         .justify_center()
-                        .py(px(sc_style::PAD_V_TIGHT))
-                        .text_size(px(sc_style::GRAPH_META_TEXT))
+                        .py(px(style.pad_v_tight))
+                        .text_size(px(style.graph_meta_text))
                         .text_color(theme.fg_subtle)
                         .when(!is_loading, |s| {
                             s.cursor_pointer().hover(|s| s.text_color(theme.fg_base))
@@ -920,15 +921,16 @@ fn placeholder_sized(
     height_px: f32,
     theme: Theme,
     density: Density,
-    _typography: &Typography,
+    typography: &Typography,
 ) -> impl IntoElement {
+    let style = ScmStyle::new(density, typography);
     div()
         .flex()
         .items_center()
         .justify_center()
         .p(px(density.pad_panel))
         .h(px(height_px))
-        .text_size(px(sc_style::BODY_TEXT))
+        .text_size(px(style.body_text))
         .text_color(theme.fg_subtle)
         .child(msg.to_string())
 }

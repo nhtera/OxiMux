@@ -16,6 +16,16 @@ pub struct Typography {
     pub t_label_xs: f32,
     pub t_label_caps: f32,
     pub t_body_sm: f32,
+    /// The step between `t_body_sm` and `t_body_md`. For surfaces that want
+    /// their body copy a notch above the cockpit default without ratcheting
+    /// the whole scale — the Source Control panel, where file names and commit
+    /// subjects scan from arm's length.
+    ///
+    /// Shares a value with `t_brand` and stays a separate field anyway: they
+    /// are different concepts that happen to agree today, and a surface asking
+    /// for "brand size" to get readable file rows would be a trap for whoever
+    /// changes the wordmark next.
+    pub t_body_base: f32,
     pub t_brand: f32,
     pub t_body_md: f32,
     pub t_body_lg: f32,
@@ -109,6 +119,7 @@ impl Typography {
             t_label_xs: 10.0,
             t_label_caps: 10.5,
             t_body_sm: 11.0,
+            t_body_base: 12.0,
             t_brand: 12.0,
             t_body_md: 13.0,
             t_body_lg: 14.0,
@@ -155,6 +166,7 @@ impl Typography {
             t_label_xs: self.t_label_xs * factor,
             t_label_caps: self.t_label_caps * factor,
             t_body_sm: self.t_body_sm * factor,
+            t_body_base: self.t_body_base * factor,
             t_brand: self.t_brand * factor,
             t_body_md: self.t_body_md * factor,
             t_body_lg: self.t_body_lg * factor,
@@ -231,6 +243,7 @@ mod tests {
             (base.t_label_xs, big.t_label_xs),
             (base.t_label_caps, big.t_label_caps),
             (base.t_body_sm, big.t_body_sm),
+            (base.t_body_base, big.t_body_base),
             (base.t_brand, big.t_brand),
             (base.t_body_md, big.t_body_md),
             (base.t_body_lg, big.t_body_lg),

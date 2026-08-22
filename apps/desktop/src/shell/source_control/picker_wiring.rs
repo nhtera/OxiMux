@@ -25,7 +25,6 @@ use crate::shell::source_control::SourceControlPanel;
 use crate::shell::source_control::branch_picker::{PickerMode, PickerOutcome};
 use crate::shell::source_control::commit_area::{CommitArea, CommitStatus};
 use crate::shell::source_control::settings_persistence::merge_base_ref_into_settings;
-use crate::shell::source_control::style as sc_style;
 
 impl SourceControlPanel {
     /// Open the branch picker in Switch mode anchored under the toolbar
@@ -37,6 +36,9 @@ impl SourceControlPanel {
         let repo = self.repo.clone();
         let current = self.git_state.as_ref().and_then(|s| s.branch.clone());
         let picker = self.branch_picker.clone();
+        // Snapshot before the spawn: the anchor is measured in the panel's
+        // current spacing, and the async body outlives this borrow.
+        let style = self.style();
         cx.spawn_in(window, async move |_panel_weak, cx| {
             let candidates: Vec<String> = match repo.list_branches().await {
                 Ok(bs) => {
@@ -57,8 +59,8 @@ impl SourceControlPanel {
                 p.open(
                     candidates,
                     current.clone(),
-                    sc_style::PAD_H,
-                    sc_style::TAB_H + sc_style::TOOLBAR_H,
+                    style.pad_h,
+                    style.tab_h + style.toolbar_h,
                     window,
                     cx,
                 );
@@ -143,6 +145,7 @@ impl SourceControlPanel {
         let repo = self.repo.clone();
         let picker = self.branch_picker.clone();
         let current_base = self.base_ref.clone();
+        let style = self.style();
         cx.spawn_in(window, async move |_panel_weak, cx| {
             let candidates: Vec<String> = match repo.list_remote_branches(false).await {
                 Ok(bs) => bs.into_iter().map(|b| b.name).collect(),
@@ -160,8 +163,8 @@ impl SourceControlPanel {
                 p.open(
                     candidates,
                     current_base,
-                    sc_style::PAD_H,
-                    sc_style::TAB_H + sc_style::TOOLBAR_H,
+                    style.pad_h,
+                    style.tab_h + style.toolbar_h,
                     window,
                     cx,
                 );
