@@ -171,6 +171,20 @@ editor by design.
 | `pad_tab` | 12 | Horizontal padding inside a tab chip — chunkier than a list row because the strip is the busiest hit area in the cockpit |
 | `gap_inline` | 6 | Spacing between inline siblings |
 
+**Picking a step when the shape falls between two.** Two rules settle most of
+the cases the table alone does not, both learned from converting surfaces that
+had drifted off the scale:
+
+- **A square icon button is a button, not a badge.** A 20px or 24px tap target
+  with a glyph in it takes `r_xs`, however small it is. `r_chip` is for things
+  that sit *inside* a line of text. Several such buttons had shipped at 5 —
+  off every step and a pixel from the one they wanted.
+- **A surface flush against another takes that surface’s radius,** not the one
+  its own size suggests. The slash palette, the mention overlay and the usage
+  hint all abut the composer input, so all four are `r_xl`. A corner that
+  disagrees with the surface it is joined to reads as a misalignment rather
+  than a choice; this outranks "a popup is a floating sheet, so `r_lg`".
+
 **Two user controls, and why they are two.** The table above is the `Cockpit`
 preset at 100%. Both of the knobs in Settings → Appearance resolve into it, and
 they are deliberately separate because they answer different questions:

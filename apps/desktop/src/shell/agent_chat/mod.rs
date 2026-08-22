@@ -28,6 +28,7 @@ mod screen_control_absent;
 #[cfg(not(any(target_os = "macos", windows)))]
 use screen_control_absent::{computer_use, screen_card, screen_consent};
 mod composer_history;
+mod composer_worktree;
 mod acp_terminal_host;
 mod context_meter;
 mod dictation_history;
@@ -4628,8 +4629,7 @@ impl AgentChatView {
                         if copied { "icons/check.svg" } else { "icons/copy.svg" },
                         if copied { "Copied" } else { "Copy" },
                         if copied { theme.status_ok } else { theme.fg_muted },
-                        theme,
-                        density,
+                        theme, density,
                         cx.listener(move |this, _e, _w, cx| {
                             this.copy_message(idx, copy_text.clone(), cx);
                         }),
@@ -4640,8 +4640,7 @@ impl AgentChatView {
                             "icons/pencil.svg",
                             "Edit message",
                             theme.fg_muted,
-                            theme,
-                            density,
+                            theme, density,
                             cx.listener(move |this, _e, window, cx| {
                                 this.enter_pending_edit(idx, window, cx);
                             }),
@@ -4653,8 +4652,7 @@ impl AgentChatView {
                             "icons/undo-2.svg",
                             "Rewind to here",
                             theme.fg_muted,
-                            theme,
-                            density,
+                            theme, density,
                             cx.listener(move |this, _e, _w, cx| {
                                 this.open_rewind_confirm(idx, cx)
                             }),
@@ -4671,8 +4669,7 @@ impl AgentChatView {
                             "icons/git-branch.svg",
                             "Fork from here",
                             theme.fg_muted,
-                            theme,
-                            density,
+                            theme, density,
                             cx.listener(move |this, _e, _w, cx| {
                                 this.request_fork(idx, cx)
                             }),
