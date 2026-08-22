@@ -1,0 +1,324 @@
+//! The two appearance choices a user actually gets: how much air the cockpit
+//! leaves around its text, and how big the whole thing is drawn.
+//!
+//! Both resolve into [`Density`](crate::Density) and
+//! [`Typography`](crate::Typography) — they do not add a third token set. A
+//! render path never asks "what did the user pick", it reads the tokens it
+//! already read, and they come out different.
+//!
+//! # Why these are two controls and not one
+//!
+//! They are easy to confuse and the difference is the whole point:
+//!
+//! * [`UiScale`] multiplies *everything* — type and chrome together. It is the
+//!   answer to "this display is too dense for my eyes", and it changes how much
+//!   fits on screen only as a side effect of making the text bigger.
+//! * [`DensityPreset`] leaves the type exactly where it is and changes only the
+//!   space around it. It is the answer to "I can read this fine, I just want
+//!   more rows" — or the opposite.
+//!
+//! Collapsing them into one slider would give the settings pane two names for
+//! the same knob, which is worse than having no knob.
+//!
+//! # The one token neither of them moves
+//!
+//! `h_top_bar` is pinned. Its height is chosen so the chrome row's vertical
+//! centre lands on the macOS traffic-light glyphs, whose position is fixed at
+//! window creation and cannot follow a live preference. Scaling it would slide
+//! the row off the buttons it is aligned to. See `Density::cockpit`.
+
+use serde::{Deserialize, Serialize};
+
+/// How much air the cockpit leaves around text of a fixed size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DensityPreset {
+    /// The original — tight, maximum rows on screen.
+    #[default]
+    Cockpit,
+    /// Roomier: the same type with more space around it. Every value is
+    /// `1.25×` the cockpit one, rounded to an even pixel — see
+    /// `Density::comfortable`.
+    Comfortable,
+}
+
+impl DensityPreset {
+    /// Every preset, in the order a picker should offer them (tightest first).
+    pub const ALL: [Self; 2] = [Self::Cockpit, Self::Comfortable];
+
+    /// Name for a settings control.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cockpit => "Cockpit",
+            Self::Comfortable => "Comfortable",
+        }
+    }
+
+    /// One line saying what picking it does, for the row under the control.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Cockpit => "Tight rows. Fits the most on screen.",
+            Self::Comfortable => "The same text with more room around it.",
+        }
+    }
+}
+
+/// Smallest and largest whole-UI zoom, in percent.
+///
+/// The floor is 80 rather than something smaller because `t_sub_label` is
+/// already 9.5px and the cockpit's hairlines stop separating below that. The
+/// ceiling is 160 because the left rail's 500px maximum stops being enough
+/// room for a workspace card past it.
+pub const MIN_SCALE_PERCENT: u16 = 80;
+/// See [`MIN_SCALE_PERCENT`].
+pub const MAX_SCALE_PERCENT: u16 = 160;
+/// One press of zoom in / zoom out.
+pub const SCALE_STEP_PERCENT: u16 = 10;
+
+/// Whole-UI zoom, as a percentage of the size the cockpit was designed at.
+///
+/// Held as a percent rather than a float because it is a user-facing number:
+/// it is written into a settings file a person may edit, and shown in the UI
+/// as `110%`. Values are clamped and snapped to [`SCALE_STEP_PERCENT`] on the
+/// way in, so a hand-edited `107` behaves like a real step rather than
+/// stranding zoom-out one press away from the grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UiScale(u16);
+
+impl Default for UiScale {
+    fn default() -> Self {
+        Self(100)
+    }
+}
+
+impl UiScale {
+    /// Clamp to the supported range and snap to the nearest step.
+    pub fn from_percent(percent: u16) -> Self {
+        let clamped = percent.clamp(MIN_SCALE_PERCENT, MAX_SCALE_PERCENT);
+        let step = SCALE_STEP_PERCENT;
+        // Nearest multiple of `step`, half away from zero. The clamp above
+        // keeps the result inside the range because both bounds are multiples.
+        let snapped = ((clamped + step / 2) / step) * step;
+        Self(snapped)
+    }
+
+    /// The percentage, for display and for the settings file.
+    pub fn percent(self) -> u16 {
+        self.0
+    }
+
+    /// The multiplier the token scales apply.
+    pub fn factor(self) -> f32 {
+        f32::from(self.0) / 100.0
+    }
+
+    /// True at the designed size, where scaling is a no-op.
+    pub fn is_default(self) -> bool {
+        self == Self::default()
+    }
+
+    /// One step larger, stopping at [`MAX_SCALE_PERCENT`].
+    pub fn zoomed_in(self) -> Self {
+        Self::from_percent(self.0.saturating_add(SCALE_STEP_PERCENT))
+    }
+
+    /// One step smaller, stopping at [`MIN_SCALE_PERCENT`].
+    pub fn zoomed_out(self) -> Self {
+        Self::from_percent(self.0.saturating_sub(SCALE_STEP_PERCENT))
+    }
+
+    /// `"100%"` — what a status readout or a menu item shows.
+    pub fn label(self) -> String {
+        format!("{}%", self.0)
+    }
+}
+
+/// The user's appearance choices, together.
+///
+/// Small and `Copy` so a resolved [`Density`](crate::Density) can carry the
+/// choices it was built from — that is what lets a view holding a stale token
+/// snapshot notice, in one comparison, that it needs a fresh one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Appearance {
+    /// How much air. See [`DensityPreset`].
+    pub density: DensityPreset,
+    /// How big. See [`UiScale`].
+    pub scale: UiScale,
+}
+
+impl Appearance {
+    /// Name of the settings file in the app data dir.
+    pub const FILE_NAME: &'static str = "appearance.toml";
+
+    /// Parse a settings file. Unknown keys are ignored for forward-compat and
+    /// missing ones keep their defaults, matching every other settings file.
+    pub fn from_toml_str(s: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(s)
+    }
+
+    /// Serialize to a TOML document, used to seed a default file.
+    pub fn to_toml_string(&self) -> String {
+        toml::to_string_pretty(self).unwrap_or_default()
+    }
+
+    /// Re-clamp anything a hand edit could have put out of range.
+    pub fn sanitized(mut self) -> Self {
+        self.scale = UiScale::from_percent(self.scale.percent());
+        self
+    }
+}
+
+#[cfg(feature = "gpui")]
+impl gpui::Global for Appearance {}
+
+/// The appearance in force, or the shipped default if none was installed
+/// (headless tests, and the window or two before startup finishes).
+#[cfg(feature = "gpui")]
+pub fn active(cx: &gpui::App) -> Appearance {
+    cx.try_global::<Appearance>().copied().unwrap_or_default()
+}
+
+/// Bring a view's cached tokens up to date with the current appearance.
+///
+/// # Why views cache tokens at all, and why this exists
+///
+/// Tokens are threaded down the view tree as plain values: a view is handed a
+/// `Density` and a `Typography` when it is built and keeps them. That is a
+/// deliberate choice — it keeps every render path total and testable, with no
+/// ambient state to stub — but it means a live preference change leaves ~50
+/// snapshots stale, scattered across views that nothing can enumerate.
+///
+/// Pushing new values down to all of them would need a setter on each view and
+/// a fan-out that has to be extended by hand every time a view is added; the
+/// first one anybody forgets renders at the old size forever, and nothing
+/// fails. So the refresh is a *pull* instead, from the one place every view
+/// already has: the top of its `render`. Call it there and a view cannot be
+/// stale for longer than a frame.
+///
+/// The [`Density::appearance`](crate::Density::appearance) stamp makes this
+/// nearly free — the common case is one `Appearance` comparison per view per
+/// frame, and nothing is rebuilt or allocated until the user actually changes
+/// something.
+#[cfg(feature = "gpui")]
+pub fn sync(density: &mut crate::Density, typography: &mut crate::Typography, cx: &gpui::App) {
+    let current = active(cx);
+    if density.appearance == current {
+        return;
+    }
+    *density = crate::Density::for_appearance(current);
+    *typography = crate::Typography::for_appearance(current);
+}
+
+/// [`sync`] for a view that keeps a type scale but no density, and so has no
+/// stamp to compare. One size stands in for the whole scale, which is sound
+/// because the zoom moves all of them by the same factor.
+#[cfg(feature = "gpui")]
+pub fn sync_typography(typography: &mut crate::Typography, cx: &gpui::App) {
+    let current = active(cx);
+    let want = crate::Typography::cockpit().t_body_sm * current.scale.factor();
+    if (typography.t_body_sm - want).abs() < f32::EPSILON {
+        return;
+    }
+    *typography = crate::Typography::for_appearance(current);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_appearance_is_the_shipped_cockpit() {
+        // Every existing screenshot, spacing decision and test in the tree was
+        // taken at this pair. A change here is a change to what the app looks
+        // like on first launch, which is not something to do by accident.
+        let a = Appearance::default();
+        assert_eq!(a.density, DensityPreset::Cockpit);
+        assert_eq!(a.scale.percent(), 100);
+        assert!(a.scale.is_default());
+        assert_eq!(a.scale.factor(), 1.0);
+    }
+
+    #[test]
+    fn zoom_stops_at_the_ends_rather_than_wrapping() {
+        let mut s = UiScale::default();
+        for _ in 0..20 {
+            s = s.zoomed_in();
+        }
+        assert_eq!(s.percent(), MAX_SCALE_PERCENT);
+        for _ in 0..40 {
+            s = s.zoomed_out();
+        }
+        assert_eq!(s.percent(), MIN_SCALE_PERCENT);
+        // And the floor is a real floor, not a saturating-subtract artefact:
+        // one more press must not underflow into a huge percentage.
+        assert_eq!(s.zoomed_out().percent(), MIN_SCALE_PERCENT);
+    }
+
+    #[test]
+    fn an_off_grid_percentage_snaps_onto_the_step() {
+        // The trap this closes: a file saying 107 would otherwise leave zoom-out
+        // landing on 97, and the user never gets back to a round number.
+        assert_eq!(UiScale::from_percent(107).percent(), 110);
+        assert_eq!(UiScale::from_percent(104).percent(), 100);
+        assert_eq!(UiScale::from_percent(105).percent(), 110);
+    }
+
+    #[test]
+    fn an_out_of_range_percentage_is_clamped_both_ways() {
+        assert_eq!(UiScale::from_percent(1).percent(), MIN_SCALE_PERCENT);
+        assert_eq!(UiScale::from_percent(0).percent(), MIN_SCALE_PERCENT);
+        assert_eq!(UiScale::from_percent(u16::MAX).percent(), MAX_SCALE_PERCENT);
+    }
+
+    #[test]
+    fn a_settings_file_round_trips() {
+        let original = Appearance {
+            density: DensityPreset::Comfortable,
+            scale: UiScale::from_percent(130),
+        };
+        let parsed =
+            Appearance::from_toml_str(&original.to_toml_string()).expect("round-trip parse");
+        assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn a_partial_file_keeps_the_other_default() {
+        let only_density = Appearance::from_toml_str("density = \"comfortable\"\n").expect("parse");
+        assert_eq!(only_density.density, DensityPreset::Comfortable);
+        assert_eq!(only_density.scale, UiScale::default());
+
+        let only_scale = Appearance::from_toml_str("scale = 120\n").expect("parse");
+        assert_eq!(only_scale.density, DensityPreset::Cockpit);
+        assert_eq!(only_scale.scale.percent(), 120);
+    }
+
+    #[test]
+    fn a_hand_edited_file_is_sanitized_rather_than_trusted() {
+        // Parsing does not clamp — serde builds the struct straight from the
+        // number — so the loader has to. Without this, `scale = 900` renders a
+        // cockpit whose top bar is off the bottom of the screen.
+        let wild = Appearance::from_toml_str("scale = 900\n").expect("parse");
+        assert_eq!(wild.sanitized().scale.percent(), MAX_SCALE_PERCENT);
+    }
+
+    #[test]
+    fn unknown_keys_are_ignored() {
+        let parsed = Appearance::from_toml_str("scale = 110\nfuture_key = true\n")
+            .expect("unknown keys tolerated");
+        assert_eq!(parsed.scale.percent(), 110);
+    }
+
+    #[test]
+    fn every_preset_is_offered_and_named() {
+        // `ALL` drives the settings picker; a preset missing from it is a
+        // preset the user cannot choose.
+        assert_eq!(DensityPreset::ALL.len(), 2);
+        for preset in DensityPreset::ALL {
+            assert!(!preset.label().is_empty());
+            assert!(!preset.description().is_empty());
+        }
+        assert_eq!(DensityPreset::ALL[0], DensityPreset::default());
+    }
+}

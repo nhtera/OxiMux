@@ -191,6 +191,7 @@ impl ToastLayer {
 
 impl Render for ToastLayer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
         // Nothing queued → render an inert empty node (no overlay, no hit area).
         if self.toasts.is_empty() {
             return div();

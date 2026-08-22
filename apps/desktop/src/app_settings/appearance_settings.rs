@@ -1,0 +1,295 @@
+//! App-side loader and writer for the [`Appearance`] global — the density
+//! preset and the whole-UI zoom.
+//!
+//! Startup reads `appearance.toml` from the app data dir (seeding a default so
+//! the file is there to look at), sanitizes it, and installs it as a GPUI
+//! global. Every view then resolves its own tokens from that global on render
+//! — see [`oximux_settings::appearance::sync`] for why the refresh is a pull
+//! rather than a push.
+//!
+//! # No file watch, unlike `terminal.toml`
+//!
+//! The terminal settings are file-only, so a watcher is the *only* way an edit
+//! can reach the app. Appearance has controls in the Settings modal, which
+//! makes the app the writer — and a debounced watch between a click and its
+//! effect would put a quarter-second of lag on a control whose entire job is
+//! immediate visual feedback. So [`set`] writes the global first and the file
+//! second. The cost is that hand-editing `appearance.toml` needs a relaunch,
+//! which is the right trade for the surface that has a UI.
+
+use std::path::PathBuf;
+
+use gpui::App;
+use oximux_settings::Appearance;
+
+fn settings_path() -> Option<PathBuf> {
+    crate::app_paths::data_dir().map(|d| d.join(Appearance::FILE_NAME))
+}
+
+/// Read + sanitize from disk, falling back to the shipped default on a missing
+/// file or a parse error (logged, so a typo is visible without a crash).
+fn load() -> Appearance {
+    let Some(path) = settings_path() else {
+        return Appearance::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match Appearance::from_toml_str(&text) {
+            Ok(parsed) => {
+                let clean = parsed.sanitized();
+                if clean != parsed {
+                    // Say so rather than clamping in silence: the number on
+                    // disk and the number in use would otherwise disagree with
+                    // no way to tell from inside the app.
+                    tracing::warn!(
+                        ?path,
+                        "appearance.toml was out of range; clamped to the supported zoom"
+                    );
+                }
+                clean
+            }
+            Err(err) => {
+                tracing::warn!(?path, %err, "appearance.toml parse failed; using defaults");
+                Appearance::default()
+            }
+        },
+        // Absent is the common case (fresh install) — silent default.
+        Err(_) => Appearance::default(),
+    }
+}
+
+/// Write a default `appearance.toml` if none exists, so the keys are visible
+/// to anyone who goes looking. Best-effort; a failure only costs the template.
+fn seed_default_if_absent() {
+    let Some(path) = settings_path() else { return };
+    if path.exists() {
+        return;
+    }
+    if let Some(dir) = path.parent()
+        && std::fs::create_dir_all(dir).is_err()
+    {
+        return;
+    }
+    if let Err(err) = std::fs::write(&path, Appearance::default().to_toml_string()) {
+        tracing::warn!(?path, %err, "could not seed default appearance.toml");
+    }
+}
+
+/// Load `appearance.toml` and install the global. Call once from the app's
+/// `run` closure, before any window opens — a window that opens first would
+/// paint one frame at the default size before correcting itself.
+pub fn install(cx: &mut App) {
+    seed_default_if_absent();
+    let loaded = load();
+    if loaded != Appearance::default() {
+        tracing::info!(
+            density = ?loaded.density,
+            scale = loaded.scale.percent(),
+            "appearance loaded"
+        );
+    }
+    cx.set_global(loaded);
+}
+
+/// The appearance in force. Falls back to the shipped default when the global
+/// was never installed, so headless tests and early startup stay total.
+pub fn active(cx: &App) -> Appearance {
+    oximux_settings::appearance::active(cx)
+}
+
+/// Adopt `next`, repaint everything, and persist.
+///
+/// Order matters. The global and the repaint come first so the control the
+/// user just clicked answers within the frame; the write follows, and a failed
+/// write costs the setting at next launch rather than the response now.
+///
+/// [`gpui::App::refresh_windows`] is what makes one assignment reach ~50 views:
+/// it marks every window dirty, each view re-renders, and each pulls its fresh
+/// tokens on the way through.
+pub fn set(cx: &mut App, next: Appearance) {
+    let next = next.sanitized();
+    if active(cx) == next {
+        return;
+    }
+    cx.set_global(next);
+    bridge_component_radii(cx, next);
+    cx.refresh_windows();
+    if let Err(err) = save(&next) {
+        tracing::warn!(%err, "could not persist appearance.toml");
+    }
+}
+
+/// The four transitions the controls make, as pure functions.
+///
+/// Split out from the `cx`-taking wrappers below so the rule that binds them —
+/// each control moves its own field and leaves the other alone — can be tested
+/// without a global or a settings file. It is an easy rule to break by
+/// building a fresh `Appearance` instead of updating the current one, and the
+/// break is invisible until someone who set a preset presses zoom-reset and
+/// watches their preset go with it.
+mod step {
+    use oximux_settings::{Appearance, DensityPreset, UiScale};
+
+    pub(super) fn zoom_in(current: Appearance) -> Appearance {
+        Appearance {
+            scale: current.scale.zoomed_in(),
+            ..current
+        }
+    }
+
+    pub(super) fn zoom_out(current: Appearance) -> Appearance {
+        Appearance {
+            scale: current.scale.zoomed_out(),
+            ..current
+        }
+    }
+
+    pub(super) fn zoom_reset(current: Appearance) -> Appearance {
+        Appearance {
+            scale: UiScale::default(),
+            ..current
+        }
+    }
+
+    pub(super) fn density(current: Appearance, density: DensityPreset) -> Appearance {
+        Appearance { density, ..current }
+    }
+}
+
+/// One step larger, up to the supported maximum.
+pub fn zoom_in(cx: &mut App) {
+    let next = step::zoom_in(active(cx));
+    set(cx, next);
+}
+
+/// One step smaller, down to the supported minimum.
+pub fn zoom_out(cx: &mut App) {
+    let next = step::zoom_out(active(cx));
+    set(cx, next);
+}
+
+/// Back to 100%, leaving the density preset alone.
+pub fn zoom_reset(cx: &mut App) {
+    let next = step::zoom_reset(active(cx));
+    set(cx, next);
+}
+
+/// Switch density preset, leaving the zoom alone.
+pub fn set_density(cx: &mut App, density: oximux_settings::DensityPreset) {
+    let next = step::density(active(cx), density);
+    set(cx, next);
+}
+
+/// Re-copy the corner radii into gpui-component's own theme.
+///
+/// The library paints its `Input`s and `Button`s from that theme and cannot
+/// see ours, so the bridge `main` sets up at startup has to be redone on every
+/// change — otherwise a zoom moves the chrome around a text field while the
+/// field's own corner stays where it was. A no-op when the library's theme was
+/// never installed, which is the case in headless tests.
+fn bridge_component_radii(cx: &mut App, appearance: Appearance) {
+    if !cx.has_global::<gpui_component::Theme>() {
+        return;
+    }
+    let density = oximux_settings::Density::for_appearance(appearance);
+    let component_theme = gpui_component::Theme::global_mut(cx);
+    component_theme.radius = gpui::px(density.r_xs);
+    component_theme.radius_lg = gpui::px(density.r_card);
+}
+
+/// Persist to `appearance.toml`. Public for tests; production goes through
+/// [`set`], which also updates the global that everything reads.
+pub fn save(appearance: &Appearance) -> std::io::Result<()> {
+    let path =
+        settings_path().ok_or_else(|| std::io::Error::other("no app data dir for appearance"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, appearance.to_toml_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use oximux_settings::{Density, DensityPreset, Typography, UiScale};
+
+    /// A preset choice must survive a zoom, and a zoom must survive a preset
+    /// choice. They are independent controls; a user who set Comfortable and
+    /// then pressed zoom-reset should still be on Comfortable.
+    #[test]
+    fn each_control_moves_its_own_field_and_leaves_the_other() {
+        let start = Appearance {
+            density: DensityPreset::Comfortable,
+            scale: UiScale::from_percent(130),
+        };
+
+        let zoomed = step::zoom_in(start);
+        assert_eq!(zoomed.density, DensityPreset::Comfortable);
+        assert_eq!(zoomed.scale.percent(), 140);
+
+        let out = step::zoom_out(start);
+        assert_eq!(out.density, DensityPreset::Comfortable);
+        assert_eq!(out.scale.percent(), 120);
+
+        let reset = step::zoom_reset(start);
+        assert_eq!(reset.density, DensityPreset::Comfortable, "reset kept the preset");
+        assert!(reset.scale.is_default());
+
+        let tightened = step::density(start, DensityPreset::Cockpit);
+        assert_eq!(tightened.density, DensityPreset::Cockpit);
+        assert_eq!(tightened.scale.percent(), 130, "preset kept the zoom");
+    }
+
+    /// The pull: a view holding tokens from before a change picks up the new
+    /// ones on its next render. This is what stands in for the push we do not
+    /// do — see `oximux_settings::appearance::sync`.
+    #[gpui::test]
+    fn a_stale_snapshot_is_refreshed_by_the_pull(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut density = Density::cockpit();
+            let mut typography = Typography::cockpit();
+
+            cx.set_global(Appearance {
+                density: DensityPreset::Comfortable,
+                scale: UiScale::from_percent(120),
+            });
+            oximux_settings::appearance::sync(&mut density, &mut typography, cx);
+
+            assert_eq!(density.h_row, Density::comfortable().h_row * 1.2);
+            assert_eq!(typography.t_body_sm, Typography::cockpit().t_body_sm * 1.2);
+            // Pinned against both controls — the macOS traffic lights cannot move.
+            assert_eq!(density.h_top_bar, Density::cockpit().h_top_bar);
+        });
+    }
+
+    /// The common case has to cost nothing: with nothing changed, the pull
+    /// must leave the snapshot exactly as it found it rather than rebuilding
+    /// a `Typography` (and its fallback list) on every view, every frame.
+    #[gpui::test]
+    fn the_pull_is_inert_when_nothing_changed(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut density = Density::for_appearance(Appearance::default());
+            let mut typography = Typography::cockpit();
+            let before = typography.mono_fallbacks.as_ptr();
+
+            oximux_settings::appearance::sync(&mut density, &mut typography, cx);
+
+            assert_eq!(density.h_row, Density::cockpit().h_row);
+            assert_eq!(
+                typography.mono_fallbacks.as_ptr(),
+                before,
+                "an unchanged appearance must not reallocate the fallback list"
+            );
+        });
+    }
+
+    /// With no global installed at all — headless tests, and the moments
+    /// before startup finishes — everything must still resolve to the shipped
+    /// default rather than panicking.
+    #[gpui::test]
+    fn an_uninstalled_global_reads_as_the_default(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            assert_eq!(active(cx), Appearance::default());
+        });
+    }
+}

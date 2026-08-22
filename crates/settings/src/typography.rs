@@ -134,6 +134,34 @@ impl Typography {
         }
     }
 
+    /// The type scale a given set of user choices resolves to.
+    ///
+    /// Only the zoom reaches here. A density preset deliberately does not
+    /// touch type — it changes the space around the text, not the text — which
+    /// is what keeps the two controls from being two names for one knob. See
+    /// [`crate::appearance`].
+    pub fn for_appearance(appearance: crate::appearance::Appearance) -> Self {
+        Self::cockpit().scaled(appearance.scale.factor())
+    }
+
+    /// Every size multiplied by `factor`. Families, weights and fallbacks are
+    /// untouched — zoom changes how big the type is, not which type it is.
+    pub fn scaled(&self, factor: f32) -> Self {
+        if factor == 1.0 {
+            return self.clone();
+        }
+        Self {
+            t_sub_label: self.t_sub_label * factor,
+            t_label_xs: self.t_label_xs * factor,
+            t_label_caps: self.t_label_caps * factor,
+            t_body_sm: self.t_body_sm * factor,
+            t_brand: self.t_brand * factor,
+            t_body_md: self.t_body_md * factor,
+            t_body_lg: self.t_body_lg * factor,
+            ..self.clone()
+        }
+    }
+
     /// Build a GPUI `Font` for terminal/editor surfaces with the configured
     /// fallback chain. Call sites use `.font(typography.mono_font())` rather
     /// than `.font_family(...)` so glyphs the primary lacks cascade through
@@ -174,5 +202,70 @@ impl Typography {
 impl Default for Typography {
     fn default() -> Self {
         Self::cockpit()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::appearance::{Appearance, DensityPreset, UiScale};
+
+    #[test]
+    fn the_default_appearance_leaves_the_type_scale_alone() {
+        let (base, resolved) = (Typography::cockpit(), Typography::for_appearance(
+            Appearance::default(),
+        ));
+        assert_eq!(resolved.t_body_sm, base.t_body_sm);
+        assert_eq!(resolved.t_body_lg, base.t_body_lg);
+        assert_eq!(resolved.t_sub_label, base.t_sub_label);
+    }
+
+    #[test]
+    fn zoom_moves_every_size_by_the_same_factor() {
+        // Proportional, not per-field: a scale that drifted between sizes
+        // would break the hierarchy the scale exists to encode.
+        let base = Typography::cockpit();
+        let big = base.scaled(1.5);
+        for (small, large) in [
+            (base.t_sub_label, big.t_sub_label),
+            (base.t_label_xs, big.t_label_xs),
+            (base.t_label_caps, big.t_label_caps),
+            (base.t_body_sm, big.t_body_sm),
+            (base.t_brand, big.t_brand),
+            (base.t_body_md, big.t_body_md),
+            (base.t_body_lg, big.t_body_lg),
+        ] {
+            assert!((large - small * 1.5).abs() < f32::EPSILON, "{small} → {large}");
+        }
+    }
+
+    #[test]
+    fn the_density_preset_does_not_touch_type() {
+        // The two controls have to stay distinguishable: if picking
+        // Comfortable also grew the text, the settings pane would be offering
+        // the zoom twice under different names.
+        let roomy = Typography::for_appearance(Appearance {
+            density: DensityPreset::Comfortable,
+            scale: UiScale::default(),
+        });
+        assert_eq!(roomy.t_body_sm, Typography::cockpit().t_body_sm);
+    }
+
+    #[test]
+    fn zoom_changes_the_size_and_not_the_typeface() {
+        let base = Typography::cockpit();
+        let big = base.scaled(1.4);
+        assert_eq!(big.family_mono, base.family_mono);
+        assert_eq!(big.family_ui, base.family_ui);
+        assert_eq!(big.mono_fallbacks, base.mono_fallbacks);
+        assert_eq!(big.w_semibold, base.w_semibold);
+    }
+
+    #[test]
+    fn scaling_by_one_changes_nothing() {
+        let base = Typography::cockpit();
+        let same = base.scaled(1.0);
+        assert_eq!(same.t_body_sm, base.t_body_sm);
+        assert_eq!(same.t_body_lg, base.t_body_lg);
     }
 }

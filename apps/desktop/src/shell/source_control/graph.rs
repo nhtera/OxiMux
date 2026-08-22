@@ -517,6 +517,7 @@ impl Focusable for CommitGraph {
 
 impl Render for CommitGraph {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
         // A drag-resize is over once no drag is active: releasing the mouse
         // produces no further drag-move ticks, so the flag (and the latched
         // anchor) are cleared here on the next render instead.

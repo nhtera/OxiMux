@@ -1193,6 +1193,7 @@ impl SourceControlPanel {
 
 impl Render for SourceControlPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
         let theme = self.theme;
         let action = self.resolve_primary(cx);
         // Cache for the status bar — kept at most one frame behind render.

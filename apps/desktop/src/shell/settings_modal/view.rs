@@ -78,7 +78,7 @@ impl SettingsModal {
                 ),
                 (
                     SettingsPane::Appearance.label(),
-                    pane_about::appearance_entries(theme, typography),
+                    pane_about::appearance_entries(theme, density, typography, cx),
                 ),
                 (
                     SettingsPane::About.label(),
@@ -113,7 +113,9 @@ impl SettingsModal {
             SettingsPane::Keybindings => {
                 pane_keybindings::render(self, theme, density, typography, cx)
             }
-            SettingsPane::Appearance => pane_about::render_appearance(&query, theme, typography),
+            SettingsPane::Appearance => {
+                pane_about::render_appearance(theme, density, typography, cx)
+            }
             SettingsPane::About => {
                 pane_about::render_about(&query, theme, density, typography, cx)
             }
@@ -123,6 +125,7 @@ impl SettingsModal {
 
 impl Render for SettingsModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
         if !self.open {
             return div().into_any_element();
         }

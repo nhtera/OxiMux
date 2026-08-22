@@ -274,6 +274,7 @@ impl Focusable for StashPanel {
 
 impl Render for StashPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
         let count = match &self.state {
             StashListState::Ready(entries) => entries.len(),
             _ => 0,

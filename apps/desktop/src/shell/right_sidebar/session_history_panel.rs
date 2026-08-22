@@ -483,6 +483,7 @@ impl Focusable for SessionHistoryPanel {
 
 impl Render for SessionHistoryPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync_typography(&mut self.typography, cx);
         let t = self.theme;
         let typo = self.typography.clone();
         let order = self.filtered();

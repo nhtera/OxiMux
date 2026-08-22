@@ -3269,6 +3269,7 @@ impl ComposerView {
 
 impl Render for ComposerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
         // Flush any finished dictation transcript (insert at cursor) and pending
         // toast here — this is the first place with a `Window` after an event.
         self.apply_pending_dictation(window, cx);
@@ -3288,8 +3289,7 @@ impl Render for ComposerView {
         };
         let desired_placeholder = format!("Message {desired_label}…  (↵ send · ⇧↵ newline)");
         if self.applied_placeholder.as_deref() != Some(desired_placeholder.as_str()) {
-            self.input
-                .update(cx, |s, cx| s.set_placeholder(desired_placeholder.clone(), window, cx));
+            self.input.update(cx, |s, cx| s.set_placeholder(desired_placeholder.clone(), window, cx));
             self.applied_placeholder = Some(desired_placeholder);
         }
 

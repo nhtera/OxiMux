@@ -13,6 +13,7 @@ fn import_preset_slug(id: &str) -> &'static str {
 
 impl Render for WorkspaceRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
         // Push sidebar data down before LeftRail::render runs in the tree.
         self.refresh_left_rail(cx);
 
@@ -418,6 +419,18 @@ impl Render for WorkspaceRoot {
             .on_action(cx.listener(|this, _: &ToggleLeftSidebar, _window, cx| {
                 this.left_rail_open = !this.left_rail_open;
                 cx.notify();
+            }))
+            // Interface zoom. No `cx.notify()` on any of the three: the setter
+            // refreshes every window, which is the point — one view notifying
+            // itself would leave the other fifty at the old size.
+            .on_action(cx.listener(|_this, _: &UiZoomIn, _window, cx| {
+                crate::appearance_settings::zoom_in(cx);
+            }))
+            .on_action(cx.listener(|_this, _: &UiZoomOut, _window, cx| {
+                crate::appearance_settings::zoom_out(cx);
+            }))
+            .on_action(cx.listener(|_this, _: &UiZoomReset, _window, cx| {
+                crate::appearance_settings::zoom_reset(cx);
             }))
             // ⌘E dictates into whatever text pane is focused. A focused chat
             // composer consumes this first (its own handler stops propagation);

@@ -5051,6 +5051,7 @@ impl Focusable for AgentChatView {
 
 impl Render for AgentChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
         // Once per frame, before anything decodes: attachment images are cached
         // by the render path, which has no `Window` to release them with, so the
         // cache is allowed over budget until here. Overshooting by one frame of

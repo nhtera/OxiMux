@@ -153,6 +153,7 @@ fn section_label(text: &'static str, theme: Theme, typography: &Typography) -> i
 
 impl Render for WorkspaceOptionsMenu {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
         let Some((state, x, y)) = self.open_for else {
             return div().into_any_element();
         };

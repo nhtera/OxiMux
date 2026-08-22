@@ -300,6 +300,10 @@ fn main() {
         // than the hairline dividers so the type-here affordance reads),
         // and `focus_ring` is the dedicated focus accent — same tokens,
         // single source of truth.
+        // The user's density + zoom, before any window opens: the bridge below
+        // copies radii into gpui-component's own theme, and a window that
+        // opened first would paint one frame at the shipped default.
+        oximux_app::appearance_settings::install(cx);
         {
             let palette = oximux_settings::Theme::charcoal();
             // Read the OS auto-hide preference before taking the mutable global
@@ -308,7 +312,9 @@ fn main() {
             // accessibility choice some low-vision users rely on) reports
             // `false` here.
             let auto_hide_scrollbars = cx.should_auto_hide_scrollbars();
-            let component_density = oximux_settings::Density::cockpit();
+            let component_density = oximux_settings::Density::for_appearance(
+                oximux_app::appearance_settings::active(cx),
+            );
             let component_theme = gpui_component::Theme::global_mut(cx);
             component_theme.colors.input = palette.border_input;
             component_theme.colors.ring = palette.focus_ring;
@@ -385,7 +391,8 @@ fn main() {
         // global before any window opens, so the first animated surface reads
         // the right durations.
         oximux_app::motion_settings::install(cx);
-        // Process-wide last-known-`GitState` cache. Registered before any
+        // Process-wide last-known-`GitState` cache. (Appearance is installed
+        // further up, before the gpui-component bridge that reads it.) Registered before any
         // window opens so the first SCM panel can seed from it (no-op on a
         // cold start; populated as each project's poller produces a sample,
         // then read back when the user switches between already-visited

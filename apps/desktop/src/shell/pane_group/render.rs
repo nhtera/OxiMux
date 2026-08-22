@@ -43,6 +43,7 @@ const ELLIPSIS_BUTTON_WIDTH_PX: f32 = 28.0;
 
 impl Render for PaneGroup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
         // Drag-cancel cleanup: chips' `on_drag_move` fires only while a
         // drag is live, so a press-Escape (or off-window release) leaves
         // the last hover state painted. Mirrors the body-level guard in

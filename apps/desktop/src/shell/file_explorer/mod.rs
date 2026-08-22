@@ -441,6 +441,7 @@ impl FileExplorer {
 
 impl Render for FileExplorer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
         let theme = self.theme;
         let count = self.rows.len();
         let header = render_header(self, cx);

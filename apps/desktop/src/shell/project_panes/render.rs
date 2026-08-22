@@ -168,6 +168,7 @@ impl ProjectPanes {
 
 impl Render for ProjectPanes {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
         // Drop any group whose tabs got closed down to zero. Refusing
         // the last group keeps the workspace anchored.
         self.purge_empty_groups(window, cx);

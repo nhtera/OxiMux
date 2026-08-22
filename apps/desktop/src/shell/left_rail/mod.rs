@@ -273,12 +273,14 @@ pub struct LeftRail {
 }
 
 impl LeftRail {
-    /// Default-construct theme/density/typography. WorkspaceRoot uses the
-    /// same constants in its own `new`, so the rail and root always agree.
-    pub fn new(weak_root: WeakEntity<WorkspaceRoot>, _cx: &mut Context<Self>) -> Self {
-        let density = Density::cockpit();
+    /// Resolve theme/density/typography from the current appearance.
+    /// WorkspaceRoot resolves the same way in its own `new`, so the rail and
+    /// root always agree.
+    pub fn new(weak_root: WeakEntity<WorkspaceRoot>, cx: &mut Context<Self>) -> Self {
+        let appearance = oximux_settings::appearance::active(cx);
+        let density = Density::for_appearance(appearance);
         let theme = Theme::charcoal();
-        let typography = Typography::cockpit();
+        let typography = Typography::for_appearance(appearance);
         Self {
             active_nav: None,
             weak_root,
@@ -1007,6 +1009,7 @@ fn agents_display_equal(a: &WorkspaceAgentList, b: &WorkspaceAgentList) -> bool 
 
 impl Render for LeftRail {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
         // A resize drag is over once no drag is active — releasing the
         // button produces no further drag-move ticks, so the flag is
         // cleared here on the next render instead.

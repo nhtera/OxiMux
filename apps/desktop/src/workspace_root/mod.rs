@@ -90,7 +90,8 @@ use crate::actions::{
     SelectSearchTab,
     SelectSourceControlTab, SendTextToActiveAgent, SplitDown, SplitGroupAt, SplitHorizontal,
     SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleChatTerminalView, ToggleDictation,
-    ToggleFloatingTerminal, ToggleLeftSidebar, ToggleRightSidebar,
+    ToggleFloatingTerminal, ToggleLeftSidebar, ToggleRightSidebar, UiZoomIn, UiZoomOut,
+    UiZoomReset,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
@@ -565,8 +566,12 @@ impl WorkspaceRoot {
         cx: &mut Context<Self>,
     ) -> Self {
         let theme = Theme::charcoal();
-        let density = Density::cockpit();
-        let typography = Typography::cockpit();
+        // Seeded from the user's appearance rather than the shipped default:
+        // every render pulls the current tokens anyway, but starting wrong
+        // would paint one frame at the wrong size on launch.
+        let appearance = oximux_settings::appearance::active(cx);
+        let density = Density::for_appearance(appearance);
+        let typography = Typography::for_appearance(appearance);
 
         // Construct the CLI agent runtime + adapter registry once per
         // workspace. The registry is built with every built-in adapter in dialog

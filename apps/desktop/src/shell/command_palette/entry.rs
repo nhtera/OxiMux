@@ -12,7 +12,7 @@ use crate::actions::{
     ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseTab, NewTab,
     OpenCommandPalette, OpenCommitDialog, OpenQuickOpen, ReloadCustomCommands, Search,
     SelectSourceControlTab, ShowWelcomeWizard, SplitHorizontal, SplitVertical, ToggleLeftSidebar,
-    ToggleRightSidebar,
+    ToggleRightSidebar, UiZoomIn, UiZoomOut, UiZoomReset,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +165,24 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
         action_id: None,
         make_action: || Box::new(ShowWelcomeWizard),
     },
+    // Interface zoom. Listed here as well as in Settings because its chord is
+    // the *shifted* one — the bare ⌘+/⌘−/⌘0 belong to the editor's font — and
+    // a shortcut nobody guesses is one nobody finds.
+    CommandEntry {
+        name: "Zoom In Interface",
+        action_id: Some("ui_zoom_in"),
+        make_action: || Box::new(UiZoomIn),
+    },
+    CommandEntry {
+        name: "Zoom Out Interface",
+        action_id: Some("ui_zoom_out"),
+        make_action: || Box::new(UiZoomOut),
+    },
+    CommandEntry {
+        name: "Reset Interface Zoom",
+        action_id: Some("ui_zoom_reset"),
+        make_action: || Box::new(UiZoomReset),
+    },
 ];
 
 /// Build the unified candidate list from the static catalog plus loaded
@@ -231,9 +249,10 @@ mod tests {
     }
 
     #[test]
-    fn palette_commands_has_sixteen_entries() {
+    fn palette_commands_has_nineteen_entries() {
         // 14 original + "Reload Custom Commands" + "Show Welcome Wizard"
-        assert_eq!(PALETTE_COMMANDS.len(), 16);
+        // + the three interface-zoom rows.
+        assert_eq!(PALETTE_COMMANDS.len(), 19);
     }
 
     #[test]

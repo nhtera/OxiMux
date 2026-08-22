@@ -509,6 +509,19 @@ actions!(
         /// Submit the active commit dialog. Routed via dialog button click;
         /// declared here so step 14 can also bind Cmd+Enter to it.
         CommitStaged,
+        /// Make the whole interface one step larger.
+        ///
+        /// Not the same control as `EditorZoomIn`, which is deliberately left
+        /// on the bare ⌘+ / ⌘- / ⌘0 it has always had: that one changes the
+        /// code font in the editor and diff body, the way it does in every
+        /// other editor, and people reach for it constantly. This one moves
+        /// the chrome as well and is a preference, not a per-file gesture, so
+        /// it takes the shifted chord and is persisted.
+        UiZoomIn,
+        /// One step smaller — see [`UiZoomIn`].
+        UiZoomOut,
+        /// Back to 100% — see [`UiZoomIn`].
+        UiZoomReset,
         /// Toggle the left rail (workspaces + nav) visibility (Cmd+B).
         ToggleLeftSidebar,
         /// Toggle the right sidebar visibility (Cmd+L).

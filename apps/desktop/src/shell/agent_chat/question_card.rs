@@ -396,6 +396,7 @@ impl QuestionCard {
 
 impl Render for QuestionCard {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
         let theme = self.theme;
         let density = self.density;
         let typo = self.typography.clone();

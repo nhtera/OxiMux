@@ -352,7 +352,10 @@ impl Render for FileTreeView {
         // render_row so the closure captures stable Copy values rather
         // than re-instantiating per row.
         let theme = self.theme;
-        let typography = Typography::cockpit();
+        // Resolved from the appearance rather than the constant: this view
+        // keeps no typography of its own to sync, so the zoom has to reach it
+        // here or the file tree stays at 100% while everything beside it moves.
+        let typography = Typography::for_appearance(oximux_settings::appearance::active(cx));
         // Resolve the focused-editor file path once per render. Cached
         // into the uniform_list closure so every row's match check is a
         // cheap `==` instead of an Arc call per row.

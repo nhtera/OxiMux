@@ -12,12 +12,14 @@ use gpui::{AnyElement, IntoElement, ParentElement, SharedString, Styled, div, px
 use oximux_auto_update::{CheckTrigger, UpdateStatus};
 #[cfg(target_os = "macos")]
 use oximux_settings::AutoUpdateSettings;
-use oximux_settings::{Theme, Typography};
+use oximux_settings::{Density, DensityPreset, Theme, Typography};
 
 use super::controls::info_row;
 #[cfg(target_os = "macos")]
 use super::controls::value_chip;
 use super::layout::{SettingEntry, entries_card, entry};
+use super::segmented::{Segment, segmented};
+use super::controls::stepper;
 use super::SettingsModal;
 #[cfg(target_os = "macos")]
 use crate::updater::UpdaterState;
@@ -26,13 +28,70 @@ use crate::updater::UpdaterState;
 #[cfg(target_os = "macos")]
 const RELEASES_URL: &str = "https://github.com/nhtera/OxiMux/releases/latest";
 
-/// The Appearance pane's `label: value` facts.
+/// The Appearance pane's read-only facts — the ones with nothing to choose
+/// yet. Theme is here rather than beside the two live controls because a
+/// second palette is a separate piece of work; the honest thing is to show
+/// what is in force and not imply a picker that does not exist.
 fn appearance_pairs(typography: &Typography) -> Vec<(SharedString, SharedString)> {
     vec![
         ("Theme".into(), "Charcoal (dark)".into()),
-        ("Density".into(), "Cockpit".into()),
         ("UI font".into(), typography.family_ui.clone()),
         ("Mono font".into(), typography.family_mono.clone()),
+    ]
+}
+
+/// The two appearance controls, as entries.
+///
+/// Density and zoom are separate rows on purpose — they are easy to mistake
+/// for one control, and the descriptions are where that distinction gets
+/// made. See `oximux_settings::appearance`.
+fn appearance_controls(
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> Vec<SettingEntry> {
+    let current = crate::appearance_settings::active(cx);
+
+    let density_pick = segmented(
+        "appearance-density",
+        DensityPreset::ALL
+            .iter()
+            .map(|preset| {
+                let preset = *preset;
+                Segment::new(preset.label(), current.density == preset, move |_this, _w, cx| {
+                    crate::appearance_settings::set_density(cx, preset);
+                })
+            })
+            .collect(),
+        theme,
+        density,
+        typography,
+        cx,
+    );
+
+    let zoom = stepper(
+        "appearance-zoom",
+        current.scale.label(),
+        theme,
+        density,
+        typography,
+        |_this, _w, cx| crate::appearance_settings::zoom_out(cx),
+        |_this, _w, cx| crate::appearance_settings::zoom_in(cx),
+        cx,
+    );
+
+    vec![
+        entry(
+            "Density",
+            "How much space sits around the text. The text itself stays the same size.",
+            density_pick,
+        ),
+        entry(
+            "Interface zoom",
+            "Scales the whole cockpit — text and chrome together.",
+            zoom,
+        ),
     ]
 }
 
@@ -47,7 +106,7 @@ fn about_pairs() -> Vec<(SharedString, SharedString)> {
         ("App data dir".into(), SharedString::from(data_dir)),
         (
             "Settings files".into(),
-            "terminal.toml · commit_message_ai.toml".into(),
+            "terminal.toml · appearance.toml · commit_message_ai.toml".into(),
         ),
     ]
 }
@@ -71,8 +130,19 @@ fn pairs_to_entries(
         .collect()
 }
 
-pub(super) fn appearance_entries(theme: Theme, typography: &Typography) -> Vec<SettingEntry> {
-    pairs_to_entries(appearance_pairs(typography), theme, typography)
+pub(super) fn appearance_entries(
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> Vec<SettingEntry> {
+    let mut entries = appearance_controls(theme, density, typography, cx);
+    entries.extend(pairs_to_entries(
+        appearance_pairs(typography),
+        theme,
+        typography,
+    ));
+    entries
 }
 
 pub(super) fn about_entries(theme: Theme, typography: &Typography) -> Vec<SettingEntry> {
@@ -126,14 +196,32 @@ fn info_pane(
     col.into_any_element()
 }
 
-pub(super) fn render_appearance(query: &str, theme: Theme, typography: &Typography) -> AnyElement {
-    info_pane(
-        query,
-        &appearance_pairs(typography),
-        "Light mode is a deferred decision. Dark-only for now.",
-        theme,
-        typography,
-    )
+pub(super) fn render_appearance(
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .child(entries_card(
+            theme,
+            density,
+            typography,
+            appearance_entries(theme, density, typography, cx),
+        ))
+        .child(
+            div()
+                .pt(px(12.0))
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_subtle)
+                .child(
+                    "Changes apply immediately and save to appearance.toml. \
+                     Light mode is still a deferred decision.",
+                ),
+        )
+        .into_any_element()
 }
 
 /// One line describing where the updater currently stands.

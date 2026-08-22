@@ -9,23 +9,26 @@
 /// Outer horizontal padding for tabs, toolbar, filter row, commit area, and
 /// section headers. Matches `px-3` (12px) in the reference layout.
 ///
-/// Use [`pad_h`] when a render site has access to the panel's `Density` —
-/// at `Density::Compact` the panel tightens to 8px to recover visible
-/// width in narrow sidebars. The bare `PAD_H` constant stays for sites
-/// that don't get a density (e.g. test fixtures, pure helper functions
-/// that build sub-elements outside a density-aware render scope).
+/// Use [`pad_h`] when a render site has access to the panel's `Density`. The
+/// bare `PAD_H` constant stays for sites that don't get one (test fixtures,
+/// pure helpers that build sub-elements outside a density-aware render scope).
 pub const PAD_H: f32 = 12.0;
 
-/// Density-aware horizontal padding. Today returns `PAD_H` (12px) at
-/// every density — v1 only ships the `cockpit()` density preset, so
-/// there's no second branch to take. The helper exists so a future
-/// density (`Density::compact()` lands in v1.1) can drop the SCM
-/// surface to 8px without touching every call site: render code
-/// already reads `sc_style::pad_h(self.density)` and the constant
-/// becomes a runtime branch the moment the preset is added.
+/// Density-aware horizontal padding. Still returns the flat `PAD_H` at every
+/// density and every zoom.
 ///
-/// Threading `density` through every render method that currently
-/// hard-codes `PAD_H` is the load-bearing work, not the constant.
+/// The seam this helper was added for now exists — `DensityPreset` ships two
+/// presets and `UiScale` multiplies both — so the honest status is that this
+/// module has not been converted yet, not that there is nothing to convert.
+/// Every constant here is one of the literals the type/radius ratchet is
+/// counting down (`xtask literal-lint`), and they should all move together:
+/// scaling this one alone would grow the panel's horizontal padding at 150%
+/// while its row heights and gaps stayed put, which reads worse than a panel
+/// that is uniformly unscaled.
+///
+/// When they do move, `PAD_H` becomes `density.pad_panel * 1.5` — that is the
+/// ratio it already sits at against the cockpit's 8px, so the conversion is a
+/// no-op at the default and follows both controls everywhere else.
 pub fn pad_h(density: oximux_settings::Density) -> f32 {
     let _ = density;
     PAD_H

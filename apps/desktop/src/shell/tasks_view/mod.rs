@@ -652,6 +652,7 @@ impl Focusable for TasksView {
 
 impl Render for TasksView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
         // Tasks sits on the content canvas (`bg_panel`), not the rail surface.
         let root = div()
             .flex()

@@ -103,6 +103,31 @@ editor by design.
 | `pad_row` | 6 | Row left/right padding |
 | `gap_inline` | 6 | Spacing between inline siblings |
 
+**Two user controls, and why they are two.** The table above is the `Cockpit`
+preset at 100%. Both of the knobs in Settings → Appearance resolve into it, and
+they are deliberately separate because they answer different questions:
+
+| Control | What it moves | The question it answers |
+|---|---|---|
+| Density preset (`Cockpit` / `Comfortable`) | Heights, paddings, gaps. **Not** type, radii, or rail widths | "I can read this fine, I just want more rows" — or less crowding |
+| Interface zoom (80–160%, 10% steps) | Every density token *and* every type size | "This display is too dense for my eyes" |
+
+`Comfortable` is `1.25×` each cockpit value, rounded to the nearest even pixel
+so centred content never lands on a half-pixel. It is a rule in
+`Density::comfortable`, not a second column of literals, so a token added to one
+preset cannot be forgotten in the other.
+
+**`h_top_bar` is pinned** — no preset and no zoom moves it. Its height is chosen
+so the chrome row's vertical centre lands on the macOS traffic-light glyphs, and
+those are positioned when the window is created; a preference changed afterwards
+cannot move them, so a top bar that followed it would simply stop lining up.
+
+**How a change reaches the screen.** Views cache their tokens, so the refresh is
+a pull: every `Render` impl that caches a `Density`/`Typography` calls
+`oximux_settings::appearance::sync` at the top of its `render`, and the setter
+calls `refresh_windows()`. A view that forgets renders at the old size forever
+with nothing failing, so `xtask appearance-lint` fails CI on any that does.
+
 **Radius scale.** Every radius derives from a 10px base with the ratio steps
 xs `0.2×` (2) / sm `0.6×` (6) / md `0.8×` (8) / lg `1×` (10) / xl `1.4×` (14).
 The table above is the whole set; `density_radius_scale` in
