@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use super::{ProjectPanes, TabDragHoveredTarget};
 use crate::shell::divider::{ActiveDivider, DividerBoundsCache, split_row_bounds_canvas};
 use crate::shell::pane_group::file_drag::FilePathDragPayload;
-use crate::shell::pane_group::render::{build_tab_strip_for, filter_droppable_files};
+use crate::shell::pane_group::render::{TabTokens, build_tab_strip_for, filter_droppable_files};
 use crate::shell::pane_group::tab_drag::TabDragPayload;
 use crate::shell::pane_group::tab_drag_zones::{Zone, resolve_drop_zone};
 use crate::shell::pane_tree::{Axis, PaneGroupId, PaneTree};
@@ -114,6 +114,11 @@ impl ProjectPanes {
             return None;
         }
         let theme = self.theme;
+        let tokens = TabTokens {
+            theme,
+            density: self.density,
+            typography: &self.typography,
+        };
         let active_id = self.manager().active_group_id();
         let sum: f32 = entries.iter().map(|(_, w)| *w).sum();
         let sum = if sum > 0.0 { sum } else { 1.0 };
@@ -138,7 +143,7 @@ impl ProjectPanes {
                 id,
                 is_focused,
                 true,
-                theme,
+                &tokens,
                 self.workspace_tint,
                 project_panes.clone(),
                 cx,
@@ -290,7 +295,11 @@ fn render_tree(
                         *id,
                         is_focused,
                         true,
-                        theme,
+                        &TabTokens {
+                            theme,
+                            density: panes.density,
+                            typography: &panes.typography,
+                        },
                         panes.workspace_tint,
                         project_panes_entity.clone(),
                         cx,

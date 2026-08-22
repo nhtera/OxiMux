@@ -9,6 +9,8 @@
 
 use std::path::PathBuf;
 
+use oximux_settings::{Density, Typography};
+
 use gpui::{
     Context, IntoElement, ParentElement, Render, SharedString, Styled, Window, div, px, rgb,
 };
@@ -42,17 +44,23 @@ const BORDER_PREVIEW: u32 = 0x4B5563;
 const FG_PREVIEW: u32 = 0xE2E8F0;
 
 impl Render for FilePathDragPreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Resolved per drag rather than cached -- see `TabDragPreview`. The
+        // measures are the tab chip's so a file dragged toward the strip
+        // previews at the size of the chip it would become.
+        let appearance = oximux_settings::appearance::active(cx);
+        let density = Density::for_appearance(appearance);
+        let typography = Typography::for_appearance(appearance);
         div()
             .flex()
             .items_center()
-            .h(px(28.0))
-            .px(px(12.0))
-            .rounded(px(6.0))
+            .h(px(density.h_tab))
+            .px(px(density.pad_tab))
+            .rounded(px(density.r_xs))
             .bg(rgb(BG_PREVIEW))
             .border_1()
             .border_color(rgb(BORDER_PREVIEW))
-            .text_size(px(11.0))
+            .text_size(px(typography.t_body_sm))
             .text_color(rgb(FG_PREVIEW))
             .shadow_md()
             .child(SharedString::from("\u{1F4C4} "))

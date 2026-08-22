@@ -44,6 +44,16 @@ pub struct Hit {
     pub text: String,
 }
 
+/// The zoom escape hatch for dimensions that are not on a token scale.
+///
+/// Legitimate for a glyph box or a gradient width; never for the two call
+/// sites this lint watches. Type sizes and corner radii *have* scales, so
+/// routing one through `scale()` would make it follow the zoom while still
+/// disagreeing with every other size and corner in the tree — and it would
+/// slip off this ratchet on the way, since the argument no longer starts
+/// with a digit. Counted as a hit so the ratchet cannot be gamed by it.
+const SCALE_HATCH: &str = ".scale(";
+
 /// Count literal-valued calls in one file's text.
 ///
 /// A call is "literal-valued" when the character after `px(` starts a number.
@@ -58,11 +68,12 @@ pub fn scan(text: &str) -> Vec<Hit> {
             let mut from = 0usize;
             while let Some(at) = line[from..].find(pat) {
                 let open = from + at + pat.len();
-                if line[open..]
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_digit())
-                {
+                let rest = &line[open..];
+                let literal = rest.chars().next().is_some_and(|c| c.is_ascii_digit());
+                // The argument up to its first `)`, which is where a
+                // `density.scale(N)` call would close.
+                let arg = &rest[..rest.find(')').map_or(rest.len(), |i| i + 1)];
+                if literal || arg.contains(SCALE_HATCH) {
                     hits.push(Hit {
                         line: n + 1,
                         text: line.trim().to_string(),
@@ -230,5 +241,25 @@ mod tests {
     #[test]
     fn allows_arithmetic_on_a_token() {
         assert_eq!(scan(".rounded(px(density.r_card * 2.0))").len(), 0);
+    }
+
+    /// The zoom hatch does not launder a literal off this ratchet.
+    ///
+    /// `density.scale(11.0)` makes a size follow the zoom, which is right for
+    /// a glyph box and wrong here: the result still disagrees with every
+    /// other type size in the tree, and the argument no longer starts with a
+    /// digit, so without this the literal would simply vanish from the count.
+    #[test]
+    fn flags_a_literal_routed_through_the_zoom_hatch() {
+        assert_eq!(scan(".text_size(px(density.scale(11.0)))").len(), 1);
+        assert_eq!(scan(".rounded(px(self.density.scale(6.0)))").len(), 1);
+    }
+
+    /// …but a real token in the same shape is still fine, and so is the hatch
+    /// anywhere this lint does not watch.
+    #[test]
+    fn allows_the_hatch_away_from_type_and_radius() {
+        assert_eq!(scan(".w(px(density.scale(28.0)))").len(), 0);
+        assert_eq!(scan(".text_size(px(typography.t_body_sm))").len(), 0);
     }
 }

@@ -59,6 +59,13 @@ pub struct Density {
     /// sit on their own surface with a border and don't need the same
     /// internal breathing room.
     pub pad_overlay: f32,
+    /// Horizontal padding inside a tab chip. Chunkier than `pad_row`
+    /// because a chip is a target you click and drag, not a line you read
+    /// down a list — the strip is the busiest hit area in the cockpit.
+    /// A token rather than `pad_row * 2` for the reason the guidelines give
+    /// for `h_action_row`: arithmetic on a token is a token in disguise, and
+    /// it hides from anyone reading the scale.
+    pub pad_tab: f32,
     /// Row height for items inside a floating card (context menu rows,
     /// picker rows). Shared across pane / adapter / commit-context
     /// menus so the click targets feel like one component family.
@@ -123,6 +130,7 @@ impl Density {
             gap_inline: 6.0,
             h_action_row: 34.0,
             pad_overlay: 6.0,
+            pad_tab: 12.0,
             h_overlay_item: 30.0,
             // 0.2× — was 3.0, just off the scale's tightest step.
             r_chip: 2.0,
@@ -154,6 +162,7 @@ impl Density {
             pad_row: roomier(c.pad_row),
             gap_inline: roomier(c.gap_inline),
             pad_overlay: roomier(c.pad_overlay),
+            pad_tab: roomier(c.pad_tab),
             ..c
         }
     }
@@ -175,6 +184,26 @@ impl Density {
         // resolution, and the stamp names the choices, not the arithmetic.
         resolved.appearance = appearance;
         resolved
+    }
+
+    /// Apply the current zoom to a dimension that is not a density token.
+    ///
+    /// Not everything with a size belongs on the density scale. A close glyph
+    /// is 14px because that is the size of the glyph; a scroll fade is 24px
+    /// wide because that is where the gradient stops reading. Inventing
+    /// `d_close_button` and `d_fade_width` to make those scale would grow the
+    /// token set with values no second surface will ever share, and a token
+    /// nobody reuses is a constant with extra steps.
+    ///
+    /// So they stay named constants where they are, and pass through here to
+    /// pick up the zoom. The preset is deliberately *not* applied: a preset
+    /// changes how much air sits between things, not how big a glyph is.
+    ///
+    /// This is for dimensions only. A type size or a corner radius has a real
+    /// scale to belong to, and `xtask literal-lint` rejects routing those
+    /// through here — they take a `Typography` / `Density` token instead.
+    pub fn scale(&self, dimension: f32) -> f32 {
+        dimension * self.appearance.scale.factor()
     }
 
     /// Every dimension multiplied by `factor`, except the pinned top bar.
@@ -201,6 +230,7 @@ impl Density {
             gap_inline: s(self.gap_inline),
             h_action_row: s(self.h_action_row),
             pad_overlay: s(self.pad_overlay),
+            pad_tab: s(self.pad_tab),
             h_overlay_item: s(self.h_overlay_item),
             r_chip: s(self.r_chip),
             w_sidebar: s(self.w_sidebar),
@@ -372,6 +402,19 @@ mod tests {
         assert_eq!(s.pad_row, c.pad_row);
         assert_eq!(s.r_chip, c.r_chip);
         assert_eq!(s.w_left_rail, c.w_left_rail);
+    }
+
+    /// A loose dimension follows the zoom but not the preset — it is a glyph
+    /// or a gradient, not a measure of how much air the cockpit leaves.
+    #[test]
+    fn a_loose_dimension_follows_the_zoom_only() {
+        assert_eq!(Density::cockpit().scale(14.0), 14.0);
+        assert_eq!(Density::comfortable().scale(14.0), 14.0);
+        let zoomed = Density::for_appearance(Appearance {
+            density: DensityPreset::Comfortable,
+            scale: UiScale::from_percent(150),
+        });
+        assert_eq!(zoomed.scale(14.0), 21.0);
     }
 
     /// The stamp names the user's choices, so a stale snapshot can be spotted

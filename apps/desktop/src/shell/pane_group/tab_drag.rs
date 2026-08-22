@@ -11,7 +11,12 @@ use gpui::{
     Context, IntoElement, ParentElement, Render, SharedString, Styled, Window, div,
     prelude::FluentBuilder, px, svg,
 };
-use oximux_settings::Theme;
+use oximux_settings::{Density, Theme, Typography};
+
+/// The tab-kind glyph in a drag preview -- the chip's own
+/// `ICON_SIZE_PX`, restated here rather than made public because a
+/// preview is a separate surface that happens to agree.
+const TAB_GLYPH_PX: f32 = 11.0;
 
 use crate::shell::pane_group::TabColor;
 use crate::shell::pane_tree::PaneGroupId;
@@ -66,7 +71,15 @@ impl TabDragPreview {
 }
 
 impl Render for TabDragPreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Resolved rather than cached: the preview exists for the length of one
+        // drag, so there is no snapshot to go stale and nothing for
+        // `appearance::sync` to refresh. Every measure below is the chip's own,
+        // because a preview that does not match what you picked up is worse
+        // than no preview.
+        let appearance = oximux_settings::appearance::active(cx);
+        let density = Density::for_appearance(appearance);
+        let typography = Typography::for_appearance(appearance);
         // Color dot mirrors the chip's color tag, when set.
         let color_dot = self.color.map(|c| {
             div()
@@ -77,19 +90,19 @@ impl Render for TabDragPreview {
         div()
             .flex()
             .items_center()
-            .gap(px(5.0))
-            .h(px(28.0))
-            .px(px(12.0))
-            .rounded(px(6.0))
+            .gap(px(density.gap_inline))
+            .h(px(density.h_tab))
+            .px(px(density.pad_tab))
+            .rounded(px(density.r_xs))
             .bg(self.theme.bg_overlay)
             .border_1()
             .border_color(self.theme.border_active)
-            .text_size(px(11.0))
+            .text_size(px(typography.t_body_sm))
             .text_color(self.theme.fg_base)
             .shadow_md()
             .child(
                 svg()
-                    .size(px(11.0))
+                    .size(px(density.scale(TAB_GLYPH_PX)))
                     .path(self.icon_path.clone())
                     .text_color(self.theme.fg_muted),
             )

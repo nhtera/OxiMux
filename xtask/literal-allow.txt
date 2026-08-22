@@ -37,9 +37,7 @@ apps/desktop/src/shell/left_rail/project_drag.rs 2
 apps/desktop/src/shell/onboarding/agent_step.rs 1
 apps/desktop/src/shell/onboarding/view.rs 2
 apps/desktop/src/shell/onboarding/view_step.rs 1
-apps/desktop/src/shell/pane_group/file_drag.rs 2
-apps/desktop/src/shell/pane_group/render.rs 6
-apps/desktop/src/shell/pane_group/tab_drag.rs 2
+apps/desktop/src/shell/pane_group/render.rs 4
 apps/desktop/src/shell/right_sidebar/session_history_panel.rs 8
 apps/desktop/src/shell/search_panel/result_row.rs 1
 apps/desktop/src/shell/session_history/mod.rs 4

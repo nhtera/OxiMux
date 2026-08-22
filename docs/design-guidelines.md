@@ -101,6 +101,7 @@ editor by design.
 | `pad_panel` | 8 | Panel inner padding |
 | `pad_overlay` | 6 | Inner padding for floating cards |
 | `pad_row` | 6 | Row left/right padding |
+| `pad_tab` | 12 | Horizontal padding inside a tab chip — chunkier than a list row because the strip is the busiest hit area in the cockpit |
 | `gap_inline` | 6 | Spacing between inline siblings |
 
 **Two user controls, and why they are two.** The table above is the `Cockpit`
@@ -121,6 +122,21 @@ preset cannot be forgotten in the other.
 so the chrome row's vertical centre lands on the macOS traffic-light glyphs, and
 those are positioned when the window is created; a preference changed afterwards
 cannot move them, so a top bar that followed it would simply stop lining up.
+
+**Dimensions that are not tokens.** Not everything with a size belongs on the
+scale. A close glyph is 14px because that is the size of the glyph; a scroll
+fade is 24px wide because that is where the gradient stops reading. Inventing
+`d_close_button` for those would grow the token set with values no second
+surface will ever share, and a token nobody reuses is a constant with extra
+steps. They stay named constants and pass through `density.scale(N)`, which
+applies the zoom but *not* the preset — a preset changes how much air sits
+between things, not how big a glyph is.
+
+That hatch is for dimensions only. A type size or a corner radius has a real
+scale to belong to, and `xtask literal-lint` counts `.text_size(px(d.scale(N)))`
+as a literal for exactly that reason: routing one through the hatch would make
+it follow the zoom while still disagreeing with every other size in the tree,
+and would slip off the ratchet on the way.
 
 **How a change reaches the screen.** Views cache their tokens, so the refresh is
 a pull: every `Render` impl that caches a `Density`/`Typography` calls
