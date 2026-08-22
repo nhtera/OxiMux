@@ -4,6 +4,11 @@
 
 pub mod checkpoint;
 pub mod codec;
+// Whether this process can still reach the OS lookup daemons — and therefore
+// whether the PTYs it spawns can. Unix-only: the failure it watches for is an
+// inherited Mach bootstrap port going dead, which has no Windows equivalent.
+#[cfg(unix)]
+pub mod host_lookup;
 pub mod registry;
 pub mod ring_buffer;
 // The pipe's access control. Windows-only because it is the platform that

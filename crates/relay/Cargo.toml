@@ -38,7 +38,10 @@ tracing-appender = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.25", features = ["signal"] }
+# `user` for `User::from_uid` — the getpwuid probe in `host_lookup`. It rides in
+# on nix's defaults today; naming it keeps that from becoming a silent
+# compile break if anyone ever sets `default-features = false` here.
+nix = { version = "0.25", features = ["signal", "user"] }
 
 # Windows-only. `widestring` hands the pipe's security descriptor to
 # `interprocess` as UTF-16; the job object is the process group's stand-in, so a
