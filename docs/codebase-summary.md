@@ -257,7 +257,8 @@ src/
     │   ├── mod.rs          DiffView entity; load(path, staged); expand()
     │   ├── render.rs       pure hunk/line render plan helpers
     │   ├── review_notes.rs note store + reconcile (line moved / gone) + agent markdown
-    │   └── review_note_popover.rs compose/edit one note at a gutter anchor
+    │   ├── review_note_popover.rs compose/edit one note at a gutter anchor
+    │   └── live_refresh.rs which diff scopes can go stale (worktree yes, history no)
     ├── commit_dialog/
     │   ├── mod.rs          CommitDialog entity; cycle_prefix(); submit()
     │   └── prefix.rs       conventional-commit prefix list (pure)

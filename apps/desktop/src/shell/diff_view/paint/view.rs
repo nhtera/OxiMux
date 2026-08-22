@@ -14,6 +14,10 @@ const SYNC_HIGHLIGHT_THRESHOLD: usize = 250;
 
 impl Render for DiffView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // First render is the first time this view is handed a `Window`, and
+        // so the only place the background refresh can learn whether its
+        // window is focused. Idempotent; see `arm_live_refresh`.
+        self.arm_live_refresh(window, cx);
         // When no file is selected, collapse to a zero-height placeholder so
         // the source-control panel flows directly from the staged-files list
         // into the commit graph. Earlier builds rendered a full-width

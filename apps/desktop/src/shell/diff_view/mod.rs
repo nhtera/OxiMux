@@ -22,6 +22,7 @@ pub mod file_header;
 pub mod file_rail;
 pub mod hunk_actions;
 pub mod image_diff;
+pub mod live_refresh;
 pub mod note_repo_handle;
 pub mod paint;
 pub mod render;
@@ -33,6 +34,7 @@ pub mod word_diff;
 use crate::actions::{ExpandDiff, RetryDiff, SendTextToActiveAgent};
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
 use crate::shell::diff_view::file_header::StickyHeader;
+use crate::shell::diff_view::live_refresh::{LiveQuery, LiveResult};
 use crate::shell::diff_view::note_repo_handle::note_repo;
 use crate::shell::diff_view::paint::{FoldId, OverviewRun, PreparedRow};
 use crate::shell::diff_view::render::{FilePlan, build_render_plan};
@@ -56,6 +58,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use tokio::sync::oneshot;
+
+/// How often an open working-tree diff re-asks git what it is showing.
+///
+/// Matched to the rail's `DIFF_REFRESH_TICK` on purpose: both spend one git
+/// child process per tick, and there is no reason for a diff the user is
+/// reading to lag behind the counts in the rail beside it. A tick that finds
+/// nothing changed costs the process and stops — no invalidation, no repaint.
+const LIVE_REFRESH_TICK: std::time::Duration = std::time::Duration::from_millis(2000);
 
 #[derive(Debug)]
 pub enum DiffViewState {
@@ -224,6 +234,28 @@ pub struct DiffView {
     /// the prior op's gpui-side refresh, but the tokio side-effect still
     /// completes; the next op fires its own reload.
     _op_task: Option<Task<()>>,
+    /// The heartbeat that keeps a working-tree diff showing the working tree.
+    /// Held for the view's lifetime; dropping it stops the loop.
+    _live_refresh_task: Option<Task<()>>,
+    /// The current background fetch. Its own slot rather than sharing
+    /// `_load_task`: a refresh must never cancel a load the user is waiting
+    /// on, and a load must be free to cancel a refresh nobody asked for.
+    _live_fetch_task: Option<Task<()>>,
+    /// In-flight background refresh. Distinct from `_load_task`, which stays
+    /// `Some` long after its load finished — this is the actual "one at a
+    /// time" guard, so a slow git call cannot stack a queue of refreshes
+    /// behind it.
+    live_refresh_in_flight: bool,
+    /// Whether this view's window is focused. Starts `true` so a view that
+    /// has not rendered yet still refreshes: being wrong about the cost for
+    /// one tick is cheaper than being wrong about the content indefinitely.
+    window_active: bool,
+    /// Window-activation observer, installed on first render because that is
+    /// the first time this view is handed a `Window`. An observer rather than
+    /// a per-render read: a view that is simply sitting there stops being
+    /// rendered, and a focus gate that only updated during renders would
+    /// freeze at whatever it last saw.
+    _activation_sub: Option<Subscription>,
     /// Active hunk-discard confirm modal (per-request; `None` when idle).
     /// Mounted INSIDE the DiffView's render tree rather than
     /// workspace_root so multiple open diff tabs each carry their own
@@ -404,6 +436,20 @@ impl DiffView {
         // Cmd+/-) must repaint the diff body so its code lines track the same
         // size.
         let _zoom_sub = cx.observe_global::<EditorZoom>(|_view, cx| cx.notify());
+        // The heartbeat. Ticks for the view's whole life; `tick_live_refresh`
+        // decides on each one whether there is anything worth asking, so a
+        // commit view or an unfocused window costs a wakeup and nothing else.
+        let _live_refresh_task = cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor().timer(LIVE_REFRESH_TICK).await;
+                if weak
+                    .update(cx, |view, cx| view.tick_live_refresh(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Self {
             repo,
             state: DiffViewState::Empty,
@@ -413,6 +459,11 @@ impl DiffView {
             typography,
             _load_task: None,
             _op_task: None,
+            _live_refresh_task: Some(_live_refresh_task),
+            _live_fetch_task: None,
+            live_refresh_in_flight: false,
+            window_active: true,
+            _activation_sub: None,
             confirm_dialog: None,
             _confirm_dialog_observer: None,
             body_list: ListState::new(0, ListAlignment::Top, px(400.0)),
@@ -844,6 +895,212 @@ impl DiffView {
             });
         });
         self._load_task = Some(task);
+    }
+
+    /// Install the window-focus observer, on the first render that hands this
+    /// view a `Window`.
+    ///
+    /// Called from `render`. Idempotent — the subscription is taken once and
+    /// then keeps reporting on its own, which is the point: a view nobody is
+    /// interacting with stops rendering, so anything that only updated during
+    /// a render would be frozen at whatever it last happened to see.
+    pub(crate) fn arm_live_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self._activation_sub.is_some() {
+            return;
+        }
+        self.window_active = window.is_window_active();
+        self._activation_sub = Some(cx.observe_window_activation(window, |view, window, cx| {
+            let active = window.is_window_active();
+            let regained = active && !view.window_active;
+            view.window_active = active;
+            // Coming back is the moment the answer is most likely to be stale
+            // — the user was away, and away is when things change. Waiting out
+            // a tick here would show them the old diff for up to two seconds
+            // after they had already started reading it.
+            if regained {
+                view.refresh_content(cx);
+            }
+        }));
+    }
+
+    /// One beat of the heartbeat: refresh if there is anything to refresh.
+    fn tick_live_refresh(&mut self, cx: &mut Context<Self>) {
+        if !self.window_active {
+            return;
+        }
+        self.refresh_content(cx);
+    }
+
+    /// Re-ask git for what this view is showing, and adopt the answer only if
+    /// it differs from what is on screen.
+    ///
+    /// Deliberately not `load()`. A load is a navigation: it resets folds,
+    /// collapses expanded context, drops the scroll to the top and blanks the
+    /// body to "Loading…" — all correct when a person picked a different file,
+    /// all hostile when nobody asked for anything. This keeps the view exactly
+    /// as the reader left it and swaps the content underneath.
+    ///
+    /// The comparison is the load-bearing part. Most ticks find the diff
+    /// byte-identical, and an unconditional apply would re-tokenise the body,
+    /// throw away the syntax-highlight cache and repaint a view nothing had
+    /// changed about — several times a minute, forever.
+    fn refresh_content(&mut self, cx: &mut Context<Self>) {
+        if self.live_refresh_in_flight {
+            return;
+        }
+        let Some(query) = LiveQuery::for_state(&self.state) else {
+            return;
+        };
+        // A hunk op has its own reload chained behind it. Letting a refresh
+        // land in the middle would show the pre-op diff again for a tick.
+        if self._op_task.is_some() {
+            return;
+        }
+        let repo = self.repo.clone();
+        let (tx, rx) = oneshot::channel::<LiveResult>();
+        let query_for_fetch = query.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let fetched = match query_for_fetch {
+                        LiveQuery::Single {
+                            path,
+                            staged,
+                            untracked,
+                        } => {
+                            // Asked before the diff, and only for untracked
+                            // files: git cannot describe a file that is not
+                            // there, so without this its error is
+                            // indistinguishable from a transient one and the
+                            // view would keep showing a deleted file forever.
+                            if untracked && !repo.workdir().join(&path).exists() {
+                                let _ = tx.send(LiveResult::Gone);
+                                return;
+                            }
+                            let r = if untracked {
+                                repo.diff_for_untracked(&path).await
+                            } else {
+                                repo.diff_for_path(&path, staged).await
+                            };
+                            r.ok().map(LiveResult::Single)
+                        }
+                        LiveQuery::Combined { scope } => {
+                            repo.diff_combined(scope).await.ok().map(LiveResult::Combined)
+                        }
+                    };
+                    let _ = tx.send(fetched.unwrap_or(LiveResult::Unavailable));
+                });
+            }
+            // No runtime: the same degradation every other fetch here takes.
+            // Silent, because this one runs on a timer and a warning per tick
+            // would bury the log.
+            Err(_) => return,
+        }
+        self.live_refresh_in_flight = true;
+        let task = cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |view, cx| {
+                view.live_refresh_in_flight = false;
+                let Ok(result) = result else {
+                    return;
+                };
+                view.apply_live_result(query, result, cx);
+            });
+        });
+        self._live_fetch_task = Some(task);
+    }
+
+    /// Adopt a background refresh, or decline it.
+    ///
+    /// Declines in three cases, all of them "this answer is not about what is
+    /// on screen any more": the fetch failed, the view moved on to a different
+    /// diff while the git call was out, or nothing changed.
+    ///
+    /// A failure is dropped rather than surfaced. `load()` turns an error into
+    /// a `Failed` state because a person is sitting there waiting for a file
+    /// they asked for; nobody asked for this one, and replacing a diff that is
+    /// on screen and readable with an error banner — because a `git diff`
+    /// happened to collide with an index lock — would break a working view to
+    /// report a problem that is usually gone by the next tick.
+    fn apply_live_result(&mut self, query: LiveQuery, result: LiveResult, cx: &mut Context<Self>) {
+        // The view may have been navigated elsewhere while the fetch was out.
+        if LiveQuery::for_state(&self.state).as_ref() != Some(&query) {
+            return;
+        }
+        let anchor = self.first_visible_row(cx);
+        match (result, &self.state) {
+            (LiveResult::Single(diffs), DiffViewState::Ready { diffs: shown, .. })
+                if &diffs == shown => {}
+            (
+                LiveResult::Single(diffs),
+                DiffViewState::Ready {
+                    path,
+                    staged,
+                    untracked,
+                    ..
+                },
+            ) => {
+                let (path, staged, untracked) = (path.clone(), *staged, *untracked);
+                self.invalidate_plan();
+                self.apply_load_result(path, staged, untracked, Ok(diffs));
+                self.finish_live_refresh(anchor, cx);
+            }
+            (
+                LiveResult::Combined(combined),
+                DiffViewState::CombinedReady {
+                    diffs: shown,
+                    groups: shown_groups,
+                    ..
+                },
+            ) if &combined.diffs == shown && &combined.groups == shown_groups => {}
+            (LiveResult::Combined(combined), DiffViewState::CombinedReady { scope, .. }) => {
+                let scope = scope.clone();
+                self.invalidate_plan();
+                self.apply_combined_result(scope, Ok(combined));
+                self.finish_live_refresh(anchor, cx);
+            }
+            (
+                LiveResult::Gone,
+                DiffViewState::Ready {
+                    path,
+                    staged,
+                    untracked,
+                    ..
+                },
+            ) => {
+                let (path, staged, untracked) = (path.clone(), *staged, *untracked);
+                self.invalidate_plan();
+                self.state = DiffViewState::Failed {
+                    path,
+                    staged,
+                    untracked,
+                    error: "This file is no longer in the working tree.".to_string(),
+                };
+                // No scroll anchor to keep — there is no body to scroll. The
+                // notes for the scope are dropped by `reload_notes` alongside
+                // the state, since a non-`Ready` state carries none.
+                self.reload_notes();
+                cx.notify();
+            }
+            // Fetch failed, or the state shape no longer matches the answer.
+            _ => {}
+        }
+    }
+
+    /// Shared tail of an adopted refresh: put the reader back where they were,
+    /// then let everything that reads the diff catch up with it.
+    ///
+    /// The scroll anchor matters more here than on a load. A load follows a
+    /// click, so landing at the top reads as the result of that click; this
+    /// happens while someone is reading, and moving the page under them is the
+    /// one thing a background refresh must never do.
+    fn finish_live_refresh(&mut self, anchor: usize, cx: &mut Context<Self>) {
+        self.pending_scroll_anchor = Some(anchor);
+        // The content moved, so notes anchored to it may have moved with it —
+        // exactly the drift `reload_notes` reconciles.
+        self.reload_notes();
+        self.fetch_image_blobs(cx);
+        cx.notify();
     }
 
     /// Re-run the most recent load. No-op unless the current state is
