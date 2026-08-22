@@ -274,12 +274,12 @@ mod tests {
     }
 
     impl SleepAssertionBackend for MockBackend {
-        fn create(&self, _name: &str) -> Option<u32> {
+        fn create(&self, _name: &str) -> Option<u64> {
             let mut created = self.created.lock().unwrap();
             *created += 1;
-            Some(*created)
+            Some(u64::from(*created))
         }
-        fn release(&self, _id: u32) {}
+        fn release(&self, _id: u64) {}
     }
 
     /// A firer over an empty in-memory database, plus the backend so a test

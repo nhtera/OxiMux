@@ -267,8 +267,8 @@ fn constraint_banner(theme: Theme, typography: &Typography) -> AnyElement {
         .text_size(px(typography.t_sub_label))
         .text_color(theme.fg_subtle)
         .child("Scheduled runs only fire while OxiMux is running. Leaving it open keeps this")
-        .child("Mac awake so a run is not missed — but it cannot wake a sleeping Mac or")
-        .child("relaunch a quit app. Runs use your default agent (Settings → Agents).")
+        .child("computer awake so a run is not missed — but it cannot wake a sleeping one")
+        .child("or relaunch a quit app. Runs use your default agent (Settings → Agents).")
         .into_any_element()
 }
 
