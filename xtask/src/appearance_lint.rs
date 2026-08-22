@@ -24,10 +24,53 @@ use std::error::Error;
 /// it holds whether the site writes the full path or imports the module.
 const SYNC_CALLS: &[&str] = &["appearance::sync(", "appearance::sync_typography("];
 
+/// The half-answer: it sizes the type scale and leaves the faces at the
+/// platform default, so a caller that stops there paints its surface in a
+/// typeface the user replaced while everything around it obeys.
+/// `oximux_settings::appearance::typography(cx)` is the whole answer.
+const HALF_RESOLVER: &str = "Typography::for_appearance(";
+/// What to reach for instead.
+const WHOLE_RESOLVER: &str = "appearance::typography(cx)";
+
 /// One view that caches tokens without refreshing them.
 pub struct Miss {
     pub view: String,
     pub file: String,
+}
+
+/// One site that builds a type scale without the user's font choice.
+pub struct HalfResolved {
+    pub file: String,
+    pub line: usize,
+}
+
+/// The portion of `text` that ships — everything before the first
+/// `#[cfg(test)]`.
+///
+/// Test code legitimately builds a scale from a hand-made `Appearance` with no
+/// `App` to ask for the font choice, and demanding the whole resolver there
+/// would mean standing up a GPUI context to assert on a padding.
+fn shipped(text: &str) -> &str {
+    match text.find("#[cfg(test)]") {
+        Some(at) => &text[..at],
+        None => text,
+    }
+}
+
+/// Every call to the half-answer in code that ships.
+fn half_resolved(text: &str) -> Vec<usize> {
+    let body = shipped(text);
+    let mut lines = Vec::new();
+    for (at, _) in body.match_indices(HALF_RESOLVER) {
+        let line_start = body[..at].rfind('\n').map_or(0, |n| n + 1);
+        // A mention in a comment is documentation, not a call — this lint's
+        // own explanation of what to use instead names it.
+        if body[line_start..at].contains("//") {
+            continue;
+        }
+        lines.push(body[..at].matches('\n').count() + 1);
+    }
+    lines
 }
 
 /// The body between the first `{` at or after `from` and its matching `}`.
@@ -130,10 +173,34 @@ pub fn scan(files: &[(String, String)]) -> Vec<Miss> {
     misses
 }
 
+/// Scan `files` for sites that size the type scale without the face choice.
+///
+/// The settings crate is exempt: it is where the whole resolver is written, and
+/// it has to call the half-answer to build one.
+pub fn scan_resolvers(files: &[(String, String)]) -> Vec<HalfResolved> {
+    let mut hits = Vec::new();
+    for (path, text) in files {
+        if path.replace('\\', "/").contains("crates/settings/") {
+            continue;
+        }
+        for line in half_resolved(text) {
+            hits.push(HalfResolved {
+                file: path.clone(),
+                line,
+            });
+        }
+    }
+    hits
+}
+
 pub fn run(files: &[(String, String)]) -> Result<(), Box<dyn Error>> {
     let misses = scan(files);
-    if misses.is_empty() {
-        println!("appearance-lint: every token-caching view pulls the current appearance");
+    let half = scan_resolvers(files);
+    if misses.is_empty() && half.is_empty() {
+        println!(
+            "appearance-lint: every token-caching view pulls the current appearance, \
+             and every type scale is resolved with the chosen faces"
+        );
         return Ok(());
     }
     for miss in &misses {
@@ -143,11 +210,27 @@ pub fn run(files: &[(String, String)]) -> Result<(), Box<dyn Error>> {
             miss.file, miss.view
         );
     }
-    Err(format!(
-        "appearance-lint: {} view(s) would go stale on a density or zoom change",
-        misses.len()
-    )
-    .into())
+    for hit in &half {
+        eprintln!(
+            "{}:{}: `{HALF_RESOLVER}…)` leaves the font choice behind — use \
+             `oximux_settings::{WHOLE_RESOLVER}`",
+            hit.file, hit.line
+        );
+    }
+    let mut reasons = Vec::new();
+    if !misses.is_empty() {
+        reasons.push(format!(
+            "{} view(s) would go stale on a density or zoom change",
+            misses.len()
+        ));
+    }
+    if !half.is_empty() {
+        reasons.push(format!(
+            "{} site(s) would ignore the chosen font",
+            half.len()
+        ));
+    }
+    Err(format!("appearance-lint: {}", reasons.join("; ")).into())
 }
 
 #[cfg(test)]
@@ -245,6 +328,51 @@ pub struct Panel { density: Density, typography: Typography }
 // `impl Render for Panel` lives in render.rs
 ";
         assert!(scan(&files(src)).is_empty());
+    }
+
+    #[test]
+    fn resolving_a_type_scale_without_the_font_choice_is_caught() {
+        // The failure this stops is invisible until someone picks a font: the
+        // surface sizes correctly, syncs correctly, and is drawn in a typeface
+        // the user replaced everywhere else.
+        let files = vec![(
+            "apps/desktop/src/shell/rail.rs".to_string(),
+            "let typography = Typography::for_appearance(appearance);".to_string(),
+        )];
+        let hits = scan_resolvers(&files);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].line, 1);
+    }
+
+    #[test]
+    fn the_crate_that_defines_the_whole_resolver_may_call_the_half_one() {
+        let files = vec![(
+            "crates/settings/src/appearance.rs".to_string(),
+            "Typography::for_appearance(active(cx)).with_fonts(fonts)".to_string(),
+        )];
+        assert!(scan_resolvers(&files).is_empty());
+    }
+
+    #[test]
+    fn a_test_helper_may_resolve_from_a_hand_made_appearance() {
+        // Unit tests build an `Appearance` directly and have no `App` to ask
+        // for the font choice; requiring the whole resolver there would mean
+        // standing up a GPUI context to assert on a padding.
+        let files = vec![(
+            "apps/desktop/src/shell/style.rs".to_string(),
+            "pub fn new() {}\n#[cfg(test)]\nmod tests {\n  Typography::for_appearance(a);\n}"
+                .to_string(),
+        )];
+        assert!(scan_resolvers(&files).is_empty());
+    }
+
+    #[test]
+    fn a_mention_in_a_comment_is_not_a_call() {
+        let files = vec![(
+            "apps/desktop/src/shell/rail.rs".to_string(),
+            "// Typography::for_appearance( is the half-answer; do not use it.".to_string(),
+        )];
+        assert!(scan_resolvers(&files).is_empty());
     }
 
     #[test]

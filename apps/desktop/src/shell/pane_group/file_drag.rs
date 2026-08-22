@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 
-use oximux_settings::{Density, Typography};
+use oximux_settings::Density;
 
 use gpui::{
     Context, IntoElement, ParentElement, Render, SharedString, Styled, Window, div, px, rgb,
@@ -50,7 +50,7 @@ impl Render for FilePathDragPreview {
         // previews at the size of the chip it would become.
         let appearance = oximux_settings::appearance::active(cx);
         let density = Density::for_appearance(appearance);
-        let typography = Typography::for_appearance(appearance);
+        let typography = oximux_settings::appearance::typography(cx);
         div()
             .flex()
             .items_center()

@@ -280,7 +280,7 @@ impl LeftRail {
         let appearance = oximux_settings::appearance::active(cx);
         let density = Density::for_appearance(appearance);
         let theme = Theme::for_appearance(appearance);
-        let typography = Typography::for_appearance(appearance);
+        let typography = oximux_settings::appearance::typography(cx);
         Self {
             active_nav: None,
             weak_root,

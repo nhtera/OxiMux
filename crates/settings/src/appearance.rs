@@ -1,12 +1,17 @@
-//! The two appearance choices a user actually gets: how much air the cockpit
-//! leaves around its text, and how big the whole thing is drawn.
+//! The appearance choices a user actually gets: which palette the cockpit is
+//! painted in, how much air it leaves around its text, how big the whole thing
+//! is drawn, and which two typefaces it is drawn with.
 //!
-//! Both resolve into [`Density`](crate::Density) and
-//! [`Typography`](crate::Typography) — they do not add a third token set. A
-//! render path never asks "what did the user pick", it reads the tokens it
-//! already read, and they come out different.
+//! They all resolve into [`Theme`](crate::Theme), [`Density`](crate::Density)
+//! and [`Typography`](crate::Typography) — they do not add a token set of their
+//! own. A render path never asks "what did the user pick", it reads the tokens
+//! it already read, and they come out different.
 //!
-//! # Why these are two controls and not one
+//! The first three live in [`Appearance`], which is `Copy` and doubles as the
+//! staleness stamp the pull compares. The faces cannot: see
+//! [`fonts`](crate::fonts) for where they live and why.
+//!
+//! # Why density and zoom are two controls and not one
 //!
 //! They are easy to confuse and the difference is the whole point:
 //!
@@ -207,16 +212,29 @@ impl Appearance {
         toml::from_str(s)
     }
 
-    /// Serialize to a TOML document, used to seed a default file.
-    pub fn to_toml_string(&self) -> String {
-        toml::to_string_pretty(self).unwrap_or_default()
-    }
-
     /// Re-clamp anything a hand edit could have put out of range.
     pub fn sanitized(mut self) -> Self {
         self.scale = UiScale::from_percent(self.scale.percent());
         self
     }
+}
+
+/// Serialize both halves of the appearance settings into one document.
+///
+/// `appearance.toml` has two readers — this struct and
+/// [`FontChoice`](crate::fonts::FontChoice) — because the font names cannot
+/// live in a `Copy` stamp; see the [`fonts`](crate::fonts) module docs. Reading
+/// splits cleanly, since each type ignores the keys it does not own. Writing
+/// does not, so this is the one function that knows the whole file.
+///
+/// Concatenation is sound because both halves serialize to flat scalars: TOML
+/// requires every key/value pair to precede any table header, and neither
+/// struct emits one. `a_written_file_round_trips_through_both_readers` is what
+/// keeps that true if either side ever gains a nested field.
+pub fn to_toml_string(appearance: &Appearance, fonts: &crate::fonts::FontChoice) -> String {
+    let mut doc = toml::to_string_pretty(appearance).unwrap_or_default();
+    doc.push_str(&toml::to_string_pretty(fonts).unwrap_or_default());
+    doc
 }
 
 #[cfg(feature = "gpui")]
@@ -258,12 +276,40 @@ pub fn sync(
     cx: &gpui::App,
 ) {
     let current = active(cx);
-    if density.appearance == current {
+    let fonts = crate::fonts::active(cx);
+    if density.appearance == current && faces_are_current(typography, fonts) {
         return;
     }
     *theme = crate::Theme::for_appearance(current);
     *density = crate::Density::for_appearance(current);
-    *typography = crate::Typography::for_appearance(current);
+    *typography = crate::Typography::for_appearance(current).with_fonts(fonts);
+}
+
+/// True when `typography` is already drawn in the faces `fonts` asks for.
+///
+/// A second comparison is needed because the face choice is not in the
+/// `Appearance` stamp — see [`fonts`](crate::fonts). It compares the *resolved*
+/// names rather than the `Option`s, so clearing a choice back to the platform
+/// face is a change like any other; an `is_some` test would leave every view
+/// painted in the typeface the user had just removed.
+#[cfg(feature = "gpui")]
+fn faces_are_current(typography: &crate::Typography, fonts: &crate::fonts::FontChoice) -> bool {
+    typography.family_ui.as_ref() == fonts.resolved_ui()
+        && typography.family_mono.as_ref() == fonts.resolved_mono()
+}
+
+/// The type scale in force: the current sizes, in the current faces.
+///
+/// The one correct way to build a `Typography` from scratch outside a view's
+/// cached snapshot. [`Typography::for_appearance`](crate::Typography::for_appearance)
+/// alone answers half the question — it sizes the scale and leaves the faces at
+/// the platform default — so a caller that stops there paints its surface in a
+/// typeface the user replaced, while everything around it obeys. That failure
+/// is invisible until someone picks a font, which is why `xtask
+/// appearance-lint` fails on a call to the half-answer outside this crate.
+#[cfg(feature = "gpui")]
+pub fn typography(cx: &gpui::App) -> crate::Typography {
+    crate::Typography::for_appearance(active(cx)).with_fonts(crate::fonts::active(cx))
 }
 
 /// [`sync`] for a view that keeps a type scale but no density, and so has no
@@ -272,11 +318,12 @@ pub fn sync(
 #[cfg(feature = "gpui")]
 pub fn sync_typography(typography: &mut crate::Typography, cx: &gpui::App) {
     let current = active(cx);
+    let fonts = crate::fonts::active(cx);
     let want = crate::Typography::cockpit().t_body_sm * current.scale.factor();
-    if (typography.t_body_sm - want).abs() < f32::EPSILON {
+    if (typography.t_body_sm - want).abs() < f32::EPSILON && faces_are_current(typography, fonts) {
         return;
     }
-    *typography = crate::Typography::for_appearance(current);
+    *typography = crate::Typography::for_appearance(current).with_fonts(fonts);
 }
 
 #[cfg(test)]
@@ -334,9 +381,36 @@ mod tests {
             density: DensityPreset::Comfortable,
             scale: UiScale::from_percent(130),
         };
-        let parsed =
-            Appearance::from_toml_str(&original.to_toml_string()).expect("round-trip parse");
+        let doc = to_toml_string(&original, &crate::fonts::FontChoice::default());
+        let parsed = Appearance::from_toml_str(&doc).expect("round-trip parse");
         assert_eq!(original, parsed);
+    }
+
+    #[test]
+    fn a_written_file_round_trips_through_both_readers() {
+        // The writer concatenates two documents, which only stays valid TOML
+        // while both halves are flat scalars. If either grows a nested field
+        // its `[table]` header lands above the other half's bare keys and the
+        // whole file stops parsing — this is where that shows up.
+        let appearance = Appearance {
+            theme: ThemeChoice::Paper,
+            density: DensityPreset::Comfortable,
+            scale: UiScale::from_percent(120),
+        };
+        let fonts = crate::fonts::FontChoice {
+            ui: Some("Inter".into()),
+            mono: Some("Cascadia Code".into()),
+        };
+        let doc = to_toml_string(&appearance, &fonts);
+
+        assert_eq!(
+            Appearance::from_toml_str(&doc).expect("appearance half parses"),
+            appearance
+        );
+        assert_eq!(
+            crate::fonts::FontChoice::from_toml_str(&doc).expect("font half parses"),
+            fonts
+        );
     }
 
     #[test]

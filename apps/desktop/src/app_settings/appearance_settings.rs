@@ -1,5 +1,10 @@
-//! App-side loader and writer for the [`Appearance`] global — the density
-//! preset and the whole-UI zoom.
+//! App-side loader and writer for `appearance.toml` — the palette, the density
+//! preset, the whole-UI zoom, and the two font families.
+//!
+//! The first three are the [`Appearance`] global; the faces are a
+//! [`FontChoice`] beside it, because they cannot live in a `Copy` stamp (see
+//! [`oximux_settings::fonts`]). This module owns the file both are written to;
+//! `font_settings` owns the half that needs a text system to validate.
 //!
 //! Startup reads `appearance.toml` from the app data dir (seeding a default so
 //! the file is there to look at), sanitizes it, and installs it as a GPUI
@@ -20,7 +25,7 @@
 use std::path::PathBuf;
 
 use gpui::App;
-use oximux_settings::Appearance;
+use oximux_settings::{Appearance, FontChoice};
 
 fn settings_path() -> Option<PathBuf> {
     crate::app_paths::data_dir().map(|d| d.join(Appearance::FILE_NAME))
@@ -28,33 +33,47 @@ fn settings_path() -> Option<PathBuf> {
 
 /// Read + sanitize from disk, falling back to the shipped default on a missing
 /// file or a parse error (logged, so a typo is visible without a crash).
-fn load() -> Appearance {
+///
+/// One file, two readers: the font names cannot live in the `Copy` stamp the
+/// token scales compare on, so they parse separately out of the same text. Each
+/// half ignores the keys it does not own — see [`oximux_settings::fonts`].
+fn load() -> (Appearance, FontChoice) {
     let Some(path) = settings_path() else {
-        return Appearance::default();
+        return (Appearance::default(), FontChoice::default());
     };
-    match std::fs::read_to_string(&path) {
-        Ok(text) => match Appearance::from_toml_str(&text) {
-            Ok(parsed) => {
-                let clean = parsed.sanitized();
-                if clean != parsed {
-                    // Say so rather than clamping in silence: the number on
-                    // disk and the number in use would otherwise disagree with
-                    // no way to tell from inside the app.
-                    tracing::warn!(
-                        ?path,
-                        "appearance.toml was out of range; clamped to the supported zoom"
-                    );
-                }
-                clean
-            }
-            Err(err) => {
-                tracing::warn!(?path, %err, "appearance.toml parse failed; using defaults");
-                Appearance::default()
-            }
-        },
+    let Ok(text) = std::fs::read_to_string(&path) else {
         // Absent is the common case (fresh install) — silent default.
-        Err(_) => Appearance::default(),
-    }
+        return (Appearance::default(), FontChoice::default());
+    };
+
+    let appearance = match Appearance::from_toml_str(&text) {
+        Ok(parsed) => {
+            let clean = parsed.sanitized();
+            if clean != parsed {
+                // Say so rather than clamping in silence: the number on disk
+                // and the number in use would otherwise disagree with no way
+                // to tell from inside the app.
+                tracing::warn!(
+                    ?path,
+                    "appearance.toml was out of range; clamped to the supported zoom"
+                );
+            }
+            clean
+        }
+        Err(err) => {
+            tracing::warn!(?path, %err, "appearance.toml parse failed; using defaults");
+            Appearance::default()
+        }
+    };
+
+    // A malformed font key must not cost the density and zoom beside it, and
+    // vice versa: two parses means one typo takes out one setting.
+    let fonts = FontChoice::from_toml_str(&text).unwrap_or_else(|err| {
+        tracing::warn!(?path, %err, "appearance.toml font keys unreadable; using the platform faces");
+        FontChoice::default()
+    });
+
+    (appearance, fonts)
 }
 
 /// Write a default `appearance.toml` if none exists, so the keys are visible
@@ -69,7 +88,11 @@ fn seed_default_if_absent() {
     {
         return;
     }
-    if let Err(err) = std::fs::write(&path, Appearance::default().to_toml_string()) {
+    let body = oximux_settings::appearance::to_toml_string(
+        &Appearance::default(),
+        &FontChoice::default(),
+    );
+    if let Err(err) = std::fs::write(&path, body) {
         tracing::warn!(?path, %err, "could not seed default appearance.toml");
     }
 }
@@ -79,7 +102,7 @@ fn seed_default_if_absent() {
 /// paint one frame at the default size before correcting itself.
 pub fn install(cx: &mut App) {
     seed_default_if_absent();
-    let loaded = load();
+    let (loaded, fonts) = load();
     if loaded != Appearance::default() {
         tracing::info!(
             theme = ?loaded.theme,
@@ -88,7 +111,16 @@ pub fn install(cx: &mut App) {
             "appearance loaded"
         );
     }
+    // Validated on every load, not only when the pane writes one: the two ways
+    // to hold a name for a font that is not installed are carrying the file
+    // between machines and uninstalling the font afterwards, and neither goes
+    // through the picker. See `font_settings`.
+    let fonts = crate::font_settings::validated(cx, fonts);
+    if !fonts.is_default() {
+        tracing::info!(ui = ?fonts.ui, mono = ?fonts.mono, "font choices loaded");
+    }
     publish_terminal_polarity(loaded);
+    cx.set_global(fonts);
     cx.set_global(loaded);
 }
 
@@ -136,7 +168,7 @@ pub fn set(cx: &mut App, next: Appearance) {
     bridge_component_theme(cx);
     publish_terminal_polarity(next);
     cx.refresh_windows();
-    if let Err(err) = save(&next) {
+    if let Err(err) = save(&next, oximux_settings::fonts::active(cx)) {
         tracing::warn!(%err, "could not persist appearance.toml");
     }
 }
@@ -218,7 +250,14 @@ pub fn set_theme(cx: &mut App, theme: oximux_settings::ThemeChoice) {
 /// owns and cannot see ours, so anything it draws has to be pushed across:
 /// the light/dark mode it resolves its own defaults from, the two colours
 /// whose defaults are tuned for a light shadcn page and read as
-/// "always focused" against a deep panel fill, and the corner radii.
+/// "always focused" against a deep panel fill, the corner radii, and the two
+/// font families.
+///
+/// The families matter more than they look. `gpui_component::Root` wraps the
+/// whole window and sets `font_family` on it, so the library's idea of the UI
+/// face is the *ambient* face for everything that does not name its own —
+/// tooltips and its search inputs among them. Its default is `.SystemUIFont`,
+/// which is why nobody noticed while there was nothing to choose.
 ///
 /// Called at startup and again on every change. Skipping the second call is
 /// the bug this exists to prevent — it leaves every text field in the
@@ -233,6 +272,14 @@ pub fn bridge_component_theme(cx: &mut App) {
     let appearance = active(cx);
     let palette = oximux_settings::Theme::for_appearance(appearance);
     let density = oximux_settings::Density::for_appearance(appearance);
+    // Resolved before `global_mut` takes the mutable borrow.
+    let (ui_face, mono_face) = {
+        let fonts = oximux_settings::fonts::active(cx);
+        (
+            fonts.resolved_ui().to_string(),
+            fonts.resolved_mono().to_string(),
+        )
+    };
     // Mode first: `change` rebuilds the library's colour set from its own
     // defaults, so the overrides below have to land after it or they are
     // discarded.
@@ -256,24 +303,34 @@ pub fn bridge_component_theme(cx: &mut App) {
     // chrome sat at 4 while every `Input` and `Button` beside it was already 6.
     component_theme.radius = gpui::px(density.r_xs);
     component_theme.radius_lg = gpui::px(density.r_card);
+    component_theme.font_family = ui_face.into();
+    component_theme.mono_font_family = mono_face.into();
 }
 
 /// Persist to `appearance.toml`. Public for tests; production goes through
-/// [`set`], which also updates the global that everything reads.
-pub fn save(appearance: &Appearance) -> std::io::Result<()> {
+/// [`set`] or `font_settings::set`, which also update the globals everything
+/// reads.
+///
+/// Takes both halves because the file holds both and a write replaces it: a
+/// writer that knew only about the density would erase a font choice every time
+/// someone pressed zoom.
+pub fn save(appearance: &Appearance, fonts: &FontChoice) -> std::io::Result<()> {
     let path =
         settings_path().ok_or_else(|| std::io::Error::other("no app data dir for appearance"))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, appearance.to_toml_string())
+    std::fs::write(
+        &path,
+        oximux_settings::appearance::to_toml_string(appearance, fonts),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::TestAppContext;
-    use oximux_settings::{Density, DensityPreset, Theme, ThemeChoice, Typography, UiScale};
+    use oximux_settings::{Density, DensityPreset, FontChoice, Theme, ThemeChoice, Typography, UiScale};
 
     /// A preset choice must survive a zoom, and a zoom must survive a preset
     /// choice. They are independent controls; a user who set Comfortable and
@@ -337,6 +394,55 @@ mod tests {
             // The palette rides the same pull -- a view that refreshed its
             // sizes but kept the old colours would be the worse half-update.
             assert!(theme.is_light());
+        });
+    }
+
+    /// A face change carries no stamp — `Appearance` is `Copy` and the names
+    /// cannot ride in it — so the pull has to notice it some other way. This is
+    /// the case a stamp-only comparison misses entirely.
+    #[gpui::test]
+    fn a_font_change_alone_reaches_a_stale_snapshot(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut theme = Theme::charcoal();
+            let mut density = Density::for_appearance(Appearance::default());
+            let mut typography = Typography::cockpit();
+
+            cx.set_global(FontChoice {
+                ui: None,
+                mono: Some("Cascadia Code".into()),
+            });
+            oximux_settings::appearance::sync(&mut theme, &mut density, &mut typography, cx);
+
+            assert_eq!(typography.family_mono.as_ref(), "Cascadia Code");
+            assert_eq!(
+                density.appearance,
+                Appearance::default(),
+                "nothing about the density or zoom moved — only the face did"
+            );
+        });
+    }
+
+    /// And the way back: clearing a choice has to repaint too. Comparing the
+    /// `Option` rather than the resolved name would leave every view in the
+    /// typeface the user had just removed, with the pane showing the default.
+    #[gpui::test]
+    fn clearing_a_font_choice_reaches_the_snapshot_too(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut theme = Theme::charcoal();
+            let mut density = Density::for_appearance(Appearance::default());
+            let mut typography = Typography::cockpit().with_fonts(&FontChoice {
+                ui: None,
+                mono: Some("Cascadia Code".into()),
+            });
+
+            cx.set_global(FontChoice::default());
+            oximux_settings::appearance::sync(&mut theme, &mut density, &mut typography, cx);
+
+            assert_eq!(
+                typography.family_mono,
+                Typography::cockpit().family_mono,
+                "back to the platform face"
+            );
         });
     }
 

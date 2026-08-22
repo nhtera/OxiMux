@@ -571,7 +571,7 @@ impl WorkspaceRoot {
         let appearance = oximux_settings::appearance::active(cx);
         let theme = Theme::for_appearance(appearance);
         let density = Density::for_appearance(appearance);
-        let typography = Typography::for_appearance(appearance);
+        let typography = oximux_settings::appearance::typography(cx);
 
         // Construct the CLI agent runtime + adapter registry once per
         // workspace. The registry is built with every built-in adapter in dialog

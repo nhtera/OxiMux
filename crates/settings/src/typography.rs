@@ -4,6 +4,11 @@
 //! Source of truth: `docs/design-guidelines.md`.
 
 use gpui::{Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, SharedString};
+// The platform families live in `fonts` rather than here so the names stay
+// reachable without gpui: this module carries gpui types and is feature-
+// gated, but a family name is just a string, and `FontChoice` has to
+// resolve one either way.
+use crate::fonts::{FontChoice, platform as platform_fonts};
 
 #[derive(Debug, Clone)]
 pub struct Typography {
@@ -47,71 +52,6 @@ pub struct Typography {
     pub ui_fallbacks: Vec<SharedString>,
 }
 
-/// The faces each platform is guaranteed to ship.
-///
-/// GPUI looks `Font::family` up verbatim, and `FontFallbacks` only cascades for
-/// *individual glyph* lookups inside a family that already loaded. It does not
-/// rescue a primary that fails to resolve at all — that goes to
-/// `TextSystem::resolve_font`, which walks a hardcoded stack inside gpui whose
-/// only monospace entry is the `.ZedMono` sentinel. So the primary should still
-/// be a face the OS always has: a miss means the grid is drawn in a typeface
-/// nobody chose, and `terminal_canvas` pins every glyph to a `cell_width`
-/// measured from `'m'`, so any width mismatch shows up as uneven spacing.
-///
-/// `apps/desktop` bundles Lilex, which is what `.ZedMono` resolves to, so the
-/// floor under that path is at least monospace rather than the proportional
-/// `Segoe UI` it used to land on. Keeping the platform primary correct is still
-/// the first line of defence; the bundled font is the net, not the plan.
-///
-/// Lilex is last in every `MONO_FALLBACKS` for the *other* reason — glyphs
-/// missing from a family that did load. It maps all 32 Block Elements at its
-/// ASCII advance, so it backstops Consolas's 8-of-32.
-#[cfg(target_os = "macos")]
-mod platform_fonts {
-    /// Menlo is the only mono face guaranteeable on every macOS 13+ install
-    /// (Geist Mono is opt-in, and "SF Mono" registers as `.SF NS Mono` /
-    /// `SFMono-Regular`, which font-kit's family selector misses). It
-    /// carries the full Block Elements range (U+2580–259F) and Box Drawing
-    /// (U+2500–257F), which half-block pixel art needs — Claude Code's
-    /// mascot is the canonical regression case.
-    pub const MONO: &str = "Menlo";
-    pub const MONO_FALLBACKS: &[&str] = &["SF Mono", "Monaco", "Lilex"];
-    pub const UI: &str = "Helvetica Neue";
-    pub const UI_FALLBACKS: &[&str] = &["Helvetica"];
-}
-
-#[cfg(target_os = "windows")]
-mod platform_fonts {
-    /// Consolas ships with every Windows since Vista. It covers Box Drawing in
-    /// full, and of Block Elements it carries exactly the eight that half-block
-    /// rendering uses (▀ ▄ █ ▌ ▐ ░ ▒ ▓) — the 24 it lacks are the
-    /// eighth-fraction blocks that sparkline-style output wants. Bundled Lilex
-    /// covers those (32/32), so unlike the other two fallbacks it is not a
-    /// maybe. Cascadia Mono is still worth naming ahead of it for Braille,
-    /// which neither Consolas nor Lilex has, but it arrives with Windows
-    /// Terminal rather than with Windows.
-    pub const MONO: &str = "Consolas";
-    pub const MONO_FALLBACKS: &[&str] = &["Cascadia Mono", "Segoe UI Symbol", "Lilex"];
-    /// Segoe UI is what the Helvetica Neue lookup was already landing on by
-    /// accident. Naming it is a no-op visually and stops the UI chrome from
-    /// depending on where GPUI's default happens to point.
-    pub const UI: &str = "Segoe UI";
-    pub const UI_FALLBACKS: &[&str] = &["Tahoma"];
-}
-
-/// Not a platform we ship, but the crate should still build and render
-/// something monospaced if someone compiles for it. Unlike macOS and Windows
-/// there is no face a Linux install is *guaranteed* to have — a minimal
-/// container can lack all three of these — which is the case bundled Lilex
-/// exists for.
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-mod platform_fonts {
-    pub const MONO: &str = "DejaVu Sans Mono";
-    pub const MONO_FALLBACKS: &[&str] = &["Liberation Mono", "Noto Sans Mono", "Lilex"];
-    pub const UI: &str = "DejaVu Sans";
-    pub const UI_FALLBACKS: &[&str] = &["Liberation Sans"];
-}
-
 impl Typography {
     pub fn cockpit() -> Self {
         Self {
@@ -145,12 +85,18 @@ impl Typography {
         }
     }
 
-    /// The type scale a given set of user choices resolves to.
+    /// The type *sizes* a given set of user choices resolves to.
     ///
     /// Only the zoom reaches here. A density preset deliberately does not
     /// touch type — it changes the space around the text, not the text — which
     /// is what keeps the two controls from being two names for one knob. See
     /// [`crate::appearance`].
+    ///
+    /// This is half an answer, and the wrong one to reach for outside this
+    /// crate: it leaves both faces at the platform default, so a surface built
+    /// from it ignores a chosen font while everything around it obeys. Use
+    /// [`crate::appearance::typography`], which applies both. `xtask
+    /// appearance-lint` fails on a call to this one from anywhere else.
     pub fn for_appearance(appearance: crate::appearance::Appearance) -> Self {
         Self::cockpit().scaled(appearance.scale.factor())
     }
@@ -172,6 +118,36 @@ impl Typography {
             t_body_lg: self.t_body_lg * factor,
             ..self.clone()
         }
+    }
+
+    /// The same scale, drawn in the faces the user asked for.
+    ///
+    /// A `None` on either side keeps the platform face. An override pushes the
+    /// family it replaced onto the front of that side's fallback list: the
+    /// chain only covers glyphs *missing from a family that loaded*, and a
+    /// hand-picked face is far likelier than the platform primary to be short
+    /// a box-drawing or block-element glyph the terminal grid needs.
+    ///
+    /// The names are taken on trust. Whether the machine actually has a family
+    /// is a question only the text system can answer, and guessing at it here
+    /// would be worse than not asking: gpui resolves `Font::family` verbatim,
+    /// so an absent primary lands on a sentinel face nobody chose, with
+    /// nothing to say why. Validation happens where the choice is made — see
+    /// the desktop's `font_settings`.
+    pub fn with_fonts(mut self, choice: &FontChoice) -> Self {
+        if let Some(ui) = &choice.ui
+            && ui.as_str() != self.family_ui.as_ref()
+        {
+            let replaced = std::mem::replace(&mut self.family_ui, ui.clone().into());
+            self.ui_fallbacks.insert(0, replaced);
+        }
+        if let Some(mono) = &choice.mono
+            && mono.as_str() != self.family_mono.as_ref()
+        {
+            let replaced = std::mem::replace(&mut self.family_mono, mono.clone().into());
+            self.mono_fallbacks.insert(0, replaced);
+        }
+        self
     }
 
     /// Build a GPUI `Font` for terminal/editor surfaces with the configured
@@ -281,5 +257,64 @@ mod tests {
         let same = base.scaled(1.0);
         assert_eq!(same.t_body_sm, base.t_body_sm);
         assert_eq!(same.t_body_lg, base.t_body_lg);
+    }
+
+    #[test]
+    fn an_unset_choice_leaves_the_platform_faces_alone() {
+        let base = Typography::cockpit();
+        let same = base.clone().with_fonts(&FontChoice::default());
+        assert_eq!(same.family_ui, base.family_ui);
+        assert_eq!(same.family_mono, base.family_mono);
+        assert_eq!(
+            same.mono_fallbacks, base.mono_fallbacks,
+            "nothing to demote, so nothing added to the chain"
+        );
+    }
+
+    #[test]
+    fn a_chosen_face_takes_the_primary_and_demotes_the_platform_one() {
+        // The demotion is the point: a person picking a display-ish mono face
+        // should still get box drawing from the family that definitely has it,
+        // rather than tofu in the one place tofu is least acceptable.
+        let base = Typography::cockpit();
+        let picked = base.clone().with_fonts(&FontChoice {
+            ui: None,
+            mono: Some("Cascadia Code".into()),
+        });
+        assert_eq!(picked.family_mono.as_ref(), "Cascadia Code");
+        assert_eq!(picked.mono_fallbacks[0], base.family_mono);
+        assert_eq!(
+            picked.family_ui, base.family_ui,
+            "the side that was not chosen is untouched"
+        );
+        assert_eq!(picked.ui_fallbacks, base.ui_fallbacks);
+    }
+
+    #[test]
+    fn choosing_the_face_already_in_use_does_not_grow_the_fallback_chain() {
+        // Naming the platform family explicitly is a legitimate thing to do
+        // from the picker, and it must not push that same family onto its own
+        // fallback list — once per launch would be harmless, but this runs on
+        // every appearance change.
+        let base = Typography::cockpit();
+        let same = base.clone().with_fonts(&FontChoice {
+            ui: Some(base.family_ui.to_string()),
+            mono: Some(base.family_mono.to_string()),
+        });
+        assert_eq!(same.ui_fallbacks, base.ui_fallbacks);
+        assert_eq!(same.mono_fallbacks, base.mono_fallbacks);
+    }
+
+    #[test]
+    fn a_chosen_face_survives_the_zoom() {
+        // `scaled` rebuilds the size fields and clones the rest; a face chosen
+        // before a zoom must not be dropped by it.
+        let picked = Typography::cockpit().with_fonts(&FontChoice {
+            ui: Some("Inter".into()),
+            mono: None,
+        });
+        let big = picked.scaled(1.4);
+        assert_eq!(big.family_ui.as_ref(), "Inter");
+        assert_eq!(big.ui_fallbacks, picked.ui_fallbacks);
     }
 }

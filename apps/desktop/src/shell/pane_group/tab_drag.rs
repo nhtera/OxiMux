@@ -11,7 +11,7 @@ use gpui::{
     Context, IntoElement, ParentElement, Render, SharedString, Styled, Window, div,
     prelude::FluentBuilder, px, svg,
 };
-use oximux_settings::{Density, Theme, Typography};
+use oximux_settings::{Density, Theme};
 
 /// The tab-kind glyph in a drag preview -- the chip's own
 /// `ICON_SIZE_PX`, restated here rather than made public because a
@@ -79,7 +79,7 @@ impl Render for TabDragPreview {
         // than no preview.
         let appearance = oximux_settings::appearance::active(cx);
         let density = Density::for_appearance(appearance);
-        let typography = Typography::for_appearance(appearance);
+        let typography = oximux_settings::appearance::typography(cx);
         // Color dot mirrors the chip's color tag, when set.
         let color_dot = self.color.map(|c| {
             div()

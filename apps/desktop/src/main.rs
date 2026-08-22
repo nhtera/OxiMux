@@ -290,16 +290,17 @@ fn main() {
                 oximux_app::shell::diff_view::syntax::prewarm();
             })
             .detach();
-        // The user's palette, density and zoom, before any window opens: the
-        // bridge below copies them into gpui-component's own theme, and a
-        // window that opened first would paint one frame at the shipped
+        // The user's palette, density, zoom and typefaces, before any window
+        // opens: the bridge below copies them into gpui-component's own theme,
+        // and a window that opened first would paint one frame at the shipped
         // defaults and then correct itself.
         oximux_app::appearance_settings::install(cx);
         // Everything gpui-component needs to agree with our palette — the
         // light/dark mode it starts in, the input border and focus ring, the
-        // corner radii. Shared with the settings control, because the library
-        // paints its own widgets and a change that skipped it would leave
-        // every `Input` and `Button` in the previous theme.
+        // corner radii, the two font families. Shared with the settings
+        // controls, because the library paints its own widgets and a change
+        // that skipped it would leave every `Input` and `Button` in the
+        // previous theme.
         oximux_app::appearance_settings::bridge_component_theme(cx);
         {
             // Read the OS auto-hide preference before taking the mutable global

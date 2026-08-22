@@ -209,7 +209,11 @@ and would slip off the ratchet on the way.
 a pull: every `Render` impl that caches a `Density`/`Typography` calls
 `oximux_settings::appearance::sync` at the top of its `render`, and the setter
 calls `refresh_windows()`. A view that forgets renders at the old size forever
-with nothing failing, so `xtask appearance-lint` fails CI on any that does.
+with nothing failing, so `xtask appearance-lint` fails CI on any that does. The
+same lint rejects `Typography::for_appearance` outside the settings crate: it
+sizes the scale and leaves the faces at the platform default, so a surface built
+that way ignores a chosen font while everything around it obeys. The whole
+answer is `oximux_settings::appearance::typography(cx)`.
 
 **Radius scale.** Every radius derives from a 10px base with the ratio steps
 xs `0.2×` (2) / sm `0.6×` (6) / md `0.8×` (8) / lg `1×` (10) / xl `1.4×` (14).
@@ -241,12 +245,13 @@ Single font family. Numbers tabular everywhere for diff alignment and counters.
 | `t_label_xs` | 10 | 500 | Tiny chips (LSP, branch) |
 | `t_label_caps` | 10.5 | 600, tracking +0.5 | All-caps section labels |
 | `t_body_sm` | 11 | 400 | Status bar, gutter, tooltip, file tree body |
+| `t_body_base` | 12 | 400 | Body copy a notch above the cockpit default — Source Control file names and commit subjects |
 | `t_brand` | 12 | 600 | Brand wordmark in top bar |
 | `t_body_md` | 13 | 400 | Sidebar rows, body text |
 | `t_body_lg` | 14 | 400 | Main content, terminal default |
 
 **Font stack**: per-platform, because the *primary* family has to be one the OS
-is guaranteed to ship. Defined in `oximux-settings::typography::platform_fonts`.
+is guaranteed to ship. Defined in `oximux-settings::fonts::platform`.
 
 | | macOS | Windows |
 |---|---|---|
@@ -261,6 +266,18 @@ primary is missing, GPUI drops to the platform default UI face, which is
 measured from `'m'`, narrow characters then sit left-aligned in over-wide cells
 and the grid reads as randomly spaced. Naming a font the target OS lacks is
 therefore a rendering bug, not a downgrade.
+
+**Either primary can be replaced** from Settings → Appearance, persisted as
+`ui_font` / `mono_font` in `appearance.toml`. The picker offers only families
+the machine reports, and every load re-checks the stored name against that list
+— a font uninstalled after it was picked, or a settings file carried between
+machines, falls back to the platform face with a line in the log rather than
+resolving to a sentinel nobody chose. A replaced primary demotes the family it
+displaced to the front of that side's fallback list, so a hand-picked mono face
+missing box-drawing glyphs still gets them from the one that definitely has
+them. Because the mono primary is now a free choice, the pane measures it: a
+face whose `i` and `M` advance differently is named in the row as not
+fixed-width. It is not refused — that is the user's machine and their call.
 
 ## Color Roles
 
