@@ -138,6 +138,9 @@ oximux-computer-use = { workspace = true, features = ["windows-screen-control"] 
 widestring = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    # `AttachConsole` — the GUI-subsystem binary joining the console it was
+    # launched from, so dev runs keep their logs (`main.rs` crate attribute).
+    "Win32_System_Console",
     # `PowerCreateRequest` / `PowerSetRequest` — the prevent-idle-sleep hold
     # behind `agent_glue::agent_awake`, and the Windows counterpart of macOS's
     # IOKit assertion. `Win32_System_Threading` comes with it for

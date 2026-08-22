@@ -10,16 +10,17 @@
 //! then runtime — is intentional: GPUI returns from `app.run`, the guard
 //! exits the runtime, then the runtime itself shuts down gracefully.
 
-// Windows decides at link time whether a process gets a console, and there is
-// no way to ask for one later that does not flash an empty black window first.
-// A released build must not: double-clicking OxiMux would open a console behind
-// it that stays for the session and closes the app when closed.
-//
-// Debug builds keep the console on purpose. It is where `tracing` goes, and the
-// subsystem is the difference between `cargo run` printing logs and printing
-// nothing at all. Release builds lose stdout entirely — anything that must
-// survive a packaged run has to reach a file or the event log, not `eprintln!`.
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// Windows decides at link time whether a process gets a console. A
+// console-subsystem binary launched anywhere but from an existing console —
+// Explorer, the debugger, a Start menu pin — makes Windows conjure one, and on
+// a machine whose default terminal is Windows Terminal that console is a
+// persistent empty "Terminal" window that outlives the app as a dead pane.
+// Debug builds used to accept that in exchange for `cargo run` logs; they no
+// longer have to, because `attach_parent_console` below reconnects to the
+// launching console when there is one. So: GUI subsystem for every build, and
+// anything that must survive a launch with no parent console has to reach a
+// file or the event log, not `eprintln!`.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,6 +53,8 @@ const HOST_IDENTITY_SCOPE: &str = "remote-control-host";
 const DB_FILE_NAME: &str = "oximux.db";
 
 fn main() {
+    #[cfg(all(windows, debug_assertions))]
+    attach_parent_console();
     init_tracing();
 
     // Before anything writes into the data directory — including the migration
@@ -1703,6 +1706,38 @@ fn notify_user(title: &'static str, message: &'static str) {
     oximux_app::notifier::mac::post_system_banner(title, message);
     #[cfg(not(target_os = "macos"))]
     let _ = (title, message);
+}
+
+/// Join the console this process was launched from, if there is one.
+///
+/// The binary is GUI-subsystem (see the crate attribute), so Windows never
+/// creates a console for it. This call is the other half of that choice: when
+/// a console-launched dev run (`cargo run`, `.\oximux.exe` in a shell) does
+/// have a parent console, attach to it so `tracing` output lands there and
+/// Ctrl+C still reaches the process. Launched from Explorer or the debugger
+/// there is no parent console, the call fails, and that failure is the
+/// desired outcome — no window.
+///
+/// Debug builds only — the same recipe as Zed's, which gates its
+/// `AttachConsole` behind an explicit `--foreground` flag. The gate exists
+/// because attaching couples the process to the console's window: close that
+/// terminal and Windows ends every attached client, which is right for a dev
+/// run and wrong for a release app someone happened to start from a shell.
+/// Build profile stands in for Zed's flag until OxiMux grows a CLI surface.
+///
+/// Ordering: must run before `init_tracing` (and any other stdio use), because
+/// the std handles are resolved on first use. Handle semantics are Windows's,
+/// not ours: `AttachConsole` rebinds the std handles only when the parent did
+/// NOT pass explicit ones (`STARTF_USESTDHANDLES`), so a redirected
+/// `cargo run > log.txt` keeps its pipe.
+#[cfg(all(windows, debug_assertions))]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // SAFETY: first thing in `main`, no other threads exist; AttachConsole
+    // only mutates this process's console association.
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
 }
 
 fn init_tracing() {

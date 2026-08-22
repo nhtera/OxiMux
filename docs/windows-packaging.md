@@ -72,12 +72,26 @@ in the build log.
 ## Console window
 
 `apps/desktop/src/main.rs` carries
-`#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]`.
+`#![cfg_attr(windows, windows_subsystem = "windows")]` — every build, debug
+included.
 
-Release builds get no console. Debug builds keep it, because that is where
-`tracing` output goes and losing it would make `cargo run` silent. The
-consequence is worth stating plainly: **a packaged release build has no stdout**.
-Anything that has to survive a packaged run must reach a file, not `eprintln!`.
+Debug builds used to stay console-subsystem so `cargo run` had somewhere to
+print. The cost surfaced once the port was actually used: a console-subsystem
+binary launched outside an existing console (Explorer, the debugger, a Start
+menu pin) makes Windows conjure one, and on a machine whose default terminal
+is Windows Terminal that console is a *persistent* empty "Terminal" window —
+one per launch, left behind as a dead pane when the app exits.
+
+Debug `main` now calls `AttachConsole(ATTACH_PARENT_PROCESS)` first thing
+instead: launched from a console, the process joins it (logs land there,
+Ctrl+C works); launched from anywhere else the call fails and no window ever
+exists. This is Zed's recipe — their `AttachConsole` sits behind an explicit
+`--foreground` flag because attaching ties the app's life to the launching
+terminal, which is right for a dev run and wrong for a release app started
+from a shell; OxiMux gates on build profile until it grows a CLI surface.
+The release consequence is unchanged and worth stating plainly: **a release
+build has no stdout anywhere**. Anything that has to survive a packaged run
+must reach a file, not `eprintln!`.
 
 ## Signing
 

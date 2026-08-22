@@ -70,8 +70,13 @@ fn looks_like_a_gui_launch(path: &str) -> bool {
 /// interactive shell additionally loads prompts, completions, and whatever else
 /// the user has, none of which is wanted on a boot path.
 fn login_shell_path() -> Option<String> {
+    use oximux_no_window::NoWindow as _;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let out = Command::new(shell).args(["-lc", "printf %s \"$PATH\""]).output().ok()?;
+    let out = Command::new(shell)
+        .args(["-lc", "printf %s \"$PATH\""])
+        .no_window()
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
