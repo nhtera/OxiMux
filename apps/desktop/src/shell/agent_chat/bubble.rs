@@ -136,6 +136,9 @@ fn legacy_assistant_body(key: usize, body: &str, typo: &Typography) -> AnyElemen
         highlight_theme: HighlightTheme::default_dark(),
         ..Default::default()
     };
+    // Copied out so the `'static` code-block closure below can carry it: the
+    // closure outlives this borrow of `typo`, but an `f32` moves in freely.
+    let body_sm = typo.t_body_sm;
     div()
         .w_full()
         // `min_w_0` is load-bearing: the markdown view reports its longest
@@ -152,7 +155,7 @@ fn legacy_assistant_body(key: usize, body: &str, typo: &Typography) -> AnyElemen
                 // way a polished chat surfaces a code answer (selection-copy is
                 // still available; this is the affordance). The closure resolves
                 // the active theme at render time, so this stays cx-free here.
-                .code_block_actions(|code_block, _window, cx| {
+                .code_block_actions(move |code_block, _window, cx| {
                     let code = code_block.code();
                     h_flex()
                         .gap_2()
@@ -160,7 +163,7 @@ fn legacy_assistant_body(key: usize, body: &str, typo: &Typography) -> AnyElemen
                         .when_some(code_block.lang(), |this, lang| {
                             this.child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(px(body_sm))
                                     .text_color(cx.theme().muted_foreground)
                                     .child(lang),
                             )

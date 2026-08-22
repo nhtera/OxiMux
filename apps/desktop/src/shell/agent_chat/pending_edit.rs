@@ -138,6 +138,7 @@ impl AgentChatView {
     ) -> Option<impl IntoElement> {
         let pe = self.pending_edit.as_ref()?;
         let t = &self.theme;
+        let density = self.density;
         let files_offerable = pe.sha.is_some();
         let include_files = pe.include_files;
         let removed = pe.messages_removed.saturating_sub(1);
@@ -169,7 +170,9 @@ impl AgentChatView {
                 .pl(px(11.0))
                 .pr(px(9.0))
                 .py(px(8.0))
-                .rounded(px(9.0))
+                // `r_card`, like every sibling card in the transcript. It
+                // shipped at 9 against their 8 — a near-miss nobody chose.
+                .rounded(px(density.r_card))
                 .bg(t.bg_panel_alt)
                 .border_1()
                 .border_color(t.border_inactive)
@@ -182,7 +185,7 @@ impl AgentChatView {
                         .items_center()
                         .justify_center()
                         .size(px(24.0))
-                        .rounded(px(6.0))
+                        .rounded(px(density.r_xs))
                         .bg(accent_soft)
                         .text_sm()
                         .text_color(t.fg_base)
@@ -216,7 +219,7 @@ impl AgentChatView {
                             .gap(px(5.0))
                             .px(px(8.0))
                             .py(px(4.0))
-                            .rounded(px(6.0))
+                            .rounded(px(density.r_xs))
                             .cursor_pointer()
                             .text_xs()
                             .text_color(if include_files { t.fg_base } else { t.fg_muted })
@@ -239,7 +242,7 @@ impl AgentChatView {
                         .flex_shrink_0()
                         .px(px(10.0))
                         .py(px(5.0))
-                        .rounded(px(6.0))
+                        .rounded(px(density.r_xs))
                         .cursor_pointer()
                         .text_xs()
                         .text_color(t.fg_muted)

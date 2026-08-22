@@ -287,6 +287,7 @@ fn worktree_popover_panel(
     view: Entity<ComposerView>,
     theme: Theme,
     typo: &Typography,
+    density: Density,
     cx: &mut Context<PopoverState>,
 ) -> AnyElement {
     let mut panel = div()
@@ -311,7 +312,7 @@ fn worktree_popover_panel(
                 .gap(px(8.0))
                 .px(px(8.0))
                 .py(px(6.0))
-                .rounded(px(6.0))
+                .rounded(px(density.r_xs))
                 .hover(|s| s.bg(theme.hover_overlay))
                 .cursor_pointer()
                 .on_click(move |_ev, _window, cx| {
@@ -920,7 +921,14 @@ impl ComposerView {
         if self.meter_cost > 0.0 {
             tip.push_str(&format!("\nCost since open: ${:.2}", self.meter_cost));
         }
-        Some(context_meter::context_meter(fraction, label, tip, &self.theme, &self.typography))
+        Some(context_meter::context_meter(
+            fraction,
+            label,
+            tip,
+            &self.theme,
+            &self.typography,
+            &self.density,
+        ))
     }
 
     /// Push the bound agent's display name so the input placeholder reads "Message
@@ -1918,6 +1926,7 @@ impl ComposerView {
         let draft = self.worktree_draft.clone()?;
         let theme = self.theme;
         let typo = self.typography.clone();
+        let density = self.density;
         let view = cx.entity();
 
         // Label: the slug when a worktree is armed (it's the thing the user
@@ -1962,7 +1971,7 @@ impl ComposerView {
                 move |_state, _window, cx| {
                     let view = view.clone();
                     let draft = draft.clone();
-                    worktree_popover_panel(draft, view, theme, &typo, cx)
+                    worktree_popover_panel(draft, view, theme, &typo, density, cx)
                 }
             });
 
@@ -2078,6 +2087,7 @@ impl ComposerView {
         // this hand-rolled one gives both centering AND open-time suppression.
         let theme = self.theme;
         let body_sm = self.typography.t_body_sm;
+        let r_xs = self.density.r_xs;
         let group_name = SharedString::from(format!("{ctrl_id}-grp"));
         let mut wrap = div().id(wrap_id).relative().group(group_name.clone()).child(popover);
         if !is_open {
@@ -2098,7 +2108,7 @@ impl ComposerView {
                             .whitespace_nowrap()
                             .px(px(8.0))
                             .py(px(3.0))
-                            .rounded(px(6.0))
+                            .rounded(px(r_xs))
                             .bg(theme.bg_overlay)
                             .border_1()
                             .border_color(theme.border_inactive)
@@ -2402,6 +2412,7 @@ impl ComposerView {
         };
 
         let theme = self.theme;
+        let density = self.density;
         let mic: AnyElement = if hold {
             // Press-and-hold: start on mouse-down, stop+insert on release. Both
             // go through `toggle_dictation`, which flips on the current state.
@@ -2411,7 +2422,7 @@ impl ComposerView {
                 .items_center()
                 .justify_center()
                 .size(px(24.0))
-                .rounded(px(6.0))
+                .rounded(px(density.r_xs))
                 .text_color(theme.fg_muted)
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.bg_overlay).text_color(theme.fg_base))
@@ -2591,7 +2602,9 @@ impl ComposerView {
             .justify_center()
             .flex_none()
             .size(px(20.0))
-            .rounded(px(5.0))
+            // A 20px square button, not a badge: `r_xs` is the button tier.
+            // It shipped at 5 — off every step, and a pixel from this one.
+            .rounded(px(density.r_xs))
             .bg(theme.status_error)
             .cursor_pointer()
             .hover(|s| s.opacity(0.85))
@@ -2599,7 +2612,7 @@ impl ComposerView {
                 MouseButton::Left,
                 cx.listener(|this, _ev, window, cx| this.toggle_dictation(window, cx)),
             )
-            .child(div().size(px(9.0)).rounded(px(2.0)).bg(theme.bg_base));
+            .child(div().size(px(9.0)).rounded(px(density.r_chip)).bg(theme.bg_base));
 
         // Cancel (✕): discard the recording.
         let cancel = div()
@@ -2609,7 +2622,7 @@ impl ComposerView {
             .justify_center()
             .flex_none()
             .size(px(24.0))
-            .rounded(px(6.0))
+            .rounded(px(density.r_xs))
             .text_color(theme.fg_muted)
             .cursor_pointer()
             .hover(|s| s.bg(theme.bg_overlay).text_color(theme.fg_base))
@@ -2690,7 +2703,7 @@ impl ComposerView {
             .flex_row()
             .items_center()
             .gap(px(density.gap_inline))
-            .rounded(px(14.0))
+            .rounded(px(density.r_xl))
             .bg(theme.bg_panel_alt)
             .px(px(density.pad_panel))
             .text_size(px(typo.t_body_sm))
@@ -2712,6 +2725,7 @@ impl ComposerView {
     fn render_attachments(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let density = self.density;
+        let typo = &self.typography;
         let mut row = div()
             .flex()
             .flex_row()
@@ -2723,7 +2737,7 @@ impl ComposerView {
             let thumb = div()
                 .size(px(48.0))
                 .flex_none()
-                .rounded(px(8.0))
+                .rounded(px(density.r_card))
                 .overflow_hidden()
                 .border_1()
                 .border_color(theme.border_input)
@@ -2746,7 +2760,7 @@ impl ComposerView {
                 .border_1()
                 .border_color(theme.border_input)
                 .text_color(theme.fg_muted)
-                .text_size(px(9.0))
+                .text_size(px(typo.t_sub_label))
                 .cursor_pointer()
                 .hover(|s| s.text_color(theme.fg_base))
                 .on_mouse_down(
@@ -2782,7 +2796,7 @@ impl ComposerView {
                 .items_center()
                 .flex_none()
                 .gap(px(density.gap_inline * 0.5))
-                .rounded(px(8.0))
+                .rounded(px(density.r_card))
                 .border_1()
                 .border_color(theme.border_input)
                 .bg(theme.bg_panel)
@@ -2802,7 +2816,7 @@ impl ComposerView {
                         .items_center()
                         .justify_center()
                         .text_color(theme.fg_subtle)
-                        .text_size(px(9.0))
+                        .text_size(px(typo.t_sub_label))
                         .cursor_pointer()
                         .hover(|s| s.text_color(theme.fg_base))
                         .on_mouse_down(
@@ -2852,7 +2866,7 @@ impl ComposerView {
                 .items_center()
                 .w_full()
                 .gap(px(density.gap_inline))
-                .rounded(px(10.0))
+                .rounded(px(density.r_lg))
                 .border_1()
                 .border_color(theme.border_input)
                 .bg(theme.bg_panel)
@@ -2997,7 +3011,11 @@ impl ComposerView {
             .w_full()
             .flex()
             .flex_col()
-            .rounded(px(12.0))
+            // `r_xl`, matching the input shell this list grows out of. It
+            // shipped at 12 — between two steps, and a corner that disagrees
+            // with the surface it is flush against reads as a misalignment
+            // rather than a choice.
+            .rounded(px(density.r_xl))
             .border_1()
             .border_color(theme.border_input)
             .bg(theme.bg_panel)
@@ -3121,7 +3139,8 @@ impl ComposerView {
             .w_full()
             .flex()
             .flex_col()
-            .rounded(px(12.0))
+            // `r_xl` for the same reason as the slash palette above.
+            .rounded(px(density.r_xl))
             .border_1()
             .border_color(theme.border_input)
             .bg(theme.bg_panel)
@@ -3241,7 +3260,7 @@ impl ComposerView {
                 .flex()
                 .flex_row()
                 .items_center()
-                .rounded(px(12.0))
+                .rounded(px(density.r_xl))
                 .border_1()
                 .border_color(theme.border_input)
                 .bg(theme.bg_panel)
@@ -3471,7 +3490,7 @@ impl Render for ComposerView {
             .flex_row()
             .items_center()
             .w_full()
-            .rounded(px(14.0))
+            .rounded(px(density.r_xl))
             .border_1()
             .border_color(if focused { theme.focus_ring } else { theme.border_input })
             .bg(theme.bg_panel_alt)

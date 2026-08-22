@@ -948,6 +948,7 @@ impl AgentChatView {
                             self.provider_label(),
                             theme,
                             &typo,
+                            density,
                             cx,
                         ));
                     // Thinking display honors the chat-wide level (see
@@ -1142,7 +1143,7 @@ impl AgentChatView {
                 .clone()
                 .unwrap_or_else(|| "Agent process exited.".to_string());
             let retry = self.retry_button(cx);
-            col = col.child(error_card::error_card(&msg, theme, &typo, retry));
+            col = col.child(error_card::error_card(&msg, theme, &typo, density, retry));
         } else if self.auth.is_some() {
             // The agent needs login before a session can open — the auth card is
             // the only actionable state, so it takes precedence over the working
@@ -1173,14 +1174,14 @@ impl AgentChatView {
             // Takes precedence over the plain error card below since it's the
             // actionable version of the same state.
             let action = self.open_login_terminal_button(cx);
-            col = col.child(login_card::login_card(self.provider_label(), theme, &typo, action));
+            col = col.child(login_card::login_card(self.provider_label(), theme, &typo, density, action));
         } else if let Some(err) = self.thread.last_error.clone() {
             // An idle turn that ended in error: surface it inline at the tail
             // with a Retry. This is the ONLY place a failure after the first
             // message becomes visible — the empty-state hint that also renders
             // `last_error` only paints when the transcript is empty.
             let retry = self.retry_button(cx);
-            col = col.child(error_card::error_card(&err, theme, &typo, retry));
+            col = col.child(error_card::error_card(&err, theme, &typo, density, retry));
         } else {
             // A settled turn: surface its one-line summary and token/cost usage
             // (both decoded by the backend; shown only when present).

@@ -10,7 +10,7 @@
 //! color (a designed state, not a missing feature).
 
 use gpui::{div, px, relative, Hsla, InteractiveElement, IntoElement, ParentElement, Styled};
-use oximux_settings::{Theme, Typography};
+use oximux_settings::{Density, Theme, Typography};
 
 /// Threshold color for the fraction of the context window USED (the inverse of
 /// the rate-limit meter's headroom coloring): >90% error, ≥70% warn, else a
@@ -43,6 +43,7 @@ pub fn context_meter(
     tooltip_text: String,
     theme: &Theme,
     typography: &Typography,
+    density: &Density,
 ) -> impl IntoElement {
     let mut pill = div()
         .id("chat-context-meter")
@@ -56,7 +57,7 @@ pub fn context_meter(
         .gap(px(6.0))
         .px(px(8.0))
         .py(px(2.0))
-        .rounded(px(8.0))
+        .rounded(px(density.r_card))
         .text_size(px(typography.t_sub_label))
         .text_color(theme.fg_muted)
         .child(div().child(label));
@@ -101,7 +102,7 @@ pub fn context_meter(
                     .gap(px(2.0))
                     .px(px(8.0))
                     .py(px(3.0))
-                    .rounded(px(6.0))
+                    .rounded(px(density.r_xs))
                     .bg(theme.bg_overlay)
                     .border_1()
                     .border_color(theme.border_inactive)

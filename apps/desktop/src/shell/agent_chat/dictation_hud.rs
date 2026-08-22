@@ -275,7 +275,7 @@ impl Render for DictationHud {
 
         let stop_square = div()
             .size(px(10.0))
-            .rounded(px(2.0))
+            .rounded(px(density.r_chip))
             .bg(theme.status_error);
 
         let pill = div()

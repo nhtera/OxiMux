@@ -202,6 +202,7 @@ impl AgentChatView {
             return None;
         }
         let theme = self.theme;
+        let density = self.density;
         let typo = &self.typography;
         let active = self.current_user_ordinal().min(previews.len() - 1);
 
@@ -228,7 +229,7 @@ impl AgentChatView {
                     .px(px(9.0))
                     .py(px(5.0))
                     .gap(px(1.0))
-                    .rounded(px(6.0))
+                    .rounded(px(density.r_xs))
                     .cursor_pointer()
                     .when(selected, |s| s.bg(theme.hover_overlay))
                     .hover(|s| s.bg(theme.hover_overlay))
@@ -291,7 +292,7 @@ impl AgentChatView {
                     .w_full()
                     .px(px(9.0))
                     .py(px(5.0))
-                    .rounded(px(6.0))
+                    .rounded(px(density.r_xs))
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.hover_overlay))
                     .text_size(px(typo.t_body_sm))
@@ -313,7 +314,7 @@ impl AgentChatView {
             .flex_col()
             .w(px(MENU_W))
             .max_h(px(LIST_MAX_H))
-            .rounded(px(10.0))
+            .rounded(px(density.r_lg))
             .border_1()
             .border_color(theme.border_inactive)
             .bg(theme.bg_panel_alt)

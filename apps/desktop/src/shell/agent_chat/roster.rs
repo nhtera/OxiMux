@@ -506,7 +506,7 @@ impl AgentChatView {
                     .w_full()
                     .min_w_0()
                     .gap(px(6.0))
-                    .rounded(px(8.0))
+                    .rounded(px(self.density.r_card))
                     .border_1()
                     .border_color(theme.status_error.opacity(0.4))
                     .bg(theme.status_error.opacity(0.08))

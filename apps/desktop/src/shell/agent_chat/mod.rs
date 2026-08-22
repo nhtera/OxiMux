@@ -2325,7 +2325,7 @@ impl AgentChatView {
             .gap(px(5.0))
             .px(px(10.0))
             .py(px(4.0))
-            .rounded(px(6.0))
+            .rounded(px(self.density.r_xs))
             .cursor_pointer()
             .bg(theme.status_error.opacity(0.15))
             .text_size(px(typo.t_body_sm))
@@ -2402,7 +2402,7 @@ impl AgentChatView {
             .gap(px(5.0))
             .px(px(10.0))
             .py(px(4.0))
-            .rounded(px(6.0))
+            .rounded(px(self.density.r_xs))
             .cursor_pointer()
             .bg(theme.status_info.opacity(0.15))
             .text_size(px(typo.t_body_sm))
@@ -4150,7 +4150,7 @@ impl AgentChatView {
                 .max_w(px(CONTENT_MAX_W))
                 .px(px(10.0))
                 .py(px(5.0))
-                .rounded(px(8.0))
+                .rounded(px(self.density.r_card))
                 .bg(t.status_warn.opacity(0.15))
                 .text_sm()
                 .text_color(t.fg_base)
@@ -4184,7 +4184,7 @@ impl AgentChatView {
                     .id("thinking-level-toggle")
                     .px(px(8.0))
                     .py(px(2.0))
-                    .rounded(px(6.0))
+                    .rounded(px(self.density.r_xs))
                     .text_xs()
                     .text_color(t.fg_subtle)
                     .cursor_pointer()
@@ -4629,6 +4629,7 @@ impl AgentChatView {
                         if copied { "Copied" } else { "Copy" },
                         if copied { theme.status_ok } else { theme.fg_muted },
                         theme,
+                        density,
                         cx.listener(move |this, _e, _w, cx| {
                             this.copy_message(idx, copy_text.clone(), cx);
                         }),
@@ -4640,6 +4641,7 @@ impl AgentChatView {
                             "Edit message",
                             theme.fg_muted,
                             theme,
+                            density,
                             cx.listener(move |this, _e, window, cx| {
                                 this.enter_pending_edit(idx, window, cx);
                             }),
@@ -4652,6 +4654,7 @@ impl AgentChatView {
                             "Rewind to here",
                             theme.fg_muted,
                             theme,
+                            density,
                             cx.listener(move |this, _e, _w, cx| {
                                 this.open_rewind_confirm(idx, cx)
                             }),
@@ -4669,6 +4672,7 @@ impl AgentChatView {
                             "Fork from here",
                             theme.fg_muted,
                             theme,
+                            density,
                             cx.listener(move |this, _e, _w, cx| {
                                 this.request_fork(idx, cx)
                             }),
@@ -5382,6 +5386,7 @@ fn assistant_header(
     provider: &str,
     theme: Theme,
     typo: &Typography,
+    density: Density,
     cx: &mut Context<AgentChatView>,
 ) -> AnyElement {
     let copy_text = text.to_string();
@@ -5396,7 +5401,7 @@ fn assistant_header(
             .items_center()
             .justify_center()
             .size(px(22.0))
-            .rounded(px(6.0))
+            .rounded(px(density.r_xs))
             .cursor_pointer()
             .invisible()
             .group_hover(group, |s| s.visible())
@@ -5455,6 +5460,7 @@ fn message_action_icon(
     tooltip: &'static str,
     icon_color: gpui::Hsla,
     theme: Theme,
+    density: Density,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let tip = SharedString::from(tooltip);
@@ -5464,7 +5470,7 @@ fn message_action_icon(
         .items_center()
         .justify_center()
         .size(px(24.0))
-        .rounded(px(6.0))
+        .rounded(px(density.r_xs))
         .cursor_pointer()
         .hover(|s| s.bg(theme.hover_overlay))
         .tooltip(move |window, cx| {

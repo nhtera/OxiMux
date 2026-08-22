@@ -451,6 +451,7 @@ impl AgentChatView {
     ) -> Option<impl IntoElement> {
         let rc = self.rewind_confirm.as_ref()?;
         let t = &self.theme;
+        let density = self.density;
         let files_offerable = rc.sha.is_some();
         let include_files = rc.include_files;
         let file_note: SharedString = match (include_files, rc.dirty_count) {
@@ -488,7 +489,9 @@ impl AgentChatView {
                 .pl(px(11.0))
                 .pr(px(10.0))
                 .py(px(10.0))
-                .rounded(px(9.0))
+                // `r_card`, like every sibling card in the transcript. It
+                // shipped at 9 against their 8 — a near-miss nobody chose.
+                .rounded(px(density.r_card))
                 .bg(t.bg_panel_alt)
                 .border_1()
                 .border_color(t.border_inactive)
@@ -505,7 +508,7 @@ impl AgentChatView {
                                 .justify_center()
                                 .flex_shrink_0()
                                 .size(px(24.0))
-                                .rounded(px(6.0))
+                                .rounded(px(density.r_xs))
                                 .bg(badge_soft)
                                 .text_sm()
                                 .text_color(t.status_error)
@@ -552,7 +555,7 @@ impl AgentChatView {
                                 .id("rewind-cancel")
                                 .px(px(10.0))
                                 .py(px(5.0))
-                                .rounded(px(6.0))
+                                .rounded(px(density.r_xs))
                                 .cursor_pointer()
                                 .text_xs()
                                 .text_color(t.fg_muted)
@@ -569,7 +572,7 @@ impl AgentChatView {
                                 .id("rewind-go")
                                 .px(px(10.0))
                                 .py(px(5.0))
-                                .rounded(px(6.0))
+                                .rounded(px(density.r_xs))
                                 .cursor_pointer()
                                 .text_xs()
                                 .font_weight(gpui::FontWeight::MEDIUM)

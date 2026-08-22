@@ -90,7 +90,10 @@ fn option_row(
         indicator = indicator.bg(theme.status_ok);
         if multi {
             indicator = indicator.child(
-                div().text_size(px(10.0)).text_color(theme.bg_panel).child(SharedString::from("✓")),
+                div()
+                    .text_size(px(typo.t_label_xs))
+                    .text_color(theme.bg_panel)
+                    .child(SharedString::from("✓")),
             );
         }
     }
@@ -615,6 +618,7 @@ impl QuestionCard {
     fn pager(&self, page: usize, n: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let typo = self.typography.clone();
+        let density = self.density;
         // Precompute answered-state so the dot builders don't re-borrow `self`
         // while `cx.listener` is live.
         let answered: Vec<bool> = (0..n).map(|i| self.question_answered(i, cx)).collect();
@@ -624,7 +628,7 @@ impl QuestionCard {
                 .id(SharedString::from(format!("q-nav-{glyph}-{page}")))
                 .px(px(5.0))
                 .py(px(1.0))
-                .rounded(px(6.0))
+                .rounded(px(density.r_xs))
                 .text_size(px(typo.t_body_md))
                 .text_color(if target.is_some() { theme.fg_muted } else { theme.fg_subtle })
                 .child(SharedString::from(glyph.to_string()));
