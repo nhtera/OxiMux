@@ -48,20 +48,30 @@ use syntect::parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet};
 /// variant matches the per-line feeding in `highlight_line`.
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(two_face::syntax::extra_no_newlines);
 
-/// The diff syntax theme — a conventional dark-editor token palette
-/// (keyword-blue / string-orange / comment-green) bundled as a TextMate
-/// theme (`assets/themes/syntax-dark.tmTheme`) and embedded at compile
-/// time. Only token foregrounds are consumed; the theme's background is
-/// inert (OxiMux paints its own charcoal surface).
+/// The diff syntax theme for the charcoal palette — a conventional
+/// dark-editor token set (keyword-blue / string-orange / comment-green)
+/// bundled as a TextMate theme and embedded at compile time. Only token
+/// foregrounds are consumed; the theme's background is inert (OxiMux paints
+/// its own surface).
 static SYNTAX_DARK: LazyLock<Theme> = LazyLock::new(|| {
     let bytes = include_bytes!("../../../assets/themes/syntax-dark.tmTheme");
     ThemeSet::load_from_reader(&mut Cursor::new(&bytes[..]))
         .expect("bundled syntax-dark.tmTheme parses")
 });
 
-/// The active highlight theme for the diff body.
-fn active_theme() -> &'static Theme {
-    &SYNTAX_DARK
+/// The Paper counterpart, scope for scope. A second file rather than a tint
+/// applied to the first: token hues are not a hue rotation of each other, and
+/// a diff highlighted in Dark+ colours on a white page is the most obvious
+/// tell that a light theme was bolted on.
+static SYNTAX_LIGHT: LazyLock<Theme> = LazyLock::new(|| {
+    let bytes = include_bytes!("../../../assets/themes/syntax-light.tmTheme");
+    ThemeSet::load_from_reader(&mut Cursor::new(&bytes[..]))
+        .expect("bundled syntax-light.tmTheme parses")
+});
+
+/// The highlight theme for the palette in force.
+fn active_theme(light: bool) -> &'static Theme {
+    if light { &SYNTAX_LIGHT } else { &SYNTAX_DARK }
 }
 
 /// The syntect highlighter, derived once from the bundled theme. Building it
@@ -71,8 +81,15 @@ fn active_theme() -> &'static Theme {
 /// ~6 ms/line in a debug build, i.e. a ~1 s stall to highlight a 170-line
 /// diff. Shared here so each line pays only a cheap `ParseState` +
 /// `HighlightState` setup.
-static HIGHLIGHTER: LazyLock<Highlighter<'static>> =
-    LazyLock::new(|| Highlighter::new(active_theme()));
+static HIGHLIGHTER_DARK: LazyLock<Highlighter<'static>> =
+    LazyLock::new(|| Highlighter::new(active_theme(false)));
+
+/// Its Paper counterpart. Two statics rather than one swapped at runtime:
+/// building a `Highlighter` walks every scope selector in the theme, so it
+/// must be paid once per palette and never per line — and a user who switches
+/// back and forth should not re-pay it each time.
+static HIGHLIGHTER_LIGHT: LazyLock<Highlighter<'static>> =
+    LazyLock::new(|| Highlighter::new(active_theme(true)));
 
 /// A resolved grammar handle for one file. Wraps the syntect
 /// [`SyntaxReference`] matched from the bundled set, or `None` when nothing
@@ -143,7 +160,7 @@ pub struct HiToken {
 /// The caller (`paint.rs`) treats empty output as "fall back to muted base
 /// color", which keeps the renderer simple and prevents a bad grammar
 /// match from blanking out the row.
-pub fn highlight_line(line: &str, lang: Language) -> Vec<HiToken> {
+pub fn highlight_line(line: &str, lang: Language, light: bool) -> Vec<HiToken> {
     let Some(syntax) = lang.0 else {
         return Vec::new();
     };
@@ -154,7 +171,11 @@ pub fn highlight_line(line: &str, lang: Language) -> Vec<HiToken> {
     // state per line — preserving the prior per-line behaviour (added/removed
     // rows must not leak multi-line string/comment state across the +/-
     // boundary). Only the heavy `Highlighter` (theme scope cache) is shared.
-    let highlighter = &*HIGHLIGHTER;
+    let highlighter: &Highlighter<'static> = if light {
+        &HIGHLIGHTER_LIGHT
+    } else {
+        &HIGHLIGHTER_DARK
+    };
     let mut parse_state = ParseState::new(syntax);
     let mut highlight_state = HighlightState::new(highlighter, ScopeStack::new());
     // syntect expects the trailing `\n` so it knows the line ended. Diff rows
@@ -196,7 +217,9 @@ pub fn highlight_line(line: &str, lang: Language) -> Vec<HiToken> {
 /// paint. Safe to call any number of times; first call to
 /// `highlight_line` would warm them anyway.
 pub fn prewarm() {
-    let _ = (&*SYNTAX_SET, &*SYNTAX_DARK);
+    // Both palettes: the cost is a one-off parse each, and warming only the
+    // one in force would move the stall to whenever the user switched.
+    let _ = (&*SYNTAX_SET, &*SYNTAX_DARK, &*SYNTAX_LIGHT);
 }
 
 /// Test-only — expose a Style→u8 helper. Production code reads
@@ -264,14 +287,14 @@ mod tests {
 
     #[test]
     fn highlight_empty_line_yields_no_tokens() {
-        assert!(highlight_line("", detect_language(&PathBuf::from("x.rs"))).is_empty());
+        assert!(highlight_line("", detect_language(&PathBuf::from("x.rs")), false).is_empty());
     }
 
     #[test]
     fn highlight_plain_language_yields_no_tokens() {
         let plain = detect_language(&PathBuf::from("notes.unknownext"));
         assert!(plain.is_plain());
-        assert!(highlight_line("anything goes", plain).is_empty());
+        assert!(highlight_line("anything goes", plain, false).is_empty());
     }
 
     #[test]
@@ -281,7 +304,7 @@ mod tests {
         let lang = detect_language(&PathBuf::from("app.py"));
         assert!(!lang.is_plain(), "python should resolve");
         assert!(
-            !highlight_line("def main():", lang).is_empty(),
+            !highlight_line("def main():", lang, false).is_empty(),
             "python keyword line should produce tokens"
         );
     }
@@ -291,7 +314,7 @@ mod tests {
         // `let` (keyword) and `"hello"` (string) should land on different
         // foreground colors under any sane theme. The exact values are
         // theme-dependent so we assert on inequality only.
-        let toks = highlight_line(r#"let x = "hello";"#, detect_language(&PathBuf::from("x.rs")));
+        let toks = highlight_line(r#"let x = "hello";"#, detect_language(&PathBuf::from("x.rs")), false);
         assert!(!toks.is_empty(), "rust line should produce tokens");
         // Find a token covering `let` and one covering the string body.
         let let_tok = toks.iter().find(|t| t.start == 0).expect("token at start");
@@ -310,7 +333,7 @@ mod tests {
         // Lock the dark-editor hues: keyword #569CD6 (blue), string body
         // #CE9178 (orange). Guards against an accidental theme swap silently
         // regressing the syntax palette.
-        let toks = highlight_line(r#"let x = "hello";"#, detect_language(&PathBuf::from("x.rs")));
+        let toks = highlight_line(r#"let x = "hello";"#, detect_language(&PathBuf::from("x.rs")), false);
         let kw = toks.iter().find(|t| t.start == 0).expect("keyword token");
         assert_eq!((kw.r, kw.g, kw.b), (0x56, 0x9C, 0xD6), "keyword should be blue");
         // The string body sits inside the quotes (bytes 8..=15).
@@ -328,7 +351,7 @@ mod tests {
         // the last token's end should be <= line.len(), and the first
         // should start at 0.
         let line = "let x = 1;";
-        let toks = highlight_line(line, detect_language(&PathBuf::from("x.rs")));
+        let toks = highlight_line(line, detect_language(&PathBuf::from("x.rs")), false);
         assert!(toks.first().is_some_and(|t| t.start == 0));
         assert!(toks.last().is_some_and(|t| t.end == line.len()));
         // No gaps and no overlaps.
@@ -355,5 +378,67 @@ mod tests {
         // Default foreground is non-zero in any sane theme but this is
         // a Style::default() so the values are theme-independent zeroes.
         assert_eq!((r, g, b), (0, 0, 0));
+    }
+    /// The two bundled themes must cover the same scopes.
+    ///
+    /// A scope present in one and missing from the other is a construct that
+    /// highlights in charcoal and falls back to the base foreground on paper
+    /// (or the reverse) — which reads as a rendering bug, not as a theme, and
+    /// is invisible to anyone who only ever uses one palette.
+    #[test]
+    fn the_two_bundled_themes_cover_the_same_scopes() {
+        fn scopes(src: &str) -> Vec<String> {
+            src.split("<key>scope</key>")
+                .skip(1)
+                .filter_map(|chunk| {
+                    let start = chunk.find("<string>")? + "<string>".len();
+                    let end = chunk[start..].find("</string>")? + start;
+                    Some(chunk[start..end].to_string())
+                })
+                .collect()
+        }
+        let dark = include_str!("../../../assets/themes/syntax-dark.tmTheme");
+        let light = include_str!("../../../assets/themes/syntax-light.tmTheme");
+        let (d, l) = (scopes(dark), scopes(light));
+        assert!(!d.is_empty(), "the dark theme should declare scopes");
+        assert_eq!(d, l, "scope lists diverged between the two syntax themes");
+    }
+
+    /// The palette actually reaches the tokens. Without this the light theme
+    /// could be bundled, parsed, and never consulted — which is exactly the
+    /// state the diff body was in when Paper first shipped.
+    #[test]
+    fn the_two_palettes_colour_the_same_line_differently() {
+        let lang = detect_language(&PathBuf::from("x.rs"));
+        let line = r#"let x = "hello";"#;
+        let dark = highlight_line(line, lang, false);
+        let light = highlight_line(line, lang, true);
+        assert!(!dark.is_empty() && !light.is_empty(), "rust tokenizes");
+        assert_eq!(
+            dark.len(),
+            light.len(),
+            "same grammar, same spans -- only the colours may differ"
+        );
+        assert!(
+            dark.iter().zip(&light).any(|(a, b)| (a.r, a.g, a.b) != (b.r, b.g, b.b)),
+            "the two palettes produced identical colours"
+        );
+    }
+
+    /// And each one lands on the right side of the ground it is drawn on: a
+    /// keyword that is light on charcoal must be dark on paper.
+    #[test]
+    fn each_palette_tokenises_for_its_own_ground() {
+        let lang = detect_language(&PathBuf::from("x.rs"));
+        let line = "let x = 1;";
+        let mean = |toks: Vec<HiToken>| {
+            let n = toks.len().max(1) as u32;
+            let sum: u32 = toks.iter().map(|t| t.r as u32 + t.g as u32 + t.b as u32).sum();
+            sum / (3 * n)
+        };
+        let dark = mean(highlight_line(line, lang, false));
+        let light = mean(highlight_line(line, lang, true));
+        assert!(dark > 128, "charcoal tokens should be light (mean {dark})");
+        assert!(light < 128, "paper tokens should be dark (mean {light})");
     }
 }

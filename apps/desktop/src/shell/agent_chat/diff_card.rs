@@ -136,7 +136,11 @@ pub(super) fn render_diff(
 ) -> AnyElement {
     // Resolved once per card, not once per row: the grammar lookup is a
     // syntax-set search, and the rows all share a file.
-    let style = path.map(|p| RowStyle { lang: syntax::detect_language(std::path::Path::new(p)), path: p });
+    let style = path.map(|p| RowStyle {
+        lang: syntax::detect_language(std::path::Path::new(p)),
+        path: p,
+        light: theme.is_light(),
+    });
     let mut col = div()
         .flex()
         .flex_col()
@@ -200,6 +204,9 @@ pub(super) fn render_diff(
 struct RowStyle<'a> {
     lang: syntax::Language,
     path: &'a str,
+    /// Which palette to tokenise against. Resolved per card with the rest of
+    /// the style, so it reaches the row cache without widening `row_text`.
+    light: bool,
 }
 
 /// One row's highlight runs, ready to hand to `StyledText`.
@@ -217,7 +224,7 @@ type Runs = Vec<(std::ops::Range<usize>, HighlightStyle)>;
 /// Thread-local because rendering only ever happens on the foreground thread.
 const HL_CACHE_MAX: usize = 4096;
 thread_local! {
-    static HL_CACHE: std::cell::RefCell<std::collections::HashMap<(String, String), Runs>> =
+    static HL_CACHE: std::cell::RefCell<std::collections::HashMap<(bool, String, String), Runs>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -241,12 +248,16 @@ fn row_text(content: &str, style: Option<&RowStyle<'_>>) -> AnyElement {
 
 /// This row's highlight runs, tokenizing only on a cache miss.
 fn cached_runs(content: &str, style: &RowStyle<'_>) -> Runs {
-    let key = (style.path.to_string(), content.to_string());
+    let light = style.light;
+    // The palette is part of the key, not just the value: the cached runs
+    // carry baked r/g/b, so a switch has to miss rather than hand back the
+    // previous theme's colours.
+    let key = (light, style.path.to_string(), content.to_string());
     HL_CACHE.with(|c| {
         if let Some(hit) = c.borrow().get(&key) {
             return hit.clone();
         }
-        let runs = highlight_runs(content, style.lang);
+        let runs = highlight_runs(content, style.lang, light);
         let mut cache = c.borrow_mut();
         // A whole session's diffs must not accumulate forever. Rows are cheap
         // to recompute, so drop everything rather than track recency — the
@@ -261,8 +272,8 @@ fn cached_runs(content: &str, style: &RowStyle<'_>) -> Runs {
 
 /// Tokenize one row into colour runs, skipping any token whose byte range
 /// doesn't land on a char boundary of this row.
-fn highlight_runs(content: &str, lang: syntax::Language) -> Runs {
-    syntax::highlight_line(content, lang)
+fn highlight_runs(content: &str, lang: syntax::Language, light: bool) -> Runs {
+    syntax::highlight_line(content, lang, light)
         .into_iter()
         .filter_map(|t| {
             let (start, end) = (t.start.min(content.len()), t.end.min(content.len()));
@@ -373,9 +384,13 @@ mod tests {
 
     #[test]
     fn cached_runs_match_a_fresh_tokenize_and_key_on_the_file() {
-        let rs = RowStyle { lang: syntax::detect_language(std::path::Path::new("a.rs")), path: "a.rs" };
+        let rs = RowStyle {
+            lang: syntax::detect_language(std::path::Path::new("a.rs")),
+            path: "a.rs",
+            light: false,
+        };
         let line = "let x = \"hi\";";
-        let fresh = highlight_runs(line, rs.lang);
+        let fresh = highlight_runs(line, rs.lang, false);
         // First call populates, second hits — both must equal a fresh tokenize,
         // or the cache would silently paint a row wrong.
         assert_eq!(cached_runs(line, &rs), fresh);
@@ -383,8 +398,18 @@ mod tests {
         assert!(!fresh.is_empty(), "rust tokenizes, so this test is not vacuous");
 
         // Same text in a different language must not collide on the cache key.
-        let py = RowStyle { lang: syntax::detect_language(std::path::Path::new("a.py")), path: "a.py" };
-        assert_eq!(cached_runs(line, &py), highlight_runs(line, py.lang));
+        let py = RowStyle {
+            lang: syntax::detect_language(std::path::Path::new("a.py")),
+            path: "a.py",
+            light: false,
+        };
+        assert_eq!(cached_runs(line, &py), highlight_runs(line, py.lang, false));
+
+        // …and neither must the same text in the same file under the other
+        // palette: the runs carry baked colours, so a hit here would repaint
+        // the card in the theme the user just left.
+        let lit = RowStyle { light: true, ..rs };
+        assert_ne!(cached_runs(line, &lit), fresh, "palette is part of the key");
 
         // Growth only happens on a miss, so that is where the bound is enforced:
         // a full cache plus one new row evicts rather than growing forever.
@@ -392,13 +417,13 @@ mod tests {
             let mut cache = c.borrow_mut();
             cache.clear();
             for i in 0..HL_CACHE_MAX {
-                cache.insert(("f.rs".into(), format!("line{i}")), Vec::new());
+                cache.insert((false, "f.rs".into(), format!("line{i}")), Vec::new());
             }
         });
         let fresh_row = "let evicting = 1;";
         assert_eq!(
             cached_runs(fresh_row, &rs),
-            highlight_runs(fresh_row, rs.lang),
+            highlight_runs(fresh_row, rs.lang, false),
             "a miss against a full cache still returns correct runs"
         );
         HL_CACHE.with(|c| assert!(c.borrow().len() <= HL_CACHE_MAX, "cache stays bounded"));
@@ -408,13 +433,13 @@ mod tests {
     fn row_highlighting_degrades_to_plain_text() {
         // A grammar that matches produces token runs...
         let rust = syntax::detect_language(std::path::Path::new("a.rs"));
-        assert!(!syntax::highlight_line("let x = 1;", rust).is_empty(), "rust tokenizes");
+        assert!(!syntax::highlight_line("let x = 1;", rust, false).is_empty(), "rust tokenizes");
         // ...while an unknown extension yields none, which `row_text` renders
         // as flat text rather than a blank row.
         let unknown = syntax::detect_language(std::path::Path::new("a.zzzz"));
-        assert!(syntax::highlight_line("let x = 1;", unknown).is_empty());
+        assert!(syntax::highlight_line("let x = 1;", unknown, false).is_empty());
         // An empty row is safe in either language.
-        assert!(syntax::highlight_line("", rust).is_empty());
+        assert!(syntax::highlight_line("", rust, false).is_empty());
     }
 
     #[test]

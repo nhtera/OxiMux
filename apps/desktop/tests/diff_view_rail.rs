@@ -7,7 +7,7 @@
 
 use oximux_app::shell::diff_view::file_header::build_first_row_of_file;
 use oximux_app::shell::diff_view::paint::{PreparedRow, prepare};
-use oximux_app::shell::diff_view::render::{RenderCtx, build_render_plan};
+use oximux_app::shell::diff_view::render::{Highlight, RenderCtx, build_render_plan};
 use oximux_core::{DiffHunk, DiffLine, DiffLineKind, DiffStatus, FileDiff};
 use oximux_settings::{Density, Theme, Typography};
 use std::collections::HashSet;
@@ -38,7 +38,7 @@ fn one_change_file(path: &str) -> FileDiff {
 }
 
 fn prepared(files: &[FileDiff]) -> Vec<PreparedRow> {
-    let plan = build_render_plan(files, false, true);
+    let plan = build_render_plan(files, false, Highlight::On { light: false });
     let regions: Vec<_> = files.iter().map(oximux_core::change_regions).collect();
     let typography = Typography::default();
     let rctx = RenderCtx {

@@ -14,7 +14,14 @@ const SYNC_HIGHLIGHT_THRESHOLD: usize = 250;
 
 impl Render for DiffView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette_before = self.theme.choice;
         oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
+        // The cached plan holds tokens with baked r/g/b, so unlike every other
+        // surface a fresh `Theme` is not enough here — the diff would keep the
+        // previous palette's code colours until something else invalidated it.
+        if self.theme.choice != palette_before {
+            self.invalidate_plan();
+        }
         // First render is the first time this view is handed a `Window`, and
         // so the only place the background refresh can learn whether its
         // window is focused. Idempotent; see `arm_live_refresh`.
@@ -73,7 +80,12 @@ impl Render for DiffView {
                         let lines = diff_body_line_count(diffs);
                         let highlightable = lines <= SYNTAX_HIGHLIGHT_BUDGET_LINES;
                         let sync_highlight = highlightable && lines <= SYNC_HIGHLIGHT_THRESHOLD;
-                        let plan = build_render_plan(diffs, *expanded, sync_highlight);
+                        let want = Highlight::On { light: self.theme.is_light() };
+                        let plan = build_render_plan(
+                            diffs,
+                            *expanded,
+                            if sync_highlight { want } else { Highlight::Off },
+                        );
                         // Stageable change regions per file — full-file context
                         // makes one giant hunk, so the renderer docks a chip bar
                         // per region (git add -p granularity) using these.
@@ -114,9 +126,10 @@ impl Render for DiffView {
                 if let Some((diffs, expanded)) = spawn_async {
                     let gen_at_spawn = self.plan_gen;
                     let executor = cx.background_executor().clone();
+                    let want = Highlight::On { light: self.theme.is_light() };
                     self._highlight_task = Some(cx.spawn(async move |this, cx| {
                         let colored = executor
-                            .spawn(async move { build_render_plan(&diffs, expanded, true) })
+                            .spawn(async move { build_render_plan(&diffs, expanded, want) })
                             .await;
                         let _ = this.update(cx, |view, cx| {
                             if view.plan_gen != gen_at_spawn {

@@ -37,7 +37,7 @@ use crate::shell::diff_view::file_header::StickyHeader;
 use crate::shell::diff_view::live_refresh::{LiveQuery, LiveResult};
 use crate::shell::diff_view::note_repo_handle::note_repo;
 use crate::shell::diff_view::paint::{FoldId, OverviewRun, PreparedRow};
-use crate::shell::diff_view::render::{FilePlan, build_render_plan};
+use crate::shell::diff_view::render::{FilePlan, Highlight, build_render_plan};
 use crate::shell::diff_view::review_note_popover::{
     ReviewNoteCallback, ReviewNoteOutcome, ReviewNotePopover,
 };
@@ -2146,7 +2146,7 @@ impl DiffView {
             _ => return map,
         };
         // Note-anchor mapping only reads line numbers — skip the syntect pass.
-        for fp in build_render_plan(diffs, true, false) {
+        for fp in build_render_plan(diffs, true, Highlight::Off) {
             let FilePlan::Hunked { path, hunks, .. } = fp else {
                 continue;
             };
