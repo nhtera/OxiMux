@@ -82,12 +82,34 @@ pub fn install(cx: &mut App) {
     let loaded = load();
     if loaded != Appearance::default() {
         tracing::info!(
+            theme = ?loaded.theme,
             density = ?loaded.density,
             scale = loaded.scale.percent(),
             "appearance loaded"
         );
     }
+    publish_terminal_polarity(loaded);
     cx.set_global(loaded);
+}
+
+/// Tell the terminal emulator which way the window reads.
+///
+/// A child program asks twice and picks a whole palette from the answer:
+/// `COLORFGBG` when it starts, OSC 11 over the TTY while it runs. Both used to
+/// say "dark" unconditionally, so a Paper window got CLIs — Claude Code, fzf,
+/// delta — emitting truecolor tuned for near-black onto white. Truecolor
+/// carries explicit r/g/b, so the renderer's own palette never sees it; the
+/// only place to fix it is the answer.
+///
+/// What this cannot do is recolor a program that is already running: it chose
+/// its palette at startup and has no reason to ask again. New panes, and
+/// anything that re-queries, follow immediately.
+fn publish_terminal_polarity(appearance: Appearance) {
+    oximux_pty::set_background_polarity(if appearance.theme.is_light() {
+        oximux_pty::BackgroundPolarity::Light
+    } else {
+        oximux_pty::BackgroundPolarity::Dark
+    });
 }
 
 /// The appearance in force. Falls back to the shipped default when the global
@@ -112,6 +134,7 @@ pub fn set(cx: &mut App, next: Appearance) {
     }
     cx.set_global(next);
     bridge_component_theme(cx);
+    publish_terminal_polarity(next);
     cx.refresh_windows();
     if let Err(err) = save(&next) {
         tracing::warn!(%err, "could not persist appearance.toml");
