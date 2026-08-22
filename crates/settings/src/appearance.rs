@@ -63,6 +63,53 @@ impl DensityPreset {
     }
 }
 
+/// Which palette the cockpit is painted in.
+///
+/// Named for materials rather than for "dark" and "light" because that is how
+/// the dark one was already named, and because the pair says something the
+/// polarity does not: charcoal on paper is one drawing in two media, which is
+/// the relationship the two palettes are meant to have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeChoice {
+    /// The original, and still the default.
+    #[default]
+    Charcoal,
+    /// The light counterpart.
+    Paper,
+}
+
+impl ThemeChoice {
+    /// Every palette, in the order a picker should offer them.
+    pub const ALL: [Self; 2] = [Self::Charcoal, Self::Paper];
+
+    /// Name for a settings control.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Charcoal => "Charcoal",
+            Self::Paper => "Paper",
+        }
+    }
+
+    /// The polarity, spelled out — a picker showing only two material names
+    /// makes the reader guess which one is the dark one.
+    pub fn polarity(self) -> &'static str {
+        match self {
+            Self::Charcoal => "dark",
+            Self::Paper => "light",
+        }
+    }
+
+    /// True when the palette paints dark text on a light ground.
+    ///
+    /// The question every polarity-aware token has to ask: an overlay that is
+    /// white at 6% reads as a highlight on charcoal and as nothing at all on
+    /// paper, where the same job wants black at 5%.
+    pub fn is_light(self) -> bool {
+        matches!(self, Self::Paper)
+    }
+}
+
 /// Smallest and largest whole-UI zoom, in percent.
 ///
 /// The floor is 80 rather than something smaller because `t_sub_label` is
@@ -142,6 +189,8 @@ impl UiScale {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Appearance {
+    /// Which palette. See [`ThemeChoice`].
+    pub theme: ThemeChoice,
     /// How much air. See [`DensityPreset`].
     pub density: DensityPreset,
     /// How big. See [`UiScale`].
@@ -202,11 +251,17 @@ pub fn active(cx: &gpui::App) -> Appearance {
 /// frame, and nothing is rebuilt or allocated until the user actually changes
 /// something.
 #[cfg(feature = "gpui")]
-pub fn sync(density: &mut crate::Density, typography: &mut crate::Typography, cx: &gpui::App) {
+pub fn sync(
+    theme: &mut crate::Theme,
+    density: &mut crate::Density,
+    typography: &mut crate::Typography,
+    cx: &gpui::App,
+) {
     let current = active(cx);
     if density.appearance == current {
         return;
     }
+    *theme = crate::Theme::for_appearance(current);
     *density = crate::Density::for_appearance(current);
     *typography = crate::Typography::for_appearance(current);
 }
@@ -275,6 +330,7 @@ mod tests {
     #[test]
     fn a_settings_file_round_trips() {
         let original = Appearance {
+            theme: ThemeChoice::default(),
             density: DensityPreset::Comfortable,
             scale: UiScale::from_percent(130),
         };

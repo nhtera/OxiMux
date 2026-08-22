@@ -565,11 +565,11 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let theme = Theme::charcoal();
-        // Seeded from the user's appearance rather than the shipped default:
+        // Seeded from the user's appearance rather than the shipped defaults:
         // every render pulls the current tokens anyway, but starting wrong
-        // would paint one frame at the wrong size on launch.
+        // would paint one frame in the wrong palette and size on launch.
         let appearance = oximux_settings::appearance::active(cx);
+        let theme = Theme::for_appearance(appearance);
         let density = Density::for_appearance(appearance);
         let typography = Typography::for_appearance(appearance);
 

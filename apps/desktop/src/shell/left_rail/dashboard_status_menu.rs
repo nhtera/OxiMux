@@ -83,7 +83,7 @@ impl DashboardStatusFilterMenu {
 
 impl Render for DashboardStatusFilterMenu {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         let Some((active, x, y)) = self.open_for else {
             return div().into_any_element();
         };

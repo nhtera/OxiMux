@@ -111,7 +111,7 @@ pub fn set(cx: &mut App, next: Appearance) {
         return;
     }
     cx.set_global(next);
-    bridge_component_radii(cx, next);
+    bridge_component_theme(cx);
     cx.refresh_windows();
     if let Err(err) = save(&next) {
         tracing::warn!(%err, "could not persist appearance.toml");
@@ -127,7 +127,7 @@ pub fn set(cx: &mut App, next: Appearance) {
 /// break is invisible until someone who set a preset presses zoom-reset and
 /// watches their preset go with it.
 mod step {
-    use oximux_settings::{Appearance, DensityPreset, UiScale};
+    use oximux_settings::{Appearance, DensityPreset, ThemeChoice, UiScale};
 
     pub(super) fn zoom_in(current: Appearance) -> Appearance {
         Appearance {
@@ -153,6 +153,10 @@ mod step {
     pub(super) fn density(current: Appearance, density: DensityPreset) -> Appearance {
         Appearance { density, ..current }
     }
+
+    pub(super) fn theme(current: Appearance, theme: ThemeChoice) -> Appearance {
+        Appearance { theme, ..current }
+    }
 }
 
 /// One step larger, up to the supported maximum.
@@ -173,25 +177,60 @@ pub fn zoom_reset(cx: &mut App) {
     set(cx, next);
 }
 
-/// Switch density preset, leaving the zoom alone.
+/// Switch density preset, leaving the palette and the zoom alone.
 pub fn set_density(cx: &mut App, density: oximux_settings::DensityPreset) {
     let next = step::density(active(cx), density);
     set(cx, next);
 }
 
-/// Re-copy the corner radii into gpui-component's own theme.
+/// Switch palette, leaving the density and the zoom alone.
+pub fn set_theme(cx: &mut App, theme: oximux_settings::ThemeChoice) {
+    let next = step::theme(active(cx), theme);
+    set(cx, next);
+}
+
+/// Bring gpui-component's own theme into line with ours.
 ///
-/// The library paints its `Input`s and `Button`s from that theme and cannot
-/// see ours, so the bridge `main` sets up at startup has to be redone on every
-/// change — otherwise a zoom moves the chrome around a text field while the
-/// field's own corner stays where it was. A no-op when the library's theme was
-/// never installed, which is the case in headless tests.
-fn bridge_component_radii(cx: &mut App, appearance: Appearance) {
+/// The library paints its `Input`s, `Button`s and `TabBar`s from a theme it
+/// owns and cannot see ours, so anything it draws has to be pushed across:
+/// the light/dark mode it resolves its own defaults from, the two colours
+/// whose defaults are tuned for a light shadcn page and read as
+/// "always focused" against a deep panel fill, and the corner radii.
+///
+/// Called at startup and again on every change. Skipping the second call is
+/// the bug this exists to prevent — it leaves every text field in the
+/// previous theme while the chrome around it moves.
+///
+/// A no-op when the library's theme was never installed, which is the case in
+/// headless tests.
+pub fn bridge_component_theme(cx: &mut App) {
     if !cx.has_global::<gpui_component::Theme>() {
         return;
     }
+    let appearance = active(cx);
+    let palette = oximux_settings::Theme::for_appearance(appearance);
     let density = oximux_settings::Density::for_appearance(appearance);
+    // Mode first: `change` rebuilds the library's colour set from its own
+    // defaults, so the overrides below have to land after it or they are
+    // discarded.
+    let mode = if appearance.theme.is_light() {
+        gpui_component::ThemeMode::Light
+    } else {
+        gpui_component::ThemeMode::Dark
+    };
+    gpui_component::Theme::change(mode, None, cx);
+
     let component_theme = gpui_component::Theme::global_mut(cx);
+    // Inputs rest on `border_input` (alpha over the surface, stronger than the
+    // hairline dividers so the type-here affordance reads), and `focus_ring`
+    // is the dedicated focus accent — same tokens, single source of truth.
+    component_theme.colors.input = palette.border_input;
+    component_theme.colors.ring = palette.focus_ring;
+    // Radius, bridged for the same reason: the library cannot see our scale.
+    // It happens to default to 6/8 — the same scale — so at 100% this changes
+    // nothing. It is here so the two cannot drift apart silently, which is
+    // precisely what had happened to the radii it does not own: hand-rolled
+    // chrome sat at 4 while every `Input` and `Button` beside it was already 6.
     component_theme.radius = gpui::px(density.r_xs);
     component_theme.radius_lg = gpui::px(density.r_card);
 }
@@ -211,7 +250,7 @@ pub fn save(appearance: &Appearance) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
-    use oximux_settings::{Density, DensityPreset, Typography, UiScale};
+    use oximux_settings::{Density, DensityPreset, Theme, ThemeChoice, Typography, UiScale};
 
     /// A preset choice must survive a zoom, and a zoom must survive a preset
     /// choice. They are independent controls; a user who set Comfortable and
@@ -219,6 +258,7 @@ mod tests {
     #[test]
     fn each_control_moves_its_own_field_and_leaves_the_other() {
         let start = Appearance {
+            theme: ThemeChoice::Paper,
             density: DensityPreset::Comfortable,
             scale: UiScale::from_percent(130),
         };
@@ -238,6 +278,16 @@ mod tests {
         let tightened = step::density(start, DensityPreset::Cockpit);
         assert_eq!(tightened.density, DensityPreset::Cockpit);
         assert_eq!(tightened.scale.percent(), 130, "preset kept the zoom");
+
+        // And the palette is a third independent axis: none of the four moved
+        // it, and switching it leaves the other two where they were.
+        for moved in [zoomed, out, reset, tightened] {
+            assert_eq!(moved.theme, ThemeChoice::Paper, "palette survived");
+        }
+        let relit = step::theme(start, ThemeChoice::Charcoal);
+        assert_eq!(relit.theme, ThemeChoice::Charcoal);
+        assert_eq!(relit.density, DensityPreset::Comfortable);
+        assert_eq!(relit.scale.percent(), 130);
     }
 
     /// The pull: a view holding tokens from before a change picks up the new
@@ -246,19 +296,24 @@ mod tests {
     #[gpui::test]
     fn a_stale_snapshot_is_refreshed_by_the_pull(cx: &mut TestAppContext) {
         cx.update(|cx| {
+            let mut theme = Theme::charcoal();
             let mut density = Density::cockpit();
             let mut typography = Typography::cockpit();
 
             cx.set_global(Appearance {
+                theme: ThemeChoice::Paper,
                 density: DensityPreset::Comfortable,
                 scale: UiScale::from_percent(120),
             });
-            oximux_settings::appearance::sync(&mut density, &mut typography, cx);
+            oximux_settings::appearance::sync(&mut theme, &mut density, &mut typography, cx);
 
             assert_eq!(density.h_row, Density::comfortable().h_row * 1.2);
             assert_eq!(typography.t_body_sm, Typography::cockpit().t_body_sm * 1.2);
             // Pinned against both controls — the macOS traffic lights cannot move.
             assert_eq!(density.h_top_bar, Density::cockpit().h_top_bar);
+            // The palette rides the same pull -- a view that refreshed its
+            // sizes but kept the old colours would be the worse half-update.
+            assert!(theme.is_light());
         });
     }
 
@@ -268,11 +323,12 @@ mod tests {
     #[gpui::test]
     fn the_pull_is_inert_when_nothing_changed(cx: &mut TestAppContext) {
         cx.update(|cx| {
+            let mut theme = Theme::charcoal();
             let mut density = Density::for_appearance(Appearance::default());
             let mut typography = Typography::cockpit();
             let before = typography.mono_fallbacks.as_ptr();
 
-            oximux_settings::appearance::sync(&mut density, &mut typography, cx);
+            oximux_settings::appearance::sync(&mut theme, &mut density, &mut typography, cx);
 
             assert_eq!(density.h_row, Density::cockpit().h_row);
             assert_eq!(

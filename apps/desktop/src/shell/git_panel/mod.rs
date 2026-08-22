@@ -480,7 +480,7 @@ impl Focusable for GitPanel {
 
 impl Render for GitPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         let body = match (&self.poll_state, &self.git_state) {
             (PollState::Failed(e), _) => placeholder_state(
                 &format!("git status failed: {e}"),

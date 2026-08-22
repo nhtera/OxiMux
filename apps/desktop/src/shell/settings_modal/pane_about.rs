@@ -12,7 +12,7 @@ use gpui::{AnyElement, IntoElement, ParentElement, SharedString, Styled, div, px
 use oximux_auto_update::{CheckTrigger, UpdateStatus};
 #[cfg(target_os = "macos")]
 use oximux_settings::AutoUpdateSettings;
-use oximux_settings::{Density, DensityPreset, Theme, Typography};
+use oximux_settings::{Density, DensityPreset, Theme, ThemeChoice, Typography};
 
 use super::controls::info_row;
 #[cfg(target_os = "macos")]
@@ -28,13 +28,9 @@ use crate::updater::UpdaterState;
 #[cfg(target_os = "macos")]
 const RELEASES_URL: &str = "https://github.com/nhtera/OxiMux/releases/latest";
 
-/// The Appearance pane's read-only facts — the ones with nothing to choose
-/// yet. Theme is here rather than beside the two live controls because a
-/// second palette is a separate piece of work; the honest thing is to show
-/// what is in force and not imply a picker that does not exist.
+/// The Appearance pane's read-only facts — the ones with nothing to choose.
 fn appearance_pairs(typography: &Typography) -> Vec<(SharedString, SharedString)> {
     vec![
-        ("Theme".into(), "Charcoal (dark)".into()),
         ("UI font".into(), typography.family_ui.clone()),
         ("Mono font".into(), typography.family_mono.clone()),
     ]
@@ -52,6 +48,26 @@ fn appearance_controls(
     cx: &mut gpui::Context<SettingsModal>,
 ) -> Vec<SettingEntry> {
     let current = crate::appearance_settings::active(cx);
+
+    let theme_pick = segmented(
+        "appearance-theme",
+        ThemeChoice::ALL
+            .iter()
+            .map(|choice| {
+                let choice = *choice;
+                // "Charcoal (dark)" rather than "Charcoal": two material names
+                // on their own make the reader guess which is which.
+                let label = format!("{} ({})", choice.label(), choice.polarity());
+                Segment::new(label, current.theme == choice, move |_this, _w, cx| {
+                    crate::appearance_settings::set_theme(cx, choice);
+                })
+            })
+            .collect(),
+        theme,
+        density,
+        typography,
+        cx,
+    );
 
     let density_pick = segmented(
         "appearance-density",
@@ -82,6 +98,11 @@ fn appearance_controls(
     );
 
     vec![
+        entry(
+            "Theme",
+            "Charcoal is the original. Paper is the same cockpit drawn light.",
+            theme_pick,
+        ),
         entry(
             "Density",
             "How much space sits around the text. The text itself stays the same size.",
@@ -216,10 +237,7 @@ pub(super) fn render_appearance(
                 .pt(px(12.0))
                 .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_subtle)
-                .child(
-                    "Changes apply immediately and save to appearance.toml. \
-                     Light mode is still a deferred decision.",
-                ),
+                .child("Changes apply immediately and save to appearance.toml."),
         )
         .into_any_element()
 }

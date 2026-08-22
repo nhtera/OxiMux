@@ -1,14 +1,49 @@
-//! Theme tokens (charcoal palette, dark only in v1).
+//! Theme tokens — two palettes, one shape.
 //!
 //! Hex values are owned by `docs/design-guidelines.md`. Keep this file and
 //! that doc in sync — the doc is the contract.
+//!
+//! # Two palettes, and the tokens that cannot simply be inverted
+//!
+//! [`Theme::charcoal`] and [`Theme::paper`] fill the same struct, so no render
+//! path branches on which one is in force. Most tokens are a straight
+//! substitution. Three groups are not, and they are where a light theme
+//! usually goes wrong:
+//!
+//! * **Alpha overlays.** `hover_overlay`, `border_inactive`, `border_input`
+//!   are white at low alpha on charcoal, deliberately, so one token
+//!   composites to the same perceived step over every surface tier. White
+//!   over paper is invisible. They flip to black at alpha — and not at the
+//!   same alpha, because a dark veil over white reads stronger than a light
+//!   veil over black at equal opacity.
+//! * **Elevation.** On charcoal a floating card is *lighter* than what it
+//!   sits on, and `edge_highlight` is a white top rule reading as an edge
+//!   catching light. On paper the canvas is already the lightest thing in the
+//!   window; a card cannot get lighter, so elevation reads as a border and a
+//!   shadow, and the highlight becomes a faint dark rule instead.
+//! * **The surface ladder.** Charcoal runs darkest-canvas → lighter-chrome.
+//!   Paper does not invert that into darkest-chrome: the content canvas is
+//!   white (that is what a page of code should be), the chrome is a light
+//!   grey *below* it, and overlays return to white. So `bg_rail` is lighter
+//!   than `bg_panel` on charcoal and darker than it on paper — both meaning
+//!   "this slab is distinct from the canvas beside it".
 
 use gpui::{Hsla, rgb};
+
+use crate::appearance::{Appearance, ThemeChoice};
 
 /// Resolved theme handed to every view. Built once at startup and stashed in
 /// a global state context.
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
+    /// Which palette this is.
+    ///
+    /// Carried so a surface that must branch on polarity can ask, rather than
+    /// reaching for the `Appearance` global from a pure function that was
+    /// handed a `Theme` and nothing else. The terminal's sixteen named colors
+    /// are the case that needs it — see `terminal_palette`.
+    pub choice: ThemeChoice,
+
     // Backgrounds
     pub bg_base: Hsla,
     pub bg_panel: Hsla,
@@ -139,9 +174,18 @@ pub struct SyntaxPalette {
 }
 
 impl Theme {
-    /// The one OxiMux theme: monochrome charcoal.
+    /// The palette a set of appearance choices resolves to.
+    pub fn for_appearance(appearance: Appearance) -> Self {
+        match appearance.theme {
+            ThemeChoice::Charcoal => Self::charcoal(),
+            ThemeChoice::Paper => Self::paper(),
+        }
+    }
+
+    /// The original OxiMux theme: monochrome charcoal.
     pub fn charcoal() -> Self {
         Self {
+            choice: ThemeChoice::Charcoal,
             bg_base: rgb(0x0E0F11).into(),
             bg_panel: rgb(0x15171A).into(),
             bg_panel_alt: rgb(0x1B1E22).into(),
@@ -242,6 +286,117 @@ impl Theme {
                 tag: rgb(0x569CD6).into(),
             },
         }
+    }
+
+    /// The light counterpart: charcoal drawn on paper.
+    ///
+    /// Not an inversion. See the module docs for the three groups of token
+    /// that cannot be flipped — the alpha overlays, the elevation cues, and
+    /// the surface ladder — and why each one is the way it is here.
+    pub fn paper() -> Self {
+        Self {
+            choice: ThemeChoice::Paper,
+            // The content canvas is white, because that is what a page of
+            // code should be, and the chrome sits a step *below* it. Overlays
+            // return to white and lean on their border and shadow to float.
+            bg_base: rgb(0xFFFFFF).into(),
+            bg_panel: rgb(0xF4F5F7).into(),
+            bg_panel_alt: rgb(0xE8EBEF).into(),
+            bg_overlay: rgb(0xFFFFFF).into(),
+
+            // Distinct from the canvas beside it, which on paper means a
+            // touch darker rather than a touch lighter — see the module docs.
+            bg_rail: rgb(0xEDEFF3).into(),
+
+            // Near-black rather than black: pure #000 on pure #FFF is a
+            // contrast the eye reads as a glare rather than as text.
+            fg_base: rgb(0x1A1D21).into(),
+            fg_muted: rgb(0x5C6570).into(),
+            fg_subtle: rgb(0x8A929C).into(),
+
+            // Black at alpha, the polarity flip of charcoal's white-at-alpha,
+            // and at a lower number: a dark veil over white reads stronger
+            // than a light veil over black at the same opacity.
+            border_inactive: Hsla { h: 0., s: 0., l: 0., a: 0.10 },
+            border_active: rgb(0xAEB6C0).into(),
+            selection: rgb(0xD3E3F7).into(),
+            focus_ring: rgb(0x2F6FB5).into(),
+
+            hover_overlay: Hsla { h: 0., s: 0., l: 0., a: 0.05 },
+
+            border_input: Hsla { h: 0., s: 0., l: 0., a: 0.18 },
+
+            // Charcoal's white top rule reads as an edge catching light. On
+            // paper nothing is lighter than the surface, so the same job
+            // falls to a faint dark rule and the card's own shadow.
+            edge_highlight: Hsla { h: 0., s: 0., l: 0., a: 0.05 },
+
+            // The current match keeps its amber; the resting ones drop to a
+            // pale wash, because on white a mid-tone fill reads as loud as
+            // the highlight it is supposed to sit behind.
+            match_bg_current: rgb(0xF2C14E).into(),
+            match_bg_other: rgb(0xF0E6C8).into(),
+            match_fg: rgb(0x1A1D21).into(),
+
+            // Every status hue darkens: the charcoal set is tuned to carry on
+            // near-black, and the same values on white are pastel.
+            status_ok: rgb(0x2E7D32).into(),
+            status_warn: rgb(0xB37400).into(),
+            status_error: rgb(0xC0392B).into(),
+            status_info: rgb(0x1F6FB2).into(),
+            status_muted: rgb(0x8A929C).into(),
+
+            // Same colour-blind-safe five hues, darkened to carry on white.
+            graph_lane_colors: [
+                rgb(0xB37400).into(),
+                rgb(0xC2185B).into(),
+                rgb(0x7A3E00).into(),
+                rgb(0x00796B).into(),
+                rgb(0x7B3FBF).into(),
+            ],
+
+            status_added: rgb(0x1E7A3C).into(),
+            status_removed: rgb(0xC0392B).into(),
+            status_warning: rgb(0xA97A20).into(),
+
+            git: GitDecorations {
+                modified: rgb(0xB37400).into(),
+                added: rgb(0x2E7D32).into(),
+                deleted: rgb(0xC0392B).into(),
+                renamed: rgb(0x1F6FB2).into(),
+                untracked: rgb(0x3E8E41).into(),
+                copied: rgb(0x00796B).into(),
+                ignored: rgb(0x8A929C).into(),
+            },
+
+            // The charcoal set is VS Code's Dark+ token hues; this is Light+,
+            // deliberately, so the pair is the same well-worn relationship
+            // rather than two independently invented palettes. A reader who
+            // knows one editor's light theme already knows this one.
+            syntax: SyntaxPalette {
+                keyword: rgb(0x0000FF).into(),
+                function: rgb(0x795E26).into(),
+                type_name: rgb(0x267F99).into(),
+                string: rgb(0xA31515).into(),
+                escape: rgb(0xEE0000).into(),
+                number: rgb(0x098658).into(),
+                comment: rgb(0x008000).into(),
+                constant: rgb(0x0070C1).into(),
+                // Same reasoning as charcoal: operators and punctuation stay
+                // at the code default rather than taking a hue.
+                operator: rgb(0x1A1D21).into(),
+                punctuation: rgb(0x1A1D21).into(),
+                variable: rgb(0x001080).into(),
+                attribute: rgb(0x001080).into(),
+                namespace: rgb(0x267F99).into(),
+                tag: rgb(0x800000).into(),
+            },
+        }
+    }
+
+    /// True when this palette paints dark text on a light ground.
+    pub fn is_light(&self) -> bool {
+        self.choice.is_light()
     }
 
     /// Translucent background for added-line highlights in diff views.
@@ -396,5 +551,160 @@ mod tests {
         let t = Theme::charcoal();
         assert!(t.diff_word_added_bg().a > t.diff_added_bg().a);
         assert!(t.diff_word_removed_bg().a > t.diff_removed_bg().a);
+    }
+    // ---- Paper, and what has to stay true of both palettes ---------------
+
+    /// The choices resolve to the palettes they name, and each palette knows
+    /// which one it is — the terminal's named colors branch on it.
+    #[test]
+    fn a_choice_resolves_to_its_palette() {
+        for choice in ThemeChoice::ALL {
+            let t = Theme::for_appearance(Appearance {
+                theme: choice,
+                ..Appearance::default()
+            });
+            assert_eq!(t.choice, choice);
+        }
+        assert!(!Theme::charcoal().is_light());
+        assert!(Theme::paper().is_light());
+    }
+
+    /// Text has to read on its own ground. The cheap version of a contrast
+    /// check — the two palettes are near-neutral, so lightness stands in for
+    /// luminance — but it is the check that catches a palette pasted in from
+    /// the wrong polarity, which is the mistake worth catching automatically.
+    #[test]
+    fn each_palette_puts_its_text_at_the_far_end_from_its_ground() {
+        let dark = Theme::charcoal();
+        assert!(dark.bg_base.l < 0.15, "charcoal ground is dark");
+        assert!(dark.fg_base.l > 0.85, "charcoal text is light");
+
+        let light = Theme::paper();
+        assert!(light.bg_base.l > 0.95, "paper ground is light");
+        assert!(light.fg_base.l < 0.20, "paper text is dark");
+
+        // And the muted tiers stay between the two, in order, or "muted"
+        // stops meaning anything.
+        for t in [dark, light] {
+            let span = (t.fg_base.l - t.bg_base.l).abs();
+            let muted = (t.fg_muted.l - t.bg_base.l).abs();
+            let subtle = (t.fg_subtle.l - t.bg_base.l).abs();
+            assert!(subtle < muted && muted < span, "fg tiers out of order");
+        }
+    }
+
+    /// The alpha overlays are the tokens a light theme gets wrong. They are
+    /// white over charcoal and must be black over paper — an unflipped
+    /// overlay is not subtly wrong, it is invisible.
+    #[test]
+    fn alpha_overlays_flip_polarity() {
+        let dark = Theme::charcoal();
+        for (name, c) in [
+            ("hover_overlay", dark.hover_overlay),
+            ("border_inactive", dark.border_inactive),
+            ("border_input", dark.border_input),
+            ("edge_highlight", dark.edge_highlight),
+        ] {
+            assert_eq!(c.l, 1.0, "{name} should be white over charcoal");
+            assert!(c.a > 0.0 && c.a < 1.0, "{name} should be an alpha veil");
+        }
+
+        let light = Theme::paper();
+        for (name, c) in [
+            ("hover_overlay", light.hover_overlay),
+            ("border_inactive", light.border_inactive),
+            ("border_input", light.border_input),
+            ("edge_highlight", light.edge_highlight),
+        ] {
+            assert_eq!(c.l, 0.0, "{name} should be black over paper");
+            assert!(c.a > 0.0 && c.a < 1.0, "{name} should be an alpha veil");
+        }
+    }
+
+    /// Elevation reads in opposite directions, and the ladder is what says so.
+    ///
+    /// Charcoal lifts each tier lighter. Paper cannot: the canvas is already
+    /// the lightest thing on screen, so chrome sits below it and a floating
+    /// card returns to the canvas value and leans on its border instead.
+    #[test]
+    fn the_surface_ladder_runs_the_way_each_palette_needs() {
+        let dark = Theme::charcoal();
+        assert!(dark.bg_base.l < dark.bg_panel.l);
+        assert!(dark.bg_panel.l < dark.bg_panel_alt.l);
+        assert!(dark.bg_panel_alt.l < dark.bg_overlay.l);
+        assert!(dark.bg_rail.l > dark.bg_panel.l, "rail lifts off the panel");
+
+        let light = Theme::paper();
+        assert!(light.bg_base.l > light.bg_panel.l, "chrome sits below the canvas");
+        assert!(light.bg_panel.l > light.bg_panel_alt.l);
+        assert_eq!(light.bg_overlay.l, light.bg_base.l, "a card returns to canvas white");
+        assert!(light.bg_rail.l < light.bg_panel.l, "rail settles under the panel");
+    }
+
+    /// A status hue exists to be noticed. On paper the charcoal values are
+    /// pastel, so every one of them has to have come down.
+    #[test]
+    fn paper_darkens_every_accent_it_inherited() {
+        let (dark, light) = (Theme::charcoal(), Theme::paper());
+        for (name, d, l) in [
+            ("status_ok", dark.status_ok, light.status_ok),
+            ("status_warn", dark.status_warn, light.status_warn),
+            ("status_error", dark.status_error, light.status_error),
+            ("status_info", dark.status_info, light.status_info),
+            ("status_added", dark.status_added, light.status_added),
+            ("status_removed", dark.status_removed, light.status_removed),
+            ("git.added", dark.git.added, light.git.added),
+            ("git.deleted", dark.git.deleted, light.git.deleted),
+            ("git.modified", dark.git.modified, light.git.modified),
+        ] {
+            assert!(l.l < d.l, "{name} must darken for paper ({} -> {})", d.l, l.l);
+            assert!(l.l < 0.5, "{name} must carry on white (l = {})", l.l);
+        }
+        for (i, lane) in light.graph_lane_colors.iter().enumerate() {
+            assert!(lane.l < 0.5, "graph lane {i} must carry on white");
+        }
+    }
+
+    /// Every syntax kind has to read on its own ground too — a token palette
+    /// lifted from the wrong polarity is the most obvious tell there is.
+    #[test]
+    fn syntax_tokens_carry_on_their_own_ground() {
+        for (t, lo, hi) in [(Theme::charcoal(), 0.4, 1.0), (Theme::paper(), 0.0, 0.55)] {
+            let s = t.syntax;
+            for (name, c) in [
+                ("keyword", s.keyword),
+                ("function", s.function),
+                ("type_name", s.type_name),
+                ("string", s.string),
+                ("escape", s.escape),
+                ("number", s.number),
+                ("comment", s.comment),
+                ("constant", s.constant),
+                ("operator", s.operator),
+                ("punctuation", s.punctuation),
+                ("variable", s.variable),
+                ("attribute", s.attribute),
+                ("namespace", s.namespace),
+                ("tag", s.tag),
+            ] {
+                assert!(
+                    c.l >= lo && c.l <= hi,
+                    "{name} at l = {} is outside {lo}..{hi} for {:?}",
+                    c.l,
+                    t.choice
+                );
+            }
+        }
+    }
+
+    /// The diff washes are derived, so they follow the palette for free — but
+    /// only if the derivation stays alpha-over-hue rather than a second hex.
+    #[test]
+    fn the_diff_washes_follow_whichever_palette_they_came_from() {
+        for t in [Theme::charcoal(), Theme::paper()] {
+            assert_eq!(t.diff_added_bg().h, t.git.added.h);
+            assert_eq!(t.diff_removed_bg().h, t.git.deleted.h);
+            assert!(t.diff_word_added_bg().a > t.diff_added_bg().a);
+        }
     }
 }

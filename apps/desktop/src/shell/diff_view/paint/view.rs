@@ -14,7 +14,7 @@ const SYNC_HIGHLIGHT_THRESHOLD: usize = 250;
 
 impl Render for DiffView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         // First render is the first time this view is handed a `Window`, and
         // so the only place the background refresh can learn whether its
         // window is focused. Idempotent; see `arm_live_refresh`.

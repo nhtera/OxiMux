@@ -279,7 +279,7 @@ impl LeftRail {
     pub fn new(weak_root: WeakEntity<WorkspaceRoot>, cx: &mut Context<Self>) -> Self {
         let appearance = oximux_settings::appearance::active(cx);
         let density = Density::for_appearance(appearance);
-        let theme = Theme::charcoal();
+        let theme = Theme::for_appearance(appearance);
         let typography = Typography::for_appearance(appearance);
         Self {
             active_nav: None,
@@ -1009,7 +1009,7 @@ fn agents_display_equal(a: &WorkspaceAgentList, b: &WorkspaceAgentList) -> bool 
 
 impl Render for LeftRail {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         // A resize drag is over once no drag is active — releasing the
         // button produces no further drag-move ticks, so the flag is
         // cleared here on the next render instead.

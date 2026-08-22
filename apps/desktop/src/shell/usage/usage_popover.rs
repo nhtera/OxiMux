@@ -111,7 +111,7 @@ impl Focusable for UsagePopover {
 
 impl Render for UsagePopover {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         div()
             .size_full()
             .track_focus(&self.focus_handle)

@@ -94,7 +94,7 @@ impl BranchCommitsPanel {
 
 impl Render for BranchCommitsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         let theme = self.theme;
         // Hide the whole section when the branch carries no committed work
         // ahead of its base — no empty header, matching the file sections.

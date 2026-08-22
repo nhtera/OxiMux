@@ -60,7 +60,7 @@ pub struct TabTokens<'a> {
 
 impl Render for PaneGroup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         // Drag-cancel cleanup: chips' `on_drag_move` fires only while a
         // drag is live, so a press-Escape (or off-window release) leaves
         // the last hover state painted. Mirrors the body-level guard in

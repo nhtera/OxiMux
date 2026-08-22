@@ -290,43 +290,25 @@ fn main() {
                 oximux_app::shell::diff_view::syntax::prewarm();
             })
             .detach();
-        // gpui-component defaults to ThemeMode::Light; flip to Dark so the
-        // TabBar + future component chrome match OxiMux's dark terminal panes.
-        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
-        // Align the gpui-component Input border palette with OxiMux's
-        // charcoal theme. Default `input`/`ring` are tuned for a light
-        // shadcn-style page and read as "always focused" against our deep
-        // panel fill. Inputs rest on `border_input` (alpha-white, stronger
-        // than the hairline dividers so the type-here affordance reads),
-        // and `focus_ring` is the dedicated focus accent — same tokens,
-        // single source of truth.
-        // The user's density + zoom, before any window opens: the bridge below
-        // copies radii into gpui-component's own theme, and a window that
-        // opened first would paint one frame at the shipped default.
+        // The user's palette, density and zoom, before any window opens: the
+        // bridge below copies them into gpui-component's own theme, and a
+        // window that opened first would paint one frame at the shipped
+        // defaults and then correct itself.
         oximux_app::appearance_settings::install(cx);
+        // Everything gpui-component needs to agree with our palette — the
+        // light/dark mode it starts in, the input border and focus ring, the
+        // corner radii. Shared with the settings control, because the library
+        // paints its own widgets and a change that skipped it would leave
+        // every `Input` and `Button` in the previous theme.
+        oximux_app::appearance_settings::bridge_component_theme(cx);
         {
-            let palette = oximux_settings::Theme::charcoal();
             // Read the OS auto-hide preference before taking the mutable global
             // borrow below (can't call `cx` methods while `component_theme`
             // holds it). A user who set "Always show scrollbars" (an
             // accessibility choice some low-vision users rely on) reports
             // `false` here.
             let auto_hide_scrollbars = cx.should_auto_hide_scrollbars();
-            let component_density = oximux_settings::Density::for_appearance(
-                oximux_app::appearance_settings::active(cx),
-            );
             let component_theme = gpui_component::Theme::global_mut(cx);
-            component_theme.colors.input = palette.border_input;
-            component_theme.colors.ring = palette.focus_ring;
-            // Corner radius, bridged for the same reason the two colours above
-            // are: the library paints its own widgets and cannot see our
-            // tokens. It happens to default to 6/8 — the same scale — so this
-            // changes nothing today. It is here so the two cannot drift apart
-            // silently, which is precisely what had happened to the radii it
-            // does not own: hand-rolled chrome sat at 4 while every `Input`
-            // and `Button` beside it was already 6.
-            component_theme.radius = gpui::px(component_density.r_xs);
-            component_theme.radius_lg = gpui::px(component_density.r_card);
             // List scrollbars stay invisible until the pointer enters the
             // scroll region, then reveal thumb-only — quiet at rest, no
             // persistent rail chrome. The library default (`Scrolling`) only
@@ -335,6 +317,9 @@ fn main() {
             // `vertical_scrollbar` call site inherits it. Skip the override
             // when the user asked for always-visible scrollbars — leave the
             // appearance gpui-component already synced from the system.
+            //
+            // Startup-only, unlike the bridge above: this follows an OS
+            // accessibility preference, not ours.
             if auto_hide_scrollbars {
                 component_theme.scrollbar_show = gpui_component::scroll::ScrollbarShow::Hover;
             }

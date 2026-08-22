@@ -153,7 +153,7 @@ fn computer_use_state(project: &Project, cx: &gpui::App) -> Option<bool> {
 
 impl Render for ProjectRowMenu {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         let Some((_, x, y)) = self.open_for.clone() else {
             return div().into_any_element();
         };

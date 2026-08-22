@@ -2,7 +2,7 @@ use super::*;
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         // Adopt the grid size the canvas measured from its real bounds
         // last paint, then apply it. `maybe_resize` resizes the PTY +
         // refetches the snapshot only when the size actually changed.

@@ -13,7 +13,7 @@ fn import_preset_slug(id: &str) -> &'static str {
 
 impl Render for WorkspaceRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         // Push sidebar data down before LeftRail::render runs in the tree.
         self.refresh_left_rail(cx);
 

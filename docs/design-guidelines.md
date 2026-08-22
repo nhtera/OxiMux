@@ -20,8 +20,30 @@ many panes, one operator).
 
 ## Mode
 
-Dark only in v1. Light mode deferred until after Phase 8. Every token below assumes
-dark canvas.
+Two palettes, chosen in Settings → Appearance and persisted in `appearance.toml`:
+**Charcoal** (dark, the default and the one every token below is written against) and
+**Paper** (light). They fill the same `Theme` struct, so no render path branches on
+which is in force — a view reads `theme.bg_panel` and gets the right answer.
+
+Three groups of token do not survive a straight inversion, and they are where a light
+theme usually goes wrong. Read `crates/settings/src/theme.rs`'s module docs before
+touching any of them:
+
+- **Alpha overlays** (`hover_overlay`, `border_inactive`, `border_input`,
+  `edge_highlight`) are white-at-alpha on charcoal so one token composites to the same
+  perceived step over every surface tier. White over paper is invisible — they flip to
+  black, at a *lower* alpha, because a dark veil over white reads stronger than a light
+  veil over black at equal opacity.
+- **Elevation** runs opposite. On charcoal a floating card is lighter than its ground.
+  On paper the canvas is already the lightest thing on screen, so a card returns to the
+  canvas value and reads as raised through its border and shadow instead.
+- **The surface ladder** is not mirrored. Paper keeps the content canvas white — that is
+  what a page of code should be — and puts the chrome a step *below* it. So `bg_rail` is
+  lighter than `bg_panel` on charcoal and darker than it on paper; both mean "this slab
+  is distinct from the canvas beside it".
+
+`theme.is_light()` is the branch for the rare place that genuinely needs one; today that
+is the terminal's sixteen named ANSI colors, which cannot be shared across polarities.
 
 ## Palette — Monochrome Charcoal
 
@@ -79,6 +101,51 @@ Constructed on the `Theme` struct so call sites stop hand-rolling `Hsla { a: 0.2
 
 No brand accent in v1. The brand *is* the absence of accent. Adding one is a Phase 8
 decision, not a Phase 0 one.
+
+## Palette — Paper (light)
+
+Same tokens, same jobs — only the values move, so the "Use" column above still applies.
+Listed on its own rather than as a second column because the reasoning is shared and the
+notes are long; what differs is spelled out under **Mode**.
+
+| Token | Hex | Note |
+|---|---|---|
+| `bg_base` | `#FFFFFF` | The content canvas stays white |
+| `bg_panel` | `#F4F5F7` | Chrome sits a step *below* the canvas |
+| `bg_panel_alt` | `#E8EBEF` | |
+| `bg_overlay` | `#FFFFFF` | Back to canvas white; the border and shadow carry the elevation |
+| `bg_rail` | `#EDEFF3` | Below `bg_panel`, the mirror of charcoal's lift |
+| `fg_base` | `#1A1D21` | Near-black, not black — `#000` on `#FFF` reads as glare |
+| `fg_muted` | `#5C6570` | |
+| `fg_subtle` | `#8A929C` | |
+| `border_inactive` | black @ 10% | Polarity flip |
+| `border_active` | `#AEB6C0` | |
+| `edge_highlight` | black @ 5% | A faint dark rule; the "catching light" metaphor does not survive |
+| `hover_overlay` | black @ 5% | Lower alpha than charcoal's 6% — see **Mode** |
+| `border_input` | black @ 18% | |
+| `selection` | `#D3E3F7` | |
+| `focus_ring` | `#2F6FB5` | |
+| `match_bg_current` | `#F2C14E` | |
+| `match_bg_other` | `#F0E6C8` | A pale wash — a mid-tone fill on white reads as loud as the highlight it sits behind |
+| `match_fg` | `#1A1D21` | |
+| `status_ok` | `#2E7D32` | Every status hue darkens to carry on white |
+| `status_warn` | `#B37400` | |
+| `status_error` | `#C0392B` | |
+| `status_info` | `#1F6FB2` | |
+| `status_muted` | `#8A929C` | |
+| `status_added` | `#1E7A3C` | |
+| `status_removed` | `#C0392B` | |
+| `status_warning` | `#A97A20` | |
+| `graph_lane_colors[0..5]` | `#B37400` `#C2185B` `#7A3E00` `#00796B` `#7B3FBF` | Same colour-blind-safe five hues, darkened |
+
+Git decorations and the syntax palette move with them. The syntax set is VS Code's
+**Light+** token hues, deliberately — charcoal's is Dark+, so the pair stays the same
+well-worn relationship rather than two independently invented palettes.
+
+`crates/settings/src/theme.rs` asserts the properties this table has to keep: text lands
+at the far end of the lightness range from its ground, the alpha overlays are the right
+polarity, the ladder runs the right way, and every inherited accent actually darkened.
+A palette pasted in from the wrong polarity fails the suite rather than shipping.
 
 ## Density
 

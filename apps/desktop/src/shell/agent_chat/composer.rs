@@ -3269,7 +3269,7 @@ impl ComposerView {
 
 impl Render for ComposerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         // Flush any finished dictation transcript (insert at cursor) and pending
         // toast here — this is the first place with a `Window` after an event.
         self.apply_pending_dictation(window, cx);

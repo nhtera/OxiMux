@@ -366,7 +366,7 @@ pub fn agent_label(agent: Option<AgentAdapter>) -> &'static str {
 
 impl Render for WorkspaceDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        oximux_settings::appearance::sync(&mut self.density, &mut self.typography, cx);
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         let Some(mode) = self.mode.clone() else {
             return div().into_any_element();
         };
