@@ -11,13 +11,66 @@
 //! element's window-relative bounds map straight onto the webview frame —
 //! no scale-factor or Y-flip math (wry applies both internally).
 
-use gpui::{Bounds, Pixels, Window};
+use gpui::{Bounds, Pixels};
 use wry::{
     PageLoadEvent, Rect, WebView, WebViewBuilder,
     dpi::{LogicalPosition, LogicalSize},
+    raw_window_handle::HasWindowHandle,
 };
 
 use super::agent_context::PickRect;
+
+/// The GPUI window's native surface, captured so a webview can be built into
+/// it *after* the `App` borrow that produced the `Window` has been released.
+///
+/// Windows needs this; the other platforms build a child webview synchronously
+/// and never notice. On Windows `build_as_child` creates the WebView2
+/// controller asynchronously and then runs its own `GetMessage` /
+/// `DispatchMessage` loop until the controller arrives
+/// (`webview2_com::wait_with_pump`). That loop dispatches *GPUI's* queued
+/// main-thread work, so a build called with `App` already borrowed — which
+/// `cx.new(|cx| BrowserView::new(..))` is, by construction — hands control to a
+/// runnable that re-enters `App::update`, double-borrows the `RefCell` and
+/// aborts the process. With a terminal open there is always such a runnable
+/// pending, which is why the crash was reliable rather than occasional.
+///
+/// Holding the raw handle instead of the `&Window` is what lets the build move
+/// off that borrow: `Window` borrows the `App`, an `HWND` does not.
+///
+/// [`super::BrowserView`] keeps the deferred build in a `Task`, so a tab that
+/// closes before its webview arrives takes the pending build with it.
+#[derive(Clone, Copy)]
+pub struct ParentSurface(wry::raw_window_handle::RawWindowHandle);
+
+impl ParentSurface {
+    /// Copy `window`'s native handle out of the borrow. `None` when GPUI has
+    /// no live handle to give — a window mid-teardown — which is a reason not
+    /// to start a build at all.
+    pub fn capture(window: &gpui::Window) -> Option<Self> {
+        // Fully qualified: `Window` has an inherent `window_handle()` of its
+        // own (GPUI's `AnyWindowHandle`), which shadows the trait method that
+        // yields the platform handle we need.
+        let handle = HasWindowHandle::window_handle(window).ok()?;
+        Some(Self(handle.as_raw()))
+    }
+}
+
+impl HasWindowHandle for ParentSurface {
+    fn window_handle(
+        &self,
+    ) -> Result<wry::raw_window_handle::WindowHandle<'_>, wry::raw_window_handle::HandleError> {
+        // SAFETY: the handle was copied out of a live GPUI window on this same
+        // (main) thread, and is only ever used from a foreground task on that
+        // thread. Between the copy and the build the main thread sits in its
+        // message loop, so a window torn down there also drops the owning
+        // `BrowserView` — and with it the pending build — before the task can
+        // be polled. The one gap left is a close dispatched by the build's own
+        // message pump, and it is survivable rather than unsound: WebView2
+        // either refuses to create a controller on a dead parent, or creates
+        // an orphan that is dropped when the install finds the entity gone.
+        Ok(unsafe { wry::raw_window_handle::WindowHandle::borrow_raw(self.0) })
+    }
+}
 
 /// User-Agent for the inline browser. WKWebView's *default* UA omits the
 /// trailing `Version/<n> Safari/<build>` token, and major sites (Google,
@@ -79,20 +132,25 @@ where
 }
 
 impl NativeWebview {
-    /// Build a webview as a child of `window`'s native surface, loading
-    /// `url`. `init_script` runs at document-start on every navigation.
+    /// Build a webview as a child of `parent`'s native surface, loading `url`.
+    /// `init_script` runs at document-start on every navigation.
     ///
     /// `data_store_id` selects an isolated cookie/cache store (a browser
     /// profile); `None` uses the shared default store. The id is the profile
     /// UUID's bytes — distinct ids never see each other's cookies.
-    pub fn build<N, T, L, I>(
-        window: &Window,
+    ///
+    /// `parent` is generic rather than a `&Window` so the caller can pass a
+    /// [`ParentSurface`] captured earlier — see that type for why a build may
+    /// not hold the `App` borrow it was asked from.
+    pub fn build<P, N, T, L, I>(
+        parent: &P,
         url: &str,
         init_script: &str,
         data_store_id: Option<[u8; 16]>,
         callbacks: WebviewCallbacks<N, T, L, I>,
     ) -> wry::Result<Self>
     where
+        P: HasWindowHandle,
         N: Fn(String) -> bool + 'static,
         T: Fn(String) + 'static,
         L: Fn(PageLoadEvent, String) + 'static,
@@ -130,7 +188,7 @@ impl NativeWebview {
         }
         #[cfg(not(target_os = "macos"))]
         let _ = data_store_id;
-        let webview = builder.build_as_child(window)?;
+        let webview = builder.build_as_child(parent)?;
         #[cfg(target_os = "macos")]
         let inspector_dock = wrap_for_docked_inspector(&webview);
         Ok(Self {

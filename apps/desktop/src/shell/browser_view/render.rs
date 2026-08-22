@@ -255,6 +255,10 @@ impl Render for BrowserView {
                 .size_full()
                 .into_any_element()
             }
+            // No webview yet. Either the build failed — say so — or it is
+            // still in flight, in which case an empty pane for the turn or two
+            // it takes is the honest thing to draw. A message would be a lie
+            // about to be corrected, and a spinner would flash on every tab.
             None => div()
                 .flex_1()
                 .flex()
@@ -263,9 +267,9 @@ impl Render for BrowserView {
                 .w_full()
                 .text_color(theme.fg_muted)
                 .text_size(px(typography.t_body_sm))
-                .child(SharedString::from(
-                    "Could not create the web view on this platform.",
-                ))
+                .children(self.native_failed.then(|| {
+                    SharedString::from("Could not create the web view on this platform.")
+                }))
                 .into_any_element(),
         };
 
