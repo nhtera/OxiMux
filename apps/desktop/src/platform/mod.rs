@@ -25,6 +25,11 @@ pub(crate) fn serialize_input_state() -> std::sync::MutexGuard<'static, ()> {
 
 pub mod app_nap;
 pub mod claude_session_env;
+// Unconditional rather than `#[cfg(windows)]`: the entry point calls it on
+// every platform and the function is the no-op, so the one Windows quirk
+// stays inside the module that explains it instead of spreading a cfg into
+// `main`.
+pub mod direct_composition;
 pub mod escape_tap;
 // Every line assumes POSIX: `:`-separated PATH, a `-lc` login shell, launchd's
 // four-directory stub. Windows inherits a real PATH from the registry, so

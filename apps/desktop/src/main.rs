@@ -91,6 +91,13 @@ fn main() {
         );
     }
 
+    // Before `gpui_platform::application()`, which is where GPUI reads it, and
+    // before anything spawns — it writes the environment. Without this the
+    // browser pane loads its page and renders nothing: GPUI's composited window
+    // has no redirection surface for WebView2's child HWND to draw into. See
+    // the module for the trade this makes and the two repairs it rejects.
+    oximux_app::platform::direct_composition::prefer_child_window_compositing();
+
     // Before the runtime, and before anything spawns: launched from inside a
     // Claude Code session, the process inherits session markers that make
     // every `claude` spawned down-tree disable transcript saving. Must
