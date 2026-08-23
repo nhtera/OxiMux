@@ -2,6 +2,7 @@ use super::*;
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         // Adopt the grid size the canvas measured from its real bounds
         // last paint, then apply it. `maybe_resize` resizes the PTY +
         // refetches the snapshot only when the size actually changed.
@@ -142,6 +143,7 @@ impl Render for TerminalView {
                     options,
                     theme: &theme,
                     typography: &typography,
+                    density: self.density,
                     on_toggle_case,
                     on_toggle_word,
                     on_toggle_regex,
@@ -159,7 +161,7 @@ impl Render for TerminalView {
         // could otherwise see static text and wonder why nothing reacts.
         // The badge auto-clears once `respawn_if_dormant` flips the
         // backend live + `cx.notify()` re-renders.
-        let dormant_badge = self.is_dormant().then(|| build_dormant_badge(&theme));
+        let dormant_badge = self.is_dormant().then(|| build_dormant_badge(&theme, self.density, &self.typography));
 
         // The grid is painted into a canvas child filling the pane body.
         // `canvas(prepaint, paint)` defers everything to a single paint
@@ -473,13 +475,13 @@ impl Render for TerminalView {
         // Mutually exclusive with the dormant badge (dormant = never spawned;
         // exited = spawned and died).
         if let Some(code) = self.exited {
-            root = root.child(build_exit_banner(&theme, code));
+            root = root.child(build_exit_banner(&theme, code, self.density, &self.typography));
         }
         // Scrolled-up indicator: a faint chip while the viewport is off the
         // live tail, so the user knows new output is landing below the fold
         // and that any keystroke will snap back down.
         if self.snapshot.display_offset > 0 {
-            root = root.child(build_scroll_indicator(&theme, self.snapshot.display_offset).on_mouse_down(
+            root = root.child(build_scroll_indicator(&theme, self.snapshot.display_offset, self.density, &self.typography).on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
                     // Click the chip to jump to the live tail. Stop propagation

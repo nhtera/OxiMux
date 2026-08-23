@@ -6,6 +6,7 @@
 //! Phase 0 ships dark-only. Light mode is a Phase 8+ decision.
 
 pub mod agent_launch;
+pub mod appearance;
 pub mod auto_update;
 pub mod autosave;
 pub mod commit_message_ai;
@@ -14,6 +15,7 @@ pub mod custom_commands;
 pub mod density;
 pub mod dictation;
 pub mod dictation_languages;
+pub mod fonts;
 pub mod keybindings;
 pub mod motion;
 pub mod project_scripts;
@@ -30,6 +32,7 @@ pub use agent_launch::{
     ACP_PRESETS, AcpPreset, AgentLaunchSettings, OpenMode, PerAgentLaunch, Transport, acp_preset,
     import_resume_command, split_args,
 };
+pub use appearance::{Appearance, DensityPreset, ThemeChoice, UiScale};
 pub use auto_update::AutoUpdateSettings;
 pub use autosave::AutosaveSettings;
 pub use commit_message_ai::{AgentSettings, CommitMessageAiMode, CommitMessageAiSettings};
@@ -38,6 +41,7 @@ pub use custom_commands::{CustomCommand, CustomCommandsFile, load_and_merge};
 pub use density::Density;
 pub use dictation::{DictationMode, DictationSettings, ModelUnloadTimeout};
 pub use dictation_languages::{WHISPER_LANGUAGES, display_name as language_display_name};
+pub use fonts::FontChoice;
 pub use keybindings::KeybindingOverrides;
 pub use motion::{Motion, ease_out_spring};
 pub use project_scripts::{ProjectScripts, ScriptKind, load_for_project};

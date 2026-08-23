@@ -7,17 +7,27 @@
 //! The one exception is a ready update, which earns a passive pill in the
 //! status bar because it is the only state that asks anything of them.
 
-use gpui::{AnyElement, IntoElement, ParentElement, SharedString, Styled, div, px};
+use gpui::prelude::FluentBuilder as _;
+use gpui::{
+    Anchor, AnyElement, ClickEvent, Entity, IntoElement, ParentElement, SharedString, Styled,
+    Window, div, px,
+};
+use gpui_component::Icon;
+use gpui_component::Sizable as _;
+use gpui_component::button::{Button, DropdownButton};
+use gpui_component::menu::PopupMenuItem;
 #[cfg(target_os = "macos")]
 use oximux_auto_update::{CheckTrigger, UpdateStatus};
 #[cfg(target_os = "macos")]
 use oximux_settings::AutoUpdateSettings;
-use oximux_settings::{Theme, Typography};
+use oximux_settings::{Density, DensityPreset, Theme, ThemeChoice, Typography};
 
 use super::controls::info_row;
 #[cfg(target_os = "macos")]
 use super::controls::value_chip;
 use super::layout::{SettingEntry, entries_card, entry};
+use super::segmented::{Segment, segmented};
+use super::controls::stepper;
 use super::SettingsModal;
 #[cfg(target_os = "macos")]
 use crate::updater::UpdaterState;
@@ -26,13 +36,216 @@ use crate::updater::UpdaterState;
 #[cfg(target_os = "macos")]
 const RELEASES_URL: &str = "https://github.com/nhtera/OxiMux/releases/latest";
 
-/// The Appearance pane's `label: value` facts.
-fn appearance_pairs(typography: &Typography) -> Vec<(SharedString, SharedString)> {
+/// One face's picker: a dropdown labelled by the family in use, opening the
+/// machine's font list with the platform default at the top.
+///
+/// Every row is drawn in its own family, which is the whole reason a font
+/// picker is a picker and not a text field — a name means nothing until you see
+/// it set. The list itself is enumerated once per launch, on the first render of
+/// this pane; see `font_settings::families`.
+///
+/// The default is a row of its own rather than a checkbox beside the list,
+/// spelled `"Consolas (default)"` so it names what you actually get. It has to
+/// be separate from the identically-named family below it, because the two
+/// differ: unset follows the machine, and a name does not.
+fn font_control(
+    id: &'static str,
+    chosen: Option<String>,
+    platform: &'static str,
+    on_pick: fn(&mut gpui::App, Option<String>),
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    let entity = cx.entity();
+    let families = crate::font_settings::families(cx);
+    let label = chosen
+        .clone()
+        .unwrap_or_else(|| format!("{platform} (default)"));
+    DropdownButton::new(id)
+        .button(
+            Button::new(SharedString::from(format!("{id}-btn")))
+                .label(label)
+                .small()
+                .outline(),
+        )
+        .small()
+        // `TopRight` right-aligns the menu under the button so its rows grow
+        // down-and-left rather than off the pane's right edge; `scrollable`
+        // plus a capped height keeps a few hundred families on screen.
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, window, _cx| {
+            menu = menu.scrollable(true).max_h(px(320.0));
+            menu = menu.item(font_item(
+                window,
+                &entity,
+                format!("{platform} (default)"),
+                None,
+                chosen.is_none(),
+                on_pick,
+            ));
+            for family in families {
+                let selected = chosen.as_deref() == Some(family.as_str());
+                menu = menu.item(font_item(
+                    window,
+                    &entity,
+                    family.clone(),
+                    Some(family.clone()),
+                    selected,
+                    on_pick,
+                ));
+            }
+            menu
+        })
+        .into_any_element()
+}
+
+/// One font row — the family name set in that family, with a trailing check on
+/// the active one. `value` is `None` for the "system default" row.
+fn font_item(
+    window: &mut Window,
+    entity: &Entity<SettingsModal>,
+    label: String,
+    value: Option<String>,
+    selected: bool,
+    on_pick: fn(&mut gpui::App, Option<String>),
+) -> PopupMenuItem {
+    let face = value.clone();
+    PopupMenuItem::element(move |_window, _cx| {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(28.0))
+            .min_w(px(240.0))
+            .child(
+                div()
+                    .when_some(face.clone(), |d, family| d.font_family(family))
+                    .child(label.clone()),
+            )
+            .child(div().w(px(16.0)).flex_none().flex().justify_center().when(
+                selected,
+                |d| d.child(Icon::default().path("icons/check.svg").size(px(14.0))),
+            ))
+    })
+    .on_click(window.listener_for(
+        entity,
+        move |_m: &mut SettingsModal, _ev: &ClickEvent, _window, cx| {
+            on_pick(cx, value.clone());
+        },
+    ))
+}
+
+/// The Appearance pane's controls, as entries.
+///
+/// Density and zoom are separate rows on purpose — they are easy to mistake
+/// for one control, and the descriptions are where that distinction gets
+/// made. See `oximux_settings::appearance`.
+fn appearance_controls(
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> Vec<SettingEntry> {
+    let current = crate::appearance_settings::active(cx);
+
+    let theme_pick = segmented(
+        "appearance-theme",
+        ThemeChoice::ALL
+            .iter()
+            .map(|choice| {
+                let choice = *choice;
+                // "Charcoal (dark)" rather than "Charcoal": two material names
+                // on their own make the reader guess which is which.
+                let label = format!("{} ({})", choice.label(), choice.polarity());
+                Segment::new(label, current.theme == choice, move |_this, _w, cx| {
+                    crate::appearance_settings::set_theme(cx, choice);
+                })
+            })
+            .collect(),
+        theme,
+        density,
+        typography,
+        cx,
+    );
+
+    let density_pick = segmented(
+        "appearance-density",
+        DensityPreset::ALL
+            .iter()
+            .map(|preset| {
+                let preset = *preset;
+                Segment::new(preset.label(), current.density == preset, move |_this, _w, cx| {
+                    crate::appearance_settings::set_density(cx, preset);
+                })
+            })
+            .collect(),
+        theme,
+        density,
+        typography,
+        cx,
+    );
+
+    let zoom = stepper(
+        "appearance-zoom",
+        current.scale.label(),
+        theme,
+        density,
+        typography,
+        |_this, _w, cx| crate::appearance_settings::zoom_out(cx),
+        |_this, _w, cx| crate::appearance_settings::zoom_in(cx),
+        cx,
+    );
+
+    let faces = crate::font_settings::active(cx);
+    let ui_font = font_control(
+        "appearance-ui-font",
+        faces.ui.clone(),
+        oximux_settings::fonts::platform::UI,
+        crate::font_settings::set_ui,
+        cx,
+    );
+    let mono_font = font_control(
+        "appearance-mono-font",
+        faces.mono.clone(),
+        oximux_settings::fonts::platform::MONO,
+        crate::font_settings::set_mono,
+        cx,
+    );
+
+    // The terminal grid pins every glyph to one cell width, so a proportional
+    // face there is not a taste question — the columns stop lining up. Say so
+    // in the row rather than refusing the choice: near-monospace display faces
+    // are a real thing to want, and it is their machine.
+    let mono_note = if crate::font_settings::is_monospaced(cx, faces.resolved_mono()) {
+        "The face terminals, diffs and code are drawn in.".to_string()
+    } else {
+        format!(
+            "{} is not fixed-width — the terminal grid will space unevenly.",
+            faces.resolved_mono()
+        )
+    };
+
     vec![
-        ("Theme".into(), "Charcoal (dark)".into()),
-        ("Density".into(), "Cockpit".into()),
-        ("UI font".into(), typography.family_ui.clone()),
-        ("Mono font".into(), typography.family_mono.clone()),
+        entry(
+            "Theme",
+            "Charcoal is the original. Paper is the same cockpit drawn light.",
+            theme_pick,
+        ),
+        entry(
+            "Density",
+            "How much space sits around the text. The text itself stays the same size.",
+            density_pick,
+        ),
+        entry(
+            "Interface zoom",
+            "Scales the whole cockpit — text and chrome together.",
+            zoom,
+        ),
+        entry(
+            "UI font",
+            "The face the chrome is drawn in — tabs, panels, menus.",
+            ui_font,
+        ),
+        entry("Mono font", mono_note, mono_font),
     ]
 }
 
@@ -47,7 +260,7 @@ fn about_pairs() -> Vec<(SharedString, SharedString)> {
         ("App data dir".into(), SharedString::from(data_dir)),
         (
             "Settings files".into(),
-            "terminal.toml · commit_message_ai.toml".into(),
+            "terminal.toml · appearance.toml · commit_message_ai.toml".into(),
         ),
     ]
 }
@@ -71,8 +284,13 @@ fn pairs_to_entries(
         .collect()
 }
 
-pub(super) fn appearance_entries(theme: Theme, typography: &Typography) -> Vec<SettingEntry> {
-    pairs_to_entries(appearance_pairs(typography), theme, typography)
+pub(super) fn appearance_entries(
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> Vec<SettingEntry> {
+    appearance_controls(theme, density, typography, cx)
 }
 
 pub(super) fn about_entries(theme: Theme, typography: &Typography) -> Vec<SettingEntry> {
@@ -126,14 +344,29 @@ fn info_pane(
     col.into_any_element()
 }
 
-pub(super) fn render_appearance(query: &str, theme: Theme, typography: &Typography) -> AnyElement {
-    info_pane(
-        query,
-        &appearance_pairs(typography),
-        "Light mode is a deferred decision. Dark-only for now.",
-        theme,
-        typography,
-    )
+pub(super) fn render_appearance(
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .child(entries_card(
+            theme,
+            density,
+            typography,
+            appearance_entries(theme, density, typography, cx),
+        ))
+        .child(
+            div()
+                .pt(px(12.0))
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_subtle)
+                .child("Changes apply immediately and save to appearance.toml."),
+        )
+        .into_any_element()
 }
 
 /// One line describing where the updater currently stands.

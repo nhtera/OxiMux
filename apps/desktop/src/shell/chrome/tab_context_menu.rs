@@ -237,7 +237,7 @@ impl TabContextMenu {
                 div()
                     .px(px(ROW_PADDING_X))
                     .pb(px(4.0))
-                    .text_size(px(11.0))
+                    .text_size(px(typography.t_body_sm))
                     .text_color(theme.fg_subtle)
                     .child(hint),
             );
@@ -270,6 +270,7 @@ impl TabContextMenu {
 
 impl Render for TabContextMenu {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         if !self.open {
             return div().into_any_element();
         }
@@ -529,6 +530,7 @@ impl Render for TabContextMenu {
                 target.group.clone(),
                 target.tab_idx,
                 theme,
+                typography.t_body_sm,
                 cx,
             ));
         }
@@ -634,13 +636,14 @@ fn color_palette_row(
     group: WeakEntity<PaneGroup>,
     tab_idx: usize,
     theme: Theme,
+    label_size: f32,
     cx: &mut Context<TabContextMenu>,
 ) -> gpui::AnyElement {
     use gpui::IntoElement;
     let label = div()
         .px(px(ROW_PADDING_X))
         .py(px(4.0))
-        .text_size(px(11.0))
+        .text_size(px(label_size))
         .text_color(theme.fg_subtle)
         .child("Tab Color");
     let swatches: [(&'static str, Option<TabColor>); 10] = [

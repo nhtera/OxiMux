@@ -8,7 +8,7 @@
 use crate::shell::git_panel::GitPanel;
 use crate::shell::git_panel::discard_confirm::DiscardAllArea;
 use crate::shell::git_panel::row_renderer::{RowKind, row};
-use crate::shell::source_control::style as sc_style;
+use crate::shell::source_control::style::ScmStyle;
 use gpui::{
     AnyElement, Animation, AnimationExt, ClickEvent, Context, ElementId, EventEmitter,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Styled, div,
@@ -186,6 +186,15 @@ pub struct RenderCtx<'a> {
     pub collapsed_dirs: &'a HashSet<PathBuf>,
 }
 
+impl RenderCtx<'_> {
+    /// SCM spacing and type for this render pass. The changed-files list is
+    /// the body of the Source Control panel, so it takes the panel's scale
+    /// rather than a second set of its own.
+    pub fn style(&self) -> ScmStyle {
+        ScmStyle::new(self.density, self.typography)
+    }
+}
+
 /// Map a `RowKind` to the matching `DiscardAllArea` for section-header
 /// "Discard all" / "Delete all" actions.
 fn area_for(kind: RowKind) -> DiscardAllArea {
@@ -261,14 +270,15 @@ fn view_all_row(
     cx: &mut Context<GitPanel>,
 ) -> impl IntoElement {
     let theme = rctx.theme;
+    let style = rctx.style();
     div()
         .id(gpui::SharedString::from(format!("git-view-all-{title}")))
         .flex()
         .items_center()
         .h(px(rctx.density.h_row))
-        .px(px(sc_style::PAD_H))
+        .px(px(style.pad_h))
         .rounded(px(rctx.density.r_xs))
-        .text_size(px(sc_style::CAPS_TEXT))
+        .text_size(px(style.caps_text))
         .text_color(theme.fg_muted)
         .cursor_pointer()
         .hover(|s| s.bg(theme.hover_overlay).text_color(theme.fg_base))
@@ -292,6 +302,7 @@ fn section(
     if rows.is_empty() {
         return div().into_any_element();
     }
+    let style = rctx.style();
     let is_collapsed = rctx.collapsed.contains(&title);
     let chevron = if is_collapsed {
         IconName::ChevronRight
@@ -327,9 +338,9 @@ fn section(
         .items_center()
         .gap(px(4.0))
         .h(px(rctx.density.h_tab))
-        .px(px(sc_style::PAD_H))
+        .px(px(style.pad_h))
         .rounded(px(rctx.density.r_xs))
-        .text_size(px(sc_style::CAPS_TEXT))
+        .text_size(px(style.caps_text))
         .font_weight(rctx.typography.w_semibold)
         .text_color(rctx.theme.fg_muted)
         .cursor_pointer()
@@ -585,12 +596,13 @@ fn section_hover_cluster(
 const SECTION_BTN_PX: f32 = 14.0;
 
 fn empty_state(rctx: &RenderCtx<'_>) -> impl IntoElement {
+    let style = rctx.style();
     // Two-line empty state: a strong "No changes on this branch" headline
     // followed by a muted subline that surfaces the branch name when known.
     // Falls back to a single-line headline when branch is unknown (detached
     // HEAD, pre-first-poll, etc.) — avoids "no changes ahead of None".
     let headline = div()
-        .text_size(px(sc_style::BODY_TEXT))
+        .text_size(px(style.body_text))
         .font_weight(rctx.typography.w_medium)
         .text_color(rctx.theme.fg_base)
         .child("No changes on this branch");
@@ -599,7 +611,7 @@ fn empty_state(rctx: &RenderCtx<'_>) -> impl IntoElement {
     let subline = rctx.branch.filter(|b| !b.is_empty()).map(|b| {
         div()
             .mt(px(4.0))
-            .text_size(px(sc_style::BODY_TEXT - 1.0))
+            .text_size(px(style.body_text - 1.0))
             .text_color(rctx.theme.fg_subtle)
             .child(format!(
                 "This workspace is clean and this branch has no changes ahead of {b}"
@@ -611,7 +623,7 @@ fn empty_state(rctx: &RenderCtx<'_>) -> impl IntoElement {
         .items_center()
         .justify_center()
         .h_full()
-        .px(px(sc_style::PAD_H))
+        .px(px(style.pad_h))
         .py(px(rctx.density.pad_panel))
         .child(headline)
         .children(subline)

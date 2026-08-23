@@ -77,7 +77,7 @@ const NOTIFY_ROWS: [(&str, &str, &str, NotifySelect); 10] = [
         |s| &s.only_when_unfocused,
     ),
     (
-        "Keep Mac awake while agents run",
+        "Keep this computer awake while agents run",
         "Prevent idle sleep while any agent session is running.",
         keys::AGENT_AWAKE,
         |s| &s.agent_awake,

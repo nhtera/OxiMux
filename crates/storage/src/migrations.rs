@@ -67,7 +67,12 @@ pub struct Migration {
 /// existing rows from their current display order. V016 adds
 /// `workspaces.pinned` — a per-workspace flag that floats the row to
 /// the top of its project group in every sort mode (additive, DEFAULT 0,
-/// no backfill). Future migrations append; never reorder, never rewrite.
+/// no backfill). V025 adds `diff_review_notes.anchor_text` — the diff line's
+/// text at the time a note was written, so a note that has drifted off its
+/// line number can be re-anchored or reported gone instead of silently
+/// quoting whatever code now sits there (additive, DEFAULT '', no backfill:
+/// existing rows read as unverifiable and stay put).
+/// Future migrations append; never reorder, never rewrite.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -199,6 +204,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 24,
         name: "coord_state",
         sql: include_str!("../migrations/V024__coord_state.sql"),
+    },
+    Migration {
+        version: 25,
+        name: "diff_review_notes_anchor_text",
+        sql: include_str!("../migrations/V025__diff_review_notes_anchor_text.sql"),
     },
 ];
 

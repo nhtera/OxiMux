@@ -28,6 +28,7 @@ mod screen_control_absent;
 #[cfg(not(any(target_os = "macos", windows)))]
 use screen_control_absent::{computer_use, screen_card, screen_consent};
 mod composer_history;
+mod composer_worktree;
 mod acp_terminal_host;
 mod context_meter;
 mod dictation_history;
@@ -1749,7 +1750,7 @@ impl AgentChatView {
                             .flex_none()
                             .px(px(density.pad_panel))
                             .py(px(density.gap_inline * 0.5))
-                            .rounded(px(8.0))
+                            .rounded(px(density.r_card))
                             .cursor_pointer()
                             .bg(theme.bg_panel_alt)
                             .text_color(theme.fg_base)
@@ -2325,7 +2326,7 @@ impl AgentChatView {
             .gap(px(5.0))
             .px(px(10.0))
             .py(px(4.0))
-            .rounded(px(6.0))
+            .rounded(px(self.density.r_xs))
             .cursor_pointer()
             .bg(theme.status_error.opacity(0.15))
             .text_size(px(typo.t_body_sm))
@@ -2402,7 +2403,7 @@ impl AgentChatView {
             .gap(px(5.0))
             .px(px(10.0))
             .py(px(4.0))
-            .rounded(px(6.0))
+            .rounded(px(self.density.r_xs))
             .cursor_pointer()
             .bg(theme.status_info.opacity(0.15))
             .text_size(px(typo.t_body_sm))
@@ -4150,7 +4151,7 @@ impl AgentChatView {
                 .max_w(px(CONTENT_MAX_W))
                 .px(px(10.0))
                 .py(px(5.0))
-                .rounded(px(8.0))
+                .rounded(px(self.density.r_card))
                 .bg(t.status_warn.opacity(0.15))
                 .text_sm()
                 .text_color(t.fg_base)
@@ -4184,7 +4185,7 @@ impl AgentChatView {
                     .id("thinking-level-toggle")
                     .px(px(8.0))
                     .py(px(2.0))
-                    .rounded(px(6.0))
+                    .rounded(px(self.density.r_xs))
                     .text_xs()
                     .text_color(t.fg_subtle)
                     .cursor_pointer()
@@ -4432,7 +4433,7 @@ impl AgentChatView {
                 .w_full()
                 .h(px(EMBEDDED_TERMINAL_HEIGHT))
                 .overflow_hidden()
-                .rounded(px(6.0))
+                .rounded(px(density.r_xs))
                 .border_1()
                 .border_color(theme.border_inactive)
                 .bg(theme.bg_base)
@@ -4628,7 +4629,7 @@ impl AgentChatView {
                         if copied { "icons/check.svg" } else { "icons/copy.svg" },
                         if copied { "Copied" } else { "Copy" },
                         if copied { theme.status_ok } else { theme.fg_muted },
-                        theme,
+                        theme, density,
                         cx.listener(move |this, _e, _w, cx| {
                             this.copy_message(idx, copy_text.clone(), cx);
                         }),
@@ -4639,7 +4640,7 @@ impl AgentChatView {
                             "icons/pencil.svg",
                             "Edit message",
                             theme.fg_muted,
-                            theme,
+                            theme, density,
                             cx.listener(move |this, _e, window, cx| {
                                 this.enter_pending_edit(idx, window, cx);
                             }),
@@ -4651,7 +4652,7 @@ impl AgentChatView {
                             "icons/undo-2.svg",
                             "Rewind to here",
                             theme.fg_muted,
-                            theme,
+                            theme, density,
                             cx.listener(move |this, _e, _w, cx| {
                                 this.open_rewind_confirm(idx, cx)
                             }),
@@ -4668,7 +4669,7 @@ impl AgentChatView {
                             "icons/git-branch.svg",
                             "Fork from here",
                             theme.fg_muted,
-                            theme,
+                            theme, density,
                             cx.listener(move |this, _e, _w, cx| {
                                 this.request_fork(idx, cx)
                             }),
@@ -5001,7 +5002,7 @@ impl AgentChatView {
             .w_full()
             .max_w(px(CONTENT_MAX_W))
             .gap(px(density.gap_inline * 0.5))
-            .rounded(px(10.0))
+            .rounded(px(density.r_lg))
             .border_1()
             .border_color(theme.border_inactive)
             .bg(theme.bg_panel_alt)
@@ -5051,6 +5052,7 @@ impl Focusable for AgentChatView {
 
 impl Render for AgentChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         // Once per frame, before anything decodes: attachment images are cached
         // by the render path, which has no `Window` to release them with, so the
         // cache is allowed over budget until here. Overshooting by one frame of
@@ -5381,6 +5383,7 @@ fn assistant_header(
     provider: &str,
     theme: Theme,
     typo: &Typography,
+    density: Density,
     cx: &mut Context<AgentChatView>,
 ) -> AnyElement {
     let copy_text = text.to_string();
@@ -5395,7 +5398,7 @@ fn assistant_header(
             .items_center()
             .justify_center()
             .size(px(22.0))
-            .rounded(px(6.0))
+            .rounded(px(density.r_xs))
             .cursor_pointer()
             .invisible()
             .group_hover(group, |s| s.visible())
@@ -5454,6 +5457,7 @@ fn message_action_icon(
     tooltip: &'static str,
     icon_color: gpui::Hsla,
     theme: Theme,
+    density: Density,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let tip = SharedString::from(tooltip);
@@ -5463,7 +5467,7 @@ fn message_action_icon(
         .items_center()
         .justify_center()
         .size(px(24.0))
-        .rounded(px(6.0))
+        .rounded(px(density.r_xs))
         .cursor_pointer()
         .hover(|s| s.bg(theme.hover_overlay))
         .tooltip(move |window, cx| {

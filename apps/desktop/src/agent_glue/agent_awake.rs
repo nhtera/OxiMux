@@ -6,37 +6,46 @@
 //! from idle-sleeping while costing nothing once everything is parked.
 //!
 //! **Remote access:** the host holds one for as long as it is bound. A phone can
-//! only reach a Mac that is awake, so without it remote control quietly stops
-//! working a few minutes after the user walks away — the failure it exists to
-//! prevent looks exactly like the feature being broken.
+//! only reach a machine that is awake, so without it remote control quietly
+//! stops working a few minutes after the user walks away — the failure it exists
+//! to prevent looks exactly like the feature being broken.
 //!
 //! **Scheduling:** a schedule armed to fire later holds one until it does. Note
 //! this only prevents *idle sleep while the app is running* — it cannot wake a
-//! sleeping Mac or relaunch a quit app, so an overnight schedule still needs the
-//! app left open.
+//! sleeping machine or relaunch a quit app, so an overnight schedule still needs
+//! the app left open.
 //!
-//! Each reason has its own user toggle (Notifications → "Keep Mac awake while
-//! agents run", Remote → "Keep this Mac awake while on"), and they are tracked
-//! separately so neither setting silently governs the other. Flipping one takes
-//! effect immediately on a live assertion in either direction, while keeping the
-//! hold count — so re-enabling mid-run re-asserts.
+//! Each reason has its own user toggle (Notifications → "Keep this computer
+//! awake while agents run", Remote → "Keep this computer awake while on"), and
+//! they are tracked separately so neither setting silently governs the other.
+//! Flipping one takes effect immediately on a live assertion in either
+//! direction, while keeping the hold count — so re-enabling mid-run re-asserts.
 //!
-//! The process-global [`AgentAwake`] creates **one** IOKit assertion when the
+//! The process-global [`AgentAwake`] creates **one** OS assertion when the
 //! first reason wants it and releases it when none do; the OS refcounts nothing
 //! for us, so a second assertion would only be another thing to leak.
 //!
-//! IOKit is behind [`SleepAssertionBackend`] so the refcount/toggle logic
-//! is unit-testable without touching power management.
+//! Both shipping platforms have a real hold behind [`SleepAssertionBackend`] —
+//! an IOKit assertion on macOS, a power request on Windows — so the toggles mean
+//! the same thing on each. The seam also keeps the refcount/toggle logic
+//! unit-testable without touching power management.
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Seam over `IOPMAssertionCreateWithName` / `IOPMAssertionRelease`.
+/// Seam over the OS's prevent-idle-sleep call: `IOPMAssertionCreateWithName` /
+/// `IOPMAssertionRelease` on macOS, a power request on Windows.
 pub trait SleepAssertionBackend: Send + Sync {
-    /// Create the assertion under `name` (what `pmset -g assertions` shows);
-    /// `None` when the OS call fails (logged by the impl). The returned token is
-    /// opaque to the caller.
-    fn create(&self, name: &str) -> Option<u32>;
-    fn release(&self, id: u32);
+    /// Create the assertion under `name` — what `pmset -g assertions` shows on
+    /// macOS and `powercfg /requests` on Windows. `None` when the OS call fails
+    /// (logged by the impl).
+    ///
+    /// The token is opaque to the caller and only ever handed back to the
+    /// backend that minted it. It is 64 bits wide because the two platforms
+    /// hand back different things — macOS a 32-bit assertion id, Windows a
+    /// `HANDLE` — and narrowing a handle to fit the smaller of the two would
+    /// truncate the pointer and leak the request.
+    fn create(&self, name: &str) -> Option<u64>;
+    fn release(&self, id: u64);
 }
 
 /// One independent justification for staying awake: how many things currently
@@ -62,7 +71,7 @@ struct State {
     agent: Reason,
     remote: Reason,
     scheduling: Reason,
-    assertion: Option<u32>,
+    assertion: Option<u64>,
 }
 
 pub struct AgentAwake {
@@ -94,7 +103,7 @@ impl AgentAwake {
     }
 
     /// Keep the machine reachable while remote access is bound. Same guard, a
-    /// separate reason: a phone can only reach a Mac that is awake, so the host
+    /// separate reason: a phone can only reach a machine that is awake, so the host
     /// being up is its own justification independent of any agent running.
     pub fn acquire_remote(self: &Arc<Self>) -> AwakeHold {
         self.acquire_for(Source::Remote)
@@ -107,7 +116,7 @@ impl AgentAwake {
     /// scheduled runs should be missed.
     ///
     /// This only prevents **idle sleep while the app is running**. It cannot
-    /// wake a Mac that is already asleep, and it cannot relaunch a quit app —
+    /// wake a machine that is already asleep, and it cannot relaunch a quit app —
     /// so an overnight schedule still needs the app left open. Every surface
     /// that creates a schedule is expected to say so.
     pub fn acquire_scheduling(self: &Arc<Self>) -> AwakeHold {
@@ -219,7 +228,8 @@ impl Source {
     }
 }
 
-/// What `pmset -g assertions` will show as the reason this Mac is awake. Names
+/// What `pmset -g assertions` (macOS) and `powercfg /requests` (Windows) will
+/// show as the reason this machine is awake. Names
 /// the actual cause so someone hunting a machine that won't sleep is not sent
 /// looking for an agent that isn't running.
 fn assertion_name(state: &State) -> &'static str {
@@ -259,16 +269,21 @@ fn platform_backend() -> Arc<dyn SleepAssertionBackend> {
     Arc::new(iopm::IoPmBackend)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn platform_backend() -> Arc<dyn SleepAssertionBackend> {
+    Arc::new(power_request::PowerRequestBackend)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn platform_backend() -> Arc<dyn SleepAssertionBackend> {
     /// No sleep-assertion path wired on this platform; holds are tracked
     /// but never materialize.
     struct NoopBackend;
     impl SleepAssertionBackend for NoopBackend {
-        fn create(&self, _name: &str) -> Option<u32> {
+        fn create(&self, _name: &str) -> Option<u64> {
             None
         }
-        fn release(&self, _id: u32) {}
+        fn release(&self, _id: u64) {}
     }
     Arc::new(NoopBackend)
 }
@@ -302,7 +317,7 @@ mod iopm {
     pub(super) struct IoPmBackend;
 
     impl SleepAssertionBackend for IoPmBackend {
-        fn create(&self, name: &str) -> Option<u32> {
+        fn create(&self, name: &str) -> Option<u64> {
             // NSString is toll-free bridged to CFString, so the retained
             // pointers double as CFStringRef for the duration of the call
             // (both values outlive it — they drop at end of scope).
@@ -318,15 +333,143 @@ mod iopm {
                 )
             };
             if rc == KERN_SUCCESS {
-                Some(id)
+                Some(u64::from(id))
             } else {
                 tracing::warn!(rc, "IOPMAssertionCreateWithName failed");
                 None
             }
         }
 
-        fn release(&self, id: u32) {
-            let _ = unsafe { IOPMAssertionRelease(id) };
+        fn release(&self, id: u64) {
+            let _ = unsafe { IOPMAssertionRelease(id as IOPMAssertionID) };
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod power_request {
+    use widestring::U16CString;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Power::{
+        PowerClearRequest, PowerCreateRequest, PowerRequestSystemRequired, PowerSetRequest,
+    };
+    use windows_sys::Win32::System::Threading::{
+        POWER_REQUEST_CONTEXT_SIMPLE_STRING, REASON_CONTEXT, REASON_CONTEXT_0,
+    };
+
+    use super::SleepAssertionBackend;
+
+    /// `POWER_REQUEST_CONTEXT_VERSION`. Not exported by `windows-sys`; the SDK
+    /// defines it as 0 and has since the API shipped in Windows 7.
+    const CONTEXT_VERSION: u32 = 0;
+
+    /// The Windows counterpart of the IOKit assertion: a **power request**
+    /// rather than `SetThreadExecutionState`.
+    ///
+    /// `SetThreadExecutionState` is the older and better-known call, and it is
+    /// the wrong one here for a reason that has nothing to do with taste: its
+    /// effect belongs to the *calling thread* and lasts only as long as that
+    /// thread does. Holds here are taken and dropped from wherever an agent,
+    /// the remote host or the scheduler happens to be running, so the thread
+    /// that acquires is routinely not the thread that releases — and a thread
+    /// that exits while holding would silently drop the assertion.
+    ///
+    /// A power request is process-wide and handle-based, so it survives the
+    /// thread that made it and is released by whoever holds the handle. It also
+    /// carries the reason string, which is what makes the hold accountable:
+    /// `powercfg /requests` names OxiMux and says *why*, the same way
+    /// `pmset -g assertions` does on macOS.
+    pub(super) struct PowerRequestBackend;
+
+    impl SleepAssertionBackend for PowerRequestBackend {
+        fn create(&self, name: &str) -> Option<u64> {
+            // The reason string must outlive the `PowerCreateRequest` call —
+            // Windows copies it into the request — so it is held in a binding
+            // rather than materialized inside the struct literal.
+            let Ok(reason) = U16CString::from_str(name) else {
+                // Only reachable if the name contains an interior NUL. Ours are
+                // string literals, so this is a guard, not a case.
+                tracing::warn!("keep-awake reason string was not representable");
+                return None;
+            };
+            let context = REASON_CONTEXT {
+                Version: CONTEXT_VERSION,
+                Flags: POWER_REQUEST_CONTEXT_SIMPLE_STRING,
+                Reason: REASON_CONTEXT_0 {
+                    SimpleReasonString: reason.as_ptr() as *mut u16,
+                },
+            };
+            // SAFETY: `context` is fully initialized and its string outlives
+            // the call; the union arm matches the `SIMPLE_STRING` flag.
+            let handle: HANDLE = unsafe { PowerCreateRequest(&context) };
+            if handle.is_null() {
+                tracing::warn!("PowerCreateRequest failed");
+                return None;
+            }
+            // `SystemRequired` prevents *idle sleep* while leaving the display
+            // free to blank — the same scope as `PreventUserIdleSystemSleep` on
+            // macOS. Keeping the screen on is a different promise and not one
+            // any of these three reasons made.
+            // SAFETY: `handle` is a live power request from the call above.
+            if unsafe { PowerSetRequest(handle, PowerRequestSystemRequired) } == 0 {
+                tracing::warn!("PowerSetRequest failed");
+                // SAFETY: closing a handle we own and are about to forget.
+                unsafe { CloseHandle(handle) };
+                return None;
+            }
+            Some(handle as u64)
+        }
+
+        fn release(&self, id: u64) {
+            let handle = id as HANDLE;
+            // SAFETY: `id` came from this backend's `create`, which only ever
+            // returns a live request handle, and `reevaluate` hands each token
+            // back exactly once.
+            //
+            // Logged rather than ignored because a clear that does not land is
+            // invisible from inside the app and permanent from outside it: the
+            // request outlives every reason for it and the machine simply
+            // stops idle-sleeping, with nothing on screen to say why.
+            if unsafe { PowerClearRequest(handle, PowerRequestSystemRequired) } == 0 {
+                tracing::warn!("PowerClearRequest failed; the keep-awake hold may outlive the app");
+            }
+            // SAFETY: closing a handle this backend owns, exactly once.
+            unsafe { CloseHandle(handle) };
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Against the real kernel32, not a mock: the point of this one is that
+        /// Windows *accepted* the request. A malformed `REASON_CONTEXT` — wrong
+        /// version, a flag that disagrees with the union arm, a reason string
+        /// that stopped existing before the call — fails right here, and it is
+        /// the only way to find out short of an elevated `powercfg /requests`.
+        #[test]
+        fn windows_grants_and_releases_a_real_power_request() {
+            let backend = PowerRequestBackend;
+            let id = backend
+                .create("OxiMux test assertion")
+                .expect("PowerCreateRequest + PowerSetRequest should succeed");
+            assert_ne!(id, 0, "a granted request has a real handle");
+
+            // Clearing through the round-tripped token is the half worth
+            // asserting. `release` does exactly this and can only log when it
+            // fails, so if widening the handle to `u64` and back ever stopped
+            // naming the same request, the release would quietly clear nothing
+            // and the machine would never idle-sleep again. Here it is an
+            // assertion instead.
+            let handle = id as HANDLE;
+            // SAFETY: `handle` is the live request `create` just returned.
+            assert_ne!(
+                unsafe { PowerClearRequest(handle, PowerRequestSystemRequired) },
+                0,
+                "the round-tripped handle must still name the request"
+            );
+            // SAFETY: closing the handle this test owns, exactly once.
+            assert_ne!(unsafe { CloseHandle(handle) }, 0);
         }
     }
 }
@@ -346,12 +489,12 @@ mod tests {
     }
 
     impl SleepAssertionBackend for MockBackend {
-        fn create(&self, name: &str) -> Option<u32> {
+        fn create(&self, name: &str) -> Option<u64> {
             *self.last_name.lock().unwrap() = name.to_string();
             self.creates.fetch_add(1, Ordering::Relaxed);
-            Some(self.next_id.fetch_add(1, Ordering::Relaxed))
+            Some(u64::from(self.next_id.fetch_add(1, Ordering::Relaxed)))
         }
-        fn release(&self, _id: u32) {
+        fn release(&self, _id: u64) {
             self.releases.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -404,7 +547,7 @@ mod tests {
     }
 
     /// The whole point of two reasons: the settings that gate them are different
-    /// questions. Turning off "keep awake while agents run" must not let the Mac
+    /// questions. Turning off "keep awake while agents run" must not let the machine
     /// sleep on a paired phone, and turning off the remote one must not undo the
     /// agent behaviour either.
     #[test]
@@ -462,10 +605,10 @@ mod tests {
     fn create_failure_leaves_no_assertion_but_keeps_holds() {
         struct FailBackend;
         impl SleepAssertionBackend for FailBackend {
-            fn create(&self, _name: &str) -> Option<u32> {
+            fn create(&self, _name: &str) -> Option<u64> {
                 None
             }
-            fn release(&self, _id: u32) {}
+            fn release(&self, _id: u64) {}
         }
         let awake = Arc::new(AgentAwake::with_backend(Arc::new(FailBackend), true));
         let _h = awake.acquire();
@@ -474,7 +617,7 @@ mod tests {
 
     /// An armed schedule holds the assertion on its own — with no agent running
     /// and remote off. Without this a scheduled run set for later would sit
-    /// behind an idle-sleeping Mac and silently never fire.
+    /// behind an idle-sleeping machine and silently never fire.
     #[test]
     fn a_scheduling_hold_asserts_by_itself() {
         let backend = Arc::new(MockBackend::default());

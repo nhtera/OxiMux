@@ -3,10 +3,18 @@
 //! Layout: `left | center | right`. Left zone shows brand + version. Center
 //! shows the git branch chip + dirty count when a repository is mounted,
 //! plus a compact primary-action button when an SCM panel is active. Right
-//! zone shows a metric strip: `N TTY | N agents | N panes`.
+//! zone shows a metric strip: `N ports | N TTY | N agents | N panes`.
+//!
+//! The ports segment is the one metric that comes and goes. It is a *signal*,
+//! not a count of something always present — "something you started is
+//! serving" is worth a permanent place in the eye's path only while it is
+//! true, and the Ports tab in the activity bar is the affordance that is
+//! always there. Unlike its neighbours it is clickable, because a metric that
+//! only appears when there is something to look at should take you to it.
 //!
 //! Pure helpers (`tty_label`, `agent_label`, `pane_label`, `metric_color`,
-//! `primary_button_visible`) drive the visible labels; tested without GPUI.
+//! `primary_button_visible`, `ports_segment_visible`) drive the visible
+//! labels; tested without GPUI.
 
 use gpui::{
     App, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
@@ -89,6 +97,16 @@ fn separator(theme: Theme, typography: &Typography) -> impl IntoElement {
         .child(" | ")
 }
 
+/// Whether the clickable ports segment belongs in the metric strip.
+///
+/// Zero is hidden rather than dimmed. The neighbouring metrics describe things
+/// the window always has some number of; a listening port is an event, and a
+/// permanent "0 ports" would be the only segment in the strip that is usually
+/// reporting nothing happened.
+pub fn ports_segment_visible(count: usize) -> bool {
+    count > 0
+}
+
 /// Returns `true` when the primary-action button should be rendered in the
 /// git zone: requires both a mounted repo (git_state present) and a resolved
 /// primary action from the SCM panel.
@@ -100,13 +118,16 @@ pub fn primary_button_visible(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn view<F, G, H>(
+pub fn view<F, G, H, P>(
     theme: Theme,
     density: Density,
     typography: &Typography,
     pane_count: usize,
     tty_count: usize,
     agent_count: usize,
+    // Listening ports attributed to this window's terminals. Hidden at zero —
+    // see `ports_segment_visible`.
+    port_count: usize,
     git_state: Option<&PollState>,
     primary: Option<PrimaryAction>,
     usage: Option<&UsageState>,
@@ -115,11 +136,13 @@ pub fn view<F, G, H>(
     on_primary_click: F,
     on_usage_click: G,
     on_update_click: H,
+    on_ports_click: P,
 ) -> impl IntoElement
 where
     F: Fn(&mut Window, &mut App) + 'static,
     G: Fn(&mut Window, &mut App) + 'static,
     H: Fn(&mut Window, &mut App) + 'static,
+    P: Fn(&mut Window, &mut App) + 'static,
 {
     let git_label = git_zone_label(git_state);
     let show_primary = primary_button_visible(git_state, primary.as_ref());
@@ -244,6 +267,29 @@ where
             .child(format!("v{version} ready — restart to update"))
     });
 
+    // Clickable, unlike its neighbours: it appears exactly when there is
+    // something to go and look at, so it opens the panel that shows it.
+    let ports_chip = ports_segment_visible(port_count).then(|| {
+        let hover_bg = theme.hover_overlay;
+        div()
+            .id("status-bar-ports")
+            .flex()
+            .items_center()
+            .h(px(16.))
+            .px(px(4.))
+            .rounded(px(density.r_chip))
+            .text_size(px(typography.t_body_sm))
+            .text_color(theme.fg_muted)
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg))
+            .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+                on_ports_click(window, cx);
+            })
+            .child(crate::shell::ports_panel::labels::port_metric_label(
+                port_count,
+            ))
+    });
+
     div()
         .flex()
         .flex_row()
@@ -280,6 +326,13 @@ where
                         .child(chip)
                         .child(separator(theme, typography))
                 }))
+                .children(ports_chip.map(|chip| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(chip)
+                        .child(separator(theme, typography))
+                }))
                 .child(
                     div()
                         .text_size(px(typography.t_body_sm))
@@ -306,6 +359,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ports_segment_appears_only_when_something_is_serving() {
+        assert!(!ports_segment_visible(0), "an idle window keeps a quiet strip");
+        assert!(ports_segment_visible(1));
+        assert!(ports_segment_visible(9));
+    }
 
     #[test]
     fn tty_label_singular() {

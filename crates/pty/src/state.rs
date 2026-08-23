@@ -29,6 +29,7 @@ use alacritty_terminal::vte::ansi::{
 use crate::backend::TerminalSessionId;
 use crate::events::TerminalEvent;
 use crate::osc7::{OscHit, OscScanner};
+use crate::polarity::{BackgroundPolarity, background_polarity};
 use crate::snapshot::{Cell, CellColor, HyperlinkSpan, NamedColor16, TerminalSnapshot};
 
 /// Cap on the event sink so a misbehaving stream (or a huge replay) can't grow
@@ -219,8 +220,10 @@ impl TerminalState {
                 SinkEvent::PtyWrite(bytes) => out.push(TerminalEvent::PtyReply { id, bytes }),
                 SinkEvent::ColorQuery { index, reply } => {
                     // Honor any color the app SET (OSC 4/10/11); else answer
-                    // from a dark default palette so probes detect dark mode.
-                    let rgb = self.term.colors()[index].unwrap_or_else(|| default_palette_rgb(index));
+                    // from the default palette for the polarity in force, so a
+                    // probe detects the theme the window is actually wearing.
+                    let rgb = self.term.colors()[index]
+                        .unwrap_or_else(|| default_palette_rgb(index, background_polarity()));
                     out.push(TerminalEvent::PtyReply {
                         id,
                         bytes: reply(rgb).into_bytes(),
@@ -499,23 +502,49 @@ fn map_cell(cell: &alacritty_terminal::term::cell::Cell) -> Cell {
 }
 
 /// Default color for an OSC color query when the app hasn't SET that slot.
-/// Background is intentionally dark so tools (fzf, codex, vim) querying OSC 11
-/// detect a dark theme; the 0..255 palette uses the standard xterm map.
-fn default_palette_rgb(index: usize) -> Rgb {
-    const FG: Rgb = Rgb {
+///
+/// Foreground, background and cursor follow the host window's
+/// [`BackgroundPolarity`] — this is the answer tools (fzf, delta, vim, Claude
+/// Code) use to decide whether they are running on a dark or a light terminal,
+/// and getting it wrong is not a subtle shade difference: they pick a whole
+/// palette from it and emit it as truecolor, which no downstream mapping can
+/// correct. See [`crate::polarity`].
+///
+/// The 0..=255 palette stays the standard xterm map at both polarities. Those
+/// slots answer "what is color N", and N is a well-known constant that
+/// programs also hard-code; the renderer's own tuned 16 are a display choice,
+/// not a redefinition of the palette.
+fn default_palette_rgb(index: usize, polarity: BackgroundPolarity) -> Rgb {
+    const DARK_FG: Rgb = Rgb {
         r: 0xcd,
         g: 0xd6,
         b: 0xe4,
     };
-    const BG: Rgb = Rgb {
+    const DARK_BG: Rgb = Rgb {
         r: 0x12,
         g: 0x14,
         b: 0x18,
     };
+    // Paper's `fg_base` on Paper's `bg_base`, so the answer matches what the
+    // renderer actually paints behind the child's output.
+    const LIGHT_FG: Rgb = Rgb {
+        r: 0x1a,
+        g: 0x1d,
+        b: 0x21,
+    };
+    const LIGHT_BG: Rgb = Rgb {
+        r: 0xff,
+        g: 0xff,
+        b: 0xff,
+    };
+    let (fg, bg) = match polarity {
+        BackgroundPolarity::Dark => (DARK_FG, DARK_BG),
+        BackgroundPolarity::Light => (LIGHT_FG, LIGHT_BG),
+    };
     match index {
-        i if i == NamedColor::Foreground as usize => FG,
-        i if i == NamedColor::Background as usize => BG,
-        i if i == NamedColor::Cursor as usize => FG,
+        i if i == NamedColor::Foreground as usize => fg,
+        i if i == NamedColor::Background as usize => bg,
+        i if i == NamedColor::Cursor as usize => fg,
         0..=15 => ansi16_rgb(index as u8),
         16..=231 => {
             // 6×6×6 color cube. Each axis level 0 → 0, else 55 + 40·level.
@@ -532,7 +561,7 @@ fn default_palette_rgb(index: usize) -> Rgb {
             let v = 8 + (index as u8 - 232) * 10;
             Rgb { r: v, g: v, b: v }
         }
-        _ => FG,
+        _ => fg,
     }
 }
 
@@ -964,6 +993,72 @@ mod tests {
             reply.contains("rgb:1212/1414/1818"),
             "dark default bg, got: {reply:?}"
         );
+    }
+
+    // The polarity-dependent answers are tested through the pure function
+    // rather than by flipping the process-wide global: that global is shared
+    // by every test in this binary, and a test that moved it would race the
+    // dark-default assertion above.
+    fn luma(c: Rgb) -> u32 {
+        // Rough perceptual weighting; only used to ask "nearer black or
+        // nearer white", which no reasonable coefficient set disagrees about.
+        (2 * c.r as u32 + 5 * c.g as u32 + c.b as u32) / 8
+    }
+
+    const BG_SLOT: usize = NamedColor::Background as usize;
+    const FG_SLOT: usize = NamedColor::Foreground as usize;
+
+    // The whole point of the module: a probe asking "what is your background"
+    // must be told light when the window is light. This is the single bit
+    // that decides which palette a CLI picks.
+    #[test]
+    fn the_background_answer_follows_the_polarity() {
+        let dark = default_palette_rgb(BG_SLOT, BackgroundPolarity::Dark);
+        let light = default_palette_rgb(BG_SLOT, BackgroundPolarity::Light);
+        assert!(luma(dark) < 64, "dark bg should read as dark: {dark:?}");
+        assert!(luma(light) > 192, "light bg should read as light: {light:?}");
+    }
+
+    // Foreground has to travel with it. Answering "light background, light
+    // foreground" would describe a terminal nobody could read, and a tool
+    // that trusts the pair would produce exactly that.
+    #[test]
+    fn foreground_stays_opposite_its_background() {
+        for polarity in [BackgroundPolarity::Dark, BackgroundPolarity::Light] {
+            let fg = luma(default_palette_rgb(FG_SLOT, polarity));
+            let bg = luma(default_palette_rgb(BG_SLOT, polarity));
+            assert!(
+                fg.abs_diff(bg) > 128,
+                "{polarity:?}: fg {fg} and bg {bg} must sit at opposite ends"
+            );
+        }
+    }
+
+    // The cursor is drawn as a block over the background, so it follows the
+    // foreground; a cursor that matched the background would be invisible.
+    #[test]
+    fn cursor_matches_the_foreground() {
+        for polarity in [BackgroundPolarity::Dark, BackgroundPolarity::Light] {
+            assert_eq!(
+                default_palette_rgb(NamedColor::Cursor as usize, polarity),
+                default_palette_rgb(FG_SLOT, polarity),
+                "{polarity:?}"
+            );
+        }
+    }
+
+    // Slots 0..=255 answer "what is color N" for a well-known N that programs
+    // also hard-code, so they must NOT move with the theme. If this ever
+    // changes it should be a deliberate decision, not a side effect.
+    #[test]
+    fn the_numbered_palette_ignores_the_polarity() {
+        for index in [0usize, 1, 7, 15, 16, 128, 231, 232, 255] {
+            assert_eq!(
+                default_palette_rgb(index, BackgroundPolarity::Dark),
+                default_palette_rgb(index, BackgroundPolarity::Light),
+                "index {index} should not depend on the polarity"
+            );
+        }
     }
 
     #[test]

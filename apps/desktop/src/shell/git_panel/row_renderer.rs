@@ -15,7 +15,7 @@
 use crate::shell::file_explorer::file_icon::icon_for_name;
 use crate::shell::git_panel::GitPanel;
 use crate::shell::git_panel::changed_files::{RenderCtx, RowKindForActions};
-use crate::shell::source_control::style as sc_style;
+use crate::shell::source_control::style::ScmStyle;
 use gpui::{
     AnyElement, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Styled, div, prelude::FluentBuilder as _, px, svg,
@@ -85,6 +85,7 @@ pub fn render_diff_counts(
     line_counts: Option<(u32, u32)>,
     theme: &Theme,
     typography: &Typography,
+    style: ScmStyle,
 ) -> Option<AnyElement> {
     let (added, removed) = line_counts?;
     if added == 0 && removed == 0 {
@@ -96,9 +97,9 @@ pub fn render_diff_counts(
         .flex()
         .flex_row()
         .items_baseline()
-        .gap(px(sc_style::LINE_COUNT_GAP))
+        .gap(px(style.line_count_gap))
         .flex_shrink_0()
-        .text_size(px(sc_style::GRAPH_META_TEXT))
+        .text_size(px(style.graph_meta_text))
         .font_weight(typography.w_medium);
     if added > 0 {
         row = row.child(
@@ -171,11 +172,15 @@ pub fn render_name_with_rename(
 /// 14px-tall muted conflict-kind label, e.g. "both modified". Returns
 /// `None` for non-conflict rows so the caller can omit the slot
 /// entirely (no zero-height div, no layout jitter).
-pub fn render_conflict_sub_label(kind: Option<ConflictKind>, theme: &Theme) -> Option<AnyElement> {
+pub fn render_conflict_sub_label(
+    kind: Option<ConflictKind>,
+    theme: &Theme,
+    style: ScmStyle,
+) -> Option<AnyElement> {
     let kind = kind?;
     Some(
         div()
-            .text_size(px(sc_style::SUB_LABEL_TEXT))
+            .text_size(px(style.sub_label_text))
             .text_color(theme.fg_subtle)
             .child(kind.label())
             .into_any_element(),
@@ -192,6 +197,7 @@ pub(super) fn row(
     rctx: &RenderCtx<'_>,
     cx: &mut Context<GitPanel>,
 ) -> impl IntoElement {
+    let style = rctx.style();
     let is_selected = rctx.selected.contains(&f.path);
     let bg = if is_selected {
         rctx.theme.selection
@@ -254,7 +260,7 @@ pub(super) fn row(
     );
 
     let name_el = render_name_with_rename(&file_name, f.rename.as_ref(), &theme, rctx.typography);
-    let sub_label = render_conflict_sub_label(f.conflict_kind, &theme);
+    let sub_label = render_conflict_sub_label(f.conflict_kind, &theme, style);
     // Each section shows its own side of a partial stage: the Staged row
     // the index-vs-HEAD counts, the Changes/Untracked rows the
     // worktree-vs-index (or whole-file) counts.
@@ -262,7 +268,7 @@ pub(super) fn row(
         RowKind::Staged => f.staged_line_counts,
         RowKind::Unstaged | RowKind::Untracked => f.line_counts,
     };
-    let diff_counts = render_diff_counts(section_counts, &theme, rctx.typography);
+    let diff_counts = render_diff_counts(section_counts, &theme, rctx.typography, style);
 
     // Name-and-meta cluster: file name (+ rename arrow) and the parent
     // directory share one baseline row; the conflict sub-label, when
@@ -284,7 +290,7 @@ pub(super) fn row(
                 // Ellipsis (…) rather than a hard clip so a deep path reads as
                 // truncated, not broken mid-word, when the panel is narrow.
                 .truncate()
-                .text_size(px(sc_style::GRAPH_META_TEXT))
+                .text_size(px(style.graph_meta_text))
                 .text_color(rctx.theme.fg_subtle)
                 .child(parent),
         );
@@ -316,9 +322,9 @@ pub(super) fn row(
         .items_center()
         .gap(px(rctx.density.gap_inline))
         .h(px(row_height))
-        .px(px(sc_style::PAD_H))
+        .px(px(style.pad_h))
         .bg(bg)
-        .text_size(px(sc_style::BODY_TEXT))
+        .text_size(px(style.body_text))
         .text_color(rctx.theme.fg_base)
         .when(!is_selected, |s| s.hover(|s| s.bg(theme.hover_overlay)))
         .on_mouse_down(

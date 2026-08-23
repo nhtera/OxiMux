@@ -32,7 +32,7 @@ use oximux_settings::{Density, Theme, Typography};
 use wry::PageLoadEvent;
 
 use agent_context::{IpcMessage, PickRect};
-use native::{NativeWebview, WebviewCallbacks};
+use native::{NativeWebview, ParentSurface, WebviewCallbacks};
 
 use crate::browser_profiles::{BrowserProfile, BrowserProfiles};
 
@@ -235,6 +235,16 @@ pub struct BrowserView {
     /// `Cell` so the paint closure can write without borrowing the entity).
     appearance_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
     profile_anchor: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Holds the deferred webview build (see [`native::ParentSurface`]). Kept
+    /// rather than detached so closing the tab abandons a build still in
+    /// flight instead of installing a webview into a view nobody can see.
+    _native_build: Option<Task<()>>,
+    /// `true` once a build has actually come back empty-handed. Distinct from
+    /// `native.is_none()`, which is also the ordinary state of a tab whose
+    /// build has been asked for but has not landed yet — the two want
+    /// different things on screen, and conflating them would flash "could not
+    /// create the web view" at every browser tab as it opened.
+    native_failed: bool,
 }
 
 impl BrowserView {
@@ -255,11 +265,7 @@ impl BrowserView {
 
         // Channel: webview callbacks (main run loop) → entity event loop.
         let (tx, mut rx) = unbounded::<ChromeEvent>();
-        let events_tx = tx.clone();
-        let native = build_native(window, &url, profile_id.map(|u| *u.as_bytes()), tx).map(Rc::new);
-        if native.is_none() {
-            tracing::warn!("BrowserView: native webview build failed; tab will show an error state");
-        }
+        let events_tx = tx;
 
         let events = cx.spawn(async move |this, cx| {
             while let Some(ev) = rx.next().await {
@@ -269,8 +275,12 @@ impl BrowserView {
             }
         });
 
-        Self {
-            native,
+        // Built after the struct exists, not inside this expression: the build
+        // is deferred off the `App` borrow this constructor runs under, so the
+        // webview arrives a main-thread turn later and has to be installed
+        // into a `BrowserView` that is already in the entity map.
+        let mut this = Self {
+            native: None,
             url,
             title: String::new(),
             loading: false,
@@ -296,7 +306,83 @@ impl BrowserView {
             pending_profile: None,
             appearance_anchor: Rc::new(Cell::new(None)),
             profile_anchor: Rc::new(Cell::new(None)),
+            _native_build: None,
+            native_failed: false,
+        };
+        this.start_native_build(window, cx);
+        this
+    }
+
+    /// Build this tab's webview for its current URL and profile, and install
+    /// it when it is ready.
+    ///
+    /// The build does not happen here. It is queued onto the foreground
+    /// executor and runs on the next main-thread turn, where nothing is
+    /// borrowed — because on Windows the build pumps the message loop and the
+    /// work it pumps is GPUI's own. [`native::ParentSurface`] carries the full
+    /// account; the short version is that a webview built inside an
+    /// `App::update` takes the process with it.
+    ///
+    /// Deliberately uniform across platforms even though only one of them has
+    /// the hazard. A deferral costs the others a frame in which the tab has no
+    /// page yet — invisible, since the webview is built hidden and revealed by
+    /// the render sweep — and buys a single path that is exercised everywhere
+    /// rather than a Windows-only path exercised on one machine.
+    fn start_native_build(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(parent) = ParentSurface::capture(window) else {
+            tracing::warn!("BrowserView: window has no native handle; cannot build a webview");
+            self.native_failed = self.native.is_none();
+            return;
+        };
+        let url = self.url.clone();
+        let data_store_id = self.profile_id.map(|u| *u.as_bytes());
+        let tx = self.events_tx.clone();
+        self._native_build = Some(cx.spawn(async move |this, cx| {
+            // Nothing is borrowed at this point: this body runs as a queued
+            // main-thread runnable, not from inside an `App::update`. That is
+            // the entire reason the build was moved here.
+            let built = build_native(&parent, &url, data_store_id, tx).map(Rc::new);
+            let _ = this.update(cx, |view, cx| view.adopt_native(built, &url, cx));
+        }));
+    }
+
+    /// Install a freshly built webview and bring it in line with the tab.
+    ///
+    /// Not just an assignment. The build lands a turn after it was asked for,
+    /// and in that gap the tab can have been activated, had its page theme
+    /// changed, or been navigated — each of those drove a native call that
+    /// found no webview and silently did nothing. `set_active` in particular
+    /// only touches the native view when the flag *changes*, so a tab that was
+    /// revealed while its webview was still building would never be shown at
+    /// all: it would open as a blank pane and stay one.
+    ///
+    /// A failed build leaves whatever was already there. On the first build
+    /// that is nothing, and the tab says so; on a profile switch it is the
+    /// previous profile's live page, which is a better answer than tearing
+    /// down a working browser because one rebuild did not take.
+    fn adopt_native(
+        &mut self,
+        built: Option<Rc<NativeWebview>>,
+        built_url: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(native) = built else {
+            tracing::warn!("BrowserView: native webview build failed");
+            self.native_failed = self.native.is_none();
+            cx.notify();
+            return;
+        };
+        native.set_appearance(self.appearance);
+        // The address bar accepts input before the webview exists, and its
+        // `load_url` went nowhere. The URL the build was started with is the
+        // one the page is on, so any difference is a navigation to replay.
+        if self.url != built_url {
+            native.load_url(&self.url);
         }
+        native.set_visible(self.active);
+        self.native_failed = false;
+        self.native = Some(native);
+        cx.notify();
     }
 
     /// Flash a transient confirmation for a probe result: light the firing
@@ -810,26 +896,16 @@ impl BrowserView {
             return;
         }
         self.profile_id = profile_id;
-        let tx = self.events_tx.clone();
-        let rebuilt =
-            build_native(window, &self.url, profile_id.map(|u| *u.as_bytes()), tx).map(Rc::new);
-        if rebuilt.is_none() {
-            tracing::warn!("BrowserView: webview rebuild for profile switch failed");
-            return;
-        }
-        // Swap in the fresh webview (dropping the old one tears it down) and
-        // restore the live presentation state the rebuild reset. The new page
-        // reloads `self.url`, but its title/load state belong to the old
-        // profile's page — clear them so the chip doesn't show a stale title
-        // or a spinner that never resolves.
-        self.native = rebuilt;
+        // The new page will reload `self.url`, but the title and load state on
+        // screen belong to the *old* profile's page — clear them now rather
+        // than when the rebuild lands, or the chip shows a stale title (and a
+        // spinner that never resolves) for as long as the build takes.
         self.devtools_open = false;
         self.title = String::new();
         self.loading = false;
-        if let Some(n) = &self.native {
-            n.set_appearance(self.appearance);
-            n.set_visible(self.active);
-        }
+        // The old webview stays up until the new one is installed, so the
+        // switch reads as a page change rather than a blank flash.
+        self.start_native_build(window, cx);
         cx.notify();
     }
 
@@ -852,7 +928,7 @@ impl Focusable for BrowserView {
 /// over `tx`. Split out so the closures' `'static` capture of `tx` clones
 /// stays readable.
 fn build_native(
-    window: &Window,
+    parent: &ParentSurface,
     url: &str,
     data_store_id: Option<[u8; 16]>,
     tx: UnboundedSender<ChromeEvent>,
@@ -882,7 +958,7 @@ fn build_native(
         },
     };
     NativeWebview::build(
-        window,
+        parent,
         url,
         agent_context::INIT_SCRIPT,
         data_store_id,

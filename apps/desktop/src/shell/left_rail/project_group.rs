@@ -677,7 +677,7 @@ fn build_header(
             },
         )
         .on_drag(drag_payload, move |_p, _offset, _window, cx| {
-            cx.new(|_| SidebarDragPreview::new(ghost_label.clone(), theme))
+            cx.new(|_| SidebarDragPreview::new(ghost_label.clone()))
         })
         // Stateless insertion indicator: a 2px accent line on the edge the
         // dragged header would land on. Suppressed on the source row itself

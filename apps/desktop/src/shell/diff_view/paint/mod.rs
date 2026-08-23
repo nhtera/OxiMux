@@ -52,7 +52,7 @@ use crate::shell::diff_view::file_header::{
 use crate::shell::diff_view::file_rail::{RAIL_WIDTH, RailContext, file_rail};
 use crate::shell::diff_view::hunk_actions::render_hunk_actions;
 use crate::shell::diff_view::render::{
-    FilePlan, LinePlan, RenderCtx, SYNTAX_HIGHLIGHT_BUDGET_LINES, build_render_plan,
+    FilePlan, Highlight, LinePlan, RenderCtx, SYNTAX_HIGHLIGHT_BUDGET_LINES, build_render_plan,
     diff_body_line_count,
 };
 use crate::shell::diff_view::review_notes::{NoteAnchor, ReviewNoteStore};

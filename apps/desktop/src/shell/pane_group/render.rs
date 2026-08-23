@@ -17,7 +17,7 @@ use gpui::{
     ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
     StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px, svg,
 };
-use oximux_settings::Theme;
+use oximux_settings::{Density, Theme, Typography};
 
 use super::sub_pane::TerminalSplitTree;
 use super::tab_drag::{TabDragPayload, TabDragPreview};
@@ -32,17 +32,35 @@ use crate::shell::pane_group::file_drag::FilePathDragPayload;
 use crate::shell::pane_tree::PaneGroupId;
 use crate::shell::project_panes::ProjectPanes;
 
-pub const TAB_STRIP_HEIGHT_PX: f32 = 28.0;
-const TAB_PAD_X_PX: f32 = 12.0;
+/// Close / view-menu / pin glyph box. A hit target sized to its glyph rather
+/// than to the strip, so it follows the zoom but not the density preset —
+/// see [`Density::scale`].
 const CLOSE_BUTTON_SIZE_PX: f32 = 14.0;
+/// Leading tab-kind glyph, and the agent-chat tab's eye. Same reasoning as
+/// [`CLOSE_BUTTON_SIZE_PX`].
 const ICON_SIZE_PX: f32 = 11.0;
-const PLUS_BUTTON_WIDTH_PX: f32 = 28.0;
-/// "..." Pane Actions button width — matches the `+` neighbor so the
-/// trailing button cluster stays balanced.
-const ELLIPSIS_BUTTON_WIDTH_PX: f32 = 28.0;
+/// The "x" inside the close button's box.
+const CLOSE_GLYPH_PX: f32 = 9.0;
+/// The `+` and `...` glyphs in the strip's trailing cluster.
+const STRIP_GLYPH_PX: f32 = 14.0;
+/// The pin that replaces the close button on a pinned tab.
+const PIN_GLYPH_PX: f32 = 10.0;
+
+/// The tokens the tab strip draws from, as one value.
+///
+/// Bundled rather than passed as two more parameters: [`render_tab_chip`]
+/// already takes nineteen, and every leaf helper under it needs the same set.
+/// Held by reference because `Typography` owns its fallback lists and the
+/// strip rebuilds every chip every frame.
+pub struct TabTokens<'a> {
+    pub theme: Theme,
+    pub density: Density,
+    pub typography: &'a Typography,
+}
 
 impl Render for PaneGroup {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         // Drag-cancel cleanup: chips' `on_drag_move` fires only while a
         // drag is live, so a press-Escape (or off-window release) leaves
         // the last hover state painted. Mirrors the body-level guard in
@@ -145,6 +163,7 @@ impl Render for PaneGroup {
             // Tasks tab renders the TasksView entity directly — same pattern
             // as Diff/Browser: the view owns its own scroll and layout.
             PaneContent::Tasks(view) => view.clone().into_any_element(),
+            PaneContent::Automations(view) => view.clone().into_any_element(),
             // Agent Chat renders its own transcript + composer, same pattern.
             PaneContent::AgentChat(view) => view.clone().into_any_element(),
         });
@@ -171,7 +190,14 @@ impl Render for PaneGroup {
         // outer flex column then positioned absolute over it via the
         // helper's own styling.
         let mru_overlay: Option<AnyElement> = self.mru_switcher().map(|state| {
-            render_mru_hud(state.snapshot.as_slice(), state.cursor, &self.tabs, theme)
+            render_mru_hud(
+                state.snapshot.as_slice(),
+                state.cursor,
+                &self.tabs,
+                theme,
+                self.density,
+                &self.typography,
+            )
         });
 
         // While a sub-pane divider is held, a topmost occluding overlay
@@ -271,7 +297,7 @@ pub fn build_tab_strip_for(
     group_id: PaneGroupId,
     is_focused: bool,
     show_pane_actions: bool,
-    theme: Theme,
+    tokens: &TabTokens<'_>,
     workspace_tint: Option<super::TabColor>,
     project_panes: Entity<ProjectPanes>,
     cx: &App,
@@ -336,7 +362,7 @@ pub fn build_tab_strip_for(
         drag_hover,
         is_focused,
         show_pane_actions,
-        theme,
+        tokens,
         workspace_tint,
         scroll_handle,
         project_panes,
@@ -386,6 +412,8 @@ enum PaneTabKindMarker {
     Browser,
     /// Tasks tab — list-tree glyph, no agent status badge.
     Tasks,
+    /// Automations tab — calendar glyph, no agent status badge.
+    Automations,
     /// Agent Chat tab — message glyph, no agent status badge (status is shown
     /// inline in the transcript, not on the chip).
     AgentChat,
@@ -479,6 +507,7 @@ fn kind_marker(kind: &PaneGroupTabKind) -> PaneTabKindMarker {
         | PaneGroupTabKind::CombinedDiff { .. } => PaneTabKindMarker::Diff,
         PaneGroupTabKind::Browser { .. } => PaneTabKindMarker::Browser,
         PaneGroupTabKind::Tasks => PaneTabKindMarker::Tasks,
+        PaneGroupTabKind::Automations => PaneTabKindMarker::Automations,
         PaneGroupTabKind::AgentChat { .. } => PaneTabKindMarker::AgentChat,
     }
 }
@@ -525,11 +554,16 @@ fn build_tab_strip_from_headers(
     drag_hover: Option<TabDragHover>,
     is_focused: bool,
     show_pane_actions: bool,
-    theme: Theme,
+    tokens: &TabTokens<'_>,
     workspace_tint: Option<super::TabColor>,
     scroll_handle: gpui::ScrollHandle,
     project_panes: Entity<ProjectPanes>,
 ) -> AnyElement {
+    let theme = tokens.theme;
+    let density = tokens.density;
+    // Resolved once: the strip's own height, which both the row and the
+    // wheel-to-horizontal remap below measure against.
+    let strip_height = px(density.h_tab);
     let entity_id = entity.entity_id();
     let strip_hover_entity = entity.clone();
     let strip_drop_entity = entity.clone();
@@ -663,10 +697,10 @@ fn build_tab_strip_from_headers(
         // axis, so they arrive as `delta.x` and bypass this remap.
         // GPUI's `ScrollDelta::pixel_delta(line_height)` normalizes
         // pixel-deltas (trackpad) and line-deltas (USB wheel) to a
-        // consistent pixel space; `TAB_STRIP_HEIGHT_PX` is a sensible
+        // consistent pixel space; the strip's own height is a sensible
         // line-height for chips that are exactly one strip tall.
         .on_scroll_wheel(move |ev: &ScrollWheelEvent, _window, _cx| {
-            let pixel_delta: Point<Pixels> = ev.delta.pixel_delta(px(TAB_STRIP_HEIGHT_PX));
+            let pixel_delta: Point<Pixels> = ev.delta.pixel_delta(strip_height);
             let dy = pixel_delta.y;
             if f32::from(dy).abs() < f32::EPSILON {
                 return;
@@ -706,7 +740,7 @@ fn build_tab_strip_from_headers(
             header.pinned,
             header.is_preview,
             header.external_mutation,
-            theme,
+            tokens,
             workspace_tint,
             entity.clone(),
             project_panes.clone(),
@@ -736,25 +770,28 @@ fn build_tab_strip_from_headers(
     let max_offset_x = f32::from(scroll_handle.max_offset().x);
     let show_left_fade = offset_x < -0.5;
     let show_right_fade = offset_x > -(max_offset_x - 0.5);
+    // Both trailing buttons are square on the strip, so their width is the
+    // strip's own height rather than a constant that would stop matching it
+    // the moment the density preset moved.
     let trailing_cluster_px = if show_pane_actions {
-        PLUS_BUTTON_WIDTH_PX + ELLIPSIS_BUTTON_WIDTH_PX
+        density.h_tab * 2.0
     } else {
-        PLUS_BUTTON_WIDTH_PX
+        density.h_tab
     };
     let mut row = div()
         .flex()
         .flex_row()
         .items_stretch()
-        .h(px(TAB_STRIP_HEIGHT_PX))
+        .h(strip_height)
         .w_full()
         .relative()
         .bg(theme.bg_panel)
         .border_b_2()
         .border_color(border_color)
         .child(chips)
-        .child(plus_button(entity_id.as_u64(), theme));
+        .child(plus_button(entity_id.as_u64(), tokens));
     if show_pane_actions {
-        row = row.child(pane_actions_button(entity_id.as_u64(), is_focused, theme));
+        row = row.child(pane_actions_button(entity_id.as_u64(), is_focused, tokens));
     }
     // Overlays last so they paint on top of the chips.
     if show_left_fade {
@@ -1095,11 +1132,14 @@ fn render_tab_chip(
     is_pinned: bool,
     is_preview: bool,
     external_mutation: Option<super::ExternalMutation>,
-    theme: Theme,
+    tokens: &TabTokens<'_>,
     workspace_tint: Option<super::TabColor>,
     entity: Entity<PaneGroup>,
     project_panes: Entity<ProjectPanes>,
 ) -> impl IntoElement {
+    let theme = tokens.theme;
+    let density = tokens.density;
+    let typography = tokens.typography;
     let icon_path = match marker {
         // Diff tabs reuse the editor "file" glyph until a dedicated
         // diff icon ships (deferred — see plan phase 04 file-type icons).
@@ -1107,6 +1147,7 @@ fn render_tab_chip(
         PaneTabKindMarker::Terminal => "icons/square-terminal.svg",
         PaneTabKindMarker::Browser => "icons/globe.svg",
         PaneTabKindMarker::Tasks => "icons/list-tree.svg",
+        PaneTabKindMarker::Automations => "icons/calendar.svg",
         PaneTabKindMarker::AgentChat => "icons/sparkles.svg",
         PaneTabKindMarker::Agent(adapter_id) => agent_icon(adapter_id),
     };
@@ -1189,7 +1230,6 @@ fn render_tab_chip(
     let preview_label = label.clone();
     let preview_icon = SharedString::from(icon_path);
     let preview_color = color_tag;
-    let preview_theme = theme;
 
     // Optional left-edge color bar (2px) when the user has assigned a
     // color tag. Rendered as an absolutely-positioned child so it
@@ -1215,8 +1255,8 @@ fn render_tab_chip(
         .items_center()
         .gap(px(5.0))
         .h_full()
-        .px(px(TAB_PAD_X_PX))
-        .text_size(px(11.0))
+        .px(px(density.pad_tab))
+        .text_size(px(typography.t_body_sm))
         .text_color(text_color)
         .flex_shrink_0()
         .cursor_pointer()
@@ -1276,7 +1316,6 @@ fn render_tab_chip(
                     preview_label.clone(),
                     preview_icon.clone(),
                     preview_color,
-                    preview_theme,
                 )
             })
         })
@@ -1463,7 +1502,7 @@ fn render_tab_chip(
         .child(
             svg()
                 .path(icon_path)
-                .size(px(ICON_SIZE_PX))
+                .size(px(density.scale(ICON_SIZE_PX)))
                 .text_color(icon_color),
         )
         .when_some(agent_dot, |s, dot| s.child(dot))
@@ -1484,7 +1523,7 @@ fn render_tab_chip(
             };
             s.child(
                 div()
-                    .text_size(px(10.0))
+                    .text_size(px(typography.t_label_xs))
                     .text_color(theme.fg_subtle)
                     .child(suffix),
             )
@@ -1499,13 +1538,14 @@ fn render_tab_chip(
                 ix,
                 is_active,
                 group_name.clone(),
-                theme,
+                tokens,
             ))
         })
         .child(if is_pinned {
-            pin_indicator(entity_id_raw, ix, theme).into_any_element()
+            pin_indicator(entity_id_raw, ix, tokens).into_any_element()
         } else {
-            close_button(entity_id_raw, ix, is_active, entity, group_name, theme).into_any_element()
+            close_button(entity_id_raw, ix, is_active, entity, group_name, tokens)
+                .into_any_element()
         })
         .when_some(drag_edge, |s, side| {
             s.child(insertion_bar(entity_id_raw, ix, side, theme))
@@ -1526,11 +1566,13 @@ fn chat_view_menu_button(
     ix: usize,
     is_active: bool,
     group_name: SharedString,
-    theme: Theme,
+    tokens: &TabTokens<'_>,
 ) -> impl IntoElement {
+    let theme = tokens.theme;
+    let density = tokens.density;
     let glyph = svg()
         .path("icons/eye.svg")
-        .size(px(11.0))
+        .size(px(density.scale(ICON_SIZE_PX)))
         .text_color(theme.fg_muted);
     // Mirror the close button: visible on the active tab, revealed on hover for
     // inactive tabs so idle chips stay uncluttered.
@@ -1539,8 +1581,8 @@ fn chat_view_menu_button(
         .id(SharedString::from(format!(
             "pane-group-tab-viewmenu-{entity_id_raw}-{ix}"
         )))
-        .w(px(CLOSE_BUTTON_SIZE_PX))
-        .h(px(CLOSE_BUTTON_SIZE_PX))
+        .w(px(density.scale(CLOSE_BUTTON_SIZE_PX)))
+        .h(px(density.scale(CLOSE_BUTTON_SIZE_PX)))
         .flex()
         .items_center()
         .justify_center()
@@ -1570,17 +1612,19 @@ fn chat_view_menu_button(
 /// Same footprint as `close_button` so swapping doesn't reflow the chip;
 /// non-interactive (the right-click "Unpin Tab" row is the toggle path)
 /// to keep accidental clicks from un-pinning.
-fn pin_indicator(entity_id_raw: u64, ix: usize, theme: Theme) -> impl IntoElement {
+fn pin_indicator(entity_id_raw: u64, ix: usize, tokens: &TabTokens<'_>) -> impl IntoElement {
+    let theme = tokens.theme;
+    let density = tokens.density;
     let glyph = svg()
         .path("icons/pin.svg")
-        .size(px(10.0))
+        .size(px(density.scale(PIN_GLYPH_PX)))
         .text_color(theme.fg_muted);
     div()
         .id(SharedString::from(format!(
             "pane-group-tab-pin-{entity_id_raw}-{ix}"
         )))
-        .w(px(CLOSE_BUTTON_SIZE_PX))
-        .h(px(CLOSE_BUTTON_SIZE_PX))
+        .w(px(density.scale(CLOSE_BUTTON_SIZE_PX)))
+        .h(px(density.scale(CLOSE_BUTTON_SIZE_PX)))
         .flex()
         .items_center()
         .justify_center()
@@ -1619,13 +1663,19 @@ fn insertion_bar(
 /// than the workspace top-right corner. Unfocused groups still reserve
 /// the slot via a zero-width collapse so focus shifts don't reflow the
 /// strip.
-fn pane_actions_button(entity_id_raw: u64, is_focused: bool, theme: Theme) -> impl IntoElement {
+fn pane_actions_button(
+    entity_id_raw: u64,
+    is_focused: bool,
+    tokens: &TabTokens<'_>,
+) -> impl IntoElement {
+    let theme = tokens.theme;
+    let density = tokens.density;
     let glyph = svg()
         .path("icons/ellipsis.svg")
-        .size(px(14.0))
+        .size(px(density.scale(STRIP_GLYPH_PX)))
         .text_color(theme.fg_muted);
     let (width_px, opacity) = if is_focused {
-        (ELLIPSIS_BUTTON_WIDTH_PX, 1.0_f32)
+        (density.h_tab, 1.0_f32)
     } else {
         (0.0_f32, 0.0_f32)
     };
@@ -1666,16 +1716,18 @@ fn pane_actions_button(entity_id_raw: u64, is_focused: bool, theme: Theme) -> im
 /// The click x is passed as `Some(cursor_x)` so the popover anchors
 /// under THIS group's `+` — fixes the multi-group anchor bug acknowledged
 /// in `plans/reports/refactor-260524-0131-tab-manager-parity.md`.
-fn plus_button(entity_id_raw: u64, theme: Theme) -> impl IntoElement {
+fn plus_button(entity_id_raw: u64, tokens: &TabTokens<'_>) -> impl IntoElement {
+    let theme = tokens.theme;
+    let density = tokens.density;
     let glyph = svg()
         .path("icons/plus.svg")
-        .size(px(14.0))
+        .size(px(density.scale(STRIP_GLYPH_PX)))
         .text_color(theme.fg_muted);
     div()
         .id(SharedString::from(format!(
             "pane-group-plus-{entity_id_raw}"
         )))
-        .w(px(PLUS_BUTTON_WIDTH_PX))
+        .w(px(density.h_tab))
         .h_full()
         .flex()
         .items_center()
@@ -1708,6 +1760,8 @@ fn render_mru_hud(
     cursor: usize,
     tabs: &[PaneGroupTab],
     theme: Theme,
+    density: Density,
+    typography: &Typography,
 ) -> AnyElement {
     let mut card = div()
         .flex()
@@ -1718,13 +1772,13 @@ fn render_mru_hud(
         .bg(theme.bg_overlay)
         .border_1()
         .border_color(theme.border_active)
-        .rounded(px(8.0))
+        .rounded(px(density.r_card))
         .shadow_lg();
     card = card.child(
         div()
             .px(px(8.0))
             .pb(px(6.0))
-            .text_size(px(11.0))
+            .text_size(px(typography.t_body_sm))
             .text_color(theme.fg_subtle)
             .child("Switch Tab"),
     );
@@ -1748,6 +1802,8 @@ fn render_mru_hud(
             PaneGroupTabKind::Browser { .. } => "icons/globe.svg",
             // Tasks uses the list-tree glyph for the Ctrl+Tab switcher row.
             PaneGroupTabKind::Tasks => "icons/list-tree.svg",
+            // Automations matches its nav row and tab chip: the calendar.
+            PaneGroupTabKind::Automations => "icons/calendar.svg",
             // Agent Chat uses the sparkles glyph (AI convention), matching its
             // tab chip in the Ctrl+Tab switcher.
             PaneGroupTabKind::AgentChat { .. } => "icons/sparkles.svg",
@@ -1773,9 +1829,9 @@ fn render_mru_hud(
             .gap(px(8.0))
             .h(px(28.0))
             .px(px(10.0))
-            .rounded(px(4.0))
+            .rounded(px(density.r_xs))
             .bg(row_bg)
-            .text_size(px(12.0))
+            .text_size(px(typography.t_body_base))
             .text_color(row_fg)
             .child(svg().path(icon_path).size(px(12.0)).text_color(row_fg))
             .child(div().flex_1().child(label));
@@ -1834,19 +1890,21 @@ fn close_button(
     is_active: bool,
     entity: Entity<PaneGroup>,
     group_name: SharedString,
-    theme: Theme,
+    tokens: &TabTokens<'_>,
 ) -> impl IntoElement {
+    let theme = tokens.theme;
+    let density = tokens.density;
     let glyph = svg()
         .path("icons/close.svg")
-        .size(px(9.0))
+        .size(px(density.scale(CLOSE_GLYPH_PX)))
         .text_color(theme.fg_muted);
     let initial_opacity = if is_active { 1.0 } else { 0.0 };
     div()
         .id(SharedString::from(format!(
             "pane-group-tab-close-{entity_id_raw}-{ix}"
         )))
-        .w(px(CLOSE_BUTTON_SIZE_PX))
-        .h(px(CLOSE_BUTTON_SIZE_PX))
+        .w(px(density.scale(CLOSE_BUTTON_SIZE_PX)))
+        .h(px(density.scale(CLOSE_BUTTON_SIZE_PX)))
         .flex()
         .items_center()
         .justify_center()

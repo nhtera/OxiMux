@@ -151,22 +151,50 @@ pub fn diff_body_line_count(diffs: &[FileDiff]) -> usize {
         .sum()
 }
 
-/// Build the pure render plan. `allow_highlight` lets the caller suppress
+/// Whether to tokenise a plan, and against which palette.
+///
+/// One value rather than a `highlight: bool` beside a `light: bool`, because
+/// `build_render_plan(diffs, true, true, false)` is unreadable at the call
+/// site and two adjacent booleans are trivially swappable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Highlight {
+    /// Skip tokenising — the caller wants line numbers only, or this is the
+    /// uncoloured first pass while the real one runs off-thread.
+    Off,
+    /// Tokenise for the palette in force.
+    On { light: bool },
+}
+
+impl Highlight {
+    /// The palette to tokenise against, or `None` when tokenising is off.
+    fn light(self) -> Option<bool> {
+        match self {
+            Highlight::Off => None,
+            Highlight::On { light } => Some(light),
+        }
+    }
+}
+
+/// Build the pure render plan. [`Highlight::Off`] lets the caller suppress
 /// syntect tokenization (the dominant per-line cost): the diff view paints an
 /// instant uncolored plan first, then a background pass rebuilds the colored
 /// one (see `DiffView`'s highlight task); note-anchor mapping likewise only
 /// needs line numbers. Highlighting stays gated on the size budget even when
-/// allowed, so an over-budget diff never tokenizes
+/// asked for, so an over-budget diff never tokenizes
 /// (see [`SYNTAX_HIGHLIGHT_BUDGET_LINES`]).
-pub fn build_render_plan(diffs: &[FileDiff], expanded: bool, allow_highlight: bool) -> Vec<FilePlan> {
-    let highlight = allow_highlight && diff_body_line_count(diffs) <= SYNTAX_HIGHLIGHT_BUDGET_LINES;
+pub fn build_render_plan(diffs: &[FileDiff], expanded: bool, highlight: Highlight) -> Vec<FilePlan> {
+    let highlight = if diff_body_line_count(diffs) <= SYNTAX_HIGHLIGHT_BUDGET_LINES {
+        highlight
+    } else {
+        Highlight::Off
+    };
     diffs
         .iter()
         .map(|d| build_file_plan(d, expanded, highlight))
         .collect()
 }
 
-fn build_file_plan(d: &FileDiff, expanded: bool, highlight: bool) -> FilePlan {
+fn build_file_plan(d: &FileDiff, expanded: bool, highlight: Highlight) -> FilePlan {
     let path = d.path.display().to_string();
     let lang = detect_language(d.path.as_path());
     let header = FileHeader {
@@ -338,12 +366,15 @@ fn tokens_for_row(
     content: &str,
     kind: DiffLineKind,
     lang: Language,
-    highlight: bool,
+    highlight: Highlight,
 ) -> Vec<HiToken> {
-    if !highlight || matches!(kind, DiffLineKind::NoNewlineHint) {
+    let Some(light) = highlight.light() else {
+        return Vec::new();
+    };
+    if matches!(kind, DiffLineKind::NoNewlineHint) {
         return Vec::new();
     }
-    highlight_line(content, lang)
+    highlight_line(content, lang, light)
 }
 
 /// Smooth over git's `\ No newline at end of file` quirk.

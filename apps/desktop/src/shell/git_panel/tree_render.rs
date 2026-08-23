@@ -15,7 +15,6 @@ use crate::shell::git_panel::GitPanel;
 use crate::shell::git_panel::changed_files::RenderCtx;
 use crate::shell::git_panel::discard_confirm::DiscardAllArea;
 use crate::shell::git_panel::row_renderer::{RowKind, row};
-use crate::shell::source_control::style as sc_style;
 use crate::shell::source_control::tree::{
     NodeKind, NodeStatus, RenderRow, TreeNode, TreeSection, sibling_dirs, subtree_leaves,
 };
@@ -109,6 +108,7 @@ fn folder_row(
     cx: &mut Context<GitPanel>,
 ) -> AnyElement {
     let folder_path = flat_row.path.clone();
+    let style = rctx.style();
     let is_collapsed = rctx.collapsed_dirs.contains(&folder_path);
     let chevron = if is_collapsed {
         IconName::ChevronRight
@@ -163,9 +163,9 @@ fn folder_row(
         .items_center()
         .gap(px(4.0))
         .h(px(rctx.density.h_tab))
-        .pl(px(depth_px + sc_style::PAD_H))
-        .pr(px(sc_style::PAD_H))
-        .text_size(px(sc_style::BODY_TEXT))
+        .pl(px(depth_px + style.pad_h))
+        .pr(px(style.pad_h))
+        .text_size(px(style.body_text))
         .text_color(theme.fg_base)
         .cursor_pointer()
         .hover(|s| s.bg(theme.hover_overlay))

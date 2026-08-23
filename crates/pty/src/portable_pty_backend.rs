@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 use crate::backend::{SpawnConfig, TerminalBackend, TerminalSessionId};
 use crate::close_grace::{JoinHandleWatcher, close_with_grace, term_step};
 use crate::events::TerminalEvent;
+use crate::polarity::{COLOR_FG_BG, background_polarity};
 use crate::snapshot::{Cell, TerminalSnapshot};
 use crate::state::TerminalState;
 
@@ -175,6 +176,10 @@ impl TerminalBackend for PortablePtyBackend {
         command.env("COLORTERM", "truecolor");
         // Host-terminal identity so tools/agents can detect the emulator.
         command.env("TERM_PROGRAM", "oximux");
+        // Which way the window reads, for the programs that check the
+        // environment instead of querying OSC 11 (see `crate::polarity`).
+        // Before the caller loop, so an explicit `cfg.env` entry still wins.
+        command.env(COLOR_FG_BG, background_polarity().color_fg_bg());
         seed_utf8_locale(&mut command);
         // After the identity defaults above and before the caller loop below:
         // an inherited `NO_COLOR` would otherwise contradict the `COLORTERM`
@@ -309,6 +314,10 @@ impl TerminalBackend for PortablePtyBackend {
         command.env("COLORTERM", "truecolor");
         // Host-terminal identity so tools/agents can detect the emulator.
         command.env("TERM_PROGRAM", "oximux");
+        // Which way the window reads, for the programs that check the
+        // environment instead of querying OSC 11 (see `crate::polarity`).
+        // Before the caller loop, so an explicit `cfg.env` entry still wins.
+        command.env(COLOR_FG_BG, background_polarity().color_fg_bg());
         seed_utf8_locale(&mut command);
         // After the identity defaults above and before the caller loop below:
         // an inherited `NO_COLOR` would otherwise contradict the `COLORTERM`

@@ -2,7 +2,9 @@
 //!
 //! Composition (top → bottom):
 //!
-//! 1. Nav section: Tasks / Automations / Agents / Search rows (shells)
+//! 1. Nav section: Tasks / Automations / Agents / Search rows. Tasks and
+//!    Automations open pane tabs; Agents swaps the rail body; Search is
+//!    still a shell.
 //! 2. WORKSPACES section header with filter / sort / + controls
 //! 3. Workspace list — per-project groups rendering OxiMux `Workspace`
 //!    rows with status dots derived from the latest agent session.
@@ -271,12 +273,14 @@ pub struct LeftRail {
 }
 
 impl LeftRail {
-    /// Default-construct theme/density/typography. WorkspaceRoot uses the
-    /// same constants in its own `new`, so the rail and root always agree.
-    pub fn new(weak_root: WeakEntity<WorkspaceRoot>, _cx: &mut Context<Self>) -> Self {
-        let density = Density::cockpit();
-        let theme = Theme::charcoal();
-        let typography = Typography::cockpit();
+    /// Resolve theme/density/typography from the current appearance.
+    /// WorkspaceRoot resolves the same way in its own `new`, so the rail and
+    /// root always agree.
+    pub fn new(weak_root: WeakEntity<WorkspaceRoot>, cx: &mut Context<Self>) -> Self {
+        let appearance = oximux_settings::appearance::active(cx);
+        let density = Density::for_appearance(appearance);
+        let theme = Theme::for_appearance(appearance);
+        let typography = oximux_settings::appearance::typography(cx);
         Self {
             active_nav: None,
             weak_root,
@@ -931,12 +935,12 @@ impl LeftRail {
     /// Toggle a nav page. Clicking the active page returns to the home view
     /// (workspace list, no nav row highlighted).
     ///
-    /// Tasks is no longer a rail body — it lives in the pane group. Callers
-    /// that have a `&mut Window` should use `select_nav_in` so Tasks gets the
-    /// window context required to open the pane tab.
+    /// Tasks and Automations are not rail bodies — they live in the pane
+    /// group. Callers that have a `&mut Window` should use `select_nav_in` so
+    /// those get the window context required to open the pane tab.
     pub fn select_nav(&mut self, item: NavItem, cx: &mut Context<Self>) {
-        // Tasks moved to pane; skip the rail-body toggle path.
-        if item == NavItem::Tasks {
+        // Pane-hosted pages skip the rail-body toggle path entirely.
+        if item.opens_in_pane() {
             return;
         }
         self.active_nav = if self.active_nav == Some(item) {
@@ -951,22 +955,28 @@ impl LeftRail {
     }
 
     /// Version of `select_nav` that carries `&mut Window`, required when
-    /// opening the Tasks pane tab (RT-1). For Tasks dispatches up through
-    /// `weak_root` to open the singleton Tasks tab in the active project's
-    /// pane group. For all other items delegates to `select_nav`.
+    /// opening a pane-hosted page (RT-1). Dispatches up through `weak_root` to
+    /// open the singleton tab in the active project's pane group; everything
+    /// else delegates to `select_nav`.
     pub fn select_nav_in(
         &mut self,
         item: NavItem,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if item == NavItem::Tasks {
-            let _ = self.weak_root.update(cx, |root, cx| {
-                root.open_tasks_tab(window, cx);
-            });
-            return;
+        match item {
+            NavItem::Tasks => {
+                let _ = self.weak_root.update(cx, |root, cx| {
+                    root.open_tasks_tab(window, cx);
+                });
+            }
+            NavItem::Automations => {
+                let _ = self.weak_root.update(cx, |root, cx| {
+                    root.open_automations_tab(window, cx);
+                });
+            }
+            NavItem::Agents | NavItem::Search => self.select_nav(item, cx),
         }
-        self.select_nav(item, cx);
     }
 }
 
@@ -999,6 +1009,7 @@ fn agents_display_equal(a: &WorkspaceAgentList, b: &WorkspaceAgentList) -> bool 
 
 impl Render for LeftRail {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         // A resize drag is over once no drag is active — releasing the
         // button produces no further drag-move ticks, so the flag is
         // cleared here on the next render instead.

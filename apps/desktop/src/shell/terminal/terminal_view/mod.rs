@@ -990,17 +990,17 @@ impl InputHandler for TerminalInputHandler {
 /// body. Click/focus anywhere in the pane already wakes it via the
 /// `on_focus` observer wired in `mount_dormant`, so the badge is purely
 /// informational — no click handler needed.
-fn build_dormant_badge(theme: &Theme) -> gpui::Div {
+fn build_dormant_badge(theme: &Theme, density: Density, typo: &Typography) -> gpui::Div {
     div()
         .absolute()
         .top(px(6.0))
         .right(px(10.0))
         .px(px(8.0))
         .py(px(2.0))
-        .rounded(px(4.0))
+        .rounded(px(density.r_xs))
         .bg(theme.bg_overlay)
         .text_color(theme.fg_muted)
-        .text_size(px(11.0))
+        .text_size(px(typo.t_body_sm))
         .border_1()
         .border_color(theme.border_inactive)
         // `↻` = U+21BB Clockwise Open Circle Arrow. Hint copy mirrors
@@ -1013,7 +1013,7 @@ fn build_dormant_badge(theme: &Theme) -> gpui::Div {
 /// pane as finished (not hung) and points the user at the close shortcut —
 /// this is a terminating affordance, so there is no inline restart. Exit code
 /// `0` reads as a clean end; any non-zero code is shown so a crash is visible.
-fn build_exit_banner(theme: &Theme, code: i32) -> gpui::Div {
+fn build_exit_banner(theme: &Theme, code: i32, density: Density, typo: &Typography) -> gpui::Div {
     // `0` = clean, `>0` = real status, `<0` = signal/unknown (the `-1`
     // sentinel from a `None` exit code) where no number is meaningful.
     let label = if code > 0 {
@@ -1032,10 +1032,10 @@ fn build_exit_banner(theme: &Theme, code: i32) -> gpui::Div {
             div()
                 .px(px(10.0))
                 .py(px(3.0))
-                .rounded(px(4.0))
+                .rounded(px(density.r_xs))
                 .bg(theme.bg_overlay)
                 .text_color(theme.fg_muted)
-                .text_size(px(11.0))
+                .text_size(px(typo.t_body_sm))
                 .border_1()
                 .border_color(theme.border_inactive)
                 // `⏻` = U+23FB Power Symbol.
@@ -1090,7 +1090,12 @@ fn accumulate_scroll_lines(acc: &mut f32, delta_px: f32, line_height: f32) -> i3
 /// tail (`display_offset > 0`). Click it to jump back to the bottom; any
 /// keystroke also snaps down (`send_bytes` → `scroll_to_bottom`). The caller
 /// wires the click handler — this only builds the chip + pointer affordance.
-fn build_scroll_indicator(theme: &Theme, offset: usize) -> gpui::Stateful<gpui::Div> {
+fn build_scroll_indicator(
+    theme: &Theme,
+    offset: usize,
+    density: Density,
+    typo: &Typography,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id("oximux-scroll-to-tail")
         .absolute()
@@ -1098,10 +1103,10 @@ fn build_scroll_indicator(theme: &Theme, offset: usize) -> gpui::Stateful<gpui::
         .right(px(10.0))
         .px(px(8.0))
         .py(px(2.0))
-        .rounded(px(4.0))
+        .rounded(px(density.r_xs))
         .bg(theme.bg_overlay)
         .text_color(theme.fg_muted)
-        .text_size(px(11.0))
+        .text_size(px(typo.t_body_sm))
         .border_1()
         .border_color(theme.border_inactive)
         .cursor_pointer()

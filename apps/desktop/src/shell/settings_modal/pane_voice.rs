@@ -115,7 +115,7 @@ fn history_section(
         let rows: Vec<AnyElement> = items
             .iter()
             .enumerate()
-            .map(|(i, e)| history_row(i, e, theme, typography, cx))
+            .map(|(i, e)| history_row(i, e, theme, density, typography, cx))
             .collect();
         section_card(theme, density, rows)
     };
@@ -136,6 +136,7 @@ fn history_row(
     idx: usize,
     e: &HistoryEntry,
     theme: Theme,
+    density: Density,
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
@@ -172,7 +173,7 @@ fn history_row(
                 .items_center()
                 .justify_center()
                 .size(px(24.0))
-                .rounded(px(6.0))
+                .rounded(px(density.r_xs))
                 .text_color(theme.fg_muted)
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.bg_overlay).text_color(theme.fg_base))
@@ -255,7 +256,7 @@ pub(super) fn entries(
     rows.push(entry(
         "Speech model",
         model_desc,
-        model_control(modal, theme, typography, cx),
+        model_control(modal, theme, density, typography, cx),
     ));
 
     // Language selector — only whisper models honor a language; Parakeet,
@@ -610,6 +611,7 @@ fn language_item(
 fn model_control(
     modal: &SettingsModal,
     theme: Theme,
+    density: Density,
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
@@ -644,6 +646,7 @@ fn model_control(
                     selected,
                     spec.id == recommended,
                     theme,
+                    density,
                     &typo,
                 ));
             }
@@ -657,6 +660,11 @@ fn model_control(
 /// active model and a trailing trash on downloaded ones. The row's `on_click`
 /// selects-or-downloads; the trash intercepts its own click (via
 /// `stop_propagation`) so deleting never also selects.
+// One more argument than the lint likes, and the shape is right: every one is
+// a distinct fact about the row (which model, is it selected, is it the
+// recommended one, and the three appearance tokens). Bundling them into a
+// struct to satisfy a count would name nothing the parameter list does not.
+#[allow(clippy::too_many_arguments)]
 fn model_item(
     window: &mut Window,
     entity: &Entity<SettingsModal>,
@@ -664,6 +672,7 @@ fn model_item(
     selected: bool,
     recommended: bool,
     theme: Theme,
+    density: Density,
     typography: &Typography,
 ) -> PopupMenuItem {
     let id = spec.id.to_string();
@@ -713,7 +722,7 @@ fn model_item(
                     .child(label.clone()),
             );
         if recommended {
-            line1 = line1.child(recommended_badge(theme, &typo));
+            line1 = line1.child(recommended_badge(theme, density, &typo));
         }
         line1 = line1.child(div().flex_1()).child(
             div()
@@ -731,7 +740,7 @@ fn model_item(
                     .items_center()
                     .justify_center()
                     .size(px(20.0))
-                    .rounded(px(5.0))
+                    .rounded(px(density.r_xs))
                     .text_color(theme.fg_muted)
                     .cursor_pointer()
                     .hover(|s| s.bg(theme.hover_overlay).text_color(theme.status_error))
@@ -794,12 +803,12 @@ fn model_item(
 }
 
 /// A small green "recommended" pill for the default model row.
-fn recommended_badge(theme: Theme, typography: &Typography) -> AnyElement {
+fn recommended_badge(theme: Theme, density: Density, typography: &Typography) -> AnyElement {
     div()
         .flex_none()
         .px(px(6.0))
         .py(px(1.0))
-        .rounded(px(4.0))
+        .rounded(px(density.r_chip))
         .bg(theme.status_ok.opacity(0.15))
         .text_size(px(typography.t_sub_label))
         .text_color(theme.status_ok)

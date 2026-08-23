@@ -89,7 +89,46 @@ impl WorkspaceRoot {
                 let counts = oximux_git::diff_numstat_head(std::path::Path::new(&path))
                     .await
                     .ok()
-                    .map(|map| sum_numstat(&map));
+                    .map(|map| {
+                        let counts = sum_numstat(&map);
+                        // Instrumentation for an unreproduced defect (see
+                        // `looks_like_renormalization`). Logged, never
+                        // suppressed: the recurrence is the thing we need, and
+                        // a silently corrected count would destroy the
+                        // evidence. Names the files because "which files did
+                        // git think changed" is the question analysis could not
+                        // answer after the fact.
+                        if looks_like_renormalization(map.len(), &counts) {
+                            let mut names: Vec<String> = map
+                                .keys()
+                                .take(20)
+                                .map(|p| p.display().to_string())
+                                .collect();
+                            names.sort();
+                            tracing::warn!(
+                                target: "oximux_app::workspace_root",
+                                worktree = %path,
+                                files = map.len(),
+                                added = counts.added,
+                                removed = counts.removed,
+                                sample = ?names,
+                                "implausible worktree diff: symmetric line counts across \
+                                 several files. Capture `git status --porcelain` and \
+                                 `git diff --stat HEAD` for this worktree now — this is the \
+                                 unreproduced phantom-diff defect recurring."
+                            );
+                        } else {
+                            tracing::debug!(
+                                target: "oximux_app::workspace_root",
+                                worktree = %path,
+                                files = map.len(),
+                                added = counts.added,
+                                removed = counts.removed,
+                                "worktree diff refreshed"
+                            );
+                        }
+                        counts
+                    });
                 (path, counts)
             });
             let _ = tx.send(futures::future::join_all(futs).await);
@@ -171,6 +210,77 @@ impl WorkspaceRoot {
             p.open_or_activate_tasks_tab_in_active_group(
                 weak_root,
                 projects,
+                window,
+                cx,
+            );
+        });
+    }
+
+    /// Open (or re-activate) the singleton Automations tab in the active
+    /// project's active pane group. Called from the nav rail's Automations row.
+    ///
+    /// Automations are global — they carry their own working directory and
+    /// fire whether or not the project they mention is open — but the tab
+    /// still needs a pane group to live in, so a project must be open. As with
+    /// Tasks, a toast beats a silent no-op.
+    pub(crate) fn open_automations_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(panes) = self.active_project_panes() else {
+            self.push_toast(ToastKind::Info, "Open a project to see automations.", cx);
+            return;
+        };
+        let weak_root: WeakEntity<WorkspaceRoot> = cx.weak_entity();
+        let store = self.app_state.schedule_store();
+        panes.update(cx, |p, cx| {
+            p.open_or_activate_automations_tab_in_active_group(weak_root, store, window, cx);
+        });
+    }
+
+    /// Walk this window's terminals down to their listening ports and hand the
+    /// result to the ports panel.
+    ///
+    /// Two halves, split by which thread they belong on. The terminal roots
+    /// have to be read on the main thread (they live in entities); the process
+    /// walk and the socket read must not be, because on Linux they are `/proc`
+    /// IO and on the relay path resolving a shell pid can touch a checkpoint
+    /// file. So: snapshot the roots here, do the walking and reading on the
+    /// background executor, come back with a finished inventory.
+    ///
+    /// Self-guarded against overlap — a scan that is somehow slow must not
+    /// have the next tick's stacked behind it.
+    pub(crate) fn run_port_scan(&mut self, cx: &mut Context<Self>) {
+        if self.port_scan_in_flight {
+            return;
+        }
+        let mut roots: Vec<(std::path::PathBuf, u32)> = Vec::new();
+        for panes in self.project_panes_by_project.values() {
+            roots.extend(panes.read(cx).terminal_roots(cx));
+        }
+        let has_terminals = !roots.is_empty();
+        self.port_scan_in_flight = true;
+        cx.spawn(async move |weak, cx| {
+            let inventory = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::shell::ports_panel::scan::gather(roots)
+                })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                this.port_scan_in_flight = false;
+                this.ports_panel.update(cx, |panel, cx| {
+                    panel.apply(inventory, has_terminals, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Open Settings at the Schedules pane. The Automations page hands off
+    /// here for creation rather than carrying a second copy of the six-field
+    /// create form.
+    pub(crate) fn open_schedule_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_modal.update(cx, |m, cx| {
+            m.open_to_pane(
+                crate::shell::settings_modal::SettingsPane::Schedules,
                 window,
                 cx,
             );

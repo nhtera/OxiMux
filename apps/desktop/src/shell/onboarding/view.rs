@@ -19,6 +19,7 @@ const CARD_MAX_HEIGHT: f32 = 600.0;
 
 impl Render for OnboardingWizard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         if !self.open {
             return div().into_any_element();
         }
@@ -201,7 +202,7 @@ impl Render for OnboardingWizard {
 }
 
 fn step_dot(active: bool, theme: oximux_settings::Theme) -> gpui::Div {
-    let dot = div().h(px(5.0)).rounded(px(3.0));
+    let dot = div().h(px(5.0)).rounded_full();
     if active {
         dot.w(px(16.0)).bg(theme.fg_base)
     } else {
@@ -252,7 +253,7 @@ pub(super) fn step_heading(
         .pb(px(24.0))
         .child(
             div()
-                .text_size(px(21.0))
+                .text_size(px(typography.t_display))
                 .font_weight(typography.w_semibold)
                 .text_color(theme.fg_base)
                 .child(title),

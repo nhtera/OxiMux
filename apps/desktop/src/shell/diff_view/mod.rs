@@ -22,6 +22,7 @@ pub mod file_header;
 pub mod file_rail;
 pub mod hunk_actions;
 pub mod image_diff;
+pub mod live_refresh;
 pub mod note_repo_handle;
 pub mod paint;
 pub mod render;
@@ -33,13 +34,16 @@ pub mod word_diff;
 use crate::actions::{ExpandDiff, RetryDiff, SendTextToActiveAgent};
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
 use crate::shell::diff_view::file_header::StickyHeader;
+use crate::shell::diff_view::live_refresh::{LiveQuery, LiveResult};
 use crate::shell::diff_view::note_repo_handle::note_repo;
 use crate::shell::diff_view::paint::{FoldId, OverviewRun, PreparedRow};
-use crate::shell::diff_view::render::{FilePlan, build_render_plan};
+use crate::shell::diff_view::render::{FilePlan, Highlight, build_render_plan};
 use crate::shell::diff_view::review_note_popover::{
     ReviewNoteCallback, ReviewNoteOutcome, ReviewNotePopover,
 };
-use crate::shell::diff_view::review_notes::{NoteAnchor, ReviewNoteStore, format_notes_markdown};
+use crate::shell::diff_view::review_notes::{
+    LineIndex, Note, NoteAnchor, ReviewNoteStore, format_notes_markdown,
+};
 use gpui::{
     App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, ListAlignment,
     ListOffset, ListState, Subscription, Task, WeakEntity, Window, px,
@@ -49,10 +53,19 @@ use oximux_core::{CombinedDiffScope, FileDiff, FileGroup, NoteSide};
 use oximux_editor::{EditorZoom, EditorZoomIn, EditorZoomOut, EditorZoomReset};
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
+use oximux_storage::DiffReviewNoteRepo;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use tokio::sync::oneshot;
+
+/// How often an open working-tree diff re-asks git what it is showing.
+///
+/// Matched to the rail's `DIFF_REFRESH_TICK` on purpose: both spend one git
+/// child process per tick, and there is no reason for a diff the user is
+/// reading to lag behind the counts in the rail beside it. A tick that finds
+/// nothing changed costs the process and stops — no invalidation, no repaint.
+const LIVE_REFRESH_TICK: std::time::Duration = std::time::Duration::from_millis(2000);
 
 #[derive(Debug)]
 pub enum DiffViewState {
@@ -221,6 +234,28 @@ pub struct DiffView {
     /// the prior op's gpui-side refresh, but the tokio side-effect still
     /// completes; the next op fires its own reload.
     _op_task: Option<Task<()>>,
+    /// The heartbeat that keeps a working-tree diff showing the working tree.
+    /// Held for the view's lifetime; dropping it stops the loop.
+    _live_refresh_task: Option<Task<()>>,
+    /// The current background fetch. Its own slot rather than sharing
+    /// `_load_task`: a refresh must never cancel a load the user is waiting
+    /// on, and a load must be free to cancel a refresh nobody asked for.
+    _live_fetch_task: Option<Task<()>>,
+    /// In-flight background refresh. Distinct from `_load_task`, which stays
+    /// `Some` long after its load finished — this is the actual "one at a
+    /// time" guard, so a slow git call cannot stack a queue of refreshes
+    /// behind it.
+    live_refresh_in_flight: bool,
+    /// Whether this view's window is focused. Starts `true` so a view that
+    /// has not rendered yet still refreshes: being wrong about the cost for
+    /// one tick is cheaper than being wrong about the content indefinitely.
+    window_active: bool,
+    /// Window-activation observer, installed on first render because that is
+    /// the first time this view is handed a `Window`. An observer rather than
+    /// a per-render read: a view that is simply sitting there stops being
+    /// rendered, and a focus gate that only updated during renders would
+    /// freeze at whatever it last saw.
+    _activation_sub: Option<Subscription>,
     /// Active hunk-discard confirm modal (per-request; `None` when idle).
     /// Mounted INSIDE the DiffView's render tree rather than
     /// workspace_root so multiple open diff tabs each carry their own
@@ -367,6 +402,10 @@ pub struct DiffView {
     /// Mirrored from SQLite on each `*Ready` load and written back through the
     /// process-wide `DiffReviewNoteRepo`. The prepare pass reads it to mark
     /// noted lines; empty for non-`Ready` states.
+    ///
+    /// Every load reconciles the mirrored notes against the diff as it now
+    /// reads, so a note whose line moved follows it and a note whose line is
+    /// gone stops claiming one.
     notes: ReviewNoteStore,
     /// Active compose/edit popover (per-request; `None` when idle). Mounted
     /// INSIDE this DiffView's render tree like `confirm_dialog` so it scopes
@@ -397,6 +436,20 @@ impl DiffView {
         // Cmd+/-) must repaint the diff body so its code lines track the same
         // size.
         let _zoom_sub = cx.observe_global::<EditorZoom>(|_view, cx| cx.notify());
+        // The heartbeat. Ticks for the view's whole life; `tick_live_refresh`
+        // decides on each one whether there is anything worth asking, so a
+        // commit view or an unfocused window costs a wakeup and nothing else.
+        let _live_refresh_task = cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor().timer(LIVE_REFRESH_TICK).await;
+                if weak
+                    .update(cx, |view, cx| view.tick_live_refresh(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Self {
             repo,
             state: DiffViewState::Empty,
@@ -406,6 +459,11 @@ impl DiffView {
             typography,
             _load_task: None,
             _op_task: None,
+            _live_refresh_task: Some(_live_refresh_task),
+            _live_fetch_task: None,
+            live_refresh_in_flight: false,
+            window_active: true,
+            _activation_sub: None,
             confirm_dialog: None,
             _confirm_dialog_observer: None,
             body_list: ListState::new(0, ListAlignment::Top, px(400.0)),
@@ -837,6 +895,212 @@ impl DiffView {
             });
         });
         self._load_task = Some(task);
+    }
+
+    /// Install the window-focus observer, on the first render that hands this
+    /// view a `Window`.
+    ///
+    /// Called from `render`. Idempotent — the subscription is taken once and
+    /// then keeps reporting on its own, which is the point: a view nobody is
+    /// interacting with stops rendering, so anything that only updated during
+    /// a render would be frozen at whatever it last happened to see.
+    pub(crate) fn arm_live_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self._activation_sub.is_some() {
+            return;
+        }
+        self.window_active = window.is_window_active();
+        self._activation_sub = Some(cx.observe_window_activation(window, |view, window, cx| {
+            let active = window.is_window_active();
+            let regained = active && !view.window_active;
+            view.window_active = active;
+            // Coming back is the moment the answer is most likely to be stale
+            // — the user was away, and away is when things change. Waiting out
+            // a tick here would show them the old diff for up to two seconds
+            // after they had already started reading it.
+            if regained {
+                view.refresh_content(cx);
+            }
+        }));
+    }
+
+    /// One beat of the heartbeat: refresh if there is anything to refresh.
+    fn tick_live_refresh(&mut self, cx: &mut Context<Self>) {
+        if !self.window_active {
+            return;
+        }
+        self.refresh_content(cx);
+    }
+
+    /// Re-ask git for what this view is showing, and adopt the answer only if
+    /// it differs from what is on screen.
+    ///
+    /// Deliberately not `load()`. A load is a navigation: it resets folds,
+    /// collapses expanded context, drops the scroll to the top and blanks the
+    /// body to "Loading…" — all correct when a person picked a different file,
+    /// all hostile when nobody asked for anything. This keeps the view exactly
+    /// as the reader left it and swaps the content underneath.
+    ///
+    /// The comparison is the load-bearing part. Most ticks find the diff
+    /// byte-identical, and an unconditional apply would re-tokenise the body,
+    /// throw away the syntax-highlight cache and repaint a view nothing had
+    /// changed about — several times a minute, forever.
+    fn refresh_content(&mut self, cx: &mut Context<Self>) {
+        if self.live_refresh_in_flight {
+            return;
+        }
+        let Some(query) = LiveQuery::for_state(&self.state) else {
+            return;
+        };
+        // A hunk op has its own reload chained behind it. Letting a refresh
+        // land in the middle would show the pre-op diff again for a tick.
+        if self._op_task.is_some() {
+            return;
+        }
+        let repo = self.repo.clone();
+        let (tx, rx) = oneshot::channel::<LiveResult>();
+        let query_for_fetch = query.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let fetched = match query_for_fetch {
+                        LiveQuery::Single {
+                            path,
+                            staged,
+                            untracked,
+                        } => {
+                            // Asked before the diff, and only for untracked
+                            // files: git cannot describe a file that is not
+                            // there, so without this its error is
+                            // indistinguishable from a transient one and the
+                            // view would keep showing a deleted file forever.
+                            if untracked && !repo.workdir().join(&path).exists() {
+                                let _ = tx.send(LiveResult::Gone);
+                                return;
+                            }
+                            let r = if untracked {
+                                repo.diff_for_untracked(&path).await
+                            } else {
+                                repo.diff_for_path(&path, staged).await
+                            };
+                            r.ok().map(LiveResult::Single)
+                        }
+                        LiveQuery::Combined { scope } => {
+                            repo.diff_combined(scope).await.ok().map(LiveResult::Combined)
+                        }
+                    };
+                    let _ = tx.send(fetched.unwrap_or(LiveResult::Unavailable));
+                });
+            }
+            // No runtime: the same degradation every other fetch here takes.
+            // Silent, because this one runs on a timer and a warning per tick
+            // would bury the log.
+            Err(_) => return,
+        }
+        self.live_refresh_in_flight = true;
+        let task = cx.spawn(async move |this, cx| {
+            let result = rx.await;
+            let _ = this.update(cx, |view, cx| {
+                view.live_refresh_in_flight = false;
+                let Ok(result) = result else {
+                    return;
+                };
+                view.apply_live_result(query, result, cx);
+            });
+        });
+        self._live_fetch_task = Some(task);
+    }
+
+    /// Adopt a background refresh, or decline it.
+    ///
+    /// Declines in three cases, all of them "this answer is not about what is
+    /// on screen any more": the fetch failed, the view moved on to a different
+    /// diff while the git call was out, or nothing changed.
+    ///
+    /// A failure is dropped rather than surfaced. `load()` turns an error into
+    /// a `Failed` state because a person is sitting there waiting for a file
+    /// they asked for; nobody asked for this one, and replacing a diff that is
+    /// on screen and readable with an error banner — because a `git diff`
+    /// happened to collide with an index lock — would break a working view to
+    /// report a problem that is usually gone by the next tick.
+    fn apply_live_result(&mut self, query: LiveQuery, result: LiveResult, cx: &mut Context<Self>) {
+        // The view may have been navigated elsewhere while the fetch was out.
+        if LiveQuery::for_state(&self.state).as_ref() != Some(&query) {
+            return;
+        }
+        let anchor = self.first_visible_row(cx);
+        match (result, &self.state) {
+            (LiveResult::Single(diffs), DiffViewState::Ready { diffs: shown, .. })
+                if &diffs == shown => {}
+            (
+                LiveResult::Single(diffs),
+                DiffViewState::Ready {
+                    path,
+                    staged,
+                    untracked,
+                    ..
+                },
+            ) => {
+                let (path, staged, untracked) = (path.clone(), *staged, *untracked);
+                self.invalidate_plan();
+                self.apply_load_result(path, staged, untracked, Ok(diffs));
+                self.finish_live_refresh(anchor, cx);
+            }
+            (
+                LiveResult::Combined(combined),
+                DiffViewState::CombinedReady {
+                    diffs: shown,
+                    groups: shown_groups,
+                    ..
+                },
+            ) if &combined.diffs == shown && &combined.groups == shown_groups => {}
+            (LiveResult::Combined(combined), DiffViewState::CombinedReady { scope, .. }) => {
+                let scope = scope.clone();
+                self.invalidate_plan();
+                self.apply_combined_result(scope, Ok(combined));
+                self.finish_live_refresh(anchor, cx);
+            }
+            (
+                LiveResult::Gone,
+                DiffViewState::Ready {
+                    path,
+                    staged,
+                    untracked,
+                    ..
+                },
+            ) => {
+                let (path, staged, untracked) = (path.clone(), *staged, *untracked);
+                self.invalidate_plan();
+                self.state = DiffViewState::Failed {
+                    path,
+                    staged,
+                    untracked,
+                    error: "This file is no longer in the working tree.".to_string(),
+                };
+                // No scroll anchor to keep — there is no body to scroll. The
+                // notes for the scope are dropped by `reload_notes` alongside
+                // the state, since a non-`Ready` state carries none.
+                self.reload_notes();
+                cx.notify();
+            }
+            // Fetch failed, or the state shape no longer matches the answer.
+            _ => {}
+        }
+    }
+
+    /// Shared tail of an adopted refresh: put the reader back where they were,
+    /// then let everything that reads the diff catch up with it.
+    ///
+    /// The scroll anchor matters more here than on a load. A load follows a
+    /// click, so landing at the top reads as the result of that click; this
+    /// happens while someone is reading, and moving the page under them is the
+    /// one thing a background refresh must never do.
+    fn finish_live_refresh(&mut self, anchor: usize, cx: &mut Context<Self>) {
+        self.pending_scroll_anchor = Some(anchor);
+        // The content moved, so notes anchored to it may have moved with it —
+        // exactly the drift `reload_notes` reconciles.
+        self.reload_notes();
+        self.fetch_image_blobs(cx);
+        cx.notify();
     }
 
     /// Re-run the most recent load. No-op unless the current state is
@@ -1696,7 +1960,57 @@ impl DiffView {
                 self.notes.clear();
             }
         }
+        self.reconcile_notes(&repo, &scope, &diff_ref);
         self.invalidate_prepared();
+    }
+
+    /// Re-decide each loaded note's anchor against the diff as it now reads,
+    /// and write the conclusions back.
+    ///
+    /// This runs on load rather than on save because the drift happens while
+    /// nobody is looking: the file is edited, a hunk is staged, the poller
+    /// reloads. By the time the notes are read back their line numbers have
+    /// already stopped meaning what they meant, and the load is the first
+    /// moment there is both a note and a diff to compare it against.
+    ///
+    /// Moves are persisted so the work is done once. A detached note is left
+    /// exactly as stored — its line is a record of where it was written, not
+    /// a claim about where it is, and keeping it is what lets the note
+    /// re-attach if the code comes back.
+    fn reconcile_notes(&mut self, repo: &DiffReviewNoteRepo, scope: &str, diff_ref: &str) {
+        // Checked before building anything: the context map walks a fresh
+        // render plan over every file in the diff, and a diff nobody has
+        // annotated — which is nearly all of them — must not pay for that on
+        // every poll-driven reload.
+        if self.notes.is_empty() {
+            return;
+        }
+        let outcome = self.notes.reconcile(&self.note_context_map());
+        if outcome.is_noop() {
+            return;
+        }
+        let moves: Vec<(String, NoteSide, u32, u32)> = outcome
+            .moves
+            .iter()
+            .map(|(anchor, to)| (anchor.path.clone(), anchor.side, anchor.line, *to))
+            .collect();
+        if let Err(err) = repo.reanchor(scope, diff_ref, &moves) {
+            // The in-memory store has already followed the code, so the view
+            // is right for this session; only the saved copy is stale, and the
+            // next load reconciles it again from the same evidence.
+            tracing::warn!(
+                target: "oximux_app::diff_view",
+                %err,
+                "review-note re-anchor failed"
+            );
+        }
+        tracing::debug!(
+            target: "oximux_app::diff_view",
+            moved = outcome.moves.len(),
+            detached = outcome.newly_detached,
+            reattached = outcome.reattached,
+            "review notes reconciled against the current diff"
+        );
     }
 
     /// Open the compose/edit popover anchored to `anchor`. Pre-fills with the
@@ -1752,12 +2066,16 @@ impl DiffView {
     ) {
         match outcome {
             ReviewNoteOutcome::Save(body) => {
-                self.persist_note(&anchor, Some(&body));
-                self.notes.set(anchor, body);
+                // Record the line as it reads at the moment of writing. This
+                // is the only point where the note and its subject are known
+                // to agree, and every later reconcile is measured from it.
+                let anchor_text = self.anchor_text_at(&anchor).unwrap_or_default();
+                self.persist_note(&anchor, Some(&body), &anchor_text);
+                self.notes.set(anchor, Note::new(body, anchor_text));
                 self.invalidate_prepared();
             }
             ReviewNoteOutcome::Delete => {
-                self.persist_note(&anchor, None);
+                self.persist_note(&anchor, None, "");
                 self.notes.remove(&anchor);
                 self.invalidate_prepared();
             }
@@ -1766,11 +2084,17 @@ impl DiffView {
         cx.notify();
     }
 
+    /// The current text of the diff line an anchor names, if the diff still
+    /// has that line.
+    fn anchor_text_at(&self, anchor: &NoteAnchor) -> Option<String> {
+        self.note_context_map().get(anchor).cloned()
+    }
+
     /// Write one note through to SQLite — `Some(body)` upserts, `None`
     /// deletes. No-op without a diff_ref (non-`Ready` state) or repo handle.
     /// Errors are logged, not surfaced: the in-memory store still reflects the
     /// user's edit, and the next load reconciles against the DB.
-    fn persist_note(&self, anchor: &NoteAnchor, body: Option<&str>) {
+    fn persist_note(&self, anchor: &NoteAnchor, body: Option<&str>, anchor_text: &str) {
         let Some(diff_ref) = diff_ref_for(&self.state) else {
             return;
         };
@@ -1779,7 +2103,15 @@ impl DiffView {
         };
         let scope = self.scope_key();
         let res = match body {
-            Some(b) => repo.upsert(&scope, &diff_ref, &anchor.path, anchor.side, anchor.line, b),
+            Some(b) => repo.upsert(
+                &scope,
+                &diff_ref,
+                &anchor.path,
+                anchor.side,
+                anchor.line,
+                b,
+                anchor_text,
+            ),
             None => repo.delete(&scope, &diff_ref, &anchor.path, anchor.side, anchor.line),
         };
         if let Err(err) = res {
@@ -1804,8 +2136,8 @@ impl DiffView {
     /// view-mode-independently (inline AND split, which carries no per-line
     /// anchors) and before the first render. `expanded = true` so a collapsed
     /// large-diff file still yields context for its lines.
-    fn note_context_map(&self) -> HashMap<NoteAnchor, String> {
-        let mut map = HashMap::new();
+    fn note_context_map(&self) -> LineIndex {
+        let mut map = LineIndex::new();
         let diffs = match &self.state {
             DiffViewState::Ready { diffs, .. }
             | DiffViewState::CommitReady { diffs, .. }
@@ -1814,7 +2146,7 @@ impl DiffView {
             _ => return map,
         };
         // Note-anchor mapping only reads line numbers — skip the syntect pass.
-        for fp in build_render_plan(diffs, true, false) {
+        for fp in build_render_plan(diffs, true, Highlight::Off) {
             let FilePlan::Hunked { path, hunks, .. } = fp else {
                 continue;
             };
@@ -1858,6 +2190,21 @@ impl DiffView {
             return;
         }
         cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    /// Drop only the notes whose line is gone, in memory and in SQLite.
+    ///
+    /// The gutter is untouched by design — a detached note never had a marker
+    /// — so this repaints the toolbar's count and nothing else.
+    fn clear_detached_notes(&mut self, cx: &mut Context<Self>) {
+        let dropped = self.notes.drain_detached();
+        if dropped.is_empty() {
+            return;
+        }
+        for anchor in &dropped {
+            self.persist_note(anchor, None, "");
+        }
+        cx.notify();
     }
 
     /// Drop every note for the current scope, in memory and in SQLite.

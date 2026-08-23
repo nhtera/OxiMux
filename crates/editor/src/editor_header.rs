@@ -111,6 +111,10 @@ pub fn actions_overlay(path: &Path, has_text: bool, cx: &Context<EditorView>) ->
     let radius = theme.radius;
     let accent = theme.accent;
     let fg = theme.foreground;
+    // Per render, like the rest of this overlay: the editor keeps no token
+    // snapshot of its own.
+    let corner = oximux_settings::appearance::density(cx).r_xs;
+    let text_size = oximux_settings::appearance::typography(cx).t_body_base;
 
     let mut card = v_flex()
         // Definite width (not `min_w`): a shrink-wrapped card sizes to its
@@ -134,6 +138,8 @@ pub fn actions_overlay(path: &Path, has_text: bool, cx: &Context<EditorView>) ->
             "Copy file contents",
             accent,
             fg,
+            corner,
+            text_size,
             cx.listener(|view, _, window, cx| {
                 if let Some(text) = view.current_text(cx) {
                     copy_with_toast(text, "File contents copied", window, cx);
@@ -150,6 +156,8 @@ pub fn actions_overlay(path: &Path, has_text: bool, cx: &Context<EditorView>) ->
         "Reveal in Finder",
         accent,
         fg,
+        corner,
+        text_size,
         cx.listener(move |view, _, _w, cx| {
             cx.reveal_path(&reveal_target);
             view.close_actions_menu();
@@ -166,6 +174,8 @@ pub fn actions_overlay(path: &Path, has_text: bool, cx: &Context<EditorView>) ->
         "Reveal in Explorer View",
         accent,
         fg,
+        corner,
+        text_size,
         cx.listener(move |view, _, window, cx| {
             window.dispatch_action(
                 Box::new(crate::editor_view::RevealInExplorer {
@@ -189,6 +199,8 @@ pub fn actions_overlay(path: &Path, has_text: bool, cx: &Context<EditorView>) ->
                 format!("Open in {}", ed.label),
                 accent,
                 fg,
+                corner,
+                text_size,
                 cx.listener(move |view, _, _w, cx| {
                     open_in_external(app, &target);
                     view.close_actions_menu();
@@ -237,6 +249,8 @@ fn menu_row(
     label: impl Into<SharedString>,
     accent: Hsla,
     fg: Hsla,
+    corner: f32,
+    text_size: f32,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
@@ -249,8 +263,8 @@ fn menu_row(
         // the standard contextual-menu look.
         .px(px(8.0))
         .py(px(6.0))
-        .rounded(px(6.0))
-        .text_size(px(12.0))
+        .rounded(px(corner))
+        .text_size(px(text_size))
         .text_color(fg)
         .cursor_pointer()
         .hover(|s| s.bg(accent))

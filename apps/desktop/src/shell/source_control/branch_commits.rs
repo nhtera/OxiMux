@@ -15,7 +15,7 @@
 //! `ProjectPanes::open_or_activate_branch_diff_tab`.
 
 use crate::shell::file_explorer::file_icon::icon_for_name;
-use crate::shell::source_control::style as sc_style;
+use crate::shell::source_control::style::ScmStyle;
 use gpui::{
     Animation, AnimationExt, ClickEvent, Context, EventEmitter, Hsla, InteractiveElement,
     IntoElement, ParentElement, Render, StatefulInteractiveElement as _, Styled, Window, div,
@@ -58,6 +58,11 @@ impl EventEmitter<ShowBranchFileRequested> for BranchCommitsPanel {}
 impl EventEmitter<ShowBranchDiffAllRequested> for BranchCommitsPanel {}
 
 impl BranchCommitsPanel {
+    /// Spacing and type for the appearance this panel currently holds.
+    fn style(&self) -> ScmStyle {
+        ScmStyle::new(self.density, &self.typography)
+    }
+
     pub fn new(theme: Theme, density: Density, typography: Typography) -> Self {
         Self {
             theme,
@@ -94,7 +99,9 @@ impl BranchCommitsPanel {
 
 impl Render for BranchCommitsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         let theme = self.theme;
+        let style = self.style();
         // Hide the whole section when the branch carries no committed work
         // ahead of its base — no empty header, matching the file sections.
         if self.files.is_empty() {
@@ -125,7 +132,7 @@ impl Render for BranchCommitsPanel {
                 .px(px(6.0))
                 .py(px(1.0))
                 .rounded(px(r_xs))
-                .text_size(px(sc_style::GRAPH_META_TEXT))
+                .text_size(px(style.graph_meta_text))
                 .text_color(theme.fg_muted)
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.hover_overlay).text_color(theme.fg_base))
@@ -145,9 +152,9 @@ impl Render for BranchCommitsPanel {
             .items_center()
             .gap(px(4.0))
             .h(px(self.density.h_tab))
-            .px(px(sc_style::PAD_H))
+            .px(px(style.pad_h))
             .rounded(px(self.density.r_xs))
-            .text_size(px(sc_style::CAPS_TEXT))
+            .text_size(px(style.caps_text))
             .font_weight(self.typography.w_semibold)
             .text_color(theme.fg_muted)
             .cursor_pointer()
@@ -194,7 +201,8 @@ impl Render for BranchCommitsPanel {
 impl BranchCommitsPanel {
     fn row(&self, f: &BranchCommittedFile, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
-        let pad = px(sc_style::pad_h(self.density));
+        let style = self.style();
+        let pad = px(style.pad_h);
         let (badge, badge_color) = status_badge(&f.status, &theme);
 
         let leaf = f
@@ -235,7 +243,7 @@ impl BranchCommitsPanel {
             .gap(px(6.0))
             .h(px(self.density.h_row))
             .px(pad)
-            .text_size(px(sc_style::BODY_TEXT))
+            .text_size(px(style.body_text))
             .text_color(theme.fg_base)
             .cursor_pointer()
             .hover(|s| s.bg(theme.hover_overlay))
@@ -267,17 +275,17 @@ impl BranchCommitsPanel {
                         div()
                             .min_w(px(0.0))
                             .truncate()
-                            .text_size(px(sc_style::GRAPH_META_TEXT))
+                            .text_size(px(style.graph_meta_text))
                             .text_color(theme.fg_subtle)
                             .child(parent)
                     })),
             )
             // Counts + status badge pinned to the trailing edge (never shrink).
-            .child(line_counts(f.added, f.removed, &theme))
+            .child(line_counts(f.added, f.removed, &theme, style))
             .child(
                 div()
                     .flex_shrink_0()
-                    .text_size(px(sc_style::GRAPH_META_TEXT))
+                    .text_size(px(style.graph_meta_text))
                     .text_color(badge_color)
                     .child(badge),
             )
@@ -286,13 +294,13 @@ impl BranchCommitsPanel {
 
 /// `+A` (green) `-B` (red) cluster. Zeroes are shown so the column stays
 /// stable across rows (an all-context rename still reads as `+0 -0`).
-fn line_counts(added: u32, removed: u32, theme: &Theme) -> impl IntoElement {
+fn line_counts(added: u32, removed: u32, theme: &Theme, style: ScmStyle) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
         .flex_shrink_0()
-        .gap(px(sc_style::LINE_COUNT_GAP))
-        .text_size(px(sc_style::GRAPH_META_TEXT))
+        .gap(px(style.line_count_gap))
+        .text_size(px(style.graph_meta_text))
         .child(
             div()
                 .text_color(theme.git.added)

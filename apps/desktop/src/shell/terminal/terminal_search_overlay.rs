@@ -26,7 +26,7 @@ use gpui_component::{
     button::{Button, ButtonVariants},
     tooltip::Tooltip,
 };
-use oximux_settings::{Theme, Typography};
+use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::terminal_search::SearchOptions;
 
@@ -50,6 +50,7 @@ pub struct Params<'a> {
     pub options: SearchOptions,
     pub theme: &'a Theme,
     pub typography: &'a Typography,
+    pub density: Density,
     pub on_toggle_case: ToggleHandler,
     pub on_toggle_word: ToggleHandler,
     pub on_toggle_regex: ToggleHandler,
@@ -74,6 +75,7 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
         options,
         theme,
         typography,
+        density,
         on_toggle_case,
         on_toggle_word,
         on_toggle_regex,
@@ -106,7 +108,7 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
         .bg(theme.bg_overlay)
         .border_1()
         .border_color(theme.border_inactive)
-        .rounded(px(6.0))
+        .rounded(px(density.r_xs))
         .child(
             // Input frame: query | toggles | badge, all on one row. Border
             // uses `focus_ring` because the overlay is the active keyboard
@@ -124,7 +126,7 @@ pub fn build(params: Params<'_>) -> impl IntoElement + use<> {
                 .bg(theme.bg_base)
                 .border_1()
                 .border_color(theme.focus_ring)
-                .rounded(px(4.0))
+                .rounded(px(density.r_xs))
                 .font(mono.clone())
                 .text_size(px(typography.t_body_lg))
                 .child(

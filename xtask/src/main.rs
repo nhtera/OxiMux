@@ -5,6 +5,13 @@
 //!                          fail > 3000.
 //!   xtask data-dir-lint    Fail if anything outside `app_paths` picks its own
 //!                          data/cache directory.
+//!   xtask literal-lint     Fail on hardcoded `.rounded(px(N))` /
+//!                          `.text_size(px(N))` — those belong to `Density`
+//!                          and `Typography`, and a literal cannot scale for
+//!                          UI zoom. Ratcheted via `xtask/literal-allow.txt`.
+//!   xtask appearance-lint  Fail if a view caches `Density`/`Typography` but
+//!                          its `render` never pulls the current appearance —
+//!                          that view goes stale on a density or zoom change.
 //!   xtask icon             Regenerate the Windows .ico from the macOS .icns.
 //!   xtask icon --check     Fail if the checked-in .ico is stale.
 //!   xtask ci-check         Run all xtask checks back-to-back.
@@ -15,8 +22,10 @@
 //! shrink freely but fails the moment it grows past its recorded size, so the
 //! debt can only go down. Drop a row once the file falls under the cap.
 
+mod appearance_lint;
 mod data_dir_lint;
 mod icon;
+mod literal_lint;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -40,6 +49,8 @@ fn main() -> ExitCode {
     let result = match cmd.as_str() {
         "file-size-lint" => file_size_lint(),
         "data-dir-lint" => data_dir_lint(),
+        "literal-lint" => literal_lint(),
+        "appearance-lint" => appearance_lint(),
         "icon" => icon::run(check),
         // Every check CI should run, in one command. `icon --check` is here
         // rather than in a Windows-only job because the icon is derived from a
@@ -50,6 +61,8 @@ fn main() -> ExitCode {
         // CI rather than Windows'.
         "ci-check" => file_size_lint()
             .and_then(|()| data_dir_lint())
+            .and_then(|()| literal_lint())
+            .and_then(|()| appearance_lint())
             .and_then(|()| icon::run(true)),
         "help" | "--help" | "-h" => {
             print_help();
@@ -81,6 +94,8 @@ fn print_help() {
          COMMANDS:\n\
            file-size-lint   Enforce {WARN_LOC} warn / {FAIL_LOC} fail LOC caps across {roots}\n\
            data-dir-lint    Keep data/cache path choices inside app_paths\n\
+           literal-lint     Keep radius/type sizes on the Density + Typography scales\n\
+           appearance-lint  Keep token-caching views pulling the current appearance\n\
            icon [--check]   Derive assets/windows/OxiMux.ico from assets/AppIcon.icns\n\
            ci-check         Run all checks (file-size-lint, data-dir-lint, icon --check)\n\
            help             Print this message"
@@ -122,6 +137,26 @@ fn data_dir_lint() -> Result<(), Box<dyn std::error::Error>> {
     let root = workspace_root()?;
     let sources = collect_sources(&root)?;
     data_dir_lint::run(&sources, &root)
+}
+
+fn literal_lint() -> Result<(), Box<dyn std::error::Error>> {
+    let root = workspace_root()?;
+    literal_lint::run(&root)
+}
+
+fn appearance_lint() -> Result<(), Box<dyn std::error::Error>> {
+    let root = workspace_root()?;
+    let mut files = Vec::new();
+    for path in collect_sources(&root)? {
+        let text = std::fs::read_to_string(&path)?;
+        let shown = path
+            .strip_prefix(&root)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
+        files.push((shown, text));
+    }
+    appearance_lint::run(&files)
 }
 
 fn file_size_lint() -> Result<(), Box<dyn std::error::Error>> {

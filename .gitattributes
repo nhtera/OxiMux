@@ -1,0 +1,25 @@
+# Line-ending policy.
+#
+# Without this file the repository's contents depend on each contributor's
+# `core.autocrlf`, and a machine configured differently can commit CRLF into
+# the index. Every text blob here is LF today (`git ls-files --eol`); these
+# rules are what keep it that way independently of local git config.
+#
+# `text=auto` normalises on commit only — worktree endings still follow each
+# machine's autocrlf, so this changes nothing on disk for existing checkouts.
+* text=auto
+
+# Read by a POSIX shell, so these must be LF in the *worktree* too, not just in
+# the index. A CRLF shebang resolves to the interpreter name plus a carriage
+# return: `/usr/bin/env bash\r`, which fails as "bad interpreter" on Linux and
+# macOS. Git Bash on Windows happens to tolerate it, which is exactly why this
+# stays invisible on a Windows checkout until someone runs install-cli.sh under
+# WSL or on a clean VM.
+*.sh text eol=lf
+
+# Binary: never normalise, never diff as text.
+*.png binary
+*.ttf binary
+*.tiff binary
+*.ico binary
+*.icns binary

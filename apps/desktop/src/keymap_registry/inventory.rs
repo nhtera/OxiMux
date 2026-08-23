@@ -22,7 +22,7 @@ use crate::actions::{
     SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SplitHorizontal,
     SplitSubPaneDown, SplitSubPaneRight, SplitVertical, ToggleChatTerminalView,
     ToggleDictation, ToggleFloatingTerminal, ToggleLeftSidebar, ToggleRightSidebar,
-    ToggleZoomSubPane,
+    ToggleZoomSubPane, UiZoomIn, UiZoomOut, UiZoomReset,
 };
 // The AppKit application menu's actions, bound only where that menu exists.
 #[cfg(target_os = "macos")]
@@ -49,9 +49,13 @@ macro_rules! entry {
 ///   is the *Windows* key — so `cmd-p` would have become Win+P (Project a
 ///   display) rather than Quick Open. `secondary-` is Command on macOS and
 ///   Control elsewhere, which is what every one of these chords means.
-/// - macOS strips `shift` and remaps the key to the shifted character
+/// - Shift is stripped and the key remapped to the shifted character
 ///   (`]`→`}`, `[`→`{`), so binding strings use the post-shift char —
-///   `secondary-shift-]` would never match.
+///   `secondary-shift-]` would never match. Long recorded here as a macOS
+///   quirk; it is not. gpui's Windows backend does the same thing for the
+///   punctuation and digit keys (`get_keystroke_key` → `get_shifted_key`,
+///   which clears `modifiers.shift`), which is why a `secondary-shift-=`
+///   binding was measured matching nothing on Windows either.
 /// - ctrl-tab is the cross-platform "last tab" standard (cmd-tab is
 ///   reserved by macOS for app switching).
 /// - ctrl-shift-1/2/3 are free of macOS system bindings.
@@ -82,6 +86,20 @@ pub const ACTIONS: &[ActionSpec] = &[
     entry!("editor_zoom_in", "Zoom in editor", Global, "secondary-=", EditorZoomIn),
     entry!("editor_zoom_out", "Zoom out editor", Global, "secondary--", EditorZoomOut),
     entry!("editor_zoom_reset", "Reset editor zoom", Global, "secondary-0", EditorZoomReset),
+    // Interface zoom sits on the shifted versions of the editor's chords: same
+    // gesture, wider blast radius. Written with the post-shift characters
+    // because that is what both platforms deliver — see the chord notes above;
+    // `secondary-shift-=` matches nothing anywhere and was measured doing
+    // exactly that.
+    entry!("ui_zoom_in", "Zoom in interface", Global, "secondary-+", UiZoomIn),
+    entry!("ui_zoom_out", "Zoom out interface", Global, "secondary-_", UiZoomOut),
+    // Reset has no default chord. Its natural one is ⌘⇧0, and Windows does not
+    // deliver Ctrl+Shift+0 to applications at all — a documented OS-level quirk
+    // that gpui's own keyboard handling carries a note about. Rather than ship
+    // a shortcut that works on one platform and silently does nothing on the
+    // other, reset lives in Settings → Appearance and the command palette,
+    // where it is discoverable on both. A user who wants a key can bind one.
+    entry!("ui_zoom_reset", "Reset interface zoom", Global, "", UiZoomReset),
     entry!(
         "reload_custom_commands",
         "Reload custom commands",

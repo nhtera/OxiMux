@@ -10,7 +10,7 @@
 //! a `Context` listener the view owns; this stays pure.
 
 use gpui::{AnyElement, IntoElement, ParentElement, SharedString, Styled, div, px};
-use oximux_settings::{Theme, Typography};
+use oximux_settings::{Density, Theme, Typography};
 
 /// Build the inline signed-out banner: a warn-tinted panel naming the provider
 /// plus a caller-supplied `action` control ("Open terminal to sign in").
@@ -18,6 +18,7 @@ pub(super) fn login_card(
     provider: &str,
     theme: Theme,
     typo: &Typography,
+    density: Density,
     action: impl IntoElement,
 ) -> AnyElement {
     div()
@@ -28,7 +29,7 @@ pub(super) fn login_card(
         // Same wrap trap as the markdown bodies: without `min_w_0` a flex
         // ancestor honors the longest unwrapped line and overflows the column.
         .min_w_0()
-        .rounded(px(8.0))
+        .rounded(px(density.r_card))
         .border_1()
         .border_color(theme.status_warning.opacity(0.4))
         .bg(theme.status_warning.opacity(0.08))

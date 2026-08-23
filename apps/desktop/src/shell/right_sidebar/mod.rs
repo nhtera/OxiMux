@@ -98,6 +98,14 @@ pub struct RightSidebar {
     // callback yet (tests).
     pub(crate) file_tree_view: Option<Entity<FileTreeView>>,
 
+    // Ports panel. **Not owned here**, unlike every other panel above: the
+    // sidebar is cached per project, but a port is a fact about the whole
+    // window, and one panel per project would mean N copies of one list
+    // disagreeing about which of them the scan last updated. `WorkspaceRoot`
+    // owns the single panel and hands the same entity to every sidebar it
+    // builds. `None` only before that handoff (and in tests).
+    pub(crate) ports_panel: Option<Entity<crate::shell::ports_panel::PortsPanel>>,
+
     // Poll state mirrored for the status bar (avoids borrowing through entity tree).
     pub latest_poll_state: PollState,
 
@@ -258,6 +266,7 @@ impl RightSidebar {
             session_history_panel::SessionHistoryPanel::new(
                 root_path.clone(),
                 theme,
+                density,
                 typography.clone(),
                 window,
                 cx,
@@ -301,6 +310,9 @@ impl RightSidebar {
             search_panel,
             session_history,
             file_tree_view,
+            // Handed over by `WorkspaceRoot` after construction — see the
+            // field's own note on why it is not built here.
+            ports_panel: None,
             latest_poll_state: initial,
             _poller: poller,
             _poll_observer: poll_observer,
@@ -421,6 +433,7 @@ impl RightSidebar {
             session_history_panel::SessionHistoryPanel::new(
                 repo_root,
                 theme,
+                density,
                 typography.clone(),
                 window,
                 cx,
@@ -451,6 +464,7 @@ impl RightSidebar {
             search_panel,
             session_history,
             file_tree_view: None,
+            ports_panel: None,
             latest_poll_state: PollState::Loading,
             _poller: poller,
             _poll_observer: poll_observer,
@@ -506,6 +520,20 @@ impl RightSidebar {
         visible_tabs(TabVisibility {
             has_repo: self._poller.is_some(),
         })
+    }
+
+    /// Adopt the window's single ports panel.
+    ///
+    /// Called by `WorkspaceRoot` for every sidebar it builds or restores from
+    /// its per-project cache, so all of them render the same entity — see the
+    /// field's note for why the panel is not built per sidebar.
+    pub fn set_ports_panel(
+        &mut self,
+        panel: Entity<crate::shell::ports_panel::PortsPanel>,
+        cx: &mut Context<Self>,
+    ) {
+        self.ports_panel = Some(panel);
+        cx.notify();
     }
 
     /// Switch the active tab and notify GPUI to re-render.
@@ -569,6 +597,10 @@ impl Render for RightSidebar {
         if self.resizing && !cx.has_active_drag() {
             self.resizing = false;
         }
+        // This view holds a palette and nothing else, so `appearance::sync`
+        // does not fit — and without a pull the sidebar ground stays in the
+        // old theme while every panel inside it repaints.
+        self.theme = oximux_settings::appearance::theme(cx);
         let theme = self.theme;
 
         // NOTE: on_action handlers for sidebar keybindings are registered on
@@ -695,6 +727,31 @@ impl Render for RightSidebar {
                         .child(self.session_history.clone()),
                 )
                 .into_any_element(),
+            RightTab::Ports => {
+                let body_div = div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden();
+                // Rendered empty before `WorkspaceRoot` hands the panel over,
+                // and in tests that mount a sidebar with no host — same shape
+                // the Files tab uses for the same reason.
+                match self.ports_panel.clone() {
+                    Some(panel) => body_div
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .w_full()
+                                .overflow_hidden()
+                                .child(panel),
+                        )
+                        .into_any_element(),
+                    None => body_div.into_any_element(),
+                }
+            }
         };
 
         // Width is now state, not const — see set_panel_width / the

@@ -851,6 +851,12 @@ impl Focusable for EditorView {
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Resolved per render rather than cached: this view keeps no token
+        // snapshot, so there is nothing to go stale and nothing for
+        // `appearance-lint` to hold it to. Taken before the theme borrow,
+        // which the placeholder helpers below already work around.
+        let typo = oximux_settings::appearance::typography(cx);
+        let density = oximux_settings::appearance::density(cx);
         let theme = cx.theme();
 
         // Path breadcrumb row above the content. Dirty indicator is text
@@ -930,7 +936,7 @@ impl Render for EditorView {
                     MarkdownViewMode::Source => input.into_any_element(),
                     MarkdownViewMode::Preview => {
                         let value = t.state.read(cx).value().to_string();
-                        markdown_preview::render_preview(&value, dir, view_id, is_dark)
+                        markdown_preview::render_preview(&value, dir, view_id, is_dark, typo.t_body_sm)
                     }
                     MarkdownViewMode::Split => {
                         let value = t.state.read(cx).value().to_string();
@@ -946,7 +952,11 @@ impl Render for EditorView {
                                     .child(
                                         resizable_panel().child(
                                             markdown_preview::render_preview(
-                                                &value, dir, view_id, is_dark,
+                                                &value,
+                                                dir,
+                                                view_id,
+                                                is_dark,
+                                                typo.t_body_sm,
                                             ),
                                         ),
                                     ),
@@ -961,8 +971,8 @@ impl Render for EditorView {
                 .size_full()
                 .into_any_element(),
             EditorContent::Image { .. } => render_image_body(&self.file_path),
-            EditorContent::Binary => render_binary_placeholder(muted_fg),
-            EditorContent::Loading => render_loading_placeholder(muted_fg),
+            EditorContent::Binary => render_binary_placeholder(muted_fg, typo.t_body_md),
+            EditorContent::Loading => render_loading_placeholder(muted_fg, typo.t_body_md),
             EditorContent::LoadFailed { message } => gpui::div()
                 .flex()
                 .flex_1()
@@ -970,7 +980,7 @@ impl Render for EditorView {
                 .items_center()
                 .justify_center()
                 .gap(px(10.0))
-                .text_size(px(13.0))
+                .text_size(px(typo.t_body_md))
                 .text_color(muted_fg)
                 .child(message.clone())
                 .child(
@@ -980,7 +990,7 @@ impl Render for EditorView {
                         .py(px(5.0))
                         .border_1()
                         .border_color(theme.border)
-                        .rounded(px(6.0))
+                        .rounded(px(density.r_xs))
                         .text_color(theme.foreground)
                         .cursor_pointer()
                         .hover(|s| s.bg(theme.muted))
@@ -1065,13 +1075,13 @@ fn render_image_body(path: &Path) -> gpui::AnyElement {
 /// look stays consistent across the app. `muted_fg` is snapshotted by the
 /// caller so this helper does not need a `&mut Context` (which would
 /// conflict with the active immutable theme borrow there).
-fn render_binary_placeholder(muted_fg: gpui::Hsla) -> gpui::AnyElement {
+fn render_binary_placeholder(muted_fg: gpui::Hsla, text_size: f32) -> gpui::AnyElement {
     gpui::div()
         .flex()
         .flex_1()
         .items_center()
         .justify_center()
-        .text_size(px(13.0))
+        .text_size(px(text_size))
         .text_color(muted_fg)
         .child("Binary file — cannot display")
         .into_any_element()
@@ -1080,13 +1090,13 @@ fn render_binary_placeholder(muted_fg: gpui::Hsla) -> gpui::AnyElement {
 /// Centered "Loading…" placeholder shown while a transient read failure is
 /// being retried on the backoff schedule. Mirrors the binary placeholder's
 /// muted style so the look stays consistent.
-fn render_loading_placeholder(muted_fg: gpui::Hsla) -> gpui::AnyElement {
+fn render_loading_placeholder(muted_fg: gpui::Hsla, text_size: f32) -> gpui::AnyElement {
     gpui::div()
         .flex()
         .flex_1()
         .items_center()
         .justify_center()
-        .text_size(px(13.0))
+        .text_size(px(text_size))
         .text_color(muted_fg)
         .child("Loading…")
         .into_any_element()

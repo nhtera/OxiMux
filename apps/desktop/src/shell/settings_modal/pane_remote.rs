@@ -423,7 +423,9 @@ pub(super) fn render(
             .pt(px(6.0))
             .text_size(px(typography.t_sub_label))
             .text_color(theme.fg_subtle)
-            .child("Turning this on publishes this Mac's address to a public discovery service."),
+            .child(
+                "Turning this on publishes this computer's address to a public discovery service.",
+            ),
     );
 
     // The action sits above the inventory it adds to: pair a device, then watch it
@@ -878,8 +880,8 @@ fn network_disclosure(theme: Theme, typography: &Typography) -> AnyElement {
         .gap(px(4.0))
         .text_size(px(typography.t_sub_label))
         .text_color(theme.fg_subtle)
-        .child("While remote access is on, this Mac publishes its network addresses")
-        .child("to n0's public discovery service, so a paired device can find it.")
+        .child("While remote access is on, this computer publishes its network")
+        .child("addresses to n0's public discovery service, so a paired device can find it.")
         .child("If a direct connection isn't possible, traffic falls back to n0's public relays.")
         .child("Relays forward encrypted traffic and cannot read it, but they do see")
         .child("the IP addresses of both ends.")
@@ -1114,7 +1116,7 @@ pub(super) fn entries(
             remote_toggle(theme, cx),
         ),
         entry(
-            "Keep this Mac awake while on",
+            "Keep this computer awake while on",
             "Stop it idle-sleeping, so a paired device can still reach it. Sleeping with the lid closed is unaffected.",
             keep_awake_toggle(theme, cx),
         ),

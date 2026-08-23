@@ -31,6 +31,7 @@ oximux-proc-cwd = { workspace = true }
 # descendants — the one presence signal that covers every agent and outlives
 # an idle one, since it depends on nothing the agent chooses to emit.
 oximux-proc-tree = { workspace = true }
+oximux-proc-ports = { workspace = true }
 oximux-pty = { workspace = true }
 async-trait = { workspace = true }
 oximux-relay-client = { workspace = true }
@@ -137,6 +138,14 @@ oximux-computer-use = { workspace = true, features = ["windows-screen-control"] 
 widestring = "1"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    # `AttachConsole` — the GUI-subsystem binary joining the console it was
+    # launched from, so dev runs keep their logs (`main.rs` crate attribute).
+    "Win32_System_Console",
+    # `PowerCreateRequest` / `PowerSetRequest` — the prevent-idle-sleep hold
+    # behind `agent_glue::agent_awake`, and the Windows counterpart of macOS's
+    # IOKit assertion. `Win32_System_Threading` comes with it for
+    # `REASON_CONTEXT`, which is where the reason string lives.
+    "Win32_System_Power",
     "Win32_System_Threading",
     # `SetWindowsHookExW(WH_KEYBOARD_LL, …)` and the message-pump calls the
     # Escape kill switch is built on (`escape_tap`).

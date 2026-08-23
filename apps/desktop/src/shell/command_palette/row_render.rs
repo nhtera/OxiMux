@@ -9,7 +9,7 @@ use gpui::{
     App, HighlightStyle, InteractiveElement, IntoElement, MouseButton, ParentElement, Styled,
     StyledText, Window, div, prelude::FluentBuilder, px,
 };
-use oximux_settings::{Theme, Typography};
+use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::command_palette::entry::PaletteItem;
 use crate::shell::command_palette::match_engine::match_ranges;
@@ -18,7 +18,6 @@ use crate::shell::command_palette::match_engine::match_ranges;
 /// one component family.
 pub const ROW_HEIGHT: f32 = 34.0;
 pub const GROUP_LABEL_HEIGHT: f32 = 24.0;
-const ROW_RADIUS: f32 = 5.0;
 
 /// Row activation callback: dispatch the row's action at the given
 /// filtered-list index AND close the modal. Shared by click and keyboard so
@@ -35,12 +34,13 @@ pub fn palette_row(
     row_idx: usize,
     query: &str,
     theme: Theme,
+    density: Density,
     typography: &Typography,
     on_activate: ActivateFn,
 ) -> impl IntoElement {
     let fg = if selected { theme.fg_base } else { theme.fg_muted };
 
-    let mut row = row_shell(selected, theme).cursor_pointer().on_mouse_down(
+    let mut row = row_shell(selected, theme, density).cursor_pointer().on_mouse_down(
         MouseButton::Left,
         move |_event, window, cx| on_activate(row_idx, window, cx),
     );
@@ -54,7 +54,7 @@ pub fn palette_row(
     );
 
     if let Some(kb) = item.keybinding.as_deref() {
-        row = row.child(keybinding_chip(kb, theme, typography));
+        row = row.child(keybinding_chip(kb, theme, density, typography));
     }
     row
 }
@@ -69,11 +69,12 @@ pub fn file_row(
     query: &str,
     actionable: bool,
     theme: Theme,
+    density: Density,
     typography: &Typography,
     on_activate: ActivateFn,
 ) -> impl IntoElement {
     let fg = if selected { theme.fg_base } else { theme.fg_muted };
-    let mut row = row_shell(selected, theme);
+    let mut row = row_shell(selected, theme, density);
     if actionable {
         row = row.cursor_pointer().on_mouse_down(
             MouseButton::Left,
@@ -106,7 +107,7 @@ pub fn group_label(label: &str, theme: Theme, typography: &Typography) -> impl I
 /// Shared row container: fixed height, rounded, selection fill + hover.
 /// Selection uses the dedicated selection tint (clearly above the card bg);
 /// unselected rows light up on hover so the pointer target is obvious.
-fn row_shell(selected: bool, theme: Theme) -> gpui::Div {
+fn row_shell(selected: bool, theme: Theme, density: Density) -> gpui::Div {
     div()
         .flex()
         .flex_row()
@@ -117,21 +118,21 @@ fn row_shell(selected: bool, theme: Theme) -> gpui::Div {
         // a long catalog shrinks every row to fit instead of scrolling.
         .flex_shrink_0()
         .px(px(10.))
-        .rounded(px(ROW_RADIUS))
+        .rounded(px(density.r_xs))
         .when(selected, |d| d.bg(theme.selection))
         .when(!selected, |d| d.hover(|s| s.bg(theme.hover_overlay)))
 }
 
 /// Keybinding rendered as a faint inset chip (one pill for the whole combo,
 /// e.g. `⌘⇧D`) so the shortcut reads as a key affordance, not body text.
-fn keybinding_chip(kb: &str, theme: Theme, typography: &Typography) -> impl IntoElement {
+fn keybinding_chip(kb: &str, theme: Theme, density: Density, typography: &Typography) -> impl IntoElement {
     div()
         .px(px(6.))
         .py(px(1.))
         .bg(theme.bg_panel)
         .border_1()
         .border_color(theme.border_inactive)
-        .rounded(px(4.))
+        .rounded(px(density.r_xs))
         .text_size(px(typography.t_sub_label))
         .text_color(theme.fg_subtle)
         .child(kb.to_string())

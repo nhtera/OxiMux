@@ -258,6 +258,7 @@ impl DictationHud {
 
 impl Render for DictationHud {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         // Insert any finished transcript first (window in hand).
         self.apply_pending(window, cx);
 
@@ -274,7 +275,7 @@ impl Render for DictationHud {
 
         let stop_square = div()
             .size(px(10.0))
-            .rounded(px(2.0))
+            .rounded(px(density.r_chip))
             .bg(theme.status_error);
 
         let pill = div()

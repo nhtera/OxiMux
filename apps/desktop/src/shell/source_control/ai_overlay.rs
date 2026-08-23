@@ -33,7 +33,7 @@ use gpui_component::{
 };
 use oximux_settings::Theme;
 
-use crate::shell::source_control::style as sc_style;
+use crate::shell::source_control::style::ScmStyle;
 
 /// Sub-px stroke width for the dim scrim, expressed as an alpha
 /// channel ratio applied to the existing `bg_panel`. Tuned so the
@@ -62,6 +62,7 @@ const SPINNER_PERIOD: f32 = 0.9;
 pub fn render_ai_overlay<F>(
     visible: bool,
     theme: Theme,
+    style: ScmStyle,
     on_cancel: F,
 ) -> Option<impl IntoElement>
 where
@@ -90,7 +91,7 @@ where
         .icon(
             Icon::default()
                 .path("icons/x.svg")
-                .size(px(sc_style::ICON)),
+                .size(px(style.icon)),
         )
         .tooltip("Cancel generation")
         .on_click(on_cancel);
@@ -107,7 +108,7 @@ where
             .flex_row()
             .items_center()
             .justify_center()
-            .gap(px(sc_style::PAD_V))
+            .gap(px(style.pad_v))
             .bg(scrim)
             .child(spinner)
             .child(stop_button),

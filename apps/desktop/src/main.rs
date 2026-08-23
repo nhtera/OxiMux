@@ -10,16 +10,17 @@
 //! then runtime — is intentional: GPUI returns from `app.run`, the guard
 //! exits the runtime, then the runtime itself shuts down gracefully.
 
-// Windows decides at link time whether a process gets a console, and there is
-// no way to ask for one later that does not flash an empty black window first.
-// A released build must not: double-clicking OxiMux would open a console behind
-// it that stays for the session and closes the app when closed.
-//
-// Debug builds keep the console on purpose. It is where `tracing` goes, and the
-// subsystem is the difference between `cargo run` printing logs and printing
-// nothing at all. Release builds lose stdout entirely — anything that must
-// survive a packaged run has to reach a file or the event log, not `eprintln!`.
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+// Windows decides at link time whether a process gets a console. A
+// console-subsystem binary launched anywhere but from an existing console —
+// Explorer, the debugger, a Start menu pin — makes Windows conjure one, and on
+// a machine whose default terminal is Windows Terminal that console is a
+// persistent empty "Terminal" window that outlives the app as a dead pane.
+// Debug builds used to accept that in exchange for `cargo run` logs; they no
+// longer have to, because `attach_parent_console` below reconnects to the
+// launching console when there is one. So: GUI subsystem for every build, and
+// anything that must survive a launch with no parent console has to reach a
+// file or the event log, not `eprintln!`.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,6 +53,8 @@ const HOST_IDENTITY_SCOPE: &str = "remote-control-host";
 const DB_FILE_NAME: &str = "oximux.db";
 
 fn main() {
+    #[cfg(all(windows, debug_assertions))]
+    attach_parent_console();
     init_tracing();
 
     // Before anything writes into the data directory — including the migration
@@ -87,6 +90,13 @@ fn main() {
             "adopted app data left in the legacy roaming directory"
         );
     }
+
+    // Before `gpui_platform::application()`, which is where GPUI reads it, and
+    // before anything spawns — it writes the environment. Without this the
+    // browser pane loads its page and renders nothing: GPUI's composited window
+    // has no redirection surface for WebView2's child HWND to draw into. See
+    // the module for the trade this makes and the two repairs it rejects.
+    oximux_app::platform::direct_composition::prefer_child_window_compositing();
 
     // Before the runtime, and before anything spawns: launched from inside a
     // Claude Code session, the process inherits session markers that make
@@ -287,18 +297,19 @@ fn main() {
                 oximux_app::shell::diff_view::syntax::prewarm();
             })
             .detach();
-        // gpui-component defaults to ThemeMode::Light; flip to Dark so the
-        // TabBar + future component chrome match OxiMux's dark terminal panes.
-        gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
-        // Align the gpui-component Input border palette with OxiMux's
-        // charcoal theme. Default `input`/`ring` are tuned for a light
-        // shadcn-style page and read as "always focused" against our deep
-        // panel fill. Inputs rest on `border_input` (alpha-white, stronger
-        // than the hairline dividers so the type-here affordance reads),
-        // and `focus_ring` is the dedicated focus accent — same tokens,
-        // single source of truth.
+        // The user's palette, density, zoom and typefaces, before any window
+        // opens: the bridge below copies them into gpui-component's own theme,
+        // and a window that opened first would paint one frame at the shipped
+        // defaults and then correct itself.
+        oximux_app::appearance_settings::install(cx);
+        // Everything gpui-component needs to agree with our palette — the
+        // light/dark mode it starts in, the input border and focus ring, the
+        // corner radii, the two font families. Shared with the settings
+        // controls, because the library paints its own widgets and a change
+        // that skipped it would leave every `Input` and `Button` in the
+        // previous theme.
+        oximux_app::appearance_settings::bridge_component_theme(cx);
         {
-            let palette = oximux_settings::Theme::charcoal();
             // Read the OS auto-hide preference before taking the mutable global
             // borrow below (can't call `cx` methods while `component_theme`
             // holds it). A user who set "Always show scrollbars" (an
@@ -306,8 +317,6 @@ fn main() {
             // `false` here.
             let auto_hide_scrollbars = cx.should_auto_hide_scrollbars();
             let component_theme = gpui_component::Theme::global_mut(cx);
-            component_theme.colors.input = palette.border_input;
-            component_theme.colors.ring = palette.focus_ring;
             // List scrollbars stay invisible until the pointer enters the
             // scroll region, then reveal thumb-only — quiet at rest, no
             // persistent rail chrome. The library default (`Scrolling`) only
@@ -316,6 +325,9 @@ fn main() {
             // `vertical_scrollbar` call site inherits it. Skip the override
             // when the user asked for always-visible scrollbars — leave the
             // appearance gpui-component already synced from the system.
+            //
+            // Startup-only, unlike the bridge above: this follows an OS
+            // accessibility preference, not ours.
             if auto_hide_scrollbars {
                 component_theme.scrollbar_show = gpui_component::scroll::ScrollbarShow::Hover;
             }
@@ -372,7 +384,8 @@ fn main() {
         // global before any window opens, so the first animated surface reads
         // the right durations.
         oximux_app::motion_settings::install(cx);
-        // Process-wide last-known-`GitState` cache. Registered before any
+        // Process-wide last-known-`GitState` cache. (Appearance is installed
+        // further up, before the gpui-component bridge that reads it.) Registered before any
         // window opens so the first SCM panel can seed from it (no-op on a
         // cold start; populated as each project's poller produces a sample,
         // then read back when the user switches between already-visited
@@ -938,9 +951,19 @@ fn run_editor_spike() {
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
         {
             let palette = oximux_settings::Theme::charcoal();
+            let component_density = oximux_settings::Density::cockpit();
             let component_theme = gpui_component::Theme::global_mut(cx);
             component_theme.colors.input = palette.border_input;
             component_theme.colors.ring = palette.focus_ring;
+            // Corner radius, bridged for the same reason the two colours above
+            // are: the library paints its own widgets and cannot see our
+            // tokens. It happens to default to 6/8 — the same scale — so this
+            // changes nothing today. It is here so the two cannot drift apart
+            // silently, which is precisely what had happened to the radii it
+            // does not own: hand-rolled chrome sat at 4 while every `Input`
+            // and `Button` beside it was already 6.
+            component_theme.radius = gpui::px(component_density.r_xs);
+            component_theme.radius_lg = gpui::px(component_density.r_card);
         }
         cx.activate(true);
 
@@ -1011,9 +1034,19 @@ fn run_file_tree_spike() {
         // the same borders the shipping window does.
         {
             let palette = oximux_settings::Theme::charcoal();
+            let component_density = oximux_settings::Density::cockpit();
             let component_theme = gpui_component::Theme::global_mut(cx);
             component_theme.colors.input = palette.border_input;
             component_theme.colors.ring = palette.focus_ring;
+            // Corner radius, bridged for the same reason the two colours above
+            // are: the library paints its own widgets and cannot see our
+            // tokens. It happens to default to 6/8 — the same scale — so this
+            // changes nothing today. It is here so the two cannot drift apart
+            // silently, which is precisely what had happened to the radii it
+            // does not own: hand-rolled chrome sat at 4 while every `Input`
+            // and `Button` beside it was already 6.
+            component_theme.radius = gpui::px(component_density.r_xs);
+            component_theme.radius_lg = gpui::px(component_density.r_card);
         }
         cx.activate(true);
 
@@ -1673,6 +1706,38 @@ fn notify_user(title: &'static str, message: &'static str) {
     oximux_app::notifier::mac::post_system_banner(title, message);
     #[cfg(not(target_os = "macos"))]
     let _ = (title, message);
+}
+
+/// Join the console this process was launched from, if there is one.
+///
+/// The binary is GUI-subsystem (see the crate attribute), so Windows never
+/// creates a console for it. This call is the other half of that choice: when
+/// a console-launched dev run (`cargo run`, `.\oximux.exe` in a shell) does
+/// have a parent console, attach to it so `tracing` output lands there and
+/// Ctrl+C still reaches the process. Launched from Explorer or the debugger
+/// there is no parent console, the call fails, and that failure is the
+/// desired outcome — no window.
+///
+/// Debug builds only — the same recipe as Zed's, which gates its
+/// `AttachConsole` behind an explicit `--foreground` flag. The gate exists
+/// because attaching couples the process to the console's window: close that
+/// terminal and Windows ends every attached client, which is right for a dev
+/// run and wrong for a release app someone happened to start from a shell.
+/// Build profile stands in for Zed's flag until OxiMux grows a CLI surface.
+///
+/// Ordering: must run before `init_tracing` (and any other stdio use), because
+/// the std handles are resolved on first use. Handle semantics are Windows's,
+/// not ours: `AttachConsole` rebinds the std handles only when the parent did
+/// NOT pass explicit ones (`STARTF_USESTDHANDLES`), so a redirected
+/// `cargo run > log.txt` keeps its pipe.
+#[cfg(all(windows, debug_assertions))]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+    // SAFETY: first thing in `main`, no other threads exist; AttachConsole
+    // only mutates this process's console association.
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
 }
 
 fn init_tracing() {

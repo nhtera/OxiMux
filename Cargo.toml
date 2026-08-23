@@ -35,6 +35,7 @@ members = [
     "crates/remote-local",
     "crates/mobile-core",
     "crates/proc-cwd",
+    "crates/proc-ports",
     "crates/proc-tree",
     "crates/worktree-ops",
     "xtask",
@@ -114,6 +115,10 @@ oximux-proc-cwd = { path = "crates/proc-cwd" }
 # descendants. Its own crate for the same reason proc-cwd is: dependency-light
 # kernel introspection whose consumers share nothing else.
 oximux-proc-tree = { path = "crates/proc-tree" }
+# Which local ports a set of processes is listening on. Scoped to a caller's
+# pid set rather than the whole machine — see the crate doc for why that is a
+# correctness decision on Linux and not just a courtesy.
+oximux-proc-ports = { path = "crates/proc-ports" }
 
 # GPUI — see docs/gpui-pins.md. We deliberately do NOT pin `rev` here. The
 # upstream `longbridge/gpui-component` workspace pins `gpui` to the default

@@ -23,8 +23,7 @@ use gpui::{
     AnyElement, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Styled, div,
     px,
 };
-use gpui_component::highlighter::HighlightTheme;
-use gpui_component::text::{TextView, TextViewStyle};
+use gpui_component::text::TextView;
 
 use crate::shell::forge::ref_parse::parse_forge_ref;
 use crate::shell::session_merge::relative_age_long;
@@ -229,13 +228,7 @@ fn render_body(view: &TasksView, id: usize) -> AnyElement {
         return centered("No description.");
     }
 
-    // Dark-only app, so pin the renderer to the dark highlight theme (its own
-    // default is a light code theme, which reads washed-out on `bg_panel`).
-    let style = TextViewStyle {
-        is_dark: true,
-        highlight_theme: HighlightTheme::default_dark(),
-        ..Default::default()
-    };
+    let style = crate::shell::markdown_style::gfm_style(&theme);
     // Frame the description in a card (a step up from `bg_panel`) so the body
     // reads as a distinct block beneath the header rather than floating loose.
     div()

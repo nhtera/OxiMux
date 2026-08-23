@@ -1,105 +1,265 @@
-//! Source Control panel style tokens.
+//! Source Control panel style tokens, resolved from the user's appearance.
 //!
 //! The Source Control surface intentionally runs a touch looser than the
 //! global cockpit density: 12px horizontal padding instead of 8, 12px body
-//! text instead of 11. Keeping these locally scoped (instead of bumping
-//! `Density` / `Typography`) leaves the rest of the cockpit chrome — top
-//! bar, file explorer, terminal — at the tight default.
+//! text instead of 11. That intent is preserved here — but as a *ratio* to a
+//! [`Density`] / [`Typography`] token rather than a literal, so the panel
+//! follows both appearance controls instead of standing still while the rest
+//! of the cockpit moves.
+//!
+//! # Why a resolved struct and not `const`
+//!
+//! These were bare constants until a live pass at 120% zoom caught the
+//! consequence: every other surface grew and the SCM panel did not, so its
+//! 12px rows sat inside chrome sized for 18px type. A helper that took a
+//! `Density` and ignored it stood in for the conversion; this is the
+//! conversion.
+//!
+//! Everything moves together on purpose. Scaling the padding alone would grow
+//! the panel's horizontal air at 150% while row heights stayed put, which
+//! reads worse than a panel that is uniformly unscaled — so the whole module
+//! converts in one step or not at all.
+//!
+//! # Deriving, not re-listing
+//!
+//! Each field below names the token it comes from. Two rules decide which:
+//!
+//! * A value with a real scale to belong to — a type size, a padding, a row
+//!   height — takes the token, so it follows *both* the density preset and
+//!   the zoom.
+//! * A value that is just how big a thing is — a 14px glyph, a 2px gap inside
+//!   an icon cluster — passes through [`Density::scale`], which applies the
+//!   zoom but deliberately not the preset. See that method for why inventing
+//!   a token nobody else shares would be worse.
 
-/// Outer horizontal padding for tabs, toolbar, filter row, commit area, and
-/// section headers. Matches `px-3` (12px) in the reference layout.
-///
-/// Use [`pad_h`] when a render site has access to the panel's `Density` —
-/// at `Density::Compact` the panel tightens to 8px to recover visible
-/// width in narrow sidebars. The bare `PAD_H` constant stays for sites
-/// that don't get a density (e.g. test fixtures, pure helper functions
-/// that build sub-elements outside a density-aware render scope).
-pub const PAD_H: f32 = 12.0;
+use oximux_settings::{Density, Typography};
 
-/// Density-aware horizontal padding. Today returns `PAD_H` (12px) at
-/// every density — v1 only ships the `cockpit()` density preset, so
-/// there's no second branch to take. The helper exists so a future
-/// density (`Density::compact()` lands in v1.1) can drop the SCM
-/// surface to 8px without touching every call site: render code
-/// already reads `sc_style::pad_h(self.density)` and the constant
-/// becomes a runtime branch the moment the preset is added.
+/// Line-height ratio for the panel's body type: 12px text on 16px leading,
+/// which is what `text-xs` means in the reference layout. Used to size the
+/// commit composer from the type rather than from a remembered pixel count.
+const BODY_LINE_HEIGHT: f32 = 4.0 / 3.0;
+
+/// Hairline border width. Named so the composer's height arithmetic reads as
+/// "two lines, padding, and the box around them".
+const BORDER: f32 = 1.0;
+
+/// The SCM panel's spacing and type, resolved for one appearance.
 ///
-/// Threading `density` through every render method that currently
-/// hard-codes `PAD_H` is the load-bearing work, not the constant.
-pub fn pad_h(density: oximux_settings::Density) -> f32 {
-    let _ = density;
-    PAD_H
+/// `Copy` and all-`f32`, so free render helpers take it by value instead of
+/// threading a `Density` and a `&Typography` separately.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScmStyle {
+    /// Outer horizontal padding for tabs, toolbar, filter row, commit area,
+    /// and section headers. `1.5×` the cockpit panel padding — the ratio the
+    /// shipped 12px already sat at against 8px, so this is a no-op at the
+    /// default and follows both controls everywhere else.
+    pub pad_h: f32,
+    /// Vertical padding for the branch-compare toolbar.
+    pub pad_v: f32,
+    /// Vertical padding for the filter row and other tight stacks.
+    pub pad_v_tight: f32,
+    /// Fixed row height for the scope-tabs strip. Definite height keeps the
+    /// row from being compressed by flex pressure when the file list expands
+    /// below. Combined with `items_end`, the active tab's underline lands on
+    /// the row's bottom border so the two lines unify visually.
+    pub tab_h: f32,
+    /// Row height for the branch-compare toolbar.
+    pub toolbar_h: f32,
+    /// Minimum row height for one commit in the graph list. Lets rows with a
+    /// ref-badge sub-row (e.g. "(main)") grow taller, while non-ref rows stay
+    /// compact. The timeline column distributes connector lines across this
+    /// height; without a definite parent height the lines collapse to 2-3px.
+    pub commit_row_h: f32,
+    /// Commit message textarea height. A compact ~2-line composer that
+    /// scrolls for longer bodies rather than ballooning the panel — keeps the
+    /// file list and graph above the fold on a typical 13" display.
+    pub commit_h: f32,
+    /// Primary text size: tabs, toolbar copy, filter input, file rows, commit
+    /// subject placeholder, graph subject lines.
+    ///
+    /// **Why not `t_body_sm` (11px)?** The SCM panel intentionally runs a
+    /// notch larger so file names and commit subjects scan from arm's length
+    /// while the operator works the cockpit — the file explorer and terminal
+    /// stay at 11px.
+    pub body_text: f32,
+    /// Metadata text for parent paths and graph author/date columns.
+    pub graph_meta_text: f32,
+    /// Uppercase section headers ("STAGED CHANGES", "GRAPH").
+    pub caps_text: f32,
+    /// Small fixed annotations hanging off a row: the conflict-kind sub-label
+    /// on unmerged files (e.g. "both modified") and the short OID in the graph.
+    /// Both read as parentheticals to the row they sit beside.
+    pub sub_label_text: f32,
+    /// The panel's corner radius. One value: every rounded thing here is a
+    /// control or a badge, and the panel has no surface large enough to want
+    /// a second tier.
+    pub corner: f32,
+    /// The smallest text the panel uses — the scope-tab count badge, the AI
+    /// agent name under the generate button, the subject character counter.
+    /// Below `sub_label_text` because none of these is read, only glanced at.
+    pub micro_text: f32,
+    /// Inline icon size for the toolbar / filter / split-button chevron. The
+    /// reference uses Lucide `size-3.5`, which is 14px.
+    pub icon: f32,
+    /// Horizontal gap between the `+A` (green) and `-B` (red) line-count
+    /// fragments beside a file name. Tight enough that the pair reads as one
+    /// decoration, loose enough that the minus sign doesn't blur into the
+    /// digits before it.
+    pub line_count_gap: f32,
+    /// Tight gap inside dense icon-button clusters (toolbar view-mode group,
+    /// graph commit-row actions, commit-area trailing icons). Smaller than
+    /// `density.gap_inline` because icon buttons inside a cluster need to read
+    /// as one element row, not three separate buttons.
+    pub icon_cluster_gap: f32,
 }
 
-/// Vertical padding for the filter row (tight). Matches `py-1.5` (6px).
-pub const PAD_V_TIGHT: f32 = 6.0;
+impl ScmStyle {
+    /// Resolve the panel's style for one appearance.
+    pub fn new(density: Density, typography: &Typography) -> Self {
+        let pad_v_tight = density.pad_row;
+        let body_text = typography.t_body_base;
+        Self {
+            pad_h: density.pad_panel * 1.5,
+            pad_v: density.pad_panel,
+            pad_v_tight,
+            // One token for all three chrome rows. They shipped as 32 / 32 /
+            // 34 — a near-miss nobody chose — and `h_action_row` is what a row
+            // of inline action buttons is measured by everywhere else in the
+            // cockpit, which is exactly what the toolbar and the tab strip are.
+            tab_h: density.h_action_row,
+            toolbar_h: density.h_action_row,
+            commit_row_h: density.h_action_row,
+            commit_h: (body_text * BODY_LINE_HEIGHT + pad_v_tight + BORDER) * 2.0,
+            body_text,
+            graph_meta_text: typography.t_body_sm,
+            caps_text: typography.t_label_caps,
+            sub_label_text: typography.t_label_xs,
+            corner: density.r_xs,
+            micro_text: typography.t_sub_label,
+            icon: density.scale(14.0),
+            line_count_gap: density.scale(4.0),
+            icon_cluster_gap: density.scale(2.0),
+        }
+    }
+}
 
-/// Vertical padding for the branch-compare toolbar. Matches `py-2` (8px).
-pub const PAD_V: f32 = 8.0;
+impl Default for ScmStyle {
+    fn default() -> Self {
+        Self::new(Density::cockpit(), &Typography::cockpit())
+    }
+}
 
-/// Fixed row height for the scope-tabs strip. Definite height keeps the row
-/// from being compressed by flex pressure when the file list expands below.
-/// Combined with `items_end`, the active tab's 2px underline lands directly
-/// on the row's 1px bottom border so the two lines unify visually.
-pub const TAB_H: f32 = 32.0;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oximux_settings::{Appearance, DensityPreset, ThemeChoice, UiScale};
 
-/// Primary text size used for tabs, toolbar copy, filter input, file rows,
-/// commit subject placeholder, and graph subject lines. Matches `text-xs`
-/// (12px) in the reference.
-///
-/// **Why not `typography.t_body_sm` (11px)?** The SCM panel intentionally
-/// runs a notch larger so file names and commit subjects scan from arm's
-/// length while the operator works the cockpit. Keeping the const local
-/// (instead of bumping `t_body_sm`) lets the file explorer and terminal
-/// stay at 11px without ratcheting up everything.
-pub const BODY_TEXT: f32 = 12.0;
+    fn resolved(density: DensityPreset, percent: u16) -> ScmStyle {
+        let appearance = Appearance {
+            theme: ThemeChoice::default(),
+            density,
+            scale: UiScale::from_percent(percent),
+        };
+        ScmStyle::new(
+            Density::for_appearance(appearance),
+            &Typography::for_appearance(appearance),
+        )
+    }
 
-/// Metadata text size for parent paths and graph author/date columns.
-/// Equals `typography.t_body_sm` (11px) but kept as a named const so the
-/// SCM-specific intent (graph metadata, secondary annotations) is self-
-/// documenting at call sites.
-pub const GRAPH_META_TEXT: f32 = 11.0;
+    // The conversion has to be invisible at the shipped default, or it is a
+    // redesign wearing a refactor's clothes. Every value here is the literal
+    // this module carried before it derived anything.
+    #[test]
+    fn the_default_matches_the_pixels_that_shipped() {
+        let s = ScmStyle::default();
+        assert_eq!(s.pad_h, 12.0);
+        assert_eq!(s.pad_v, 8.0);
+        assert_eq!(s.pad_v_tight, 6.0);
+        assert_eq!(s.commit_row_h, 34.0);
+        assert_eq!(s.commit_h, 46.0);
+        assert_eq!(s.body_text, 12.0);
+        assert_eq!(s.graph_meta_text, 11.0);
+        assert_eq!(s.sub_label_text, 10.0);
+        assert_eq!(s.icon, 14.0);
+        assert_eq!(s.line_count_gap, 4.0);
+        assert_eq!(s.icon_cluster_gap, 2.0);
+    }
 
-/// Uppercase section-header text size (e.g. "STAGED CHANGES", "GRAPH").
-/// Same value as `GRAPH_META_TEXT` today but a semantically-distinct
-/// concept; kept separate so the two can diverge without a sweeping
-/// rename.
-pub const CAPS_TEXT: f32 = 11.0;
+    // The two deliberate departures, pinned so they read as decisions rather
+    // than drift: the chrome rows unify on `h_action_row`, and the section
+    // headers take the caps token they were always describing.
+    #[test]
+    fn the_chrome_rows_share_one_height() {
+        let s = ScmStyle::default();
+        assert_eq!(s.tab_h, 34.0, "was 32, now h_action_row");
+        assert_eq!(s.toolbar_h, s.tab_h);
+        assert_eq!(s.commit_row_h, s.tab_h);
+    }
 
-/// Inline icon size for the toolbar / filter / split-button chevron. The
-/// reference uses Lucide `size-3.5` which is 14px.
-pub const ICON: f32 = 14.0;
+    #[test]
+    fn section_headers_take_the_caps_token() {
+        assert_eq!(ScmStyle::default().caps_text, 10.5, "was 11");
+    }
 
-/// Commit message textarea height. A compact ~2-line composer that scrolls
-/// for longer bodies rather than ballooning the panel — keeps the file list
-/// and graph above the fold on a typical 13" display. Matches the reference
-/// 2-row default: text-xs line-height × 2 + py-1.5 padding + border.
-pub const COMMIT_H: f32 = 46.0;
+    // The bug this module was rewritten for: at 150% every value has to move,
+    // because type moves and chrome sized for 12px type will not hold 18px.
+    #[test]
+    fn zoom_reaches_every_field() {
+        let base = ScmStyle::default();
+        let big = resolved(DensityPreset::Cockpit, 150);
+        for (name, a, b) in [
+            ("pad_h", base.pad_h, big.pad_h),
+            ("pad_v", base.pad_v, big.pad_v),
+            ("pad_v_tight", base.pad_v_tight, big.pad_v_tight),
+            ("tab_h", base.tab_h, big.tab_h),
+            ("toolbar_h", base.toolbar_h, big.toolbar_h),
+            ("commit_row_h", base.commit_row_h, big.commit_row_h),
+            ("commit_h", base.commit_h, big.commit_h),
+            ("body_text", base.body_text, big.body_text),
+            ("graph_meta_text", base.graph_meta_text, big.graph_meta_text),
+            ("caps_text", base.caps_text, big.caps_text),
+            ("sub_label_text", base.sub_label_text, big.sub_label_text),
+            ("icon", base.icon, big.icon),
+            ("line_count_gap", base.line_count_gap, big.line_count_gap),
+            (
+                "icon_cluster_gap",
+                base.icon_cluster_gap,
+                big.icon_cluster_gap,
+            ),
+        ] {
+            assert!(b > a, "{name} did not grow at 150%: {a} -> {b}");
+        }
+    }
 
-/// Row height for the branch-compare toolbar.
-pub const TOOLBAR_H: f32 = 32.0;
+    // The composer holds two lines of body type plus its own padding. Assert
+    // the relationship rather than a number, so the two cannot drift apart at
+    // a zoom level nobody wrote a case for.
+    #[test]
+    fn the_composer_holds_two_lines_at_any_zoom() {
+        for percent in [100, 120, 150, 200] {
+            let s = resolved(DensityPreset::Cockpit, percent);
+            let two_lines = s.body_text * BODY_LINE_HEIGHT * 2.0;
+            assert!(
+                s.commit_h > two_lines,
+                "at {percent}%: {} does not clear two {} lines",
+                s.commit_h,
+                s.body_text
+            );
+        }
+    }
 
-/// Minimum row height for one commit in the graph list. Lets rows with a
-/// ref-badge sub-row (e.g. "(main)") grow taller, while non-ref rows stay
-/// compact. The timeline column distributes connector lines across this
-/// height; without a definite parent height the lines collapse to 2-3 px.
-pub const COMMIT_ROW_H: f32 = 34.0;
-
-/// Horizontal gap between the `+A` (green) and `-B` (red) line-count
-/// fragments rendered to the right of a file name. Tight enough that the
-/// pair reads as one decoration, loose enough that the minus sign doesn't
-/// blur into the digits of the previous number.
-pub const LINE_COUNT_GAP: f32 = 4.0;
-
-/// Font size for the conflict-kind sub-label that hangs under a file name
-/// on unmerged rows (e.g. "both modified"). One point smaller than the
-/// secondary GRAPH_META_TEXT so it reads as a parenthetical to the row name.
-pub const SUB_LABEL_TEXT: f32 = 10.0;
-
-/// Tight gap used inside dense icon-button clusters (toolbar view-mode
-/// group, graph commit-row action cluster, commit-area trailing icons).
-/// Sub-token: 2px is smaller than the global `density.gap_inline = 6`
-/// because icon buttons inside a cluster need to read as one element
-/// row, not three separate buttons. Not a general-purpose token —
-/// promote to `density` only if a non-SCM surface needs the same value.
-pub const ICON_CLUSTER_GAP: f32 = 2.0;
+    // A preset changes the air, not the type — so the padding and rows move
+    // while the text sizes hold. This is the distinction that keeps Density
+    // and Typography from being two names for one control.
+    #[test]
+    fn the_preset_moves_the_air_and_leaves_the_type() {
+        let cockpit = ScmStyle::default();
+        let roomy = resolved(DensityPreset::Comfortable, 100);
+        assert!(roomy.pad_h > cockpit.pad_h);
+        assert!(roomy.pad_v_tight > cockpit.pad_v_tight);
+        assert!(roomy.tab_h > cockpit.tab_h);
+        assert_eq!(roomy.body_text, cockpit.body_text);
+        assert_eq!(roomy.caps_text, cockpit.caps_text);
+        assert_eq!(roomy.icon, cockpit.icon, "a glyph is not spacing");
+    }
+}

@@ -125,12 +125,20 @@ mod tests {
         assert_eq!(dir_size(dir.path()), 150);
     }
 
+    // Shells out to a macOS-only binary, so it can only run there. The
+    // crate is a macOS-only dependency; it stays a workspace member so it
+    // keeps compiling everywhere, which is why the gate is per-test.
+    #[cfg(target_os = "macos")]
     #[test]
     fn free_bytes_reports_something_for_the_temp_dir() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(free_bytes(dir.path()).is_some_and(|bytes| bytes > 0));
     }
 
+    // Shells out to a macOS-only binary, so it can only run there. The
+    // crate is a macOS-only dependency; it stays a workspace member so it
+    // keeps compiling everywhere, which is why the gate is per-test.
+    #[cfg(target_os = "macos")]
     #[test]
     fn ensure_disk_space_refuses_an_impossible_ask() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -157,6 +165,10 @@ mod tests {
         assert_eq!(fs::read(b.join("marker")).expect("read"), b"new");
     }
 
+    // Shells out to a macOS-only binary, so it can only run there. The
+    // crate is a macOS-only dependency; it stays a workspace member so it
+    // keeps compiling everywhere, which is why the gate is per-test.
+    #[cfg(target_os = "macos")]
     #[test]
     fn ditto_copies_a_directory_tree() {
         let root = tempfile::tempdir().expect("tempdir");

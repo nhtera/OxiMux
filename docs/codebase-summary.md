@@ -2,7 +2,10 @@
 
 **Updated**: 2026-07-31  
 **Phase**: 5 + multiplexer enhancements + UI/UX batch (settings modal, Quick Open index, lifecycle scripts, Create PR + CI checks, floating PiP terminal) + Agent Chat (round-7) shipped to main; Remote Control Phase 1-2 groundwork in progress on `feat/remote-control-headless-registry` (agent-core split + SessionRegistry, not yet wired into the view); external-CLI auto-provisioning (bundled ripgrep + `cua-driver` one-click installer) shipped; desktop auto-update shipped  
-**Tests**: workspace suite green
+**Tests**: workspace suite green on macOS **and Windows**. It was macOS-only until the six
+`oximux-macos-trust` tests that shell out to `/bin/sh` and `/usr/bin/ditto` were gated to
+macOS — the crate is a macOS-only *dependency* but an unconditional *workspace member*, so
+`cargo test --workspace` had always run them everywhere and always failed off macOS.
 
 ---
 
@@ -29,6 +32,13 @@ oximux/
     │                       also SessionRegistry — gpui-free session event bus + command surface (not yet wired)
     ├── editor/             gpui-component code editor + LSP client (Phase 5 spike)
     ├── storage/            SQLite via rusqlite — Db wrapper + migrations + V001 schema + 5 typed repos (Phase 4 step 3)
+    ├── proc-cwd/           working directory of a pid
+    ├── proc-tree/          descendants of a pid — which program a terminal is really running
+    ├── proc-ports/         which local TCP ports a given pid set is listening on. Scoped to a
+    │                       caller-supplied pid set, not the machine: on Linux the socket table
+    │                       names an inode, so an unscoped answer means reading every process's
+    │                       fds. Windows GetExtendedTcpTable / Linux /proc / macOS lsof; the
+    │                       text parsers compile on every platform so their tests run everywhere
     └── settings/           TOML config, theme tokens, typography
 ```
 
@@ -77,6 +87,9 @@ src/
     ├── left_rail/          250px workspace + nav rail (replaces old sidebar stub)
     │   ├── mod.rs          LeftRail entity; owns WorktreePanel for state; snapshots diff_counts
     │   ├── nav_section.rs  NavItem (Tasks/Automations/Agents/Search) + pure bg/fg helpers
+    │   │                   NavItem::opens_in_pane(): Tasks + Automations open a
+    │   │                   singleton PANE tab (they need width); Agents swaps the
+    │   │                   rail body; Search is still a shell.
     │   ├── workspace_row.rs WorkspaceCardPlan + build_workspace_card_plan (pure) + sum_numstat;
     │   │                   status_dot_color delegates to agent_verb for color parity
     │   ├── workspace_card.rs render_workspace_card — two-line card painter consuming WorkspaceCardPlan;
@@ -85,6 +98,37 @@ src/
     │   ├── project_drag.rs drag payloads, insertion_side, paint_insertion_line (2px accent line),
     │   │                   SidebarDragPreview ghost chip, WorkspaceDragConfig, reorder_slot_value
     │   └── toolbar.rs      Add Project + settings (stubs)
+    ├── integrations/       External CLIs OxiMux shells out to, and their health
+    │   ├── catalog.rs      Tool enum (git/gh/glab/rg): what each is for, docs link,
+    │   │                   whether it has a sign-in, and the per-platform install
+    │   │                   recipe. Pure data + pure wording. Linux deliberately has no
+    │   │                   recipe — a command that fails beats no command only in theory
+    │   ├── probe.rs        Health per tool: PATH resolution (bundled rg via tool_paths),
+    │   │                   `--version` parse, `auth status` exit code. Blocking, bounded
+    │   ├── install.rs      Package-manager child + Running/Failed state, same shape as
+    │   │                   driver_install. Failure carries the manager's own words
+    │   └── path_refresh.rs Windows only: re-reads the persisted PATH after an install.
+    │                       winget appends to the registry PATH, which a running process
+    │                       never sees — without this, a successful install looks failed
+    ├── ports_panel/        Ports PANEL (right sidebar) — local ports this window's terminals serve
+    │   ├── labels.rs       pure wording shared with the status-bar metric: port_metric_label,
+    │   │                   url_for, origin_label, reach_label, project_label, row_title
+    │   ├── scan.rs         pure attribution (TreeSnapshot + ListeningPort → PortInventory
+    │   │                   grouped by project), plus gather() — the one syscall bridge,
+    │   │                   proc-tree walk + proc-ports read, run on the background executor
+    │   └── mod.rs          PortsPanel entity; Open (system browser) / Copy URL / inline Rename.
+    │                       Labels persist per project+port via app_settings/port_label_settings.
+    │                       Driven by WorkspaceRoot::run_port_scan (3s, focus-gated, kicked on
+    │                       focus regain), which owns the terminals the walk starts from
+    ├── automations_view/   Automations PANE page — scheduled runs, one card each
+    │   ├── labels.rs       pure wording shared with the Schedules settings pane:
+    │   │                   next_fire_label, run_summary, armed_summary, home_abbrev,
+    │   │                   prompt_preview. One source of truth so two surfaces of the
+    │   │                   same store never word a schedule differently.
+    │   └── mod.rs          AutomationsView entity; reads ScheduleStore::list_spawning on
+    │                       activate/refresh/mutate; enable toggle + two-step delete
+    │                       (DeleteArm, pure + tested); creation hands off to Settings →
+    │                       Schedules rather than duplicating that form
     ├── agents_dashboard/   all-agents view rendered when the Agents nav item is active
     │   ├── model.rs        pure: AgentRow, attention_rank, sort_agent_rows, build_agent_rows,
     │   │                   widest_row_index — assembled from LeftRail's pushed-down snapshot
@@ -102,13 +146,21 @@ src/
     │   │                   cache invalidated on project switch; replaces 3 hardcoded stubs
     │   ├── match_engine.rs pure scorer: prefix > consecutive > subsequence (no external crate)
     │   └── palette_modal.rs pure render: card + header chip + result list
-    ├── settings_modal/     Cmd+, / left-rail cog — five-pane settings overlay
+    ├── settings_modal/     Cmd+, / left-rail cog — settings overlay
     │   ├── mod.rs          SettingsModal entity; pane routing; open/close
-    │   ├── view.rs         top-level render: nav rail + active pane body
-    │   ├── controls.rs     shared form control helpers (toggle, text field, select)
-    │   ├── nav.rs          pane nav list (Terminal / Agents / Keybindings / Appearance / About)
+    │   ├── view.rs         top-level render: nav rail + active pane body; global search
+    │   │                   across every pane's entries()
+    │   ├── controls.rs     shared form control helpers. value_chip + toggle_switch are
+    │   │                   generic over the hosting view (Automations page uses them too)
+    │   ├── nav.rs          SettingsPane enum + SettingsGroup (AI / WORKSPACE / INTERFACE
+    │   │                   / APP). Panes sharing a group must be adjacent in ALL — the nav
+    │   │                   emits a heading on change, so an out-of-order pane repeats one
     │   ├── pane_terminal.rs terminal settings form; writes terminal.toml via save()
     │   ├── pane_agents.rs  agent settings form; writes commit_message_ai.toml via save()
+    │   ├── pane_integrations.rs external-CLI health + inline remediation. Owns the
+    │   │                   per-row install state machine (start/cancel/pump) and the copy
+    │   │                   that turns a silent degradation into a sentence and a button.
+    │   │                   Backend in shell/integrations/
     │   ├── pane_keybindings.rs read-only keybinding display
     │   └── pane_about.rs   version + license info; auto-update toggle, status line,
     │                       Check now / Restart now / Download update (reads UpdaterState)
@@ -117,7 +169,8 @@ src/
     │                       debounce-persisted to settings repo as JSON; NOT a second OS window
     ├── welcome_view.rs     centered empty-state card (logo + wordmark + tagline + kbd hints)
     ├── main_pane.rs        pane binary-tree; split/close/focus actions; each leaf holds
-    │                       PaneContent enum (Terminal | Editor | Diff | Browser | Tasks); open_editor_in_focused_pane
+    │                       PaneContent enum (Terminal | Editor | Diff | Browser | Tasks |
+    │                       Automations | AgentChat); open_editor_in_focused_pane
     │                       replaces focused leaf content; same-path short-circuit
     ├── pane_tree.rs        pure PaneTree data structure (weight-aware)
     ├── pane_layout.rs      layout helpers
@@ -179,8 +232,14 @@ src/
     │   └── fs_load.rs      async tokio read_dir; 5s timeout; symlink skip; 12-deep guard
     ├── right_sidebar/
     │   ├── mod.rs          RightSidebar entity; tab switching; hosts FileExplorer (Explorer) + SearchPanel (Search) + GitPanel+DiffView (SourceControl) + FileTreeView (Files)
-    │   ├── tab.rs          RightTab enum: Explorer | Search | SourceControl | Files; icon_path() per tab
-    │   │                   Files tab: always visible (no repo gate); hosts FileTreeView; SelectFilesTab action bound to Cmd+Shift+T
+    │   ├── tab.rs          RightTab enum: Explorer | Search | SourceControl | History | Ports | Files
+    │   │                   visible_tabs(): SourceControl is the only repo-gated tab; Files is
+    │   │                   deliberately omitted from the visible set (variant + view kept for a
+    │   │                   later LSP-aware relaunch — see the fn's own doc)
+    │   │                   Ports: hosts the window's single PortsPanel, handed over by
+    │   │                   WorkspaceRoot rather than built here (one panel per window, not per
+    │   │                   cached per-project sidebar). Click-only — no chord, because the
+    │   │                   obvious one is the command palette's
     │   ├── activity_bar.rs top tab bar (SVG icons) + persistent collapsed rail + PanelRight toggle
     │   └── layout.rs       layout constants
     ├── search_panel/       SearchPanel entity; ripgrep --json shell-out; debounced + cancellation
@@ -196,7 +255,10 @@ src/
     │   └── changed_files.rs partition helper (staged / unstaged / untracked)
     ├── diff_view/
     │   ├── mod.rs          DiffView entity; load(path, staged); expand()
-    │   └── render.rs       pure hunk/line render plan helpers
+    │   ├── render.rs       pure hunk/line render plan helpers
+    │   ├── review_notes.rs note store + reconcile (line moved / gone) + agent markdown
+    │   ├── review_note_popover.rs compose/edit one note at a gutter anchor
+    │   └── live_refresh.rs which diff scopes can go stale (worktree yes, history no)
     ├── commit_dialog/
     │   ├── mod.rs          CommitDialog entity; cycle_prefix(); submit()
     │   └── prefix.rs       conventional-commit prefix list (pure)

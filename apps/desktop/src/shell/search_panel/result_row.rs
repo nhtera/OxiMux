@@ -13,7 +13,7 @@ use gpui::{
     ParentElement, Styled, div, px,
 };
 use gpui_component::{Icon, IconName, Sizable as _};
-use oximux_settings::{Theme, Typography};
+use oximux_settings::{Density, Theme, Typography};
 
 /// Constants shared by file + match rows. Both heights are intentionally
 /// tighter than the global `density.h_row = 24` because search results
@@ -29,6 +29,7 @@ const ROW_INDENT: f32 = 14.0;
 /// Per-render context. Cloned cheaply into closures.
 pub(super) struct RowPaintCtx {
     pub theme: Theme,
+    pub density: Density,
     pub typography: Typography,
 }
 
@@ -190,7 +191,7 @@ pub(super) fn paint_match_row(
                 .child(
                     div()
                         .px(px(2.0))
-                        .rounded(px(2.0))
+                        .rounded(px(ctx.density.r_chip))
                         .bg(amber_highlight_bg(theme))
                         .text_color(theme.fg_base)
                         .child(truncated.matched),

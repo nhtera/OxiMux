@@ -15,6 +15,7 @@ pub(crate) mod conpty_c0;
 pub mod events;
 pub mod grid_serializer;
 pub mod osc7;
+pub mod polarity;
 pub mod portable_pty_backend;
 pub mod snapshot;
 pub mod state;
@@ -26,6 +27,10 @@ pub use events::{CommandMarkKind, TerminalEvent};
 pub use grid_serializer::{
     CAPTURE_HEADER_LEN, CAPTURE_HEADER_MAGIC, SerializeOptions, build_capture_header,
     parse_capture_header, serialize_term, serialize_term_capped, serialize_term_capped_with_dims,
+};
+pub use polarity::{
+    BackgroundPolarity, COLOR_FG_BG, apply_color_fg_bg, background_polarity,
+    set_background_polarity,
 };
 pub use portable_pty_backend::PortablePtyBackend;
 pub use snapshot::{Cell, CellColor, CursorShapeKind, NamedColor16, TerminalSnapshot};

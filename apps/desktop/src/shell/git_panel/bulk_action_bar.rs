@@ -13,7 +13,7 @@
 //! re-click can't queue a second op against stale state.
 
 use crate::shell::git_panel::GitPanel;
-use crate::shell::source_control::style as sc_style;
+use crate::shell::source_control::style::ScmStyle;
 use gpui::{
     AnyElement, ClickEvent, Context, Hsla, IntoElement, ParentElement, Styled, div, px,
 };
@@ -77,6 +77,7 @@ pub fn render_bulk_action_bar(
     typography: &Typography,
     cx: &mut Context<GitPanel>,
 ) -> Option<AnyElement> {
+    let style = ScmStyle::new(density, typography);
     let n_selected = panel.selected.len();
     if n_selected == 0 {
         return None;
@@ -105,9 +106,9 @@ pub fn render_bulk_action_bar(
         .flex_row()
         .items_center()
         .gap(px(density.gap_inline))
-        .px(px(sc_style::PAD_H))
+        .px(px(style.pad_h))
         .py(px(4.0))
-        .text_size(px(sc_style::BODY_TEXT))
+        .text_size(px(style.body_text))
         .child(count_slot);
 
     // Stage / Unstage buttons: omit when their count is 0 (the op

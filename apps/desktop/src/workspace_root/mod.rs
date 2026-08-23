@@ -58,6 +58,15 @@ const LAYOUT_AUTOSAVE_TICK: Duration = Duration::from_secs(15);
 /// ~2 s" without measurable IO churn.
 const AGENT_ACTIVITY_TICK: Duration = Duration::from_secs(2);
 
+/// Cadence of the listening-ports scan. Set by how long it is tolerable to
+/// wait after `npm run dev` prints its URL — a couple of seconds reads as
+/// "immediately", ten does not — rather than by cost: the socket read is one
+/// kernel call on Windows and one small `/proc` read on Linux. Like the diff
+/// refresh, it pauses while the window is unfocused and is kicked once on
+/// focus regain, so a server started while you were away is listed by the
+/// time you have looked back.
+const PORT_SCAN_TICK: Duration = Duration::from_secs(3);
+
 /// Cadence of the usage-meter sample. The probe re-parses only logs whose
 /// (mtime, len) changed since the previous sample, so a steady-state tick
 /// costs one directory scan + at most one active-log re-parse.
@@ -81,7 +90,8 @@ use crate::actions::{
     SelectSearchTab,
     SelectSourceControlTab, SendTextToActiveAgent, SplitDown, SplitGroupAt, SplitHorizontal,
     SplitLeft, SplitRight, SplitUp, SplitVertical, ToggleChatTerminalView, ToggleDictation,
-    ToggleFloatingTerminal, ToggleLeftSidebar, ToggleRightSidebar,
+    ToggleFloatingTerminal, ToggleLeftSidebar, ToggleRightSidebar, UiZoomIn, UiZoomOut,
+    UiZoomReset,
 };
 use crate::shell::pane_tree::{Axis, SplitInsert};
 use crate::shell::{
@@ -109,7 +119,7 @@ use crate::shell::{
         options_menu::WorkspaceOptionsMenu,
         project_menu::ProjectRowMenu,
         row_menu::WorkspaceRowMenu,
-        workspace_row::{DiffCounts, sum_numstat},
+        workspace_row::{DiffCounts, looks_like_renormalization, sum_numstat},
     },
     main_area,
     openable_text_file::is_openable_text_file,
@@ -462,6 +472,17 @@ pub struct WorkspaceRoot {
     _agent_activity_task: Task<()>,
     /// Periodic usage-meter sample (60 s, background IO). Dropping cancels.
     _usage_meter_task: Task<()>,
+    /// The window's single ports panel. One per *window*, not per project:
+    /// a listening port is a fact about the machine, and the panel groups by
+    /// project itself. Every `RightSidebar` this root builds is handed this
+    /// same entity.
+    pub(crate) ports_panel: Entity<crate::shell::ports_panel::PortsPanel>,
+    /// Guards against overlapping port scans — the socket read runs on the
+    /// background executor, and a slow one must not have a second stacked
+    /// behind it.
+    pub(crate) port_scan_in_flight: bool,
+    /// Periodic listening-ports scan (focus-gated). Dropping cancels.
+    _port_scan_task: Task<()>,
 }
 
 impl WorkspaceRoot {
@@ -544,9 +565,13 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let theme = Theme::charcoal();
-        let density = Density::cockpit();
-        let typography = Typography::cockpit();
+        // Seeded from the user's appearance rather than the shipped defaults:
+        // every render pulls the current tokens anyway, but starting wrong
+        // would paint one frame in the wrong palette and size on launch.
+        let appearance = oximux_settings::appearance::active(cx);
+        let theme = Theme::for_appearance(appearance);
+        let density = Density::for_appearance(appearance);
+        let typography = oximux_settings::appearance::typography(cx);
 
         // Construct the CLI agent runtime + adapter registry once per
         // workspace. The registry is built with every built-in adapter in dialog
@@ -955,6 +980,12 @@ impl WorkspaceRoot {
                         this.toast_layer.downgrade(),
                     );
                     this.run_diff_refresh_round(cx);
+                    // Same reason the diff round is kicked here: the ports
+                    // scan pauses while the window is behind another, so a
+                    // server started in the meantime would otherwise be
+                    // missing from the panel for up to one tick after the
+                    // user has already looked at it.
+                    this.run_port_scan(cx);
                     // The user is back — clear the accumulated attention dock badge.
                     this.notifier.clear_attention();
                 }
@@ -1030,6 +1061,40 @@ impl WorkspaceRoot {
                     })
                     .is_ok();
                 if !alive {
+                    break;
+                }
+            }
+        });
+
+        // The window's ports panel, built once and shared by every sidebar
+        // this root goes on to build.
+        let weak_for_ports: WeakEntity<WorkspaceRoot> = cx.weak_entity();
+        let ports_panel = cx.new(|cx| {
+            crate::shell::ports_panel::PortsPanel::new(
+                weak_for_ports,
+                Some(app_state.settings_repo.clone()),
+                theme,
+                density,
+                typography.clone(),
+                window,
+                cx,
+            )
+        });
+
+        // Periodic listening-ports scan. Focus-gated like the diff refresh:
+        // nobody is reading the panel while the window is behind another, and
+        // the activation observer kicks a scan the moment they are.
+        let port_scan_task = cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor().timer(PORT_SCAN_TICK).await;
+                let still_alive = weak
+                    .update(cx, |this, cx| {
+                        if this.diff_refresh_focused {
+                            this.run_port_scan(cx);
+                        }
+                    })
+                    .is_ok();
+                if !still_alive {
                     break;
                 }
             }
@@ -1235,6 +1300,9 @@ impl WorkspaceRoot {
             _layout_autosave_task: layout_autosave_task,
             _agent_activity_task: agent_activity_task,
             _usage_meter_task: usage_meter_task,
+            ports_panel,
+            port_scan_in_flight: false,
+            _port_scan_task: port_scan_task,
         };
         // Seed the sidebar's DB-backed caches (workspace rows + agent
         // statuses) — the first gather lands async, typically before the

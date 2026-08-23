@@ -14,6 +14,18 @@ const SYNC_HIGHLIGHT_THRESHOLD: usize = 250;
 
 impl Render for DiffView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette_before = self.theme.choice;
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
+        // The cached plan holds tokens with baked r/g/b, so unlike every other
+        // surface a fresh `Theme` is not enough here — the diff would keep the
+        // previous palette's code colours until something else invalidated it.
+        if self.theme.choice != palette_before {
+            self.invalidate_plan();
+        }
+        // First render is the first time this view is handed a `Window`, and
+        // so the only place the background refresh can learn whether its
+        // window is focused. Idempotent; see `arm_live_refresh`.
+        self.arm_live_refresh(window, cx);
         // When no file is selected, collapse to a zero-height placeholder so
         // the source-control panel flows directly from the staged-files list
         // into the commit graph. Earlier builds rendered a full-width
@@ -68,7 +80,12 @@ impl Render for DiffView {
                         let lines = diff_body_line_count(diffs);
                         let highlightable = lines <= SYNTAX_HIGHLIGHT_BUDGET_LINES;
                         let sync_highlight = highlightable && lines <= SYNC_HIGHLIGHT_THRESHOLD;
-                        let plan = build_render_plan(diffs, *expanded, sync_highlight);
+                        let want = Highlight::On { light: self.theme.is_light() };
+                        let plan = build_render_plan(
+                            diffs,
+                            *expanded,
+                            if sync_highlight { want } else { Highlight::Off },
+                        );
                         // Stageable change regions per file — full-file context
                         // makes one giant hunk, so the renderer docks a chip bar
                         // per region (git add -p granularity) using these.
@@ -109,9 +126,10 @@ impl Render for DiffView {
                 if let Some((diffs, expanded)) = spawn_async {
                     let gen_at_spawn = self.plan_gen;
                     let executor = cx.background_executor().clone();
+                    let want = Highlight::On { light: self.theme.is_light() };
                     self._highlight_task = Some(cx.spawn(async move |this, cx| {
                         let colored = executor
-                            .spawn(async move { build_render_plan(&diffs, expanded, true) })
+                            .spawn(async move { build_render_plan(&diffs, expanded, want) })
                             .await;
                         let _ = this.update(cx, |view, cx| {
                             if view.plan_gen != gen_at_spawn {
@@ -409,8 +427,16 @@ impl Render for DiffView {
             // shown only once the current scope carries at least one note.
             // Send pipes the markdown prompt to the active agent; Copy is the
             // clipboard escape hatch; Clear drops the scope's notes.
+            //
+            // The count spans notes whose line is gone as well as the ones in
+            // the gutter, because Send, Copy and Clear each act on all of
+            // them: a label counting only the ones with a marker would
+            // understate what those buttons are about to do.
             let notes_cluster = (!self.notes.is_empty()).then(|| {
-                let n = self.notes.len();
+                let detached = self.notes.detached_len();
+                let has_detached = detached > 0;
+                let label =
+                    crate::shell::diff_view::review_notes::notes_label(self.notes.len(), detached);
                 let t_sm = self.typography.t_body_sm;
                 let r_chip = self.density.r_chip;
                 let fg_muted = self.theme.fg_muted;
@@ -435,7 +461,7 @@ impl Render for DiffView {
                         div()
                             .text_size(px(t_sm))
                             .text_color(self.theme.fg_subtle)
-                            .child(format!("Notes ({n})")),
+                            .child(label),
                     )
                     .child(action_chip("diff-notes-send", "Send").on_click(cx.listener(
                         |view, _: &gpui::ClickEvent, window, cx| {
@@ -452,6 +478,16 @@ impl Render for DiffView {
                             view.clear_notes(cx);
                         },
                     )))
+                    // Only offered when there is something to drop, and named
+                    // after the label's own wording so the two read as one
+                    // sentence: "2 lines gone" / "Clear gone".
+                    .children(has_detached.then(|| {
+                        action_chip("diff-notes-clear-gone", "Clear gone").on_click(cx.listener(
+                            |view, _: &gpui::ClickEvent, _window, cx| {
+                                view.clear_detached_notes(cx);
+                            },
+                        ))
+                    }))
             });
             // Leading rail toggle (multi-file only), pushed apart from the
             // view controls by a flex spacer so it sits at the left edge.
@@ -971,7 +1007,7 @@ fn failed_state(
                 .text_color(rctx.theme.status_info)
                 .border_1()
                 .border_color(rctx.theme.border_inactive)
-                .rounded(px(4.0))
+                .rounded(px(rctx.density.r_xs))
                 .cursor_pointer()
                 .hover(|s| s.bg(rctx.theme.hover_overlay))
                 .on_click(cx.listener(|view, _: &gpui::ClickEvent, _, cx| {

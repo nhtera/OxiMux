@@ -49,7 +49,7 @@ pub(super) fn auth_card(
         // Same wrap trap as the markdown bodies: without `min_w_0` a flex ancestor
         // honors the longest unwrapped line and overflows the column.
         .min_w_0()
-        .rounded(px(8.0))
+        .rounded(px(density.r_card))
         .border_1()
         .border_color(theme.status_info.opacity(0.4))
         .bg(theme.status_info.opacity(0.06))

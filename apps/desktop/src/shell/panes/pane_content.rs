@@ -13,6 +13,7 @@ use gpui::{App, Entity, FocusHandle, Focusable};
 use oximux_editor::EditorView;
 
 use crate::shell::agent_chat::AgentChatView;
+use crate::shell::automations_view::AutomationsView;
 use crate::shell::browser_view::BrowserView;
 use crate::shell::diff_view::DiffView;
 use crate::shell::pane_group::sub_pane::TerminalSplitTree;
@@ -39,6 +40,10 @@ pub enum PaneContent {
     /// subsequent clicks. Not persisted across restarts — the nav re-opens
     /// it from scratch after a session restore.
     Tasks(Entity<TasksView>),
+    /// Scheduled-run browser. Singleton per group, exactly like `Tasks`, and
+    /// likewise not persisted — the nav re-opens it after a session restore.
+    /// Reads the same `ScheduleStore` the ticker fires from.
+    Automations(Entity<AutomationsView>),
     /// Structured Agent Chat leaf: a Claude Code session rendered as a chat
     /// thread (bubbles / streaming / tool-call lines) over the `stream-json`
     /// transport, distinct from the raw-PTY `Agent` terminal kind. Owns its own
@@ -59,6 +64,7 @@ impl PaneContent {
             Self::Diff(view) => view.read(cx).focus_handle(cx),
             Self::Browser(view) => view.read(cx).focus_handle(cx),
             Self::Tasks(view) => view.read(cx).focus_handle(cx),
+            Self::Automations(view) => view.read(cx).focus_handle(cx),
             // Focus the composer in chat view, or the companion terminal when the
             // chat is toggled to terminal view — whichever surface is showing.
             Self::AgentChat(view) => view.read(cx).active_focus_handle(cx),
@@ -84,6 +90,9 @@ impl PaneContent {
             // handle); the pane anchor itself is never a focus target, so the
             // per-leaf bookkeeping reports `false` like the diff view.
             Self::Tasks(_) => false,
+            // No text input at all — creation lives in Settings — so the
+            // Automations pane is never a focus target either.
+            Self::Automations(_) => false,
             // The composer Input owns its own focus; the per-leaf bookkeeping
             // reports `false` like the diff/tasks views.
             Self::AgentChat(_) => false,
@@ -100,6 +109,7 @@ impl PaneContent {
             | Self::Diff(_)
             | Self::Browser(_)
             | Self::Tasks(_)
+            | Self::Automations(_)
             | Self::AgentChat(_) => None,
             Self::Editor(view) => Some(view.read(cx).file_path()),
         }
@@ -116,6 +126,7 @@ impl PaneContent {
             | Self::Diff(_)
             | Self::Browser(_)
             | Self::Tasks(_)
+            | Self::Automations(_)
             | Self::AgentChat(_) => None,
         }
     }

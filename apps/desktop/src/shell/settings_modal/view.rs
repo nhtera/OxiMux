@@ -11,7 +11,8 @@ use oximux_settings::{Density, Typography};
 
 use super::{
     CARD_HEIGHT, CARD_WIDTH, SettingsModal, SettingsPane, layout, nav, pane_about, pane_agents,
-    pane_keybindings, pane_notifications, pane_remote, pane_schedules, pane_terminal, pane_voice,
+    pane_integrations, pane_keybindings, pane_notifications, pane_remote, pane_schedules,
+    pane_terminal, pane_voice,
 };
 #[cfg(any(target_os = "macos", windows))]
 use super::pane_computer_use;
@@ -68,12 +69,16 @@ impl SettingsModal {
                     pane_remote::entries(self, theme, density, typography, cx),
                 ),
                 (
+                    SettingsPane::Integrations.label(),
+                    pane_integrations::entries(self, theme, density, typography, cx),
+                ),
+                (
                     SettingsPane::Keybindings.label(),
                     pane_keybindings::entries(self, theme, density, typography, cx),
                 ),
                 (
                     SettingsPane::Appearance.label(),
-                    pane_about::appearance_entries(theme, typography),
+                    pane_about::appearance_entries(theme, density, typography, cx),
                 ),
                 (
                     SettingsPane::About.label(),
@@ -102,10 +107,15 @@ impl SettingsModal {
             }
             SettingsPane::Schedules => pane_schedules::render(self, theme, density, typography, cx),
             SettingsPane::Remote => pane_remote::render(self, theme, density, typography, cx),
+            SettingsPane::Integrations => {
+                pane_integrations::render(self, theme, density, typography, cx)
+            }
             SettingsPane::Keybindings => {
                 pane_keybindings::render(self, theme, density, typography, cx)
             }
-            SettingsPane::Appearance => pane_about::render_appearance(&query, theme, typography),
+            SettingsPane::Appearance => {
+                pane_about::render_appearance(theme, density, typography, cx)
+            }
             SettingsPane::About => {
                 pane_about::render_about(&query, theme, density, typography, cx)
             }
@@ -115,6 +125,7 @@ impl SettingsModal {
 
 impl Render for SettingsModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         if !self.open {
             return div().into_any_element();
         }

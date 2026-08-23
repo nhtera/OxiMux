@@ -247,7 +247,7 @@ impl OnboardingWizard {
             .items_center()
             .justify_center()
             .size(px(30.0))
-            .rounded(px(7.0))
+            .rounded(px(density.r_card))
             .bg(theme.bg_overlay)
             .border_1()
             .border_color(theme.border_inactive)

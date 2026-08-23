@@ -1,0 +1,16 @@
+# radius / type literal ratchet allowlist
+#
+# Files still calling `.rounded(px(N))` or `.text_size(px(N))` with a raw
+# number instead of a `Density` / `Typography` token, recorded at their current
+# count. A file may shed literals freely but fails `xtask literal-lint` the
+# moment it gains one -- so this list can only ratchet down. Drop a row once its
+# file reaches zero (the lint prints STALE to nudge).
+#
+# Every row here is a corner or a type size that will refuse to scale when UI
+# zoom lands. The goal is an empty file.
+#
+# EMPTY -- reached 2026-08-23. Every radius and type size in the workspace now
+# resolves through a token. Keep it this way: a new row here is a regression,
+# not a checkpoint, and the lint will name the file that added one.
+#
+# Format: <repo-relative-path> <literal-count>

@@ -125,6 +125,7 @@ pub fn render_preview(
     base_dir: Option<&Path>,
     view_id: EntityId,
     is_dark: bool,
+    lang_tag_size: f32,
 ) -> AnyElement {
     let rendered = match base_dir {
         Some(dir) => absolutize_image_paths(source, dir),
@@ -140,7 +141,7 @@ pub fn render_preview(
                 .style(preview_style(is_dark))
                 // Code blocks get a language tag + one-click copy, the way a
                 // polished doc viewer surfaces fenced code.
-                .code_block_actions(|code_block, _window, cx| {
+                .code_block_actions(move |code_block, _window, cx| {
                     let code = code_block.code();
                     h_flex()
                         .gap_2()
@@ -148,7 +149,7 @@ pub fn render_preview(
                         .when_some(code_block.lang(), |this, lang| {
                             this.child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(px(lang_tag_size))
                                     .text_color(cx.theme().muted_foreground)
                                     .child(lang),
                             )

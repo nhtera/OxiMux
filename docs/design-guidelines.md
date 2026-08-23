@@ -20,8 +20,30 @@ many panes, one operator).
 
 ## Mode
 
-Dark only in v1. Light mode deferred until after Phase 8. Every token below assumes
-dark canvas.
+Two palettes, chosen in Settings → Appearance and persisted in `appearance.toml`:
+**Charcoal** (dark, the default and the one every token below is written against) and
+**Paper** (light). They fill the same `Theme` struct, so no render path branches on
+which is in force — a view reads `theme.bg_panel` and gets the right answer.
+
+Three groups of token do not survive a straight inversion, and they are where a light
+theme usually goes wrong. Read `crates/settings/src/theme.rs`'s module docs before
+touching any of them:
+
+- **Alpha overlays** (`hover_overlay`, `border_inactive`, `border_input`,
+  `edge_highlight`) are white-at-alpha on charcoal so one token composites to the same
+  perceived step over every surface tier. White over paper is invisible — they flip to
+  black, at a *lower* alpha, because a dark veil over white reads stronger than a light
+  veil over black at equal opacity.
+- **Elevation** runs opposite. On charcoal a floating card is lighter than its ground.
+  On paper the canvas is already the lightest thing on screen, so a card returns to the
+  canvas value and reads as raised through its border and shadow instead.
+- **The surface ladder** is not mirrored. Paper keeps the content canvas white — that is
+  what a page of code should be — and puts the chrome a step *below* it. So `bg_rail` is
+  lighter than `bg_panel` on charcoal and darker than it on paper; both mean "this slab
+  is distinct from the canvas beside it".
+
+`theme.is_light()` is the branch for the rare place that genuinely needs one; today that
+is the terminal's sixteen named ANSI colors, which cannot be shared across polarities.
 
 ## Palette — Monochrome Charcoal
 
@@ -80,6 +102,51 @@ Constructed on the `Theme` struct so call sites stop hand-rolling `Hsla { a: 0.2
 No brand accent in v1. The brand *is* the absence of accent. Adding one is a Phase 8
 decision, not a Phase 0 one.
 
+## Palette — Paper (light)
+
+Same tokens, same jobs — only the values move, so the "Use" column above still applies.
+Listed on its own rather than as a second column because the reasoning is shared and the
+notes are long; what differs is spelled out under **Mode**.
+
+| Token | Hex | Note |
+|---|---|---|
+| `bg_base` | `#FFFFFF` | The content canvas stays white |
+| `bg_panel` | `#F4F5F7` | Chrome sits a step *below* the canvas |
+| `bg_panel_alt` | `#E8EBEF` | |
+| `bg_overlay` | `#FFFFFF` | Back to canvas white; the border and shadow carry the elevation |
+| `bg_rail` | `#EDEFF3` | Below `bg_panel`, the mirror of charcoal's lift |
+| `fg_base` | `#1A1D21` | Near-black, not black — `#000` on `#FFF` reads as glare |
+| `fg_muted` | `#5C6570` | |
+| `fg_subtle` | `#8A929C` | |
+| `border_inactive` | black @ 10% | Polarity flip |
+| `border_active` | `#AEB6C0` | |
+| `edge_highlight` | black @ 5% | A faint dark rule; the "catching light" metaphor does not survive |
+| `hover_overlay` | black @ 5% | Lower alpha than charcoal's 6% — see **Mode** |
+| `border_input` | black @ 18% | |
+| `selection` | `#D3E3F7` | |
+| `focus_ring` | `#2F6FB5` | |
+| `match_bg_current` | `#F2C14E` | |
+| `match_bg_other` | `#F0E6C8` | A pale wash — a mid-tone fill on white reads as loud as the highlight it sits behind |
+| `match_fg` | `#1A1D21` | |
+| `status_ok` | `#2E7D32` | Every status hue darkens to carry on white |
+| `status_warn` | `#B37400` | |
+| `status_error` | `#C0392B` | |
+| `status_info` | `#1F6FB2` | |
+| `status_muted` | `#8A929C` | |
+| `status_added` | `#1E7A3C` | |
+| `status_removed` | `#C0392B` | |
+| `status_warning` | `#A97A20` | |
+| `graph_lane_colors[0..5]` | `#B37400` `#C2185B` `#7A3E00` `#00796B` `#7B3FBF` | Same colour-blind-safe five hues, darkened |
+
+Git decorations and the syntax palette move with them. The syntax set is VS Code's
+**Light+** token hues, deliberately — charcoal's is Dark+, so the pair stays the same
+well-worn relationship rather than two independently invented palettes.
+
+`crates/settings/src/theme.rs` asserts the properties this table has to keep: text lands
+at the far end of the lightness range from its ground, the alpha overlays are the right
+polarity, the ladder runs the right way, and every inherited accent actually darkened.
+A palette pasted in from the wrong polarity fails the suite rather than shipping.
+
 ## Density
 
 Tight is the default. The cockpit fits more on screen than the conventional desktop
@@ -93,19 +160,90 @@ editor by design.
 | `h_row` | 24 | Sidebar list row, file tree row (baseline) |
 | `h_action_row` | 34 | Row hosting inline action buttons (stash entry, worktree entry) |
 | `h_overlay_item` | 30 | Item row inside floating cards (context menus, pickers) |
-| `r_card` | 8 | Panels, cards |
-| `r_xs` | 4 | Buttons, inputs |
-| `r_chip` | 3 | Inline chips, badges, toggle pills — intentionally tighter than `r_xs` |
+| `r_card` | 8 | Panels, cards (`0.8×`) |
+| `r_xs` | 6 | Buttons, inputs (`0.6×`) |
+| `r_chip` | 2 | Inline chips, badges, toggle pills — intentionally tighter than `r_xs` (`0.2×`) |
+| `r_lg` | 10 | Modals, floating sheets (`1×`) |
+| `r_xl` | 14 | Largest floating surfaces (`1.4×`) |
 | `pad_panel` | 8 | Panel inner padding |
 | `pad_overlay` | 6 | Inner padding for floating cards |
 | `pad_row` | 6 | Row left/right padding |
+| `pad_tab` | 12 | Horizontal padding inside a tab chip — chunkier than a list row because the strip is the busiest hit area in the cockpit |
 | `gap_inline` | 6 | Spacing between inline siblings |
 
-**Radius scale (reference ratios).** Shipped radii predate this note; new
-surfaces that need a radius outside the table should derive it from a 10px
-base with the ratio steps sm `0.6×` (6) / md `0.8×` (8) / lg `1×` (10) /
-xl `1.4×` (14), then promote the value to a `Density` token once a second
-site appears — never inline a one-off number twice.
+**Picking a step when the shape falls between two.** Two rules settle most of
+the cases the table alone does not, both learned from converting surfaces that
+had drifted off the scale:
+
+- **A square icon button is a button, not a badge.** A 20px or 24px tap target
+  with a glyph in it takes `r_xs`, however small it is. `r_chip` is for things
+  that sit *inside* a line of text. Several such buttons had shipped at 5 —
+  off every step and a pixel from the one they wanted.
+- **A surface flush against another takes that surface’s radius,** not the one
+  its own size suggests. The slash palette, the mention overlay and the usage
+  hint all abut the composer input, so all four are `r_xl`. A corner that
+  disagrees with the surface it is joined to reads as a misalignment rather
+  than a choice; this outranks "a popup is a floating sheet, so `r_lg`".
+
+**Two user controls, and why they are two.** The table above is the `Cockpit`
+preset at 100%. Both of the knobs in Settings → Appearance resolve into it, and
+they are deliberately separate because they answer different questions:
+
+| Control | What it moves | The question it answers |
+|---|---|---|
+| Density preset (`Cockpit` / `Comfortable`) | Heights, paddings, gaps. **Not** type, radii, or rail widths | "I can read this fine, I just want more rows" — or less crowding |
+| Interface zoom (80–160%, 10% steps) | Every density token *and* every type size | "This display is too dense for my eyes" |
+
+`Comfortable` is `1.25×` each cockpit value, rounded to the nearest even pixel
+so centred content never lands on a half-pixel. It is a rule in
+`Density::comfortable`, not a second column of literals, so a token added to one
+preset cannot be forgotten in the other.
+
+**`h_top_bar` is pinned** — no preset and no zoom moves it. Its height is chosen
+so the chrome row's vertical centre lands on the macOS traffic-light glyphs, and
+those are positioned when the window is created; a preference changed afterwards
+cannot move them, so a top bar that followed it would simply stop lining up.
+
+**Dimensions that are not tokens.** Not everything with a size belongs on the
+scale. A close glyph is 14px because that is the size of the glyph; a scroll
+fade is 24px wide because that is where the gradient stops reading. Inventing
+`d_close_button` for those would grow the token set with values no second
+surface will ever share, and a token nobody reuses is a constant with extra
+steps. They stay named constants and pass through `density.scale(N)`, which
+applies the zoom but *not* the preset — a preset changes how much air sits
+between things, not how big a glyph is.
+
+That hatch is for dimensions only. A type size or a corner radius has a real
+scale to belong to, and `xtask literal-lint` counts `.text_size(px(d.scale(N)))`
+as a literal for exactly that reason: routing one through the hatch would make
+it follow the zoom while still disagreeing with every other size in the tree,
+and would slip off the ratchet on the way.
+
+**How a change reaches the screen.** Views cache their tokens, so the refresh is
+a pull: every `Render` impl that caches a `Density`/`Typography` calls
+`oximux_settings::appearance::sync` at the top of its `render`, and the setter
+calls `refresh_windows()`. A view that forgets renders at the old size forever
+with nothing failing, so `xtask appearance-lint` fails CI on any that does. The
+same lint rejects `Typography::for_appearance` outside the settings crate: it
+sizes the scale and leaves the faces at the platform default, so a surface built
+that way ignores a chosen font while everything around it obeys. The whole
+answer is `oximux_settings::appearance::typography(cx)`.
+
+**Radius scale.** Every radius derives from a 10px base with the ratio steps
+xs `0.2×` (2) / sm `0.6×` (6) / md `0.8×` (8) / lg `1×` (10) / xl `1.4×` (14).
+The table above is the whole set; `density_radius_scale` in
+`crates/settings/src/density.rs` asserts it, so a value off the scale fails the
+suite rather than shipping. A surface needing a radius not in the table takes
+the nearest step — never a one-off number, and never a second inline copy of
+one. `xtask literal-lint` enforces this at the call site: a raw
+`.rounded(px(N))` or `.text_size(px(N))` fails CI. The ratchet in
+`xtask/literal-allow.txt` that used to grandfather the stragglers is now
+**empty** — every radius and type size in the workspace resolves through a
+token, so a new row there is a regression rather than a checkpoint.
+
+This scale is deliberately the same one shadcn/ui's `new-york` theme uses,
+which is what the reference cockpit is built on — matching it is why OxiMux's
+chrome reads as the same family rather than an approximation of it.
 
 **Hover-only scrollbar (reference spec).** Scroll surfaces that grow custom
 scrollbars use: thumb at 28% white-alpha resting, 48% on hover, 36% while
@@ -123,12 +261,14 @@ Single font family. Numbers tabular everywhere for diff alignment and counters.
 | `t_label_xs` | 10 | 500 | Tiny chips (LSP, branch) |
 | `t_label_caps` | 10.5 | 600, tracking +0.5 | All-caps section labels |
 | `t_body_sm` | 11 | 400 | Status bar, gutter, tooltip, file tree body |
+| `t_body_base` | 12 | 400 | Body copy a notch above the cockpit default — Source Control file names and commit subjects |
 | `t_brand` | 12 | 600 | Brand wordmark in top bar |
 | `t_body_md` | 13 | 400 | Sidebar rows, body text |
 | `t_body_lg` | 14 | 400 | Main content, terminal default |
+| `t_display` | 21 | 600 | The one heading in the app — the onboarding welcome line. Nothing else is a landing page. |
 
 **Font stack**: per-platform, because the *primary* family has to be one the OS
-is guaranteed to ship. Defined in `oximux-settings::typography::platform_fonts`.
+is guaranteed to ship. Defined in `oximux-settings::fonts::platform`.
 
 | | macOS | Windows |
 |---|---|---|
@@ -143,6 +283,18 @@ primary is missing, GPUI drops to the platform default UI face, which is
 measured from `'m'`, narrow characters then sit left-aligned in over-wide cells
 and the grid reads as randomly spaced. Naming a font the target OS lacks is
 therefore a rendering bug, not a downgrade.
+
+**Either primary can be replaced** from Settings → Appearance, persisted as
+`ui_font` / `mono_font` in `appearance.toml`. The picker offers only families
+the machine reports, and every load re-checks the stored name against that list
+— a font uninstalled after it was picked, or a settings file carried between
+machines, falls back to the platform face with a line in the log rather than
+resolving to a sentinel nobody chose. A replaced primary demotes the family it
+displaced to the front of that side's fallback list, so a hand-picked mono face
+missing box-drawing glyphs still gets them from the one that definitely has
+them. Because the mono primary is now a free choice, the pane measures it: a
+face whose `i` and `M` advance differently is named in the row as not
+fixed-width. It is not refused — that is the user's machine and their call.
 
 ## Color Roles
 
@@ -676,7 +828,7 @@ Common drift, paired with the right fix:
 | `.text_size(px(typography.t_body_sm * 0.85))` | `.text_size(px(typography.t_sub_label))` | The arithmetic is a de-facto token without a name |
 | `.h(px(density.h_row * 1.4))` | `.h(px(density.h_action_row))` | Same: arithmetic is a token in disguise |
 | `const CARD_PADDING: f32 = 6.0;` (per-file) | `density.pad_overlay` | Eight pickers were each carrying this — one source of truth |
-| `.rounded(px(3.0))` | `.rounded(px(density.r_chip))` | The chip radius is intentional, not magic |
+| `.rounded(px(2.0))` | `.rounded(px(density.r_chip))` | The chip radius is intentional, not magic — and a literal silently stops tracking the token when the scale moves, which is exactly what stranded 21 sites at the old values when the radii were rescaled |
 | `.danger()` in a compact row | `ui::danger_ghost(...)` | Full danger weight overwhelms row hierarchy |
 | `Hsla { a: 0.22, ..theme.status_added }` | `theme.diff_added_bg()` | Alpha tints belong on `Theme`, not at call sites |
 | Two grays + a brand accent | Two grays + status hue when warranted | The brand IS the absence of accent in v1 |

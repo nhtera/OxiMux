@@ -14,7 +14,7 @@ use gpui::{
     uniform_list,
 };
 use oximux_editor::{FileTree, FileTreeEvent, FileTreeNode, TreeNodeId};
-use oximux_settings::{Theme, Typography};
+use oximux_settings::{Density, Theme, Typography};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -351,8 +351,15 @@ impl Render for FileTreeView {
         // Theme / typography are resolved per-render and threaded into
         // render_row so the closure captures stable Copy values rather
         // than re-instantiating per row.
+        // Resolved from the appearance rather than the constant: this view
+        // keeps no typography of its own to sync, so the zoom has to reach it
+        // here or the file tree stays at 100% while everything beside it moves.
+        // The palette is pulled for the same reason and must land *before*
+        // the snapshot below, or this frame paints the previous theme.
+        self.theme = oximux_settings::appearance::theme(cx);
         let theme = self.theme;
-        let typography = Typography::cockpit();
+        let typography = oximux_settings::appearance::typography(cx);
+        let density = oximux_settings::appearance::density(cx);
         // Resolve the focused-editor file path once per render. Cached
         // into the uniform_list closure so every row's match check is a
         // cheap `==` instead of an Arc call per row.
@@ -378,6 +385,7 @@ impl Render for FileTreeView {
                                 selected,
                                 active_path.as_deref(),
                                 theme,
+                                density,
                                 &typography,
                                 cx,
                             )
@@ -412,6 +420,7 @@ fn render_row(
     selected: Option<TreeNodeId>,
     active_path: Option<&std::path::Path>,
     theme: Theme,
+    density: Density,
     typography: &Typography,
     cx: &mut Context<FileTreeView>,
 ) -> impl IntoElement {
@@ -493,7 +502,7 @@ fn render_row(
         .mx(px(4.0))
         .pl(indent)
         .pr(px(6.0))
-        .rounded(px(4.0))
+        .rounded(px(density.r_xs))
         .when(is_active, |s| {
             s.bg(theme.selection).text_color(theme.fg_base)
         })

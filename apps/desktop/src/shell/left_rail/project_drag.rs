@@ -15,7 +15,6 @@ use gpui::{
     App, BoxShadow, Context, Hsla, IntoElement, ParentElement, Render, SharedString,
     StyleRefinement, Styled, Window, div, point, px,
 };
-use oximux_settings::Theme;
 
 /// Payload attached to an in-flight project-header drag. `src_index` is the
 /// header's position in the ordered project list at drag start; the drop
@@ -113,31 +112,35 @@ pub struct WorkspaceDragConfig {
 /// without mirroring the full row.
 pub struct SidebarDragPreview {
     label: SharedString,
-    theme: Theme,
 }
 
 impl SidebarDragPreview {
-    pub fn new(label: impl Into<SharedString>, theme: Theme) -> Self {
+    pub fn new(label: impl Into<SharedString>) -> Self {
         Self {
             label: label.into(),
-            theme,
         }
     }
 }
 
 impl Render for SidebarDragPreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Every token resolved per render rather than carried in. A ghost that
+        // held a palette would be one more place for a stale one to hide, and
+        // it has no state worth keeping — it exists for one drag.
+        let theme = oximux_settings::appearance::theme(cx);
+        let density = oximux_settings::appearance::density(cx);
+        let typography = oximux_settings::appearance::typography(cx);
         div()
             .flex()
             .items_center()
             .h(px(24.0))
             .px(px(10.0))
-            .rounded(px(4.0))
-            .bg(self.theme.bg_overlay)
+            .rounded(px(density.r_xs))
+            .bg(theme.bg_overlay)
             .border_1()
-            .border_color(self.theme.border_active)
-            .text_size(px(11.0))
-            .text_color(self.theme.fg_base)
+            .border_color(theme.border_active)
+            .text_size(px(typography.t_body_sm))
+            .text_color(theme.fg_base)
             .shadow_md()
             .child(self.label.clone())
     }

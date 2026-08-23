@@ -279,6 +279,7 @@ pub(super) fn card_container(theme: Theme, density: Density) -> Div {
 
 impl Render for AdapterPicker {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
         if !self.open {
             return div().into_any_element();
         }

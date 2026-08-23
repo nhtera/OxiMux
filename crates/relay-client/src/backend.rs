@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Result, anyhow, bail};
 use oximux_pty::{
     Cell, SpawnConfig, TerminalBackend, TerminalEvent, TerminalSessionId, TerminalSnapshot,
-    TerminalState,
+    TerminalState, apply_color_fg_bg, background_polarity,
 };
 use oximux_relay_proto::{Notification, Request, Response};
 use tokio::runtime::Handle;
@@ -486,13 +486,19 @@ impl TerminalBackend for RelayBackend {
     }
 
     fn spawn(&mut self, cfg: SpawnConfig) -> Result<TerminalSessionId> {
+        // The daemon spawns the child but has no idea what the window looks
+        // like — it is a detached process with no theme of its own. So the
+        // polarity has to ride the wire in the environment the app sends
+        // (see `oximux_pty::polarity`).
+        let mut env = cfg.env;
+        apply_color_fg_bg(&mut env, background_polarity());
         let resp = self.request(Request::Spawn {
             cwd: cfg.cwd.to_string_lossy().into_owned(),
             cols: cfg.cols,
             rows: cfg.rows,
             shell: Some(cfg.shell),
             args: cfg.args,
-            env: cfg.env,
+            env,
         })?;
         let (relay_pty_id, attachment_id) = match resp {
             Response::SpawnOk {
