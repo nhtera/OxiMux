@@ -519,7 +519,7 @@ pub fn render_workspace_card(
                     src_index: cfg.src_index,
                 },
                 move |_p, _offset, _window, cx| {
-                    cx.new(|_| SidebarDragPreview::new(ghost.clone(), theme))
+                    cx.new(|_| SidebarDragPreview::new(ghost.clone()))
                 },
             )
             .drag_over::<WorkspaceDragPayload>(move |style, payload, _window, _cx| {

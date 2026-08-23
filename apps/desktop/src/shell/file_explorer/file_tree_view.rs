@@ -351,10 +351,13 @@ impl Render for FileTreeView {
         // Theme / typography are resolved per-render and threaded into
         // render_row so the closure captures stable Copy values rather
         // than re-instantiating per row.
-        let theme = self.theme;
         // Resolved from the appearance rather than the constant: this view
         // keeps no typography of its own to sync, so the zoom has to reach it
         // here or the file tree stays at 100% while everything beside it moves.
+        // The palette is pulled for the same reason and must land *before*
+        // the snapshot below, or this frame paints the previous theme.
+        self.theme = oximux_settings::appearance::theme(cx);
+        let theme = self.theme;
         let typography = oximux_settings::appearance::typography(cx);
         let density = oximux_settings::appearance::density(cx);
         // Resolve the focused-editor file path once per render. Cached

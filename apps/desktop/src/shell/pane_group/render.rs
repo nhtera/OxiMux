@@ -1230,7 +1230,6 @@ fn render_tab_chip(
     let preview_label = label.clone();
     let preview_icon = SharedString::from(icon_path);
     let preview_color = color_tag;
-    let preview_theme = theme;
 
     // Optional left-edge color bar (2px) when the user has assigned a
     // color tag. Rendered as an absolutely-positioned child so it
@@ -1317,7 +1316,6 @@ fn render_tab_chip(
                     preview_label.clone(),
                     preview_icon.clone(),
                     preview_color,
-                    preview_theme,
                 )
             })
         })

@@ -597,6 +597,10 @@ impl Render for RightSidebar {
         if self.resizing && !cx.has_active_drag() {
             self.resizing = false;
         }
+        // This view holds a palette and nothing else, so `appearance::sync`
+        // does not fit — and without a pull the sidebar ground stays in the
+        // old theme while every panel inside it repaints.
+        self.theme = oximux_settings::appearance::theme(cx);
         let theme = self.theme;
 
         // NOTE: on_action handlers for sidebar keybindings are registered on

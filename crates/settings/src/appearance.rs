@@ -312,6 +312,17 @@ pub fn typography(cx: &gpui::App) -> crate::Typography {
     crate::Typography::for_appearance(active(cx)).with_fonts(crate::fonts::active(cx))
 }
 
+/// The palette in force.
+///
+/// For a view that holds a `Theme` and nothing else. [`sync`] is the usual
+/// answer, but it takes all three tokens and a view with only a palette has
+/// no density or type scale to hand it — which is exactly how such a view
+/// ends up never refreshing at all.
+#[cfg(feature = "gpui")]
+pub fn theme(cx: &gpui::App) -> crate::Theme {
+    crate::Theme::for_appearance(active(cx))
+}
+
 /// The spacing scale in force.
 ///
 /// The companion to [`typography`], for a surface that resolves its tokens per

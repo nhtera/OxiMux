@@ -1,11 +1,13 @@
 //! Keep every token-caching view pulling the current appearance.
 //!
-//! Views are handed a `Density` and a `Typography` when they are built and
-//! keep them. That is deliberate — it keeps render paths total and testable —
-//! but it means a live density or zoom change leaves every one of those
-//! snapshots stale. The refresh is therefore a pull: each `Render` impl calls
-//! `oximux_settings::appearance::sync` at the top of its `render`, and cannot
-//! then be stale for longer than a frame.
+//! Views are handed a `Theme`, a `Density` and a `Typography` when they are
+//! built and keep them. That is deliberate — it keeps render paths total and
+//! testable — but it means a live theme, density or zoom change leaves every
+//! one of those snapshots stale. The refresh is therefore a pull: each
+//! `Render` impl calls `oximux_settings::appearance::sync` at the top of its
+//! `render`, and cannot then be stale for longer than a frame. A view holding
+//! only a palette calls `appearance::theme` instead, because `sync` wants all
+//! three tokens and such a view has no other two to give it.
 //!
 //! The failure mode this exists to stop is the quiet one. A new view that
 //! caches tokens and forgets the call compiles, renders, passes its tests, and
@@ -22,7 +24,13 @@ use std::error::Error;
 
 /// The call that satisfies the lint. Matched on the module-qualified suffix so
 /// it holds whether the site writes the full path or imports the module.
-const SYNC_CALLS: &[&str] = &["appearance::sync(", "appearance::sync_typography("];
+const SYNC_CALLS: &[&str] = &[
+    "appearance::sync(",
+    "appearance::sync_typography(",
+    // A view holding only a palette cannot call `sync`, which wants all three
+    // tokens. Re-resolving the one it has is the whole pull for that view.
+    "appearance::theme(cx)",
+];
 
 /// The half-answer: it sizes the type scale and leaves the faces at the
 /// platform default, so a caller that stops there paints its surface in a
@@ -114,7 +122,14 @@ fn token_holders(text: &str, into: &mut HashMap<String, ()>) {
             continue;
         };
         let body = &text[open..close];
-        if body.contains("density: Density") || body.contains("typography: Typography") {
+        // `theme: Theme` counts. It was left out originally, and the gap was
+        // not theoretical: the right sidebar and the file tree each held one,
+        // passed this lint, and stayed in the old palette on every theme
+        // switch while the panels inside them repainted.
+        if body.contains("density: Density")
+            || body.contains("typography: Typography")
+            || body.contains("theme: Theme")
+        {
             into.insert(name, ());
         }
     }
@@ -163,6 +178,12 @@ pub fn scan(files: &[(String, String)]) -> Vec<Miss> {
     }
     let mut misses = Vec::new();
     for (path, text) in files {
+        // Test fixtures are exempt. A fixture view is constructed with fixed
+        // tokens on purpose — that is what makes its assertions repeatable —
+        // and it has no user to leave looking at a stale pane.
+        if path.replace('\\', "/").contains("/tests/") {
+            continue;
+        }
         for view in unsynced(text, &holders) {
             misses.push(Miss {
                 view,
@@ -239,6 +260,54 @@ mod tests {
 
     fn files(src: &str) -> Vec<(String, String)> {
         vec![("test.rs".to_string(), src.to_string())]
+    }
+
+    /// The gap that let two shipped views stay in the old palette: a view can
+    /// cache a `Theme` and nothing else, and the rule used to look only for a
+    /// density or a type scale.
+    #[test]
+    fn a_view_caching_only_a_palette_is_still_asked_to_pull() {
+        let src = "\r
+pub struct Sidebar { theme: Theme }
+impl Render for Sidebar {
+    fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+";
+        assert_eq!(scan(&files(src)).len(), 1);
+    }
+
+    /// `sync` wants all three tokens, so a palette-only view cannot call it.
+    /// Re-resolving the one token it has is the whole pull for that view.
+    #[test]
+    fn re_resolving_the_palette_satisfies_a_palette_only_view() {
+        let src = "\r
+pub struct Sidebar { theme: Theme }
+impl Render for Sidebar {
+    fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.theme = oximux_settings::appearance::theme(cx);
+        div()
+    }
+}
+";
+        assert!(scan(&files(src)).is_empty());
+    }
+
+    /// A fixture builds its view with fixed tokens on purpose — that is what
+    /// makes its assertions repeatable — and has no user to strand.
+    #[test]
+    fn a_test_fixture_view_is_exempt() {
+        let src = "\r
+pub struct Fixture { theme: Theme }
+impl Render for Fixture {
+    fn render(&mut self, _w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
+";
+        let f = vec![("apps/desktop/tests/smoke.rs".to_string(), src.to_string())];
+        assert!(scan(&f).is_empty());
     }
 
     #[test]
