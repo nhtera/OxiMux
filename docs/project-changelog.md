@@ -4,7 +4,49 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
-### 2026-08-14 — unreleased: the rest of the agents report what they said (`main`)
+### 2026-08-23 — v0.1.12: a transcript that scales, and a cockpit you can restyle (`main`)
+
+- **`5c15dbf` … `28bfa74`** — the chat transcript is rebuilt around
+  `gpui::list()` virtualization. A reply is one row per markdown block rather
+  than one element per message, each message remembers its block count so a
+  streaming token clones one block instead of rebuilding the reply, and frame
+  cost stopped tracking transcript length (measured, and pinned by a test).
+  The renderer is now our own: an incremental block parser crate
+  (`markdown`), a neutral-kind highlighting crate built on syntect, and a
+  chat markdown renderer OxiMux owns end to end. The tail glides into place
+  instead of being assigned, long fence lines no longer wrap (they scroll
+  sideways, with a fade on the fuller edge, and copy as code), and four
+  defects only a live window could show were found and fixed that way.
+
+- **`c0af5a4` … `a56711d`** — appearance became a system. A light palette
+  joins the dark one behind a seam any palette can be chosen through; the
+  diff body gets a light syntax theme and a reason to rebuild when the
+  palette flips; Source Control, agent chat, rendered markdown, and the
+  terminal all follow the appearance controls instead of assuming dark —
+  the terminal stops telling every CLI the window is dark. A second density,
+  a whole-UI zoom the tab strip follows, and a choice of the two typefaces
+  the cockpit is drawn in round it out. `xtask` ratchets radius and type
+  literals onto the token scales so the drift cannot silently return.
+
+- **`92632ac`**, **`fb8767c`**, **`c6e671e`** — three new surfaces. A Ports
+  panel (backed by a new `proc-ports` crate) shows what your terminals are
+  actually serving; an Integrations pane names the tool that is missing and
+  installs it there; scheduled runs are promoted to an Automations page of
+  their own. The settings nav is grouped under four headings to hold them.
+
+- **`c833ba6`**, **`b40b330`** — an open diff now tracks the working tree
+  instead of a snapshot of it, and review notes anchor to their code rather
+  than their line number, so an edit above a note no longer strands it.
+
+- Windows: the debug build stops conjuring a console and rejoins the real
+  one (`cbe4db7`), keep-awake is real on Windows and stops calling itself a
+  Mac (`99623ae`), and the webview gets a surface to draw on (`46a1d4f`,
+  `f21e00f`).
+
+- **`e14f754`** — `cmd-c` is bound in the keymap, so Copy reaches the app at
+  all. **`e746346`** — a runtime memory harness now gates CI.
+
+### 2026-08-14 — the rest of the agents report what they said (`main`)
 
 - **`7631b3f`** — status hooks for every agent CLI OxiMux names, not just two.
   Codex closed the gap for one agent; the same gap was open for the other six,
