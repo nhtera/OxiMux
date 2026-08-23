@@ -370,6 +370,7 @@ impl Render for SearchPanel {
                     let results = me.last_results().cloned();
                     let ctx = RowPaintCtx {
                         theme: me.theme,
+                        density: me.density,
                         typography: me.typography.clone(),
                     };
                     range

@@ -34,6 +34,17 @@ pub struct Typography {
     pub t_brand: f32,
     pub t_body_md: f32,
     pub t_body_lg: f32,
+    /// Display heading — the one tier above body copy.
+    ///
+    /// A cockpit has no headings: every other surface in the app is a dense
+    /// working view whose largest text is `t_body_lg`. Onboarding is the
+    /// exception, because it is the one screen that is a landing page rather
+    /// than a tool, and a welcome line set at body size reads as a form label.
+    ///
+    /// The gap to `t_body_lg` is deliberately wide. A near-miss above the body
+    /// scale would look like a mistake; this is meant to be unmistakably a
+    /// heading, and it is used in exactly one place.
+    pub t_display: f32,
 
     // Weights
     pub w_regular: FontWeight,
@@ -63,6 +74,7 @@ impl Typography {
             t_brand: 12.0,
             t_body_md: 13.0,
             t_body_lg: 14.0,
+            t_display: 21.0,
 
             w_regular: FontWeight::NORMAL,
             w_medium: FontWeight::MEDIUM,
@@ -116,6 +128,7 @@ impl Typography {
             t_brand: self.t_brand * factor,
             t_body_md: self.t_body_md * factor,
             t_body_lg: self.t_body_lg * factor,
+            t_display: self.t_display * factor,
             ..self.clone()
         }
     }

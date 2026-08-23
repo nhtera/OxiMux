@@ -109,7 +109,7 @@ pub(super) fn render_commit_row(
     // without competing visually with the subject/author meta.
     let sha = div()
         .flex_shrink_0()
-        .text_size(px(10.0))
+        .text_size(px(style.sub_label_text))
         .font_family(typography.family_mono.clone())
         .text_color(theme.fg_subtle)
         .child(c.short_oid.clone());

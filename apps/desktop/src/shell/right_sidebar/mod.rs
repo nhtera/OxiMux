@@ -266,6 +266,7 @@ impl RightSidebar {
             session_history_panel::SessionHistoryPanel::new(
                 root_path.clone(),
                 theme,
+                density,
                 typography.clone(),
                 window,
                 cx,
@@ -432,6 +433,7 @@ impl RightSidebar {
             session_history_panel::SessionHistoryPanel::new(
                 repo_root,
                 theme,
+                density,
                 typography.clone(),
                 window,
                 cx,

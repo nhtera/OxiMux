@@ -289,7 +289,7 @@ fn update_pill(theme: Theme, typography: &Typography) -> impl IntoElement {
         .h(px(20.0))
         .px(px(10.0))
         .ml(px(2.0))
-        .rounded(px(10.0))
+        .rounded_full()
         .bg(base.alpha(0.9))
         .text_size(px(typography.t_body_sm))
         .font_weight(typography.w_semibold)

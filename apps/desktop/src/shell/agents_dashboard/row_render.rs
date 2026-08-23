@@ -62,7 +62,7 @@ pub(crate) fn render_section_header(
             div()
                 .flex_shrink_0()
                 .px(px(5.))
-                .rounded(px(6.))
+                .rounded(px(density.r_xs))
                 .bg(theme.hover_overlay)
                 .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_muted)

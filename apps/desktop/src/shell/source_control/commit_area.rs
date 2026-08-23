@@ -656,7 +656,7 @@ impl CommitArea {
                 .when_some(agent_sublabel, |col, name| {
                     col.child(
                         div()
-                            .text_size(px(9.0))
+                            .text_size(px(style.micro_text))
                             .text_color(theme.fg_subtle)
                             .child(name),
                     )
@@ -795,7 +795,7 @@ impl CommitArea {
         let meta_row = prefix_row.child(
             div()
                 .ml_auto()
-                .text_size(px(9.0))
+                .text_size(px(style.micro_text))
                 .text_color(counter_color)
                 .child(format!("{subject_chars} / {SUBJECT_MAX_CHARS}")),
         );

@@ -95,7 +95,7 @@ impl OnboardingWizard {
             .items_center()
             .justify_center()
             .size(px(38.0))
-            .rounded(px(9.0))
+            .rounded(px(density.r_card))
             .bg(theme.bg_overlay)
             .border_1()
             .border_color(if selected { theme.border_active } else { theme.border_inactive })

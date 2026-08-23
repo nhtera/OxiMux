@@ -34,7 +34,7 @@ use oximux_agents::session_log::{
     session_preview::{PreviewMessage, PreviewRole, load_session_preview},
 };
 use oximux_core::AgentAdapter;
-use oximux_settings::{Theme, Typography};
+use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{OpenChatSession, ResumeAgentSession};
 use crate::shell::agent_ui::agent_presentation::{adapter_display_name, adapter_icon_path};
@@ -49,6 +49,7 @@ const PREVIEW_MAX_MESSAGES: usize = 6;
 
 pub struct SessionHistoryPanel {
     theme: Theme,
+    density: Density,
     typography: Typography,
     focus_handle: FocusHandle,
     list_scroll: ScrollHandle,
@@ -84,12 +85,14 @@ impl SessionHistoryPanel {
     pub fn new(
         project_root: PathBuf,
         theme: Theme,
+        density: Density,
         typography: Typography,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut this = Self {
             theme,
+            density,
             typography,
             focus_handle: cx.focus_handle(),
             list_scroll: ScrollHandle::new(),
@@ -283,6 +286,7 @@ impl SessionHistoryPanel {
         adapter: AgentAdapter,
         preset_id: Option<String>,
         theme: Theme,
+        density: Density,
         typo: &Typography,
     ) -> impl IntoElement {
         // The whole expanded body is one sunken container inset under the row —
@@ -296,7 +300,7 @@ impl SessionHistoryPanel {
             .mt(px(2.0))
             .mb(px(6.0))
             .p(px(8.0))
-            .rounded(px(8.0))
+            .rounded(px(density.r_card))
             .bg(theme.bg_base)
             .border_1()
             .border_color(theme.border_inactive)
@@ -324,7 +328,7 @@ impl SessionHistoryPanel {
                 .unwrap_or_else(|| adapter_display(adapter))
                 .to_uppercase();
             for m in msgs {
-                col = col.child(preview_turn(m, &assistant_label, theme, typo));
+                col = col.child(preview_turn(m, &assistant_label, theme, density, typo));
             }
         } else {
             col = col.child(
@@ -354,7 +358,7 @@ impl SessionHistoryPanel {
                     .justify_center()
                     .px(px(12.0))
                     .py(px(5.0))
-                    .rounded(px(6.0))
+                    .rounded(px(density.r_xs))
                     .cursor_pointer()
                     .text_size(px(typo.t_label_xs))
                     .font_weight(gpui::FontWeight::MEDIUM)
@@ -408,6 +412,7 @@ impl SessionHistoryPanel {
 
     fn render_scope_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = &self.theme;
+        let density = self.density;
         let typo = &self.typography;
         let seg = |label: &'static str, active: bool, all: bool| {
             div()
@@ -417,7 +422,7 @@ impl SessionHistoryPanel {
                 .items_center()
                 .justify_center()
                 .py(px(4.0))
-                .rounded(px(5.0))
+                .rounded(px(density.r_xs))
                 .cursor_pointer()
                 .text_size(px(typo.t_label_xs))
                 .text_color(if active { t.fg_base } else { t.fg_muted })
@@ -434,7 +439,7 @@ impl SessionHistoryPanel {
             .flex_row()
             .gap(px(2.0))
             .p(px(2.0))
-            .rounded(px(7.0))
+            .rounded(px(density.r_chip))
             .bg(t.bg_base)
             .child(seg("This project", !self.show_all, false))
             .child(seg("All", self.show_all, true))
@@ -442,6 +447,7 @@ impl SessionHistoryPanel {
 
     fn render_search(&self) -> impl IntoElement {
         let t = &self.theme;
+        let density = self.density;
         let typo = &self.typography;
         let caret_color = if self.caret_on { t.fg_base } else { hsla(0.0, 0.0, 0.0, 0.0) };
         div()
@@ -451,7 +457,7 @@ impl SessionHistoryPanel {
             .gap(px(6.0))
             .px(px(8.0))
             .py(px(5.0))
-            .rounded(px(6.0))
+            .rounded(px(density.r_xs))
             .bg(t.bg_base)
             .border_1()
             .border_color(t.border_inactive)
@@ -467,7 +473,7 @@ impl SessionHistoryPanel {
                     .when(!self.query.is_empty(), |d| {
                         d.child(div().text_color(t.fg_base).child(self.query.clone()))
                     })
-                    .child(div().w(px(1.5)).h(px(14.0)).rounded(px(1.0)).bg(caret_color))
+                    .child(div().w(px(1.5)).h(px(14.0)).rounded_full().bg(caret_color))
                     .when(self.query.is_empty(), |d| {
                         d.child(div().text_color(t.fg_subtle).child("Search sessions…"))
                     }),
@@ -483,8 +489,14 @@ impl Focusable for SessionHistoryPanel {
 
 impl Render for SessionHistoryPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        oximux_settings::appearance::sync_typography(&mut self.typography, cx);
+        oximux_settings::appearance::sync(
+            &mut self.theme,
+            &mut self.density,
+            &mut self.typography,
+            cx,
+        );
         let t = self.theme;
+        let density = self.density;
         let typo = self.typography.clone();
         let order = self.filtered();
         let row_count = order.len();
@@ -550,7 +562,7 @@ impl Render for SessionHistoryPanel {
                         .w_full()
                         .px(px(6.0))
                         .py(px(5.0))
-                        .rounded(px(6.0))
+                        .rounded(px(density.r_xs))
                         .when(selected || is_expanded, |d| d.bg(t.hover_overlay))
                         .hover(|s| s.bg(t.hover_overlay))
                         .child(
@@ -631,6 +643,7 @@ impl Render for SessionHistoryPanel {
                             adapter,
                             preset_id.clone(),
                             t,
+                            density,
                             &typo,
                         ));
                     }
@@ -717,6 +730,7 @@ fn preview_turn(
     m: &PreviewMessage,
     assistant_label: &str,
     theme: Theme,
+    density: Density,
     typo: &Typography,
 ) -> impl IntoElement {
     let (label, label_color) = match m.role {
@@ -729,7 +743,7 @@ fn preview_turn(
         .gap(px(3.0))
         .w_full()
         .p(px(8.0))
-        .rounded(px(6.0))
+        .rounded(px(density.r_xs))
         .bg(theme.bg_panel_alt)
         .border_1()
         .border_color(theme.border_inactive)

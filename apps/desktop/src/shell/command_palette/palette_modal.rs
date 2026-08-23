@@ -78,6 +78,7 @@ pub fn build_modal_layout(input: ModalRenderInput<'_>) -> gpui::Div {
             input.query,
             input.caret_on,
             input.theme,
+            input.density,
             input.typography,
         ))
         .child(divider(input.theme))
@@ -131,6 +132,7 @@ fn header_row(
     query: &str,
     caret_on: bool,
     theme: Theme,
+    density: Density,
     typography: &Typography,
 ) -> impl IntoElement {
     let mode_label = match mode {
@@ -151,7 +153,7 @@ fn header_row(
     } else {
         hsla(0.0, 0.0, 0.0, 0.0)
     };
-    let caret = div().w(px(1.5)).h(px(16.)).rounded(px(1.)).bg(caret_color);
+    let caret = div().w(px(1.5)).h(px(16.)).rounded_full().bg(caret_color);
 
     // Query area reads as a live input: typed text followed by the caret, or
     // the caret followed by greyed placeholder text when empty.
@@ -191,7 +193,7 @@ fn header_row(
                 .px(px(6.))
                 .py(px(2.))
                 .bg(theme.bg_panel_alt)
-                .rounded(px(6.0))
+                .rounded(px(density.r_xs))
                 .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_muted)
                 .child(mode_label),
@@ -234,6 +236,7 @@ fn result_list(input: &ModalRenderInput<'_>) -> gpui::AnyElement {
                     i,
                     input.query,
                     input.theme,
+                    input.density,
                     input.typography,
                     input.on_activate.clone(),
                 ));
@@ -253,6 +256,7 @@ fn result_list(input: &ModalRenderInput<'_>) -> gpui::AnyElement {
                     input.query,
                     actionable,
                     input.theme,
+                    input.density,
                     input.typography,
                     input.on_activate.clone(),
                 ));

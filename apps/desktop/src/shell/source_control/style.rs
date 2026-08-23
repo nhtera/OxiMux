@@ -86,9 +86,18 @@ pub struct ScmStyle {
     pub graph_meta_text: f32,
     /// Uppercase section headers ("STAGED CHANGES", "GRAPH").
     pub caps_text: f32,
-    /// The conflict-kind sub-label that hangs under a file name on unmerged
-    /// rows (e.g. "both modified"). Reads as a parenthetical to the row name.
+    /// Small fixed annotations hanging off a row: the conflict-kind sub-label
+    /// on unmerged files (e.g. "both modified") and the short OID in the graph.
+    /// Both read as parentheticals to the row they sit beside.
     pub sub_label_text: f32,
+    /// The panel's corner radius. One value: every rounded thing here is a
+    /// control or a badge, and the panel has no surface large enough to want
+    /// a second tier.
+    pub corner: f32,
+    /// The smallest text the panel uses — the scope-tab count badge, the AI
+    /// agent name under the generate button, the subject character counter.
+    /// Below `sub_label_text` because none of these is read, only glanced at.
+    pub micro_text: f32,
     /// Inline icon size for the toolbar / filter / split-button chevron. The
     /// reference uses Lucide `size-3.5`, which is 14px.
     pub icon: f32,
@@ -125,6 +134,8 @@ impl ScmStyle {
             graph_meta_text: typography.t_body_sm,
             caps_text: typography.t_label_caps,
             sub_label_text: typography.t_label_xs,
+            corner: density.r_xs,
+            micro_text: typography.t_sub_label,
             icon: density.scale(14.0),
             line_count_gap: density.scale(4.0),
             icon_cluster_gap: density.scale(2.0),

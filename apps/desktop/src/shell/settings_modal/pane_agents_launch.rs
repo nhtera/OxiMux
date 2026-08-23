@@ -386,7 +386,7 @@ fn agent_row(
                 .child(display),
         );
     if is_default {
-        name_line = name_line.child(default_badge(theme, typography));
+        name_line = name_line.child(default_badge(theme, density, typography));
     }
 
     let info = div()
@@ -479,14 +479,14 @@ fn agent_row(
 }
 
 /// A small accent pill marking the configured default agent.
-fn default_badge(theme: Theme, typography: &Typography) -> AnyElement {
+fn default_badge(theme: Theme, density: Density, typography: &Typography) -> AnyElement {
     div()
         .flex()
         .items_center()
         .flex_none()
         .px(px(6.0))
         .py(px(1.0))
-        .rounded(px(2.0))
+        .rounded(px(density.r_chip))
         .bg(Hsla { a: 0.16, ..theme.status_info })
         .text_size(px(typography.t_sub_label))
         .text_color(theme.status_info)

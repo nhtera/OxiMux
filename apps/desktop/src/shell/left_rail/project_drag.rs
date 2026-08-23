@@ -126,17 +126,21 @@ impl SidebarDragPreview {
 }
 
 impl Render for SidebarDragPreview {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Resolved per render rather than carried in: the ghost exists only
+        // for the length of one drag, so there is nothing here to go stale.
+        let density = oximux_settings::appearance::density(cx);
+        let typography = oximux_settings::appearance::typography(cx);
         div()
             .flex()
             .items_center()
             .h(px(24.0))
             .px(px(10.0))
-            .rounded(px(6.0))
+            .rounded(px(density.r_xs))
             .bg(self.theme.bg_overlay)
             .border_1()
             .border_color(self.theme.border_active)
-            .text_size(px(11.0))
+            .text_size(px(typography.t_body_sm))
             .text_color(self.theme.fg_base)
             .shadow_md()
             .child(self.label.clone())

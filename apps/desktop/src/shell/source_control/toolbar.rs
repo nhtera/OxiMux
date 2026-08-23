@@ -112,9 +112,9 @@ impl SourceControlPanel {
                         div()
                             .px(px(5.0))
                             .py(px(0.0))
-                            .rounded(px(6.0))
+                            .rounded(px(style.corner))
                             .bg(theme.bg_panel_alt)
-                            .text_size(px(9.0))
+                            .text_size(px(style.micro_text))
                             .text_color(theme.fg_subtle)
                             .child(badge_count.to_string()),
                     )

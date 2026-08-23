@@ -190,7 +190,14 @@ impl Render for PaneGroup {
         // outer flex column then positioned absolute over it via the
         // helper's own styling.
         let mru_overlay: Option<AnyElement> = self.mru_switcher().map(|state| {
-            render_mru_hud(state.snapshot.as_slice(), state.cursor, &self.tabs, theme)
+            render_mru_hud(
+                state.snapshot.as_slice(),
+                state.cursor,
+                &self.tabs,
+                theme,
+                self.density,
+                &self.typography,
+            )
         });
 
         // While a sub-pane divider is held, a topmost occluding overlay
@@ -1755,6 +1762,8 @@ fn render_mru_hud(
     cursor: usize,
     tabs: &[PaneGroupTab],
     theme: Theme,
+    density: Density,
+    typography: &Typography,
 ) -> AnyElement {
     let mut card = div()
         .flex()
@@ -1765,13 +1774,13 @@ fn render_mru_hud(
         .bg(theme.bg_overlay)
         .border_1()
         .border_color(theme.border_active)
-        .rounded(px(8.0))
+        .rounded(px(density.r_card))
         .shadow_lg();
     card = card.child(
         div()
             .px(px(8.0))
             .pb(px(6.0))
-            .text_size(px(11.0))
+            .text_size(px(typography.t_body_sm))
             .text_color(theme.fg_subtle)
             .child("Switch Tab"),
     );
@@ -1822,9 +1831,9 @@ fn render_mru_hud(
             .gap(px(8.0))
             .h(px(28.0))
             .px(px(10.0))
-            .rounded(px(6.0))
+            .rounded(px(density.r_xs))
             .bg(row_bg)
-            .text_size(px(12.0))
+            .text_size(px(typography.t_body_base))
             .text_color(row_fg)
             .child(svg().path(icon_path).size(px(12.0)).text_color(row_fg))
             .child(div().flex_1().child(label));

@@ -312,6 +312,19 @@ pub fn typography(cx: &gpui::App) -> crate::Typography {
     crate::Typography::for_appearance(active(cx)).with_fonts(crate::fonts::active(cx))
 }
 
+/// The spacing scale in force.
+///
+/// The companion to [`typography`], for a surface that resolves its tokens per
+/// render rather than caching them. Unlike the type scale this needs no second
+/// half — a density is a set of numbers and nothing outside `Appearance` can
+/// change it — so [`Density::for_appearance`](crate::Density::for_appearance)
+/// is a complete answer and stays callable anywhere. This exists so the two
+/// read alike at a call site that wants both.
+#[cfg(feature = "gpui")]
+pub fn density(cx: &gpui::App) -> crate::Density {
+    crate::Density::for_appearance(active(cx))
+}
+
 /// [`sync`] for a view that keeps a type scale but no density, and so has no
 /// stamp to compare. One size stands in for the whole scale, which is sound
 /// because the zoom moves all of them by the same factor.

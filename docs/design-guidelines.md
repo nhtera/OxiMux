@@ -236,8 +236,10 @@ The table above is the whole set; `density_radius_scale` in
 suite rather than shipping. A surface needing a radius not in the table takes
 the nearest step — never a one-off number, and never a second inline copy of
 one. `xtask literal-lint` enforces this at the call site: a raw
-`.rounded(px(N))` fails CI unless its file is on the shrinking ratchet in
-`xtask/literal-allow.txt`.
+`.rounded(px(N))` or `.text_size(px(N))` fails CI. The ratchet in
+`xtask/literal-allow.txt` that used to grandfather the stragglers is now
+**empty** — every radius and type size in the workspace resolves through a
+token, so a new row there is a regression rather than a checkpoint.
 
 This scale is deliberately the same one shadcn/ui's `new-york` theme uses,
 which is what the reference cockpit is built on — matching it is why OxiMux's
@@ -263,6 +265,7 @@ Single font family. Numbers tabular everywhere for diff alignment and counters.
 | `t_brand` | 12 | 600 | Brand wordmark in top bar |
 | `t_body_md` | 13 | 400 | Sidebar rows, body text |
 | `t_body_lg` | 14 | 400 | Main content, terminal default |
+| `t_display` | 21 | 600 | The one heading in the app — the onboarding welcome line. Nothing else is a landing page. |
 
 **Font stack**: per-platform, because the *primary* family has to be one the OS
 is guaranteed to ship. Defined in `oximux-settings::fonts::platform`.

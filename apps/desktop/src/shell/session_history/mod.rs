@@ -618,7 +618,7 @@ impl Render for SessionHistoryModal {
                         .h(px(ROW_HEIGHT))
                         .w_full()
                         .px(px(10.))
-                        .rounded(px(6.))
+                        .rounded(px(density.r_xs))
                         .cursor_pointer()
                         .when(is_selected, |d| d.bg(theme.selection))
                         .when(!is_selected, |d| d.hover(|s| s.bg(theme.hover_overlay)))
@@ -726,11 +726,13 @@ impl Render for SessionHistoryModal {
                 &self.scope_label(),
                 self.caret_on,
                 theme,
+                density,
                 &typography,
             ))
             .child(type_filter_chips(
                 self.type_filter,
                 theme,
+                density,
                 &typography,
                 entity.clone(),
             ))
@@ -826,6 +828,7 @@ fn header_row(
     scope: &str,
     caret_on: bool,
     theme: Theme,
+    density: Density,
     typography: &Typography,
 ) -> impl IntoElement {
     // Blinking text caret — fixed width whether on or off so the toggle never
@@ -836,7 +839,7 @@ fn header_row(
     } else {
         hsla(0.0, 0.0, 0.0, 0.0)
     };
-    let caret = div().w(px(1.5)).h(px(16.)).rounded(px(1.)).bg(caret_color);
+    let caret = div().w(px(1.5)).h(px(16.)).rounded_full().bg(caret_color);
 
     // Query area reads as a live input: typed text then the caret, or the caret
     // then greyed placeholder when empty.
@@ -876,7 +879,7 @@ fn header_row(
                 .px(px(6.))
                 .py(px(2.))
                 .bg(theme.bg_panel_alt)
-                .rounded(px(6.0))
+                .rounded(px(density.r_xs))
                 .text_size(px(typography.t_sub_label))
                 .text_color(theme.fg_muted)
                 .child("History"),
@@ -900,6 +903,7 @@ fn header_row(
 fn type_filter_chips(
     active: AgentTypeFilter,
     theme: Theme,
+    density: Density,
     typography: &Typography,
     entity: gpui::Entity<SessionHistoryModal>,
 ) -> impl IntoElement {
@@ -918,7 +922,7 @@ fn type_filter_chips(
                 .id(("type-chip", i))
                 .px(px(10.))
                 .py(px(3.))
-                .rounded(px(6.))
+                .rounded(px(density.r_xs))
                 .cursor_pointer()
                 .text_size(px(typography.t_sub_label))
                 .when(is_active, |d| d.bg(theme.selection).text_color(theme.fg_base))

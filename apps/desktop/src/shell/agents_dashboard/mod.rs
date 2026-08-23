@@ -177,7 +177,7 @@ fn render_dashboard_header(
                 .items_center()
                 .gap(px(4.))
                 .px(px(8.))
-                .rounded(px(6.))
+                .rounded(px(density.r_xs))
                 .border_1()
                 .border_color(theme.border_inactive)
                 .bg(theme.bg_panel)
