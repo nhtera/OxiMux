@@ -26,9 +26,13 @@ use gpui::{
     Anchor, AnyElement, ClickEvent, Context, Entity, IntoElement, ParentElement, SharedString,
     Styled, Window, div, prelude::FluentBuilder, px,
 };
-use gpui_component::button::{Button, DropdownButton};
+use gpui_component::button::Button;
 use gpui_component::input::{Input, InputState};
-use gpui_component::menu::PopupMenuItem;
+// A plain `Button` carrying its own menu, not `DropdownButton`: that widget
+// splits the label and the chevron into two buttons and hangs the menu off the
+// chevron alone, leaving the label — most of the control's width — dead to
+// clicks. `dropdown_caret(true)` keeps the chevron look on a single trigger.
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::{Icon, Sizable as _};
 use oximux_agents::schedule::{
     NewSchedule, Recurrence, RecurrenceError, Schedule, ScheduleRun, describe,
@@ -515,14 +519,11 @@ fn number_dropdown(
     entity: Entity<SettingsModal>,
     set: fn(&mut SettingsModal, u32),
 ) -> AnyElement {
-    DropdownButton::new(id)
-        .button(
-            Button::new(SharedString::from(format!("{id}-btn")))
-                .label(current_label)
-                .small()
-                .outline(),
-        )
+    Button::new(SharedString::from(id))
+        .label(current_label)
         .small()
+        .outline()
+        .dropdown_caret(true)
         .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, window, _cx| {
             for (label, value) in options.clone() {
                 let selected = value == selected_value;

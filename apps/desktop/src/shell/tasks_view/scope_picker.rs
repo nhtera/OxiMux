@@ -5,10 +5,14 @@
 //! cross-project issue/PR inbox. Kept in its own module so the toolbar builder
 //! stays focused on the chip row.
 
-use gpui::{Anchor, ClickEvent, Context, Entity, ParentElement, Window, div};
+use gpui::{Anchor, ClickEvent, Context, Entity, IntoElement, ParentElement, Window, div};
 use gpui_component::Sizable as _;
-use gpui_component::button::{Button, ButtonVariants, DropdownButton};
-use gpui_component::menu::PopupMenuItem;
+use gpui_component::button::{Button, ButtonVariants};
+// A plain `Button` carrying its own menu, not `DropdownButton`: that widget
+// splits the label and the chevron into two buttons and hangs the menu off the
+// chevron alone, leaving the label — most of the control's width — dead to
+// clicks. `dropdown_caret(true)` keeps the chevron look on a single trigger.
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use oximux_core::Project;
 
 use crate::shell::tasks_view::{TaskScope, TasksView};
@@ -19,14 +23,16 @@ pub(super) fn render_scope_picker(
     scope: &TaskScope,
     projects: &[Project],
     cx: &mut Context<TasksView>,
-) -> DropdownButton {
+) -> impl IntoElement {
     let entity = cx.entity();
     let label = scope_label(scope, projects);
     let projects_owned = projects.to_vec();
     let scope_owned = scope.clone();
-    DropdownButton::new("tasks-scope")
-        .button(Button::new("tasks-scope-btn").label(label).small().ghost())
+    Button::new("tasks-scope")
+        .label(label)
         .small()
+        .ghost()
+        .dropdown_caret(true)
         .dropdown_menu_with_anchor(Anchor::TopLeft, move |mut menu, window, _cx| {
             menu = menu.item(scope_item(
                 window,

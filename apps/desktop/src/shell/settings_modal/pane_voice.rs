@@ -10,9 +10,15 @@ use gpui::{
 };
 use gpui_component::Icon;
 use gpui_component::Sizable as _;
-use gpui_component::button::{Button, DropdownButton};
+use gpui_component::button::Button;
 use gpui_component::input::Input;
-use gpui_component::menu::PopupMenuItem;
+// `DropdownMenu` is what makes a whole `Button` open its menu. These pickers
+// deliberately do NOT use `DropdownButton`: that widget renders the label and
+// the chevron as two separate buttons and hangs the menu off the chevron
+// alone, so clicking the label — most of the control's width — does nothing.
+// A plain `Button` with `dropdown_caret(true)` keeps the same chevron look
+// while making the entire surface the trigger.
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use oximux_dictation::{
     DEFAULT_MODEL_ID, Family, ModelSpec, ModelStatus, catalog, list_input_devices,
     recommended_model_id, spec_for,
@@ -413,14 +419,11 @@ pub(super) fn entries(
 fn unload_control(modal: &SettingsModal, cx: &mut gpui::Context<SettingsModal>) -> AnyElement {
     let entity = cx.entity();
     let current = modal.dictation.model_unload_timeout;
-    DropdownButton::new("voice-unload")
-        .button(
-            Button::new("voice-unload-btn")
-                .label(current.label())
-                .small()
-                .outline(),
-        )
+    Button::new("voice-unload")
+        .label(current.label())
         .small()
+        .outline()
+        .dropdown_caret(true)
         .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, window, _cx| {
             for opt in ModelUnloadTimeout::ALL {
                 menu = menu.item(unload_item(window, &entity, *opt, *opt == current));
@@ -481,9 +484,11 @@ fn device_control(modal: &SettingsModal, cx: &mut gpui::Context<SettingsModal>) 
     let label = current
         .clone()
         .unwrap_or_else(|| "System default".to_string());
-    DropdownButton::new("voice-device")
-        .button(Button::new("voice-device-btn").label(label).small().outline())
+    Button::new("voice-device")
+        .label(label)
         .small()
+        .outline()
+        .dropdown_caret(true)
         // Enumerate devices only when the menu opens (a CoreAudio HAL call);
         // the trigger label needs only the persisted setting, not the scan.
         // Layout mirrors the ChatGPT desktop mic menu: "System default" first,
@@ -552,9 +557,11 @@ fn language_control(modal: &SettingsModal, cx: &mut gpui::Context<SettingsModal>
     let entity = cx.entity();
     let current = modal.dictation.language.clone();
     let label = language_display_name(&current).to_string();
-    DropdownButton::new("voice-lang")
-        .button(Button::new("voice-lang-btn").label(label).small().outline())
+    Button::new("voice-lang")
+        .label(label)
         .small()
+        .outline()
+        .dropdown_caret(true)
         // `TopRight` right-aligns the menu under the button; `scrollable` + a
         // capped height keep the long language list on-screen.
         .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, window, _cx| {
@@ -626,9 +633,11 @@ fn model_control(
     // `auto` keeps the multilingual default. Computed per menu build — changing
     // the language closes this menu, so it can never go stale while open.
     let recommended = recommended_model_id(&modal.dictation.language);
-    DropdownButton::new("voice-model")
-        .button(Button::new("voice-model-btn").label(label).small().outline())
+    Button::new("voice-model")
+        .label(label)
         .small()
+        .outline()
+        .dropdown_caret(true)
         // Build rows when the menu opens: `model_status` is pulled per row so the
         // Each row pulls `model_status` live inside its render closure (not a
         // snapshot here), so an open menu reflects download progress + delete in

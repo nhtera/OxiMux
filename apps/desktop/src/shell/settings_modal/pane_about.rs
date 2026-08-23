@@ -14,8 +14,12 @@ use gpui::{
 };
 use gpui_component::Icon;
 use gpui_component::Sizable as _;
-use gpui_component::button::{Button, DropdownButton};
-use gpui_component::menu::PopupMenuItem;
+use gpui_component::button::Button;
+// A plain `Button` carrying its own menu, not `DropdownButton`: that widget
+// splits the label and the chevron into two buttons and hangs the menu off the
+// chevron alone, leaving the label — most of the control's width — dead to
+// clicks. `dropdown_caret(true)` keeps the chevron look on a single trigger.
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 #[cfg(target_os = "macos")]
 use oximux_auto_update::{CheckTrigger, UpdateStatus};
 #[cfg(target_os = "macos")]
@@ -60,14 +64,11 @@ fn font_control(
     let label = chosen
         .clone()
         .unwrap_or_else(|| format!("{platform} (default)"));
-    DropdownButton::new(id)
-        .button(
-            Button::new(SharedString::from(format!("{id}-btn")))
-                .label(label)
-                .small()
-                .outline(),
-        )
+    Button::new(SharedString::from(id))
+        .label(label)
         .small()
+        .outline()
+        .dropdown_caret(true)
         // `TopRight` right-aligns the menu under the button so its rows grow
         // down-and-left rather than off the pane's right edge; `scrollable`
         // plus a capped height keeps a few hundred families on screen.
