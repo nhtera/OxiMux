@@ -66,9 +66,14 @@
 ///
 /// It treats exactly `"true"` and `"1"` as on and anything else as off, which
 /// is why [`WANTED`] is `"1"` rather than something more descriptive.
+///
+/// Exists only where it is read — the Windows write path and the tests — so a
+/// macOS `cargo check` of the bare lib does not see it as dead.
+#[cfg(any(windows, test))]
 const VAR: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
 
 /// What we set when nobody has said otherwise.
+#[cfg(any(windows, test))]
 const WANTED: &str = "1";
 
 /// Ask GPUI for the redirected present path unless the environment already
@@ -102,6 +107,7 @@ pub fn prefer_child_window_compositing() {
 /// Split out from the write so the rule can be tested without touching the
 /// process environment — an env-mutating test races every other test in the
 /// binary, and the rule is the only part with a decision in it.
+#[cfg(any(windows, test))]
 fn wants_write(existing: Option<&std::ffi::OsStr>) -> bool {
     existing.is_none()
 }
