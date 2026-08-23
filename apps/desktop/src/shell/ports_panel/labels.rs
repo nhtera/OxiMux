@@ -131,6 +131,10 @@ mod tests {
     #[test]
     fn a_heading_is_the_directory_name() {
         assert_eq!(project_label(&PathBuf::from("/work/api")), "api");
+        // `Path` splits on the platform's own separators, so a `\`-separated
+        // path is one single component everywhere but Windows — asserting it
+        // here on macOS would demand the wrong answer.
+        #[cfg(windows)]
         assert_eq!(project_label(&PathBuf::from("D:\\Projects\\OxiMux")), "OxiMux");
     }
 
