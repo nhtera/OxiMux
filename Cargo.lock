@@ -7318,15 +7318,16 @@ name = "oximux-dictation"
 version = "0.1.12"
 dependencies = [
  "anyhow",
+ "bzip2 0.6.1",
  "cpal",
  "dirs 5.0.1",
  "futures",
  "hound",
- "oximux-no-window",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "sherpa-rs",
+ "tar",
  "tracing",
  "ureq",
 ]

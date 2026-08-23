@@ -2,8 +2,9 @@
 //!
 //! Disk is the source of truth: on init we scan the model store and mark a model
 //! Ready only when all its files exist. Downloads are resumable (HTTP Range into
-//! a `.partial`), verified against SHA-256 when a hash is pinned, extracted with
-//! the system `tar`, then validated file-by-file before flipping to Ready. All
+//! a `.partial`), verified against SHA-256 when a hash is pinned, extracted
+//! in-process (bzip2 + tar; never the system `tar`, which is not a portable
+//! bzip2 reader), then validated file-by-file before flipping to Ready. All
 //! IO is blocking and meant to run on a worker thread the app owns — nothing
 //! here touches GPUI. UI reads status by pull (`status`/`readiness`) so a modal
 //! reopened mid-download shows the right percentage, and by push (`ModelEvent`).
@@ -236,7 +237,11 @@ impl ModelManager {
             tracing::warn!(model = spec.id, "no pinned sha256; skipping archive verification");
         }
 
-        // Promote partial → archive, extract, validate.
+        // Promote partial → archive, extract, validate. Drop any archive left
+        // behind by an earlier failed extract first: on Windows a rename onto an
+        // existing file fails outright if anything still holds a handle to it,
+        // which turned one stuck extract into a permanent "Failed" on retry.
+        let _ = std::fs::remove_file(&archive);
         std::fs::rename(&partial, &archive).context("finalize archive")?;
         self.set_status(spec.id, ModelStatus::Extracting);
         let dir = self.model_dir(spec.id);
@@ -354,21 +359,57 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 /// Extract a `.tar.bz2` into `dest`, stripping the leading archive dir so files
-/// land directly. Uses the system `tar` (present on macOS, handles bzip2).
+/// land directly (the `--strip-components=1` equivalent).
+///
+/// Decoded in-process. We used to shell out to `tar -xjf`, which only ever
+/// worked on macOS: Windows' bundled `tar.exe` is bsdtar built against
+/// libarchive-with-zlib-only, so `-j` falls through to spawning an external
+/// `bzip2` filter that does not exist there — and rather than failing, it
+/// **hangs forever**, pinning the model at `Extracting` ("Installing…") while
+/// holding a read handle on the archive that makes the next attempt's
+/// partial→archive rename fail with a sharing violation. GNU tar (from Git for
+/// Windows, if it wins the PATH race) is no better: it reads `C:\…` as an rmt
+/// `host:path` spec and dies with "Cannot connect to C:". So: no external
+/// binary, no PATH lottery.
+///
+/// Entry paths are sanitized rather than trusted — after the leading component
+/// is stripped, anything absolute, rooted, or containing `..` is skipped, so a
+/// hostile archive cannot write outside `dest`.
 fn extract_archive(archive: &Path, dest: &Path) -> Result<()> {
-    use oximux_no_window::NoWindow as _;
+    use std::path::Component;
+
     std::fs::create_dir_all(dest)?;
-    let status = std::process::Command::new("tar")
-        .no_window()
-        .arg("-xjf")
-        .arg(archive)
-        .arg("-C")
-        .arg(dest)
-        .arg("--strip-components=1")
-        .status()
-        .context("spawn tar")?;
-    if !status.success() {
-        bail!("tar exited with {status}");
+    let file = std::fs::File::open(archive).with_context(|| format!("open {}", archive.display()))?;
+    let decoder = bzip2::read::BzDecoder::new(std::io::BufReader::new(file));
+    let mut tar = tar::Archive::new(decoder);
+
+    for entry in tar.entries().context("read archive entries")? {
+        let mut entry = entry.context("read archive entry")?;
+        let path = entry.path().context("read entry path")?.into_owned();
+
+        // `--strip-components=1`: drop the archive's top-level directory. An
+        // entry that *is* that directory strips to nothing and is skipped.
+        let mut components = path.components();
+        components.next();
+        let stripped = components.as_path().to_path_buf();
+        if stripped.as_os_str().is_empty() {
+            continue;
+        }
+        // Only ever join plain names — no `..`, no absolute or drive-rooted path.
+        if !stripped.components().all(|c| matches!(c, Component::Normal(_))) {
+            tracing::warn!(entry = %path.display(), "skipping unsafe archive path");
+            continue;
+        }
+
+        let out = dest.join(&stripped);
+        if entry.header().entry_type().is_dir() {
+            std::fs::create_dir_all(&out).with_context(|| format!("create {}", out.display()))?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        entry.unpack(&out).with_context(|| format!("unpack {}", out.display()))?;
     }
     Ok(())
 }
@@ -461,6 +502,72 @@ mod tests {
         assert_eq!(got, sha256_file(&f).unwrap());
         assert_ne!(got, expected.to_lowercase());
         assert_eq!(got.len(), 64);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Build a `.tar.bz2` whose entries sit under a single top-level dir,
+    /// mirroring the k2-fsa release archives. Names go straight into the raw
+    /// header rather than through `append_data`, whose validation rejects the
+    /// `..` the traversal test needs to plant — the point is to prove *our*
+    /// reader drops it.
+    fn tar_bz2(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, body) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+            header.set_cksum();
+            builder.append(&header, *body).unwrap();
+        }
+        let tar_bytes = builder.into_inner().unwrap();
+        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        enc.write_all(&tar_bytes).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// The regression this guards: extraction must not depend on a system `tar`
+    /// that can read bzip2. Windows' bundled bsdtar cannot, and hung rather than
+    /// failing — so exercise the real decode path in-process.
+    #[test]
+    fn extract_decodes_bzip2_and_strips_the_leading_component() {
+        let dir = tmp();
+        let archive = dir.join("m.tar.bz2");
+        let bytes = tar_bz2(&[
+            ("sherpa-onnx-zipformer-vi/tokens.txt", b"a b c".as_slice()),
+            ("sherpa-onnx-zipformer-vi/test_wavs/0.wav", b"RIFF".as_slice()),
+        ]);
+        std::fs::write(&archive, bytes).unwrap();
+
+        let dest = dir.join("out");
+        extract_archive(&archive, &dest).unwrap();
+
+        // Top-level dir stripped: the files land directly in `dest`.
+        assert_eq!(std::fs::read(dest.join("tokens.txt")).unwrap(), b"a b c");
+        // Nested dirs survive the strip and are created on the way down.
+        assert!(dest.join("test_wavs/0.wav").is_file());
+        assert!(!dest.join("sherpa-onnx-zipformer-vi").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn extract_refuses_to_escape_the_destination() {
+        let dir = tmp();
+        let archive = dir.join("evil.tar.bz2");
+        let bytes = tar_bz2(&[
+            ("top/../../pwned.txt", b"nope".as_slice()),
+            ("top/tokens.txt", b"ok".as_slice()),
+        ]);
+        std::fs::write(&archive, bytes).unwrap();
+
+        let dest = dir.join("out");
+        extract_archive(&archive, &dest).unwrap();
+
+        // The traversal entry is dropped; the legitimate one still lands.
+        assert_eq!(std::fs::read(dest.join("tokens.txt")).unwrap(), b"ok");
+        assert!(!dir.join("pwned.txt").exists());
+        assert!(!dir.parent().unwrap().join("pwned.txt").is_file());
         std::fs::remove_dir_all(&dir).ok();
     }
 

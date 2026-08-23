@@ -291,6 +291,12 @@ sha2 = "0.10"
 minisign-verify = "0.2"
 flate2 = "1"
 tar = "0.4"
+# Speech-model archives are `.tar.bz2`. Decoded in-process rather than via the
+# system `tar`: Windows' bundled bsdtar is built without bzip2 (libarchive with
+# zlib only), so `tar -xjf` there falls back to an external `bzip2` filter that
+# does not exist and hangs forever. 0.6 uses the pure-Rust `libbz2-rs-sys`
+# backend, so this adds no C toolchain requirement.
+bzip2 = "0.6"
 blake2 = "0.10"
 
 # Phase 5 step 3 — file tree backend. `ignore` is the gitignore-aware

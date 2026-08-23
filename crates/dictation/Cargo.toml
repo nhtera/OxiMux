@@ -8,8 +8,10 @@ publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# CREATE_NO_WINDOW on the model-archive `tar` spawn.
-oximux-no-window = { workspace = true }
+# Model-archive extraction, in-process. See the workspace note on `bzip2`: the
+# system `tar` is not a portable bzip2 reader, so we never shell out for it.
+tar = { workspace = true }
+bzip2 = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
