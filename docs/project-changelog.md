@@ -4,6 +4,39 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-08-24 — v0.1.13: Windows gets an installer (`main`)
+
+- **`d7a9b5f`** — Windows ships `OxiMux-<version>-x64-setup.exe` alongside the
+  portable zip, built by Inno Setup from the same `dist/OxiMux` directory the
+  zip is made from, so the two cannot disagree about what is inside them. The
+  zip was a fine way to try the app and a poor way to keep it: no Start menu
+  entry, no Add/Remove entry, and no upgrade path other than deleting the
+  folder and extracting over it. The installer is per-user, into
+  `%LOCALAPPDATA%\Programs\OxiMux` — not modesty, but the only shape a future
+  Windows auto-updater can write to without an elevated helper service
+  existing purely to copy files. It closes the relay daemon on upgrade (it
+  outlives the app on purpose, so the directory is busy even when the app is
+  shut), and its uninstaller *asks* before deleting your settings, transcripts
+  and downloaded speech models, defaulting to keeping them. Signing is
+  unchanged, i.e. absent: a setup.exe is a packaging convenience, not a trust
+  story, and SmartScreen warns on it exactly as it warns on the zip.
+
+- **`047280c`** — every value picker had a dead label. `DropdownButton` renders
+  the label and the chevron as two separate buttons and attached the menu only
+  to the chevron, so clicking the name — roughly 85% of the control — did
+  nothing. Found on the speech-model picker, which was unresponsive everywhere
+  except a ~30px strip on its right edge. Fixed across the Voice pane, both
+  font pickers, the schedule pickers and the Tasks scope picker; the source
+  control commit split button is left alone, being a real split control.
+
+- **`6abb07c`** — downloading a speech model on Windows either hung at
+  "Installing…" forever or failed with "finalize archive". Extraction shelled
+  out to `tar -xjf`, and Windows' bundled bsdtar has no bzip2, so `-j` spawned
+  a filter that does not exist and blocked — leaving an orphaned tar holding
+  the archive open, which made every retry fail with a sharing violation. One
+  bug, two faces. Archives are now decoded in-process, with entry paths
+  sanitized so a hostile archive cannot escape the model directory.
+
 ### 2026-08-23 — v0.1.12: a transcript that scales, and a cockpit you can restyle (`main`)
 
 - **`5c15dbf` … `28bfa74`** — the chat transcript is rebuilt around
