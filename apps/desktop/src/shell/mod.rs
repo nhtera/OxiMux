@@ -14,7 +14,6 @@ pub mod command_palette;
 pub mod commit_dialog;
 pub mod compose_bar;
 pub mod diff_view;
-#[cfg(target_os = "macos")]
 pub mod driver_install;
 pub mod file_explorer;
 pub mod forge;

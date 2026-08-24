@@ -45,13 +45,11 @@ struct Release {
 #[derive(Debug, Clone)]
 pub struct DriverRelease {
     pub version: Version,
-    pub tarball: ReleaseAsset,
+    /// The platform's archive: a `.tar.gz` carrying `CuaDriver.app` on macOS, a
+    /// `.zip` of bare executables on Windows. Named for what it is to every
+    /// platform rather than for the shape one of them happens to use.
+    pub archive: ReleaseAsset,
     pub checksums: ReleaseAsset,
-}
-
-/// The macOS asset carrying `CuaDriver.app` (alongside the bare binary).
-pub fn tarball_name(version: &Version) -> String {
-    format!("cua-driver-rs-{version}-darwin-universal.tar.gz")
 }
 
 /// Newest published driver release in a raw `/releases` response.
@@ -60,11 +58,20 @@ pub fn tarball_name(version: &Version) -> String {
 /// against an *installed* driver lives in the pipeline, where the installed
 /// version is known.
 ///
+/// `asset_for` names the archive this platform installs from. It is a parameter
+/// rather than a `cfg!` read inside here so that one fixture can be parsed for
+/// *either* platform's asset on *any* host — a `cfg!` would make the macOS
+/// asset name untestable on Windows and vice versa, which is precisely the
+/// drift a cross-platform installer has to keep out.
+///
 /// Drafts are skipped; the `prerelease` flag is deliberately ignored —
 /// upstream marks **every** driver release prerelease (verified against the
 /// live feed, 2026-07-30), so filtering on it selects nothing. The version
 /// floor and signature gates carry the actual quality bar.
-pub fn parse_latest(json: &str) -> Result<DriverRelease, InstallError> {
+pub fn parse_latest(
+    json: &str,
+    asset_for: fn(&Version) -> String,
+) -> Result<DriverRelease, InstallError> {
     let releases: Vec<Release> =
         serde_json::from_str(json).map_err(|err| InstallError::Feed {
             detail: format!("release feed did not parse: {err}"),
@@ -94,7 +101,7 @@ pub fn parse_latest(json: &str) -> Result<DriverRelease, InstallError> {
     };
 
     Ok(DriverRelease {
-        tarball: find(&tarball_name(&version))?,
+        archive: find(&asset_for(&version))?,
         checksums: find(CHECKSUMS_ASSET)?,
         version,
     })
@@ -114,6 +121,7 @@ pub fn expected_sha256(checksums: &str, asset_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::install::platform::{macos_asset_name, windows_asset_name};
 
     fn asset(name: &str) -> String {
         format!(
@@ -147,27 +155,54 @@ mod tests {
                 ]
             ),
         );
-        let picked = parse_latest(&feed).expect("must find the published driver release");
+        let picked =
+            parse_latest(&feed, macos_asset_name).expect("must find the published driver release");
         assert_eq!(picked.version, Version::new(0, 14, 1));
-        assert!(picked.tarball.name.ends_with("darwin-universal.tar.gz"));
+        assert!(picked.archive.name.ends_with("darwin-universal.tar.gz"));
+    }
+
+    /// The cross-platform contract: one feed, either platform's archive, on
+    /// whichever host happens to be running the test.
+    #[test]
+    fn the_same_release_resolves_each_platforms_own_archive() {
+        let version = Version::new(0, 21, 0);
+        let feed = format!(
+            "[{}]",
+            release(
+                "cua-driver-rs-v0.21.0",
+                r#""prerelease":true,"#,
+                &[
+                    &macos_asset_name(&version),
+                    &windows_asset_name(&version),
+                    "checksums.txt",
+                ]
+            )
+        );
+
+        let mac = parse_latest(&feed, macos_asset_name).expect("macOS archive");
+        assert_eq!(mac.archive.name, macos_asset_name(&version));
+
+        let win = parse_latest(&feed, windows_asset_name).expect("Windows archive");
+        assert_eq!(win.archive.name, windows_asset_name(&version));
+        assert!(win.archive.name.ends_with("-binary.zip"));
     }
 
     #[test]
     fn a_feed_with_no_driver_release_is_a_specific_error() {
         let feed = format!("[{}]", release("fleet-v0.0.5", "", &[]));
         assert!(matches!(
-            parse_latest(&feed),
+            parse_latest(&feed, macos_asset_name),
             Err(InstallError::NoDriverRelease)
         ));
     }
 
     #[test]
-    fn a_driver_release_missing_its_tarball_names_the_asset() {
+    fn a_driver_release_missing_its_archive_names_the_asset() {
         let feed = format!(
             "[{}]",
             release("cua-driver-rs-v0.14.1", "", &["checksums.txt"])
         );
-        match parse_latest(&feed) {
+        match parse_latest(&feed, macos_asset_name) {
             Err(InstallError::MissingAsset { name, .. }) => {
                 assert_eq!(name, "cua-driver-rs-0.14.1-darwin-universal.tar.gz");
             }

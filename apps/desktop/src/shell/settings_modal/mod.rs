@@ -137,17 +137,17 @@ pub struct SettingsModal {
     /// idle — and also while merely *observing* an install another surface
     /// owns (that state lives in `driver_install_ui`, fed by the backend's
     /// pull-style status).
-    #[cfg(target_os = "macos")]
+    ///
+    /// Not platform-gated: the installer runs on every platform the desktop app
+    /// ships on. What differs is the row that renders it and the gate it waits
+    /// on — see `oximux_computer_use::install::platform`.
     pub(super) driver_install: Option<crate::shell::driver_install::InstallHandle>,
     /// What the Driver row renders for the install affordance.
-    #[cfg(target_os = "macos")]
     pub(super) driver_install_ui: crate::shell::driver_install::DriverInstallUi,
     /// Guards against stacking poll timers across repaints/reopens.
-    #[cfg(target_os = "macos")]
     pub(super) driver_poll_running: bool,
     /// Set when the install replaced an existing driver — gates the one-line
     /// "old version until the daemon respawns" note.
-    #[cfg(target_os = "macos")]
     pub(super) driver_upgraded: bool,
     /// Flat KV store the notification toggles persist into (keys in
     /// [`crate::notifier::keys`]), so prefs survive a restart.
@@ -274,18 +274,14 @@ impl SettingsModal {
             driver_status: pane_computer_use::DriverStatus::Unknown,
             #[cfg(windows)]
             driver_trust: pane_driver_trust::TrustState::Unknown,
-            #[cfg(target_os = "macos")]
             driver_install: None,
-            #[cfg(target_os = "macos")]
             driver_install_ui: crate::shell::driver_install::DriverInstallUi::Idle,
-            #[cfg(target_os = "macos")]
             driver_poll_running: false,
             integrations: Vec::new(),
             integration_install: std::collections::HashMap::new(),
             integration_handles: std::collections::HashMap::new(),
             integration_copied: None,
             integration_poll_running: false,
-            #[cfg(target_os = "macos")]
             driver_upgraded: false,
             notify,
             notify_repo,
@@ -355,19 +351,6 @@ impl SettingsModal {
             // installed or updated the driver since, and "not installed" is the
             // status most likely to be stale.
             self.driver_status = pane_computer_use::DriverStatus::resolve();
-            // A modal reopened mid-install shows live progress: attach to the
-            // backend's pull-style status (cheap, unlike a resolve per tick) and
-            // restart the poll loop. A stale failure from a previous open is
-            // cleared — the fresh resolve above is the truth now.
-            if !self.driver_install_ui.is_running() {
-                self.driver_install_ui = match oximux_computer_use::install::status() {
-                    Some(stage) => crate::shell::driver_install::DriverInstallUi::Running { stage },
-                    None => crate::shell::driver_install::DriverInstallUi::Idle,
-                };
-                // The post-upgrade note belongs to the session that upgraded;
-                // a fresh open starts from the resolved truth alone.
-                self.driver_upgraded = false;
-            }
         }
         #[cfg(windows)]
         {
@@ -376,7 +359,19 @@ impl SettingsModal {
             // the driver since the modal was last open.
             self.driver_trust = pane_driver_trust::TrustState::resolve();
         }
-        #[cfg(target_os = "macos")]
+        // A modal reopened mid-install shows live progress: attach to the
+        // backend's pull-style status (cheap, unlike a resolve per tick) and
+        // restart the poll loop. A stale failure from a previous open is
+        // cleared — the fresh resolve above is the truth now.
+        if !self.driver_install_ui.is_running() {
+            self.driver_install_ui = match oximux_computer_use::install::status() {
+                Some(stage) => crate::shell::driver_install::DriverInstallUi::Running { stage },
+                None => crate::shell::driver_install::DriverInstallUi::Idle,
+            };
+            // The post-upgrade note belongs to the session that upgraded; a
+            // fresh open starts from the resolved truth alone.
+            self.driver_upgraded = false;
+        }
         self.spawn_driver_install_poll(cx);
         // Start reporting devices that drop themselves, if the host is up. Not in
         // the constructor: the remote host binds later than the shell is built, so

@@ -52,7 +52,15 @@ windows-sys = { version = "0.61", features = [
     # `QueryFullProcessImageNameW`, for resolving a pid to its executable —
     # the Windows counterpart to macOS's `proc_pidpath`.
     "Win32_System_Threading",
+    # Driver install: `CreateFileW` with FILE_FLAG_OPEN_REPARSE_POINT, and the
+    # `FSCTL_SET_REPARSE_POINT` ioctl that creates the directory junctions the
+    # install swaps on. See `install/platform/junction.rs`.
+    "Win32_Storage_FileSystem",
+    "Win32_System_Ioctl",
+    "Win32_System_IO",
 ] }
+# Driver install: the Windows release archive is a zip.
+zip.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # `proc_pidpath`, for resolving a granted pid back to its executable. Only

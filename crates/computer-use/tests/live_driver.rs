@@ -30,6 +30,8 @@ fn installed() -> Option<std::path::PathBuf> {
     }
 }
 
+/// macOS: "every gate" means the publisher's.
+#[cfg(not(windows))]
 #[test]
 fn a_real_driver_passes_every_gate() {
     let Some(path) = installed() else { return };
@@ -53,6 +55,48 @@ fn a_real_driver_passes_every_gate() {
             );
         }
         other => panic!("verify must vouch by signature, got {other:?}"),
+    }
+    assert!(
+        driver.version >= verify::MIN_VERSION,
+        "installed {} is below the {} floor",
+        driver.version,
+        verify::MIN_VERSION
+    );
+    assert_eq!(driver.sha256.len(), 64, "sha256 must be a full hex digest");
+}
+
+/// Windows: there is no publisher to ask, so "every gate" is a different set —
+/// the trust store must refuse the driver until a person approves it, and vouch
+/// by `UserPinned` afterwards.
+///
+/// Against a throwaway store, never the user's real one: a test that pinned
+/// into the real store would hand the whole product a trust decision nobody
+/// made. This one became reachable when OxiMux learned to install the driver
+/// itself; before that the check simply never had a driver to run against.
+#[cfg(windows)]
+#[test]
+fn a_real_driver_passes_every_gate() {
+    let Some(path) = installed() else { return };
+
+    let pins = tempfile::tempdir().expect("tempdir");
+    let store = oximux_computer_use::TrustStore::at(pins.path().join("pins.json"));
+
+    match verify::verify_pinned(&path, &store) {
+        Err(Error::NotApproved { sha256, .. }) => {
+            assert_eq!(sha256.len(), 64, "sha256 must be a full hex digest");
+        }
+        other => panic!("an unapproved driver must be refused, got {other:?}"),
+    }
+
+    store.approve(&path).expect("recording an approval must succeed");
+    let driver = verify::verify_pinned(&path, &store).expect("approved driver must pass");
+
+    match &driver.basis {
+        // The Windows anchor can only ever vouch this way. A signature verdict
+        // here would mean the unsigned artifacts had somehow been checked
+        // against a publisher — i.e. that the gate was not the one it claims.
+        verify::TrustBasis::UserPinned { .. } => {}
+        other => panic!("verify_pinned must vouch by user approval, got {other:?}"),
     }
     assert!(
         driver.version >= verify::MIN_VERSION,

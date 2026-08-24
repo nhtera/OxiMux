@@ -81,6 +81,20 @@ pub fn trust_store() -> oximux_computer_use::TrustStore {
     )
 }
 
+/// What the driver installer's gate may rely on where the platform has no
+/// anchor of its own: nothing on macOS, this machine's trust store on Windows.
+///
+/// The same store [`trust_store`] hands the chat glue, and deliberately so — an
+/// install that pinned into a different store would end with a driver the pane
+/// calls approved and every chat refuses.
+#[cfg(windows)]
+pub fn install_anchor() -> oximux_computer_use::install::Anchor {
+    trust_store()
+}
+
+#[cfg(not(windows))]
+pub fn install_anchor() -> oximux_computer_use::install::Anchor {}
+
 /// Put the installed driver through every gate this platform has.
 ///
 /// The two anchors are not interchangeable and neither is the call: macOS asks

@@ -34,6 +34,14 @@
 //! Re-approval is the routine path rather than an edge case: upstream ships
 //! roughly six releases a week and the driver rewrites itself in place. The
 //! pane makes that one click. It deliberately does not make it zero.
+//!
+//! # Installing from here
+//!
+//! OxiMux can also fetch the driver itself (`oximux_computer_use::install`),
+//! and that changes nothing above. The download is checked against the
+//! checksum upstream publishes beside it, which is corruption cover and not a
+//! signature — the file still arrives unsigned, and the approval it asks for
+//! is the same decision, made about bytes that have not been placed yet.
 
 use std::path::PathBuf;
 
@@ -51,6 +59,8 @@ use super::layout::{SettingEntry, entry, section_title};
 /// approved in settings while every chat kept refusing it, and nothing in either
 /// place would look wrong.
 use crate::shell::agent_chat::computer_use::trust_store as store;
+
+use crate::shell::driver_install::{self, DriverInstallUi};
 
 /// What the trust gate reports about the installed driver.
 ///
@@ -181,7 +191,16 @@ pub(super) fn driver_entry(
 ) -> SettingEntry {
     entry(
         "Driver",
-        "Computer use runs through a separate helper you install yourself.",
+        // No longer "a helper you install yourself" — OxiMux can fetch it now,
+        // and the Install button beside this says so. What the sentence keeps is
+        // the part no button conveys: you approve it.
+        //
+        // Kept SHORTER than the string it replaced, deliberately. `entries_card`
+        // sizes one label column across every row, so a long description here
+        // squeezes the controls off the right edge of *other* rows — a two-clause
+        // version of this sentence made the master toggle disappear entirely.
+        // Found by looking at the running pane, not by reading the diff.
+        "Computer use runs through a separate helper you approve.",
         driver_control(modal, theme, density, typography, cx),
     )
 }
@@ -193,6 +212,22 @@ fn driver_control(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
+    // An install in flight owns this row. The trust verdict beside it would be
+    // about the file being replaced, which is the one thing nobody is deciding
+    // right now.
+    match &modal.driver_install_ui {
+        DriverInstallUi::Running { stage } => {
+            return install_progress(modal, stage, theme, density, typography, cx);
+        }
+        DriverInstallUi::AwaitingApproval { .. } => {
+            return staged_decision(theme, density, typography, cx);
+        }
+        DriverInstallUi::Failed { message } => {
+            return install_failure(message, theme, density, typography, cx);
+        }
+        DriverInstallUi::Idle => {}
+    }
+
     let state = &modal.driver_trust;
     let mut row = div()
         .flex()
@@ -247,9 +282,26 @@ fn driver_control(
         }
     }
 
-    // Re-check exists because the driver is installed outside OxiMux: a user who
-    // installs it while this pane is open would otherwise have to reopen the
-    // modal to be noticed.
+    // Install is offered where it is the actual fix — nothing on disk — and as
+    // an update where something already is. Never beside `Unapproved` or
+    // `Superseded`: those are decisions about a file that is already here, and
+    // burying them under a download button would answer a question the user
+    // did not ask.
+    if let Some(label) = install_label(state) {
+        row = row.child(value_chip(
+            "driver-trust-install",
+            label,
+            theme,
+            density,
+            typography,
+            |this, _w, cx| this.start_driver_install(cx),
+            cx,
+        ));
+    }
+
+    // Re-check exists because the driver may also be installed outside OxiMux:
+    // a user who installs it while this pane is open would otherwise have to
+    // reopen the modal to be noticed.
     row.child(value_chip(
         "driver-trust-recheck",
         "Re-check",
@@ -263,6 +315,137 @@ fn driver_control(
         cx,
     ))
     .into_any_element()
+}
+
+/// What the install button should say, if it should appear at all.
+fn install_label(state: &TrustState) -> Option<&'static str> {
+    match state {
+        TrustState::NotInstalled => Some("Install"),
+        TrustState::Approved { .. } => Some("Update"),
+        _ => None,
+    }
+}
+
+/// Live progress, plus Cancel when this modal is the surface that started it —
+/// an install observed from another window gets progress but no inert button.
+fn install_progress(
+    modal: &SettingsModal,
+    stage: &oximux_computer_use::install::InstallStage,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(density.gap_inline))
+        .child(
+            div()
+                .text_size(px(typography.t_body_sm))
+                .text_color(theme.fg_muted)
+                .child(driver_install::stage_label(stage)),
+        );
+    if modal.driver_install.is_some() {
+        row = row.child(value_chip(
+            "driver-install-cancel",
+            "Cancel",
+            theme,
+            density,
+            typography,
+            |this, _w, _cx| {
+                if let Some(handle) = &this.driver_install {
+                    handle.cancel();
+                }
+            },
+            cx,
+        ));
+    }
+    row.into_any_element()
+}
+
+/// The decision the parked install is waiting on. The evidence for it is on the
+/// card below, not behind this button — see the module doc.
+fn staged_decision(
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(density.gap_inline))
+        .child(
+            div()
+                .text_size(px(typography.t_body_sm))
+                .text_color(theme.fg_base)
+                .child("Downloaded — publisher unverified"),
+        )
+        .child(value_chip(
+            "driver-install-approve",
+            "Approve and install",
+            theme,
+            density,
+            typography,
+            |_this, _w, _cx| driver_install::approve(),
+            cx,
+        ))
+        .child(value_chip(
+            "driver-install-decline",
+            "Don't install",
+            theme,
+            density,
+            typography,
+            |_this, _w, _cx| driver_install::decline(),
+            cx,
+        ))
+        .into_any_element()
+}
+
+/// A failed install, with the manual route out. Nothing was placed.
+fn install_failure(
+    message: &str,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(density.gap_inline))
+        .child(
+            div()
+                .max_w(px(240.0))
+                .text_size(px(typography.t_body_sm))
+                .text_color(theme.status_warn)
+                .child(SharedString::from(message.to_string())),
+        )
+        .child(value_chip(
+            "driver-install-retry",
+            "Try again",
+            theme,
+            density,
+            typography,
+            |this, _w, cx| this.start_driver_install(cx),
+            cx,
+        ))
+        .child(value_chip(
+            "driver-install-manual",
+            "Download manually",
+            theme,
+            density,
+            typography,
+            |_this, _w, cx| {
+                crate::shell::open_url::open_url(driver_install::MANUAL_DOWNLOAD_URL, cx);
+            },
+            cx,
+        ))
+        .into_any_element()
 }
 
 /// Record the user's approval, then re-resolve so the pane shows the result of
@@ -294,6 +477,20 @@ pub(super) fn detail_card(
     density: Density,
     typography: &Typography,
 ) -> Option<AnyElement> {
+    // A parked install is asking about bytes that are not on disk yet, so the
+    // evidence is different: there is no path to name, and what stands in for
+    // it is which release these bytes came from.
+    if let DriverInstallUi::AwaitingApproval {
+        version,
+        sha256,
+        bytes,
+    } = &modal.driver_install_ui
+    {
+        return Some(staged_evidence(
+            version, sha256, *bytes, theme, density, typography,
+        ));
+    }
+
     let (path, digest, previous) = match &modal.driver_trust {
         TrustState::Unapproved { path, sha256, .. } => (path, sha256, None),
         TrustState::Approved { path, sha256, .. } => (path, sha256, None),
@@ -359,6 +556,67 @@ pub(super) fn detail_card(
             )
             .into_any_element(),
     )
+}
+
+/// What a staged, not-yet-placed download is asking the user to accept.
+///
+/// Says "unsigned" rather than letting the checksum imply otherwise: OxiMux did
+/// check the download against upstream's published hash, but that file ships
+/// from the same place as the binary, so it rules out corruption and not
+/// substitution. Presenting it as verification would be the one lie this pane
+/// exists to avoid.
+fn staged_evidence(
+    version: &oximux_computer_use::Version,
+    sha256: &str,
+    bytes: u64,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> AnyElement {
+    let rows = div()
+        .flex()
+        .flex_col()
+        .child(info_row(
+            "Release",
+            format!("cua-driver {version}"),
+            theme,
+            typography,
+        ))
+        .child(info_row(
+            "From",
+            "github.com/trycua/cua releases".to_string(),
+            theme,
+            typography,
+        ))
+        .child(info_row(
+            "Size",
+            format!("{bytes} bytes"),
+            theme,
+            typography,
+        ))
+        .child(info_row("SHA-256", sha256.to_string(), theme, typography));
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(density.gap_inline))
+        .child(section_title(
+            "What you are approving",
+            "These binaries are unsigned, so nobody vouched for them. Approving pins these \
+             exact bytes — if they ever change, OxiMux asks again.",
+            theme,
+            typography,
+        ))
+        .child(
+            div()
+                .p(px(12.0))
+                .rounded(px(density.r_chip))
+                .bg(theme.bg_panel_alt)
+                .border_1()
+                .border_color(theme.border_inactive)
+                .child(rows),
+        )
+        .into_any_element()
 }
 
 fn detail_blurb(state: &TrustState) -> &'static str {

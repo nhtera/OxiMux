@@ -18,10 +18,13 @@ use std::path::{Path, PathBuf};
 
 use oximux_macos_trust::{ditto_copy, dir_size, ensure_disk_space, exchange, TrustError};
 
-use super::pipeline::APP_NAME;
 use super::InstallError;
 use crate::discovery;
 use crate::verify::from_trust;
+
+/// The bundle this module places. Lives here rather than with the recipe
+/// because it is placement's subject: the name of the thing being swapped.
+pub(super) const APP_NAME: &str = "CuaDriver.app";
 
 /// Headroom past the app's own size — extraction slack plus "the disk was
 /// nearly full anyway is its own problem" margin. This repo has ENOSPC

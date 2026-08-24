@@ -13,10 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread::JoinHandle;
 
-use oximux_computer_use::install::{
-    self, InstallError, InstallEvent, InstallStage,
-};
-use oximux_computer_use::VerifiedDriver;
+use oximux_computer_use::install::{self, Anchor, InstallError, InstallEvent, InstallStage};
+use oximux_computer_use::{VerifiedDriver, Version};
 
 /// Where the official releases live — the "Download manually" escape hatch
 /// when the in-app path fails.
@@ -26,14 +24,33 @@ pub(crate) const MANUAL_DOWNLOAD_URL: &str = "https://github.com/trycua/cua/rele
 #[derive(Debug)]
 pub(crate) enum DriverInstallUi {
     Idle,
-    Running { stage: InstallStage },
+    Running {
+        stage: InstallStage,
+    },
+    /// The download is staged and gated as far as this platform can gate it,
+    /// and now needs a person. Only reached where there is no publisher to
+    /// check — see `oximux_computer_use::trust`. The install is parked until
+    /// [`approve`] or [`decline`], so this is *not* a terminal state.
+    AwaitingApproval {
+        version: Version,
+        sha256: String,
+        bytes: u64,
+    },
     /// The backend refused or the pipeline failed — verbatim reason.
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
 }
 
 impl DriverInstallUi {
+    /// Whether an install is still in flight. Includes the parked-on-a-person
+    /// state: the pipeline is alive, the poll timer must keep running, and a
+    /// second click must not start a second install.
     pub(crate) fn is_running(&self) -> bool {
-        matches!(self, DriverInstallUi::Running { .. })
+        matches!(
+            self,
+            DriverInstallUi::Running { .. } | DriverInstallUi::AwaitingApproval { .. }
+        )
     }
 }
 
@@ -53,9 +70,12 @@ impl InstallHandle {
 
 /// Start the install, or attach to one already running elsewhere. Returns the
 /// handle plus the state to render right away.
-pub(crate) fn begin() -> (Option<InstallHandle>, DriverInstallUi) {
+///
+/// `anchor` is whose approval the gate may rely on where the platform has none
+/// of its own — nothing on macOS, the trust store on Windows.
+pub(crate) fn begin(anchor: Anchor) -> (Option<InstallHandle>, DriverInstallUi) {
     let cancel = Arc::new(AtomicBool::new(false));
-    match install::spawn_install(cancel.clone()) {
+    match install::spawn_install(cancel.clone(), anchor) {
         Ok((receiver, join)) => (
             Some(InstallHandle {
                 receiver: Some(receiver),
@@ -108,7 +128,29 @@ pub(crate) fn pump(handle: &mut Option<InstallHandle>, ui: &mut DriverInstallUi)
     loop {
         match receiver.try_recv() {
             Ok(InstallEvent::Stage(stage)) => {
-                *ui = DriverInstallUi::Running { stage };
+                // The stage arrives alongside the request that carries the
+                // details; keep whichever state actually has something to
+                // render rather than flickering back to a bare stage line.
+                if !matches!(
+                    (&stage, &*ui),
+                    (
+                        InstallStage::AwaitingApproval,
+                        DriverInstallUi::AwaitingApproval { .. }
+                    )
+                ) {
+                    *ui = DriverInstallUi::Running { stage };
+                }
+            }
+            Ok(InstallEvent::NeedsApproval {
+                sha256,
+                version,
+                bytes,
+            }) => {
+                *ui = DriverInstallUi::AwaitingApproval {
+                    version,
+                    sha256,
+                    bytes,
+                };
             }
             // Cancel is the user's own choice — terminal, but not a failure;
             // the row reverts to the plain status line.
@@ -155,9 +197,26 @@ pub(crate) fn stage_label(stage: &InstallStage) -> String {
             received,
             total: None,
         } => format!("Downloading… {} MB", received / MB),
+        // The gate differs, so the label does. Claiming "verifying publisher"
+        // on Windows would name a check that cannot happen there.
+        #[cfg(target_os = "macos")]
         InstallStage::Verifying => "Verifying publisher + notarization…".to_string(),
+        #[cfg(not(target_os = "macos"))]
+        InstallStage::Verifying => "Checking the download…".to_string(),
+        InstallStage::AwaitingApproval => "Waiting for your approval…".to_string(),
         InstallStage::Installing => "Installing…".to_string(),
     }
+}
+
+/// The user approved the staged bytes. The parked install resumes and pins
+/// them; it does not become "verified" — see `oximux_computer_use::trust`.
+pub(crate) fn approve() {
+    install::approve();
+}
+
+/// The user declined. The install ends as cancelled and nothing is placed.
+pub(crate) fn decline() {
+    install::decline();
 }
 
 /// Shown once after a successful upgrade-over-existing: the shared daemon is

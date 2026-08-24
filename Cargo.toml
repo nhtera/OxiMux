@@ -298,6 +298,11 @@ tar = "0.4"
 # backend, so this adds no C toolchain requirement.
 bzip2 = "0.6"
 blake2 = "0.10"
+# The Windows driver archive is a `.zip`, unpacked in-process for the same
+# reason the tarballs above are: an extraction path that can be tested against
+# a hostile archive. `deflate-flate2` only — reading needs a decompressor, and
+# the default feature set drags in five compressors plus AES this never uses.
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 
 # Phase 5 step 3 — file tree backend. `ignore` is the gitignore-aware
 # walker ripgrep uses; `WalkBuilder::max_depth(Some(1))` gives lazy

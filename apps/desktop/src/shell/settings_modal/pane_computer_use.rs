@@ -15,7 +15,6 @@ use oximux_settings::{Density, Theme, Typography};
 use super::SettingsModal;
 use super::controls::{toggle_switch, value_chip};
 use super::layout::{SettingEntry, entries_card, entry, section_title};
-#[cfg(target_os = "macos")]
 use crate::shell::driver_install::{self, DriverInstallUi};
 
 /// What `prepare()` reported about the installed driver, resolved when the
@@ -107,6 +106,16 @@ pub(super) fn render(
             entries(modal, theme, density, typography, cx),
         ));
 
+    // A pending approval is a decision, so its evidence goes *here* — directly
+    // under the row holding the buttons — rather than at the foot of the page
+    // with the standing disclosure. Driving the real pane is what showed why:
+    // below two unrelated sections, the digest fell past the modal's bottom
+    // edge, so the one thing the user is meant to compare was off screen while
+    // the Approve button sat in full view.
+    if let Some(pending) = pending_approval_detail(modal, theme, density, typography) {
+        body = body.child(pending);
+    }
+
     body = body
         .child(section_title(
             "Projects",
@@ -149,11 +158,41 @@ pub(super) fn render(
         .into_any_element()
 }
 
-/// The evidence card under the Driver row: path, size, digest.
+/// The same card, when an install is parked on an approval — rendered high, as
+/// part of the decision rather than as a footnote to it.
+#[cfg(windows)]
+fn pending_approval_detail(
+    modal: &SettingsModal,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> Option<AnyElement> {
+    matches!(
+        modal.driver_install_ui,
+        DriverInstallUi::AwaitingApproval { .. }
+    )
+    .then(|| super::pane_driver_trust::detail_card(modal, theme, density, typography))
+    .flatten()
+}
+
+#[cfg(target_os = "macos")]
+fn pending_approval_detail(
+    _modal: &SettingsModal,
+    _theme: Theme,
+    _density: Density,
+    _typography: &Typography,
+) -> Option<AnyElement> {
+    // macOS never parks on a person: the publisher answers.
+    None
+}
+
+/// The standing evidence card at the foot of the pane: what is approved right
+/// now, so "what did I approve?" stays answerable long after the fact.
 ///
 /// Windows only, because it is the disclosure behind an approval decision macOS
 /// never has to make — there the publisher answers it and there is nothing for
-/// the user to compare.
+/// the user to compare. Suppressed while an approval is pending, since
+/// [`pending_approval_detail`] is already showing that card higher up.
 #[cfg(windows)]
 fn driver_detail(
     modal: &SettingsModal,
@@ -161,6 +200,12 @@ fn driver_detail(
     density: Density,
     typography: &Typography,
 ) -> Option<AnyElement> {
+    if matches!(
+        modal.driver_install_ui,
+        DriverInstallUi::AwaitingApproval { .. }
+    ) {
+        return None;
+    }
     super::pane_driver_trust::detail_card(modal, theme, density, typography)
 }
 
@@ -197,7 +242,15 @@ const FOOTNOTES: &[&str] = &[
     "Enabling this grants OxiMux macOS Accessibility, which is how agents drive apps.",
     "Every agent's shell inherits that grant — in all projects, not only those listed.",
     "Esc needs Input Monitoring as well — a separate switch, granted separately.",
+    TELEMETRY_NOTE,
 ];
+
+/// Disclosed because the install acts on the user's behalf: upstream turns
+/// product telemetry on by default, and OxiMux turns it back off rather than
+/// enrolling anyone silently. Shared by both platforms — the driver behaves the
+/// same way on each.
+const TELEMETRY_NOTE: &str =
+    "Installing from here also turns off the driver's own telemetry, which upstream enables.";
 
 /// The Windows set. Deliberately not a translation of the list above: none of
 /// those permissions exist here, and the two things a Windows user has to know
@@ -209,6 +262,7 @@ const FOOTNOTES: &[&str] = &[
     "The driver is unsigned — you approved the exact file, not its publisher.",
     "Every agent's shell can reach the screen, in all projects, not only those listed.",
     "Esc stops an agent, but Windows cannot confirm the key is being seen.",
+    TELEMETRY_NOTE,
 ];
 
 fn footnotes(theme: Theme, typography: &Typography) -> AnyElement {
@@ -285,17 +339,13 @@ fn driver_entry(
 }
 
 /// Post-upgrade only: the shared daemon is deliberately left running, so the
-/// user should know old behavior may persist until it respawns. Tied to the
-/// in-app installer, which is macOS-only.
-#[cfg(target_os = "macos")]
+/// user should know old behavior may persist until it respawns.
+///
+/// True on both platforms and for the same reason — placement swaps rather than
+/// overwrites, so a live process keeps the binary it started with.
 fn upgrade_note(modal: &SettingsModal) -> Option<SettingEntry> {
-    (modal.driver_upgraded && matches!(modal.driver_status, DriverStatus::Ready { .. }))
+    (modal.driver_upgraded && modal.driver_present())
         .then(|| entry("Driver updated", driver_install::UPGRADE_NOTE, div()))
-}
-
-#[cfg(windows)]
-fn upgrade_note(_modal: &SettingsModal) -> Option<SettingEntry> {
-    None
 }
 
 /// The driver row's right-hand control.
@@ -422,20 +472,22 @@ fn driver_control(
     .into_any_element()
 }
 
-#[cfg(target_os = "macos")]
 impl SettingsModal {
     /// Kick off (or attach to) the driver install and start polling it.
+    ///
+    /// Shared by both platforms' Driver rows. Only two things differ, and both
+    /// are one call away: whose approval the gate may consult
+    /// ([`install_anchor`](crate::shell::agent_chat::computer_use::install_anchor)),
+    /// and which status this pane re-resolves when the install ends.
     pub(super) fn start_driver_install(&mut self, cx: &mut gpui::Context<Self>) {
         if self.driver_install_ui.is_running() {
             return;
         }
         // Remember whether this is an upgrade before the status flips, so the
         // stale-daemon note can be shown exactly when it applies.
-        self.driver_upgraded = matches!(
-            self.driver_status,
-            DriverStatus::Ready { .. } | DriverStatus::Outdated { .. }
-        );
-        let (handle, ui) = driver_install::begin();
+        self.driver_upgraded = self.driver_present();
+        let (handle, ui) =
+            driver_install::begin(crate::shell::agent_chat::computer_use::install_anchor());
         self.driver_install = handle;
         self.driver_install_ui = ui;
         self.spawn_driver_install_poll(cx);
@@ -443,8 +495,8 @@ impl SettingsModal {
     }
 
     /// Poll loop: pump backend events into UI state every tick until the
-    /// install reaches a terminal state, then re-resolve the driver status
-    /// (the pipeline's word is never trusted over a fresh `codesign` check).
+    /// install reaches a terminal state, then re-resolve the driver status (the
+    /// pipeline's word is never trusted over a fresh check of what is on disk).
     pub(super) fn spawn_driver_install_poll(&mut self, cx: &mut gpui::Context<Self>) {
         if self.driver_poll_running || !self.driver_install_ui.is_running() {
             return;
@@ -460,11 +512,11 @@ impl SettingsModal {
                         driver_install::pump(&mut this.driver_install, &mut this.driver_install_ui);
                     if done {
                         this.driver_poll_running = false;
-                        this.driver_status = DriverStatus::resolve();
+                        this.refresh_driver_state();
                         // The note only matters when the upgrade actually
                         // landed — a failure means the old driver still runs
                         // and still matches what is on disk.
-                        if !matches!(this.driver_status, DriverStatus::Ready { .. }) {
+                        if !this.driver_present() {
                             this.driver_upgraded = false;
                         }
                     }
@@ -477,6 +529,38 @@ impl SettingsModal {
             }
         })
         .detach();
+    }
+
+    /// Re-read what is actually installed. Each platform asks its own question
+    /// — a publisher check on macOS, a trust verdict on Windows — and each
+    /// keeps its answer in its own field.
+    #[cfg(target_os = "macos")]
+    fn refresh_driver_state(&mut self) {
+        self.driver_status = DriverStatus::resolve();
+    }
+
+    #[cfg(windows)]
+    fn refresh_driver_state(&mut self) {
+        self.driver_trust = super::pane_driver_trust::TrustState::resolve();
+    }
+
+    /// Is there a driver on disk at all? The question the upgrade note needs,
+    /// and the one both platforms can answer despite gating differently.
+    #[cfg(target_os = "macos")]
+    fn driver_present(&self) -> bool {
+        matches!(
+            self.driver_status,
+            DriverStatus::Ready { .. } | DriverStatus::Outdated { .. }
+        )
+    }
+
+    #[cfg(windows)]
+    fn driver_present(&self) -> bool {
+        use super::pane_driver_trust::TrustState;
+        !matches!(
+            self.driver_trust,
+            TrustState::Unknown | TrustState::NotInstalled
+        )
     }
 }
 

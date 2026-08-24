@@ -1,10 +1,15 @@
 //! Locating the `cua-driver` executable.
 //!
-//! OxiMux does not ship or download the driver — the user installs it, which
-//! puts a notarized `CuaDriver.app` in `/Applications` and a symlink on `PATH`.
-//! Preferring the bundle over the symlink matters for verification: the grants
-//! and the signature belong to the bundle, and reporting the real path keeps
-//! diagnostics honest about what was actually checked.
+//! OxiMux does not *ship* the driver. It can install one (see
+//! [`crate::install`]), and the user may install their own; either way the
+//! result is the same layout, because the installer writes where upstream's
+//! does. On macOS that is a notarized `CuaDriver.app` plus a symlink on `PATH`;
+//! on Windows a junction at `%LOCALAPPDATA%\Programs\Cua\cua-driver\bin`.
+//!
+//! Preferring the known location over `PATH` matters for verification: on macOS
+//! the grants and the signature belong to the bundle rather than to the symlink
+//! pointing at it, and on both platforms reporting the real, resolved path
+//! keeps diagnostics honest about which bytes were actually checked.
 
 use std::path::{Path, PathBuf};
 
@@ -29,11 +34,11 @@ fn exe_name() -> String {
 
 /// Find the driver, or explain what was searched.
 ///
-/// Order is deliberate: an explicit override wins, then the two standard
-/// install locations, then `PATH`. `PATH` is last because the installer puts a
-/// *symlink* there pointing back into the bundle — reaching it first would
-/// work, but every later step would be reasoning about the link rather than
-/// the signed binary.
+/// Order is deliberate: an explicit override wins, then the platform's install
+/// location, then `PATH`. `PATH` is last because what sits there is a link back
+/// into the install — a symlink on macOS, a junction on Windows. Reaching it
+/// first would work, but every later step would be reasoning about the link
+/// rather than about the bytes that run.
 pub fn locate() -> Result<PathBuf, Error> {
     let mut searched = Vec::new();
 
@@ -51,11 +56,20 @@ pub fn locate() -> Result<PathBuf, Error> {
         };
     }
 
-    // The app-bundle roots are a macOS install layout. Windows has no OxiMux-run
-    // installer to create a known location — under the user-anchored trust model
-    // the user installs the driver by whatever route they trust — so there is no
-    // standard path to guess at, and guessing wrong would report a confident
-    // "looked here" that was never where anything installs.
+    // The known install location, checked before `PATH` for the same reason the
+    // bundle is: it is where OxiMux's own installer places, so it is the path
+    // whose contents this crate can reason about.
+    #[cfg(windows)]
+    if let Some(bin) = windows_bin_dir() {
+        let candidate = bin.join(exe_name());
+        if is_executable(&candidate) {
+            return Ok(resolve(&candidate));
+        }
+        searched.push(candidate.display().to_string());
+    }
+
+    // The app-bundle roots are a macOS install layout; Windows has its own,
+    // checked just above.
     #[cfg(not(windows))]
     for base in install_roots() {
         let candidate = base.join(BUNDLE_SUFFIX);
@@ -78,12 +92,35 @@ pub fn locate() -> Result<PathBuf, Error> {
     Err(Error::NotFound { searched })
 }
 
+/// The visible bin directory on Windows — a junction pointing at whichever
+/// release is active (`%LOCALAPPDATA%\Programs\Cua\cua-driver\bin`).
+///
+/// Shared with the installer for the same reason the macOS bundle roots are:
+/// one function means discovery and installation cannot drift apart. (No
+/// intra-doc link to `install_roots` — it is `cfg(not(windows))`, so on the
+/// only platform that compiles this the link would not resolve.) Upstream's
+/// `CUA_DRIVER_RS_INSTALL_DIR` is honored so a user who moved their install has
+/// one install rather than two.
+///
+/// `resolve()` canonicalizes what it finds here, so callers see the real
+/// release directory — `\\?\`-prefixed, and pointing past the junction at the
+/// bytes that will actually run.
+#[cfg(windows)]
+pub(crate) fn windows_bin_dir() -> Option<PathBuf> {
+    if let Some(raw) = std::env::var_os("CUA_DRIVER_RS_INSTALL_DIR") {
+        return Some(PathBuf::from(raw));
+    }
+    std::env::var_os("LOCALAPPDATA")
+        .map(|local| PathBuf::from(local).join(r"Programs\Cua\cua-driver\bin"))
+}
+
 /// Directories an installed `CuaDriver.app` can live in. Shared with the
 /// in-app installer (`install`), which writes to the first writable root —
 /// one list, so discovery and installation can never drift apart.
 ///
-/// Still compiled on Windows because `install::place` references it, even though
-/// the installer is inert there.
+/// macOS only: these are bundle roots, and the Windows installer places through
+/// [`windows_bin_dir`] instead.
+#[cfg(not(windows))]
 pub(crate) fn install_roots() -> Vec<PathBuf> {
     let mut roots = vec![PathBuf::from("/Applications")];
     if let Some(home) = std::env::var_os("HOME") {
@@ -215,9 +252,23 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn install_roots_lead_with_the_system_applications_dir() {
         assert_eq!(install_roots()[0], PathBuf::from("/Applications"));
+    }
+
+    /// The Windows counterpart: the installer and discovery must name one
+    /// directory, and it must be the one upstream's installer uses too.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_bin_dir_is_upstreams_own() {
+        let bin = windows_bin_dir().expect("%LOCALAPPDATA% is always set on Windows");
+        assert!(
+            bin.ends_with(r"Programs\Cua\cua-driver\bin"),
+            "{}",
+            bin.display()
+        );
     }
 
     /// The `PATH` sweep and the executable test have to agree on the name, and
