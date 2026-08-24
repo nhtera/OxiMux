@@ -25,6 +25,11 @@ impl OnboardingWizard {
             DriverInstallUi::Running { stage } => div()
                 .text_color(theme.fg_muted)
                 .child(driver_install::stage_label(stage)),
+            // Windows only in practice — macOS gates on the signature and
+            // never parks here. Same wording as the settings pane's card.
+            DriverInstallUi::AwaitingApproval { version, .. } => div()
+                .text_color(theme.fg_muted)
+                .child(format!("Driver {version} downloaded — publisher unverified")),
             DriverInstallUi::Failed { message } => {
                 div().text_color(theme.status_warn).child(message.clone())
             }
@@ -67,6 +72,23 @@ impl OnboardingWizard {
                 );
             }
             DriverInstallUi::Running { .. } => {}
+            // The parked install needs the person's verdict; the poll loop is
+            // still alive (`is_running`), so a decision resumes it in place.
+            DriverInstallUi::AwaitingApproval { .. } => {
+                controls = controls
+                    .child(
+                        Button::new("onboarding-driver-approve")
+                            .primary()
+                            .label("Approve and install")
+                            .on_click(|_, _, _| driver_install::approve()),
+                    )
+                    .child(
+                        Button::new("onboarding-driver-decline")
+                            .ghost()
+                            .label("Don't install")
+                            .on_click(|_, _, _| driver_install::decline()),
+                    );
+            }
             _ => {
                 if let Some(label) = self.driver_status.install_label() {
                     controls = controls.child(
@@ -135,7 +157,8 @@ impl OnboardingWizard {
             self.driver_status,
             DriverStatus::Ready { .. } | DriverStatus::Outdated { .. }
         );
-        let (handle, ui) = driver_install::begin();
+        let (handle, ui) =
+            driver_install::begin(crate::shell::agent_chat::computer_use::install_anchor());
         self.driver_install = handle;
         self.driver_install_ui = ui;
         self.spawn_driver_install_poll(cx);

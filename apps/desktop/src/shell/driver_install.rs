@@ -33,7 +33,11 @@ pub(crate) enum DriverInstallUi {
     /// [`approve`] or [`decline`], so this is *not* a terminal state.
     AwaitingApproval {
         version: Version,
+        // Read only by the Windows-only evidence card (`pane_driver_trust`);
+        // macOS never reaches this state at all.
+        #[cfg_attr(not(windows), allow(dead_code))]
         sha256: String,
+        #[cfg_attr(not(windows), allow(dead_code))]
         bytes: u64,
     },
     /// The backend refused or the pipeline failed — verbatim reason.

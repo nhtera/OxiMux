@@ -78,6 +78,7 @@ pub(super) struct Staged {
     /// the gate replaces it with the version the binary reports, and on Windows
     /// nothing may replace it before placement, because reading a version means
     /// executing a binary nobody has approved yet.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(super) claimed: Version,
 }
 
@@ -87,6 +88,8 @@ pub(super) enum Gate {
     Passed(VerifiedDriver),
     /// The platform cannot answer. These bytes need a person — see
     /// [`crate::trust`] for what that approval does and does not establish.
+    /// Only the Windows gate constructs it; macOS answers on its own.
+    #[cfg_attr(not(windows), allow(dead_code))]
     NeedsApproval {
         sha256: String,
         version: Version,
