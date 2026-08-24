@@ -267,8 +267,8 @@ pub type RunningInstall = (
 /// parked on an approval.
 ///
 /// `anchor` is what the gate will rely on where the platform has no answer of
-/// its own — see [`Anchor`]. On macOS it is `()`; on Windows the caller must
-/// name a trust store, exactly as [`crate::prepare`] requires.
+/// its own — see [`Anchor`]. On macOS it carries nothing; on Windows the caller
+/// must name a trust store, exactly as [`crate::prepare`] requires.
 pub fn spawn_install(
     cancel: Arc<AtomicBool>,
     anchor: Anchor,
@@ -324,7 +324,9 @@ mod tests {
     }
 
     #[cfg(not(windows))]
-    fn test_anchor() -> Anchor {}
+    fn test_anchor() -> Anchor {
+        Anchor
+    }
 
     #[test]
     fn second_concurrent_install_is_refused_without_side_effects() {

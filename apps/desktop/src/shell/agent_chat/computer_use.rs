@@ -93,7 +93,9 @@ pub fn install_anchor() -> oximux_computer_use::install::Anchor {
 }
 
 #[cfg(not(windows))]
-pub fn install_anchor() -> oximux_computer_use::install::Anchor {}
+pub fn install_anchor() -> oximux_computer_use::install::Anchor {
+    oximux_computer_use::install::Anchor
+}
 
 /// Put the installed driver through every gate this platform has.
 ///

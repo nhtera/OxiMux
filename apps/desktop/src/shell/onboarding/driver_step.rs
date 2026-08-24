@@ -25,8 +25,13 @@ impl OnboardingWizard {
             DriverInstallUi::Running { stage } => div()
                 .text_color(theme.fg_muted)
                 .child(driver_install::stage_label(stage)),
-            // Windows only in practice — macOS gates on the signature and
-            // never parks here. Same wording as the settings pane's card.
+            // Not reachable today, and worth saying so plainly: this whole
+            // step is `cfg(target_os = "macos")` (see `onboarding/mod.rs`,
+            // which also pins `driver_step_planned = false` everywhere else),
+            // and macOS gates on the signature rather than parking on a person.
+            // The arm is kept because it is what the wizard needs the day it
+            // covers Windows, and because dropping it would leave
+            // `driver_install::approve`/`decline` with no macOS caller at all.
             DriverInstallUi::AwaitingApproval { version, .. } => div()
                 .text_color(theme.fg_muted)
                 .child(format!("Driver {version} downloaded — publisher unverified")),
@@ -74,6 +79,7 @@ impl OnboardingWizard {
             DriverInstallUi::Running { .. } => {}
             // The parked install needs the person's verdict; the poll loop is
             // still alive (`is_running`), so a decision resumes it in place.
+            // Same caveat as the status arm above: no build reaches this yet.
             DriverInstallUi::AwaitingApproval { .. } => {
                 controls = controls
                     .child(

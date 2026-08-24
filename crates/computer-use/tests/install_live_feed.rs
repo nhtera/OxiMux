@@ -73,7 +73,9 @@ fn anchor(pins: &tempfile::TempDir) -> oximux_computer_use::install::Anchor {
 }
 
 #[cfg(not(windows))]
-fn anchor(_pins: &tempfile::TempDir) -> oximux_computer_use::install::Anchor {}
+fn anchor(_pins: &tempfile::TempDir) -> oximux_computer_use::install::Anchor {
+    oximux_computer_use::install::Anchor
+}
 
 /// The gate that actually ran, asserted per platform.
 #[cfg(windows)]

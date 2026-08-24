@@ -63,8 +63,18 @@ compile_error!(
 /// installer that invented its own answer would be inventing the trust model.
 #[cfg(windows)]
 pub type Anchor = crate::trust::TrustStore;
+
+/// A name for "there is nothing to supply", rather than `()`.
+///
+/// It *was* `()`, and that made every `begin(install_anchor())` a unit
+/// argument — which `clippy::unit_arg` refuses, and rightly: handing over
+/// nothing should not be written the same way as handing over something. A unit
+/// struct says exactly as much to the type system while still reading as a
+/// value, so both platforms' call sites stay identical instead of each needing
+/// an `allow`.
 #[cfg(not(windows))]
-pub type Anchor = ();
+#[derive(Debug, Clone, Copy)]
+pub struct Anchor;
 
 /// An extracted, not-yet-placed driver.
 #[derive(Debug)]
