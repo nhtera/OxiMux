@@ -12,7 +12,7 @@ missing. `scripts/bundle-windows.ps1` is where the noticing lives.
 ```powershell
 ./scripts/bundle-windows.ps1                                  # dist/OxiMux (release)
 ./scripts/bundle-windows.ps1 -Profile debug -SkipBuild        # inner loop
-./scripts/bundle-windows.ps1 -Target x86_64-pc-windows-msvc -Zip
+./scripts/bundle-windows.ps1 -Target x86_64-pc-windows-msvc -Zip -Installer
 ```
 
 ## What is in the directory, and what happens without it
@@ -93,17 +93,67 @@ The release consequence is unchanged and worth stating plainly: **a release
 build has no stdout anywhere**. Anything that has to survive a packaged run
 must reach a file, not `eprintln!`.
 
+## The installer
+
+`-Installer` compiles `packaging/windows/oximux.iss` with
+[Inno Setup](https://jrsoftware.org/isinfo.php) into
+`dist/OxiMux-<version>-x64-setup.exe`. A release carries both it and the zip,
+because they answer different questions — "let me try this" versus "put it in my
+Start menu and let me uninstall it later" — from one payload directory, so they
+cannot disagree about what shipped.
+
+```powershell
+winget install JRSoftware.InnoSetup     # 6.3+; preinstalled on windows-latest
+```
+
+The `.iss` does not know the file list. `bundle-windows.ps1` owns it, asserts it,
+and hands over `dist/OxiMux` wholesale; a second copy of the manifest here is a
+second copy that can silently disagree about `oximux-screen-gate.exe`.
+
+Three choices in it are worth the words:
+
+**Per-user, into `%LOCALAPPDATA%\Programs\OxiMux`** (`PrivilegesRequired=lowest`,
+with no override offered). Not modesty — `crates/auto-update` has no Windows
+pipeline yet, and when it grows one it has to replace `oximux.exe` and its
+siblings in place. A directory it can write unelevated is the only shape that
+works without shipping an elevated helper service purely to copy files. Machine
+scope would buy a UAC prompt on every upgrade and nothing else, because every
+writable path is under `%LOCALAPPDATA%` already (`apps/desktop/src/app_paths.rs`).
+
+**`CloseApplications=yes`.** The relay daemon outlives the app on purpose, so an
+upgrade that only looked for `oximux.exe` would still find the directory busy:
+Windows refuses to replace a mapped image, and left alone that surfaces as
+"cannot write `onnxruntime.dll`" — a file nobody touched. This is the same
+failure `bundle-windows.ps1` guards with its `Get-Process` check, in the one
+place a user meets it.
+
+**The uninstaller asks before deleting `%LOCALAPPDATA%\dev.nhtera.oximux`**, and
+defaults to keeping it. That directory is `oximux.db` — every transcript of every
+project — plus session snapshots and any downloaded speech models, which are
+hundreds of megabytes nobody wants to fetch twice. An uninstall is also how a
+reinstall starts.
+
+Never change `AppId`. It is the identity Windows matches an upgrade against; a
+new one turns every future release into a second parallel installation with its
+own Add/Remove entry.
+
 ## Signing
 
 There is none. Windows code signing requires a certificate issued by a CA — it
-cannot be self-issued the way an ad-hoc macOS signature can — so the release
-artifact is an unsigned zip and SmartScreen will warn on first run.
+cannot be self-issued the way an ad-hoc macOS signature can — so both release
+artifacts are unsigned and SmartScreen will warn on first run.
+
+**The installer does not change this.** A `setup.exe` is a packaging
+convenience, not a trust story: SmartScreen warns on it exactly as it warns on
+an `oximux.exe` extracted from the zip.
 
 That is deliberate rather than unfinished. A self-signed binary would *look*
 signed while still triggering the same warning, which is worse than being
 plainly unsigned. Adding real signing later means running `signtool sign /fd
 sha256 /tr <timestamp-url>` over each `.exe`, innermost first, before the zip is
-made.
+made — and over the payload *before* `iscc` reads it as well as over the
+`setup.exe` after, since signing the wrapper alone leaves every installed binary
+unsigned.
 
 Note the asymmetry with the driver-trust story in
 `docs/windows-port-exclusions.md`: OxiMux asks users to pin an unsigned
@@ -113,11 +163,19 @@ platform fact, and neither is a reason to overstate the other.
 ## CI
 
 `release.yml` has a `release-windows` job that builds, packages, and attaches
-`OxiMux-<version>-windows-x64.zip` to the draft release. It does not depend on
-the macOS job: notarization can stall for an hour, and there is no reason a
-Windows artifact should wait behind that. Both jobs may therefore try to create
-the draft release, so whichever loses that race falls through to uploading into
-the one that already exists.
+both `OxiMux-<version>-windows-x64.zip` and `OxiMux-<version>-x64-setup.exe` to
+the draft release. It does not depend on the macOS job: notarization can stall
+for an hour, and there is no reason a Windows artifact should wait behind that.
+Both jobs may therefore try to create the draft release, so whichever loses that
+race falls through to uploading into the one that already exists. The upload step
+requires *both* files — a release that quietly carries only the zip is exactly
+the failure a user following a "download the installer" link would hit.
+
+`ci.yml`'s `windows-check` job parse-checks `install-cli.ps1` and
+`bundle-windows.ps1`, and *compiles* `oximux.iss` against a stand-in payload.
+Inno Setup has no syntax-only mode, and the `[Code]` section is Pascal that
+nothing else here would look at; without this step a typo in either file first
+surfaces after a tag, at the end of an hour-long build.
 
 `ci.yml` runs `xtask icon --check` on the macOS job — the icon goes stale on the
 machine that edits the `.icns`, which is not the Windows runner.

@@ -1,5 +1,5 @@
 # Build and publish the release artifacts: a signed, notarized macOS DMG and an
-# unsigned Windows x64 zip.
+# unsigned Windows x64 zip plus setup.exe.
 #
 # Trigger: pushing a version tag (v0.1.3), or manually via workflow_dispatch —
 # the manual path exists because Apple's notary service occasionally stalls
@@ -166,7 +166,7 @@ jobs:
             security delete-keychain "$KEYCHAIN"
           fi
 
-  # Windows x64 zip.
+  # Windows x64 zip + installer.
   #
   # Deliberately NOT `needs: release-macos`. The macOS job can sit for an hour
   # waiting on Apple's notary service — the workflow header says as much — and
@@ -175,12 +175,18 @@ jobs:
   # tolerates losing that race, so whichever finishes first creates it and the
   # other uploads into it.
   #
-  # There is no signing step and no installer. Windows code signing needs a
-  # certificate from a CA, which cannot be self-issued, so the artifact is an
-  # unsigned zip and SmartScreen will say so on first run. That is honest about
-  # what it is; a self-signed binary would look signed and warn anyway.
+  # Two artifacts from one build, because they answer different questions:
+  # the zip is "let me try this without installing anything", the setup.exe is
+  # "put it in my Start menu and let me uninstall it later". Same payload
+  # directory feeds both, so they cannot disagree about what shipped.
+  #
+  # There is still no signing step. Windows code signing needs a certificate
+  # from a CA, which cannot be self-issued, so both artifacts are unsigned and
+  # SmartScreen will say so on first run - the installer included; a setup.exe
+  # is a packaging convenience, not a trust story. That is honest about what it
+  # is; a self-signed binary would look signed and warn anyway.
   release-windows:
-    name: Windows x64 zip
+    name: Windows x64 zip + installer
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -251,14 +257,20 @@ jobs:
           }
 
       # The bundle script builds, lays out dist/OxiMux, asserts the icon
-      # resource made it into the executable, and zips. Its assertions are the
-      # point: a Windows build that silently omits oximux-screen-gate.exe runs
-      # every agent chat unenforced and otherwise looks normal.
+      # resource made it into the executable, zips, and compiles
+      # packaging/windows/oximux.iss. Its assertions are the point: a Windows
+      # build that silently omits oximux-screen-gate.exe runs every agent chat
+      # unenforced and otherwise looks normal.
+      #
+      # No step installs Inno Setup: the windows-latest image ships it (6.7.1 at
+      # the time of writing, and the .iss needs 6.3+). If a future image drops
+      # it, the bundle script's ISCC lookup fails with the winget command to fix
+      # it rather than with a missing-file error.
       - name: Build and package
         shell: pwsh
-        run: ./scripts/bundle-windows.ps1 -Target x86_64-pc-windows-msvc -Zip
+        run: ./scripts/bundle-windows.ps1 -Target x86_64-pc-windows-msvc -Zip -Installer
 
-      - name: Upload zip to the release
+      - name: Upload zip and installer to the release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -271,6 +283,11 @@ jobs:
           }
           $zip = Get-ChildItem dist/OxiMux-*-windows-*.zip | Select-Object -First 1
           if (-not $zip) { throw 'no zip in dist/ - did bundle-windows.ps1 run?' }
+          # Both are required, not best-effort. A release that quietly carries
+          # only one of them is the failure this check exists to prevent: users
+          # who followed a "download the installer" link find a zip instead.
+          $setup = Get-ChildItem dist/OxiMux-*-x64-setup.exe | Select-Object -First 1
+          if (-not $setup) { throw 'no setup.exe in dist/ - did -Installer run?' }
 
           # `gh release view` failing means "not created yet". Creating it may
           # still lose to the macOS job doing the same thing a second earlier,
@@ -281,9 +298,9 @@ jobs:
             gh release create $tag --draft --generate-notes --title $tag
             if ($LASTEXITCODE -ne 0) { Write-Host 'release already created by another job' }
           }
-          gh release upload $tag $zip.FullName --clobber
+          gh release upload $tag $zip.FullName $setup.FullName --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed with exit code $LASTEXITCODE" }
-          Write-Host "uploaded $($zip.Name) to $tag"
+          Write-Host "uploaded $($zip.Name) and $($setup.Name) to $tag"
 
   # ---------------------------------------------------------------------------
   # The `oximux` CLI, for every platform it runs on.

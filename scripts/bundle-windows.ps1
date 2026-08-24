@@ -9,7 +9,9 @@
     whole design. Everything OxiMux resolves at runtime, it resolves as a
     *sibling of the running exe*, so getting the layout right is the entire job.
 
-    Output: dist/OxiMux/ (add -Zip for dist/OxiMux-<version>-windows-<arch>.zip)
+    Output: dist/OxiMux/
+      -Zip        also dist/OxiMux-<version>-windows-<arch>.zip
+      -Installer  also dist/OxiMux-<version>-x64-setup.exe
 
     What ships, and what breaks without it:
 
@@ -36,7 +38,11 @@
     CA; it cannot be self-issued the way an ad-hoc macOS signature can, so an
     unsigned build is the honest default rather than a placeholder. A signed
     release would add `signtool sign /fd sha256 /tr <timestamp-url> ...` over
-    every .exe below, nested-first, before zipping.
+    every .exe below, nested-first, before zipping. An installer produced by
+    -Installer is not exempt: SmartScreen warns on the setup.exe exactly as it
+    warns on an exe extracted from the zip, so the installer is a convenience,
+    not a trust story. Signing would cover the setup.exe too, and must run over
+    the payload *before* iscc reads it as well as over the setup.exe after.
 
     NOTE: this file is deliberately pure ASCII. Windows PowerShell 5.1 reads a
     .ps1 with no byte-order mark as ANSI, so a UTF-8 em dash in a comment turns
@@ -53,6 +59,12 @@
 .PARAMETER Zip
     Also produce dist/OxiMux-<version>-windows-<arch>.zip.
 
+.PARAMETER Installer
+    Also compile packaging/windows/oximux.iss into
+    dist/OxiMux-<version>-x64-setup.exe. Needs Inno Setup 6.3 or newer on the
+    machine (`winget install JRSoftware.InnoSetup`); it is preinstalled on
+    GitHub's windows-latest runners.
+
 .PARAMETER SkipBuild
     Assemble from whatever is already in target/. For the inner loop; never for
     a release.
@@ -62,7 +74,7 @@
 .EXAMPLE
     ./scripts/bundle-windows.ps1 -Profile debug -SkipBuild
 .EXAMPLE
-    ./scripts/bundle-windows.ps1 -Target x86_64-pc-windows-msvc -Zip
+    ./scripts/bundle-windows.ps1 -Target x86_64-pc-windows-msvc -Zip -Installer
 #>
 [CmdletBinding()]
 param(
@@ -70,6 +82,7 @@ param(
     [string]$Profile = 'release',
     [string]$Target,
     [switch]$Zip,
+    [switch]$Installer,
     [switch]$SkipBuild
 )
 
@@ -210,6 +223,81 @@ treats a missing one as optional and says so only in the build log.
         # runs from there - which is worse than failing, because it looks fine.
         Compress-Archive -Path $AppDir -DestinationPath $zipPath
         Write-Host "==> $zipPath ready"
+    }
+
+    if ($Installer) {
+        # The .iss declares ArchitecturesAllowed=x64compatible and names its
+        # output -x64-setup, so an arm64 payload would ship under a filename
+        # that lies about it and then refuse to install natively. Refuse here
+        # instead, where the message can say why.
+        if ($arch -ne 'x64') {
+            throw @"
+-Installer only supports an x64 payload (this host reports $arch).
+packaging/windows/oximux.iss is x64-only, and release.yml builds
+x86_64-pc-windows-msvc only. Cross-bundle with -Target x86_64-pc-windows-msvc,
+or teach the .iss an arm64 variant first.
+"@
+        }
+
+        # Inno Setup's compiler. On GitHub's windows-latest it is preinstalled
+        # and on PATH; a developer install does not touch PATH at all, so look
+        # in the three places it lands rather than telling most callers their
+        # install is broken.
+        #
+        # %LOCALAPPDATA%\Programs is first and is not a fallback: `winget
+        # install JRSoftware.InnoSetup` runs the installer unelevated, and Inno
+        # Setup's own installer then defaults to a per-user install there. The
+        # Program Files entries only cover someone who ran the .exe as admin.
+        #
+        # String concatenation, not Join-Path: ProgramFiles(x86) is absent on a
+        # 32-bit host and Join-Path throws on a null base, which would report a
+        # missing environment variable as a bug in this script.
+        $candidates = @("$env:LOCALAPPDATA\Programs", ${env:ProgramFiles(x86)}, $env:ProgramFiles) |
+            Where-Object { $_ } |
+            ForEach-Object { "$_\Inno Setup 6\ISCC.exe" }
+        # Two statements, not `(Get-Command ...).Source`: under Set-StrictMode
+        # -Version Latest, dereferencing a property on the $null a missed
+        # lookup returns is a terminating error, so the one-liner turns "Inno
+        # Setup is not installed" into "The property 'Source' cannot be found
+        # on this object". CI never sees it - iscc is on PATH there - so it
+        # would only ever fail on a developer machine.
+        $onPath = Get-Command 'iscc.exe' -ErrorAction SilentlyContinue
+        $iscc = if ($onPath) { $onPath.Source }
+                else { $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1 }
+        if (-not $iscc) {
+            throw @"
+ISCC.exe (the Inno Setup compiler) was not found.
+Install it with:  winget install JRSoftware.InnoSetup
+Version 6.3 or newer is required - the .iss uses ArchitecturesAllowed=x64compatible,
+which older compilers reject as an unknown value.
+Looked on PATH and in: $($candidates -join ', ')
+"@
+        }
+
+        $iss = Join-Path $RepoRoot 'packaging/windows/oximux.iss'
+        $setupPath = Join-Path $RepoRoot "dist/OxiMux-$version-x64-setup.exe"
+        if (Test-Path $setupPath) { Remove-Item -Force $setupPath }
+
+        # Backslashes throughout: $AppDir carries a forward slash from the
+        # Join-Path literal above, and while Windows tolerates the mix, an .iss
+        # that echoes the path into an error message should not.
+        $payload = $AppDir.Replace('/', '\')
+        $outDir = (Join-Path $RepoRoot 'dist').Replace('/', '\')
+
+        # /Q keeps the compile quiet on success and still prints errors. The
+        # payload is $AppDir - the directory this script just assembled and
+        # asserted - so the .iss never has to know the file list.
+        & $iscc /Q "/DAppVersion=$version" "/DSourceDir=$payload" `
+                "/DOutputDir=$outDir" $iss
+        if ($LASTEXITCODE -ne 0) { throw "iscc failed with exit code $LASTEXITCODE" }
+        # iscc reports success even when OutputBaseFilename resolved to
+        # something other than what we expect, and the release job globs for
+        # this exact name, so check rather than trust.
+        if (-not (Test-Path $setupPath)) {
+            throw "iscc reported success but $setupPath is not there - did OutputBaseFilename change?"
+        }
+        $setupMb = [math]::Round(((Get-Item $setupPath).Length / 1MB), 1)
+        Write-Host "==> $setupPath ready ($setupMb MB, unsigned)"
     }
 
     $size = [math]::Round(((Get-ChildItem $AppDir -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1)

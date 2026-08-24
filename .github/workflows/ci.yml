@@ -456,24 +456,62 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The Windows bootstrap installer is PowerShell, so this is the only job
-      # that can tell whether it even parses — and it is the one script no
-      # developer on macOS or Linux can run before shipping it. A parse error
-      # here would first surface to a user running the published one-liner.
+      # Both are PowerShell, so this is the only job that can tell whether they
+      # even parse — and they are the scripts no developer on macOS or Linux can
+      # run before shipping them. A parse error in install-cli.ps1 would first
+      # surface to a user running the published one-liner.
       #
-      # Parse-only: the script downloads a release and writes to PATH, so
-      # executing it is not something CI should do.
-      - name: Parse-check the Windows installer
+      # Parse-only: the scripts download a release, write to PATH, and drive
+      # cargo, so executing them is not something CI should do.
+      #
+      # bundle-windows.ps1 is here for the same reason as install-cli.ps1, one
+      # step further removed: it runs *only* in release.yml, so a typo in it
+      # would first surface after a tag, at the end of a build that takes the
+      # better part of an hour.
+      - name: Parse-check the Windows PowerShell scripts
         shell: pwsh
         run: |
-          $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path scripts/install-cli.ps1), [ref]$null, [ref]$errors) | Out-Null
-          if ($errors -and $errors.Count -gt 0) {
-            $errors | ForEach-Object { Write-Host "$($_.Extent.StartLineNumber): $($_.Message)" }
-            throw "scripts/install-cli.ps1 has $($errors.Count) parse error(s)"
+          $bad = 0
+          foreach ($script in 'scripts/install-cli.ps1', 'scripts/bundle-windows.ps1') {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script), [ref]$null, [ref]$errors) | Out-Null
+            if ($errors -and $errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Host "${script}:$($_.Extent.StartLineNumber): $($_.Message)" }
+              $bad += $errors.Count
+            } else {
+              Write-Host "$script parses"
+            }
           }
-          Write-Host 'scripts/install-cli.ps1 parses'
+          if ($bad -gt 0) { throw "$bad parse error(s) across the Windows scripts" }
+
+      # The installer script is compiled, not parsed, because Inno Setup has no
+      # syntax-only mode - and the [Code] section in particular is Pascal that
+      # nothing else here would ever look at. Same reasoning as the step above:
+      # it is otherwise only exercised by a tagged release.
+      #
+      # The payload is a stand-in, so this proves the .iss compiles and nothing
+      # about what ships. dist/ is what release.yml compiles for real.
+      - name: Compile-check the Inno Setup installer script
+        shell: pwsh
+        run: |
+          # Deliberately narrower than the lookup in bundle-windows.ps1, which
+          # also checks %LOCALAPPDATA%\Programs for a winget-installed copy.
+          # Here a miss should fail loudly: it means the runner image changed,
+          # and release.yml would break next.
+          $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) {
+            throw "ISCC.exe not found - the windows-latest image no longer ships Inno Setup?"
+          }
+          $payload = Join-Path $env:RUNNER_TEMP 'iss-payload'
+          $out = Join-Path $env:RUNNER_TEMP 'iss-out'
+          New-Item -ItemType Directory -Force -Path $payload, $out | Out-Null
+          Set-Content -Path (Join-Path $payload 'oximux.exe') -Value 'not an exe'
+          & $iscc /Q "/DAppVersion=0.0.0" "/DSourceDir=$payload" "/DOutputDir=$out" `
+                  packaging/windows/oximux.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed with exit code $LASTEXITCODE" }
+          Write-Host 'packaging/windows/oximux.iss compiles'
 
       - name: Install Rust toolchain
         run: |
