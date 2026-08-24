@@ -13,7 +13,7 @@
 //!
 //! Live-reload: a file watcher (in the app crate) reparses on change and
 //! swaps the global, so an edit takes effect on the next launch without a
-//! restart. Keys are agent slugs (`claude-code`, `codex`, `aider`) matching
+//! restart. Keys are agent slugs (`claude-code`, `codex`, `pi`) matching
 //! [`oximux_core::AgentAdapter`]'s adapter id.
 
 use std::collections::BTreeMap;
@@ -199,7 +199,8 @@ pub fn import_resume_command(preset_id: &str, handle: &str) -> Option<(String, V
 pub const DEFAULT_AGENT_ARGS: &[(&str, &str)] = &[
     ("claude-code", "--dangerously-skip-permissions"),
     ("codex", "--dangerously-bypass-approvals-and-sandbox"),
-    ("aider", "--yes-always"),
+    // Pi ships no entry: its CLI has no approval gate to skip, so a launch
+    // is already full-autonomy with zero flags.
 ];
 
 /// All per-agent launch settings plus the picker's default agent.
@@ -916,7 +917,7 @@ disabled = true
             s.args_for("codex"),
             vec!["--dangerously-bypass-approvals-and-sandbox"]
         );
-        assert_eq!(s.args_for("aider"), vec!["--yes-always"]);
+        assert!(s.args_for("pi").is_empty(), "pi has no approval gate, so no seeded flag");
         assert!(s.yolo_defaults_migrated);
         // Idempotent: a second run is a no-op.
         assert!(!s.seed_yolo_defaults());
@@ -934,7 +935,10 @@ disabled = true
             "existing (empty) entry must be preserved, not re-seeded"
         );
         // Untouched agents still get their default.
-        assert_eq!(s.args_for("aider"), vec!["--yes-always"]);
+        assert_eq!(
+            s.args_for("codex"),
+            vec!["--dangerously-bypass-approvals-and-sandbox"]
+        );
     }
 
     #[test]

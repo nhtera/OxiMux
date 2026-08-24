@@ -334,7 +334,8 @@ impl AgentRuntime for CliRuntime {
             // way the agent ends up as the PTY leaf (so cancel's process-group
             // SIGTERM and exit→EOF status both reach it), and the daemon owns
             // the PTY so it survives an app restart and re-attaches on launch.
-            // A stdin prompt seed (aider) is written after spawn in both cases.
+            // A stdin prompt seed, when the adapter supplies one, is written
+            // after spawn in both cases.
             let direct_program = resolve_program_abs(&spec.program).await;
             let relay_cfg = SpawnConfig {
                 shell: direct_program

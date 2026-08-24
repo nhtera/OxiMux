@@ -98,7 +98,7 @@ mod tests {
     fn null_params_roundtrip_as_none() {
         let db = open_memory().expect("open_memory");
         let repo = AgentLastParamsRepo::new(db);
-        repo.upsert("aider", None, None).expect("upsert");
+        repo.upsert("pi", None, None).expect("upsert");
         let all = repo.list_all().expect("list");
         assert_eq!(all[0].1, None);
         assert_eq!(all[0].2, None);

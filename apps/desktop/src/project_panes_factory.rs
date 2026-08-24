@@ -1106,7 +1106,6 @@ fn static_adapter_id(adapter: AgentAdapter) -> &'static str {
         AgentAdapter::ClaudeCode => "claude-code",
         AgentAdapter::Codex => "codex",
         AgentAdapter::Pi => "pi",
-        AgentAdapter::Aider => "aider",
         AgentAdapter::Custom => "custom",
     }
 }

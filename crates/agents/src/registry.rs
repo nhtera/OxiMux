@@ -29,8 +29,7 @@ use std::sync::Arc;
 use oximux_core::AgentAdapter;
 
 use crate::cli::{
-    AiderAdapter, ClaudeCodeAdapter, CliAgentAdapter, CodexAdapter, CustomCommandAdapter,
-    PiAdapter,
+    ClaudeCodeAdapter, CliAgentAdapter, CodexAdapter, CustomCommandAdapter, PiAdapter,
 };
 
 /// One adapter entry the launch-dialog UI consumes. `&'static str` for
@@ -39,7 +38,7 @@ use crate::cli::{
 /// allocation when the dialog re-renders.
 #[derive(Debug, Clone)]
 pub struct RegistryEntry {
-    /// Stable slug (`claude-code`, `codex`, `aider`, `custom`). Matches
+    /// Stable slug (`claude-code`, `codex`, `pi`, `custom`). Matches
     /// `CliAgentAdapter::id()`. Storage uses this discriminator in Phase 4.
     /// `'static` is contractually backed by [`CliAgentAdapter::id`]'s
     /// return type. If a future trait revision relaxes that lifetime (for
@@ -80,7 +79,7 @@ pub struct AdapterRegistry {
 
 impl AdapterRegistry {
     /// Registry preloaded with the built-in adapters in launch-dialog order:
-    /// Claude Code, Codex, Pi, Aider, Custom. Order is significant — the dialog
+    /// Claude Code, Codex, Pi, Custom. Order is significant — the dialog
     /// dropdown renders in this order; the chat-capable adapters lead, and
     /// `Custom` sits last so the escape hatch is where users learn to expect it.
     ///
@@ -93,7 +92,6 @@ impl AdapterRegistry {
         reg.register(AgentAdapter::ClaudeCode, Arc::new(ClaudeCodeAdapter));
         reg.register(AgentAdapter::Codex, Arc::new(CodexAdapter));
         reg.register(AgentAdapter::Pi, Arc::new(PiAdapter));
-        reg.register(AgentAdapter::Aider, Arc::new(AiderAdapter));
         reg.register(AgentAdapter::Custom, Arc::new(CustomCommandAdapter));
         reg
     }
@@ -314,7 +312,7 @@ mod tests {
     #[test]
     fn builtin_registry_holds_every_adapter_in_dialog_order() {
         let reg = AdapterRegistry::with_builtin_adapters();
-        assert_eq!(reg.len(), 5);
+        assert_eq!(reg.len(), 4);
         // Order contract — the launch dialog renders in this sequence.
         let order: Vec<AgentAdapter> = reg.slots.iter().map(|s| s.kind).collect();
         assert_eq!(
@@ -323,7 +321,6 @@ mod tests {
                 AgentAdapter::ClaudeCode,
                 AgentAdapter::Codex,
                 AgentAdapter::Pi,
-                AgentAdapter::Aider,
                 AgentAdapter::Custom,
             ],
             "dropdown order is significant; Custom must remain last"
@@ -370,7 +367,7 @@ mod tests {
         let entries = reg.entries_without_detection();
         // One per slot, in registration order, all forced available (no detect).
         let ids: Vec<&str> = entries.iter().map(|e| e.adapter_id).collect();
-        assert_eq!(ids, ["claude-code", "codex", "pi", "aider", "custom"]);
+        assert_eq!(ids, ["claude-code", "codex", "pi", "custom"]);
         assert!(entries.iter().all(|e| e.available));
         // Static vocab rides along (the roster's pre-bind model source).
         let claude = entries.iter().find(|e| e.adapter_id == "claude-code").unwrap();
@@ -388,7 +385,6 @@ mod tests {
             AgentAdapter::ClaudeCode,
             AgentAdapter::Codex,
             AgentAdapter::Pi,
-            AgentAdapter::Aider,
             AgentAdapter::Custom,
         ] {
             assert!(
@@ -405,14 +401,14 @@ mod tests {
         reg.register(AgentAdapter::Custom, Arc::new(CustomCommandAdapter));
         assert!(reg.adapter_for(AgentAdapter::Custom).is_some());
         assert!(reg.adapter_for(AgentAdapter::Codex).is_none());
-        assert!(reg.adapter_for(AgentAdapter::Aider).is_none());
+        assert!(reg.adapter_for(AgentAdapter::Pi).is_none());
         assert!(reg.adapter_for(AgentAdapter::ClaudeCode).is_none());
     }
 
     #[test]
     fn adapter_by_id_matches_each_builtin_slug() {
         let reg = AdapterRegistry::with_builtin_adapters();
-        for slug in ["claude-code", "codex", "aider", "custom"] {
+        for slug in ["claude-code", "codex", "pi", "custom"] {
             let a = reg
                 .adapter_by_id(slug)
                 .unwrap_or_else(|| panic!("missing adapter_by_id({slug})"));
@@ -459,7 +455,7 @@ mod tests {
     async fn detect_available_returns_one_entry_per_adapter() {
         let reg = AdapterRegistry::with_builtin_adapters();
         let entries = reg.detect_available().await;
-        assert_eq!(entries.len(), 5);
+        assert_eq!(entries.len(), 4);
         let kinds: Vec<AgentAdapter> = entries.iter().map(|e| e.adapter_enum).collect();
         assert_eq!(
             kinds,
@@ -467,7 +463,6 @@ mod tests {
                 AgentAdapter::ClaudeCode,
                 AgentAdapter::Codex,
                 AgentAdapter::Pi,
-                AgentAdapter::Aider,
                 AgentAdapter::Custom,
             ],
         );
@@ -476,7 +471,7 @@ mod tests {
     #[tokio::test]
     async fn detect_available_marks_custom_as_available() {
         // Custom adapter always reports true — the universal escape hatch.
-        // Any environment-dependent adapter (Claude Code / Codex / Aider)
+        // Any environment-dependent adapter (Claude Code / Codex / Pi)
         // would be flaky to assert here, so we lock the Custom row only.
         let reg = AdapterRegistry::with_builtin_adapters();
         let entries = reg.detect_available().await;

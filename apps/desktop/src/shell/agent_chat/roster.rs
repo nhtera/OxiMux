@@ -9,8 +9,8 @@
 //!   declared static model/effort lists (`RegistryEntry::models`/`::efforts`),
 //! - the ACP presets (Cursor/Amp/OpenCode) from settings,
 //!
-//! filtered to chat-capable agents (terminal-only Aider and the Custom escape
-//! hatch are dropped, matching the launcher's chat rows). Availability
+//! filtered to chat-capable agents (terminal-only adapters and the Custom
+//! escape hatch are dropped, matching the launcher's chat rows). Availability
 //! (which-detection) and the live post-bind model list are layered on by the UI;
 //! this module is a pure, connection-independent lookup.
 //!
@@ -111,7 +111,7 @@ pub(crate) fn chat_roster(
     let mut roster: Vec<ChatRosterEntry> = Vec::new();
 
     // Built-in chat-capable adapters, carrying their declared static vocab.
-    // `chat_capable` already excludes terminal-only Aider; `custom` is the
+    // `chat_capable` already excludes terminal-only adapters; `custom` is the
     // free-form escape hatch and never a chat provider.
     for entry in detected {
         if entry.adapter_id == "custom" || !settings.chat_capable(entry.adapter_id) {
@@ -741,14 +741,6 @@ mod tests {
                 efforts: &[],
             },
             RegistryEntry {
-                adapter_id: "aider",
-                display_name: "Aider",
-                adapter_enum: AgentAdapter::Aider,
-                available: true,
-                models: &[],
-                efforts: &[],
-            },
-            RegistryEntry {
                 adapter_id: "custom",
                 display_name: "Custom",
                 adapter_enum: AgentAdapter::Custom,
@@ -764,8 +756,8 @@ mod tests {
         let s = AgentLaunchSettings::default();
         let roster = chat_roster(&builtin_entries(), &s);
         let ids: Vec<&str> = roster.iter().map(|e| e.id.as_str()).collect();
-        // Built-ins first (Claude, Codex, Pi), then the three ACP presets. Aider
-        // (terminal-only) and Custom are absent.
+        // Built-ins first (Claude, Codex, Pi), then the three ACP presets.
+        // Custom is absent.
         assert_eq!(ids, ["claude-code", "codex", "pi", "cursor", "amp", "opencode"]);
     }
 

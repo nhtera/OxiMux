@@ -51,10 +51,14 @@ pub enum AgentAdapter {
     #[default]
     ClaudeCode,
     Codex,
-    Aider,
     /// The `pi` CLI. A TUI in a PTY like the others, and additionally a chat
     /// backend of its own (`pi --mode rpc`) — the same dual nature Claude and
     /// Codex have.
+    ///
+    /// The alias keeps tab-restore blobs written before the `Aider` variant
+    /// was retired parsing; those tabs rehydrate as Pi (its successor in the
+    /// built-in roster) instead of failing the whole snapshot.
+    #[serde(alias = "Aider")]
     Pi,
     /// Arbitrary shell command launched in a PTY. The program + args travel
     /// on `AgentSessionConfig::custom_command`; status detection falls back
@@ -69,4 +73,27 @@ pub enum CoreError {
     NotFound(String),
     #[error("invalid input: {0}")]
     Invalid(String),
+}
+
+#[cfg(test)]
+mod agent_adapter_tests {
+    use super::AgentAdapter;
+
+    /// Tab-restore blobs written while the retired `Aider` variant existed
+    /// carry `"Aider"` as the serialized variant name. The alias on `Pi`
+    /// must keep those blobs parsing (as Pi, its roster successor) instead
+    /// of failing the whole snapshot.
+    #[test]
+    fn legacy_aider_blob_deserializes_as_pi() {
+        let a: AgentAdapter = serde_json::from_str("\"Aider\"").expect("legacy blob parses");
+        assert_eq!(a, AgentAdapter::Pi);
+    }
+
+    #[test]
+    fn pi_still_round_trips_as_pi() {
+        let s = serde_json::to_string(&AgentAdapter::Pi).expect("serialize");
+        assert_eq!(s, "\"Pi\"", "the alias must not change what Pi serializes as");
+        let back: AgentAdapter = serde_json::from_str(&s).expect("parse");
+        assert_eq!(back, AgentAdapter::Pi);
+    }
 }

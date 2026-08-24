@@ -1,6 +1,6 @@
 //! `CliAgentAdapter` — the per-CLI contract.
 //!
-//! One impl per agent binary (Claude Code, Codex, Aider, custom-command).
+//! One impl per agent binary (Claude Code, Codex, Pi, custom-command).
 //! The adapter is pure metadata + arg-construction; the actual PTY spawn
 //! lives in the runtime so all adapters share one zombie-prevention path.
 
@@ -63,7 +63,7 @@ impl StatusPattern {
 }
 
 /// Empty pattern slice shared by adapters that intentionally don't
-/// classify (`CustomCommandAdapter`, `CodexAdapter`, `AiderAdapter`).
+/// classify (`CustomCommandAdapter`, `CodexAdapter`, `PiAdapter`).
 /// Returning the same `&'static []` from `status_patterns()` keeps the
 /// per-call allocation at zero and lets the `StatusMachine` skip the
 /// pattern loop on a known-empty slice.
@@ -74,7 +74,7 @@ pub(crate) const EMPTY_PATTERNS: &[StatusPattern] = &[];
 /// session table.
 #[async_trait]
 pub trait CliAgentAdapter: Send + Sync + 'static {
-    /// Stable id for storage / config (`claude-code`, `codex`, `aider`,
+    /// Stable id for storage / config (`claude-code`, `codex`, `pi`,
     /// `custom`). Used as the SQLite discriminator in Phase 4.
     fn id(&self) -> &'static str;
 

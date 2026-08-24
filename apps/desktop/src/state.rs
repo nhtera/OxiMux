@@ -252,7 +252,7 @@ mod tests {
             .insert(&workspace.id, "codex", None, None)
             .expect("session 2");
         let done = agent_repo
-            .insert(&workspace.id, "aider", None, None)
+            .insert(&workspace.id, "gemini", None, None)
             .expect("session 3");
         // Freshly inserted rows are `Idle`; bump the two we want to test
         // up to `Running`, leave the third as Done so it doesn't match.

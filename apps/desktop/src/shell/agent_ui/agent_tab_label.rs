@@ -1,7 +1,7 @@
 //! Monotonic per-adapter counter for agent-tab labels.
 //!
-//! Renders a label like `"Claude #1"` / `"Codex #2"` / `"Aider #1"` from the
-//! adapter slug (`"claude-code"` / `"codex"` / `"aider"`) plus a counter
+//! Renders a label like `"Claude #1"` / `"Codex #2"` / `"Pi #1"` from the
+//! adapter slug (`"claude-code"` / `"codex"` / `"pi"`) plus a counter
 //! seeded by walking the current `WorkspaceTab` list. Monotonic — closing
 //! `Claude #1` and reopening will produce `Claude #2`, never `#1` again, so
 //! the user's tab-history mental model stays unambiguous within one session.
@@ -20,7 +20,7 @@ fn display_name_for(adapter_id: &str) -> &'static str {
     match adapter_id {
         "claude-code" => "Claude",
         "codex" => "Codex",
-        "aider" => "Aider",
+        "pi" => "Pi",
         "custom" => "Custom",
         // Unknown adapter slug — fall back to the slug itself in title case
         // would require allocation; ship a stable placeholder instead. The
@@ -55,7 +55,7 @@ mod tests {
     fn display_name_for_known_slugs() {
         assert_eq!(display_name_for("claude-code"), "Claude");
         assert_eq!(display_name_for("codex"), "Codex");
-        assert_eq!(display_name_for("aider"), "Aider");
+        assert_eq!(display_name_for("pi"), "Pi");
         assert_eq!(display_name_for("custom"), "Custom");
     }
 

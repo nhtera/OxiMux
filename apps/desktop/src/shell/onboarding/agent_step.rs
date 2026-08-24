@@ -90,14 +90,14 @@ impl AgentRow {
 }
 
 /// The onboarding roster, in render order. Chat-capable agents lead (builtins
-/// Claude Code / Codex / Pi, then the OpenCode preset); Cursor / Amp / Aider
-/// sit under the expander. `Custom` is excluded (it needs a config flow), and
+/// Claude Code / Codex / Pi, then the OpenCode preset); Cursor / Amp sit
+/// under the expander. `Custom` is excluded (it needs a config flow), and
 /// Copilot is import-only today — not a launchable onboarding target.
 pub(super) fn assemble_roster(
     builtin_entries: &[(String, String)],
     chat_capable: impl Fn(&str) -> bool,
 ) -> Vec<AgentRow> {
-    const MORE: &[&str] = &["cursor", "amp", "aider"];
+    const MORE: &[&str] = &["cursor", "amp"];
     const EXCLUDED: &[&str] = &["custom"];
     const INSTALL_URLS: &[(&str, &str)] = &[
         ("claude-code", "https://claude.com/claude-code"),
@@ -105,7 +105,6 @@ pub(super) fn assemble_roster(
         ("opencode", "https://opencode.ai"),
         ("cursor", "https://cursor.com"),
         ("amp", "https://ampcode.com"),
-        ("aider", "https://aider.chat"),
     ];
     let install_url =
         |id: &str| INSTALL_URLS.iter().find(|(k, _)| *k == id).map(|(_, url)| *url);
@@ -133,7 +132,7 @@ pub(super) fn assemble_roster(
         });
     }
     // Render order: main group first (roster order within), expander group
-    // after in the mockup's Cursor → Amp → Aider order. The sort is stable, so
+    // after in the mockup's Cursor → Amp order. The sort is stable, so
     // non-more rows (rank 0) keep their insertion order.
     let more_rank =
         |row: &AgentRow| MORE.iter().position(|m| *m == row.id.as_str()).unwrap_or(0);
@@ -379,7 +378,7 @@ mod tests {
     use super::*;
 
     fn builtin_pairs() -> Vec<(String, String)> {
-        [("claude-code", "Claude Code"), ("codex", "Codex"), ("pi", "Pi"), ("aider", "Aider"), ("custom", "Custom")]
+        [("claude-code", "Claude Code"), ("codex", "Codex"), ("pi", "Pi"), ("custom", "Custom")]
             .into_iter()
             .map(|(a, b)| (a.to_string(), b.to_string()))
             .collect()
@@ -391,13 +390,11 @@ mod tests {
             matches!(id, "claude-code" | "codex" | "pi" | "opencode" | "cursor" | "amp")
         });
         let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids, ["claude-code", "codex", "pi", "opencode", "cursor", "amp", "aider"]);
+        assert_eq!(ids, ["claude-code", "codex", "pi", "opencode", "cursor", "amp"]);
         assert!(!ids.contains(&"custom"));
         let more: Vec<&str> =
             rows.iter().filter(|r| r.more).map(|r| r.id.as_str()).collect();
-        assert_eq!(more, ["cursor", "amp", "aider"]);
-        // Aider is the terminal-only badge case.
-        assert!(!rows.iter().find(|r| r.id == "aider").unwrap().chat_capable);
+        assert_eq!(more, ["cursor", "amp"]);
     }
 
     #[test]

@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn sideband_needs_approval_overrides_empty_patterns() {
-        // The regex table is empty (the Codex/Aider EMPTY_PATTERNS gap), yet
+        // The regex table is empty (the Codex/Pi EMPTY_PATTERNS gap), yet
         // the OSC-9999 sideband still drives NeedsApproval with its tool.
         let bytes = osc(r#"{"v":1,"state":"needs_approval","tool":"Bash","tool_input":"ls"}"#);
         let (snap, saw_exit) = run(vec![TerminalEvent::Output { id: TERM, bytes }]);

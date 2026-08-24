@@ -4,6 +4,24 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-08-25 — Aider retired from the built-in roster; Pi takes its slot (`main`)
+
+- The Aider adapter is no longer a built-in agent. Pi — already a first-class
+  adapter with both a terminal and a structured-chat face — is its successor
+  everywhere Aider appeared: the launch dialog, the workspace-create agent
+  picker, onboarding, and the launch-settings pane (where Pi had been missing
+  entirely). Pi's settings row renders no skip-permissions chip — its CLI has
+  no approval gate to skip — and offers only "Default" as a model preset,
+  because pi fuzzy-matches bare model ids across providers and a static list
+  would misresolve.
+- `AgentAdapter::Aider` is removed from the domain enum; tab-restore blobs
+  written before the retirement still parse via a serde alias that rehydrates
+  a legacy Aider tab as Pi. The first-run skip-permissions seed no longer
+  writes an `aider` entry.
+- Ambient detection is unchanged: an `aider` process running in a plain
+  terminal is still recognized and labeled on the rail, the same way Gemini,
+  Cursor, or Amp are — recognized on sight, just not launchable as a built-in.
+
 ### 2026-08-24 — v0.1.13: Windows gets an installer (`main`)
 
 - **`d7a9b5f`** — Windows ships `OxiMux-<version>-x64-setup.exe` alongside the

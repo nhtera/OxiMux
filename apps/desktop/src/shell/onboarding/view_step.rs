@@ -14,8 +14,8 @@ impl OnboardingWizard {
     pub(super) fn render_view_body(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let theme = self.theme;
         let typography = self.typography.clone();
-        // The footnote fires only for a terminal-only pick (e.g. Aider) with
-        // Chat selected — Chat UI simply won't apply to that agent.
+        // The footnote fires only for a terminal-only pick with Chat
+        // selected — Chat UI simply won't apply to that agent.
         let footnote = self
             .selected_row()
             .filter(|row| !row.chat_capable && self.open_mode == OpenMode::Chat)

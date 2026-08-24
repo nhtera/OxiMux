@@ -956,7 +956,6 @@ pub(crate) fn adapter_display(adapter: oximux_core::AgentAdapter) -> &'static st
         oximux_core::AgentAdapter::ClaudeCode => "Claude",
         oximux_core::AgentAdapter::Codex => "Codex",
         oximux_core::AgentAdapter::Pi => "Pi",
-        oximux_core::AgentAdapter::Aider => "Aider",
         oximux_core::AgentAdapter::Custom => "Assistant",
     }
 }

@@ -13,7 +13,7 @@
 //!
 //!  1. **Extract** the OSC-9999 JSON payload into a `SidebandEvent` so the
 //!     status machine can be `force()`d to the reported state — this is what
-//!     closes the `EMPTY_PATTERNS` gap for adapters (Codex/Aider) whose raw
+//!     closes the `EMPTY_PATTERNS` gap for adapters (Codex/Pi) whose raw
 //!     output the regex table can't classify.
 //!  2. **Strip** the OSC-9999 bytes out of a `cleaned` copy of the chunk so
 //!     the regex machine never sees them. This matters because the regex

@@ -98,7 +98,6 @@ pub fn adapter_slug(adapter: AgentAdapter) -> &'static str {
         AgentAdapter::ClaudeCode => "claude-code",
         AgentAdapter::Codex => "codex",
         AgentAdapter::Pi => "pi",
-        AgentAdapter::Aider => "aider",
         AgentAdapter::Custom => "custom",
     }
 }
@@ -123,7 +122,6 @@ fn provider_tag(entry: &SessionEntry) -> &str {
             AgentAdapter::ClaudeCode => "claude",
             AgentAdapter::Codex => "codex",
             AgentAdapter::Pi => "pi",
-            AgentAdapter::Aider => "aider",
             AgentAdapter::Custom => "custom",
         })
 }
@@ -335,7 +333,7 @@ mod tests {
     fn adapter_slug_matches_spawn_registry_ids() {
         assert_eq!(adapter_slug(AgentAdapter::ClaudeCode), "claude-code");
         assert_eq!(adapter_slug(AgentAdapter::Codex), "codex");
-        assert_eq!(adapter_slug(AgentAdapter::Aider), "aider");
+        assert_eq!(adapter_slug(AgentAdapter::Pi), "pi");
         assert_eq!(adapter_slug(AgentAdapter::Custom), "custom");
     }
 

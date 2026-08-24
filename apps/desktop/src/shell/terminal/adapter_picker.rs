@@ -744,7 +744,7 @@ mod tests {
         let entries = vec![
             entry("claude-code", "Claude Code", AgentAdapter::ClaudeCode, true),
             entry("codex", "Codex", AgentAdapter::Codex, false),
-            entry("aider", "Aider", AgentAdapter::Aider, true),
+            entry("pi", "Pi", AgentAdapter::Pi, true),
             entry("custom", "Custom Command", AgentAdapter::Custom, true),
         ];
         let visible = render_rows(&entries, &AgentLaunchSettings::default());
@@ -761,10 +761,10 @@ mod tests {
         let entries = vec![
             entry("claude-code", "Claude Code", AgentAdapter::ClaudeCode, true),
             entry("codex", "Codex", AgentAdapter::Codex, true),
-            entry("aider", "Aider", AgentAdapter::Aider, true),
+            entry("pi", "Pi", AgentAdapter::Pi, true),
         ];
         let mut launch = AgentLaunchSettings::default();
-        launch.entry_mut("aider").disabled = true; // hidden
+        launch.entry_mut("pi").disabled = true; // hidden
         launch.default_agent = "codex".to_string(); // floats to front
         let visible = render_rows(&entries, &launch);
         let order: Vec<&str> = visible.iter().map(|e| e.adapter_id).collect();
@@ -777,11 +777,11 @@ mod tests {
             entry("claude-code", "Claude Code", AgentAdapter::ClaudeCode, true),
             entry("custom", "Custom", AgentAdapter::Custom, true),
             entry("codex", "Codex", AgentAdapter::Codex, true),
-            entry("aider", "Aider", AgentAdapter::Aider, true),
+            entry("pi", "Pi", AgentAdapter::Pi, true),
         ];
         let visible = render_rows(&entries, &AgentLaunchSettings::default());
         let order: Vec<&str> = visible.iter().map(|e| e.adapter_id).collect();
-        assert_eq!(order, vec!["claude-code", "codex", "aider"]);
+        assert_eq!(order, vec!["claude-code", "codex", "pi"]);
     }
 
     #[test]

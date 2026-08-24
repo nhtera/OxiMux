@@ -153,7 +153,7 @@ fn agent_session_list_unfinished_at_shutdown_filters_correctly() {
         .expect("set done");
     agents.update_ended_at(&done.id).expect("end done");
 
-    let interrupted = agents.insert(&workspace_id, "aider", None, None).unwrap();
+    let interrupted = agents.insert(&workspace_id, "pi", None, None).unwrap();
     agents
         .update_status(&interrupted.id, &AgentStatus::Interrupted)
         .expect("set interrupted");

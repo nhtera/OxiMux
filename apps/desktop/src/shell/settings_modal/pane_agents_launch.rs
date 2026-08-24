@@ -22,28 +22,32 @@ use crate::shell::agent_presentation::adapter_icon_path;
 pub(super) const LAUNCH_AGENTS: [(&str, &str); 3] = [
     ("claude-code", "Claude Code"),
     ("codex", "Codex"),
-    ("aider", "Aider"),
+    ("pi", "Pi"),
 ];
 
 /// The skip-permissions ("YOLO") flag for an agent — toggled in and out of
 /// that agent's free-text args by the skip-perms chip. Each CLI spells it
-/// differently; an unknown id falls back to the most common form.
-fn yolo_flag(adapter_id: &str) -> &'static str {
+/// differently; `None` means the agent has no approval gate to skip (pi runs
+/// tools ungated already), so the row renders no skip-perms chip at all.
+/// An unknown id falls back to the most common spelling.
+fn yolo_flag(adapter_id: &str) -> Option<&'static str> {
     match adapter_id {
-        "codex" => "--dangerously-bypass-approvals-and-sandbox",
-        "aider" => "--yes-always",
+        "codex" => Some("--dangerously-bypass-approvals-and-sandbox"),
+        "pi" => None,
         // claude-code and any future addition default to claude's spelling.
-        _ => "--dangerously-skip-permissions",
+        _ => Some("--dangerously-skip-permissions"),
     }
 }
 
 /// Model presets the per-agent model chip cycles through. The leading empty
 /// string is the "Default" option (no `--model` flag). Mirrors the slugs the
-/// adapters accept.
+/// adapters accept. Pi offers only "Default": its catalog is per-user and a
+/// bare model id is fuzzy-matched across providers, so a static list would
+/// misresolve — a hand-edited `provider/id` still survives the cycle.
 fn model_presets(adapter_id: &str) -> &'static [&'static str] {
     match adapter_id {
         "codex" => &["", "gpt-5-codex", "o3"],
-        "aider" => &["", "sonnet", "opus", "gpt-5.5"],
+        "pi" => &[""],
         _ => &["", "opus", "sonnet", "haiku"],
     }
 }
@@ -353,7 +357,6 @@ fn agent_row(
     let disabled = launch.map(|l| l.disabled).unwrap_or(false);
     let args = launch.map(|l| l.args.as_str()).unwrap_or("");
     let model = launch.map(|l| l.model.as_str()).unwrap_or("");
-    let yolo_on = has_flag(args, yolo_flag(adapter_id));
     let is_default =
         !modal.agent_launch.default_agent.is_empty() && modal.agent_launch.default_agent == adapter_id;
 
@@ -415,21 +418,23 @@ fn agent_row(
         .child(tile)
         .child(info);
 
-    let yolo_chip = toggle_chip(
-        SharedString::from(format!("launch-yolo-{adapter_id}")),
-        "Skip perms",
-        yolo_on,
-        theme,
-        density,
-        typography,
-        move |this, _w, cx| {
-            let flag = yolo_flag(adapter_id);
-            let e = this.agent_launch.entry_mut(adapter_id);
-            e.args = toggle_flag(&e.args, flag);
-            this.persist_agent_launch(cx);
-        },
-        cx,
-    );
+    // Agents with no approval gate (yolo_flag = None) get no chip at all.
+    let yolo_chip = yolo_flag(adapter_id).map(|flag| {
+        toggle_chip(
+            SharedString::from(format!("launch-yolo-{adapter_id}")),
+            "Skip perms",
+            has_flag(args, flag),
+            theme,
+            density,
+            typography,
+            move |this, _w, cx| {
+                let e = this.agent_launch.entry_mut(adapter_id);
+                e.args = toggle_flag(&e.args, flag);
+                this.persist_agent_launch(cx);
+            },
+            cx,
+        )
+    });
     let model_chip = value_chip(
         SharedString::from(format!("launch-model-{adapter_id}")),
         model_label(model),
@@ -462,7 +467,7 @@ fn agent_row(
         .items_center()
         .gap(px(6.0))
         .flex_none()
-        .child(yolo_chip)
+        .children(yolo_chip)
         .child(model_chip)
         .child(enabled_toggle);
 
@@ -530,7 +535,6 @@ fn agent_control(
     let disabled = launch.map(|l| l.disabled).unwrap_or(false);
     let args = launch.map(|l| l.args.as_str()).unwrap_or("");
     let model = launch.map(|l| l.model.as_str()).unwrap_or("");
-    let yolo_on = has_flag(args, yolo_flag(adapter_id));
 
     let enabled_chip = value_chip(
         SharedString::from(format!("launch-enabled-{adapter_id}")),
@@ -545,24 +549,26 @@ fn agent_control(
         },
         cx,
     );
-    let yolo_chip = value_chip(
-        SharedString::from(format!("launch-yolo-{adapter_id}")),
-        if yolo_on {
-            "Skip perms: On"
-        } else {
-            "Skip perms: Off"
-        },
-        theme,
-        density,
-        typography,
-        move |this, _w, cx| {
-            let flag = yolo_flag(adapter_id);
-            let e = this.agent_launch.entry_mut(adapter_id);
-            e.args = toggle_flag(&e.args, flag);
-            this.persist_agent_launch(cx);
-        },
-        cx,
-    );
+    // Agents with no approval gate (yolo_flag = None) get no chip at all.
+    let yolo_chip = yolo_flag(adapter_id).map(|flag| {
+        value_chip(
+            SharedString::from(format!("launch-yolo-{adapter_id}")),
+            if has_flag(args, flag) {
+                "Skip perms: On"
+            } else {
+                "Skip perms: Off"
+            },
+            theme,
+            density,
+            typography,
+            move |this, _w, cx| {
+                let e = this.agent_launch.entry_mut(adapter_id);
+                e.args = toggle_flag(&e.args, flag);
+                this.persist_agent_launch(cx);
+            },
+            cx,
+        )
+    });
     let model_chip = value_chip(
         SharedString::from(format!("launch-model-{adapter_id}")),
         model_label(model),
@@ -584,7 +590,7 @@ fn agent_control(
         .items_center()
         .gap(px(6.0))
         .child(enabled_chip)
-        .child(yolo_chip)
+        .children(yolo_chip)
         .child(model_chip)
         .into_any_element()
 }
@@ -618,9 +624,12 @@ mod tests {
 
     #[test]
     fn yolo_flag_is_per_agent() {
-        assert_eq!(yolo_flag("claude-code"), "--dangerously-skip-permissions");
-        assert_eq!(yolo_flag("codex"), "--dangerously-bypass-approvals-and-sandbox");
-        assert_eq!(yolo_flag("aider"), "--yes-always");
+        assert_eq!(yolo_flag("claude-code"), Some("--dangerously-skip-permissions"));
+        assert_eq!(
+            yolo_flag("codex"),
+            Some("--dangerously-bypass-approvals-and-sandbox")
+        );
+        assert_eq!(yolo_flag("pi"), None, "pi has no approval gate, so no chip");
     }
 
     #[test]

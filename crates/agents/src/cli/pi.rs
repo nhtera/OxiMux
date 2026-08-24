@@ -23,7 +23,7 @@
 //!
 //! ## Why empty `status_patterns()`
 //!
-//! Same standing rule as `CodexAdapter`/`AiderAdapter`: pi's TUI prompt bytes
+//! Same standing rule as `CodexAdapter`: pi's TUI prompt bytes
 //! (with ANSI SGR wrapping) have not been captured, and this project does not
 //! write regex against an imagined haystack. The `StatusMachine` fallback
 //! supplies Running / Idle / exit transitions.

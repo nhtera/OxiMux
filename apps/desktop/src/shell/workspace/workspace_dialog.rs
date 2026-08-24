@@ -46,7 +46,6 @@ const AGENT_CHOICES: &[AgentAdapter] = &[
     AgentAdapter::ClaudeCode,
     AgentAdapter::Codex,
     AgentAdapter::Pi,
-    AgentAdapter::Aider,
     AgentAdapter::Custom,
 ];
 
@@ -359,7 +358,6 @@ pub fn agent_label(agent: Option<AgentAdapter>) -> &'static str {
         Some(AgentAdapter::ClaudeCode) => "Claude Code",
         Some(AgentAdapter::Codex) => "Codex",
         Some(AgentAdapter::Pi) => "Pi",
-        Some(AgentAdapter::Aider) => "Aider",
         Some(AgentAdapter::Custom) => "Custom",
     }
 }
@@ -670,8 +668,7 @@ fn agent_option_row(
         Some(AgentAdapter::ClaudeCode) => 1,
         Some(AgentAdapter::Codex) => 2,
         Some(AgentAdapter::Pi) => 3,
-        Some(AgentAdapter::Aider) => 4,
-        Some(AgentAdapter::Custom) => 5,
+        Some(AgentAdapter::Custom) => 4,
     };
     div()
         .id(("ws-dialog-agent-opt", id))
@@ -737,7 +734,7 @@ mod tests {
     fn agent_label_resolves_each_variant() {
         assert_eq!(agent_label(Some(AgentAdapter::ClaudeCode)), "Claude Code");
         assert_eq!(agent_label(Some(AgentAdapter::Codex)), "Codex");
-        assert_eq!(agent_label(Some(AgentAdapter::Aider)), "Aider");
+        assert_eq!(agent_label(Some(AgentAdapter::Pi)), "Pi");
         assert_eq!(agent_label(Some(AgentAdapter::Custom)), "Custom");
     }
 
@@ -776,7 +773,6 @@ mod tests {
                 AgentAdapter::ClaudeCode,
                 AgentAdapter::Codex,
                 AgentAdapter::Pi,
-                AgentAdapter::Aider,
                 AgentAdapter::Custom,
             ]
         );

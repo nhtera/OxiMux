@@ -417,13 +417,10 @@ src/
     │                   cfg.effort silently ignored (no CLI analog); no --ask-for-approval / --sandbox
     │                   (user's ~/.codex/config.toml owns approval cadence per v0.9 retro)
     │                   status_patterns() intentionally empty — deferred to step-14 dogfood capture
-    ├── aider.rs        AiderAdapter — interactive PTY launch of `aider`
-    │                   build_command: optional --model <m> long flag
-    │                   cfg.prompt → stdin_seed (Aider's REPL has no positional-prompt arg;
-    │                     --message is one-shot incompatible with interactive PTY)
-    │                   embedded `\n` submits each line as a discrete REPL prompt
-    │                   no --yes / --auto-commits overrides (user's ~/.aider.conf.yml owns)
-    │                   status_patterns() intentionally empty — deferred to step-14 capture
+    ├── pi.rs           PiAdapter — interactive PTY launch of `pi`
+    │                   build_command: optional --session <id> / --model <m>, prompt as
+    │                     trailing positional; also the chat backend (`pi --mode rpc`)
+    │                   status_patterns() intentionally empty — deferred to dogfood capture
     └── custom.rs       CustomCommandAdapter — escape-hatch CliAgentAdapter impl
                         Reads custom_command: Option<(String, Vec<String>)> from AgentSessionConfig
                         status_patterns() intentionally empty — falls through to StatusMachine defaults

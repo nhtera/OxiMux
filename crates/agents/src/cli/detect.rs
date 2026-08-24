@@ -3,8 +3,8 @@
 //! Every concrete `CliAgentAdapter` implementation answers `detect()` by
 //! asking "is this binary on PATH?" The first adapter (`claude_code.rs`,
 //! step 5) inlined the helper; the second (`codex.rs`, step 6) is its
-//! second caller — promoting now keeps the third (`aider.rs`, step 7)
-//! from sprouting a fresh copy.
+//! second caller — promoting now keeps later adapters from sprouting a
+//! fresh copy each.
 //!
 //! Contract: never `Err`. A missing tool is `Ok(false)`, not a panic —
 //! the startup registry calls this for every adapter at cold boot and a

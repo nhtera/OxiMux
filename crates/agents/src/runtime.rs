@@ -1,6 +1,6 @@
 //! `AgentRuntime` trait — the seam every adapter implements.
 //!
-//! CLI adapters (Claude Code, Codex, Aider, custom-command) wrap one
+//! CLI adapters (Claude Code, Codex, Pi, custom-command) wrap one
 //! PTY each. The future ACP runtime (v1.1) will wrap a JSON-RPC stream.
 //! Both surface the same `AgentStatus` shape to the UI so the badge,
 //! sidebar dot, and multi-agent dashboard don't care which runtime
