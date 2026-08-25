@@ -33,17 +33,19 @@ pub enum AgentTypeFilter {
     Copilot,
     OpenCode,
     Pi,
+    Omp,
 }
 
 /// Chip order shown in the header and cycled by `Tab` (matches the reference
 /// import modal's provider order).
-pub const AGENT_TYPE_FILTERS: [AgentTypeFilter; 6] = [
+pub const AGENT_TYPE_FILTERS: [AgentTypeFilter; 7] = [
     AgentTypeFilter::All,
     AgentTypeFilter::Claude,
     AgentTypeFilter::Codex,
     AgentTypeFilter::Copilot,
     AgentTypeFilter::OpenCode,
     AgentTypeFilter::Pi,
+    AgentTypeFilter::Omp,
 ];
 
 impl AgentTypeFilter {
@@ -56,6 +58,7 @@ impl AgentTypeFilter {
             AgentTypeFilter::Copilot => "Copilot",
             AgentTypeFilter::OpenCode => "OpenCode",
             AgentTypeFilter::Pi => "Pi",
+            AgentTypeFilter::Omp => "omp",
         }
     }
 
@@ -77,6 +80,7 @@ impl AgentTypeFilter {
             AgentTypeFilter::Copilot => entry.preset_id.as_deref() == Some("copilot"),
             AgentTypeFilter::OpenCode => entry.preset_id.as_deref() == Some("opencode"),
             AgentTypeFilter::Pi => entry.preset_id.as_deref() == Some("pi"),
+            AgentTypeFilter::Omp => entry.preset_id.as_deref() == Some("omp"),
         }
     }
 }
@@ -98,6 +102,7 @@ pub fn adapter_slug(adapter: AgentAdapter) -> &'static str {
         AgentAdapter::ClaudeCode => "claude-code",
         AgentAdapter::Codex => "codex",
         AgentAdapter::Pi => "pi",
+        AgentAdapter::Omp => "omp",
         AgentAdapter::Custom => "custom",
     }
 }
@@ -122,6 +127,7 @@ fn provider_tag(entry: &SessionEntry) -> &str {
             AgentAdapter::ClaudeCode => "claude",
             AgentAdapter::Codex => "codex",
             AgentAdapter::Pi => "pi",
+            AgentAdapter::Omp => "omp",
             AgentAdapter::Custom => "custom",
         })
 }
@@ -478,8 +484,9 @@ mod tests {
         assert_eq!(AgentTypeFilter::Codex.next(), AgentTypeFilter::Copilot);
         assert_eq!(AgentTypeFilter::Copilot.next(), AgentTypeFilter::OpenCode);
         assert_eq!(AgentTypeFilter::OpenCode.next(), AgentTypeFilter::Pi);
+        assert_eq!(AgentTypeFilter::Pi.next(), AgentTypeFilter::Omp);
         // Wraps back to All.
-        assert_eq!(AgentTypeFilter::Pi.next(), AgentTypeFilter::All);
+        assert_eq!(AgentTypeFilter::Omp.next(), AgentTypeFilter::All);
     }
 
     #[test]
@@ -504,6 +511,11 @@ mod tests {
         assert!(AgentTypeFilter::Copilot.accepts(&co));
         assert!(AgentTypeFilter::Pi.accepts(&pi));
         assert!(!AgentTypeFilter::Pi.accepts(&oc));
+        // omp is its own family — a Pi fork must never fold into the Pi chip.
+        let omp = preset_entry("omp", None);
+        assert!(AgentTypeFilter::Omp.accepts(&omp));
+        assert!(!AgentTypeFilter::Pi.accepts(&omp));
+        assert!(!AgentTypeFilter::Omp.accepts(&pi));
         // A native adapter never matches an import-provider segment.
         assert!(!AgentTypeFilter::OpenCode.accepts(&cc));
     }

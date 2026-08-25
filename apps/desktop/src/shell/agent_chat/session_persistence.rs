@@ -58,6 +58,8 @@ pub struct RestoredPosture {
     pub codex: Option<(String, String)>,
     /// Pi's tool allowlist + context-file choice.
     pub pi: Option<PiPosture>,
+    /// omp's approval mode (`--approval-mode`).
+    pub omp: Option<oximux_agents::thread::omp::posture::OmpPosture>,
 }
 
 /// Build the initial composer feature-pick overlay for a restored chat, so the
@@ -79,6 +81,14 @@ pub(super) fn seed_posture_feature_values(
         map.insert(
             pi_posture::FEATURE_CONTEXT_FILES.to_string(),
             FeatureValue::Bool(pi.context_files),
+        );
+    }
+    // Same stakes as Pi's: a dropped omp posture falls to a WIDER approval
+    // mode on the restore's respawn.
+    if let Some(omp) = posture.omp {
+        map.insert(
+            oximux_agents::thread::omp::posture::FEATURE_APPROVALS.to_string(),
+            FeatureValue::Choice(omp.wire().to_string()),
         );
     }
     map
@@ -200,6 +210,7 @@ impl AgentChatView {
             acp_args: self.backend.acp_args.clone(),
             codex_posture: self.codex_posture_snapshot(),
             pi_posture: self.pi_posture_snapshot(),
+            omp_posture: self.omp_posture_snapshot(),
             // Read off the live connection while there is one: a remote client
             // opening this session once it is dormant has no backend to ask, and
             // making the desktop spawn one to fill two dropdowns would undo

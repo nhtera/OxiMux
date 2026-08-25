@@ -148,6 +148,7 @@ impl AgentChatView {
             Claude(PathBuf),
             Codex { codex_dir: PathBuf, thread_id: String },
             Pi { home: PathBuf, session_id: String },
+            Omp { home: PathBuf, session_id: String },
             OpenCode { home: PathBuf, session_id: String },
         }
         let source = match self.backend.transport {
@@ -160,6 +161,9 @@ impl AgentChatView {
                 thread_id: session_id,
             },
             Transport::Rpc => CompanionLog::Pi { home, session_id },
+            // omp's store, NOT the pi home — the two dialects' rollouts live
+            // in different roots even though the file format is shared.
+            Transport::OmpRpc => CompanionLog::Omp { home, session_id },
             Transport::Acp => {
                 // Only opencode has an interactive-resume companion AND a
                 // readable store importer keyed by the agent-supplied id.
@@ -196,6 +200,18 @@ impl AgentChatView {
                         }
                         CompanionLog::Pi { home, session_id } => {
                             oximux_agents::session_log::import_transcript_pi::locate_pi_session(
+                                &home,
+                                &session_id,
+                            )
+                            .map(|p| {
+                                oximux_agents::session_log::import_transcript_pi::pi_transcript(
+                                    &p,
+                                )
+                            })
+                            .unwrap_or_default()
+                        }
+                        CompanionLog::Omp { home, session_id } => {
+                            oximux_agents::session_log::import_transcript_pi::locate_omp_session(
                                 &home,
                                 &session_id,
                             )

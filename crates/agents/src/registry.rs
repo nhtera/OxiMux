@@ -9,12 +9,12 @@
 //!
 //! ## Detection cost
 //!
-//! `detect()` shells out to `which <bin>` per adapter. Four adapters is
-//! ~60 ms wall-clock total at cold boot. Sequential is intentional — the
-//! `JoinSet` alternative was rejected as premature optimization until
-//! cold-start telemetry shows it matters. If a fifth adapter lands and
-//! detection time crosses the 200 ms felt threshold, swap the loop body
-//! for a `tokio::task::JoinSet` walk.
+//! `detect()` shells out to `which <bin>` per adapter — roughly 15 ms
+//! each, so the five adapters run ~75 ms wall-clock total at cold boot,
+//! still well under the 200 ms felt threshold. Sequential stays
+//! intentional — the `JoinSet` alternative remains premature until
+//! cold-start telemetry shows detection crossing that threshold, at which
+//! point swap the loop body for a `tokio::task::JoinSet` walk.
 //!
 //! ## Errors fold to unavailable
 //!
@@ -29,7 +29,8 @@ use std::sync::Arc;
 use oximux_core::AgentAdapter;
 
 use crate::cli::{
-    ClaudeCodeAdapter, CliAgentAdapter, CodexAdapter, CustomCommandAdapter, PiAdapter,
+    ClaudeCodeAdapter, CliAgentAdapter, CodexAdapter, CustomCommandAdapter, OmpAdapter,
+    PiAdapter,
 };
 
 /// One adapter entry the launch-dialog UI consumes. `&'static str` for
@@ -92,6 +93,7 @@ impl AdapterRegistry {
         reg.register(AgentAdapter::ClaudeCode, Arc::new(ClaudeCodeAdapter));
         reg.register(AgentAdapter::Codex, Arc::new(CodexAdapter));
         reg.register(AgentAdapter::Pi, Arc::new(PiAdapter));
+        reg.register(AgentAdapter::Omp, Arc::new(OmpAdapter));
         reg.register(AgentAdapter::Custom, Arc::new(CustomCommandAdapter));
         reg
     }
@@ -312,7 +314,7 @@ mod tests {
     #[test]
     fn builtin_registry_holds_every_adapter_in_dialog_order() {
         let reg = AdapterRegistry::with_builtin_adapters();
-        assert_eq!(reg.len(), 4);
+        assert_eq!(reg.len(), 5);
         // Order contract — the launch dialog renders in this sequence.
         let order: Vec<AgentAdapter> = reg.slots.iter().map(|s| s.kind).collect();
         assert_eq!(
@@ -321,6 +323,7 @@ mod tests {
                 AgentAdapter::ClaudeCode,
                 AgentAdapter::Codex,
                 AgentAdapter::Pi,
+                AgentAdapter::Omp,
                 AgentAdapter::Custom,
             ],
             "dropdown order is significant; Custom must remain last"
@@ -367,7 +370,7 @@ mod tests {
         let entries = reg.entries_without_detection();
         // One per slot, in registration order, all forced available (no detect).
         let ids: Vec<&str> = entries.iter().map(|e| e.adapter_id).collect();
-        assert_eq!(ids, ["claude-code", "codex", "pi", "custom"]);
+        assert_eq!(ids, ["claude-code", "codex", "pi", "omp", "custom"]);
         assert!(entries.iter().all(|e| e.available));
         // Static vocab rides along (the roster's pre-bind model source).
         let claude = entries.iter().find(|e| e.adapter_id == "claude-code").unwrap();
@@ -385,6 +388,7 @@ mod tests {
             AgentAdapter::ClaudeCode,
             AgentAdapter::Codex,
             AgentAdapter::Pi,
+            AgentAdapter::Omp,
             AgentAdapter::Custom,
         ] {
             assert!(
@@ -408,7 +412,7 @@ mod tests {
     #[test]
     fn adapter_by_id_matches_each_builtin_slug() {
         let reg = AdapterRegistry::with_builtin_adapters();
-        for slug in ["claude-code", "codex", "pi", "custom"] {
+        for slug in ["claude-code", "codex", "pi", "omp", "custom"] {
             let a = reg
                 .adapter_by_id(slug)
                 .unwrap_or_else(|| panic!("missing adapter_by_id({slug})"));
@@ -455,7 +459,7 @@ mod tests {
     async fn detect_available_returns_one_entry_per_adapter() {
         let reg = AdapterRegistry::with_builtin_adapters();
         let entries = reg.detect_available().await;
-        assert_eq!(entries.len(), 4);
+        assert_eq!(entries.len(), 5);
         let kinds: Vec<AgentAdapter> = entries.iter().map(|e| e.adapter_enum).collect();
         assert_eq!(
             kinds,
@@ -463,6 +467,7 @@ mod tests {
                 AgentAdapter::ClaudeCode,
                 AgentAdapter::Codex,
                 AgentAdapter::Pi,
+                AgentAdapter::Omp,
                 AgentAdapter::Custom,
             ],
         );

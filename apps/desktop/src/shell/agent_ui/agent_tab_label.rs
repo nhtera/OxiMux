@@ -21,6 +21,7 @@ fn display_name_for(adapter_id: &str) -> &'static str {
         "claude-code" => "Claude",
         "codex" => "Codex",
         "pi" => "Pi",
+        "omp" => "omp",
         "custom" => "Custom",
         // Unknown adapter slug — fall back to the slug itself in title case
         // would require allocation; ship a stable placeholder instead. The
@@ -45,6 +46,14 @@ pub fn next_label_for(adapter_id: &str, existing: &[SharedString]) -> SharedStri
         .max()
         .unwrap_or(0);
     SharedString::from(format!("{name} #{}", max_n + 1))
+}
+
+/// Test-only window into the private label table, so the table-driven
+/// non-fallback sweep in `agent_presentation` can cover it without widening
+/// the runtime API.
+#[cfg(test)]
+pub(crate) fn display_name_for_test(adapter_id: &str) -> &'static str {
+    display_name_for(adapter_id)
 }
 
 #[cfg(test)]

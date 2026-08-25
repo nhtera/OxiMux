@@ -60,6 +60,11 @@ pub enum AgentAdapter {
     /// built-in roster) instead of failing the whole snapshot.
     #[serde(alias = "Aider")]
     Pi,
+    /// The `omp` CLI (a Pi fork). Same dual nature: a TUI in a PTY, and a
+    /// chat backend of its own (`omp --mode rpc-ui`). Additive variant —
+    /// this enum never crosses the postcard wire, so appending is safe
+    /// (verified during the Aider retirement).
+    Omp,
     /// Arbitrary shell command launched in a PTY. The program + args travel
     /// on `AgentSessionConfig::custom_command`; status detection falls back
     /// to the StatusMachine's Idle/Running/exit-code defaults since there
@@ -87,6 +92,14 @@ mod agent_adapter_tests {
     fn legacy_aider_blob_deserializes_as_pi() {
         let a: AgentAdapter = serde_json::from_str("\"Aider\"").expect("legacy blob parses");
         assert_eq!(a, AgentAdapter::Pi);
+    }
+
+    #[test]
+    fn omp_round_trips_and_never_collides_with_pi() {
+        let s = serde_json::to_string(&AgentAdapter::Omp).expect("serialize");
+        assert_eq!(s, "\"Omp\"");
+        let back: AgentAdapter = serde_json::from_str(&s).expect("parse");
+        assert_eq!(back, AgentAdapter::Omp);
     }
 
     #[test]

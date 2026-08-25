@@ -120,6 +120,7 @@ pub fn adapter_display_name(adapter_id: &str) -> &'static str {
         "opencode" => "OpenCode",
         "copilot" => "Copilot",
         "pi" => "Pi",
+        "omp" => "omp",
         _ => "Agent",
     }
 }
@@ -137,6 +138,7 @@ pub fn adapter_id_for_label(label: &str) -> &'static str {
         "GitHub Copilot" => "copilot",
         "Cursor" => "cursor",
         "Pi" => "pi",
+        "omp" => "omp",
         "Amp" => "amp",
         "Grok" => "grok",
         "Droid" => "droid",
@@ -163,6 +165,7 @@ pub fn adapter_brand_icon(adapter_id: &str) -> Option<&'static str> {
         "opencode" => "icons/opencode.svg",
         "copilot" => "icons/copilot.svg",
         "pi" => "icons/pi.svg",
+        "omp" => "icons/omp.svg",
         "cursor" => "icons/cursor.svg",
         "amp" => "icons/amp.svg",
         _ => return None,
@@ -388,5 +391,39 @@ mod tests {
         let v = agent_verb(Some(&AgentStatus::Interrupted), false, t());
         assert_eq!(v.label, "Stopped");
         assert_eq!(v.color, t().status_muted);
+    }
+
+    /// Red-team F5: the enum sweep is compiler-enforced only for
+    /// `AgentAdapter` matches — these string-keyed tables have silent `_ =>`
+    /// fallbacks, so a first-class adapter id missing a row renders as a
+    /// generic "Agent" with the sparkles glyph and every unit test stays
+    /// green. Table-driven so the NEXT adapter is caught too.
+    #[test]
+    fn every_first_class_adapter_id_resolves_without_a_fallback() {
+        // (registry id, ambient label) for every first-class adapter.
+        // `custom` is excluded by design: generic is its correct rendering.
+        let first_class =
+            [("claude-code", "Claude Code"), ("codex", "Codex"), ("pi", "Pi"), ("omp", "omp")];
+        for (id, label) in first_class {
+            assert_ne!(
+                adapter_display_name(id),
+                "Agent",
+                "{id} fell through adapter_display_name's fallback"
+            );
+            assert_ne!(
+                adapter_id_for_label(label),
+                "agent",
+                "{label} fell through adapter_id_for_label's fallback"
+            );
+            assert!(
+                adapter_brand_icon(id).is_some(),
+                "{id} has no brand icon — it would render the generic sparkles"
+            );
+            assert_ne!(
+                crate::shell::agent_ui::agent_tab_label::display_name_for_test(id),
+                "Agent",
+                "{id} fell through display_name_for's fallback"
+            );
+        }
     }
 }

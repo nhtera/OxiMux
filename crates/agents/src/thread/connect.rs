@@ -16,6 +16,8 @@ use super::codex::CodexAppServerConnection;
 use super::connection::{AgentConnection, ModelChoice};
 use super::event::ThreadEvent;
 use super::mcp_server_spec::McpServerSpec;
+use super::omp::posture::OmpPosture;
+use super::omp::OmpRpcConnection;
 use super::pi::posture::PiPosture;
 use super::pi::PiRpcConnection;
 use super::transport::Transport;
@@ -109,6 +111,15 @@ pub struct ConnectSpec {
     /// field per transport (`permission_mode`, `effort`, `codex_posture`) — a
     /// convention, not a shared abstraction.
     pub pi_posture: Option<PiPosture>,
+    /// An explicit path to the `omp` binary (only read by the `OmpRpc` arm) —
+    /// same GUI-has-no-PATH rationale as `pi_command`, its own field for the
+    /// same per-adapter-launch-detail reason.
+    pub omp_command: Option<String>,
+    /// omp's approval posture (only read by the `OmpRpc` arm). `None` uses
+    /// the deliberate OxiMux default (`Write` — NOT omp's own `yolo` default;
+    /// the flag is always passed explicitly either way). Never `PiPosture`:
+    /// the domains differ (a tool allowlist vs an approval mode).
+    pub omp_posture: Option<OmpPosture>,
     /// MCP servers the *host* declares for this session — a sidecar OxiMux
     /// spawns and supervises, on top of whatever the user's own config provides.
     ///
@@ -173,6 +184,8 @@ impl ConnectSpec {
             codex_posture: None,
             pi_command: None,
             pi_posture: None,
+            omp_command: None,
+            omp_posture: None,
             // Set by the caller after construction when the host has something
             // to declare; a plain launch declares nothing.
             mcp_servers: Vec::new(),
@@ -255,6 +268,23 @@ pub fn connect(spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<
             )?;
             Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
+        Transport::OmpRpc => {
+            // `None` → the deliberate OxiMux default (Write). The flag itself
+            // is ALWAYS emitted — omp's own default is yolo (see `build_args`).
+            let posture = spec.omp_posture.unwrap_or_default();
+            // omp resumes by full session UUID only; `build_args` refuses
+            // anything else (its resolver prefix-matches silently). Spawn in
+            // the session's own cwd so tool work lands in the right project.
+            let (conn, rx) = OmpRpcConnection::spawn(
+                &spec.cwd,
+                spec.model.as_deref(),
+                spec.omp_command.as_deref(),
+                posture,
+                spec.resume_session_id.as_deref(),
+                &spec.env,
+            )?;
+            Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
+        }
     }
 }
 
@@ -330,6 +360,8 @@ mod tests {
             codex_posture: None,
             pi_command: None,
             pi_posture: None,
+            omp_command: None,
+            omp_posture: None,
             mcp_servers: vec![],
             settings_json: None,
             disallowed_tools: vec![],
@@ -364,6 +396,8 @@ mod tests {
             codex_posture: None,
             pi_command: None,
             pi_posture: None,
+            omp_command: None,
+            omp_posture: None,
             mcp_servers: vec![],
             settings_json: None,
             disallowed_tools: vec![],

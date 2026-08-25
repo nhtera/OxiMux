@@ -54,6 +54,11 @@ use super::{parse_timestamp_ms, read_tail};
 pub const OPENCODE: &str = "opencode";
 pub const COPILOT: &str = "copilot";
 pub const PI: &str = "pi";
+/// omp — a Pi fork with the same rollout JSONL shape (verified against omp
+/// 18.0.4: identical `session` header and `message` records; a padded
+/// `{"type":"title"}` record precedes the header). Unlike Pi, the resume
+/// handle is the SESSION ID (`omp --resume <id>`), never the file path.
+pub const OMP: &str = "omp";
 
 /// Tail window for a Pi rollout: the newest activity timestamp is at the end.
 const PI_TAIL_BYTES: u64 = 64 * 1024;
@@ -257,7 +262,7 @@ pub fn collect_pi(home: &Path, scope: &SessionScope, out: &mut Vec<SessionEntry>
     let mut files = Vec::new();
     collect_pi_files(&sessions, 0, &mut files);
     for path in files {
-        let Some(entry) = build_pi_entry(&path) else {
+        let Some(entry) = build_rollout_entry(&path, PI) else {
             continue;
         };
         if !scope_keeps(scope, entry.cwd.as_deref()) {
@@ -290,22 +295,78 @@ pub(crate) fn collect_pi_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>)
     }
 }
 
-/// Parse one Pi rollout into an entry. Requires a `session` header line with an
-/// `id` (a torn/foreign file yields `None`). Title prefers a `session_info.name`
+/// Index omp's per-session JSONL files under `~/.omp/agent/sessions`. Same
+/// rollout shape as Pi's (omp is a Pi fork), read by the same parser; the
+/// entry differs in preset id and in what the id is FOR — omp resumes by
+/// session id, so the id must be the full canonical UUID (omp's resolver is
+/// a prefix match with a cross-project fallback that resolves silently).
+///
+/// Subagent child sessions are excluded: omp nests them in a directory named
+/// for the parent rollout's file stem (`<ts>_<uuid>/…`), so a file whose
+/// parent directory looks like a session stem is a sub-turn, not a session.
+pub fn collect_omp(home: &Path, scope: &SessionScope, out: &mut Vec<SessionEntry>) {
+    let sessions = home.join(".omp/agent/sessions");
+    let mut files = Vec::new();
+    collect_pi_files(&sessions, 0, &mut files);
+    for path in files {
+        if parent_is_session_stem(&path) {
+            continue;
+        }
+        let Some(entry) = build_rollout_entry(&path, OMP) else {
+            continue;
+        };
+        if !scope_keeps(scope, entry.cwd.as_deref()) {
+            continue;
+        }
+        out.push(entry);
+    }
+}
+
+/// True when the file's parent directory is named like a rollout file stem
+/// (`2026-08-25T07-11-21-148Z_<uuid>`) — the shape omp uses for a parent
+/// session's subagent-children directory. Project grouping directories are
+/// cwd slugs (`-Code-projects-x`) and never start with a timestamp.
+fn parent_is_session_stem(path: &Path) -> bool {
+    let Some(dir) = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let bytes = dir.as_bytes();
+    bytes.len() > 10
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[4] == b'-'
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[7] == b'-'
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
+
+/// Parse one Pi-family rollout into an entry, tagged with `preset_id`.
+/// Requires a `session` header line with an `id` (a torn/foreign file yields
+/// `None`) — the header need not be the FIRST line: omp puts a padded
+/// `{"type":"title"}` record above it. Title prefers that `title` record
+/// (omp auto-titles, rewriting it in place), then a `session_info.name`
 /// record, then the first genuine user message.
-fn build_pi_entry(path: &Path) -> Option<SessionEntry> {
+fn build_rollout_entry(path: &Path, preset_id: &str) -> Option<SessionEntry> {
     let head = read_head(path, PI_HEAD_BYTES).unwrap_or_default();
     let tail = read_tail(path, PI_TAIL_BYTES).unwrap_or_default();
 
     let mut session_id: Option<String> = None;
     let mut cwd: Option<String> = None;
     let mut created_at_ms: Option<i64> = None;
+    let mut title_record: Option<String> = None;
     let mut name: Option<String> = None;
     let mut first_user: Option<String> = None;
 
     for line in head.lines() {
         let Some(v) = line_value(line) else { continue };
         match v.get("type").and_then(Value::as_str) {
+            Some("title") if title_record.is_none() => {
+                title_record = v
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+            }
             Some("session") => {
                 session_id = v
                     .get("id")
@@ -336,15 +397,17 @@ fn build_pi_entry(path: &Path) -> Option<SessionEntry> {
         }
     }
     let session_id = session_id?;
-    // A later rename (`session_info.name`) in the tail wins over the head's.
+    // The padded `title` record is the CURRENT title (omp rewrites it in
+    // place), so it wins; then a later rename (`session_info.name`) in the
+    // tail wins over the head's.
     let tail_name = pi_last_session_name(&tail);
-    let title = clean_title(tail_name.or(name).or(first_user));
+    let title = clean_title(title_record.or(tail_name).or(name).or(first_user));
     let last_ts = pi_last_timestamp(&tail).or(created_at_ms);
 
     Some(SessionEntry {
         session_id,
         adapter: AgentAdapter::Custom,
-        preset_id: Some(PI.to_string()),
+        preset_id: Some(preset_id.to_string()),
         path: Some(path.to_string_lossy().into_owned()),
         cwd,
         title,
@@ -429,7 +492,9 @@ pub fn load_import_provider_preview(
     match preset_id {
         OPENCODE => opencode_preview(home, session_id, max_messages),
         COPILOT => copilot_preview(home, session_id, max_messages),
-        PI => path
+        // omp rollouts share Pi's record shape (same fork lineage, verified
+        // against 18.0.4), so one preview reader serves both.
+        PI | OMP => path
             .map(|p| pi_preview(Path::new(p), max_messages))
             .unwrap_or_default(),
         _ => Vec::new(),
@@ -451,7 +516,9 @@ pub fn load_import_provider_transcript(
 ) -> Vec<crate::thread::ThreadEntry> {
     match preset_id {
         OPENCODE => super::import_transcript_opencode::opencode_transcript(home, session_id),
-        PI => path
+        // One transcript mapper for the Pi family — omp's `message` records
+        // are byte-shape-identical to Pi's.
+        PI | OMP => path
             .map(|p| super::import_transcript_pi::pi_transcript(Path::new(p)))
             .unwrap_or_default(),
         _ => Vec::new(),
@@ -816,6 +883,120 @@ mod tests {
         collect_pi(home.path(), &scope(&["/proj"]), &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].session_id, "keep");
+    }
+
+    // --- omp ---
+
+    /// Real bytes from a live omp 18.0.4 session (probe 01): padded `title`
+    /// record first, `session` header SECOND, then model/thinking records, a
+    /// user+assistant turn, a `credential_pin`, and `custom` tool records.
+    const OMP_FIXTURE: &str = include_str!("testdata/omp_import_fixture.jsonl");
+    const OMP_FIXTURE_ID: &str = "01a037fe-2a2b-76e1-8d1f-db954755a79c";
+
+    fn write_omp_session(home: &Path, rel: &str, body: &str) {
+        let path = home.join(".omp/agent/sessions").join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn omp_reads_a_real_rollout_with_its_title_record_above_the_header() {
+        let home = tempfile::tempdir().unwrap();
+        write_omp_session(
+            home.path(),
+            "--private-tmp-ompprobe-proj2--/2026-08-25T08-16-38-955Z_01a037fe-2a2b-76e1-8d1f-db954755a79c.jsonl",
+            OMP_FIXTURE,
+        );
+        let mut out = Vec::new();
+        collect_omp(home.path(), &SessionScope::AllProjects, &mut out);
+        assert_eq!(out.len(), 1);
+        let e = &out[0];
+        assert_eq!(e.session_id, OMP_FIXTURE_ID);
+        assert_eq!(e.preset_id.as_deref(), Some("omp"));
+        assert_eq!(e.cwd.as_deref(), Some("/tmp/ompprobe/proj2"));
+        // The fixture's `title` record is empty (never auto-titled), so the
+        // first user message becomes the title.
+        assert_eq!(e.title.as_deref(), Some("Reply with only the word DONE"));
+        assert!(e.last_message_ts_ms.unwrap() > 0);
+        // The path is kept for preview/transcript reads — the RESUME handle
+        // stays the id (`omp --resume <id>`), enforced at the argv seam.
+        assert!(e.path.as_deref().unwrap().ends_with(".jsonl"));
+    }
+
+    #[test]
+    fn omp_title_record_wins_over_the_first_user_message() {
+        let home = tempfile::tempdir().unwrap();
+        // Same real bytes, with the padded title record carrying a value the
+        // way omp rewrites it in place after auto-titling.
+        let titled = OMP_FIXTURE.replace(r#""title":"""#, r#""title":"auto titled probe""#);
+        write_omp_session(home.path(), "p/s.jsonl", &titled);
+        let mut out = Vec::new();
+        collect_omp(home.path(), &SessionScope::AllProjects, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].title.as_deref(), Some("auto titled probe"));
+    }
+
+    #[test]
+    fn omp_scopes_by_header_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        write_omp_session(home.path(), "p/s.jsonl", OMP_FIXTURE);
+        let mut kept = Vec::new();
+        collect_omp(home.path(), &scope(&["/tmp/ompprobe/proj2"]), &mut kept);
+        assert_eq!(kept.len(), 1);
+        let mut dropped = Vec::new();
+        collect_omp(home.path(), &scope(&["/somewhere/else"]), &mut dropped);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn omp_subagent_children_are_excluded_from_the_list() {
+        let home = tempfile::tempdir().unwrap();
+        write_omp_session(
+            home.path(),
+            "p/2026-08-25T08-16-38-955Z_01a037fe-2a2b-76e1-8d1f-db954755a79c.jsonl",
+            OMP_FIXTURE,
+        );
+        // A child rollout nested under a directory named for the parent's file
+        // stem — a sub-turn, not a session the picker should offer.
+        write_omp_session(
+            home.path(),
+            "p/2026-08-25T08-16-38-955Z_01a037fe-2a2b-76e1-8d1f-db954755a79c/child.jsonl",
+            OMP_FIXTURE,
+        );
+        let mut out = Vec::new();
+        collect_omp(home.path(), &SessionScope::AllProjects, &mut out);
+        assert_eq!(out.len(), 1, "the child rollout must not surface as a session");
+    }
+
+    #[test]
+    fn omp_truncated_or_headerless_files_are_skipped_not_fatal() {
+        let home = tempfile::tempdir().unwrap();
+        // Only the padded title line — a torn write's head, no session header.
+        let first_line = OMP_FIXTURE.lines().next().unwrap();
+        write_omp_session(home.path(), "p/torn.jsonl", &format!("{first_line}\n{{\"type\":"));
+        let mut out = Vec::new();
+        collect_omp(home.path(), &SessionScope::AllProjects, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn omp_preview_renders_the_real_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let rel = "p/s.jsonl";
+        write_omp_session(home.path(), rel, OMP_FIXTURE);
+        let path = home.path().join(".omp/agent/sessions").join(rel);
+        let msgs = load_import_provider_preview(
+            home.path(),
+            OMP,
+            OMP_FIXTURE_ID,
+            Some(path.to_str().unwrap()),
+            4,
+        );
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(msgs[0].role, PreviewRole::User));
+        assert_eq!(msgs[0].text, "Reply with only the word DONE");
+        assert!(matches!(msgs[1].role, PreviewRole::Assistant));
+        assert_eq!(msgs[1].text, "DONE");
     }
 
     // --- Previews ---

@@ -34,6 +34,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::super::event::{ThreadEvent, TurnUsage};
+use super::super::snapshot_diff::{block_text, content_text, suffix_delta};
 
 #[cfg(test)]
 use super::super::entry::ThreadEntry;
@@ -181,20 +182,12 @@ fn map_message_update(v: &Value, st: &mut PiState) -> Vec<ThreadEvent> {
         "text_delta" | "thinking_delta" => {
             // Diff the SNAPSHOT, not the `delta` field. Both are present and the
             // snapshot is authoritative; appending `delta` alongside it is how
-            // text gets duplicated.
+            // text gets duplicated. A non-extension (rewrite) emits nothing —
+            // text is verified append-only, so it shouldn't happen, and the
+            // `_end` finalize below reconciles it either way.
             let Some(full) = block_text(ae.get("partial"), ci) else { return Vec::new() };
             let seen = st.emitted.entry(key).or_default();
-            let Some(suffix) = full.strip_prefix(seen.as_str()) else {
-                // Not an extension of what we emitted — a rewrite. Text is
-                // verified append-only, so this shouldn't happen; the `_end`
-                // finalize below reconciles it either way.
-                return Vec::new();
-            };
-            if suffix.is_empty() {
-                return Vec::new();
-            }
-            let suffix = suffix.to_string();
-            *seen = full;
+            let Some(suffix) = suffix_delta(seen, full) else { return Vec::new() };
             vec![if kind == "text_delta" {
                 ThreadEvent::AssistantTextDelta(suffix)
             } else {
@@ -236,38 +229,8 @@ fn map_tool_update(v: &Value, st: &mut PiState) -> Vec<ThreadEvent> {
     // across 201 updates). Diff the text, never the JSON.
     let Some(full) = content_text(v.get("partialResult")) else { return Vec::new() };
     let seen = st.tool_out.entry(id.to_string()).or_default();
-    let Some(chunk) = full.strip_prefix(seen.as_str()) else {
-        return Vec::new();
-    };
-    if chunk.is_empty() {
-        return Vec::new();
-    }
-    let chunk = chunk.to_string();
-    *seen = full;
+    let Some(chunk) = suffix_delta(seen, full) else { return Vec::new() };
     vec![ThreadEvent::ToolOutputDelta { id: id.to_string(), chunk }]
-}
-
-/// The text of `content[ci]` in a partial message snapshot — pi names it `text`
-/// on a text block and `thinking` on a thinking block.
-fn block_text(partial: Option<&Value>, ci: u64) -> Option<String> {
-    let block = partial?.get("content")?.as_array()?.get(ci as usize)?;
-    let s = block
-        .get("text")
-        .or_else(|| block.get("thinking"))
-        .and_then(Value::as_str)?;
-    Some(s.to_string())
-}
-
-/// Flatten a pi result/partialResult's `content[]` to its text.
-fn content_text(v: Option<&Value>) -> Option<String> {
-    let arr = v?.get("content")?.as_array()?;
-    Some(
-        arr.iter()
-            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join(""),
-    )
 }
 
 /// Usage from a finalized assistant message — everything the meter needs, on

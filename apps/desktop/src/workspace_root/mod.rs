@@ -156,6 +156,7 @@ fn to_agents_transport(t: oximux_settings::Transport) -> oximux_agents::thread::
         oximux_settings::Transport::AppServer => oximux_agents::thread::Transport::AppServer,
         oximux_settings::Transport::Acp => oximux_agents::thread::Transport::Acp,
         oximux_settings::Transport::Rpc => oximux_agents::thread::Transport::Rpc,
+        oximux_settings::Transport::OmpRpc => oximux_agents::thread::Transport::OmpRpc,
     }
 }
 

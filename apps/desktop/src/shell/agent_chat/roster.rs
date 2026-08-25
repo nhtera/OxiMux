@@ -741,6 +741,14 @@ mod tests {
                 efforts: &[],
             },
             RegistryEntry {
+                adapter_id: "omp",
+                display_name: "omp",
+                adapter_enum: AgentAdapter::Omp,
+                available: true,
+                models: &[],
+                efforts: &[],
+            },
+            RegistryEntry {
                 adapter_id: "custom",
                 display_name: "Custom",
                 adapter_enum: AgentAdapter::Custom,
@@ -756,9 +764,9 @@ mod tests {
         let s = AgentLaunchSettings::default();
         let roster = chat_roster(&builtin_entries(), &s);
         let ids: Vec<&str> = roster.iter().map(|e| e.id.as_str()).collect();
-        // Built-ins first (Claude, Codex, Pi), then the three ACP presets.
-        // Custom is absent.
-        assert_eq!(ids, ["claude-code", "codex", "pi", "cursor", "amp", "opencode"]);
+        // Built-ins first (Claude, Codex, Pi, omp), then the three ACP
+        // presets. Custom is absent.
+        assert_eq!(ids, ["claude-code", "codex", "pi", "omp", "cursor", "amp", "opencode"]);
     }
 
     /// The roster is built by filtering the registry through `chat_capable`, so a

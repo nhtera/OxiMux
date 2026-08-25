@@ -43,6 +43,7 @@ pub(crate) const AGENT_LABELS: &[(&str, &str)] = &[
     ("aider", "Aider"),
     ("cursor", "Cursor"),
     ("droid", "Droid"),
+    ("omp", "omp"),
     ("pi", "Pi"),
     ("amp", "Amp"),
     ("claude", "Claude Code"),

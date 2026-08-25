@@ -153,6 +153,7 @@ impl SessionIndex {
         import_provider_index::collect_opencode(home, scope, &mut entries);
         import_provider_index::collect_copilot(home, scope, &mut entries);
         import_provider_index::collect_pi(home, scope, &mut entries);
+        import_provider_index::collect_omp(home, scope, &mut entries);
         // Newest first; entries without a timestamp sort to the bottom.
         entries.sort_by_key(|e| std::cmp::Reverse(e.last_message_ts_ms));
         entries

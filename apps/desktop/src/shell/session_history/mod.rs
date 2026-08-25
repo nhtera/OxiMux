@@ -406,7 +406,9 @@ impl SessionHistoryModal {
             return;
         };
         // Pi resumes by rollout file path (`pi --session <file>`); OpenCode /
-        // Copilot resume by session id. Native rows carry no preset_id.
+        // Copilot / omp resume by session id — for omp the id MUST stay the
+        // full canonical UUID (its resolver prefix-matches and falls back
+        // across projects silently). Native rows carry no preset_id.
         let resume_handle = if entry.preset_id.as_deref() == Some("pi") {
             entry.path.clone().unwrap_or_else(|| entry.session_id.clone())
         } else {
@@ -502,7 +504,7 @@ pub(crate) fn entry_opens_as_chat(entry: &SessionEntry) -> bool {
     ) {
         return true;
     }
-    matches!(entry.preset_id.as_deref(), Some("opencode") | Some("pi"))
+    matches!(entry.preset_id.as_deref(), Some("opencode") | Some("pi") | Some("omp"))
 }
 
 impl EventEmitter<SessionHistoryEvent> for SessionHistoryModal {}
@@ -956,6 +958,7 @@ pub(crate) fn adapter_display(adapter: oximux_core::AgentAdapter) -> &'static st
         oximux_core::AgentAdapter::ClaudeCode => "Claude",
         oximux_core::AgentAdapter::Codex => "Codex",
         oximux_core::AgentAdapter::Pi => "Pi",
+        oximux_core::AgentAdapter::Omp => "omp",
         oximux_core::AgentAdapter::Custom => "Assistant",
     }
 }

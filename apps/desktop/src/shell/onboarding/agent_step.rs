@@ -81,6 +81,9 @@ pub(super) struct AgentRow {
     pub available: Option<bool>,
     /// Where "Install ↗" sends the user. `None` = no button, sub-label only.
     pub install_url: Option<&'static str>,
+    /// One-line sub-label disclosure the user should see before picking this
+    /// agent (rendered under the name). `None` for most rows.
+    pub note: Option<&'static str>,
 }
 
 impl AgentRow {
@@ -97,12 +100,15 @@ pub(super) fn assemble_roster(
     builtin_entries: &[(String, String)],
     chat_capable: impl Fn(&str) -> bool,
 ) -> Vec<AgentRow> {
-    const MORE: &[&str] = &["cursor", "amp"];
+    // omp sits in the More section (validation decision: additive Pi-family
+    // agent, not a headline row).
+    const MORE: &[&str] = &["omp", "cursor", "amp"];
     const EXCLUDED: &[&str] = &["custom"];
     const INSTALL_URLS: &[(&str, &str)] = &[
         ("claude-code", "https://claude.com/claude-code"),
         ("codex", "https://developers.openai.com/codex"),
         ("opencode", "https://opencode.ai"),
+        ("omp", "https://omp.sh"),
         ("cursor", "https://cursor.com"),
         ("amp", "https://ampcode.com"),
     ];
@@ -119,6 +125,7 @@ pub(super) fn assemble_roster(
             more: MORE.contains(&id.as_str()),
             available: None,
             install_url: install_url(id),
+            note: agent_note(id),
         })
         .collect();
     for preset in ACP_PRESETS {
@@ -129,6 +136,7 @@ pub(super) fn assemble_roster(
             more: MORE.contains(&preset.id),
             available: None,
             install_url: install_url(preset.id),
+            note: agent_note(preset.id),
         });
     }
     // Render order: main group first (roster order within), expander group
@@ -138,6 +146,18 @@ pub(super) fn assemble_roster(
         |row: &AgentRow| MORE.iter().position(|m| *m == row.id.as_str()).unwrap_or(0);
     rows.sort_by_key(|r| (r.more, more_rank(r)));
     rows
+}
+
+/// The one-line disclosure a row carries, when picking it has a consequence
+/// the user cannot otherwise see. omp's is credential reach (red-team F14):
+/// it keeps its own provider logins (its `agent.db`) and also discovers
+/// ambient provider credentials (e.g. an AWS credential chain) on its own —
+/// verified on 18.0.4 — which is not obvious from a picker row.
+fn agent_note(id: &str) -> Option<&'static str> {
+    match id {
+        "omp" => Some("Keeps its own provider logins and may use ambient credentials (e.g. AWS)"),
+        _ => None,
+    }
 }
 
 /// Where a row's model list comes from. Resolution order: Claude's static rich
@@ -289,6 +309,15 @@ impl OnboardingWizard {
                     .child("CLI NOT FOUND ON PATH"),
             );
         }
+        if let Some(note) = row.note {
+            identity = identity.child(
+                div()
+                    .text_size(px(typography.t_sub_label))
+                    .text_color(theme.fg_subtle)
+                    .mt(px(3.0))
+                    .child(note),
+            );
+        }
 
         let mut card = div()
             .id(("onboarding-agent", ix))
@@ -378,23 +407,37 @@ mod tests {
     use super::*;
 
     fn builtin_pairs() -> Vec<(String, String)> {
-        [("claude-code", "Claude Code"), ("codex", "Codex"), ("pi", "Pi"), ("custom", "Custom")]
-            .into_iter()
-            .map(|(a, b)| (a.to_string(), b.to_string()))
-            .collect()
+        [
+            ("claude-code", "Claude Code"),
+            ("codex", "Codex"),
+            ("pi", "Pi"),
+            ("omp", "omp"),
+            ("custom", "Custom"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
     }
 
     #[test]
     fn roster_orders_main_before_more_and_excludes_custom() {
         let rows = assemble_roster(&builtin_pairs(), |id| {
-            matches!(id, "claude-code" | "codex" | "pi" | "opencode" | "cursor" | "amp")
+            matches!(id, "claude-code" | "codex" | "pi" | "omp" | "opencode" | "cursor" | "amp")
         });
         let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids, ["claude-code", "codex", "pi", "opencode", "cursor", "amp"]);
+        assert_eq!(ids, ["claude-code", "codex", "pi", "opencode", "omp", "cursor", "amp"]);
         assert!(!ids.contains(&"custom"));
+        // omp is a More-section row (validation decision), with the
+        // credential-reach disclosure and its install link.
         let more: Vec<&str> =
             rows.iter().filter(|r| r.more).map(|r| r.id.as_str()).collect();
-        assert_eq!(more, ["cursor", "amp"]);
+        assert_eq!(more, ["omp", "cursor", "amp"]);
+        let omp = rows.iter().find(|r| r.id == "omp").unwrap();
+        assert_eq!(omp.install_url, Some("https://omp.sh"));
+        assert!(
+            omp.note.is_some_and(|n| n.contains("credentials")),
+            "the credential-reach disclosure must ride the row"
+        );
     }
 
     #[test]

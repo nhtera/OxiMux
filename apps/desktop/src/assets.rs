@@ -176,6 +176,9 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/copilot.svg"),
     ),
     ("icons/pi.svg", include_bytes!("../assets/icons/pi.svg")),
+    // omp's rail/tab glyph — an original blocky omega, not the omp.sh brand
+    // mark (license unverified), in the same rectilinear family as pi.svg.
+    ("icons/omp.svg", include_bytes!("../assets/icons/omp.svg")),
     (
         "icons/keyboard.svg",
         include_bytes!("../assets/icons/keyboard.svg"),

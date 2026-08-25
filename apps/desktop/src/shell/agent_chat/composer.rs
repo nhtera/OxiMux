@@ -255,6 +255,10 @@ pub enum ComposerEvent {
     PermissionModePicked(String),
     /// The user picked a reasoning-effort level in the bottom toolbar.
     EffortPicked(String),
+    /// The user picked a thinking-visibility level in the bottom toolbar
+    /// (`off` / `auto` / `shown`) — a transcript view preference the parent
+    /// view owns and persists; nothing is sent to the backend.
+    ThinkingDisplayPicked(String),
     /// The user changed a generic feature control in the bottom toolbar (a
     /// toggle flip or a select pick). Carries the control's stable `id` and its
     /// new value. The parent applies it live (ACP `set_config`) or via respawn.
@@ -376,6 +380,10 @@ pub struct ComposerView {
     /// Whether the backend honors a permission-mode switch (hides the mode picker
     /// when it doesn't). Model is always offered.
     supports_modes: bool,
+    /// Thinking-visibility chip state (wire `off`/`auto`/`shown`), pushed by
+    /// the parent view. `None` hides the chip — the transcript holds no
+    /// thinking block yet, so there is nothing the control could change.
+    thinking_display: Option<String>,
     /// Whether the backend accepts a reasoning-effort setting (hides the effort
     /// picker when it doesn't).
     supports_effort: bool,
@@ -583,6 +591,7 @@ impl ComposerView {
             model: None,
             permission_mode: None,
             effort: None,
+            thinking_display: None,
             supports_modes: false,
             supports_effort: false,
             vocab: ControlVocab::default(),
@@ -1388,6 +1397,18 @@ impl ComposerView {
         cx.emit(ComposerEvent::PermissionModePicked(mode));
     }
 
+    /// Push the thinking-visibility chip state (`None` hides the chip).
+    pub fn set_thinking_display(&mut self, wire: Option<String>, cx: &mut Context<Self>) {
+        if self.thinking_display != wire {
+            self.thinking_display = wire;
+            cx.notify();
+        }
+    }
+
+    fn pick_thinking_display(&mut self, wire: String, cx: &mut Context<Self>) {
+        cx.emit(ComposerEvent::ThinkingDisplayPicked(wire));
+    }
+
     fn pick_effort(&mut self, effort: String, cx: &mut Context<Self>) {
         cx.emit(ComposerEvent::EffortPicked(effort));
     }
@@ -2119,6 +2140,35 @@ impl ComposerView {
             current_wire,
             efforts,
             std::rc::Rc::new(|view: &mut ComposerView, wire, cx| view.pick_effort(wire, cx)),
+            cx,
+        )
+    }
+
+    /// The thinking-visibility control beside the effort picker — "how hard it
+    /// thinks" next to "whether you see it". Off hides thinking blocks, Auto
+    /// expands the streaming one and collapses settled ones, Always keeps every
+    /// block open. A transcript view preference; no backend involved.
+    fn render_thinking_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let options: Vec<(String, String)> = [("off", "Off"), ("auto", "Auto"), ("shown", "Always")]
+            .into_iter()
+            .map(|(w, l)| (w.to_string(), l.to_string()))
+            .collect();
+        let current_wire = self.thinking_display.clone().unwrap_or_else(|| "auto".to_string());
+        let current_label = options
+            .iter()
+            .find(|(w, _)| *w == current_wire)
+            .map(|(_, l)| l.clone())
+            .unwrap_or_else(|| current_wire.clone());
+        self.render_labeled_dropdown(
+            "chat-thinking".into(),
+            "icons/eye.svg",
+            "Thinking visibility".into(),
+            current_label,
+            current_wire,
+            options,
+            std::rc::Rc::new(|view: &mut ComposerView, wire, cx| {
+                view.pick_thinking_display(wire, cx)
+            }),
             cx,
         )
     }
@@ -3334,6 +3384,13 @@ impl Render for ComposerView {
         // (with no thought-level) rendered an effort button with an empty label.
         if self.supports_effort && !self.vocab.efforts.is_empty() {
             controls = controls.child(self.render_effort_picker(cx));
+        }
+        // Thinking visibility (a transcript view preference) sits beside the
+        // effort picker so "how hard it thinks" and "whether you see it" read
+        // together. Hidden until the parent pushes a state — i.e. until the
+        // transcript actually holds a thinking block.
+        if self.thinking_display.is_some() {
+            controls = controls.child(self.render_thinking_picker(cx));
         }
         // Generic backend-advertised feature controls (fast / plan / auto-accept
         // / agent-profile …) close the far-right cluster. Renders nothing when the

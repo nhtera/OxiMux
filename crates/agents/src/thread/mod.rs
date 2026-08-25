@@ -12,17 +12,21 @@
 //! The event model is deliberately ACP-shaped so a future ACP backend can feed
 //! the same `ChatThread` without changing the state machine or the view.
 
+pub(crate) mod agent_binary;
 pub mod acp;
 pub mod claude_stream_json;
 pub mod codex;
 pub mod codex_session_import;
 pub mod connect;
 pub mod connection;
+pub mod ndjson_transport;
+pub mod omp;
 pub mod pi;
 pub mod session_file_fork;
 pub mod session_import;
 #[cfg(test)]
 pub(crate) mod sh_fixture;
+pub(crate) mod snapshot_diff;
 pub mod transport;
 
 // The pure fold + wire vocabulary + stream-json decoder now live in the

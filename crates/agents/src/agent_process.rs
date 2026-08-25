@@ -49,6 +49,7 @@ const KNOWN_AGENTS: &[KnownAgent] = &[
     KnownAgent { bin: "cursor-agent", label: "Cursor" },
     KnownAgent { bin: "droid", label: "Droid" },
     KnownAgent { bin: "pi", label: "Pi" },
+    KnownAgent { bin: "omp", label: "omp" },
     KnownAgent { bin: "amp", label: "Amp" },
 ];
 
@@ -183,6 +184,9 @@ mod tests {
             label("node", "node --max-old-space-size=24576 /opt/homebrew/bin/gemini"),
             Some("Gemini CLI")
         );
+        // A bun-installed CLI runs as its interpreter: the measured shape of a
+        // live `omp` was `comm=bun`, `args=bun /Users/x/.bun/bin/omp`.
+        assert_eq!(label("bun", "bun /Users/x/.bun/bin/omp"), Some("omp"));
     }
 
     #[test]

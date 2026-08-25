@@ -40,18 +40,44 @@ use std::path::Path;
 /// on uninstall without inspecting the contents: no other tool writes it.
 pub(crate) const EXTENSION_FILE: &str = "extensions/oximux-agent-status.ts";
 
-/// Render the extension, calling back into the `oximux` binary at
+/// Where the omp extension goes, relative to omp's configuration directory.
+///
+/// A DIFFERENT basename than Pi's on purpose: omp kept Pi's
+/// `PI_CODING_AGENT_DIR` env override, so with that variable set both agents
+/// resolve the SAME directory — two dialects writing one path would leave
+/// install order deciding which survives, and prune would delete the winner.
+/// Distinct names keep each dialect's install/uninstall its own even when the
+/// homes collide (each runtime then loads both files; the format slug keeps
+/// the reports apart).
+pub(crate) const OMP_EXTENSION_FILE: &str = "extensions/oximux-agent-status-omp.ts";
+
+/// Render the Pi extension, calling back into the `oximux` binary at
 /// `binary_path`.
 ///
 /// The path is embedded in a single-quoted shell argument, so an embedded
 /// quote is escaped the same way the hooks-file commands escape theirs — a
 /// home directory like `/Users/O'X` must not break out into shell injection.
 pub(crate) fn source(binary_path: &Path) -> String {
+    source_for(binary_path, "Pi", "pi")
+}
+
+/// Render the omp extension. Same program, same measured event dialect
+/// (re-verified live against omp 18.0.4), different `--format` slug so the
+/// reader attributes the report to the right agent.
+pub(crate) fn omp_source(binary_path: &Path) -> String {
+    source_for(binary_path, "omp", "omp")
+}
+
+/// The shared renderer: one template, parameterized over the runtime's display
+/// name (comments) and status slug (the `--format` argument). Pi and omp share
+/// an extension API and event taxonomy by lineage — omp is a Pi fork — so the
+/// program itself is identical; only the identity strings differ.
+fn source_for(binary_path: &Path, name: &str, slug: &str) -> String {
     let quoted = binary_path.display().to_string().replace('\'', "'\\''");
     format!(
         r#"// Managed by OxiMux. Written on start; edits are overwritten.
 //
-// Reports this Pi agent's lifecycle to the OxiMux pane it is running in, so
+// Reports this {name} agent's lifecycle to the OxiMux pane it is running in, so
 // the pane's row can show what the agent is doing and what it last said.
 // Outside an OxiMux pane this file does nothing at all.
 
@@ -62,13 +88,13 @@ const OXIMUX_BINARY = '{quoted}';
 export default function (pi: any) {{
   // The pane id the relay injects into every PTY it spawns. Without it there
   // is nothing to report to, and this extension is a complete no-op — which is
-  // the case for every `pi` the user runs outside OxiMux.
+  // the case for every `{slug}` the user runs outside OxiMux.
   if (!process.env.OXIMUX_PTY_ID) return;
 
   // The agent's most recent reply, held from the message that carried it until
-  // the turn actually ends. Pi emits the two separately and in that order.
+  // the turn actually ends. {name} emits the two separately and in that order.
   let lastMessage: string | undefined;
-  // The last thing reported, so a repeat can be dropped. Pi fires two events
+  // The last thing reported, so a repeat can be dropped. {name} fires two events
   // for each end of a turn, and reporting both would spend a process and a
   // relay round-trip restating what the row already says. A report that
   // carries something NEW — a prompt, then a tool — differs here and goes
@@ -80,7 +106,7 @@ export default function (pi: any) {{
     if (signature === lastReport) return;
     lastReport = signature;
     try {{
-      const child = spawn(OXIMUX_BINARY, ["agent-status", "--state", state, "--format", "pi"], {{
+      const child = spawn(OXIMUX_BINARY, ["agent-status", "--state", state, "--format", "{slug}"], {{
         stdio: ["pipe", "ignore", "ignore"],
         detached: true,
       }});
@@ -109,14 +135,14 @@ export default function (pi: any) {{
   }};
 
   const on = (event: string, handler: (e: any) => void) => {{
-    // A Pi version that does not know an event must not take the rest down
+    // A {name} version that does not know an event must not take the rest down
     // with it, so each subscription stands alone.
     try {{
       pi.on(event, handler);
     }} catch {{}}
   }};
 
-  // Turn start. Both spellings are subscribed because which one a given Pi
+  // Turn start. Both spellings are subscribed because which one a given {name}
   // dispatches has moved between versions.
   for (const event of ["before_agent_start", "agent_start"]) {{
     on(event, () => {{
@@ -167,6 +193,27 @@ mod tests {
         let src = rendered();
         assert!(src.contains("/Applications/OxiMux.app/Contents/MacOS/oximux"));
         assert!(src.contains(r#""agent-status", "--state", state, "--format", "pi""#));
+    }
+
+    #[test]
+    fn the_omp_variant_is_the_same_program_under_its_own_identity() {
+        // One template, two identities: the omp render must select the omp
+        // reader and must not carry Pi's name anywhere — a leaked "Pi" would
+        // mean an identity substitution was missed and the next divergence
+        // between the two would edit one render thinking it edited both.
+        let src = omp_source(Path::new("/Applications/OxiMux.app/Contents/MacOS/oximux"));
+        assert!(src.contains(r#""agent-status", "--state", state, "--format", "omp""#));
+        assert!(!src.contains("Pi"), "Pi identity leaked into the omp render");
+        // The inertness guard is identity-independent and must survive.
+        assert!(src.contains("if (!process.env.OXIMUX_PTY_ID) return;"));
+        // And the Pi render stays free of omp's identity in return. (A bare
+        // "omp" substring probe would trip on the word "complete", so the
+        // reader selection — the one identity a wrong render would act on —
+        // is what is asserted.)
+        assert!(
+            !rendered().contains(r#""--format", "omp""#),
+            "omp identity leaked into the Pi render"
+        );
     }
 
     #[test]

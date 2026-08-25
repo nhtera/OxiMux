@@ -297,6 +297,7 @@ fn agent_adapter_id(kind: AgentAdapter) -> &'static str {
         AgentAdapter::ClaudeCode => "claude-code",
         AgentAdapter::Codex => "codex",
         AgentAdapter::Pi => "pi",
+        AgentAdapter::Omp => "omp",
         AgentAdapter::Custom => "custom",
     }
 }
