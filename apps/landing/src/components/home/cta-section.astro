@@ -21,9 +21,10 @@ import { SITE } from "../../consts";
     </p>
 
     <!--
-      Same two intents as the hero, same two labels. Download is the primary
-      action in both places and the repo link is called "GitHub" everywhere on
-      the page, so no single intent picks up a second name.
+      Same intents as the hero, same labels. The Mac download is the primary
+      action in both places, Windows is the same secondary button, and the repo
+      link is called "GitHub" everywhere on the page, so no single intent picks
+      up a second name.
     -->
     <div class="mt-8 flex flex-wrap items-center justify-center gap-3">
       <a
@@ -32,6 +33,13 @@ import { SITE } from "../../consts";
       >
         <Icon name="simple-icons:apple" class="size-4" aria-hidden="true" />
         Download for Mac
+      </a>
+      <a
+        href={SITE.download}
+        class="press inline-flex items-center gap-2 rounded-[--radius-control] border border-edge bg-panel px-6 py-3 text-sm whitespace-nowrap text-fg hover:border-edge-strong hover:bg-panel-alt"
+      >
+        <Icon name="ph:windows-logo" class="size-4" aria-hidden="true" />
+        Download for Windows
       </a>
       <a
         href={SITE.repo}

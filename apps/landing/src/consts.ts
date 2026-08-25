@@ -11,12 +11,14 @@ export const SITE = {
   tagline: "Many agents. One native cockpit.",
   heroLines: ["Many agents.", "One native cockpit."],
   description:
-    "Open-source, Rust-native development cockpit for macOS. Spawn isolated git worktrees, run coding agents in parallel, and review every change through a full Git UX.",
+    "Open-source, Rust-native development cockpit for macOS and Windows. Spawn isolated git worktrees, run coding agents in parallel, and review every change through a full Git UX.",
   license: "Apache-2.0",
-  platform: "macOS 13.0+",
+  platform: "macOS 13.0+ · Windows x64",
   /**
-   * Resolves to the newest published GitHub release. This 404s until a release
-   * is actually tagged, so tag one before the site goes public.
+   * Resolves to the newest published GitHub release. Release asset names carry
+   * the version number, so there is no stable direct URL per platform; both the
+   * Mac and Windows buttons land here and the reader picks the DMG or the
+   * x64 setup.exe.
    */
   download: "https://github.com/nhtera/OxiMux/releases/latest",
 } as const;
@@ -105,7 +107,7 @@ export const FAQ = [
   },
   {
     q: "What platforms does it run on?",
-    a: "macOS 13.0 or later in v1, with a companion mobile client for pairing a phone to a desktop host. Other desktop platforms are not supported yet.",
+    a: "macOS 13.0 or later and Windows x64, with a companion mobile client for pairing a phone to a desktop host. Linux desktop is not supported yet.",
   },
   {
     q: "How stable is it?",

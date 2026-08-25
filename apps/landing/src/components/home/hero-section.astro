@@ -58,6 +58,18 @@ import cockpit from "../../assets/shots/cockpit.png";
         </a>
 
         <!--
+          Windows ships from the same release page as the DMG. It stays a
+          secondary button so the hero keeps a single primary action.
+        -->
+        <a
+          href={SITE.download}
+          class="press inline-flex items-center gap-2 rounded-[--radius-control] border border-edge bg-panel px-5 py-3 text-sm whitespace-nowrap text-fg hover:border-edge-strong hover:bg-panel-alt"
+        >
+          <Icon name="ph:windows-logo" class="size-4" aria-hidden="true" />
+          Download for Windows
+        </a>
+
+        <!--
           iOS is a real client but is not distributed yet, so this is a state
           chip rather than a link. A disabled anchor would still look clickable
           and would land the reader nowhere; a span with the status spelled out
