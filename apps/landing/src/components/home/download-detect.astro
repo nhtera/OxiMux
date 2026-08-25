@@ -1,53 +1,51 @@
 <!--
-  Shows one download button, matched to the visitor's OS: Mac visitors see
-  only "Download for Mac", Windows visitors only "Download for Windows"
-  (promoted to the primary style). Any other platform — Linux, bots, no-JS —
-  keeps the full server-rendered pair, so nobody is ever left with zero
-  download paths.
+  Shows the one download control that matches the visitor's OS, Orca-compact:
+  Mac visitors get "Download for Mac", Windows visitors "Download for
+  Windows", Linux visitors a "Linux · Soon" chip — each with an "Also for …"
+  line naming the other platform's direct download underneath.
 
   The page is served static, so the server cannot know the visitor's OS; the
-  markup ships with Mac primary and this script prunes after the fact. It is
-  imported by both the hero and the CTA section — Astro hoists processed
-  scripts, so it runs once and rewrites every [data-dl] pair on the page.
+  markup ships the Mac state (majority audience and the no-JS fallback, whose
+  "Also for Windows" anchor keeps every installer reachable) and this script
+  swaps the visible pieces after the fact. It is imported by both the hero
+  and the CTA section — Astro hoists processed scripts, so it runs once and
+  rewrites every [data-dl]/[data-dl-alt] element on the page.
 
-  Detection is user-agent sniffing on purpose: "Mac, Windows, or neither" is
-  a question every browser answers in its UA string. No high-entropy client
-  hints needed — there is no Intel-Mac build to disambiguate.
+  Visibility is toggled through inline `display`, never Tailwind's `hidden`
+  class: the compiled sheet orders .hidden before .inline-flex, so at equal
+  specificity the class loses the cascade on these elements and does nothing
+  — which is precisely the bug that shipped both buttons at once.
 -->
 <script>
-  // Class-list halves of the two button styles. Every class here already
-  // appears in the section markup, so Tailwind has generated all of them.
-  const PRIMARY = ["bg-fg", "font-medium", "text-canvas", "hover:bg-white"];
-  const SECONDARY = [
-    "border",
-    "border-edge",
-    "bg-panel",
-    "text-fg",
-    "hover:border-edge-strong",
-    "hover:bg-panel-alt",
-  ];
-
   const ua = navigator.userAgent;
   const platform =
     (navigator as any).userAgentData?.platform ?? navigator.platform ?? "";
   const isWindows =
     /Windows NT|Win(64|32|16)|WOW64/i.test(ua) || /^Win/i.test(platform);
-  const isMac =
+  // Android UAs (and their "Linux armv8" platform strings) must not count as
+  // desktop Linux — a phone gets the default Mac state, same as any unknown.
+  const isLinux =
     !isWindows &&
-    (/Macintosh|Mac OS X|MacIntel|MacPPC|Mac_PowerPC/i.test(ua) ||
-      /^Mac/i.test(platform));
+    !/Android|CrOS/i.test(ua) &&
+    (/Linux/i.test(ua) || /^Linux/i.test(platform));
 
-  if (isWindows) {
-    for (const win of document.querySelectorAll("[data-dl='windows']")) {
-      win.classList.remove(...SECONDARY);
-      win.classList.add(...PRIMARY);
+  const setShown = (selector: string, shown: boolean) => {
+    for (const el of document.querySelectorAll(selector)) {
+      (el as HTMLElement).style.display = shown ? "" : "none";
     }
-    for (const mac of document.querySelectorAll("[data-dl='mac']")) {
-      mac.classList.add("hidden");
-    }
-  } else if (isMac) {
-    for (const win of document.querySelectorAll("[data-dl='windows']")) {
-      win.classList.add("hidden");
+  };
+
+  // The Mac state is what the server rendered, so only the other two swap.
+  if (isWindows || isLinux) {
+    setShown("[data-dl='mac']", false);
+    setShown("[data-dl-alt='mac']", true);
+    if (isWindows) {
+      setShown("[data-dl='windows']", true);
+      setShown("[data-dl-alt='windows']", false);
+    } else {
+      // Linux: no build to offer, so the chip plus both real downloads.
+      setShown("[data-dl='linux-soon']", true);
+      setShown("[data-dl-alt-sep]", true);
     }
   }
 </script>

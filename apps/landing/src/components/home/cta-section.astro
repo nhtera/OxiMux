@@ -23,9 +23,10 @@ import { SITE } from "../../consts";
 
     <!--
       Same intents as the hero, same labels, same direct-download URLs, and the
-      same data-dl markers so download-detect.astro prunes to the visitor's own
-      platform here too. The repo link is called "GitHub" everywhere on the
-      page, so no single intent picks up a second name.
+      same data-dl markers so download-detect.astro swaps to the visitor's own
+      platform here too (inline display, not `hidden` — see the hero comment).
+      The repo link is called "GitHub" everywhere on the page, so no single
+      intent picks up a second name.
     -->
     <div class="mt-8 flex flex-wrap items-center justify-center gap-3">
       <a
@@ -39,11 +40,25 @@ import { SITE } from "../../consts";
       <a
         href={SITE.downloads.windows}
         data-dl="windows"
-        class="press inline-flex items-center gap-2 rounded-[--radius-control] border border-edge bg-panel px-6 py-3 text-sm whitespace-nowrap text-fg hover:border-edge-strong hover:bg-panel-alt"
+        style="display: none"
+        class="press inline-flex items-center gap-2 rounded-[--radius-control] bg-fg px-6 py-3 text-sm font-medium whitespace-nowrap text-canvas hover:bg-white"
       >
         <Icon name="ph:windows-logo" class="size-4" aria-hidden="true" />
         Download for Windows
       </a>
+      <span
+        data-dl="linux-soon"
+        style="display: none"
+        class="inline-flex items-center gap-2 rounded-[--radius-control] border border-edge px-4 py-3 text-sm whitespace-nowrap text-fg-muted"
+      >
+        <Icon name="ph:linux-logo" class="size-4" aria-hidden="true" />
+        Linux
+        <span
+          class="rounded-[--radius-chip] bg-panel-alt px-1.5 py-0.5 text-[11px] tracking-wide text-fg-subtle"
+        >
+          Soon
+        </span>
+      </span>
       <a
         href={SITE.repo}
         class="press inline-flex items-center gap-2 rounded-[--radius-control] border border-edge bg-panel px-6 py-3 text-sm whitespace-nowrap text-fg hover:border-edge-strong hover:bg-panel-alt"
@@ -52,6 +67,22 @@ import { SITE } from "../../consts";
         GitHub
       </a>
     </div>
+
+    <p class="mt-3 flex flex-wrap items-center justify-center gap-x-1.5 text-sm text-fg-subtle">
+      <span>Also for</span>
+      <a
+        href={SITE.downloads.mac}
+        data-dl-alt="mac"
+        style="display: none"
+        class="underline decoration-edge-strong underline-offset-4 hover:text-fg"
+      >macOS</a>
+      <span data-dl-alt-sep style="display: none">·</span>
+      <a
+        href={SITE.downloads.windows}
+        data-dl-alt="windows"
+        class="underline decoration-edge-strong underline-offset-4 hover:text-fg"
+      >Windows</a>
+    </p>
 
     <DownloadDetect />
   </div>
