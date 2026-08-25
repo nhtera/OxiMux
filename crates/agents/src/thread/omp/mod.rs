@@ -948,7 +948,7 @@ mod tests {
 
     fn fake_omp(script: &str) -> Command {
         let mut cmd = crate::thread::sh_fixture::sh_command();
-        cmd.arg("-c").arg(script.to_string());
+        cmd.arg("-c").arg(script);
         cmd
     }
 
