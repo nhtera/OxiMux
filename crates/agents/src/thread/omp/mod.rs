@@ -1054,6 +1054,10 @@ printf '{"type":"echo_for_test","raw":%s}\n' "$(printf '%s' "$answer" | sed 's/\
                     break (request_id, tool_name, input)
                 }
                 Ok(_) => continue,
+                // A quiet second is not failure — slow CI runners (Windows
+                // especially) can gap that long; the deadline above is the
+                // real limit. Only a dead channel is fatal.
+                Err(RecvTimeoutError::Timeout) => continue,
                 Err(e) => panic!("waiting for permission request: {e:?}"),
             }
         };
@@ -1130,6 +1134,8 @@ printf '{"type":"extension_ui_request","id":"d1","method":"input","title":"Type 
             match rx.recv_timeout(Duration::from_secs(1)) {
                 Ok(ThreadEvent::Error(m)) if m.contains("can't render") => break,
                 Ok(_) => continue,
+                // Quiet ≠ dead: the deadline above bounds the wait (slow CI).
+                Err(RecvTimeoutError::Timeout) => continue,
                 Err(e) => panic!("waiting for the notice: {e:?}"),
             }
         }
@@ -1340,6 +1346,8 @@ printf '{{"type":"message_update","assistantMessageEvent":{{"type":"text_delta",
                     break;
                 }
                 Ok(_) => continue,
+                // Quiet ≠ dead: the deadline above bounds the wait (slow CI).
+                Err(RecvTimeoutError::Timeout) => continue,
                 Err(e) => panic!("waiting for the delta: {e:?}"),
             }
         }

@@ -2,41 +2,37 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleDevelopmentRegion</key>
-    <string>en</string>
-    <key>CFBundleDisplayName</key>
-    <string>OxiMux</string>
-    <key>CFBundleExecutable</key>
-    <string>oximux</string>
-    <key>CFBundleIdentifier</key>
-    <string>dev.nhtera.oximux</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>CFBundleName</key>
-    <string>OxiMux</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>0.1.13</string>
-    <key>CFBundleVersion</key>
-    <string>0.1.13</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
-    <key>NSHighResolutionCapable</key>
-    <true/>
-    <key>NSSupportsAutomaticGraphicsSwitching</key>
-    <true/>
-    <key>NSRequiresAquaSystemAppearance</key>
-    <false/>
-    <key>CFBundleIconFile</key>
-    <string>AppIcon</string>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>OxiMux uses the microphone for voice dictation.</string>
-    <!-- Without this key macOS never offers Input Monitoring, and the Escape
-         kill switch cannot be armed: a keyboard event tap is gated on that
-         permission, and an app the system never prompts for has to be added by
-         hand in System Settings, which nobody thinks to do. -->
-    <key>NSInputMonitoringUsageDescription</key>
-    <string>OxiMux watches for the Escape key so you can stop an agent that is controlling your screen.</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>OxiMux</string>
+	<key>CFBundleExecutable</key>
+	<string>oximux</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.nhtera.oximux</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>OxiMux</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.14</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.14</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSInputMonitoringUsageDescription</key>
+	<string>OxiMux watches for the Escape key so you can stop an agent that is controlling your screen.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>OxiMux uses the microphone for voice dictation.</string>
+	<key>NSRequiresAquaSystemAppearance</key>
+	<false/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
 </dict>
 </plist>
