@@ -199,8 +199,14 @@ impl TerminalView {
         let session = self.session_id;
         let pane_visible = self.is_visible();
         if let Some(opener) = self.opener.clone() {
-            let _ = opener.update(cx, |pg, cx| {
-                pg.notify_terminal_bell(session, pane_visible, cx);
+            // Deferred, never inline: this runs from `tick`, inside this very
+            // view's entity update. The group's tab walk reads every terminal
+            // view — this one included — and reading a checked-out entity is a
+            // double-lease abort. `defer` lets the current borrow release first.
+            cx.defer(move |cx| {
+                let _ = opener.update(cx, |pg, cx| {
+                    pg.notify_terminal_bell(session, pane_visible, cx);
+                });
             });
         }
     }
