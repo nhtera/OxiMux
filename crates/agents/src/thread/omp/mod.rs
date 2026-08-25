@@ -947,8 +947,23 @@ mod tests {
     // ── fake-omp integration tests (no real omp needed) ────────────────────
 
     fn fake_omp(script: &str) -> Command {
+        // The script goes through a FILE, not `sh -c <argv>`: on Windows the
+        // MSYS `sh` re-parses the raw command line with cygwin quoting rules,
+        // where a quoted `\\` collapses to `\` — silently rewriting the
+        // script's printf escapes (a `\\n` meant as a literal JSON `\n`
+        // became a real newline, splitting a frame mid-string). A file has no
+        // argv encoding: sh reads exactly the bytes the test wrote. The tiny
+        // temp files are left for the OS to clean.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "oximux-fake-omp-{}-{}.sh",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, script).expect("write fake-omp script");
         let mut cmd = crate::thread::sh_fixture::sh_command();
-        cmd.arg("-c").arg(script);
+        cmd.arg(path);
         cmd
     }
 
