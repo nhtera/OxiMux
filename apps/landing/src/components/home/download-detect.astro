@@ -1,0 +1,53 @@
+<!--
+  Shows one download button, matched to the visitor's OS: Mac visitors see
+  only "Download for Mac", Windows visitors only "Download for Windows"
+  (promoted to the primary style). Any other platform — Linux, bots, no-JS —
+  keeps the full server-rendered pair, so nobody is ever left with zero
+  download paths.
+
+  The page is served static, so the server cannot know the visitor's OS; the
+  markup ships with Mac primary and this script prunes after the fact. It is
+  imported by both the hero and the CTA section — Astro hoists processed
+  scripts, so it runs once and rewrites every [data-dl] pair on the page.
+
+  Detection is user-agent sniffing on purpose: "Mac, Windows, or neither" is
+  a question every browser answers in its UA string. No high-entropy client
+  hints needed — there is no Intel-Mac build to disambiguate.
+-->
+<script>
+  // Class-list halves of the two button styles. Every class here already
+  // appears in the section markup, so Tailwind has generated all of them.
+  const PRIMARY = ["bg-fg", "font-medium", "text-canvas", "hover:bg-white"];
+  const SECONDARY = [
+    "border",
+    "border-edge",
+    "bg-panel",
+    "text-fg",
+    "hover:border-edge-strong",
+    "hover:bg-panel-alt",
+  ];
+
+  const ua = navigator.userAgent;
+  const platform =
+    (navigator as any).userAgentData?.platform ?? navigator.platform ?? "";
+  const isWindows =
+    /Windows NT|Win(64|32|16)|WOW64/i.test(ua) || /^Win/i.test(platform);
+  const isMac =
+    !isWindows &&
+    (/Macintosh|Mac OS X|MacIntel|MacPPC|Mac_PowerPC/i.test(ua) ||
+      /^Mac/i.test(platform));
+
+  if (isWindows) {
+    for (const win of document.querySelectorAll("[data-dl='windows']")) {
+      win.classList.remove(...SECONDARY);
+      win.classList.add(...PRIMARY);
+    }
+    for (const mac of document.querySelectorAll("[data-dl='mac']")) {
+      mac.classList.add("hidden");
+    }
+  } else if (isMac) {
+    for (const win of document.querySelectorAll("[data-dl='windows']")) {
+      win.classList.add("hidden");
+    }
+  }
+</script>

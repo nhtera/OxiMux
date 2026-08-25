@@ -1,5 +1,6 @@
 ---
 import { Icon } from "astro-icon/components";
+import DownloadDetect from "./download-detect.astro";
 import { SITE } from "../../consts";
 ---
 
@@ -21,21 +22,23 @@ import { SITE } from "../../consts";
     </p>
 
     <!--
-      Same intents as the hero, same labels. The Mac download is the primary
-      action in both places, Windows is the same secondary button, and the repo
-      link is called "GitHub" everywhere on the page, so no single intent picks
-      up a second name.
+      Same intents as the hero, same labels, same direct-download URLs, and the
+      same data-dl markers so download-detect.astro prunes to the visitor's own
+      platform here too. The repo link is called "GitHub" everywhere on the
+      page, so no single intent picks up a second name.
     -->
     <div class="mt-8 flex flex-wrap items-center justify-center gap-3">
       <a
-        href={SITE.download}
+        href={SITE.downloads.mac}
+        data-dl="mac"
         class="press inline-flex items-center gap-2 rounded-[--radius-control] bg-fg px-6 py-3 text-sm font-medium whitespace-nowrap text-canvas hover:bg-white"
       >
         <Icon name="simple-icons:apple" class="size-4" aria-hidden="true" />
         Download for Mac
       </a>
       <a
-        href={SITE.download}
+        href={SITE.downloads.windows}
+        data-dl="windows"
         class="press inline-flex items-center gap-2 rounded-[--radius-control] border border-edge bg-panel px-6 py-3 text-sm whitespace-nowrap text-fg hover:border-edge-strong hover:bg-panel-alt"
       >
         <Icon name="ph:windows-logo" class="size-4" aria-hidden="true" />
@@ -49,5 +52,7 @@ import { SITE } from "../../consts";
         GitHub
       </a>
     </div>
+
+    <DownloadDetect />
   </div>
 </section>

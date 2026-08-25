@@ -151,6 +151,11 @@ jobs:
             TAG="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           fi
           DMG=(dist/OxiMux-*-macos-arm64.dmg)
+          # Stable-name duplicate: the landing page links
+          # releases/latest/download/OxiMux-macos-arm64.dmg, which only resolves
+          # if every release carries an asset under exactly that name.
+          cp "${DMG[0]}" dist/OxiMux-macos-arm64.dmg
+          DMG+=(dist/OxiMux-macos-arm64.dmg)
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${DMG[@]}" --clobber
           else
@@ -286,8 +291,17 @@ jobs:
           # Both are required, not best-effort. A release that quietly carries
           # only one of them is the failure this check exists to prevent: users
           # who followed a "download the installer" link find a zip instead.
-          $setup = Get-ChildItem dist/OxiMux-*-x64-setup.exe | Select-Object -First 1
+          # The Where-Object keeps a re-run of this step from matching the
+          # stable-name copy made below and copying the file onto itself.
+          $setup = Get-ChildItem dist/OxiMux-*-x64-setup.exe |
+            Where-Object Name -ne 'OxiMux-windows-x64-setup.exe' |
+            Select-Object -First 1
           if (-not $setup) { throw 'no setup.exe in dist/ - did -Installer run?' }
+
+          # Stable-name duplicate: the landing page links
+          # releases/latest/download/OxiMux-windows-x64-setup.exe, which only
+          # resolves if every release carries an asset under exactly that name.
+          Copy-Item $setup.FullName dist/OxiMux-windows-x64-setup.exe -Force
 
           # `gh release view` failing means "not created yet". Creating it may
           # still lose to the macOS job doing the same thing a second earlier,
@@ -298,7 +312,7 @@ jobs:
             gh release create $tag --draft --generate-notes --title $tag
             if ($LASTEXITCODE -ne 0) { Write-Host 'release already created by another job' }
           }
-          gh release upload $tag $zip.FullName $setup.FullName --clobber
+          gh release upload $tag $zip.FullName $setup.FullName dist/OxiMux-windows-x64-setup.exe --clobber
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed with exit code $LASTEXITCODE" }
           Write-Host "uploaded $($zip.Name) and $($setup.Name) to $tag"
 

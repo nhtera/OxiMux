@@ -1,6 +1,7 @@
 ---
 import { Icon } from "astro-icon/components";
 import CliInstallDialog from "./cli-install-dialog.astro";
+import DownloadDetect from "./download-detect.astro";
 import ShotFrame from "../shot-frame.astro";
 import { SITE, AGENT_MARKS } from "../../consts";
 import cockpit from "../../assets/shots/cockpit.png";
@@ -48,21 +49,26 @@ import cockpit from "../../assets/shots/cockpit.png";
         review every diff. Rust and GPUI.
       </p>
 
+      <!--
+        Both anchors hit permanent releases/latest/download URLs, so a click
+        starts the right file directly. Both ship in the markup (the no-JS and
+        unknown-OS fallback); download-detect.astro keeps only the visitor's
+        own platform, so a Mac sees one Mac button and a Windows machine one
+        primary Windows button.
+      -->
       <div class="mt-8 flex flex-wrap items-center gap-3">
         <a
-          href={SITE.download}
+          href={SITE.downloads.mac}
+          data-dl="mac"
           class="press inline-flex items-center gap-2 rounded-[--radius-control] bg-fg px-5 py-3 text-sm font-medium whitespace-nowrap text-canvas hover:bg-white"
         >
           <Icon name="simple-icons:apple" class="size-4" aria-hidden="true" />
           Download for Mac
         </a>
 
-        <!--
-          Windows ships from the same release page as the DMG. It stays a
-          secondary button so the hero keeps a single primary action.
-        -->
         <a
-          href={SITE.download}
+          href={SITE.downloads.windows}
+          data-dl="windows"
           class="press inline-flex items-center gap-2 rounded-[--radius-control] border border-edge bg-panel px-5 py-3 text-sm whitespace-nowrap text-fg hover:border-edge-strong hover:bg-panel-alt"
         >
           <Icon name="ph:windows-logo" class="size-4" aria-hidden="true" />
@@ -127,6 +133,8 @@ import cockpit from "../../assets/shots/cockpit.png";
         <span class="text-sm text-fg-subtle">and any ACP agent</span>
       </div>
     </div>
+
+    <DownloadDetect />
 
     <div class="scroll-lift mt-14 sm:mt-16">
       <ShotFrame

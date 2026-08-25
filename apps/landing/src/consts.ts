@@ -15,12 +15,18 @@ export const SITE = {
   license: "Apache-2.0",
   platform: "macOS 13.0+ · Windows x64",
   /**
-   * Resolves to the newest published GitHub release. Release asset names carry
-   * the version number, so there is no stable direct URL per platform; both the
-   * Mac and Windows buttons land here and the reader picks the DMG or the
-   * x64 setup.exe.
+   * Direct per-platform downloads. `releases/latest/download/<name>` is
+   * GitHub's permanent alias for the newest release's asset of that exact
+   * name, so these URLs survive every release — the release workflow uploads
+   * a stable-named copy of the DMG and the Windows installer next to the
+   * versioned ones. The click starts the right file immediately instead of
+   * landing the reader on the release page to hunt through fifteen assets.
    */
-  download: "https://github.com/nhtera/OxiMux/releases/latest",
+  downloads: {
+    mac: "https://github.com/nhtera/OxiMux/releases/latest/download/OxiMux-macos-arm64.dmg",
+    windows:
+      "https://github.com/nhtera/OxiMux/releases/latest/download/OxiMux-windows-x64-setup.exe",
+  },
 } as const;
 
 /**
