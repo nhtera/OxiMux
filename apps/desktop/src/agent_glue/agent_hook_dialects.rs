@@ -175,7 +175,7 @@ pub(crate) const MANAGED_MARKER: &str = "_oximux_managed";
 /// Ordered as they were measured. Claude is first because its row is the one
 /// every other row is trying to look like.
 pub(crate) const DIALECTS: &[HookDialect] =
-    &[CLAUDE, CODEX, DROID, COPILOT, GEMINI, CURSOR, GROK, PI];
+    &[CLAUDE, CODEX, DROID, COPILOT, GEMINI, CURSOR, GROK, PI, OMP];
 
 /// Claude Code — `~/.claude/settings.json`.
 ///
@@ -443,6 +443,29 @@ const PI: HookDialect = HookDialect {
     reads_transcript: false,
 };
 
+/// omp — `~/.omp/agent/extensions/oximux-agent-status-omp.ts`.
+///
+/// A Pi fork that kept Pi's extension API and event dialect — re-measured
+/// live against omp 18.0.4: same event sequence, same double-fire pairs, the
+/// reply under `message.content[].text` in the raw events. Like Pi's, the
+/// extension composes its payload in Claude's key names, the reply already
+/// flattened out of that array of parts. The extension is the shared Pi
+/// template rendered with omp's identity, into a file whose NAME differs from
+/// Pi's because omp also kept Pi's `PI_CODING_AGENT_DIR` override: with that
+/// set, both agents read the same directory, and two dialects writing one
+/// path would fight over it (see [`crate::pi_status_extension`]).
+const OMP: HookDialect = HookDialect {
+    slug: "omp",
+    agent: "omp",
+    home: omp_home,
+    file: crate::pi_status_extension::OMP_EXTENSION_FILE,
+    install: Install::Extension {
+        source: crate::pi_status_extension::omp_source,
+    },
+    message_keys: &["last_assistant_message"],
+    reads_transcript: false,
+};
+
 /// The dialect named by a `--format` slug, or `None` for an unknown one.
 pub fn dialect_for_slug(slug: &str) -> Option<&'static HookDialect> {
     DIALECTS.iter().find(|d| d.slug == slug)
@@ -583,16 +606,43 @@ fn grok_home() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".grok"))
 }
 
-/// Honours `PI_CODING_AGENT_DIR`, which relocates Pi's whole config directory:
+/// Honours `PI_CODING_AGENT_DIR`, which relocates Pi's whole agent directory:
 /// installing into the default while Pi reads another is a file written to a
 /// directory nothing ever loads.
 fn pi_home() -> Option<PathBuf> {
-    match std::env::var_os("PI_CODING_AGENT_DIR") {
-        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
-        _ => Some(dirs::home_dir()?.join(".pi").join("agent")),
-    }
+    pi_family_home(".pi")
 }
 
+/// omp inherited Pi's env override VERBATIM (`PI_CODING_AGENT_DIR`, verified
+/// in omp 18.0.4), so with it set omp and Pi genuinely read the same agent
+/// directory — the homes are allowed to collide because the two dialects
+/// write differently-NAMED files (see
+/// [`crate::pi_status_extension::OMP_EXTENSION_FILE`]).
+fn omp_home() -> Option<PathBuf> {
+    pi_family_home(".omp")
+}
+
+/// Resolve a Pi-family agent home, believing the SHARED env override only on
+/// the agent's own evidence.
+///
+/// The override cannot say WHICH of the two agents is installed — both read
+/// the same variable, so on a machine with only one of them, trusting it
+/// alone would have the other dialect report itself installed and write its
+/// extension into a directory its agent never created (and whose resident
+/// agent loads everything under `extensions/`, spawning a second reporter per
+/// event). Each agent still writes logs and runtime records under its own
+/// config root (`~/.pi` / `~/.omp`) even when the agent dir is relocated —
+/// measured on omp 18.0.4 — so the root's existence is the footprint that
+/// tells the two apart.
+fn pi_family_home(root_name: &str) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    match std::env::var_os("PI_CODING_AGENT_DIR") {
+        Some(dir) if !dir.is_empty() => {
+            home.join(root_name).is_dir().then(|| PathBuf::from(dir))
+        }
+        _ => Some(home.join(root_name).join("agent")),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -650,6 +700,32 @@ mod tests {
         paths.sort();
         paths.dedup();
         assert_eq!(before, paths.len(), "two dialects claim one file");
+    }
+
+    #[test]
+    fn omp_and_pi_never_write_the_same_file_even_when_their_homes_collide() {
+        // omp kept Pi's `PI_CODING_AGENT_DIR` override verbatim, so with that
+        // variable set both homes resolve to ONE directory —
+        // `no_two_dialects_write_the_same_file` runs with the variable unset
+        // and can never catch that collision. The invariant that protects it
+        // is the RELATIVE file name: distinct names keep each dialect's
+        // install and prune its own whichever directory they land in.
+        assert_ne!(dialect("pi").file, dialect("omp").file);
+        // Both live under extensions/, where the runtime discovers every file,
+        // so distinct names still mean both get loaded — that is the deal.
+        assert!(dialect("omp").file.starts_with("extensions/"));
+    }
+
+    #[test]
+    fn the_omp_reply_arrives_under_the_shared_key() {
+        // The omp extension composes the same Claude-shaped payload the Pi one
+        // does; a drifted key spelling here would install working hooks that
+        // never surface a reply (the bug the ~788 Pi assert exists to stop).
+        assert_eq!(
+            last_message(dialect("omp"), r#"{"last_assistant_message":"DONE"}"#).as_deref(),
+            Some("DONE")
+        );
+        assert!(matches!(dialect("omp").install, Install::Extension { .. }));
     }
 
     #[test]

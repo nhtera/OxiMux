@@ -1,6 +1,6 @@
 # OxiMux
 
-A Rust-native, multi-agent development cockpit for macOS. Open a repo → spawn isolated worktrees → run CLI coding agents (Claude Code, Codex, Pi) in parallel → review every change through a GitLens-grade Git UX.
+A Rust-native, multi-agent development cockpit for macOS. Open a repo → spawn isolated worktrees → run CLI coding agents (Claude Code, Codex, Pi, omp) in parallel → review every change through a GitLens-grade Git UX.
 
 - **Stack**: Rust 1.95 (edition 2024) + GPUI + [`longbridge/gpui-component`](https://github.com/longbridge/gpui-component) + SQLite + Tokio
 - **Status**: Working cockpit, in active development. Dogfoodable for day-to-day repo work; pre-1.0, so expect rough edges.
@@ -145,7 +145,7 @@ crates/
 │                 stream-json decoder) — no gpui/pty/tokio, so it
 │                 cross-compiles for the mobile Rust core
 ├── agents/       AgentRuntime trait + provider adapters (Claude, Codex,
-│                 ACP, Pi) and session import
+│                 ACP, Pi, omp) and session import
 ├── editor/       gpui-component editor wrapper + LSP glue
 ├── dictation/    offline voice dictation (sherpa-onnx + CoreAudio capture)
 ├── storage/      SQLite + migration ladder + CI guard
@@ -176,7 +176,7 @@ plans/            implementation plans + reports — gitignored
 
 - **Workspaces & worktrees** — open a repo, spin up isolated `oximux/<slug>` worktrees per task; create, switch, archive, stash.
 - **Panes & terminals** — split panes, tabs, a floating terminal; PTYs run out-of-process via the relay daemon and survive an app relaunch.
-- **CLI agents** — spawn Claude Code / Codex / Pi in tabs; an agents dashboard tracks per-session status (`Running`, `NeedsApproval`, `Done`, `Failed`).
+- **CLI agents** — spawn Claude Code / Codex / Pi / omp in tabs; an agents dashboard tracks per-session status (`Running`, `NeedsApproval`, `Done`, `Failed`).
 - **Git / SCM** — status poller, staged/unstaged review, commit (with AI-drafted messages), commit graph, branch picker, push/pull/sync, CI badge, `gh pr create`.
 - **Diff viewer** — a custom-canvas renderer with per-line geometry, word-diff, combined-diff, and folded hunks.
 - **Navigation** — a command palette (Quick Open + commands, fuzzy match), file explorer, search panel.

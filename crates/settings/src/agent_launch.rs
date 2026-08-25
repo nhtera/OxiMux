@@ -40,6 +40,10 @@ pub enum Transport {
     /// Pi's own newline-JSON protocol (`pi --mode rpc`). Pi speaks neither ACP
     /// nor app-server, so it needs its own transport rather than reusing one.
     Rpc,
+    /// omp's protocol (`omp --mode rpc-ui`) — a Pi fork whose command layer,
+    /// handshake, and approval flow diverged enough to be its own transport;
+    /// reusing `Rpc` would route an omp chat into the Pi backend.
+    OmpRpc,
 }
 
 /// One agent's launch defaults. All fields optional via `#[serde(default)]`
@@ -183,13 +187,33 @@ pub fn acp_preset(id: &str) -> Option<&'static AcpPreset> {
 /// start as though it had resumed. **Prefer the id.** The history picker passes a
 /// path (it has one, and it exists — it was just read to build the row); the chat's
 /// companion terminal passes the id.
+///
+/// omp (`omp --resume <id>`) resumes by id, never by path — but its resolver
+/// is a PREFIX match with a global cross-project fallback (measured on
+/// 18.0.4: an ambiguous 8-char prefix and another project's id both resolve
+/// SILENTLY), so the handle must be the full canonical UUID. Anything else —
+/// truncated, flag-shaped, a file path — yields `None` here rather than an
+/// argv that might land in the wrong session.
 pub fn import_resume_command(preset_id: &str, handle: &str) -> Option<(String, Vec<String>)> {
     match preset_id {
         "opencode" => Some(("opencode".to_string(), vec!["--session".to_string(), handle.to_string()])),
         "copilot" => Some(("copilot".to_string(), vec![format!("--resume={handle}")])),
         "pi" => Some(("pi".to_string(), vec!["--session".to_string(), handle.to_string()])),
+        "omp" => is_full_session_uuid(handle)
+            .then(|| ("omp".to_string(), vec!["--resume".to_string(), handle.to_string()])),
         _ => None,
     }
+}
+
+/// True for a full canonical lowercase-hex UUID (`8-4-4-4-12`) — the only
+/// handle shape omp's prefix-matching resolver cannot mis-resolve.
+fn is_full_session_uuid(handle: &str) -> bool {
+    let groups: Vec<&str> = handle.split('-').collect();
+    groups.len() == 5
+        && [8, 4, 4, 4, 12]
+            .iter()
+            .zip(&groups)
+            .all(|(len, g)| g.len() == *len && g.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// The skip-permissions ("YOLO") flag seeded for each built-in agent on a
@@ -308,6 +332,9 @@ impl AgentLaunchSettings {
         match adapter_id {
             "codex" => Transport::AppServer,
             "pi" => Transport::Rpc,
+            // Explicit, never the `_` fallback: StreamJson would silently
+            // route an omp chat into the Claude backend (locked by test).
+            "omp" => Transport::OmpRpc,
             _ => Transport::StreamJson,
         }
     }
@@ -326,7 +353,7 @@ impl AgentLaunchSettings {
     /// entry (a model, some args) would otherwise fall into it and report
     /// `false` — silently un-chat-able for exactly the users who customised it.
     pub fn chat_capable(&self, adapter_id: &str) -> bool {
-        if matches!(adapter_id, "claude-code" | "codex" | "pi") {
+        if matches!(adapter_id, "claude-code" | "codex" | "pi" | "omp") {
             return true;
         }
         if let Some(a) = self.for_agent(adapter_id) {
@@ -355,7 +382,7 @@ impl AgentLaunchSettings {
         if !configured.is_empty() && self.chat_capable(configured) {
             return Some(configured.to_string());
         }
-        const BUILTINS: [&str; 3] = ["claude-code", "codex", "pi"];
+        const BUILTINS: [&str; 4] = ["claude-code", "codex", "pi", "omp"];
         BUILTINS
             .into_iter()
             .find(|id| self.chat_capable(id) && !self.is_disabled(id))
@@ -976,5 +1003,42 @@ also_unknown = true
         // An explicit `false` wins.
         let off = AgentLaunchSettings::from_toml_str("auto_title_enabled = false").expect("parse");
         assert!(!off.auto_title_enabled);
+    }
+
+    #[test]
+    fn omp_chat_gates_never_fall_through_to_claude() {
+        // `transport_for`'s `_ => StreamJson` fallback silently routes an
+        // unknown id into the Claude backend — the exact misroute the omp arm
+        // exists to prevent (red-team F1/F5 lineage).
+        let s = AgentLaunchSettings::default();
+        assert_eq!(s.transport_for("omp"), Transport::OmpRpc);
+        assert!(s.chat_capable("omp"), "omp is a built-in chat adapter");
+        // And a user entry that merely customises args must not demote it.
+        let toml = "[agents.omp]\nargs = \"--no-color\"";
+        let s = AgentLaunchSettings::from_toml_str(toml).expect("parse");
+        assert!(s.chat_capable("omp"));
+        assert_eq!(s.transport_for("omp"), Transport::OmpRpc);
+    }
+
+    #[test]
+    fn omp_resume_takes_only_a_full_canonical_uuid() {
+        // omp's resolver is a prefix match with a global cross-project
+        // fallback (measured on 18.0.4): a truncated or malformed handle can
+        // silently land in the WRONG session, so the seam refuses anything
+        // that is not the full canonical id.
+        let full = "01a037fe-2a2b-76e1-8d1f-db954755a79c";
+        let (bin, args) = import_resume_command("omp", full).expect("a full uuid resumes");
+        assert_eq!(bin, "omp");
+        assert_eq!(args, vec!["--resume".to_string(), full.to_string()]);
+        // Truncated prefix (resolves silently in omp) — refused here.
+        assert!(import_resume_command("omp", "01a037fe").is_none());
+        // Flag-shaped, path-shaped, empty, uppercase — all refused.
+        assert!(import_resume_command("omp", "--continue").is_none());
+        assert!(import_resume_command("omp", "/tmp/x/sessions/a.jsonl").is_none());
+        assert!(import_resume_command("omp", "").is_none());
+        assert!(import_resume_command("omp", "01A037FE-2A2B-76E1-8D1F-DB954755A79C").is_some(),
+            "uppercase hex is still an unambiguous full id");
+        // Wrong group lengths never pass.
+        assert!(import_resume_command("omp", "01a037fe-2a2b-76e1-8d1f-db954755a79").is_none());
     }
 }

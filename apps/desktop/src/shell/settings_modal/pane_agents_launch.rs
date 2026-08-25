@@ -19,10 +19,11 @@ use crate::shell::agent_presentation::adapter_icon_path;
 /// Built-in agents exposed in the launch settings, in picker order. The
 /// custom adapter is excluded — its command is fully user-supplied, so a
 /// "default flags" override has no meaning.
-pub(super) const LAUNCH_AGENTS: [(&str, &str); 3] = [
+pub(super) const LAUNCH_AGENTS: [(&str, &str); 4] = [
     ("claude-code", "Claude Code"),
     ("codex", "Codex"),
     ("pi", "Pi"),
+    ("omp", "omp"),
 ];
 
 /// The skip-permissions ("YOLO") flag for an agent — toggled in and out of
@@ -34,6 +35,10 @@ fn yolo_flag(adapter_id: &str) -> Option<&'static str> {
     match adapter_id {
         "codex" => Some("--dangerously-bypass-approvals-and-sandbox"),
         "pi" => None,
+        // omp's skip-everything is its own approval mode, not a bare flag.
+        // The `_` fallback would hand it Claude's flag, which omp rejects at
+        // parse — locked by test (red-team F8).
+        "omp" => Some("--approval-mode yolo"),
         // claude-code and any future addition default to claude's spelling.
         _ => Some("--dangerously-skip-permissions"),
     }
@@ -47,24 +52,64 @@ fn yolo_flag(adapter_id: &str) -> Option<&'static str> {
 fn model_presets(adapter_id: &str) -> &'static [&'static str] {
     match adapter_id {
         "codex" => &["", "gpt-5-codex", "o3"],
-        "pi" => &[""],
+        // Pi-family catalogs are per-user and bare ids fuzzy-match across
+        // providers — only "Default" is safe to offer statically. The `_`
+        // fallback would hand omp Claude's opus/sonnet/haiku (F8).
+        "pi" | "omp" => &[""],
         _ => &["", "opus", "sonnet", "haiku"],
     }
 }
 
-/// Whether `args` already contains `flag` as a standalone token.
+/// Whether `args` already contains `flag` — a single token, or a multi-token
+/// phrase matched as a contiguous token subsequence (omp's skip-everything is
+/// `--approval-mode yolo`, two tokens that round-trip through the free-text
+/// args as two tokens).
 fn has_flag(args: &str, flag: &str) -> bool {
-    split_args(args).iter().any(|t| t == flag)
+    let toks = split_args(args);
+    let flag_toks: Vec<&str> = flag.split_whitespace().collect();
+    !flag_toks.is_empty()
+        && toks.windows(flag_toks.len()).any(|w| w.iter().map(String::as_str).eq(flag_toks.iter().copied()))
 }
 
-/// Add or remove `flag` from a free-text args string, preserving any other
-/// tokens the user configured. Re-joined with single spaces.
+/// Add or remove `flag` (token phrase, see [`has_flag`]) from a free-text
+/// args string, preserving any other tokens the user configured. Re-joined
+/// with single spaces.
 fn toggle_flag(args: &str, flag: &str) -> String {
     let mut toks = split_args(args);
-    let had = toks.iter().any(|t| t == flag);
-    toks.retain(|t| t != flag);
-    if !had {
-        toks.push(flag.to_string());
+    let flag_toks: Vec<&str> = flag.split_whitespace().collect();
+    let mut removed = false;
+    if !flag_toks.is_empty() {
+        let mut i = 0;
+        while i + flag_toks.len() <= toks.len() {
+            if toks[i..i + flag_toks.len()].iter().map(String::as_str).eq(flag_toks.iter().copied())
+            {
+                toks.drain(i..i + flag_toks.len());
+                removed = true;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    if !removed {
+        // Turning a `--name value` phrase ON must first clear any OTHER value
+        // the user configured for the same `--name` — appending alongside it
+        // would ship `--approval-mode always-ask --approval-mode yolo`, and
+        // although omp resolves repeats last-wins (its parser reassigns per
+        // occurrence), an argv that says two things is wrong to write.
+        if flag_toks.len() == 2 && flag_toks[0].starts_with("--") {
+            let name = flag_toks[0];
+            let mut i = 0;
+            while i < toks.len() {
+                if toks[i] == name {
+                    // Remove the name and, when present, its value token.
+                    let take = if i + 1 < toks.len() { 2 } else { 1 };
+                    toks.drain(i..i + take);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        toks.extend(flag_toks.iter().map(|t| t.to_string()));
     }
     toks.join(" ")
 }
@@ -630,6 +675,45 @@ mod tests {
             Some("--dangerously-bypass-approvals-and-sandbox")
         );
         assert_eq!(yolo_flag("pi"), None, "pi has no approval gate, so no chip");
+        // F8 locks: the wildcard arms fall back to Claude's flag and Claude's
+        // model list — either leaking to omp would hand it a flag it rejects
+        // at parse, or a model id its resolver fuzzy-matches into the wrong
+        // provider.
+        assert_eq!(yolo_flag("omp"), Some("--approval-mode yolo"));
+        assert_eq!(model_presets("omp"), &[""], "omp's catalog is live; only Default is safe");
+    }
+
+    #[test]
+    fn omps_two_token_yolo_flag_round_trips_through_the_chip() {
+        // `--approval-mode yolo` is two tokens; after a toggle it lives in the
+        // free-text args as two tokens, and the chip must still read it as ON
+        // and toggle it back OFF cleanly.
+        let flag = yolo_flag("omp").unwrap();
+        let on = toggle_flag("", flag);
+        assert_eq!(on, "--approval-mode yolo");
+        assert!(has_flag(&on, flag), "the chip must read its own writes");
+        let off = toggle_flag(&on, flag);
+        assert_eq!(off, "");
+        // Other user tokens survive both directions.
+        let mixed = toggle_flag("--no-color", flag);
+        assert!(has_flag(&mixed, flag));
+        assert_eq!(toggle_flag(&mixed, flag), "--no-color");
+    }
+
+    #[test]
+    fn toggling_yolo_on_replaces_a_conflicting_approval_mode() {
+        // A user's hand-edited TOML can already carry a different mode. The
+        // chip reads OFF then (correct — it is not yolo), but toggling ON must
+        // REPLACE that pair, not append a second `--approval-mode` — an argv
+        // that says two things is wrong even though omp resolves it last-wins.
+        let flag = yolo_flag("omp").unwrap();
+        let on = toggle_flag("--approval-mode always-ask", flag);
+        assert_eq!(on, "--approval-mode yolo", "the conflicting pair must be replaced");
+        // Unrelated tokens around the conflict survive.
+        let on = toggle_flag("--no-color --approval-mode write -v", flag);
+        assert_eq!(on, "--no-color -v --approval-mode yolo");
+        // And OFF still restores a clean string.
+        assert_eq!(toggle_flag(&on, flag), "--no-color -v");
     }
 
     #[test]

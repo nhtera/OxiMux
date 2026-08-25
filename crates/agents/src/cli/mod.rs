@@ -8,6 +8,7 @@ pub mod claude_code;
 pub mod codex;
 pub mod custom;
 pub(crate) mod detect;
+pub mod omp;
 pub mod pi;
 
 pub use adapter::{CliAgentAdapter, CommandSpec, StatusPattern};
@@ -15,4 +16,5 @@ pub use detect::{program_for_spawn, resolve_on_path, resolve_on_path_blocking, w
 pub use claude_code::ClaudeCodeAdapter;
 pub use codex::CodexAdapter;
 pub use custom::CustomCommandAdapter;
+pub use omp::OmpAdapter;
 pub use pi::PiAdapter;

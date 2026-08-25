@@ -242,6 +242,7 @@ fn restore_chat_posture(
     crate::shell::agent_chat::RestoredPosture {
         codex: t.codex_posture.clone(),
         pi: t.pi_posture.clone(),
+        omp: t.omp_posture,
     }
 }
 
@@ -1106,6 +1107,7 @@ fn static_adapter_id(adapter: AgentAdapter) -> &'static str {
         AgentAdapter::ClaudeCode => "claude-code",
         AgentAdapter::Codex => "codex",
         AgentAdapter::Pi => "pi",
+        AgentAdapter::Omp => "omp",
         AgentAdapter::Custom => "custom",
     }
 }
@@ -2065,6 +2067,7 @@ mod tests {
             acp_args: vec![],
             codex_posture: None,
             pi_posture: None,
+            omp_posture: None,
             choices: Default::default(),
         };
         let snap = PersistedTabs {
@@ -2153,6 +2156,7 @@ mod tests {
                 acp_args: vec![],
                 codex_posture: None,
                 pi_posture: None,
+                omp_posture: None,
                 choices: Default::default(),
             }],
             ..PersistedTabs::default()
@@ -2197,6 +2201,7 @@ mod tests {
             acp_args: vec![],
             codex_posture: None,
             pi_posture: None,
+            omp_posture: None,
             choices: Default::default(),
         };
         let snap =

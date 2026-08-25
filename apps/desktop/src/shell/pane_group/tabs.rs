@@ -1471,11 +1471,18 @@ impl PaneGroup {
             self.open_pi_session_live(session_id, path, cwd, window, cx);
             return;
         }
+        // omp has a live backend too (`--mode rpc-ui`), so its rows resume for
+        // real — spawn-time `--resume <full id>` restores the conversation
+        // (probe-verified: the resumed process recalls prior context).
+        if preset_id == Some("omp") {
+            self.open_omp_session_live(session_id, path, cwd, window, cx);
+            return;
+        }
         // Import-provider bridge (OpenCode): no live chat backend, so build a
         // transcript-only bridge tab instead of a resume. Handled before the
-        // dedup + adapter match because these rows carry a `preset_id` and their
-        // seeded thread has no session id to dedup on.
-        if let Some(preset) = preset_id.filter(|p| *p == "opencode") {
+        // dedup + adapter match because these rows carry a `preset_id` and
+        // their seeded thread has no session id to dedup on.
+        if let Some(preset) = preset_id.filter(|p| matches!(*p, "opencode")) {
             self.open_import_bridge_chat(session_id, path, cwd, preset, window, cx);
             return;
         }
@@ -1635,11 +1642,95 @@ impl PaneGroup {
         );
     }
 
+    /// Open a ⌘⇧H omp row as a LIVE chat: seed the transcript from the
+    /// rollout, then spawn `omp --mode rpc-ui --resume <full id>` through the
+    /// omp backend. Mirrors [`Self::open_pi_session_live`], with one addition:
+    /// an ambient-writer check (red-team F7) — the window-tab dedup below
+    /// cannot see an omp the user launched BY HAND in a terminal pane, and a
+    /// second live writer against one session file is the hazard. The pane's
+    /// ambient detection knows an omp process exists but not which session it
+    /// holds, so the honest response is a warning toast, not a refusal
+    /// (parallel omp sessions in one repo are legitimate).
+    fn open_omp_session_live(
+        &mut self,
+        session_id: &str,
+        path: Option<&str>,
+        cwd: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Dedup on the session id — a resumed omp chat carries omp's real
+        // session id, so it keys the same way Claude/Codex/Pi do.
+        if let Some(idx) = self.tabs.iter().position(|t| {
+            matches!(&t.content, PaneContent::AgentChat(v) if v.read(cx).session_id() == Some(session_id))
+        }) {
+            self.active = idx;
+            self.bump_mru(idx);
+            self.focus_active(window, cx);
+            cx.notify();
+            return;
+        }
+        // F7: an externally-run omp in one of this group's terminal panes MAY
+        // already hold this session open. Its session id is unknowable from
+        // outside, so surface the risk and let the user decide.
+        if self
+            .ambient_agents(cx)
+            .iter()
+            .any(|e| e.agent.label == Some("omp"))
+        {
+            crate::shell::toast::toast(
+                cx,
+                crate::shell::toast::ToastKind::Info,
+                "An omp is already running in a terminal here — if it has this session open, \
+                 close it first so two writers don't share one session file.",
+            );
+        }
+        let entries = match dirs::home_dir() {
+            Some(home) => {
+                oximux_agents::session_log::import_provider_index::load_import_provider_transcript(
+                    &home, "omp", session_id, path,
+                )
+            }
+            None => {
+                tracing::warn!("omp resume: no home dir; opening with an empty transcript");
+                Vec::new()
+            }
+        };
+        // Spawn in the session's own cwd: omp's global id fallback means a
+        // wrong-cwd spawn still "works" silently, with tool work landing in
+        // the wrong project — cwd correctness is on us (probe 01).
+        let cwd = if cwd.as_os_str().is_empty() {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        } else {
+            cwd
+        };
+        self.open_agent_chat_tab_restored(
+            cwd,
+            None,
+            oximux_agents::thread::ChatBackend::from(oximux_agents::thread::Transport::OmpRpc),
+            Some(session_id.to_string()),
+            entries,
+            Vec::new(),
+            // Imported history carries no init; the next turn's init fills it.
+            Default::default(),
+            crate::shell::agent_chat::ThinkingLevel::default(),
+            // posture — a history reopen starts at the app default (Write; the
+            // spawn flag is always explicit, so omp's own yolo default is
+            // unreachable). The rollout records no posture to restore.
+            Default::default(),
+            None,
+            Vec::new(),
+            window,
+            cx,
+        );
+    }
+
     /// Build a transcript-only **import bridge** chat tab for an OpenCode
     /// session: seed the transcript via `load_import_provider_transcript` (no
-    /// live connection), and swap the composer for a Resume-in-terminal action.
-    /// Copilot is excluded upstream (`entry_opens_as_chat`), so `preset` is only
-    /// ever `opencode`/`pi` here.
+    /// live connection), and swap the composer for a Resume-in-terminal
+    /// action. Copilot is excluded upstream (`entry_opens_as_chat`), and
+    /// Pi/omp rows route to their live opens, so `preset` is only ever
+    /// `opencode` here.
     fn open_import_bridge_chat(
         &mut self,
         session_id: &str,
@@ -1678,8 +1769,9 @@ impl PaneGroup {
         } else {
             cwd
         };
-        // Pi resumes by rollout file path; OpenCode by session id — mirrors the
-        // `import_resume_command` handle contract in the Session History launch.
+        // Pi resumes by rollout file path; OpenCode and omp by session id —
+        // mirrors the `import_resume_command` handle contract in the Session
+        // History launch (omp's id must stay the full canonical UUID).
         let resume_handle = if preset == "pi" {
             path.map(|p| p.to_string()).unwrap_or_else(|| session_id.to_string())
         } else {
@@ -1687,7 +1779,6 @@ impl PaneGroup {
         };
         let provider_display = match preset {
             "opencode" => "OpenCode",
-            "pi" => "Pi",
             other => other,
         }
         .to_string();

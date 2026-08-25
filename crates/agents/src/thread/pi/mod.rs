@@ -27,9 +27,8 @@ pub mod posture;
 pub mod protocol;
 pub mod transport;
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
@@ -56,11 +55,6 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// the handler that reaps pi's detached tool children; escalating to SIGKILL
 /// skips that, so this is a real deadline, not a formality.
 const TERM_GRACE: Duration = Duration::from_secs(5);
-
-/// Upper bound on the login-shell binary probe. It runs the user's full rc chain
-/// on the UI thread, so it needs a hard ceiling: better an actionable "pi not
-/// found" than a frozen app behind someone's `.zshrc`.
-const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Upper bound on a user-driven control round-trip (`set_model`). pi answers
 /// these locally in milliseconds — no provider call — but the caller is the UI
@@ -663,7 +657,7 @@ impl AgentConnection for PiRpcConnection {
 /// pi's own name for a thinking level (`thinking-selector.ts`), so the picker
 /// reads the way pi's docs and CLI do rather than title-casing `xhigh` into
 /// something no one recognises.
-fn thinking_label(wire: &str) -> String {
+pub(crate) fn thinking_label(wire: &str) -> String {
     match wire {
         "off" => "Off",
         "minimal" => "Minimal",
@@ -797,7 +791,7 @@ fn command_info(c: &protocol::SlashCommand) -> SlashCommandInfo {
 }
 
 /// A context window as a picker blurb: `272000` → `272K`, `1050000` → `1.05M`.
-fn fmt_window(tokens: u64) -> String {
+pub(crate) fn fmt_window(tokens: u64) -> String {
     if tokens >= 1_000_000 {
         let m = tokens as f64 / 1_000_000.0;
         // Two models can differ by a fraction of a million (1.0M vs 1.05M), so
@@ -810,149 +804,12 @@ fn fmt_window(tokens: u64) -> String {
     }
 }
 
-/// Resolve the `pi` binary.
+/// Resolve the `pi` binary — configured path, PATH, then the shared
+/// login-shell probe (see [`agent_binary`] for why a GUI launch needs one).
 ///
-/// A macOS app launched from Finder does not inherit the shell's PATH, and pi is
-/// typically installed under a version manager (nvm/volta/bun) whose bin dir is
-/// only on an interactive shell's PATH. So a bare `Command::new("pi")` fails for
-/// exactly the launch mode most users use.
-///
-/// Order: an explicitly configured path wins; then PATH; then a login-shell
-/// probe, which is what actually recovers the version-manager case.
+/// [`agent_binary`]: super::agent_binary
 fn resolve_pi_binary(configured: Option<&str>) -> Result<PathBuf> {
-    if let Some(p) = configured.map(str::trim).filter(|p| !p.is_empty()) {
-        let path = PathBuf::from(p);
-        if path.is_absolute() && !path.exists() {
-            anyhow::bail!("configured pi binary not found: {p}");
-        }
-        return Ok(path);
-    }
-    if let Some(p) = which_on_path("pi") {
-        return Ok(p);
-    }
-    // Cached: this spawns a login shell, which is far too expensive to repeat on
-    // every connect/respawn, and connect runs on the UI thread. The answer only
-    // changes if the user reinstalls pi, which warrants a restart anyway.
-    static LOGIN_SHELL_PI: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    if let Some(p) = LOGIN_SHELL_PI.get_or_init(|| login_shell_which("pi")).clone() {
-        return Ok(p);
-    }
-    anyhow::bail!(
-        "could not find the `pi` binary. Install it, or set an absolute path in \
-         Settings → Agents (a GUI launch does not inherit your shell's PATH, so a \
-         version-manager install such as nvm is not visible by default)."
-    )
-}
-
-/// First match for `bin` on the inherited PATH.
-///
-/// Synchronous on purpose — this runs inside `connect`, which is called from
-/// the UI thread and has no runtime to await on. The `which` crate does not
-/// spawn, so the cost is a handful of `stat`s either way; what it adds over the
-/// hand-rolled walk this replaced is `PATHEXT` handling on Windows, where `pi`
-/// installs as `pi.cmd`.
-fn which_on_path(bin: &str) -> Option<PathBuf> {
-    which::which(bin).ok()
-}
-
-/// The shell and argv that ask "where is `bin`?" with the user's own startup
-/// files loaded. That is the whole point of the probe: the answer differs from
-/// a plain PATH lookup exactly when a startup file edits PATH.
-///
-/// The two platforms get there differently. A POSIX login shell (`-l`) sources
-/// the profile chain a version manager hooks into; PowerShell has no comparable
-/// login mode on Windows (`-Login` is honored only on unix builds), but it
-/// loads `$PROFILE` for `-Command` unless told not to — which is the same
-/// recovery, since a Windows PATH edit that a GUI launch misses lives there.
-#[cfg(unix)]
-fn login_probe_command(bin: &str) -> (String, Vec<String>) {
-    (
-        oximux_shell_env::default_shell(),
-        vec!["-lc".to_string(), format!("command -v {bin}")],
-    )
-}
-
-#[cfg(windows)]
-fn login_probe_command(bin: &str) -> (String, Vec<String>) {
-    (
-        oximux_shell_env::default_shell(),
-        vec![
-            "-NoLogo".to_string(),
-            "-Command".to_string(),
-            // `-ErrorAction SilentlyContinue` so a missing command prints
-            // nothing instead of an error record the caller would parse as a
-            // path. Empty stdout is already the "not found" signal.
-            format!("(Get-Command {bin} -ErrorAction SilentlyContinue).Source"),
-        ],
-    )
-}
-
-/// Ask a login shell where `bin` is — recovers nvm/volta/bun installs that a
-/// Finder-launched app can't see.
-///
-/// Bounded: a login shell runs the user's full rc chain, which can block
-/// indefinitely (an nvm auto-use hook, a network-mounted home, a prompt). This
-/// runs on the UI thread, so it must never wait forever — a slow shell degrades
-/// to "pi not found" (an actionable error) rather than a frozen app.
-fn login_shell_which(bin: &str) -> Option<PathBuf> {
-    use oximux_no_window::NoWindow as _;
-    let (shell, args) = login_probe_command(bin);
-    let mut child = Command::new(shell)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .no_window()
-        .spawn()
-        .ok()?;
-
-    let deadline = std::time::Instant::now() + LOGIN_SHELL_PROBE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if !status.success() {
-                    return None;
-                }
-                break;
-            }
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            // Timed out or errored: kill the shell and give up rather than hang.
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                tracing::warn!(
-                    "login-shell probe for `{bin}` exceeded {LOGIN_SHELL_PROBE_TIMEOUT:?}; \
-                     treating it as not found"
-                );
-                return None;
-            }
-        }
-    }
-
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
-    // The LAST non-empty line: an rc file that prints banners ("Now using node
-    // v20.11.0") puts them on stdout ahead of `command -v`'s answer, and
-    // treating the whole blob as one path fails for exactly the version-manager
-    // users this fallback exists to serve.
-    let last = out.lines().rev().find(|l| !l.trim().is_empty())?.trim();
-    let p = PathBuf::from(last);
-    is_executable(&p).then_some(p)
-}
-
-#[cfg(unix)]
-fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p)
-        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_executable(p: &Path) -> bool {
-    p.is_file()
+    super::agent_binary::resolve_agent_binary("pi", configured, &[])
 }
 
 #[cfg(test)]

@@ -31,11 +31,21 @@ use crate::thread::{AssistantMessage, ThreadEntry, MAX_IMPORT_ENTRIES};
 /// background thread by callers — it stats every session file once. `None`
 /// when no file matches (a pruned or foreign session).
 pub fn locate_pi_session(home: &Path, session_id: &str) -> Option<PathBuf> {
+    locate_rollout(&home.join(".pi/agent/sessions"), session_id)
+}
+
+/// As [`locate_pi_session`], for omp's store (`~/.omp/agent/sessions`) — same
+/// rollout layout by fork lineage, same filename-embeds-the-id convention.
+pub fn locate_omp_session(home: &Path, session_id: &str) -> Option<PathBuf> {
+    locate_rollout(&home.join(".omp/agent/sessions"), session_id)
+}
+
+fn locate_rollout(sessions: &Path, session_id: &str) -> Option<PathBuf> {
     if session_id.is_empty() {
         return None;
     }
     let mut files: Vec<PathBuf> = Vec::new();
-    super::import_provider_index::collect_pi_files(&home.join(".pi/agent/sessions"), 0, &mut files);
+    super::import_provider_index::collect_pi_files(sessions, 0, &mut files);
     files.into_iter().find(|p| {
         p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains(session_id))
     })

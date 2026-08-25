@@ -39,13 +39,15 @@ const MODAL_WIDTH: f32 = 480.0;
 const MODAL_TOP_OFFSET: f32 = 96.0;
 const FIELD_HEIGHT: f32 = 32.0;
 
-/// All four built-in agents in dialog order. Mirrors the order in
+/// The built-in agents in dialog order. Mirrors the order in
 /// `AdapterRegistry::with_builtin_adapters` so the picker UX stays
-/// stable across detection results.
+/// stable across detection results. (This IS a restatement of the registry —
+/// the pi rollout's bug #2 — so the test below locks the two in sync.)
 const AGENT_CHOICES: &[AgentAdapter] = &[
     AgentAdapter::ClaudeCode,
     AgentAdapter::Codex,
     AgentAdapter::Pi,
+    AgentAdapter::Omp,
     AgentAdapter::Custom,
 ];
 
@@ -358,6 +360,7 @@ pub fn agent_label(agent: Option<AgentAdapter>) -> &'static str {
         Some(AgentAdapter::ClaudeCode) => "Claude Code",
         Some(AgentAdapter::Codex) => "Codex",
         Some(AgentAdapter::Pi) => "Pi",
+        Some(AgentAdapter::Omp) => "omp",
         Some(AgentAdapter::Custom) => "Custom",
     }
 }
@@ -668,6 +671,7 @@ fn agent_option_row(
         Some(AgentAdapter::ClaudeCode) => 1,
         Some(AgentAdapter::Codex) => 2,
         Some(AgentAdapter::Pi) => 3,
+        Some(AgentAdapter::Omp) => 5,
         Some(AgentAdapter::Custom) => 4,
     };
     div()
@@ -767,15 +771,16 @@ mod tests {
 
     #[test]
     fn agent_choices_match_registry_order() {
-        assert_eq!(
-            AGENT_CHOICES,
-            &[
-                AgentAdapter::ClaudeCode,
-                AgentAdapter::Codex,
-                AgentAdapter::Pi,
-                AgentAdapter::Custom,
-            ]
-        );
+        // Against the REAL registry, not a second literal: this constant is a
+        // restatement of `with_builtin_adapters` (the pi rollout's bug #2 was
+        // exactly such a list going stale), so the registry is the oracle.
+        let registry: Vec<AgentAdapter> = oximux_agents::registry::AdapterRegistry::
+            with_builtin_adapters()
+            .entries_without_detection()
+            .iter()
+            .map(|e| e.adapter_enum)
+            .collect();
+        assert_eq!(AGENT_CHOICES, registry.as_slice());
     }
 
     #[test]

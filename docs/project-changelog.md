@@ -4,6 +4,49 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-08-26 — Thinking visibility moves into the composer footer (`feat/omp-agent-integration`)
+
+- The floating "Thinking: auto" pill that hovered over the transcript is gone.
+  Thinking visibility is now a proper footer chip — eye icon, tooltip, and a
+  three-option dropdown (Off / Auto / Always) — sitting beside the reasoning
+  -effort picker so "how hard it thinks" and "whether you see it" read
+  together. The chip appears only once the transcript actually holds a
+  thinking block, the choice still persists on the transcript blob across
+  restarts, and picking Off/Always re-renders the transcript immediately.
+
+### 2026-08-25 — omp joins as the fifth built-in agent (`feat/omp-agent-integration`)
+
+- **omp** (oh-my-pi, a Pi fork) is a first-class adapter everywhere Pi is:
+  ambient rail detection with hook-level status (the Pi status extension,
+  parameterized — one template, two runtimes, distinct file names so the two
+  can never clobber each other even when `PI_CODING_AGENT_DIR` makes their
+  homes collide), ⌘⇧H session import with preview and an omp filter chip,
+  the launch dialog, workspace-create, launch settings, and onboarding
+  (More section, with a disclosure that omp keeps its own provider logins
+  and may use ambient credentials).
+- **Native chat backend** over `omp --mode rpc-ui` (`thread/omp/`), built on
+  an NDJSON core extracted from the Pi transport (extraction gated by a
+  byte-identical fixture-replay diff): versioned `ready`/`negotiate_protocol`
+  handshake, inbound `rpc_chunk` reassembly for >1MiB frames, streaming with
+  the Pi-family snapshot→delta diffing, live palette from
+  `available_commands_update` pushes, a context meter seeded from the
+  handshake's real occupancy, and — the piece Pi never had — **per-call tool
+  approval**: `extension_ui_request` dialogs map to the standard permission
+  cards, and Deny was verified to block the tool's effect on disk against a
+  real omp 18.0.4.
+- **Safety posture**: `--approval-mode` is ALWAYS passed explicitly (omp's
+  own default is `yolo`); OxiMux defaults to `write`, the composer's
+  Approvals pill respawns with the chosen mode, the choice persists across
+  restart (a lost posture can only narrow, never widen), and the settings
+  chip that toggles `--approval-mode yolo` replaces a conflicting
+  hand-configured mode instead of duplicating the flag.
+- **Resume discipline**: omp resolves session ids by prefix with a silent
+  cross-project fallback, so every resume path (⌘⇧H, chat respawn,
+  companion terminal) refuses anything but the full canonical session UUID.
+  ⌘⇧H rows open LIVE (transcript pre-seeded, then `--resume` at spawn —
+  cross-process recall verified against the real binary), with a warning when
+  an ambient omp is already running in the same pane group.
+
 ### 2026-08-25 — Aider retired from the built-in roster; Pi takes its slot (`main`)
 
 - The Aider adapter is no longer a built-in agent. Pi — already a first-class

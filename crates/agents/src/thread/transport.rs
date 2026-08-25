@@ -14,9 +14,13 @@ use serde::{Deserialize, Serialize};
 /// names no provider restores as Claude. `AppServer` drives Codex over its
 /// native `codex app-server` JSON-RPC. `Acp` drives an external agent over the
 /// Agent Client Protocol. `Rpc` drives Pi over its own newline-JSON `--mode rpc`
-/// protocol (Pi speaks neither ACP nor app-server). Serde `lowercase` so the
-/// persisted tag is a stable short string (`"streamjson"` / `"appserver"` /
-/// `"acp"` / `"rpc"`).
+/// protocol (Pi speaks neither ACP nor app-server). `OmpRpc` drives omp — a Pi
+/// fork whose wire protocol kept Pi's event taxonomy but renamed/extended the
+/// command layer and added a versioned handshake, so it is its OWN transport:
+/// reusing `Rpc` would let every `Transport::Rpc` match site silently treat an
+/// omp chat as a Pi one (binary, posture, sessions dir, display name would all
+/// be wrong). Serde `lowercase` so the persisted tag is a stable short string
+/// (`"streamjson"` / `"appserver"` / `"acp"` / `"rpc"` / `"omprpc"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
@@ -25,6 +29,7 @@ pub enum Transport {
     AppServer,
     Acp,
     Rpc,
+    OmpRpc,
 }
 
 impl Transport {
@@ -40,6 +45,7 @@ impl Transport {
             Transport::AppServer => "Codex",
             Transport::Acp => "Agent",
             Transport::Rpc => "Pi",
+            Transport::OmpRpc => "omp",
         }
     }
 }
@@ -62,6 +68,9 @@ mod tests {
         assert_eq!(acp, Transport::Acp);
         let rpc: Transport = serde_json::from_str("\"rpc\"").unwrap();
         assert_eq!(rpc, Transport::Rpc);
+        assert_eq!(serde_json::to_string(&Transport::OmpRpc).unwrap(), "\"omprpc\"");
+        let omp: Transport = serde_json::from_str("\"omprpc\"").unwrap();
+        assert_eq!(omp, Transport::OmpRpc);
     }
 
     #[test]
@@ -70,5 +79,7 @@ mod tests {
         assert_eq!(Transport::AppServer.provider_display_name(), "Codex");
         assert_eq!(Transport::Acp.provider_display_name(), "Agent");
         assert_eq!(Transport::Rpc.provider_display_name(), "Pi");
+        // The F1 lock: an omp chat must never caption itself "Pi".
+        assert_eq!(Transport::OmpRpc.provider_display_name(), "omp");
     }
 }

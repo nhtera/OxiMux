@@ -423,18 +423,20 @@ pub enum ThinkingLevel {
 }
 
 impl ThinkingLevel {
-    fn next(self) -> Self {
+    /// Stable wire value for the composer's thinking-visibility chip.
+    fn wire(self) -> &'static str {
         match self {
-            Self::Hidden => Self::Auto,
-            Self::Auto => Self::Expanded,
-            Self::Expanded => Self::Hidden,
+            Self::Hidden => "off",
+            Self::Auto => "auto",
+            Self::Expanded => "shown",
         }
     }
-    fn label(self) -> &'static str {
-        match self {
-            Self::Hidden => "Thinking: off",
-            Self::Auto => "Thinking: auto",
-            Self::Expanded => "Thinking: shown",
+    fn from_wire(wire: &str) -> Option<Self> {
+        match wire {
+            "off" => Some(Self::Hidden),
+            "auto" => Some(Self::Auto),
+            "shown" => Some(Self::Expanded),
+            _ => None,
         }
     }
 }
@@ -1100,6 +1102,9 @@ impl AgentChatView {
                     this.change_permission_mode(mode.clone(), cx)
                 }
                 ComposerEvent::EffortPicked(effort) => this.change_effort(effort.clone(), cx),
+                ComposerEvent::ThinkingDisplayPicked(wire) => {
+                    this.set_thinking_display_level(wire, cx)
+                }
                 ComposerEvent::FeaturePicked { id, value } => {
                     this.change_feature(id.clone(), value.clone(), cx)
                 }
@@ -1140,6 +1145,7 @@ impl AgentChatView {
             // session to the (permissive) default.
             spec.codex_posture = posture.codex.clone();
             spec.pi_posture = posture.pi.clone();
+            spec.omp_posture = posture.omp;
             match computer_use::connect_declaring(spec, &screen_control, cx) {
                 Ok((conn, rx)) => {
                     connection = Some(conn);
@@ -1258,6 +1264,7 @@ impl AgentChatView {
                 Transport::AppServer => "codex",
                 Transport::Acp => "cursor",
                 Transport::Rpc => "pi",
+                Transport::OmpRpc => "omp",
             }
             .to_string()
         });
@@ -1481,6 +1488,11 @@ impl AgentChatView {
         // worse than having no pill at all. It also silently reset the posture on
         // every unrelated respawn (Stop-then-send, a model switch).
         spec.pi_posture = self.pi_posture_snapshot();
+        // omp's approval mode is also spawn-time (`--approval-mode`), so the
+        // respawn spec is the only carrier — and the flag is ALWAYS emitted
+        // downstream (omp's own default is yolo), so a `None` here means the
+        // deliberate Write default, never "whatever omp feels like".
+        spec.omp_posture = self.omp_posture_snapshot();
         spec
     }
 
@@ -1507,6 +1519,22 @@ impl AgentChatView {
             return None;
         }
         Some(PiPosture::from_parts(tools.as_deref(), context_files))
+    }
+
+    /// omp's approval posture, read from the composer's feature picks. `None`
+    /// for a non-omp chat or when the picker was never touched (restore then
+    /// applies the deliberate Write default — the spawn flag stays explicit
+    /// either way, so omp's own yolo default is unreachable).
+    fn omp_posture_snapshot(&self) -> Option<oximux_agents::thread::omp::posture::OmpPosture> {
+        if self.backend.transport != Transport::OmpRpc {
+            return None;
+        }
+        match self.feature_values.get(oximux_agents::thread::omp::posture::FEATURE_APPROVALS) {
+            Some(FeatureValue::Choice(wire)) => {
+                oximux_agents::thread::omp::posture::OmpPosture::from_wire(wire)
+            }
+            _ => None,
+        }
     }
 
     /// The Codex posture `(approval_policy, sandbox)` the user has selected, read
@@ -1662,6 +1690,16 @@ impl AgentChatView {
                     return None;
                 }
                 (AgentAdapter::Custom, "pi")
+            }
+            // omp resumes by session id (`omp --resume <id>`), and downstream
+            // `import_resume_command("omp", …)` additionally refuses anything
+            // that is not the full canonical UUID — omp's resolver
+            // prefix-matches with a silent cross-project fallback.
+            Transport::OmpRpc => {
+                if !is_safe_resume_session_id(&session_id) {
+                    return None;
+                }
+                (AgentAdapter::Custom, "omp")
             }
         };
         Some(ChatTerminalSpec {
@@ -1839,12 +1877,22 @@ impl AgentChatView {
         // *empty* defaults — pushing them would blank the draft's pre-bind model
         // list. Its picker shape is owned by `sync_unbound_composer` instead.
         let unbound = self.unbound;
+        // Thinking-visibility chip: a transcript view preference, surfaced only
+        // once the transcript actually holds a thinking block — before that
+        // there is nothing the control could change, so it stays hidden.
+        let thinking_display = self
+            .thread
+            .entries
+            .iter()
+            .any(|e| matches!(e, ThreadEntry::Assistant(m) if !m.thinking.is_empty()))
+            .then(|| self.thinking_level.wire().to_string());
         self.composer.update(cx, |c, cx| {
             c.set_state(disconnected, turn_active, cx);
             c.set_can_steer(caps.supports_steer, cx);
             c.set_usage_meter(meter_used, meter_window, meter_cost, cx);
             c.set_slash_commands(slash_commands, slash_descriptions, slash_hints, cx);
             c.set_provider_label(provider_label, cx);
+            c.set_thinking_display(thinking_display, cx);
             if !unbound {
                 c.set_controls(model, permission_mode, effort, caps.supports_modes, caps.supports_config, vocab, cx);
                 // A bound chat never shows the agent picker (its transport is
@@ -2387,6 +2435,8 @@ impl AgentChatView {
             // Pi's protocol exposes no sign-in command — authentication happens
             // in the `pi` CLI itself, which is exactly what this banner opens.
             Transport::Rpc => Some("pi"),
+            // Same story for omp: `/login` lives in the omp TUI.
+            Transport::OmpRpc => Some("omp"),
         }
     }
 
@@ -4102,13 +4152,18 @@ impl AgentChatView {
         .into_any_element()
     }
 
-    /// Cycle the chat-wide thinking level (Hidden → Auto → Expanded → …), from
-    /// the pill above the composer. Persisted via `transcript_snapshot`.
-    fn cycle_thinking_level(&mut self, cx: &mut Context<Self>) {
-        self.thinking_level = self.thinking_level.next();
-        // Persisted on the transcript blob (view-held, outside the thread).
-        self.meta_dirty.set(true);
-        cx.notify();
+    /// Apply a thinking-visibility pick from the composer's footer chip.
+    /// A transcript view preference — persisted on the transcript blob
+    /// (view-held, outside the thread), never sent to the backend.
+    fn set_thinking_display_level(&mut self, wire: &str, cx: &mut Context<Self>) {
+        if let Some(level) = ThinkingLevel::from_wire(wire)
+            && level != self.thinking_level
+        {
+            self.thinking_level = level;
+            self.meta_dirty.set(true);
+            self.sync_composer(cx); // reflect the new state in the chip label
+            cx.notify();
+        }
     }
 
     /// Count tool calls still awaiting the user (permission or question).
@@ -4170,32 +4225,6 @@ impl AgentChatView {
                     }),
                 ),
         )
-    }
-
-    /// The compact thinking-level pill shown above the composer.
-    fn render_thinking_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = self.theme;
-        div()
-            .flex()
-            .justify_end()
-            .w_full()
-            .max_w(px(CONTENT_MAX_W))
-            .child(
-                div()
-                    .id("thinking-level-toggle")
-                    .px(px(8.0))
-                    .py(px(2.0))
-                    .rounded(px(self.density.r_xs))
-                    .text_xs()
-                    .text_color(t.fg_subtle)
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(t.fg_base).bg(t.bg_panel_alt))
-                    .child(SharedString::from(self.thinking_level.label()))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _e, _w, cx| this.cycle_thinking_level(cx)),
-                    ),
-            )
     }
 
     fn toggle_tool_expanded(&mut self, id: String, cx: &mut Context<Self>) {
@@ -5255,14 +5284,6 @@ impl Render for AgentChatView {
                 this.attach_dropped_paths(paths.paths().to_vec(), cx);
             }))
             .child(transcript)
-            // The thinking-level pill shows once any assistant thought exists in
-            // the transcript (nothing to toggle otherwise).
-            .when(
-                self.thread.entries.iter().any(|e| {
-                    matches!(e, ThreadEntry::Assistant(m) if !m.thinking.is_empty())
-                }),
-                |col| col.child(self.render_thinking_toggle(cx)),
-            )
             // A pinned "awaiting approval — jump" banner when a pending card is
             // scrolled off above the composer.
             .children(self.render_awaiting_banner(cx))
@@ -6080,6 +6101,72 @@ mod tests {
             .expect("window update");
     }
 
+    /// Same load-bearing property for omp, with HIGHER stakes on the miss: a
+    /// respawn spec that dropped the posture falls to OxiMux's Write default —
+    /// and omp's OWN default is yolo, so the flag must both survive the spec
+    /// AND always be spelled in the argv (the yolo-default guard, F2).
+    #[gpui::test]
+    async fn picking_an_omp_posture_reaches_the_respawn_spec(cx: &mut TestAppContext) {
+        use oximux_agents::thread::omp::posture::{self as omp_posture, OmpPosture};
+
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, _cx| {
+                // An omp chat whose Approvals pill was set to Always-ask.
+                view.backend = ChatBackend::from(Transport::OmpRpc);
+                view.feature_values.insert(
+                    omp_posture::FEATURE_APPROVALS.to_string(),
+                    FeatureValue::Choice(omp_posture::APPROVAL_ALWAYS_ASK.to_string()),
+                );
+
+                let spec = view.respawn_spec(Vec::new(), None);
+                let posture = spec
+                    .omp_posture
+                    .expect("the respawn must carry the posture, or the pill is decoration");
+                assert_eq!(posture, OmpPosture::AlwaysAsk);
+                // And it reaches the child as real argv — explicitly, because
+                // an ABSENT flag is not "the default", it is omp's yolo.
+                let args = oximux_agents::thread::omp::build_args(None, &posture, None)
+                    .expect("build argv");
+                assert!(
+                    args.windows(2)
+                        .any(|w| w[0] == "--approval-mode" && w[1] == "always-ask"),
+                    "always-ask must arrive as omp's own flag: {args:?}"
+                );
+
+                // An untouched picker carries None — and even then the spawn
+                // path spells the Write default out (see `OmpPosture::to_args`).
+                view.feature_values.remove(omp_posture::FEATURE_APPROVALS);
+                assert_eq!(view.respawn_spec(Vec::new(), None).omp_posture, None);
+                let default_args =
+                    oximux_agents::thread::omp::build_args(None, &OmpPosture::default(), None)
+                        .expect("build argv");
+                assert!(
+                    default_args
+                        .windows(2)
+                        .any(|w| w[0] == "--approval-mode" && w[1] == "write"),
+                    "the default must still be explicit: {default_args:?}"
+                );
+
+                // A non-omp chat carries nothing here (the field is OmpRpc-only).
+                view.backend = ChatBackend::stream_json();
+                assert_eq!(view.respawn_spec(Vec::new(), None).omp_posture, None);
+            })
+            .expect("window update");
+    }
+
     /// A backend that describes its own commands drives the palette's grouping,
     /// descriptions and attribution — no on-disk scan of another CLI's config.
     #[gpui::test]
@@ -6813,6 +6900,50 @@ mod tests {
 
     /// A manual collapse during Auto stream auto-expand must register on the
     /// first click (the collapsed override wins over the streaming peek).
+    #[gpui::test]
+    async fn thinking_chip_pick_sets_level_and_persists(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _window, cx| {
+                assert_eq!(view.thinking_level, ThinkingLevel::Auto, "default is Auto");
+                view.meta_dirty.set(false);
+
+                // The composer chip's pick path: wire value in, level applied,
+                // persistence marked. An unknown wire must change nothing.
+                view.set_thinking_display_level("shown", cx);
+                assert_eq!(view.thinking_level, ThinkingLevel::Expanded);
+                assert!(view.meta_dirty.get(), "a pick marks the transcript blob dirty");
+
+                view.meta_dirty.set(false);
+                view.set_thinking_display_level("bogus", cx);
+                assert_eq!(view.thinking_level, ThinkingLevel::Expanded, "unknown wire ignored");
+                assert!(!view.meta_dirty.get(), "an ignored pick must not dirty the blob");
+
+                view.set_thinking_display_level("off", cx);
+                assert_eq!(view.thinking_level, ThinkingLevel::Hidden);
+
+                // Wire values round-trip so the chip's ✓ always lands on the
+                // active row.
+                for level in
+                    [ThinkingLevel::Hidden, ThinkingLevel::Auto, ThinkingLevel::Expanded]
+                {
+                    assert_eq!(ThinkingLevel::from_wire(level.wire()), Some(level));
+                }
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     async fn thinking_manual_collapse_wins_over_auto_stream(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);

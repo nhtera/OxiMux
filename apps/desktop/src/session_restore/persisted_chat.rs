@@ -124,6 +124,17 @@ pub struct PersistedChatTranscript {
     /// rather than re-derived.
     #[serde(default)]
     pub pi_posture: Option<oximux_agents::thread::pi::posture::PiPosture>,
+    /// omp's approval posture (`--approval-mode`) chosen via the composer, so
+    /// a reopened omp chat respawns under the same mode. Its own field, NOT a
+    /// reuse of `pi_posture` — the domains differ (a tool allowlist vs an
+    /// approval mode). `#[serde(default)]` (→ `None`) keeps older blobs
+    /// loadable; a restore then uses OxiMux's `Write` default, never omp's
+    /// own `yolo` (the spawn flag is always explicit).
+    ///
+    /// The stakes are the same as Pi's: a lost posture silently WIDENS what a
+    /// restored session may do, so it is persisted rather than re-derived.
+    #[serde(default)]
+    pub omp_posture: Option<oximux_agents::thread::omp::posture::OmpPosture>,
     /// What this session's pickers offer, so a remote client can render them
     /// without a backend to ask. `#[serde(default)]` (→ empty) keeps blobs
     /// written before this field loadable; their pickers stay hidden until the
@@ -196,6 +207,7 @@ mod tests {
             acp_args: vec![],
             codex_posture: None,
             pi_posture: Some(PiPosture { tools: TOOLS_READ_ONLY.into(), context_files: false }),
+            omp_posture: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -208,6 +220,36 @@ mod tests {
         assert_eq!(p.tools, TOOLS_READ_ONLY);
         assert!(!p.context_files);
         assert_ne!(p, PiPosture::default(), "must not have reverted to the permissive default");
+    }
+
+    #[test]
+    fn omp_posture_round_trips_so_a_restore_cannot_silently_widen_it() {
+        use oximux_agents::thread::omp::posture::OmpPosture;
+        let repo = repo();
+        let t = PersistedChatTranscript {
+            session_meta: Default::default(),
+            session_id: "omp-sess".into(),
+            model: Some("openai-codex/gpt-5.6-sol".into()),
+            entries: vec![],
+            slash_commands: vec![],
+            thinking_level: Default::default(),
+            provider: Transport::OmpRpc,
+            acp_command: None,
+            acp_args: vec![],
+            codex_posture: None,
+            pi_posture: None,
+            omp_posture: Some(OmpPosture::AlwaysAsk),
+            choices: Default::default(),
+        };
+        save_chat_transcript(&repo, &t);
+        let loaded = load_chat_transcript(&repo, "omp-sess").expect("blob loads");
+        assert_eq!(loaded.provider, Transport::OmpRpc);
+        // The critical direction: a lost posture falls to a MORE permissive
+        // mode on respawn (Write — and omp's OWN default is yolo). A user who
+        // chose Always-ask must never come back to fewer questions.
+        let p = loaded.omp_posture.expect("posture must survive the round trip");
+        assert_eq!(p, OmpPosture::AlwaysAsk);
+        assert_ne!(p, OmpPosture::default(), "must not have reverted to the wider default");
     }
 
     #[test]
@@ -240,6 +282,7 @@ mod tests {
             acp_args: vec![],
             codex_posture: None,
             pi_posture: None,
+            omp_posture: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -273,6 +316,7 @@ mod tests {
             acp_args: vec!["--experimental-acp".into()],
             codex_posture: None,
             pi_posture: None,
+            omp_posture: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);

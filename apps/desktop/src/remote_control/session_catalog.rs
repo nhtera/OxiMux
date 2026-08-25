@@ -432,6 +432,7 @@ mod tests {
             acp_args: vec![],
             codex_posture: None,
             pi_posture: None,
+            omp_posture: None,
             choices,
         }
     }

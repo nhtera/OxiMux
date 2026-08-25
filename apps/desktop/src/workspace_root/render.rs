@@ -7,6 +7,7 @@ fn import_preset_slug(id: &str) -> &'static str {
         "opencode" => "opencode",
         "copilot" => "copilot",
         "pi" => "pi",
+        "omp" => "omp",
         _ => "custom",
     }
 }
@@ -611,6 +612,26 @@ impl Render for WorkspaceRoot {
                 // Custom PTY running the provider's own resume TUI; native rows
                 // resume through their adapter. `adapter`/`adapter_id`/
                 // `custom_command` are set together so the two paths can't drift.
+                // An import-provider row whose handle the resume seam REFUSES
+                // (today: an omp id that is not a full canonical UUID — only
+                // reachable via a torn rollout header) must stop here with a
+                // toast that names the provider. Falling through would try the
+                // row's `Custom` adapter with no command and surface a
+                // baffling "Start custom agent" plumbing error instead.
+                if let Some(preset) = action.preset_id.as_deref()
+                    && oximux_settings::import_resume_command(preset, &action.resume_handle)
+                        .is_none()
+                {
+                    crate::shell::toast::toast_op_error(
+                        cx,
+                        "Resume session",
+                        &format!(
+                            "the {preset} session id {:?} is not resumable (corrupted entry?) — try re-opening the history picker",
+                            action.resume_handle
+                        ),
+                    );
+                    return;
+                }
                 let (adapter, adapter_id, resumption, custom_command) = match action
                     .preset_id
                     .as_deref()
