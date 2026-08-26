@@ -119,8 +119,16 @@ impl EditorZoom {
 /// instead of stepping once per tiny pixel-delta event.
 const WHEEL_ZOOM_STEP_PX: f32 = 20.0;
 
-/// Bucket accumulated Cmd+wheel travel into whole zoom steps. Returns the
-/// steps to apply now and the leftover travel to carry into the next event.
+/// Zoom travel (px) per whole unit of pinch delta. A pinch event's delta is
+/// fractional (0.1 = a 10% spread), so this gain sets the gesture feel: at
+/// 150, roughly every 13% of pinch crosses one `WHEEL_ZOOM_STEP_PX` bucket —
+/// a full comfortable pinch walks the font several steps, matching how the
+/// gesture behaves in mainstream editors.
+const PINCH_ZOOM_PX_PER_UNIT: f32 = 150.0;
+
+/// Bucket accumulated zoom travel (Cmd+wheel or pinch) into whole zoom
+/// steps. Returns the steps to apply now and the leftover travel to carry
+/// into the next event.
 fn wheel_zoom_steps(accum: f32) -> (i32, f32) {
     let steps = (accum / WHEEL_ZOOM_STEP_PX).trunc();
     (steps as i32, accum - steps * WHEEL_ZOOM_STEP_PX)
@@ -606,9 +614,9 @@ impl EditorView {
         self.apply_zoom(EditorZoom::reset(), cx);
     }
 
-    /// Cmd+scroll zoom: accumulate wheel
-    /// travel, convert whole buckets to zoom steps, keep the remainder.
-    /// Scroll up (positive y) zooms in.
+    /// Gesture zoom (Cmd+scroll wheel travel, or pinch delta converted to
+    /// the same travel currency): accumulate, convert whole buckets to zoom
+    /// steps, keep the remainder. Positive travel zooms in.
     fn on_wheel_zoom(&mut self, delta_y: f32, base: gpui::Pixels, cx: &mut Context<Self>) {
         let (steps, rest) = wheel_zoom_steps(self.wheel_zoom_accum + delta_y);
         self.wheel_zoom_accum = rest;
@@ -1137,15 +1145,16 @@ impl Render for EditorView {
             )
             .child(breadcrumb)
             .child(body)
-            // Cmd+scroll font zoom. Registered as a CAPTURE-phase window
-            // mouse listener rather than `.on_scroll_wheel`: the child
-            // `Input` handles plain wheel scroll in the bubble phase and
-            // stops propagation whenever it scrolled, so a bubble listener
-            // here would only see wheel events at the buffer's scroll
-            // extremes. Capture runs parent-first, and stopping propagation
-            // there keeps a zoom gesture from also scrolling the buffer.
-            // The zero-size-paint `canvas` exists to reach the low-level
-            // hitbox + mouse-listener API from inside a fluent render.
+            // Cmd+scroll and pinch font zoom. Registered as CAPTURE-phase
+            // window mouse listeners rather than `.on_scroll_wheel` /
+            // `.on_pinch`: the child `Input` handles plain wheel scroll in
+            // the bubble phase and stops propagation whenever it scrolled,
+            // so a bubble listener here would only see wheel events at the
+            // buffer's scroll extremes. Capture runs parent-first, and
+            // stopping propagation there keeps a zoom gesture from also
+            // scrolling the buffer. The zero-size-paint `canvas` exists to
+            // reach the low-level hitbox + mouse-listener API from inside a
+            // fluent render.
             .child({
                 let view = cx.entity().downgrade();
                 gpui::canvas(
@@ -1153,7 +1162,9 @@ impl Render for EditorView {
                         window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
                     },
                     move |_, hitbox, window, _| {
-                        window.on_mouse_event(
+                        window.on_mouse_event({
+                            let view = view.clone();
+                            let hitbox = hitbox.clone();
                             move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
                                 if phase == gpui::DispatchPhase::Capture
                                     && event.modifiers.secondary()
@@ -1164,6 +1175,25 @@ impl Render for EditorView {
                                     );
                                     view.update(cx, |this, cx| {
                                         this.on_wheel_zoom(delta_y, mono_base, cx)
+                                    })
+                                    .ok();
+                                    cx.stop_propagation();
+                                }
+                            }
+                        });
+                        // Two-finger pinch zoom: no modifier required — the
+                        // gesture itself is the zoom intent. The fractional
+                        // pinch delta is converted into the same travel
+                        // currency the wheel path accumulates, so both
+                        // gestures share one bucket, remainder, and clamp.
+                        window.on_mouse_event(
+                            move |event: &gpui::PinchEvent, phase, window, cx| {
+                                if phase == gpui::DispatchPhase::Capture
+                                    && hitbox.is_hovered(window)
+                                {
+                                    let travel = event.delta * PINCH_ZOOM_PX_PER_UNIT;
+                                    view.update(cx, |this, cx| {
+                                        this.on_wheel_zoom(travel, mono_base, cx)
                                     })
                                     .ok();
                                     cx.stop_propagation();
@@ -1354,6 +1384,18 @@ mod tests {
         let (steps, rest) = wheel_zoom_steps(-25.0);
         assert_eq!(steps, -1);
         assert_eq!(rest, -5.0);
+    }
+
+    #[test]
+    fn pinch_gain_crosses_one_step_within_a_small_spread() {
+        // ~13% of pinch spread (0.135 × 150 > 20) must cross one bucket so
+        // the gesture feels responsive, while a jittery ±5% wobble stays
+        // inside the bucket and doesn't step at all.
+        let (steps, _) = wheel_zoom_steps(0.135 * PINCH_ZOOM_PX_PER_UNIT);
+        assert_eq!(steps, 1);
+        let (steps, rest) = wheel_zoom_steps(0.05 * PINCH_ZOOM_PX_PER_UNIT);
+        assert_eq!(steps, 0);
+        assert!(rest > 0.0, "sub-step spread is carried, not dropped");
     }
 
     #[test]
