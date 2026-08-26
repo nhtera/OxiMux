@@ -47,9 +47,16 @@ pub mod version;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+// Used only by the pipeline machinery below, all of which is gated to the two
+// platforms that have one — ungated, these are unused-import errors on the
+// Linux CI gates, which build this crate through the CLI with `-D warnings`.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::path::PathBuf;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::sync::{mpsc, Arc};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::thread::JoinHandle;
 
 pub use bundle::UnsupportedReason;
