@@ -596,40 +596,65 @@ and the swap primitives now delegate here.
 
 ---
 
-## crates/auto-update — desktop self-update
+## crates/auto-update — desktop self-update (macOS + Windows)
 
-Checks GitHub releases in the background, downloads and stages a verified
-copy of the app next to the installed one, and lets the app's own quit path
-do the atomic swap — the bundle is never replaced while OxiMux is running.
-Full rationale + trust-anchor detail: `docs/system-architecture.md` →
-"Auto-update".
+Checks for a release in the background, downloads and stages a verified copy of
+the app next to the installed one, and lets the app's own quit path do the swap
+— the install is never replaced while OxiMux is running. Full rationale +
+trust-anchor detail: `docs/system-architecture.md` → "Auto-update".
 
 ```
 src/
-├── feed.rs      GET GitHub /releases/latest; pins the exact asset name
+├── release/     the signed-release trust chain, SHARED WITH apps/cli
+│   ├── manifest.rs  manifest.json: `targets` (CLI archives) + `apps` (desktop
+│   │                payloads), both keyed by target triple
+│   ├── verify.rs    minisign signature → sha256 digest → strictly-newer
+│   ├── download.rs  Fetcher trait + HttpFetcher, GitHub host allow-list,
+│   │                URLs built from the *signed* tag, never from the manifest
+│   ├── swap.rs      move-aside/move-in swap_all (all files or none),
+│   │                restore_or_sweep_backups for the deferred Windows half
+│   └── testkit.rs   real minisign keypairs (feature `testkit`)
+├── feed.rs      macOS only: GitHub /releases/latest, pins the exact asset name
 │                OxiMux-{version}-macos-arm64.dmg
 ├── version.rs   plain x.y.z parse/compare
-├── bundle.rs    eligibility() + boot-time signature pin; UnsupportedReason
-│                (NotABundle / Translocated / RootNotWritable / NoPinnableSignature)
-├── pipeline.rs  download → mount → stage → verify
-└── staging.rs   PendingUpdate manifest, random-suffix staging dirs, boot_sweep,
-                 apply_pending (the quit-time swap), recover_interrupted_swap
+├── bundle.rs    macOS eligibility() + boot-time signature pin; UnsupportedReason
+├── pipeline.rs  macOS: download → mount DMG → stage → verify
+├── staging.rs   macOS: PendingUpdate, staging dirs, boot_sweep, apply_pending
+└── windows/
+    ├── install.rs   eligibility() — install dir + write probe; refuses a
+    │                cargo target dir so an update never eats a dev build
+    ├── archive.rs   unzip the `OxiMux\` payload, traversal-fatal not -skipped
+    ├── pipeline.rs  verify manifest → verify digest → extract → record
+    └── staging.rs   PendingUpdate, per-file receipt, apply_pending, boot_sweep
 ```
+
+`lib.rs` presents the three verbs that differ behind one signature each —
+`boot_housekeeping`, `apply_pending_update`, `relaunch_target` — plus a shared
+`spawn_check`, so `apps/desktop/src/updater.rs` contains no `cfg` at all.
 
 Public state machine: `UpdateStatus` (`Idle`/`Checking`/`Downloading`/
 `Installing`/`Ready`/`UpToDate`/`Unsupported`/`Failed`), tagged with a
 `CheckTrigger` (`Background`/`Manual`).
 
+**Trust roots differ by platform, deliberately.** macOS pins the running
+bundle's Developer ID and requires an update to match it. The Windows artifacts
+carry no Authenticode signature, so there is no publisher identity to pin;
+instead the payload is anchored to the minisign-signed `manifest.json` the CLI
+already updates from, verified against `packaging/release-pubkey.txt` compiled
+in by `build.rs`. See `crates/auto-update/src/windows/mod.rs`.
+
 App-side wiring lives outside this crate: `apps/desktop/src/updater.rs`
 (`UpdaterState` global, 6h ticker, boot sweep, quit-time swap via
 `apply_pending_at_quit` from `on_app_quit`), `apps/desktop/src/platform/relaunch.rs`
-(detached `/bin/sh` "restart now" helper — waits for the old pid's flock to
-release, then `open -n`s the bundle), and
+(detached "restart now" helper — `/bin/sh` + `open -n` on macOS, PowerShell
+`Wait-Process` + `Start-Process` on Windows; both wait out the old pid so the
+new instance does not bounce off the single-instance lock), and
 `apps/desktop/src/app_settings/auto_update_settings.rs` +
 `crates/settings/src/auto_update.rs` (`auto_update.toml`: enabled,
 last_run_version). UI surfaces: a passive status-bar pill when an update is
 ready, a Settings → About toggle + status line + Check now / Restart now /
-Download update, and a one-shot "Updated to vX.Y.Z" toast after an update lands.
+Download update, the app menu's "Check for Updates…" on both platforms, and a
+one-shot "Updated to vX.Y.Z" toast after an update lands.
 
 ---
 

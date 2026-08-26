@@ -625,6 +625,16 @@ jobs:
       - name: cargo test (desktop app unit suite)
         run: cargo test --lib --target x86_64-pc-windows-msvc -p oximux-app
 
+      # The Windows self-updater. All-targets rather than `--lib`, and for the
+      # same reason the computer-use step below spells out: the suite that
+      # actually proves the pipeline lives under `tests/`, is gated to
+      # `cfg(target_os = "windows")`, and no other step in this file would
+      # reach it. Without this the feature's only end-to-end coverage — a
+      # signed release staged, swapped, and swept, plus the refusals that must
+      # touch nothing — never runs anywhere.
+      - name: cargo test (windows self-update)
+        run: cargo test --target x86_64-pc-windows-msvc -p oximux-auto-update
+
       # Screen control is off on Windows and the driver is never declared, but
       # the crate is compiled and half-used: the PreToolUse hook ships, and with
       # it the executable blocklist, the GUI-scripting brake and the

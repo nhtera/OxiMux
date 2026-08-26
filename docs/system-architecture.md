@@ -1062,19 +1062,37 @@ restart is always user-initiated (`RestartToUpdate` action, or "Restart now"
 in Settings → About) — and an ignored update simply applies itself at the
 next ordinary quit.
 
+Windows works the same way and needs to more literally: it refuses to overwrite
+a mapped image at all, so `oximux.exe` and every DLL beside it *cannot* be
+replaced while the process holds them. The swap there is per-file
+(move-aside/move-in, all files or none), and the backups it cannot delete —
+because this process is running out of the files it just replaced — are cleared
+by the next launch's `boot_housekeeping`.
+
 ```
 crates/auto-update/src/
-├── feed.rs      GitHub /releases/latest; pins the exact asset name
+├── release/     the signed-release trust chain, shared with apps/cli
+│   manifest.rs  `targets` (CLI archives) + `apps` (desktop payloads), by triple
+│   verify.rs    minisign signature → sha256 digest → strictly-newer
+│   download.rs  Fetcher + host allow-list; URLs from the *signed* tag
+│   swap.rs      swap_all (all or none), restore_or_sweep_backups
+├── feed.rs      macOS: GitHub /releases/latest; pins the exact asset name
 │                OxiMux-{version}-macos-arm64.dmg (see docs/deployment-guide.md)
 ├── version.rs   plain x.y.z parse/compare
-├── bundle.rs    eligibility() — is this exe update-capable at all
+├── bundle.rs    macOS eligibility() — is this exe update-capable at all
 │                (UnsupportedReason: NotABundle / Translocated /
 │                RootNotWritable / NoPinnableSignature); boot-time signature pin
-├── pipeline.rs  download → mount DMG → stage a copy → verify
-└── staging.rs   PendingUpdate manifest, random-suffix staging dirs,
-                 boot_sweep (finish/discard a pending update found at boot),
-                 apply_pending (the quit-time swap), recover_interrupted_swap
+├── pipeline.rs  macOS: download → mount DMG → stage a copy → verify
+├── staging.rs   macOS: PendingUpdate manifest, random-suffix staging dirs,
+│                boot_sweep, apply_pending, recover_interrupted_swap
+└── windows/     install.rs (eligibility + write probe), archive.rs (unzip the
+                 `OxiMux\` payload), pipeline.rs, staging.rs (per-file receipt,
+                 apply_pending, boot_housekeeping's restore-or-sweep)
 ```
+
+`lib.rs` puts the three verbs that differ behind one signature each —
+`boot_housekeeping`, `apply_pending_update`, `relaunch_target` — over a shared
+`spawn_check`, so `apps/desktop/src/updater.rs` carries no platform branch.
 
 Public state machine (`UpdateStatus`): `Idle → Checking → Downloading →
 Installing → Ready | UpToDate | Unsupported | Failed`, tagged with a
@@ -1087,7 +1105,7 @@ for the old pid to exit (releasing the single-instance `flock`), then
 `open -n`s the bundle, since a new instance launched before the old one
 exits would just bounce off the still-held lock.
 
-**Trust anchor.** The running bundle's own `Identifier` + `TeamIdentifier`,
+**Trust anchor, macOS.** The running bundle's own `Identifier` + `TeamIdentifier`,
 captured once at boot via `oximux-macos-trust::read_signature` and never
 re-derived — an ad-hoc or "not set" team id is rejected as a pin
 (`Signature::pinnable()`). The staged copy has to clear, in order: codesign
@@ -1111,6 +1129,32 @@ installer (see "External tool provisioning" above) — same threat model
 (a programmatic download that never gets Gatekeeper's quarantine-xattr
 check for free), same crash-safe same-volume-copy + `renamex_np(RENAME_SWAP)`
 placement primitive.
+
+**Trust anchor, Windows.** There is no codesign pin to take: the Windows
+artifacts are not Authenticode-signed (`scripts/bundle-windows.ps1` says so),
+so there is no publisher identity for an update to have to match. The anchor is
+instead the one the CLI's `oximux update` already uses — a **minisign signature
+over `manifest.json`**, verified against `packaging/release-pubkey.txt` compiled
+in by `crates/auto-update/build.rs`. That key lives only in the binary; the
+GitHub publish token that could rewrite a release cannot reach it, which is what
+a sha256 published beside the artifact it describes can never establish on its
+own. Gate order is signature → parse → strictly-newer → sha256 → extract, each
+before the step it guards, and `crates/auto-update/tests/windows_update_e2e.rs`
+asserts the ordering rather than just the outcomes (a refused update must also
+have made no request for the payload and touched no installed file).
+
+The staged payload is *not* re-verified against that signature at quit, and the
+reason is worth stating rather than implying a guarantee that is not there: an
+attacker who could rewrite the staging directory between staging and quit could
+equally well overwrite `oximux.exe` directly, since a per-user install under
+`%LOCALAPPDATA%\Programs` is writable by exactly one account. There is no
+privilege boundary for a re-verification to defend. (macOS pins a codesign
+identity because `/Applications` is *admin-group*-writable — a different threat
+model, not a stricter version of this one.) What the quit path does re-check is
+integrity: every staged file against a per-file sha256 receipt written when it
+was extracted, which catches the failure that actually happens — a disk that
+filled mid-extraction, an antivirus quarantine that took one DLL — and catches
+it before anything in the install directory has been renamed.
 
 ---
 

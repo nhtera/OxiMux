@@ -14,14 +14,31 @@
 
 use gpui::{Menu, MenuItem, OsAction, SystemMenuType, actions};
 
+use crate::actions::{CheckForUpdates, OpenAbout};
+
+/// Where the Help menu's two links go. Same destinations the Windows `⋯` menu
+/// offers, named here once so the two menus cannot drift.
+pub const DOCS_URL: &str = "https://github.com/nhtera/OxiMux#readme";
+pub const ISSUES_URL: &str = "https://github.com/nhtera/OxiMux/issues";
+
 // Menu actions. `Quit` and the native window/app items carry handlers wired
 // in `main.rs`; the Edit entries are driven by the OS via their `OsAction`
 // selector, so those units only satisfy the menu API.
+//
+// `About` is gone from this list on purpose. It used to open AppKit's standard
+// About panel; it now dispatches `actions::OpenAbout`, the same action the
+// Windows menu and the palette use, so both platforms land on the one pane
+// that can answer "is there a newer version" as well as "what am I running".
 actions!(
     oximux,
     [
         Quit,
-        About,
+        /// Help → OxiMux Documentation. Handled in `main.rs`, which is where
+        /// the `&mut App` needed to open a URL is available; the Windows menu
+        /// opens the same URL directly from its popup item.
+        OpenDocs,
+        /// Help → Report an Issue.
+        ReportIssue,
         HideApp,
         HideOthers,
         ShowAll,
@@ -45,7 +62,11 @@ pub fn app_menus() -> Vec<Menu> {
             name: "OxiMux".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("About OxiMux", About),
+                MenuItem::action("About OxiMux", OpenAbout),
+                // Directly under About and above the separator, which is where
+                // macOS apps have put it since Sparkle made it a convention —
+                // and where anyone looking for it will look first.
+                MenuItem::action("Check for Updates…", CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
                 MenuItem::separator(),
@@ -78,6 +99,19 @@ pub fn app_menus() -> Vec<Menu> {
                 MenuItem::action("Zoom", Zoom),
             ],
         },
+        // macOS puts a Help menu last and expects one to exist — it is where
+        // the system's own help search inserts itself. Two links rather than a
+        // help book: there is no bundled documentation to open, and a menu item
+        // that opens an empty help viewer is worse than one that opens the
+        // README someone would have searched for anyway.
+        Menu {
+            name: "Help".into(),
+            disabled: false,
+            items: vec![
+                MenuItem::action("OxiMux Documentation", OpenDocs),
+                MenuItem::action("Report an Issue", ReportIssue),
+            ],
+        },
     ]
 }
 
@@ -98,15 +132,9 @@ pub mod platform {
         msg_send![class!(NSApplication), sharedApplication]
     }
 
-    /// Standard About panel — populated from the bundle's name / version /
-    /// icon (Info.plist), so it shows the app name + bundle version with the app icon.
-    pub fn about() {
-        unsafe {
-            let app = shared_app();
-            let _: () = msg_send![app, activateIgnoringOtherApps: true];
-            let _: () = msg_send![app, orderFrontStandardAboutPanel: ptr::null_mut::<AnyObject>()];
-        }
-    }
+    // `orderFrontStandardAboutPanel` used to live here. It is gone rather than
+    // kept unused: the About menu item opens the in-app pane now, and a second
+    // About surface that nothing reaches is how the two drift apart.
 
     pub fn hide() {
         unsafe {
@@ -153,7 +181,6 @@ pub mod platform {
 /// No-op stubs so non-macOS builds compile (v1 ships macOS-only).
 #[cfg(not(target_os = "macos"))]
 pub mod platform {
-    pub fn about() {}
     pub fn hide() {}
     pub fn hide_others() {}
     pub fn show_all() {}

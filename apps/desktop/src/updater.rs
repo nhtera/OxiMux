@@ -3,17 +3,31 @@
 //!
 //! # Why the swap waits for quit
 //!
-//! Several things this app spawns are resolved from the bundle path *at spawn
+//! Several things this app spawns are resolved from the install path *at spawn
 //! time*, not at boot: the relay daemon (whose socket name is compiled from
 //! the wire-protocol version), the `agent-status` hook CLI embedded into live
-//! agent sessions, and the screen-control gate. Replacing the bundle under a
+//! agent sessions, and the screen-control gate. Replacing the install under a
 //! running process would leave an old-version app spawning new-version
 //! helpers — a skew with no error path, because each side is individually
 //! valid. So the background pipeline stops at a verified staged copy, and the
-//! millisecond swap happens on the way out.
+//! swap happens on the way out.
+//!
+//! Windows has a second, blunter reason: it refuses to overwrite a mapped
+//! image at all, so `oximux.exe` and every DLL beside it simply cannot be
+//! replaced while this process holds them.
 //!
 //! The user is never restarted. Ignoring the pill costs nothing: the next
 //! ordinary quit applies the update, and the next launch is the new version.
+//!
+//! # No `cfg` in this file, deliberately
+//!
+//! macOS swaps a `.app` bundle verified against a codesign pin; Windows swaps a
+//! directory of files verified against a minisign-signed manifest. Everything
+//! *here* — one status global, one 6-hour ticker, one quit hook — is the same
+//! on both, and reads that way because [`oximux_auto_update`] presents the
+//! three verbs that differ behind one signature each. A platform branch in this
+//! file would be a branch in the wiring, which is not where the platforms
+//! actually differ.
 
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -59,8 +73,12 @@ impl UpdaterState {
         }
     }
 
-    pub fn bundle_root(&self) -> Option<PathBuf> {
-        self.config.as_ref().map(|c| c.app.bundle_root.clone())
+    /// What "restart to update" should relaunch — the `.app` bundle on macOS,
+    /// the installed executable on Windows.
+    pub fn relaunch_target(&self) -> Option<PathBuf> {
+        self.config
+            .as_ref()
+            .map(|c| oximux_auto_update::relaunch_target(&c.app))
     }
 }
 
@@ -84,6 +102,8 @@ fn current_version() -> Version {
     Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or(Version::new(0, 0, 0))
 }
 
+/// Resolve what this install is. Runs a write probe (and, on macOS, a
+/// `codesign` subprocess), so it must not run on the GPUI thread.
 fn build_config() -> Result<UpdaterConfig, oximux_auto_update::UnsupportedReason> {
     use oximux_auto_update::UnsupportedReason;
 
@@ -142,13 +162,7 @@ pub fn install(cx: &mut App) {
         let interrupted = cx
             .background_executor()
             .spawn(async move {
-                let interrupted = recover_interrupted_swap(&sweep);
-                oximux_auto_update::boot_sweep(
-                    &sweep.cache_dir,
-                    &sweep.app.bundle_root,
-                    &sweep.manifest_path,
-                );
-                interrupted
+                oximux_auto_update::boot_housekeeping(&sweep, sentinel_path().as_deref())
             })
             .await;
         if let Some(status) = interrupted {
@@ -177,17 +191,17 @@ pub fn install(cx: &mut App) {
 /// spawned we still quit — the update applies either way, and the user gets
 /// the new version the next time they open the app.
 pub fn restart_to_update(cx: &mut App) {
-    let bundle_root = cx
+    let target = cx
         .try_global::<UpdaterState>()
-        .and_then(|state| state.bundle_root());
-    match bundle_root {
-        Some(root) => {
-            if let Err(err) = crate::platform::relaunch::spawn_relaunch_helper(&root) {
+        .and_then(|state| state.relaunch_target());
+    match target {
+        Some(target) => {
+            if let Err(err) = crate::platform::relaunch::spawn_relaunch_helper(&target) {
                 tracing::warn!(%err, "could not spawn the relaunch helper; quitting anyway");
             }
         }
         None => {
-            tracing::warn!("no installed bundle to relaunch; quitting without restart");
+            tracing::warn!("no installed app to relaunch; quitting without restart");
         }
     }
     cx.quit();
@@ -309,28 +323,8 @@ pub fn apply_pending_at_quit(cx: &mut App, from_signal: bool) -> bool {
     else {
         return false;
     };
-    oximux_auto_update::staging::apply_pending(&config, sentinel_path().as_deref())
+    oximux_auto_update::apply_pending_update(&config, sentinel_path().as_deref())
         == SwapOutcome::Applied
-}
-
-/// A sentinel at boot means a previous swap never confirmed. Nothing here can
-/// safely repair a bundle that fails to verify — the running process *is*
-/// that bundle — so the failure is reported for the About pane to show, and
-/// the sentinel is left in place for the next boot to re-check.
-fn recover_interrupted_swap(config: &UpdaterConfig) -> Option<UpdateStatus> {
-    let sentinel = sentinel_path()?;
-    match oximux_auto_update::staging::recover_interrupted_swap(config, &sentinel) {
-        Ok(()) => None,
-        Err(err) => {
-            tracing::error!(%err, "installed bundle failed verification after an interrupted update");
-            Some(UpdateStatus::Failed {
-                error: "an update was interrupted — reinstall to be safe".into(),
-                // Manual: this is not a check that quietly failed, it is a
-                // statement about the bundle the user is running right now.
-                trigger: CheckTrigger::Manual,
-            })
-        }
-    }
 }
 
 #[cfg(test)]

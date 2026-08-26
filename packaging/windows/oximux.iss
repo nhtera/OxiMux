@@ -54,10 +54,13 @@ VersionInfoVersion={#AppVersion}
 
 ; Per-user, and not for want of ambition. Two reasons, in order:
 ;
-; 1. crates/auto-update has no Windows pipeline yet, and when it grows one it
-;    has to replace oximux.exe and its siblings in place. A per-user directory
-;    it can write unelevated is the only shape that works without shipping an
-;    elevated helper service purely to copy files.
+; 1. crates/auto-update replaces oximux.exe and its siblings in place at quit
+;    (crates/auto-update/src/windows/). A per-user directory it can write
+;    unelevated is the only shape that works without shipping an elevated
+;    helper service purely to copy files. The updater's own eligibility check
+;    write-probes this directory and disables itself if it cannot write here,
+;    so moving an install into Program Files by hand turns updates off rather
+;    than failing them halfway.
 ; 2. Nothing here needs machine scope. Every writable path OxiMux touches is
 ;    under %LOCALAPPDATA% already (apps/desktop/src/app_paths.rs), so a
 ;    per-machine install would buy an admin prompt on every upgrade and change

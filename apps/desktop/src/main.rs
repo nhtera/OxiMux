@@ -365,7 +365,7 @@ fn main() {
         // window exists to announce it in.
         // The answer is only acted on where there is an updater to have
         // performed the upgrade; the settings install itself still has to run.
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+        #[cfg_attr(not(any(target_os = "macos", windows)), allow(unused_variables))]
         let upgraded_this_boot = oximux_app::auto_update_settings::install(cx);
         // The indicator that appears while an agent can drive the screen — a
         // menu-bar item on macOS, a notification-area icon on Windows. Watches
@@ -614,7 +614,7 @@ fn main() {
         // Auto-update: recovers from an interrupted swap, sweeps crash
         // leftovers, then checks periodically. Staging only — the swap itself
         // happens at quit, so the running workspace is never disturbed.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             oximux_app::updater::install(cx);
             if upgraded_this_boot {
@@ -637,7 +637,15 @@ fn main() {
         // items defer to AppKit selectors.
         cx.set_menus(oximux_app::menu::app_menus());
         cx.on_action::<oximux_app::menu::Quit>(|_, cx| cx.quit());
-        cx.on_action::<oximux_app::menu::About>(|_, _cx| oximux_app::menu::platform::about());
+        // Help → the two links. App-level rather than window-level because a
+        // URL needs no window, and the Help menu stays live when every window
+        // is closed.
+        cx.on_action::<oximux_app::menu::OpenDocs>(|_, cx| {
+            cx.open_url(oximux_app::menu::DOCS_URL)
+        });
+        cx.on_action::<oximux_app::menu::ReportIssue>(|_, cx| {
+            cx.open_url(oximux_app::menu::ISSUES_URL)
+        });
         cx.on_action::<oximux_app::menu::HideApp>(|_, _cx| oximux_app::menu::platform::hide());
         cx.on_action::<oximux_app::menu::HideOthers>(|_, _cx| {
             oximux_app::menu::platform::hide_others()
@@ -747,7 +755,7 @@ fn install_app_lifecycle(cx: &mut gpui::App, app_state: oximux_app::state::AppSt
         // session is already captured, so a swap that somehow stalls cannot
         // cost the user their workspace. The swap itself is one rename —
         // it is the re-verification either side of it that takes the time.
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         {
             let swap_started = std::time::Instant::now();
             let from_signal = SHUTDOWN_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);

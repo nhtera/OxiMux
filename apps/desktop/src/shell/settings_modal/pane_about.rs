@@ -20,24 +20,24 @@ use gpui_component::button::Button;
 // chevron alone, leaving the label — most of the control's width — dead to
 // clicks. `dropdown_caret(true)` keeps the chevron look on a single trigger.
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use oximux_auto_update::{CheckTrigger, UpdateStatus};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use oximux_settings::AutoUpdateSettings;
 use oximux_settings::{Density, DensityPreset, Theme, ThemeChoice, Typography};
 
 use super::controls::info_row;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use super::controls::value_chip;
 use super::layout::{SettingEntry, entries_card, entry};
 use super::segmented::{Segment, segmented};
 use super::controls::stepper;
 use super::SettingsModal;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use crate::updater::UpdaterState;
 
 /// Where a user goes when the app cannot update itself.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 const RELEASES_URL: &str = "https://github.com/nhtera/OxiMux/releases/latest";
 
 /// One face's picker: a dropdown labelled by the family in use, opening the
@@ -376,7 +376,7 @@ pub(super) fn render_appearance(
 /// user did not ask and nothing is broken from where they sit. A failed
 /// *manual* check names the actual error — they clicked, so they are owed the
 /// reason.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn status_line(status: &UpdateStatus) -> String {
     match status {
         UpdateStatus::Idle => "Checks automatically".into(),
@@ -410,7 +410,7 @@ fn status_line(status: &UpdateStatus) -> String {
 
 /// Colour the status text by whether it wants attention. Only a ready update
 /// and a manual failure get a non-muted colour; everything else is chrome.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn status_colour(status: &UpdateStatus, theme: Theme) -> gpui::Hsla {
     match status {
         UpdateStatus::Ready { .. } => theme.status_ok,
@@ -427,7 +427,7 @@ fn status_colour(status: &UpdateStatus, theme: Theme) -> gpui::Hsla {
 /// The button stays available while a check runs — the pipeline's own guard
 /// rejects a second one, so a click during a background check is harmless
 /// rather than something to disable a control over.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn update_control(
     theme: Theme,
     density: oximux_settings::Density,
@@ -510,17 +510,17 @@ pub(super) fn update_entries(
     // compiled out, this block *is* the function body, and `return` in tail
     // position is what `clippy::needless_return` fires on. Only reachable off
     // macOS, so only clippy running on a Windows host ever saw it.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (theme, density, typography, &cx);
         Vec::new()
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     let enabled = cx
         .try_global::<AutoUpdateSettings>()
         .is_none_or(|settings| settings.enabled);
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     vec![
         entry(
             "Automatic updates",

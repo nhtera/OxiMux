@@ -598,6 +598,15 @@ actions!(
         /// round-trip to disk, a read-only keybindings list, and an
         /// appearance/about pane. Also reachable via the left-rail cog.
         OpenSettings,
+        /// Open the settings modal directly at the About pane — version, app
+        /// data dir, and the update controls. The menu's "About OxiMux" on
+        /// both platforms; not bound to a chord, because About is a thing you
+        /// go looking for once, not a thing you reach for.
+        OpenAbout,
+        /// Ask the updater for a manual check and show the answer. Opens the
+        /// About pane first: a check whose result lands on a surface nobody is
+        /// looking at is indistinguishable from one that never ran.
+        CheckForUpdates,
         /// Quit and relaunch to apply a staged update. Only meaningful when
         /// the updater reports a ready version; the swap itself happens in
         /// the quit path, so this is "quit, then come back".

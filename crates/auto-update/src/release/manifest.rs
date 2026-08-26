@@ -26,8 +26,23 @@ pub struct Manifest {
     /// `0.1.7`, no `v`. The tag is `v` + this.
     pub version: String,
     pub channel: String,
-    /// Target triple → the one archive built for it.
+    /// Target triple → the one CLI archive built for it.
     pub targets: BTreeMap<String, Asset>,
+    /// Target triple → the desktop app payload built for it.
+    ///
+    /// A second map rather than more entries in `targets`, because the two
+    /// describe different programs that happen to share a triple: the CLI's
+    /// `x86_64-pc-windows-msvc` archive holds two binaries, and the app's holds
+    /// a whole install directory. One map keyed by triple could hold only one
+    /// of them.
+    ///
+    /// Optional, and absent in every manifest published before the desktop app
+    /// could update itself. That is deliberately not a schema bump: a v1 parser
+    /// ignores a field it does not know, so bumping would strand every already-
+    /// released client on "install a newer oximux to update further" for a
+    /// field that changes nothing about how the CLI verifies its own archive.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub apps: BTreeMap<String, Asset>,
 }
 
 /// One release archive. `sha256` is lowercase hex; `size` bounds the download
@@ -90,7 +105,7 @@ impl Manifest {
         if manifest.version.trim().is_empty() {
             return Err(ManifestError::Malformed("no version".into()));
         }
-        for asset in manifest.targets.values() {
+        for asset in manifest.targets.values().chain(manifest.apps.values()) {
             asset.validate()?;
         }
         Ok(manifest)
@@ -103,6 +118,19 @@ impl Manifest {
         self.targets.get(target).ok_or_else(|| ManifestError::NoAssetForTarget {
             target: target.to_string(),
             available: self.targets.keys().cloned().collect(),
+        })
+    }
+
+    /// The desktop app payload built for `target`.
+    ///
+    /// Refused the same way a missing CLI archive is, and for the same reason:
+    /// a release that skipped the Windows app job is a real state, and "the
+    /// release has no app build for x86_64-pc-windows-msvc" is what a user on
+    /// that machine needs to read instead of a silent "up to date".
+    pub fn app_for(&self, target: &str) -> Result<&Asset, ManifestError> {
+        self.apps.get(target).ok_or_else(|| ManifestError::NoAssetForTarget {
+            target: target.to_string(),
+            available: self.apps.keys().cloned().collect(),
         })
     }
 
@@ -189,6 +217,58 @@ mod tests {
         let asset = manifest.asset_for("aarch64-apple-darwin").expect("its target");
         assert_eq!(asset.archive, "oximux-0.1.6-aarch64-apple-darwin.tar.gz");
         assert_eq!(asset.size, 37);
+    }
+
+    /// The desktop app's half of the same workflow output, pinned for the same
+    /// reason: `apps` is written by a jq expression in a shell script and read
+    /// by serde, and nothing but this connects them.
+    #[test]
+    fn the_app_payloads_the_release_workflow_generates_parse_too() {
+        let from_ci = r#"{"schemaVersion":1,"version":"0.1.16","channel":"stable","targets":{"x86_64-pc-windows-msvc":{"archive":"oximux-0.1.16-x86_64-pc-windows-msvc.tar.gz","size":39,"sha256":"e8116cbfe68d3a7082a3c1b1cf8801c750596820ded6ab94ab45b160327c300d"}},"apps":{"x86_64-pc-windows-msvc":{"archive":"OxiMux-0.1.16-windows-x64.zip","size":214748364,"sha256":"5502bb9914bd6697b8c58d60baa7b4b7ecb61c01939c161fbd17b3fec14bd2cb"}}}"#;
+
+        let manifest = Manifest::parse(from_ci.as_bytes()).expect("the workflow's own output parses");
+        let app = manifest.app_for("x86_64-pc-windows-msvc").expect("its app payload");
+        assert_eq!(app.archive, "OxiMux-0.1.16-windows-x64.zip");
+        assert_eq!(app.size, 214_748_364);
+        // The CLI archive for the same triple is a different artifact, and
+        // must not be reachable through the app lookup or vice versa.
+        assert_ne!(
+            app.archive,
+            manifest.asset_for("x86_64-pc-windows-msvc").expect("its cli archive").archive
+        );
+    }
+
+    /// Every manifest published before the desktop app could update itself has
+    /// no `apps` at all. Those releases must keep working for `oximux update`,
+    /// which is the whole reason this was not a schema bump.
+    #[test]
+    fn a_manifest_from_before_app_payloads_still_parses() {
+        let raw = manifest_json("0.1.6", "aarch64-apple-darwin", SHA);
+        let manifest = Manifest::parse(raw.as_bytes()).expect("parses");
+        assert!(manifest.apps.is_empty());
+        assert!(manifest.asset_for("aarch64-apple-darwin").is_ok(), "the CLI still updates");
+
+        // …and asking for an app payload says so, rather than reporting the
+        // user's platform as unknown or silently answering "up to date".
+        let err = manifest.app_for("x86_64-pc-windows-msvc").expect_err("no app payloads");
+        assert!(err.to_string().contains("x86_64-pc-windows-msvc"), "{err}");
+    }
+
+    /// The traversal guard has to cover the second map too — it was added
+    /// later, and a validation loop that still walked only `targets` would
+    /// leave the newer artifact unchecked.
+    #[test]
+    fn an_app_payload_can_never_escape_the_download_directory_either() {
+        let raw = serde_json::json!({
+            "schemaVersion": 1,
+            "version": "0.2.0",
+            "channel": "stable",
+            "targets": {},
+            "apps": { "t": { "archive": "../evil.zip", "size": 1, "sha256": SHA } },
+        })
+        .to_string();
+        let err = Manifest::parse(raw.as_bytes()).expect_err("must refuse");
+        assert!(matches!(err, ManifestError::UnsafeAssetName { .. }), "{err:?}");
     }
 
     /// A newer manifest must stop an older binary rather than be parsed

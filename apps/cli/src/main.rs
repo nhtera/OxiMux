@@ -101,7 +101,10 @@ fn main() -> std::process::ExitCode {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        update::swap::sweep_backups(dir);
+        // Only names this CLI installed: the directory is usually
+        // `~/.local/bin`, shared with every other tool on the machine, and a
+        // `.old-` file belonging to one of them is not ours to delete.
+        update::swap::sweep_backups(dir, |name| name.starts_with("oximux"));
     }
 
     let code = match &args.command {

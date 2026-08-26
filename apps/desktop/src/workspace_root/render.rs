@@ -211,12 +211,12 @@ impl Render for WorkspaceRoot {
         // Title-bar Update pill: staged (downloaded + verified) update only.
         // Rendered by whichever header currently hosts the left chrome
         // cluster, so it survives collapsing the rail.
-        // Always `None` where there is no updater yet, which renders no pill.
-        #[cfg(target_os = "macos")]
+        // Always `None` where there is no updater, which renders no pill.
+        #[cfg(any(target_os = "macos", windows))]
         let update_ready_version = cx
             .try_global::<crate::updater::UpdaterState>()
             .and_then(|state| state.ready_version().map(str::to_string));
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         let update_ready_version: Option<String> = None;
 
         let left_column = if self.left_rail_open {
@@ -746,9 +746,9 @@ impl Render for WorkspaceRoot {
             .on_action(cx.listener(|_this, _: &RestartToUpdate, _window, cx| {
                 // Only reachable from the Update pill, which does not render
                 // without an updater to stage anything.
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", windows))]
                 crate::updater::restart_to_update(cx);
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", windows)))]
                 let _ = cx;
             }))
             .on_action(cx.listener(|this, _: &crate::actions::ToggleWhatsNew, _window, cx| {
@@ -764,6 +764,20 @@ impl Render for WorkspaceRoot {
                 this.close_modal_overlays(cx);
                 this.settings_modal.update(cx, |m, cx| m.open(window, cx));
             }))
+            .on_action(cx.listener(|this, _: &crate::actions::OpenAbout, window, cx| {
+                this.open_about(window, cx);
+            }))
+            .on_action(cx.listener(
+                |this, _: &crate::actions::CheckForUpdates, window, cx| {
+                    // The pane first, then the check. The About pane is the
+                    // only surface that renders update status, so starting a
+                    // check without opening it would look like the menu item
+                    // did nothing at all.
+                    this.open_about(window, cx);
+                    #[cfg(any(target_os = "macos", windows))]
+                    crate::updater::check_now(cx);
+                },
+            ))
             .on_action(cx.listener(|this, _: &ShowWelcomeWizard, window, cx| {
                 if this.onboarding.read(cx).is_open() {
                     return;
@@ -1633,11 +1647,11 @@ impl Render for WorkspaceRoot {
                 let scm_for_click = scm_panel.clone();
                 let weak_for_usage = cx.entity().downgrade();
                 let weak_for_ports = cx.entity().downgrade();
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", windows))]
                 let update_ready = cx
                     .try_global::<crate::updater::UpdaterState>()
                     .and_then(|state| state.ready_version().map(str::to_string));
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", windows)))]
                 let update_ready: Option<String> = None;
                 let settings_for_update = self.settings_modal.downgrade();
                 status_bar::view(
@@ -1757,7 +1771,7 @@ impl Render for WorkspaceRoot {
             // actually being Ready so a stale open flag (update applied or
             // discarded meanwhile) renders nothing rather than an empty card.
             .when(self.whats_new_open, |parent| {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", windows))]
                 let ready = cx.try_global::<crate::updater::UpdaterState>().and_then(
                     |state| match &state.status {
                         oximux_auto_update::UpdateStatus::Ready { version, notes } => {
@@ -1766,7 +1780,7 @@ impl Render for WorkspaceRoot {
                         _ => None,
                     },
                 );
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(not(any(target_os = "macos", windows)))]
                 let ready: Option<(String, String)> = None;
                 let Some((version, notes)) = ready else {
                     return parent;

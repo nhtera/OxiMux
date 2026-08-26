@@ -7684,15 +7684,22 @@ dependencies = [
 name = "oximux-auto-update"
 version = "0.1.15"
 dependencies = [
+ "base64",
+ "blake2",
+ "ed25519-dalek 2.2.0",
+ "minisign-verify",
+ "oximux-auto-update",
  "oximux-macos-trust",
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
  "ureq",
  "url",
+ "zip",
 ]
 
 [[package]]
@@ -7701,14 +7708,11 @@ version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64",
- "blake2",
  "chrono",
  "clap",
  "clap_complete",
  "crossterm",
  "dirs 5.0.1",
- "ed25519-dalek 2.2.0",
  "flate2",
  "futures",
  "jsonschema",

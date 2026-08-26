@@ -274,6 +274,25 @@ impl WorkspaceRoot {
         .detach();
     }
 
+    /// Open Settings at the About pane — version, install paths, and every
+    /// update control there is.
+    ///
+    /// Where "About OxiMux" goes on both platforms. macOS has a standard About
+    /// panel of its own, populated from the bundle's Info.plist, and this is
+    /// deliberately used instead: that panel can show a version and an icon and
+    /// nothing else, while the question someone opens About to answer is
+    /// usually "what am I running, and is there a newer one".
+    pub(crate) fn open_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_modal_overlays(cx);
+        self.settings_modal.update(cx, |m, cx| {
+            m.open_to_pane(
+                crate::shell::settings_modal::SettingsPane::About,
+                window,
+                cx,
+            );
+        });
+    }
+
     /// Open Settings at the Schedules pane. The Automations page hands off
     /// here for creation rather than carrying a second copy of the six-field
     /// create form.

@@ -9,12 +9,12 @@
 use std::io::Read as _;
 use std::time::Duration;
 
-use super::UpdateError;
+use super::ReleaseError;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// GitHub rejects requests without one.
-const USER_AGENT: &str = "oximux-cli-updater";
+const USER_AGENT: &str = "oximux-updater";
 
 /// Where release assets live. `latest/download/…` is GitHub's redirect to the
 /// most recent **published** release, which is why a draft release — what the
@@ -25,13 +25,13 @@ const RELEASE_LATEST: &str = "https://github.com/nhtera/OxiMux/releases/latest/d
 pub trait Fetcher {
     /// Read at most `ceiling` bytes from `url`, or fail. A response larger
     /// than the ceiling is an error, never a truncation.
-    fn get(&self, url: &str, ceiling: u64) -> Result<Vec<u8>, UpdateError>;
+    fn get(&self, url: &str, ceiling: u64) -> Result<Vec<u8>, ReleaseError>;
 }
 
 pub struct HttpFetcher;
 
 impl Fetcher for HttpFetcher {
-    fn get(&self, url: &str, ceiling: u64) -> Result<Vec<u8>, UpdateError> {
+    fn get(&self, url: &str, ceiling: u64) -> Result<Vec<u8>, ReleaseError> {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(CONNECT_TIMEOUT)
             .timeout_read(READ_TIMEOUT)
@@ -48,7 +48,7 @@ impl Fetcher for HttpFetcher {
             .and_then(|u| u.host_str().map(|host| host.to_string()))
             .unwrap_or_default();
         if !host_allowed(&final_host) {
-            return Err(UpdateError::DisallowedHost { host: final_host });
+            return Err(ReleaseError::DisallowedHost { host: final_host });
         }
 
         let mut body = Vec::new();
@@ -56,22 +56,22 @@ impl Fetcher for HttpFetcher {
             .into_reader()
             .take(ceiling.saturating_add(1))
             .read_to_end(&mut body)
-            .map_err(|err| UpdateError::Network { detail: format!("download interrupted: {err}") })?;
+            .map_err(|err| ReleaseError::Network { detail: format!("download interrupted: {err}") })?;
         if body.len() as u64 > ceiling {
-            return Err(UpdateError::Oversize { ceiling });
+            return Err(ReleaseError::Oversize { ceiling });
         }
         Ok(body)
     }
 }
 
-fn transport(err: ureq::Error) -> UpdateError {
+fn transport(err: ureq::Error) -> ReleaseError {
     match err {
-        ureq::Error::Status(404, _) => UpdateError::NoRelease,
-        ureq::Error::Status(403, _) | ureq::Error::Status(429, _) => UpdateError::RateLimited,
+        ureq::Error::Status(404, _) => ReleaseError::NoRelease,
+        ureq::Error::Status(403, _) | ureq::Error::Status(429, _) => ReleaseError::RateLimited,
         ureq::Error::Status(code, _) => {
-            UpdateError::Network { detail: format!("the release server returned HTTP {code}") }
+            ReleaseError::Network { detail: format!("the release server returned HTTP {code}") }
         }
-        ureq::Error::Transport(t) => UpdateError::Network { detail: t.to_string() },
+        ureq::Error::Transport(t) => ReleaseError::Network { detail: t.to_string() },
     }
 }
 
