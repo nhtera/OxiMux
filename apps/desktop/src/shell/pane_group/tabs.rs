@@ -233,6 +233,19 @@ impl PaneGroup {
         cx: &mut Context<Self>,
     ) -> (Entity<oximux_editor::EditorView>, Subscription) {
         let view = cx.new(|cx| oximux_editor::EditorView::new(path.to_path_buf(), window, cx));
+        // Route document links clicked in the markdown preview back into this
+        // pane group. Opened as a preview (ephemeral) tab — following a link
+        // is browsing, so hopping through several docs reuses one tab slot
+        // instead of piling up permanent tabs; any edit promotes it via the
+        // observer below.
+        let pane = cx.entity().downgrade();
+        view.update(cx, |v, _| {
+            v.set_document_opener(std::sync::Arc::new(move |path, window, cx| {
+                let _ = pane.update(cx, |pg, cx| {
+                    pg.open_or_activate_editor_tab_at(path, None, true, window, cx);
+                });
+            }));
+        });
         // Resolve + attach a language server (extension-keyed, PATH-resolved;
         // unsupported language or uninstalled server is a clean no-op).
         if let Some(server) = oximux_editor::resolve_lsp_server(path) {
