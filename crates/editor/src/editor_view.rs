@@ -42,6 +42,7 @@ use crate::editor_header;
 use crate::lsp::{LspClient, path_to_file_uri};
 use crate::lsp_bridge::spawn_attach_lsp;
 use crate::markdown_preview::{self, MarkdownViewMode};
+use crate::mermaid;
 
 actions!(
     oximux,
@@ -97,6 +98,32 @@ impl EditorZoom {
         let raw = f32::from(base) + self.steps as f32;
         px(raw.clamp(EDITOR_FONT_MIN_PX, EDITOR_FONT_MAX_PX))
     }
+
+    /// `delta` steps at once, with `steps` clamped to the range where
+    /// `effective_px(base)` still moves. The wheel path needs the clamp:
+    /// a trackpad fling delivers dozens of steps in a second, and letting
+    /// `steps` overshoot the clamp in `effective_px` would leave a dead
+    /// zone where the first reverse-scroll notches change nothing.
+    fn stepped_by(self, delta: i32, base: gpui::Pixels) -> Self {
+        let min = (EDITOR_FONT_MIN_PX - f32::from(base)).round() as i32;
+        let max = (EDITOR_FONT_MAX_PX - f32::from(base)).round() as i32;
+        Self {
+            steps: (self.steps + delta).clamp(min, max),
+        }
+    }
+}
+
+/// Scroll travel (px) per Cmd+wheel zoom step. Chosen so one discrete
+/// mouse-wheel notch — a 1-line delta, converted at this same value —
+/// lands on exactly one step, while a trackpad accumulates smoothly
+/// instead of stepping once per tiny pixel-delta event.
+const WHEEL_ZOOM_STEP_PX: f32 = 20.0;
+
+/// Bucket accumulated Cmd+wheel travel into whole zoom steps. Returns the
+/// steps to apply now and the leftover travel to carry into the next event.
+fn wheel_zoom_steps(accum: f32) -> (i32, f32) {
+    let steps = (accum / WHEEL_ZOOM_STEP_PX).trunc();
+    (steps as i32, accum - steps * WHEEL_ZOOM_STEP_PX)
 }
 
 /// The current editor zoom (default when never set this session).
@@ -324,8 +351,15 @@ pub struct EditorView {
     /// only — not persisted, so every reopen of a `.md` starts in Preview.
     /// Meaningless (and unused) when `is_markdown` is false.
     md_mode: MarkdownViewMode,
+    /// Rendered ```mermaid fences for the preview, keyed by content+theme.
+    /// Per-view so two open `.md` tabs never share diagram state. Empty
+    /// whenever the document has no mermaid fences.
+    mermaid: mermaid::MermaidCache,
     /// Whether the breadcrumb "⋯" actions dropdown is showing. View-lifetime.
     actions_menu_open: bool,
+    /// Leftover Cmd+wheel scroll travel (px) below one zoom step. Carried
+    /// across events so a slow trackpad drag still reaches a step.
+    wheel_zoom_accum: f32,
     /// Monotonic generation for the debounced autosave timer. Every buffer
     /// change bumps it; a fired timer only writes if its captured generation
     /// is still current (no newer edit superseded it).
@@ -423,8 +457,10 @@ impl EditorView {
             focused: false,
             is_markdown,
             md_mode,
+            mermaid: mermaid::MermaidCache::default(),
             actions_menu_open: false,
             autosave_gen: 0,
+            wheel_zoom_accum: 0.0,
             _autosave_task: None,
             _zoom_sub,
             _focus_sub,
@@ -568,6 +604,18 @@ impl EditorView {
 
     fn on_zoom_reset(&mut self, _: &EditorZoomReset, _window: &mut Window, cx: &mut Context<Self>) {
         self.apply_zoom(EditorZoom::reset(), cx);
+    }
+
+    /// Cmd+scroll zoom: accumulate wheel
+    /// travel, convert whole buckets to zoom steps, keep the remainder.
+    /// Scroll up (positive y) zooms in.
+    fn on_wheel_zoom(&mut self, delta_y: f32, base: gpui::Pixels, cx: &mut Context<Self>) {
+        let (steps, rest) = wheel_zoom_steps(self.wheel_zoom_accum + delta_y);
+        self.wheel_zoom_accum = rest;
+        if steps != 0 {
+            let next = current_zoom(cx).stepped_by(steps, base);
+            self.apply_zoom(next, cx);
+        }
     }
 
     /// Write the buffer to disk, clear the dirty flag, and fire `didSave`.
@@ -857,6 +905,31 @@ impl Render for EditorView {
         // which the placeholder helpers below already work around.
         let typo = oximux_settings::appearance::typography(cx);
         let density = oximux_settings::appearance::density(cx);
+
+        // Markdown preview source, pre-processed BEFORE the long-lived theme
+        // borrow below: `mermaid.process` kicks background renders and needs
+        // `&mut cx`, which can't overlap `cx.theme()`'s shared borrow. Ready
+        // ```mermaid fences come back rewritten to file:// images, which
+        // `absolutize_image_paths` later passes through untouched (it skips
+        // URLs with a scheme). `Some` exactly when a Preview/Split arm below
+        // will consume it — and those arms fall back to re-reading the raw
+        // buffer, so a future condition drift degrades to an un-rewritten
+        // preview, never a blank one.
+        let is_dark = cx.theme().is_dark();
+        let mut md_preview_value = match &self.content {
+            EditorContent::Text(t)
+                if self.is_markdown
+                    && matches!(
+                        self.md_mode,
+                        MarkdownViewMode::Preview | MarkdownViewMode::Split
+                    ) =>
+            {
+                let value = t.state.read(cx).value().to_string();
+                Some(self.mermaid.process(&value, cx).unwrap_or(value))
+            }
+            _ => None,
+        };
+
         let theme = cx.theme();
 
         // Path breadcrumb row above the content. Dirty indicator is text
@@ -918,7 +991,17 @@ impl Render for EditorView {
         // `cx` mutably if it needs to (e.g., for `cx.listener`).
         let muted_fg = theme.muted_foreground;
         // Editor-global font zoom applied on top of the theme's mono size.
-        let mono_size = current_zoom(cx).effective_px(theme.mono_font_size);
+        // The unzoomed base is also snapshotted for the Cmd+wheel listener,
+        // which clamps its steps against it.
+        let mono_base = theme.mono_font_size;
+        let zoom = current_zoom(cx);
+        let mono_size = zoom.effective_px(mono_base);
+        // The markdown preview zooms too, off its own base: the theme's UI
+        // font size, which is what the preview body would inherit (via the
+        // window rem size) if left alone. Headings scale by the ratio so the
+        // preview keeps its proportions.
+        let preview_body = zoom.effective_px(theme.font_size);
+        let preview_factor = f32::from(preview_body) / f32::from(theme.font_size);
         let body: gpui::AnyElement = match &self.content {
             // Markdown text: branch on the active view mode. Source reuses the
             // plain editor; Preview/Split render via the GFM renderer. The
@@ -931,15 +1014,26 @@ impl Render for EditorView {
                     .text_size(mono_size)
                     .size_full();
                 let view_id = cx.entity_id();
-                let is_dark = theme.is_dark();
                 match self.md_mode {
                     MarkdownViewMode::Source => input.into_any_element(),
                     MarkdownViewMode::Preview => {
-                        let value = t.state.read(cx).value().to_string();
-                        markdown_preview::render_preview(&value, dir, view_id, is_dark, typo.t_body_sm)
+                        let value = md_preview_value
+                            .take()
+                            .unwrap_or_else(|| t.state.read(cx).value().to_string());
+                        markdown_preview::render_preview(
+                            &value,
+                            dir,
+                            view_id,
+                            is_dark,
+                            typo.t_body_sm,
+                            preview_body,
+                            preview_factor,
+                        )
                     }
                     MarkdownViewMode::Split => {
-                        let value = t.state.read(cx).value().to_string();
+                        let value = md_preview_value
+                            .take()
+                            .unwrap_or_else(|| t.state.read(cx).value().to_string());
                         // Bound the split's height to the region below the 28px
                         // breadcrumb: `h_resizable` is `size_full`, so without a
                         // `flex_1`/`min_h_0` wrapper it would overflow the header.
@@ -957,6 +1051,8 @@ impl Render for EditorView {
                                                 view_id,
                                                 is_dark,
                                                 typo.t_body_sm,
+                                                preview_body,
+                                                preview_factor,
                                             ),
                                         ),
                                     ),
@@ -1041,6 +1137,46 @@ impl Render for EditorView {
             )
             .child(breadcrumb)
             .child(body)
+            // Cmd+scroll font zoom. Registered as a CAPTURE-phase window
+            // mouse listener rather than `.on_scroll_wheel`: the child
+            // `Input` handles plain wheel scroll in the bubble phase and
+            // stops propagation whenever it scrolled, so a bubble listener
+            // here would only see wheel events at the buffer's scroll
+            // extremes. Capture runs parent-first, and stopping propagation
+            // there keeps a zoom gesture from also scrolling the buffer.
+            // The zero-size-paint `canvas` exists to reach the low-level
+            // hitbox + mouse-listener API from inside a fluent render.
+            .child({
+                let view = cx.entity().downgrade();
+                gpui::canvas(
+                    |bounds, window, _| {
+                        window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
+                    },
+                    move |_, hitbox, window, _| {
+                        window.on_mouse_event(
+                            move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
+                                if phase == gpui::DispatchPhase::Capture
+                                    && event.modifiers.secondary()
+                                    && hitbox.should_handle_scroll(window)
+                                {
+                                    let delta_y = f32::from(
+                                        event.delta.pixel_delta(px(WHEEL_ZOOM_STEP_PX)).y,
+                                    );
+                                    view.update(cx, |this, cx| {
+                                        this.on_wheel_zoom(delta_y, mono_base, cx)
+                                    })
+                                    .ok();
+                                    cx.stop_propagation();
+                                }
+                            },
+                        );
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+            })
             // "⋯" actions dropdown: backdrop + card, painted above the body.
             .when(self.actions_menu_open, |this| {
                 this.child(editor_header::actions_overlay(
@@ -1179,6 +1315,62 @@ mod tests {
         // Sanity-check the save-failure path used by `on_save`.
         let result = std::fs::write("/dev/null/impossible/path/file.rs", "test");
         assert!(result.is_err(), "expected write to impossible path to fail");
+    }
+
+    #[test]
+    fn wheel_zoom_travel_below_one_step_only_accumulates() {
+        // Trackpad gestures arrive as many small pixel deltas; none of them
+        // alone may step the zoom, but the travel must not be lost.
+        let (steps, rest) = wheel_zoom_steps(7.0);
+        assert_eq!(steps, 0);
+        assert_eq!(rest, 7.0);
+        let (steps, rest) = wheel_zoom_steps(rest + 14.0);
+        assert_eq!(steps, 1, "carried travel crosses the bucket");
+        assert_eq!(rest, 1.0);
+    }
+
+    #[test]
+    fn wheel_zoom_one_notch_is_exactly_one_step() {
+        // A discrete wheel notch is a 1-line delta, converted at
+        // WHEEL_ZOOM_STEP_PX per line — one notch, one step, no remainder.
+        let (steps, rest) = wheel_zoom_steps(WHEEL_ZOOM_STEP_PX);
+        assert_eq!((steps, rest), (1, 0.0));
+        let (steps, rest) = wheel_zoom_steps(-WHEEL_ZOOM_STEP_PX);
+        assert_eq!((steps, rest), (-1, 0.0));
+    }
+
+    #[test]
+    fn wheel_zoom_fast_fling_applies_multiple_steps() {
+        let (steps, rest) = wheel_zoom_steps(WHEEL_ZOOM_STEP_PX * 3.0 + 5.0);
+        assert_eq!(steps, 3);
+        assert_eq!(rest, 5.0);
+    }
+
+    #[test]
+    fn wheel_zoom_negative_remainder_keeps_its_sign() {
+        // trunc() (not floor) keeps bucket math symmetric around zero, so a
+        // downward gesture's remainder stays negative and keeps building
+        // toward the next zoom-out step instead of cancelling into zoom-in.
+        let (steps, rest) = wheel_zoom_steps(-25.0);
+        assert_eq!(steps, -1);
+        assert_eq!(rest, -5.0);
+    }
+
+    #[test]
+    fn stepped_by_clamps_where_the_effective_size_stops_moving() {
+        // A fling worth +100 steps from a 13px base must park exactly at
+        // the point where effective_px hits the max — the very next
+        // zoom-out step has to move the size again (no dead zone).
+        let base = px(13.0);
+        let flung = EditorZoom::default().stepped_by(100, base);
+        assert_eq!(flung.effective_px(base), px(EDITOR_FONT_MAX_PX));
+        let back = flung.stepped_by(-1, base);
+        assert_eq!(back.effective_px(base), px(EDITOR_FONT_MAX_PX - 1.0));
+
+        let shrunk = EditorZoom::default().stepped_by(-100, base);
+        assert_eq!(shrunk.effective_px(base), px(EDITOR_FONT_MIN_PX));
+        let back = shrunk.stepped_by(1, base);
+        assert_eq!(back.effective_px(base), px(EDITOR_FONT_MIN_PX + 1.0));
     }
 
     #[test]

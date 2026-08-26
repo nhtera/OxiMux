@@ -20,7 +20,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use gpui::{
-    AnyElement, EntityId, InteractiveElement, IntoElement, ParentElement, Styled, div,
+    AnyElement, EntityId, InteractiveElement, IntoElement, ParentElement, Pixels, Styled, div,
     prelude::FluentBuilder as _, px, rems,
 };
 use gpui_component::{
@@ -120,25 +120,38 @@ fn preview_style(is_dark: bool) -> TextViewStyle {
 /// so two open `.md` tabs never share the renderer's keyed state. `is_dark`
 /// follows the active app theme so preview surface + code-block syntax track
 /// dark/light.
+///
+/// `body_size` is the editor-zoomed body text size (the un-zoomed default is
+/// the theme's `font_size`, which the `TextView` would otherwise inherit via
+/// the window rem size) and `zoom_factor` the ratio of that to the un-zoomed
+/// base. Headings and the code-fence language tag scale by the factor so the
+/// preview keeps its proportions at every zoom level; fenced code bodies
+/// stay at the theme mono size (the renderer sets that internally).
 pub fn render_preview(
     source: &str,
     base_dir: Option<&Path>,
     view_id: EntityId,
     is_dark: bool,
     lang_tag_size: f32,
+    body_size: Pixels,
+    zoom_factor: f32,
 ) -> AnyElement {
     let rendered = match base_dir {
         Some(dir) => absolutize_image_paths(source, dir),
         None => source.to_owned(),
     };
+    let mut style = preview_style(is_dark);
+    style.heading_base_font_size = style.heading_base_font_size * zoom_factor;
+    let lang_tag_size = lang_tag_size * zoom_factor;
     div()
         .id(("md-preview", view_id))
         .flex_1()
         .min_h_0()
         .overflow_hidden()
+        .text_size(body_size)
         .child(
             TextView::markdown(("md-preview-text", view_id), rendered)
-                .style(preview_style(is_dark))
+                .style(style)
                 // Code blocks get a language tag + one-click copy, the way a
                 // polished doc viewer surfaces fenced code.
                 .code_block_actions(move |code_block, _window, cx| {
