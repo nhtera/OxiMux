@@ -33,17 +33,19 @@ url.workspace = true
 minisign-verify.workspace = true
 sha2.workspace = true
 
+# Signing, for `testkit` only — see the feature's note. Optional so that a
+# shipped binary, which has no business being able to sign a release manifest,
+# does not carry the code to do it. These live in the platform-neutral table:
+# the testkit signs on every platform's test runner, and a stray section header
+# above them would silently scope them to one OS.
+base64 = { workspace = true, optional = true }
+blake2 = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
+
 # The Windows app payload ships as a zip (the macOS one is a DMG, mounted
 # through hdiutil). Same crate the driver installer unpacks with.
 [target.'cfg(target_os = "windows")'.dependencies]
 zip.workspace = true
-
-# Signing, for `testkit` only — see the feature's note. Optional so that a
-# shipped binary, which has no business being able to sign a release manifest,
-# does not carry the code to do it.
-base64 = { workspace = true, optional = true }
-blake2 = { workspace = true, optional = true }
-ed25519-dalek = { workspace = true, optional = true }
 
 [features]
 # Mint real minisign keypairs and signatures. Needed by any crate that tests
