@@ -137,8 +137,13 @@ gpui_macros = { git = "https://github.com/zed-industries/zed" }
 # php, ruby, lua, zig, scala, sql, css, html, json, markdown, yaml, toml,
 # bash, make, cmake, proto, graphql, diff, ...). Build time is a few extra
 # seconds; the runtime cost is per-file (lazy parser construction).
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "ccc1e7689203d09bfc88a0aae29473d1c289fa0c", features = ["tree-sitter-languages"] }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "ccc1e7689203d09bfc88a0aae29473d1c289fa0c" }
+# Sourced from our fork's `oximux/link-click-ccc1e76` branch: upstream rev
+# ccc1e76 plus one backported commit (upstream #2621) adding
+# `TextView::on_link_click`, which the markdown preview needs to open
+# relative document links in-app. Drop the fork and return to upstream the
+# next time the pin is bumped past upstream 3cb3cc13 (the API is identical).
+gpui-component = { git = "https://github.com/nhtera/gpui-component", rev = "8adf9846c26f354333ab5bdafb18bf2dc3328db4", features = ["tree-sitter-languages"] }
+gpui-component-assets = { git = "https://github.com/nhtera/gpui-component", rev = "8adf9846c26f354333ab5bdafb18bf2dc3328db4" }
 
 # Async + util
 tokio = { version = "1", features = ["full"] }

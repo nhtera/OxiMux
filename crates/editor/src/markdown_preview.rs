@@ -17,11 +17,14 @@
 //! Keeping this out of `editor_view.rs` holds that file under the size cap and
 //! lets the path-rewriting logic be unit-tested as a pure function.
 
-use std::path::{Component, Path, PathBuf};
+use std::{
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+};
 
 use gpui::{
-    AnyElement, EntityId, InteractiveElement, IntoElement, ParentElement, Pixels, Styled, div,
-    prelude::FluentBuilder as _, px, rems,
+    AnyElement, App, EntityId, InteractiveElement, IntoElement, ParentElement, Pixels, Styled,
+    Window, div, prelude::FluentBuilder as _, px, rems,
 };
 use gpui_component::{
     ActiveTheme, Icon, IconName, Selectable, Sizable,
@@ -31,6 +34,13 @@ use gpui_component::{
     highlighter::HighlightTheme,
     text::{TextView, TextViewStyle},
 };
+
+/// Callback the host app installs so a clicked document link in the rendered
+/// preview opens the target file in-app (an editor tab) instead of going to
+/// the OS URL opener. `Arc + Send + Sync` because the renderer's link-click
+/// handler contract requires it (gpui entity handles are `Send`, so a closure
+/// capturing a `WeakEntity` of the pane group satisfies the bound).
+pub type DocumentOpener = Arc<dyn Fn(PathBuf, &mut Window, &mut App) + Send + Sync>;
 
 /// Which view a markdown file is showing. `Copy` so it lives as a plain field
 /// on `EditorView` and is cheap to compare for the toggle's selected state.
@@ -127,6 +137,13 @@ fn preview_style(is_dark: bool) -> TextViewStyle {
 /// base. Headings and the code-fence language tag scale by the factor so the
 /// preview keeps its proportions at every zoom level; fenced code bodies
 /// stay at the theme mono size (the renderer sets that internally).
+///
+/// `opener`, when provided together with `base_dir`, routes clicked links
+/// that resolve to an existing local file (relative `page.md`, `../doc.md`,
+/// absolute, or `file://`) into the app instead of the OS opener; every other
+/// link (`https://`, `mailto:`, missing files, bare `#anchor`s) keeps the
+/// default open-URL behavior.
+#[allow(clippy::too_many_arguments)]
 pub fn render_preview(
     source: &str,
     base_dir: Option<&Path>,
@@ -135,6 +152,7 @@ pub fn render_preview(
     lang_tag_size: f32,
     body_size: Pixels,
     zoom_factor: f32,
+    opener: Option<DocumentOpener>,
 ) -> AnyElement {
     let rendered = match base_dir {
         Some(dir) => absolutize_image_paths(source, dir),
@@ -143,38 +161,65 @@ pub fn render_preview(
     let mut style = preview_style(is_dark);
     style.heading_base_font_size *= zoom_factor;
     let lang_tag_size = lang_tag_size * zoom_factor;
+    let mut text_view = TextView::markdown(("md-preview-text", view_id), rendered)
+        .style(style)
+        // Code blocks get a language tag + one-click copy, the way a
+        // polished doc viewer surfaces fenced code.
+        .code_block_actions(move |code_block, _window, cx| {
+            let code = code_block.code();
+            h_flex()
+                .gap_2()
+                .items_center()
+                .when_some(code_block.lang(), |this, lang| {
+                    this.child(
+                        div()
+                            .text_size(px(lang_tag_size))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(lang),
+                    )
+                })
+                .child(Clipboard::new("md-code-copy").value(code))
+        });
+    if let (Some(opener), Some(dir)) = (opener, base_dir) {
+        let base = dir.to_path_buf();
+        text_view = text_view.on_link_click(move |url, _event, window, cx| {
+            match resolve_document_link(url, &base).filter(|p| p.is_file()) {
+                Some(path) => opener(path, window, cx),
+                // Not a local document (or it doesn't exist): keep the
+                // renderer's default behavior of handing it to the OS.
+                None => cx.open_url(url),
+            }
+        });
+    }
     div()
         .id(("md-preview", view_id))
         .flex_1()
         .min_h_0()
         .overflow_hidden()
         .text_size(body_size)
-        .child(
-            TextView::markdown(("md-preview-text", view_id), rendered)
-                .style(style)
-                // Code blocks get a language tag + one-click copy, the way a
-                // polished doc viewer surfaces fenced code.
-                .code_block_actions(move |code_block, _window, cx| {
-                    let code = code_block.code();
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .when_some(code_block.lang(), |this, lang| {
-                            this.child(
-                                div()
-                                    .text_size(px(lang_tag_size))
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(lang),
-                            )
-                        })
-                        .child(Clipboard::new("md-code-copy").value(code))
-                })
-                .h_full()
-                .p_5()
-                .scrollable(true)
-                .selectable(true),
-        )
+        .child(text_view.h_full().p_5().scrollable(true).selectable(true))
         .into_any_element()
+}
+
+/// Resolve a clicked preview link to a local filesystem path, or `None` when
+/// the link is not a local-document target (external scheme, bare `#anchor`,
+/// unresolvable). Relative targets resolve against `base_dir` (the document's
+/// directory); `#fragment` suffixes and percent-encoding are handled by the
+/// `url` crate during the round-trip. Pure — existence is the caller's check,
+/// so this stays unit-testable without a filesystem.
+pub(crate) fn resolve_document_link(url: &str, base_dir: &Path) -> Option<PathBuf> {
+    let url = url.trim();
+    if url.is_empty() || url.starts_with('#') {
+        return None;
+    }
+    let base = url::Url::from_directory_path(base_dir).ok()?;
+    let joined = base.join(url).ok()?;
+    // A link with its own scheme (`https://`, `mailto:`, `data:`, ...) keeps
+    // that scheme through `join` — only `file` targets are local documents.
+    if joined.scheme() != "file" {
+        return None;
+    }
+    joined.to_file_path().ok()
 }
 
 /// Rewrite repo-relative image paths in `![alt](url)` / `![alt](url "title")`
@@ -492,6 +537,80 @@ mod tests {
             abs("![x](C:/abs/cat.png)"),
             "![x](file:///C:/abs/cat.png)"
         );
+    }
+
+    /// The path `base()` + `rel` normalizes to, for link-resolution tests.
+    fn path_for(rel: &str) -> PathBuf {
+        normalize_lexically(&base().join(rel))
+    }
+
+    #[test]
+    fn link_relative_resolves_against_base_dir() {
+        assert_eq!(
+            resolve_document_link("page.md", base()),
+            Some(path_for("page.md"))
+        );
+        assert_eq!(
+            resolve_document_link("./sub/page.md", base()),
+            Some(path_for("sub/page.md"))
+        );
+        assert_eq!(
+            resolve_document_link("../other.md", base()),
+            Some(path_for("../other.md"))
+        );
+    }
+
+    #[test]
+    fn link_fragment_suffix_is_dropped() {
+        assert_eq!(
+            resolve_document_link("page.md#section-2", base()),
+            Some(path_for("page.md"))
+        );
+    }
+
+    #[test]
+    fn link_percent_encoding_is_decoded() {
+        assert_eq!(
+            resolve_document_link("my%20doc.md", base()),
+            Some(path_for("my doc.md"))
+        );
+    }
+
+    #[test]
+    fn link_external_schemes_and_bare_anchors_are_not_documents() {
+        for url in [
+            "https://example.com/page.md",
+            "http://example.com",
+            "mailto:someone@example.com",
+            "data:text/plain,hi",
+            "#just-an-anchor",
+            "",
+            "   ",
+        ] {
+            assert_eq!(resolve_document_link(url, base()), None, "url: {url:?}");
+        }
+    }
+
+    #[test]
+    fn link_file_url_maps_back_to_a_path() {
+        let target = path_for("page.md");
+        let url = url::Url::from_file_path(&target).expect("absolute fixture");
+        assert_eq!(
+            resolve_document_link(url.as_str(), base()),
+            Some(target)
+        );
+    }
+
+    #[test]
+    fn link_root_absolute_path_resolves_from_root() {
+        // A leading `/` is root-relative in URL terms: resolved against the
+        // base's root, not joined under `base_dir`.
+        let expected = if cfg!(windows) {
+            PathBuf::from(r"C:\x\doc.md")
+        } else {
+            PathBuf::from("/x/doc.md")
+        };
+        assert_eq!(resolve_document_link("/x/doc.md", base()), Some(expected));
     }
 
     #[test]

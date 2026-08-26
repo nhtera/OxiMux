@@ -368,6 +368,11 @@ pub struct EditorView {
     /// Leftover Cmd+wheel scroll travel (px) below one zoom step. Carried
     /// across events so a slow trackpad drag still reaches a step.
     wheel_zoom_accum: f32,
+    /// Host-installed callback that opens a linked document (a clicked
+    /// relative link in the markdown preview) in the surrounding pane group.
+    /// `None` until the shell wires it, in which case such links fall back
+    /// to the OS URL opener (a no-op for relative paths).
+    document_opener: Option<markdown_preview::DocumentOpener>,
     /// Monotonic generation for the debounced autosave timer. Every buffer
     /// change bumps it; a fired timer only writes if its captured generation
     /// is still current (no newer edit superseded it).
@@ -469,6 +474,7 @@ impl EditorView {
             actions_menu_open: false,
             autosave_gen: 0,
             wheel_zoom_accum: 0.0,
+            document_opener: None,
             _autosave_task: None,
             _zoom_sub,
             _focus_sub,
@@ -516,6 +522,13 @@ impl EditorView {
     /// File path the view is showing.
     pub fn file_path(&self) -> &Path {
         &self.file_path
+    }
+
+    /// Install the host callback that opens a document linked from the
+    /// markdown preview (e.g. a clicked `[Phase 2](phase-02.md)`) as an
+    /// editor tab in the surrounding pane group.
+    pub fn set_document_opener(&mut self, opener: markdown_preview::DocumentOpener) {
+        self.document_opener = Some(opener);
     }
 
     /// `true` only for the `Text` variant — used by callers gating
@@ -1036,6 +1049,7 @@ impl Render for EditorView {
                             typo.t_body_sm,
                             preview_body,
                             preview_factor,
+                            self.document_opener.clone(),
                         )
                     }
                     MarkdownViewMode::Split => {
@@ -1061,6 +1075,7 @@ impl Render for EditorView {
                                                 typo.t_body_sm,
                                                 preview_body,
                                                 preview_factor,
+                                                self.document_opener.clone(),
                                             ),
                                         ),
                                     ),
