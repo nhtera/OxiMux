@@ -141,7 +141,7 @@ pub fn render_preview(
         None => source.to_owned(),
     };
     let mut style = preview_style(is_dark);
-    style.heading_base_font_size = style.heading_base_font_size * zoom_factor;
+    style.heading_base_font_size *= zoom_factor;
     let lang_tag_size = lang_tag_size * zoom_factor;
     div()
         .id(("md-preview", view_id))
