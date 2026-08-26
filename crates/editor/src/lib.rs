@@ -19,6 +19,7 @@ pub mod file_tree;
 pub mod lsp;
 pub mod lsp_bridge;
 pub mod markdown_preview;
+pub mod mermaid;
 
 pub use autosave::{pause_autosave, resume_autosave};
 pub use binary::{image_mime_for_path, is_binary_buffer, is_previewable_image};

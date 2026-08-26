@@ -152,6 +152,11 @@ tokio = { version = "1", features = ["full"] }
 interprocess = { version = "2.4", features = ["tokio"] }
 futures = "0.3"
 anyhow = "1"
+# Headless Mermaid (parse + layout + SVG), no browser/Node. Pinned exact: 0.x
+# with real API churn between minors, and 0.7+ raises MSRV past our 1.89.
+# `render` = SVG output; the `raster` feature stays off — gpui rasterizes SVG
+# itself via usvg/resvg.
+merman = { version = "=0.6.2", default-features = false, features = ["render"] }
 # Strips the `\\?\` verbatim prefix that `Path::canonicalize` adds on Windows,
 # where it is safe to drop. Canonicalized paths get stored in settings files and
 # compared against user-typed ones, and the prefix is correct-but-unspellable in

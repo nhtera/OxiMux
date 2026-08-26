@@ -42,6 +42,7 @@ use crate::editor_header;
 use crate::lsp::{LspClient, path_to_file_uri};
 use crate::lsp_bridge::spawn_attach_lsp;
 use crate::markdown_preview::{self, MarkdownViewMode};
+use crate::mermaid;
 
 actions!(
     oximux,
@@ -324,6 +325,10 @@ pub struct EditorView {
     /// only — not persisted, so every reopen of a `.md` starts in Preview.
     /// Meaningless (and unused) when `is_markdown` is false.
     md_mode: MarkdownViewMode,
+    /// Rendered ```mermaid fences for the preview, keyed by content+theme.
+    /// Per-view so two open `.md` tabs never share diagram state. Empty
+    /// whenever the document has no mermaid fences.
+    mermaid: mermaid::MermaidCache,
     /// Whether the breadcrumb "⋯" actions dropdown is showing. View-lifetime.
     actions_menu_open: bool,
     /// Monotonic generation for the debounced autosave timer. Every buffer
@@ -423,6 +428,7 @@ impl EditorView {
             focused: false,
             is_markdown,
             md_mode,
+            mermaid: mermaid::MermaidCache::default(),
             actions_menu_open: false,
             autosave_gen: 0,
             _autosave_task: None,
@@ -857,6 +863,31 @@ impl Render for EditorView {
         // which the placeholder helpers below already work around.
         let typo = oximux_settings::appearance::typography(cx);
         let density = oximux_settings::appearance::density(cx);
+
+        // Markdown preview source, pre-processed BEFORE the long-lived theme
+        // borrow below: `mermaid.process` kicks background renders and needs
+        // `&mut cx`, which can't overlap `cx.theme()`'s shared borrow. Ready
+        // ```mermaid fences come back rewritten to file:// images, which
+        // `absolutize_image_paths` later passes through untouched (it skips
+        // URLs with a scheme). `Some` exactly when a Preview/Split arm below
+        // will consume it — and those arms fall back to re-reading the raw
+        // buffer, so a future condition drift degrades to an un-rewritten
+        // preview, never a blank one.
+        let is_dark = cx.theme().is_dark();
+        let mut md_preview_value = match &self.content {
+            EditorContent::Text(t)
+                if self.is_markdown
+                    && matches!(
+                        self.md_mode,
+                        MarkdownViewMode::Preview | MarkdownViewMode::Split
+                    ) =>
+            {
+                let value = t.state.read(cx).value().to_string();
+                Some(self.mermaid.process(&value, cx).unwrap_or(value))
+            }
+            _ => None,
+        };
+
         let theme = cx.theme();
 
         // Path breadcrumb row above the content. Dirty indicator is text
@@ -931,15 +962,18 @@ impl Render for EditorView {
                     .text_size(mono_size)
                     .size_full();
                 let view_id = cx.entity_id();
-                let is_dark = theme.is_dark();
                 match self.md_mode {
                     MarkdownViewMode::Source => input.into_any_element(),
                     MarkdownViewMode::Preview => {
-                        let value = t.state.read(cx).value().to_string();
+                        let value = md_preview_value
+                            .take()
+                            .unwrap_or_else(|| t.state.read(cx).value().to_string());
                         markdown_preview::render_preview(&value, dir, view_id, is_dark, typo.t_body_sm)
                     }
                     MarkdownViewMode::Split => {
-                        let value = t.state.read(cx).value().to_string();
+                        let value = md_preview_value
+                            .take()
+                            .unwrap_or_else(|| t.state.read(cx).value().to_string());
                         // Bound the split's height to the region below the 28px
                         // breadcrumb: `h_resizable` is `size_full`, so without a
                         // `flex_1`/`min_h_0` wrapper it would overflow the header.

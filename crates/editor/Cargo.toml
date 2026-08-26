@@ -46,6 +46,10 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 
+# Renders ```mermaid fences in the markdown preview to SVG, headlessly. See
+# the workspace manifest for the pin rationale.
+merman = { workspace = true }
+
 # Phase 5 step 3 — file tree backend. `notify` is re-exported through
 # `notify_debouncer_full::notify` so we don't list it twice in the graph.
 ignore                = { workspace = true }
