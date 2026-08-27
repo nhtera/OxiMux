@@ -2661,3 +2661,149 @@ fn a_respawn_layers_auth_env_over_the_configured_launch_env(cx: &mut TestAppCont
         })
         .expect("respawn spec");
 }
+
+/// The drop overlay's label has to describe what a drop will actually DO, and
+/// this chat does two different things: an image is attached, anything else
+/// becomes an `@path` mention. A single "Drop to attach" — the wording the
+/// reference app uses, because it only ever attaches — would be a lie for a
+/// source file, which is the more common drag here.
+#[test]
+fn the_drop_label_describes_what_the_drop_will_do() {
+    use std::path::PathBuf;
+    let img = |n: &str| PathBuf::from(n);
+    // Every path an image → it attaches.
+    assert_eq!(
+        AgentChatView::drop_hint_for(&[img("a.png"), img("b.JPEG")]).to_string(),
+        "Drop to attach"
+    );
+    // Any non-image in the set → at least one becomes a mention, so the
+    // narrower word would be wrong.
+    assert_eq!(
+        AgentChatView::drop_hint_for(&[img("a.png"), img("main.rs")]).to_string(),
+        "Drop to add"
+    );
+    assert_eq!(AgentChatView::drop_hint_for(&[img("main.rs")]).to_string(), "Drop to add");
+    // A drag reporting no paths yet falls back to the neutral wording rather
+    // than claiming an attach it cannot promise.
+    assert_eq!(AgentChatView::drop_hint_for(&[]).to_string(), "Drop to add");
+}
+
+/// The affordance arms only while the pointer is actually over this chat.
+///
+/// `on_drag_move` fires for a drag anywhere in the window once the element has
+/// a handler, so without the bounds test the overlay would light up while
+/// dragging over a sibling pane — telling the user they can drop somewhere they
+/// cannot.
+#[gpui::test]
+fn the_drop_overlay_arms_only_while_the_pointer_is_inside(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| {
+        AgentChatView::with_connection_for_test(
+            std::sync::Arc::new(StubConnection::default()),
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            window,
+            cx,
+        )
+    });
+    window
+        .update(cx, |view, _window, cx| {
+            let png = [std::path::PathBuf::from("shot.png")];
+            let rs = [std::path::PathBuf::from("main.rs")];
+            assert!(view.drop_hint.is_none(), "idle chat shows no affordance");
+
+            view.set_drop_hint(true, &png, cx);
+            assert_eq!(view.drop_hint.as_deref(), Some("Drop to attach"));
+
+            // Moving onto a different payload updates the label in place.
+            view.set_drop_hint(true, &rs, cx);
+            assert_eq!(view.drop_hint.as_deref(), Some("Drop to add"));
+
+            // Leaving the bounds retires it.
+            view.set_drop_hint(false, &rs, cx);
+            assert!(view.drop_hint.is_none(), "a drag outside the chat must not arm it");
+        })
+        .expect("drag tracking");
+}
+
+/// A completed drop retires the affordance immediately rather than leaving it
+/// to the next paint's self-heal — a visible frame of "Drop to add" after the
+/// file has already landed reads as a drop that failed.
+#[gpui::test]
+fn a_completed_drop_retires_the_overlay(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| {
+        AgentChatView::with_connection_for_test(
+            std::sync::Arc::new(StubConnection::default()),
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            window,
+            cx,
+        )
+    });
+    window
+        .update(cx, |view, window, cx| {
+            view.cwd = std::path::PathBuf::from("/proj");
+            view.set_drop_hint(true, &[std::path::PathBuf::from("/proj/main.rs")], cx);
+            assert!(view.drop_hint.is_some(), "armed while hovering");
+
+            view.attach_dropped_paths(
+                vec![std::path::PathBuf::from("/proj/main.rs")],
+                window,
+                cx,
+            );
+            assert!(view.drop_hint.is_none(), "the drop clears it");
+            assert_eq!(view.composer.read(cx).current_draft(cx), "@main.rs ");
+        })
+        .expect("drop clears the overlay");
+}
+
+/// The drop overlay lays out and paints inside a real frame.
+///
+/// It is an absolutely-positioned child of a flex column, which is precisely
+/// the shape GPUI faults on when the positioning context is missing — and a
+/// layout fault is a runtime panic that neither `cargo check` nor the state
+/// tests above would report.
+#[gpui::test]
+fn the_drop_overlay_paints(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| {
+        AgentChatView::with_connection_for_test(
+            std::sync::Arc::new(StubConnection::default()),
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            window,
+            cx,
+        )
+    });
+    // Some transcript content, so the overlay is painted over children that
+    // draw their own backgrounds — the exact condition the old background-tint
+    // approach failed under.
+    window
+        .update(cx, |view, _window, cx| {
+            view.thread.push_user_message_with_images("question", Vec::new());
+            view.on_event(
+                oximux_agents::thread::ThreadEvent::AssistantText("reply\n".repeat(40)),
+                cx,
+            );
+            view.set_drop_hint(true, &[std::path::PathBuf::from("main.rs")], cx);
+        })
+        .expect("arm the overlay");
+
+    let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+    vcx.simulate_resize(gpui::size(gpui::px(1000.0), gpui::px(700.0)));
+    vcx.run_until_parked();
+
+    window
+        .update(&mut vcx.cx, |view, _window, _cx| {
+            assert_eq!(
+                view.drop_hint.as_deref(),
+                Some("Drop to add"),
+                "the affordance survives a paint"
+            );
+        })
+        .expect("painted");
+}

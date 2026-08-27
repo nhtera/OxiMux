@@ -781,6 +781,16 @@ pub struct AgentChatView {
     /// shifted index never tints the wrong bubble.
     flash_entry: Option<usize>,
     flash_frames: u8,
+    /// While a file drag hovers this chat, the label its drop overlay shows —
+    /// `None` when no drag is over it.
+    ///
+    /// A view flag rather than a `drag_over` style refinement, because that
+    /// refinement only changes THIS element's own background and every child
+    /// that paints its own (the transcript list, the composer) masks it. The
+    /// result was a tint covering the whole surface or only the gap below the
+    /// transcript depending on how far the conversation had scrolled — one
+    /// gesture reading as two different affordances.
+    drop_hint: Option<SharedString>,
     /// Entry index whose Copy action just fired — swaps that bubble's copy glyph
     /// to a ✓ for a beat as confirmation. Transient/cosmetic, so an index that
     /// shifts under a rewind at worst mistints for <1.5s. Reverted by
@@ -1407,6 +1417,7 @@ impl AgentChatView {
             show_background_tasks: false,
             flash_entry: None,
             flash_frames: 0,
+            drop_hint: None,
             recently_copied: None,
             _copied_clear_task: None,
             rows: RefCell::new(Vec::new()),
@@ -1655,6 +1666,84 @@ impl AgentChatView {
     /// the tab closes. `None` when no companion was ever spawned.
     pub fn companion_session_id(&self) -> Option<AgentSessionId> {
         self.companion_session
+    }
+
+
+    /// Arm or clear the drop affordance for a drag currently over this chat.
+    ///
+    /// `inside` is the bounds test — a `DragMoveEvent` fires for a drag anywhere
+    /// in the window once this element has a handler, so without it the overlay
+    /// would appear while dragging over a sibling pane.
+    ///
+    /// The label is derived from what is actually being dragged, because this
+    /// chat does two different things with a drop: an image is attached, and
+    /// anything else becomes an `@path` mention. A single "Drop to attach"
+    /// would be a lie for a source file, which is the more common drag here.
+    fn set_drop_hint(&mut self, inside: bool, paths: &[PathBuf], cx: &mut Context<Self>) {
+        let next = inside.then(|| Self::drop_hint_for(paths));
+        if next != self.drop_hint {
+            self.drop_hint = next;
+            cx.notify();
+        }
+    }
+
+    /// The overlay label for a set of dragged paths. Empty (a drag that reports
+    /// no paths yet) falls back to the neutral wording rather than guessing.
+    fn drop_hint_for(paths: &[PathBuf]) -> SharedString {
+        if !paths.is_empty() && paths.iter().all(|p| image_attach::is_image_path(p)) {
+            SharedString::from("Drop to attach")
+        } else {
+            SharedString::from("Drop to add")
+        }
+    }
+
+    /// The drop affordance: a scrim over the whole chat plus a centred pill.
+    ///
+    /// An overlay rather than a background tint, because a tint on the root is
+    /// masked by any child that paints its own background — which made the same
+    /// gesture look like two different affordances depending on how far the
+    /// transcript had scrolled.
+    fn render_drop_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Self-healing clear: a drag that ends anywhere other than on a
+        // listening target (dropped on empty space, released off-window,
+        // cancelled with Escape) dumps the active drag with no callback, so the
+        // flag has to be reconciled at paint. Same guard, same reason, as the
+        // pane group's drop-zone overlay.
+        let hint = self.drop_hint.clone()?;
+        if !cx.has_active_drag() {
+            return None;
+        }
+        let theme = self.theme;
+        let typo = &self.typography;
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                // Above the transcript and composer; a modal layer added after
+                // this one still paints over it.
+                .bg(gpui::Hsla { a: 0.55, ..theme.bg_panel })
+                .border_2()
+                .border_color(theme.border_active)
+                .rounded(px(self.density.r_card))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .px(px(14.0))
+                        .py(px(8.0))
+                        .rounded(px(self.density.r_chip))
+                        .bg(theme.bg_panel_alt)
+                        .border_1()
+                        .border_color(theme.border_active)
+                        .text_size(px(typo.t_body_md))
+                        .text_color(theme.fg_base)
+                        .child(hint),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Parameters for spawning a companion terminal that resumes THIS chat's
@@ -2117,6 +2206,10 @@ impl AgentChatView {
         // `@path` mention (the agent can read it if it decides to). Before this
         // split, a dropped source file was silently discarded — the drag
         // completed, the drop landed, and nothing happened.
+        // The drop consumed the drag, so retire the affordance now rather than
+        // leaving it to the next paint's self-heal — a visible frame of "Drop
+        // to add" after the file has already landed reads as a failed drop.
+        self.drop_hint = None;
         let (images, others): (Vec<PathBuf>, Vec<PathBuf>) = paths
             .into_iter()
             .partition(|p| image_attach::is_image_path(p));
@@ -3425,6 +3518,7 @@ impl AgentChatView {
             show_background_tasks: false,
             flash_entry: None,
             flash_frames: 0,
+            drop_hint: None,
             recently_copied: None,
             _copied_clear_task: None,
             rows: RefCell::new(Vec::new()),
@@ -5216,6 +5310,10 @@ impl Render for AgentChatView {
             .flex()
             .flex_col()
             .size_full()
+            // Positioning context for the drop overlay below. Set here rather
+            // than on the overlay's parent-of-convenience so the overlay spans
+            // the whole chat, which is what the drop handlers accept.
+            .relative()
             .bg(theme.bg_panel)
             // Escape is bound app-wide to `DismissOverlay` (not the input's own
             // Escape action), so a staged-edit cancel must hook THAT. This
@@ -5328,15 +5426,37 @@ impl Render for AgentChatView {
                 }
             }))
             // Drop files anywhere on the chat surface: images attach, everything
-            // else becomes an `@path` mention. Both payload types get the same
-            // tint so the surface reads as one drop target regardless of where
-            // the drag started.
-            .drag_over::<ExternalPaths>(move |style, _, _, _| {
-                style.bg(gpui::Hsla { a: 0.18, ..theme.selection })
-            })
-            .drag_over::<crate::shell::pane_group::file_drag::FilePathDragPayload>(
-                move |style, _, _, _| style.bg(gpui::Hsla { a: 0.18, ..theme.selection }),
-            )
+            // else becomes an `@path` mention.
+            //
+            // `on_drag_move` (not `drag_over`) drives the affordance: it sets a
+            // view flag that renders a real overlay above every child, so the
+            // whole surface reads as one target no matter what the transcript
+            // happens to be painting underneath. Both payload types feed the
+            // same flag, so a Finder drag and an explorer drag look identical.
+            .on_drag_move(cx.listener(
+                |this, ev: &gpui::DragMoveEvent<ExternalPaths>, _window, cx| {
+                    // Copy the payload out first: `ev.drag(cx)` borrows `cx`
+                    // immutably and `set_drop_hint` needs it mutably.
+                    let inside = ev.bounds.contains(&ev.event.position);
+                    let paths = ev.drag(cx).paths().to_vec();
+                    this.set_drop_hint(inside, &paths, cx);
+                },
+            ))
+            .on_drag_move(cx.listener(
+                |this,
+                 ev: &gpui::DragMoveEvent<
+                    crate::shell::pane_group::file_drag::FilePathDragPayload,
+                >,
+                 _window,
+                 cx| {
+                    let path = ev.drag(cx).path.clone();
+                    this.set_drop_hint(
+                        ev.bounds.contains(&ev.event.position),
+                        std::slice::from_ref(&path),
+                        cx,
+                    );
+                },
+            ))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
                 this.attach_dropped_paths(paths.paths().to_vec(), window, cx);
             }))
@@ -5374,6 +5494,10 @@ impl Render for AgentChatView {
             } else {
                 self.composer.clone().into_any_element()
             })
+            // The drop affordance, above the transcript and composer but below
+            // the modal layers — a lightbox or sheet that is already open stays
+            // on top of a stray drag.
+            .children(self.render_drop_overlay(cx))
             // The image lightbox overlays everything when a thumbnail is opened.
             .children(self.render_image_preview(cx))
             // The fullscreen tool-payload sheet overlays everything when open.
