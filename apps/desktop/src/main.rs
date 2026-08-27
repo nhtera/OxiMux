@@ -46,6 +46,8 @@ use oximux_storage::Db;
 use tracing_subscriber::EnvFilter;
 
 use oximux_app::app_paths;
+// The hook verb's decision half, shared with `oximux-cli` (see the crate).
+use oximux_agent_hooks::report::StatusArgs;
 /// Scope for the remote-control host key. The host is process-wide (it serves every
 /// workspace's sessions from one registry), so it uses ONE app-level identity rather
 /// than `HostIdentity`'s per-workspace keying.
@@ -1281,101 +1283,33 @@ fn run_notify_cli(rt: &tokio::runtime::Runtime) -> i32 {
 /// PTY's output stream, where the app's scanner decodes it. Returns a process
 /// exit code (0 = ok). Writes only to stderr — agent hooks capture stdout.
 fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
-    // Parse `--state <s>`. Only the tool-bearing states read stdin (the hook
-    // event JSON) to extract the tool name; `idle` (Stop) carries none.
-    let mut state = String::new();
-    let mut filter_notification = false;
-    // Which agent's payload shape to read. Every agent's hook delivers JSON on
-    // stdin and every one of them spells its fields differently; the flag says
-    // which reader to use rather than guessing from the payload, so a shape
-    // that drifts fails loudly at the hook rather than silently reporting
-    // nothing.
-    let mut format = String::from("claude");
-    let mut args = std::env::args().skip(2);
-    while let Some(a) = args.next() {
-        match a.as_str() {
-            "--state" => state = args.next().unwrap_or_default(),
-            "--format" => format = args.next().unwrap_or_default(),
-            // Gate a `Notification` hook: emit only when its payload is a real
-            // permission prompt (Claude also fires Notification for benign idle
-            // nudges, which must not flip the dot to amber).
-            "--filter-notification" => filter_notification = true,
-            _ => {}
-        }
-    }
-    let Some(dialect) = oximux_app::agent_hook_dialects::dialect_for_slug(&format) else {
-        eprintln!(
-            "oximux agent-status: --format must be {} (got {format:?})",
-            oximux_app::agent_hook_dialects::known_slugs()
-        );
-        return 1;
-    };
-    let state = match state.as_str() {
-        "working" | "needs_approval" | "idle" => state,
-        _ => {
-            eprintln!(
-                "oximux agent-status: --state must be working|needs_approval|idle (got {state:?})"
-            );
+    // Everything this verb DECIDES — which dialect's payload shape to read,
+    // whether the event should report at all, what the sideband blob says —
+    // lives in the shared crate, because `oximux-cli` runs the same verb and a
+    // second copy would be a second set of dialect bugs. What stays here is
+    // this binary's own socket.
+    let args = match StatusArgs::parse(std::env::args().skip(2)) {
+        Ok(args) => args,
+        Err(msg) => {
+            eprintln!("oximux agent-status: {msg}");
             return 1;
         }
     };
-    // Read the hook event JSON once when we'll need it — for tool extraction
-    // (working / needs_approval), the notification filter, OR — for `idle`
-    // (Stop) — the `transcript_path` we read to extract the agent's last reply.
     let stdin_json = {
         use std::io::Read;
         let mut buf = String::new();
         let _ = std::io::stdin().read_to_string(&mut buf);
-        Some(buf)
+        buf
     };
-    if filter_notification
-        && !stdin_json
-            .as_deref()
-            .map(oximux_app::agent_status_hooks::notification_is_permission)
-            .unwrap_or(false)
-    {
-        // Not a permission prompt — clean no-op so the hook never fails the agent.
-        return 0;
-    }
-    let tool = stdin_json
-        .as_deref()
-        .and_then(oximux_app::agent_hook_dialects::tool_name);
-    // A turn-start event carries the user's prompt (no tool); other working
-    // events carry a tool (no prompt). Both are read from the same stdin JSON —
-    // one of them is `None` for any given hook.
-    let prompt = stdin_json
-        .as_deref()
-        .and_then(oximux_app::agent_hook_dialects::prompt);
-    // On the turn-end event (idle) read the agent's last reply — the row's
-    // secondary text for a finished turn. Only there: it fires once per turn,
-    // whereas a per-tool read would be wasteful.
-    //
-    // The agents split on how they hand it over — some put the reply straight
-    // on the payload, others only a transcript path to chase — which is what
-    // the dialect settles. Same destination either way, so one agent's row
-    // reads like another's.
-    let message = if state == "idle" {
-        stdin_json
-            .as_deref()
-            .and_then(|json| oximux_app::agent_hook_dialects::last_message(dialect, json))
-    } else {
-        None
-    };
-
+    // Absent outside an OxiMux pane (a plain shell): nothing to report to.
+    // Exit 0 either way — a hook must never fail the agent's turn.
     let pty_id = match std::env::var("OXIMUX_PTY_ID") {
         Ok(id) if !id.is_empty() => id,
-        _ => {
-            // Not inside an OxiMux pane (e.g. a plain shell): nothing to report.
-            // Exit 0 so the hook never fails the agent.
-            return 0;
-        }
+        _ => return 0,
     };
-    let payload = oximux_app::agent_status_hooks::build_status_payload(
-        &state,
-        tool.as_deref(),
-        prompt.as_deref(),
-        message.as_deref(),
-    );
+    let Some(payload) = args.payload(&stdin_json) else {
+        return 0;
+    };
 
     let (Some(data_dir), Some(log_dir)) = (app_paths::data_dir(), app_paths::log_dir()) else {
         eprintln!("oximux agent-status: cannot resolve application data directory");

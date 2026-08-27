@@ -70,14 +70,71 @@ pub fn sync_global_status_hooks(on: bool) {
 /// detail, and must never cost the user an error they did not ask for.
 fn sync_dialect(on: bool, dialect: &HookDialect) {
     let agent = dialect.agent;
-    let Some(path) = dialect.path() else { return };
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            tracing::warn!(%err, agent, "global hooks: current_exe failed; not installing");
+            return;
+        }
+    };
+    match apply(on, dialect, &exe) {
+        Applied::Changed => tracing::info!(on, agent, "global status hooks synced"),
+        Applied::Removed => tracing::info!(on, agent, "global status hooks removed"),
+        // Already in the desired state, or an agent that is not here: no write,
+        // and nothing worth a line in the log on every boot.
+        Applied::Unchanged | Applied::AgentAbsent => {}
+        Applied::KeptForeign => {
+            tracing::warn!(on, agent, "global status hooks: file holds hooks we did not write; left alone")
+        }
+        Applied::Failed(err) => {
+            tracing::warn!(%err, on, agent, "global status hooks sync failed")
+        }
+    }
+}
+
+/// What [`apply`] did to one agent's file.
+///
+/// Reported rather than logged because the CLI has to say it out loud: someone
+/// running `oximux agent hooks on` is owed the difference between "installed",
+/// "already installed" and "that agent isn't on this machine", where the app's
+/// boot-time sync only ever needed a log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Applied {
+    /// The file was written.
+    Changed,
+    /// A file OxiMux owns outright was deleted.
+    Removed,
+    /// Already in the requested state. Re-running is a no-op by design: the
+    /// agent watches this file, and a write with no change is a reload for
+    /// nothing.
+    Unchanged,
+    /// The agent has no config directory, so there is nothing to install into.
+    /// OxiMux adds to an agent's home and never conjures one.
+    AgentAbsent,
+    /// `off` on a file OxiMux would otherwise delete outright, which turned out
+    /// to hold entries OxiMux did not write. Left exactly as it was.
+    KeptForeign,
+    Failed(String),
+}
+
+/// Install (`on`) or remove OxiMux's managed hooks in one agent's file, using
+/// `exe` as the binary the hook calls back into.
+///
+/// Takes the binary rather than resolving it so the CLI can install hooks that
+/// call the CLI. Both binaries answer `agent-status`; whichever one writes the
+/// entry names itself, and a later write by the other simply refreshes the path
+/// to a binary that answers just the same.
+pub fn apply(on: bool, dialect: &HookDialect, exe: &Path) -> Applied {
+    let Some(path) = dialect.path() else {
+        return Applied::AgentAbsent;
+    };
     // Don't conjure an agent's home. Installing into one that does not exist
     // buys nothing — the agent is not there to read it — and leaves the user a
     // dotfile for a tool they never installed, once per agent OxiMux knows of.
     // Uninstall still runs, so a file left by an agent since removed is
     // cleaned up rather than stranded.
     if on && !dialect.agent_is_installed() {
-        return;
+        return Applied::AgentAbsent;
     }
     // A file nobody but OxiMux writes is removed rather than pruned: there can
     // be no user content in it to preserve, and leaving an empty husk behind in
@@ -87,32 +144,57 @@ fn sync_dialect(on: bool, dialect: &HookDialect) {
         Install::Extension { .. } => true,
     };
     if !on && ours_alone {
-        match std::fs::remove_file(&path) {
-            Ok(()) => tracing::info!(on, agent, "global status hooks removed"),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => tracing::warn!(%err, agent, "global status hooks removal failed"),
+        // "Nobody but OxiMux writes it" is a claim about a file named after us,
+        // not a guarantee. Check before deleting: the cost of being wrong is
+        // someone's hand-written config, and the cost of checking is one read.
+        //
+        // Only for the JSON dialects. An extension is generated source with no
+        // merge semantics at all — there is nothing in it to be foreign, and
+        // regenerating it is the repair.
+        if let Install::HooksFile { marker, .. } = &dialect.install
+            && holds_foreign_entries(&path, *marker)
+        {
+            return Applied::KeptForeign;
         }
-        return;
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Applied::Removed,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Applied::Unchanged,
+            Err(err) => Applied::Failed(err.to_string()),
+        };
     }
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(err) => {
-            tracing::warn!(%err, agent, "global hooks: current_exe failed; not installing");
-            return;
-        }
-    };
     let outcome = match &dialect.install {
-        Install::Extension { source } => write_if_changed(&path, &source(&exe)),
+        Install::Extension { source } => write_if_changed(&path, &source(exe)),
         Install::HooksFile { .. } if on => {
-            rewrite_settings_at(&path, |root| install_managed(root, hook_specs(dialect, &exe), dialect))
+            rewrite_settings_at(&path, |root| install_managed(root, hook_specs(dialect, exe), dialect))
         }
         Install::HooksFile { .. } => rewrite_settings_at(&path, |root| remove_managed(root, dialect)),
     };
     match outcome {
-        Ok(true) => tracing::info!(on, agent, "global status hooks synced"),
-        Ok(false) => {} // already in the desired state — no write
-        Err(err) => tracing::warn!(%err, on, agent, "global status hooks sync failed"),
+        Ok(true) => Applied::Changed,
+        Ok(false) => Applied::Unchanged,
+        Err(err) => Applied::Failed(err.to_string()),
     }
+}
+
+/// True when `path` parses and holds at least one hook entry OxiMux did not
+/// write. A file that cannot be read or parsed answers `false`: it is not
+/// evidence of user content, and the delete below has its own error path.
+fn holds_foreign_entries(path: &Path, marker: Option<&'static str>) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    root.get("hooks")
+        .and_then(Value::as_object)
+        .is_some_and(|hooks| {
+            hooks
+                .values()
+                .filter_map(Value::as_array)
+                .flatten()
+                .any(|entry| !is_managed(entry, marker))
+        })
 }
 
 /// Write `contents` to `path`, reporting whether anything changed.
@@ -315,7 +397,7 @@ fn remove_managed(root: &mut Value, dialect: &HookDialect) -> bool {
 /// runs. The command test deliberately matches only our own CLI invocation, so
 /// a re-install replaces our entries and leaves every other hook in the file
 /// exactly where it was.
-fn is_managed(entry: &Value, marker: Option<&str>) -> bool {
+pub(crate) fn is_managed(entry: &Value, marker: Option<&str>) -> bool {
     if marker.is_some_and(|m| entry.get(m).and_then(Value::as_bool) == Some(true)) {
         return true;
     }
@@ -701,6 +783,113 @@ mod tests {
                 .find_map(|e| e["hooks"][0]["command"].as_str())
                 .unwrap();
             assert_eq!(got, spec.command, "{} command matches", spec.event);
+        }
+    }
+
+    /// `on` then `off` must return a *shared* file to the bytes it had before —
+    /// including one that started with the user's own hooks in it, which is the
+    /// case where "we only remove our own" is actually load-bearing.
+    ///
+    /// Byte equality, not a structural comparison: a round trip that reorders
+    /// keys or reformats is still a diff in the user's editor and their VCS,
+    /// and this is a file people hand-edit.
+    ///
+    /// Restricted to the dialects that SHARE their file, because that is the
+    /// only place merge-and-prune runs. A dialect that owns its file outright
+    /// is removed by deleting it, which the next test covers — and the two must
+    /// not be conflated: `remove_managed` leaves a `"version"` key behind that
+    /// only `install_managed` writes, which would be residue if it were ever
+    /// reached. It is not: the one dialect declaring a root version also owns
+    /// its file, so `off` deletes the whole thing.
+    #[test]
+    fn on_then_off_returns_a_shared_file_to_its_prior_bytes() {
+        let mut checked = 0;
+        for d in DIALECTS {
+            let Install::HooksFile { owns_file: false, .. } = &d.install else {
+                continue;
+            };
+            checked += 1;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            let before = serde_json::to_string_pretty(&json!({
+                "model": "opus",
+                "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "make lint" }] }] }
+            }))
+            .unwrap();
+            std::fs::write(&path, &before).unwrap();
+
+            assert!(
+                rewrite_settings_at(&path, |r| install_managed(r, hook_specs(d, binary()), d))
+                    .unwrap(),
+                "{} install must change the file",
+                d.slug
+            );
+            assert!(
+                rewrite_settings_at(&path, |r| remove_managed(r, d)).unwrap(),
+                "{} removal must change it back",
+                d.slug
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                before,
+                "{} did not restore the file byte for byte",
+                d.slug
+            );
+        }
+        assert!(checked >= 5, "only {checked} shared-file dialects were exercised");
+    }
+
+    /// A file OxiMux would otherwise delete outright, holding something we did
+    /// not write. Deleting it would take a user's config with it.
+    #[test]
+    fn off_refuses_to_delete_an_owned_file_that_holds_a_foreign_hook() {
+        let owned = DIALECTS
+            .iter()
+            .find(|d| matches!(&d.install, Install::HooksFile { owns_file: true, .. }))
+            .expect("copilot and grok own their files");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oximux.json");
+        let contents = json!({
+            "hooks": { "Stop": [{ "bash": "make lint", "type": "command" }] }
+        })
+        .to_string();
+        std::fs::write(&path, &contents).unwrap();
+
+        let marker = marker_of(owned);
+        assert!(holds_foreign_entries(&path, marker), "{}", owned.slug);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents, "left alone");
+    }
+
+    /// The same guard must NOT fire on a file holding only our own entries, or
+    /// `off` would never remove anything.
+    #[test]
+    fn the_foreign_guard_does_not_fire_on_our_own_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oximux.json");
+        let mut root = json!({});
+        let d = dialect("grok");
+        assert!(install_managed(&mut root, hook_specs(d, binary()), d));
+        std::fs::write(&path, serde_json::to_string(&root).unwrap()).unwrap();
+        assert!(!holds_foreign_entries(&path, marker_of(d)));
+    }
+
+    /// An agent that is not on this machine is reported as such rather than
+    /// being given a dotfile for a tool the user never installed.
+    #[test]
+    fn apply_never_writes_into_a_home_that_does_not_exist() {
+        for d in DIALECTS {
+            if d.agent_is_installed() {
+                continue;
+            }
+            assert_eq!(
+                apply(true, d, binary()),
+                Applied::AgentAbsent,
+                "{} must not be installed into",
+                d.slug
+            );
+            if let Some(path) = d.path() {
+                assert!(!path.exists(), "{} was given a file anyway", d.slug);
+            }
         }
     }
 }
