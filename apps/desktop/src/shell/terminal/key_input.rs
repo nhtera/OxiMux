@@ -31,6 +31,18 @@ pub fn keystroke_to_bytes(ks: &Keystroke, mode: InputMode) -> Vec<u8> {
         return b"\x1b[Z".to_vec();
     }
 
+    // Shift+Enter is ESC CR — the "insert a line break, don't submit" gesture
+    // agent CLIs read in their prompt composers. Terminals with no native
+    // binding for it are conventionally configured to emit exactly these
+    // bytes, and CLIs that decode the prefix as Meta+Enter bind that to the
+    // same insert-newline, so one encoding serves both. Raw is modifier-blind,
+    // so without this branch Shift+Enter collapses to a plain CR and submits
+    // the prompt. Ctrl is excluded so Ctrl+Shift+Enter keeps its plain-CR
+    // meaning; Alt reaches the same bytes via `apply_alt`.
+    if ks.key == "enter" && ks.modifiers.shift && !ks.modifiers.control && !ks.modifiers.alt {
+        return b"\x1b\r".to_vec();
+    }
+
     if let Some(seq) = classify(&ks.key) {
         return encode_special(seq, ks, mode);
     }
@@ -104,7 +116,9 @@ enum KeySeq {
     /// `ESC [ <n> ; <mod> ~`.
     Tilde(u8),
     /// Fixed bytes with no modifier encoding (enter, tab, escape, space).
-    /// Alt still ESC-prefixes these (Meta convention).
+    /// Alt still ESC-prefixes these (Meta convention). Shift is dropped here,
+    /// so the two combos that carry meaning — Shift+Tab and Shift+Enter — are
+    /// intercepted before classification.
     Raw(&'static [u8]),
 }
 
@@ -262,6 +276,33 @@ mod tests {
             keystroke_to_bytes(&ks("backspace", None, Modifiers::default()), off()),
             b"\x7f"
         );
+    }
+
+    #[test]
+    fn shift_enter_is_esc_cr() {
+        let shift = Modifiers {
+            shift: true,
+            ..Default::default()
+        };
+        // Shift+Enter → ESC CR, the line-break gesture agent CLIs read. Must
+        // NOT collapse to the plain CR that submits the prompt.
+        assert_eq!(
+            keystroke_to_bytes(&ks("enter", None, shift), off()),
+            b"\x1b\r"
+        );
+        // Alt+Enter reaches the same bytes through the Meta prefix.
+        let alt = Modifiers {
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(keystroke_to_bytes(&ks("enter", None, alt), off()), b"\x1b\r");
+        // Ctrl+Shift+Enter keeps the plain-CR meaning (regression guard).
+        let ctrl_shift = Modifiers {
+            shift: true,
+            control: true,
+            ..Default::default()
+        };
+        assert_eq!(keystroke_to_bytes(&ks("enter", None, ctrl_shift), off()), b"\r");
     }
 
     #[test]
