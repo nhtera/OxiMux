@@ -279,6 +279,42 @@ Attach to a terminal: keystrokes go to the host, output comes back. Ctrl+] detac
 | --- | --- | --- |
 | `<PTY>` | yes | The terminal id (see `term ls`) |
 
+### `oximux agent`
+
+Install, remove, and inspect the status hooks that let agent CLIs report what they are doing.
+
+_No arguments._
+
+#### `oximux agent hooks`
+
+Turn the status hooks on, off, or report what is installed
+
+_No arguments._
+
+##### `oximux agent hooks status`
+
+Report, per agent, whether OxiMux's hooks are installed and which file was read to decide.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--agent` | yes | One agent slug (see `agent hooks status`). Default: all of them |
+
+##### `oximux agent hooks on`
+
+Install the hooks, merging them into whatever is already in each file.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--agent` | yes | One agent slug. Default: all of them |
+
+##### `oximux agent hooks off`
+
+Remove the hooks, leaving anything OxiMux did not write exactly where it is — including in a file OxiMux would otherwise delete outright, which is read first and kept if it holds someone else's hooks.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--agent` | yes | One agent slug. Default: all of them |
+
 ### `oximux worktree`
 
 Create, list, and remove project worktrees on the host

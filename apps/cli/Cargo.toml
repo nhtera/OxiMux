@@ -48,6 +48,10 @@ oximux-worktree-ops = { workspace = true }
 # the tree beneath storage; named here so the CLI and the host that refuses a
 # bad phase are reading the same list rather than two copies of it.
 oximux-core = { workspace = true }
+# The status-hook dialect table, installer and readback, shared with the
+# desktop so `oximux agent hooks` writes the same entries the app's toggle
+# does — and so `agent-status` reads every agent's payload one way, not two.
+oximux-agent-hooks = { workspace = true }
 # The data-dir role lock: serve contends for the schedule ticker exactly as
 # the desktop does, so one process per data dir fires schedules.
 oximux-single-instance = { workspace = true }
@@ -59,6 +63,9 @@ toml = { workspace = true }
 oximux-relay-supervisor = { workspace = true }
 oximux-relay-terminals = { workspace = true }
 oximux-relay-client = { workspace = true }
+# `agent-status`: the hook an agent CLI runs sends one `AgentStatus` request to
+# the relay, which frames it as OSC-9999 on that pane's output stream.
+oximux-relay-proto = { workspace = true }
 # `host` explicitly: the workspace declaration is default-features = false so
 # the mobile core can't inherit the accept loop; serve is exactly the consumer
 # that wants it.

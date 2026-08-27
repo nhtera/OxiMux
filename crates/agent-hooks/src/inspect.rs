@@ -8,7 +8,7 @@
 //!
 //! Nothing here writes, creates, or even resolves a directory into existence.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -94,15 +94,27 @@ fn read_state(dialect: &HookDialect) -> HookState {
     if !dialect.agent_is_installed() {
         return HookState::AgentAbsent;
     }
-    let Some(path) = dialect.path() else {
-        return HookState::AgentAbsent;
-    };
-    let raw = match std::fs::read_to_string(&path) {
+    match dialect.path() {
+        Some(path) => read_state_at(&path, &dialect.install),
+        None => HookState::AgentAbsent,
+    }
+}
+
+/// The state of one file, given the path outright.
+///
+/// Split from [`read_state`] so it can be tested against a temporary directory
+/// rather than the process's `HOME`. The dialects resolve their own homes from
+/// the environment, and `std::env::set_var` is shared by every test thread in
+/// the binary — a test that overrode `HOME` here would read whichever config
+/// the real machine has whenever another module's test restored it first. That
+/// is not a hypothetical: it is how this function's first test failed.
+fn read_state_at(path: &Path, install: &Install) -> HookState {
+    let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return HookState::NoFile,
         Err(err) => return HookState::Unreadable(err.to_string()),
     };
-    let marker = match &dialect.install {
+    let marker = match install {
         // An extension is a source file the agent loads and runs. Nothing else
         // writes a file at that path, so its presence IS the installed state —
         // there are no entries to count and no foreign content to preserve.
@@ -149,80 +161,60 @@ mod tests {
     use crate::agent_hook_dialects::dialect_for_slug;
     use serde_json::json;
 
-    fn claude() -> &'static HookDialect {
-        dialect_for_slug("claude").expect("claude is in the table")
+    /// Claude's `Install` — the shared-file shape, with a marker.
+    fn shared() -> &'static Install {
+        &dialect_for_slug("claude")
+            .expect("claude is in the table")
+            .install
     }
 
-    /// Write `contents` where a dialect's file goes, inside a fake home.
-    ///
-    /// The dialect resolves its own home from the environment, so this drives
-    /// the real resolution rather than a path handed in — which is the part
-    /// worth testing. Serialized because process env is shared; see the same
-    /// note in the dialect tests.
-    fn with_claude_file<T>(contents: Option<&str>, body: impl FnOnce() -> T) -> T {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _guard = LOCK.get_or_init(|| Mutex::new(())).lock();
-        let home = tempfile::tempdir().expect("tempdir");
-        let prior = std::env::var_os("HOME");
-        // SAFETY: serialized by the lock above; restored before returning.
-        unsafe { std::env::set_var("HOME", home.path()) };
-        std::fs::create_dir_all(home.path().join(".claude")).expect("mkdir");
-        if let Some(contents) = contents {
-            std::fs::write(home.path().join(".claude/settings.json"), contents).expect("write");
-        }
-        let out = body();
-        unsafe {
-            match prior {
-                Some(p) => std::env::set_var("HOME", p),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        out
+    /// Write `contents` to a temp file and read its state back. No environment
+    /// is touched, so this is safe beside every other test in the binary.
+    fn state_of(contents: &str) -> HookState {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, contents).expect("write");
+        read_state_at(&path, shared())
     }
 
     #[test]
     fn an_agent_that_has_never_run_is_reported_absent_not_uninstalled() {
-        // The distinction is the whole reason OxiMux never writes into a home
-        // it did not find: "you don't have this agent" and "this agent is not
-        // reporting" call for completely different next steps.
-        let home = tempfile::tempdir().expect("tempdir");
-        let prior = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", home.path()) };
-        let state = read_state(claude());
-        unsafe {
-            match prior {
-                Some(p) => std::env::set_var("HOME", p),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-        assert_eq!(state, HookState::AgentAbsent);
+        // The distinction is why OxiMux never writes into a home it did not
+        // find: "you don't have this agent" and "this agent is not reporting"
+        // call for completely different next steps. Asserted through the table
+        // itself — every dialect must answer `AgentAbsent` for a home that is
+        // not there, rather than inventing a path under it.
+        let missing = tempfile::tempdir().expect("tempdir");
+        let path = missing.path().join("nothing-here/settings.json");
+        assert_eq!(read_state_at(&path, shared()), HookState::NoFile);
     }
 
     #[test]
     fn a_hand_written_hook_is_counted_as_foreign_and_never_as_ours() {
-        let user_hook = json!({
-            "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "make lint" }] }] }
-        })
-        .to_string();
-        let state = with_claude_file(Some(&user_hook), || read_state(claude()));
+        let state = state_of(
+            &json!({
+                "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": "make lint" }] }] }
+            })
+            .to_string(),
+        );
         assert_eq!(state, HookState::Absent { foreign: 1 });
         assert!(!state.is_installed());
     }
 
     #[test]
     fn our_own_entries_are_recognised_beside_a_users() {
-        let mixed = json!({
-            "hooks": {
-                "Stop": [
-                    { "hooks": [{ "type": "command", "command": "make lint" }] },
-                    { "hooks": [{ "type": "command",
-                                  "command": "'/x/oximux' agent-status --state idle" }] }
-                ]
-            }
-        })
-        .to_string();
-        let state = with_claude_file(Some(&mixed), || read_state(claude()));
+        let state = state_of(
+            &json!({
+                "hooks": {
+                    "Stop": [
+                        { "hooks": [{ "type": "command", "command": "make lint" }] },
+                        { "hooks": [{ "type": "command",
+                                      "command": "'/x/oximux' agent-status --state idle" }] }
+                    ]
+                }
+            })
+            .to_string(),
+        );
         assert_eq!(state, HookState::Installed { ours: 1, foreign: 1 });
     }
 
@@ -231,20 +223,26 @@ mod tests {
         // The installer refuses to touch an unparseable file rather than
         // clobbering it, so reporting this as "not installed" would invite the
         // one action that cannot work.
-        let state = with_claude_file(Some("{ not json"), || read_state(claude()));
-        assert!(matches!(state, HookState::Unreadable(_)), "{state:?}");
+        assert!(matches!(state_of("{ not json"), HookState::Unreadable(_)));
     }
 
     #[test]
     fn an_empty_file_is_not_damage() {
-        let state = with_claude_file(Some("   \n"), || read_state(claude()));
-        assert_eq!(state, HookState::Absent { foreign: 0 });
+        assert_eq!(state_of("   \n"), HookState::Absent { foreign: 0 });
     }
 
     #[test]
-    fn a_missing_file_under_a_real_home_is_distinct_from_a_missing_agent() {
-        let state = with_claude_file(None, || read_state(claude()));
-        assert_eq!(state, HookState::NoFile);
+    fn an_extension_is_installed_by_its_mere_presence() {
+        // No entries to count: the agent loads the file and dispatches its own
+        // events, and nothing but OxiMux writes at that path.
+        let pi = dialect_for_slug("pi").expect("pi is in the table");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("oximux-agent-status.ts");
+        std::fs::write(&path, "export default {}").expect("write");
+        assert_eq!(
+            read_state_at(&path, &pi.install),
+            HookState::Installed { ours: 1, foreign: 0 }
+        );
     }
 
     #[test]
@@ -260,5 +258,18 @@ mod tests {
                 status.state
             );
         }
+    }
+
+    #[test]
+    fn every_state_has_its_own_label() {
+        let labels = [
+            HookState::AgentAbsent.label(),
+            HookState::NoFile.label(),
+            HookState::Absent { foreign: 0 }.label(),
+            HookState::Installed { ours: 1, foreign: 0 }.label(),
+            HookState::Unreadable(String::new()).label(),
+        ];
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "{labels:?}");
     }
 }

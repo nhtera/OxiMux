@@ -170,10 +170,42 @@ pub fn apply(on: bool, dialect: &HookDialect, exe: &Path) -> Applied {
         Install::HooksFile { .. } => rewrite_settings_at(&path, |root| remove_managed(root, dialect)),
     };
     match outcome {
-        Ok(true) => Applied::Changed,
+        Ok(true) if on => Applied::Changed,
+        // Removing the last of our entries can leave a file holding nothing at
+        // all — which is the state it was in before OxiMux created it, for
+        // every agent that had no hooks file to begin with. Leaving `{}` behind
+        // is litter the agent still has to open and parse on every run, and it
+        // is not a round trip: `off` should undo `on`, including the file.
+        Ok(true) => match nothing_left(&path) {
+            true => match std::fs::remove_file(&path) {
+                Ok(()) => Applied::Removed,
+                // The entries are already gone, which was the point. A file we
+                // could not tidy away afterwards is not a failed removal.
+                Err(_) => Applied::Removed,
+            },
+            false => Applied::Removed,
+        },
         Ok(false) => Applied::Unchanged,
         Err(err) => Applied::Failed(err.to_string()),
     }
+}
+
+/// True when `path` holds a JSON object with nothing in it but, at most, an
+/// empty `hooks` map — semantically the same as no file at all.
+///
+/// Deliberately narrow. A file still carrying any other key is the user's
+/// (`{"model": "opus"}` with no hooks is a real Claude config) and is left
+/// exactly where it is.
+fn nothing_left(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    root.iter().all(|(key, value)| {
+        key == "hooks" && value.as_object().is_some_and(serde_json::Map::is_empty)
+    })
 }
 
 /// True when `path` parses and holds at least one hook entry OxiMux did not
@@ -223,7 +255,9 @@ fn write_if_changed(path: &Path, contents: &str) -> io::Result<bool> {
 /// typo is never overwritten.
 fn rewrite_settings_at(path: &Path, mutate: impl FnOnce(&mut Value) -> bool) -> io::Result<bool> {
     let shown = path.display();
-    let mut root = match std::fs::read_to_string(path) {
+    let existing = std::fs::read_to_string(path);
+    let trailing_newline = existing.as_deref().is_ok_and(|t| t.ends_with('\n'));
+    let mut root = match existing {
         Ok(text) if !text.trim().is_empty() => match serde_json::from_str::<Value>(&text) {
             Ok(v) if v.is_object() => v,
             Ok(_) => return Err(io::Error::other(format!("{shown} is not a JSON object"))),
@@ -249,7 +283,14 @@ fn rewrite_settings_at(path: &Path, mutate: impl FnOnce(&mut Value) -> bool) -> 
             let _ = std::fs::copy(path, &backup);
         }
     }
-    let pretty = serde_json::to_string_pretty(&root)?;
+    let mut pretty = serde_json::to_string_pretty(&root)?;
+    // Match however the file ended before we touched it. `to_string_pretty`
+    // emits no trailing newline, so without this a hand-edited file loses the
+    // one every editor puts there — a one-byte diff in the user's VCS that
+    // OxiMux caused and nothing explains.
+    if trailing_newline {
+        pretty.push('\n');
+    }
     let tmp = path.with_extension("json.oximux-tmp");
     std::fs::write(&tmp, pretty.as_bytes())?;
     std::fs::rename(&tmp, path)?;
@@ -891,5 +932,61 @@ mod tests {
                 assert!(!path.exists(), "{} was given a file anyway", d.slug);
             }
         }
+    }
+
+    /// A rewrite must not change how the file ends. Every editor writes a
+    /// trailing newline and `to_string_pretty` writes none, so without this
+    /// every `on` produces a one-byte diff in the user's VCS that nothing in
+    /// the change log explains.
+    #[test]
+    fn a_rewrite_keeps_the_files_own_line_ending() {
+        for had_newline in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("settings.json");
+            let mut before = serde_json::to_string_pretty(&json!({ "model": "opus" })).unwrap();
+            if had_newline {
+                before.push('\n');
+            }
+            std::fs::write(&path, &before).unwrap();
+            let d = dialect("claude");
+            rewrite_settings_at(&path, |r| install_managed(r, hook_specs(d, binary()), d)).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap().ends_with('\n'),
+                had_newline,
+                "line ending was not preserved (had_newline = {had_newline})"
+            );
+        }
+    }
+
+    /// `off` must undo `on` including the file itself, for an agent that had no
+    /// hooks file to begin with. A leftover `{"hooks": {}}` is not a round trip
+    /// — it is litter the agent opens and parses on every run.
+    #[test]
+    fn an_emptied_file_is_recognised_as_nothing_left() {
+        let dir = tempfile::tempdir().unwrap();
+        for (contents, expected) in [
+            (json!({}), true),
+            (json!({ "hooks": {} }), true),
+            // Anything of the user's, and the file stays.
+            (json!({ "model": "opus" }), false),
+            (json!({ "hooks": {}, "model": "opus" }), false),
+            (json!({ "hooks": { "Stop": [] } }), false),
+        ] {
+            let path = dir.path().join("settings.json");
+            std::fs::write(&path, contents.to_string()).unwrap();
+            assert_eq!(nothing_left(&path), expected, "{contents}");
+        }
+    }
+
+    /// An unreadable or malformed file is never treated as empty — deleting one
+    /// would destroy exactly the content that could not be parsed.
+    #[test]
+    fn nothing_left_is_false_for_anything_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.json");
+        assert!(!nothing_left(&missing));
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, "{ not json").unwrap();
+        assert!(!nothing_left(&bad));
     }
 }

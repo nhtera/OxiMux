@@ -180,6 +180,8 @@ mod tests {
 }
 
 pub mod agent_context;
+pub mod agent_hooks;
+pub mod agent_status;
 pub mod attach;
 pub mod git;
 pub mod heartbeat;

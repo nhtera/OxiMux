@@ -1325,27 +1325,41 @@ fn run_agent_status_cli(rt: &tokio::runtime::Runtime) -> i32 {
         }
     };
     rt.block_on(async move {
-        let client = match RelayClient::connect(&socket, &token).await {
-            Ok(c) => c,
-            Err(err) => {
-                eprintln!("oximux agent-status: connect failed: {err}");
-                return 1;
+        // Bounded, because this exchange sits in front of the user's next reply
+        // on every agent that runs its hooks synchronously. The relay does not
+        // answer `AgentStatus` for a pty it does not know, and a pane closed
+        // while its agent was mid-turn is exactly that — unbounded, the hook
+        // then waits forever, and on a dialect that runs ours asynchronously
+        // nothing else bounds it either.
+        let deadline = std::time::Duration::from_secs(3);
+        let sent = tokio::time::timeout(deadline, async {
+            let client = match RelayClient::connect(&socket, &token).await {
+                Ok(c) => c,
+                Err(err) => {
+                    eprintln!("oximux agent-status: connect failed: {err}");
+                    return 1;
+                }
+            };
+            match client
+                .request(oximux_relay_proto::Request::AgentStatus { pty_id, payload })
+                .await
+            {
+                Ok(oximux_relay_proto::Response::Ok) => 0,
+                Ok(other) => {
+                    eprintln!("oximux agent-status: unexpected response: {other:?}");
+                    1
+                }
+                Err(err) => {
+                    eprintln!("oximux agent-status: request failed: {err}");
+                    1
+                }
             }
-        };
-        match client
-            .request(oximux_relay_proto::Request::AgentStatus { pty_id, payload })
-            .await
-        {
-            Ok(oximux_relay_proto::Response::Ok) => 0,
-            Ok(other) => {
-                eprintln!("oximux agent-status: unexpected response: {other:?}");
-                1
-            }
-            Err(err) => {
-                eprintln!("oximux agent-status: request failed: {err}");
-                1
-            }
-        }
+        })
+        .await;
+        sent.unwrap_or_else(|_| {
+            eprintln!("oximux agent-status: the relay did not answer in time");
+            1
+        })
     })
 }
 

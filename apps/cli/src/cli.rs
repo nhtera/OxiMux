@@ -256,6 +256,17 @@ pub enum Command {
         #[command(subcommand)]
         command: TermCommand,
     },
+    /// Install, remove, and inspect the status hooks that let agent CLIs
+    /// report what they are doing.
+    ///
+    /// Offline: reads and writes the agents' own config files on this machine
+    /// and never contacts a host, so it answers when the app is down — which
+    /// is exactly when a misbehaving hook is being chased.
+    #[command(verbatim_doc_comment)]
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     /// Create, list, and remove project worktrees on the host.
     Worktree {
         #[command(subcommand)]
@@ -578,6 +589,59 @@ pub enum TermCommand {
     Attach {
         /// The terminal id (see `term ls`).
         pty: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AgentCommand {
+    /// Turn the status hooks on, off, or report what is installed.
+    Hooks {
+        #[command(subcommand)]
+        command: HooksCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HooksCommand {
+    /// Report, per agent, whether OxiMux's hooks are installed and which file
+    /// was read to decide.
+    ///
+    /// Never writes. The path is printed whether or not anything was found
+    /// there: "not installed" is not actionable on its own, and the file named
+    /// is what catches a `CODEX_HOME` pointing somewhere unexpected.
+    #[command(verbatim_doc_comment)]
+    Status {
+        /// One agent slug (see `agent hooks status`). Default: all of them.
+        #[arg(long, value_name = "SLUG")]
+        agent: Option<String>,
+    },
+    /// Install the hooks, merging them into whatever is already in each file.
+    ///
+    /// Only into agents that are actually on this machine: OxiMux adds to an
+    /// agent's config directory and never conjures one, so an agent you have
+    /// never run is reported and skipped rather than given a dotfile.
+    ///
+    /// Idempotent — a second run writes nothing, because the agents watch
+    /// these files and a rewrite with no change is a reload for nothing.
+    #[command(verbatim_doc_comment)]
+    On {
+        /// One agent slug. Default: all of them.
+        #[arg(long, value_name = "SLUG")]
+        agent: Option<String>,
+    },
+    /// Remove the hooks, leaving anything OxiMux did not write exactly where
+    /// it is — including in a file OxiMux would otherwise delete outright,
+    /// which is read first and kept if it holds someone else's hooks.
+    ///
+    /// A file left holding nothing at all is removed too, so `off` undoes `on`
+    /// for an agent that had no hooks file to begin with. The one-time
+    /// `*.oximux-bak` copy taken before the first edit is deliberately NOT
+    /// removed: it is the only record of what the file looked like beforehand.
+    #[command(verbatim_doc_comment)]
+    Off {
+        /// One agent slug. Default: all of them.
+        #[arg(long, value_name = "SLUG")]
+        agent: Option<String>,
     },
 }
 

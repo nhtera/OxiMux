@@ -174,7 +174,7 @@ pub(crate) const MANAGED_MARKER: &str = "_oximux_managed";
 ///
 /// Ordered as they were measured. Claude is first because its row is the one
 /// every other row is trying to look like.
-pub(crate) const DIALECTS: &[HookDialect] =
+pub const DIALECTS: &[HookDialect] =
     &[CLAUDE, CODEX, DROID, COPILOT, GEMINI, CURSOR, GROK, PI, OMP];
 
 /// Claude Code — `~/.claude/settings.json`.

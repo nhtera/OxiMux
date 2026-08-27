@@ -83,6 +83,15 @@ fn tighten_destructive_suggestions(mut err: clap::Error) -> clap::Error {
 }
 
 fn main() -> std::process::ExitCode {
+    // Before clap, and before anything else: the verb an installed agent hook
+    // runs. Its flags come from a file OxiMux wrote and may include one this
+    // binary has never heard of, which must be ignored rather than answered
+    // with clap's usage error — a hook must never fail the agent's turn. See
+    // the module.
+    if commands::agent_status::is_hook_invocation() {
+        return std::process::ExitCode::from(commands::agent_status::run());
+    }
+
     // Usage errors exit 2 here, printing clap's own message — before any I/O.
     let args = match Cli::try_parse() {
         Ok(args) => args,
@@ -147,6 +156,25 @@ fn main() -> std::process::ExitCode {
                     )),
                 ),
             }
+        }
+        // Offline, like `agent-context`: reads and writes the agents' own
+        // config files on this machine. It must answer with no host running,
+        // which is when a misbehaving hook is actually chased.
+        Command::Agent { command } => {
+            let outcome = match command {
+                cli::AgentCommand::Hooks { command } => match command {
+                    cli::HooksCommand::Status { agent } => {
+                        commands::agent_hooks::status(agent.as_deref())
+                    }
+                    cli::HooksCommand::On { agent } => {
+                        commands::agent_hooks::set(true, agent.as_deref())
+                    }
+                    cli::HooksCommand::Off { agent } => {
+                        commands::agent_hooks::set(false, agent.as_deref())
+                    }
+                },
+            };
+            render(args.json, outcome)
         }
         Command::AgentContext => {
             // Schema output is FOR machines; both modes print JSON, `--json`
@@ -542,6 +570,7 @@ fn host_verb(mut args: Cli) -> u8 {
                 Command::Version
                 | Command::Update { .. }
                 | Command::AgentContext
+                | Command::Agent { .. }
                 | Command::Completions { .. }
                 | Command::Serve { .. }
                 | Command::Pair { .. }
