@@ -2448,3 +2448,35 @@
             })
             .expect("window update");
     }
+
+#[test]
+fn a_dropped_path_inside_the_cwd_becomes_a_relative_mention() {
+    // Relative is the form the `@` overlay offers (its candidates come from a
+    // cwd scan) and the form the agent's own tools resolve against, so a drop
+    // and a typed mention must produce the SAME token for the same file.
+    use std::path::Path;
+    assert_eq!(
+        super::mention_form_in(Path::new("/proj"), Path::new("/proj/src/main.rs")),
+        "src/main.rs"
+    );
+    // The cwd itself has no useful relative form; an empty token would be worse
+    // than the directory name, but this is the degenerate case — assert the
+    // behavior rather than pretend it can't happen.
+    assert_eq!(super::mention_form_in(Path::new("/proj"), Path::new("/proj")), "");
+}
+
+#[test]
+fn a_dropped_path_outside_the_cwd_stays_absolute() {
+    // No relative form the agent could resolve, so it must not become a
+    // `../../..` chain that reads as noise and points somewhere else if the
+    // agent's own cwd differs.
+    use std::path::Path;
+    assert_eq!(
+        super::mention_form_in(Path::new("/proj"), Path::new("/etc/hosts")),
+        "/etc/hosts"
+    );
+    assert_eq!(
+        super::mention_form_in(Path::new("/proj/a"), Path::new("/proj/b/x.rs")),
+        "/proj/b/x.rs"
+    );
+}

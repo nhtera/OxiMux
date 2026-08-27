@@ -636,6 +636,30 @@ impl ComposerView {
         cx.notify();
     }
 
+    /// Append `@path ` mentions to the end of the draft — the same inline form
+    /// [`Self::mention_accept`] produces when a file is picked from the `@`
+    /// overlay, so a dropped file and a typed mention reach the agent
+    /// identically. A separating space is inserted when the draft doesn't
+    /// already end in whitespace, so a drop can't fuse onto the last word.
+    ///
+    /// Deliberately NOT a [`ContextChip`]: a chip inlines the file's *content*
+    /// into the message, and dropping a 5000-line source file should hand the
+    /// agent a reference it can choose to read, not silently spend the context
+    /// window on it.
+    pub fn append_mentions(
+        &mut self,
+        paths: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        let next = with_mentions_appended(&self.input.read(cx).value(), paths);
+        self.set_draft_end(next, window, cx);
+        cx.notify();
+    }
+
     /// Attach image files chosen from the native file dialog. `rfd`'s async
     /// dialog runs off the main thread; the read + decode also happens on a
     /// background executor (decoding a large image is not cheap), then the staged
@@ -3672,9 +3696,68 @@ impl ComposerView {
     }
 }
 
+
+/// Append `@path ` tokens to `draft`, inserting a separating space when the
+/// draft doesn't already end in whitespace so a drop can't fuse onto the last
+/// word the user typed (`fix this@src/main.rs`). Each token carries its own
+/// trailing space, so consecutive drops stay separated and the caret lands
+/// ready for the next word.
+fn with_mentions_appended(draft: &str, paths: &[String]) -> String {
+    let mut next = draft.to_string();
+    for path in paths {
+        if !next.is_empty() && !next.ends_with(char::is_whitespace) {
+            next.push(' ');
+        }
+        next.push('@');
+        next.push_str(path);
+        next.push(' ');
+    }
+    next
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mention_never_fuses_onto_the_last_typed_word() {
+        // The failure this guards: dropping a file after "fix this" producing
+        // `fix this@src/main.rs`, which is neither a mention nor prose.
+        assert_eq!(
+            with_mentions_appended("fix this", &["src/main.rs".into()]),
+            "fix this @src/main.rs "
+        );
+        // A draft that already ends in whitespace gets no second space.
+        assert_eq!(
+            with_mentions_appended("fix this ", &["src/main.rs".into()]),
+            "fix this @src/main.rs "
+        );
+        assert_eq!(
+            with_mentions_appended("fix this\n", &["src/main.rs".into()]),
+            "fix this\n@src/main.rs "
+        );
+    }
+
+    #[test]
+    fn an_empty_draft_takes_no_leading_space() {
+        assert_eq!(with_mentions_appended("", &["a.rs".into()]), "@a.rs ");
+    }
+
+    #[test]
+    fn several_dropped_files_stay_separated() {
+        // A multi-file drop is one gesture; the tokens must not run together.
+        assert_eq!(
+            with_mentions_appended("", &["a.rs".into(), "b/c.rs".into()]),
+            "@a.rs @b/c.rs "
+        );
+    }
+
+    #[test]
+    fn no_paths_leaves_the_draft_untouched() {
+        assert_eq!(with_mentions_appended("keep me", &[]), "keep me");
+    }
+
     use gpui::TestAppContext;
 
     #[test]

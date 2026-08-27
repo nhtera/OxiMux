@@ -2106,14 +2106,38 @@ impl AgentChatView {
     /// Stage image files dropped onto the chat surface into the composer. The
     /// read + decode runs on a background executor (an image can be large), then
     /// the staged attachments are handed to the composer on the foreground.
-    fn attach_dropped_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+    fn attach_dropped_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Two outcomes, split by what the file IS. An image is staged as an
+        // attachment (the agent can look at it); anything else becomes an
+        // `@path` mention (the agent can read it if it decides to). Before this
+        // split, a dropped source file was silently discarded — the drag
+        // completed, the drop landed, and nothing happened.
+        let (images, others): (Vec<PathBuf>, Vec<PathBuf>) = paths
+            .into_iter()
+            .partition(|p| image_attach::is_image_path(p));
+
+        // Mentions need no I/O, so they land synchronously — the text appears
+        // under the cursor on drop rather than a frame later.
+        let mentions: Vec<String> = others.iter().map(|p| self.mention_form(p)).collect();
+        if !mentions.is_empty() {
+            self.composer
+                .update(cx, |c, cx| c.append_mentions(&mentions, window, cx));
+        }
+
+        if images.is_empty() {
+            return;
+        }
         let composer = self.composer.clone();
         cx.spawn(async move |_this, cx| {
             let staged = cx
                 .background_spawn(async move {
-                    paths
+                    images
                         .iter()
-                        .filter(|p| image_attach::is_image_path(p))
                         .filter_map(|p| image_attach::pending_from_path(p))
                         .collect::<Vec<_>>()
                 })
@@ -2121,6 +2145,19 @@ impl AgentChatView {
             composer.update(cx, |c, cx| c.add_pending_images(staged, cx));
         })
         .detach();
+    }
+
+    /// How a dropped path is written into the prompt: relative to the chat's cwd
+    /// when it lives inside it, absolute otherwise.
+    ///
+    /// Relative is the form the `@` overlay offers (its candidates come from
+    /// `scan_candidates(cwd)`), and it is what the agent's own tools resolve
+    /// against — so a drop and a typed mention produce the same token for the
+    /// same file. A path outside the cwd has no relative form the agent could
+    /// resolve, so it stays absolute rather than becoming a `../../..` chain
+    /// that reads as noise.
+    fn mention_form(&self, path: &std::path::Path) -> String {
+        mention_form_in(&self.cwd, path)
     }
 
     /// Record + transmit a submitted prompt (from the composer's Submit event).
@@ -5290,10 +5327,30 @@ impl Render for AgentChatView {
                     cx.stop_propagation();
                 }
             }))
-            // Drop image files anywhere on the chat surface to attach them.
-            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
-                this.attach_dropped_paths(paths.paths().to_vec(), cx);
+            // Drop files anywhere on the chat surface: images attach, everything
+            // else becomes an `@path` mention. Both payload types get the same
+            // tint so the surface reads as one drop target regardless of where
+            // the drag started.
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style.bg(gpui::Hsla { a: 0.18, ..theme.selection })
+            })
+            .drag_over::<crate::shell::pane_group::file_drag::FilePathDragPayload>(
+                move |style, _, _, _| style.bg(gpui::Hsla { a: 0.18, ..theme.selection }),
+            )
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.attach_dropped_paths(paths.paths().to_vec(), window, cx);
             }))
+            // The same, for a drag that started in OxiMux's own file explorer.
+            // The explorer emits `FilePathDragPayload` while Finder emits
+            // `ExternalPaths`, so the surface has to register both — but they
+            // converge on one handler, or the two drop sources drift apart.
+            .on_drop(cx.listener(
+                |this, payload: &crate::shell::pane_group::file_drag::FilePathDragPayload,
+                 window,
+                 cx| {
+                    this.attach_dropped_paths(vec![payload.path.clone()], window, cx);
+                },
+            ))
             .child(transcript)
             // A pinned "awaiting approval — jump" banner when a pending card is
             // scrolled off above the composer.
@@ -5323,6 +5380,12 @@ impl Render for AgentChatView {
             .children(self.render_tool_sheet(cx))
             .into_any_element()
     }
+}
+
+/// See [`AgentChatView::mention_form`]. Free-standing so the cwd-relative rule
+/// is testable without constructing a chat view.
+fn mention_form_in(cwd: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(cwd).unwrap_or(path).to_string_lossy().into_owned()
 }
 
 /// A live "<provider> is working…" row shown at the tail of the transcript while
