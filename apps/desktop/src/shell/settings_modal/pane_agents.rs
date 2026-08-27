@@ -38,6 +38,7 @@ pub(super) fn render(
     );
     let launch_card =
         super::pane_agents_launch::render_launch_card(modal, theme, density, typography, cx);
+    let env_card = super::pane_agents_launch::render_env_card(modal, theme, density, typography, cx);
 
     // Each section = a labelled title + its card + a muted footnote, grouped
     // tightly (8px) and separated from the next section by a wider gap.
@@ -71,12 +72,31 @@ pub(super) fn render(
             typography,
         ));
 
+    let env_section = div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(section_title(
+            "Environment & profiles",
+            "Point an agent at an alternate endpoint, a proxy, or a second account \
+             without patching source.",
+            theme,
+            typography,
+        ))
+        .child(env_card)
+        .child(footnote(
+            "Values are stored in plain text in agent_launch.toml. Not a credential vault.",
+            theme,
+            typography,
+        ));
+
     div()
         .flex()
         .flex_col()
         .gap(px(20.0))
         .child(ai_section)
         .child(launch_section)
+        .child(env_section)
         .into_any_element()
 }
 

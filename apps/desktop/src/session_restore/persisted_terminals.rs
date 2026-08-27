@@ -304,6 +304,13 @@ pub struct PersistedAgentTab {
     /// the PTY is gone, so the tab respawns fresh instead of re-attaching.
     #[serde(default)]
     pub relay_session: Option<String>,
+    /// Named launch profile this tab was spawned under (`None` = the plain
+    /// `[agents.<id>]` entry). Carried so a respawn on restore reaches the same
+    /// endpoint/account instead of silently falling back to the default — the
+    /// failure mode is an agent that comes back pointed at the wrong provider.
+    /// `#[serde(default)]` keeps pre-existing blobs (no field) readable.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// Mirrors `PaneTree` but without GPUI-side `PaneId`s (regenerated on
@@ -551,6 +558,7 @@ mod tests {
                     effort: Some("high".into()),
                     relay_external_id: None,
                     relay_session: None,
+                    profile: None,
                 }),
                 kind: PersistedTabKind::Terminal,
                 ..PersistedTab::default()

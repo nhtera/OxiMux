@@ -8,13 +8,56 @@ use gpui::{
     AnyElement, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
     Styled, Window, div, prelude::FluentBuilder, px, svg,
 };
-use oximux_settings::{Density, OpenMode, Theme, Typography, split_args};
+use gpui_component::Sizable as _;
+use gpui_component::input::Input;
+use std::collections::BTreeMap;
+
+use oximux_settings::{DEFAULT_PROFILE, Density, OpenMode, Theme, Typography, split_args};
 
 use super::SettingsModal;
 use super::controls::{toggle_chip, toggle_switch, value_chip};
 use super::layout::{SettingEntry, card_surface, entry, section_card, setting_row_desc};
 use super::segmented::{Segment, segmented};
 use crate::shell::agent_presentation::adapter_icon_path;
+
+
+/// Parse the environment editor's text into the map [`PerAgentLaunch::env`]
+/// holds. One `KEY=value` per line, `.env`-shaped because that is the form a
+/// proxy or alternate-endpoint configuration is already pasted from.
+///
+/// - The FIRST `=` splits; a value may contain further `=` (a URL query, a
+///   base64 token) without quoting.
+/// - Blank lines and `#` comments are skipped, so a user can annotate.
+/// - A line with no `=`, or an empty key, is dropped rather than guessed at —
+///   a half-typed line must not become a variable named after a fragment.
+/// - Key and value are both trimmed. A trailing space in a key is a *different*
+///   variable than the one the user meant, which is the failure this prevents.
+///
+/// [`PerAgentLaunch::env`]: oximux_settings::PerAgentLaunch::env
+pub(super) fn parse_env_lines(raw: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let k = k.trim();
+        if k.is_empty() {
+            continue;
+        }
+        out.insert(k.to_string(), v.trim().to_string());
+    }
+    out
+}
+
+/// Render an env map back into editor text: one `KEY=value` per line, in the
+/// map's key order (it is a `BTreeMap`, so sorted and stable across reopens).
+pub(super) fn format_env_lines(env: &BTreeMap<String, String>) -> String {
+    env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n")
+}
 
 /// Built-in agents exposed in the launch settings, in picker order. The
 /// custom adapter is excluded — its command is fully user-supplied, so a
@@ -166,6 +209,121 @@ pub(super) fn entries(
         ));
     }
     out
+}
+
+/// The environment + profiles card: pick an agent, pick (or add) one of its
+/// launch profiles, and edit that profile's `KEY=value` overrides.
+///
+/// A separate card from the per-agent rows above because it is a *different
+/// selection model*: those rows show every agent at once, while this one edits
+/// one `(agent, profile)` pair at a time — the text editor holds exactly one
+/// pair's content, so showing four of them would mean four live inputs.
+pub(super) fn render_env_card(
+    modal: &SettingsModal,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    let mut rows: Vec<AnyElement> = Vec::with_capacity(4);
+
+    // Which agent's environment is being edited.
+    let current_agent = modal.env_agent;
+    let agent_segs: Vec<Segment> = LAUNCH_AGENTS
+        .iter()
+        .map(|(id, display)| {
+            let id = *id;
+            Segment::new(*display, current_agent == id, move |this, window, cx| {
+                this.select_env_agent(id, window, cx);
+            })
+        })
+        .collect();
+    rows.push(setting_row_desc(
+        "Agent",
+        "Which agent's launch environment you are editing.",
+        segmented("launch-env-agent", agent_segs, theme, density, typography, cx),
+        theme,
+        typography,
+    ));
+
+    // Which profile of that agent. `default` is the plain entry every config
+    // already has, so this reads "default" even before a profile is created.
+    let current_profile = modal.env_profile.clone();
+    let profile_segs: Vec<Segment> = modal
+        .agent_launch
+        .profile_names(current_agent)
+        .into_iter()
+        .map(|name| {
+            let selected = match (&current_profile, name.as_str()) {
+                (None, DEFAULT_PROFILE) => true,
+                (Some(sel), n) => sel == n,
+                _ => false,
+            };
+            let target = (name != DEFAULT_PROFILE).then(|| name.clone());
+            Segment::new(name, selected, move |this, window, cx| {
+                this.select_env_profile(target.clone(), window, cx);
+            })
+        })
+        .collect();
+    rows.push(setting_row_desc(
+        "Profile",
+        "A second configuration of the same agent — an alternate endpoint, a proxy, \
+         or a second account. Profiles vary flags, model, and environment; the \
+         backend stays the agent's own.",
+        segmented("launch-env-profile", profile_segs, theme, density, typography, cx),
+        theme,
+        typography,
+    ));
+
+    // Add / remove. The name field commits on Enter (see the modal's
+    // `_new_profile_sub`); Remove is disabled on `default`, which is the
+    // adapter's plain entry rather than a profile.
+    if let Some(state) = modal.new_profile_input.as_ref() {
+        let mut controls = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .w(px(180.0))
+                    .child(Input::new(state).small().text_size(px(typography.t_body_sm))),
+            );
+        if current_profile.is_some() {
+            controls = controls.child(value_chip(
+                SharedString::from("launch-env-profile-remove"),
+                "Remove",
+                theme,
+                density,
+                typography,
+                |this, window, cx| this.remove_env_profile(window, cx),
+                cx,
+            ));
+        }
+        rows.push(setting_row_desc(
+            "Add a profile",
+            "Type a name and press Enter. A new profile starts from this agent's \
+             current flags, model, and environment.",
+            controls,
+            theme,
+            typography,
+        ));
+    }
+
+    // The editor itself.
+    if let Some(state) = modal.env_input.as_ref() {
+        rows.push(setting_row_desc(
+            "Environment",
+            "One KEY=value per line, applied on top of the inherited environment \
+             at launch — for both terminal and chat. Stored in plain text in \
+             agent_launch.toml; this is not encrypted storage.",
+            Input::new(state).text_size(px(typography.t_body_sm)),
+            theme,
+            typography,
+        ));
+    }
+
+    card_surface(theme, density, section_card(theme, density, rows))
 }
 
 /// The full launch-defaults card: a "Default agent" row with one icon chip per
@@ -755,5 +913,52 @@ mod tests {
     fn model_label_maps_empty_to_default() {
         assert_eq!(model_label(""), "Model: Default");
         assert_eq!(model_label("opus"), "Model: opus");
+    }
+
+    #[test]
+    fn env_lines_round_trip_and_stay_sorted() {
+        let raw = "ZED_LAST=z\nANTHROPIC_BASE_URL=https://proxy.internal/v1\n";
+        let env = parse_env_lines(raw);
+        // Re-rendered in key order, not entry order — a reopen must not shuffle
+        // the user's file.
+        assert_eq!(
+            format_env_lines(&env),
+            "ANTHROPIC_BASE_URL=https://proxy.internal/v1\nZED_LAST=z"
+        );
+        assert_eq!(parse_env_lines(&format_env_lines(&env)), env);
+    }
+
+    #[test]
+    fn env_lines_split_on_the_first_equals_only() {
+        // A base URL with a query string, or a padded token, must survive whole.
+        let env = parse_env_lines("URL=https://h/v1?a=1&b=2\n  TOKEN = sk-abc=def==  ");
+        assert_eq!(env.get("URL").map(String::as_str), Some("https://h/v1?a=1&b=2"));
+        assert_eq!(env.get("TOKEN").map(String::as_str), Some("sk-abc=def=="));
+    }
+
+    #[test]
+    fn env_lines_drop_blanks_comments_and_half_typed_rows() {
+        // A line still being typed must not become a variable named after a
+        // fragment, and an annotated file must survive a round-trip of editing.
+        let env = parse_env_lines(
+            "\n# a comment\n   \nJUST_A_KEY\n=orphan\n   =orphan2\nGOOD=1\n",
+        );
+        assert_eq!(env.len(), 1);
+        assert_eq!(env.get("GOOD").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn env_lines_keep_an_empty_value() {
+        // `KEY=` is a deliberate act: it sets the variable to empty, which is
+        // how a user unsets an inherited one for the child.
+        let env = parse_env_lines("KEY=");
+        assert_eq!(env.get("KEY").map(String::as_str), Some(""));
+        assert_eq!(format_env_lines(&env), "KEY=");
+    }
+
+    #[test]
+    fn empty_env_formats_to_empty_text() {
+        assert_eq!(format_env_lines(&BTreeMap::new()), "");
+        assert!(parse_env_lines("").is_empty());
     }
 }

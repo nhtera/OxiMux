@@ -29,8 +29,8 @@ pub mod theme;
 pub mod typography;
 
 pub use agent_launch::{
-    ACP_PRESETS, AcpPreset, AgentLaunchSettings, OpenMode, PerAgentLaunch, Transport, acp_preset,
-    import_resume_command, split_args,
+    ACP_PRESETS, AcpPreset, AgentLaunchSettings, DEFAULT_PROFILE, NamedLaunchProfile, OpenMode,
+    PerAgentLaunch, Transport, acp_preset, import_resume_command, split_args,
 };
 pub use appearance::{Appearance, DensityPreset, ThemeChoice, UiScale};
 pub use auto_update::AutoUpdateSettings;

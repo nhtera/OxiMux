@@ -208,6 +208,11 @@ impl AgentChatView {
             provider: self.backend.transport,
             acp_command: self.backend.acp_command.clone(),
             acp_args: self.backend.acp_args.clone(),
+            // The settings key + profile, so restore re-resolves the configured
+            // env from current settings rather than replaying a stale copy (and
+            // without writing env values into a second file).
+            adapter_id: self.backend.adapter_id.clone(),
+            launch_profile: self.backend.profile.clone(),
             codex_posture: self.codex_posture_snapshot(),
             pi_posture: self.pi_posture_snapshot(),
             omp_posture: self.omp_posture_snapshot(),
@@ -251,6 +256,9 @@ mod tests {
             transport: Transport::Acp,
             acp_command: Some(String::new()),
             acp_args: Vec::new(),
+            env: Vec::new(),
+            adapter_id: None,
+            profile: None,
         };
         let window = cx.add_window(|window, cx| {
             let view = AgentChatView::new_resumed(

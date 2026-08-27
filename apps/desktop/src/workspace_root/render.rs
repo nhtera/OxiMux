@@ -678,6 +678,9 @@ impl Render for WorkspaceRoot {
                     None,
                     resumption,
                     custom_command,
+                    // A history relaunch reuses the adapter's default profile;
+                    // the persisted history row records no profile.
+                    None,
                     window,
                     cx,
                 );

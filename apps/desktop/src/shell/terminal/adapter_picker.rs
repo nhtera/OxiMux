@@ -60,10 +60,13 @@ pub enum AdapterSelection {
     /// on the first message. Distinct from the per-agent rows below, which bind
     /// eagerly to a specific agent.
     NewAgentDraft,
-    /// One of the registry's available agent adapters.
+    /// One of the registry's available agent adapters, under one of its named
+    /// launch profiles. `profile: None` is the adapter's plain entry — the only
+    /// thing this variant carried before profiles existed.
     Adapter {
         kind: AgentAdapter,
         id: &'static str,
+        profile: Option<String>,
     },
     /// A built-in ACP preset (Cursor/Amp). Chat-only by nature, so the owner
     /// opens it straight as a structured chat tab (via the generic ACP backend)
@@ -165,10 +168,11 @@ impl AdapterPicker {
         &mut self,
         kind: AgentAdapter,
         id: &'static str,
+        profile: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        (self.on_select)(AdapterSelection::Adapter { kind, id }, window, cx);
+        (self.on_select)(AdapterSelection::Adapter { kind, id, profile }, window, cx);
         self.close(cx);
     }
 
@@ -543,7 +547,7 @@ fn append_adapter_rows(
         };
         let handler = cx.listener(move |this, _: &MouseDownEvent, window, cx| {
             if matches!(state, RowState::Active) {
-                this.select_adapter(kind, id, window, cx);
+                this.select_adapter(kind, id, None, window, cx);
             }
         });
         card = card.child(picker_row(
@@ -557,6 +561,39 @@ fn append_adapter_rows(
             typography.clone(),
             handler,
         ));
+
+        // One extra row per named launch profile, directly under its agent, so
+        // an alternate endpoint or second account is reachable in the same
+        // click the agent itself is. A profile of an unavailable agent stays
+        // unavailable — the profile changes the environment, not whether the
+        // binary is installed.
+        //
+        // Only agents the user actually configured a profile for grow rows, so
+        // the picker is unchanged for everyone else.
+        for (px, profile) in launch
+            .profile_names(id)
+            .into_iter()
+            .filter(|n| n != oximux_settings::DEFAULT_PROFILE)
+            .enumerate()
+        {
+            let for_handler = profile.clone();
+            let handler = cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                if matches!(state, RowState::Active) {
+                    this.select_adapter(kind, id, Some(for_handler.clone()), window, cx);
+                }
+            });
+            card = card.child(picker_row(
+                ("adapter-profile-row", ix * 100 + px),
+                Some(adapter_icon_path(id)),
+                SharedString::from(format!("{} — {profile}", entry.display_name)),
+                None,
+                state,
+                theme,
+                density,
+                typography.clone(),
+                handler,
+            ));
+        }
     }
     card
 }

@@ -179,6 +179,24 @@ pub struct SettingsModal {
     /// doesn't blur a gpui input) — otherwise closing the modal would silently
     /// drop the typed dictionary.
     custom_words_seed: Vec<String>,
+    /// Agents pane, environment editor: which adapter is being edited, and
+    /// which of its named launch profiles. `None` profile = the adapter's plain
+    /// entry (`default`). Reset on each `open()` so the editor never reopens
+    /// pointing at a profile the user deleted from another surface.
+    pub(super) env_agent: &'static str,
+    pub(super) env_profile: Option<String>,
+    /// The `KEY=value` editor for `(env_agent, env_profile)`. Lazily built on
+    /// `open()` and rebuilt whenever the selection changes — an `InputState`'s
+    /// text is owned by the state, so re-seeding it is a rebuild, not a set.
+    pub(super) env_input: Option<Entity<InputState>>,
+    _env_sub: Option<Subscription>,
+    /// The env map the editor was seeded with, so `close()` can flush an edit
+    /// typed but never committed via blur/Enter — same hazard, and same fix, as
+    /// [`Self::custom_words_seed`].
+    env_seed: BTreeMap<String, String>,
+    /// "New profile" name field; Enter creates and selects the profile.
+    pub(super) new_profile_input: Option<Entity<InputState>>,
+    _new_profile_sub: Option<Subscription>,
     /// Working copy of the `keybindings.toml` override map; reseeded from
     /// disk at each `open()`. Edits persist + apply to the live keymap
     /// immediately (see `pane_keybindings`).
@@ -293,6 +311,13 @@ impl SettingsModal {
             custom_words_input: None,
             _custom_words_sub: None,
             custom_words_seed: Vec::new(),
+            env_agent: pane_agents_launch::LAUNCH_AGENTS[0].0,
+            env_profile: None,
+            env_input: None,
+            _env_sub: None,
+            env_seed: BTreeMap::new(),
+            new_profile_input: None,
+            _new_profile_sub: None,
             keybind_overrides: BTreeMap::new(),
             recording_action: None,
             recording_sub: None,
@@ -424,6 +449,65 @@ impl SettingsModal {
             );
         self.custom_words_input = Some(cw_input);
 
+        // Agents pane's environment editor. Reset the selection first: a reopen
+        // must not land on a profile deleted since, which would silently edit
+        // the default entry under the deleted profile's label.
+        self.env_agent = pane_agents_launch::LAUNCH_AGENTS[0].0;
+        self.env_profile = None;
+        self.env_seed = self.selected_env();
+        let env_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .rows(4)
+                .placeholder("ANTHROPIC_BASE_URL=https://proxy.internal/v1")
+                .default_value(pane_agents_launch::format_env_lines(&self.env_seed))
+        });
+        // Same split as the custom-words field: sync the working copy on every
+        // keystroke, but only WRITE the file on a discrete commit (blur/Enter),
+        // so typing an endpoint isn't a per-character `fs::write` on the main
+        // thread.
+        self._env_sub = Some(cx.subscribe(
+            &env_input,
+            |this, input, ev: &InputEvent, cx| match ev {
+                InputEvent::Change => {
+                    let raw = input.read(cx).value().to_string();
+                    let agent = this.env_agent;
+                    let profile = this.env_profile.clone();
+                    this.agent_launch.profile_entry_mut(agent, profile.as_deref()).env =
+                        pane_agents_launch::parse_env_lines(&raw);
+                }
+                InputEvent::Blur => this.persist_agent_launch(cx),
+                _ => {}
+            },
+        ));
+        self.env_input = Some(env_input);
+
+        // "New profile" name field. Enter creates + selects; the subscription
+        // needs the `Window` to re-seed the env editor, hence `subscribe_in`.
+        let np_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder("New profile name, then Enter"));
+        self._new_profile_sub = Some(cx.subscribe_in(
+            &np_input,
+            window,
+            |this, input, ev: &InputEvent, window, cx| {
+                if !matches!(ev, InputEvent::PressEnter { .. }) {
+                    return;
+                }
+                let name = input.read(cx).value().trim().to_string();
+                // `default` is the plain entry, not a nameable profile; a blank
+                // name would be unreachable through `for_agent_in`.
+                if name.is_empty() || name == oximux_settings::DEFAULT_PROFILE {
+                    return;
+                }
+                let agent = this.env_agent;
+                this.agent_launch.profile_entry_mut(agent, Some(&name));
+                this.persist_agent_launch(cx);
+                input.update(cx, |s, cx| s.set_value("", window, cx));
+                this.select_env_profile(Some(name), window, cx);
+            },
+        ));
+        self.new_profile_input = Some(np_input);
+
         // Schedules pane: reload the list + run history from the shared store,
         // and build a fresh empty create form (reset draft, clear any error).
         self.reload_schedules();
@@ -487,6 +571,17 @@ impl SettingsModal {
         self._search_sub = None;
         self.custom_words_input = None;
         self._custom_words_sub = None;
+        // Same flush-before-drop hazard as custom words: the working copy is
+        // synced on every keystroke, but only blur/Enter writes the file, and
+        // clicking dead space doesn't blur a gpui input. Without this, typing an
+        // endpoint then closing via ✕/Esc would silently drop it.
+        if self.env_input.is_some() && self.selected_env() != self.env_seed {
+            self.persist_agent_launch(cx);
+        }
+        self.env_input = None;
+        self._env_sub = None;
+        self.new_profile_input = None;
+        self._new_profile_sub = None;
         // Drop the schedule create-form inputs so their focus handles can't keep
         // window focus orphaned after the modal is hidden.
         self.sched_name_input = None;
@@ -538,6 +633,80 @@ impl SettingsModal {
 
     /// Persist the per-agent launch working copy to `agent_launch.toml`. The
     /// watcher reloads + swaps the global; we never set the global here.
+    /// The env map of the currently-selected `(agent, profile)`, or empty when
+    /// that pair has no entry yet. The comparison basis for the close-flush.
+    fn selected_env(&self) -> BTreeMap<String, String> {
+        self.agent_launch
+            .for_agent_in(self.env_agent, self.env_profile.as_deref())
+            .map(|l| l.env.clone())
+            .unwrap_or_default()
+    }
+
+    /// Point the environment editor at `profile` of the current agent, flushing
+    /// any pending edit to the profile being left first.
+    ///
+    /// The text belongs to the `InputState`, so switching selection has to push
+    /// the new value in rather than re-render from `self` — a settings pane
+    /// renders from `&self` with no `Window`, which `set_value` requires.
+    pub(super) fn select_env_profile(
+        &mut self,
+        profile: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_env() != self.env_seed {
+            self.persist_agent_launch(cx);
+        }
+        self.env_profile = profile;
+        self.reseed_env_editor(window, cx);
+    }
+
+    /// Point the environment editor at `agent`, resetting to its `default`
+    /// profile — a profile name is per-adapter, so carrying the current one
+    /// across a switch would land on an unrelated (or absent) profile.
+    pub(super) fn select_env_agent(
+        &mut self,
+        agent: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_env() != self.env_seed {
+            self.persist_agent_launch(cx);
+        }
+        self.env_agent = agent;
+        self.env_profile = None;
+        self.reseed_env_editor(window, cx);
+    }
+
+    /// Push the selected `(agent, profile)`'s env into the editor and re-baseline
+    /// the close-flush comparison.
+    fn reseed_env_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.env_seed = self.selected_env();
+        let text = pane_agents_launch::format_env_lines(&self.env_seed);
+        if let Some(input) = self.env_input.clone() {
+            input.update(cx, |s, cx| s.set_value(&text, window, cx));
+        }
+        cx.notify();
+    }
+
+    /// Delete the selected named profile and fall back to `default`. A no-op on
+    /// `default` itself, which is the adapter's plain entry.
+    pub(super) fn remove_env_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.env_profile.clone() else {
+            return;
+        };
+        let agent = self.env_agent;
+        if !self.agent_launch.remove_profile(agent, &name) {
+            return;
+        }
+        self.env_profile = None;
+        // Re-baseline BEFORE persisting so the flush in `select_*` can't write
+        // the removed profile's env back under the default entry.
+        self.env_seed = self.selected_env();
+        self.persist_agent_launch(cx);
+        self.reseed_env_editor(window, cx);
+    }
+
     pub(super) fn persist_agent_launch(&mut self, cx: &mut Context<Self>) {
         if let Err(err) = crate::agent_launch_settings::save(&self.agent_launch) {
             tracing::warn!(%err, "settings modal: failed to write agent_launch.toml");

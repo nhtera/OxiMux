@@ -448,6 +448,7 @@ impl ProjectPanes {
         backend: SharedBackend,
         term_id: TerminalSessionId,
         label_override: Option<String>,
+        profile: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -466,6 +467,7 @@ impl ProjectPanes {
                 backend,
                 term_id,
                 label_override,
+                profile,
                 window,
                 cx,
             );
@@ -631,6 +633,7 @@ impl ProjectPanes {
                         worktree_path,
                         model,
                         effort,
+                        profile,
                         ..
                     } => {
                         if matches!(adapter, AgentAdapter::Custom) {
@@ -664,6 +667,7 @@ impl ProjectPanes {
                                 effort: effort.clone(),
                                 relay_external_id,
                                 relay_session,
+                                profile: profile.clone(),
                             }),
                             PersistedTabKind::Terminal,
                         )
@@ -888,6 +892,7 @@ impl ProjectPanes {
                 backend,
                 term_id,
                 Some(label),
+                persisted.profile.clone(),
                 window,
                 cx,
             );
@@ -1125,6 +1130,7 @@ impl ProjectPanes {
                 backend,
                 term_id,
                 Some(label),
+                persisted.profile.clone(),
                 window,
                 cx,
             );

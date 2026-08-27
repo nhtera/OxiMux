@@ -1748,6 +1748,9 @@ impl WorkspaceRoot {
                                 agent_prompt.clone(),
                                 oximux_core::SessionResumption::None,
                                 None,
+                                // The create dialog offers no profile picker —
+                                // an auto-spawn takes the adapter's default.
+                                None,
                                 window,
                                 cx,
                             );

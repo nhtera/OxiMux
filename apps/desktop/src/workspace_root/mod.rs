@@ -168,12 +168,27 @@ pub(crate) fn chat_backend_for(
     settings: &oximux_settings::AgentLaunchSettings,
     adapter_id: &str,
 ) -> oximux_agents::thread::ChatBackend {
+    chat_backend_for_profile(settings, adapter_id, None)
+}
+
+/// [`chat_backend_for`] under a named launch profile — the profile contributes
+/// its `env` (and nothing else: the transport and ACP command are adapter-level
+/// by design, so the chat-routing gate can answer before a profile is chosen).
+/// `None` resolves the adapter's plain entry, i.e. the pre-profile behavior.
+pub(crate) fn chat_backend_for_profile(
+    settings: &oximux_settings::AgentLaunchSettings,
+    adapter_id: &str,
+    profile: Option<&str>,
+) -> oximux_agents::thread::ChatBackend {
     let transport = to_agents_transport(settings.transport_for(adapter_id));
     let is_acp = transport == oximux_agents::thread::Transport::Acp;
     oximux_agents::thread::ChatBackend {
         transport,
         acp_command: is_acp.then(|| settings.acp_command_for(adapter_id)).flatten(),
         acp_args: if is_acp { settings.acp_args_for(adapter_id) } else { Vec::new() },
+        env: settings.env_for(adapter_id, profile),
+        adapter_id: Some(adapter_id.to_string()),
+        profile: profile.map(str::to_string),
     }
 }
 
@@ -699,7 +714,7 @@ impl WorkspaceRoot {
                         });
                     }
                 }
-                AdapterSelection::Adapter { kind, id } => {
+                AdapterSelection::Adapter { kind, id, profile } => {
                     // Root the agent at the active project (its panes' cwd),
                     // so the worktree the agent runs in matches a sidebar
                     // workspace row — that drives the live (green) status
@@ -731,7 +746,7 @@ impl WorkspaceRoot {
                     if open_chat {
                         // `open_chat` is only true when `launch` is `Some`.
                         let backend = launch
-                            .map(|s| chat_backend_for(s, id))
+                            .map(|s| chat_backend_for_profile(s, id, profile.as_deref()))
                             .unwrap_or_default();
                         if let Some(panes) = this.active_project_panes() {
                             panes.update(cx, |p, cx| {
@@ -739,7 +754,8 @@ impl WorkspaceRoot {
                             });
                         }
                     } else {
-                        // One-click launch: always the agent's default settings.
+                        // One-click launch: the agent's settings under the
+                        // profile the picked row named (`None` = its default).
                         this.spawn_agent_tab(
                             kind,
                             id,
@@ -749,6 +765,7 @@ impl WorkspaceRoot {
                             None,
                             oximux_core::SessionResumption::None,
                             None,
+                            profile,
                             window,
                             cx,
                         )
@@ -1381,7 +1398,7 @@ fn gather_agent_activity(targets: Vec<(String, String)>) -> HashMap<String, Stri
 
 #[cfg(test)]
 mod tests {
-    use super::chat_backend_for;
+    use super::{chat_backend_for, chat_backend_for_profile};
     use oximux_agents::thread::Transport as AgentTransport;
     use oximux_settings::{AgentLaunchSettings, Transport as SettingsTransport};
 
@@ -1421,6 +1438,53 @@ mod tests {
         assert_eq!(cursor.transport, AgentTransport::Acp);
         assert_eq!(cursor.acp_command.as_deref(), Some("cursor-agent"));
         assert_eq!(cursor.acp_args, vec!["acp".to_string()]);
+    }
+
+    #[test]
+    fn two_profiles_of_one_adapter_resolve_to_different_chat_env() {
+        // The launch-path half of "two profiles run with different env": the
+        // picker hands a profile name to this resolver, and what comes back is
+        // what the spawn actually applies.
+        let mut s = AgentLaunchSettings::default();
+        s.entry_mut("claude-code")
+            .env
+            .insert("ANTHROPIC_BASE_URL".into(), "https://first.example/v1".into());
+        s.profile_entry_mut("claude-code", Some("proxy"))
+            .env
+            .insert("ANTHROPIC_BASE_URL".into(), "https://second.example/v1".into());
+
+        let default = chat_backend_for(&s, "claude-code");
+        let proxy = chat_backend_for_profile(&s, "claude-code", Some("proxy"));
+        assert_eq!(
+            default.env,
+            vec![("ANTHROPIC_BASE_URL".to_string(), "https://first.example/v1".to_string())]
+        );
+        assert_eq!(
+            proxy.env,
+            vec![("ANTHROPIC_BASE_URL".to_string(), "https://second.example/v1".to_string())]
+        );
+        // Same backend, different account: a profile must not change which
+        // protocol the adapter speaks.
+        assert_eq!(default.transport, proxy.transport);
+        // The settings key rides along so a restore can re-resolve this pair.
+        assert_eq!(proxy.adapter_id.as_deref(), Some("claude-code"));
+        assert_eq!(proxy.profile.as_deref(), Some("proxy"));
+    }
+
+    #[test]
+    fn an_adapter_with_no_configured_env_resolves_to_no_env() {
+        // Every existing config: the backend must be byte-identical to before
+        // this field existed, or every untouched launch changes.
+        let s = AgentLaunchSettings::default();
+        assert!(chat_backend_for(&s, "claude-code").env.is_empty());
+        assert!(chat_backend_for(&s, "cursor").env.is_empty());
+        // An unknown profile falls back to the default entry, never to nothing.
+        let mut s = AgentLaunchSettings::default();
+        s.entry_mut("codex").env.insert("K".into(), "v".into());
+        assert_eq!(
+            chat_backend_for_profile(&s, "codex", Some("deleted")).env,
+            vec![("K".to_string(), "v".to_string())]
+        );
     }
 }
 

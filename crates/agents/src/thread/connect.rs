@@ -34,6 +34,32 @@ pub struct ChatBackend {
     pub acp_command: Option<String>,
     /// argv appended after `acp_command`; empty for non-ACP backends.
     pub acp_args: Vec<String>,
+    /// Environment overrides the user configured for this adapter (and launch
+    /// profile), layered onto the spawn by every transport. This is how a chat
+    /// reaches an alternate base URL or a second account without a source
+    /// patch.
+    ///
+    /// It rides on the backend rather than being set per call site because the
+    /// backend is already the one thing resolved from settings, so every chat
+    /// entry point — a fresh launch, a restore, a respawn, the remote bridge,
+    /// `serve` — picks it up from [`ConnectSpec::for_backend`] instead of each
+    /// remembering to. Empty for every adapter with no configured env, which
+    /// leaves those launches byte-identical.
+    ///
+    /// Not secret storage: these come from a plaintext settings file.
+    pub env: Vec<(String, String)>,
+    /// The settings key this backend was resolved from, and the named launch
+    /// profile within it. `None`/`None` for a backend built without settings
+    /// (a bare `Transport::into()`, a test fixture).
+    ///
+    /// These are carried so a chat can be **re-resolved** later rather than
+    /// only replayed: a restore persists this pair and reads `env` back out of
+    /// the current settings, which keeps a corrected base URL effective on the
+    /// next open and keeps env values out of a second on-disk file. `env`
+    /// itself is the already-resolved answer for the live connection.
+    pub adapter_id: Option<String>,
+    /// See [`Self::adapter_id`]. `None` = the adapter's plain entry.
+    pub profile: Option<String>,
 }
 
 impl ChatBackend {
@@ -52,7 +78,14 @@ impl ChatBackend {
 impl From<Transport> for ChatBackend {
     /// A backend that carries only a transport (Claude/Codex — no ACP command).
     fn from(transport: Transport) -> Self {
-        Self { transport, acp_command: None, acp_args: Vec::new() }
+        Self {
+            transport,
+            acp_command: None,
+            acp_args: Vec::new(),
+            env: Vec::new(),
+            adapter_id: None,
+            profile: None,
+        }
     }
 }
 
@@ -175,9 +208,10 @@ impl ConnectSpec {
             effort,
             acp_command: backend.acp_command.clone(),
             acp_args: backend.acp_args.clone(),
-            // Set only by the EnvVar-auth respawn (see `respawn_with_env`);
-            // every other launch carries no extra env and no auto-authenticate.
-            env: Vec::new(),
+            // The adapter/profile env the user configured. A respawn that also
+            // carries EnvVar-auth credentials appends them AFTER these, so the
+            // credentials win on a key collision (see `respawn_spec`).
+            env: backend.env.clone(),
             auth_method: None,
             // Set only when restoring a Codex chat with a persisted posture; a
             // fresh launch starts at the default posture.

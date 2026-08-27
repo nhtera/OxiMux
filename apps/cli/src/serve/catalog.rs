@@ -136,6 +136,16 @@ impl HeadlessCatalog {
                 transport: blob.provider,
                 acp_command: blob.acp_command.clone(),
                 acp_args: blob.acp_args.clone(),
+                // No configured launch env here: `agent_launch.toml` lives in
+                // the app data dir, whose resolver (`app_paths`) is inside the
+                // desktop binary rather than a crate, so this process cannot
+                // read it. A headless resume therefore runs on the inherited
+                // environment. The blob's own `adapter_id`/`launch_profile`
+                // survive this round-trip untouched via `ChatBlob::extra`, so
+                // sharing that loader out is the only change needed to close it.
+                env: Vec::new(),
+                adapter_id: None,
+                profile: None,
             },
             PathBuf::from(&cwd),
             // Resume on the model the session last ran, resolved: the picker

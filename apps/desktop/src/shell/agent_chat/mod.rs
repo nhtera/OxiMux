@@ -378,6 +378,9 @@ pub struct ChatTerminalSpec {
     pub cwd: PathBuf,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// The chat's named launch profile, so the companion terminal resumes
+    /// against the same endpoint/account the chat is bound to.
+    pub profile: Option<String>,
 }
 
 /// Why the "Switch to Terminal View" affordance is (un)available for a chat —
@@ -1476,7 +1479,12 @@ impl AgentChatView {
             self.permission_mode.clone(),
             self.effort.clone(),
         );
-        spec.env = env;
+        // `for_backend` already seeded the adapter/profile env. Append rather
+        // than assign so an EnvVar-auth respawn keeps the configured base URL /
+        // proxy and merely adds (or, on a key collision, overrides) the
+        // credentials the user just typed — assigning here silently respawned
+        // the agent against the default endpoint.
+        spec.env.extend(env);
         spec.auth_method = auth_method;
         // Preserve the chosen Codex posture across the respawn (Stop-resume, a
         // rewind fork), so it isn't silently reset to the default on reconnect.
@@ -1709,6 +1717,9 @@ impl AgentChatView {
             cwd: self.cwd.clone(),
             model: self.model.clone(),
             effort: self.effort.clone(),
+            // The chat's own launch profile, so the companion terminal resumes
+            // against the same endpoint/account rather than the default.
+            profile: self.backend.profile.clone(),
         })
     }
 

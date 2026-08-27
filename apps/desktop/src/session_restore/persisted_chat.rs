@@ -108,6 +108,24 @@ pub struct PersistedChatTranscript {
     /// `#[serde(default)]` (→ empty) for older / non-ACP blobs.
     #[serde(default)]
     pub acp_args: Vec<String>,
+    /// The launch-settings key this chat was opened under, and the named
+    /// profile within it, so a restore can re-resolve the adapter's configured
+    /// environment from **current** settings.
+    ///
+    /// The env values themselves are deliberately NOT persisted here. They can
+    /// hold credentials, and `agent_launch.toml` is already the one plaintext
+    /// place they live — copying them into every session blob would multiply
+    /// that exposure. Re-resolving also means a corrected base URL takes effect
+    /// on the next open instead of being pinned to whatever was set the day the
+    /// session started.
+    ///
+    /// `#[serde(default)]` (→ `None`) keeps every older blob loadable; those
+    /// restore with no env, which is exactly their pre-existing behavior.
+    #[serde(default)]
+    pub adapter_id: Option<String>,
+    /// See [`Self::adapter_id`]. `None` = the adapter's plain entry.
+    #[serde(default)]
+    pub launch_profile: Option<String>,
     /// The Codex posture `(approval_policy, sandbox)` chosen via the composer's
     /// Approvals/Sandbox selects, so a reopened Codex chat resumes under the same
     /// posture. `#[serde(default)]` (→ `None`) keeps older / non-Codex blobs
@@ -205,6 +223,8 @@ mod tests {
             provider: Transport::Rpc,
             acp_command: None,
             acp_args: vec![],
+            adapter_id: None,
+            launch_profile: None,
             codex_posture: None,
             pi_posture: Some(PiPosture { tools: TOOLS_READ_ONLY.into(), context_files: false }),
             omp_posture: None,
@@ -236,6 +256,8 @@ mod tests {
             provider: Transport::OmpRpc,
             acp_command: None,
             acp_args: vec![],
+            adapter_id: None,
+            launch_profile: None,
             codex_posture: None,
             pi_posture: None,
             omp_posture: Some(OmpPosture::AlwaysAsk),
@@ -280,6 +302,8 @@ mod tests {
             provider: Transport::StreamJson,
             acp_command: None,
             acp_args: vec![],
+            adapter_id: None,
+            launch_profile: None,
             codex_posture: None,
             pi_posture: None,
             omp_posture: None,
@@ -314,6 +338,8 @@ mod tests {
             provider: Transport::Acp,
             acp_command: Some("gemini".into()),
             acp_args: vec!["--experimental-acp".into()],
+            adapter_id: None,
+            launch_profile: None,
             codex_posture: None,
             pi_posture: None,
             omp_posture: None,

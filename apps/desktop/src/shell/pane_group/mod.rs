@@ -67,6 +67,10 @@ pub enum PaneGroupTabKind {
         effort: Option<String>,
         session_id: AgentSessionId,
         status_rx: AgentStatusStream,
+        /// Named launch profile this agent was spawned under (`None` = the
+        /// adapter's plain entry). Held so a session snapshot can persist it
+        /// and a restore respawns against the same endpoint/account.
+        profile: Option<String>,
     },
     Editor {
         path: PathBuf,
