@@ -10,6 +10,16 @@ The asset name is load-bearing beyond distribution: the in-app auto-updater
 Renaming the DMG artifact breaks auto-update for every install until the
 updater is changed to match.
 
+**The Windows zip is load-bearing the same way**, by a different route. The
+Windows updater downloads `OxiMux-<version>-windows-x64.zip` — *not* the
+installer `.exe`, which is for humans — and refuses it unless its sha256
+matches the signed `manifest.json`. The name is written by
+`scripts/bundle-windows.ps1` and read back by the `APP_TRIPLE` map in
+`release.yml`'s manifest job. Those two must agree; the job now fails loudly
+rather than publishing a manifest with no Windows payload, because that
+failure is otherwise silent — every client would simply go on reporting "no
+app build for your platform".
+
 ## Artifacts & scripts
 
 | Piece | Role |

@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 publish.workspace = true
 rust-version.workspace = true
+# Compiles packaging/release-pubkey.txt and the target triple in, so the desktop
+# updater verifies against the same key the CLI and the shell installers do and
+# asks the manifest for the right platform's payload.
+build = "build.rs"
 
 [lib]
 path = "src/lib.rs"
@@ -21,9 +25,44 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-# Release feed + DMG download (same sync client as the driver installer).
+# Release feed + artifact download (same sync client as the driver installer).
 ureq.workspace = true
 url.workspace = true
+# The signed-release trust chain, shared with the CLI's `oximux update`:
+# minisign over the manifest, sha256 over every artifact it names.
+minisign-verify.workspace = true
+sha2.workspace = true
+
+# Signing, for `testkit` only — see the feature's note. Optional so that a
+# shipped binary, which has no business being able to sign a release manifest,
+# does not carry the code to do it. These live in the platform-neutral table:
+# the testkit signs on every platform's test runner, and a stray section header
+# above them would silently scope them to one OS.
+base64 = { workspace = true, optional = true }
+blake2 = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
+
+# The Windows app payload ships as a zip (the macOS one is a DMG, mounted
+# through hdiutil). Same crate the driver installer unpacks with.
+[target.'cfg(target_os = "windows")'.dependencies]
+zip.workspace = true
+
+[features]
+# Mint real minisign keypairs and signatures. Needed by any crate that tests
+# against this one's trust chain — the CLI's update pipeline does — because
+# fixtures the verifier produced itself would prove only that it agrees with
+# itself. Never enable it outside a test target.
+testkit = ["dep:base64", "dep:blake2", "dep:ed25519-dalek"]
 
 [dev-dependencies]
 tempfile.workspace = true
+# The unit tests inside the library reach `testkit` through `cfg(test)`, so
+# they need the signing crates named here directly.
+base64.workspace = true
+blake2.workspace = true
+ed25519-dalek.workspace = true
+# The integration tests under `tests/` are separate crates and see only the
+# public API, where `testkit` is behind its feature. This self dev-dependency
+# is what turns it on for them; it costs one extra build of this library and
+# is the only way to have a feature-gated testkit its own tests can use.
+oximux-auto-update = { path = ".", features = ["testkit"] }

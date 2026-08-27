@@ -113,12 +113,18 @@ second copy that can silently disagree about `oximux-screen-gate.exe`.
 Three choices in it are worth the words:
 
 **Per-user, into `%LOCALAPPDATA%\Programs\OxiMux`** (`PrivilegesRequired=lowest`,
-with no override offered). Not modesty — `crates/auto-update` has no Windows
-pipeline yet, and when it grows one it has to replace `oximux.exe` and its
-siblings in place. A directory it can write unelevated is the only shape that
-works without shipping an elevated helper service purely to copy files. Machine
-scope would buy a UAC prompt on every upgrade and nothing else, because every
-writable path is under `%LOCALAPPDATA%` already (`apps/desktop/src/app_paths.rs`).
+with no override offered). Not modesty — `crates/auto-update` replaces
+`oximux.exe` and its siblings in this directory at quit
+(`crates/auto-update/src/windows/`), and a directory it can write unelevated is
+the only shape that works without shipping an elevated helper service purely to
+copy files. Machine scope would buy a UAC prompt on every upgrade and nothing
+else, because every writable path is under `%LOCALAPPDATA%` already
+(`apps/desktop/src/app_paths.rs`).
+
+The updater write-probes this directory at boot and reports
+`UnsupportedReason::RootNotWritable` if it cannot write there, so an install
+someone moved into `Program Files` by hand turns updates *off* and says so in
+Settings → About, rather than failing halfway through a swap.
 
 **`CloseApplications=yes`.** The relay daemon outlives the app on purpose, so an
 upgrade that only looked for `oximux.exe` would still find the directory busy:

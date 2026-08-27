@@ -13,7 +13,7 @@
 //! Nothing here reaches the network or the filesystem, which is what makes all
 //! three testable against hand-made tampering.
 
-use oximux_auto_update::Version;
+use crate::Version;
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,7 +125,7 @@ pub fn verify_is_upgrade(offered: &str, running: &str) -> Result<Version, Verify
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::update::testkit::MinisignKeypair;
+    use crate::release::testkit::MinisignKeypair;
 
     #[test]
     fn a_signature_from_the_release_key_verifies() {

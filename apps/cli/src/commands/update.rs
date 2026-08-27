@@ -25,7 +25,7 @@ pub fn run(check_only: bool) -> Result<(Value, String), Failure> {
 
     if check_only {
         let manifest = update::fetch_verified_manifest(&fetcher, key)
-            .map_err(update::UpdateError::into_failure)?;
+            .map_err(update::into_failure)?;
         let newer = update::verify::verify_is_upgrade(&manifest.version, current).is_ok();
         let has_build = manifest.targets.contains_key(build_info::TARGET);
         let data = json!({
@@ -56,9 +56,9 @@ pub fn run(check_only: bool) -> Result<(Value, String), Failure> {
 
     // Resolved before the network so "you installed this with Homebrew" comes
     // back immediately rather than after two downloads.
-    let install = Install::discover().map_err(update::UpdateError::into_failure)?;
+    let install = Install::discover().map_err(update::into_failure)?;
     let applied = update::apply(&fetcher, key, current, build_info::TARGET, &install)
-        .map_err(update::UpdateError::into_failure)?;
+        .map_err(update::into_failure)?;
 
     let data = json!({
         "updated": true,

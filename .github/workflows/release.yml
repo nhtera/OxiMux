@@ -316,6 +316,23 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed with exit code $LASTEXITCODE" }
           Write-Host "uploaded $($zip.Name) and $($setup.Name) to $tag"
 
+      # The zip again, this time for the manifest job to hash and sign. The
+      # in-app updater downloads exactly this file and refuses it unless its
+      # sha256 matches what the signed manifest says — the installer .exe is
+      # for humans, the zip is for the updater, and only the zip needs to be
+      # described in the manifest.
+      #
+      # Uploaded as an actions artifact rather than read back off the release,
+      # because the release is still a draft at this point and a draft's assets
+      # are not downloadable.
+      - name: Upload the app payload for the manifest job
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-x86_64-pc-windows-msvc
+          path: dist/OxiMux-*-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 1
+
   # ---------------------------------------------------------------------------
   # The `oximux` CLI, for every platform it runs on.
   #
@@ -546,7 +563,11 @@ jobs:
     # archives, signs a JSON document, and uploads. Moving it forward costs
     # nothing and is the only way to get the signing tool from the distro.
     runs-on: ubuntu-24.04
-    needs: release-cli
+    # Also the Windows job, whose app payload the desktop updater verifies
+    # against this manifest. A manifest published without it would tell every
+    # Windows user that their platform has no app build — see `app_for` in
+    # crates/auto-update/src/release/manifest.rs.
+    needs: [release-cli, release-windows]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -556,6 +577,13 @@ jobs:
         with:
           pattern: cli-*
           path: incoming
+          merge-multiple: true
+
+      - name: Download every desktop app payload
+        uses: actions/download-artifact@v4
+        with:
+          pattern: app-*
+          path: incoming-apps
           merge-multiple: true
 
       - name: Install minisign
@@ -608,10 +636,58 @@ jobs:
             exit 1
           fi
 
+          # The desktop app payloads, in their own map. A second map rather
+          # than more entries in `targets` because the two describe different
+          # programs that share a triple: the CLI's x86_64-pc-windows-msvc
+          # archive holds two binaries, the app's holds a whole install
+          # directory, and one map keyed by triple could carry only one.
+          #
+          # The triple is not derivable from the app's file name (which reads
+          # `windows-x64`, not a triple), so unlike the CLI loop above this one
+          # maps names to triples explicitly. A new platform adds a line here.
+          apps='{}'
+          declare -A APP_TRIPLE=(
+            ["OxiMux-${VERSION}-windows-x64.zip"]="x86_64-pc-windows-msvc"
+          )
+          for name in "${!APP_TRIPLE[@]}"; do
+            payload="incoming-apps/${name}"
+            if [[ ! -f "$payload" ]]; then
+              # Fatal, not a skip. This job `needs: release-windows`, and that
+              # job's upload is `if-no-files-found: error` — so the artifact
+              # exists and only its *name* can have drifted from what
+              # bundle-windows.ps1 writes. Skipping would publish a manifest
+              # with no app payload, and every Windows client would go on
+              # reporting "no app build for your platform" with nothing in the
+              # release notes to explain why. Renaming the zip is therefore a
+              # red release, exactly like renaming the DMG (docs/deployment-guide.md).
+              echo "expected ${name} in the app payloads but it is not there." >&2
+              echo "The Windows job ran, so this means the zip's name changed:" >&2
+              echo "reconcile scripts/bundle-windows.ps1 with APP_TRIPLE above." >&2
+              ls -la incoming-apps/ >&2 || true
+              exit 1
+            fi
+            triple="${APP_TRIPLE[$name]}"
+            sha="$(sha256sum "$payload" | awk '{print $1}')"
+            size="$(stat -c%s "$payload")"
+            apps="$(jq -c --arg t "$triple" --arg a "$name" \
+                          --argjson s "$size" --arg h "$sha" \
+                       '.[$t] = {archive: $a, size: $s, sha256: $h}' <<<"$apps")"
+            echo "  app ${triple}  ${sha}  ${size} bytes"
+          done
+          # An empty map is still a valid manifest — macOS updates through its
+          # own DMG feed and needs nothing here — but with the check above it
+          # can only mean APP_TRIPLE was emptied deliberately.
+
           # Compact, single line: the POSIX installer reads it with awk, and
           # the Rust parser does not care either way.
-          jq -cn --arg v "$VERSION" --argjson t "$targets" \
-            '{schemaVersion: 1, version: $v, channel: "stable", targets: $t}' \
+          #
+          # `apps` is additive to schema 1, not a bump: a v1 parser ignores a
+          # field it does not know, and bumping would strand every already-
+          # released client on "install a newer oximux to update further" over
+          # a field that changes nothing about how the CLI verifies its archive.
+          jq -cn --arg v "$VERSION" --argjson t "$targets" --argjson a "$apps" \
+            '{schemaVersion: 1, version: $v, channel: "stable", targets: $t}
+             + (if ($a | length) > 0 then {apps: $a} else {} end)' \
             > manifest.json
           echo "manifest: $(cat manifest.json)"
 

@@ -4,6 +4,35 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-08-27 — About + Check for Updates in the menu, and Windows updates itself
+
+- **The menus both grew what they were missing.** macOS gets a
+  "Check for Updates…" item under About and a Help menu (Documentation, Report
+  an Issue). The Windows `⋯` title-bar menu gets a `Help ▸` submenu carrying
+  the same four entries. "About OxiMux" now opens Settings → About on *both*
+  platforms rather than AppKit's standard About panel — that panel can show a
+  version and an icon and nothing else, and the question people open About to
+  answer is usually "what am I running, and is there a newer one".
+- **Windows self-update, end to end.** Background check → verified payload
+  staged beside the install → per-file swap at quit → backups swept at the next
+  launch. Windows refuses to overwrite a mapped image, so the swap is
+  move-aside/move-in, all files or none, and a quit killed between its two
+  passes is repaired at boot (`restore_or_sweep_backups`) instead of having its
+  only surviving copy deleted.
+- **One trust chain, two consumers.** The manifest, its minisign signature, the
+  GitHub host allow-list, and the swap moved out of `apps/cli/src/update/` into
+  `crates/auto-update/src/release/`, shared by `oximux update` and the desktop
+  app. The Windows artifacts are not Authenticode-signed, so there is no
+  publisher identity to pin the way macOS pins a Developer ID; the anchor is the
+  signed `manifest.json` verified against `packaging/release-pubkey.txt`, which a
+  compromised publish token cannot reach. `docs/system-architecture.md` →
+  "Trust anchor, Windows" states plainly what that does and does not buy.
+- **The release manifest gained an `apps` map** (target triple → desktop
+  payload), additive to schema 1 so every already-released client keeps
+  updating. `release.yml`'s manifest job now waits on the Windows build too.
+- `apps/desktop/src/updater.rs` contains no `cfg` at all: the three verbs that
+  differ per platform sit behind one signature each in `crates/auto-update`.
+
 ### 2026-08-26 — Thinking visibility moves into the composer footer (`feat/omp-agent-integration`)
 
 - The floating "Thinking: auto" pill that hovered over the transcript is gone.

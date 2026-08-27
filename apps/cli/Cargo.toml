@@ -107,12 +107,11 @@ oximux-job-object = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 # Mint real minisign signatures in tests. The verifier is a third-party crate,
-# so fixtures it produced itself would prove nothing — these build the wire
-# format `minisign -S` writes (prehashed Blake2b-512, plus the second
-# signature over the trusted comment) from the other side.
-base64 = { workspace = true }
-blake2 = { workspace = true }
-ed25519-dalek = { workspace = true }
+# so fixtures it produced itself would prove nothing — the testkit builds the
+# wire format `minisign -S` writes (prehashed Blake2b-512, plus the second
+# signature over the trusted comment) from the other side. It lives beside the
+# verifier it exercises, and is a feature so a shipped binary never carries it.
+oximux-auto-update = { workspace = true, features = ["testkit"] }
 
 # The agent-spawn suite's Windows arm resolves Git-for-Windows' `sh` to run the
 # fake-agent fixture; unix reaches the same script through a shebang and needs

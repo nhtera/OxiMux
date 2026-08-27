@@ -38,9 +38,10 @@ pub mod escape_tap;
 pub mod login_path;
 pub mod menu;
 pub mod mic_permission;
-// Waits out the old pid in a detached `sh`, then `open -n`s the bundle. Paired
-// with the macOS updater's quit-time swap, and macOS-shaped throughout.
-#[cfg(target_os = "macos")]
+// Waits out the old pid in a detached helper, then relaunches. Paired with the
+// updater's quit-time swap on both platforms it applies to; the module holds
+// one implementation per platform because the waiting primitive differs.
+#[cfg(any(target_os = "macos", windows))]
 pub mod relaunch;
 #[cfg(any(target_os = "macos", windows))]
 pub mod screen_control_indicator;

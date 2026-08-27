@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::testkit::MinisignKeypair;
+use oximux_auto_update::release::testkit::MinisignKeypair;
 use super::*;
 
 const TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -199,7 +199,7 @@ fn a_build_with_no_release_key_never_reaches_the_network() {
 
     assert!(matches!(err, UpdateError::Verify(verify::VerifyError::NoTrustRoot)), "{err}");
     assert!(release.fetcher.asked.borrow().is_empty(), "no request may be made");
-    assert!(err.into_failure().next_steps.iter().any(|s| s.contains("install-cli.sh")));
+    assert!(into_failure(err).next_steps.iter().any(|s| s.contains("install-cli.sh")));
 }
 
 /// A platform the release skipped must not download anything, and must say
@@ -230,7 +230,7 @@ fn a_homebrew_install_is_told_to_use_brew() {
     let err = Install::at(Path::new("/opt/homebrew/Cellar/oximux/0.1.6/bin/oximux"))
         .expect_err("must refuse");
     assert!(matches!(err, UpdateError::ManagedInstall { manager: "Homebrew", .. }), "{err}");
-    assert!(err.into_failure().next_steps.iter().any(|s| s.contains("brew upgrade")));
+    assert!(into_failure(err).next_steps.iter().any(|s| s.contains("brew upgrade")));
 }
 
 #[test]
@@ -248,9 +248,10 @@ fn a_verification_failure_is_not_classified_as_unreachable() {
     let install = installed(dir.path());
     let attacker = MinisignKeypair::generate();
     let release = Release::build("9.9.9", Some(&attacker), false);
-    let failure = apply(&release.fetcher, Some(&release.public_key), RUNNING, TARGET, &install)
-        .expect_err("must refuse")
-        .into_failure();
+    let failure = into_failure(
+        apply(&release.fetcher, Some(&release.public_key), RUNNING, TARGET, &install)
+            .expect_err("must refuse"),
+    );
 
     assert_eq!(failure.code, "untrusted");
     assert_eq!(failure.exit, exit::ERROR, "not exit 3 — retrying will not help");

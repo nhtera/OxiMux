@@ -20,26 +20,43 @@
 //!
 //! The state machine, the release feed, and version comparison are plain data
 //! work and compile everywhere. Everything that touches the *shape of an
-//! install* — `.app` bundles, DMG mounting, codesign pinning, the same-volume
-//! exchange — is macOS-only and gated as such. Windows gets its own staging and
-//! trust path (versioned directories, Authenticode) built on the same neutral
-//! core; until then a Windows build carries the types but not the pipeline.
+//! install* is per-platform, because the two shapes have nothing in common: a
+//! macOS install is one `.app` bundle delivered as a DMG and pinned to a
+//! Developer ID signature; a Windows install is a directory of loose files
+//! delivered as a zip and anchored to the signed release manifest. See
+//! [`windows`] for the full comparison and why the trust roots differ.
+//!
+//! What both sides share — the manifest, its minisign signature, the download
+//! host allow-list, the all-or-nothing swap — lives in [`release`], once, and
+//! is shared with the CLI's `oximux update` rather than reimplemented per
+//! consumer.
+//!
+//! The two platform modules present the same three entry points, so the host
+//! app drives one code path: `eligibility` (is this install updatable),
+//! `pipeline::run` (stage a verified payload), and `staging::apply_pending`
+//! (swap it in at quit).
 
 pub mod bundle;
 pub mod feed;
 #[cfg(target_os = "macos")]
 pub mod pipeline;
+pub mod release;
 #[cfg(target_os = "macos")]
 pub mod staging;
 pub mod version;
+#[cfg(target_os = "windows")]
+pub mod windows;
 
-#[cfg(target_os = "macos")]
+// Used only by the pipeline machinery below, all of which is gated to the two
+// platforms that have one — ungated, these are unused-import errors on the
+// Linux CI gates, which build this crate through the CLI with `-D warnings`.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::path::PathBuf;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::sync::{mpsc, Arc};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::thread::JoinHandle;
 
 pub use bundle::UnsupportedReason;
@@ -50,6 +67,16 @@ pub use oximux_macos_trust::{DiskShortfall, SignaturePolicy, TrustError};
 #[cfg(target_os = "macos")]
 pub use staging::{boot_sweep, PendingUpdate};
 pub use version::Version;
+#[cfg(target_os = "windows")]
+pub use windows::{boot_sweep, eligibility, staging, InstalledApp, PendingUpdate};
+
+/// Whether this build has a self-update pipeline at all.
+///
+/// macOS and Windows do; a Linux desktop build carries the types (so the
+/// settings pane and the menu compile everywhere) but nothing to run, and says
+/// so through [`UnsupportedReason::NotABundle`] rather than by hiding the
+/// controls — a missing row explains nothing.
+pub const SUPPORTED: bool = cfg!(any(target_os = "macos", target_os = "windows"));
 
 /// Who asked for this check. Background failures stay quiet; a user who
 /// clicked "Check for updates" gets told what went wrong.
@@ -147,18 +174,37 @@ pub enum UpdateError {
 
     #[error("cancelled")]
     Cancelled,
+
+    /// Anything the shared signed-release machinery refused: a bad signature,
+    /// a digest that did not match, an archive that would have written outside
+    /// its staging directory.
+    ///
+    /// Transparent rather than re-worded per variant. Those errors are already
+    /// written to be read by a user — "the release manifest is not signed by
+    /// the OxiMux release key" says the whole thing — and a second layer of
+    /// paraphrase is how the specific one gets lost.
+    #[error(transparent)]
+    Release(#[from] release::ReleaseError),
 }
 
 /// Everything a pipeline run needs, resolved once by the host app.
+///
+/// `app` is the one per-platform field: a `.app` bundle plus its codesign pin
+/// on macOS, an install directory on Windows. Everything else is the same
+/// question asked of both — what version is running, where may scratch files
+/// go, and where is the record of what is staged.
 #[derive(Debug, Clone)]
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub struct UpdaterConfig {
     pub current_version: Version,
-    /// Captured at boot — see [`bundle::InstalledApp`] on why never later.
+    /// Captured at boot, never re-derived. Both platforms depend on that for
+    /// the same reason: after a staged update lands, the install path holds
+    /// different files, and an anchor read at quit would describe the very
+    /// thing it is supposed to be checking.
     pub app: InstalledApp,
-    /// Scratch space for DMGs and mountpoints (a cache directory).
+    /// Scratch space for downloads (a cache directory).
     pub cache_dir: PathBuf,
-    /// Where the pending-update manifest lives (app data directory).
+    /// Where the pending-update record lives (app data directory).
     pub manifest_path: PathBuf,
 }
 
@@ -166,14 +212,14 @@ pub struct UpdaterConfig {
 /// than a status read: the 6h ticker firing while a slow download is still in
 /// flight must be rejected here, atomically — two pipelines would race the
 /// same staging area.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 static CHECKING: AtomicBool = AtomicBool::new(false);
 
 /// Releases the process-wide lock even if the pipeline panics.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 struct RunGuard;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl Drop for RunGuard {
     fn drop(&mut self) {
         CHECKING.store(false, Ordering::SeqCst);
@@ -182,11 +228,19 @@ impl Drop for RunGuard {
 
 /// What a caller holds while a check runs: the status stream to render, and
 /// the join handle whose final status is authoritative.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub type RunningCheck = (mpsc::Receiver<UpdateStatus>, JoinHandle<UpdateStatus>);
 
-/// Start a check on a dedicated thread, or refuse if one is in flight.
+/// The platform's staging pipeline. One name so [`spawn_check`] — the
+/// threading, the single-flight lock, the status plumbing, all of it identical
+/// — does not have to be written twice around the one call that differs.
 #[cfg(target_os = "macos")]
+use crate::pipeline::run as run_pipeline;
+#[cfg(target_os = "windows")]
+use crate::windows::pipeline::run as run_pipeline;
+
+/// Start a check on a dedicated thread, or refuse if one is in flight.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn spawn_check(
     config: UpdaterConfig,
     trigger: CheckTrigger,
@@ -207,7 +261,7 @@ pub fn spawn_check(
             let emit = |status: UpdateStatus| {
                 let _ = tx.send(status);
             };
-            let terminal = match pipeline::run(&config, trigger, &cancel, &emit) {
+            let terminal = match run_pipeline(&config, trigger, &cancel, &emit) {
                 Ok(status) => status,
                 Err(UpdateError::Cancelled) => UpdateStatus::Idle,
                 Err(err) => UpdateStatus::Failed {
@@ -221,6 +275,83 @@ pub fn spawn_check(
         .expect("spawn update-check thread");
 
     Ok((rx, handle))
+}
+
+// --- The three per-platform verbs, behind one signature each ----------------
+//
+// The host app's updater wiring — the status global, the periodic check, the
+// quit hook — is identical on both platforms and should read that way. These
+// three wrappers are where the platforms stop being the same, so that the file
+// driving them contains no `cfg` at all.
+
+/// Boot housekeeping: repair whatever a previous run left half-done, then throw
+/// away what nothing references.
+///
+/// Returns a status worth showing the user, which today only macOS ever
+/// produces — a bundle whose swap never confirmed cannot be repaired from
+/// inside the process that *is* that bundle, so it is reported instead. The
+/// Windows swap is per-file with a rollback, and its own interrupted state is
+/// repairable, so it repairs it and returns nothing.
+///
+/// Does subprocess work and directory walks; call it off the UI thread.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn boot_housekeeping(config: &UpdaterConfig, sentinel: Option<&std::path::Path>) -> Option<UpdateStatus> {
+    #[cfg(target_os = "macos")]
+    {
+        let interrupted = sentinel.and_then(|sentinel| {
+            staging::recover_interrupted_swap(config, sentinel)
+                .err()
+                .map(|err| {
+                    tracing::error!(%err, "installed bundle failed verification after an interrupted update");
+                    UpdateStatus::Failed {
+                        error: "an update was interrupted — reinstall to be safe".into(),
+                        // Manual: this is not a check that quietly failed, it is
+                        // a statement about the bundle running right now.
+                        trigger: CheckTrigger::Manual,
+                    }
+                })
+        });
+        staging::boot_sweep(&config.cache_dir, &config.app.bundle_root, &config.manifest_path);
+        interrupted
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = sentinel;
+        staging::boot_sweep(&config.app.install_dir, &config.manifest_path);
+        None
+    }
+}
+
+/// Apply a staged update. Call from the quit path only — never while the app is
+/// running, for the reasons in each platform's staging module.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn apply_pending_update(
+    config: &UpdaterConfig,
+    sentinel: Option<&std::path::Path>,
+) -> staging::SwapOutcome {
+    #[cfg(target_os = "macos")]
+    {
+        staging::apply_pending(config, sentinel)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = sentinel;
+        staging::apply_pending(config, &config.manifest_path)
+    }
+}
+
+/// What to relaunch to come back on the new version: the `.app` bundle on
+/// macOS, the installed executable on Windows.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn relaunch_target(app: &InstalledApp) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        app.bundle_root.clone()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        app.install_dir.join(windows::install::APP_EXE)
+    }
 }
 
 #[cfg(test)]
@@ -243,20 +374,13 @@ mod tests {
         .is_terminal());
     }
 
-    // The single-flight lock guards the macOS pipeline, and every type this
-    // needs to build a config — the bundle, the codesign pin — describes a
-    // `.app`. Windows gets its own staging path; when it lands, this test's
-    // counterpart goes with it.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_second_spawn_while_one_runs_is_rejected() {
-        // Claim the lock by hand to simulate an in-flight check without any
-        // network: the CAS must refuse, not queue.
-        assert!(CHECKING
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok());
-        let config = UpdaterConfig {
+    /// A config that names nothing real. Only the single-flight test uses it,
+    /// and that test refuses before the pipeline ever reads a field.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn unreachable_config() -> UpdaterConfig {
+        UpdaterConfig {
             current_version: Version::new(0, 1, 0),
+            #[cfg(target_os = "macos")]
             app: InstalledApp {
                 bundle_root: PathBuf::from("/Applications/OxiMux.app"),
                 pin: SignaturePolicy {
@@ -264,16 +388,41 @@ mod tests {
                     team_id: "TEAM".into(),
                 },
             },
+            #[cfg(target_os = "windows")]
+            app: InstalledApp {
+                install_dir: PathBuf::from(r"C:\nowhere\OxiMux"),
+            },
             cache_dir: std::env::temp_dir(),
             manifest_path: std::env::temp_dir().join("never-written.json"),
-        };
+        }
+    }
+
+    /// The 6-hour ticker firing while a slow download is still in flight must
+    /// be rejected atomically, not queued — two pipelines would race the same
+    /// staging area. The lock is one `static` shared by both platforms, so this
+    /// runs on both.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn a_second_spawn_while_one_runs_is_rejected() {
+        // Claim the lock by hand to simulate an in-flight check without any
+        // network: the CAS must refuse, not queue.
+        assert!(CHECKING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok());
         let err = spawn_check(
-            config,
+            unreachable_config(),
             CheckTrigger::Background,
             Arc::new(AtomicBool::new(false)),
         )
         .expect_err("must refuse");
         assert!(matches!(err, UpdateError::AlreadyRunning), "got {err:?}");
         CHECKING.store(false, Ordering::SeqCst);
+    }
+
+    /// Both platforms have a pipeline now; a build that reports otherwise would
+    /// hide the update controls on a platform that can use them.
+    #[test]
+    fn the_two_desktop_platforms_report_themselves_as_updatable() {
+        assert_eq!(SUPPORTED, cfg!(any(target_os = "macos", target_os = "windows")));
     }
 }

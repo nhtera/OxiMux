@@ -25,7 +25,8 @@ use gpui_component::{
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::actions::{
-    NewWindow, OpenQuickOpen, OpenSettings, ToggleLeftSidebar, ToggleRightSidebar, ToggleWhatsNew,
+    CheckForUpdates, NewWindow, OpenAbout, OpenQuickOpen, OpenSettings, ToggleLeftSidebar,
+    ToggleRightSidebar, ToggleWhatsNew,
 };
 use crate::shell::chrome::window_controls::WindowsWindowControls;
 
@@ -234,9 +235,17 @@ fn left_chrome_cluster(
 }
 
 /// Title-bar `⋯` application menu (Windows only). Hosts the items macOS
-/// serves from its native menu bar: New Window, Settings, Quit. Edit-menu
-/// items (undo/copy/paste) are deliberately absent — on Windows those are
-/// plain keymap bindings with no OS menu semantics to mirror.
+/// serves from its native menu bar.
+///
+/// The shape mirrors the macOS menu bar item for item, flattened by one level:
+/// what the menu bar spreads across an app menu and a Help menu becomes a flat
+/// list plus one `Help ▸` submenu. Edit-menu items (undo/copy/paste) are
+/// deliberately absent — on Windows those are plain keymap bindings with no OS
+/// menu semantics to mirror, and a menu row that only restates a chord is a row
+/// that makes the useful ones harder to find.
+///
+/// About and Check for Updates dispatch the same actions the macOS menu does,
+/// so the two platforms cannot drift on what those words mean.
 ///
 /// The occluding wrapper keeps the button clickable inside the strip's
 /// `WindowControlArea::Drag` region — see the note in [`chrome_strip`].
@@ -249,7 +258,7 @@ fn app_menu_button() -> impl IntoElement {
             .tooltip("Menu")
             .dropdown_menu_with_anchor(
                 Anchor::TopLeft,
-                |menu: PopupMenu, _window: &mut Window, _cx: &mut gpui::Context<'_, PopupMenu>| {
+                |menu: PopupMenu, window: &mut Window, cx: &mut gpui::Context<'_, PopupMenu>| {
                     menu.min_w(px(200.0))
                         .item(PopupMenuItem::new("New Window").on_click(
                             |_, window: &mut Window, cx: &mut gpui::App| {
@@ -261,6 +270,32 @@ fn app_menu_button() -> impl IntoElement {
                                 window.dispatch_action(Box::new(OpenSettings), cx);
                             },
                         ))
+                        .separator()
+                        .submenu("Help", window, cx, |help, _window, _cx| {
+                            help.min_w(px(200.0))
+                                // `link` opens the URL itself and marks the row
+                                // as leaving the app, which is what these two
+                                // do and what About/Check for Updates do not.
+                                .item(PopupMenuItem::link(
+                                    "OxiMux Documentation",
+                                    crate::menu::DOCS_URL,
+                                ))
+                                .item(PopupMenuItem::link(
+                                    "Report an Issue",
+                                    crate::menu::ISSUES_URL,
+                                ))
+                                .separator()
+                                .item(PopupMenuItem::new("About OxiMux").on_click(
+                                    |_, window: &mut Window, cx: &mut gpui::App| {
+                                        window.dispatch_action(Box::new(OpenAbout), cx);
+                                    },
+                                ))
+                                .item(PopupMenuItem::new("Check for Updates…").on_click(
+                                    |_, window: &mut Window, cx: &mut gpui::App| {
+                                        window.dispatch_action(Box::new(CheckForUpdates), cx);
+                                    },
+                                ))
+                        })
                         .separator()
                         .item(PopupMenuItem::new("Quit OxiMux").on_click(
                             |_, window: &mut Window, cx: &mut gpui::App| {

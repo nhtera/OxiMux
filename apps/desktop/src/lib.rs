@@ -15,9 +15,11 @@ pub mod remote_control;
 pub mod scheduler;
 pub mod shell;
 pub mod state;
-// Staging and swapping a `.app` bundle, verified against a codesign pin.
-// Windows gets a versioned-directory updater of its own later.
-#[cfg(target_os = "macos")]
+// Staging and swapping an install, verified before it is trusted: a `.app`
+// bundle against a codesign pin on macOS, an install directory against the
+// minisign-signed release manifest on Windows. The wiring here is one code
+// path; see the module header.
+#[cfg(any(target_os = "macos", windows))]
 pub mod updater;
 pub mod workspace_root;
 

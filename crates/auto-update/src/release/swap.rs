@@ -71,35 +71,33 @@ impl std::fmt::Display for SwapError {
 }
 
 impl SwapError {
-    /// What to tell the user. A permission failure on the install directory is
-    /// the overwhelmingly common case and has a specific answer.
-    pub fn next_steps(&self) -> Vec<String> {
-        // The failing path and reason are bound first rather than matched in
-        // one or-pattern, because `Io` is unix-only and an or-pattern cannot
-        // carry a `#[cfg]` on just one of its alternatives.
+    /// The directory a failure was about, and why it failed — the two facts
+    /// every caller's advice is built from.
+    ///
+    /// The wording itself deliberately is not here. "Reinstall instead: curl …
+    /// install-cli.sh" is right for the CLI and nonsense for the desktop app,
+    /// which shares this swap but not that remedy, so each renders its own
+    /// guidance from these two facts.
+    ///
+    /// `None` for the inconsistent case, which is not about one directory: the
+    /// backups named in the error are what a human has to act on.
+    pub fn context(&self) -> Option<(&Path, &str)> {
+        // Bound in a match rather than an or-pattern because `Io` is unix-only
+        // and an or-pattern cannot carry a `#[cfg]` on just one alternative.
         let (path, detail) = match self {
-            Self::Inconsistent { .. } => {
-                return vec![
-                    "Restore the binaries listed above by renaming them back, then reinstall."
-                        .to_string(),
-                    format!("Or reinstall from scratch: {}", crate::update::INSTALL_HINT),
-                ];
-            }
+            Self::Inconsistent { .. } => return None,
             Self::RolledBack { path, detail } => (path, detail),
             #[cfg(unix)]
             Self::Io { path, detail } => (path, detail),
         };
-        let mut steps = Vec::new();
-        if detail.to_lowercase().contains("permission") {
-            steps.push(format!(
-                "You do not have write access to {}. Reinstall to a directory you own \
-                 (the installer defaults to ~/.local/bin), or update with the same \
-                 account that installed it.",
-                path.parent().unwrap_or(path).display()
-            ));
-        }
-        steps.push(format!("Reinstall instead: {}", crate::update::INSTALL_HINT));
-        steps
+        Some((path.parent().unwrap_or(path), detail.as_str()))
+    }
+
+    /// Whether the failure was the install directory refusing to be written —
+    /// by far the most common one, and the only one with a specific answer.
+    pub fn is_permission_denied(&self) -> bool {
+        self.context()
+            .is_some_and(|(_, detail)| detail.to_lowercase().contains("permission"))
     }
 }
 
@@ -215,24 +213,66 @@ fn make_executable(_path: &Path) -> Result<(), SwapError> {
     Ok(())
 }
 
-/// Delete backups a previous update could not remove because the binaries were
+/// Delete backups a previous update could not remove because the files were
 /// still running. Best-effort and silent: a read-only install directory is a
 /// reason to leave the file, not to fail a command the user actually ran.
 ///
 /// Call once at start. On unix it finds nothing (pass 3 already deleted them),
 /// so it is Windows' completion of the swap rather than a shared step.
-pub fn sweep_backups(install_dir: &Path) {
-    let Ok(entries) = fs::read_dir(install_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let ours = name.starts_with("oximux") && name.contains(BACKUP_INFIX);
-        if ours {
-            let _ = fs::remove_file(entry.path());
+///
+/// `ours` decides which names may be deleted, and there is no default: the two
+/// callers own very different directories. The CLI shares `~/.local/bin` with
+/// every other tool on the machine and must claim only names it installed; the
+/// desktop app owns its install directory outright and claims all of them. A
+/// built-in answer would be wrong for one of them, silently.
+pub fn sweep_backups(install_dir: &Path, ours: impl Fn(&str) -> bool) {
+    for (backup, _) in backups_in(install_dir, ours) {
+        let _ = fs::remove_file(backup);
+    }
+}
+
+/// The same sweep, except that a backup whose original is *missing* is renamed
+/// back instead of deleted.
+///
+/// This is the repair for a swap that was killed between its two passes — the
+/// window where a file has been moved aside and its replacement has not yet
+/// landed. `swap_all` rolls that back itself when it merely fails, but it
+/// cannot roll back a process that no longer exists, and the plain sweep would
+/// then delete the only surviving copy of the file.
+///
+/// Not needed by the CLI, whose two binaries are replaced in a single call the
+/// user is watching; very much needed by the desktop app, which replaces a
+/// directory's worth of files during quit and can be killed at any point in it.
+pub fn restore_or_sweep_backups(install_dir: &Path, ours: impl Fn(&str) -> bool) {
+    for (backup, original) in backups_in(install_dir, ours) {
+        if original.exists() {
+            let _ = fs::remove_file(backup);
+        } else {
+            let _ = fs::rename(&backup, &original);
         }
     }
+}
+
+/// Every `<name>.old-<hex>` in `dir` that `ours` claims, paired with the
+/// `<name>` it was moved aside from.
+fn backups_in(dir: &Path, ours: impl Fn(&str) -> bool) -> Vec<(PathBuf, PathBuf)> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let original = name.split(BACKUP_INFIX).next()?;
+            // `split` yields the whole string when the infix is absent, so the
+            // length check is what actually decides whether this is a backup.
+            if original.len() == name.len() || !ours(&name) {
+                return None;
+            }
+            Some((entry.path(), dir.join(original)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -350,16 +390,56 @@ mod tests {
             fs::write(path, "x").expect("write");
         }
 
-        sweep_backups(dir.path());
+        sweep_backups(dir.path(), |name| name.starts_with("oximux"));
 
         assert!(!ours.exists() && !relay.exists(), "our backups are swept");
         assert!(theirs.exists(), "another program's file must survive");
         assert!(live.exists(), "the installed binary must survive");
     }
 
+    /// The desktop app's filter. Its install directory holds `rg.exe` and
+    /// `onnxruntime.dll` beside the oximux binaries, so a name-prefix rule
+    /// would strand exactly the backups Windows most often cannot delete.
+    #[test]
+    fn a_caller_that_owns_the_whole_directory_sweeps_every_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dll = dir.path().join("onnxruntime.dll.old-deadbeef");
+        let live = dir.path().join("onnxruntime.dll");
+        for path in [&dll, &live] {
+            fs::write(path, "x").expect("write");
+        }
+
+        sweep_backups(dir.path(), |_| true);
+
+        assert!(!dll.exists(), "a non-oximux backup is still ours to sweep");
+        assert!(live.exists(), "the installed library must survive");
+    }
+
+    /// A swap killed between its two passes: the file was moved aside and its
+    /// replacement never landed. Deleting the backup here would destroy the
+    /// only copy — the install would be missing a DLL with nothing to restore.
+    #[test]
+    fn a_backup_whose_original_is_missing_is_put_back_not_deleted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let orphaned = dir.path().join("onnxruntime.dll.old-deadbeef");
+        let superseded = dir.path().join("oximux.exe.old-01020304");
+        let live = dir.path().join("oximux.exe");
+        for path in [&orphaned, &superseded, &live] {
+            fs::write(path, "x").expect("write");
+        }
+
+        restore_or_sweep_backups(dir.path(), |_| true);
+
+        assert!(!orphaned.exists(), "the orphaned backup is consumed");
+        assert!(dir.path().join("onnxruntime.dll").is_file(), "…by being renamed back");
+        assert!(!superseded.exists(), "a backup whose original is present is still swept");
+        assert!(live.is_file());
+    }
+
     #[test]
     fn the_sweep_is_silent_on_a_directory_that_is_not_there() {
-        sweep_backups(Path::new("/definitely/not/a/directory/here"));
+        sweep_backups(Path::new("/definitely/not/a/directory/here"), |_| true);
+        restore_or_sweep_backups(Path::new("/definitely/not/a/directory/here"), |_| true);
     }
 
     #[test]
@@ -393,8 +473,8 @@ mod tests {
         let Err(err) = outcome else {
             return;
         };
-        let steps = err.next_steps().join(" ");
-        assert!(steps.contains(&locked.display().to_string()), "{steps}");
-        assert!(steps.contains("~/.local/bin"), "{steps}");
+        assert!(err.is_permission_denied(), "{err}");
+        let (dir, _) = err.context().expect("a rolled-back swap names its directory");
+        assert_eq!(dir, locked, "the advice has to name the directory to fix");
     }
 }
