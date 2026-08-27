@@ -754,3 +754,287 @@ impl Focusable for SettingsModal {
 }
 
 impl EventEmitter<SettingsModalEvent> for SettingsModal {}
+
+#[cfg(test)]
+mod env_editor_tests {
+    //! Live-behaviour cover for the Agents pane's environment editor.
+    //!
+    //! These drive the real GPUI element tree and the real `InputState`, which
+    //! is the half plain unit tests cannot reach: a settings pane renders from
+    //! `&self` with no `Window`, so every selection change has to push text into
+    //! the input from a handler that has one. A regression there is invisible to
+    //! logic tests — the map is right and the box shows the previous profile.
+
+    use super::*;
+    use crate::notifier::null::NullNotifier;
+    use gpui::TestAppContext;
+    use oximux_settings::DEFAULT_PROFILE;
+
+    /// A modal mounted the way the real app mounts one: inside a
+    /// `gpui_component::Root`. Not a formality — `InputState` reaches for the
+    /// window's Root layer, so a window whose root view IS the modal panics in
+    /// `Root::update` before any assertion runs.
+    ///
+    /// Returns both handles because the window is what carries a `Window` into
+    /// a closure, and the modal is what the assertions are about.
+    fn modal(
+        cx: &mut TestAppContext,
+    ) -> (gpui::WindowHandle<gpui_component::Root>, Entity<SettingsModal>) {
+        cx.update(gpui_component::init);
+        let db = oximux_storage::open_memory().expect("in-memory db");
+        let repo = SettingsRepo::new(db.clone());
+        let schedules = oximux_agents::schedule::ScheduleStore::new(db.conn());
+        let built: std::cell::RefCell<Option<Entity<SettingsModal>>> =
+            std::cell::RefCell::new(None);
+        let window = cx.add_window(|window, cx| {
+            let m = cx.new(|cx| {
+                SettingsModal::new(
+                    Theme::default(),
+                    Density::default(),
+                    Typography::default(),
+                    Arc::new(AgentNotifySettings::default()),
+                    repo,
+                    Arc::new(NullNotifier),
+                    schedules,
+                    cx,
+                )
+            });
+            *built.borrow_mut() = Some(m.clone());
+            let any: gpui::AnyView = m.into();
+            gpui_component::Root::new(any, window, cx)
+        });
+        (window, built.into_inner().expect("modal built inside the Root"))
+    }
+
+    /// The editor's current text, as the user would see it.
+    fn editor_text(m: &SettingsModal, cx: &App) -> String {
+        m.env_input.as_ref().expect("env editor built").read(cx).value().to_string()
+    }
+
+    /// The Agents pane paints with the new card in it, through the window's
+    /// real draw cycle. A GPUI layout or borrow fault in the card is a runtime
+    /// panic that no `cargo check` and no logic test reports.
+    ///
+    /// Painted via `VisualTestContext` rather than by calling the pane's render
+    /// fn directly: an element built outside a frame keeps its `InputState`
+    /// handles registered with the window, and gpui's leak check then fires at
+    /// teardown for a card that rendered perfectly well.
+    #[gpui::test]
+    fn the_agents_pane_paints_with_the_environment_card(cx: &mut TestAppContext) {
+        let (w, m) = modal(cx);
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.open(window, cx);
+                m.selected = SettingsPane::Agents;
+                assert!(m.env_input.is_some(), "open() builds the env editor");
+                assert!(m.new_profile_input.is_some(), "open() builds the name field");
+                // Two profiles and a live env, so the card paints its full
+                // shape — both segmented rows populated, the editor non-empty —
+                // rather than the empty-state that would hide a layout fault.
+                m.env_agent = "claude-code";
+                m.agent_launch
+                    .entry_mut("claude-code")
+                    .env
+                    .insert("ANTHROPIC_BASE_URL".into(), "https://first/v1".into());
+                m.agent_launch
+                    .profile_entry_mut("claude-code", Some("proxy"))
+                    .env
+                    .insert("ANTHROPIC_BASE_URL".into(), "https://second/v1".into());
+                m.select_env_profile(Some("proxy".into()), window, cx);
+            });
+        })
+        .expect("open on the Agents pane");
+
+        let mut vcx = gpui::VisualTestContext::from_window(w.into(), cx);
+        vcx.simulate_resize(gpui::size(px(1100.0), px(800.0)));
+        vcx.run_until_parked();
+
+        // Reaching here means the pane laid out and painted. Close through the
+        // real path so the inputs are released before teardown.
+        w.update(&mut vcx.cx, |_root, _window, cx| {
+            m.update(cx, |m, cx| {
+                assert_eq!(m.env_profile.as_deref(), Some("proxy"), "selection survived paint");
+                m.close(cx);
+                assert!(m.env_input.is_none(), "close() drops the env editor");
+            });
+        })
+        .expect("close");
+    }
+
+    /// Switching profiles must move the TEXT, not just the selection. The bug
+    /// this pins: editing profile B while the box still shows A's env, so the
+    /// first keystroke rewrites B with A's content.
+    #[gpui::test]
+    fn switching_profile_swaps_the_editor_text(cx: &mut TestAppContext) {
+        let (w, m) = modal(cx);
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.open(window, cx);
+                m.env_agent = "claude-code";
+                m.agent_launch
+                    .entry_mut("claude-code")
+                    .env
+                    .insert("BASE".into(), "https://first/v1".into());
+                m.agent_launch
+                    .profile_entry_mut("claude-code", Some("proxy"))
+                    .env
+                    .insert("BASE".into(), "https://second/v1".into());
+
+                m.select_env_profile(None, window, cx);
+                assert_eq!(editor_text(m, cx), "BASE=https://first/v1", "default's env");
+
+                m.select_env_profile(Some("proxy".into()), window, cx);
+                assert_eq!(editor_text(m, cx), "BASE=https://second/v1", "profile's env");
+
+                m.select_env_profile(None, window, cx);
+                assert_eq!(editor_text(m, cx), "BASE=https://first/v1", "and back again");
+                m.close(cx);
+            });
+        })
+        .expect("profile switch");
+    }
+
+    /// Switching agent resets to that agent's `default`: a profile name is
+    /// per-adapter, so carrying "proxy" across would land on an unrelated (or
+    /// absent) profile of the new agent.
+    #[gpui::test]
+    fn switching_agent_resets_to_its_default_profile(cx: &mut TestAppContext) {
+        let (w, m) = modal(cx);
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.open(window, cx);
+                m.agent_launch.profile_entry_mut("claude-code", Some("proxy"));
+                m.agent_launch
+                    .entry_mut("codex")
+                    .env
+                    .insert("CODEX_HOST".into(), "h".into());
+                m.select_env_agent("claude-code", window, cx);
+                m.select_env_profile(Some("proxy".into()), window, cx);
+                assert_eq!(m.env_profile.as_deref(), Some("proxy"));
+
+                m.select_env_agent("codex", window, cx);
+                assert_eq!(m.env_profile, None, "profile resets with the agent");
+                assert_eq!(editor_text(m, cx), "CODEX_HOST=h", "editor shows the new agent");
+                m.close(cx);
+            });
+        })
+        .expect("agent switch");
+    }
+
+    /// Removing a profile falls back to `default` and must not carry the removed
+    /// profile's env onto the default entry via the flush-on-leave.
+    #[gpui::test]
+    fn removing_a_profile_falls_back_without_leaking_its_env(cx: &mut TestAppContext) {
+        let (w, m) = modal(cx);
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.open(window, cx);
+                m.env_agent = "claude-code";
+                m.agent_launch
+                    .entry_mut("claude-code")
+                    .env
+                    .insert("BASE".into(), "https://first/v1".into());
+                m.agent_launch
+                    .profile_entry_mut("claude-code", Some("proxy"))
+                    .env
+                    .insert("BASE".into(), "https://second/v1".into());
+                m.select_env_profile(Some("proxy".into()), window, cx);
+
+                m.remove_env_profile(window, cx);
+                assert_eq!(m.env_profile, None);
+                assert_eq!(
+                    m.agent_launch.profile_names("claude-code"),
+                    vec![DEFAULT_PROFILE]
+                );
+                // The default entry keeps ITS value — the removed profile's env
+                // must not have been flushed onto it on the way out.
+                assert_eq!(
+                    m.agent_launch.env_for("claude-code", None),
+                    vec![("BASE".to_string(), "https://first/v1".to_string())]
+                );
+                assert_eq!(editor_text(m, cx), "BASE=https://first/v1");
+                m.close(cx);
+            });
+        })
+        .expect("profile removal");
+    }
+
+    /// Typing parses into the working copy on every keystroke, so a close
+    /// without blur still has something to flush.
+    ///
+    /// Uses `insert` — the path a keystroke takes — not `set_value`, which
+    /// deliberately suppresses events (see the next test).
+    #[gpui::test]
+    fn typing_env_text_updates_the_working_copy(cx: &mut TestAppContext) {
+        let (w, m) = modal(cx);
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.open(window, cx);
+                m.env_agent = "claude-code";
+                let input = m.env_input.clone().expect("env editor built");
+                input.update(cx, |s, cx| {
+                    s.insert("ANTHROPIC_BASE_URL=https://typed/v1", window, cx)
+                });
+            });
+        })
+        .expect("type");
+        cx.run_until_parked();
+        w.update(cx, |_root, _window, cx| {
+            m.update(cx, |m, cx| {
+                assert_eq!(
+                    m.agent_launch.env_for("claude-code", None),
+                    vec![(
+                        "ANTHROPIC_BASE_URL".to_string(),
+                        "https://typed/v1".to_string()
+                    )],
+                    "keystrokes reach the working copy"
+                );
+                m.close(cx);
+            });
+        })
+        .expect("assert");
+    }
+
+    /// Re-seeding the editor on a profile switch must NOT be mistaken for the
+    /// user editing the newly-selected profile.
+    ///
+    /// `InputState::set_value` clears `emit_events` for exactly this reason, so
+    /// the `Change` subscription doesn't fire and immediately write the loaded
+    /// text back. If that ever changed, switching profiles would silently stamp
+    /// one profile's env onto another — this pins the assumption the selection
+    /// handlers are built on.
+    #[gpui::test]
+    fn reseeding_the_editor_does_not_write_back_as_an_edit(cx: &mut TestAppContext) {
+        let (w, m) = modal(cx);
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.open(window, cx);
+                m.env_agent = "claude-code";
+                m.agent_launch
+                    .profile_entry_mut("claude-code", Some("proxy"))
+                    .env
+                    .insert("ONLY_ON_PROXY".into(), "1".into());
+                // Land on proxy (editor now shows its env), then leave.
+                m.select_env_profile(Some("proxy".into()), window, cx);
+                m.select_env_profile(None, window, cx);
+            });
+        })
+        .expect("switch");
+        cx.run_until_parked();
+        w.update(cx, |_root, _window, cx| {
+            m.update(cx, |m, cx| {
+                assert!(
+                    m.agent_launch.env_for("claude-code", None).is_empty(),
+                    "the default entry must not have absorbed the profile's env"
+                );
+                assert_eq!(
+                    m.agent_launch.env_for("claude-code", Some("proxy")),
+                    vec![("ONLY_ON_PROXY".to_string(), "1".to_string())],
+                    "and the profile keeps its own"
+                );
+                m.close(cx);
+            });
+        })
+        .expect("assert");
+    }
+}

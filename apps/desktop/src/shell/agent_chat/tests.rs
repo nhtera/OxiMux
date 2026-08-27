@@ -2480,3 +2480,184 @@ fn a_dropped_path_outside_the_cwd_stays_absolute() {
         "/proj/b/x.rs"
     );
 }
+
+/// End-to-end cover for the explorer/Finder drop path, through the real
+/// composer rather than the string helper.
+///
+/// The bug class this pins is not arithmetic: it is a drop that lands, consumes
+/// the drag, and produces nothing — which is exactly what the explorer drag did
+/// before this handler existed, and what a non-image Finder drop did before the
+/// helper learned to insert paths. Only driving the real view catches a
+/// regression back to silence.
+#[gpui::test]
+fn dropping_a_source_file_puts_a_mention_in_the_composer(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| {
+        AgentChatView::with_connection_for_test(
+            std::sync::Arc::new(StubConnection::default()),
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            window,
+            cx,
+        )
+    });
+    window
+        .update(cx, |view, window, cx| {
+            view.cwd = std::path::PathBuf::from("/proj");
+
+            // Inside the cwd → relative, the same token the `@` overlay makes.
+            view.attach_dropped_paths(
+                vec![std::path::PathBuf::from("/proj/src/main.rs")],
+                window,
+                cx,
+            );
+            assert_eq!(
+                view.composer.read(cx).current_draft(cx),
+                "@src/main.rs ",
+                "a dropped source file must reach the prompt"
+            );
+
+            // A second drop appends rather than replacing.
+            view.attach_dropped_paths(
+                vec![std::path::PathBuf::from("/proj/README.md")],
+                window,
+                cx,
+            );
+            assert_eq!(
+                view.composer.read(cx).current_draft(cx),
+                "@src/main.rs @README.md ",
+                "a second drop appends"
+            );
+
+            // Outside the cwd → absolute, never a `../..` chain.
+            view.attach_dropped_paths(vec![std::path::PathBuf::from("/etc/hosts")], window, cx);
+            assert_eq!(
+                view.composer.read(cx).current_draft(cx),
+                "@src/main.rs @README.md @/etc/hosts ",
+                "an outside path stays absolute"
+            );
+        })
+        .expect("drop non-image files");
+}
+
+/// An image drop must NOT put its path in the prompt — it is staged as an
+/// attachment instead. The split is the whole point of the handler, and getting
+/// it backwards would send the agent a path where it expected to see a picture.
+#[gpui::test]
+fn dropping_an_image_does_not_write_its_path_into_the_prompt(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| {
+        AgentChatView::with_connection_for_test(
+            std::sync::Arc::new(StubConnection::default()),
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            window,
+            cx,
+        )
+    });
+    window
+        .update(cx, |view, window, cx| {
+            view.cwd = std::path::PathBuf::from("/proj");
+            view.attach_dropped_paths(
+                vec![
+                    std::path::PathBuf::from("/proj/shot.png"),
+                    std::path::PathBuf::from("/proj/src/main.rs"),
+                ],
+                window,
+                cx,
+            );
+            // Only the source file is a mention. The png routes to the image
+            // staging path (which reads the file on a background executor and
+            // stages nothing for a path that does not exist — irrelevant here;
+            // what matters is that it never becomes prompt text).
+            assert_eq!(
+                view.composer.read(cx).current_draft(cx),
+                "@src/main.rs ",
+                "an image path must not be written into the prompt"
+            );
+        })
+        .expect("drop a mixed selection");
+}
+
+/// A respawn must LAYER the EnvVar-auth credentials over the adapter's
+/// configured launch env, not replace it.
+///
+/// This pins a real defect. `respawn_spec` did `spec.env = env`, which was
+/// harmless while nothing else populated `spec.env` — and became silent
+/// breakage the moment launch env started riding on `ChatBackend`: an
+/// authenticated respawn would drop the configured base URL and reconnect to
+/// the default endpoint, with no error anywhere. The pill would say connected
+/// and the traffic would go to the wrong provider.
+#[gpui::test]
+fn a_respawn_layers_auth_env_over_the_configured_launch_env(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| {
+        AgentChatView::with_connection_for_test(
+            std::sync::Arc::new(StubConnection::default()),
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            window,
+            cx,
+        )
+    });
+    window
+        .update(cx, |view, _window, _cx| {
+            view.backend.env = vec![
+                ("ANTHROPIC_BASE_URL".into(), "https://proxy.internal/v1".into()),
+                ("HTTPS_PROXY".into(), "http://corp:3128".into()),
+            ];
+
+            // A plain respawn (model switch, Stop-then-send) carries the
+            // configured env and nothing else.
+            let plain = view.respawn_spec(Vec::new(), None);
+            assert_eq!(
+                plain.env,
+                vec![
+                    ("ANTHROPIC_BASE_URL".to_string(), "https://proxy.internal/v1".to_string()),
+                    ("HTTPS_PROXY".to_string(), "http://corp:3128".to_string()),
+                ],
+                "a respawn must carry the adapter's configured env"
+            );
+
+            // An EnvVar-auth respawn adds the typed credential and keeps the rest.
+            let authed = view.respawn_spec(
+                vec![("ANTHROPIC_API_KEY".into(), "sk-typed".into())],
+                Some("api-key".into()),
+            );
+            assert!(
+                authed.env.contains(&(
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    "https://proxy.internal/v1".to_string()
+                )),
+                "auth env must not wipe the configured base URL: {:?}",
+                authed.env
+            );
+            assert!(
+                authed
+                    .env
+                    .contains(&("ANTHROPIC_API_KEY".to_string(), "sk-typed".to_string())),
+                "the typed credential must reach the respawn"
+            );
+            assert_eq!(authed.auth_method.as_deref(), Some("api-key"));
+
+            // On a key collision the credential wins — it is applied last, and
+            // `Command::envs` takes the final value for a repeated key.
+            let collide = view.respawn_spec(
+                vec![("ANTHROPIC_BASE_URL".into(), "https://auth-supplied/v1".into())],
+                None,
+            );
+            let last = collide
+                .env
+                .iter()
+                .rfind(|(k, _)| k == "ANTHROPIC_BASE_URL")
+                .expect("base url present");
+            assert_eq!(
+                last.1, "https://auth-supplied/v1",
+                "the auth-supplied value must be the effective one"
+            );
+        })
+        .expect("respawn spec");
+}

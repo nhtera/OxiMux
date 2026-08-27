@@ -91,6 +91,11 @@ pub struct PerAgentLaunch {
     ///
     /// `BTreeMap` so TOML serialization is key-sorted and round-trips
     /// deterministically, matching [`AgentLaunchSettings::agents`].
+    ///
+    /// Skipped when empty: this file is documented as hand-editable, and every
+    /// agent otherwise grows a bare `[agents.<id>.env]` header the moment the
+    /// app rewrites it — noise in a file the user is invited to read.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
 }
 
@@ -312,6 +317,11 @@ pub struct AgentLaunchSettings {
     /// [`Self::agents`]. Absent for every config written before profiles
     /// existed, which is why it is a separate field rather than a change to
     /// `agents`: an old file loads with no migration and reports one profile.
+    ///
+    /// Skipped when empty for the same reason as [`PerAgentLaunch::env`] — a
+    /// config that has never defined a profile should not grow a `[profiles]`
+    /// header telling the user about a feature they did not use.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, Vec<NamedLaunchProfile>>,
 }
 
@@ -826,6 +836,25 @@ model = "opus"
         // Every pre-existing accessor answers exactly as before.
         assert_eq!(s.args_for("claude-code"), vec!["--dangerously-skip-permissions"]);
         assert_eq!(s.model_for("claude-code").as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn a_rewrite_adds_no_empty_env_or_profiles_headers() {
+        // `agent_launch.toml` is documented as hand-editable, so what the app
+        // writes back is user-facing. An agent with no env must not grow a bare
+        // `[agents.<id>.env]`, and a config with no profiles must not grow a
+        // `[profiles]` header advertising a feature it does not use.
+        let mut s = AgentLaunchSettings::default();
+        s.entry_mut("claude-code").model = "sonnet".into();
+        let text = s.to_toml_string();
+        assert!(!text.contains("[agents.claude-code.env]"), "empty env header:\n{text}");
+        assert!(!text.contains("[profiles]"), "empty profiles header:\n{text}");
+        // Still round-trips, and a NON-empty env is still written.
+        assert_eq!(AgentLaunchSettings::from_toml_str(&text).expect("reparse"), s);
+        s.entry_mut("claude-code").env.insert("K".into(), "v".into());
+        let text = s.to_toml_string();
+        assert!(text.contains("[agents.claude-code.env]"), "real env dropped:\n{text}");
+        assert_eq!(AgentLaunchSettings::from_toml_str(&text).expect("reparse"), s);
     }
 
     #[test]
