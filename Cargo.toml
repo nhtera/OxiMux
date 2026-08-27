@@ -38,6 +38,7 @@ members = [
     "crates/proc-ports",
     "crates/proc-tree",
     "crates/worktree-ops",
+    "crates/agent-hooks",
     "xtask",
 ]
 
@@ -103,6 +104,7 @@ oximux-single-instance = { path = "crates/single-instance" }
 oximux-remote-proto = { path = "crates/remote-proto" }
 oximux-remote-host = { path = "crates/remote-host" }
 oximux-worktree-ops = { path = "crates/worktree-ops" }
+oximux-agent-hooks  = { path = "crates/agent-hooks" }
 oximux-remote-session = { path = "crates/remote-session" }
 # `host` is opt-in rather than default so the mobile core cannot inherit the
 # desktop accept loop (and, through it, the PTY stack) by omission. Desktop

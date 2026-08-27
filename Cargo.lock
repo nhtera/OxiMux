@@ -7563,6 +7563,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "oximux-agent-hooks"
+version = "0.1.17"
+dependencies = [
+ "dirs 5.0.1",
+ "oximux-agents",
+ "oximux-core",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "oximux-agents"
 version = "0.1.17"
 dependencies = [
@@ -7627,6 +7639,7 @@ dependencies = [
  "objc2-user-notifications",
  "objc2-web-kit",
  "oximux-agent-core",
+ "oximux-agent-hooks",
  "oximux-agents",
  "oximux-auto-update",
  "oximux-computer-use",

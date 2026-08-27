@@ -1,0 +1,36 @@
+[package]
+name = "oximux-agent-hooks"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+# How every agent CLI is taught to report its status: the dialect table (which
+# file, how one entry is spelled, what the events are called, which key carries
+# the reply), the installer that merges OxiMux's entries into a file the user
+# may also write, and the payload readers the hook itself uses on the way back.
+#
+# Extracted from the desktop for the reason `worktree-ops` was: the CLI has to
+# install and inspect the SAME hooks the app does. A `oximux agent hooks status`
+# that only worked while the GUI was up would be useless precisely when it is
+# reached for — a hook misbehaving, an agent not reporting.
+#
+# Zero gpui, and nothing platform-specific: the whole crate is `std`, paths, and
+# JSON. That is not an accident of the lift, it is why the lift was cheap.
+
+[dependencies]
+serde_json = { workspace = true }
+dirs = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The consumers of the payload this crate builds, so the round-trip is tested
+# rather than asserted: `build_status_payload` writes the sideband blob and
+# `AgentOscScanner` is what actually decodes it on the PTY. A dev-dependency on
+# a downstream crate is deliberate — testing against the real reader is the
+# whole point, and it stays out of anything that depends on this crate.
+oximux-agents = { workspace = true }
+oximux-core = { workspace = true }

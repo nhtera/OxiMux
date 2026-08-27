@@ -47,6 +47,9 @@ oximux-owner-only = { workspace = true }
 # the shared wire types (PairingTicket).
 oximux-remote-host = { workspace = true }
 oximux-worktree-ops = { workspace = true }
+# The status-hook dialect table and installer, shared with the CLI so
+# `oximux agent hooks` writes the same entries the app's settings toggle does.
+oximux-agent-hooks = { workspace = true }
 oximux-remote-iroh = { workspace = true, features = ["host"] }
 # The owner-only control socket the `oximux` CLI dials (opt-in listener).
 oximux-remote-local = { workspace = true }
