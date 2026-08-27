@@ -203,6 +203,12 @@ pub fn render_workspace_card(
         };
         div()
             .flex()
+            // Never shrink. This chip holds one of four short, known strings,
+            // and a clipped one ("In progr") reads as damage rather than as a
+            // label. The branch chip beside it carries an arbitrary-length name
+            // that stays useful truncated, so on a narrow rail that is the one
+            // that should yield — which is what happens once this refuses to.
+            .flex_shrink_0()
             .items_center()
             .px(px(5.0))
             .h(px(15.0))
