@@ -310,6 +310,16 @@ Remove a worktree by id (see `worktree ls`). Refused (not forced) when the workt
 | --- | --- | --- |
 | `<ID>` | yes | The worktree id (from `worktree ls`) |
 
+#### `oximux worktree set`
+
+Say what is happening in a worktree — a one-line comment, a work phase, or both. Meant to be called by the agent working there, as it works.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<ID>` | yes | The worktree id (from `worktree ls`) |
+| `--comment` | yes | The status line — what is happening here right now. `""` clears it |
+| `--phase` | yes | The work phase: todo, in-progress, in-review, or done. `""` clears it. An unrecognised value is refused |
+
 ### `oximux projects`
 
 Project verbs

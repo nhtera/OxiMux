@@ -743,6 +743,8 @@ mod tests {
             tint: None,
             sort_order: 0.0,
             pinned: false,
+            comment: String::new(),
+            phase: String::new(),
         }
     }
 

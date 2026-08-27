@@ -42,7 +42,7 @@ pub use pane_session::PaneSession;
 pub use pr_state::{ForgeRefKind, PrState};
 pub use project::Project;
 pub use session_resumption::SessionResumption;
-pub use workspace::{ViewMode, Workspace, WorktreeSettings};
+pub use workspace::{ViewMode, WorkPhase, Workspace, WorktreeSettings};
 
 use serde::{Deserialize, Serialize};
 

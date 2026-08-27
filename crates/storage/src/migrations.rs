@@ -210,6 +210,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "diff_review_notes_anchor_text",
         sql: include_str!("../migrations/V025__diff_review_notes_anchor_text.sql"),
     },
+    // V026 gives a worktree an agent-writable comment and work phase, so a
+    // listing shows what each running agent is doing without a transcript read.
+    Migration {
+        version: 26,
+        name: "workspace_comment_and_phase",
+        sql: include_str!("../migrations/V026__workspace_comment_and_phase.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.
@@ -468,6 +475,61 @@ mod tests {
 
     fn mem_conn() -> Connection {
         Connection::open_in_memory().expect("open :memory:")
+    }
+
+    /// A database that predates V026 opens under the full ladder with its rows
+    /// intact and the new columns reading as unset.
+    ///
+    /// The success criterion this phase is held to is "an existing database
+    /// opens with the new migration and no data loss", and the only way to
+    /// test that honestly is to *build the old database first* — apply the
+    /// ladder up to V025, write a row through it, then migrate the rest of the
+    /// way and read that row back. Applying the whole ladder to an empty file
+    /// would prove nothing about upgrading.
+    #[test]
+    fn a_pre_v026_database_upgrades_with_its_rows_intact() {
+        let mut conn = mem_conn();
+        let upto_25: Vec<Migration> =
+            MIGRATIONS.iter().filter(|m| m.version <= 25).cloned().collect();
+        run_migrations(&mut conn, &upto_25).expect("ladder through V025");
+
+        conn.execute(
+            "INSERT INTO projects (id, name, root_path, default_branch, created_at) \
+             VALUES ('p1', 'p', '/p', 'main', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("seed project");
+        conn.execute(
+            "INSERT INTO workspaces \
+             (id, project_id, name, slug, branch, worktree_path, status, created_at, sort_order) \
+             VALUES ('w1', 'p1', 'feature', 'feature', 'oximux/feature', '/p/wt', 'active', \
+                     '2026-01-01T00:00:00Z', 1.0)",
+            [],
+        )
+        .expect("seed workspace");
+
+        // The pre-upgrade database must genuinely lack the columns, or the
+        // rest of this test would pass against a database that never needed
+        // migrating.
+        assert!(
+            conn.query_row("SELECT comment FROM workspaces", [], |r| r.get::<_, String>(0))
+                .is_err(),
+            "V025 must not already have `comment` — this test would be vacuous"
+        );
+
+        run_migrations(&mut conn, MIGRATIONS).expect("upgrade to head");
+
+        let (name, branch, comment, phase): (String, String, String, String) = conn
+            .query_row(
+                "SELECT name, branch, comment, phase FROM workspaces WHERE id = 'w1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("the pre-existing row survives the upgrade");
+        assert_eq!(name, "feature", "existing data must survive");
+        assert_eq!(branch, "oximux/feature", "existing data must survive");
+        assert_eq!(comment, "", "an upgraded row reads as having said nothing");
+        assert_eq!(phase, "", "an upgraded row reads as having no phase");
     }
 
     fn applied_versions(conn: &Connection) -> Vec<u32> {

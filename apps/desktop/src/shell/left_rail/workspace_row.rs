@@ -13,7 +13,7 @@ use gpui::{
     Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
     SharedString, StatefulInteractiveElement, Styled, div, px, svg,
 };
-use oximux_core::{AgentStatus, Workspace};
+use oximux_core::{AgentStatus, WorkPhase, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::agent_presentation::{AgentVerb, agent_verb};
@@ -132,6 +132,15 @@ pub struct WorkspaceCardPlan {
     /// `true` when this workspace is pinned — the card shows a small pin glyph
     /// and the row floats to the top of its group in every sort mode.
     pub pinned: bool,
+    /// The worktree's progress line — what the agent working here says it is
+    /// doing. `None` when unset. Takes the line-2 text slot ahead of
+    /// [`Self::agent_title`]: a sentence the agent chose to write about itself
+    /// says more than the prompt it was handed.
+    pub comment: Option<SharedString>,
+    /// The declared work phase, shown as a chip beside the branch. `None` when
+    /// unset **or unrecognised** — a phase written by a newer build renders as
+    /// no chip rather than as an error or a wrong label.
+    pub phase: Option<WorkPhase>,
 }
 
 /// Resolve the status-dot color for a workspace given its latest agent
@@ -235,6 +244,11 @@ pub fn build_workspace_card_plan(
         linked_issue: workspace.linked_issue.clone(),
         tint: workspace.tint.as_deref().and_then(TabColor::from_slug),
         pinned: workspace.pinned,
+        comment: (!workspace.comment.is_empty())
+            .then(|| SharedString::from(workspace.comment.clone())),
+        // `parse` yields `None` for an unrecognised value, which is exactly the
+        // documented degrade: no chip, never a guess.
+        phase: WorkPhase::parse(&workspace.phase),
     }
 }
 
@@ -399,6 +413,8 @@ mod tests {
             tint: None,
             sort_order: 0.0,
             pinned: false,
+            comment: String::new(),
+            phase: String::new(),
         }
     }
 
@@ -594,6 +610,8 @@ mod tests {
             tint: None,
             sort_order: 0.0,
             pinned: false,
+            comment: String::new(),
+            phase: String::new(),
         }
     }
 
@@ -824,5 +842,63 @@ mod tests {
             0,
             &DiffCounts { added: 0, removed: 0 }
         ));
+    }
+
+    // ── progress: comment + phase ────────────────────────────────────────────
+
+    fn ws_with_progress(comment: &str, phase: &str) -> Workspace {
+        let mut w = ws_with_branch("W", "w", "oximux/w");
+        w.comment = comment.to_string();
+        w.phase = phase.to_string();
+        w
+    }
+
+    fn card(w: &Workspace) -> WorkspaceCardPlan {
+        build_workspace_card_plan(w, false, false, false, false, None, None, None, None, Theme::charcoal())
+    }
+
+    #[test]
+    fn a_worktree_that_has_said_nothing_carries_no_progress() {
+        let plan = card(&ws_with_progress("", ""));
+        assert!(plan.comment.is_none(), "an empty comment must not render as an empty line");
+        assert!(plan.phase.is_none());
+    }
+
+    #[test]
+    fn a_progress_line_and_phase_reach_the_card() {
+        let plan = card(&ws_with_progress("rebasing onto main", "in-progress"));
+        assert_eq!(plan.comment.as_deref(), Some("rebasing onto main"));
+        assert_eq!(plan.phase, Some(WorkPhase::InProgress));
+    }
+
+    /// The forward-compat contract, at the surface that shows it: a phase this
+    /// build does not know renders as *no chip*. Anything else — a default
+    /// phase, a raw string chip — would have an older desktop state something
+    /// false about a worktree a newer one is managing.
+    #[test]
+    fn an_unrecognised_phase_shows_no_chip_rather_than_guessing() {
+        let plan = card(&ws_with_progress("", "shipped"));
+        assert!(plan.phase.is_none(), "an unknown phase must not become a label");
+    }
+
+    /// The comment is kept even when the phase is unreadable — one unknown
+    /// field must not suppress the other, which is the whole point of carrying
+    /// them independently.
+    #[test]
+    fn an_unrecognised_phase_does_not_suppress_the_comment() {
+        let plan = card(&ws_with_progress("still working", "shipped"));
+        assert_eq!(plan.comment.as_deref(), Some("still working"));
+        assert!(plan.phase.is_none());
+    }
+
+    /// The synthesized primary row has no `workspaces` row behind it, so it can
+    /// never carry progress. Pinned here because the card would happily render
+    /// a comment for it if one ever appeared.
+    #[test]
+    fn every_phase_in_the_vocabulary_reaches_the_card() {
+        for phase in WorkPhase::ALL {
+            let plan = card(&ws_with_progress("x", phase.as_str()));
+            assert_eq!(plan.phase, Some(phase), "`{}` must survive to the card", phase.as_str());
+        }
     }
 }

@@ -7721,6 +7721,7 @@ dependencies = [
  "oximux-agent-core",
  "oximux-agents",
  "oximux-auto-update",
+ "oximux-core",
  "oximux-job-object",
  "oximux-macos-trust",
  "oximux-owner-only",

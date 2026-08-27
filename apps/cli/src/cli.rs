@@ -611,6 +611,24 @@ pub enum WorktreeCommand {
         /// The worktree id (from `worktree ls`).
         id: String,
     },
+    /// Say what is happening in a worktree — a one-line comment, a work phase,
+    /// or both. Meant to be called by the agent working there, as it works.
+    ///
+    /// A snapshot, not a log: the last write wins and no history is kept.
+    /// Passing an empty string clears that field; omitting a flag leaves it
+    /// alone, so setting the phase never blanks the comment.
+    #[command(verbatim_doc_comment)]
+    Set {
+        /// The worktree id (from `worktree ls`).
+        id: String,
+        /// The status line — what is happening here right now. `""` clears it.
+        #[arg(long, value_name = "TEXT")]
+        comment: Option<String>,
+        /// The work phase: todo, in-progress, in-review, or done. `""` clears
+        /// it. An unrecognised value is refused.
+        #[arg(long, value_name = "PHASE")]
+        phase: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]

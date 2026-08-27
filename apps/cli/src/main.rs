@@ -491,6 +491,9 @@ fn host_verb(mut args: Cli) -> u8 {
                         commands::worktree::ls(&client, project).await
                     }
                     WorktreeCommand::Rm { id } => commands::worktree::rm(&client, &id).await,
+                    WorktreeCommand::Set { id, comment, phase } => {
+                        commands::worktree::set(&client, &id, comment, phase).await
+                    }
                 },
                 Command::Heartbeat { command } => match command {
                     HeartbeatCommand::Create { prompt, name, cron, session } => {

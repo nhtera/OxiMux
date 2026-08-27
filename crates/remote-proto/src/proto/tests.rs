@@ -17,9 +17,10 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 20,
-        "v20 = ThreadEvent::PermissionEdited (operator-edited approvals recorded in the \
-         transcript; older peers get the Notice downgrade)"
+        PROTOCOL_VERSION, 21,
+        "v21 = the worktree progress board (SetWorktreeProgress / ListWorktreeProgress). \
+         A sidecar verb pair rather than fields on WorktreeWire, which is frozen inside \
+         the Response::Worktrees vector v16 peers already request"
     );
 }
 

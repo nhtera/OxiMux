@@ -15,7 +15,7 @@
 //! RPC on this surface ever turns a client-supplied string into a filesystem
 //! path.
 
-use oximux_remote_proto::messages::WorktreeWire;
+use oximux_remote_proto::messages::{WorktreeProgressWire, WorktreeWire};
 
 /// Why a worktree operation could not happen.
 ///
@@ -43,6 +43,10 @@ pub enum WorktreeError {
     /// unavailable).
     #[error("the host cannot manage worktrees right now")]
     Unavailable,
+    /// No worktree holds the given id. Distinct from the removal path's
+    /// tolerance of a missing row: a write that names a row must find it.
+    #[error("no worktree has that id")]
+    UnknownWorktree,
 }
 
 /// Managing a project's git worktrees on the host.
@@ -74,4 +78,32 @@ pub trait WorktreeService: Send + Sync {
     /// and row. Removing one already gone is `Ok`: the caller's goal state is
     /// reached, and racing a desktop-side removal is not an error.
     async fn remove(&self, id: &str) -> Result<(), WorktreeError>;
+
+    /// Set the worktree's progress line and/or work phase.
+    ///
+    /// `None` leaves a field alone; `Some("")` clears it — an agent updating
+    /// only its phase must not blank the comment it wrote earlier.
+    ///
+    /// Unlike [`Self::remove`], an unknown id is [`WorktreeError::UnknownWorktree`]
+    /// rather than success: removal is idempotent because "gone" is a goal
+    /// state, whereas "set this row's comment" names a row that must exist for
+    /// the request to have meant anything.
+    ///
+    /// Implementations store `phase` verbatim. The closed vocabulary is
+    /// enforced by the caller (the dispatcher), so a value from a newer peer
+    /// survives a round trip through an older store.
+    async fn set_progress(
+        &self,
+        id: &str,
+        comment: Option<&str>,
+        phase: Option<&str>,
+    ) -> Result<(), WorktreeError>;
+
+    /// The progress rows of one project's worktrees (or of every project when
+    /// `None`). Rows with nothing set are omitted — the common case is an
+    /// empty vector, not a row of empty strings per worktree.
+    async fn list_progress(
+        &self,
+        project_path: Option<&str>,
+    ) -> Result<Vec<WorktreeProgressWire>, WorktreeError>;
 }

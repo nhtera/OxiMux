@@ -484,6 +484,24 @@ impl Dispatcher {
             let response = self.remove_worktree(&peer, &id).await;
             return self.send(transport, response).await;
         }
+        // The worktree progress board. Same service, but gated as coordination
+        // state rather than worktree management — see the handlers.
+        if let Request::SetWorktreeProgress { id, comment, phase } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self
+                .set_worktree_progress(&peer, &id, comment.as_deref(), phase.as_deref())
+                .await;
+            return self.send(transport, response).await;
+        }
+        if let Request::ListWorktreeProgress { project_path } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.list_worktree_progress(&peer, project_path.as_deref()).await;
+            return self.send(transport, response).await;
+        }
         // A manual fire spawns a session and waits for it to start, so it is
         // async and awaited here like `CreateSession`. Its handler applies the
         // schedule write gate on top of this authentication check.

@@ -42,6 +42,76 @@ pub struct Workspace {
     /// pre-field snapshots (defaults to `false`).
     #[serde(default)]
     pub pinned: bool,
+    /// A one-line, agent-writable snapshot of what is happening here — the
+    /// answer to "what is this worktree doing right now" without opening a
+    /// transcript. Empty when unset.
+    ///
+    /// **A snapshot, not a log.** Last write wins; there is no history. The
+    /// value is agent-authored prose, so treat it as untrusted display text.
+    #[serde(default)]
+    pub comment: String,
+    /// The work phase, as the raw stored string — `""` when unset.
+    ///
+    /// Deliberately **not** a `WorkPhase`: a value written by a newer peer
+    /// must survive a round trip through an older one rather than being
+    /// dropped on read and erased on the next write. Parse with
+    /// [`WorkPhase::parse`] at the point of display, which yields `None` for
+    /// anything unrecognised.
+    #[serde(default)]
+    pub phase: String,
+}
+
+/// The closed vocabulary a worktree's [`Workspace::phase`] is written with.
+///
+/// Writers validate against this; readers do not. [`parse`](Self::parse)
+/// returning `None` is the documented forward-compat posture — an unknown
+/// value from a newer peer renders as *no phase*, never as an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkPhase {
+    Todo,
+    InProgress,
+    InReview,
+    Done,
+}
+
+impl WorkPhase {
+    /// Every phase, in the order work moves through them — the order a picker
+    /// or a help string should list them in.
+    pub const ALL: [WorkPhase; 4] =
+        [WorkPhase::Todo, WorkPhase::InProgress, WorkPhase::InReview, WorkPhase::Done];
+
+    /// The stored (and wire, and CLI) spelling. Kebab-case, matching the serde
+    /// representation so a serde-encoded row and a hand-written CLI argument
+    /// are the same string.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            WorkPhase::Todo => "todo",
+            WorkPhase::InProgress => "in-progress",
+            WorkPhase::InReview => "in-review",
+            WorkPhase::Done => "done",
+        }
+    }
+
+    /// Parse a stored or wire value. `None` for the empty string (unset) and
+    /// for anything this build does not know — see the type docs.
+    ///
+    /// Case- and whitespace-insensitive: a phase typed at a shell prompt is
+    /// the same phase whether or not the shift key was involved.
+    pub fn parse(raw: &str) -> Option<Self> {
+        let norm = raw.trim().to_ascii_lowercase();
+        Self::ALL.into_iter().find(|p| p.as_str() == norm)
+    }
+
+    /// A short human label for a card or a column.
+    pub const fn label(self) -> &'static str {
+        match self {
+            WorkPhase::Todo => "To do",
+            WorkPhase::InProgress => "In progress",
+            WorkPhase::InReview => "In review",
+            WorkPhase::Done => "Done",
+        }
+    }
 }
 
 /// Per-worktree SCM scratch state, persisted in the V006
@@ -136,6 +206,46 @@ mod tests {
         assert_eq!(ViewMode::from_str("list"), ViewMode::Flat);
         assert_eq!(ViewMode::from_str("TREE"), ViewMode::Flat);
         assert_eq!(ViewMode::from_str("flatten"), ViewMode::Flat);
+    }
+
+    #[test]
+    fn every_phase_round_trips_through_its_stored_spelling() {
+        for phase in WorkPhase::ALL {
+            assert_eq!(
+                WorkPhase::parse(phase.as_str()),
+                Some(phase),
+                "`{}` must parse back to itself",
+                phase.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_phase_is_none_rather_than_an_error() {
+        // The forward-compat contract: a phase a newer peer knows and this
+        // build does not renders as *no phase*. If this ever becomes an error
+        // or a default, an older desktop starts lying about newer worktrees.
+        assert_eq!(WorkPhase::parse("shipped"), None);
+        assert_eq!(WorkPhase::parse(""), None);
+        assert_eq!(WorkPhase::parse("in progress"), None, "the separator is a hyphen");
+    }
+
+    #[test]
+    fn phase_parsing_ignores_case_and_surrounding_space() {
+        // These come off a shell prompt, where neither is meaningful.
+        assert_eq!(WorkPhase::parse("  In-Progress "), Some(WorkPhase::InProgress));
+        assert_eq!(WorkPhase::parse("DONE"), Some(WorkPhase::Done));
+    }
+
+    #[test]
+    fn phase_wire_spelling_matches_its_serde_form() {
+        // A row serialized by serde and a phase typed as a CLI argument must be
+        // the same string, or a snapshot written by one path fails to parse on
+        // the other.
+        for phase in WorkPhase::ALL {
+            let json = serde_json::to_string(&phase).expect("serialize");
+            assert_eq!(json, format!("\"{}\"", phase.as_str()));
+        }
     }
 
     #[test]

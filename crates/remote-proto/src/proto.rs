@@ -98,7 +98,7 @@ pub use crate::messages::*;
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -624,6 +624,44 @@ pub enum Request {
     /// encodes a struct-like variant positionally: widening the existing one
     /// would misparse on every peer that predates the change.
     StateWatchFrom { prefix: Option<String>, since_seq: Option<u64> },
+
+    // ---- v21: worktree progress board ----
+    /// Set a worktree's progress line and/or work phase — the agent-writable
+    /// answer to "what is happening in this worktree".
+    ///
+    /// `None` leaves a field untouched; `Some("")` clears it. That distinction
+    /// is the whole reason both are `Option<String>`: an agent updating only
+    /// its phase must not blank the comment it wrote a minute ago.
+    ///
+    /// **Gated as coordination state, not as worktree management.** The
+    /// worktree gates ([`AuthStore::may_manage_worktrees`]) are full-scope
+    /// because creating and removing worktrees writes the filesystem and the
+    /// repository. Writing a status line does neither, and the primary caller
+    /// is a *session-confined agent describing its own work* — precisely the
+    /// caller full scope excludes. So this shares the coordination
+    /// blackboard's reach instead, for the same reason the blackboard has it:
+    /// the payload is agent-authored text, carrying no host path, no branch
+    /// name, and no session content.
+    ///
+    /// An unrecognised `phase` is refused with [`RpcError::BadRequest`] — the
+    /// vocabulary is closed at the write edge, while readers stay lenient. The
+    /// reply is [`Response::Ack`]; an id no worktree holds is a
+    /// [`RpcError::BadRequest`] rather than a silent success, since the caller
+    /// asked for a specific row to change.
+    SetWorktreeProgress { id: String, comment: Option<String>, phase: Option<String> },
+    /// The progress lines of a project's worktrees (or of every project when
+    /// `None`) — a sidecar to [`Request::ListWorktrees`], joined by id.
+    ///
+    /// **Why a second call rather than fields on [`WorktreeWire`].** That type
+    /// travels inside [`Response::Worktrees`], a `Vec` reply that v16 peers
+    /// already request. Postcard encodes struct fields positionally, so an
+    /// appended field makes every older decoder misparse each element after
+    /// the first — a dropped connection, not a skipped field. Frozen types get
+    /// a new verb; only the envelope enums tolerate appends.
+    ///
+    /// Rows whose comment and phase are both unset are omitted, so the common
+    /// case costs an empty vector.
+    ListWorktreeProgress { project_path: Option<String> },
 }
 
 /// Host → client.
@@ -828,6 +866,9 @@ pub enum Response {
     /// subscribed with the cursor-less [`Request::StateWatch`] — that peer has
     /// no decoder for this ordinal.
     StateChangedAt(StateChangeWire),
+    /// Reply to [`Request::ListWorktreeProgress`]. Empty is a normal answer —
+    /// no worktree has said anything about itself yet.
+    WorktreeProgress(Vec<WorktreeProgressWire>),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

@@ -241,6 +241,40 @@ pub struct WorktreeWire {
     pub path: String,
 }
 
+/// One worktree's progress line — the [`Response::WorktreeProgress`] row,
+/// joined to a [`WorktreeWire`] by `id`.
+///
+/// Named *progress*, not *status*: this crate already spends that word on
+/// [`WorktreeStatusWire`] (a path's git state) and the desktop spends it on a
+/// workspace's archive lifecycle. A third meaning would make every mention
+/// ambiguous.
+///
+/// **A sidecar rather than two more fields on `WorktreeWire`.** That type
+/// travels inside `Response::Worktrees`, a `Vec` reply v16 peers already
+/// request, and postcard encodes struct fields positionally — appending one
+/// would make every older decoder misparse each element after the first and
+/// drop the connection. Types inside an existing `Vec` reply are frozen; new
+/// information gets a new type and a new verb.
+///
+/// Both fields are agent-authored display text. Neither carries a host path, a
+/// branch name, or session content, which is what lets this ride the
+/// coordination gates rather than the full-scope worktree ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeProgressWire {
+    /// The [`WorktreeWire::id`] this describes.
+    pub id: String,
+    /// The status snapshot, or `""` when unset. Last write wins; no history.
+    pub comment: String,
+    /// The work phase in its stored spelling, or `""` when unset.
+    ///
+    /// **Carried as a string, not an enum.** A closed enum would encode as an
+    /// ordinal, so a phase added by a newer peer would decode as a *different*
+    /// existing phase on an older one — silently wrong rather than merely
+    /// unknown. As a string, an unrecognised value is recognisably unknown and
+    /// renders as no phase. Parse with `oximux_core::WorkPhase::parse`.
+    pub phase: String,
+}
+
 /// A freshly-minted pairing window — the
 /// [`Response::PairingIssued`](crate::proto::Response::PairingIssued) payload.
 ///

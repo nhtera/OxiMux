@@ -191,6 +191,12 @@ fn workspaces_with_primary_for(repo: &WorkspaceRepo, project: &Project) -> Vec<W
                 // Synthesized primary row; always pinned first, never reordered.
                 sort_order: 0.0,
                 pinned: false,
+                // Permanently blank: this row is the project root, synthesized
+                // at render time with no `workspaces` row behind it, so there
+                // is nowhere for a progress write to land. `worktree ls` omits
+                // it for the same reason.
+                comment: String::new(),
+                phase: String::new(),
             },
         );
     }
@@ -1134,6 +1140,8 @@ impl WorkspaceRoot {
             tint: None,
             sort_order: 0.0,
             pinned: false,
+            comment: String::new(),
+            phase: String::new(),
         };
         self.activate_workspace(workspace, window, cx);
     }
@@ -2293,6 +2301,8 @@ mod nav_history_tests {
             tint: None,
             sort_order: 0.0,
             pinned: false,
+            comment: String::new(),
+            phase: String::new(),
         }
     }
 

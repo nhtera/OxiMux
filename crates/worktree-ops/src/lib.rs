@@ -27,7 +27,16 @@ use oximux_storage::{StorageError, WorkspaceRepo};
 /// path. The dirty-rollback variant is reached only when the rollback
 /// path itself errors — caller should escalate visibility (e.g. surface
 /// a "manual cleanup required" hint).
+///
+/// **Deliberately not boxed.** `Created(Workspace)` is the largest variant, and
+/// `Workspace` grows every time the domain does (V026's `comment` and `phase`
+/// were what first tripped `clippy::large_enum_variant` here). Boxing it would
+/// add a heap allocation to the success path and a deref at every call site to
+/// avoid a few hundred bytes moved *once per user-initiated worktree create* —
+/// an operation that has already shelled out to git. The move is free next to
+/// what surrounds it.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant, reason = "see the note above: one move per git shell-out")]
 pub enum CreateOutcome {
     /// Workspace row inserted; worktree + branch live on disk.
     Created(Workspace),
