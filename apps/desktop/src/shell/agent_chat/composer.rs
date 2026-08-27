@@ -3288,16 +3288,18 @@ impl Render for ComposerView {
                 .items_center()
                 .justify_center()
                 .rounded_full()
-                .bg(theme.fg_muted)
-                .text_color(theme.bg_base)
-                .text_size(px(typo.t_body_sm))
+                .bg(theme.fg_base)
                 .cursor_pointer()
                 .hover(|s| s.opacity(0.85))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _e, _window, cx| this.request_stop(cx)),
                 )
-                .child(SharedString::from("■"))
+                // A drawn square, not the "■" glyph: the glyph's own metrics
+                // decide its size and baseline, so it rendered as a small,
+                // optically-high rectangle. A div gives an exact, centered
+                // square with soft corners — the native chat Stop look.
+                .child(div().size(px(10.0)).rounded(px(density.r_chip)).bg(theme.bg_base))
         } else {
             let (send_bg, send_fg) = if can_send {
                 (theme.status_info, theme.bg_base)
