@@ -17,12 +17,111 @@ use oximux_settings::{DEFAULT_PROFILE, Density, OpenMode, Theme, Typography, spl
 use super::SettingsModal;
 use super::controls::{toggle_chip, toggle_switch, value_chip};
 use super::layout::{
-    SettingEntry, card_surface, entry, section_card, setting_row_desc, setting_row_stacked,
+    SettingEntry, card_surface, entry, hint_text, notice_text, section_card, setting_row_desc,
+    setting_row_desc_hint, setting_row_hint,
 };
 use super::segmented::{Segment, segmented};
 use crate::shell::agent_presentation::adapter_icon_path;
 
+/// Which row of the environment card a [`Notice`] belongs under.
+///
+/// One notice is live at a time: a notice is the answer to a *discrete commit*,
+/// and the card has no way to commit two things at once. Carrying the slot on
+/// the notice rather than keeping one `Option` per row means a message can
+/// never be left stranded under a row the user has since moved away from.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::shell) enum NoticeSlot {
+    /// Under the "Add a profile" row — the result of a create attempt.
+    Profile,
+    /// Under the environment editor — the result of a write.
+    Environment,
+}
 
+/// A transient message acknowledging a commit or explaining a refusal.
+///
+/// Not persisted and not a toast: it is view state on the modal, cleared the
+/// moment the user types again, so the card never shows a stale answer to a
+/// question that has moved on.
+#[derive(Clone, Debug)]
+pub(in crate::shell) struct Notice {
+    pub(in crate::shell) slot: NoticeSlot,
+    /// `true` acknowledges a commit, `false` explains a refusal — drives the
+    /// colour in [`notice_text`].
+    pub(in crate::shell) ok: bool,
+    pub(in crate::shell) text: SharedString,
+}
+
+impl Notice {
+    pub(in crate::shell) fn ok(slot: NoticeSlot, text: impl Into<SharedString>) -> Self {
+        Self { slot, ok: true, text: text.into() }
+    }
+
+    pub(in crate::shell) fn err(slot: NoticeSlot, text: impl Into<SharedString>) -> Self {
+        Self { slot, ok: false, text: text.into() }
+    }
+}
+
+/// Validate a typed profile name against the names an agent already has
+/// (`existing` is [`AgentLaunchSettings::profile_names`], so it always leads
+/// with `default`). `Ok` carries the trimmed name to create.
+///
+/// The three rejections exist because all three were previously silent. Blank
+/// and `default` returned early from the Enter handler, and a duplicate was
+/// worse than an error: `profile_entry_mut` *reuses* an entry of the same name,
+/// so retyping an existing name looked like a button that did nothing while
+/// actually re-selecting the profile the user already had.
+///
+/// Names are compared exactly (after trimming), matching how `for_agent_in`
+/// resolves them — a check that folded case would refuse a name the launcher
+/// would happily treat as distinct.
+///
+/// [`AgentLaunchSettings::profile_names`]: oximux_settings::AgentLaunchSettings::profile_names
+pub(super) fn validate_profile_name(raw: &str, existing: &[String]) -> Result<String, SharedString> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("Type a name for the profile, then press Enter.".into());
+    }
+    if name == DEFAULT_PROFILE {
+        return Err(SharedString::from(format!(
+            "“{DEFAULT_PROFILE}” is this agent's plain configuration — pick another name."
+        )));
+    }
+    if existing.iter().any(|n| n.trim() == name) {
+        return Err(SharedString::from(format!(
+            "This agent already has a profile named “{name}”."
+        )));
+    }
+    Ok(name.to_string())
+}
+
+/// The environment editor's placeholder for `adapter_id`: a worked example of
+/// the shape the field wants, not a single variable.
+///
+/// Per-agent because a single example implies it is the only thing worth
+/// setting, and Anthropic variables in the Codex editor are actively
+/// misleading. Every line here is a variable the named CLI actually reads, and
+/// none of them is a key the field refuses.
+pub(super) fn env_placeholder(adapter_id: &str) -> &'static str {
+    match adapter_id {
+        "codex" => {
+            "OPENAI_BASE_URL=https://proxy.internal/v1\n\
+             OPENAI_API_KEY=sk-...\n\
+             # blank lines and # comments are ignored"
+        }
+        // Pi-family agents route to several providers, so one provider's
+        // variables would under-describe the field.
+        "pi" | "omp" => {
+            "ANTHROPIC_API_KEY=sk-ant-...\n\
+             OPENAI_API_KEY=sk-...\n\
+             # blank lines and # comments are ignored"
+        }
+        _ => {
+            "ANTHROPIC_BASE_URL=https://proxy.internal/v1\n\
+             ANTHROPIC_AUTH_TOKEN=sk-ant-...\n\
+             # blank lines and # comments are ignored"
+        }
+    }
+}
 /// Parse the environment editor's text into the map [`PerAgentLaunch::env`]
 /// holds. One `KEY=value` per line, `.env`-shaped because that is the form a
 /// proxy or alternate-endpoint configuration is already pasted from.
@@ -251,9 +350,12 @@ pub(super) fn render_env_card(
     // Which profile of that agent. `default` is the plain entry every config
     // already has, so this reads "default" even before a profile is created.
     let current_profile = modal.env_profile.clone();
-    let profile_segs: Vec<Segment> = modal
-        .agent_launch
-        .profile_names(current_agent)
+    let profile_names = modal.agent_launch.profile_names(current_agent);
+    // `profile_names` always leads with `default`, so "only default" is the
+    // empty state — the user has never created a profile for this agent.
+    let has_named_profiles = profile_names.len() > 1;
+    let profile_segs: Vec<Segment> = profile_names
+        .clone()
         .into_iter()
         .map(|name| {
             let selected = match (&current_profile, name.as_str()) {
@@ -267,12 +369,30 @@ pub(super) fn render_env_card(
             })
         })
         .collect();
-    rows.push(setting_row_desc(
+    // What the current selection means, stated rather than left to be inferred
+    // — `default` in a picker reads as "nothing chosen yet" unless something
+    // says otherwise. When the agent has no named profiles this line doubles as
+    // the empty state, naming what a profile would be *for*.
+    let profile_hint: SharedString = match current_profile.as_deref() {
+        None if has_named_profiles => {
+            format!("“{DEFAULT_PROFILE}” is the plain configuration this agent already launches with.")
+                .into()
+        }
+        None => format!(
+            "“{DEFAULT_PROFILE}” is the plain configuration this agent already launches with. \
+             No profiles yet — add one to launch this agent against a second endpoint or account."
+        )
+        .into(),
+        Some(name) => {
+            format!("“{name}” launches this agent with its own environment.").into()
+        }
+    };
+    rows.push(setting_row_desc_hint(
         "Profile",
-        "A second configuration of the same agent — an alternate endpoint, a proxy, \
-         or a second account. Profiles vary flags, model, and environment; the \
-         backend stays the agent's own.",
+        "A second configuration of the same agent — an alternate endpoint, a proxy, or a \
+         second account.",
         segmented("launch-env-profile", profile_segs, theme, density, typography, cx),
+        hint_text(profile_hint, theme, typography),
         theme,
         typography,
     ));
@@ -302,11 +422,16 @@ pub(super) fn render_env_card(
                 cx,
             ));
         }
-        rows.push(setting_row_desc(
+        // The create attempt's answer, or the format rule while there is none.
+        let hint = match modal.notice_for(NoticeSlot::Profile) {
+            Some(n) => notice_text(n.ok, n.text.clone(), theme, typography),
+            None => hint_text("Type a name and press Enter.", theme, typography),
+        };
+        rows.push(setting_row_desc_hint(
             "Add a profile",
-            "Type a name and press Enter. A new profile starts from this agent's \
-             current flags, model, and environment.",
+            "A new profile starts from this agent's current flags, model, and environment.",
             controls,
+            hint,
             theme,
             typography,
         ));
@@ -315,12 +440,19 @@ pub(super) fn render_env_card(
     // The editor itself. Stacked rather than pinned right: it is the one
     // control in this card that wants the full width of the row.
     if let Some(state) = modal.env_input.as_ref() {
-        rows.push(setting_row_stacked(
+        // The format rule lives under the field, where every reference
+        // preferences pane puts it, so the description above can stay one
+        // sentence about what the field is *for*. The plaintext warning is not
+        // repeated here — it is the card's footer already.
+        let hint = match modal.notice_for(NoticeSlot::Environment) {
+            Some(n) => notice_text(n.ok, n.text.clone(), theme, typography),
+            None => hint_text("One KEY=value per line.", theme, typography),
+        };
+        rows.push(setting_row_hint(
             "Environment",
-            "One KEY=value per line, applied on top of the inherited environment \
-             at launch — for both terminal and chat. Stored in plain text in \
-             agent_launch.toml; this is not encrypted storage.",
+            "Applied on top of the inherited environment at launch, for both terminal and chat.",
             Input::new(state).text_size(px(typography.t_body_sm)),
+            hint,
             theme,
             typography,
         ));
@@ -963,5 +1095,68 @@ mod tests {
     fn empty_env_formats_to_empty_text() {
         assert_eq!(format_env_lines(&BTreeMap::new()), "");
         assert!(parse_env_lines("").is_empty());
+    }
+
+    /// The three rejections must be DISTINCT messages, not one generic refusal:
+    /// each was previously a silent early return (or, for a duplicate, a
+    /// re-selection that read as a dead button), and the whole point of the
+    /// phase is that the user learns which one happened.
+    #[test]
+    fn a_profile_name_is_rejected_with_the_reason_it_failed() {
+        let existing = vec![DEFAULT_PROFILE.to_string(), "proxy".to_string()];
+
+        let blank = validate_profile_name("   ", &existing).unwrap_err();
+        assert!(blank.contains("Type a name"), "blank said: {blank}");
+
+        let reserved = validate_profile_name(" default ", &existing).unwrap_err();
+        assert!(
+            reserved.contains("plain configuration"),
+            "`default` said: {reserved}"
+        );
+
+        let dupe = validate_profile_name("proxy", &existing).unwrap_err();
+        assert!(dupe.contains("already has"), "duplicate said: {dupe}");
+
+        // All three differ, so the message identifies the fault.
+        assert_ne!(blank, reserved);
+        assert_ne!(reserved, dupe);
+        assert_ne!(blank, dupe);
+    }
+
+    #[test]
+    fn a_valid_profile_name_is_trimmed_and_accepted() {
+        let existing = vec![DEFAULT_PROFILE.to_string()];
+        assert_eq!(validate_profile_name("  staging  ", &existing), Ok("staging".into()));
+        // Case is NOT folded: `for_agent_in` matches exactly, so "Proxy" and
+        // "proxy" really are two reachable profiles and refusing one would be
+        // stricter than resolution.
+        let existing = vec![DEFAULT_PROFILE.to_string(), "proxy".to_string()];
+        assert!(validate_profile_name("Proxy", &existing).is_ok());
+    }
+
+    /// The placeholder teaches the field's shape, so it must be multi-line and
+    /// must not demonstrate another vendor's variables in this agent's editor.
+    #[test]
+    fn the_env_placeholder_is_a_worked_example_per_agent() {
+        for id in LAUNCH_AGENTS.map(|(id, _)| id) {
+            let p = env_placeholder(id);
+            assert!(
+                p.lines().count() >= 3,
+                "{id}'s placeholder teaches only {} line(s)",
+                p.lines().count()
+            );
+            // Every non-comment line has to parse, or the example contradicts
+            // the format rule printed directly beneath it.
+            assert_eq!(
+                parse_env_lines(p).len(),
+                p.lines().filter(|l| !l.trim().starts_with('#')).count(),
+                "{id}'s placeholder shows a line the field would drop"
+            );
+        }
+        assert!(
+            !env_placeholder("codex").contains("ANTHROPIC"),
+            "Codex's editor must not teach Anthropic variables"
+        );
+        assert!(env_placeholder("claude-code").contains("ANTHROPIC_BASE_URL"));
     }
 }

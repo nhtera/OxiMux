@@ -229,6 +229,87 @@ fn result_row(
         .into_any_element()
 }
 
+/// The stacked `label` + muted `description` column shared by every setting
+/// row shape. Kept in one place so the wrap floor (`min_w_0`, applied by the
+/// caller that needs it) and the type scale cannot drift between shapes.
+fn label_column(
+    label: SharedString,
+    description: SharedString,
+    theme: Theme,
+    typography: &Typography,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(3.0))
+        .child(
+            div()
+                .text_size(px(typography.t_body_sm))
+                .text_color(theme.fg_base)
+                .child(label),
+        )
+        .when(!description.is_empty(), |c| {
+            c.child(
+                div()
+                    .text_size(px(typography.t_sub_label))
+                    .text_color(theme.fg_subtle)
+                    .child(description),
+            )
+        })
+}
+
+/// The shared body of [`setting_row_desc`] and [`setting_row_desc_hint`]:
+/// label + description left, `control` pinned right, and an optional full-width
+/// `hint` line beneath both.
+///
+/// The hint lives inside the row rather than beside it because [`section_card`]
+/// hairlines every child it is handed — a free-standing hint would be divided
+/// off from the control it explains.
+fn desc_row(
+    label: SharedString,
+    description: SharedString,
+    control: AnyElement,
+    hint: Option<AnyElement>,
+    theme: Theme,
+    typography: &Typography,
+) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .py(px(12.0))
+        .gap(px(6.0))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .w_full()
+                .gap(px(16.0))
+                .child(
+                    label_column(label, description, theme, typography)
+                        .flex_1()
+                        // Without `min_w_0` a flex item's floor is its *content*
+                        // width, so a long description refuses to wrap and
+                        // instead pushes the control off the card's right edge.
+                        // The two longest strings in the modal live in the
+                        // launch-environment card, where this hid the profile
+                        // picker and the env editor entirely.
+                        .min_w_0(),
+                )
+                // The control is measured on its own terms and never grows: a
+                // field that styles itself `w_full` would otherwise claim the
+                // whole row as its flex basis and leave the description a
+                // single character wide.
+                .child(div().flex_none().child(control)),
+        )
+        // The hint spans the row, so it can wrap freely without competing with
+        // the control for width the way the description column does.
+        .children(hint.map(|h| div().w_full().min_w_0().child(h)))
+        .into_any_element()
+}
+
 /// One setting row: a stacked `label` + muted `description` on the left, a
 /// flexible gap, then `control` pinned to the right edge.
 pub(super) fn setting_row_desc(
@@ -238,99 +319,107 @@ pub(super) fn setting_row_desc(
     theme: Theme,
     typography: &Typography,
 ) -> AnyElement {
-    let description = description.into();
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .w_full()
-        .py(px(12.0))
-        .gap(px(16.0))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(3.0))
-                .flex_1()
-                // Without `min_w_0` a flex item's floor is its *content* width,
-                // so a long description refuses to wrap and instead pushes the
-                // control off the card's right edge. The two longest strings in
-                // the modal live in the launch-environment card, where this hid
-                // the profile picker and the env editor entirely.
-                .min_w_0()
-                .child(
-                    div()
-                        .text_size(px(typography.t_body_sm))
-                        .text_color(theme.fg_base)
-                        .child(label.into()),
-                )
-                .when(!description.is_empty(), |c| {
-                    c.child(
-                        div()
-                            .text_size(px(typography.t_sub_label))
-                            .text_color(theme.fg_subtle)
-                            .child(description),
-                    )
-                }),
-        )
-        // The control is measured on its own terms and never grows: a field
-        // that styles itself `w_full` would otherwise claim the whole row as
-        // its flex basis and leave the description a single character wide.
-        .child(div().flex_none().child(control))
-        .into_any_element()
+    desc_row(
+        label.into(),
+        description.into(),
+        control.into_any_element(),
+        None,
+        theme,
+        typography,
+    )
 }
 
-/// A setting whose control is the full width of the card: label and
-/// description stacked above it rather than beside it.
+/// [`setting_row_desc`] with a full-width `hint` line beneath the control —
+/// the format rule, the state of the thing being picked, or a transient commit
+/// message. Build the line with [`hint_text`] or [`notice_text`].
+pub(super) fn setting_row_desc_hint(
+    label: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    control: impl IntoElement,
+    hint: impl IntoElement,
+    theme: Theme,
+    typography: &Typography,
+) -> AnyElement {
+    desc_row(
+        label.into(),
+        description.into(),
+        control.into_any_element(),
+        Some(hint.into_any_element()),
+        theme,
+        typography,
+    )
+}
+
+/// A setting whose control is the full width of the card — label and
+/// description stacked above it rather than beside it — with a `hint` line
+/// beneath.
 ///
 /// [`setting_row_desc`] pins its control to the right at the control's own
 /// width, which is correct for a switch, a chip, or a picker. A text editor
 /// wants the whole row, and squeezing one into the right-hand column leaves
 /// both halves unusable — the field too narrow to read and the description
 /// wrapped to a sliver.
-pub(super) fn setting_row_stacked(
+///
+/// The hint is where a field's *format rule* belongs: the reference
+/// preferences panes all put "one `KEY=value` per line" under the editor rather
+/// than inside the description, which lets the description stay one sentence
+/// about what the field is for.
+pub(super) fn setting_row_hint(
     label: impl Into<SharedString>,
     description: impl Into<SharedString>,
     control: impl IntoElement,
+    hint: impl IntoElement,
     theme: Theme,
     typography: &Typography,
 ) -> AnyElement {
-    let description = description.into();
     div()
         .flex()
         .flex_col()
         .w_full()
         .py(px(12.0))
         .gap(px(8.0))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(3.0))
-                .w_full()
-                .child(
-                    div()
-                        .text_size(px(typography.t_body_sm))
-                        .text_color(theme.fg_base)
-                        .child(label.into()),
-                )
-                .when(!description.is_empty(), |c| {
-                    c.child(
-                        div()
-                            .text_size(px(typography.t_sub_label))
-                            .text_color(theme.fg_subtle)
-                            .child(description),
-                    )
-                }),
-        )
-        .child(div().w_full().child(control))
+        .child(label_column(label.into(), description.into(), theme, typography).w_full())
+        .child(div().w_full().child(control.into_any_element()))
+        .child(div().w_full().min_w_0().child(hint.into_any_element()))
+        .into_any_element()
+}
+
+/// A muted hint line for beneath a control: a format rule, or a statement of
+/// what the current selection means. Always-present, unlike [`notice_text`].
+pub(super) fn hint_text(
+    text: impl Into<SharedString>,
+    theme: Theme,
+    typography: &Typography,
+) -> AnyElement {
+    div()
+        .w_full()
+        .text_size(px(typography.t_sub_label))
+        .text_color(theme.fg_subtle)
+        .child(text.into())
+        .into_any_element()
+}
+
+/// A transient message acknowledging a commit (`ok`) or explaining why one was
+/// refused. Coloured rather than muted, because the whole point is that it is
+/// noticed the moment it appears — these replace the silent no-ops that made
+/// the environment card read as a broken button.
+pub(super) fn notice_text(
+    ok: bool,
+    text: impl Into<SharedString>,
+    theme: Theme,
+    typography: &Typography,
+) -> AnyElement {
+    div()
+        .w_full()
+        .text_size(px(typography.t_sub_label))
+        .text_color(if ok { theme.status_ok } else { theme.status_error })
+        .child(text.into())
         .into_any_element()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{query_matches, setting_row_desc};
+    use super::{hint_text, query_matches, setting_row_desc, setting_row_desc_hint};
     use gpui::{
         Bounds, Context, IntoElement, ParentElement as _, Pixels, Render, Styled as _,
         TestAppContext, Window, canvas, div, prelude::FluentBuilder as _, px, size,
@@ -350,6 +439,10 @@ mod tests {
     const LONG_DESC: &str = "One KEY=value per line, applied on top of the inherited environment \
          at launch — for both terminal and chat. Stored in plain text in \
          agent_launch.toml; this is not encrypted storage.";
+    /// A hint long enough to reproduce the wrap fault on its own if the hint
+    /// line were ever allowed to set the row's intrinsic width.
+    const LONG_HINT: &str = "One KEY=value per line; blank lines and lines starting with # are \
+         ignored, and the first = splits each line so a value may contain more of them.";
 
     /// Renders one described row at a fixed width, standing a bounds-recording
     /// canvas in for the control so the test can read where the control
@@ -359,25 +452,43 @@ mod tests {
     struct RowProbe {
         control: Rc<Cell<Option<Bounds<Pixels>>>>,
         greedy: bool,
+        /// Render the row through `setting_row_desc_hint` with a long hint line
+        /// below the control instead of the plain row.
+        hinted: bool,
+    }
+
+    impl RowProbe {
+        fn new(control: Rc<Cell<Option<Bounds<Pixels>>>>) -> Self {
+            Self { control, greedy: false, hinted: false }
+        }
     }
 
     impl Render for RowProbe {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let sink = self.control.clone();
-            div().w(px(ROW_W)).child(setting_row_desc(
-                "Environment",
-                LONG_DESC,
-                div().when(self.greedy, |d| d.w_full()).h(px(24.0)).child(
-                    canvas(
-                        |_, _, _| (),
-                        move |bounds: Bounds<Pixels>, _: (), _window, _cx| sink.set(Some(bounds)),
-                    )
-                    .w(px(CONTROL_W))
-                    .h(px(24.0)),
-                ),
-                Theme::default(),
-                &Typography::default(),
-            ))
+            let control = div().when(self.greedy, |d| d.w_full()).h(px(24.0)).child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds: Bounds<Pixels>, _: (), _window, _cx| sink.set(Some(bounds)),
+                )
+                .w(px(CONTROL_W))
+                .h(px(24.0)),
+            );
+            let theme = Theme::default();
+            let typography = Typography::default();
+            let row = if self.hinted {
+                setting_row_desc_hint(
+                    "Environment",
+                    LONG_DESC,
+                    control,
+                    hint_text(LONG_HINT, theme, &typography),
+                    theme,
+                    &typography,
+                )
+            } else {
+                setting_row_desc("Environment", LONG_DESC, control, theme, &typography)
+            };
+            div().w(px(ROW_W)).child(row)
         }
     }
 
@@ -390,7 +501,7 @@ mod tests {
     fn a_long_description_does_not_push_the_control_out_of_the_row(cx: &mut TestAppContext) {
         let control = Rc::new(Cell::new(None));
         let sink = control.clone();
-        let w = cx.add_window(move |_window, _cx| RowProbe { control: sink, greedy: false });
+        let w = cx.add_window(move |_window, _cx| RowProbe::new(sink));
         let vcx = gpui::VisualTestContext::from_window(w.into(), cx);
         vcx.simulate_resize(size(px(900.0), px(600.0)));
         vcx.run_until_parked();
@@ -417,7 +528,7 @@ mod tests {
     fn a_full_width_control_does_not_starve_the_description(cx: &mut TestAppContext) {
         let control = Rc::new(Cell::new(None));
         let sink = control.clone();
-        let w = cx.add_window(move |_window, _cx| RowProbe { control: sink, greedy: true });
+        let w = cx.add_window(move |_window, _cx| RowProbe { greedy: true, ..RowProbe::new(sink) });
         let vcx = gpui::VisualTestContext::from_window(w.into(), cx);
         vcx.simulate_resize(size(px(900.0), px(600.0)));
         vcx.run_until_parked();
@@ -433,6 +544,33 @@ mod tests {
         assert!(
             (f32::from(bounds.size.width) - CONTROL_W).abs() < 0.5,
             "control grew to {} instead of its own {CONTROL_W}px",
+            f32::from(bounds.size.width),
+        );
+    }
+
+    /// The hint line added in phase 1 is a THIRD long string in the row that
+    /// broke twice already. It spans the row rather than sharing the
+    /// description's column, so it must wrap on its own and leave the control
+    /// exactly where the un-hinted row put it — neither pushed out (the first
+    /// fault) nor squeezed (the second).
+    #[gpui::test]
+    fn a_long_hint_does_not_disturb_the_control(cx: &mut TestAppContext) {
+        let control = Rc::new(Cell::new(None));
+        let sink = control.clone();
+        let w = cx.add_window(move |_window, _cx| RowProbe { hinted: true, ..RowProbe::new(sink) });
+        let vcx = gpui::VisualTestContext::from_window(w.into(), cx);
+        vcx.simulate_resize(size(px(900.0), px(600.0)));
+        vcx.run_until_parked();
+
+        let bounds = control.get().expect("the control painted");
+        assert!(
+            f32::from(bounds.right()) <= ROW_W + 0.5,
+            "hinted row's control right edge {} escaped the {ROW_W}px row",
+            f32::from(bounds.right()),
+        );
+        assert!(
+            (f32::from(bounds.size.width) - CONTROL_W).abs() < 0.5,
+            "hinted row squeezed the control to {} instead of {CONTROL_W}px",
             f32::from(bounds.size.width),
         );
     }

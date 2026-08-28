@@ -197,6 +197,12 @@ pub struct SettingsModal {
     /// "New profile" name field; Enter creates and selects the profile.
     pub(super) new_profile_input: Option<Entity<InputState>>,
     _new_profile_sub: Option<Subscription>,
+    /// The environment card's transient acknowledgment or refusal — see
+    /// [`pane_agents_launch::Notice`]. Cleared on the next keystroke in either
+    /// field and on every selection change, so the card never answers a
+    /// question the user has moved on from. View state only: never persisted,
+    /// and dropped with the modal.
+    pub(super) env_notice: Option<pane_agents_launch::Notice>,
     /// Working copy of the `keybindings.toml` override map; reseeded from
     /// disk at each `open()`. Edits persist + apply to the live keymap
     /// immediately (see `pane_keybindings`).
@@ -318,6 +324,7 @@ impl SettingsModal {
             env_seed: BTreeMap::new(),
             new_profile_input: None,
             _new_profile_sub: None,
+            env_notice: None,
             keybind_overrides: BTreeMap::new(),
             recording_action: None,
             recording_sub: None,
@@ -454,12 +461,19 @@ impl SettingsModal {
         // the default entry under the deleted profile's label.
         self.env_agent = pane_agents_launch::LAUNCH_AGENTS[0].0;
         self.env_profile = None;
+        self.env_notice = None;
         self.env_seed = self.selected_env();
+        let placeholder = pane_agents_launch::env_placeholder(self.env_agent);
         let env_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .multi_line(true)
-                .rows(4)
-                .placeholder("ANTHROPIC_BASE_URL=https://proxy.internal/v1")
+                // `auto_grow`, not `multi_line(true).rows(4)`: `rows()` only
+                // drives the field's height in auto-grow mode. For a plain
+                // multi-line input the element hard-codes `min_size.height` to
+                // ONE line and sizes the rest from its parent, so the field
+                // collapsed to a single row and clipped everything below it —
+                // including lines 2 and 3 of the worked example below.
+                .auto_grow(4, 10)
+                .placeholder(placeholder)
                 .default_value(pane_agents_launch::format_env_lines(&self.env_seed))
         });
         // Same split as the custom-words field: sync the working copy on every
@@ -475,8 +489,29 @@ impl SettingsModal {
                     let profile = this.env_profile.clone();
                     this.agent_launch.profile_entry_mut(agent, profile.as_deref()).env =
                         pane_agents_launch::parse_env_lines(&raw);
+                    // Typing is not a commit: the previous answer is now stale,
+                    // so retire it rather than let it hang over new input.
+                    this.env_notice = None;
                 }
-                InputEvent::Blur => this.persist_agent_launch(cx),
+                // Blur is the write, so it is also the acknowledgment — the one
+                // thing this editor never gave. Only a blur that actually
+                // CHANGED something is acknowledged: clicking through the card
+                // blurs the field constantly, and "Saved" on a no-op is the
+                // noise that teaches users to stop reading these lines.
+                InputEvent::Blur if this.selected_env() != this.env_seed => {
+                    this.persist_agent_launch(cx);
+                    this.env_seed = this.selected_env();
+                    let count = this.env_seed.len();
+                    this.env_notice = Some(pane_agents_launch::Notice::ok(
+                        pane_agents_launch::NoticeSlot::Environment,
+                        match count {
+                            0 => "Saved — no variables set.".to_string(),
+                            1 => "Saved 1 variable.".to_string(),
+                            n => format!("Saved {n} variables."),
+                        },
+                    ));
+                    cx.notify();
+                }
                 _ => {}
             },
         ));
@@ -490,20 +525,41 @@ impl SettingsModal {
             &np_input,
             window,
             |this, input, ev: &InputEvent, window, cx| {
+                use pane_agents_launch::{Notice, NoticeSlot};
+                // Typing retires the previous answer; only Enter produces one.
+                if matches!(ev, InputEvent::Change) {
+                    this.env_notice = None;
+                    return;
+                }
                 if !matches!(ev, InputEvent::PressEnter { .. }) {
                     return;
                 }
-                let name = input.read(cx).value().trim().to_string();
-                // `default` is the plain entry, not a nameable profile; a blank
-                // name would be unreachable through `for_agent_in`.
-                if name.is_empty() || name == oximux_settings::DEFAULT_PROFILE {
-                    return;
-                }
                 let agent = this.env_agent;
+                let raw = input.read(cx).value().to_string();
+                // Each of blank / `default` / already-taken used to be a silent
+                // early return, which read as a broken button. All three now
+                // say which one it was, and none of them creates anything.
+                let name = match pane_agents_launch::validate_profile_name(
+                    &raw,
+                    &this.agent_launch.profile_names(agent),
+                ) {
+                    Ok(name) => name,
+                    Err(msg) => {
+                        this.env_notice = Some(Notice::err(NoticeSlot::Profile, msg));
+                        cx.notify();
+                        return;
+                    }
+                };
                 this.agent_launch.profile_entry_mut(agent, Some(&name));
                 this.persist_agent_launch(cx);
                 input.update(cx, |s, cx| s.set_value("", window, cx));
-                this.select_env_profile(Some(name), window, cx);
+                this.select_env_profile(Some(name.clone()), window, cx);
+                // Set AFTER the selection change, which clears the slot.
+                this.env_notice = Some(Notice::ok(
+                    NoticeSlot::Profile,
+                    format!("Created “{name}” — editing it now."),
+                ));
+                cx.notify();
             },
         ));
         self.new_profile_input = Some(np_input);
@@ -582,6 +638,7 @@ impl SettingsModal {
         self._env_sub = None;
         self.new_profile_input = None;
         self._new_profile_sub = None;
+        self.env_notice = None;
         // Drop the schedule create-form inputs so their focus handles can't keep
         // window focus orphaned after the modal is hidden.
         self.sched_name_input = None;
@@ -633,6 +690,15 @@ impl SettingsModal {
 
     /// Persist the per-agent launch working copy to `agent_launch.toml`. The
     /// watcher reloads + swaps the global; we never set the global here.
+    /// The live notice, if it belongs under `slot`. The environment card asks
+    /// per row, so a message raised under one row cannot render under another.
+    pub(super) fn notice_for(
+        &self,
+        slot: pane_agents_launch::NoticeSlot,
+    ) -> Option<&pane_agents_launch::Notice> {
+        self.env_notice.as_ref().filter(|n| n.slot == slot)
+    }
+
     /// The env map of the currently-selected `(agent, profile)`, or empty when
     /// that pair has no entry yet. The comparison basis for the close-flush.
     fn selected_env(&self) -> BTreeMap<String, String> {
@@ -682,9 +748,18 @@ impl SettingsModal {
     /// the close-flush comparison.
     fn reseed_env_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.env_seed = self.selected_env();
+        // A message about the pair being left would read as being about the
+        // pair being arrived at.
+        self.env_notice = None;
         let text = pane_agents_launch::format_env_lines(&self.env_seed);
+        let placeholder = pane_agents_launch::env_placeholder(self.env_agent);
         if let Some(input) = self.env_input.clone() {
-            input.update(cx, |s, cx| s.set_value(&text, window, cx));
+            input.update(cx, |s, cx| {
+                s.set_value(&text, window, cx);
+                // The example set is per-agent, so it follows the selection —
+                // Anthropic variables in the Codex editor teach the wrong thing.
+                s.set_placeholder(placeholder, window, cx);
+            });
         }
         cx.notify();
     }
@@ -1086,6 +1161,146 @@ mod env_editor_tests {
                         .value()
                         .is_empty(),
                     "the name field clears, so the next name starts blank"
+                );
+                m.close(cx);
+            });
+        })
+        .expect("assert");
+    }
+
+    /// Every commit path through the name field must ANSWER. Creating says
+    /// which profile it made; each of the three refusals says which rule was
+    /// broken. All four used to be silent — the reported confusion ("seem only
+    /// default? and how to save new profile?") was exactly this.
+    ///
+    /// Driven through the `InputState` event, like the creation test: the
+    /// notices are raised inside the subscription, which no logic test reaches.
+    #[gpui::test]
+    fn every_profile_commit_answers_the_user(cx: &mut TestAppContext) {
+        use pane_agents_launch::NoticeSlot;
+
+        let (w, m) = modal(cx);
+        // Each case: what to type, and whether it should be accepted.
+        let press = |m: &Entity<SettingsModal>,
+                     cx: &mut gpui::Context<'_, gpui_component::Root>,
+                     window: &mut Window,
+                     text: &str| {
+            m.update(cx, |m, cx| {
+                let field = m.new_profile_input.clone().expect("name field");
+                field.update(cx, |s, cx| s.set_value(text, window, cx));
+                field.update(cx, |_, cx| cx.emit(InputEvent::PressEnter { secondary: false }));
+            });
+        };
+
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.open(window, cx);
+                m.env_agent = "claude-code";
+            });
+        })
+        .expect("open");
+        cx.run_until_parked();
+
+        // 1. A real name is created AND acknowledged by name.
+        w.update(cx, |_root, window, cx| press(&m, cx, window, "proxy")).expect("create");
+        cx.run_until_parked();
+        let created = w
+            .update(cx, |_root, _window, cx| {
+                m.update(cx, |m, _| {
+                    let n = m.notice_for(NoticeSlot::Profile).expect("a create is answered").clone();
+                    assert!(n.ok, "creating is not a failure");
+                    n.text.to_string()
+                })
+            })
+            .expect("read notice");
+        assert!(created.contains("proxy"), "the confirmation names it: {created}");
+
+        // 2-4. Each refusal answers, creates nothing, and says something
+        // different from the others.
+        let mut refusals = Vec::new();
+        for typed in ["   ", DEFAULT_PROFILE, "proxy"] {
+            w.update(cx, |_root, window, cx| press(&m, cx, window, typed)).expect("refused");
+            cx.run_until_parked();
+            let text = w
+                .update(cx, |_root, _window, cx| {
+                    m.update(cx, |m, _| {
+                        let n = m
+                            .notice_for(NoticeSlot::Profile)
+                            .unwrap_or_else(|| panic!("“{typed}” was refused silently"))
+                            .clone();
+                        assert!(!n.ok, "“{typed}” must read as a refusal: {}", n.text);
+                        assert_eq!(
+                            m.agent_launch.profile_names("claude-code"),
+                            vec![DEFAULT_PROFILE, "proxy"],
+                            "“{typed}” must not have created anything"
+                        );
+                        n.text.to_string()
+                    })
+                })
+                .expect("read refusal");
+            refusals.push(text);
+        }
+        refusals.sort();
+        refusals.dedup();
+        assert_eq!(refusals.len(), 3, "the three refusals must be distinguishable");
+
+        // Typing again retires the answer, so the card never shows a stale one.
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                let field = m.new_profile_input.clone().expect("name field");
+                field.update(cx, |s, cx| s.set_value("stag", window, cx));
+                field.update(cx, |_, cx| cx.emit(InputEvent::Change));
+            });
+        })
+        .expect("type");
+        cx.run_until_parked();
+        w.update(cx, |_root, _window, cx| {
+            m.update(cx, |m, cx| {
+                assert!(m.env_notice.is_none(), "typing must clear the previous answer");
+                m.close(cx);
+            });
+        })
+        .expect("assert");
+    }
+
+    /// The env editor writes on blur and used to say nothing at all. It must
+    /// acknowledge a write — and, just as importantly, stay quiet on a blur
+    /// that changed nothing, or the acknowledgment becomes noise nobody reads.
+    #[gpui::test]
+    fn the_env_editor_acknowledges_a_write_but_not_a_no_op(cx: &mut TestAppContext) {
+        use pane_agents_launch::NoticeSlot;
+
+        let (w, m) = modal(cx);
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.open(window, cx);
+                m.env_agent = "claude-code";
+                let input = m.env_input.clone().expect("env editor");
+                input.update(cx, |s, cx| {
+                    s.set_value("ANTHROPIC_BASE_URL=https://proxy.internal/v1", window, cx)
+                });
+                input.update(cx, |_, cx| cx.emit(InputEvent::Change));
+                input.update(cx, |_, cx| cx.emit(InputEvent::Blur));
+            });
+        })
+        .expect("write then blur");
+        cx.run_until_parked();
+        w.update(cx, |_root, _window, cx| {
+            m.update(cx, |m, cx| {
+                let n = m
+                    .notice_for(NoticeSlot::Environment)
+                    .expect("a write is acknowledged")
+                    .clone();
+                assert!(n.ok, "a successful write is not a failure: {}", n.text);
+                assert!(n.text.contains('1'), "it says how much it saved: {}", n.text);
+
+                // A second blur with nothing changed must NOT re-announce.
+                m.env_notice = None;
+                let input = m.env_input.clone().expect("env editor");
+                input.update(cx, |_, cx| cx.emit(InputEvent::Blur));
+                assert!(
+                    m.env_notice.is_none(),
+                    "a blur that committed nothing must stay silent"
                 );
                 m.close(cx);
             });
