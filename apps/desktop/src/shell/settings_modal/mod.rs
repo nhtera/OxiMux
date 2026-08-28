@@ -200,6 +200,11 @@ pub struct SettingsModal {
     pub(super) profile_name_input: Option<Entity<InputState>>,
     pub(super) profile_name_mode: Option<pane_agents_launch::ProfileNameMode>,
     _profile_name_sub: Option<Subscription>,
+    /// Whether the environment editor is showing its values rather than a
+    /// masked stand-in. Off on every open and on every selection change: a
+    /// reveal is an act about one profile's values, and carrying it forward
+    /// would un-mask the next one without being asked.
+    pub(super) env_revealed: bool,
     /// The profile whose Delete has been pressed once. The second press
     /// removes it. View state, so an armed delete never survives a reopen.
     pub(super) pending_profile_delete: Option<String>,
@@ -332,6 +337,7 @@ impl SettingsModal {
             profile_name_mode: None,
             _profile_name_sub: None,
             pending_profile_delete: None,
+            env_revealed: false,
             env_notice: None,
             keybind_overrides: BTreeMap::new(),
             recording_action: None,
@@ -470,6 +476,7 @@ impl SettingsModal {
         self.env_agent = pane_agents_launch::LAUNCH_AGENTS[0].0;
         self.env_profile = None;
         self.env_notice = None;
+        self.env_revealed = false;
         self.env_seed = self.selected_env();
         let placeholder = pane_agents_launch::env_placeholder(self.env_agent);
         let env_input = cx.new(|cx| {
@@ -493,32 +500,27 @@ impl SettingsModal {
             |this, input, ev: &InputEvent, cx| match ev {
                 InputEvent::Change => {
                     let raw = input.read(cx).value().to_string();
-                    let agent = this.env_agent;
-                    let profile = this.env_profile.clone();
-                    this.agent_launch.profile_entry_mut(agent, profile.as_deref()).env =
-                        pane_agents_launch::parse_env_lines(&raw);
+                    // An oversized draft is not synced at all, so it cannot
+                    // reach the file through the close-flush either. The
+                    // working copy keeps its last good value until the draft
+                    // comes back under the cap.
+                    if raw.len() <= pane_agents_launch::MAX_ENV_DRAFT {
+                        let agent = this.env_agent;
+                        let profile = this.env_profile.clone();
+                        this.agent_launch.profile_entry_mut(agent, profile.as_deref()).env =
+                            pane_agents_launch::parse_env_lines(&raw);
+                    }
                     // Typing is not a commit: the previous answer is now stale,
                     // so retire it rather than let it hang over new input.
+                    // Diagnostics deliberately do NOT run here — this fires on
+                    // every keystroke, and it would flag `ANTHROPIC_BASE_UR`
+                    // as malformed while it is still being typed.
                     this.env_notice = None;
                 }
-                // Blur is the write, so it is also the acknowledgment — the one
-                // thing this editor never gave. Only a blur that actually
-                // CHANGED something is acknowledged: clicking through the card
-                // blurs the field constantly, and "Saved" on a no-op is the
-                // noise that teaches users to stop reading these lines.
-                InputEvent::Blur if this.selected_env() != this.env_seed => {
-                    this.persist_agent_launch(cx);
-                    this.env_seed = this.selected_env();
-                    let count = this.env_seed.len();
-                    this.env_notice = Some(pane_agents_launch::Notice::ok(
-                        pane_agents_launch::NoticeSlot::Environment,
-                        match count {
-                            0 => "Saved — no variables set.".to_string(),
-                            1 => "Saved 1 variable.".to_string(),
-                            n => format!("Saved {n} variables."),
-                        },
-                    ));
-                    cx.notify();
+                // Blur is the write, so it is also where the draft is judged.
+                InputEvent::Blur => {
+                    let raw = input.read(cx).value().to_string();
+                    this.commit_env_draft(&raw, cx);
                 }
                 _ => {}
             },
@@ -693,6 +695,7 @@ impl SettingsModal {
         self.profile_name_mode = None;
         self.pending_profile_delete = None;
         self.env_notice = None;
+        self.env_revealed = false;
         // Drop the schedule create-form inputs so their focus handles can't keep
         // window focus orphaned after the modal is hidden.
         self.sched_name_input = None;
@@ -823,6 +826,7 @@ impl SettingsModal {
         // A message about the pair being left would read as being about the
         // pair being arrived at.
         self.env_notice = None;
+        self.env_revealed = false;
         let text = pane_agents_launch::format_env_lines(&self.env_seed);
         let placeholder = pane_agents_launch::env_placeholder(self.env_agent);
         if let Some(input) = self.env_input.clone() {
@@ -833,6 +837,92 @@ impl SettingsModal {
                 s.set_placeholder(placeholder, window, cx);
             });
         }
+        cx.notify();
+    }
+
+    /// Judge and write the environment draft. The one place a commit happens,
+    /// so blur, the reveal toggle, and any future Enter path all say the same
+    /// thing about the same text.
+    ///
+    /// Three outcomes, all of them spoken:
+    ///
+    /// - Over the size cap: nothing is written and the field says so. A cap
+    ///   that truncated would be the same silent-loss failure as the dropped
+    ///   line below, one order of magnitude larger.
+    /// - Lines that cannot become variables: reported, naming the first and
+    ///   counting the rest. Reported even when the map did not change, which is
+    ///   the case that matters — a line with no `=` produces no map change, so
+    ///   a plain "did anything change?" test calls it a no-op and stays quiet.
+    /// - A clean write: acknowledged with the count, as before.
+    ///
+    /// A blur that changed nothing and had nothing to report stays silent:
+    /// clicking through the card blurs this field constantly, and "Saved" on a
+    /// no-op is the noise that teaches users to stop reading these lines.
+    pub(super) fn commit_env_draft(&mut self, raw: &str, cx: &mut Context<Self>) {
+        use pane_agents_launch::{MAX_ENV_DRAFT, Notice, NoticeSlot};
+
+        if raw.len() > MAX_ENV_DRAFT {
+            self.env_notice = Some(Notice::err(
+                NoticeSlot::Environment,
+                format!(
+                    "Too large to save — {} characters, limit {MAX_ENV_DRAFT}. \
+                     Nothing was written; shorten it and it will save.",
+                    raw.len()
+                ),
+            ));
+            cx.notify();
+            return;
+        }
+
+        // Sync from `raw` here rather than trusting the keystroke handler to
+        // have run: the reveal toggle commits from a mouse click on another
+        // element, and a commit that silently depended on a prior `Change`
+        // would strand the last thing typed.
+        let (map, rejects) = pane_agents_launch::parse_env_draft(raw);
+        let agent = self.env_agent;
+        let profile = self.env_profile.clone();
+        self.agent_launch.profile_entry_mut(agent, profile.as_deref()).env = map;
+        let changed = self.selected_env() != self.env_seed;
+        if !changed && rejects.is_empty() {
+            return;
+        }
+        if changed {
+            self.persist_agent_launch(cx);
+            self.env_seed = self.selected_env();
+        }
+        // Resolution drops reserved keys, so the saved count is the count that
+        // will actually reach a launch — not the number of lines typed.
+        let applied = self
+            .agent_launch
+            .env_for(self.env_agent, self.env_profile.as_deref())
+            .len();
+        self.env_notice = Some(match pane_agents_launch::reject_message(&rejects) {
+            // Part of the draft was refused, so this reads as a refusal even
+            // though the rest of it saved.
+            Some(msg) => Notice::err(NoticeSlot::Environment, msg),
+            None => Notice::ok(
+                NoticeSlot::Environment,
+                match applied {
+                    0 => "Saved — no variables set.".to_string(),
+                    1 => "Saved 1 variable.".to_string(),
+                    n => format!("Saved {n} variables."),
+                },
+            ),
+        });
+        cx.notify();
+    }
+
+    /// Show or hide the environment editor's values.
+    ///
+    /// Hiding commits first: the editor is unmounted while masked, so its blur
+    /// — the write — would never fire, and a value typed and then hidden would
+    /// be lost.
+    pub(super) fn toggle_env_reveal(&mut self, cx: &mut Context<Self>) {
+        if self.env_revealed && let Some(input) = self.env_input.clone() {
+            let raw = input.read(cx).value().to_string();
+            self.commit_env_draft(&raw, cx);
+        }
+        self.env_revealed = !self.env_revealed;
         cx.notify();
     }
 
@@ -1137,6 +1227,148 @@ mod env_editor_tests {
             });
         })
         .expect("agent switch");
+    }
+
+    /// The three ways this editor used to lose input without saying so: a line
+    /// it could not parse, a key it will never apply, and a draft too big to
+    /// hold. All three are now spoken, and none of them writes silently.
+    #[gpui::test]
+    fn the_env_editor_refuses_what_breaks_a_launch_and_says_which_line(cx: &mut TestAppContext) {
+        use pane_agents_launch::{MAX_ENV_DRAFT, NoticeSlot};
+
+        let (w, m) = modal(cx);
+        let commit = |m: &Entity<SettingsModal>,
+                      cx: &mut gpui::Context<'_, gpui_component::Root>,
+                      window: &mut Window,
+                      text: &str| {
+            m.update(cx, |m, cx| {
+                let input = m.env_input.clone().expect("env editor");
+                input.update(cx, |s, cx| s.set_value(text, window, cx));
+                input.update(cx, |_, cx| cx.emit(InputEvent::Change));
+                input.update(cx, |_, cx| cx.emit(InputEvent::Blur));
+            });
+        };
+        let notice = |m: &Entity<SettingsModal>, cx: &mut gpui::Context<'_, gpui_component::Root>| {
+            m.update(cx, |m, _| {
+                m.notice_for(NoticeSlot::Environment)
+                    .map(|n| (n.ok, n.text.to_string()))
+            })
+        };
+
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.open(window, cx);
+                m.env_agent = "claude-code";
+                let _ = cx;
+            });
+        })
+        .expect("open");
+
+        // 1. A line with no `=`. The map does not change, so a plain
+        // "did anything change?" check would call this a no-op and stay quiet —
+        // which is exactly how the line used to vanish.
+        w.update(cx, |_root, window, cx| commit(&m, cx, window, "ANTHROPIC_BASE_URL https://p/v1"))
+            .expect("malformed");
+        let (ok, msg) = w
+            .update(cx, |_root, _window, cx| notice(&m, cx))
+            .expect("read")
+            .expect("a malformed line is answered");
+        assert!(!ok, "it is a refusal");
+        assert!(msg.contains("Line 1") && msg.contains("="), "{msg}");
+
+        // 2. A reserved key: reported, and filtered out of what resolution
+        // hands a spawn even though the line stays in the draft.
+        w.update(cx, |_root, window, cx| {
+            commit(&m, cx, window, "PATH=/nowhere\nANTHROPIC_BASE_URL=https://p/v1")
+        })
+        .expect("reserved");
+        let (ok, msg) = w
+            .update(cx, |_root, _window, cx| notice(&m, cx))
+            .expect("read")
+            .expect("a reserved key is answered");
+        assert!(!ok && msg.contains("PATH"), "{msg}");
+        m.read_with(cx, |m, _| {
+            assert_eq!(
+                m.agent_launch.env_for("claude-code", None),
+                vec![("ANTHROPIC_BASE_URL".to_string(), "https://p/v1".to_string())],
+                "the reserved key never reaches a spawn",
+            );
+            assert_eq!(
+                m.agent_launch.for_agent("claude-code").expect("entry").env.len(),
+                2,
+                "but the line the user typed is still there to be corrected",
+            );
+        });
+
+        // 3. A clean draft is acknowledged with the count that will actually
+        // apply, and the notice goes green.
+        w.update(cx, |_root, window, cx| {
+            commit(&m, cx, window, "ANTHROPIC_BASE_URL=https://p/v1\nANTHROPIC_AUTH_TOKEN=x")
+        })
+        .expect("clean");
+        let (ok, msg) = w
+            .update(cx, |_root, _window, cx| notice(&m, cx))
+            .expect("read")
+            .expect("a clean write is acknowledged");
+        assert!(ok && msg.contains('2'), "{msg}");
+
+        // 4. Over the cap: nothing is written, and the last good value stands.
+        let huge = format!("BIG={}", "x".repeat(MAX_ENV_DRAFT));
+        assert!(huge.len() > MAX_ENV_DRAFT);
+        w.update(cx, |_root, window, cx| commit(&m, cx, window, &huge)).expect("oversized");
+        let (ok, msg) = w
+            .update(cx, |_root, _window, cx| notice(&m, cx))
+            .expect("read")
+            .expect("an oversized draft is answered");
+        assert!(!ok && msg.contains("Too large"), "{msg}");
+        m.read_with(cx, |m, _| {
+            assert!(
+                !m.agent_launch.for_agent("claude-code").expect("entry").env.contains_key("BIG"),
+                "an oversized draft must not reach the working copy at all — \
+                 the close-flush would otherwise write it",
+            );
+            assert_eq!(m.agent_launch.env_for("claude-code", None).len(), 2);
+        });
+
+        w.update(cx, |_root, _window, cx| m.update(cx, |m, cx| m.close(cx))).expect("close");
+    }
+
+    /// Masking is display-only, and hiding has to commit first: the editor is
+    /// unmounted while masked, so its blur — the write — never fires.
+    #[gpui::test]
+    fn hiding_the_values_commits_the_draft_first(cx: &mut TestAppContext) {
+        let (w, m) = modal(cx);
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.open(window, cx);
+                m.env_agent = "claude-code";
+                assert!(!m.env_revealed, "values start masked");
+
+                m.toggle_env_reveal(cx);
+                assert!(m.env_revealed);
+
+                let input = m.env_input.clone().expect("env editor");
+                input.update(cx, |s, cx| s.set_value("ANTHROPIC_AUTH_TOKEN=secret", window, cx));
+                input.update(cx, |_, cx| cx.emit(InputEvent::Change));
+                // Hide WITHOUT blurring — the hazard.
+                m.toggle_env_reveal(cx);
+                assert!(!m.env_revealed);
+                assert_eq!(
+                    m.agent_launch.env_for("claude-code", None),
+                    vec![("ANTHROPIC_AUTH_TOKEN".to_string(), "secret".to_string())],
+                    "hiding wrote the draft rather than stranding it",
+                );
+
+                // Selecting elsewhere re-masks: a reveal is about one profile's
+                // values and must not carry to the next.
+                m.toggle_env_reveal(cx);
+                assert!(m.env_revealed);
+                m.select_env_profile(Some("proxy".into()), window, cx);
+                assert!(!m.env_revealed);
+                m.close(cx);
+            });
+        })
+        .expect("reveal, edit, hide");
     }
 
     /// The functional hole phase 3 closes, and the consistency requirement that

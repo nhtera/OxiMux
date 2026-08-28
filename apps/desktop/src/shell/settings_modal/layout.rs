@@ -351,42 +351,20 @@ pub(super) fn setting_row_desc_hint(
     )
 }
 
-/// A setting whose control is the full width of the card — label and
-/// description stacked above it rather than beside it — with a `hint` line
-/// beneath.
+/// A setting whose `body` is the full width of the card — label and
+/// description stacked above it rather than beside it — with an `action`
+/// control on the label line and a `hint` line beneath.
 ///
 /// [`setting_row_desc`] pins its control to the right at the control's own
-/// width, which is correct for a switch, a chip, or a picker. A text editor
-/// wants the whole row, and squeezing one into the right-hand column leaves
-/// both halves unusable — the field too narrow to read and the description
-/// wrapped to a sliver.
+/// width, which is correct for a switch, a chip, or a picker. A list or a text
+/// editor wants the whole row, and squeezing one into the right-hand column
+/// leaves both halves unusable — the field too narrow to read and the
+/// description wrapped to a sliver.
 ///
 /// The hint is where a field's *format rule* belongs: the reference
 /// preferences panes all put "one `KEY=value` per line" under the editor rather
 /// than inside the description, which lets the description stay one sentence
 /// about what the field is for.
-pub(super) fn setting_row_hint(
-    label: impl Into<SharedString>,
-    description: impl Into<SharedString>,
-    control: impl IntoElement,
-    hint: impl IntoElement,
-    theme: Theme,
-    typography: &Typography,
-) -> AnyElement {
-    stacked_row(
-        label.into(),
-        description.into(),
-        None,
-        control.into_any_element(),
-        hint.into_any_element(),
-        theme,
-        typography,
-    )
-}
-
-/// [`setting_row_hint`] with an `action` control on the label line — a `+`
-/// that reveals a field, or anything else that acts on the whole body rather
-/// than on one of its rows.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn setting_row_action_hint(
     label: impl Into<SharedString>,
@@ -394,29 +372,6 @@ pub(super) fn setting_row_action_hint(
     action: impl IntoElement,
     body: impl IntoElement,
     hint: impl IntoElement,
-    theme: Theme,
-    typography: &Typography,
-) -> AnyElement {
-    stacked_row(
-        label.into(),
-        description.into(),
-        Some(action.into_any_element()),
-        body.into_any_element(),
-        hint.into_any_element(),
-        theme,
-        typography,
-    )
-}
-
-/// The shared body of [`setting_row_hint`] and [`setting_row_action_hint`]:
-/// a label line (with an optional trailing `action`), a full-width `body`
-/// beneath it, and a `hint` line under that.
-fn stacked_row(
-    label: SharedString,
-    description: SharedString,
-    action: Option<AnyElement>,
-    body: AnyElement,
-    hint: AnyElement,
     theme: Theme,
     typography: &Typography,
 ) -> AnyElement {
@@ -436,11 +391,15 @@ fn stacked_row(
                 .gap(px(16.0))
                 // Same pairing as `desc_row`: the text column may shrink and
                 // wrap, the action never does.
-                .child(label_column(label, description, theme, typography).flex_1().min_w_0())
-                .children(action.map(|a| div().flex_none().child(a))),
+                .child(
+                    label_column(label.into(), description.into(), theme, typography)
+                        .flex_1()
+                        .min_w_0(),
+                )
+                .child(div().flex_none().child(action.into_any_element())),
         )
-        .child(div().w_full().child(body))
-        .child(div().w_full().min_w_0().child(hint))
+        .child(div().w_full().child(body.into_any_element()))
+        .child(div().w_full().min_w_0().child(hint.into_any_element()))
         .into_any_element()
 }
 

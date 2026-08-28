@@ -111,6 +111,63 @@ pub enum OpenMode {
     Chat,
 }
 
+/// Environment variables a launch profile may not override, each with the
+/// thing that breaks when it does.
+///
+/// This is data with reasons attached, deliberately: a blocklist whose entries
+/// have no stated cause rots into a list nobody dares change. If a real use
+/// case for one of these appears, delete the entry **and its reason together**
+/// rather than adding an escape hatch that disarms the guard for every key.
+///
+/// The `OXIMUX_` prefix is blocked separately — see
+/// [`RESERVED_ENV_PREFIX`].
+pub const RESERVED_ENV_KEYS: [&str; 7] = [
+    // The spawn resolves the agent binary through `PATH`. Replacing it is the
+    // difference between "the agent launched" and "command not found", with no
+    // message that points at this field.
+    "PATH",
+    // Every agent CLI keeps its credentials and config under the home
+    // directory. Repointing it does not give the agent a second account — it
+    // gives it no account, and silently.
+    "HOME",
+    // Read by tooling the agent shells out to (git authorship among them).
+    // A launch is not the place to become a different person.
+    "USER",
+    // The PTY's shell is chosen by the terminal settings, which resolve it
+    // themselves; an override here disagrees with what actually spawned.
+    "SHELL",
+    // The terminal emulator sets this to describe the capabilities it actually
+    // has. A value that claims otherwise produces unreadable output.
+    "TERM",
+    // OxiMux reads `$CODEX_HOME` from its own environment to find Codex's
+    // rollout logs (the usage meter) and to install its status hooks. A launch
+    // that moves it leaves both looking in the wrong directory, and the agent
+    // simply appears to stop reporting.
+    "CODEX_HOME",
+    // Same for Claude Code: the usage meter and hook installer resolve
+    // `$CLAUDE_CONFIG_DIR` app-side, so a per-launch override desynchronises
+    // them from the agent without any error.
+    "CLAUDE_CONFIG_DIR",
+];
+
+/// Variables under this prefix belong to OxiMux itself and are never a
+/// profile's to set. `OXIMUX_SESSION_ID` is the credential a spawned agent
+/// presents to claim its own scope — a profile that could set it could hand
+/// one agent another's authority.
+pub const RESERVED_ENV_PREFIX: &str = "OXIMUX_";
+
+/// Whether `key` is refused by [`AgentLaunchSettings::env_for`]. Exported so
+/// the settings UI can say so before the user commits, rather than leaving
+/// resolution as the only place the rule is known.
+///
+/// Compared case-sensitively after trimming, matching how the environment is
+/// applied: on Unix `path` and `PATH` are different variables, and refusing
+/// the former would be a guess about intent.
+pub fn is_reserved_env_key(key: &str) -> bool {
+    let key = key.trim();
+    RESERVED_ENV_KEYS.contains(&key) || key.starts_with(RESERVED_ENV_PREFIX)
+}
+
 /// The name of the implicit first profile — the plain `[agents.<id>]` entry
 /// every existing config already carries. Reserved: a named profile may not
 /// reuse it, so "default" always resolves to that entry and never to a
@@ -640,7 +697,12 @@ impl AgentLaunchSettings {
             .map(|a| {
                 a.env
                     .iter()
-                    .filter(|(k, _)| !k.trim().is_empty())
+                    // Reserved keys are filtered HERE, at resolution, rather
+                    // than on the way into the file: a hand-written
+                    // `agent_launch.toml` must be guarded too, and dropping the
+                    // line on load would delete input the user typed instead of
+                    // telling them it cannot be applied.
+                    .filter(|(k, _)| !k.trim().is_empty() && !is_reserved_env_key(k))
                     .map(|(k, v)| (k.trim().to_string(), v.clone()))
                     .collect()
             })
@@ -1158,6 +1220,58 @@ args = "--dangerously-bypass-approvals-and-sandbox"
         // Editing the copy leaves the default entry alone.
         s.profile_entry_mut("claude-code", Some("second")).model = "haiku".into();
         assert_eq!(s.model_for("claude-code").as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn a_reserved_key_never_reaches_a_spawn_however_it_got_into_the_file() {
+        // The hand-edited case: this TOML was never written by the UI, so the
+        // guard has to live at resolution or it does not exist.
+        let toml = r#"
+[agents.claude-code]
+[agents.claude-code.env]
+PATH = "/nowhere"
+HOME = "/tmp/elsewhere"
+CODEX_HOME = "/tmp/codex"
+CLAUDE_CONFIG_DIR = "/tmp/claude"
+OXIMUX_SESSION_ID = "borrowed"
+ANTHROPIC_BASE_URL = "https://proxy/v1"
+"#;
+        let s: AgentLaunchSettings = toml::from_str(toml).expect("parses");
+        assert_eq!(
+            s.env_for("claude-code", None),
+            vec![("ANTHROPIC_BASE_URL".to_string(), "https://proxy/v1".to_string())],
+            "only the one key that is the user's to set survives",
+        );
+        // The lines are still IN the file — filtered on the way out, not
+        // deleted on the way in, so nothing the user typed vanishes.
+        assert_eq!(s.for_agent("claude-code").expect("entry").env.len(), 6);
+    }
+
+    #[test]
+    fn the_reserved_rule_is_prefix_plus_an_exact_list() {
+        for k in RESERVED_ENV_KEYS {
+            assert!(is_reserved_env_key(k), "{k} is on the list");
+        }
+        assert!(is_reserved_env_key("  PATH  "), "trimmed before comparing");
+        assert!(is_reserved_env_key("OXIMUX_SESSION_ID"));
+        assert!(is_reserved_env_key("OXIMUX_ANYTHING_AT_ALL"), "the whole prefix is ours");
+        // Case-sensitive: on Unix these are different variables, and refusing
+        // the lowercase one would be a guess about what was meant.
+        assert!(!is_reserved_env_key("path"));
+        assert!(!is_reserved_env_key("oximux_session_id"));
+        // The things a profile exists to set are not on it.
+        assert!(!is_reserved_env_key("ANTHROPIC_BASE_URL"));
+        assert!(!is_reserved_env_key("OPENAI_API_KEY"));
+        assert!(!is_reserved_env_key("HOMEBREW_PREFIX"), "a prefix match on HOME would be wrong");
+    }
+
+    #[test]
+    fn a_profile_cannot_reintroduce_a_reserved_key_the_default_lacks() {
+        let mut s = AgentLaunchSettings::default();
+        s.profile_entry_mut("claude-code", Some("proxy"))
+            .env
+            .insert("PATH".into(), "/nowhere".into());
+        assert!(s.env_for("claude-code", Some("proxy")).is_empty());
     }
 
     #[test]

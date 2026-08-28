@@ -20,7 +20,7 @@ use super::SettingsModal;
 use super::controls::{icon_button, toggle_chip, toggle_switch, value_chip};
 use super::layout::{
     SettingEntry, card_surface, entry, hint_text, list_row, notice_text, section_card,
-    setting_row_action_hint, setting_row_desc, setting_row_desc_hint, setting_row_hint,
+    setting_row_action_hint, setting_row_desc, setting_row_desc_hint,
 };
 use super::segmented::{Segment, segmented};
 use crate::shell::agent_presentation::adapter_icon_path;
@@ -168,42 +168,124 @@ pub(super) fn env_placeholder(adapter_id: &str) -> &'static str {
         }
     }
 }
+/// The largest environment draft the editor will commit, in bytes.
+///
+/// A cap rather than a truncation: silently keeping the first 8 KB of a paste
+/// is the same class of failure as silently dropping a malformed line. Well
+/// past any real set of variables — the longest plausible entry is a token,
+/// and 8 KB is dozens of them.
+pub(super) const MAX_ENV_DRAFT: usize = 8 * 1024;
+
+/// A line of the environment draft that will not become a variable, and why.
+///
+/// Every one of these used to be a `continue`: the line disappeared on reopen
+/// and the field read as having accepted it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(in crate::shell) enum EnvReject {
+    /// No `=` anywhere — the line names nothing to set.
+    NoAssignment { line: usize },
+    /// `=value` with nothing before the `=`.
+    BlankKey { line: usize },
+    /// A key resolution refuses to apply (see `is_reserved_env_key`).
+    Reserved { line: usize, key: String },
+}
+
+impl EnvReject {
+    /// What the user is told. Names the line number in every case, because the
+    /// draft is free text and "one of your lines is wrong" is not actionable.
+    fn message(&self) -> String {
+        match self {
+            Self::NoAssignment { line } => {
+                format!("Line {line} has no “=” — write it as KEY=value.")
+            }
+            Self::BlankKey { line } => format!("Line {line} has no name before its “=”."),
+            Self::Reserved { line, key } => format!(
+                "Line {line}: “{key}” is set by OxiMux and can't be overridden here — \
+                 it would break the launch."
+            ),
+        }
+    }
+}
+
+/// Sum up what a draft's rejects should say: the first one in full, plus a
+/// count of the rest, so one message stays one line however many lines are
+/// wrong.
+pub(super) fn reject_message(rejects: &[EnvReject]) -> Option<String> {
+    let first = rejects.first()?;
+    Some(match rejects.len() {
+        1 => first.message(),
+        n => format!("{} (+{} more)", first.message(), n - 1),
+    })
+}
+
 /// Parse the environment editor's text into the map [`PerAgentLaunch::env`]
-/// holds. One `KEY=value` per line, `.env`-shaped because that is the form a
-/// proxy or alternate-endpoint configuration is already pasted from.
+/// holds, together with the lines that did not become variables.
+///
+/// One `KEY=value` per line, `.env`-shaped because that is the form a proxy or
+/// alternate-endpoint configuration is already pasted from.
 ///
 /// - The FIRST `=` splits; a value may contain further `=` (a URL query, a
 ///   base64 token) without quoting.
-/// - Blank lines and `#` comments are skipped, so a user can annotate.
-/// - A line with no `=`, or an empty key, is dropped rather than guessed at —
-///   a half-typed line must not become a variable named after a fragment.
+/// - Blank lines and `#` comments are skipped silently — they are annotation,
+///   not failed input.
+/// - A line with no `=`, an empty key, or a reserved key is REPORTED rather
+///   than guessed at. A reserved key is still kept in the map: resolution
+///   filters it, and deleting the user's line would be the silent drop this
+///   exists to stop.
 /// - Key and value are both trimmed. A trailing space in a key is a *different*
 ///   variable than the one the user meant, which is the failure this prevents.
 ///
 /// [`PerAgentLaunch::env`]: oximux_settings::PerAgentLaunch::env
-pub(super) fn parse_env_lines(raw: &str) -> BTreeMap<String, String> {
+pub(super) fn parse_env_draft(raw: &str) -> (BTreeMap<String, String>, Vec<EnvReject>) {
     let mut out = BTreeMap::new();
-    for line in raw.lines() {
+    let mut rejects = Vec::new();
+    for (idx, line) in raw.lines().enumerate() {
+        // 1-based: the editor shows lines the way a person counts them.
+        let n = idx + 1;
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let Some((k, v)) = line.split_once('=') else {
+            rejects.push(EnvReject::NoAssignment { line: n });
             continue;
         };
         let k = k.trim();
         if k.is_empty() {
+            rejects.push(EnvReject::BlankKey { line: n });
             continue;
+        }
+        if oximux_settings::is_reserved_env_key(k) {
+            rejects.push(EnvReject::Reserved { line: n, key: k.to_string() });
         }
         out.insert(k.to_string(), v.trim().to_string());
     }
-    out
+    (out, rejects)
+}
+
+/// The map half of [`parse_env_draft`], for the keystroke-rate sync that has
+/// no use for diagnostics.
+pub(super) fn parse_env_lines(raw: &str) -> BTreeMap<String, String> {
+    parse_env_draft(raw).0
 }
 
 /// Render an env map back into editor text: one `KEY=value` per line, in the
 /// map's key order (it is a `BTreeMap`, so sorted and stable across reopens).
 pub(super) fn format_env_lines(env: &BTreeMap<String, String>) -> String {
     env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n")
+}
+
+/// The masked stand-in for the editor: the keys, with every value replaced by
+/// a fixed run of bullets.
+///
+/// Fixed-width on purpose — a mask that tracks the value's length leaks it,
+/// and a token's length is a meaningful hint. Keys are shown in full: the key
+/// is what makes the row identifiable, and it is not the secret.
+pub(super) fn masked_env_preview(env: &BTreeMap<String, String>) -> String {
+    env.iter()
+        .map(|(k, v)| if v.is_empty() { format!("{k}=") } else { format!("{k}=••••••••") })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Built-in agents exposed in the launch settings, in picker order. The
@@ -586,18 +668,72 @@ pub(super) fn render_env_card(
     // The editor itself. Stacked rather than pinned right: it is the one
     // control in this card that wants the full width of the row.
     if let Some(state) = modal.env_input.as_ref() {
+        // Masked by default. The widget's own `masked` mode is single-line
+        // only, so hiding swaps the live field for a read-only stand-in rather
+        // than trying to make a masked textarea editable — editing text you
+        // cannot read is worse than a second click to reveal.
+        let body: AnyElement = if modal.env_revealed {
+            Input::new(state).text_size(px(typography.t_body_sm)).into_any_element()
+        } else {
+            let env = modal
+                .agent_launch
+                .for_agent_in(current_agent, modal.env_profile.as_deref())
+                .map(|l| l.env.clone())
+                .unwrap_or_default();
+            let preview = masked_env_preview(&env);
+            div()
+                .w_full()
+                .min_w_0()
+                .px(px(9.0))
+                .py(px(7.0))
+                .rounded(px(density.r_xs))
+                .border_1()
+                .border_color(theme.border_inactive)
+                .bg(theme.bg_panel_alt)
+                .text_size(px(typography.t_body_sm))
+                .text_color(if preview.is_empty() { theme.fg_subtle } else { theme.fg_base })
+                .child(if preview.is_empty() {
+                    SharedString::from("No variables set.")
+                } else {
+                    SharedString::from(preview)
+                })
+                .into_any_element()
+        };
+
+        let reveal = toggle_chip(
+            SharedString::from("launch-env-reveal"),
+            if modal.env_revealed { "Hide" } else { "Reveal" },
+            modal.env_revealed,
+            theme,
+            density,
+            typography,
+            |this, _w, cx| this.toggle_env_reveal(cx),
+            cx,
+        );
+
         // The format rule lives under the field, where every reference
         // preferences pane puts it, so the description above can stay one
         // sentence about what the field is *for*. The plaintext warning is not
-        // repeated here — it is the card's footer already.
+        // repeated here — it is the card's footer already, and the masking
+        // above must not be read as contradicting it: one is about who can
+        // read this screen, the other about what is on disk.
         let hint = match modal.notice_for(NoticeSlot::Environment) {
             Some(n) => notice_text(n.ok, n.text.clone(), theme, typography),
-            None => hint_text("One KEY=value per line.", theme, typography),
+            None if modal.env_revealed => {
+                hint_text("One KEY=value per line.", theme, typography)
+            }
+            None => hint_text(
+                "Values are hidden on screen. Reveal to read or edit them — they are stored \
+                 in plain text either way.",
+                theme,
+                typography,
+            ),
         };
-        rows.push(setting_row_hint(
+        rows.push(setting_row_action_hint(
             "Environment",
             "Applied on top of the inherited environment at launch, for both terminal and chat.",
-            Input::new(state).text_size(px(typography.t_body_sm)),
+            reveal,
+            body,
             hint,
             theme,
             typography,
@@ -1291,9 +1427,16 @@ fn summary_parts(launch: Option<&PerAgentLaunch>) -> Vec<String> {
     if !l.model.trim().is_empty() {
         parts.push(format!("model {}", l.model.trim()));
     }
-    // Counted the way resolution counts them: a blank key never reaches a
-    // spawn, so it must not be advertised as a variable either.
-    match l.env.keys().filter(|k| !k.trim().is_empty()).count() {
+    // Counted the way resolution counts them: a blank key and a reserved key
+    // never reach a spawn, so neither may be advertised as a variable. The
+    // count is a promise about what will be applied, not about how many lines
+    // were typed.
+    match l
+        .env
+        .keys()
+        .filter(|k| !k.trim().is_empty() && !oximux_settings::is_reserved_env_key(k))
+        .count()
+    {
         0 => {}
         1 => parts.push("1 variable".to_string()),
         n => parts.push(format!("{n} variables")),
@@ -1366,9 +1509,10 @@ mod tests {
         assert_eq!(summarize(Some(&l)), "flags --verbose · model opus · 1 variable");
         l.env.insert("B".into(), "2".into());
         assert_eq!(summarize(Some(&l)), "flags --verbose · model opus · 2 variables");
-        // Counted the way resolution counts: a blank key never reaches a spawn
-        // and must not be advertised as a variable either.
+        // Counted the way resolution counts: neither a blank key nor a
+        // reserved one reaches a spawn, so neither is advertised as a variable.
         l.env.insert("   ".into(), "orphan".into());
+        l.env.insert("PATH".into(), "/nowhere".into());
         assert_eq!(summarize(Some(&l)), "flags --verbose · model opus · 2 variables");
 
         // Env alone is enough to have something to say.
@@ -1553,6 +1697,89 @@ mod tests {
         );
         assert_eq!(env.len(), 1);
         assert_eq!(env.get("GOOD").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn every_unusable_line_is_reported_instead_of_dropped() {
+        // The same input as `env_lines_drop_blanks_comments_and_half_typed_rows`,
+        // read through the diagnostic half: the map is identical, and each
+        // dropped line now has a message naming which line it was.
+        let (env, rejects) =
+            parse_env_draft("\n# a comment\n   \nJUST_A_KEY\n=orphan\n   =orphan2\nGOOD=1\n");
+        assert_eq!(env.len(), 1);
+        assert_eq!(
+            rejects,
+            vec![
+                EnvReject::NoAssignment { line: 4 },
+                EnvReject::BlankKey { line: 5 },
+                EnvReject::BlankKey { line: 6 },
+            ],
+            "blank lines and comments are annotation, not failed input",
+        );
+        // Every message names its line, because the draft is free text and
+        // "one of your lines is wrong" is not actionable.
+        for r in &rejects {
+            assert!(r.message().contains("Line "), "{}", r.message());
+        }
+    }
+
+    #[test]
+    fn a_reserved_key_is_reported_but_kept_in_the_draft() {
+        let (env, rejects) = parse_env_draft("PATH=/nowhere\nANTHROPIC_BASE_URL=https://p/v1");
+        assert_eq!(
+            rejects,
+            vec![EnvReject::Reserved { line: 1, key: "PATH".to_string() }],
+        );
+        // Kept, so reopening the pane does not silently delete the line the
+        // user typed. Resolution is what refuses to apply it.
+        assert_eq!(env.len(), 2);
+        assert!(oximux_settings::is_reserved_env_key("PATH"));
+    }
+
+    #[test]
+    fn one_message_covers_however_many_lines_are_wrong() {
+        assert_eq!(reject_message(&[]), None);
+        let one = reject_message(&[EnvReject::NoAssignment { line: 2 }]).expect("a message");
+        assert!(one.contains("Line 2") && !one.contains("more"));
+        let many = reject_message(&[
+            EnvReject::NoAssignment { line: 2 },
+            EnvReject::BlankKey { line: 5 },
+            EnvReject::Reserved { line: 7, key: "HOME".into() },
+        ])
+        .expect("a message");
+        assert!(many.contains("Line 2") && many.contains("(+2 more)"), "{many}");
+    }
+
+    #[test]
+    fn the_mask_shows_the_keys_and_never_the_value_or_its_length() {
+        let env: BTreeMap<String, String> = [
+            ("SHORT".to_string(), "a".to_string()),
+            ("LONG".to_string(), "a".repeat(200)),
+            ("UNSET".to_string(), String::new()),
+        ]
+        .into_iter()
+        .collect();
+        let preview = masked_env_preview(&env);
+        // Fixed width: a mask that tracked length would leak how long a token
+        // is, which is itself a hint.
+        assert_eq!(preview, "LONG=••••••••\nSHORT=••••••••\nUNSET=");
+        assert!(!preview.contains('a'), "no fragment of any value survives");
+        assert!(masked_env_preview(&BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn no_placeholder_demonstrates_a_key_the_field_would_refuse() {
+        // The worked examples teach the format. One of them naming a reserved
+        // key would teach a line that is reported the moment it is committed.
+        for agent in ["claude-code", "codex", "pi", "omp", "something-new"] {
+            for line in env_placeholder(agent).lines() {
+                let Some((key, _)) = line.split_once('=') else { continue };
+                assert!(
+                    !oximux_settings::is_reserved_env_key(key),
+                    "{agent}'s placeholder demonstrates the reserved key {key}",
+                );
+            }
+        }
     }
 
     #[test]

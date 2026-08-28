@@ -30,7 +30,8 @@ pub mod typography;
 
 pub use agent_launch::{
     ACP_PRESETS, AcpPreset, AgentLaunchSettings, DEFAULT_PROFILE, NamedLaunchProfile, OpenMode,
-    PerAgentLaunch, Transport, acp_preset, import_resume_command, split_args,
+    PerAgentLaunch, RESERVED_ENV_KEYS, RESERVED_ENV_PREFIX, Transport, acp_preset,
+    import_resume_command, is_reserved_env_key, split_args,
 };
 pub use appearance::{Appearance, DensityPreset, ThemeChoice, UiScale, UsageDetail};
 pub use auto_update::AutoUpdateSettings;
