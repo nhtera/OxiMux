@@ -26,8 +26,49 @@ pub const APP_DATA_SUBDIR: &str = "dev.nhtera.oximux";
 /// database, a live pid file, and a named-pipe token are all things that must
 /// not follow a user to another machine — the token especially, since it is a
 /// credential for a daemon that is not running there.
+#[cfg(not(test))]
 pub fn data_dir() -> Option<PathBuf> {
+    real_data_dir()
+}
+
+/// Where a shipped build keeps its data, whatever [`data_dir`] answers here.
+///
+/// The two differ only under `cargo test`. Anything reasoning about the
+/// *convention* — that the CLI dials where the desktop binds, that a roaming
+/// profile is a different place — must ask this one, or the test redirect
+/// below turns a real invariant into a comparison against a temp directory.
+fn real_data_dir() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join(APP_DATA_SUBDIR))
+}
+
+/// Under `cargo test`, a throwaway directory instead of the real data root.
+///
+/// Every settings writer, the grants file, and the relay's token resolve their
+/// path through [`data_dir`], and a unit test that opens a view and edits
+/// anything persists exactly as the app does. That is not hypothetical: a run
+/// of this crate's own settings tests overwrote a developer's real
+/// `agent_launch.toml` with fixture values — their launch flags, model, and
+/// default agent gone, with nothing printed to say so.
+///
+/// One directory per process, so tests sharing a binary see one consistent
+/// root, and a fresh one per run, so nothing carries over. Left behind on
+/// purpose: a failing test's files are evidence, and the OS clears `/tmp`.
+#[cfg(test)]
+pub fn data_dir() -> Option<PathBuf> {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    Some(
+        DIR.get_or_init(|| {
+            // Same leaf as the real root, one throwaway parent up, so the
+            // path conventions built on that leaf still hold here.
+            let dir = std::env::temp_dir()
+                .join(format!("oximux-test-data-{}", std::process::id()))
+                .join(APP_DATA_SUBDIR);
+            let _ = std::fs::create_dir_all(&dir);
+            dir
+        })
+        .clone(),
+    )
 }
 
 /// Close the data root to every other account on the machine, on every boot.
@@ -92,7 +133,10 @@ pub fn log_dir() -> Option<PathBuf> {
 /// the old spelling resolved to the *roaming* profile.
 fn legacy_data_dir() -> Option<PathBuf> {
     let legacy = dirs::data_dir()?.join(APP_DATA_SUBDIR);
-    (Some(&legacy) != data_dir().as_ref()).then_some(legacy)
+    // Against the REAL root: compared to the test redirect, every platform
+    // would look like Windows and a test run would start moving the
+    // developer's own files into a temp directory.
+    (Some(&legacy) != real_data_dir().as_ref()).then_some(legacy)
 }
 
 /// Adopt anything an older build left in the roaming profile.
@@ -184,7 +228,22 @@ mod tests {
     /// between the two reads as "host unreachable" with both sides healthy.
     #[test]
     fn control_socket_convention_matches_the_data_dir() {
-        assert_eq!(data_dir(), oximux_remote_local::default_runtime_dir());
+        assert_eq!(real_data_dir(), oximux_remote_local::default_runtime_dir());
+    }
+
+    /// A test run must not write into the real data root.
+    ///
+    /// Settings, the grants file, and the database all resolve through
+    /// [`data_dir`], and a view test that edits a setting persists exactly as
+    /// the app does — which once overwrote a developer's real
+    /// `agent_launch.toml` with fixture values.
+    #[test]
+    fn tests_never_resolve_the_real_data_root() {
+        assert_ne!(
+            data_dir(),
+            real_data_dir(),
+            "a test that saves a setting would write the developer's own file"
+        );
     }
 
     /// A cold start with local CLI access **disabled** still leaves the data

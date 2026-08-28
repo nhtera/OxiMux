@@ -1037,4 +1037,59 @@ mod env_editor_tests {
         })
         .expect("assert");
     }
+
+    /// Typing a name and pressing Enter is the ONLY way to create a profile,
+    /// so the subscription that turns that keystroke into a profile is the
+    /// whole feature. It runs on an `InputState` event, which no logic test
+    /// reaches: a broken wire leaves the picker showing `default` forever with
+    /// nothing in the log to say why.
+    #[gpui::test]
+    fn enter_in_the_name_field_creates_and_selects_the_profile(cx: &mut TestAppContext) {
+        let (w, m) = modal(cx);
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.open(window, cx);
+                m.env_agent = "claude-code";
+                assert_eq!(
+                    m.agent_launch.profile_names("claude-code"),
+                    vec![DEFAULT_PROFILE],
+                    "a fresh config reports only the implicit default"
+                );
+                let field = m.new_profile_input.clone().expect("name field");
+                field.update(cx, |s, cx| s.set_value("proxy", window, cx));
+                // The event the Input emits on Enter, not a direct call to the
+                // creation code — the subscription is what is under test.
+                field.update(cx, |_, cx| {
+                    cx.emit(InputEvent::PressEnter { secondary: false })
+                });
+            });
+        })
+        .expect("type a profile name and press Enter");
+        cx.run_until_parked();
+        w.update(cx, |_root, _window, cx| {
+            m.update(cx, |m, cx| {
+                assert_eq!(
+                    m.agent_launch.profile_names("claude-code"),
+                    vec![DEFAULT_PROFILE, "proxy"],
+                    "Enter created the profile"
+                );
+                assert_eq!(
+                    m.env_profile.as_deref(),
+                    Some("proxy"),
+                    "and selected it, so the editor below now edits the new profile"
+                );
+                assert!(
+                    m.new_profile_input
+                        .as_ref()
+                        .expect("name field")
+                        .read(cx)
+                        .value()
+                        .is_empty(),
+                    "the name field clears, so the next name starts blank"
+                );
+                m.close(cx);
+            });
+        })
+        .expect("assert");
+    }
 }
