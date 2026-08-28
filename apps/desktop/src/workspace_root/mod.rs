@@ -437,9 +437,9 @@ pub struct WorkspaceRoot {
     /// EVERY open agent so the rail can list multiple agents per workspace.
     /// Entries live only while the session is non-terminal (its tab is open).
     pub(crate) live_agents: crate::shell::session_live_store::LiveAgentMap,
-    /// Latest usage-meter state. `None` only before the first sample lands
-    /// (then it is always `Available` or `Unavailable`).
-    pub(crate) usage_state: Option<oximux_agents::session_log::usage::UsageState>,
+    /// Latest usage-meter sample: one row per configured agent account.
+    /// Empty before the first sample lands, and again if no account is set up.
+    pub(crate) usage: Vec<oximux_agents::session_log::usage::ProviderUsage>,
     /// Whether the in-window usage popover is open (non-macOS fallback render).
     pub(crate) usage_popover_open: bool,
     /// Whether the "What's New" popover (staged-update release notes, opened
@@ -536,15 +536,18 @@ impl WorkspaceRoot {
             return;
         }
         // Snapshot the data + styling, then open the panel.
-        let Ok(Some((state, theme, density, typography))) = owner.update(cx, |this, _| {
-            this.usage_state
-                .clone()
-                .map(|s| (s, this.theme, this.density, this.typography.clone()))
+        let Ok((rows, theme, density, typography)) = owner.update(cx, |this, _| {
+            (
+                this.usage.clone(),
+                this.theme,
+                this.density,
+                this.typography.clone(),
+            )
         }) else {
             return;
         };
         if let Some(handle) = crate::shell::usage_popover::open(
-            state,
+            rows,
             theme,
             density,
             typography,
@@ -1133,14 +1136,22 @@ impl WorkspaceRoot {
         let usage_meter_task = cx.spawn(async move |weak, cx| {
             loop {
                 let probe = usage_probe.clone();
-                let state = cx
+                let rows = cx
                     .background_executor()
                     .spawn(async move { probe.sample() })
                     .await;
                 let alive = weak
                     .update(cx, |this, cx| {
-                        if this.usage_state.as_ref() != Some(&state) {
-                            this.usage_state = Some(state);
+                        let changed = this.usage != rows;
+                        this.usage = rows;
+                        // Compact segments carry a live countdown to the next
+                        // window reset, so they go wrong just by sitting there.
+                        // Verbose ones state only percentages and reset times
+                        // that don't move, so they are repainted when the
+                        // numbers actually change and not once a minute.
+                        let counts_down = crate::appearance_settings::active(cx).usage_detail
+                            == oximux_settings::UsageDetail::Compact;
+                        if changed || counts_down {
                             cx.notify();
                         }
                     })
@@ -1303,7 +1314,7 @@ impl WorkspaceRoot {
             agent_activity: HashMap::new(),
             agent_sideband: HashMap::new(),
             live_agents: HashMap::new(),
-            usage_state: None,
+            usage: Vec::new(),
             usage_popover_open: false,
             whats_new_open: false,
             #[cfg(target_os = "macos")]

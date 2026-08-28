@@ -1667,7 +1667,9 @@ impl Render for WorkspaceRoot {
                     port_count,
                     git_state.as_ref(),
                     primary,
-                    self.usage_state.as_ref(),
+                    &self.usage,
+                    crate::appearance_settings::active(cx).usage_detail,
+                    oximux_agents::session_log::now_unix_ms(),
                     update_ready,
                     move |window, cx| {
                         if let Some(sc) = scm_for_click.clone() {
@@ -1720,12 +1722,9 @@ impl Render for WorkspaceRoot {
             // outside click; z-band above the floating terminal, below the
             // palette overlays that follow.
             .when(self.usage_popover_open, |parent| {
-                let Some(state) = self.usage_state.as_ref() else {
-                    return parent;
-                };
                 let weak_close = cx.entity().downgrade();
                 let card = crate::shell::usage_meter::render_usage_popover(
-                    state,
+                    &self.usage,
                     oximux_agents::session_log::now_unix_ms(),
                     theme,
                     density,
@@ -1750,6 +1749,19 @@ impl Render for WorkspaceRoot {
                                 .absolute()
                                 .right(px(8.0))
                                 .bottom(px(density.h_status_bar + 6.0))
+                                // The card fills its host, which on macOS is a
+                                // window sized to the same measurement. Here the
+                                // host is this box, so it has to be given that
+                                // size explicitly — an auto-sized parent leaves
+                                // the card's `size_full` nothing to resolve
+                                // against, and the height now varies with how
+                                // many accounts are configured.
+                                .w(px(crate::shell::usage_meter::POPOVER_WIDTH))
+                                .h(px(crate::shell::usage_meter::popover_height(
+                                    &self.usage,
+                                    density,
+                                    typography,
+                                )))
                                 // Clicks on the card must not bubble to the
                                 // backdrop's dismiss handler — the user may
                                 // click while reading the numbers.

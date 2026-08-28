@@ -20,10 +20,11 @@ use gpui::{
     App, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
     StatefulInteractiveElement, Styled, Window, div, px,
 };
-use oximux_agents::session_log::usage::UsageState;
+use gpui_component::Icon;
+use oximux_agents::session_log::usage::ProviderUsage;
 use oximux_core::GitState;
 use oximux_git::PollState;
-use oximux_settings::{Density, Theme, Typography};
+use oximux_settings::{Density, Theme, Typography, UsageDetail};
 
 use crate::shell::source_control::primary_action::PrimaryAction;
 use crate::shell::usage_meter;
@@ -130,7 +131,12 @@ pub fn view<F, G, H, P>(
     port_count: usize,
     git_state: Option<&PollState>,
     primary: Option<PrimaryAction>,
-    usage: Option<&UsageState>,
+    usage: &[ProviderUsage],
+    // How much each account's segment spells out — the user's Appearance choice.
+    usage_detail: UsageDetail,
+    // Passed in rather than read here so the whole bar renders from one instant
+    // and the pure formatting stays testable.
+    now_ms: i64,
     // Version of a staged update awaiting restart, if any.
     update_ready: Option<String>,
     on_primary_click: F,
@@ -207,30 +213,22 @@ where
         zone
     };
 
-    // Usage meter — present once the probe has produced a state. An available
-    // reading shows exact `NN% 5h · NN% wk`; an unavailable one shows a
-    // warn-colored "Usage unavailable" chip. The click popover carries the
-    // window detail or the failure reason.
-    let usage_chip = usage.map(|state| {
-        let (label, color) = match state {
-            UsageState::Available(snapshot) => (
-                usage_meter::meter_label(snapshot),
-                usage_meter::meter_color(snapshot, theme),
-            ),
-            UsageState::Unavailable { .. } => {
-                (usage_meter::UNAVAILABLE_LABEL.to_string(), theme.status_warn)
-            }
-        };
+    // Usage meter — one segment per configured account, each its own icon and
+    // numbers, sharing a single click target so they open one card rather than
+    // several. Absent entirely until the first sample lands, and on a machine
+    // with no agent account set up.
+    let segments = usage_meter::meter_segments(usage, usage_detail, now_ms, theme);
+    let usage_chip = (!segments.is_empty()).then(|| {
         let hover_bg = theme.hover_overlay;
-        div()
+        let mut chip = div()
             .id("status-bar-usage-meter")
             .flex()
             .items_center()
+            .gap(px(8.))
             .h(px(16.))
             .px(px(4.))
             .rounded(px(density.r_chip))
             .text_size(px(typography.t_body_sm))
-            .text_color(color)
             .cursor_pointer()
             .hover(move |s| s.bg(hover_bg))
             // No hover tooltip: an in-window element can't composite above the
@@ -239,8 +237,26 @@ where
             // detail card (its own higher-level window), which carries the info.
             .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
                 on_usage_click(window, cx);
-            })
-            .child(label)
+            });
+        for segment in segments {
+            chip = chip.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(3.))
+                    .text_color(segment.color)
+                    // The icon carries the account's identity so the numbers
+                    // don't have to spell out whose they are.
+                    .child(
+                        Icon::default()
+                            .path(segment.icon_path)
+                            .size(px(11.))
+                            .text_color(segment.color),
+                    )
+                    .child(segment.label),
+            );
+        }
+        chip
     });
 
     // The only place a pending update touches the main window. Passive on
