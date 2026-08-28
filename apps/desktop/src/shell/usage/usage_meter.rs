@@ -427,6 +427,21 @@ fn line_h(size: f32) -> f32 {
     (size * PHI).round()
 }
 
+/// Rough line count for `text` at `size` inside a `column_w`-wide text column.
+///
+/// A failure reason comes from the provider, not from us — "OAuth access token
+/// has expired. Re-authenticate to continue." wraps to two lines in this card,
+/// and a height that assumed one clipped the block below it. The real shaper
+/// cannot be reached from a decision made before anything renders, so this
+/// estimates from character count and is deliberately biased to over-count:
+/// a few extra pixels of panel is invisible, a short window loses a line.
+fn wrapped_lines(text: &str, size: f32, column_w: f32) -> f32 {
+    // Half the font size is a generous mean advance for the UI face; a wide
+    // string is what must not be under-measured.
+    let width = text.chars().count() as f32 * size * 0.5;
+    (width / column_w).ceil().max(1.0)
+}
+
 /// How tall the popover must be to show `rows` without clipping.
 ///
 /// Deliberately a function of the content: a second account roughly doubles the
@@ -437,6 +452,8 @@ pub fn popover_height(rows: &[ProviderUsage], density: Density, typography: &Typ
     let gap = density.gap_inline * 1.5;
     let body = line_h(typography.t_body_sm);
     let sub = line_h(typography.t_sub_label);
+    // What a line of text actually has to fit in.
+    let column = POPOVER_WIDTH - density.pad_panel * 2.0;
     // A window block: name, bar, and the `NN% left … resets` row, at half gaps.
     let window_block = body + density.gap_inline * 0.5 + BAR_H + density.gap_inline * 0.5 + sub;
 
@@ -457,7 +474,15 @@ pub fn popover_height(rows: &[ProviderUsage], density: Density, typography: &Typ
             // The "Unavailable" line standing in for the windows.
             UsageState::Unavailable { .. } => density.gap_inline + body,
         };
-        h += density.gap_inline + sub;
+        // The footer. Ours is short and fits on one line; a provider's failure
+        // reason is not ours and routinely does not.
+        let footer_lines = match &row.state {
+            UsageState::Available(_) => 1.0,
+            UsageState::Unavailable { reason } => {
+                wrapped_lines(reason, typography.t_sub_label, column)
+            }
+        };
+        h += density.gap_inline + sub * footer_lines;
     }
     h
 }
@@ -690,6 +715,40 @@ mod tests {
         let one_window = vec![available(UsageProvider::Codex, single)];
         let two_windows = vec![available(UsageProvider::Codex, snapshot(12.0, 4.0))];
         assert!(height(&one_window) < height(&two_windows));
+    }
+
+    #[test]
+    fn a_wrapping_failure_reason_gets_the_lines_it_needs() {
+        // Caught live: this exact message wraps to two lines in the card, and a
+        // height that counted one sliced the last line off the block below.
+        let long = "OAuth access token has expired. Re-authenticate to continue.";
+        let wrapping = vec![
+            unavailable(UsageProvider::ClaudeCode, long),
+            available(UsageProvider::Codex, snapshot(0.0, 1.0)),
+        ];
+        let short = vec![
+            unavailable(UsageProvider::ClaudeCode, "Not signed in"),
+            available(UsageProvider::Codex, snapshot(0.0, 1.0)),
+        ];
+        assert!(
+            height(&wrapping) > height(&short),
+            "a reason that wraps must buy its own extra line"
+        );
+    }
+
+    #[test]
+    fn wrapped_lines_counts_a_full_column_as_more_than_one() {
+        let column = POPOVER_WIDTH - Density::cockpit().pad_panel * 2.0;
+        let size = Typography::cockpit().t_sub_label;
+        assert_eq!(wrapped_lines("Not signed in", size, column), 1.0);
+        assert_eq!(wrapped_lines("", size, column), 1.0, "an empty line is still a line");
+        assert!(
+            wrapped_lines(
+                "OAuth access token has expired. Re-authenticate to continue.",
+                size,
+                column
+            ) >= 2.0
+        );
     }
 
     #[test]
