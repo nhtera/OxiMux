@@ -153,15 +153,30 @@ impl Render for SettingsModal {
         let body = div()
             .id("settings-body")
             .flex_1()
+            .min_w_0()
             .overflow_y_scroll()
             .px(px(density.pad_panel))
             .pb(px(density.pad_panel))
-            .child(self.render_body(density, &typography, cx));
+            // The panes are `flex_col` stacks whose cards size to content.
+            // Stretching them inside a full-width column is what makes each
+            // card span the pane instead of ending at its widest row.
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .child(self.render_body(density, &typography, cx)),
+            );
 
         let body_col = div()
             .flex()
             .flex_col()
             .flex_1()
+            // The body's width has to be BOUNDED for the rows inside it to
+            // wrap: a flex item's floor is its content width, so without this
+            // the column grows to the longest description and every row's
+            // `min_w_0` is moot.
+            .min_w_0()
             .h_full()
             .child(header)
             .child(div().w_full().h(px(1.0)).bg(theme.border_inactive))

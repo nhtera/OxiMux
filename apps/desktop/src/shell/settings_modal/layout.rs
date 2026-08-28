@@ -202,6 +202,8 @@ fn result_row(
                 .flex_col()
                 .gap(px(3.0))
                 .flex_1()
+                // See `setting_row_desc` — same wrap floor, same rows.
+                .min_w_0()
                 .child(
                     div()
                         .text_size(px(typography.t_sub_label))
@@ -251,6 +253,12 @@ pub(super) fn setting_row_desc(
                 .flex_col()
                 .gap(px(3.0))
                 .flex_1()
+                // Without `min_w_0` a flex item's floor is its *content* width,
+                // so a long description refuses to wrap and instead pushes the
+                // control off the card's right edge. The two longest strings in
+                // the modal live in the launch-environment card, where this hid
+                // the profile picker and the env editor entirely.
+                .min_w_0()
                 .child(
                     div()
                         .text_size(px(typography.t_body_sm))
@@ -266,13 +274,168 @@ pub(super) fn setting_row_desc(
                     )
                 }),
         )
-        .child(control)
+        // The control is measured on its own terms and never grows: a field
+        // that styles itself `w_full` would otherwise claim the whole row as
+        // its flex basis and leave the description a single character wide.
+        .child(div().flex_none().child(control))
+        .into_any_element()
+}
+
+/// A setting whose control is the full width of the card: label and
+/// description stacked above it rather than beside it.
+///
+/// [`setting_row_desc`] pins its control to the right at the control's own
+/// width, which is correct for a switch, a chip, or a picker. A text editor
+/// wants the whole row, and squeezing one into the right-hand column leaves
+/// both halves unusable — the field too narrow to read and the description
+/// wrapped to a sliver.
+pub(super) fn setting_row_stacked(
+    label: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    control: impl IntoElement,
+    theme: Theme,
+    typography: &Typography,
+) -> AnyElement {
+    let description = description.into();
+    div()
+        .flex()
+        .flex_col()
+        .w_full()
+        .py(px(12.0))
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .w_full()
+                .child(
+                    div()
+                        .text_size(px(typography.t_body_sm))
+                        .text_color(theme.fg_base)
+                        .child(label.into()),
+                )
+                .when(!description.is_empty(), |c| {
+                    c.child(
+                        div()
+                            .text_size(px(typography.t_sub_label))
+                            .text_color(theme.fg_subtle)
+                            .child(description),
+                    )
+                }),
+        )
+        .child(div().w_full().child(control))
         .into_any_element()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::query_matches;
+    use super::{query_matches, setting_row_desc};
+    use gpui::{
+        Bounds, Context, IntoElement, ParentElement as _, Pixels, Render, Styled as _,
+        TestAppContext, Window, canvas, div, prelude::FluentBuilder as _, px, size,
+    };
+    use oximux_settings::{Theme, Typography};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// The row's own width in the probe below — narrower than the real settings
+    /// body, so the failure it pins reproduces without a 1000px window.
+    const ROW_W: f32 = 420.0;
+    /// The control's intrinsic width. A control that reaches layout with room
+    /// to spare keeps exactly this.
+    const CONTROL_W: f32 = 120.0;
+    /// The launch-environment card's real description — the longest string in
+    /// the modal, and the one that pushed its editor off the card.
+    const LONG_DESC: &str = "One KEY=value per line, applied on top of the inherited environment \
+         at launch — for both terminal and chat. Stored in plain text in \
+         agent_launch.toml; this is not encrypted storage.";
+
+    /// Renders one described row at a fixed width, standing a bounds-recording
+    /// canvas in for the control so the test can read where the control
+    /// actually landed. Layout faults of this kind are invisible to `render`
+    /// unit tests — the element tree is identical either way, only the measured
+    /// geometry differs.
+    struct RowProbe {
+        control: Rc<Cell<Option<Bounds<Pixels>>>>,
+        greedy: bool,
+    }
+
+    impl Render for RowProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let sink = self.control.clone();
+            div().w(px(ROW_W)).child(setting_row_desc(
+                "Environment",
+                LONG_DESC,
+                div().when(self.greedy, |d| d.w_full()).h(px(24.0)).child(
+                    canvas(
+                        |_, _, _| (),
+                        move |bounds: Bounds<Pixels>, _: (), _window, _cx| sink.set(Some(bounds)),
+                    )
+                    .w(px(CONTROL_W))
+                    .h(px(24.0)),
+                ),
+                Theme::default(),
+                &Typography::default(),
+            ))
+        }
+    }
+
+    /// A long description must WRAP inside its column, not shove the control
+    /// past the row's right edge. Without `min_w_0` on the text column a flex
+    /// item's minimum size is its content width, so the description claimed
+    /// ~3x the row and the control — a segmented picker, or the environment
+    /// editor itself — was laid out entirely outside the card.
+    #[gpui::test]
+    fn a_long_description_does_not_push_the_control_out_of_the_row(cx: &mut TestAppContext) {
+        let control = Rc::new(Cell::new(None));
+        let sink = control.clone();
+        let w = cx.add_window(move |_window, _cx| RowProbe { control: sink, greedy: false });
+        let vcx = gpui::VisualTestContext::from_window(w.into(), cx);
+        vcx.simulate_resize(size(px(900.0), px(600.0)));
+        vcx.run_until_parked();
+
+        let bounds = control.get().expect("the control painted");
+        assert!(
+            f32::from(bounds.right()) <= ROW_W + 0.5,
+            "control right edge {} escaped the {ROW_W}px row",
+            f32::from(bounds.right()),
+        );
+        assert!(
+            (f32::from(bounds.size.width) - CONTROL_W).abs() < 0.5,
+            "control was squeezed to {} instead of {CONTROL_W}px",
+            f32::from(bounds.size.width),
+        );
+    }
+
+    /// The other half of the same squeeze. A control that styles itself
+    /// `w_full` — which a text field does — claims the whole row as its flex
+    /// basis, and once `min_w_0` lets the description shrink there is nothing
+    /// left to stop it: the text collapsed to one character per line. The
+    /// control is therefore measured on its own terms and never grows.
+    #[gpui::test]
+    fn a_full_width_control_does_not_starve_the_description(cx: &mut TestAppContext) {
+        let control = Rc::new(Cell::new(None));
+        let sink = control.clone();
+        let w = cx.add_window(move |_window, _cx| RowProbe { control: sink, greedy: true });
+        let vcx = gpui::VisualTestContext::from_window(w.into(), cx);
+        vcx.simulate_resize(size(px(900.0), px(600.0)));
+        vcx.run_until_parked();
+
+        let bounds = control.get().expect("the control painted");
+        // Half the row is the floor a two-column setting row has to clear;
+        // the real failure left the description a single character.
+        assert!(
+            f32::from(bounds.origin.x) >= ROW_W / 2.0,
+            "description column got only {}px of the {ROW_W}px row",
+            f32::from(bounds.origin.x),
+        );
+        assert!(
+            (f32::from(bounds.size.width) - CONTROL_W).abs() < 0.5,
+            "control grew to {} instead of its own {CONTROL_W}px",
+            f32::from(bounds.size.width),
+        );
+    }
 
     #[test]
     fn empty_query_matches_everything() {

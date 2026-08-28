@@ -42,9 +42,14 @@ pub(super) fn render(
 
     // Each section = a labelled title + its card + a muted footnote, grouped
     // tightly (8px) and separated from the next section by a wider gap.
+    // Every column here claims the pane's full width. A `flex_col` that sets
+    // none is sized by its content, and the launch-environment card's rows have
+    // no intrinsic width left once their descriptions are allowed to wrap — the
+    // card collapsed to nothing and took its picker and editor with it.
     let ai_section = div()
         .flex()
         .flex_col()
+        .w_full()
         .gap(px(8.0))
         .child(section_title(
             "Commit messages",
@@ -58,6 +63,7 @@ pub(super) fn render(
     let launch_section = div()
         .flex()
         .flex_col()
+        .w_full()
         .gap(px(8.0))
         .child(section_title(
             "Agent launch",
@@ -75,6 +81,7 @@ pub(super) fn render(
     let env_section = div()
         .flex()
         .flex_col()
+        .w_full()
         .gap(px(8.0))
         .child(section_title(
             "Environment & profiles",
@@ -93,6 +100,7 @@ pub(super) fn render(
     div()
         .flex()
         .flex_col()
+        .w_full()
         .gap(px(20.0))
         .child(ai_section)
         .child(launch_section)

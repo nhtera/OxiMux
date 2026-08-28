@@ -16,7 +16,9 @@ use oximux_settings::{DEFAULT_PROFILE, Density, OpenMode, Theme, Typography, spl
 
 use super::SettingsModal;
 use super::controls::{toggle_chip, toggle_switch, value_chip};
-use super::layout::{SettingEntry, card_surface, entry, section_card, setting_row_desc};
+use super::layout::{
+    SettingEntry, card_surface, entry, section_card, setting_row_desc, setting_row_stacked,
+};
 use super::segmented::{Segment, segmented};
 use crate::shell::agent_presentation::adapter_icon_path;
 
@@ -310,9 +312,10 @@ pub(super) fn render_env_card(
         ));
     }
 
-    // The editor itself.
+    // The editor itself. Stacked rather than pinned right: it is the one
+    // control in this card that wants the full width of the row.
     if let Some(state) = modal.env_input.as_ref() {
-        rows.push(setting_row_desc(
+        rows.push(setting_row_stacked(
             "Environment",
             "One KEY=value per line, applied on top of the inherited environment \
              at launch — for both terminal and chat. Stored in plain text in \
