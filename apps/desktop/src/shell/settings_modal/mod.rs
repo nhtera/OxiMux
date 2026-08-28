@@ -753,6 +753,20 @@ impl SettingsModal {
         self.env_notice.as_ref().filter(|n| n.slot == slot)
     }
 
+    /// The launch entry the environment card is currently editing — the plain
+    /// `[agents.<id>]` entry when the selection is `default`, that profile's
+    /// own entry otherwise.
+    ///
+    /// One write path so no control has to remember which entry it is on. Every
+    /// flag and model chip in the launch card above calls `entry_mut` and so
+    /// always writes the default; the card below has a profile selected, and
+    /// writing the default from there is exactly the hole this closes.
+    pub(super) fn selected_launch_mut(&mut self) -> &mut oximux_settings::PerAgentLaunch {
+        let agent = self.env_agent;
+        let profile = self.env_profile.clone();
+        self.agent_launch.profile_entry_mut(agent, profile.as_deref())
+    }
+
     /// The env map of the currently-selected `(agent, profile)`, or empty when
     /// that pair has no entry yet. The comparison basis for the close-flush.
     fn selected_env(&self) -> BTreeMap<String, String> {
@@ -1123,6 +1137,109 @@ mod env_editor_tests {
             });
         })
         .expect("agent switch");
+    }
+
+    /// The functional hole phase 3 closes, and the consistency requirement that
+    /// falls out of it.
+    ///
+    /// Painted through `VisualTestContext` with both cards live, not asserted
+    /// off the map alone: with `default` selected the flags/model controls in
+    /// the environment card and the agent row above address ONE entry, and
+    /// "the row above didn't update until I reopened the modal" is exactly the
+    /// class of defect a logic test reports as passing.
+    #[gpui::test]
+    fn flags_and_model_write_the_selected_profile_and_both_cards_agree(cx: &mut TestAppContext) {
+        let (w, m) = modal(cx);
+
+        // The agent row's subtitle, read through the same entry list the pane
+        // renders from — so this asserts what the row says, not a private fn.
+        let row_subtitle = |m: &Entity<SettingsModal>, cx: &mut gpui::Context<'_, gpui_component::Root>| {
+            m.update(cx, |m, cx| {
+                let theme = m.theme;
+                let density = m.density;
+                let typography = m.typography.clone();
+                pane_agents_launch::entries(m, theme, density, &typography, cx)
+                    .into_iter()
+                    .find(|e| e.label == "Claude Code")
+                    .expect("the Claude Code agent row")
+                    .description
+                    .to_string()
+            })
+        };
+
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.open(window, cx);
+                m.selected = SettingsPane::Agents;
+                m.env_agent = "claude-code";
+                m.agent_launch.entry_mut("claude-code").model = "opus".into();
+                m.agent_launch.profile_entry_mut("claude-code", Some("proxy"));
+                m.select_env_profile(Some("proxy".into()), window, cx);
+
+                // 1. With a profile selected, the write lands on the PROFILE.
+                let e = m.selected_launch_mut();
+                e.model = "haiku".into();
+                e.args = "--quiet".into();
+                m.persist_agent_launch(cx);
+                assert_eq!(
+                    m.agent_launch.model_for_in("claude-code", Some("proxy")).as_deref(),
+                    Some("haiku"),
+                );
+                assert_eq!(
+                    m.agent_launch.model_for("claude-code").as_deref(),
+                    Some("opus"),
+                    "the agent's default entry must be untouched",
+                );
+                assert!(
+                    m.agent_launch.args_for("claude-code").is_empty(),
+                    "and so must its flags",
+                );
+            });
+        })
+        .expect("edit the selected profile");
+
+        let vcx = gpui::VisualTestContext::from_window(w.into(), cx);
+        vcx.simulate_resize(gpui::size(px(1100.0), px(800.0)));
+        vcx.run_until_parked();
+
+        // 2. The agent row now carries a profile count, so it does not read as
+        // a description of every profile.
+        let before = w
+            .update(cx, |_root, _window, cx| row_subtitle(&m, cx))
+            .expect("read the row");
+        assert!(
+            before.contains("model opus") && before.contains("1 profile"),
+            "the row describes the default and admits the profile: {before}",
+        );
+
+        // 3. Switch to `default` and write again: now the SAME entry the row
+        // above shows, and the row must reflect it in the next paint.
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.select_env_profile(None, window, cx);
+                let e = m.selected_launch_mut();
+                e.model = "sonnet".into();
+                m.persist_agent_launch(cx);
+            });
+        })
+        .expect("edit the default");
+        vcx.run_until_parked();
+
+        let after = w
+            .update(cx, |_root, _window, cx| row_subtitle(&m, cx))
+            .expect("read the row again");
+        assert!(
+            after.contains("model sonnet"),
+            "the agent row must follow a write made from the card below: {after}",
+        );
+        assert_eq!(
+            m.read_with(cx, |m, _| m.agent_launch.model_for_in("claude-code", Some("proxy"))),
+            Some("haiku".to_string()),
+            "and the profile must not have been dragged along",
+        );
+
+        w.update(cx, |_root, _window, cx| m.update(cx, |m, cx| m.close(cx)))
+            .expect("close");
     }
 
     /// Rename and duplicate are the two operations that did not exist, and both

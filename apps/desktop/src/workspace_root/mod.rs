@@ -1460,9 +1460,18 @@ mod tests {
         s.entry_mut("claude-code")
             .env
             .insert("ANTHROPIC_BASE_URL".into(), "https://first.example/v1".into());
-        s.profile_entry_mut("claude-code", Some("proxy"))
-            .env
-            .insert("ANTHROPIC_BASE_URL".into(), "https://second.example/v1".into());
+        s.entry_mut("claude-code").model = "opus".into();
+        {
+            let proxy = s.profile_entry_mut("claude-code", Some("proxy"));
+            proxy.env.insert("ANTHROPIC_BASE_URL".into(), "https://second.example/v1".into());
+            // The two axes the settings UI could not reach until phase 3. They
+            // resolve through a different seam than `env` (the terminal and
+            // chat spawn sites read `args_for_in` / `model_for_in` directly),
+            // so a profile can be right about its endpoint and still launch
+            // with the default's model.
+            proxy.args = "--append-system-prompt proxy".into();
+            proxy.model = "haiku".into();
+        }
 
         let default = chat_backend_for(&s, "claude-code");
         let proxy = chat_backend_for_profile(&s, "claude-code", Some("proxy"));
@@ -1480,6 +1489,19 @@ mod tests {
         // The settings key rides along so a restore can re-resolve this pair.
         assert_eq!(proxy.adapter_id.as_deref(), Some("claude-code"));
         assert_eq!(proxy.profile.as_deref(), Some("proxy"));
+
+        // Flags and model resolve per profile too, and the default entry keeps
+        // its own — the whole point of a profile being three-axis.
+        assert_eq!(s.model_for_in("claude-code", Some("proxy")).as_deref(), Some("haiku"));
+        assert_eq!(s.model_for("claude-code").as_deref(), Some("opus"));
+        assert_eq!(
+            s.args_for_in("claude-code", Some("proxy")),
+            vec!["--append-system-prompt", "proxy"],
+        );
+        assert!(s.args_for("claude-code").is_empty());
+        // And a stale profile name still degrades to the default rather than
+        // launching bare, on these axes as much as on `env`.
+        assert_eq!(s.model_for_in("claude-code", Some("renamed")).as_deref(), Some("opus"));
     }
 
     #[test]

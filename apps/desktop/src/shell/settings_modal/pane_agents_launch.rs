@@ -518,6 +518,71 @@ pub(super) fn render_env_card(
         typography,
     ));
 
+    // Flags + model for the SELECTED profile. Until now these lived only in the
+    // launch card above, which always writes the agent's default entry — so a
+    // profile advertised three axes and could only be given one. They sit here,
+    // beside the environment they share a selection with, rather than being
+    // duplicated per profile row: one selection, one editor.
+    let selected_launch = modal
+        .agent_launch
+        .for_agent_in(current_agent, modal.env_profile.as_deref());
+    let sel_args = selected_launch.map(|l| l.args.as_str()).unwrap_or("");
+    let sel_model = selected_launch.map(|l| l.model.as_str()).unwrap_or("");
+
+    let mut launch_controls = div().flex().flex_row().items_center().gap(px(6.0));
+    // Agents with no approval gate (`yolo_flag` = None) get no chip at all.
+    if let Some(flag) = yolo_flag(current_agent) {
+        launch_controls = launch_controls.child(toggle_chip(
+            SharedString::from("launch-env-yolo"),
+            "Skip perms",
+            has_flag(sel_args, flag),
+            theme,
+            density,
+            typography,
+            move |this, _w, cx| {
+                let e = this.selected_launch_mut();
+                e.args = toggle_flag(&e.args, flag);
+                this.persist_agent_launch(cx);
+            },
+            cx,
+        ));
+    }
+    launch_controls = launch_controls.child(value_chip(
+        SharedString::from("launch-env-model"),
+        model_label(sel_model),
+        theme,
+        density,
+        typography,
+        move |this, _w, cx| {
+            let presets = model_presets(this.env_agent);
+            let e = this.selected_launch_mut();
+            e.model = cycle_model(presets, &e.model);
+            this.persist_agent_launch(cx);
+        },
+        cx,
+    ));
+
+    // With `default` selected these controls and the agent row above address
+    // the SAME entry, which is invisible unless said: two controls, one value.
+    let launch_hint: SharedString = match modal.env_profile.as_deref() {
+        None => format!(
+            "Writing to “{DEFAULT_PROFILE}” — the same entry the {agent_display} row above edits."
+        )
+        .into(),
+        Some(name) => format!(
+            "Writing to “{name}” only — the {agent_display} row above keeps showing the default."
+        )
+        .into(),
+    };
+    rows.push(setting_row_desc_hint(
+        "Flags & model",
+        "The extra CLI flags and default model this profile launches with.",
+        launch_controls,
+        hint_text(launch_hint, theme, typography),
+        theme,
+        typography,
+    ));
+
     // The editor itself. Stacked rather than pinned right: it is the one
     // control in this card that wants the full width of the row.
     if let Some(state) = modal.env_input.as_ref() {
@@ -1187,7 +1252,21 @@ fn agent_summary(modal: &SettingsModal, adapter_id: &str) -> SharedString {
     if launch.disabled {
         return "Hidden from the launcher.".into();
     }
-    summarize(Some(launch))
+    let mut parts = summary_parts(Some(launch));
+    // This row describes the agent's DEFAULT entry, and once a profile can
+    // diverge from it (flags and model, not just environment) the row would be
+    // over-claiming without saying so. The count both admits the subtitle is
+    // partial and makes profiles discoverable from the card users read first.
+    // Omitted entirely at zero: most agents have none, and "0 profiles" is
+    // noise on every one of them.
+    //
+    // `profile_names` always leads with `default`, which is this entry.
+    match modal.agent_launch.profile_names(adapter_id).len().saturating_sub(1) {
+        0 => {}
+        1 => parts.push("1 profile".to_string()),
+        n => parts.push(format!("{n} profiles")),
+    }
+    joined(parts)
 }
 
 /// What both résumés say when a configuration overrides nothing at all.
@@ -1198,11 +1277,12 @@ const NO_OVERRIDES: &str = "Launches with defaults.";
 /// Both surfaces that describe one — the agent rows in the launch card and the
 /// profile rows in this card — read from here, so "flags … · model … · N
 /// variables" means the same thing in both and cannot drift into two spellings
-/// of the same sentence. Phase 3 adds a profile count to the agent rows on top
-/// of this, not beside it.
-fn summarize(launch: Option<&PerAgentLaunch>) -> SharedString {
+/// of the same sentence. Each caller appends the one term only it can know
+/// (the agent row a profile count, a profile row how it diverges) rather than
+/// growing its own copy of the shared three.
+fn summary_parts(launch: Option<&PerAgentLaunch>) -> Vec<String> {
     let Some(l) = launch else {
-        return NO_OVERRIDES.into();
+        return Vec::new();
     };
     let mut parts: Vec<String> = Vec::new();
     if !l.args.trim().is_empty() {
@@ -1218,6 +1298,11 @@ fn summarize(launch: Option<&PerAgentLaunch>) -> SharedString {
         1 => parts.push("1 variable".to_string()),
         n => parts.push(format!("{n} variables")),
     }
+    parts
+}
+
+/// Join a résumé's terms, or say that there are none.
+fn joined(parts: Vec<String>) -> SharedString {
     if parts.is_empty() {
         NO_OVERRIDES.into()
     } else {
@@ -1226,13 +1311,46 @@ fn summarize(launch: Option<&PerAgentLaunch>) -> SharedString {
 }
 
 /// One profile's résumé. `None` is the adapter's plain entry (`default`).
+///
+/// A named profile also says which axis it diverges on. Now that flags and
+/// model are editable per profile, two rows can differ in a way neither
+/// résumé's own terms make obvious — "model opus" above "model sonnet" is a
+/// comparison the reader has to perform. Environment is excluded: varying it
+/// is the whole reason a profile exists, so naming it as a divergence would
+/// mark every profile.
 fn profile_summary(modal: &SettingsModal, adapter_id: &str, profile: Option<&str>) -> SharedString {
-    summarize(modal.agent_launch.for_agent_in(adapter_id, profile))
+    let launch = modal.agent_launch.for_agent_in(adapter_id, profile);
+    let mut parts = summary_parts(launch);
+    if profile.is_some()
+        && let Some(term) = divergence(modal.agent_launch.for_agent(adapter_id), launch)
+    {
+        parts.push(term.to_string());
+    }
+    joined(parts)
+}
+
+/// How `profile` differs from the agent's `default` entry, on the two axes a
+/// profile can now override besides environment. `None` when it matches.
+fn divergence(default: Option<&PerAgentLaunch>, profile: Option<&PerAgentLaunch>) -> Option<&'static str> {
+    let (Some(d), Some(p)) = (default, profile) else {
+        return None;
+    };
+    match (d.args.trim() != p.args.trim(), d.model.trim() != p.model.trim()) {
+        (true, true) => Some("own flags and model"),
+        (true, false) => Some("own flags"),
+        (false, true) => Some("own model"),
+        (false, false) => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shared formatter, exercised the way both callers use it.
+    fn summarize(launch: Option<&PerAgentLaunch>) -> SharedString {
+        joined(summary_parts(launch))
+    }
 
     #[test]
     fn summarize_puts_a_configuration_into_words() {
@@ -1259,6 +1377,37 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(summarize(Some(&env_only)), "1 variable");
+    }
+
+    #[test]
+    fn a_divergent_profile_says_which_axis_it_diverges_on() {
+        let default = PerAgentLaunch {
+            args: "--verbose".into(),
+            model: "opus".into(),
+            ..Default::default()
+        };
+        // Identical on both axes: nothing to say. Environment is deliberately
+        // not compared — varying it is why a profile exists.
+        let mut same = default.clone();
+        same.env.insert("K".into(), "v".into());
+        assert_eq!(divergence(Some(&default), Some(&same)), None);
+
+        let flags = PerAgentLaunch { args: "--quiet".into(), ..default.clone() };
+        assert_eq!(divergence(Some(&default), Some(&flags)), Some("own flags"));
+
+        let model = PerAgentLaunch { model: "haiku".into(), ..default.clone() };
+        assert_eq!(divergence(Some(&default), Some(&model)), Some("own model"));
+
+        let both = PerAgentLaunch { args: String::new(), model: String::new(), ..default.clone() };
+        assert_eq!(divergence(Some(&default), Some(&both)), Some("own flags and model"));
+
+        // Whitespace is not a divergence: the same value typed with a trailing
+        // space would otherwise mark a profile as differing forever.
+        let padded = PerAgentLaunch { args: "  --verbose  ".into(), ..default.clone() };
+        assert_eq!(divergence(Some(&default), Some(&padded)), None);
+
+        // An agent with no default entry at all has nothing to diverge from.
+        assert_eq!(divergence(None, Some(&flags)), None);
     }
 
     #[test]
