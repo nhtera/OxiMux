@@ -152,13 +152,13 @@ impl Default for ScmStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oximux_settings::{Appearance, DensityPreset, ThemeChoice, UiScale};
+    use oximux_settings::{Appearance, DensityPreset, UiScale};
 
     fn resolved(density: DensityPreset, percent: u16) -> ScmStyle {
         let appearance = Appearance {
-            theme: ThemeChoice::default(),
             density,
             scale: UiScale::from_percent(percent),
+            ..Appearance::default()
         };
         ScmStyle::new(
             Density::for_appearance(appearance),

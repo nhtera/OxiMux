@@ -104,9 +104,11 @@ impl Density {
     pub fn cockpit() -> Self {
         Self {
             appearance: Appearance {
-                theme: crate::appearance::ThemeChoice::default(),
                 density: DensityPreset::Cockpit,
-                scale: crate::appearance::UiScale::default(),
+                // Only the density preset shapes these tokens; the rest of the
+                // appearance choices ride along at their defaults, so a new one
+                // does not have to be spelled out here to compile.
+                ..Appearance::default()
             },
             // Per-column chrome row height. Sized so the chrome row's
             // vertical center (y=16) lines up with where the macOS
@@ -151,9 +153,11 @@ impl Density {
         let c = Self::cockpit();
         Self {
             appearance: Appearance {
-                theme: crate::appearance::ThemeChoice::default(),
                 density: DensityPreset::Comfortable,
-                scale: crate::appearance::UiScale::default(),
+                // Only the density preset shapes these tokens; the rest of the
+                // appearance choices ride along at their defaults, so a new one
+                // does not have to be spelled out here to compile.
+                ..Appearance::default()
             },
             h_status_bar: roomier(c.h_status_bar),
             h_tab: roomier(c.h_tab),
@@ -252,7 +256,7 @@ impl Default for Density {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::appearance::{ThemeChoice, UiScale};
+    use crate::appearance::UiScale;
 
     /// The base the radius scale is derived from. Stated once here so the
     /// test below fails if someone edits a radius without moving the base.
@@ -357,9 +361,9 @@ mod tests {
         assert_eq!(Density::cockpit().scaled(0.8).h_top_bar, pinned);
         assert_eq!(
             Density::for_appearance(Appearance {
-                theme: ThemeChoice::default(),
                 density: DensityPreset::Comfortable,
                 scale: UiScale::from_percent(150),
+                ..Appearance::default()
             })
             .h_top_bar,
             pinned
@@ -414,9 +418,9 @@ mod tests {
         assert_eq!(Density::cockpit().scale(14.0), 14.0);
         assert_eq!(Density::comfortable().scale(14.0), 14.0);
         let zoomed = Density::for_appearance(Appearance {
-            theme: ThemeChoice::default(),
             density: DensityPreset::Comfortable,
             scale: UiScale::from_percent(150),
+            ..Appearance::default()
         });
         assert_eq!(zoomed.scale(14.0), 21.0);
     }
@@ -426,9 +430,9 @@ mod tests {
     #[test]
     fn the_resolved_density_remembers_what_it_came_from() {
         let asked = Appearance {
-            theme: ThemeChoice::default(),
             density: DensityPreset::Comfortable,
             scale: UiScale::from_percent(120),
+            ..Appearance::default()
         };
         let d = Density::for_appearance(asked);
         assert_eq!(d.appearance, asked);

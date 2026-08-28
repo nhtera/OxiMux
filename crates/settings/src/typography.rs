@@ -209,7 +209,7 @@ impl Default for Typography {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::appearance::{Appearance, DensityPreset, ThemeChoice, UiScale};
+    use crate::appearance::{Appearance, DensityPreset};
 
     #[test]
     fn the_default_appearance_leaves_the_type_scale_alone() {
@@ -247,9 +247,8 @@ mod tests {
         // Comfortable also grew the text, the settings pane would be offering
         // the zoom twice under different names.
         let roomy = Typography::for_appearance(Appearance {
-            theme: ThemeChoice::default(),
             density: DensityPreset::Comfortable,
-            scale: UiScale::default(),
+            ..Appearance::default()
         });
         assert_eq!(roomy.t_body_sm, Typography::cockpit().t_body_sm);
     }

@@ -32,7 +32,7 @@ pub use agent_launch::{
     ACP_PRESETS, AcpPreset, AgentLaunchSettings, DEFAULT_PROFILE, NamedLaunchProfile, OpenMode,
     PerAgentLaunch, Transport, acp_preset, import_resume_command, split_args,
 };
-pub use appearance::{Appearance, DensityPreset, ThemeChoice, UiScale};
+pub use appearance::{Appearance, DensityPreset, ThemeChoice, UiScale, UsageDetail};
 pub use auto_update::AutoUpdateSettings;
 pub use autosave::AutosaveSettings;
 pub use commit_message_ai::{AgentSettings, CommitMessageAiMode, CommitMessageAiSettings};

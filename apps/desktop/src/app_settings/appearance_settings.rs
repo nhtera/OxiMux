@@ -182,7 +182,7 @@ pub fn set(cx: &mut App, next: Appearance) {
 /// break is invisible until someone who set a preset presses zoom-reset and
 /// watches their preset go with it.
 mod step {
-    use oximux_settings::{Appearance, DensityPreset, ThemeChoice, UiScale};
+    use oximux_settings::{Appearance, DensityPreset, ThemeChoice, UiScale, UsageDetail};
 
     pub(super) fn zoom_in(current: Appearance) -> Appearance {
         Appearance {
@@ -211,6 +211,13 @@ mod step {
 
     pub(super) fn theme(current: Appearance, theme: ThemeChoice) -> Appearance {
         Appearance { theme, ..current }
+    }
+
+    pub(super) fn usage_detail(current: Appearance, usage_detail: UsageDetail) -> Appearance {
+        Appearance {
+            usage_detail,
+            ..current
+        }
     }
 }
 
@@ -241,6 +248,12 @@ pub fn set_density(cx: &mut App, density: oximux_settings::DensityPreset) {
 /// Switch palette, leaving the density and the zoom alone.
 pub fn set_theme(cx: &mut App, theme: oximux_settings::ThemeChoice) {
     let next = step::theme(active(cx), theme);
+    set(cx, next);
+}
+
+/// Switch how much the usage meter spells out, leaving the rest alone.
+pub fn set_usage_detail(cx: &mut App, usage_detail: oximux_settings::UsageDetail) {
+    let next = step::usage_detail(active(cx), usage_detail);
     set(cx, next);
 }
 
@@ -330,7 +343,9 @@ pub fn save(appearance: &Appearance, fonts: &FontChoice) -> std::io::Result<()> 
 mod tests {
     use super::*;
     use gpui::TestAppContext;
-    use oximux_settings::{Density, DensityPreset, FontChoice, Theme, ThemeChoice, Typography, UiScale};
+    use oximux_settings::{
+        Density, DensityPreset, FontChoice, Theme, ThemeChoice, Typography, UiScale, UsageDetail,
+    };
 
     /// A preset choice must survive a zoom, and a zoom must survive a preset
     /// choice. They are independent controls; a user who set Comfortable and
@@ -341,6 +356,7 @@ mod tests {
             theme: ThemeChoice::Paper,
             density: DensityPreset::Comfortable,
             scale: UiScale::from_percent(130),
+            usage_detail: UsageDetail::Compact,
         };
 
         let zoomed = step::zoom_in(start);
@@ -368,6 +384,16 @@ mod tests {
         assert_eq!(relit.theme, ThemeChoice::Charcoal);
         assert_eq!(relit.density, DensityPreset::Comfortable);
         assert_eq!(relit.scale.percent(), 130);
+
+        // And a fourth: the meter's detail level is nobody else's business.
+        for moved in [zoomed, out, reset, tightened, relit] {
+            assert_eq!(moved.usage_detail, UsageDetail::Compact, "meter detail survived");
+        }
+        let spelled_out = step::usage_detail(start, UsageDetail::Verbose);
+        assert_eq!(spelled_out.usage_detail, UsageDetail::Verbose);
+        assert_eq!(spelled_out.theme, ThemeChoice::Paper);
+        assert_eq!(spelled_out.density, DensityPreset::Comfortable);
+        assert_eq!(spelled_out.scale.percent(), 130);
     }
 
     /// The pull: a view holding tokens from before a change picks up the new
@@ -384,6 +410,7 @@ mod tests {
                 theme: ThemeChoice::Paper,
                 density: DensityPreset::Comfortable,
                 scale: UiScale::from_percent(120),
+                ..Appearance::default()
             });
             oximux_settings::appearance::sync(&mut theme, &mut density, &mut typography, cx);
 
