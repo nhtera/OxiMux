@@ -194,9 +194,15 @@ pub struct SettingsModal {
     /// typed but never committed via blur/Enter — same hazard, and same fix, as
     /// [`Self::custom_words_seed`].
     env_seed: BTreeMap<String, String>,
-    /// "New profile" name field; Enter creates and selects the profile.
-    pub(super) new_profile_input: Option<Entity<InputState>>,
-    _new_profile_sub: Option<Subscription>,
+    /// The profile list's single name field, shared by add / rename /
+    /// duplicate — see [`pane_agents_launch::ProfileNameMode`]. Enter commits
+    /// whichever the mode names. `None` mode hides the field entirely.
+    pub(super) profile_name_input: Option<Entity<InputState>>,
+    pub(super) profile_name_mode: Option<pane_agents_launch::ProfileNameMode>,
+    _profile_name_sub: Option<Subscription>,
+    /// The profile whose Delete has been pressed once. The second press
+    /// removes it. View state, so an armed delete never survives a reopen.
+    pub(super) pending_profile_delete: Option<String>,
     /// The environment card's transient acknowledgment or refusal — see
     /// [`pane_agents_launch::Notice`]. Cleared on the next keystroke in either
     /// field and on every selection change, so the card never answers a
@@ -322,8 +328,10 @@ impl SettingsModal {
             env_input: None,
             _env_sub: None,
             env_seed: BTreeMap::new(),
-            new_profile_input: None,
-            _new_profile_sub: None,
+            profile_name_input: None,
+            profile_name_mode: None,
+            _profile_name_sub: None,
+            pending_profile_delete: None,
             env_notice: None,
             keybind_overrides: BTreeMap::new(),
             recording_action: None,
@@ -517,15 +525,17 @@ impl SettingsModal {
         ));
         self.env_input = Some(env_input);
 
-        // "New profile" name field. Enter creates + selects; the subscription
-        // needs the `Window` to re-seed the env editor, hence `subscribe_in`.
-        let np_input = cx
-            .new(|cx| InputState::new(window, cx).placeholder("New profile name, then Enter"));
-        self._new_profile_sub = Some(cx.subscribe_in(
+        // The profile list's shared name field. Hidden until an affordance sets
+        // a mode; the subscription needs the `Window` to re-seed the env editor
+        // after a commit, hence `subscribe_in`.
+        self.profile_name_mode = None;
+        self.pending_profile_delete = None;
+        let np_input = cx.new(|cx| InputState::new(window, cx).placeholder("Profile name"));
+        self._profile_name_sub = Some(cx.subscribe_in(
             &np_input,
             window,
             |this, input, ev: &InputEvent, window, cx| {
-                use pane_agents_launch::{Notice, NoticeSlot};
+                use pane_agents_launch::{Notice, NoticeSlot, ProfileNameMode};
                 // Typing retires the previous answer; only Enter produces one.
                 if matches!(ev, InputEvent::Change) {
                     this.env_notice = None;
@@ -534,11 +544,15 @@ impl SettingsModal {
                 if !matches!(ev, InputEvent::PressEnter { .. }) {
                     return;
                 }
+                // No mode means no field on screen; nothing to commit.
+                let Some(mode) = this.profile_name_mode.clone() else {
+                    return;
+                };
                 let agent = this.env_agent;
                 let raw = input.read(cx).value().to_string();
                 // Each of blank / `default` / already-taken used to be a silent
                 // early return, which read as a broken button. All three now
-                // say which one it was, and none of them creates anything.
+                // say which one it was, and none of them changes anything.
                 let name = match pane_agents_launch::validate_profile_name(
                     &raw,
                     &this.agent_launch.profile_names(agent),
@@ -550,19 +564,57 @@ impl SettingsModal {
                         return;
                     }
                 };
-                this.agent_launch.profile_entry_mut(agent, Some(&name));
+                // The settings-crate call can still refuse — the source may
+                // have gone (a hand edit to the file, a delete in between).
+                let gone = |from: &str| {
+                    Notice::err(
+                        NoticeSlot::Profile,
+                        format!("“{from}” is no longer there — reopen the pane and try again."),
+                    )
+                };
+                let ack = match &mode {
+                    ProfileNameMode::Add => {
+                        this.agent_launch.profile_entry_mut(agent, Some(&name));
+                        format!("Created “{name}” — editing it now.")
+                    }
+                    ProfileNameMode::Rename(from) => {
+                        if !this.agent_launch.rename_profile(agent, from, &name) {
+                            this.env_notice = Some(gone(from));
+                            cx.notify();
+                            return;
+                        }
+                        format!("Renamed “{from}” to “{name}”.")
+                    }
+                    ProfileNameMode::Duplicate(from) => {
+                        if !this.agent_launch.duplicate_profile(agent, from, &name) {
+                            this.env_notice = Some(gone(from));
+                            cx.notify();
+                            return;
+                        }
+                        format!("Duplicated “{from}” as “{name}” — editing it now.")
+                    }
+                };
                 this.persist_agent_launch(cx);
+                this.profile_name_mode = None;
                 input.update(cx, |s, cx| s.set_value("", window, cx));
-                this.select_env_profile(Some(name.clone()), window, cx);
-                // Set AFTER the selection change, which clears the slot.
-                this.env_notice = Some(Notice::ok(
-                    NoticeSlot::Profile,
-                    format!("Created “{name}” — editing it now."),
-                ));
+                match &mode {
+                    // A rename of the profile being edited keeps editing it:
+                    // assigning the selection directly (rather than going
+                    // through `select_env_profile`) avoids a flush against a
+                    // name that no longer resolves.
+                    ProfileNameMode::Rename(from) if this.env_profile.as_deref() == Some(from) => {
+                        this.env_profile = Some(name.clone());
+                        this.reseed_env_editor(window, cx);
+                    }
+                    ProfileNameMode::Rename(_) => {}
+                    _ => this.select_env_profile(Some(name.clone()), window, cx),
+                }
+                // Set AFTER any selection change, which clears the slot.
+                this.env_notice = Some(Notice::ok(NoticeSlot::Profile, ack));
                 cx.notify();
             },
         ));
-        self.new_profile_input = Some(np_input);
+        self.profile_name_input = Some(np_input);
 
         // Schedules pane: reload the list + run history from the shared store,
         // and build a fresh empty create form (reset draft, clear any error).
@@ -636,8 +688,10 @@ impl SettingsModal {
         }
         self.env_input = None;
         self._env_sub = None;
-        self.new_profile_input = None;
-        self._new_profile_sub = None;
+        self.profile_name_input = None;
+        self._profile_name_sub = None;
+        self.profile_name_mode = None;
+        self.pending_profile_delete = None;
         self.env_notice = None;
         // Drop the schedule create-form inputs so their focus handles can't keep
         // window focus orphaned after the modal is hidden.
@@ -724,6 +778,7 @@ impl SettingsModal {
             self.persist_agent_launch(cx);
         }
         self.env_profile = profile;
+        self.pending_profile_delete = None;
         self.reseed_env_editor(window, cx);
     }
 
@@ -741,6 +796,9 @@ impl SettingsModal {
         }
         self.env_agent = agent;
         self.env_profile = None;
+        // Both are per-adapter, so neither survives the switch.
+        self.pending_profile_delete = None;
+        self.profile_name_mode = None;
         self.reseed_env_editor(window, cx);
     }
 
@@ -764,22 +822,93 @@ impl SettingsModal {
         cx.notify();
     }
 
-    /// Delete the selected named profile and fall back to `default`. A no-op on
+    /// Open the profile list's name field in `mode`, seeded and focused.
+    ///
+    /// Rename and duplicate also select the profile they act on, so the
+    /// confirmation they eventually produce names the profile the card is
+    /// visibly pointing at.
+    pub(super) fn begin_profile_name(
+        &mut self,
+        mode: pane_agents_launch::ProfileNameMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use pane_agents_launch::ProfileNameMode;
+        self.pending_profile_delete = None;
+        self.env_notice = None;
+        if let ProfileNameMode::Rename(name) | ProfileNameMode::Duplicate(name) = &mode {
+            let name = name.clone();
+            let target = (name != oximux_settings::DEFAULT_PROFILE).then_some(name);
+            self.select_env_profile(target, window, cx);
+        }
+        let seed = mode.seed();
+        self.profile_name_mode = Some(mode);
+        if let Some(input) = self.profile_name_input.clone() {
+            input.update(cx, |s, cx| s.set_value(&seed, window, cx));
+            // Focus set synchronously inside a mouse-down handler is clobbered
+            // by GPUI's post-click focus dispatch — the field would open blurred
+            // and the user's first keystroke would go nowhere.
+            let handle = input.read(cx).focus_handle(cx);
+            window.defer(cx, move |window, app| handle.focus(window, app));
+        }
+        cx.notify();
+    }
+
+    /// Dismiss the name field without committing.
+    pub(super) fn cancel_profile_name(&mut self, cx: &mut Context<Self>) {
+        self.profile_name_mode = None;
+        self.env_notice = None;
+        cx.notify();
+    }
+
+    /// First press of a profile's Delete: arm it, and select it so the
+    /// consequence is read against the profile the card is pointing at.
+    pub(super) fn arm_profile_delete(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_env_profile(Some(name.clone()), window, cx);
+        self.profile_name_mode = None;
+        self.pending_profile_delete = Some(name);
+        cx.notify();
+    }
+
+    /// Second thoughts.
+    pub(super) fn cancel_profile_delete(&mut self, cx: &mut Context<Self>) {
+        self.pending_profile_delete = None;
+        cx.notify();
+    }
+
+    /// Second press: remove `name` and fall back to `default`. A no-op on
     /// `default` itself, which is the adapter's plain entry.
-    pub(super) fn remove_env_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(name) = self.env_profile.clone() else {
-            return;
-        };
+    pub(super) fn confirm_profile_delete(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_profile_delete = None;
         let agent = self.env_agent;
-        if !self.agent_launch.remove_profile(agent, &name) {
+        if !self.agent_launch.remove_profile(agent, name) {
+            cx.notify();
             return;
         }
-        self.env_profile = None;
-        // Re-baseline BEFORE persisting so the flush in `select_*` can't write
-        // the removed profile's env back under the default entry.
+        if self.env_profile.as_deref() == Some(name) {
+            self.env_profile = None;
+        }
+        // Re-baseline BEFORE persisting so a pending edit to the profile just
+        // removed can't be written back under the default entry.
         self.env_seed = self.selected_env();
         self.persist_agent_launch(cx);
         self.reseed_env_editor(window, cx);
+        // Set AFTER the reseed, which clears the slot.
+        self.env_notice = Some(pane_agents_launch::Notice::ok(
+            pane_agents_launch::NoticeSlot::Profile,
+            format!("Deleted “{name}”."),
+        ));
+        cx.notify();
     }
 
     pub(super) fn persist_agent_launch(&mut self, cx: &mut Context<Self>) {
@@ -902,7 +1031,7 @@ mod env_editor_tests {
                 m.open(window, cx);
                 m.selected = SettingsPane::Agents;
                 assert!(m.env_input.is_some(), "open() builds the env editor");
-                assert!(m.new_profile_input.is_some(), "open() builds the name field");
+                assert!(m.profile_name_input.is_some(), "open() builds the name field");
                 // Two profiles and a live env, so the card paints its full
                 // shape — both segmented rows populated, the editor non-empty —
                 // rather than the empty-state that would hide a layout fault.
@@ -996,6 +1125,137 @@ mod env_editor_tests {
         .expect("agent switch");
     }
 
+    /// Rename and duplicate are the two operations that did not exist, and both
+    /// have to keep the editor pointing somewhere real: a rename keeps editing
+    /// the profile under its new name, a duplicate moves to the copy.
+    #[gpui::test]
+    fn renaming_keeps_the_editor_on_it_and_duplicating_moves_to_the_copy(cx: &mut TestAppContext) {
+        use pane_agents_launch::{NoticeSlot, ProfileNameMode};
+
+        let (w, m) = modal(cx);
+        // Drive through the `InputState` event: the dispatch on mode lives in
+        // the subscription, which no logic test reaches.
+        let commit = |m: &Entity<SettingsModal>,
+                      cx: &mut gpui::Context<'_, gpui_component::Root>,
+                      window: &mut Window,
+                      mode: ProfileNameMode,
+                      text: &str| {
+            m.update(cx, |m, cx| {
+                m.begin_profile_name(mode, window, cx);
+                let field = m.profile_name_input.clone().expect("name field");
+                field.update(cx, |s, cx| s.set_value(text, window, cx));
+                field.update(cx, |_, cx| cx.emit(InputEvent::PressEnter { secondary: false }));
+            });
+        };
+
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.open(window, cx);
+                m.env_agent = "claude-code";
+                m.agent_launch.profile_entry_mut("claude-code", Some("proxy")).env
+                    .insert("BASE".into(), "https://second/v1".into());
+                m.select_env_profile(Some("proxy".into()), window, cx);
+            });
+        })
+        .expect("seed a profile");
+        cx.run_until_parked();
+
+        // Rename the profile being edited.
+        w.update(cx, |_root, window, cx| {
+            commit(&m, cx, window, ProfileNameMode::Rename("proxy".into()), "staging")
+        })
+        .expect("rename");
+        cx.run_until_parked();
+        w.update(cx, |_root, _window, cx| {
+            m.update(cx, |m, cx| {
+                assert_eq!(
+                    m.agent_launch.profile_names("claude-code"),
+                    vec![DEFAULT_PROFILE, "staging"],
+                );
+                assert_eq!(
+                    m.env_profile.as_deref(),
+                    Some("staging"),
+                    "the editor follows the profile through its rename",
+                );
+                assert_eq!(editor_text(m, cx), "BASE=https://second/v1");
+                let n = m.notice_for(NoticeSlot::Profile).expect("a rename is answered");
+                assert!(n.ok && n.text.contains("proxy") && n.text.contains("staging"));
+                // The field closes on a commit: it is revealed by an action,
+                // not permanently open.
+                assert!(m.profile_name_mode.is_none());
+            });
+        })
+        .expect("assert rename");
+
+        // Duplicate it. The copy is independent of its source.
+        w.update(cx, |_root, window, cx| {
+            commit(&m, cx, window, ProfileNameMode::Duplicate("staging".into()), "staging-copy")
+        })
+        .expect("duplicate");
+        cx.run_until_parked();
+        w.update(cx, |_root, _window, cx| {
+            m.update(cx, |m, cx| {
+                assert_eq!(
+                    m.agent_launch.profile_names("claude-code"),
+                    vec![DEFAULT_PROFILE, "staging", "staging-copy"],
+                );
+                assert_eq!(
+                    m.env_profile.as_deref(),
+                    Some("staging-copy"),
+                    "a duplicate moves the editor to the copy, which is the one to edit",
+                );
+                assert_eq!(editor_text(m, cx), "BASE=https://second/v1", "the copy carries the env");
+                let n = m.notice_for(NoticeSlot::Profile).expect("a duplicate is answered");
+                assert!(n.ok && n.text.contains("staging-copy"));
+                m.close(cx);
+            });
+        })
+        .expect("assert duplicate");
+    }
+
+    /// Deleting must be two presses, and the second must say what it removed.
+    /// Cancelling after the first must leave the profile exactly as it was.
+    #[gpui::test]
+    fn deleting_a_profile_asks_first_and_then_says_what_went(cx: &mut TestAppContext) {
+        use pane_agents_launch::NoticeSlot;
+
+        let (w, m) = modal(cx);
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.open(window, cx);
+                m.env_agent = "claude-code";
+                m.agent_launch.profile_entry_mut("claude-code", Some("proxy"));
+
+                // Armed, then cancelled: nothing is removed.
+                m.arm_profile_delete("proxy".into(), window, cx);
+                assert_eq!(m.pending_profile_delete.as_deref(), Some("proxy"));
+                m.cancel_profile_delete(cx);
+                assert_eq!(m.pending_profile_delete, None);
+                assert_eq!(
+                    m.agent_launch.profile_names("claude-code"),
+                    vec![DEFAULT_PROFILE, "proxy"],
+                    "cancelling must leave the profile alone",
+                );
+
+                // Selecting somewhere else also disarms, so an armed row can't
+                // follow the user around the card.
+                m.arm_profile_delete("proxy".into(), window, cx);
+                m.select_env_profile(None, window, cx);
+                assert_eq!(m.pending_profile_delete, None);
+
+                // Confirmed: removed, deselected, and acknowledged by name.
+                m.arm_profile_delete("proxy".into(), window, cx);
+                m.confirm_profile_delete("proxy", window, cx);
+                assert_eq!(m.agent_launch.profile_names("claude-code"), vec![DEFAULT_PROFILE]);
+                assert_eq!(m.env_profile, None);
+                let n = m.notice_for(NoticeSlot::Profile).expect("a delete is answered");
+                assert!(n.ok && n.text.contains("proxy"), "{}", n.text);
+                m.close(cx);
+            });
+        })
+        .expect("delete a profile");
+    }
+
     /// Removing a profile falls back to `default` and must not carry the removed
     /// profile's env onto the default entry via the flush-on-leave.
     #[gpui::test]
@@ -1015,8 +1275,13 @@ mod env_editor_tests {
                     .insert("BASE".into(), "https://second/v1".into());
                 m.select_env_profile(Some("proxy".into()), window, cx);
 
-                m.remove_env_profile(window, cx);
+                // Two steps: arm, then confirm. Arming alone must not remove.
+                m.arm_profile_delete("proxy".into(), window, cx);
+                assert_eq!(m.pending_profile_delete.as_deref(), Some("proxy"));
+                assert_eq!(m.agent_launch.profile_names("claude-code").len(), 2);
+                m.confirm_profile_delete("proxy", window, cx);
                 assert_eq!(m.env_profile, None);
+                assert_eq!(m.pending_profile_delete, None);
                 assert_eq!(
                     m.agent_launch.profile_names("claude-code"),
                     vec![DEFAULT_PROFILE]
@@ -1130,7 +1395,10 @@ mod env_editor_tests {
                     vec![DEFAULT_PROFILE],
                     "a fresh config reports only the implicit default"
                 );
-                let field = m.new_profile_input.clone().expect("name field");
+                // The `+` affordance is what reveals the field; without a mode
+                // there is nothing on screen to press Enter in.
+                m.begin_profile_name(pane_agents_launch::ProfileNameMode::Add, window, cx);
+                let field = m.profile_name_input.clone().expect("name field");
                 field.update(cx, |s, cx| s.set_value("proxy", window, cx));
                 // The event the Input emits on Enter, not a direct call to the
                 // creation code — the subscription is what is under test.
@@ -1154,7 +1422,7 @@ mod env_editor_tests {
                     "and selected it, so the editor below now edits the new profile"
                 );
                 assert!(
-                    m.new_profile_input
+                    m.profile_name_input
                         .as_ref()
                         .expect("name field")
                         .read(cx)
@@ -1186,7 +1454,9 @@ mod env_editor_tests {
                      window: &mut Window,
                      text: &str| {
             m.update(cx, |m, cx| {
-                let field = m.new_profile_input.clone().expect("name field");
+                // A commit closes the field, so each press re-opens it.
+                m.begin_profile_name(pane_agents_launch::ProfileNameMode::Add, window, cx);
+                let field = m.profile_name_input.clone().expect("name field");
                 field.update(cx, |s, cx| s.set_value(text, window, cx));
                 field.update(cx, |_, cx| cx.emit(InputEvent::PressEnter { secondary: false }));
             });
@@ -1247,7 +1517,7 @@ mod env_editor_tests {
         // Typing again retires the answer, so the card never shows a stale one.
         w.update(cx, |_root, window, cx| {
             m.update(cx, |m, cx| {
-                let field = m.new_profile_input.clone().expect("name field");
+                let field = m.profile_name_input.clone().expect("name field");
                 field.update(cx, |s, cx| s.set_value("stag", window, cx));
                 field.update(cx, |_, cx| cx.emit(InputEvent::Change));
             });

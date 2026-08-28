@@ -12,13 +12,15 @@ use gpui_component::Sizable as _;
 use gpui_component::input::Input;
 use std::collections::BTreeMap;
 
-use oximux_settings::{DEFAULT_PROFILE, Density, OpenMode, Theme, Typography, split_args};
+use oximux_settings::{
+    DEFAULT_PROFILE, Density, OpenMode, PerAgentLaunch, Theme, Typography, split_args,
+};
 
 use super::SettingsModal;
-use super::controls::{toggle_chip, toggle_switch, value_chip};
+use super::controls::{icon_button, toggle_chip, toggle_switch, value_chip};
 use super::layout::{
-    SettingEntry, card_surface, entry, hint_text, notice_text, section_card, setting_row_desc,
-    setting_row_desc_hint, setting_row_hint,
+    SettingEntry, card_surface, entry, hint_text, list_row, notice_text, section_card,
+    setting_row_action_hint, setting_row_desc, setting_row_desc_hint, setting_row_hint,
 };
 use super::segmented::{Segment, segmented};
 use crate::shell::agent_presentation::adapter_icon_path;
@@ -58,6 +60,50 @@ impl Notice {
 
     pub(in crate::shell) fn err(slot: NoticeSlot, text: impl Into<SharedString>) -> Self {
         Self { slot, ok: false, text: text.into() }
+    }
+}
+
+/// What the card's single name field is currently naming.
+///
+/// One field, not three: add, rename, and duplicate are all "type a name,
+/// press Enter", they share [`validate_profile_name`] and its three refusals,
+/// and three live `InputState`s in one card is three focus handles and three
+/// subscriptions to keep in step. The mode is what the Enter handler
+/// dispatches on.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(in crate::shell) enum ProfileNameMode {
+    /// Create a new profile, seeded from the agent's current configuration.
+    Add,
+    /// Rename the named profile.
+    Rename(String),
+    /// Copy the named profile (which may be `default`) under a new name.
+    Duplicate(String),
+}
+
+impl ProfileNameMode {
+    /// The text the field opens with. Rename starts from the current name
+    /// because a rename is usually an edit of it; duplicate offers a name that
+    /// is already valid, so Enter alone is a complete answer.
+    pub(in crate::shell) fn seed(&self) -> String {
+        match self {
+            Self::Add => String::new(),
+            Self::Rename(name) => name.clone(),
+            Self::Duplicate(name) => format!("{name}-copy"),
+        }
+    }
+
+    /// What the field is asking for, shown under it while nothing has been
+    /// refused or confirmed yet.
+    fn prompt(&self) -> SharedString {
+        match self {
+            Self::Add => "Type a name for the new profile and press Enter.".into(),
+            Self::Rename(name) => {
+                SharedString::from(format!("Rename “{name}” — type the new name and press Enter."))
+            }
+            Self::Duplicate(name) => SharedString::from(format!(
+                "Copy “{name}” — type a name for the copy and press Enter."
+            )),
+        }
     }
 }
 
@@ -339,103 +385,138 @@ pub(super) fn render_env_card(
             })
         })
         .collect();
-    rows.push(setting_row_desc(
+    let agent_display = LAUNCH_AGENTS
+        .iter()
+        .find(|(id, _)| *id == current_agent)
+        .map(|(_, d)| *d)
+        .unwrap_or(current_agent);
+    rows.push(setting_row_desc_hint(
         "Agent",
         "Which agent's launch environment you are editing.",
         segmented("launch-env-agent", agent_segs, theme, density, typography, cx),
+        // The two rows below are scoped to this choice and say nothing about
+        // it themselves, which is easy to lose once a profile is selected.
+        hint_text(
+            format!("The profiles and environment below belong to {agent_display}."),
+            theme,
+            typography,
+        ),
         theme,
         typography,
     ));
 
     // Which profile of that agent. `default` is the plain entry every config
-    // already has, so this reads "default" even before a profile is created.
-    let current_profile = modal.env_profile.clone();
+    // already has, so the list is never empty.
     let profile_names = modal.agent_launch.profile_names(current_agent);
     // `profile_names` always leads with `default`, so "only default" is the
     // empty state — the user has never created a profile for this agent.
     let has_named_profiles = profile_names.len() > 1;
-    let profile_segs: Vec<Segment> = profile_names
-        .clone()
-        .into_iter()
-        .map(|name| {
-            let selected = match (&current_profile, name.as_str()) {
-                (None, DEFAULT_PROFILE) => true,
-                (Some(sel), n) => sel == n,
-                _ => false,
+
+    let mut list = div().flex().flex_col().w_full().gap(px(2.0));
+    for name in &profile_names {
+        list = list.child(profile_row(
+            modal,
+            current_agent,
+            name,
+            theme,
+            density,
+            typography,
+            cx,
+        ));
+    }
+    // The name field is revealed by an action, not permanently open: adding or
+    // renaming a profile is rare next to picking one, and a resting text field
+    // reads as something the card wants filled in.
+    if let (true, Some(state)) =
+        (modal.profile_name_mode.is_some(), modal.profile_name_input.as_ref())
+    {
+        list = list.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .w_full()
+                .gap(px(6.0))
+                .pt(px(4.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(state).small().text_size(px(typography.t_body_sm))),
+                )
+                .child(value_chip(
+                    SharedString::from("launch-env-profile-name-cancel"),
+                    "Cancel",
+                    theme,
+                    density,
+                    typography,
+                    |this, _w, cx| this.cancel_profile_name(cx),
+                    cx,
+                )),
+        );
+    }
+
+    // The last commit's answer, else what the field is asking for, else what
+    // the current selection means — `default` in a picker reads as "nothing
+    // chosen yet" unless something says otherwise, and with no named profiles
+    // this line doubles as the empty state.
+    let profile_hint = match (modal.notice_for(NoticeSlot::Profile), &modal.profile_name_mode) {
+        (Some(n), _) => notice_text(n.ok, n.text.clone(), theme, typography),
+        (None, Some(mode)) => hint_text(mode.prompt(), theme, typography),
+        (None, None) => {
+            let text: SharedString = match modal.env_profile.as_deref() {
+                None if has_named_profiles => format!(
+                    "Editing “{DEFAULT_PROFILE}” — the plain configuration this agent already \
+                     launches with."
+                )
+                .into(),
+                None => format!(
+                    "Editing “{DEFAULT_PROFILE}” — the plain configuration this agent already \
+                     launches with. Add a profile to launch it against a second endpoint or \
+                     account."
+                )
+                .into(),
+                Some(name) => format!("Editing “{name}” — it launches with its own environment.").into(),
             };
-            let target = (name != DEFAULT_PROFILE).then(|| name.clone());
-            Segment::new(name, selected, move |this, window, cx| {
-                this.select_env_profile(target.clone(), window, cx);
-            })
-        })
-        .collect();
-    // What the current selection means, stated rather than left to be inferred
-    // — `default` in a picker reads as "nothing chosen yet" unless something
-    // says otherwise. When the agent has no named profiles this line doubles as
-    // the empty state, naming what a profile would be *for*.
-    let profile_hint: SharedString = match current_profile.as_deref() {
-        None if has_named_profiles => {
-            format!("“{DEFAULT_PROFILE}” is the plain configuration this agent already launches with.")
-                .into()
-        }
-        None => format!(
-            "“{DEFAULT_PROFILE}” is the plain configuration this agent already launches with. \
-             No profiles yet — add one to launch this agent against a second endpoint or account."
-        )
-        .into(),
-        Some(name) => {
-            format!("“{name}” launches this agent with its own environment.").into()
+            hint_text(text, theme, typography)
         }
     };
-    rows.push(setting_row_desc_hint(
-        "Profile",
+
+    // `+` opens the name field; while one is open the same slot cancels it, so
+    // the affordance that created the field is also the one that dismisses it.
+    let add_action = match modal.profile_name_mode {
+        Some(_) => icon_button(
+            "launch-env-profile-add",
+            "icons/x.svg",
+            "Cancel",
+            false,
+            theme,
+            density,
+            |this, _w, cx| this.cancel_profile_name(cx),
+            cx,
+        ),
+        None => icon_button(
+            "launch-env-profile-add",
+            "icons/plus.svg",
+            "Add a profile",
+            false,
+            theme,
+            density,
+            |this, window, cx| this.begin_profile_name(ProfileNameMode::Add, window, cx),
+            cx,
+        ),
+    };
+
+    rows.push(setting_row_action_hint(
+        "Profiles",
         "A second configuration of the same agent — an alternate endpoint, a proxy, or a \
-         second account.",
-        segmented("launch-env-profile", profile_segs, theme, density, typography, cx),
-        hint_text(profile_hint, theme, typography),
+         second account. Pick one to edit its environment below.",
+        add_action,
+        list,
+        profile_hint,
         theme,
         typography,
     ));
-
-    // Add / remove. The name field commits on Enter (see the modal's
-    // `_new_profile_sub`); Remove is disabled on `default`, which is the
-    // adapter's plain entry rather than a profile.
-    if let Some(state) = modal.new_profile_input.as_ref() {
-        let mut controls = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(6.0))
-            .child(
-                div()
-                    .w(px(180.0))
-                    .child(Input::new(state).small().text_size(px(typography.t_body_sm))),
-            );
-        if current_profile.is_some() {
-            controls = controls.child(value_chip(
-                SharedString::from("launch-env-profile-remove"),
-                "Remove",
-                theme,
-                density,
-                typography,
-                |this, window, cx| this.remove_env_profile(window, cx),
-                cx,
-            ));
-        }
-        // The create attempt's answer, or the format rule while there is none.
-        let hint = match modal.notice_for(NoticeSlot::Profile) {
-            Some(n) => notice_text(n.ok, n.text.clone(), theme, typography),
-            None => hint_text("Type a name and press Enter.", theme, typography),
-        };
-        rows.push(setting_row_desc_hint(
-            "Add a profile",
-            "A new profile starts from this agent's current flags, model, and environment.",
-            controls,
-            hint,
-            theme,
-            typography,
-        ));
-    }
 
     // The editor itself. Stacked rather than pinned right: it is the one
     // control in this card that wants the full width of the row.
@@ -459,6 +540,181 @@ pub(super) fn render_env_card(
     }
 
     card_surface(theme, density, section_card(theme, density, rows))
+}
+
+
+/// One row of the profile list: the profile's name and its résumé on the left,
+/// its actions pinned right, and an accent fill when it is the one being
+/// edited. Clicking anywhere on the row selects it.
+///
+/// An action click also selects the row it acted on — the click bubbles from
+/// the button to the row, and that is deliberate rather than tolerated: an
+/// action names a profile in its confirmation, and the profile it names should
+/// be the one the card is visibly pointing at.
+///
+/// When this row is the one armed for deletion, the résumé is replaced by the
+/// consequence and the actions by a two-step confirm. Inline rather than a
+/// dialog: the settings modal is already a modal, and a dialog over a dialog is
+/// where this codebase's focus bugs live.
+#[allow(clippy::too_many_arguments)]
+fn profile_row(
+    modal: &SettingsModal,
+    adapter_id: &'static str,
+    name: &str,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    let is_default = name == DEFAULT_PROFILE;
+    let selected = match (modal.env_profile.as_deref(), is_default) {
+        (None, true) => true,
+        (Some(sel), false) => sel == name,
+        _ => false,
+    };
+    let armed = modal.pending_profile_delete.as_deref() == Some(name);
+    // The selection value this row stands for: `None` is the plain entry.
+    let target = (!is_default).then(|| name.to_string());
+    let owned = name.to_string();
+
+    let mut name_line = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .child(
+            div()
+                .text_size(px(typography.t_body_sm))
+                .text_color(theme.fg_base)
+                .child(SharedString::from(owned.clone())),
+        );
+    if is_default {
+        // Named in the row rather than only in the hint below, so the label
+        // holds whether or not this row is the selected one.
+        name_line = name_line.child(pill("Plain configuration", theme.fg_subtle, density, typography));
+    }
+
+    let subtitle: SharedString = if armed {
+        format!(
+            "Deleting “{owned}” removes its flags, model, and environment. Anything already \
+             launched under it falls back to {DEFAULT_PROFILE}."
+        )
+        .into()
+    } else {
+        profile_summary(modal, adapter_id, target.as_deref())
+    };
+    let text = div().child(name_line).child(
+        div()
+            .text_size(px(typography.t_sub_label))
+            .text_color(if armed { theme.status_error } else { theme.fg_subtle })
+            .child(subtitle),
+    );
+
+    let mut controls = div().flex().flex_row().items_center().gap(px(6.0));
+    if armed {
+        let confirming = owned.clone();
+        controls = controls
+            .child(value_chip(
+                SharedString::from(format!("launch-env-profile-delete-go-{owned}")),
+                "Delete",
+                theme,
+                density,
+                typography,
+                move |this, window, cx| this.confirm_profile_delete(&confirming, window, cx),
+                cx,
+            ))
+            .child(value_chip(
+                SharedString::from(format!("launch-env-profile-delete-no-{owned}")),
+                "Cancel",
+                theme,
+                density,
+                typography,
+                |this, _w, cx| this.cancel_profile_delete(cx),
+                cx,
+            ));
+    } else {
+        if !is_default {
+            let renaming = owned.clone();
+            controls = controls.child(icon_button(
+                SharedString::from(format!("launch-env-profile-rename-{owned}")),
+                "icons/pencil.svg",
+                format!("Rename “{owned}”"),
+                false,
+                theme,
+                density,
+                move |this, window, cx| {
+                    this.begin_profile_name(ProfileNameMode::Rename(renaming.clone()), window, cx);
+                },
+                cx,
+            ));
+        }
+        // `default` is duplicable and only duplicable: copying it is the one
+        // way to start a profile from the plain configuration without editing
+        // the plain configuration itself.
+        let copying = owned.clone();
+        controls = controls.child(icon_button(
+            SharedString::from(format!("launch-env-profile-duplicate-{owned}")),
+            "icons/copy.svg",
+            format!("Duplicate “{owned}”"),
+            false,
+            theme,
+            density,
+            move |this, window, cx| {
+                this.begin_profile_name(ProfileNameMode::Duplicate(copying.clone()), window, cx);
+            },
+            cx,
+        ));
+        if !is_default {
+            let deleting = owned.clone();
+            controls = controls.child(icon_button(
+                SharedString::from(format!("launch-env-profile-delete-{owned}")),
+                "icons/trash.svg",
+                format!("Delete “{owned}”"),
+                true,
+                theme,
+                density,
+                move |this, window, cx| this.arm_profile_delete(deleting.clone(), window, cx),
+                cx,
+            ));
+        }
+    }
+
+    list_row(
+        SharedString::from(format!("launch-env-profile-{name}")),
+        selected,
+        text,
+        controls,
+        theme,
+        density,
+    )
+    .on_mouse_down(
+        MouseButton::Left,
+        cx.listener(move |this, _ev, window, cx| {
+            this.select_env_profile(target.clone(), window, cx);
+        }),
+    )
+    .into_any_element()
+}
+
+/// A small rounded label pill in `color`, used to mark a row's kind.
+fn pill(
+    text: impl Into<SharedString>,
+    color: Hsla,
+    density: Density,
+    typography: &Typography,
+) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .flex_none()
+        .px(px(6.0))
+        .py(px(1.0))
+        .rounded(px(density.r_chip))
+        .bg(Hsla { a: 0.16, ..color })
+        .text_size(px(typography.t_sub_label))
+        .text_color(color)
+        .child(text.into())
+        .into_any_element()
 }
 
 /// The full launch-defaults card: a "Default agent" row with one icon chip per
@@ -823,18 +1079,7 @@ fn agent_row(
 
 /// A small accent pill marking the configured default agent.
 fn default_badge(theme: Theme, density: Density, typography: &Typography) -> AnyElement {
-    div()
-        .flex()
-        .items_center()
-        .flex_none()
-        .px(px(6.0))
-        .py(px(1.0))
-        .rounded(px(density.r_chip))
-        .bg(Hsla { a: 0.16, ..theme.status_info })
-        .text_size(px(typography.t_sub_label))
-        .text_color(theme.status_info)
-        .child("Default")
-        .into_any_element()
+    pill("Default", theme.status_info, density, typography)
 }
 
 /// Segmented picker: None + one segment per built-in agent.
@@ -937,28 +1182,107 @@ fn agent_control(
 /// haystack), e.g. "Flags: --dangerously-skip-permissions · model opus".
 fn agent_summary(modal: &SettingsModal, adapter_id: &str) -> SharedString {
     let Some(launch) = modal.agent_launch.for_agent(adapter_id) else {
-        return "Launches with defaults.".into();
+        return NO_OVERRIDES.into();
     };
     if launch.disabled {
         return "Hidden from the launcher.".into();
     }
+    summarize(Some(launch))
+}
+
+/// What both résumés say when a configuration overrides nothing at all.
+const NO_OVERRIDES: &str = "Launches with defaults.";
+
+/// The one place a launch configuration is put into words.
+///
+/// Both surfaces that describe one — the agent rows in the launch card and the
+/// profile rows in this card — read from here, so "flags … · model … · N
+/// variables" means the same thing in both and cannot drift into two spellings
+/// of the same sentence. Phase 3 adds a profile count to the agent rows on top
+/// of this, not beside it.
+fn summarize(launch: Option<&PerAgentLaunch>) -> SharedString {
+    let Some(l) = launch else {
+        return NO_OVERRIDES.into();
+    };
     let mut parts: Vec<String> = Vec::new();
-    if !launch.args.trim().is_empty() {
-        parts.push(format!("flags {}", launch.args.trim()));
+    if !l.args.trim().is_empty() {
+        parts.push(format!("flags {}", l.args.trim()));
     }
-    if !launch.model.trim().is_empty() {
-        parts.push(format!("model {}", launch.model.trim()));
+    if !l.model.trim().is_empty() {
+        parts.push(format!("model {}", l.model.trim()));
+    }
+    // Counted the way resolution counts them: a blank key never reaches a
+    // spawn, so it must not be advertised as a variable either.
+    match l.env.keys().filter(|k| !k.trim().is_empty()).count() {
+        0 => {}
+        1 => parts.push("1 variable".to_string()),
+        n => parts.push(format!("{n} variables")),
     }
     if parts.is_empty() {
-        "Launches with defaults.".into()
+        NO_OVERRIDES.into()
     } else {
         SharedString::from(parts.join(" · "))
     }
 }
 
+/// One profile's résumé. `None` is the adapter's plain entry (`default`).
+fn profile_summary(modal: &SettingsModal, adapter_id: &str, profile: Option<&str>) -> SharedString {
+    summarize(modal.agent_launch.for_agent_in(adapter_id, profile))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summarize_puts_a_configuration_into_words() {
+        // Nothing set reads as the same sentence for an agent row and a
+        // profile row, because it is literally the same sentence.
+        assert_eq!(summarize(None), NO_OVERRIDES);
+        assert_eq!(summarize(Some(&PerAgentLaunch::default())), NO_OVERRIDES);
+
+        let mut l = PerAgentLaunch { args: " --verbose ".into(), model: " opus ".into(), ..Default::default() };
+        assert_eq!(summarize(Some(&l)), "flags --verbose · model opus");
+
+        l.env.insert("A".into(), "1".into());
+        assert_eq!(summarize(Some(&l)), "flags --verbose · model opus · 1 variable");
+        l.env.insert("B".into(), "2".into());
+        assert_eq!(summarize(Some(&l)), "flags --verbose · model opus · 2 variables");
+        // Counted the way resolution counts: a blank key never reaches a spawn
+        // and must not be advertised as a variable either.
+        l.env.insert("   ".into(), "orphan".into());
+        assert_eq!(summarize(Some(&l)), "flags --verbose · model opus · 2 variables");
+
+        // Env alone is enough to have something to say.
+        let env_only = PerAgentLaunch {
+            env: [("K".to_string(), "v".to_string())].into_iter().collect(),
+            ..Default::default()
+        };
+        assert_eq!(summarize(Some(&env_only)), "1 variable");
+    }
+
+    #[test]
+    fn a_name_field_opens_with_what_it_is_asking_for() {
+        assert_eq!(ProfileNameMode::Add.seed(), "");
+        // A rename starts from the current name because a rename is usually an
+        // edit of it; a duplicate offers a name that already validates, so
+        // Enter alone is a complete answer.
+        assert_eq!(ProfileNameMode::Rename("proxy".into()).seed(), "proxy");
+        assert_eq!(ProfileNameMode::Duplicate("proxy".into()).seed(), "proxy-copy");
+
+        // Each mode asks a different question, and each names the profile it
+        // is about.
+        let prompts = [
+            ProfileNameMode::Add.prompt().to_string(),
+            ProfileNameMode::Rename("proxy".into()).prompt().to_string(),
+            ProfileNameMode::Duplicate("proxy".into()).prompt().to_string(),
+        ];
+        assert!(prompts[1].contains("proxy") && prompts[2].contains("proxy"));
+        let mut sorted = prompts.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 3, "the three prompts must be distinguishable");
+    }
 
     #[test]
     fn yolo_flag_is_per_agent() {

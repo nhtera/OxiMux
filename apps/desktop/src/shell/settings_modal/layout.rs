@@ -5,7 +5,8 @@
 //! without touching control behavior.
 
 use gpui::{
-    AnyElement, IntoElement, ParentElement, SharedString, Styled, div, prelude::FluentBuilder, px,
+    AnyElement, InteractiveElement as _, IntoElement, ParentElement, SharedString, Styled, div,
+    prelude::FluentBuilder, px,
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -372,16 +373,141 @@ pub(super) fn setting_row_hint(
     theme: Theme,
     typography: &Typography,
 ) -> AnyElement {
+    stacked_row(
+        label.into(),
+        description.into(),
+        None,
+        control.into_any_element(),
+        hint.into_any_element(),
+        theme,
+        typography,
+    )
+}
+
+/// [`setting_row_hint`] with an `action` control on the label line — a `+`
+/// that reveals a field, or anything else that acts on the whole body rather
+/// than on one of its rows.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn setting_row_action_hint(
+    label: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    action: impl IntoElement,
+    body: impl IntoElement,
+    hint: impl IntoElement,
+    theme: Theme,
+    typography: &Typography,
+) -> AnyElement {
+    stacked_row(
+        label.into(),
+        description.into(),
+        Some(action.into_any_element()),
+        body.into_any_element(),
+        hint.into_any_element(),
+        theme,
+        typography,
+    )
+}
+
+/// The shared body of [`setting_row_hint`] and [`setting_row_action_hint`]:
+/// a label line (with an optional trailing `action`), a full-width `body`
+/// beneath it, and a `hint` line under that.
+fn stacked_row(
+    label: SharedString,
+    description: SharedString,
+    action: Option<AnyElement>,
+    body: AnyElement,
+    hint: AnyElement,
+    theme: Theme,
+    typography: &Typography,
+) -> AnyElement {
     div()
         .flex()
         .flex_col()
         .w_full()
         .py(px(12.0))
         .gap(px(8.0))
-        .child(label_column(label.into(), description.into(), theme, typography).w_full())
-        .child(div().w_full().child(control.into_any_element()))
-        .child(div().w_full().min_w_0().child(hint.into_any_element()))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .w_full()
+                .gap(px(16.0))
+                // Same pairing as `desc_row`: the text column may shrink and
+                // wrap, the action never does.
+                .child(label_column(label, description, theme, typography).flex_1().min_w_0())
+                .children(action.map(|a| div().flex_none().child(a))),
+        )
+        .child(div().w_full().child(body))
+        .child(div().w_full().min_w_0().child(hint))
         .into_any_element()
+}
+
+/// One row of an inset list inside a card row — a name and its résumé on the
+/// left, a cluster of actions pinned right, and an accent fill when
+/// `selected`. Returned unfinished (`Stateful<Div>`) so the caller attaches
+/// its own click handler; every other property is fixed here so the rows of a
+/// list cannot drift apart.
+///
+/// The three width rules are the whole point of this primitive, and this card
+/// has already shipped the failure each one prevents: the text column is
+/// allowed to shrink below its content and wrap, the action cluster is
+/// measured on its own terms and never grows, and the row claims its parent's
+/// full width rather than being sized by its content. See
+/// `a_list_rows_actions_stay_inside_it_and_its_resume_wraps` for which of them
+/// a probe can actually catch.
+pub(super) fn list_row(
+    id: impl Into<gpui::ElementId>,
+    selected: bool,
+    text: impl IntoElement,
+    controls: impl IntoElement,
+    theme: Theme,
+    density: Density,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id.into())
+        .flex()
+        .flex_row()
+        .items_center()
+        .w_full()
+        .gap(px(12.0))
+        .px(px(8.0))
+        .py(px(7.0))
+        .rounded(px(density.r_xs))
+        .border_1()
+        .cursor_pointer()
+        .when(selected, |s| {
+            s.bg(gpui::Hsla { a: 0.12, ..theme.status_info }).border_color(theme.status_info)
+        })
+        .when(!selected, |s| {
+            s.border_color(gpui::Hsla { a: 0.0, ..theme.border_inactive })
+                .hover(|h| h.bg(theme.bg_panel_alt))
+        })
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .child(text.into_any_element()),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .flex_none()
+                // A click on an action is not also a click on the row. Stopping
+                // it here rather than inside each button keeps the rule in one
+                // place and leaves the shared chip widgets untouched — they are
+                // used outside any list, where swallowing the click is wrong.
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(controls.into_any_element()),
+        )
 }
 
 /// A muted hint line for beneath a control: a format rule, or a statement of
@@ -419,12 +545,12 @@ pub(super) fn notice_text(
 
 #[cfg(test)]
 mod tests {
-    use super::{hint_text, query_matches, setting_row_desc, setting_row_desc_hint};
+    use super::{hint_text, list_row, query_matches, setting_row_desc, setting_row_desc_hint};
     use gpui::{
         Bounds, Context, IntoElement, ParentElement as _, Pixels, Render, Styled as _,
         TestAppContext, Window, canvas, div, prelude::FluentBuilder as _, px, size,
     };
-    use oximux_settings::{Theme, Typography};
+    use oximux_settings::{Density, Theme, Typography};
     use std::cell::Cell;
     use std::rc::Rc;
 
@@ -572,6 +698,97 @@ mod tests {
             (f32::from(bounds.size.width) - CONTROL_W).abs() < 0.5,
             "hinted row squeezed the control to {} instead of {CONTROL_W}px",
             f32::from(bounds.size.width),
+        );
+    }
+
+    /// A profile's résumé — the widest text a list row carries, and the only
+    /// part of it that grows without bound (flags are free text).
+    ///
+    /// The long unbroken `--settings=<path>` token is the point: a text
+    /// column's automatic minimum size is its longest unbreakable run, so a
+    /// résumé of ordinary words cannot reproduce the fault however long it is.
+    /// Real flags carry paths, and a path is one word.
+    const LONG_RESUME: &str = "flags --dangerously-skip-permissions \
+         --settings=/Users/me/.config/oximux/agents/claude-code/proxy-settings.json \
+         · model opus · 4 variables";
+
+    /// Stands a bounds-recording canvas in for a list row's action cluster, so
+    /// the test can read where the actions actually landed. Same technique as
+    /// [`RowProbe`], against the other shape this card renders.
+    struct ListRowProbe {
+        control: Rc<Cell<Option<Bounds<Pixels>>>>,
+    }
+
+    impl Render for ListRowProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let sink = self.control.clone();
+            let theme = Theme::default();
+            let typography = Typography::default();
+            let controls = div().h(px(24.0)).child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds: Bounds<Pixels>, _: (), _window, _cx| sink.set(Some(bounds)),
+                )
+                .w(px(CONTROL_W))
+                .h(px(24.0)),
+            );
+            let text = div()
+                .flex()
+                .flex_col()
+                .child(div().text_size(px(typography.t_body_sm)).child("proxy"))
+                .child(div().text_size(px(typography.t_sub_label)).child(LONG_RESUME));
+            div().w(px(ROW_W)).child(list_row(
+                "probe",
+                false,
+                text,
+                controls,
+                theme,
+                Density::default(),
+            ))
+        }
+    }
+
+    /// The list row is the shape the phase-2 risk names: a growing subtitle
+    /// beside a trailing control cluster, which is what erased this card's
+    /// controls twice. Measured rather than reasoned about — the element tree
+    /// is identical whether the flex rules are right or wrong.
+    ///
+    /// Measured coverage, established by reverting each rule in turn:
+    ///
+    /// - Let the text column keep its automatic minimum size (drop BOTH
+    ///   `min_w_0` and `overflow_hidden`) and the actions land at x=808 in a
+    ///   420px row — the original fault, reproduced in the new shape. The two
+    ///   are interchangeable here: `overflow` other than `visible` zeroes the
+    ///   automatic minimum size on its own, so either alone holds the row.
+    /// - `flex_none` on the cluster cannot be caught by a probe of this shape.
+    ///   A `flex_1` text column has a zero flex basis, so the row is never
+    ///   under the overflow pressure that would shrink an auto-basis sibling.
+    ///   It is kept because it states the intent and holds if the text column
+    ///   ever stops being `flex_1`.
+    #[gpui::test]
+    fn a_list_rows_actions_stay_inside_it_and_its_resume_wraps(cx: &mut TestAppContext) {
+        let control = Rc::new(Cell::new(None));
+        let sink = control.clone();
+        let w = cx.add_window(move |_window, _cx| ListRowProbe { control: sink });
+        let vcx = gpui::VisualTestContext::from_window(w.into(), cx);
+        vcx.simulate_resize(size(px(900.0), px(600.0)));
+        vcx.run_until_parked();
+
+        let bounds = control.get().expect("the action cluster painted");
+        assert!(
+            f32::from(bounds.right()) <= ROW_W + 0.5,
+            "actions right edge {} escaped the {ROW_W}px row",
+            f32::from(bounds.right()),
+        );
+        assert!(
+            (f32::from(bounds.size.width) - CONTROL_W).abs() < 0.5,
+            "actions were resized to {} instead of {CONTROL_W}px",
+            f32::from(bounds.size.width),
+        );
+        assert!(
+            f32::from(bounds.origin.x) >= ROW_W / 2.0,
+            "the name + résumé column got only {}px of the {ROW_W}px row",
+            f32::from(bounds.origin.x),
         );
     }
 

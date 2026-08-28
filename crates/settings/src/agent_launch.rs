@@ -543,6 +543,91 @@ impl AgentLaunchSettings {
         removed
     }
 
+    /// Rename `from` to `to` for `adapter_id`. Returns `true` when a profile
+    /// was renamed.
+    ///
+    /// Refuses the same three things the create path refuses, for the same
+    /// reasons: a blank or [`DEFAULT_PROFILE`] name on either side (the default
+    /// is the `agents` entry, not a row in this list), and a target name the
+    /// adapter already carries — [`Self::for_agent_in`] resolves by name, so
+    /// two rows sharing one would make the second unreachable.
+    ///
+    /// A rename does **not** rewrite the profile selection held by anything
+    /// already launched under the old name. That is deliberate rather than
+    /// unhandled: `for_agent_in` falls back to the adapter's default entry for
+    /// an unknown name, so a live tab degrades to the plain configuration
+    /// instead of losing its model and flags entirely.
+    pub fn rename_profile(&mut self, adapter_id: &str, from: &str, to: &str) -> bool {
+        let (Some(from), Some(to)) =
+            (Self::named_profile(Some(from)), Self::named_profile(Some(to)))
+        else {
+            return false;
+        };
+        let (from, to) = (from.to_string(), to.to_string());
+        let Some(list) = self.profiles.get_mut(adapter_id) else {
+            return false;
+        };
+        // Covers rename-to-self as well, which is a no-op worth reporting as a
+        // refusal rather than a silent success.
+        if list.iter().any(|p| p.name.trim() == to) {
+            return false;
+        }
+        let Some(existing) = list.iter_mut().find(|p| p.name.trim() == from) else {
+            return false;
+        };
+        existing.name = to;
+        true
+    }
+
+    /// Copy `from` into a new profile called `new_name` for `adapter_id`.
+    /// Returns `true` when one was created.
+    ///
+    /// `from` may be [`DEFAULT_PROFILE`] (or blank), which copies the adapter's
+    /// plain entry — that is the only way to seed a profile from the default
+    /// without editing the default itself. An unknown source name is refused
+    /// rather than silently resolved through [`Self::for_agent_in`]'s
+    /// default-entry fallback, which would make a typo look like a successful
+    /// duplicate of the wrong thing.
+    ///
+    /// Only the three [`Self::profile_axes`] are copied, for the same reason
+    /// [`Self::profile_entry_mut`] seeds only those: a profile varies the
+    /// account and endpoint, never the backend.
+    pub fn duplicate_profile(&mut self, adapter_id: &str, from: &str, new_name: &str) -> bool {
+        let Some(to) = Self::named_profile(Some(new_name)) else {
+            return false;
+        };
+        let to = to.to_string();
+        if self.profile_names(adapter_id).contains(&to) {
+            return false;
+        }
+        let source = match Self::named_profile(Some(from)) {
+            None => self.agents.get(adapter_id).cloned().unwrap_or_default(),
+            Some(name) => {
+                let found = self
+                    .profiles
+                    .get(adapter_id)
+                    .and_then(|list| list.iter().find(|p| p.name.trim() == name));
+                match found {
+                    Some(p) => p.launch.clone(),
+                    None => return false,
+                }
+            }
+        };
+        self.profiles
+            .entry(adapter_id.to_string())
+            .or_default()
+            .push(NamedLaunchProfile {
+                name: to,
+                launch: PerAgentLaunch {
+                    args: source.args,
+                    model: source.model,
+                    env: source.env,
+                    ..PerAgentLaunch::default()
+                },
+            });
+        true
+    }
+
     /// Environment overrides for `adapter_id` under `profile`, as the
     /// `(key, value)` pairs both spawn seams take. Key-sorted (the field is a
     /// `BTreeMap`) so a launch is reproducible, and blank keys are dropped —
@@ -977,6 +1062,102 @@ args = "--dangerously-bypass-approvals-and-sandbox"
         assert!(!s.remove_profile("codex", "work"), "removing twice is not an error");
         assert!(s.profiles.is_empty());
         assert_eq!(s.profile_names("codex"), vec!["default"]);
+    }
+
+    #[test]
+    fn rename_profile_refuses_blank_default_and_a_taken_name() {
+        let mut s = AgentLaunchSettings::default();
+        s.profile_entry_mut("codex", Some("work")).model = "gpt-5".into();
+        s.profile_entry_mut("codex", Some("home"));
+
+        // The same three the create path refuses.
+        assert!(!s.rename_profile("codex", "work", ""), "blank target");
+        assert!(!s.rename_profile("codex", "work", "  "), "whitespace target");
+        assert!(!s.rename_profile("codex", "work", DEFAULT_PROFILE), "reserved target");
+        assert!(!s.rename_profile("codex", "work", "home"), "target already taken");
+        assert!(!s.rename_profile("codex", "work", "work"), "rename to self is a no-op");
+        // The default entry is not a row in this list, so it is not renamable.
+        assert!(!s.rename_profile("codex", DEFAULT_PROFILE, "anything"));
+        // An unknown source, and an adapter with no profiles at all.
+        assert!(!s.rename_profile("codex", "missing", "anything"));
+        assert!(!s.rename_profile("pi", "work", "anything"));
+        assert_eq!(s.profile_names("codex"), vec!["default", "work", "home"]);
+
+        // A real rename moves the configuration with the name.
+        assert!(s.rename_profile("codex", "work", " proxy "), "trims and accepts");
+        assert_eq!(s.profile_names("codex"), vec!["default", "proxy", "home"]);
+        assert_eq!(s.model_for_in("codex", Some("proxy")).as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn a_renamed_profile_leaves_a_stale_selection_on_the_default_entry() {
+        // The orphaned-tab path: something launched under the old name still
+        // holds it. Resolution must degrade to the plain configuration rather
+        // than launch the agent bare.
+        let mut s = AgentLaunchSettings::default();
+        s.entry_mut("codex").model = "gpt-5-codex".into();
+        s.profile_entry_mut("codex", Some("work")).model = "o3".into();
+        assert!(s.rename_profile("codex", "work", "proxy"));
+        assert_eq!(
+            s.model_for_in("codex", Some("work")).as_deref(),
+            Some("gpt-5-codex"),
+            "a stale name falls back to the default entry, not to nothing",
+        );
+    }
+
+    #[test]
+    fn duplicate_profile_copies_only_the_profile_axes() {
+        let mut s = AgentLaunchSettings::default();
+        {
+            let src = s.profile_entry_mut("codex", Some("work"));
+            src.args = "--search".into();
+            src.model = "o3".into();
+            src.env.insert("OPENAI_BASE_URL".into(), "https://proxy/v1".into());
+            // Backend fields a profile never varies — they must not be copied.
+            src.transport = Transport::Acp;
+            src.acp_command = "acp-codex".into();
+            src.disabled = true;
+        }
+
+        assert!(!s.duplicate_profile("codex", "work", ""), "blank target");
+        assert!(!s.duplicate_profile("codex", "work", DEFAULT_PROFILE), "reserved target");
+        assert!(!s.duplicate_profile("codex", "work", "work"), "target already taken");
+        assert!(!s.duplicate_profile("codex", "missing", "copy"), "unknown source");
+
+        assert!(s.duplicate_profile("codex", "work", "work-copy"));
+        assert_eq!(s.profile_names("codex"), vec!["default", "work", "work-copy"]);
+        assert_eq!(s.args_for_in("codex", Some("work-copy")), vec!["--search"]);
+        assert_eq!(s.model_for_in("codex", Some("work-copy")).as_deref(), Some("o3"));
+        assert_eq!(
+            s.env_for("codex", Some("work-copy")),
+            vec![("OPENAI_BASE_URL".to_string(), "https://proxy/v1".to_string())],
+        );
+        let copy = s
+            .profiles
+            .get("codex")
+            .and_then(|l| l.iter().find(|p| p.name == "work-copy"))
+            .expect("the copy exists");
+        assert_eq!(copy.launch.transport, Transport::default());
+        assert!(copy.launch.acp_command.is_empty());
+        assert!(!copy.launch.disabled);
+    }
+
+    #[test]
+    fn duplicating_the_default_seeds_a_profile_from_the_plain_entry() {
+        // The only way to start a profile from the default without editing the
+        // default itself — which is what the "duplicate" affordance on the
+        // `default` row means.
+        let mut s = AgentLaunchSettings::default();
+        let d = s.entry_mut("claude-code");
+        d.model = "opus".into();
+        d.env.insert("ANTHROPIC_BASE_URL".into(), "https://proxy/v1".into());
+
+        assert!(s.duplicate_profile("claude-code", DEFAULT_PROFILE, "second"));
+        assert_eq!(s.model_for_in("claude-code", Some("second")).as_deref(), Some("opus"));
+        assert_eq!(s.env_for("claude-code", Some("second")).len(), 1);
+        // Editing the copy leaves the default entry alone.
+        s.profile_entry_mut("claude-code", Some("second")).model = "haiku".into();
+        assert_eq!(s.model_for("claude-code").as_deref(), Some("opus"));
     }
 
     #[test]
