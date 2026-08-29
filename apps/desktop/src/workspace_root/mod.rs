@@ -1411,7 +1411,7 @@ fn gather_agent_activity(targets: Vec<(String, String)>) -> HashMap<String, Stri
 mod tests {
     use super::{chat_backend_for, chat_backend_for_profile};
     use oximux_agents::thread::Transport as AgentTransport;
-    use oximux_settings::{AgentLaunchSettings, Transport as SettingsTransport};
+    use oximux_settings::{AgentLaunchSettings, DEFAULT_PROFILE, Transport as SettingsTransport};
 
     #[test]
     fn chat_backend_for_carries_acp_command_only_for_acp_adapters() {
@@ -1502,6 +1502,51 @@ mod tests {
         // And a stale profile name still degrades to the default rather than
         // launching bare, on these axes as much as on `env`.
         assert_eq!(s.model_for_in("claude-code", Some("renamed")).as_deref(), Some("opus"));
+    }
+
+    /// The hole phase 5 closes, proven where it matters: an ACP agent's
+    /// environment and named profiles resolve exactly like a built-in's.
+    ///
+    /// The resolution path was always generic — `env_for` and
+    /// `profile_entry_mut` never cared which adapter id they were handed. The
+    /// settings pane's hard-coded four-item list was the entire obstacle, so
+    /// what needs proving is the launch side, not the map.
+    #[test]
+    fn an_acp_agent_carries_env_and_profiles_the_same_way_a_builtin_does() {
+        let mut s = AgentLaunchSettings::default();
+        // A zero-config preset: no `[agents.cursor]` block at all, which is the
+        // state the settings pane now has to be able to configure from.
+        s.profile_entry_mut("cursor", Some("proxy"))
+            .env
+            .insert("HTTPS_PROXY".into(), "http://proxy.internal:8080".into());
+        s.entry_mut("cursor").env.insert("HTTPS_PROXY".into(), "http://direct:8080".into());
+
+        let default = chat_backend_for(&s, "cursor");
+        let proxy = chat_backend_for_profile(&s, "cursor", Some("proxy"));
+
+        // Still ACP, still the preset's command: a profile varies the account
+        // and endpoint, never the backend.
+        assert_eq!(default.transport, oximux_agents::thread::Transport::Acp);
+        assert_eq!(proxy.transport, default.transport);
+        assert_eq!(proxy.acp_command, default.acp_command);
+        assert_eq!(proxy.acp_command.as_deref(), Some("cursor-agent"));
+
+        assert_eq!(
+            default.env,
+            vec![("HTTPS_PROXY".to_string(), "http://direct:8080".to_string())],
+        );
+        assert_eq!(
+            proxy.env,
+            vec![("HTTPS_PROXY".to_string(), "http://proxy.internal:8080".to_string())],
+        );
+        // The profile rides along, so a restore re-resolves the same pair.
+        assert_eq!(proxy.profile.as_deref(), Some("proxy"));
+        assert_eq!(s.profile_names("cursor"), vec![DEFAULT_PROFILE, "proxy"]);
+
+        // Reserved keys are filtered for an ACP agent too — the guard lives at
+        // resolution, so it cannot be adapter-specific.
+        s.profile_entry_mut("cursor", Some("proxy")).env.insert("PATH".into(), "/nowhere".into());
+        assert_eq!(chat_backend_for_profile(&s, "cursor", Some("proxy")).env.len(), 1);
     }
 
     #[test]

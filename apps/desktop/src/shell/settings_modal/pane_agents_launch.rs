@@ -24,6 +24,7 @@ use super::layout::{
 };
 use super::segmented::{Segment, segmented};
 use crate::shell::agent_presentation::adapter_icon_path;
+use crate::shell::agent_ui::agent_catalog::CatalogAgent;
 
 /// Which row of the environment card a [`Notice`] belongs under.
 ///
@@ -161,6 +162,18 @@ pub(super) fn env_placeholder(adapter_id: &str) -> &'static str {
              OPENAI_API_KEY=sk-...\n\
              # blank lines and # comments are ignored"
         }
+        // ACP agents and `Custom` reach this arm. Their provider variables are
+        // the vendor's business and this app has no way to know them, so the
+        // example teaches only what is true for every process: the proxy
+        // variables the whole toolchain honours. Naming a guessed
+        // `<VENDOR>_API_KEY` here would be the same fault as Anthropic
+        // variables in the Codex editor — an example that looks authoritative
+        // and is wrong.
+        "cursor" | "amp" | "opencode" | "custom" => {
+            "HTTPS_PROXY=http://proxy.internal:8080\n\
+             NO_PROXY=localhost,127.0.0.1\n\
+             # blank lines and # comments are ignored"
+        }
         _ => {
             "ANTHROPIC_BASE_URL=https://proxy.internal/v1\n\
              ANTHROPIC_AUTH_TOKEN=sk-ant-...\n\
@@ -288,16 +301,6 @@ pub(super) fn masked_env_preview(env: &BTreeMap<String, String>) -> String {
         .join("\n")
 }
 
-/// Built-in agents exposed in the launch settings, in picker order. The
-/// custom adapter is excluded — its command is fully user-supplied, so a
-/// "default flags" override has no meaning.
-pub(super) const LAUNCH_AGENTS: [(&str, &str); 4] = [
-    ("claude-code", "Claude Code"),
-    ("codex", "Codex"),
-    ("pi", "Pi"),
-    ("omp", "omp"),
-];
-
 /// The skip-permissions ("YOLO") flag for an agent — toggled in and out of
 /// that agent's free-text args by the skip-perms chip. Each CLI spells it
 /// differently; `None` means the agent has no approval gate to skip (pi runs
@@ -414,7 +417,8 @@ pub(super) fn entries(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> Vec<SettingEntry> {
-    let mut out = Vec::with_capacity(LAUNCH_AGENTS.len() + 2);
+    let catalog = modal.agent_catalog();
+    let mut out = Vec::with_capacity(catalog.len() + 3);
     out.push(entry(
         "Agent status hooks",
         "Show the live tool on agent dashboard cards (Claude Code).",
@@ -430,11 +434,11 @@ pub(super) fn entries(
         "Surfaced first in the launcher.",
         default_agent_control(modal, theme, density, typography, cx),
     ));
-    for (adapter_id, display) in LAUNCH_AGENTS {
+    for agent in &catalog {
         out.push(entry(
-            display,
-            agent_summary(modal, adapter_id),
-            agent_control(modal, adapter_id, theme, density, typography, cx),
+            agent.display.clone(),
+            agent_summary(modal, &agent.id),
+            agent_control(modal, agent, theme, density, typography, cx),
         ));
     }
     out
@@ -456,40 +460,88 @@ pub(super) fn render_env_card(
 ) -> AnyElement {
     let mut rows: Vec<AnyElement> = Vec::with_capacity(4);
 
-    // Which agent's environment is being edited.
-    let current_agent = modal.env_agent;
-    let agent_segs: Vec<Segment> = LAUNCH_AGENTS
-        .iter()
-        .map(|(id, display)| {
-            let id = *id;
-            Segment::new(*display, current_agent == id, move |this, window, cx| {
-                this.select_env_agent(id, window, cx);
-            })
-        })
-        .collect();
-    let agent_display = LAUNCH_AGENTS
-        .iter()
-        .find(|(id, _)| *id == current_agent)
-        .map(|(_, d)| *d)
-        .unwrap_or(current_agent);
-    rows.push(setting_row_desc_hint(
-        "Agent",
-        "Which agent's launch environment you are editing.",
-        segmented("launch-env-agent", agent_segs, theme, density, typography, cx),
-        // The two rows below are scoped to this choice and say nothing about
-        // it themselves, which is easy to lose once a profile is selected.
-        hint_text(
-            format!("The profiles and environment below belong to {agent_display}."),
+    // Which agent's environment is being edited. The catalog, not a hard-coded
+    // four: `Custom` and every ACP agent resolve env and profiles exactly the
+    // same way, and the only thing that ever excluded them was this list.
+    let catalog = modal.agent_catalog();
+    let current_agent = modal.env_agent.clone();
+    let current = catalog.iter().find(|a| a.id == current_agent);
+    let agent_display: SharedString = current
+        .map(|a| a.display.clone())
+        .unwrap_or_else(|| SharedString::from(current_agent.clone()));
+    let acp = current.map(|a| !a.origin.takes_flags_and_model()).unwrap_or(false);
+
+    if catalog.is_empty() {
+        // Nothing to configure and nothing to index into. The old code took
+        // `LAUNCH_AGENTS[0]` here and would have panicked.
+        rows.push(setting_row_desc(
+            "Agent",
+            "No agents are registered, so there is nothing to configure here yet.",
+            div(),
             theme,
             typography,
-        ),
+        ));
+        return card_surface(theme, density, section_card(theme, density, rows));
+    }
+
+    // A wrapping grid, not a segmented control: the set is a dozen agents and
+    // grows, and a segmented control divides its width by however many there
+    // are until every label is unreadable.
+    let mut grid = div().flex().flex_row().flex_wrap().gap(px(6.0)).w_full();
+    for agent in &catalog {
+        let id = agent.id.to_string();
+        let selected = agent.id == current_agent;
+        grid = grid.child(agent_chip(agent, selected, theme, density, typography, {
+            move |this: &mut SettingsModal, window: &mut Window, cx: &mut gpui::Context<SettingsModal>| {
+                this.select_env_agent(id.clone(), window, cx);
+            }
+        }, cx));
+    }
+
+    let detected = catalog.iter().filter(|a| a.available == Some(true)).count();
+    let answered = catalog.iter().filter(|a| a.available.is_some()).count();
+    let detection_hint: SharedString = if modal.agent_detect_running {
+        "Checking which agent CLIs are installed…".into()
+    } else if answered == 0 {
+        // Nothing was probed: a configured-ACP-only catalog, or a detection
+        // that has not started. Neither is a claim that anything is missing.
+        format!("{} agents. The profiles and environment below belong to {agent_display}.", catalog.len()).into()
+    } else if detected == 0 {
+        "Detection found nothing on PATH — the agents below can still be configured, \
+         and Refresh will try again."
+            .into()
+    } else {
+        format!(
+            "{detected} of {} installed. The profiles and environment below belong to \
+             {agent_display}.",
+            catalog.len()
+        )
+        .into()
+    };
+
+    let refresh = value_chip(
+        SharedString::from("launch-env-detect-refresh"),
+        if modal.agent_detect_running { "Checking…" } else { "Refresh" },
+        theme,
+        density,
+        typography,
+        |this, window, cx| this.refresh_agent_detection(window, cx),
+        cx,
+    );
+    rows.push(setting_row_action_hint(
+        "Agent",
+        "Which agent's launch environment you are editing. A dimmed agent's CLI \
+         wasn't found on PATH — it can still be configured.",
+        refresh,
+        grid,
+        hint_text(detection_hint, theme, typography),
         theme,
         typography,
     ));
 
     // Which profile of that agent. `default` is the plain entry every config
     // already has, so the list is never empty.
-    let profile_names = modal.agent_launch.profile_names(current_agent);
+    let profile_names = modal.agent_launch.profile_names(&current_agent);
     // `profile_names` always leads with `default`, so "only default" is the
     // empty state — the user has never created a profile for this agent.
     let has_named_profiles = profile_names.len() > 1;
@@ -498,7 +550,7 @@ pub(super) fn render_env_card(
     for name in &profile_names {
         list = list.child(profile_row(
             modal,
-            current_agent,
+            &current_agent,
             name,
             theme,
             density,
@@ -607,13 +659,13 @@ pub(super) fn render_env_card(
     // duplicated per profile row: one selection, one editor.
     let selected_launch = modal
         .agent_launch
-        .for_agent_in(current_agent, modal.env_profile.as_deref());
+        .for_agent_in(&current_agent, modal.env_profile.as_deref());
     let sel_args = selected_launch.map(|l| l.args.as_str()).unwrap_or("");
     let sel_model = selected_launch.map(|l| l.model.as_str()).unwrap_or("");
 
     let mut launch_controls = div().flex().flex_row().items_center().gap(px(6.0));
     // Agents with no approval gate (`yolo_flag` = None) get no chip at all.
-    if let Some(flag) = yolo_flag(current_agent) {
+    if !acp && let Some(flag) = yolo_flag(&current_agent) {
         launch_controls = launch_controls.child(toggle_chip(
             SharedString::from("launch-env-yolo"),
             "Skip perms",
@@ -629,32 +681,45 @@ pub(super) fn render_env_card(
             cx,
         ));
     }
-    launch_controls = launch_controls.child(value_chip(
-        SharedString::from("launch-env-model"),
-        model_label(sel_model),
-        theme,
-        density,
-        typography,
-        move |this, _w, cx| {
-            let presets = model_presets(this.env_agent);
-            let e = this.selected_launch_mut();
-            e.model = cycle_model(presets, &e.model);
-            this.persist_agent_launch(cx);
-        },
-        cx,
-    ));
+    if !acp {
+        launch_controls = launch_controls.child(value_chip(
+            SharedString::from("launch-env-model"),
+            model_label(sel_model),
+            theme,
+            density,
+            typography,
+            move |this, _w, cx| {
+                let presets = model_presets(&this.env_agent);
+                let e = this.selected_launch_mut();
+                e.model = cycle_model(presets, &e.model);
+                this.persist_agent_launch(cx);
+            },
+            cx,
+        ));
+    }
 
     // With `default` selected these controls and the agent row above address
     // the SAME entry, which is invisible unless said: two controls, one value.
-    let launch_hint: SharedString = match modal.env_profile.as_deref() {
-        None => format!(
-            "Writing to “{DEFAULT_PROFILE}” — the same entry the {agent_display} row above edits."
+    let launch_hint: SharedString = if acp {
+        // Not a missing feature — a wrong one. An ACP chat backend is built
+        // from `acp_command` + `acp_args`, so of the three profile axes only
+        // `env` reaches the process. A skip-perms chip here would write a flag
+        // nothing ever reads and look like it had taken effect.
+        format!(
+            "{agent_display} speaks ACP, so its flags and model come from the agent itself.              Its environment below still applies."
         )
-        .into(),
-        Some(name) => format!(
-            "Writing to “{name}” only — the {agent_display} row above keeps showing the default."
-        )
-        .into(),
+        .into()
+    } else {
+        match modal.env_profile.as_deref() {
+            None => format!(
+                "Writing to “{DEFAULT_PROFILE}” — the same entry the {agent_display} row                  above edits."
+            )
+            .into(),
+            Some(name) => format!(
+                "Writing to “{name}” only — the {agent_display} row above keeps showing                  the default."
+            )
+            .into(),
+        }
     };
     rows.push(setting_row_desc_hint(
         "Flags & model",
@@ -677,7 +742,7 @@ pub(super) fn render_env_card(
         } else {
             let env = modal
                 .agent_launch
-                .for_agent_in(current_agent, modal.env_profile.as_deref())
+                .for_agent_in(&current_agent, modal.env_profile.as_deref())
                 .map(|l| l.env.clone())
                 .unwrap_or_default();
             let preview = masked_env_preview(&env);
@@ -744,6 +809,68 @@ pub(super) fn render_env_card(
 }
 
 
+/// One agent in the environment card's picker grid: icon, name, and — once
+/// detection has answered — a dimmed treatment when the CLI is not on PATH.
+///
+/// Dimmed is the whole vocabulary here, deliberately. "Not installed" and
+/// "configured and broken" must not look alike, and this pane cannot tell them
+/// apart: a dimmed chip says only "the binary wasn't found", and the chip stays
+/// selectable because configuring an agent you are about to install is a
+/// reasonable thing to do.
+#[allow(clippy::too_many_arguments)]
+fn agent_chip(
+    agent: &CatalogAgent,
+    selected: bool,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    on_click: impl Fn(&mut SettingsModal, &mut Window, &mut gpui::Context<SettingsModal>) + 'static,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> AnyElement {
+    // `None` renders exactly like available: before detection answers, an
+    // unknown agent must not be accused of being missing.
+    let missing = agent.available == Some(false);
+    let icon_color = if selected { theme.status_info } else { theme.fg_muted };
+    div()
+        .id(gpui::ElementId::from(SharedString::from(format!("launch-env-agent-{}", agent.id))))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(5.0))
+        .flex_none()
+        .h(px(density.h_overlay_item))
+        .px(px(9.0))
+        .rounded(px(density.r_chip))
+        .border_1()
+        .text_size(px(typography.t_body_sm))
+        .cursor_pointer()
+        .when(missing, |s| s.opacity(0.55))
+        .when(selected, |s| {
+            s.bg(Hsla { a: 0.14, ..theme.status_info })
+                .border_color(theme.status_info)
+                .text_color(theme.fg_base)
+        })
+        .when(!selected, |s| {
+            s.bg(theme.bg_panel_alt)
+                .border_color(theme.border_inactive)
+                .text_color(theme.fg_muted)
+                .hover(|h| h.border_color(theme.border_active).text_color(theme.fg_base))
+        })
+        .child(
+            svg()
+                .path(adapter_icon_path(&agent.id))
+                .size(px(13.0))
+                .flex_none()
+                .text_color(icon_color),
+        )
+        .child(agent.display.clone())
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _ev, window, cx| on_click(this, window, cx)),
+        )
+        .into_any_element()
+}
+
 /// One row of the profile list: the profile's name and its résumé on the left,
 /// its actions pinned right, and an accent fill when it is the one being
 /// edited. Clicking anywhere on the row selects it.
@@ -760,7 +887,7 @@ pub(super) fn render_env_card(
 #[allow(clippy::too_many_arguments)]
 fn profile_row(
     modal: &SettingsModal,
-    adapter_id: &'static str,
+    adapter_id: &str,
     name: &str,
     theme: Theme,
     density: Density,
@@ -930,7 +1057,8 @@ pub(super) fn render_launch_card(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
-    let mut rows: Vec<AnyElement> = Vec::with_capacity(LAUNCH_AGENTS.len() + 2);
+    let catalog = modal.agent_catalog();
+    let mut rows: Vec<AnyElement> = Vec::with_capacity(catalog.len() + 4);
     rows.push(setting_row_desc(
         "Status hooks",
         "Show each Claude Code agent's prompt, live tool, and status on the rail and dashboard. On by default.",
@@ -959,10 +1087,8 @@ pub(super) fn render_launch_card(
         theme,
         typography,
     ));
-    for (adapter_id, display) in LAUNCH_AGENTS {
-        rows.push(agent_row(
-            modal, adapter_id, display, theme, density, typography, cx,
-        ));
+    for agent in &catalog {
+        rows.push(agent_row(modal, agent, theme, density, typography, cx));
     }
     card_surface(theme, density, section_card(theme, density, rows))
 }
@@ -992,18 +1118,20 @@ fn default_agent_chips(
         },
         cx,
     ));
-    for (adapter_id, display) in LAUNCH_AGENTS {
-        let selected = current == adapter_id;
+    for agent in modal.agent_catalog() {
+        let id = agent.id.to_string();
+        let selected = current == id;
+        let assign = id.clone();
         row = row.child(choice_chip(
-            SharedString::from(format!("launch-default-{adapter_id}")),
-            display,
-            Some(adapter_icon_path(adapter_id)),
+            SharedString::from(format!("launch-default-{id}")),
+            agent.display.clone(),
+            Some(adapter_icon_path(&id)),
             selected,
             theme,
             density,
             typography,
             move |this, _w, cx| {
-                this.agent_launch.default_agent = adapter_id.to_string();
+                this.agent_launch.default_agent = assign.clone();
                 this.persist_agent_launch(cx);
             },
             cx,
@@ -1141,13 +1269,21 @@ fn choice_chip(
 #[allow(clippy::too_many_arguments)]
 fn agent_row(
     modal: &SettingsModal,
-    adapter_id: &'static str,
-    display: &'static str,
+    agent: &CatalogAgent,
     theme: Theme,
     density: Density,
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
+    // Owned per closure: the id is a runtime string now (a hand-configured ACP
+    // agent's comes out of the settings file), so the `'static` capture the
+    // hard-coded list allowed is gone.
+    let adapter_id: &str = &agent.id;
+    let display = agent.display.clone();
+    // An ACP agent's flags and model come from its own backend — see
+    // `AgentOrigin::takes_flags_and_model`. Offering the chips would write
+    // values no spawn reads.
+    let tunable = agent.origin.takes_flags_and_model();
     let launch = modal.agent_launch.for_agent(adapter_id);
     let disabled = launch.map(|l| l.disabled).unwrap_or(false);
     let args = launch.map(|l| l.args.as_str()).unwrap_or("");
@@ -1214,7 +1350,8 @@ fn agent_row(
         .child(info);
 
     // Agents with no approval gate (yolo_flag = None) get no chip at all.
-    let yolo_chip = yolo_flag(adapter_id).map(|flag| {
+    let yolo_chip = tunable.then(|| yolo_flag(adapter_id)).flatten().map(|flag| {
+        let id = agent.id.to_string();
         toggle_chip(
             SharedString::from(format!("launch-yolo-{adapter_id}")),
             "Skip perms",
@@ -1223,38 +1360,44 @@ fn agent_row(
             density,
             typography,
             move |this, _w, cx| {
-                let e = this.agent_launch.entry_mut(adapter_id);
+                let e = this.agent_launch.entry_mut(&id);
                 e.args = toggle_flag(&e.args, flag);
                 this.persist_agent_launch(cx);
             },
             cx,
         )
     });
-    let model_chip = value_chip(
-        SharedString::from(format!("launch-model-{adapter_id}")),
-        model_label(model),
-        theme,
-        density,
-        typography,
-        move |this, _w, cx| {
-            let presets = model_presets(adapter_id);
-            let e = this.agent_launch.entry_mut(adapter_id);
-            e.model = cycle_model(presets, &e.model);
-            this.persist_agent_launch(cx);
-        },
-        cx,
-    );
-    let enabled_toggle = toggle_switch(
-        SharedString::from(format!("launch-enabled-{adapter_id}")),
-        !disabled,
-        theme,
-        move |this, _w, cx| {
-            let e = this.agent_launch.entry_mut(adapter_id);
-            e.disabled = !e.disabled;
-            this.persist_agent_launch(cx);
-        },
-        cx,
-    );
+    let model_chip = tunable.then(|| {
+        let id = agent.id.to_string();
+        value_chip(
+            SharedString::from(format!("launch-model-{adapter_id}")),
+            model_label(model),
+            theme,
+            density,
+            typography,
+            move |this, _w, cx| {
+                let presets = model_presets(&id);
+                let e = this.agent_launch.entry_mut(&id);
+                e.model = cycle_model(presets, &e.model);
+                this.persist_agent_launch(cx);
+            },
+            cx,
+        )
+    });
+    let enabled_toggle = {
+        let id = agent.id.to_string();
+        toggle_switch(
+            SharedString::from(format!("launch-enabled-{adapter_id}")),
+            !disabled,
+            theme,
+            move |this, _w, cx| {
+                let e = this.agent_launch.entry_mut(&id);
+                e.disabled = !e.disabled;
+                this.persist_agent_launch(cx);
+            },
+            cx,
+        )
+    };
 
     let controls = div()
         .flex()
@@ -1263,7 +1406,7 @@ fn agent_row(
         .gap(px(6.0))
         .flex_none()
         .children(yolo_chip)
-        .child(model_chip)
+        .children(model_chip)
         .child(enabled_toggle);
 
     div()
@@ -1296,10 +1439,11 @@ fn default_agent_control(
         this.agent_launch.default_agent = String::new();
         this.persist_agent_launch(cx);
     })];
-    for (adapter_id, display) in LAUNCH_AGENTS {
-        let selected = current == adapter_id;
-        segs.push(Segment::new(display, selected, move |this, _w, cx| {
-            this.agent_launch.default_agent = adapter_id.to_string();
+    for agent in modal.agent_catalog() {
+        let id = agent.id.to_string();
+        let selected = current == id;
+        segs.push(Segment::new(agent.display.clone(), selected, move |this, _w, cx| {
+            this.agent_launch.default_agent = id.clone();
             this.persist_agent_launch(cx);
         }));
     }
@@ -1309,32 +1453,39 @@ fn default_agent_control(
 /// The three live chips for one agent: enabled, skip-permissions, model.
 fn agent_control(
     modal: &SettingsModal,
-    adapter_id: &'static str,
+    agent: &CatalogAgent,
     theme: Theme,
     density: Density,
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
+    let adapter_id: &str = &agent.id;
+    let tunable = agent.origin.takes_flags_and_model();
     let launch = modal.agent_launch.for_agent(adapter_id);
     let disabled = launch.map(|l| l.disabled).unwrap_or(false);
     let args = launch.map(|l| l.args.as_str()).unwrap_or("");
     let model = launch.map(|l| l.model.as_str()).unwrap_or("");
 
-    let enabled_chip = value_chip(
-        SharedString::from(format!("launch-enabled-{adapter_id}")),
-        if disabled { "Disabled" } else { "Enabled" },
-        theme,
-        density,
-        typography,
-        move |this, _w, cx| {
-            let e = this.agent_launch.entry_mut(adapter_id);
-            e.disabled = !e.disabled;
-            this.persist_agent_launch(cx);
-        },
-        cx,
-    );
-    // Agents with no approval gate (yolo_flag = None) get no chip at all.
-    let yolo_chip = yolo_flag(adapter_id).map(|flag| {
+    let enabled_chip = {
+        let id = agent.id.to_string();
+        value_chip(
+            SharedString::from(format!("launch-enabled-{adapter_id}")),
+            if disabled { "Disabled" } else { "Enabled" },
+            theme,
+            density,
+            typography,
+            move |this, _w, cx| {
+                let e = this.agent_launch.entry_mut(&id);
+                e.disabled = !e.disabled;
+                this.persist_agent_launch(cx);
+            },
+            cx,
+        )
+    };
+    // Agents with no approval gate (yolo_flag = None) get no chip at all, and
+    // neither do ACP agents, whose flags come from their own backend.
+    let yolo_chip = tunable.then(|| yolo_flag(adapter_id)).flatten().map(|flag| {
+        let id = agent.id.to_string();
         value_chip(
             SharedString::from(format!("launch-yolo-{adapter_id}")),
             if has_flag(args, flag) {
@@ -1346,27 +1497,30 @@ fn agent_control(
             density,
             typography,
             move |this, _w, cx| {
-                let e = this.agent_launch.entry_mut(adapter_id);
+                let e = this.agent_launch.entry_mut(&id);
                 e.args = toggle_flag(&e.args, flag);
                 this.persist_agent_launch(cx);
             },
             cx,
         )
     });
-    let model_chip = value_chip(
-        SharedString::from(format!("launch-model-{adapter_id}")),
-        model_label(model),
-        theme,
-        density,
-        typography,
-        move |this, _w, cx| {
-            let presets = model_presets(adapter_id);
-            let e = this.agent_launch.entry_mut(adapter_id);
-            e.model = cycle_model(presets, &e.model);
-            this.persist_agent_launch(cx);
-        },
-        cx,
-    );
+    let model_chip = tunable.then(|| {
+        let id = agent.id.to_string();
+        value_chip(
+            SharedString::from(format!("launch-model-{adapter_id}")),
+            model_label(model),
+            theme,
+            density,
+            typography,
+            move |this, _w, cx| {
+                let presets = model_presets(&id);
+                let e = this.agent_launch.entry_mut(&id);
+                e.model = cycle_model(presets, &e.model);
+                this.persist_agent_launch(cx);
+            },
+            cx,
+        )
+    });
 
     div()
         .flex()
@@ -1375,7 +1529,7 @@ fn agent_control(
         .gap(px(6.0))
         .child(enabled_chip)
         .children(yolo_chip)
-        .child(model_chip)
+        .children(model_chip)
         .into_any_element()
 }
 
@@ -1838,7 +1992,18 @@ mod tests {
     /// must not demonstrate another vendor's variables in this agent's editor.
     #[test]
     fn the_env_placeholder_is_a_worked_example_per_agent() {
-        for id in LAUNCH_AGENTS.map(|(id, _)| id) {
+        // Every agent the catalog can offer, not a hard-coded four — an ACP
+        // agent reaching a placeholder written for Claude is the fault this
+        // guards against.
+        let registered = oximux_agents::registry::AdapterRegistry::with_builtin_adapters()
+            .entries_without_detection();
+        let catalog = crate::shell::agent_ui::agent_catalog::agent_catalog(
+            crate::shell::agent_ui::agent_catalog::AdapterDetection::Pending(&registered),
+            None,
+            &oximux_settings::AgentLaunchSettings::default(),
+        );
+        for id in catalog.iter().map(|a| a.id.to_string()) {
+            let id = id.as_str();
             let p = env_placeholder(id);
             assert!(
                 p.lines().count() >= 3,
@@ -1851,6 +2016,12 @@ mod tests {
                 parse_env_lines(p).len(),
                 p.lines().filter(|l| !l.trim().starts_with('#')).count(),
                 "{id}'s placeholder shows a line the field would drop"
+            );
+        }
+        for acp in ["cursor", "amp", "opencode"] {
+            assert!(
+                !env_placeholder(acp).contains("ANTHROPIC"),
+                "{acp} speaks ACP; its editor must not teach Anthropic variables",
             );
         }
         assert!(

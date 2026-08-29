@@ -183,7 +183,10 @@ pub struct SettingsModal {
     /// which of its named launch profiles. `None` profile = the adapter's plain
     /// entry (`default`). Reset on each `open()` so the editor never reopens
     /// pointing at a profile the user deleted from another surface.
-    pub(super) env_agent: &'static str,
+    /// A catalog id, not a `&'static str`: a hand-configured ACP agent's id
+    /// comes out of `agent_launch.toml` at runtime. Empty means the catalog
+    /// resolved to nothing and there is no agent to edit.
+    pub(super) env_agent: String,
     pub(super) env_profile: Option<String>,
     /// The `KEY=value` editor for `(env_agent, env_profile)`. Lazily built on
     /// `open()` and rebuilt whenever the selection changes — an `InputState`'s
@@ -200,6 +203,15 @@ pub struct SettingsModal {
     pub(super) profile_name_input: Option<Entity<InputState>>,
     pub(super) profile_name_mode: Option<pane_agents_launch::ProfileNameMode>,
     _profile_name_sub: Option<Subscription>,
+    /// Detected agent availability for the Agents pane, carrying the same
+    /// tri-state the launcher's picker models: `None` until the first detection
+    /// answers, `Some(vec![])` when it timed out, `Some(list)` otherwise.
+    /// `agent_detect_running` drives the in-flight label.
+    pub(super) agent_detect: Option<Vec<oximux_agents::registry::RegistryEntry>>,
+    /// PATH availability of each `ACP_PRESETS` entry, positionally parallel to
+    /// it — the launcher's convention, detected under the same timeout.
+    pub(super) preset_detect: Option<Vec<bool>>,
+    pub(super) agent_detect_running: bool,
     /// Whether the environment editor is showing its values rather than a
     /// masked stand-in. Off on every open and on every selection change: a
     /// reveal is an act about one profile's values, and carrying it forward
@@ -328,7 +340,7 @@ impl SettingsModal {
             custom_words_input: None,
             _custom_words_sub: None,
             custom_words_seed: Vec::new(),
-            env_agent: pane_agents_launch::LAUNCH_AGENTS[0].0,
+            env_agent: String::new(),
             env_profile: None,
             env_input: None,
             _env_sub: None,
@@ -338,6 +350,9 @@ impl SettingsModal {
             _profile_name_sub: None,
             pending_profile_delete: None,
             env_revealed: false,
+            agent_detect: None,
+            preset_detect: None,
+            agent_detect_running: false,
             env_notice: None,
             keybind_overrides: BTreeMap::new(),
             recording_action: None,
@@ -473,12 +488,16 @@ impl SettingsModal {
         // Agents pane's environment editor. Reset the selection first: a reopen
         // must not land on a profile deleted since, which would silently edit
         // the default entry under the deleted profile's label.
-        self.env_agent = pane_agents_launch::LAUNCH_AGENTS[0].0;
+        // Seeded from the resolved catalog rather than from a hard-coded first
+        // element: the set is dynamic now, and an empty one has to select
+        // nothing and render an empty state instead of indexing into it.
+        self.env_agent = self.agent_catalog().first().map(|a| a.id.to_string()).unwrap_or_default();
         self.env_profile = None;
         self.env_notice = None;
         self.env_revealed = false;
         self.env_seed = self.selected_env();
-        let placeholder = pane_agents_launch::env_placeholder(self.env_agent);
+        let placeholder = pane_agents_launch::env_placeholder(&self.env_agent);
+        self.detect_agents(window, cx);
         let env_input = cx.new(|cx| {
             InputState::new(window, cx)
                 // `auto_grow`, not `multi_line(true).rows(4)`: `rows()` only
@@ -505,9 +524,9 @@ impl SettingsModal {
                     // working copy keeps its last good value until the draft
                     // comes back under the cap.
                     if raw.len() <= pane_agents_launch::MAX_ENV_DRAFT {
-                        let agent = this.env_agent;
+                        let agent = this.env_agent.clone();
                         let profile = this.env_profile.clone();
-                        this.agent_launch.profile_entry_mut(agent, profile.as_deref()).env =
+                        this.agent_launch.profile_entry_mut(&agent, profile.as_deref()).env =
                             pane_agents_launch::parse_env_lines(&raw);
                     }
                     // Typing is not a commit: the previous answer is now stale,
@@ -550,14 +569,14 @@ impl SettingsModal {
                 let Some(mode) = this.profile_name_mode.clone() else {
                     return;
                 };
-                let agent = this.env_agent;
+                let agent = this.env_agent.clone();
                 let raw = input.read(cx).value().to_string();
                 // Each of blank / `default` / already-taken used to be a silent
                 // early return, which read as a broken button. All three now
                 // say which one it was, and none of them changes anything.
                 let name = match pane_agents_launch::validate_profile_name(
                     &raw,
-                    &this.agent_launch.profile_names(agent),
+                    &this.agent_launch.profile_names(&agent),
                 ) {
                     Ok(name) => name,
                     Err(msg) => {
@@ -576,11 +595,11 @@ impl SettingsModal {
                 };
                 let ack = match &mode {
                     ProfileNameMode::Add => {
-                        this.agent_launch.profile_entry_mut(agent, Some(&name));
+                        this.agent_launch.profile_entry_mut(&agent, Some(&name));
                         format!("Created “{name}” — editing it now.")
                     }
                     ProfileNameMode::Rename(from) => {
-                        if !this.agent_launch.rename_profile(agent, from, &name) {
+                        if !this.agent_launch.rename_profile(&agent, from, &name) {
                             this.env_notice = Some(gone(from));
                             cx.notify();
                             return;
@@ -588,7 +607,7 @@ impl SettingsModal {
                         format!("Renamed “{from}” to “{name}”.")
                     }
                     ProfileNameMode::Duplicate(from) => {
-                        if !this.agent_launch.duplicate_profile(agent, from, &name) {
+                        if !this.agent_launch.duplicate_profile(&agent, from, &name) {
                             this.env_notice = Some(gone(from));
                             cx.notify();
                             return;
@@ -756,6 +775,112 @@ impl SettingsModal {
         self.env_notice.as_ref().filter(|n| n.slot == slot)
     }
 
+    /// The agents this pane can configure, in catalog order.
+    ///
+    /// Reads the same composition the launcher's picker does, so the two
+    /// cannot disagree about which agents exist — the disagreement is what let
+    /// `Custom` and every ACP agent fall out of the settings pane entirely.
+    ///
+    /// The registry is rebuilt per call rather than held: it is a list of
+    /// stateless adapter objects, the call sites are render-rate at worst, and
+    /// threading one through the modal's constructor would put a launch
+    /// concern in the settings modal's signature.
+    pub(super) fn agent_catalog(&self) -> Vec<crate::shell::agent_ui::agent_catalog::CatalogAgent> {
+        use crate::shell::agent_ui::agent_catalog::{AdapterDetection, agent_catalog};
+        let registered;
+        let adapters = match self.agent_detect.as_deref() {
+            Some(entries) => AdapterDetection::Done(entries),
+            None => {
+                registered =
+                    oximux_agents::registry::AdapterRegistry::with_builtin_adapters()
+                        .entries_without_detection();
+                AdapterDetection::Pending(&registered)
+            }
+        };
+        agent_catalog(adapters, self.preset_detect.as_deref(), &self.agent_launch)
+    }
+
+    /// Probe which agent CLIs are actually installed.
+    ///
+    /// The same call, the same 500 ms budget, and the same tri-state the
+    /// launcher's picker uses — a second detector would be a second answer to
+    /// a question that already has one. A timeout leaves `Some(vec![])`, which
+    /// is what the pane renders as "detection failed" with a retry.
+    pub(super) fn detect_agents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.agent_detect_running {
+            return;
+        }
+        self.agent_detect_running = true;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            // `detect_available` and the timeout below are Tokio-bound. Under a
+            // GPUI test context there is no reactor, and calling them there
+            // aborts the whole test rather than failing a probe — so ask first
+            // and leave the pane in its Pending state, which is what an
+            // undetected catalog is supposed to look like anyway.
+            if tokio::runtime::Handle::try_current().is_err() {
+                let _ = this.update(cx, |m, cx| {
+                    m.agent_detect_running = false;
+                    cx.notify();
+                });
+                tracing::debug!("settings: no Tokio runtime; skipping agent detection");
+                return;
+            }
+            let registry = oximux_agents::registry::AdapterRegistry::with_builtin_adapters();
+            // Adapters and presets under ONE timeout: both are `which`-style
+            // PATH probes, so a slow mount caps them together rather than
+            // twice over.
+            let detect = async {
+                let entries = registry.detect_available().await;
+                let mut presets = Vec::with_capacity(oximux_settings::ACP_PRESETS.len());
+                for preset in oximux_settings::ACP_PRESETS {
+                    presets.push(oximux_agents::cli::which_on_path(preset.command).await);
+                }
+                (entries, presets)
+            };
+            let result =
+                tokio::time::timeout(std::time::Duration::from_millis(500), detect).await;
+            let applied = this.update(cx, |m, cx| {
+                match result {
+                    Ok((entries, presets)) => {
+                        m.agent_detect = Some(entries);
+                        m.preset_detect = Some(presets);
+                    }
+                    Err(_timeout) => {
+                        // Empty rather than left unknown: unknown renders
+                        // neutral forever, and the user would never learn that
+                        // detection is what failed.
+                        m.agent_detect.get_or_insert_with(Vec::new);
+                        m.preset_detect.get_or_insert_with(|| {
+                            vec![false; oximux_settings::ACP_PRESETS.len()]
+                        });
+                        tracing::warn!(
+                            "settings: agent detection timed out after 500ms; \
+                             PATH may be on a slow mount"
+                        );
+                    }
+                }
+                m.agent_detect_running = false;
+                cx.notify();
+            });
+            if applied.is_err() {
+                tracing::debug!("settings: modal dropped before detection completed");
+            }
+        })
+        .detach();
+    }
+
+    /// Re-run detection from the pane's Refresh affordance, discarding the
+    /// cached answer so the failure state can be retried rather than stuck.
+    pub(super) fn refresh_agent_detection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.agent_detect_running {
+            return;
+        }
+        self.agent_detect = None;
+        self.preset_detect = None;
+        self.detect_agents(window, cx);
+    }
+
     /// The launch entry the environment card is currently editing — the plain
     /// `[agents.<id>]` entry when the selection is `default`, that profile's
     /// own entry otherwise.
@@ -765,16 +890,16 @@ impl SettingsModal {
     /// always writes the default; the card below has a profile selected, and
     /// writing the default from there is exactly the hole this closes.
     pub(super) fn selected_launch_mut(&mut self) -> &mut oximux_settings::PerAgentLaunch {
-        let agent = self.env_agent;
+        let agent = self.env_agent.clone();
         let profile = self.env_profile.clone();
-        self.agent_launch.profile_entry_mut(agent, profile.as_deref())
+        self.agent_launch.profile_entry_mut(&agent, profile.as_deref())
     }
 
     /// The env map of the currently-selected `(agent, profile)`, or empty when
     /// that pair has no entry yet. The comparison basis for the close-flush.
     fn selected_env(&self) -> BTreeMap<String, String> {
         self.agent_launch
-            .for_agent_in(self.env_agent, self.env_profile.as_deref())
+            .for_agent_in(&self.env_agent, self.env_profile.as_deref())
             .map(|l| l.env.clone())
             .unwrap_or_default()
     }
@@ -804,7 +929,7 @@ impl SettingsModal {
     /// across a switch would land on an unrelated (or absent) profile.
     pub(super) fn select_env_agent(
         &mut self,
-        agent: &'static str,
+        agent: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -828,7 +953,7 @@ impl SettingsModal {
         self.env_notice = None;
         self.env_revealed = false;
         let text = pane_agents_launch::format_env_lines(&self.env_seed);
-        let placeholder = pane_agents_launch::env_placeholder(self.env_agent);
+        let placeholder = pane_agents_launch::env_placeholder(&self.env_agent);
         if let Some(input) = self.env_input.clone() {
             input.update(cx, |s, cx| {
                 s.set_value(&text, window, cx);
@@ -879,9 +1004,9 @@ impl SettingsModal {
         // element, and a commit that silently depended on a prior `Change`
         // would strand the last thing typed.
         let (map, rejects) = pane_agents_launch::parse_env_draft(raw);
-        let agent = self.env_agent;
+        let agent = self.env_agent.clone();
         let profile = self.env_profile.clone();
-        self.agent_launch.profile_entry_mut(agent, profile.as_deref()).env = map;
+        self.agent_launch.profile_entry_mut(&agent, profile.as_deref()).env = map;
         let changed = self.selected_env() != self.env_seed;
         if !changed && rejects.is_empty() {
             return;
@@ -894,7 +1019,7 @@ impl SettingsModal {
         // will actually reach a launch — not the number of lines typed.
         let applied = self
             .agent_launch
-            .env_for(self.env_agent, self.env_profile.as_deref())
+            .env_for(&self.env_agent, self.env_profile.as_deref())
             .len();
         self.env_notice = Some(match pane_agents_launch::reject_message(&rejects) {
             // Part of the draft was refused, so this reads as a refusal even
@@ -994,8 +1119,8 @@ impl SettingsModal {
         cx: &mut Context<Self>,
     ) {
         self.pending_profile_delete = None;
-        let agent = self.env_agent;
-        if !self.agent_launch.remove_profile(agent, name) {
+        let agent = self.env_agent.clone();
+        if !self.agent_launch.remove_profile(&agent, name) {
             cx.notify();
             return;
         }
@@ -1139,7 +1264,7 @@ mod env_editor_tests {
                 // Two profiles and a live env, so the card paints its full
                 // shape — both segmented rows populated, the editor non-empty —
                 // rather than the empty-state that would hide a layout fault.
-                m.env_agent = "claude-code";
+                m.env_agent = "claude-code".into();
                 m.agent_launch
                     .entry_mut("claude-code")
                     .env
@@ -1178,7 +1303,7 @@ mod env_editor_tests {
         w.update(cx, |_root, window, cx| {
             m.update(cx, |m, cx| {
                 m.open(window, cx);
-                m.env_agent = "claude-code";
+                m.env_agent = "claude-code".into();
                 m.agent_launch
                     .entry_mut("claude-code")
                     .env
@@ -1216,11 +1341,11 @@ mod env_editor_tests {
                     .entry_mut("codex")
                     .env
                     .insert("CODEX_HOST".into(), "h".into());
-                m.select_env_agent("claude-code", window, cx);
+                m.select_env_agent("claude-code".into(), window, cx);
                 m.select_env_profile(Some("proxy".into()), window, cx);
                 assert_eq!(m.env_profile.as_deref(), Some("proxy"));
 
-                m.select_env_agent("codex", window, cx);
+                m.select_env_agent("codex".into(), window, cx);
                 assert_eq!(m.env_profile, None, "profile resets with the agent");
                 assert_eq!(editor_text(m, cx), "CODEX_HOST=h", "editor shows the new agent");
                 m.close(cx);
@@ -1258,7 +1383,7 @@ mod env_editor_tests {
         w.update(cx, |_root, window, cx| {
             m.update(cx, |m, cx| {
                 m.open(window, cx);
-                m.env_agent = "claude-code";
+                m.env_agent = "claude-code".into();
                 let _ = cx;
             });
         })
@@ -1341,7 +1466,7 @@ mod env_editor_tests {
         w.update(cx, |_root, window, cx| {
             m.update(cx, |m, cx| {
                 m.open(window, cx);
-                m.env_agent = "claude-code";
+                m.env_agent = "claude-code".into();
                 assert!(!m.env_revealed, "values start masked");
 
                 m.toggle_env_reveal(cx);
@@ -1403,7 +1528,7 @@ mod env_editor_tests {
             m.update(cx, |m, cx| {
                 m.open(window, cx);
                 m.selected = SettingsPane::Agents;
-                m.env_agent = "claude-code";
+                m.env_agent = "claude-code".into();
                 m.agent_launch.entry_mut("claude-code").model = "opus".into();
                 m.agent_launch.profile_entry_mut("claude-code", Some("proxy"));
                 m.select_env_profile(Some("proxy".into()), window, cx);
@@ -1500,7 +1625,7 @@ mod env_editor_tests {
         w.update(cx, |_root, window, cx| {
             m.update(cx, |m, cx| {
                 m.open(window, cx);
-                m.env_agent = "claude-code";
+                m.env_agent = "claude-code".into();
                 m.agent_launch.profile_entry_mut("claude-code", Some("proxy")).env
                     .insert("BASE".into(), "https://second/v1".into());
                 m.select_env_profile(Some("proxy".into()), window, cx);
@@ -1572,7 +1697,7 @@ mod env_editor_tests {
         w.update(cx, |_root, window, cx| {
             m.update(cx, |m, cx| {
                 m.open(window, cx);
-                m.env_agent = "claude-code";
+                m.env_agent = "claude-code".into();
                 m.agent_launch.profile_entry_mut("claude-code", Some("proxy"));
 
                 // Armed, then cancelled: nothing is removed.
@@ -1613,7 +1738,7 @@ mod env_editor_tests {
         w.update(cx, |_root, window, cx| {
             m.update(cx, |m, cx| {
                 m.open(window, cx);
-                m.env_agent = "claude-code";
+                m.env_agent = "claude-code".into();
                 m.agent_launch
                     .entry_mut("claude-code")
                     .env
@@ -1659,7 +1784,7 @@ mod env_editor_tests {
         w.update(cx, |_root, window, cx| {
             m.update(cx, |m, cx| {
                 m.open(window, cx);
-                m.env_agent = "claude-code";
+                m.env_agent = "claude-code".into();
                 let input = m.env_input.clone().expect("env editor built");
                 input.update(cx, |s, cx| {
                     s.insert("ANTHROPIC_BASE_URL=https://typed/v1", window, cx)
@@ -1698,7 +1823,7 @@ mod env_editor_tests {
         w.update(cx, |_root, window, cx| {
             m.update(cx, |m, cx| {
                 m.open(window, cx);
-                m.env_agent = "claude-code";
+                m.env_agent = "claude-code".into();
                 m.agent_launch
                     .profile_entry_mut("claude-code", Some("proxy"))
                     .env
@@ -1738,7 +1863,7 @@ mod env_editor_tests {
         w.update(cx, |_root, window, cx| {
             m.update(cx, |m, cx| {
                 m.open(window, cx);
-                m.env_agent = "claude-code";
+                m.env_agent = "claude-code".into();
                 assert_eq!(
                     m.agent_launch.profile_names("claude-code"),
                     vec![DEFAULT_PROFILE],
@@ -1814,7 +1939,7 @@ mod env_editor_tests {
         w.update(cx, |_root, window, cx| {
             m.update(cx, |m, cx| {
                 m.open(window, cx);
-                m.env_agent = "claude-code";
+                m.env_agent = "claude-code".into();
             });
         })
         .expect("open");
@@ -1893,7 +2018,7 @@ mod env_editor_tests {
         w.update(cx, |_root, window, cx| {
             m.update(cx, |m, cx| {
                 m.open(window, cx);
-                m.env_agent = "claude-code";
+                m.env_agent = "claude-code".into();
                 let input = m.env_input.clone().expect("env editor");
                 input.update(cx, |s, cx| {
                     s.set_value("ANTHROPIC_BASE_URL=https://proxy.internal/v1", window, cx)

@@ -24,6 +24,7 @@ use oximux_core::AgentAdapter;
 use oximux_settings::{AgentLaunchSettings, Density, Theme, Typography};
 
 use crate::shell::agent_presentation::adapter_icon_path;
+use crate::shell::agent_ui::agent_catalog::{AdapterDetection, agent_catalog};
 use crate::keymap_registry::display_chord_for;
 use crate::ui::FloatingSurface;
 
@@ -248,12 +249,31 @@ impl AdapterPicker {
 /// returned by `AdapterRegistry::detect_available`, including Custom. This
 /// helper is the only path that filters Custom. Any future code touching
 /// the cache directly must NOT assume cache contents equal display rows.
+/// [`render_rows`] for the catalog's cross-surface invariant test, which lives
+/// beside the catalog rather than here — the property it asserts is about the
+/// two surfaces agreeing, not about this popover.
+#[cfg(test)]
+pub(crate) fn render_rows_for_test<'a>(
+    entries: &'a [RegistryEntry],
+    launch: &AgentLaunchSettings,
+) -> Vec<&'a RegistryEntry> {
+    render_rows(entries, launch)
+}
+
 fn render_rows<'a>(
     entries: &'a [RegistryEntry],
     launch: &AgentLaunchSettings,
 ) -> Vec<&'a RegistryEntry> {
+    // Membership comes from the catalog, which is also what the Agents
+    // settings pane reads — the two lists drifting apart is what let `Custom`
+    // and every ACP agent end up configurable in neither place. What stays
+    // here is the launcher's own DISPLAY filter: it hides `Custom` (which
+    // needs a program/args flow this popover does not have) and anything the
+    // user disabled, neither of which is a statement about what exists.
+    let catalog = agent_catalog(AdapterDetection::Done(entries), None, launch);
     let mut rows: Vec<&RegistryEntry> = entries
         .iter()
+        .filter(|e| catalog.iter().any(|c| c.id == e.adapter_id))
         .filter(|e| e.adapter_enum != AgentAdapter::Custom)
         .filter(|e| !launch.is_disabled(e.adapter_id))
         .collect();
@@ -458,9 +478,13 @@ fn append_preset_rows(
     // of the id, but FALSE when a non-ACP `[agents.<id>]` entry has taken the id
     // over — in which case resolution would fall back to stream-json and silently
     // launch the wrong agent, so the row is omitted rather than misrouting.
+    // Same split as `render_rows`: the catalog decides which presets exist,
+    // this filter decides which of them the launcher offers right now.
+    let catalog = agent_catalog(AdapterDetection::Pending(&[]), None, &launch);
     let rows: Vec<(usize, &oximux_settings::AcpPreset)> = oximux_settings::ACP_PRESETS
         .iter()
         .enumerate()
+        .filter(|(_, p)| catalog.iter().any(|c| c.id == p.id))
         .filter(|(_, p)| !launch.is_disabled(p.id) && launch.chat_capable(p.id))
         .collect();
     if rows.is_empty() {
