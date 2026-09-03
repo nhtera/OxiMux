@@ -22,6 +22,8 @@ oximux team run \
   --name "parser rewrite" \
   --role plan="survey the lexer and write a plan to plans/lexer.md" \
   --role impl="implement the plan once plans/lexer.md exists" \
+  --role-agent plan=claude \
+  --role-agent impl=codex \
   --worktree-each \
   --json
 ```
@@ -29,6 +31,59 @@ oximux team run \
 `--role NAME=PROMPT`, repeated, 1 to 8 of them. `--cwd` is the project every
 role works in (default: the current directory). `--agent` picks which
 configured agent runs every role.
+
+## One agent per role
+
+`--role-agent NAME=AGENT_ID` gives one role its own agent; `--role-model
+NAME=MODEL` gives it its own model. Both are matched by role name and repeat
+per role. A role named by neither falls back to `--agent`, and then to the
+host's default — so mixing them is normal:
+
+```sh
+oximux team run --name sweep \
+  --role plan="survey" --role impl="build" --role review="check" \
+  --agent claude --role-agent impl=codex --role-model plan=opus
+```
+
+That runs `impl` on codex and the other two on claude, with `plan` switched to
+opus.
+
+Two things to know before scripting it:
+
+- A `--role-agent` naming a role no `--role` declared is a **usage error**
+  (exit 2) listing the roles that do exist, and nothing starts. That is
+  deliberate: a typo would otherwise silently apply to nothing, and the run has
+  already begun by the time you could notice it ran on the wrong agent.
+- `--role-model` is applied **at spawn**, not as a switch afterwards. That is
+  the only moment it works for Claude and Codex, which take `--model` on the
+  command line and refuse to change it at runtime.
+- An agent that cannot be given a model at spawn — an ACP-based one, whose
+  protocol has no model at connect time — **fails that role** rather than
+  quietly opening on its default. Its teammates keep going, and the board says
+  what to do about it.
+- A model name the agent *does* accept at spawn but does not recognise is the
+  agent's own business: OxiMux does not validate model names, so depending on
+  the backend that surfaces as a failed launch or a failing first turn.
+
+Both flags need a host speaking protocol v22 or newer. Against an older one,
+`team run` with neither flag still works exactly as before; naming either is
+refused with a message about the version (exit 3), not a broken run.
+
+`team status` shows the agent per role once a run has one:
+
+```
+run-x9  sweep  open
+  plan   done     session s-1  agent claude  model opus
+  impl   running  session s-2  agent codex
+```
+
+A role that names no agent shows none rather than the word "default": the host
+resolved its own and never reported which. Runs opened before per-role agents
+existed read back the same way — no agent recorded, which is what they are.
+
+Under `--json` the `agent_id` and `model` keys are always present, and `null`
+when nothing was recorded — including from a host too old to have them. A
+missing key never means "no agent".
 
 `--worktree-each` gives each role its own worktree so roles editing the same
 files do not collide. The host derives each path. Use it whenever two roles

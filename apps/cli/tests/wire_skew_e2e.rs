@@ -115,6 +115,44 @@ fn json_stdout(out: &std::process::Output) -> Value {
     })
 }
 
+/// Boot the RELEASED `serve` and return its child plus its data directory.
+///
+/// A local sibling of `common::boot_serve`, which is hard-wired to the current
+/// binary. Shared by every direction-2 test so the released host is booted one
+/// way — a second copy would drift the moment the readiness contract moves.
+fn boot_released_serve(
+    old: &PathBuf,
+    data: &std::path::Path,
+    shim: &std::path::Path,
+    tmp: &std::path::Path,
+) -> (std::process::Child, String) {
+    let mut child = old_bin(old)
+        .args(["serve", "--data-dir", data.to_str().unwrap()])
+        .env("PATH", common::path_with(shim))
+        .env("OXIMUX_FAKE_AGENT_REPORT", tmp.join("report"))
+        .env("OXIMUX_FAKE_AGENT_SESSION", "skew-old-host")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("released serve boots");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        let _ = tx.send(line);
+        let mut sink = String::new();
+        while reader.read_line(&mut sink).unwrap_or(0) > 0 {
+            sink.clear();
+        }
+    });
+    let ready = rx.recv_timeout(Duration::from_secs(60)).expect("released serve readiness line");
+    let ready: Value = serde_json::from_str(ready.trim()).expect("readiness is JSON");
+    let dir = ready["dataDir"].as_str().expect("dataDir").to_string();
+    (child, dir)
+}
+
 /// Direction 1: a RELEASED client drives the current tree's host through
 /// spawn → wait → approval, and its live stream survives an event minted
 /// after it shipped. A client below v20 must see the Notice downgrade — never
@@ -238,32 +276,7 @@ fn a_new_client_drives_an_old_host_through_a_full_turn() {
     std::fs::create_dir_all(&cwd).unwrap();
     common::install_claude_shim(&shim);
 
-    // Boot the RELEASED serve. A local sibling of `common::boot_serve`, which
-    // is hard-wired to the current binary.
-    let mut child = old_bin(&old)
-        .args(["serve", "--data-dir", data.to_str().unwrap()])
-        .env("PATH", common::path_with(&shim))
-        .env("OXIMUX_FAKE_AGENT_REPORT", tmp.path().join("report"))
-        .env("OXIMUX_FAKE_AGENT_SESSION", "skew-old-host")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("released serve boots");
-    let stdout = child.stdout.take().expect("piped stdout");
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut reader = std::io::BufReader::new(stdout);
-        let mut line = String::new();
-        let _ = reader.read_line(&mut line);
-        let _ = tx.send(line);
-        let mut sink = String::new();
-        while reader.read_line(&mut sink).unwrap_or(0) > 0 {
-            sink.clear();
-        }
-    });
-    let ready = rx.recv_timeout(Duration::from_secs(60)).expect("released serve readiness line");
-    let ready: Value = serde_json::from_str(ready.trim()).expect("readiness is JSON");
-    let dir = ready["dataDir"].as_str().expect("dataDir").to_string();
+    let (mut child, dir) = boot_released_serve(&old, &data, &shim, tmp.path());
 
     // A full turn, streamed to completion by the current client.
     let out = common::bin()
@@ -293,6 +306,97 @@ fn a_new_client_drives_an_old_host_through_a_full_turn() {
         Some(0),
         "transcript from the released host: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Direction 2, the team surface: a v22 client must not send v22 ordinals to a
+/// host that predates them.
+///
+/// This is the case the rest of this suite does not reach. `TeamRunCreateV2`
+/// and `TeamStatusV2` are appended ordinals — a host that does not know them
+/// cannot decode the frame and answers `BadRequest("undecodable request
+/// frame")`, so an updated CLI would report a malformed request against a host
+/// that was working a moment earlier, with nothing pointing at the version.
+///
+/// So: a plain `team run` must fall back to the v18 verb and work, `team
+/// status` must read the board back, and only a run that actually names a
+/// per-role agent may be refused — with a sentence about versions, not a dead
+/// socket.
+#[test]
+fn a_new_client_runs_a_team_on_an_old_host() {
+    let Some(old) = old_cli() else {
+        eprintln!("skipped: OXIMUX_SKEW_CLI is unset");
+        return;
+    };
+    // Only meaningful against a host below the per-role floor. A release at or
+    // above it serves the v2 verbs and there is nothing to fall back from.
+    let host_version = protocol_of(&old);
+    if host_version >= oximux_remote_proto::proto::TEAM_PER_ROLE_MIN_VERSION {
+        eprintln!("skipped: the released peer already speaks v{host_version}");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data = tmp.path().join("data");
+    let shim = tmp.path().join("bin");
+    let cwd = tmp.path().join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    common::install_claude_shim(&shim);
+    let (mut child, dir) = boot_released_serve(&old, &data, &shim, tmp.path());
+
+    // A run naming no per-role agent IS the v18 request, so it must work.
+    let out = common::bin()
+        .args([
+            "--dir", &dir, "--json", "team", "run", "--name", "skew", "--role", "impl=go",
+            "--cwd", cwd.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a plain team run must degrade to the v18 verb: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let run_id = json_stdout(&out)["data"]["id"].as_str().expect("a run id").to_string();
+
+    // And the board reads back, without an agent column the old host has no
+    // field for.
+    let out = common::bin()
+        .args(["--dir", &dir, "--json", "team", "status", "--run", &run_id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "team status must degrade too: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let board = json_stdout(&out);
+    assert_eq!(board["data"]["id"], run_id.as_str());
+
+    // Only the thing the old host genuinely cannot do is refused — and it is
+    // refused with a sentence, not a dropped connection.
+    let out = common::bin()
+        .args([
+            "--dir", &dir, "team", "run", "--name", "skew2", "--role", "impl=go",
+            "--role-agent", "impl=claude", "--cwd", cwd.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "unreachable-class, not a crash: {stderr}");
+    assert!(stderr.contains("protocol v22"), "it names the version needed: {stderr}");
+    // The symptom this gate exists to prevent, measured against this very
+    // binary: without the client-side refusal the host cannot decode the
+    // ordinal and answers `BadRequest("undecodable request frame")`, which
+    // reaches the user as a complaint about the frame rather than the version.
+    assert!(
+        !stderr.contains("undecodable"),
+        "and never blames the frame for what is a version problem: {stderr}"
     );
 
     let _ = child.kill();

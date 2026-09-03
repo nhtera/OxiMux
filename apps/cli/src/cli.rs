@@ -839,6 +839,17 @@ pub enum TeamCommand {
         /// Which configured agent runs every role (default: the host's).
         #[arg(long, value_name = "AGENT_ID")]
         agent: Option<String>,
+        /// Give one role its own agent, as NAME=AGENT_ID. Repeat per role.
+        /// A role named here overrides `--agent`; the rest still use it.
+        #[arg(long = "role-agent", value_name = "NAME=AGENT_ID")]
+        role_agents: Vec<String>,
+        /// Give one role its own model, as NAME=MODEL. Repeat per role.
+        ///
+        /// Applied once the role's session is open. A backend that fixes its
+        /// model at spawn respawns to honour it; a model the session does not
+        /// offer fails that role rather than running it on another one.
+        #[arg(long = "role-model", value_name = "NAME=MODEL")]
+        role_models: Vec<String>,
         /// Give each role its own worktree, so roles editing the same files do
         /// not collide. The host derives each path.
         #[arg(long)]

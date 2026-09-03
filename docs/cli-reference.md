@@ -534,6 +534,8 @@ Start one session per role and open a run to track them.
 | `--role` | yes | A role, as NAME=PROMPT. Repeat for each (1–8) |
 | `--cwd` | yes | The project every role works in (default: the current directory) |
 | `--agent` | yes | Which configured agent runs every role (default: the host's) |
+| `--role-agent` | yes | Give one role its own agent, as NAME=AGENT_ID. Repeat per role. A role named here overrides `--agent`; the rest still use it |
+| `--role-model` | yes | Give one role its own model, as NAME=MODEL. Repeat per role |
 | `--worktree-each` | no | Give each role its own worktree, so roles editing the same files do not collide. The host derives each path |
 
 #### `oximux team report`

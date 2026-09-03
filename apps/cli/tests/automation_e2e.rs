@@ -5,7 +5,7 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use oximux_agents::coord::CoordStore;
@@ -46,9 +46,16 @@ fn json_stdout(out: &std::process::Output) -> serde_json::Value {
     })
 }
 
+/// What each launch was asked for: `(agent_id, model)`, in launch order.
+type LaunchedWith = Arc<Mutex<Vec<(Option<String>, Option<String>)>>>;
+
 struct StubLauncher {
     registry: Arc<SessionRegistry>,
     counter: AtomicU32,
+    /// The agent and model each launch was asked for, in order — the only place
+    /// a test can see that `--role-agent`/`--role-model` reached the thing that
+    /// starts processes, rather than only the board that echoes them back.
+    agents: LaunchedWith,
 }
 
 #[async_trait::async_trait]
@@ -56,11 +63,15 @@ impl SessionLauncher for StubLauncher {
     async fn create(
         &self,
         _cwd: &str,
-        _agent_id: Option<&str>,
-        _model: Option<&str>,
+        agent_id: Option<&str>,
+        model: Option<&str>,
     ) -> Result<String, LaunchError> {
         let id = format!("role-{}", self.counter.fetch_add(1, Ordering::SeqCst) + 1);
         self.registry.register(id.clone(), Arc::new(StubConnection::default()));
+        self.agents
+            .lock()
+            .unwrap()
+            .push((agent_id.map(str::to_string), model.map(str::to_string)));
         Ok(id)
     }
 }
@@ -71,12 +82,15 @@ struct Host {
     /// agent at spawn.
     agent_secret: String,
     teams: TeamStore,
+    /// What the launcher was asked for, per launch: `(agent_id, model)`.
+    launched_agents: LaunchedWith,
 }
 
 /// Boot a host on `runtime_dir` against the database at `db_path`, so a second
 /// boot over the same path is a genuine restart.
 fn boot(rt: &tokio::runtime::Runtime, runtime_dir: &Path, db_path: &Path) -> Host {
     let db = oximux_storage::open(db_path).expect("open db");
+    let launched_agents: LaunchedWith = Arc::new(Mutex::new(Vec::new()));
     let registry = Arc::new(SessionRegistry::new());
     registry.register("sess-1".into(), Arc::new(StubConnection::default()));
     let teams = TeamStore::new(db.conn());
@@ -85,6 +99,7 @@ fn boot(rt: &tokio::runtime::Runtime, runtime_dir: &Path, db_path: &Path) -> Hos
             .with_launcher(Arc::new(StubLauncher {
                 registry: registry.clone(),
                 counter: AtomicU32::new(0),
+                agents: launched_agents.clone(),
             }))
             .with_schedule_store(Arc::new(ScheduleStore::new(db.conn())))
             .with_team_store(Arc::new(teams.clone()))
@@ -111,7 +126,7 @@ fn boot(rt: &tokio::runtime::Runtime, runtime_dir: &Path, db_path: &Path) -> Hos
             });
         }
     });
-    Host { agent_secret, teams }
+    Host { agent_secret, teams, launched_agents }
 }
 
 /// An agent arms a wake-up on itself with no `--session`, sees it listed, and
@@ -287,6 +302,114 @@ fn a_team_run_survives_a_host_restart() {
         roles[1]["summary"].as_str().unwrap_or_default().contains("restarted"),
         "and it says why: {:?}",
         roles[1]["summary"]
+    );
+}
+
+/// The phase's headline, driven through the actual binary: two roles, two
+/// different agents, and a board that says which one worked each.
+///
+/// The launcher assertion is the load-bearing half — a board echoing what the
+/// CLI sent would pass while every role was still being started on the
+/// run-level default.
+#[test]
+fn per_role_agents_reach_the_launcher_and_show_on_the_board() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("host");
+    let host = boot(&rt, &runtime_dir, &dir.path().join("oximux.db"));
+
+    let opened = bin(&runtime_dir)
+        .args([
+            "--json",
+            "team",
+            "run",
+            "--name",
+            "sweep",
+            "--role",
+            "plan=survey the lexer",
+            "--role",
+            "impl=build it",
+            "--role",
+            "review=check it",
+            "--role-agent",
+            "plan=claude",
+            "--role-agent",
+            "impl=codex",
+            "--role-model",
+            "plan=opus",
+            "--agent",
+            "gemini",
+            "--cwd",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run");
+    assert!(opened.status.success(), "stderr: {}", String::from_utf8_lossy(&opened.stderr));
+
+    assert_eq!(
+        host.launched_agents.lock().unwrap().clone(),
+        vec![
+            (Some("claude".to_string()), Some("opus".to_string())),
+            (Some("codex".to_string()), None),
+            // Named by no `--role-agent`, so it takes the run-level `--agent`.
+            (Some("gemini".to_string()), None),
+        ],
+        "the launcher was asked for three different agents, and one model"
+    );
+
+    let run_id = json_stdout(&opened)["data"]["id"].as_str().expect("a run id").to_string();
+    let board = bin(&runtime_dir)
+        .args(["--json", "team", "status", "--run", &run_id])
+        .output()
+        .expect("run");
+    let roles = json_stdout(&board)["data"]["roles"].as_array().expect("roles").clone();
+    assert_eq!(roles[0]["agent_id"], "claude");
+    assert_eq!(roles[1]["agent_id"], "codex");
+    assert_eq!(roles[2]["agent_id"], "gemini");
+    assert_eq!(roles[0]["model"], "opus");
+    assert!(roles[1]["model"].is_null(), "and a role that asked for none has none");
+
+    // And the human board says it too, since that is what a person reads.
+    let human = bin(&runtime_dir)
+        .args(["team", "status", "--run", &run_id])
+        .output()
+        .expect("run");
+    let human = String::from_utf8_lossy(&human.stdout);
+    assert!(human.contains("agent claude"), "{human}");
+    assert!(human.contains("agent codex"), "{human}");
+}
+
+/// A `--role-agent` naming a role that does not exist is refused before
+/// anything starts — exit 2, and nothing launched.
+#[test]
+fn a_role_agent_for_an_unknown_role_starts_nothing() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let runtime_dir = dir.path().join("host");
+    let host = boot(&rt, &runtime_dir, &dir.path().join("oximux.db"));
+
+    let out = bin(&runtime_dir)
+        .args([
+            "team",
+            "run",
+            "--name",
+            "sweep",
+            "--role",
+            "plan=survey",
+            "--role-agent",
+            "typo=claude",
+            "--cwd",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(2), "a usage error, not a host error");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("typo"), "it names the offender: {stderr}");
+    assert!(stderr.contains("plan"), "and the role that does exist: {stderr}");
+    assert!(
+        host.launched_agents.lock().unwrap().is_empty(),
+        "and the run never started — the check is client-side, before the RPC"
     );
 }
 

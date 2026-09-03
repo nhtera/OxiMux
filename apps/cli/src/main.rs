@@ -25,6 +25,7 @@ use cli::{
     TermCommand, WorktreeCommand,
 };
 use client::Client;
+use oximux_remote_proto::proto::TEAM_PER_ROLE_MIN_VERSION;
 use output::render;
 
 /// Leaf verbs that erase something. A typo is never nudged toward one of
@@ -231,17 +232,34 @@ fn main() -> std::process::ExitCode {
 /// Only verbs whose RPCs were *appended* appear here. That is the point of the
 /// gate: an old host serves everything below its own version perfectly well, so
 /// refusing wholesale would break the compatibility this protocol is designed
-/// for. What it must not do is send an ordinal the host cannot decode — postcard
-/// answers that by dropping the connection, which surfaces to the user as "the
-/// host closed the connection" with nothing to act on.
+/// for. What it must not do is send an ordinal the host cannot decode. Measured
+/// against a released v20 host (2026-09-04): postcard fails to decode the frame
+/// and the host answers `BadRequest("undecodable request frame")`, keeping the
+/// connection open — so the user gets `error: undecodable request frame` at
+/// exit 1, a complaint about the frame for what is really a version problem,
+/// with nothing in it to act on.
 fn required_version(command: &Command) -> Option<(u32, &'static str)> {
     match command {
         // v19: the watch cursor. `state watch` sends `StateWatchFrom`, an
-        // ordinal a v18 host answers by dropping the connection — so it needs
+        // ordinal a v18 host cannot decode — so it needs
         // its own floor above the rest of its family, exactly as
         // `schedule run-once` does. Must stay ABOVE the catch-all `State` arm
         // below, which would otherwise match it first and claim v18.
         Command::State { command: StateCommand::Watch { .. } } => Some((19, "state watch")),
+        // v22: per-role agents. Only a run that actually names one needs the
+        // newer verb — `team run` with neither flag is the v18 request, and an
+        // older host serves it exactly. Refusing on the *shape* of the command
+        // rather than on what it asks for would strand callers who never wanted
+        // the feature. Must stay ABOVE the catch-all `Team` arm below.
+        //
+        // Without this the caller would get "undecodable request frame" from a
+        // host that cannot decode the ordinal — a message about a malformed
+        // request, for a version problem, with nothing actionable in it.
+        Command::Team { command: TeamCommand::Run { role_agents, role_models, .. } }
+            if !role_agents.is_empty() || !role_models.is_empty() =>
+        {
+            Some((TEAM_PER_ROLE_MIN_VERSION, "team run --role-agent/--role-model"))
+        }
         // v18: the automation surface.
         Command::Heartbeat { .. } => Some((18, "heartbeat")),
         Command::Team { .. } => Some((18, "team")),
@@ -361,9 +379,9 @@ fn host_verb(mut args: Cli) -> u8 {
             .await?;
             // The compat gate. `Hello` already refused a host outside the
             // mutually-compatible range; this catches the narrower case of a
-            // host inside it that predates a specific verb — where postcard
-            // would answer an appended ordinal by dropping the connection
-            // rather than erroring. Only the verbs that need a floor are
+            // host inside it that predates a specific verb — where the host
+            // rejects an appended ordinal as an undecodable frame rather than
+            // saying anything about versions. Only the verbs that need a floor are
             // gated, so reads a v15 host can still serve keep working.
             if let Some((needed, verb)) = required_version(&args.command) {
                 client.require_version(needed, verb)?;
@@ -541,12 +559,22 @@ fn host_verb(mut args: Cli) -> u8 {
                     HeartbeatCommand::Rm { id } => commands::heartbeat::rm(&client, &id).await,
                 },
                 Command::Team { command } => match command {
-                    TeamCommand::Run { name, roles, cwd, agent, worktree_each } => {
+                    TeamCommand::Run {
+                        name,
+                        roles,
+                        cwd,
+                        agent,
+                        role_agents,
+                        role_models,
+                        worktree_each,
+                    } => {
                         let args = commands::team::RunArgs {
                             name,
                             roles,
                             cwd,
                             agent,
+                            role_agents,
+                            role_models,
                             worktree_each,
                         };
                         commands::team::run(&client, args).await
@@ -601,8 +629,8 @@ mod tests {
 
     /// The gate covers exactly the appended surfaces, and nothing else. A verb
     /// wrongly listed here would refuse a host that can serve it perfectly
-    /// well; one wrongly omitted would send an ordinal an old host answers by
-    /// dropping the connection.
+    /// well; one wrongly omitted would send an ordinal an old host rejects as
+    /// an undecodable frame.
     #[test]
     fn only_appended_verbs_declare_a_version_floor() {
         for (argv, expected) in [
@@ -760,6 +788,37 @@ mod tests {
         precheck(&mut command, false).expect("ok");
         let Command::Send { prompt, .. } = &command else { panic!("send") };
         assert_eq!(prompt, "do the thing");
+    }
+
+    /// `team` is split the same way: only a run that actually names a per-role
+    /// agent or model needs v22.
+    ///
+    /// Gating the whole family on the flag's *existence* would strand every
+    /// caller who never wanted the feature the moment this CLI shipped — the
+    /// exact fleet-wide break `MIN_COMPATIBLE_VERSION` exists to avoid. What a
+    /// pre-v22 host cannot do is honour a per-role choice, so that is the only
+    /// thing refused; everything else falls back to the v18 verbs.
+    #[test]
+    fn only_a_per_role_run_gates_the_team_family() {
+        let plain = ["oximux", "team", "run", "--name", "s", "--role", "a=go"];
+        assert_eq!(
+            required_version(&command_of(&plain)).map(|(v, _)| v),
+            Some(18),
+            "a run naming no per-role agent is the v18 request"
+        );
+        assert_eq!(
+            required_version(&command_of(&["oximux", "team", "status", "--run", "r"]))
+                .map(|(v, _)| v),
+            Some(18),
+            "and reading a board never needs the newer verb"
+        );
+
+        let with_agent =
+            ["oximux", "team", "run", "--name", "s", "--role", "a=go", "--role-agent", "a=claude"];
+        assert_eq!(required_version(&command_of(&with_agent)).map(|(v, _)| v), Some(22));
+        let with_model =
+            ["oximux", "team", "run", "--name", "s", "--role", "a=go", "--role-model", "a=opus"];
+        assert_eq!(required_version(&command_of(&with_model)).map(|(v, _)| v), Some(22));
     }
 
     /// `schedule` is the one family split across versions: only the manual fire
