@@ -39,7 +39,8 @@ impl ScheduleFirer for ServeFirer {
             }
         }
         let session_id =
-            match self.launcher.create(&schedule.cwd, schedule.agent_id.as_deref()).await {
+            // A schedule names no model; its session opens on the agent's default.
+            match self.launcher.create(&schedule.cwd, schedule.agent_id.as_deref(), None).await {
                 Ok(session_id) => session_id,
                 // Draining: the host is shutting down. The occurrence stays due
                 // for whichever host boots next.
@@ -83,5 +84,7 @@ fn launch_error_detail(err: &LaunchError) -> &'static str {
         LaunchError::Failed => "the agent could not be started (unknown agent id, or its CLI is missing)",
         // Handled as NotNow above; total match.
         LaunchError::Unavailable => "the host could not start a session right now",
+        // Unreachable: a schedule names no model, so it never asks for one.
+        LaunchError::ModelUnsupported => "this agent cannot be given a model when it starts",
     }
 }

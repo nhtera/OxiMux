@@ -311,7 +311,8 @@ impl Dispatcher {
         let Some(launcher) = self.launcher.as_ref() else {
             return Response::Error(RpcError::Unauthorized);
         };
-        match launcher.create(cwd, agent_id).await {
+        // `CreateSession` names no model; the agent opens on its own default.
+        match launcher.create(cwd, agent_id, None).await {
             Ok(session_id) => Response::SessionCreated { session_id },
             Err(e) => {
                 // The launcher's own error text routinely embeds absolute host

@@ -55,7 +55,12 @@ struct StubLauncher {
 
 #[async_trait::async_trait]
 impl SessionLauncher for StubLauncher {
-    async fn create(&self, _cwd: &str, _agent_id: Option<&str>) -> Result<String, LaunchError> {
+    async fn create(
+        &self,
+        _cwd: &str,
+        _agent_id: Option<&str>,
+        _model: Option<&str>,
+    ) -> Result<String, LaunchError> {
         let id = format!("run-{}", self.counter.fetch_add(1, Ordering::SeqCst) + 1);
         self.registry.register(id.clone(), Arc::new(StubConnection::default()));
         Ok(id)

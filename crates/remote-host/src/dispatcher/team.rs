@@ -72,7 +72,7 @@ impl Dispatcher {
             } else {
                 req.cwd.clone()
             };
-            match launcher.create(&cwd, req.agent_id.as_deref()).await {
+            match launcher.create(&cwd, req.agent_id.as_deref(), None).await {
                 Ok(session_id) => {
                     // The opening instruction goes in like any other prompt; a
                     // session that opened but cannot take it still names itself,
@@ -236,6 +236,9 @@ fn launch_detail(err: &crate::launcher::LaunchError) -> &'static str {
             "the host could not start a session right now"
         }
         crate::launcher::LaunchError::Failed => "the agent could not be started",
+        crate::launcher::LaunchError::ModelUnsupported => {
+            "this agent cannot be given a model when it starts"
+        }
     }
 }
 

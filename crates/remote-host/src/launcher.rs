@@ -33,6 +33,16 @@ pub enum LaunchError {
     /// The desktop tried and failed. Detail is logged host-side, never returned.
     #[error("the session could not be started")]
     Failed,
+    /// A model was named for an agent that cannot be given one at spawn.
+    ///
+    /// Its own variant rather than [`Self::Failed`] because the caller can act
+    /// on it — drop the model, or pick an agent that takes one — and because
+    /// the alternative is worse than any error: an ACP agent silently ignores a
+    /// model at spawn, so the session would run its default while the team
+    /// board recorded the model that was asked for. A record nothing ever
+    /// contradicts is the one outcome worth refusing a launch over.
+    #[error("this agent cannot be given a model when it starts")]
+    ModelUnsupported,
 }
 
 /// Starting a new agent session on the desktop.
@@ -61,7 +71,22 @@ pub trait SessionLauncher: Send + Sync {
     /// silent fallback to the default — starting a *different* agent than the
     /// one asked for is a worse outcome than refusing.
     ///
+    /// `model` fixes the session's model **at spawn**, and is a parameter here
+    /// rather than a switch afterwards because that is the only moment the
+    /// common backends accept one: Claude and Codex take `--model` on the
+    /// command line and refuse to change it at runtime, so a post-launch switch
+    /// reaches the trait-default `set_model`, which bails. The desktop papers
+    /// over that by respawning through its view, but a headless host has no view
+    /// — so a model applied after the fact works on ACP backends and silently
+    /// fails on the two most common ones. Applying it at spawn works everywhere
+    /// and costs a parameter. `None` = the agent's own default.
+    ///
     /// Implementations must validate `cwd` themselves: the dispatcher checks
     /// authorization, not filesystem reality.
-    async fn create(&self, cwd: &str, agent_id: Option<&str>) -> Result<String, LaunchError>;
+    async fn create(
+        &self,
+        cwd: &str,
+        agent_id: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<String, LaunchError>;
 }

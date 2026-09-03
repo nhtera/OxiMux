@@ -20,6 +20,9 @@ use tokio::sync::{mpsc, oneshot};
 pub struct LaunchRequest {
     pub cwd: String,
     pub agent_id: Option<String>,
+    /// The model to open the session on, fixed at spawn. `None` = the agent's
+    /// own default.
+    pub model: Option<String>,
     /// Sent as the session's first message once it opens. Remote launches pass
     /// `None` (an empty session for the phone to type into); the scheduler
     /// passes its schedule's prompt.
@@ -56,12 +59,14 @@ impl BridgeLauncher {
         &self,
         cwd: &str,
         agent_id: Option<&str>,
+        model: Option<&str>,
         initial_prompt: Option<String>,
     ) -> Result<String, LaunchError> {
         let (reply, answer) = oneshot::channel();
         let request = LaunchRequest {
             cwd: cwd.to_string(),
             agent_id: agent_id.map(str::to_string),
+            model: model.map(str::to_string),
             initial_prompt,
             reply,
         };
@@ -85,8 +90,13 @@ pub fn launch_bridge() -> (BridgeLauncher, mpsc::Receiver<LaunchRequest>) {
 
 #[async_trait::async_trait]
 impl SessionLauncher for BridgeLauncher {
-    async fn create(&self, cwd: &str, agent_id: Option<&str>) -> Result<String, LaunchError> {
-        self.create_with_prompt(cwd, agent_id, None).await
+    async fn create(
+        &self,
+        cwd: &str,
+        agent_id: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<String, LaunchError> {
+        self.create_with_prompt(cwd, agent_id, model, None).await
     }
 }
 
@@ -138,9 +148,10 @@ pub fn serve_launches(rx: tokio::sync::mpsc::Receiver<LaunchRequest>, cx: &mut g
             // for is already open either way.
             // Split before sending: `send` consumes the reply channel, so the
             // request cannot still be borrowed by the closure at that point.
-            let LaunchRequest { cwd, agent_id, initial_prompt, reply } = request;
-            let opened =
-                cx.update(|cx| open_session(&cwd, agent_id.as_deref(), initial_prompt, cx));
+            let LaunchRequest { cwd, agent_id, model, initial_prompt, reply } = request;
+            let opened = cx.update(|cx| {
+                open_session(&cwd, agent_id.as_deref(), model, initial_prompt, cx)
+            });
             let _ = reply.send(opened);
         }
     })
@@ -155,6 +166,7 @@ pub fn serve_launches(rx: tokio::sync::mpsc::Receiver<LaunchRequest>, cx: &mut g
 pub(crate) fn open_session(
     cwd: &str,
     agent_id: Option<&str>,
+    model: Option<String>,
     initial_prompt: Option<String>,
     cx: &mut gpui::App,
 ) -> Result<String, LaunchError> {
@@ -182,6 +194,14 @@ pub(crate) fn open_session(
         return Err(LaunchError::Failed);
     }
     let backend = crate::workspace_root::chat_backend_for(&settings, &adapter_id);
+    // Refused rather than dropped. ACP takes no model at spawn — `connect`'s
+    // `Transport::Acp` arm never reads `ConnectSpec.model` — so passing one here
+    // would open the session on the agent's default while every record said
+    // otherwise. This is the reachable case: unlike the headless host, the
+    // desktop resolves any chat-capable adapter, ACP presets included.
+    if model.is_some() && !backend.transport.takes_model_at_spawn() {
+        return Err(LaunchError::ModelUnsupported);
+    }
 
     // The first registered window. A desktop with several open has no signal
     // about which one the phone meant, and asking would defeat the point of
@@ -204,7 +224,7 @@ pub(crate) fn open_session(
             panes.update(cx, |panes, cx| {
                 panes.open_agent_chat_tab_in_active_group(
                     cwd,
-                    None,
+                    model,
                     backend,
                     initial_prompt,
                     window,
@@ -227,9 +247,17 @@ mod tests {
             let req = rx.recv().await.expect("a request");
             assert_eq!(req.cwd, "/work");
             assert_eq!(req.agent_id.as_deref(), Some("claude"));
+            assert_eq!(
+                req.model.as_deref(),
+                Some("opus-5"),
+                "the model rides the request, so the tab opens on it rather than                  being switched afterwards"
+            );
             let _ = req.reply.send(Ok("sess-7".into()));
         });
-        assert_eq!(launcher.create("/work", Some("claude")).await.unwrap(), "sess-7");
+        assert_eq!(
+            launcher.create("/work", Some("claude"), Some("opus-5")).await.unwrap(),
+            "sess-7"
+        );
         ui.await.unwrap();
     }
 
@@ -240,7 +268,7 @@ mod tests {
         let (launcher, rx) = launch_bridge();
         drop(rx);
         assert!(matches!(
-            launcher.create("/work", None).await,
+            launcher.create("/work", None, None).await,
             Err(LaunchError::Unavailable)
         ));
     }
@@ -255,7 +283,7 @@ mod tests {
             drop(req.reply);
         });
         assert!(matches!(
-            launcher.create("/work", None).await,
+            launcher.create("/work", None, None).await,
             Err(LaunchError::Unavailable)
         ));
     }
@@ -270,14 +298,14 @@ mod tests {
         // below passing for the wrong reason.
         let mut held = Vec::new();
         for _ in 0..QUEUE {
-            held.push(Box::pin(launcher.create("/work", None)));
+            held.push(Box::pin(launcher.create("/work", None, None)));
         }
         for f in &mut held {
             // Poll each once so it lands in the queue.
             let _ = futures::poll!(f.as_mut());
         }
         assert!(matches!(
-            launcher.create("/work", None).await,
+            launcher.create("/work", None, None).await,
             Err(LaunchError::Unavailable)
         ));
     }
