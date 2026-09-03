@@ -313,6 +313,27 @@ pub struct SendTextToActiveAgent {
     pub text: String,
 }
 
+/// Payload action carrying an element picked in the embedded browser up to the
+/// workspace, which resolves the target Agent Chat and stages the capture as a
+/// `@browser` context chip plus an image attachment.
+///
+/// Separate from [`SendTextToActiveAgent`] because the two land on different
+/// surfaces: that one bracketed-pastes into a PTY (where an image cannot go),
+/// this one stages into a chat composer. The workspace falls back to
+/// `SendTextToActiveAgent` with `markdown` alone when no chat tab is open, so a
+/// terminal-only workspace keeps the behavior it had.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct SendPickToActiveChat {
+    /// The element block from `browser_view::agent_context::format_pick`.
+    pub markdown: String,
+    /// The picked element's selector — becomes the chip's source label.
+    pub selector: String,
+    /// PNG of the element's bounding box. Empty when the crop failed or the
+    /// platform has no native snapshot, in which case the chip is sent alone.
+    pub png: Vec<u8>,
+}
+
 /// Payload action raised by the session-history picker to relaunch a past
 /// session. The workspace resolves the adapter slug + cwd (falling back to
 /// the active project's directory when the log omits one) and threads

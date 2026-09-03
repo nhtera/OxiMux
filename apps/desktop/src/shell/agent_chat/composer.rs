@@ -3946,6 +3946,81 @@ mod tests {
             .expect("window update");
     }
 
+    /// End-to-end for Design Mode: an element picked in the embedded browser is
+    /// staged exactly as `AgentChatView::stage_browser_pick` stages it, then sent.
+    ///
+    /// This is the seam a unit test cannot reach and a webview is not needed for:
+    /// it proves the capture survives chip staging, image decode, and submit, and
+    /// that both halves reach the wire together.
+    #[gpui::test]
+    async fn a_picked_browser_element_reaches_the_wire_with_its_screenshot(
+        cx: &mut TestAppContext,
+    ) {
+        // A 1x1 red PNG — the smallest thing `pending_from_bytes` will accept.
+        use base64::Engine as _;
+        let png: Vec<u8> = base64::engine::general_purpose::STANDARD
+            .decode(concat!(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8",
+                "z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+            ))
+            .expect("valid base64 fixture");
+
+        let window = test_composer(cx);
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let seen = sent.clone();
+        cx.update(|cx| {
+            let root = window.root(cx).expect("root view");
+            cx.subscribe(
+                &root,
+                move |_, ev: &ComposerEvent, _| {
+                    if let ComposerEvent::Submit { text, images } = ev {
+                        *seen.borrow_mut() = Some((text.clone(), images.clone()));
+                    }
+                },
+            )
+            .detach();
+        });
+
+        window
+            .update(cx, |c, window, cx| {
+                // Exactly what `stage_browser_pick` does with a pick.
+                let chip = crate::shell::agent_chat::context_providers::browser_chip(
+                    "a#go",
+                    "Selected element: <a id=\"go\">x</a>\ncolor: rgb(0, 0, 0)".to_string(),
+                )
+                .expect("a non-empty capture makes a chip");
+                assert!(chip.label().starts_with("@browser a#go · "));
+                c.add_context_chip(chip, cx);
+                let staged = image_attach::pending_from_bytes(png, None)
+                    .expect("a 1x1 PNG decodes");
+                c.add_pending_images(vec![staged], cx);
+
+                // The capture is staged, not sent — the user still types the ask.
+                assert_eq!(c.context_chips_len_for_test(), 1);
+                assert_eq!(c.current_images().len(), 1);
+
+                c.set_draft_for_test("why is this misaligned?", window, cx);
+                c.submit(window, cx);
+            })
+            .expect("window update");
+        cx.run_until_parked();
+
+        let (text, images) = sent.borrow_mut().take().expect("a submit was emitted");
+        // The element rides as a tagged context block naming its selector...
+        assert!(
+            text.starts_with("<context name=\"browser\" source=\"a#go\">\n"),
+            "wire text was: {text}"
+        );
+        assert!(text.contains("<a id=\"go\">x</a>"), "the HTML must survive");
+        assert!(text.contains("color: rgb(0, 0, 0)"), "the computed CSS must survive");
+        // ...and the user's own question is still the tail of the message.
+        assert!(text.ends_with("why is this misaligned?"));
+        // ...with the crop attached, not left on the clipboard.
+        assert_eq!(images.len(), 1, "the screenshot must travel with the text");
+        assert_eq!(images[0].media_type, "image/png");
+        assert!(!images[0].data.is_empty());
+    }
+
     /// Restored queued chips (`seed_queued`) re-render without auto-sending; a
     /// seeded draft respects the no-clobber guard.
     #[gpui::test]

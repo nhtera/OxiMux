@@ -200,6 +200,43 @@ impl ProjectPanes {
             .find_map(|g| g.read(cx).first_agent_session())
     }
 
+    /// Resolve "the chat to hand a picked browser element to", using the same
+    /// preference order as [`Self::target_agent_session`]: the active group's
+    /// active tab, then its MRU, then any group's active tab, then any group's
+    /// MRU, then any group's first chat tab.
+    ///
+    /// Chat-only on purpose. A picked element carries a cropped screenshot, and
+    /// only an Agent Chat composer can stage an image — a PTY-backed agent tab
+    /// takes a bracketed paste and nothing else. The caller falls back to the
+    /// text-only `SendTextToActiveAgent` path when this returns `None`.
+    pub fn target_agent_chat_view(
+        &self,
+        cx: &App,
+    ) -> Option<Entity<crate::shell::agent_chat::AgentChatView>> {
+        if let Some(active) = self.active_group() {
+            let group = active.read(cx);
+            if let Some(view) = group.active_agent_chat_view() {
+                return Some(view);
+            }
+            if let Some(view) = group.mru_agent_chat_view() {
+                return Some(view);
+            }
+        }
+        for group in self.groups.values() {
+            if let Some(view) = group.read(cx).active_agent_chat_view() {
+                return Some(view);
+            }
+        }
+        for group in self.groups.values() {
+            if let Some(view) = group.read(cx).mru_agent_chat_view() {
+                return Some(view);
+            }
+        }
+        self.groups
+            .values()
+            .find_map(|g| g.read(cx).first_agent_chat_view())
+    }
+
     pub fn tab_count(&self, cx: &App) -> usize {
         self.groups.values().map(|g| g.read(cx).tab_count()).sum()
     }

@@ -3328,6 +3328,33 @@ impl AgentChatView {
         sources
     }
 
+    /// Stage an element picked in the embedded browser: its formatted capture as
+    /// a `@browser` context chip, and the crop of its box as an image
+    /// attachment. Nothing is sent — the chips sit above the composer so the
+    /// user types the actual question ("why is this misaligned?") before
+    /// pressing Enter.
+    ///
+    /// `png` may be empty when the crop failed or the platform has no native
+    /// snapshot; the chip still lands, because the element's HTML and computed
+    /// styles are the half the agent needs most.
+    pub fn stage_browser_pick(
+        &mut self,
+        selector: &str,
+        markdown: String,
+        png: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(chip) = context_providers::browser_chip(selector, markdown) {
+            self.composer.update(cx, |c, cx| c.add_context_chip(chip, cx));
+        }
+        if png.is_empty() {
+            return;
+        }
+        if let Some(staged) = image_attach::pending_from_bytes(png, None) {
+            self.composer.update(cx, |c, cx| c.add_pending_images(vec![staged], cx));
+        }
+    }
+
     /// Capture a picked context provider and hand the resulting chip back to the
     /// composer. Clipboard is synchronous; diff shells out to git off-thread;
     /// terminal re-resolves the tab by its PTY id (it may have closed since the

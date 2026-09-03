@@ -11,7 +11,8 @@
 //!   `@ref1…` so the agent can refer to them compactly.
 //! - **element picker** — an injected shadow-overlay highlights the element
 //!   under the cursor; `C` copies a formatted payload, `S` screenshots its
-//!   rect, `Esc` cancels. All read-only — the picker never mutates the page.
+//!   rect, `A` sends the payload plus that crop to the active Agent Chat,
+//!   `Esc` cancels. All read-only — the picker never mutates the page.
 //! - **screenshot** — native (see [`super::native`]); the picker's `S` path
 //!   routes a rect through it.
 //!
@@ -310,8 +311,10 @@ pub fn profile_menu_js(items_json: &str) -> String {
 /// element, HTML, styles, or text, copy a screenshot of its rect, or send it
 /// to the agent. The chip + popover live in their own shadow root (a
 /// host-drawn popover would render *under* the native webview). Bare `C` / `A`
-/// / `S` keyboard accelerators copy element / send to agent / screenshot
-/// directly while hovering; `Esc` cancels. Listeners are capture-phase +
+/// / `S` keyboard accelerators copy element / send to chat / screenshot
+/// directly while hovering; `Esc` cancels. `A` differs from the other two: it
+/// sends the element *and* a crop of its box to the active Agent Chat, so the
+/// agent gets the markup and the picture together. Listeners are capture-phase +
 /// `stopPropagation` so the page's own handlers never see the picker's clicks
 /// or keys.
 pub const PICKER_JS: &str = r#"
@@ -325,7 +328,7 @@ pub const PICKER_JS: &str = r#"
   var label = document.createElement('div');
   label.style.cssText = 'position:fixed;pointer-events:none;font:12px monospace;background:#111;color:#fff;padding:2px 6px;border-radius:3px;white-space:nowrap;';
   var hint = document.createElement('div');
-  hint.textContent = 'Click to copy element · ⋯ for more · S screenshot · A → agent · Esc';
+  hint.textContent = 'Click to copy element · ⋯ for more · S screenshot · A → chat (with screenshot) · Esc';
   hint.style.cssText = 'position:fixed;left:50%;bottom:16px;transform:translateX(-50%);pointer-events:none;font:11px system-ui,sans-serif;background:rgba(17,17,17,0.92);color:#fff;padding:4px 10px;border-radius:999px;white-space:nowrap;';
   shadow.appendChild(box);
   shadow.appendChild(label);
