@@ -732,6 +732,15 @@ impl BrowserView {
         if !cfg!(target_os = "macos") {
             return false;
         }
+        // A zero-area crop is a request WebKit cannot answer: it returns an
+        // image that fails PNG encoding, so the caller would wait out the whole
+        // deadline for a crop that was never possible. The picker fills a
+        // degenerate box from the nearest ancestor (see `boxOf`), so reaching
+        // here means even that found nothing to shoot.
+        if rect.is_some_and(|r| r.w <= 0.0 || r.h <= 0.0) {
+            tracing::debug!(?rect, "skipping a zero-area screenshot request");
+            return false;
+        }
         let tx = self.events_tx.clone();
         native.screenshot(rect, move |png| {
             let _ = tx.unbounded_send(ChromeEvent::Screenshot { png, dest });
@@ -1234,6 +1243,24 @@ mod tests {
             expired: false,
             _deadline: None,
         }
+    }
+
+    /// The zero-area guard in `capture_screenshot`, as a predicate.
+    fn is_degenerate(r: PickRect) -> bool {
+        r.w <= 0.0 || r.h <= 0.0
+    }
+
+    #[test]
+    fn a_zero_area_rect_is_refused_before_it_reaches_webkit() {
+        // What a `display:contents` span reports. WebKit answers this with an
+        // image that cannot be PNG-encoded, so the crop never arrives and the
+        // pick would wait out the full deadline for nothing.
+        assert!(is_degenerate(PickRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }));
+        // A zero on either axis alone is just as unshootable.
+        assert!(is_degenerate(PickRect { x: 4.0, y: 8.0, w: 120.0, h: 0.0 }));
+        assert!(is_degenerate(PickRect { x: 4.0, y: 8.0, w: 0.0, h: 20.0 }));
+        // A real element's box goes through.
+        assert!(!is_degenerate(PickRect { x: 4.0, y: 8.0, w: 120.0, h: 20.0 }));
     }
 
     #[test]

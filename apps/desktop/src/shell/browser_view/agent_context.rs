@@ -425,8 +425,35 @@ pub const PICKER_JS: &str = r#"
     label.style.left = r.left + 'px';
     label.style.top = Math.max(0, r.top - 20) + 'px';
   }
-  function payload(el) {
+  // The box to screenshot for `el`. An element can be visible yet have a
+  // zero-area `getBoundingClientRect()` — `display:contents` generates no box
+  // of its own, and an inline element can report an empty rect — and asking
+  // WebKit to snapshot a 0x0 region yields an image that cannot be encoded, so
+  // the crop silently never arrives. Fall back to the union of the element's
+  // own client rects, then to the nearest ancestor that has real area: when
+  // someone points at a button's label, the button is what they meant.
+  function boxOf(el) {
     var r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) return r;
+    var rects = el.getClientRects && el.getClientRects();
+    if (rects && rects.length) {
+      var l = Infinity, t = Infinity, rt = -Infinity, b = -Infinity;
+      for (var i = 0; i < rects.length; i++) {
+        l = Math.min(l, rects[i].left); t = Math.min(t, rects[i].top);
+        rt = Math.max(rt, rects[i].right); b = Math.max(b, rects[i].bottom);
+      }
+      if (rt > l && b > t) return { left: l, top: t, width: rt - l, height: b - t };
+    }
+    var n = el.parentElement, hops = 0;
+    while (n && hops < 8) {
+      var pr = n.getBoundingClientRect();
+      if (pr.width > 0 && pr.height > 0) return pr;
+      n = n.parentElement; hops++;
+    }
+    return r;
+  }
+  function payload(el) {
+    var r = boxOf(el);
     var cs = getComputedStyle(el);
     var styles = {};
     ['color', 'background-color', 'font-size', 'font-family', 'display', 'padding', 'margin'].forEach(function (k) {
