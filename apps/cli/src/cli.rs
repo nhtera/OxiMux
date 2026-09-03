@@ -415,6 +415,15 @@ pub enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// The agent-facing guides that teach an agent to drive OxiMux.
+    ///
+    /// Offline: the guides are built into this binary, so what `get` prints
+    /// always matches the verbs this binary accepts. A guide fetched from
+    /// anywhere else can be a release out of date, and an agent cannot tell.
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
     /// Print the full command schema as JSON, for agents driving this CLI
     /// (offline — never touches the host).
     AgentContext,
@@ -640,6 +649,45 @@ pub enum HooksCommand {
     #[command(verbatim_doc_comment)]
     Off {
         /// One agent slug. Default: all of them.
+        #[arg(long, value_name = "SLUG")]
+        agent: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillsCommand {
+    /// List the guides this binary carries, with a one-line summary each.
+    Ls,
+    /// Print one guide on stdout.
+    ///
+    /// Prints the prose. `--full` prints the file exactly as `install` would
+    /// write it, YAML frontmatter and all — that header is skill-discovery
+    /// metadata for an agent runtime, not something a reader asked for.
+    #[command(verbatim_doc_comment)]
+    Get {
+        /// The topic (see `skills ls`).
+        topic: String,
+        /// Include the YAML frontmatter, as installed.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Install the guides into the agents on this machine.
+    ///
+    /// Writes `<agent home>/skills/<topic>/SKILL.md`. Only into agents that
+    /// are actually here: OxiMux adds to an agent's own config directory and
+    /// never conjures one, so an agent you have never run is an error rather
+    /// than a dotfile it did not ask for.
+    ///
+    /// With no --agent the targets are the agents that already keep a skills
+    /// directory. Naming one installs there regardless, creating the directory.
+    ///
+    /// A guide OxiMux wrote before is overwritten — that is the point, since a
+    /// stale guide is the failure this verb exists to prevent. A file OxiMux
+    /// did NOT write, or a symlink, is reported and left alone.
+    #[command(verbatim_doc_comment)]
+    Install {
+        /// One agent slug (see `agent hooks status`). Default: every agent
+        /// here that already keeps skills.
         #[arg(long, value_name = "SLUG")]
         agent: Option<String>,
     },

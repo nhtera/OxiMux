@@ -194,6 +194,7 @@ pub mod schedule;
 pub mod send;
 pub mod session_ctl;
 pub mod sessions;
+pub mod skills;
 pub mod state;
 pub mod status;
 pub mod team;

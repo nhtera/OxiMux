@@ -648,6 +648,35 @@ Replace this installation with the latest signed release
 | --- | --- | --- |
 | `--check` | no | Report what a release offers and exit without changing anything |
 
+### `oximux skills`
+
+The agent-facing guides that teach an agent to drive OxiMux
+
+_No arguments._
+
+#### `oximux skills ls`
+
+List the guides this binary carries, with a one-line summary each
+
+_No arguments._
+
+#### `oximux skills get`
+
+Print one guide on stdout.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<TOPIC>` | yes | The topic (see `skills ls`) |
+| `--full` | no | Include the YAML frontmatter, as installed |
+
+#### `oximux skills install`
+
+Install the guides into the agents on this machine.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--agent` | yes | One agent slug (see `agent hooks status`). Default: every agent here that already keeps skills |
+
 ### `oximux agent-context`
 
 Print the full command schema as JSON, for agents driving this CLI (offline — never touches the host)

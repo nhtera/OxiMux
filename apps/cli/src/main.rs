@@ -176,6 +176,14 @@ fn main() -> std::process::ExitCode {
             };
             render(args.json, outcome)
         }
+        Command::Skills { command } => {
+            let outcome = match command {
+                cli::SkillsCommand::Ls => commands::skills::list(),
+                cli::SkillsCommand::Get { topic, full } => commands::skills::get(topic, *full),
+                cli::SkillsCommand::Install { agent } => commands::skills::install(agent.as_deref()),
+            };
+            render(args.json, outcome)
+        }
         Command::AgentContext => {
             // Schema output is FOR machines; both modes print JSON, `--json`
             // merely wraps it in the standard envelope.
@@ -570,6 +578,7 @@ fn host_verb(mut args: Cli) -> u8 {
                 Command::Version
                 | Command::Update { .. }
                 | Command::AgentContext
+                | Command::Skills { .. }
                 | Command::Agent { .. }
                 | Command::Completions { .. }
                 | Command::Serve { .. }
