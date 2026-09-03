@@ -486,12 +486,31 @@ impl Render for WorkspaceRoot {
                         tracing::debug!("send-pick: no active project");
                         return;
                     };
-                    if let Some(view) = panes.read(cx).target_agent_chat_view(cx) {
+                    if let Some(target) = panes.read(cx).target_agent_chat_view(cx) {
                         let (selector, markdown, png) =
                             (action.selector.clone(), action.markdown.clone(), action.png.clone());
-                        view.update(cx, |chat, cx| {
+                        let had_crop = !png.is_empty();
+                        target.view.update(cx, |chat, cx| {
                             chat.stage_browser_pick(&selector, markdown, png, cx)
                         });
+                        // Say where it went. The destination is usually a tab
+                        // the user is not looking at — they picked in the
+                        // browser — so without this a delivered pick is
+                        // indistinguishable from one that was dropped.
+                        //
+                        // Drawn in the page, not as a host toast: the webview is
+                        // a native view layered over the GPU canvas, so a host
+                        // toast is occluded exactly while a browser tab is
+                        // active, which is always when a pick happens.
+                        let what = if had_crop { "Element + screenshot" } else { "Element" };
+                        let note = format!("{what} → {}", target.name);
+                        if let Some(browser) =
+                            panes.read(cx).active_group().and_then(|g| g.read(cx).active_browser_view())
+                        {
+                            browser.read(cx).confirm_pick_sent(&note);
+                        } else {
+                            this.push_toast(ToastKind::Info, note, cx);
+                        }
                         return;
                     }
                     // No chat tab open. Fall back to the pre-existing behavior —

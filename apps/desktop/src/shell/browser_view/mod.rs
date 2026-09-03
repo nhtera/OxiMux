@@ -720,6 +720,18 @@ impl BrowserView {
         }
     }
 
+    /// Report where a picked element ended up, drawn *in the page*.
+    ///
+    /// It has to be in the page: the webview is a native view layered over the
+    /// GPU canvas, so a host-drawn toast renders underneath it and is invisible
+    /// exactly when a pick happens — while the browser tab is the active one.
+    pub fn confirm_pick_sent(&self, destination: &str) {
+        let Some(native) = &self.native else {
+            return;
+        };
+        native.eval_script(&agent_context::confirm_toast_js(destination));
+    }
+
     /// Returns whether a snapshot was actually requested. Only macOS has a
     /// native one (see [`native::NativeWebview::screenshot`]); elsewhere the
     /// call is a no-op that never answers, and a caller waiting on the result

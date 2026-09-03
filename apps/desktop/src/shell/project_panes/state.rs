@@ -212,24 +212,24 @@ impl ProjectPanes {
     pub fn target_agent_chat_view(
         &self,
         cx: &App,
-    ) -> Option<Entity<crate::shell::agent_chat::AgentChatView>> {
+    ) -> Option<crate::shell::pane_group::ChatTarget> {
         if let Some(active) = self.active_group() {
             let group = active.read(cx);
-            if let Some(view) = group.active_agent_chat_view() {
-                return Some(view);
+            if let Some(target) = group.active_chat_target() {
+                return Some(target);
             }
-            if let Some(view) = group.mru_agent_chat_view() {
-                return Some(view);
-            }
-        }
-        for group in self.groups.values() {
-            if let Some(view) = group.read(cx).active_agent_chat_view() {
-                return Some(view);
+            if let Some(target) = group.mru_agent_chat_view() {
+                return Some(target);
             }
         }
         for group in self.groups.values() {
-            if let Some(view) = group.read(cx).mru_agent_chat_view() {
-                return Some(view);
+            if let Some(target) = group.read(cx).active_chat_target() {
+                return Some(target);
+            }
+        }
+        for group in self.groups.values() {
+            if let Some(target) = group.read(cx).mru_agent_chat_view() {
+                return Some(target);
             }
         }
         self.groups
