@@ -730,6 +730,89 @@ pub struct TeamRoleWire {
     pub updated_at: String,
 }
 
+/// Open a team run whose roles each choose their own agent.
+///
+/// A separate type from [`TeamRunCreateReq`] rather than an extension of it —
+/// see [`crate::proto::Request::TeamRunCreateV2`] for why the v18 shape is
+/// frozen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRunCreateV2Req {
+    /// A name for the run, shown in listings.
+    pub name: String,
+    /// The project root every role's session opens in (or the base for its
+    /// worktree). Validated by the host exactly as `CreateSession`'s cwd is.
+    pub cwd: String,
+    /// The agent for roles that name none of their own. `None` = the host's
+    /// default. Unchanged in meaning from `TeamRunCreateReq.agent_id`.
+    pub agent_id: Option<String>,
+    /// Give each role its own worktree under the project, so roles editing the
+    /// same files do not collide. The host derives each path — never the
+    /// client.
+    pub worktree_each: bool,
+    /// The roles, in order. At least one; the host caps how many.
+    pub roles: Vec<TeamRoleSpecV2Wire>,
+}
+
+/// One role's name, opening instruction, and the agent to work it with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRoleSpecV2Wire {
+    pub name: String,
+    pub prompt: String,
+    /// Which configured agent runs this role. `None` falls back to the run's
+    /// `agent_id`, and then to the host's default.
+    pub agent_id: Option<String>,
+    /// The model to open this role's session on. `None` leaves the agent on its
+    /// own default.
+    ///
+    /// Applied **at spawn**, not as a switch afterwards: Claude and Codex take
+    /// `--model` on the command line and refuse to change it at runtime, and a
+    /// headless host has no view to respawn them through, so a later switch
+    /// would silently fail for exactly those two.
+    ///
+    /// An agent that cannot be given a model at spawn — ACP, whose protocol has
+    /// no model at connect time — fails *that role* rather than opening on its
+    /// default while this field says otherwise.
+    pub model: Option<String>,
+}
+
+/// A team run and every role in it, with the agent each role was worked by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRunV2Wire {
+    pub id: String,
+    pub name: String,
+    pub cwd: String,
+    /// RFC-3339 creation instant, host-local.
+    pub created_at: String,
+    /// `true` once every role has reported.
+    pub closed: bool,
+    pub roles: Vec<TeamRoleV2Wire>,
+}
+
+/// One role's live state, plus what it was launched with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRoleV2Wire {
+    pub name: String,
+    /// The session working this role, when one started. `None` means the
+    /// session could not be opened — the role's status says why.
+    pub session_id: Option<String>,
+    pub status: TeamRoleStatusWire,
+    /// What the role reported, or why it could not start.
+    pub summary: Option<String>,
+    /// RFC-3339 instant the role last changed state, host-local.
+    pub updated_at: String,
+    /// The agent this role was **asked** to be worked by: its own choice, or
+    /// the run's. Present even when the role failed to start, which is the
+    /// point — a board that dropped the name of the agent that could not launch
+    /// would hide the most useful fact about the failure. `None` means none was
+    /// recorded: the run predates this verb, or nobody named one and the host
+    /// resolved its own default, whose id it does not report.
+    pub agent_id: Option<String>,
+    /// The model this role was launched on, when one was asked for. Recorded
+    /// for a failed role too, for the same reason as `agent_id` — including a
+    /// role that failed *because* its agent could not be given one at spawn.
+    pub model: Option<String>,
+}
+
 /// Where a role stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TeamRoleStatusWire {

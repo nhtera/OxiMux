@@ -66,6 +66,14 @@ pub struct TeamRole {
     pub status: TeamRoleStatus,
     pub summary: Option<String>,
     pub updated_at: DateTime<Local>,
+    /// Which agent worked this role: its own override, or the run-level
+    /// default the host resolved for it. `None` means no name was recorded —
+    /// the role predates per-role agents, or nobody named one and the host
+    /// fell back to its own default, whose id the launcher never returns.
+    pub agent_id: Option<String>,
+    /// The model asked for on top of that agent, when one was. `None` is the
+    /// agent's own default, not a failure to record.
+    pub model: Option<String>,
 }
 
 /// A run and its roles.
@@ -101,6 +109,11 @@ pub struct NewTeamRole {
     /// nothing running.
     pub status: TeamRoleStatus,
     pub summary: Option<String>,
+    /// The agent resolved for this role, when the caller named one at either
+    /// level. See [`TeamRole::agent_id`] for why `None` is a real answer.
+    pub agent_id: Option<String>,
+    /// The model asked for, when one was.
+    pub model: Option<String>,
 }
 
 /// Team runs, backed by the app's SQLite database. Cloning shares the
@@ -141,7 +154,7 @@ impl TeamStore {
         for role in roles {
             tx.execute(
                 "INSERT INTO team_run_roles (run_id, name, session_id, status, summary, \
-                 updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 updated_at, agent_id, model) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     id,
                     role.name,
@@ -149,6 +162,8 @@ impl TeamStore {
                     role.status.as_text(),
                     role.summary,
                     now.to_rfc3339(),
+                    role.agent_id,
+                    role.model,
                 ],
             )
             .context("insert team role")?;
@@ -167,6 +182,8 @@ impl TeamStore {
                     status: r.status,
                     summary: r.summary.clone(),
                     updated_at: now,
+                    agent_id: r.agent_id.clone(),
+                    model: r.model.clone(),
                 })
                 .collect(),
         })
@@ -339,8 +356,8 @@ impl TeamStore {
 fn read_roles(conn: &Connection, run_id: &str) -> Result<Vec<TeamRole>> {
     let mut stmt = conn
         .prepare(
-            "SELECT name, session_id, status, summary, updated_at FROM team_run_roles \
-             WHERE run_id = ?1 ORDER BY rowid",
+            "SELECT name, session_id, status, summary, updated_at, agent_id, model \
+             FROM team_run_roles WHERE run_id = ?1 ORDER BY rowid",
         )
         .context("prepare roles")?;
     let rows = stmt
@@ -360,6 +377,8 @@ fn row_to_role(row: &Row<'_>) -> TeamRole {
         ),
         summary: row.get::<_, Option<String>>(3).unwrap_or(None),
         updated_at: parse_time(&row.get::<_, String>(4).unwrap_or_default()),
+        agent_id: row.get::<_, Option<String>>(5).unwrap_or(None),
+        model: row.get::<_, Option<String>>(6).unwrap_or(None),
     }
 }
 
@@ -393,6 +412,8 @@ mod tests {
             session_id: session.map(str::to_string),
             status: TeamRoleStatus::Running,
             summary: None,
+            agent_id: None,
+            model: None,
         }
     }
 
@@ -413,6 +434,65 @@ mod tests {
         assert_eq!(read.roles.len(), 2);
         assert_eq!(read.roles[0].name, "backend", "roles keep their creation order");
         assert!(!read.closed(), "nothing has reported");
+    }
+
+    /// Each role carries its own agent and model, and a role that named
+    /// neither reads back as having named neither — not as the other role's.
+    #[test]
+    fn each_role_keeps_its_own_agent_and_model() {
+        let store = store();
+        let made = store
+            .create(
+                "split brain",
+                "/work",
+                &[
+                    NewTeamRole {
+                        agent_id: Some("claude".into()),
+                        model: Some("opus".into()),
+                        ..role("plan", Some("sess-1"))
+                    },
+                    NewTeamRole { agent_id: Some("codex".into()), ..role("impl", Some("sess-2")) },
+                    role("review", Some("sess-3")),
+                ],
+                at("2026-09-04 09:00:00"),
+            )
+            .expect("create");
+
+        // The value `create` returns and the value a later read produces must
+        // agree: a board read after a restart is the one that matters, and a
+        // return-only field would look correct until exactly then.
+        for run in [made.clone(), store.get(&made.id).expect("get").expect("exists")] {
+            let by = |name: &str| {
+                run.roles.iter().find(|r| r.name == name).expect("role present").clone()
+            };
+            assert_eq!(by("plan").agent_id.as_deref(), Some("claude"));
+            assert_eq!(by("plan").model.as_deref(), Some("opus"));
+            assert_eq!(by("impl").agent_id.as_deref(), Some("codex"));
+            assert_eq!(by("impl").model, None, "no model asked for is not the sibling's model");
+            assert_eq!(by("review").agent_id, None, "a role that named none reads as none");
+        }
+    }
+
+    /// A report settles a role without disturbing what it was launched with —
+    /// the board still says which agent did the work after it has finished.
+    #[test]
+    fn a_report_does_not_erase_the_agent() {
+        let store = store();
+        let made = store
+            .create(
+                "sweep",
+                "/work",
+                &[NewTeamRole { agent_id: Some("codex".into()), ..role("impl", Some("s-1")) }],
+                at("2026-09-04 09:00:00"),
+            )
+            .expect("create");
+        store
+            .report(&made.id, "impl", true, Some("done"), at("2026-09-04 10:00:00"))
+            .expect("report");
+
+        let read = store.get(&made.id).expect("get").expect("exists");
+        assert_eq!(read.roles[0].status, TeamRoleStatus::Done);
+        assert_eq!(read.roles[0].agent_id.as_deref(), Some("codex"));
     }
 
     /// The convergence property `team status` depends on: a run is closed

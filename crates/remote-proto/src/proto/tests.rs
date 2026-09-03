@@ -17,10 +17,10 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 21,
-        "v21 = the worktree progress board (SetWorktreeProgress / ListWorktreeProgress). \
-         A sidecar verb pair rather than fields on WorktreeWire, which is frozen inside \
-         the Response::Worktrees vector v16 peers already request"
+        PROTOCOL_VERSION, 22,
+        "v22 = per-role agents in a team run (TeamRunCreateV2 / TeamStatusV2 / TeamRunV2). \
+         New verbs and new wire types rather than fields on the v18 ones, which are frozen \
+         inside the Vec a v18 CLI already sends and decodes"
     );
 }
 
@@ -474,4 +474,85 @@ fn early_variants_keep_their_literal_ordinals() {
         entry: None,
     });
     assert_eq!(changed_at.to_bytes().expect("encode")[0], 47);
+
+    // v21: the worktree progress sidecar — `SetWorktreeProgress` (62),
+    // `ListWorktreeProgress` (63), and `WorktreeProgress` (48).
+    let set_progress =
+        Request::SetWorktreeProgress { id: String::new(), comment: None, phase: None };
+    assert_eq!(set_progress.to_bytes().expect("encode")[0], 62);
+    let list_progress = Request::ListWorktreeProgress { project_path: None };
+    assert_eq!(list_progress.to_bytes().expect("encode")[0], 63);
+    assert_eq!(Response::WorktreeProgress(vec![]).to_bytes().expect("encode")[0], 48);
+
+    // v22: per-role agents — `TeamRunCreateV2` (64), `TeamStatusV2` (65), and
+    // `TeamRunV2` (49). The v18 team verbs (53-56) and `TeamRun` (40) keep
+    // their ordinals above: a stale CLI must go on speaking what it spoke.
+    let create_v2 = Request::TeamRunCreateV2(TeamRunCreateV2Req {
+        name: String::new(),
+        cwd: String::new(),
+        agent_id: None,
+        worktree_each: false,
+        roles: vec![],
+    });
+    assert_eq!(create_v2.to_bytes().expect("encode")[0], 64);
+    let status_v2 = Request::TeamStatusV2 { run_id: String::new() };
+    assert_eq!(status_v2.to_bytes().expect("encode")[0], 65);
+    let run_v2 = TeamRunV2Wire {
+        id: String::new(),
+        name: String::new(),
+        cwd: String::new(),
+        created_at: String::new(),
+        closed: false,
+        roles: vec![],
+    };
+    assert_eq!(Response::TeamRunV2(run_v2).to_bytes().expect("encode")[0], 49);
+}
+
+/// The reason both team shapes exist: a v18 `TeamRunWire` frame must decode
+/// identically under this build, byte for byte, as the shape it always was.
+///
+/// If someone "simplifies" this later by adding `agent_id` to `TeamRoleWire`
+/// instead, this fails — which is the entire point. Postcard encodes struct
+/// fields positionally, so the appended field would make a stale CLI misparse
+/// every role after the first and drop the connection.
+#[test]
+fn the_v18_team_shape_is_frozen() {
+    let v18 = Response::TeamRun(TeamRunWire {
+        id: "run-1".into(),
+        name: "sweep".into(),
+        cwd: "/w".into(),
+        created_at: "t".into(),
+        closed: false,
+        roles: vec![TeamRoleWire {
+            name: "impl".into(),
+            session_id: None,
+            status: TeamRoleStatusWire::Running,
+            summary: None,
+            updated_at: "t".into(),
+        }],
+    });
+    let bytes = v18.to_bytes().expect("encode");
+    // Hand-computed from the v18 field order: ordinal 40, then id/name/cwd/
+    // created_at as length-prefixed strings, `closed` as 0, one role, and that
+    // role's five fields. A change to any field's position or presence moves
+    // these bytes.
+    assert_eq!(
+        bytes,
+        vec![
+            40, // Response::TeamRun
+            5, b'r', b'u', b'n', b'-', b'1', //
+            5, b's', b'w', b'e', b'e', b'p', //
+            2, b'/', b'w', //
+            1, b't',  //
+            0,    // closed
+            1,    // one role
+            4, b'i', b'm', b'p', b'l', //
+            0, // session_id: None
+            0, // status: Running
+            0, // summary: None
+            1, b't', //
+        ],
+        "the v18 team reply is frozen — a field added to it strands every stale CLI"
+    );
+    assert_eq!(Response::from_bytes(&bytes).expect("decode"), v18);
 }

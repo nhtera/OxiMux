@@ -393,6 +393,10 @@ impl Dispatcher {
             Request::TeamReport(r) => self.team_report(peer, r),
             Request::TeamStatus { run_id } => self.team_status(peer, &run_id),
             Request::TeamList => self.team_list(peer),
+            // v22: the same board, one shape wider. `TeamRunCreateV2` is async
+            // for the same reason its v18 sibling is and is intercepted beside
+            // it in `serve`.
+            Request::TeamStatusV2 { run_id } => self.team_status_v2(peer, &run_id),
             Request::StateGet { key } => self.state_get(peer, &key),
             Request::StateSet(r) => self.state_set(peer, r),
             Request::StateDelete { key } => self.state_delete(peer, &key),

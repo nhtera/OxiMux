@@ -71,7 +71,10 @@ pub struct Migration {
 /// text at the time a note was written, so a note that has drifted off its
 /// line number can be re-anchored or reported gone instead of silently
 /// quoting whatever code now sits there (additive, DEFAULT '', no backfill:
-/// existing rows read as unverifiable and stay put).
+/// existing rows read as unverifiable and stay put). V027 adds
+/// `team_run_roles.agent_id` and `.model` — which agent worked each role,
+/// nullable because "no agent recorded" is a permanent state for every role
+/// created before it, not an unset field.
 /// Future migrations append; never reorder, never rewrite.
 pub const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -216,6 +219,13 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 26,
         name: "workspace_comment_and_phase",
         sql: include_str!("../migrations/V026__workspace_comment_and_phase.sql"),
+    },
+    // V027 moves the agent choice from the run onto the role, so one run can
+    // have a planner and an implementer rather than three copies of one agent.
+    Migration {
+        version: 27,
+        name: "team_role_agent",
+        sql: include_str!("../migrations/V027__team_role_agent.sql"),
     },
 ];
 
@@ -530,6 +540,53 @@ mod tests {
         assert_eq!(branch, "oximux/feature", "existing data must survive");
         assert_eq!(comment, "", "an upgraded row reads as having said nothing");
         assert_eq!(phase, "", "an upgraded row reads as having no phase");
+    }
+
+    /// The same upgrade proof for V027, on the table a team run reads back
+    /// through: a role recorded before per-role agents existed must open as
+    /// "no agent recorded" rather than as a failed read.
+    #[test]
+    fn a_pre_v027_team_role_upgrades_with_no_agent_recorded() {
+        let mut conn = mem_conn();
+        let upto_26: Vec<Migration> =
+            MIGRATIONS.iter().filter(|m| m.version <= 26).cloned().collect();
+        run_migrations(&mut conn, &upto_26).expect("ladder through V026");
+
+        conn.execute(
+            "INSERT INTO team_runs (id, name, cwd, created_at) \
+             VALUES ('run-1', 'sweep', '/p', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("seed run");
+        conn.execute(
+            "INSERT INTO team_run_roles (run_id, name, session_id, status, summary, updated_at) \
+             VALUES ('run-1', 'impl', 's-1', 'running', NULL, '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("seed role");
+
+        assert!(
+            conn.query_row("SELECT agent_id FROM team_run_roles", [], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .is_err(),
+            "V026 must not already have `agent_id` — this test would be vacuous"
+        );
+
+        run_migrations(&mut conn, MIGRATIONS).expect("upgrade to head");
+
+        let (name, session, agent, model): (String, Option<String>, Option<String>, Option<String>) =
+            conn.query_row(
+                "SELECT name, session_id, agent_id, model FROM team_run_roles \
+                 WHERE run_id = 'run-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("the pre-existing role survives the upgrade");
+        assert_eq!(name, "impl", "existing data must survive");
+        assert_eq!(session.as_deref(), Some("s-1"), "existing data must survive");
+        assert_eq!(agent, None, "an upgraded role names no agent");
+        assert_eq!(model, None, "an upgraded role names no model");
     }
 
     fn applied_versions(conn: &Connection) -> Vec<u32> {

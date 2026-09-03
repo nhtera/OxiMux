@@ -523,6 +523,15 @@ impl Dispatcher {
             let response = self.team_run_create(&peer, req).await;
             return self.send(transport, response).await;
         }
+        // v22: the same launch, with each role free to name its own agent and
+        // model. Async for the same reason, and gated by the same handler.
+        if let Request::TeamRunCreateV2(req) = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.team_run_create_v2(&peer, req).await;
+            return self.send(transport, response).await;
+        }
         // `StateWatch`, like `Subscribe`, answers with a baseline AND opens a
         // live stream, so it is handled here rather than in the sync `dispatch`.
         if let Request::StateWatch { prefix } = req {

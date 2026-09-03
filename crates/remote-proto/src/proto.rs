@@ -93,12 +93,22 @@ pub use crate::messages::*;
 /// `StateWatch` is untouched and still served: a v18 peer keeps working exactly
 /// as before, and gets the cursor-less push it has a decoder for.
 ///
+/// v22: appended **per-role agents in a team run** (`TeamRunCreateV2` and
+/// `TeamStatusV2`, answered by `TeamRunV2`). v18 put one `--agent` on the whole
+/// run because that is what the launcher took; the loop teams are built around
+/// is one agent planning while another implements, which makes the choice a
+/// property of the role. New verbs and new wire types rather than fields on the
+/// v18 ones, for the reason stated on `ListWorktreeProgress`: everything in
+/// `TeamRunCreateReq.roles` and `TeamRunWire.roles` is a positional postcard
+/// struct a v18 CLI already sends and decodes. The v18 verbs are untouched and
+/// still served.
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 21;
+pub const PROTOCOL_VERSION: u32 = 22;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -125,6 +135,21 @@ pub const STATE_PUSH_MIN_VERSION: u32 = 18;
 /// that — but the gate is stated so it is a property of the push rather than an
 /// inference about who could have subscribed.
 pub const STATE_CURSOR_PUSH_MIN_VERSION: u32 = 19;
+
+/// The oldest host that serves the per-role team verbs
+/// ([`Request::TeamRunCreateV2`], [`Request::TeamStatusV2`]).
+///
+/// Unlike the push gates above, this one is read by the **client**: an older
+/// host cannot decode an ordinal it does not know, and answers
+/// [`RpcError::BadRequest`] with "undecodable request frame" — a message about
+/// a malformed request, for what is really a version problem, and one a caller
+/// has no way to act on. So a client must not send these to one. A client that
+/// wants only what v18 could
+/// do falls back to the v18 verbs rather than refusing — the older host can
+/// honour that request exactly, and the board it returns simply has no agent
+/// column. Only a request that actually names a per-role agent or model is
+/// refused, because that one it genuinely cannot serve.
+pub const TEAM_PER_ROLE_MIN_VERSION: u32 = 22;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the
@@ -655,13 +680,37 @@ pub enum Request {
     /// **Why a second call rather than fields on [`WorktreeWire`].** That type
     /// travels inside [`Response::Worktrees`], a `Vec` reply that v16 peers
     /// already request. Postcard encodes struct fields positionally, so an
-    /// appended field makes every older decoder misparse each element after
-    /// the first — a dropped connection, not a skipped field. Frozen types get
-    /// a new verb; only the envelope enums tolerate appends.
+    /// appended field makes every older decoder misparse each element after the
+    /// first — at best a decode error, at worst rows that parse into plausible
+    /// garbage, and never a skipped field. Frozen types get a new verb; only
+    /// the envelope enums tolerate appends.
     ///
     /// Rows whose comment and phase are both unset are omitted, so the common
     /// case costs an empty vector.
     ListWorktreeProgress { project_path: Option<String> },
+
+    // ---- v22: per-role agents in a team run ----
+    /// Open a team run whose roles each name their own agent and model.
+    ///
+    /// Gated exactly as [`Request::TeamRunCreate`], which it does not replace:
+    /// that verb still works and still opens a run where one agent covers
+    /// every role.
+    ///
+    /// **Why a second verb rather than fields on [`TeamRoleSpecWire`].** That
+    /// type travels inside `TeamRunCreateReq.roles`, a `Vec` a v18 CLI already
+    /// sends. Postcard encodes struct fields positionally, so a host expecting
+    /// an appended field would misparse every element after the first of an
+    /// older client's request — a rejected frame, not a skipped field. The
+    /// direction is reversed from [`Request::ListWorktreeProgress`]'s case,
+    /// and the conclusion is the same: frozen types get a new verb.
+    TeamRunCreateV2(TeamRunCreateV2Req),
+    /// One run's board, including which agent worked each role.
+    ///
+    /// Same read gate and same answer as [`Request::TeamStatus`], in the
+    /// [`TeamRunV2Wire`] shape. Both verbs are served: a v18 CLI keeps asking
+    /// the old one and gets a board with no agent column, which is the honest
+    /// reading — it has no field to put one in.
+    TeamStatusV2 { run_id: String },
 }
 
 /// Host → client.
@@ -869,6 +918,15 @@ pub enum Response {
     /// Reply to [`Request::ListWorktreeProgress`]. Empty is a normal answer —
     /// no worktree has said anything about itself yet.
     WorktreeProgress(Vec<WorktreeProgressWire>),
+
+    // ---- v22: per-role agents in a team run ----
+    /// Reply to [`Request::TeamRunCreateV2`] and [`Request::TeamStatusV2`] —
+    /// one run with every role's state and the agent that worked it.
+    ///
+    /// A run opened through the v18 verb answers here too when asked through
+    /// [`Request::TeamStatusV2`]: its roles simply name no agent, which is
+    /// what they recorded.
+    TeamRunV2(TeamRunV2Wire),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.
