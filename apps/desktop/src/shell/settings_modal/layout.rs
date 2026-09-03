@@ -375,6 +375,57 @@ pub(super) fn setting_row_action_hint(
     theme: Theme,
     typography: &Typography,
 ) -> AnyElement {
+    stacked_row(
+        label.into(),
+        description.into(),
+        Some(action.into_any_element()),
+        body.into_any_element(),
+        Some(hint.into_any_element()),
+        theme,
+        typography,
+    )
+}
+
+/// A setting whose control is a full-width block under its label, with no
+/// trailing action and no hint.
+///
+/// Use this the moment a control's *intrinsic* width can exceed the row.
+/// [`setting_row_desc`] pins its control right at that intrinsic width and
+/// never shrinks it, which is correct for a switch or a chip and catastrophic
+/// for a growing cluster: the label column is the only thing in the row
+/// allowed to shrink, so it absorbs the whole overflow and collapses to one
+/// character per line. Not hypothetical — it is what the default-agent picker
+/// did the moment its list stopped being four items.
+pub(super) fn setting_row_stack(
+    label: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    body: impl IntoElement,
+    theme: Theme,
+    typography: &Typography,
+) -> AnyElement {
+    stacked_row(
+        label.into(),
+        description.into(),
+        None,
+        body.into_any_element(),
+        None,
+        theme,
+        typography,
+    )
+}
+
+/// The shared body of [`setting_row_action_hint`] and [`setting_row_stack`]:
+/// a label line carrying an optional trailing `action`, a full-width `body`
+/// beneath it, and an optional `hint` under that.
+fn stacked_row(
+    label: SharedString,
+    description: SharedString,
+    action: Option<AnyElement>,
+    body: AnyElement,
+    hint: Option<AnyElement>,
+    theme: Theme,
+    typography: &Typography,
+) -> AnyElement {
     div()
         .flex()
         .flex_col()
@@ -391,15 +442,14 @@ pub(super) fn setting_row_action_hint(
                 .gap(px(16.0))
                 // Same pairing as `desc_row`: the text column may shrink and
                 // wrap, the action never does.
-                .child(
-                    label_column(label.into(), description.into(), theme, typography)
-                        .flex_1()
-                        .min_w_0(),
-                )
-                .child(div().flex_none().child(action.into_any_element())),
+                .child(label_column(label, description, theme, typography).flex_1().min_w_0())
+                .children(action.map(|a| div().flex_none().child(a))),
         )
-        .child(div().w_full().child(body.into_any_element()))
-        .child(div().w_full().min_w_0().child(hint.into_any_element()))
+        // `min_w_0` so a body that cannot wrap (a long chip cluster) is clipped
+        // by the row rather than widening it, which would push the whole card
+        // past the pane and take its scroll with it.
+        .child(div().w_full().min_w_0().child(body))
+        .children(hint.map(|h| div().w_full().min_w_0().child(h)))
         .into_any_element()
 }
 
@@ -504,7 +554,10 @@ pub(super) fn notice_text(
 
 #[cfg(test)]
 mod tests {
-    use super::{hint_text, list_row, query_matches, setting_row_desc, setting_row_desc_hint};
+    use super::{
+        hint_text, list_row, query_matches, setting_row_desc, setting_row_desc_hint,
+        setting_row_stack,
+    };
     use gpui::{
         Bounds, Context, IntoElement, ParentElement as _, Pixels, Render, Styled as _,
         TestAppContext, Window, canvas, div, prelude::FluentBuilder as _, px, size,
@@ -748,6 +801,84 @@ mod tests {
             f32::from(bounds.origin.x) >= ROW_W / 2.0,
             "the name + résumé column got only {}px of the {ROW_W}px row",
             f32::from(bounds.origin.x),
+        );
+    }
+
+    /// Wider than `ROW_W` — eight chips' worth. The shape a growing cluster
+    /// becomes; every other probe here uses a control that FITS, which is
+    /// exactly the case `setting_row_desc` handles correctly.
+    const WIDE_W: f32 = 640.0;
+
+    /// Renders one row with an over-wide control and measures the row's
+    /// HEIGHT, by reading where a canvas placed directly beneath it lands.
+    ///
+    /// Height is the signal, not width: pinned right, the over-wide control
+    /// keeps its intrinsic size and the label column — the only shrinkable
+    /// thing in the row — is squeezed to nothing, so "Default agent" wraps to
+    /// one character per line and the row grows several times taller. Reading
+    /// the control's own bounds cannot tell the two shapes apart; the label's
+    /// collapse is what is visible.
+    struct WideProbe {
+        below: Rc<Cell<Option<Bounds<Pixels>>>>,
+        pinned: bool,
+    }
+
+    impl Render for WideProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let sink = self.below.clone();
+            let theme = Theme::default();
+            let typography = Typography::default();
+            let body = div().h(px(24.0)).child(div().w(px(WIDE_W)).h(px(24.0)));
+            let row = if self.pinned {
+                setting_row_desc("Default agent", "Surfaced first in the launcher.", body, theme, &typography)
+            } else {
+                setting_row_stack("Default agent", "Surfaced first in the launcher.", body, theme, &typography)
+            };
+            div().w(px(ROW_W)).flex().flex_col().child(row).child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds: Bounds<Pixels>, _: (), _window, _cx| sink.set(Some(bounds)),
+                )
+                .w_full()
+                .h(px(1.0)),
+            )
+        }
+    }
+
+    fn wide_row_height(cx: &mut TestAppContext, pinned: bool) -> f32 {
+        let below = Rc::new(Cell::new(None));
+        let sink = below.clone();
+        let w = cx.add_window(move |_window, _cx| WideProbe { below: sink, pinned });
+        let vcx = gpui::VisualTestContext::from_window(w.into(), cx);
+        vcx.simulate_resize(size(px(900.0), px(600.0)));
+        vcx.run_until_parked();
+        f32::from(below.get().expect("the marker painted").origin.y)
+    }
+
+    /// A control cluster wider than its row must be stacked, not pinned right.
+    ///
+    /// This is the fault phase 5 shipped and no existing probe caught. The two
+    /// shapes are compared against each other rather than against a fixed
+    /// pixel budget, so the guard survives a font-metric change and still
+    /// fails the moment a growing cluster is routed back through
+    /// [`setting_row_desc`].
+    #[gpui::test]
+    fn a_cluster_wider_than_its_row_must_be_stacked_not_pinned(cx: &mut TestAppContext) {
+        let stacked = wide_row_height(cx, false);
+        let pinned = wide_row_height(cx, true);
+        assert!(
+            pinned > stacked * 1.5,
+            "the probe no longer tells the two shapes apart — pinned {pinned}px vs \
+             stacked {stacked}px. Either the pinned shape stopped starving its label \
+             (good: rewrite this test) or the probe stopped reproducing the fault.",
+        );
+        // A stacked row is 12+12 padding, two 8px gaps, a label line, a
+        // description line and a 24px body — a shade over 90. Well clear of a
+        // label that has wrapped even twice.
+        assert!(
+            stacked < 110.0,
+            "a stacked row is a label line, a description line and a 24px body; \
+             {stacked}px means the label wrapped when it should not have",
         );
     }
 

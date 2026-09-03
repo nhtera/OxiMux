@@ -20,7 +20,7 @@ use super::SettingsModal;
 use super::controls::{icon_button, toggle_chip, toggle_switch, value_chip};
 use super::layout::{
     SettingEntry, card_surface, entry, hint_text, list_row, notice_text, section_card,
-    setting_row_action_hint, setting_row_desc, setting_row_desc_hint,
+    setting_row_action_hint, setting_row_desc, setting_row_desc_hint, setting_row_stack,
 };
 use super::segmented::{Segment, segmented};
 use crate::shell::agent_presentation::adapter_icon_path;
@@ -698,29 +698,7 @@ pub(super) fn render_env_card(
         ));
     }
 
-    // With `default` selected these controls and the agent row above address
-    // the SAME entry, which is invisible unless said: two controls, one value.
-    let launch_hint: SharedString = if acp {
-        // Not a missing feature — a wrong one. An ACP chat backend is built
-        // from `acp_command` + `acp_args`, so of the three profile axes only
-        // `env` reaches the process. A skip-perms chip here would write a flag
-        // nothing ever reads and look like it had taken effect.
-        format!(
-            "{agent_display} speaks ACP, so its flags and model come from the agent itself.              Its environment below still applies."
-        )
-        .into()
-    } else {
-        match modal.env_profile.as_deref() {
-            None => format!(
-                "Writing to “{DEFAULT_PROFILE}” — the same entry the {agent_display} row                  above edits."
-            )
-            .into(),
-            Some(name) => format!(
-                "Writing to “{name}” only — the {agent_display} row above keeps showing                  the default."
-            )
-            .into(),
-        }
-    };
+    let launch_hint = flags_hint(acp, &agent_display, modal.env_profile.as_deref());
     rows.push(setting_row_desc_hint(
         "Flags & model",
         "The extra CLI flags and default model this profile launches with.",
@@ -808,6 +786,38 @@ pub(super) fn render_env_card(
     card_surface(theme, density, section_card(theme, density, rows))
 }
 
+
+/// What the Flags & model row says about where its controls write.
+///
+/// Extracted from the render so the card's longest sentences are assertable:
+/// they name the agent, the profile, and — with `default` selected — the fact
+/// that these controls and the agent row above address the SAME entry, which
+/// is invisible unless said.
+///
+/// For an ACP agent the row has no controls at all. That is not a missing
+/// feature but the avoidance of a wrong one: an ACP chat backend is built from
+/// `acp_command` + `acp_args`, so of the three profile axes only `env` reaches
+/// the process, and a skip-perms chip here would write a flag nothing reads
+/// while looking like it had taken effect.
+fn flags_hint(acp: bool, agent_display: &str, profile: Option<&str>) -> SharedString {
+    if acp {
+        return format!(
+            "{agent_display} speaks ACP, so its flags and model come from the agent itself. \
+             Its environment below still applies."
+        )
+        .into();
+    }
+    match profile {
+        None => format!(
+            "Writing to “{DEFAULT_PROFILE}” — the same entry the {agent_display} row above edits."
+        )
+        .into(),
+        Some(name) => format!(
+            "Writing to “{name}” only — the {agent_display} row above keeps showing the default."
+        )
+        .into(),
+    }
+}
 
 /// One agent in the environment card's picker grid: icon, name, and — once
 /// detection has answered — a dimmed treatment when the CLI is not on PATH.
@@ -1080,7 +1090,11 @@ pub(super) fn render_launch_card(
         theme,
         typography,
     ));
-    rows.push(setting_row_desc(
+    // Stacked, not right-pinned: the chip row grows with the catalog, and a
+    // right-pinned cluster is measured at its own intrinsic width and never
+    // shrinks — so the label column absorbs the overflow. At eight agents
+    // "Default agent" rendered one character per line.
+    rows.push(setting_row_stack(
         "Default agent",
         "Surfaced first in the launcher.",
         default_agent_chips(modal, theme, density, typography, cx),
@@ -1103,7 +1117,9 @@ fn default_agent_chips(
     cx: &mut gpui::Context<SettingsModal>,
 ) -> AnyElement {
     let current = modal.agent_launch.default_agent.clone();
-    let mut row = div().flex().flex_row().items_center().gap(px(6.0));
+    // Wraps: the catalog is a dozen agents and grows, and a single line of
+    // chips would simply run off the card.
+    let mut row = div().flex().flex_row().flex_wrap().items_center().gap(px(6.0)).w_full();
     row = row.child(choice_chip(
         "launch-default-none",
         "None",
@@ -1675,6 +1691,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(summarize(Some(&env_only)), "1 variable");
+    }
+
+    #[test]
+    fn the_flags_row_says_which_entry_it_writes() {
+        let default = flags_hint(false, "Claude Code", None);
+        assert!(
+            default.contains(DEFAULT_PROFILE) && default.contains("Claude Code"),
+            "with `default` selected the row and the card above are ONE entry, \
+             and only this line says so: {default}",
+        );
+        let named = flags_hint(false, "Claude Code", Some("proxy"));
+        assert!(named.contains("proxy") && named.contains("Claude Code"), "{named}");
+        assert_ne!(default, named, "the two cases must not read alike");
+
+        // An ACP agent has no controls in this row at all, so the line has to
+        // explain the absence rather than leave it looking broken.
+        let acp = flags_hint(true, "in-house", None);
+        assert!(acp.contains("in-house") && acp.contains("ACP"), "{acp}");
+        assert!(
+            acp.contains("environment"),
+            "it must still point at the axis that DOES apply: {acp}",
+        );
+
+        // Every one of them is a sentence, not a sentence with a hole in it —
+        // a line-continuation that failed to strip its indent shipped exactly
+        // that, twice, and only a screenshot caught it.
+        for line in [default, named, acp] {
+            assert!(!line.contains("  "), "run of spaces in a user-facing line: {line:?}");
+        }
     }
 
     #[test]
