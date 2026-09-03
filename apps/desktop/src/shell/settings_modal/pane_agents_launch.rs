@@ -1552,22 +1552,40 @@ fn agent_control(
 /// One-line description of an agent's current launch config (also the search
 /// haystack), e.g. "Flags: --dangerously-skip-permissions · model opus".
 fn agent_summary(modal: &SettingsModal, adapter_id: &str) -> SharedString {
-    let Some(launch) = modal.agent_launch.for_agent(adapter_id) else {
-        return NO_OVERRIDES.into();
-    };
-    if launch.disabled {
+    agent_resume(
+        modal.agent_launch.for_agent(adapter_id),
+        modal.agent_launch.profile_names(adapter_id).len(),
+    )
+}
+
+/// The agent row's résumé: the shared formatter plus the one term only this
+/// row can know, the profile count.
+///
+/// Split from [`agent_summary`] so it can be tested without a `SettingsModal`.
+/// `profile_name_count` is the length of `profile_names`, which always leads
+/// with `default` — hence the `saturating_sub(1)`.
+fn agent_resume(launch: Option<&PerAgentLaunch>, profile_name_count: usize) -> SharedString {
+    // Deliberately tolerant of `None`: an agent can carry profiles while
+    // having no `[agents.<id>]` entry at all, because nothing writes that
+    // entry until a default-scoped control is touched. Returning early on
+    // `None` skipped the profile count below, so an agent configured ONLY
+    // through a profile advertised "Launches with defaults." and hid the
+    // profile that exists — reachable for every agent phase 5 made
+    // configurable, and visible only in a screenshot.
+    //
+    // `disabled` is a field of the default entry, so an agent without one
+    // cannot be hidden from the launcher.
+    if launch.is_some_and(|l| l.disabled) {
         return "Hidden from the launcher.".into();
     }
-    let mut parts = summary_parts(Some(launch));
+    let mut parts = summary_parts(launch);
     // This row describes the agent's DEFAULT entry, and once a profile can
     // diverge from it (flags and model, not just environment) the row would be
     // over-claiming without saying so. The count both admits the subtitle is
     // partial and makes profiles discoverable from the card users read first.
     // Omitted entirely at zero: most agents have none, and "0 profiles" is
     // noise on every one of them.
-    //
-    // `profile_names` always leads with `default`, which is this entry.
-    match modal.agent_launch.profile_names(adapter_id).len().saturating_sub(1) {
+    match profile_name_count.saturating_sub(1) {
         0 => {}
         1 => parts.push("1 profile".to_string()),
         n => parts.push(format!("{n} profiles")),
@@ -1691,6 +1709,36 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(summarize(Some(&env_only)), "1 variable");
+    }
+
+    #[test]
+    fn an_agent_configured_only_through_a_profile_still_counts_it() {
+        // The regression: `agent_summary` used `let else` on the default
+        // entry, so an agent with profiles and no `[agents.<id>]` section
+        // returned "Launches with defaults." before ever reaching the count.
+        // Every ACP preset and `Custom` lands in exactly that state — they get
+        // no default entry until a default-scoped control is touched — so the
+        // agents the catalog phase made configurable were the ones that hid
+        // their own profiles. Live-caught; no unit test reached this path
+        // because they all called the pure formatter directly.
+        //
+        // `profile_names` leads with `default`, so two names is one profile.
+        assert_eq!(agent_resume(None, 2), "1 profile");
+        assert_eq!(agent_resume(None, 3), "2 profiles");
+
+        // With no profiles it must still read as the plain sentence, not as
+        // "0 profiles" and not as an empty string.
+        assert_eq!(agent_resume(None, 1), NO_OVERRIDES);
+        assert_eq!(agent_resume(None, 0), NO_OVERRIDES);
+
+        // A default entry that exists keeps composing with the count.
+        let l = PerAgentLaunch { args: "--verbose".into(), ..Default::default() };
+        assert_eq!(agent_resume(Some(&l), 2), "flags --verbose · 1 profile");
+
+        // Disabled still wins over everything, and an agent with no default
+        // entry cannot be disabled at all.
+        let off = PerAgentLaunch { disabled: true, ..Default::default() };
+        assert_eq!(agent_resume(Some(&off), 2), "Hidden from the launcher.");
     }
 
     #[test]
