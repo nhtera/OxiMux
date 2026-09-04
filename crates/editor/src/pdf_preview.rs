@@ -690,6 +690,9 @@ pub struct PdfContent {
     pub(crate) goto: Option<GotoPage>,
     /// Page the rail was last pointed at, so it is nudged only on a change.
     rail_synced: Cell<usize>,
+    /// The scale (×1000) the column's scroll offset was last anchored at.
+    /// `0` until the first frame that has a scale.
+    anchored_scale: Cell<u32>,
     /// Page last written to the page memory, likewise.
     pub(crate) remembered: Cell<usize>,
     /// Receives finished pages and folds them into the store.
@@ -769,6 +772,7 @@ impl PdfContent {
             show_thumbs: true,
             goto: None,
             rail_synced: Cell::new(usize::MAX),
+            anchored_scale: Cell::new(0),
             remembered: Cell::new(start),
             _pump: pump,
         }
@@ -792,17 +796,52 @@ impl PdfContent {
     /// immediately after [`Self::scroll_to_page`] sees where it asked to go.
     pub(crate) fn page(&self) -> usize {
         let last = self.page_count.saturating_sub(1);
-        let state = self.list.0.borrow();
-        if state.deferred_scroll_to_item.is_some() {
-            return self.store.top_page().min(last);
-        }
-        let Some(row_h) = self.row_height().filter(|h| *h > 1.0) else {
+        let (Some(scale), Some(row_h)) = (
+            self.effective_scale(),
+            self.row_height().filter(|h| *h > 1.0),
+        ) else {
             return self.store.top_page().min(last);
         };
+        // Two windows where the offset does not yet mean what it will:
+        // a jump that has not been applied, and a scale change that
+        // `keep_place_across_scale_change` has not re-anchored yet. Reading
+        // through either would cache a page nobody asked for — and since the
+        // re-anchor reads that cache back, the error would stick.
+        let state = self.list.0.borrow();
+        if state.deferred_scroll_to_item.is_some()
+            || self.anchored_scale.get() != PageKey::new(0, scale).scale_milli
+        {
+            return self.store.top_page().min(last);
+        }
         let offset = -f32::from(state.base_handle.offset().y);
         let page = ((offset / row_h).floor().max(0.0) as usize).min(last);
         self.store.top_page.set(page);
         page
+    }
+
+    /// Keep the reader's place when the rows change height.
+    ///
+    /// The list stores a scroll offset in **pixels**, and every row's height
+    /// is the page height times the effective scale. So any scale change —
+    /// a zoom, but also a pane resize, which is what a session restore does
+    /// while the panes settle — leaves the offset pointing at a different
+    /// page. Restoring at page 3 and finding page 14 is this, and nothing
+    /// else. Re-anchor on the page we were on *before* the rows moved.
+    ///
+    /// Must run before [`Self::page`] in a frame: `page` recomputes from the
+    /// offset and would otherwise cache the drifted value first.
+    pub(crate) fn keep_place_across_scale_change(&self) {
+        let Some(scale) = self.effective_scale() else {
+            return;
+        };
+        let milli = PageKey::new(0, scale).scale_milli;
+        if self.anchored_scale.replace(milli) == milli {
+            return;
+        }
+        // Also fires on the first frame that has a scale, which is what puts
+        // a restored tab on its remembered page rather than wherever the
+        // constructor's scroll landed at whatever height was measured then.
+        self.scroll_to_page(self.store.top_page());
     }
 
     /// Centre the rail on `page`. Called from `render`, where the deferred

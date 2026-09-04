@@ -1344,6 +1344,9 @@ impl Render for EditorView {
         // scroll is consumed by this same frame's layout) and record it, both
         // no-ops unless the page actually changed.
         if let EditorContent::Pdf(p) = &self.content {
+            // Order matters: re-anchor before reading the page, or `page()`
+            // caches the value the drifted offset implies.
+            p.keep_place_across_scale_change();
             p.sync_rail(p.page());
         }
         self.pdf_remember_current_page(cx);
@@ -2027,6 +2030,50 @@ mod tests {
                 // top row is as far down as the remaining pages allow — not
                 // necessarily page 5 itself.
                 assert!(page >= 3, "and lands at the end of the document ({page})");
+            })
+            .expect("window alive");
+    }
+
+    /// A resize changes the fit scale, which changes every row's height —
+    /// and the list's scroll offset is in pixels, so the reader would
+    /// otherwise land on a different page. This is what made a restored tab
+    /// open at page 14 when its snapshot said page 3.
+    #[gpui::test]
+    async fn pdf_keeps_its_place_when_the_pane_resizes(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("book.pdf");
+        std::fs::write(&path, crate::pdf_preview::test_pdf_sized(60, 600, 800)).expect("write");
+        let window = cx.add_window(|window, cx| EditorView::new(path, window, cx));
+        cx.run_until_parked();
+        cx.simulate_window_resize(window.into(), gpui::size(px(832.0), px(600.0)));
+        render_pdf_now(cx, &window);
+
+        window
+            .update(cx, |view, win, cx| {
+                view.pdf_goto_page(20, win, cx);
+            })
+            .expect("window alive");
+        render_pdf_now(cx, &window);
+        window
+            .update(cx, |view, _win, _cx| {
+                assert_eq!(view.pdf_page(), Some(20), "jumped to page 21");
+            })
+            .expect("window alive");
+
+        // Narrowing the pane shrinks the fit scale, so every row gets
+        // shorter. The pixel offset that meant page 20 now means a much
+        // later page unless the pane re-anchors.
+        cx.simulate_window_resize(window.into(), gpui::size(px(448.0), px(600.0)));
+        render_pdf_now(cx, &window);
+        window
+            .update(cx, |view, _win, _cx| {
+                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
+                assert!(
+                    p.effective_scale().expect("measured") < 832.0 / 600.0,
+                    "the resize really did change the fit scale"
+                );
+                assert_eq!(view.pdf_page(), Some(20), "and the reader kept their page");
             })
             .expect("window alive");
     }
