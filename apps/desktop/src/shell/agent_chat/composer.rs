@@ -2245,7 +2245,7 @@ impl ComposerView {
     /// UI asset path; unknown/`None` hints fall back to a neutral settings glyph.
     fn feature_icon_path(hint: Option<&str>) -> &'static str {
         match hint {
-            Some("zap" | "fast") => "icons/sparkles.svg",
+            Some("zap" | "fast") => "icons/zap.svg",
             Some("plan" | "list-todo" | "list") => "icons/list-tree.svg",
             Some("bot" | "check" | "auto-accept") => "icons/check.svg",
             Some("shield" | "lock" | "permission") => "icons/lock.svg",

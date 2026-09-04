@@ -125,6 +125,10 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../assets/icons/sparkles.svg"),
     ),
     (
+        "icons/zap.svg",
+        include_bytes!("../assets/icons/zap.svg"),
+    ),
+    (
         "icons/settings-2.svg",
         include_bytes!("../assets/icons/settings-2.svg"),
     ),
