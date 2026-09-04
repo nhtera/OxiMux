@@ -769,20 +769,31 @@ impl TerminalView {
 
     pub(super) fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         input_trace(&format!("key_down key={}", event.keystroke.key));
+        // Anything the search overlay took belongs to the overlay, so claim it
+        // — that is what keeps a character typed into the search box out of the
+        // shell. Without the claim the same key still reaches the platform
+        // input method, which commits it straight to the PTY (see the note on
+        // the byte path below for why a propagating key gets delivered twice).
         match self.search.handle_key(event) {
             SearchKeyOutcome::Pass => {}
-            SearchKeyOutcome::Consumed => return,
+            SearchKeyOutcome::Consumed => {
+                cx.stop_propagation();
+                return;
+            }
             SearchKeyOutcome::Dismissed => {
+                cx.stop_propagation();
                 cx.notify();
                 return;
             }
             SearchKeyOutcome::CurrentChanged => {
                 self.follow_current_match();
+                cx.stop_propagation();
                 cx.notify();
                 return;
             }
             SearchKeyOutcome::QueryChanged => {
                 self.schedule_debounced_search(cx);
+                cx.stop_propagation();
                 cx.notify();
                 return;
             }
@@ -881,7 +892,33 @@ impl TerminalView {
             stripped.modifiers.alt = false;
             keystroke_to_bytes(&stripped, mode)
         };
+        // Empty means "not ours" (Cmd combos, bare modifier presses): leave
+        // those propagating so app-level bindings still see them.
+        if bytes.is_empty() {
+            return;
+        }
         self.send_bytes(&bytes, cx);
+        // Claim the keystroke. GPUI's macOS window reads a *propagating* key
+        // event as unhandled and then hands the same native event to the
+        // platform text-input path — `insertText:` on the registered
+        // `NSTextInputClient`, or, for a held key with
+        // `apple_press_and_hold_enabled() == false`, a direct
+        // `replace_text_in_range` (`gpui_macos::window::handle_key_event`).
+        // Both land in `commit_ime_text`, which writes to the PTY. Without
+        // this call the character we just sent is written to the shell a
+        // second time.
+        //
+        // Off the alt-screen that never bit: plain text is deferred to the IME
+        // above and never encoded here. On the alt-screen the deferral is
+        // skipped by design (full-screen TUIs must read keys raw), so every
+        // printable key went out twice — issue #3, "double keystroke output in
+        // terminal", reported against an agent CLI's full-screen UI.
+        //
+        // No `#[gpui::test]` can cover this: the test platform has no
+        // `NSTextInputContext`, so the second delivery does not exist there.
+        // `cargo run -p oximux-app --example key_double_repro` shows both
+        // halves against a real window.
+        cx.stop_propagation();
     }
 
     fn send_bytes(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
