@@ -4,6 +4,46 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-04 — Large scanned PDFs: fit to the pane, open off the UI thread (`feat/enhancement`)
+
+- **A page never renders wider than the pane can show.** Measured against a
+  bilevel scan whose page box is in pixels (2480 × 3508 pt, as scanner drivers
+  emit): at retina scale that was a 4960 × 7016 bitmap, 139 MB for one page,
+  and the edge clamp shipped with the viewer would have allowed 268 MB. The
+  page body now carries a zero-paint layout probe that reports its width to
+  the view; the render scale is one point per logical pixel, reduced to fit
+  the pane width when the page is wider than that, times the editor zoom —
+  so ⌘+ still magnifies from the fitted size — and nothing is requested
+  until the probe has reported, so an oversized page is never rasterized at
+  a size the pane cannot show, not even for the first frame. The probe
+  reports in 32 px steps: a rasterization that has started cannot be
+  cancelled, so a resize drag must not queue one per pixel. On top of that
+  the rasterizer request is capped at 16 Mpx of area (64 MB) and 16 384 px
+  per edge. A real A4 page is ~2 Mpx at retina and unaffected.
+- **A `.pdf` opens without a synchronous read.** It opens as Loading; a
+  background task reads and parses it and lands through the same path a
+  retried read uses, and a file mid-export — which reads back truncated and
+  fails to parse — is retried on the same backoff schedule as a transient
+  read error while its size keeps changing, and reported once it stops. A 283 MB scan read in ~50 ms
+  warm and parsed in 0 ms in
+  the measurement, so the parse was never the cost — the read was, and it
+  scales with the file. A `.pdf` that fails to parse shows the reason with
+  Retry, and Retry re-runs the asynchronous loader. Memory-mapping the file
+  was measured (63 MB resident instead of file size + 75 MB) and rejected:
+  a mapped file truncated in place by a build tool is a fatal signal.
+  Report: `plans/reports/research-260904-2137-very-large-scanned-pdf-support.md`.
+- **Reading a page, not just seeing it.** A fitted page is usually taller
+  than the pane, so the keys now follow a reader: ↑/↓ scroll within the
+  page, PageUp/PageDown (and Space, ⇧Space) scroll a viewport and step to
+  the neighbouring page once the current one is at its edge — landing at
+  the bottom when going backwards — while ←/→ step pages outright and
+  Home/End jump to the first and last. A page step always opens the new
+  page at its top rather than wherever the previous one was scrolled. The
+  page itself now has a hairline edge and a soft shadow so it reads as paper
+  under both themes, and a page zoomed wider than the pane scrolls
+  horizontally instead of being centred and clipped (the scroll surface's
+  wrapper is sized to the content, not stretched to the pane).
+
 ### 2026-09-04 — PDFs open in the editor pane (`feat/enhancement`)
 
 - **A `.pdf` opens and renders instead of being refused.** The editor gained
