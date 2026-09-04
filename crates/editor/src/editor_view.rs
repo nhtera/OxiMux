@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use gpui::{
     App, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
     Styled, Subscription, Task, Window, img, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
@@ -43,6 +43,7 @@ use crate::lsp::{LspClient, path_to_file_uri};
 use crate::lsp_bridge::spawn_attach_lsp;
 use crate::markdown_preview::{self, MarkdownViewMode};
 use crate::mermaid;
+use crate::pdf_preview::{self, PdfContent, PdfDocument};
 
 actions!(
     oximux,
@@ -296,9 +297,11 @@ pub enum EditorContent {
     /// Editable text buffer — full code-editor path with LSP wiring.
     Text(TextContent),
     /// Previewable image — rendered via GPUI's native `img(path)` element.
-    /// The `mime` field is plumbed mainly for diagnostic logging today;
-    /// future inline previewers (PDF, etc.) will key off it.
+    /// The `mime` field is plumbed mainly for diagnostic logging today.
     Image { mime: &'static str },
+    /// A PDF: parsed once, one page rasterized at a time off the UI thread.
+    /// Page state and the current bitmap live in `PdfContent`.
+    Pdf(PdfContent),
     /// Non-text, non-image binary — shown as a centered placeholder.
     Binary,
     /// A transient read failure is being retried on the backoff schedule.
@@ -385,6 +388,11 @@ pub struct EditorView {
     _zoom_sub: Subscription,
     _focus_sub: Subscription,
     _blur_sub: Subscription,
+    /// Releases the PDF page texture from the sprite atlas when the view is
+    /// dropped — gpui only evicts `RenderImage` sources on request, so a
+    /// closed tab would otherwise keep its last page resident until the
+    /// window closes.
+    _release_sub: Subscription,
     /// LSP attach request received while the buffer was still loading. The
     /// host attaches the server right after construction; if the first read
     /// failed transiently the content isn't text yet, so the request waits
@@ -416,6 +424,13 @@ impl EditorView {
         // Editor-global font zoom changes from any editor must repaint this
         // one too — otherwise background tabs keep the old size until painted.
         let _zoom_sub = cx.observe_global::<EditorZoom>(|_view, cx| cx.notify());
+        let _release_sub = cx.on_release(|view, cx| {
+            if let EditorContent::Pdf(p) = &mut view.content
+                && let Some(bitmap) = p.bitmap.take()
+            {
+                cx.drop_image(bitmap, None);
+            }
+        });
 
         // Read bytes (not a String) so a non-UTF-8 sequence does not
         // silently produce an empty buffer. The mode-detection below
@@ -479,6 +494,7 @@ impl EditorView {
             _zoom_sub,
             _focus_sub,
             _blur_sub,
+            _release_sub,
             pending_lsp: None,
             _load_task,
         }
@@ -772,6 +788,84 @@ impl EditorView {
         self._load_task = Some(schedule_load_retry_task(self.file_path.clone(), window, cx));
         cx.notify();
     }
+
+    /// Step the PDF page by `delta`, clamped to the document. A no-op for
+    /// other content and at the ends; the render is requested on the next
+    /// paint via `ensure_pdf_page`.
+    pub(crate) fn pdf_step(&mut self, delta: i64, _window: &mut Window, cx: &mut Context<Self>) {
+        let EditorContent::Pdf(p) = &mut self.content else {
+            return;
+        };
+        let last = p.page_count.saturating_sub(1) as i64;
+        let next = (p.page as i64 + delta).clamp(0, last) as usize;
+        if next != p.page {
+            p.page = next;
+            cx.notify();
+        }
+    }
+
+    /// Arrow / page keys step a PDF; Home and End jump to the ends. Other
+    /// content ignores the event so it keeps bubbling, and so does any
+    /// modified chord (⌘←, ⇧↓ …) — those belong to whoever bound them.
+    fn on_pdf_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let EditorContent::Pdf(p) = &self.content else {
+            return;
+        };
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
+        let last = p.page_count.saturating_sub(1) as i64;
+        let delta = match event.keystroke.key.as_str() {
+            "left" | "up" | "pageup" => -1,
+            "right" | "down" | "pagedown" => 1,
+            "home" => -last,
+            "end" => last,
+            _ => return,
+        };
+        self.pdf_step(delta, window, cx);
+        cx.stop_propagation();
+    }
+
+    /// Request the bitmap for the current PDF page at the current zoom and
+    /// window scale, unless that exact render is already on screen or in
+    /// flight. The render runs on the background executor; the result is
+    /// applied on the window, swapping the old texture out of the atlas.
+    fn ensure_pdf_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let base = cx.theme().font_size;
+        let zoom_ratio = f32::from(current_zoom(cx).effective_px(base)) / f32::from(base);
+        let scale = window.scale_factor() * zoom_ratio;
+        let EditorContent::Pdf(p) = &mut self.content else {
+            return;
+        };
+        let key = PdfContent::request_key(p.page, scale);
+        if p.requested == Some(key) {
+            return;
+        }
+        p.requested = Some(key);
+        p.generation += 1;
+        let generation = p.generation;
+        let doc = p.doc.clone();
+        let page = p.page;
+        p._render_task = Some(cx.spawn_in(window, async move |weak, cx| {
+            let rendered = cx
+                .background_executor()
+                .spawn(async move { doc.render_page(page, scale) })
+                .await;
+            let _ = weak.update_in(cx, |this, window, cx| {
+                let EditorContent::Pdf(p) = &mut this.content else {
+                    return;
+                };
+                if p.generation != generation {
+                    return;
+                }
+                p.failed = rendered.is_none();
+                if let Some(old) = std::mem::replace(&mut p.bitmap, rendered) {
+                    cx.drop_image(old, Some(window));
+                }
+                cx.notify();
+            });
+        }));
+    }
 }
 
 /// Spawn the backoff retry loop for a transient read failure. Each tick
@@ -830,6 +924,27 @@ fn decide_content(
     window: &mut Window,
     cx: &mut Context<EditorView>,
 ) -> EditorContent {
+    // Before the NUL sniff: a small hand-written PDF is pure ASCII and would
+    // otherwise open as text. A `.pdf` that fails to parse is reported as
+    // such (with Retry) — the reason is what the user needs. A file that only
+    // *looks* like a PDF by its header keeps the ordinary text/binary path
+    // when the parse fails: the marker is a hint, and prose can contain it.
+    if pdf_preview::has_pdf_extension(path) {
+        return match PdfDocument::parse(bytes) {
+            Ok(doc) => EditorContent::Pdf(PdfContent::new(Arc::new(doc))),
+            Err(reason) => {
+                tracing::warn!(file = %path.display(), %reason, "editor: PDF could not be parsed");
+                EditorContent::LoadFailed {
+                    message: SharedString::from(format!("PDF could not be opened: {reason}")),
+                }
+            }
+        };
+    }
+    if pdf_preview::has_pdf_header(&bytes)
+        && let Ok(doc) = PdfDocument::parse(bytes.clone())
+    {
+        return EditorContent::Pdf(PdfContent::new(Arc::new(doc)));
+    }
     if is_binary_buffer(&bytes) {
         return match image_mime_for_path(path) {
             Some(mime) => EditorContent::Image { mime },
@@ -919,7 +1034,13 @@ impl Focusable for EditorView {
 }
 
 impl Render for EditorView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A PDF pane requests its page bitmap here, where the window's scale
+        // factor and the editor zoom are both known. Idempotent: it spawns
+        // only when the wanted (page, scale) differs from the last request.
+        if matches!(self.content, EditorContent::Pdf(_)) {
+            self.ensure_pdf_page(window, cx);
+        }
         // Resolved per render rather than cached: this view keeps no token
         // snapshot, so there is nothing to go stale and nothing for
         // `appearance-lint` to hold it to. Taken before the theme borrow,
@@ -951,6 +1072,13 @@ impl Render for EditorView {
             _ => None,
         };
 
+        // PDF page state for the breadcrumb navigator, read before the theme
+        // borrow below pins `cx`.
+        let pdf_nav = match &self.content {
+            EditorContent::Pdf(p) => Some((p.page, p.page_count)),
+            _ => None,
+        };
+
         let theme = cx.theme();
 
         // Path breadcrumb row above the content. Dirty indicator is text
@@ -963,6 +1091,7 @@ impl Render for EditorView {
         };
         let kind_suffix = match &self.content {
             EditorContent::Image { mime } => SharedString::from(format!("  ·  {mime}")),
+            EditorContent::Pdf(_) => SharedString::from("  ·  pdf"),
             EditorContent::Binary => SharedString::from("  ·  binary"),
             EditorContent::Loading => SharedString::from("  ·  loading…"),
             EditorContent::LoadFailed { .. } => SharedString::from("  ·  load failed"),
@@ -988,6 +1117,10 @@ impl Render for EditorView {
             ))
             // Spacer pushes the toggle + actions to the row's trailing edge.
             .child(gpui::div().flex_1())
+            // PDF-only: `‹ N / M ›` page stepper.
+            .when_some(pdf_nav, |row, (page, count)| {
+                row.child(pdf_preview::page_nav(page, count, cx))
+            })
             // Markdown-only: the Source/Preview/Split toggle.
             .when(self.is_markdown, |row| {
                 row.child(
@@ -1090,6 +1223,13 @@ impl Render for EditorView {
                 .size_full()
                 .into_any_element(),
             EditorContent::Image { .. } => render_image_body(&self.file_path),
+            EditorContent::Pdf(p) => pdf_preview::page_body(
+                p,
+                window.scale_factor(),
+                cx.entity_id(),
+                muted_fg,
+                typo.t_body_md,
+            ),
             EditorContent::Binary => render_binary_placeholder(muted_fg, typo.t_body_md),
             EditorContent::Loading => render_loading_placeholder(muted_fg, typo.t_body_md),
             EditorContent::LoadFailed { message } => gpui::div()
@@ -1144,7 +1284,10 @@ impl Render for EditorView {
             .on_action(cx.listener(Self::on_zoom_in))
             .on_action(cx.listener(Self::on_zoom_out))
             .on_action(cx.listener(Self::on_zoom_reset))
-            // Re-claim focus on click for Image / Binary surfaces. For
+            // PDF page stepping from the keyboard. Only acts when the view
+            // holds a PDF, so text buffers keep their arrow keys.
+            .on_key_down(cx.listener(Self::on_pdf_key))
+            // Re-claim focus on click for Image / PDF / Binary surfaces. For
             // Text content the child `Input` widget grabs focus on its
             // own click path; this handler is the fallback so the
             // editor's focus_handle becomes the active focus even when
@@ -1287,6 +1430,100 @@ fn render_loading_placeholder(muted_fg: gpui::Hsla, text_size: f32) -> gpui::Any
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// A text file that merely mentions the `%PDF-` marker (this repository's
+    /// changelog does) must still open as text: the header is a hint, and a
+    /// failed parse falls through. Regression caught in review.
+    #[gpui::test]
+    async fn prose_containing_pdf_marker_opens_as_text(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("notes.md");
+        std::fs::write(&path, "# Notes\n\nDetection is by a `%PDF-` header.\n").expect("write");
+
+        let window = cx.add_window(|window, cx| EditorView::new(path, window, cx));
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _win, _cx| {
+                assert!(view.is_text(), "prose with the marker is still a text buffer");
+                assert!(view.is_markdown, "and keeps its markdown mode");
+            })
+            .expect("window alive");
+    }
+
+    /// A PDF with the wrong extension is still recognised by its header.
+    #[gpui::test]
+    async fn pdf_with_wrong_extension_opens_by_header(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("renamed.bin");
+        std::fs::write(&path, crate::pdf_preview::test_pdf(2)).expect("write");
+
+        let window = cx.add_window(|window, cx| EditorView::new(path, window, cx));
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _win, _cx| {
+                let EditorContent::Pdf(p) = &view.content else {
+                    panic!("header-detected PDF must open as EditorContent::Pdf");
+                };
+                assert_eq!(p.page_count, 2);
+            })
+            .expect("window alive");
+    }
+
+    /// Opening a `.pdf` lands in the `Pdf` arm with the right page count;
+    /// stepping clamps at both ends; the page bitmap arrives from the
+    /// background executor sized for the window's scale factor; and asking
+    /// again for the same page + scale does not re-render.
+    #[gpui::test]
+    async fn pdf_opens_steps_and_renders_off_thread(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("three.pdf");
+        std::fs::write(&path, crate::pdf_preview::test_pdf(3)).expect("write fixture");
+
+        let window = cx.add_window(|window, cx| EditorView::new(path, window, cx));
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, win, cx| {
+                let EditorContent::Pdf(p) = &view.content else {
+                    panic!("a .pdf must open as EditorContent::Pdf");
+                };
+                assert_eq!((p.page, p.page_count), (0, 3));
+                assert!(!view.is_text(), "PDF is not a text buffer");
+
+                view.pdf_step(1, win, cx);
+                view.pdf_step(-10, win, cx);
+                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
+                assert_eq!(p.page, 0, "stepping below the first page clamps");
+                view.pdf_step(10, win, cx);
+                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
+                assert_eq!(p.page, 2, "stepping past the last page clamps");
+
+                // What `render` does on every paint for a PDF pane.
+                view.ensure_pdf_page(win, cx);
+            })
+            .expect("window alive");
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, win, cx| {
+                let scale = win.scale_factor();
+                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
+                assert!(!p.failed, "render of page 3 must not fail");
+                let bitmap = p.bitmap.as_ref().expect("bitmap landed off-thread");
+                let size = bitmap.size(0);
+                assert_eq!(size.width.0, (200.0 * scale).floor() as i32);
+                assert_eq!(size.height.0, (100.0 * scale).floor() as i32);
+
+                let generation = p.generation;
+                view.ensure_pdf_page(win, cx);
+                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
+                assert_eq!(p.generation, generation, "same page + scale is a no-op");
+            })
+            .expect("window alive");
+    }
 
     #[test]
     fn language_for_path_maps_rust() {

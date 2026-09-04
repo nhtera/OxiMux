@@ -704,6 +704,10 @@ src/
 │                             file via fs::write, sends didSave; window title shows
 │                             " •" dirty badge; impl Drop sends didClose via sync mpsc
 │                           Keyed by --editor-spike CLI flag
+│                           PDF: decide_content() routes .pdf/%PDF- before the NUL sniff;
+│                             ensure_pdf_page() at the top of render() (window scale ×
+│                             editor zoom), cx.drop_image on swap + on_release; arrows /
+│                             PageUp/PageDown/Home/End step pages (on_key_down, PDF only)
 │                           Markdown: is_markdown_path() detects .md/.markdown (not .mdx);
 │                             header toggle renders Source/Preview/Split segmented buttons;
 │                             body dispatches on md_mode (Source=Input / Preview / Split)
@@ -712,6 +716,11 @@ src/
 │                           render_preview() — gpui-component text::markdown GFM renderer;
 │                           absolutize_image_paths(text, file_path) — pure fn: rewrites
 │                             repo-relative ![](path) → file:// URIs for local image loads
+├── pdf_preview.rs          PDF arm: is_pdf() (.pdf ext or %PDF- header in first KiB),
+│                           PdfDocument (hayro parse; render_page → BGRA RenderImage on a
+│                             white ground, off the UI thread), PdfContent (page, count,
+│                             bitmap, (page,scale) request key, generation guard),
+│                           page_nav() ‹ N / M › for the breadcrumb, page_body() scrollable
 ├── lsp_bridge.rs           spawn_attach_lsp (factored from editor_view.rs)
 │                           Runs LSP handshake on tokio; calls set_lsp_client on
 │                           EditorView entity; passes did_open_text for catch-up

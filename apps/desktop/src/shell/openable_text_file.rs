@@ -53,8 +53,6 @@ pub fn is_openable_text_file(path: &Path) -> bool {
         | "ttf" | "otf" | "woff" | "woff2" | "eot"
         // Databases.
         | "db" | "sqlite" | "sqlite3"
-        // Generic large-blob containers.
-        | "pdf"
     )
 }
 
@@ -83,6 +81,13 @@ mod tests {
         assert!(is_openable_text_file(&PathBuf::from("logo.png")));
         assert!(is_openable_text_file(&PathBuf::from("photo.jpg")));
         assert!(is_openable_text_file(&PathBuf::from("icon.svg")));
+    }
+
+    #[test]
+    fn accepts_pdf() {
+        // Editor opens as the PDF preview (rasterized page + navigation).
+        assert!(is_openable_text_file(&PathBuf::from("spec.pdf")));
+        assert!(is_openable_text_file(&PathBuf::from("SPEC.PDF")));
     }
 
     #[test]

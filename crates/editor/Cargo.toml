@@ -50,6 +50,12 @@ tracing = { workspace = true }
 # the workspace manifest for the pin rationale.
 merman = { workspace = true }
 
+# PDF preview: parses the document and rasterizes one page at a time into a
+# GPUI `RenderImage`. `image` is the same 0.25 line gpui uses, so the frame
+# type handed to `RenderImage::new` is gpui's own.
+hayro = { workspace = true }
+image = { workspace = true }
+
 # Phase 5 step 3 — file tree backend. `notify` is re-exported through
 # `notify_debouncer_full::notify` so we don't list it twice in the graph.
 ignore                = { workspace = true }
@@ -57,3 +63,6 @@ notify-debouncer-full = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `#[gpui::test]` + `TestAppContext` for the headless view tests (PDF open /
+# page step / off-thread render). Same feature the desktop crate enables.
+gpui = { workspace = true, features = ["test-support"] }

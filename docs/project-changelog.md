@@ -4,6 +4,31 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-04 — PDFs open in the editor pane (`feat/enhancement`)
+
+- **A `.pdf` opens and renders instead of being refused.** The editor gained
+  an `EditorContent::Pdf` arm backed by `hayro`, a pure-Rust rasterizer
+  (Apache-2.0/MIT, no native library), chosen over the alternatives that ship
+  a native blob per target or carry a copyleft licence.
+  The document is parsed once; each page is rasterized off the UI thread at
+  the window's scale factor times the editor zoom, handed to gpui as a
+  `RenderImage`, and the previous page's texture is dropped from the atlas on
+  swap and when the tab closes. The breadcrumb shows `‹ N / M ›`; ← → ↑ ↓,
+  PageUp/PageDown, Home and End step pages while the pane is focused.
+  Detection is by `.pdf` extension, or by a `%PDF-` header in the first KiB
+  for a PDF with the wrong extension (a small hand-written one is pure ASCII
+  and would otherwise open as text). A `.pdf` that fails to parse shows the
+  reason with Retry; a file that only mentions the marker in prose — this
+  changelog, now — falls through to the text editor. `pdf` left the refuse
+  list in `openable_text_file.rs` last.
+- **Cost, measured:** +4.3 MB on the stripped release binary, 23 new lockfile
+  entries (20 new permissively-licensed crates plus second versions of
+  `read-fonts`, `skrifa` and `vello_common` beside the ones gpui already
+  pulls), about eight seconds of cold build. The
+  workspace `rust-version` now reads 1.92 (hayro's floor); the toolchain was
+  already pinned at 1.95 on every CI target. Spike table and fixtures in
+  `plans/260827-2313-oximux-gap-closure/phase-11-pdf-viewer.md`.
+
 ### 2026-09-04 — The Claude model picker follows the installed CLI (`feat/enhancement`)
 
 - **The chat's Claude model list is no longer copied from one CLI build.** The

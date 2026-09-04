@@ -48,7 +48,7 @@ version = "0.1.17"
 authors = ["nhtera"]
 license = "Apache-2.0"
 publish = false
-rust-version = "1.89"
+rust-version = "1.92"
 
 [workspace.dependencies]
 # Internal crates
@@ -164,6 +164,15 @@ anyhow = "1"
 # `render` = SVG output; the `raster` feature stays off — gpui rasterizes SVG
 # itself via usvg/resvg.
 merman = { version = "=0.6.2", default-features = false, features = ["render"] }
+# PDF rasterizer for the editor's PDF preview. Pure Rust, no native library,
+# so notarization and the Windows build are untouched. The hayro crates
+# themselves forbid unsafe code; the SIMD image-resize and rasterizer crates
+# beneath them (`pic-scale`, `fearless_simd`) do not. Default features embed
+# the standard-14 substitute fonts (~240 KB) and the predefined CMaps
+# (~250 KB); the 0.7 line needs Rust 1.92, which is why `rust-version` above
+# reads 1.92. Measured +4.3 MB on the stripped release binary — see
+# plans/260827-2313-oximux-gap-closure/phase-11-pdf-viewer.md.
+hayro = "0.7"
 # Strips the `\\?\` verbatim prefix that `Path::canonicalize` adds on Windows,
 # where it is safe to drop. Canonicalized paths get stored in settings files and
 # compared against user-typed ones, and the prefix is correct-but-unspellable in
