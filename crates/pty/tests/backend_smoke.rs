@@ -8,7 +8,9 @@
 //!   2. Bounded channel deadlock (we'd time out before the marker).
 //!   3. Exit detection broken (we'd see Output but never Exit).
 
-use oximux_shell_env::test_support::{lines, run_script, test_cwd, test_shell};
+use oximux_shell_env::test_support::{
+    echo_if_var_set, echo_var, lines, run_script, test_cwd, test_shell,
+};
 use oximux_pty::{PortablePtyBackend, SpawnConfig, TerminalBackend, TerminalEvent};
 // Only the `#[cfg(unix)]` OSC 7 test below constructs a PathBuf.
 #[cfg(unix)]
@@ -119,11 +121,11 @@ fn caller_env_reaches_the_child_and_wins_over_backend_defaults() {
             // One line per fact, each tagged so a partial environment is
             // distinguishable from a missing one in the failure message.
             args: run_script(&[
-                &format!("echo probe=${CUSTOM}"),
-                "echo term=$TERM",
-                // `-n` so an inherited-but-empty PATH reads as absent, which is
-                // the failure this line is here to catch.
-                "if [ -n \"$PATH\" ]; then echo path=present; else echo path=EMPTY; fi",
+                &echo_var("probe", CUSTOM),
+                &echo_var("term", "TERM"),
+                // Set-and-non-empty, so an inherited-but-empty PATH reads as
+                // absent — the failure this line is here to catch.
+                &echo_if_var_set("PATH", "path=present", "path=EMPTY"),
             ]),
             env: vec![
                 (CUSTOM.to_string(), "reached".to_string()),

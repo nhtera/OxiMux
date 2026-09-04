@@ -308,6 +308,29 @@ pub mod test_support {
         }
     }
 
+    /// `echo <label>=<value of var>` in the running shell's syntax. `sh`
+    /// expands `$VAR`, `cmd` expands `%VAR%` — a line written for one prints
+    /// the other's sigil literally, and the assertion then reads back the
+    /// command instead of the environment.
+    pub fn echo_var(label: &str, var: &str) -> String {
+        if cfg!(windows) {
+            format!("echo {label}=%{var}%")
+        } else {
+            format!("echo {label}=${var}")
+        }
+    }
+
+    /// `echo <present>` when `var` is set and non-empty, `<absent>` otherwise.
+    /// `cmd` has no `[ -n ... ]`: fed one it stops at `-n was unexpected at
+    /// this time`, which is a shell parse error and not the assertion failing.
+    pub fn echo_if_var_set(var: &str, present: &str, absent: &str) -> String {
+        if cfg!(windows) {
+            format!("if defined {var} (echo {present}) else (echo {absent})")
+        } else {
+            format!("if [ -n \"${var}\" ]; then echo {present}; else echo {absent}; fi")
+        }
+    }
+
     /// A program and argv that print `arg` and exit without reading input, so a
     /// marker can only have come from argv. Windows has no `/bin/echo`;
     /// `cmd /c echo` is the nearest thing that still never touches the console.
