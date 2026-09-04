@@ -331,9 +331,12 @@ pub struct ClaudeStreamJsonConnection {
     /// the CLI's catalog says they differ per model (Haiku has none).
     model: Option<String>,
     /// Whether fast mode is on for this session: seeded from the spawn overlay
-    /// by [`Self::seed_fast_mode`], flipped by a live `set_feature`. What the
-    /// toggle's `on` reads.
-    fast_mode: AtomicBool,
+    /// by [`Self::seed_fast_mode`], overwritten by what the CLI reports in its
+    /// `system/init` line (the reader thread holds the other clone), flipped
+    /// by a live `set_feature`. What the toggle's `on` reads. The CLI's report
+    /// is the truth: without an overlay the CLI applies the user's own
+    /// `settings.json`, which the app cannot see any other way.
+    fast_mode: Arc<AtomicBool>,
     // Windows stand-in for the process group `claude` would otherwise be killed
     // through. `claude` runs tools as its own children — a `bash` tool can be
     // holding a build or a dev server — and `Child::kill` ends only `claude`
@@ -410,10 +413,19 @@ impl ClaudeStreamJsonConnection {
 
         let (tx, rx) = mpsc::channel();
         let ring_out = ring.clone();
+        let fast_mode = Arc::new(AtomicBool::new(false));
+        let fast_mode_reader = fast_mode.clone();
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
                 let Ok(line) = line else { break }; // read error — treat as EOF
+                // The init line says whether the CLI actually runs fast — from
+                // our overlay or from the user's settings.json. Recorded before
+                // the SessionInit event is forwarded, so the app's resync on
+                // that event reads the settled value.
+                if let Some(on) = init_fast_mode_state(&line) {
+                    fast_mode_reader.store(on, Ordering::Relaxed);
+                }
                 for ev in decode_line(&line) {
                     // Attach a best-effort stderr diagnostic just BEFORE an error
                     // turn-end (state.rs folds it into that turn's error text),
@@ -460,7 +472,7 @@ impl ClaudeStreamJsonConnection {
                 stdin: Mutex::new(Some(stdin)),
                 child: Mutex::new(child),
                 model: None,
-                fast_mode: AtomicBool::new(false),
+                fast_mode,
                 #[cfg(windows)]
                 job,
             },
@@ -471,7 +483,9 @@ impl ClaudeStreamJsonConnection {
     /// Record the fast-mode value this session was spawned with (the inline
     /// `--settings` overlay), so the toggle reads the right state before the
     /// user touches it. Called once, right after spawn, by the connection
-    /// factory; no request is sent.
+    /// factory; no request is sent. The CLI's own `system/init` report lands
+    /// later and overwrites this — the two agree whenever an overlay was
+    /// sent, and without one the report is the only source there is.
     pub fn seed_fast_mode(&self, on: bool) {
         self.fast_mode.store(on, Ordering::Relaxed);
     }
@@ -507,6 +521,25 @@ const STDERR_RING_CAP: usize = 8 * 1024;
 /// oldest bytes past the cap. Runs on its own thread for the child's lifetime;
 /// exits on EOF or a read error. Draining (not the ring itself) is what prevents
 /// a full-pipe deadlock.
+/// The fast-mode state a `system/init` line reports, if this is one:
+/// `Some(true)` for `"on"`, `Some(false)` for `"off"` / `"cooldown"` (the CLI
+/// has paused fast mode itself, so the session is not running fast), `None`
+/// for any other line or an init line without the field. The substring gate
+/// keeps the extra parse off the hot path — only the one init line has it.
+fn init_fast_mode_state(line: &str) -> Option<bool> {
+    if !line.contains("\"fast_mode_state\"") {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line).ok()?;
+    let is_init = v.get("type").and_then(Value::as_str) == Some("system")
+        && v.get("subtype").and_then(Value::as_str) == Some("init");
+    if !is_init {
+        return None;
+    }
+    let state = v.get("fast_mode_state").and_then(Value::as_str)?;
+    Some(state == "on")
+}
+
 fn drain_stderr(stderr: ChildStderr, ring: &Arc<Mutex<VecDeque<u8>>>) {
     let mut reader = BufReader::new(stderr);
     let mut buf = [0u8; 4096];
@@ -1260,6 +1293,42 @@ mod tests {
     /// Spawn a FAKE program that prints two stream-json lines; the reader
     /// thread must decode them to the receiver. Proves the spawn/read/decode
     /// wiring without a real `claude`.
+    #[test]
+    fn init_fast_mode_state_reads_only_the_init_line() {
+        let init = |state: &str| {
+            serde_json::json!({"type":"system","subtype":"init","session_id":"s",
+                "fast_mode_state": state})
+            .to_string()
+        };
+        assert_eq!(init_fast_mode_state(&init("on")), Some(true));
+        assert_eq!(init_fast_mode_state(&init("off")), Some(false));
+        assert_eq!(init_fast_mode_state(&init("cooldown")), Some(false));
+        // An init line from an older CLI without the field says nothing.
+        let bare = serde_json::json!({"type":"system","subtype":"init","session_id":"s"});
+        assert_eq!(init_fast_mode_state(&bare.to_string()), None);
+        // The field on any other line is not a report about this session.
+        let other = serde_json::json!({"type":"assistant","fast_mode_state":"on"});
+        assert_eq!(init_fast_mode_state(&other.to_string()), None);
+        assert_eq!(init_fast_mode_state("not json \"fast_mode_state\""), None);
+    }
+
+    /// Spawn a FAKE program whose init line reports fast mode on; the toggle
+    /// must read on after the reader thread has seen it, even though nothing
+    /// seeded it — the user's settings.json case.
+    #[test]
+    fn init_line_seeds_the_fast_mode_flag() {
+        let l1 = serde_json::json!({"type":"system","subtype":"init",
+            "session_id":"s","model":"m","permissionMode":"default","fast_mode_state":"on"})
+        .to_string();
+        let mut cmd = crate::thread::sh_fixture::sh_command();
+        cmd.arg("-c").arg(format!("printf '%s\\n' '{l1}'"));
+        let (conn, rx) = ClaudeStreamJsonConnection::spawn_command(cmd).expect("spawn fake");
+        assert!(!conn.fast_mode.load(Ordering::Relaxed), "nothing seeded yet");
+        // Drain to EOF: the reader stores the flag before forwarding SessionInit.
+        while rx.recv_timeout(Duration::from_secs(5)).is_ok() {}
+        assert!(conn.fast_mode.load(Ordering::Relaxed), "init line said on");
+    }
+
     #[test]
     fn reader_thread_decodes_stdout_lines() {
         let l1 = serde_json::json!({"type":"system","subtype":"init",

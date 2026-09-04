@@ -20,6 +20,16 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
   does (a CLI that predates the request answers `error` and exits 0; the probe
   treats that as empty and the existing seed-preservation fold keeps what is
   shown).
+- **The fast-mode toggle mirrors what the CLI reports.** The connection's
+  fast-mode flag is shared with the stdout reader, which reads
+  `fast_mode_state` off the CLI's `system/init` line (`on` / `off` /
+  `cooldown`) and overwrites the spawn seed. Verified against 2.1.260: that
+  line arrives only with the first turn, and in `-p` stream-json mode a
+  `fastMode` key in the user's or project's settings files is NOT honoured —
+  only the inline `--settings` overlay and the live `apply_flag_settings`
+  request turn it on — so the reader changes nothing visible today and exists
+  so the app follows the CLI if that ever changes. The toggle's glyph is a
+  bolt (`icons/zap.svg`); the sparkle stays on the effort picker beside it.
 - **Desktop wiring rides the catalog machinery that already existed.** The
   "static list means never probe" gate is gone for Claude; the probe runs on a
   draft pick and when a bound Claude tab connects, through the same raw
