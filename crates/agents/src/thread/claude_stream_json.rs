@@ -11,17 +11,20 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
-use serde_json::Value;
+use serde_json::{json, Value};
 
+use super::claude_catalog::{shared_claude_catalog, ClaudeCatalog};
 use super::connection::{
-    control_response_json, interrupt_json, question_answer_json, set_permission_mode_json,
-    user_message_json, user_message_json_with_images, AgentCapabilities, AgentConnection,
-    EffortChoice, ModeChoice, ModelChoice,
+    apply_flag_settings_json, control_response_json, interrupt_json, question_answer_json,
+    set_permission_mode_json, user_message_json, user_message_json_with_images,
+    AgentCapabilities, AgentConnection, EffortChoice, FeatureControl, FeatureKind, FeatureValue,
+    ModeChoice, ModelChoice,
 };
 use super::entry::ChatImage;
 use super::mcp_server_spec::{to_claude_mcp_config, McpServerSpec};
@@ -102,8 +105,66 @@ const CLAUDE_EFFORTS: &[(&str, &str)] = &[
 /// The effort shown as current when none is chosen — the CLI's own default.
 const DEFAULT_EFFORT: &str = "high";
 
-/// The model shown as current when none is chosen — Claude's mid alias
-/// (`CLAUDE_MODELS[1].0`, "sonnet").
+/// The composer feature id of Claude's fast-mode toggle. Advertised only for a
+/// model whose catalog row says `supportsFastMode`; switched live through an
+/// `apply_flag_settings` control request and carried across a respawn as an
+/// inline `--settings {"fastMode":..}` overlay.
+pub const FEATURE_FAST_MODE: &str = "claude_fast_mode";
+
+/// The settings key the CLI reads fast mode from, in both the inline
+/// `--settings` overlay and the `apply_flag_settings` request.
+const FAST_MODE_SETTING: &str = "fastMode";
+
+/// Lay `overlay` over the inline `--settings` JSON, key by key.
+///
+/// Exactly one `--settings` may be passed (see [`HostInjection::settings`]),
+/// and `existing` may already hold the computer-use hook declaration — so a
+/// fast-mode overlay has to merge into that object, never replace it, or the
+/// sidecar hook silently disappears. Both sides are parsed as objects and
+/// unioned with `overlay`'s keys winning. An `existing` that fails to parse is
+/// returned untouched (and logged): dropping a hook declaration to fit a
+/// convenience flag would be the wrong trade.
+pub fn merge_settings_json(existing: Option<&str>, overlay: &Value) -> Option<String> {
+    let Some(overlay) = overlay.as_object().filter(|o| !o.is_empty()) else {
+        return existing.map(str::to_string);
+    };
+    let base = match existing.map(str::trim).filter(|s| !s.is_empty()) {
+        None => serde_json::Map::new(),
+        Some(text) => match serde_json::from_str::<Value>(text) {
+            Ok(Value::Object(map)) => map,
+            _ => {
+                tracing::warn!("inline --settings is not a JSON object; leaving it as is");
+                return Some(text.to_string());
+            }
+        },
+    };
+    let mut merged = base;
+    for (k, v) in overlay {
+        merged.insert(k.clone(), v.clone());
+    }
+    Some(Value::Object(merged).to_string())
+}
+
+/// The picker label for an effort wire: the static spelling when there is one,
+/// else the wire with its first letter raised, so a level the CLI adds later
+/// still reads as a word rather than vanishing from the picker.
+fn effort_label(wire: &str) -> String {
+    if let Some((_, label)) = CLAUDE_EFFORTS.iter().find(|(w, _)| *w == wire) {
+        return (*label).to_string();
+    }
+    let mut chars = wire.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// The model shown as current when none is chosen and no catalog has been
+/// probed. The CLI's own default is whatever its `Default (recommended)` row
+/// resolves to (Opus 1M today), which [`shared_claude_catalog`] reports as
+/// `default_wire`; this constant is only the seed shown before that lands. No
+/// `--model` flag is sent either way until the user picks, so the CLI resolves
+/// its own default and the picker merely labels it.
 const DEFAULT_MODEL: &str = "sonnet";
 
 /// Flags for the persistent, structured, interactive Claude session. Pure so
@@ -264,6 +325,15 @@ pub struct ClaudeStreamJsonConnection {
     // and further writes are refused rather than panicking.
     stdin: Mutex<Option<ChildStdin>>,
     child: Mutex<Child>,
+    /// The `--model` this session was spawned with (`None` = the CLI's own
+    /// default). Claude fixes the model at spawn, so this is always the
+    /// session's current model — which is what decides its effort levels once
+    /// the CLI's catalog says they differ per model (Haiku has none).
+    model: Option<String>,
+    /// Whether fast mode is on for this session: seeded from the spawn overlay
+    /// by [`Self::seed_fast_mode`], flipped by a live `set_feature`. What the
+    /// toggle's `on` reads.
+    fast_mode: AtomicBool,
     // Windows stand-in for the process group `claude` would otherwise be killed
     // through. `claude` runs tools as its own children — a `bash` tool can be
     // holding a build or a dev server — and `Child::kill` ends only `claude`
@@ -279,7 +349,9 @@ impl ClaudeStreamJsonConnection {
     pub fn spawn(cwd: &Path, model: Option<&str>) -> Result<(Self, Receiver<ThreadEvent>)> {
         let mut cmd = Command::new(crate::cli::program_for_spawn("claude"));
         cmd.args(build_args(model)).current_dir(cwd);
-        Self::spawn_command(cmd)
+        let (mut conn, rx) = Self::spawn_command(cmd)?;
+        conn.model = model.map(str::to_string);
+        Ok((conn, rx))
     }
 
     /// Spawn `claude` resuming a persisted session (`--resume <session_id>`) so a
@@ -308,7 +380,9 @@ impl ClaudeStreamJsonConnection {
         // variables for this one child (its local-control credential), which
         // must reach the agent and no sibling process.
         .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-        Self::spawn_command(cmd)
+        let (mut conn, rx) = Self::spawn_command(cmd)?;
+        conn.model = model.map(str::to_string);
+        Ok((conn, rx))
     }
 
     /// Spawn an already-built command (the real `claude` command, or a fake in
@@ -385,11 +459,27 @@ impl ClaudeStreamJsonConnection {
             Self {
                 stdin: Mutex::new(Some(stdin)),
                 child: Mutex::new(child),
+                model: None,
+                fast_mode: AtomicBool::new(false),
                 #[cfg(windows)]
                 job,
             },
             rx,
         ))
+    }
+
+    /// Record the fast-mode value this session was spawned with (the inline
+    /// `--settings` overlay), so the toggle reads the right state before the
+    /// user touches it. Called once, right after spawn, by the connection
+    /// factory; no request is sent.
+    pub fn seed_fast_mode(&self, on: bool) {
+        self.fast_mode.store(on, Ordering::Relaxed);
+    }
+
+    /// The wire this session runs on: the one it was spawned with, else the
+    /// CLI's default row.
+    fn current_wire(&self, catalog: &ClaudeCatalog) -> Option<String> {
+        self.model.clone().or_else(|| catalog.default_wire.clone())
     }
 
     fn write_line(&self, v: &Value) -> Result<()> {
@@ -541,8 +631,17 @@ impl AgentConnection for ClaudeStreamJsonConnection {
         }
     }
 
+    /// The installed CLI's own `/model` rows once a probe has published them
+    /// (see `claude_catalog`); the static seed until then. Reading the shared
+    /// slot here, rather than snapshotting at spawn, is what lets a session
+    /// that was already open when the probe landed show the new list on its
+    /// next composer sync — and what gives the phone the same rows through
+    /// `SessionHandle::models()` with no further plumbing.
     fn models(&self) -> Vec<ModelChoice> {
-        claude_model_choices()
+        match shared_claude_catalog() {
+            Some(catalog) => catalog.model_choices(),
+            None => claude_model_choices(),
+        }
     }
 
     fn permission_modes(&self) -> Vec<ModeChoice> {
@@ -552,15 +651,73 @@ impl AgentConnection for ClaudeStreamJsonConnection {
             .collect()
     }
 
+    /// The effort levels for *this session's* model. The CLI's catalog says
+    /// they differ per model (Haiku takes none), so once a probe has published
+    /// it the answer follows the model this connection was spawned with — or
+    /// the CLI's default model when none was — and an empty list hides the
+    /// composer's effort row. The static list serves until then, and for a
+    /// legacy wire (`opus`) the catalog no longer lists.
     fn efforts(&self) -> Vec<EffortChoice> {
-        CLAUDE_EFFORTS
-            .iter()
-            .map(|(w, l)| EffortChoice { wire: (*w).to_string(), label: (*l).to_string() })
+        let levels: Vec<String> = match shared_claude_catalog() {
+            Some(catalog) => {
+                let wire = self.model.clone().or_else(|| catalog.default_wire.clone());
+                match wire.as_deref().and_then(|w| catalog.effort_levels_for(w)) {
+                    Some(levels) => levels.to_vec(),
+                    None => CLAUDE_EFFORTS.iter().map(|(w, _)| (*w).to_string()).collect(),
+                }
+            }
+            None => CLAUDE_EFFORTS.iter().map(|(w, _)| (*w).to_string()).collect(),
+        };
+        levels
+            .into_iter()
+            .map(|wire| {
+                let label = effort_label(&wire);
+                EffortChoice { wire, label }
+            })
             .collect()
     }
 
+    /// The CLI's own default (the row its `Default (recommended)` entry
+    /// resolves to) when a catalog is published, else the static seed.
     fn default_model(&self) -> Option<String> {
-        Some(DEFAULT_MODEL.to_string())
+        shared_claude_catalog()
+            .and_then(|c| c.default_wire.clone())
+            .or_else(|| Some(DEFAULT_MODEL.to_string()))
+    }
+
+    /// One toggle, fast mode, and only when the CLI's catalog marks this
+    /// session's model `supportsFastMode` (the Opus rows today). No catalog →
+    /// no toggle: the control is catalog-gated by design, so a CLI that drops
+    /// the flag simply stops offering it.
+    fn features(&self) -> Vec<FeatureControl> {
+        let Some(catalog) = shared_claude_catalog() else { return Vec::new() };
+        let supported = self
+            .current_wire(&catalog)
+            .is_some_and(|wire| catalog.supports_fast_mode(&wire));
+        if !supported {
+            return Vec::new();
+        }
+        vec![FeatureControl {
+            id: FEATURE_FAST_MODE.to_string(),
+            label: "Fast mode".to_string(),
+            description: Some("Faster output from the same model".to_string()),
+            icon: Some("fast".to_string()),
+            kind: FeatureKind::Toggle { on: self.fast_mode.load(Ordering::Relaxed) },
+        }]
+    }
+
+    /// Flip fast mode on the running session with an `apply_flag_settings`
+    /// control request — the live path, so the app does not respawn. Anything
+    /// else is refused, which sends the app down its respawn fallback.
+    fn set_feature(&self, id: &str, value: FeatureValue) -> Result<()> {
+        match (id, value) {
+            (FEATURE_FAST_MODE, FeatureValue::Bool(on)) => {
+                self.write_line(&apply_flag_settings_json(json!({ FAST_MODE_SETTING: on })))?;
+                self.fast_mode.store(on, Ordering::Relaxed);
+                Ok(())
+            }
+            (id, _) => anyhow::bail!("claude has no runtime feature {id:?}"),
+        }
     }
 
     fn default_mode(&self) -> Option<String> {
@@ -870,6 +1027,12 @@ mod tests {
     /// spawned connection exercises them without a real `claude`.
     #[test]
     fn claude_vocab_matches_expected() {
+        // `models()` reads the process-wide catalog slot; hold its lock so a
+        // publish in a parallel test cannot land between these assertions.
+        let _guard = crate::thread::claude_catalog::slot_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::thread::claude_catalog::clear_claude_catalog_for_test();
         let (conn, _rx) =
             ClaudeStreamJsonConnection::spawn_command(crate::thread::sh_fixture::sh_script(":"))
                 .expect("spawn");
@@ -907,6 +1070,136 @@ mod tests {
         assert_eq!(efforts, vec!["low", "medium", "high", "xhigh", "max"]);
         assert_eq!(conn.default_effort().as_deref(), Some("high"));
         assert!(conn.capabilities().supports_rewind);
+    }
+
+    /// Once a probe publishes the CLI's catalog, the live connection serves
+    /// those rows and that default instead of the static seed — with no field
+    /// on the connection, so a session already open when the probe lands sees
+    /// the new list on its next sync.
+    #[test]
+    fn published_catalog_replaces_the_static_vocab() {
+        use crate::thread::claude_catalog::{
+            clear_claude_catalog_for_test, parse_list_models, publish_claude_catalog,
+            slot_test_lock, FIXTURE_2_1_260,
+        };
+        let _guard = slot_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_claude_catalog_for_test();
+        let (conn, _rx) =
+            ClaudeStreamJsonConnection::spawn_command(crate::thread::sh_fixture::sh_script(":"))
+                .expect("spawn");
+        assert_eq!(conn.models(), claude_model_choices(), "no catalog → static seed");
+        assert_eq!(conn.default_model().as_deref(), Some("sonnet"));
+
+        publish_claude_catalog(parse_list_models(FIXTURE_2_1_260));
+        let wires: Vec<String> = conn.models().into_iter().map(|m| m.wire).collect();
+        assert_eq!(wires, vec!["opus[1m]", "claude-fable-5-1[1m]", "sonnet", "haiku"]);
+        assert_eq!(conn.default_model().as_deref(), Some("opus[1m]"));
+        clear_claude_catalog_for_test();
+    }
+
+    /// Effort levels follow the session's model once the catalog is known:
+    /// Haiku has none (the composer hides the row), Sonnet has five, a
+    /// session on the CLI's default inherits the default row's levels, and a
+    /// legacy wire the catalog no longer lists keeps the static list.
+    #[test]
+    fn efforts_follow_the_sessions_model() {
+        use crate::thread::claude_catalog::{
+            clear_claude_catalog_for_test, parse_list_models, publish_claude_catalog,
+            slot_test_lock, FIXTURE_2_1_260,
+        };
+        let _guard = slot_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_claude_catalog_for_test();
+        let spawn = || {
+            ClaudeStreamJsonConnection::spawn_command(crate::thread::sh_fixture::sh_script(":"))
+                .expect("spawn")
+                .0
+        };
+        let wires = |conn: &ClaudeStreamJsonConnection| -> Vec<String> {
+            conn.efforts().into_iter().map(|e| e.wire).collect()
+        };
+        let mut haiku = spawn();
+        haiku.model = Some("haiku".into());
+        assert_eq!(wires(&haiku).len(), 5, "no catalog → static list for every model");
+
+        publish_claude_catalog(parse_list_models(FIXTURE_2_1_260));
+        assert!(wires(&haiku).is_empty(), "the catalog says Haiku takes no effort");
+        let mut sonnet = spawn();
+        sonnet.model = Some("sonnet".into());
+        assert_eq!(wires(&sonnet), vec!["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(sonnet.efforts()[3].label, "Extra high", "static spelling kept");
+        let default = spawn();
+        assert_eq!(wires(&default).len(), 5, "no --model → the default row's levels");
+        let mut legacy = spawn();
+        legacy.model = Some("opus".into());
+        assert_eq!(wires(&legacy).len(), 5, "a wire the catalog no longer lists keeps the static list");
+        clear_claude_catalog_for_test();
+        assert_eq!(effort_label("ultra"), "Ultra");
+    }
+
+    /// The fast-mode toggle is catalog-gated and model-gated: none without a
+    /// catalog, one on an Opus session, none on Sonnet; the default-model
+    /// session follows the default row (Opus 1M today).
+    #[test]
+    fn fast_mode_toggle_follows_the_catalog() {
+        use crate::thread::claude_catalog::{
+            clear_claude_catalog_for_test, parse_list_models, publish_claude_catalog,
+            slot_test_lock, FIXTURE_2_1_260,
+        };
+        let _guard = slot_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_claude_catalog_for_test();
+        let spawn = |model: Option<&str>| {
+            let (mut conn, _rx) = ClaudeStreamJsonConnection::spawn_command(
+                crate::thread::sh_fixture::sh_script("cat >/dev/null"),
+            )
+            .expect("spawn");
+            conn.model = model.map(str::to_string);
+            conn
+        };
+        let opus = spawn(Some("opus[1m]"));
+        assert!(opus.features().is_empty(), "no catalog → no toggle");
+
+        publish_claude_catalog(parse_list_models(FIXTURE_2_1_260));
+        let features = opus.features();
+        assert_eq!(features.len(), 1);
+        assert_eq!(features[0].id, FEATURE_FAST_MODE);
+        assert!(matches!(features[0].kind, FeatureKind::Toggle { on: false }));
+        assert!(spawn(Some("sonnet")).features().is_empty(), "Sonnet has no fast mode");
+        assert_eq!(spawn(None).features().len(), 1, "no --model → the default row (Opus)");
+
+        // Seeded from the spawn overlay, flipped live by set_feature.
+        opus.seed_fast_mode(true);
+        assert!(matches!(opus.features()[0].kind, FeatureKind::Toggle { on: true }));
+        opus.set_feature(FEATURE_FAST_MODE, FeatureValue::Bool(false)).expect("live switch");
+        assert!(matches!(opus.features()[0].kind, FeatureKind::Toggle { on: false }));
+        assert!(opus.set_feature("plan_mode", FeatureValue::Bool(true)).is_err());
+        clear_claude_catalog_for_test();
+    }
+
+    /// The fast-mode overlay merges into an existing `--settings` object — the
+    /// computer-use hook declaration must survive it — and a string that is not
+    /// an object is left exactly as it was.
+    #[test]
+    fn merge_settings_json_unions_objects_and_keeps_a_bad_string() {
+        let hooks = r#"{"hooks":{"PreToolUse":[{"matcher":"x"}]}}"#;
+        let merged = merge_settings_json(Some(hooks), &json!({"fastMode": true})).unwrap();
+        let v: Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v["fastMode"], true);
+        assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "x", "hook declaration kept");
+
+        // Nothing to merge into → the overlay alone.
+        let alone = merge_settings_json(None, &json!({"fastMode": false})).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&alone).unwrap(), json!({"fastMode": false}));
+        assert_eq!(merge_settings_json(Some("  "), &json!({"fastMode": true})).unwrap(), r#"{"fastMode":true}"#);
+
+        // Overlay keys win on a collision.
+        let over = merge_settings_json(Some(r#"{"fastMode":false}"#), &json!({"fastMode": true})).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&over).unwrap()["fastMode"], true);
+
+        // An empty overlay changes nothing, and a malformed base is untouched.
+        assert_eq!(merge_settings_json(Some(hooks), &json!({})).as_deref(), Some(hooks));
+        assert_eq!(merge_settings_json(None, &json!({})), None);
+        assert_eq!(merge_settings_json(Some("not json"), &json!({"fastMode": true})).as_deref(), Some("not json"));
+        assert_eq!(merge_settings_json(Some("[1,2]"), &json!({"fastMode": true})).as_deref(), Some("[1,2]"));
     }
 
     #[test]

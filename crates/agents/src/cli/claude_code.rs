@@ -151,8 +151,11 @@ impl CliAgentAdapter for ClaudeCodeAdapter {
     fn models(&self) -> &'static [&'static str] {
         // Documented `--model` aliases the CLI resolves to the latest of
         // each tier. Aliases (not pinned IDs) so they keep tracking the
-        // newest model without a code change.
-        &["opus", "sonnet", "haiku"]
+        // newest model without a code change. The chat picker reads the
+        // installed CLI's own list instead (`thread::claude_catalog`); this
+        // trait returns a `'static` slice, so the terminal launcher keeps a
+        // seed and a catalog-backed launcher list is a follow-up.
+        &["opus", "fable", "sonnet", "haiku"]
     }
 
     fn efforts(&self) -> &'static [&'static str] {

@@ -374,7 +374,7 @@ mod tests {
         assert!(entries.iter().all(|e| e.available));
         // Static vocab rides along (the roster's pre-bind model source).
         let claude = entries.iter().find(|e| e.adapter_id == "claude-code").unwrap();
-        assert_eq!(claude.models, ["opus", "sonnet", "haiku"]);
+        assert_eq!(claude.models, ["opus", "fable", "sonnet", "haiku"]);
         // Pi declares none: its catalog is per-user, and a static list would have
         // to name bare ids, which pi fuzzy-matches across providers.
         let pi = entries.iter().find(|e| e.adapter_id == "pi").unwrap();

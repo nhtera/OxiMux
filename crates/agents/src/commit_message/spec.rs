@@ -14,7 +14,11 @@
 //! Extending the catalog is mechanical: add a `pub const` spec, add the
 //! variant to [`AgentId`], add it to [`get_spec`].
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
+
+use crate::thread::claude_catalog::shared_claude_catalog;
 
 /// Top-level discriminator for which agent to spawn (or use a custom
 /// user template). `Custom` lives outside the spec table because its
@@ -69,10 +73,14 @@ pub struct ThinkingLevel {
 
 /// One model the agent supports. `thinking_levels` is empty when the
 /// model has no effort selector (UI hides the dropdown in that case).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `id`/`label` are `Cow` so the static seed lists stay `const` while a
+/// Claude row taken from the installed CLI's catalog (see [`models_for`])
+/// can carry its own strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Model {
-    pub id: &'static str,
-    pub label: &'static str,
+    pub id: Cow<'static, str>,
+    pub label: Cow<'static, str>,
     pub thinking_levels: &'static [ThinkingLevel],
     /// Default level to use when none is specified. `""` when the
     /// model has no thinking-levels list.
@@ -115,20 +123,20 @@ const OPENAI_THINKING: &[ThinkingLevel] = &[
 
 const CLAUDE_MODELS: &[Model] = &[
     Model {
-        id: "haiku",
-        label: "Haiku",
+        id: Cow::Borrowed("haiku"),
+        label: Cow::Borrowed("Haiku"),
         thinking_levels: NO_THINKING,
         default_thinking: "",
     },
     Model {
-        id: "sonnet",
-        label: "Sonnet",
+        id: Cow::Borrowed("sonnet"),
+        label: Cow::Borrowed("Sonnet"),
         thinking_levels: CLAUDE_THINKING,
         default_thinking: "low",
     },
     Model {
-        id: "opus",
-        label: "Opus",
+        id: Cow::Borrowed("opus"),
+        label: Cow::Borrowed("Opus"),
         thinking_levels: CLAUDE_THINKING,
         default_thinking: "low",
     },
@@ -136,20 +144,20 @@ const CLAUDE_MODELS: &[Model] = &[
 
 const CODEX_MODELS: &[Model] = &[
     Model {
-        id: "gpt-5.5",
-        label: "GPT-5.5",
+        id: Cow::Borrowed("gpt-5.5"),
+        label: Cow::Borrowed("GPT-5.5"),
         thinking_levels: OPENAI_THINKING,
         default_thinking: "low",
     },
     Model {
-        id: "gpt-5.4",
-        label: "GPT-5.4",
+        id: Cow::Borrowed("gpt-5.4"),
+        label: Cow::Borrowed("GPT-5.4"),
         thinking_levels: OPENAI_THINKING,
         default_thinking: "low",
     },
     Model {
-        id: "gpt-5.4-mini",
-        label: "GPT-5.4 Mini",
+        id: Cow::Borrowed("gpt-5.4-mini"),
+        label: Cow::Borrowed("GPT-5.4 Mini"),
         thinking_levels: OPENAI_THINKING,
         default_thinking: "low",
     },
@@ -239,10 +247,44 @@ pub fn get_spec(agent_id: AgentId) -> Option<&'static AgentSpec> {
 /// All built-in specs, for settings UI dropdowns.
 pub const BUILTIN_SPECS: &[&AgentSpec] = &[&CLAUDE_SPEC, &CODEX_SPEC];
 
+/// The models `spec` accepts right now.
+///
+/// Claude's follow the installed CLI once its catalog has been probed (the
+/// chat's model picker publishes it): every wire the CLI's own `/model` picker
+/// sends is valid for `claude -p` too, so the commit-message settings can
+/// offer Fable, or whatever the next release adds, without a code change. The
+/// catalog rows come first; the static seed's aliases that the catalog does not
+/// list (`opus`, where the CLI now says `opus[1m]`) stay behind them, because
+/// they remain valid `--model` values and a settings file that names one must
+/// keep generating the moment a chat probe lands. Effort levels are the static
+/// Claude set for any row the CLI says takes effort and none for one that does
+/// not (Haiku); the CLI itself is the final judge of a level. Until a probe
+/// lands — and for every other agent — the static seed list is the answer.
+pub fn models_for(spec: &AgentSpec) -> Vec<Model> {
+    let mut models = Vec::new();
+    if spec.id == AgentId::Claude
+        && let Some(catalog) = shared_claude_catalog()
+    {
+        models.extend(catalog.models.iter().map(|m| {
+            let thinks = !m.effort_levels.is_empty();
+            Model {
+                id: Cow::Owned(m.wire.clone()),
+                label: Cow::Owned(m.label.clone()),
+                thinking_levels: if thinks { CLAUDE_THINKING } else { NO_THINKING },
+                default_thinking: if thinks { "low" } else { "" },
+            }
+        }));
+    }
+    let seed: Vec<Model> =
+        spec.models.iter().filter(|m| !models.iter().any(|c| c.id == m.id)).cloned().collect();
+    models.extend(seed);
+    models
+}
+
 /// Look up a specific model on a spec. Returns `None` when the model
-/// id isn't known to the agent.
-pub fn get_model(spec: &AgentSpec, model_id: &str) -> Option<&'static Model> {
-    spec.models.iter().find(|m| m.id == model_id)
+/// id isn't known to the agent (see [`models_for`] for what "known" means).
+pub fn get_model(spec: &AgentSpec, model_id: &str) -> Option<Model> {
+    models_for(spec).into_iter().find(|m| m.id == model_id)
 }
 
 #[cfg(test)]
@@ -312,13 +354,52 @@ mod tests {
 
     #[test]
     fn get_model_returns_known_models() {
+        // `get_model` reads the process-wide Claude catalog slot.
+        let _guard = crate::thread::claude_catalog::slot_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::thread::claude_catalog::clear_claude_catalog_for_test();
         assert!(get_model(&CLAUDE_SPEC, "sonnet").is_some());
         assert!(get_model(&CODEX_SPEC, "gpt-5.5").is_some());
         assert!(get_model(&CLAUDE_SPEC, "unknown").is_none());
     }
 
+    /// With the CLI's catalog published, Claude's list is the catalog: a wire
+    /// the static seed never knew (Fable) validates, a row the CLI says takes
+    /// no effort carries none, and Codex is untouched.
+    #[test]
+    fn claude_models_follow_the_published_catalog() {
+        use crate::thread::claude_catalog::{
+            clear_claude_catalog_for_test, parse_list_models, publish_claude_catalog,
+            slot_test_lock, FIXTURE_2_1_260,
+        };
+        let _guard = slot_test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        clear_claude_catalog_for_test();
+        assert!(get_model(&CLAUDE_SPEC, "claude-fable-5-1[1m]").is_none(), "static seed has no Fable");
+        assert_eq!(models_for(&CLAUDE_SPEC).len(), 3);
+
+        publish_claude_catalog(parse_list_models(FIXTURE_2_1_260));
+        let fable = get_model(&CLAUDE_SPEC, "claude-fable-5-1[1m]").expect("catalog row");
+        assert_eq!(fable.label, "Fable");
+        assert_eq!(fable.thinking_levels, CLAUDE_THINKING);
+        let haiku = get_model(&CLAUDE_SPEC, "haiku").expect("catalog row");
+        assert!(haiku.thinking_levels.is_empty(), "the catalog row wins over the seed's");
+        // Four catalog rows plus the seed's `opus`, which the catalog spells
+        // `opus[1m]` but which a settings file may still name.
+        let all = models_for(&CLAUDE_SPEC);
+        let ids: Vec<&str> = all.iter().map(|m| m.id.as_ref()).collect();
+        assert_eq!(ids, ["opus[1m]", "claude-fable-5-1[1m]", "sonnet", "haiku", "opus"]);
+        assert!(get_model(&CLAUDE_SPEC, "opus").is_some(), "a stored alias keeps generating");
+        assert_eq!(models_for(&CODEX_SPEC), CODEX_MODELS.to_vec(), "codex keeps its seed");
+        clear_claude_catalog_for_test();
+    }
+
     #[test]
     fn default_models_exist_in_their_spec_model_list() {
+        let _guard = crate::thread::claude_catalog::slot_test_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::thread::claude_catalog::clear_claude_catalog_for_test();
         for spec in BUILTIN_SPECS {
             assert!(
                 get_model(spec, spec.default_model).is_some(),
