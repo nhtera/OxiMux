@@ -1508,11 +1508,12 @@ impl Render for EditorView {
                 p,
                 window.scale_factor(),
                 cx.entity().downgrade(),
-                pdf_preview::PdfColors {
+                pdf_preview::PdfChrome {
                     muted_fg,
                     border: theme.border,
                     surface: theme.secondary,
                     accent: theme.selection,
+                    radius: density.r_card,
                 },
                 typo.t_body_md,
             ),

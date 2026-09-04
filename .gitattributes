@@ -17,6 +17,15 @@
 # WSL or on a clean VM.
 *.sh text eol=lf
 
+# Compiled into the binary with `include_str!` and then parsed byte-for-byte:
+# the frontmatter delimiter is matched as `---\n` and each fenced command is
+# split on `\n`, so a CRLF worktree yields `---\r\n` and argv entries with a
+# trailing `\r`. That is not a checkout detail by the time it is embedded — it
+# is the program's own data, and it broke four `skills` tests on the Windows
+# runner while every other platform passed. Same reasoning as `*.sh` above:
+# `text=auto` alone normalises the index, not the worktree the compiler reads.
+docs/skills/*.md text eol=lf
+
 # Binary: never normalise, never diff as text.
 *.png binary
 *.ttf binary

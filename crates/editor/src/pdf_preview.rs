@@ -1080,16 +1080,18 @@ pub fn page_toolbar(content: &PdfContent, cx: &Context<EditorView>) -> AnyElemen
         .into_any_element()
 }
 
-/// Colours the document body needs, snapshotted by the caller so this
+/// Theme tokens the document body needs, snapshotted by the caller so this
 /// module never holds a theme borrow across a `cx.listener`.
 #[derive(Clone, Copy)]
-pub struct PdfColors {
+pub struct PdfChrome {
     pub muted_fg: gpui::Hsla,
     pub border: gpui::Hsla,
     pub surface: gpui::Hsla,
     /// The theme's selection colour: the ring and the label of the page the
     /// reader is on.
     pub accent: gpui::Hsla,
+    /// Corner radius for a thumbnail cell — a card in a list, so `r_card`.
+    pub radius: f32,
 }
 
 /// The document: an optional thumbnail rail beside a continuously scrolling
@@ -1104,7 +1106,7 @@ pub fn document_body(
     content: &PdfContent,
     scale_factor: f32,
     view: WeakEntity<EditorView>,
-    colors: PdfColors,
+    colors: PdfChrome,
     text_size: f32,
 ) -> AnyElement {
     let view_id = view.entity_id();
@@ -1177,7 +1179,7 @@ fn page_column(
     content: &PdfContent,
     scale: f32,
     scale_factor: f32,
-    colors: PdfColors,
+    colors: PdfChrome,
     text_size: f32,
 ) -> AnyElement {
     let (page_w, page_h) = content.page_size;
@@ -1265,7 +1267,7 @@ fn page_column(
 fn thumbnail_rail(
     content: &PdfContent,
     view: WeakEntity<EditorView>,
-    colors: PdfColors,
+    colors: PdfChrome,
     text_size: f32,
 ) -> AnyElement {
     let page_count = content.page_count;
@@ -1325,7 +1327,7 @@ fn thumbnail_rail(
                     .child(
                         gpui::div()
                             .p(px(THUMB_INSET_PX))
-                            .rounded(px(5.0))
+                            .rounded(px(colors.radius))
                             .border(px(THUMB_RING_PX))
                             // The ring is always laid out, transparent when
                             // the page is not current, so selecting one
