@@ -60,6 +60,8 @@ pub struct RestoredPosture {
     pub pi: Option<PiPosture>,
     /// omp's approval mode (`--approval-mode`).
     pub omp: Option<oximux_agents::thread::omp::posture::OmpPosture>,
+    /// Claude's fast-mode toggle. `None` = never touched.
+    pub claude_fast_mode: Option<bool>,
 }
 
 /// Build the initial composer feature-pick overlay for a restored chat, so the
@@ -89,6 +91,12 @@ pub(super) fn seed_posture_feature_values(
         map.insert(
             oximux_agents::thread::omp::posture::FEATURE_APPROVALS.to_string(),
             FeatureValue::Choice(omp.wire().to_string()),
+        );
+    }
+    if let Some(on) = posture.claude_fast_mode {
+        map.insert(
+            oximux_agents::thread::FEATURE_FAST_MODE.to_string(),
+            FeatureValue::Bool(on),
         );
     }
     map
@@ -216,6 +224,7 @@ impl AgentChatView {
             codex_posture: self.codex_posture_snapshot(),
             pi_posture: self.pi_posture_snapshot(),
             omp_posture: self.omp_posture_snapshot(),
+            claude_fast_mode: self.claude_fast_mode_snapshot(),
             // Read off the live connection while there is one: a remote client
             // opening this session once it is dormant has no backend to ask, and
             // making the desktop spawn one to fill two dropdowns would undo

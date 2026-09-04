@@ -54,6 +54,39 @@ struct PendingTranscript {
     send_after: bool,
 }
 
+/// One agent in the draft's agent picker: its adapter id, display name, and
+/// how many models the draft knows for it (see [`AgentModelCount`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPickerRow {
+    pub id: String,
+    pub display: String,
+    pub models: AgentModelCount,
+}
+
+/// What the agent picker shows beside an agent's name about its model list.
+/// `Known(n)` renders muted (`· 4 models`), `Loading` an ellipsis, `Failed` an
+/// `Error` badge in the warning colour, `Unknown` nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentModelCount {
+    Known(usize),
+    Loading,
+    Unknown,
+    Failed,
+}
+
+impl AgentModelCount {
+    /// The trailing text and whether it is a warning. `None` renders nothing.
+    fn label(&self) -> Option<(String, bool)> {
+        match self {
+            AgentModelCount::Known(1) => Some(("· 1 model".to_string(), false)),
+            AgentModelCount::Known(n) => Some((format!("· {n} models"), false)),
+            AgentModelCount::Loading => Some(("…".to_string(), false)),
+            AgentModelCount::Failed => Some(("Error".to_string(), true)),
+            AgentModelCount::Unknown => None,
+        }
+    }
+}
+
 /// The model/mode/effort options plus their "current when unset" defaults,
 /// sourced from the live [`oximux_agents::thread::AgentConnection`] and pushed
 /// into the composer so the bottom-toolbar pickers render whatever the backend
@@ -403,7 +436,7 @@ pub struct ComposerView {
     unbound: bool,
     /// The pickable coding agents for the unbound draft's dropdown, `(id,
     /// display)` in roster order. Empty when bound.
-    agent_options: Vec<(String, String)>,
+    agent_options: Vec<AgentPickerRow>,
     /// The currently-picked agent `(id, display)`, for the agent-picker button
     /// label + the menu checkmark. `None` when bound / not yet seeded.
     current_agent: Option<(String, String)>,
@@ -866,7 +899,7 @@ impl ComposerView {
     pub fn set_agent_picker(
         &mut self,
         unbound: bool,
-        agents: Vec<(String, String)>,
+        agents: Vec<AgentPickerRow>,
         current: Option<(String, String)>,
         cx: &mut Context<Self>,
     ) {
@@ -1752,6 +1785,7 @@ impl ComposerView {
     /// read together ("Claude ▾  opus ▾").
     fn render_agent_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
+        let theme = self.theme;
         let agents = self.agent_options.clone();
         let current_id =
             self.current_agent.as_ref().map(|(id, _)| id.clone()).unwrap_or_default();
@@ -1774,7 +1808,8 @@ impl ComposerView {
         // same Popover + centered/self-hiding tooltip via `render_dropdown_shell`.
         let build_menu =
             move |mut menu: PopupMenu, window: &mut Window, _cx: &mut Context<PopupMenu>| {
-                for (id, display) in &agents {
+                for row in &agents {
+                    let (id, display) = (&row.id, &row.display);
                     let selected = current_id == *id;
                     let icon_path = adapter_icon_path(id);
                     let text = if selected {
@@ -1782,17 +1817,25 @@ impl ComposerView {
                     } else {
                         display.clone()
                     };
+                    // The model count trails the name, muted — or `Error` in
+                    // the warning colour when that agent's probe failed.
+                    let count = row.models.label();
                     let choice = id.to_string();
                     let entity = entity.clone();
                     menu = menu.item(
                         PopupMenuItem::element(move |_w, _c| {
-                            div()
+                            let mut item = div()
                                 .flex()
                                 .flex_row()
                                 .items_center()
                                 .gap(px(6.0))
                                 .child(Icon::default().path(icon_path).size(px(14.0)))
-                                .child(text.clone())
+                                .child(text.clone());
+                            if let Some((label, is_error)) = count.clone() {
+                                let color = if is_error { theme.status_warn } else { theme.fg_muted };
+                                item = item.child(div().text_color(color).child(label));
+                            }
+                            item
                         })
                         .on_click(window.listener_for(
                             &entity,
@@ -3278,7 +3321,15 @@ impl Render for ComposerView {
             self.model_select.update(cx, |s, cx| s.set_items(SearchableVec::new(items), window, cx));
             self.model_select_current = None; // re-apply selection against the new list
         }
-        let current_model = self.model.clone().or_else(|| self.vocab.default_model.clone());
+        // A persisted legacy wire (`opus`, `fable`) is still a valid `--model`
+        // but is no longer a catalog row once the CLI's list has landed, so it
+        // is shown as the row of the same family. Display only: the stored
+        // value is never rewritten, and a pick sends the row's real wire.
+        let current_model = self
+            .model
+            .clone()
+            .or_else(|| self.vocab.default_model.clone())
+            .map(|m| resolve_display_wire(&m, &self.vocab.models).unwrap_or(m));
         if self.model_select_current != current_model {
             self.model_select_current = current_model.clone();
             if let Some(wire) = current_model {
@@ -4135,5 +4186,107 @@ mod tests {
         assert_eq!(rank_context_sources(&sources, "clip"), vec![1]);
         // No match.
         assert!(rank_context_sources(&sources, "zzz").is_empty());
+    }
+}
+
+/// The catalog row a model wire should show as selected.
+///
+/// `model` itself when it is a catalog wire. Otherwise the first row of the
+/// same *family* — `opus` → `opus[1m]`, `fable` → `claude-fable-5-1[1m]` — so
+/// a tab or launch profile that persisted a bare alias before the picker
+/// started reading the CLI's own list still shows its checkmark. `None` when
+/// nothing in the catalog is of that family (the picker then shows no
+/// selection rather than a wrong one). Pure so it is testable without a
+/// window; never used to rewrite the persisted value.
+pub(crate) fn resolve_display_wire(model: &str, catalog: &[ModelChoice]) -> Option<String> {
+    if catalog.iter().any(|m| m.wire == model) {
+        return Some(model.to_string());
+    }
+    let family = model_family(model)?;
+    catalog.iter().find(|m| model_family(&m.wire) == Some(family)).map(|m| m.wire.clone())
+}
+
+/// The Claude families a legacy alias can name. Only these map: the picker
+/// serves every agent, and a Codex or ACP wire that has left its catalog
+/// (`gpt-5.4` beside `gpt-5.5`) must show no selection rather than a wrong one.
+const CLAUDE_FAMILIES: [&str; 4] = ["opus", "sonnet", "haiku", "fable"];
+
+/// The family token of a Claude model wire: the bracket suffix and any
+/// `claude-` prefix dropped, then the first dash-separated word —
+/// `opus[1m]` → `opus`, `claude-fable-5-1[1m]` → `fable`, `sonnet` → `sonnet`.
+/// `None` for anything that is not a Claude family.
+fn model_family(wire: &str) -> Option<&'static str> {
+    let bare = wire.split('[').next().unwrap_or(wire);
+    let bare = bare.strip_prefix("claude-").unwrap_or(bare);
+    let token = bare.split('-').next().unwrap_or(bare);
+    CLAUDE_FAMILIES.iter().copied().find(|f| *f == token)
+}
+
+#[cfg(test)]
+mod agent_count_tests {
+    use super::AgentModelCount;
+
+    #[test]
+    fn count_labels() {
+        assert_eq!(AgentModelCount::Known(4).label(), Some(("· 4 models".into(), false)));
+        assert_eq!(AgentModelCount::Known(1).label(), Some(("· 1 model".into(), false)));
+        assert_eq!(AgentModelCount::Loading.label(), Some(("…".into(), false)));
+        assert_eq!(AgentModelCount::Failed.label(), Some(("Error".into(), true)));
+        assert_eq!(AgentModelCount::Unknown.label(), None);
+    }
+}
+
+#[cfg(test)]
+mod display_wire_tests {
+    use super::*;
+
+    fn catalog() -> Vec<ModelChoice> {
+        ["opus[1m]", "claude-fable-5[1m]", "claude-fable-5-1[1m]", "sonnet", "haiku"]
+            .into_iter()
+            .map(|w| ModelChoice { wire: w.to_string(), label: w.to_string(), description: None })
+            .collect()
+    }
+
+    #[test]
+    fn a_catalog_wire_is_itself() {
+        assert_eq!(resolve_display_wire("sonnet", &catalog()).as_deref(), Some("sonnet"));
+        assert_eq!(resolve_display_wire("opus[1m]", &catalog()).as_deref(), Some("opus[1m]"));
+    }
+
+    #[test]
+    fn a_legacy_alias_maps_to_its_family_row() {
+        assert_eq!(resolve_display_wire("opus", &catalog()).as_deref(), Some("opus[1m]"));
+        // Two Fable rows: the first listed wins, which is display-only anyway.
+        assert_eq!(
+            resolve_display_wire("fable", &catalog()).as_deref(),
+            Some("claude-fable-5[1m]")
+        );
+        assert_eq!(
+            resolve_display_wire("claude-opus-4-1", &catalog()).as_deref(),
+            Some("opus[1m]")
+        );
+    }
+
+    #[test]
+    fn an_unrelated_wire_selects_nothing() {
+        assert_eq!(resolve_display_wire("gpt", &catalog()), None);
+        assert_eq!(resolve_display_wire("", &catalog()), None);
+        assert_eq!(resolve_display_wire("opus", &[]), None);
+        // A non-Claude catalog: a wire that left it must not pick a sibling.
+        let codex: Vec<ModelChoice> = ["gpt-5.5", "gpt-5.5-codex"]
+            .into_iter()
+            .map(|w| ModelChoice { wire: w.to_string(), label: w.to_string(), description: None })
+            .collect();
+        assert_eq!(resolve_display_wire("gpt-5.4", &codex), None);
+        assert_eq!(resolve_display_wire("gpt-5.5", &codex).as_deref(), Some("gpt-5.5"));
+    }
+
+    #[test]
+    fn family_token_shapes() {
+        assert_eq!(model_family("opus[1m]"), Some("opus"));
+        assert_eq!(model_family("claude-fable-5-1[1m]"), Some("fable"));
+        assert_eq!(model_family("claude-sonnet-5"), Some("sonnet"));
+        assert_eq!(model_family("haiku"), Some("haiku"));
+        assert_eq!(model_family("gpt-5.4"), None);
     }
 }

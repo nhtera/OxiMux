@@ -435,6 +435,7 @@ mod tests {
             codex_posture: None,
             pi_posture: None,
             omp_posture: None,
+            claude_fast_mode: None,
             choices,
         }
     }

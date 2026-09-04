@@ -89,6 +89,28 @@
         assert!(matches!(state, Some(ProbeState::Failed)));
     }
 
+    /// The picker's model count prefers a landed probe, then the cache's disk
+    /// seed, then the roster's static list; with none of those the probe state
+    /// itself is the answer.
+    #[test]
+    fn agent_model_count_prefers_probe_then_cache_then_roster() {
+        use super::composer::AgentModelCount;
+        use oximux_agents::thread::ModelChoice;
+        let m = |n: usize| ProbedCatalog {
+            models: (0..n)
+                .map(|i| ModelChoice { wire: i.to_string(), label: i.to_string(), description: None })
+                .collect(),
+            default_model: None,
+        };
+        let ready = ProbeState::Ready(m(4));
+        assert_eq!(agent_model_count(Some(&ready), Some(9), 9), AgentModelCount::Known(4));
+        assert_eq!(agent_model_count(Some(&ProbeState::Loading), Some(3), 0), AgentModelCount::Known(3));
+        assert_eq!(agent_model_count(None, None, 4), AgentModelCount::Known(4));
+        assert_eq!(agent_model_count(Some(&ProbeState::Loading), None, 0), AgentModelCount::Loading);
+        assert_eq!(agent_model_count(Some(&ProbeState::Failed), None, 0), AgentModelCount::Failed);
+        assert_eq!(agent_model_count(None, None, 0), AgentModelCount::Unknown);
+    }
+
     #[gpui::test]
     async fn disconnect_fails_closed_pending_permission(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
@@ -1634,10 +1656,12 @@
                 assert_eq!(view.model_for_test(), None);
                 assert!(!view.is_bound_for_test());
 
-                // Back to Claude, then switch the model on the draft: it records
-                // the pick (no respawn) and still hasn't bound.
+                // Back to Claude: the draft holds no model (the picker shows the
+                // vocab's default and the bind sends no `--model`, so the CLI's
+                // own default applies). Then switch the model on the draft: it
+                // records the pick (no respawn) and still hasn't bound.
                 view.change_agent("claude-code".into(), cx);
-                assert_eq!(view.model_for_test(), Some("opus"));
+                assert_eq!(view.model_for_test(), None);
                 view.change_model("sonnet".into(), cx);
                 assert_eq!(view.model_for_test(), Some("sonnet"));
                 assert!(!view.is_bound_for_test(), "a model pick on a draft must not bind");
@@ -1669,9 +1693,11 @@
         window
             .update(cx, |view, _window, cx| {
                 view.make_unbound_for_test();
-                // Codex/ACP are exactly the dynamic-model agents a live probe targets.
+                // Codex/ACP are exactly the dynamic-model agents a live probe targets;
+                // Claude joined them when its list started coming from the CLI.
                 view.change_agent("codex".into(), cx);
                 view.change_agent("opencode".into(), cx);
+                view.change_agent("claude-code".into(), cx);
                 assert!(
                     view.probed_catalogs.is_empty(),
                     "a stub-connection view must not spawn a live catalog probe"

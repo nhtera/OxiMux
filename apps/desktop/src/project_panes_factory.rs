@@ -243,6 +243,7 @@ fn restore_chat_posture(
         codex: t.codex_posture.clone(),
         pi: t.pi_posture.clone(),
         omp: t.omp_posture,
+        claude_fast_mode: t.claude_fast_mode,
     }
 }
 
@@ -2101,6 +2102,7 @@ mod tests {
             codex_posture: None,
             pi_posture: None,
             omp_posture: None,
+            claude_fast_mode: None,
             choices: Default::default(),
         };
         let snap = PersistedTabs {
@@ -2192,6 +2194,7 @@ mod tests {
                 codex_posture: None,
                 pi_posture: None,
                 omp_posture: None,
+                claude_fast_mode: None,
                 choices: Default::default(),
             }],
             ..PersistedTabs::default()
@@ -2239,6 +2242,7 @@ mod tests {
             codex_posture: None,
             pi_posture: None,
             omp_posture: None,
+            claude_fast_mode: None,
             choices: Default::default(),
         };
         let snap =

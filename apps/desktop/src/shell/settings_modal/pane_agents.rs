@@ -14,10 +14,36 @@ use super::segmented::{Segment, segmented};
 /// Agent CLIs the segmented picker exposes.
 const AGENTS: [&str; 3] = ["claude", "codex", "custom"];
 
-/// Model presets the model chip cycles through. The current value is kept
-/// as a stable anchor (prepended when not already a preset) so cycling
-/// never silently drops a hand-set model.
+/// Model presets the model chip cycles through when no Claude catalog has
+/// been probed yet. The current value is kept as a stable anchor (prepended
+/// when not already a preset) so cycling never silently drops a hand-set
+/// model.
 const MODEL_PRESETS: [&str; 5] = ["sonnet", "opus", "haiku", "gpt-5.5-codex", "gpt-5.5"];
+
+/// The presets that are not Claude's: what stays when the installed CLI's own
+/// Claude list replaces the three static aliases.
+const NON_CLAUDE_PRESETS: [&str; 2] = ["gpt-5.5-codex", "gpt-5.5"];
+
+/// The model chip's presets right now: the installed CLI's Claude wires (the
+/// same rows the chat picker shows, all valid for `claude -p`) followed by the
+/// Codex presets, or the static list until a probe has landed.
+fn model_presets() -> Vec<String> {
+    presets_from(oximux_agents::thread::shared_claude_catalog().as_deref())
+}
+
+/// [`model_presets`] over an explicit catalog, so the derivation is testable
+/// without touching the process-wide slot.
+fn presets_from(catalog: Option<&oximux_agents::thread::ClaudeCatalog>) -> Vec<String> {
+    match catalog {
+        Some(catalog) => catalog
+            .models
+            .iter()
+            .map(|m| m.wire.clone())
+            .chain(NON_CLAUDE_PRESETS.iter().map(|p| (*p).to_string()))
+            .collect(),
+        None => MODEL_PRESETS.iter().map(|p| (*p).to_string()).collect(),
+    }
+}
 
 pub(super) fn render(
     modal: &SettingsModal,
@@ -195,7 +221,7 @@ fn ai_entries(
         density,
         typography,
         |this, _w, cx| {
-            this.ai.agent.model = cycle_model(&this.ai.agent.model);
+            this.ai.agent.model = cycle_model(&this.ai.agent.model, &model_presets());
             this.persist_ai(cx);
         },
         cx,
@@ -239,12 +265,12 @@ fn mode_label(mode: CommitMessageAiMode) -> &'static str {
 
 /// Cycle to the next model preset, anchoring on the current value so a
 /// hand-set custom model is preserved (reachable by wrapping).
-fn cycle_model(current: &str) -> String {
-    let mut list: Vec<&str> = Vec::with_capacity(MODEL_PRESETS.len() + 1);
-    if !MODEL_PRESETS.contains(&current) {
+fn cycle_model(current: &str, presets: &[String]) -> String {
+    let mut list: Vec<&str> = Vec::with_capacity(presets.len() + 1);
+    if !presets.iter().any(|p| p == current) {
         list.push(current);
     }
-    list.extend_from_slice(&MODEL_PRESETS);
+    list.extend(presets.iter().map(String::as_str));
     let idx = list.iter().position(|m| *m == current).unwrap_or(0);
     list[(idx + 1) % list.len()].to_string()
 }
@@ -253,18 +279,39 @@ fn cycle_model(current: &str) -> String {
 mod tests {
     use super::*;
 
+    fn static_presets() -> Vec<String> {
+        MODEL_PRESETS.iter().map(|p| (*p).to_string()).collect()
+    }
+
     #[test]
     fn cycle_model_advances_through_presets() {
-        assert_eq!(cycle_model("sonnet"), "opus");
-        assert_eq!(cycle_model("gpt-5.5"), "sonnet"); // wraps
+        let presets = static_presets();
+        assert_eq!(cycle_model("sonnet", &presets), "opus");
+        assert_eq!(cycle_model("gpt-5.5", &presets), "sonnet"); // wraps
     }
 
     #[test]
     fn cycle_model_preserves_custom_anchor() {
         // A non-preset value is anchored, so the first cycle moves into
         // the presets and wrapping returns to it.
-        assert_eq!(cycle_model("my-local-model"), "sonnet");
-        assert_eq!(cycle_model("gpt-5.5"), "sonnet");
+        let presets = static_presets();
+        assert_eq!(cycle_model("my-local-model", &presets), "sonnet");
+        assert_eq!(cycle_model("gpt-5.5", &presets), "sonnet");
+    }
+
+    /// The chip offers the CLI's own Claude rows once probed — Fable among
+    /// them — and keeps the Codex presets after them.
+    #[test]
+    fn presets_follow_the_claude_catalog() {
+        use oximux_agents::thread::parse_list_models;
+        let fixture = include_str!(
+            "../../../../../crates/agents/src/thread/testdata/claude_list_models_2_1_260.jsonl"
+        );
+        let presets = presets_from(Some(&parse_list_models(fixture)));
+        assert!(presets.iter().any(|p| p == "claude-fable-5-1[1m]"), "{presets:?}");
+        assert_eq!(&presets[presets.len() - 2..], &["gpt-5.5-codex", "gpt-5.5"]);
+        assert!(!presets.iter().any(|p| p == "opus"), "static alias replaced by the CLI's wire");
+        assert_eq!(presets_from(None), static_presets());
     }
 
     #[test]

@@ -160,10 +160,11 @@ fn agent_note(id: &str) -> Option<&'static str> {
     }
 }
 
-/// Where a row's model list comes from. Resolution order: Claude's static rich
-/// vocabulary → a warm catalog-cache entry → Codex's static slug list →
-/// deferred to first chat. The cache outranks Codex's static list because a
-/// live probe is fresher than the pinned slugs.
+/// Where a row's model list comes from. Resolution order: a warm catalog-cache
+/// entry → Claude's static seed → Codex's static slug list → deferred to first
+/// chat. The cache outranks both static lists because a live probe is fresher
+/// than anything pinned in source: for Claude it is the installed CLI's own
+/// `/model` rows, for Codex the app-server's handshake.
 pub(super) enum ModelSource {
     Rich { choices: Vec<ModelChoice>, default_model: Option<String> },
     Deferred,
@@ -174,13 +175,13 @@ pub(super) fn resolve_model_source(
     cached: Option<(Vec<ModelChoice>, Option<String>)>,
     codex_static: &[&str],
 ) -> ModelSource {
-    if adapter_id == "claude-code" {
-        return ModelSource::Rich { choices: claude_model_choices(), default_model: None };
-    }
     if let Some((choices, default_model)) = cached
         && !choices.is_empty()
     {
         return ModelSource::Rich { choices, default_model };
+    }
+    if adapter_id == "claude-code" {
+        return ModelSource::Rich { choices: claude_model_choices(), default_model: None };
     }
     if adapter_id == "codex" {
         return ModelSource::Rich {
@@ -442,11 +443,30 @@ mod tests {
 
     #[test]
     fn model_source_resolution_order() {
-        // Claude: static rich list regardless of cache.
-        assert!(matches!(
-            resolve_model_source("claude-code", None, &[]),
-            ModelSource::Rich { .. }
+        // Claude: the static seed when the cache is cold…
+        let ModelSource::Rich { choices, default_model } =
+            resolve_model_source("claude-code", None, &[])
+        else {
+            panic!("expected claude static seed");
+        };
+        assert_eq!(choices, claude_model_choices());
+        assert_eq!(default_model, None);
+        // …and the probed CLI list, with its default, when the cache has one.
+        let probed = Some((
+            vec![ModelChoice {
+                wire: "opus[1m]".into(),
+                label: "Opus (1M context)".into(),
+                description: None,
+            }],
+            Some("opus[1m]".to_string()),
         ));
+        let ModelSource::Rich { choices, default_model } =
+            resolve_model_source("claude-code", probed, &[])
+        else {
+            panic!("expected claude cached list");
+        };
+        assert_eq!(choices[0].wire, "opus[1m]");
+        assert_eq!(default_model.as_deref(), Some("opus[1m]"));
         // Warm cache wins for any other agent.
         let cached = Some((
             vec![ModelChoice { wire: "m".into(), label: "M".into(), description: None }],

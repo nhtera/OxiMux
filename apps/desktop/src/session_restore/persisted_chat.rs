@@ -153,6 +153,12 @@ pub struct PersistedChatTranscript {
     /// restored session may do, so it is persisted rather than re-derived.
     #[serde(default)]
     pub omp_posture: Option<oximux_agents::thread::omp::posture::OmpPosture>,
+    /// Claude's fast-mode toggle as last set in the composer, so a reopened
+    /// Claude chat respawns with the same `fastMode` overlay. `None` = never
+    /// touched (the CLI's own setting applies). `#[serde(default)]` keeps
+    /// older blobs loadable.
+    #[serde(default)]
+    pub claude_fast_mode: Option<bool>,
     /// What this session's pickers offer, so a remote client can render them
     /// without a backend to ask. `#[serde(default)]` (→ empty) keeps blobs
     /// written before this field loadable; their pickers stay hidden until the
@@ -209,6 +215,38 @@ mod tests {
         SettingsRepo::new(open_memory().expect("in-memory db"))
     }
 
+    /// The fast-mode pick survives the blob, and an older blob without the
+    /// field loads as "never touched".
+    #[test]
+    fn claude_fast_mode_round_trips_and_defaults_to_none() {
+        let repo = repo();
+        let mut t = PersistedChatTranscript {
+            session_id: "sid-fast".into(),
+            model: Some("opus[1m]".into()),
+            entries: vec![],
+            slash_commands: vec![],
+            session_meta: Default::default(),
+            thinking_level: Default::default(),
+            provider: Default::default(),
+            acp_command: None,
+            acp_args: vec![],
+            adapter_id: None,
+            launch_profile: None,
+            codex_posture: None,
+            pi_posture: None,
+            omp_posture: None,
+            claude_fast_mode: Some(true),
+            choices: Default::default(),
+        };
+        save_chat_transcript(&repo, &t);
+        let loaded = load_chat_transcript(&repo, "sid-fast").expect("saved blob loads");
+        assert_eq!(loaded.claude_fast_mode, Some(true));
+        t.claude_fast_mode = None;
+        let json = serde_json::to_string(&t).unwrap();
+        let stripped: PersistedChatTranscript = serde_json::from_str(&json).unwrap();
+        assert_eq!(stripped.claude_fast_mode, None);
+    }
+
     #[test]
     fn pi_posture_round_trips_so_a_restore_cannot_silently_widen_it() {
         use oximux_agents::thread::pi::posture::{PiPosture, TOOLS_READ_ONLY};
@@ -228,6 +266,7 @@ mod tests {
             codex_posture: None,
             pi_posture: Some(PiPosture { tools: TOOLS_READ_ONLY.into(), context_files: false }),
             omp_posture: None,
+            claude_fast_mode: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -261,6 +300,7 @@ mod tests {
             codex_posture: None,
             pi_posture: None,
             omp_posture: Some(OmpPosture::AlwaysAsk),
+            claude_fast_mode: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -307,6 +347,7 @@ mod tests {
             codex_posture: None,
             pi_posture: None,
             omp_posture: None,
+            claude_fast_mode: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -343,6 +384,7 @@ mod tests {
             codex_posture: None,
             pi_posture: None,
             omp_posture: None,
+            claude_fast_mode: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
