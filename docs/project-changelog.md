@@ -4,6 +4,47 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-04 — The Claude model picker follows the installed CLI (`feat/enhancement`)
+
+- **The chat's Claude model list is no longer copied from one CLI build.** The
+  installed `claude` answers a `list_models` control request over stream-json
+  with the same rows its own `/model` picker shows — wire value, display name,
+  blurb, effort levels, fast-mode support — without starting an API turn.
+  `crates/agents/src/thread/claude_catalog.rs` runs that probe (with
+  `--setting-sources ""`, so the user's SessionStart hooks do not fire and
+  OxiMux's own status hook cannot paint a phantom session) and publishes the
+  parsed catalog into a process-wide slot that every live Claude connection
+  reads. `SessionHandle::models()` is `conn.models()`, so the phone sees the
+  same rows with no extra plumbing. The static list in `claude_stream_json.rs`
+  is now the seed painted until a probe lands and the fallback when one never
+  does (a CLI that predates the request answers `error` and exits 0; the probe
+  treats that as empty and the existing seed-preservation fold keeps what is
+  shown).
+- **Desktop wiring rides the catalog machinery that already existed.** The
+  "static list means never probe" gate is gone for Claude; the probe runs on a
+  draft pick and when a bound Claude tab connects, through the same raw
+  `std::thread` seam and `CatalogCache` stale-while-revalidate path Codex and
+  the ACP agents use, cached under `claude-code`. Onboarding runs the same probe
+  once detection finds `claude`, so a fresh install's first picker already shows
+  the CLI's rows with its default preselected instead of the static seed.
+- **The preselected model is the CLI's default** (the `Default (recommended)`
+  row's resolved target, Opus 1M today), shown checked while no `--model` flag
+  is sent until the user picks. Effort levels are per model — Haiku takes none,
+  so its effort row hides. A tab that persisted a bare alias (`opus`, `fable`)
+  keeps its value and shows the checkmark on the catalog row of the same family.
+- **Fast mode has a toggle.** Offered only for a model whose catalog row says
+  `supportsFastMode`, switched live with an `apply_flag_settings` control
+  request (no respawn), and carried across a respawn by merging
+  `{"fastMode":..}` into the one inline `--settings` object — merged, never
+  replaced, so the computer-use hook declaration that already lives there
+  survives. Persisted with the chat as `claude_fast_mode`.
+- **The agent picker shows a model count** beside each agent (`Claude · 4
+  models`), `…` while a probe runs and `Error` where one failed.
+- The secondary static copies moved with it: the commit-message spec validates
+  against the catalog when one is published (so Fable is a valid choice there),
+  the settings chips offer the catalog's wires, and the terminal launcher's
+  static list gains `fable`.
+
 ### 2026-08-27 — About + Check for Updates in the menu, and Windows updates itself
 
 - **The menus both grew what they were missing.** macOS gets a
