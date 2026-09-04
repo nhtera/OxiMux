@@ -103,12 +103,26 @@ pub use crate::messages::*;
 /// struct a v18 CLI already sends and decodes. The v18 verbs are untouched and
 /// still served.
 ///
+/// v23: appended **cron schedules** (`CreateScheduleV2` and `ListSchedulesV2`,
+/// answered by `ScheduleCreatedV2` / `SchedulesV2`). The three preset
+/// recurrences cannot say "weekdays at 09:00", which until now needed a
+/// heartbeat workaround. New verbs and a new `RecurrenceV2Wire` rather than a
+/// fourth variant on `RecurrenceWire`, and here the reason is sharper than
+/// usual: `RecurrenceWire` rides inside `Vec<ScheduleWire>` *replies* as well as
+/// inside `CreateSchedule`, so a fourth ordinal would make one cron schedule
+/// render every `ListSchedules` reply undecodable for a pre-v23 peer — every
+/// row, not just the cron one. The v18 verbs are untouched and still served;
+/// a cron schedule reaches them as the stand-in documented on
+/// `ScheduleWire::recurrence`. Heartbeats are deliberately not included: nothing
+/// asks for a cron heartbeat, and leaving them out means `HeartbeatWire` needs
+/// no degradation path at all.
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -150,6 +164,16 @@ pub const STATE_CURSOR_PUSH_MIN_VERSION: u32 = 19;
 /// column. Only a request that actually names a per-role agent or model is
 /// refused, because that one it genuinely cannot serve.
 pub const TEAM_PER_ROLE_MIN_VERSION: u32 = 22;
+
+/// The oldest host that understands a cron recurrence.
+///
+/// Read by the **client**, like [`TEAM_PER_ROLE_MIN_VERSION`] and for the same
+/// reason: a host below this cannot decode `Request::CreateScheduleV2` at all,
+/// and answers an undecodable frame rather than a refusal a user could read.
+/// Gate on what the command *asks for* — a plain `schedule create` with a
+/// preset recurrence still works against any v10 host, so only `--cron` may
+/// require this.
+pub const SCHEDULE_CRON_MIN_VERSION: u32 = 23;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the
@@ -711,6 +735,32 @@ pub enum Request {
     /// the old one and gets a board with no agent column, which is the honest
     /// reading — it has no field to put one in.
     TeamStatusV2 { run_id: String },
+    /// Create a schedule whose recurrence may be a cron expression.
+    ///
+    /// The v23 successor to [`Request::CreateSchedule`], carrying
+    /// [`RecurrenceV2Wire`] instead of [`RecurrenceWire`]. Gated identically —
+    /// full scope and not read-only — because it is the same standing grant to
+    /// run an agent unattended; cron changes when it fires, not what it may do.
+    ///
+    /// The expression is validated host-side through the same constructor the
+    /// desktop uses. A pattern that will not parse as five fields, one that can
+    /// never fire (`0 9 30 2 *`), and one tighter than the interval floor are
+    /// all refused rather than stored.
+    CreateScheduleV2 {
+        name: String,
+        cwd: String,
+        prompt: String,
+        agent_id: Option<String>,
+        recurrence: RecurrenceV2Wire,
+    },
+    /// Every schedule, with cron expressions intact.
+    ///
+    /// The v23 successor to [`Request::ListSchedules`], same read gate. A client
+    /// that can decode this should always prefer it: the v18 reply substitutes a
+    /// stand-in recurrence for any cron schedule (see
+    /// [`ScheduleWire::recurrence`]), which is fine to *display* and wrong to
+    /// reason about.
+    ListSchedulesV2,
 }
 
 /// Host → client.
@@ -927,6 +977,15 @@ pub enum Response {
     /// [`Request::TeamStatusV2`]: its roles simply name no agent, which is
     /// what they recorded.
     TeamRunV2(TeamRunV2Wire),
+    /// Reply to [`Request::ListSchedulesV2`]. Empty is a normal answer.
+    ///
+    /// Carries every schedule, not only the cron ones: a client asking the v2
+    /// verb wants one list in one shape, and splitting them across two replies
+    /// would make ordering and paging the client's problem for no gain.
+    SchedulesV2(Vec<ScheduleV2Wire>),
+    /// Reply to [`Request::CreateScheduleV2`] — the stored row, so the client
+    /// can show the resolved next fire without a second round trip.
+    ScheduleCreatedV2(ScheduleV2Wire),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

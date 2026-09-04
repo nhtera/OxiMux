@@ -9,10 +9,12 @@
 
 use std::sync::Arc;
 
+use chrono::Timelike;
+
 use oximux_agents::schedule::ScheduleStore;
 use oximux_agents::session_registry::SessionRegistry;
 use oximux_remote_host::{AuthStore, Dispatcher, PairingSlot, registration_proof};
-use oximux_remote_proto::messages::{RecurrenceWire, RegisterReq};
+use oximux_remote_proto::messages::{RecurrenceV2Wire, RecurrenceWire, RegisterReq};
 use oximux_remote_proto::proto::{Request, Response, RpcError};
 use oximux_remote_proto::testing::duplex_pair;
 use oximux_remote_proto::Transport;
@@ -259,4 +261,217 @@ async fn a_recurrence_under_the_floor_is_refused_before_storing() {
     futures::future::join(serve, script).await;
 
     assert!(store.list().unwrap().is_empty(), "the invalid create stored nothing");
+}
+
+// ---- v23: cron schedules ----
+
+fn cron_create_req(name: &str, expr: &str) -> Request {
+    Request::CreateScheduleV2 {
+        name: name.into(),
+        cwd: "/work".into(),
+        prompt: "run the nightly report".into(),
+        agent_id: None,
+        recurrence: RecurrenceV2Wire::Cron { expr: expr.into() },
+    }
+}
+
+/// The whole point of the phase, end to end through the dispatcher: a cadence
+/// the three presets cannot express, created and read back intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cron_schedule_round_trips_through_the_v23_verbs() {
+    let store = store();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), auth)
+        .with_clock(clock)
+        .with_schedule_store(Arc::clone(&store));
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32]))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        let created = call(&client, cron_create_req("Weekdays", "0 9 * * 1-5")).await;
+        let Response::ScheduleCreatedV2(sched) = created else {
+            panic!("expected ScheduleCreatedV2, got {created:?}");
+        };
+        assert_eq!(
+            sched.recurrence,
+            RecurrenceV2Wire::Cron { expr: "0 9 * * 1-5".into() },
+            "the expression comes back as written"
+        );
+        assert!(sched.summary.contains("09:00"), "human phrasing: {}", sched.summary);
+        assert!(!sched.next_fire_at.is_empty(), "a concrete next fire, not a placeholder");
+
+        let listed = call(&client, Request::ListSchedulesV2).await;
+        let Response::SchedulesV2(rows) = listed else {
+            panic!("expected SchedulesV2, got {listed:?}");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].recurrence, RecurrenceV2Wire::Cron { expr: "0 9 * * 1-5".into() });
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+}
+
+/// **The degradation, asserted where it matters.** A pre-v23 peer asking the
+/// v10 verb must still receive the row — with an exact `summary` and
+/// `next_fire_at`, and a stand-in recurrence in place of the cron it cannot
+/// decode. Omitting the row instead would leave a user on an old phone seeing
+/// fewer schedules than exist, with nothing to explain why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cron_schedule_still_reaches_a_pre_v23_peer() {
+    let store = store();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), auth)
+        .with_clock(clock)
+        .with_schedule_store(Arc::clone(&store));
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32]))).await
+        else {
+            panic!("expected Registered");
+        };
+
+        // One cron schedule and one preset, so this also proves the cron row
+        // does not take the readable one down with it.
+        //
+        // **Two fires a day on purpose.** A once-daily pattern like
+        // `0 9 * * 1-5` makes this test vacuous: the stored next fire and a
+        // freshly computed one both land on 09:00, so a stand-in built from the
+        // wrong clock agrees by accident. With 09:00 and 17:00 the host's
+        // injected clock and the wall clock pick different ones.
+        let Response::ScheduleCreatedV2(cron) =
+            call(&client, cron_create_req("TwiceDaily", "0 9,17 * * *")).await
+        else {
+            panic!("expected ScheduleCreatedV2");
+        };
+        let Response::ScheduleCreated(preset) =
+            call(&client, create_req("Nightly", daily(9, 0))).await
+        else {
+            panic!("expected ScheduleCreated");
+        };
+
+        let listed = call(&client, Request::ListSchedules).await;
+        let Response::Schedules(rows) = listed else {
+            panic!("expected Schedules, got {listed:?}");
+        };
+        assert_eq!(rows.len(), 2, "the old verb still answers with every schedule");
+
+        let old_view = rows.iter().find(|r| r.id == cron.id).expect("the cron row is listed");
+        assert_eq!(
+            old_view.summary, cron.summary,
+            "the phrasing a person reads is identical on both verbs"
+        );
+        assert_eq!(
+            old_view.next_fire_at, cron.next_fire_at,
+            "and so is the next fire — neither is approximated"
+        );
+        // Asserted by VALUE, not merely by shape. A `matches!(DailyAt { .. })`
+        // passes just as happily when the stand-in is computed from the wall
+        // clock instead of the schedule's own next fire — which puts two
+        // different answers about one schedule in a single frame.
+        let RecurrenceWire::DailyAt { hour, minute } = old_view.recurrence else {
+            panic!("the stand-in is the closest thing v10 can say: {:?}", old_view.recurrence);
+        };
+        let fire: chrono::DateTime<chrono::FixedOffset> =
+            chrono::DateTime::parse_from_rfc3339(&old_view.next_fire_at).expect("rfc3339");
+        assert_eq!(
+            (hour as u32, minute as u32),
+            (fire.hour(), fire.minute()),
+            "the stand-in must agree with the `next_fire_at` shipped beside it"
+        );
+        // The preset row is untouched by any of this.
+        let preset_view =
+            rows.iter().find(|r| r.id == preset.id).expect("the preset row is listed");
+        assert_eq!(preset_view.recurrence, RecurrenceWire::DailyAt { hour: 9, minute: 0 });
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+}
+
+/// Every way a cron expression can be wrong is refused by the host, not stored
+/// — `BadRequest` naming the rule, never `Internal`, and never a row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bad_cron_is_refused_by_the_host_and_never_stored() {
+    let store = store();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), auth)
+        .with_clock(clock)
+        .with_schedule_store(Arc::clone(&store));
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req([0x33; 32]))).await
+        else {
+            panic!("expected Registered");
+        };
+        for (expr, why) in [
+            ("not a cron", "does not parse"),
+            ("0 0 9 * * 1-5", "six fields would silently mean seconds"),
+            ("0 9 30 2 *", "parses but never comes around"),
+            ("* * * * *", "fires inside the interval floor"),
+        ] {
+            let reply = call(&client, cron_create_req("Bad", expr)).await;
+            let Response::Error(RpcError::BadRequest(msg)) = reply else {
+                panic!("{expr} ({why}) should be a BadRequest, got {reply:?}");
+            };
+            assert!(!msg.is_empty(), "{expr}: the refusal must say something");
+        }
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+
+    assert!(store.list().unwrap().is_empty(), "not one bad expression reached the store");
+}
+
+/// Cron changes *when* a schedule fires, never what it may do, so the v23 verbs
+/// carry exactly the gates their v10 twins do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_v23_verbs_are_gated_exactly_as_their_v10_twins() {
+    let store = store();
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let pubkey = [0x33; 32];
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), Arc::clone(&auth))
+        .with_clock(clock)
+        .with_schedule_store(Arc::clone(&store));
+
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        let Response::Registered { .. } =
+            call(&client, Request::Register(register_req(pubkey))).await
+        else {
+            panic!("expected Registered");
+        };
+        // Narrowed after registration, the way a device is demoted in practice.
+        auth.set_read_only(&pubkey, true);
+        assert_eq!(
+            call(&client, cron_create_req("Weekdays", "0 9 * * 1-5")).await,
+            Response::Error(RpcError::Unauthorized),
+            "a read-only device cannot plant a standing grant, cron or otherwise"
+        );
+        // ...but the read still works, exactly as `ListSchedules` does.
+        let listed = call(&client, Request::ListSchedulesV2).await;
+        assert!(
+            matches!(listed, Response::SchedulesV2(_)),
+            "a read-only device may still read, got {listed:?}"
+        );
+        drop(client);
+    };
+    futures::future::join(serve, script).await;
+
+    assert!(store.list().unwrap().is_empty(), "the refusal really refused");
 }

@@ -156,22 +156,13 @@ fn to_wire(s: &Schedule, session_id: &str) -> HeartbeatWire {
         session_id: session_id.to_string(),
         name: s.name.clone(),
         prompt: s.prompt.clone(),
-        recurrence: recurrence_to_wire(&s.recurrence),
+        recurrence: super::schedules::recurrence_to_wire(&s.recurrence, s.next_fire_at),
         enabled: s.enabled,
         next_fire_at: s.next_fire_at.to_rfc3339(),
         summary: describe(&s.recurrence),
     }
 }
 
-fn recurrence_to_wire(r: &Recurrence) -> RecurrenceWire {
-    match *r {
-        Recurrence::EveryMinutes(minutes) => RecurrenceWire::EveryMinutes { minutes },
-        Recurrence::DailyAt { hour, minute } => RecurrenceWire::DailyAt { hour, minute },
-        Recurrence::WeeklyAt { weekday, hour, minute } => {
-            RecurrenceWire::WeeklyAt { weekday, hour, minute }
-        }
-    }
-}
 
 /// Wire → validated recurrence, through the constructors so the interval floor
 /// and the time checks bite here rather than in the store.

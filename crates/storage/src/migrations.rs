@@ -227,6 +227,14 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "team_role_agent",
         sql: include_str!("../migrations/V027__team_role_agent.sql"),
     },
+    // V028 adds `schedules.cron_expr` — the escape hatch for a recurrence the
+    // three presets cannot express ("weekdays at 09:00"), which until now
+    // needed a heartbeat workaround.
+    Migration {
+        version: 28,
+        name: "schedules_cron",
+        sql: include_str!("../migrations/V028__schedules_cron.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.
@@ -587,6 +595,48 @@ mod tests {
         assert_eq!(session.as_deref(), Some("s-1"), "existing data must survive");
         assert_eq!(agent, None, "an upgraded role names no agent");
         assert_eq!(model, None, "an upgraded role names no model");
+    }
+
+    /// The same upgrade proof for V028, on the table schedules live in: a
+    /// schedule created before cron existed must open as "no expression"
+    /// rather than as a failed read.
+    #[test]
+    fn a_pre_v028_schedule_upgrades_with_no_cron_expression() {
+        let mut conn = mem_conn();
+        let upto_27: Vec<Migration> =
+            MIGRATIONS.iter().filter(|m| m.version <= 27).cloned().collect();
+        run_migrations(&mut conn, &upto_27).expect("ladder through V027");
+
+        conn.execute(
+            "INSERT INTO schedules \
+             (id, name, cwd, prompt, kind, hour, minute, enabled, next_fire_at, created_at) \
+             VALUES ('sch-1', 'standup', '/p', 'go', 'daily', 9, 0, 1, \
+                     '2026-01-01T09:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("seed schedule");
+
+        assert!(
+            conn.query_row("SELECT cron_expr FROM schedules", [], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .is_err(),
+            "V027 must not already have `cron_expr` — this test would be vacuous"
+        );
+
+        run_migrations(&mut conn, MIGRATIONS).expect("upgrade to head");
+
+        let (name, kind, hour, cron): (String, String, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT name, kind, hour, cron_expr FROM schedules WHERE id = 'sch-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("the pre-existing schedule survives the upgrade");
+        assert_eq!(name, "standup", "existing data must survive");
+        assert_eq!(kind, "daily", "its cadence is untouched by the upgrade");
+        assert_eq!(hour, Some(9), "existing data must survive");
+        assert_eq!(cron, None, "an upgraded schedule carries no expression");
     }
 
     fn applied_versions(conn: &Connection) -> Vec<u32> {

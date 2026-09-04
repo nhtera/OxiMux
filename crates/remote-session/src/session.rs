@@ -19,8 +19,8 @@ use futures::channel::oneshot;
 use oximux_agent_core::thread::{AskQuestion, ChatImage, PermissionDecision, QuestionAnswers};
 use oximux_remote_proto::messages::{
     AnswerQuestionReq, CheckRunWire, ForgeItemDetailWire, ForgeItemKindWire, ForgeItemWire,
-    ForgeStateWire, ProjectSummaryWire, RecurrenceWire, ResolvePermissionReq, ScheduleRunWire,
-    ScheduleWire, SendPromptReq, SessionInfoWire, SessionSummary, SessionTranscriptWire,
+    ForgeStateWire, ProjectSummaryWire, RecurrenceV2Wire, RecurrenceWire, ResolvePermissionReq,
+    ScheduleRunWire, ScheduleV2Wire, ScheduleWire, SendPromptReq, SessionInfoWire, SessionSummary, SessionTranscriptWire,
 };
 use oximux_remote_proto::proto::{Request, Response, RpcError, SessionChoices};
 use oximux_remote_proto::{HostEvent, Transport};
@@ -398,6 +398,22 @@ impl RemoteSession {
         }
     }
 
+    /// [`Self::list_schedules`] against a v23 host: the same rows, with cron
+    /// expressions intact.
+    ///
+    /// Callers that can decode this should prefer it — the v18 reply substitutes
+    /// a stand-in recurrence for a cron schedule, which is fine to display and
+    /// wrong to reason about. Gate on
+    /// [`SCHEDULE_CRON_MIN_VERSION`](oximux_remote_proto::proto::SCHEDULE_CRON_MIN_VERSION)
+    /// before calling: an older host cannot decode the request frame at all.
+    pub async fn list_schedules_v2(&self) -> Result<Vec<ScheduleV2Wire>> {
+        match self.call(Request::ListSchedulesV2).await? {
+            Response::SchedulesV2(rows) => Ok(rows),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "SchedulesV2" }),
+        }
+    }
+
     /// Create a schedule, returning the stored row — its derived id and first
     /// next-fire come back so the caller can show it without re-listing.
     ///
@@ -423,6 +439,34 @@ impl RemoteSession {
             Response::ScheduleCreated(sched) => Ok(sched),
             Response::Error(e) => Err(SessionError::Rpc(e)),
             _ => Err(SessionError::Unexpected { expected: "ScheduleCreated" }),
+        }
+    }
+
+    /// [`Self::create_schedule`] against a v23 host, whose recurrence may be a
+    /// cron expression.
+    ///
+    /// The expression is validated host-side: one that will not parse as five
+    /// fields, one that can never fire, and one tighter than the interval floor
+    /// all come back as a `BadRequest` naming the rule broken.
+    pub async fn create_schedule_v2(
+        &self,
+        name: &str,
+        cwd: &str,
+        prompt: &str,
+        agent_id: Option<&str>,
+        recurrence: RecurrenceV2Wire,
+    ) -> Result<ScheduleV2Wire> {
+        let req = Request::CreateScheduleV2 {
+            name: name.to_string(),
+            cwd: cwd.to_string(),
+            prompt: prompt.to_string(),
+            agent_id: agent_id.map(str::to_string),
+            recurrence,
+        };
+        match self.call(req).await? {
+            Response::ScheduleCreatedV2(sched) => Ok(sched),
+            Response::Error(e) => Err(SessionError::Rpc(e)),
+            _ => Err(SessionError::Unexpected { expected: "ScheduleCreatedV2" }),
         }
     }
 

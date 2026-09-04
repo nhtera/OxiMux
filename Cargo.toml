@@ -241,6 +241,12 @@ image = "0.25"
 qrcode = { version = "0.14", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
+# Cron expressions for schedules (phase 9). `croner` rather than `cron`: the
+# latter demands a 7-field pattern with seconds and a year, which is not the
+# grammar a person types. croner parses the ordinary 5-field form and reads
+# time through the `chrono` already in this graph, so it adds no second clock.
+croner = { version = "4", default-features = false, features = ["chrono"] }
+
 # Phase 5 editor + LSP. Pinned to match gpui-component's transitive
 # `lsp-types = "0.97"` so the `HoverProvider` trait surface (Hover,
 # Diagnostic, Position) is a single concrete type across the dep graph.

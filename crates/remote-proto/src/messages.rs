@@ -601,6 +601,35 @@ pub struct ScheduleWire {
     pub cwd: String,
     pub prompt: String,
     pub agent_id: Option<String>,
+    /// **A stand-in for a cron schedule.** This enum has no cron variant and
+    /// cannot gain one (see [`RecurrenceV2Wire`]), so a cron schedule reaches a
+    /// pre-v23 peer as a `DailyAt` at the wall-clock time of its next fire.
+    ///
+    /// Deliberately still sent, rather than omitting the row: `summary` and
+    /// `next_fire_at` below are host-rendered strings and stay exact, so the
+    /// peer displays the schedule correctly. Verified live against the released
+    /// v20 CLI, which lists a cron schedule with the right phrasing and the
+    /// right next fire.
+    ///
+    /// What keeps the stand-in from becoming a lie that matters: **nothing
+    /// reads it.** The phone's row renders `summary` verbatim
+    /// (`schedule-row.tsx`); its picker is initialised from `defaultRecurrence`,
+    /// never from a listed row; the desktop reads its own store type; and the
+    /// CLI's v10 JSON drops the field entirely.
+    ///
+    /// **If you are adding an edit or duplicate flow, read this.** The safe
+    /// invariant is *no UI prefills a recurrence from a listed row* — not "no
+    /// edit verb exists". There is no edit verb today, but `DeleteSchedule` +
+    /// `CreateSchedule` are both already exposed to the phone, so a
+    /// delete-and-recreate edit built from them needs no new verb and would
+    /// write this stand-in back over a real cron rule, silently — and
+    /// `mobile-core`'s ffi conversion already carries this value across into
+    /// `Schedule.recurrence`, so it is one prefill away from a picker. Prefill
+    /// from [`ScheduleV2Wire`] instead, or refuse to edit a schedule this shape
+    /// cannot describe.
+    ///
+    /// A v23 peer asks [`Request::ListSchedulesV2`](crate::proto::Request::ListSchedulesV2)
+    /// and gets the expression itself.
     pub recurrence: RecurrenceWire,
     pub enabled: bool,
     /// RFC-3339 next-fire instant in the **desktop's** local zone. Formatted
@@ -610,6 +639,63 @@ pub struct ScheduleWire {
     /// The desktop's own human phrasing of the recurrence (e.g. "Weekdays at
     /// 09:00"). Carried rather than re-derived on the phone so both surfaces read
     /// identically — the same reason the fold runs once, on the desktop.
+    pub summary: String,
+}
+
+/// How often a schedule repeats, with cron. The v23 successor to
+/// [`RecurrenceWire`].
+///
+/// A second enum rather than a fourth variant on [`RecurrenceWire`], because
+/// that type rides inside `Vec<ScheduleWire>` replies as well as inside
+/// [`Request::CreateSchedule`](crate::proto::Request::CreateSchedule). Postcard
+/// encodes a variant as an ordinal, so a pre-v23 peer handed ordinal 3 fails the
+/// **whole frame** — one cron schedule anywhere would make every `ListSchedules`
+/// reply undecodable for it, not just the cron row.
+///
+/// The first three variants mirror [`RecurrenceWire`] exactly, so the mapping
+/// between them is total in the v1 -> v2 direction and lossy in only one place
+/// (see [`ScheduleWire::recurrence`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecurrenceV2Wire {
+    /// Every N minutes, measured from the previous fire.
+    EveryMinutes { minutes: u32 },
+    /// Every day at a wall-clock time.
+    DailyAt { hour: u8, minute: u8 },
+    /// Every week on one weekday at a wall-clock time. `weekday` is 0=Monday.
+    WeeklyAt { weekday: u8, hour: u8, minute: u8 },
+    /// A five-field cron expression (`minute hour day-of-month month
+    /// day-of-week`), evaluated in the **host's** local zone — schedules carry
+    /// no timezone of their own.
+    ///
+    /// Validated host-side on create through the same constructor the desktop
+    /// uses: a pattern that will not parse, one that can never fire, and one
+    /// tighter than the interval floor are all refused rather than stored.
+    /// Note cron's own weekday numbering, where both 0 and 7 mean Sunday --
+    /// unrelated to `WeeklyAt`'s 0=Monday.
+    Cron { expr: String },
+}
+
+/// A stored schedule that can carry a cron recurrence. The v23 successor to
+/// [`ScheduleWire`].
+///
+/// Identical to [`ScheduleWire`] but for the recurrence type. Its own struct
+/// rather than an appended field for the usual reason: `ScheduleWire` is
+/// positional, and a v22 client decoding `Vec<ScheduleWire>` would misparse
+/// every element after the first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleV2Wire {
+    pub id: String,
+    pub name: String,
+    pub cwd: String,
+    pub prompt: String,
+    pub agent_id: Option<String>,
+    pub recurrence: RecurrenceV2Wire,
+    pub enabled: bool,
+    /// RFC-3339 next-fire instant in the **desktop's** local zone.
+    pub next_fire_at: String,
+    /// The desktop's own human phrasing of the recurrence. Exact for every
+    /// recurrence including cron, which is why the v1 shape stays useful even
+    /// where its structured field cannot be.
     pub summary: String,
 }
 

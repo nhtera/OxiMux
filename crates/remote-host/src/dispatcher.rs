@@ -354,8 +354,12 @@ impl Dispatcher {
                 self.events_since(peer, &session_id, after_seq, peer_version)
             }
             Request::ListSchedules => self.list_schedules(peer),
+            Request::ListSchedulesV2 => self.list_schedules_v2(peer),
             Request::CreateSchedule { name, cwd, prompt, agent_id, recurrence } => {
                 self.create_schedule(peer, name, cwd, prompt, agent_id, recurrence)
+            }
+            Request::CreateScheduleV2 { name, cwd, prompt, agent_id, recurrence } => {
+                self.create_schedule_v2(peer, name, cwd, prompt, agent_id, recurrence)
             }
             Request::DeleteSchedule { id } => self.delete_schedule(peer, &id),
             Request::SetScheduleEnabled { id, enabled } => {

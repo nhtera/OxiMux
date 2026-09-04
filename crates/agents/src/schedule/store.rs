@@ -158,34 +158,35 @@ impl ScheduleStore {
             cwd: new.cwd,
             prompt: new.prompt,
             agent_id: new.agent_id,
+            next_fire_at: new.recurrence.next_after(now),
             recurrence: new.recurrence,
             enabled: true,
-            next_fire_at: new.recurrence.next_after(now),
             target,
         };
-        let (kind, interval, hour, minute, weekday) = decompose(&schedule.recurrence);
+        let cols = decompose(&schedule.recurrence);
         self.conn
             .lock()
             .unwrap()
             .execute(
                 "INSERT INTO schedules (id, name, cwd, prompt, agent_id, kind, \
                  interval_minutes, hour, minute, weekday, enabled, next_fire_at, created_at, \
-                 target_session_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13)",
+                 target_session_id, cron_expr) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?13, ?14)",
                 params![
                     schedule.id,
                     schedule.name,
                     schedule.cwd,
                     schedule.prompt,
                     schedule.agent_id,
-                    kind,
-                    interval,
-                    hour,
-                    minute,
-                    weekday,
+                    cols.kind,
+                    cols.interval_minutes,
+                    cols.hour,
+                    cols.minute,
+                    cols.weekday,
                     schedule.next_fire_at.to_rfc3339(),
                     now.to_rfc3339(),
                     target_session_id,
+                    cols.cron_expr,
                 ],
             )
             .context("insert schedule")?;
@@ -222,7 +223,7 @@ impl ScheduleStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, cwd, prompt, agent_id, kind, interval_minutes, hour, \
-                 minute, weekday, enabled, next_fire_at, target_session_id \
+                 minute, weekday, enabled, next_fire_at, target_session_id, cron_expr \
                  FROM schedules ORDER BY next_fire_at",
             )
             .context("prepare list")?;
@@ -581,19 +582,50 @@ fn outcome_text(outcome: RunOutcome) -> &'static str {
     }
 }
 
-fn decompose(r: &Recurrence) -> (&'static str, Option<i64>, Option<i64>, Option<i64>, Option<i64>) {
+/// A recurrence flattened into the columns `schedules` stores it in.
+///
+/// A struct rather than the tuple this used to be: five positional `Option`s
+/// were already easy to transpose at the call site, and `cron_expr` made six.
+struct RecurrenceColumns {
+    /// Discriminates the shape. `row_to_schedule` reads this first and skips
+    /// any row whose kind it does not recognise.
+    kind: &'static str,
+    interval_minutes: Option<i64>,
+    hour: Option<i64>,
+    minute: Option<i64>,
+    weekday: Option<i64>,
+    cron_expr: Option<String>,
+}
+
+fn decompose(r: &Recurrence) -> RecurrenceColumns {
+    let empty = RecurrenceColumns {
+        kind: "interval",
+        interval_minutes: None,
+        hour: None,
+        minute: None,
+        weekday: None,
+        cron_expr: None,
+    };
     match *r {
-        Recurrence::EveryMinutes(m) => ("interval", Some(m as i64), None, None, None),
-        Recurrence::DailyAt { hour, minute } => {
-            ("daily", None, Some(hour as i64), Some(minute as i64), None)
+        Recurrence::EveryMinutes(m) => {
+            RecurrenceColumns { interval_minutes: Some(m as i64), ..empty }
         }
-        Recurrence::WeeklyAt { weekday, hour, minute } => (
-            "weekly",
-            None,
-            Some(hour as i64),
-            Some(minute as i64),
-            Some(weekday as i64),
-        ),
+        Recurrence::DailyAt { hour, minute } => RecurrenceColumns {
+            kind: "daily",
+            hour: Some(hour as i64),
+            minute: Some(minute as i64),
+            ..empty
+        },
+        Recurrence::WeeklyAt { weekday, hour, minute } => RecurrenceColumns {
+            kind: "weekly",
+            hour: Some(hour as i64),
+            minute: Some(minute as i64),
+            weekday: Some(weekday as i64),
+            ..empty
+        },
+        Recurrence::Cron(ref expr) => {
+            RecurrenceColumns { kind: "cron", cron_expr: Some(expr.clone()), ..empty }
+        }
     }
 }
 
@@ -615,6 +647,10 @@ fn row_to_schedule(row: &rusqlite::Row<'_>) -> Option<Schedule> {
             row.get::<_, i64>(8).ok()? as u8,
         )
         .ok()?,
+        // Validated on the way back in, not merely reconstructed: a row edited
+        // by hand into `* * * * *` must not become a schedule the floor would
+        // never have allowed anyone to create.
+        "cron" => Recurrence::cron(&row.get::<_, String>(13).ok()?).ok()?,
         _ => return None,
     };
     Some(Schedule {
@@ -1010,12 +1046,75 @@ mod tests {
             Recurrence::every_minutes(45).unwrap(),
             Recurrence::daily_at(6, 30).unwrap(),
             Recurrence::weekly_at(4, 17, 15).unwrap(),
+            // Cron rides a column the other three leave NULL, so it is the one
+            // shape a `decompose`/`row_to_schedule` mismatch would silently drop.
+            Recurrence::cron("0 9 * * 1-5").unwrap(),
         ] {
-            let made = store.create(new_schedule(r), now).expect("create");
+            let made = store.create(new_schedule(r.clone()), now).expect("create");
             let back = store.list().unwrap().into_iter().find(|s| s.id == made.id).expect("found");
             assert_eq!(back.recurrence, r, "recurrence survived the round trip");
             store.delete(&made.id).unwrap();
         }
+    }
+
+    /// A `cron` row written by a newer binary must be *skipped* by an older
+    /// one, not defaulted into something plausible and wrong.
+    ///
+    /// `row_to_schedule` already returns `None` for an unrecognised `kind`;
+    /// this pins that the cron row is the shape that behaviour now protects,
+    /// and that skipping one row does not lose the rest of the list.
+    #[test]
+    fn a_row_whose_kind_is_unreadable_is_skipped_not_defaulted() {
+        let store = store();
+        let now = at("2026-07-21 08:00:00");
+        let keeper = store
+            .create(new_schedule(Recurrence::daily_at(9, 0).unwrap()), now)
+            .expect("create");
+        let cron = store
+            .create(new_schedule(Recurrence::cron("0 9 * * 1-5").unwrap()), now)
+            .expect("create");
+
+        // Stand in for an older reader by making the kind one no version knows.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE schedules SET kind = 'from-the-future' WHERE id = ?1", [&cron.id])
+            .expect("rewrite kind");
+
+        let listed = store.list().unwrap();
+        assert!(
+            listed.iter().any(|s| s.id == keeper.id),
+            "an unreadable row must not take the readable ones down with it"
+        );
+        assert!(
+            !listed.iter().any(|s| s.id == cron.id),
+            "a row whose rule cannot be read is omitted, never guessed at"
+        );
+    }
+
+    /// The floor is enforced on the way *out* of the database as well as in.
+    ///
+    /// A row hand-edited to `* * * * *` must not become a schedule nobody could
+    /// have created — `row_to_schedule` rebuilds through `Recurrence::cron`, so
+    /// the row is skipped exactly as a corrupt one is.
+    #[test]
+    fn a_hand_edited_cron_row_below_the_floor_is_refused_on_read() {
+        let store = store();
+        let now = at("2026-07-21 08:00:00");
+        let made = store
+            .create(new_schedule(Recurrence::cron("0 9 * * 1-5").unwrap()), now)
+            .expect("create");
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE schedules SET cron_expr = '* * * * *' WHERE id = ?1", [&made.id])
+            .expect("rewrite expr");
+        assert!(
+            !store.list().unwrap().iter().any(|s| s.id == made.id),
+            "a runaway pattern must not enter through the database either"
+        );
     }
 
     /// Ids must not collide even when two schedules are created back to back on
@@ -1141,3 +1240,4 @@ mod tests {
         );
     }
 }
+
