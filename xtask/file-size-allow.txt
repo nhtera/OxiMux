@@ -17,5 +17,10 @@
 # rendering and its scroll primitives now live in `agent_chat/transcript.rs`,
 # and the budget below is the post-extraction size. That was the only exception
 # ever made to "ratchet down only", and it is now closed.
-apps/desktop/src/shell/agent_chat/mod.rs 5315
-apps/desktop/src/shell/agent_chat/composer.rs 3848
+#
+# Both came down again when the gap-closure branch grew them past these rows:
+# `assemble` + `sync_composer` moved to `agent_chat/assemble.rs`, and the
+# composer's tests to `agent_chat/composer/tests.rs`. Raising the numbers was
+# considered and refused — this is what the rule above is for.
+apps/desktop/src/shell/agent_chat/mod.rs 5211
+apps/desktop/src/shell/agent_chat/composer.rs 3523
