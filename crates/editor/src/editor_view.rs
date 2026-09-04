@@ -425,10 +425,10 @@ impl EditorView {
         // one too — otherwise background tabs keep the old size until painted.
         let _zoom_sub = cx.observe_global::<EditorZoom>(|_view, cx| cx.notify());
         let _release_sub = cx.on_release(|view, cx| {
-            if let EditorContent::Pdf(p) = &mut view.content
-                && let Some(bitmap) = p.bitmap.take()
-            {
-                cx.drop_image(bitmap, None);
+            if let EditorContent::Pdf(p) = &view.content {
+                for img in p.take_all_images() {
+                    cx.drop_image(img, None);
+                }
             }
         });
 
@@ -639,29 +639,50 @@ impl EditorView {
     }
 
     fn on_zoom_in(&mut self, _: &EditorZoomIn, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_pdf() {
+            self.pdf_zoom_by(1, cx);
+            return;
+        }
         let next = current_zoom(cx).zoomed_in();
         self.apply_zoom(next, cx);
     }
 
     fn on_zoom_out(&mut self, _: &EditorZoomOut, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_pdf() {
+            self.pdf_zoom_by(-1, cx);
+            return;
+        }
         let next = current_zoom(cx).zoomed_out();
         self.apply_zoom(next, cx);
     }
 
     fn on_zoom_reset(&mut self, _: &EditorZoomReset, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_pdf() {
+            // ⌘0 on a PDF is "back to how it opened", which is Fit width —
+            // not 100 %, which has its own preset button.
+            self.pdf_set_zoom(pdf_preview::PdfZoom::FitWidth, cx);
+            return;
+        }
         self.apply_zoom(EditorZoom::reset(), cx);
     }
 
     /// Gesture zoom (Cmd+scroll wheel travel, or pinch delta converted to
     /// the same travel currency): accumulate, convert whole buckets to zoom
-    /// steps, keep the remainder. Positive travel zooms in.
+    /// steps, keep the remainder. Positive travel zooms in. A PDF pane
+    /// spends the steps on its own per-pane zoom, leaving every text tab's
+    /// font alone.
     fn on_wheel_zoom(&mut self, delta_y: f32, base: gpui::Pixels, cx: &mut Context<Self>) {
         let (steps, rest) = wheel_zoom_steps(self.wheel_zoom_accum + delta_y);
         self.wheel_zoom_accum = rest;
-        if steps != 0 {
-            let next = current_zoom(cx).stepped_by(steps, base);
-            self.apply_zoom(next, cx);
+        if steps == 0 {
+            return;
         }
+        if self.is_pdf() {
+            self.pdf_zoom_by(steps, cx);
+            return;
+        }
+        let next = current_zoom(cx).stepped_by(steps, base);
+        self.apply_zoom(next, cx);
     }
 
     /// Write the buffer to disk, clear the dirty flag, and fire `didSave`.
@@ -802,7 +823,7 @@ impl EditorView {
         cx.notify();
     }
 
-    /// The PDF state, if this view holds one. Used by the page body's width
+    /// The PDF state, if this view holds one. Used by the page body's size
     /// probe, which runs outside the module.
     pub(crate) fn pdf_content_mut(&mut self) -> Option<&mut PdfContent> {
         match &mut self.content {
@@ -811,47 +832,195 @@ impl EditorView {
         }
     }
 
-    /// Step the PDF page by `delta`, clamped to the document, and open the
-    /// new page at its top (or its bottom when `land_at_bottom`, for a
-    /// PageUp that crossed backwards). A no-op for other content and at the
-    /// ends. Returns whether the page changed; the render is requested on
-    /// the next paint via `ensure_pdf_page`.
-    pub(crate) fn pdf_step(&mut self, delta: i64, _window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.pdf_step_landing(delta, false, cx)
+    /// `true` when this view holds a PDF. The zoom actions and the wheel
+    /// gesture branch on it.
+    pub fn is_pdf(&self) -> bool {
+        matches!(self.content, EditorContent::Pdf(_))
     }
 
-    fn pdf_step_landing(&mut self, delta: i64, land_at_bottom: bool, cx: &mut Context<Self>) -> bool {
+    /// The page a PDF pane is showing (0-based); `None` for other content.
+    /// Read by the host at session-snapshot time so a restored tab reopens
+    /// where the user left off.
+    pub fn pdf_page(&self) -> Option<usize> {
+        match &self.content {
+            EditorContent::Pdf(p) => Some(p.page()),
+            _ => None,
+        }
+    }
+
+    /// Walk the PDF zoom `steps` rungs from what is currently on screen.
+    /// A no-op before the pane has been measured (there is no effective
+    /// scale to step from yet).
+    pub(crate) fn pdf_zoom_by(&mut self, steps: i32, cx: &mut Context<Self>) {
+        let Some(current) = self.pdf_content_mut().and_then(|p| p.effective_scale()) else {
+            return;
+        };
+        let next = pdf_preview::zoom_stepped(current, steps);
+        self.pdf_set_zoom(pdf_preview::PdfZoom::Scale(next), cx);
+    }
+
+    /// Switch the PDF pane's zoom mode. Scrolls back to the page top when
+    /// the whole page now fits, so a Fit page never leaves a stale offset.
+    pub(crate) fn pdf_set_zoom(&mut self, zoom: pdf_preview::PdfZoom, cx: &mut Context<Self>) {
         let EditorContent::Pdf(p) = &mut self.content else {
+            return;
+        };
+        if p.zoom == zoom {
+            return;
+        }
+        p.zoom = zoom;
+        // Keep the reader on the page they were on: the row heights just
+        // changed, so the scroll offset would otherwise land anywhere.
+        let page = p.page();
+        p.scroll_to_page(page);
+        // Every cached bitmap is now the wrong size.
+        let stale = p.drop_other_scales();
+        for img in stale {
+            cx.drop_image(img, None);
+        }
+        cx.notify();
+    }
+
+    /// Swap the `N / M` counter for a typed page number, focused and
+    /// selected so the user can type straight over it.
+    pub(crate) fn pdf_open_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let EditorContent::Pdf(p) = &self.content else {
+            return;
+        };
+        if p.goto.is_some() {
+            return;
+        }
+        let initial = SharedString::from((p.page() + 1).to_string());
+        let input = cx.new(|cx| InputState::new(window, cx));
+        input.update(cx, |s, cx| {
+            s.set_value(initial, window, cx);
+            s.focus(window, cx);
+        });
+        // Enter commits, a blur (a click anywhere else) cancels. Subscribing
+        // to the input's own events rather than hanging off the parent key
+        // handler avoids double-firing on an IME commit — the same reasoning
+        // as the file explorer's inline rename.
+        let _enter_sub = cx.subscribe_in(
+            &input,
+            window,
+            |view, _input, event: &gpui_component::input::InputEvent, window, cx| {
+                match event {
+                    gpui_component::input::InputEvent::PressEnter { .. } => {
+                        view.pdf_commit_goto(window, cx)
+                    }
+                    gpui_component::input::InputEvent::Blur => view.pdf_cancel_goto(cx),
+                    _ => {}
+                }
+            },
+        );
+        window.dispatch_action(Box::new(gpui_component::input::SelectAll), cx);
+        let Some(p) = self.pdf_content_mut() else {
+            return;
+        };
+        p.goto = Some(pdf_preview::GotoPage { input, _enter_sub });
+        cx.notify();
+    }
+
+    /// Jump to the typed page, clamped into range. Junk (or an empty field)
+    /// closes the editor without moving — a typo must not lose the reader's
+    /// place.
+    pub(crate) fn pdf_commit_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let EditorContent::Pdf(p) = &self.content else {
+            return;
+        };
+        let Some(goto) = &p.goto else { return };
+        let typed = goto.input.read(cx).value().trim().to_string();
+        let target = typed.parse::<i64>().ok();
+        self.pdf_cancel_goto(cx);
+        if let Some(one_based) = target {
+            self.pdf_goto_page((one_based - 1).max(0) as usize, window, cx);
+        }
+    }
+
+    /// Close the go-to editor, leaving the page where it is. Escape, a blur,
+    /// and a committed jump all land here.
+    pub(crate) fn pdf_cancel_goto(&mut self, cx: &mut Context<Self>) {
+        let Some(p) = self.pdf_content_mut() else {
+            return;
+        };
+        if p.goto.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Record the page the reader has scrolled to, so reopening the file —
+    /// or restoring the tab after a quit — lands there. Called from the page
+    /// list once the visible page changes, not only on an explicit jump.
+    pub fn pdf_remember_current_page(&mut self, cx: &mut Context<Self>) {
+        let EditorContent::Pdf(p) = &self.content else {
+            return;
+        };
+        let page = p.page();
+        // Only on a change: this runs every frame, and the write pushes a
+        // global-mutation effect.
+        if p.remembered.replace(page) == page {
+            return;
+        }
+        let path = self.file_path.clone();
+        pdf_preview::remember_pdf_page(cx, &path, page);
+    }
+
+    /// Show or hide the thumbnail rail.
+    pub(crate) fn pdf_toggle_thumbs(&mut self, cx: &mut Context<Self>) {
+        if let Some(p) = self.pdf_content_mut() {
+            p.show_thumbs = !p.show_thumbs;
+            cx.notify();
+        }
+    }
+
+    /// Move `delta` pages from where the reader is, clamped to the document.
+    /// Returns whether the page changed. A no-op for other content.
+    pub(crate) fn pdf_step(
+        &mut self,
+        delta: i64,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let EditorContent::Pdf(p) = &self.content else {
             return false;
         };
-        let last = p.page_count.saturating_sub(1) as i64;
-        let next = (p.page as i64 + delta).clamp(0, last) as usize;
-        if next == p.page {
-            return false;
-        }
-        p.page = next;
-        // The handle can only aim at what is laid out — still the old page —
-        // so "bottom" is deferred until the new bitmap lands; "top" is exact
-        // now and also the right place while the new page is in flight.
-        p.scroll_to_top();
-        p.land_at_bottom = land_at_bottom;
-        cx.notify();
-        true
+        let target = (p.page() as i64 + delta).max(0) as usize;
+        self.pdf_goto_page_inner(target, cx)
     }
 
-    /// Keyboard for a PDF pane. ←/→ step pages; ↑/↓ scroll within the page;
-    /// PageUp/PageDown (and Space / ⇧Space) scroll a viewport and step to
-    /// the neighbouring page once the current one is at its edge; Home/End
-    /// jump to the first/last page. Other content ignores the event so it
-    /// keeps bubbling, and so does any other modified chord (⌘←, ⌥↓ …) —
-    /// those belong to whoever bound them.
+    /// Jump to `page` (0-based) and remember it. Public so the thumbnail
+    /// rail — built inside a `'static` list closure — can route a click back
+    /// through the view.
+    pub fn pdf_goto_page(&mut self, page: usize, _window: &mut Window, cx: &mut Context<Self>) {
+        self.pdf_goto_page_inner(page, cx);
+    }
+
+    fn pdf_goto_page_inner(&mut self, page: usize, cx: &mut Context<Self>) -> bool {
+        let EditorContent::Pdf(p) = &self.content else {
+            return false;
+        };
+        let before = p.page();
+        let landed = p.scroll_to_page(page);
+        let path = self.file_path.clone();
+        pdf_preview::remember_pdf_page(cx, &path, landed);
+        cx.notify();
+        landed != before
+    }
+
+    /// Keyboard for a PDF pane. ←/→ step a page; ↑/↓ scroll; PageUp/PageDown
+    /// (and Space / ⇧Space) scroll a viewport; Home/End jump to the ends.
+    /// Other content ignores the event so it keeps bubbling, and so does any
+    /// other modified chord (⌘←, ⌥↓ …) — those belong to whoever bound them.
     fn on_pdf_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let EditorContent::Pdf(p) = &self.content else {
             return;
         };
-        // Before the first bitmap the scroll surface is not in the tree, so
-        // there is nothing to scroll and no page the user has seen to leave.
-        if p.bitmap.is_none() {
+        // While the go-to editor is open every key belongs to it — except
+        // Escape, which the input propagates after its own handler.
+        if p.goto.is_some() {
+            if event.keystroke.key.as_str() == "escape" {
+                self.pdf_cancel_goto(cx);
+            }
             return;
         }
         let key = event.keystroke.key.as_str();
@@ -884,31 +1053,19 @@ impl EditorView {
                 true
             }
             "pageup" | "space" if key == "pageup" || shift_space => {
-                if !p.scroll_by(-viewport) {
-                    self.pdf_step_landing(-1, true, cx);
-                }
+                p.scroll_by(-viewport);
                 true
             }
             "pagedown" | "space" => {
-                if !p.scroll_by(viewport) {
-                    self.pdf_step_landing(1, false, cx);
-                }
+                p.scroll_by(viewport);
                 true
             }
             "home" => {
-                if !self.pdf_step(-last, window, cx)
-                    && let EditorContent::Pdf(p) = &self.content
-                {
-                    p.scroll_to_top();
-                }
+                self.pdf_step(-last, window, cx);
                 true
             }
             "end" => {
-                if !self.pdf_step(last, window, cx)
-                    && let EditorContent::Pdf(p) = &self.content
-                {
-                    p.scroll.scroll_to_bottom();
-                }
+                self.pdf_step(last, window, cx);
                 true
             }
             _ => false,
@@ -917,65 +1074,6 @@ impl EditorView {
             cx.notify();
             cx.stop_propagation();
         }
-    }
-
-    /// Request the bitmap for the current PDF page at the current zoom and
-    /// window scale, unless that exact render is already on screen or in
-    /// flight. The render runs on the background executor; the result is
-    /// applied on the window, swapping the old texture out of the atlas.
-    ///
-    /// Scale is one logical px per PDF point, **reduced to fit the pane
-    /// width** when the page is wider than that, times the editor zoom — so
-    /// a page opens no wider than it can be shown, and ⌘+ still magnifies it
-    /// from there (the area cap in `render_page` bounds the result). Nothing
-    /// is requested until the body's width probe has reported
-    /// (`pane_width`), so the first frame shows "Rendering…" rather than an
-    /// oversized page.
-    fn ensure_pdf_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let base = cx.theme().font_size;
-        let zoom_ratio = f32::from(current_zoom(cx).effective_px(base)) / f32::from(base);
-        let scale_factor = window.scale_factor();
-        let EditorContent::Pdf(p) = &mut self.content else {
-            return;
-        };
-        let (Some(pane_width), Some((page_w, _))) = (p.pane_width, p.doc.page_size(p.page))
-        else {
-            return;
-        };
-        let fit = (pane_width - 2.0 * pdf_preview::PAGE_PADDING_PX).max(64.0) / page_w.max(1.0);
-        let scale = scale_factor * zoom_ratio * fit.min(1.0);
-        let key = PdfContent::request_key(p.page, scale);
-        if p.requested == Some(key) {
-            return;
-        }
-        p.requested = Some(key);
-        p.generation += 1;
-        let generation = p.generation;
-        let doc = p.doc.clone();
-        let page = p.page;
-        p._render_task = Some(cx.spawn_in(window, async move |weak, cx| {
-            let rendered = cx
-                .background_executor()
-                .spawn(async move { doc.render_page(page, scale) })
-                .await;
-            let _ = weak.update_in(cx, |this, window, cx| {
-                let EditorContent::Pdf(p) = &mut this.content else {
-                    return;
-                };
-                if p.generation != generation {
-                    return;
-                }
-                p.failed = rendered.is_none();
-                if let Some(old) = std::mem::replace(&mut p.bitmap, rendered) {
-                    cx.drop_image(old, Some(window));
-                }
-                if std::mem::take(&mut p.land_at_bottom) && p.bitmap.is_some() {
-                    // Now the new page is what the next layout measures.
-                    p.scroll.scroll_to_bottom();
-                }
-                cx.notify();
-            });
-        }));
     }
 }
 
@@ -1014,8 +1112,13 @@ fn spawn_pdf_load(path: PathBuf, window: &mut Window, cx: &mut Context<EditorVie
                 .await;
             let message = match loaded {
                 Ok(doc) => {
-                    let _ = weak.update(cx, |this, cx| {
-                        this.finish_load(EditorContent::Pdf(PdfContent::new(Arc::new(doc))), cx)
+                    let _ = weak.update_in(cx, |this, window, cx| {
+                        // Reopening in the same session lands where the user
+                        // left off; a restore seeds the same memory first.
+                        let page =
+                            pdf_preview::remembered_pdf_page(cx, &this.file_path).unwrap_or(0);
+                        let content = PdfContent::new(Arc::new(doc), page, window, cx);
+                        this.finish_load(EditorContent::Pdf(content), cx)
                     });
                     return;
                 }
@@ -1112,7 +1215,8 @@ fn decide_content(
     if pdf_preview::has_pdf_header(&bytes)
         && let Ok(doc) = PdfDocument::parse(bytes.clone())
     {
-        return EditorContent::Pdf(PdfContent::new(Arc::new(doc)));
+        let page = pdf_preview::remembered_pdf_page(cx, path).unwrap_or(0);
+        return EditorContent::Pdf(PdfContent::new(Arc::new(doc), page, window, cx));
     }
     if is_binary_buffer(&bytes) {
         return match image_mime_for_path(path) {
@@ -1204,12 +1308,6 @@ impl Focusable for EditorView {
 
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // A PDF pane requests its page bitmap here, where the window's scale
-        // factor and the editor zoom are both known. Idempotent: it spawns
-        // only when the wanted (page, scale) differs from the last request.
-        if matches!(self.content, EditorContent::Pdf(_)) {
-            self.ensure_pdf_page(window, cx);
-        }
         // Resolved per render rather than cached: this view keeps no token
         // snapshot, so there is nothing to go stale and nothing for
         // `appearance-lint` to hold it to. Taken before the theme borrow,
@@ -1241,10 +1339,19 @@ impl Render for EditorView {
             _ => None,
         };
 
-        // PDF page state for the breadcrumb navigator, read before the theme
-        // borrow below pins `cx`.
-        let pdf_nav = match &self.content {
-            EditorContent::Pdf(p) => Some((p.page, p.page_count)),
+        // A PDF pane's page is derived from its scroll offset, so following
+        // it is a render-time read: point the rail at it (the deferred
+        // scroll is consumed by this same frame's layout) and record it, both
+        // no-ops unless the page actually changed.
+        if let EditorContent::Pdf(p) = &self.content {
+            p.sync_rail(p.page());
+        }
+        self.pdf_remember_current_page(cx);
+
+        // The PDF page toolbar, built before the long-lived theme borrow
+        // below — it reads the theme itself for its separator.
+        let pdf_toolbar = match &self.content {
+            EditorContent::Pdf(p) => Some(pdf_preview::page_toolbar(p, cx)),
             _ => None,
         };
 
@@ -1278,6 +1385,7 @@ impl Render for EditorView {
             .border_color(theme.border)
             .text_size(gpui::px(11.0))
             .text_color(theme.muted_foreground)
+            .overflow_hidden()
             // The path is one click from the clipboard (with a toast).
             .child(editor_header::clickable_path(
                 format!("{path_str}{dirty_suffix}{kind_suffix}"),
@@ -1286,9 +1394,10 @@ impl Render for EditorView {
             ))
             // Spacer pushes the toggle + actions to the row's trailing edge.
             .child(gpui::div().flex_1())
-            // PDF-only: `‹ N / M ›` page stepper.
-            .when_some(pdf_nav, |row, (page, count)| {
-                row.child(pdf_preview::page_nav(page, count, cx))
+            // PDF-only: the page stepper + zoom toolbar. Never shrinks —
+            // the path gives way to it instead.
+            .when_some(pdf_toolbar, |row, toolbar| {
+                row.child(gpui::div().flex_none().child(toolbar))
             })
             // Markdown-only: the Source/Preview/Split toggle.
             .when(self.is_markdown, |row| {
@@ -1392,12 +1501,16 @@ impl Render for EditorView {
                 .size_full()
                 .into_any_element(),
             EditorContent::Image { .. } => render_image_body(&self.file_path),
-            EditorContent::Pdf(p) => pdf_preview::page_body(
+            EditorContent::Pdf(p) => pdf_preview::document_body(
                 p,
                 window.scale_factor(),
                 cx.entity().downgrade(),
-                muted_fg,
-                theme.border,
+                pdf_preview::PdfColors {
+                    muted_fg,
+                    border: theme.border,
+                    surface: theme.secondary,
+                    accent: theme.selection,
+                },
                 typo.t_body_md,
             ),
             EditorContent::Binary => render_binary_placeholder(muted_fg, typo.t_body_md),
@@ -1494,19 +1607,24 @@ impl Render for EditorView {
                             let view = view.clone();
                             let hitbox = hitbox.clone();
                             move |event: &gpui::ScrollWheelEvent, phase, window, cx| {
-                                if phase == gpui::DispatchPhase::Capture
-                                    && event.modifiers.secondary()
-                                    && hitbox.should_handle_scroll(window)
+                                if phase != gpui::DispatchPhase::Capture
+                                    || !hitbox.should_handle_scroll(window)
                                 {
-                                    let delta_y = f32::from(
-                                        event.delta.pixel_delta(px(WHEEL_ZOOM_STEP_PX)).y,
-                                    );
-                                    view.update(cx, |this, cx| {
-                                        this.on_wheel_zoom(delta_y, mono_base, cx)
-                                    })
-                                    .ok();
-                                    cx.stop_propagation();
+                                    return;
                                 }
+                                if !event.modifiers.secondary() {
+                                    // A plain wheel belongs to whatever is
+                                    // under it: the PDF column and the text
+                                    // buffer both scroll themselves.
+                                    return;
+                                }
+                                let delta_y =
+                                    f32::from(event.delta.pixel_delta(px(WHEEL_ZOOM_STEP_PX)).y);
+                                view.update(cx, |this, cx| {
+                                    this.on_wheel_zoom(delta_y, mono_base, cx)
+                                })
+                                .ok();
+                                cx.stop_propagation();
                             }
                         });
                         // Two-finger pinch zoom: no modifier required — the
@@ -1624,84 +1742,86 @@ mod tests {
     /// A page wider than the pane renders fitted to the pane width (minus
     /// padding), not at one point per pixel. Drives the real layout probe:
     /// the window is resized and the fitted render follows.
-    #[gpui::test]
-    async fn pdf_page_fits_the_pane_width(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("scan.pdf");
-        std::fs::write(&path, crate::pdf_preview::test_pdf_sized(1, 2480, 3508)).expect("write");
-
-        let window = cx.add_window(|window, cx| EditorView::new(path, window, cx));
+    /// Render everything the lists have queued and repaint. The view tests
+    /// run with no render workers — gpui's test scheduler panics on activity
+    /// from a thread it does not own — so this stands in for them.
+    fn render_pdf_now(cx: &mut gpui::TestAppContext, window: &gpui::WindowHandle<EditorView>) {
         cx.run_until_parked();
         window
-            .update(cx, |view, _win, _cx| {
-                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
-                let probed = p.pane_width.expect("the width probe reported after layout");
-                assert!(probed > 0.0);
-            })
-            .expect("window alive");
-
-        // Narrow the window: 800 px remain for the page after padding.
-        cx.simulate_window_resize(window.into(), gpui::size(px(832.0), px(600.0)));
-        cx.run_until_parked();
-
-        window
-            .update(cx, |view, win, _cx| {
-                let scale = win.scale_factor();
-                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
-                assert_eq!(p.pane_width, Some(832.0), "probe followed the resize");
-                let bitmap = p.bitmap.as_ref().expect("fitted page rendered");
-                let size = bitmap.size(0);
-                assert_eq!(size.width.0, (800.0 * scale).floor() as i32, "fitted to the pane");
-                let expected_h = (3508.0 * (800.0 / 2480.0) * scale).floor() as i32;
-                assert!((size.height.0 - expected_h).abs() <= 1, "aspect kept");
-            })
-            .expect("window alive");
-
-        // A resize inside one probe step changes nothing: no new render.
-        let generation_before = window
-            .update(cx, |view, _win, _cx| {
-                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
-                p.generation
-            })
-            .expect("window alive");
-        cx.simulate_window_resize(window.into(), gpui::size(px(850.0), px(600.0)));
-        cx.run_until_parked();
-        window
-            .update(cx, |view, _win, _cx| {
-                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
-                assert_eq!(p.pane_width, Some(832.0), "probe is quantised to 32 px");
-                assert_eq!(p.generation, generation_before, "sub-step resize does not re-render");
-            })
-            .expect("window alive");
-
-        // Zoom in past the pane: the page is now wider than the pane and the
-        // scroll surface must expose that width, not clip it.
-        window
-            .update(cx, |view, win, cx| {
-                for _ in 0..12 {
-                    view.on_zoom_in(&EditorZoomIn, win, cx);
+            .update(cx, |view, _win, cx| {
+                if let EditorContent::Pdf(p) = &view.content {
+                    p.render_pending_inline();
+                    cx.notify();
                 }
             })
             .expect("window alive");
         cx.run_until_parked();
+    }
+
+    /// Every page of the document is a row in one scrolling list, sized from
+    /// the document's largest page box, and the pages the list is about to
+    /// paint are the ones the renderer is asked for.
+    #[gpui::test]
+    async fn pdf_opens_as_a_scrolling_document(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("book.pdf");
+        std::fs::write(&path, crate::pdf_preview::test_pdf_sized(20, 600, 800)).expect("write");
+
+        let window = cx.add_window(|window, cx| EditorView::new(path, window, cx));
+        // A .pdf opens as Loading and lands from the background executor.
         window
             .update(cx, |view, _win, _cx| {
-                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
                 assert!(
-                    f32::from(p.scroll.max_offset().x) > 0.0,
-                    "a zoomed-in page scrolls horizontally"
+                    matches!(view.content, EditorContent::Loading),
+                    "a .pdf must not be read synchronously on open"
+                );
+            })
+            .expect("window alive");
+        cx.run_until_parked();
+        cx.simulate_window_resize(window.into(), gpui::size(px(832.0), px(600.0)));
+        render_pdf_now(cx, &window);
+
+        window
+            .update(cx, |view, win, _cx| {
+                let scale_factor = win.scale_factor();
+                let EditorContent::Pdf(p) = &view.content else {
+                    panic!("a .pdf must open as EditorContent::Pdf once loaded");
+                };
+                assert_eq!(p.page_count, 20);
+                assert_eq!(p.page_size, (600.0, 800.0), "sized from the largest page");
+                assert!(p.pane_size.is_some(), "the layout probe has reported");
+                assert!(!view.is_text(), "PDF is not a text buffer");
+
+                // Fit width by default: the page fills the column.
+                let scale = p.effective_scale().expect("pane measured");
+                let pane_w = p.pane_size.expect("probed").0;
+                let expected = (pane_w - 2.0 * crate::pdf_preview::PAGE_PADDING_PX) / 600.0;
+                assert!((scale - expected).abs() < 1e-3, "fit width: {scale} vs {expected}");
+
+                // Page 0 rendered, and its neighbours were queued too — the
+                // list asked for its visible range plus the margin.
+                let key = crate::pdf_preview::PageKey::new(0, scale * scale_factor);
+                assert!(p.store.page(key).is_some(), "the first page is on screen");
+                let ahead = crate::pdf_preview::PageKey::new(1, scale * scale_factor);
+                assert!(
+                    p.store.page(ahead).is_some(),
+                    "the next page was rendered before the reader got there"
+                );
+                assert!(
+                    p.store.resident_pages() > 2,
+                    "the prefetch margin is resident too ({})",
+                    p.store.resident_pages()
                 );
             })
             .expect("window alive");
     }
 
-    /// Keyboard model on a fitted page taller than the pane: ↓ scrolls
-    /// without changing the page, PageDown scrolls until the bottom and then
-    /// steps to the next page at its top, ← steps back, End jumps to the
-    /// last page, and a modified chord is left alone.
+    /// ←/→ move a page and the toolbar follows; ↑/↓ and PageDown scroll
+    /// without leaving the page; Home/End reach the ends; a modified chord
+    /// belongs to whoever bound it.
     #[gpui::test]
-    async fn pdf_keys_scroll_within_a_page_and_step_at_its_edges(cx: &mut gpui::TestAppContext) {
+    async fn pdf_keys_scroll_and_step(cx: &mut gpui::TestAppContext) {
         use gpui::Keystroke;
         fn key(spec: &str) -> KeyDownEvent {
             KeyDownEvent {
@@ -1712,51 +1832,201 @@ mod tests {
         }
         cx.update(gpui_component::init);
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("scan.pdf");
-        std::fs::write(&path, crate::pdf_preview::test_pdf_sized(3, 2480, 3508)).expect("write");
+        let path = dir.path().join("book.pdf");
+        std::fs::write(&path, crate::pdf_preview::test_pdf_sized(10, 600, 800)).expect("write");
         let window = cx.add_window(|window, cx| EditorView::new(path, window, cx));
         cx.run_until_parked();
         cx.simulate_window_resize(window.into(), gpui::size(px(832.0), px(600.0)));
         cx.run_until_parked();
 
-        let page_and_offset = |view: &EditorView| {
-            let EditorContent::Pdf(p) = &view.content else { unreachable!() };
-            (p.page, f32::from(p.scroll.offset().y))
-        };
         window
             .update(cx, |view, win, cx| {
-                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
-                assert!(p.bitmap.is_some(), "fitted page rendered");
-                let scrollable = f32::from(p.scroll.max_offset().y);
-                assert!(scrollable > 0.0, "an 800×1131 page in a 600 px pane scrolls ({scrollable})");
-
-                view.on_pdf_key(&key("down"), win, cx);
-                let (page, y) = page_and_offset(view);
-                assert_eq!(page, 0, "↓ scrolls, it does not step");
-                assert!(y < 0.0, "↓ moved the page up ({y})");
-
-                view.on_pdf_key(&key("cmd-down"), win, cx);
-                assert_eq!(page_and_offset(view).1, y, "a modified chord is not ours");
-                view.on_pdf_key(&key("cmd-shift-space"), win, cx);
-                assert_eq!(page_and_offset(view), (0, y), "⌘⇧Space is not ours either");
-
-                // PageDown until the bottom, then one more steps the page.
-                let mut presses = 0;
-                while page_and_offset(view).0 == 0 && presses < 20 {
-                    view.on_pdf_key(&key("pagedown"), win, cx);
-                    presses += 1;
-                }
-                let (page, y) = page_and_offset(view);
-                assert_eq!(page, 1, "PageDown past the bottom steps to the next page");
-                assert_eq!(y, 0.0, "the next page opens at its top");
-                assert!(presses >= 2, "the first PageDown scrolled, it did not step ({presses})");
-
+                assert_eq!(view.pdf_page(), Some(0));
+                view.on_pdf_key(&key("right"), win, cx);
+                assert_eq!(view.pdf_page(), Some(1), "→ moves a page");
                 view.on_pdf_key(&key("left"), win, cx);
-                assert_eq!(page_and_offset(view).0, 0, "← steps back");
+                assert_eq!(view.pdf_page(), Some(0), "← moves back");
                 view.on_pdf_key(&key("end"), win, cx);
-                assert_eq!(page_and_offset(view).0, 2, "End jumps to the last page");
+                assert_eq!(view.pdf_page(), Some(9), "End reaches the last page");
                 view.on_pdf_key(&key("home"), win, cx);
-                assert_eq!(page_and_offset(view), (0, 0.0), "Home jumps to the first page, at its top");
+                assert_eq!(view.pdf_page(), Some(0), "Home reaches the first");
+
+                // A modified chord is not ours: the page must not move.
+                view.on_pdf_key(&key("cmd-right"), win, cx);
+                assert_eq!(view.pdf_page(), Some(0), "⌘→ is not ours");
+                view.on_pdf_key(&key("cmd-shift-space"), win, cx);
+                assert_eq!(view.pdf_page(), Some(0), "⌘⇧Space is not ours either");
+            })
+            .expect("window alive");
+        cx.run_until_parked();
+
+        // ↓ scrolls the column rather than stepping a page.
+        window
+            .update(cx, |view, win, cx| {
+                let offset = |view: &EditorView| {
+                    let EditorContent::Pdf(p) = &view.content else { unreachable!() };
+                    f32::from(p.list.0.borrow().base_handle.offset().y)
+                };
+                let before = offset(view);
+                view.on_pdf_key(&key("down"), win, cx);
+                assert!(offset(view) < before, "↓ scrolls the document");
+            })
+            .expect("window alive");
+    }
+
+    /// Typing a page number and pressing Enter jumps there; out-of-range
+    /// clamps; Escape leaves the reader where they were.
+    #[gpui::test]
+    async fn pdf_goto_commits_clamps_and_cancels(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("five.pdf");
+        std::fs::write(&path, crate::pdf_preview::test_pdf(5)).expect("write");
+        let window = cx.add_window(|window, cx| EditorView::new(path, window, cx));
+        cx.run_until_parked();
+
+        let type_and_commit = |cx: &mut gpui::TestAppContext, text: &str| {
+            let text = text.to_string();
+            window
+                .update(cx, |view, win, cx| {
+                    view.pdf_open_goto(win, cx);
+                    let EditorContent::Pdf(p) = &view.content else { unreachable!() };
+                    let input = p.goto.as_ref().expect("go-to editor opened").input.clone();
+                    input.update(cx, |s, cx| s.set_value(SharedString::from(text), win, cx));
+                    view.pdf_commit_goto(win, cx);
+                    view.pdf_page().expect("still a pdf")
+                })
+                .expect("window alive")
+        };
+
+        assert_eq!(type_and_commit(cx, "4"), 3, "1-based input, 0-based page");
+        assert_eq!(type_and_commit(cx, "99"), 4, "past the end clamps to the last page");
+        assert_eq!(type_and_commit(cx, "0"), 0, "before the start clamps to the first");
+        assert_eq!(type_and_commit(cx, "not a page"), 0, "junk does not move the reader");
+
+        // Escape closes the editor without moving, and hands the keyboard back.
+        window
+            .update(cx, |view, win, cx| {
+                view.pdf_goto_page(2, win, cx);
+                view.pdf_open_goto(win, cx);
+                view.on_pdf_key(
+                    &KeyDownEvent {
+                        keystroke: gpui::Keystroke::parse("escape").expect("keystroke"),
+                        is_held: false,
+                        prefer_character_input: false,
+                    },
+                    win,
+                    cx,
+                );
+                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
+                assert!(p.goto.is_none(), "Escape closed the go-to editor");
+                assert_eq!(p.page(), 2, "and left the page alone");
+            })
+            .expect("window alive");
+    }
+
+    /// The zoom presets: Fit page fits both axes where Fit width overflows,
+    /// 100 % is one logical px per point, and every bitmap rendered at the
+    /// old scale is released rather than left in the atlas.
+    #[gpui::test]
+    async fn pdf_zoom_presets_and_scale_invalidation(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tall.pdf");
+        std::fs::write(&path, crate::pdf_preview::test_pdf_sized(6, 600, 800)).expect("write");
+        let window = cx.add_window(|window, cx| EditorView::new(path, window, cx));
+        cx.run_until_parked();
+        cx.simulate_window_resize(window.into(), gpui::size(px(832.0), px(600.0)));
+        render_pdf_now(cx, &window);
+
+        window
+            .update(cx, |view, _win, cx| {
+                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
+                let pane = p.pane_size.expect("probed");
+                let wide = p.effective_scale().expect("measured");
+                assert!(
+                    800.0 * wide > pane.1,
+                    "fit width overflows this pane vertically"
+                );
+                let resident_before = p.store.resident_pages();
+                assert!(resident_before > 0, "pages were rendered at fit width");
+
+                view.pdf_set_zoom(crate::pdf_preview::PdfZoom::FitPage, cx);
+                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
+                let fitted = p.effective_scale().expect("measured");
+                assert!(800.0 * fitted <= pane.1, "fit page fits vertically");
+                assert!(600.0 * fitted <= pane.0, "and horizontally");
+                assert_eq!(
+                    p.store.resident_pages(),
+                    0,
+                    "every page rendered at the old scale was released"
+                );
+
+                view.pdf_set_zoom(crate::pdf_preview::PdfZoom::Scale(1.0), cx);
+                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
+                assert_eq!(p.effective_scale(), Some(1.0), "100 % is one px per point");
+            })
+            .expect("window alive");
+        render_pdf_now(cx, &window);
+
+        window
+            .update(cx, |view, win, _cx| {
+                let scale_factor = win.scale_factor();
+                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
+                let key = crate::pdf_preview::PageKey::new(0, 1.0 * scale_factor);
+                let size = p.store.page(key).expect("100 % page rendered").size(0);
+                assert_eq!(size.width.0, (600.0 * scale_factor).floor() as i32);
+                assert_eq!(size.height.0, (800.0 * scale_factor).floor() as i32);
+            })
+            .expect("window alive");
+    }
+
+    /// Closing a PDF and reopening it lands on the page it was left on —
+    /// the same memory a restored tab seeds before the loader runs.
+    #[gpui::test]
+    async fn pdf_reopens_on_the_remembered_page(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("five.pdf");
+        std::fs::write(&path, crate::pdf_preview::test_pdf(5)).expect("write");
+
+        let first = cx.add_window({
+            let path = path.clone();
+            |window, cx| EditorView::new(path, window, cx)
+        });
+        cx.run_until_parked();
+        first
+            .update(cx, |view, win, cx| {
+                view.pdf_goto_page(3, win, cx);
+                assert_eq!(view.pdf_page(), Some(3));
+            })
+            .expect("window alive");
+
+        // A second view of the same file — what reopening the tab does.
+        let second = cx.add_window({
+            let path = path.clone();
+            |window, cx| EditorView::new(path, window, cx)
+        });
+        cx.run_until_parked();
+        second
+            .update(cx, |view, _win, _cx| {
+                assert_eq!(view.pdf_page(), Some(3), "reopened where it was left");
+            })
+            .expect("window alive");
+
+        // A page past the end of a shrunken document clamps rather than
+        // opening an empty pane.
+        cx.update(|cx| pdf_preview::remember_pdf_page(cx, &path, 99));
+        let third = cx.add_window(|window, cx| EditorView::new(path, window, cx));
+        cx.run_until_parked();
+        third
+            .update(cx, |view, _win, _cx| {
+                let page = view.pdf_page().expect("still a pdf");
+                assert!(page < 5, "a page past the end is clamped into range");
+                // The list puts the *last* page on screen, which means the
+                // top row is as far down as the remaining pages allow — not
+                // necessarily page 5 itself.
+                assert!(page >= 3, "and lands at the end of the document ({page})");
             })
             .expect("window alive");
     }
@@ -1819,71 +2089,6 @@ mod tests {
             })
             .expect("window alive");
     }
-
-    /// Opening a `.pdf` lands in the `Pdf` arm with the right page count;
-    /// stepping clamps at both ends; the page bitmap arrives from the
-    /// background executor sized for the window's scale factor; and asking
-    /// again for the same page + scale does not re-render.
-    #[gpui::test]
-    async fn pdf_opens_steps_and_renders_off_thread(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("three.pdf");
-        std::fs::write(&path, crate::pdf_preview::test_pdf(3)).expect("write fixture");
-
-        let window = cx.add_window(|window, cx| EditorView::new(path, window, cx));
-        // A .pdf opens as Loading and lands from the background executor.
-        window
-            .update(cx, |view, _win, _cx| {
-                assert!(
-                    matches!(view.content, EditorContent::Loading),
-                    "a .pdf must not be read synchronously on open"
-                );
-            })
-            .expect("window alive");
-        cx.run_until_parked();
-
-        window
-            .update(cx, |view, win, cx| {
-                let EditorContent::Pdf(p) = &mut view.content else {
-                    panic!("a .pdf must open as EditorContent::Pdf once loaded");
-                };
-                assert_eq!((p.page, p.page_count), (0, 3));
-                assert!(p.pane_width.is_some(), "the layout probe has reported");
-                assert!(!view.is_text(), "PDF is not a text buffer");
-
-                view.pdf_step(1, win, cx);
-                view.pdf_step(-10, win, cx);
-                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
-                assert_eq!(p.page, 0, "stepping below the first page clamps");
-                view.pdf_step(10, win, cx);
-                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
-                assert_eq!(p.page, 2, "stepping past the last page clamps");
-
-                // What `render` does on every paint for a PDF pane.
-                view.ensure_pdf_page(win, cx);
-            })
-            .expect("window alive");
-        cx.run_until_parked();
-
-        window
-            .update(cx, |view, win, cx| {
-                let scale = win.scale_factor();
-                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
-                assert!(!p.failed, "render of page 3 must not fail");
-                let bitmap = p.bitmap.as_ref().expect("bitmap landed off-thread");
-                let size = bitmap.size(0);
-                assert_eq!(size.width.0, (200.0 * scale).floor() as i32);
-                assert_eq!(size.height.0, (100.0 * scale).floor() as i32);
-
-                let generation = p.generation;
-                view.ensure_pdf_page(win, cx);
-                let EditorContent::Pdf(p) = &view.content else { unreachable!() };
-                assert_eq!(p.generation, generation, "same page + scale is a no-op");
-            })
-            .expect("window alive");
-    }
-
     #[test]
     fn language_for_path_maps_rust() {
         assert_eq!(language_for_path(&PathBuf::from("foo.rs")), "rust");

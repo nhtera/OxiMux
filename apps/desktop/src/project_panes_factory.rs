@@ -374,7 +374,7 @@ pub(crate) fn build_project_panes(
         // looking exactly as the user left it.
         let meta = restored_meta(tab, rank_in(&snap.tab_order, flat_idx));
         match &tab.kind {
-            PersistedTabKind::Editor { path } => {
+            PersistedTabKind::Editor { path, pdf_page } => {
                 let path_buf = PathBuf::from(path);
                 if !path_buf.exists() {
                     // Drop the tab + log; the user can reopen via Cmd+P.
@@ -391,6 +391,11 @@ pub(crate) fn build_project_panes(
                     continue;
                 }
                 panes_entity.update(cx, |p, cx| {
+                    // Seed the page memory before the tab opens — the PDF
+                    // loader reads it when the document lands.
+                    if let Some(page) = pdf_page {
+                        oximux_editor::pdf_preview::remember_pdf_page(cx, &path_buf, *page);
+                    }
                     p.open_or_activate_editor_tab(path_buf, window, cx);
                     p.place_restored_last_tab(None, meta, cx);
                 });
@@ -574,7 +579,7 @@ fn restore_multi_group(
             // position within the group (= its local index).
             let meta = restored_meta(tab, rank_in(&group_snap.tab_order, local_idx));
             match &tab.kind {
-                PersistedTabKind::Editor { path } => {
+                PersistedTabKind::Editor { path, pdf_page } => {
                     let path_buf = PathBuf::from(path);
                     if !path_buf.exists() {
                         tracing::warn!(
@@ -584,6 +589,9 @@ fn restore_multi_group(
                         continue;
                     }
                     panes_entity.update(cx, |p, cx| {
+                        if let Some(page) = pdf_page {
+                            oximux_editor::pdf_preview::remember_pdf_page(cx, &path_buf, *page);
+                        }
                         p.open_editor_in_group_restore(group_id, path_buf, window, cx);
                         p.place_restored_last_tab(Some(group_id), meta, cx);
                     });

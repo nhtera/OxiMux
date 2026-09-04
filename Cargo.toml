@@ -401,6 +401,21 @@ opt-level = 3
 [profile.dev.package.regex-syntax]
 opt-level = 3
 
+# PDF rasterization is the same story: unoptimized, hayro + vello spend
+# ~30 ms on a page a release build draws in ~12 ms, and a 651-page book is
+# then visibly slower to scroll in a dev build than in the shipped one.
+# Same treatment — the hot crates optimized, the app itself still opt-level 0.
+[profile.dev.package.hayro]
+opt-level = 3
+[profile.dev.package.hayro-interpret]
+opt-level = 3
+[profile.dev.package.hayro-syntax]
+opt-level = 3
+[profile.dev.package.vello_cpu]
+opt-level = 3
+[profile.dev.package.vello_common]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = "thin"
