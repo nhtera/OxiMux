@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use super::acp::AcpConnection;
-use super::claude_stream_json::{ClaudeStreamJsonConnection, HostInjection};
+use super::claude_stream_json::{merge_settings_json, ClaudeStreamJsonConnection, HostInjection};
 use super::codex::CodexAppServerConnection;
 use super::connection::{AgentConnection, ModelChoice};
 use super::event::ThreadEvent;
@@ -34,6 +34,32 @@ pub struct ChatBackend {
     pub acp_command: Option<String>,
     /// argv appended after `acp_command`; empty for non-ACP backends.
     pub acp_args: Vec<String>,
+    /// Environment overrides the user configured for this adapter (and launch
+    /// profile), layered onto the spawn by every transport. This is how a chat
+    /// reaches an alternate base URL or a second account without a source
+    /// patch.
+    ///
+    /// It rides on the backend rather than being set per call site because the
+    /// backend is already the one thing resolved from settings, so every chat
+    /// entry point — a fresh launch, a restore, a respawn, the remote bridge,
+    /// `serve` — picks it up from [`ConnectSpec::for_backend`] instead of each
+    /// remembering to. Empty for every adapter with no configured env, which
+    /// leaves those launches byte-identical.
+    ///
+    /// Not secret storage: these come from a plaintext settings file.
+    pub env: Vec<(String, String)>,
+    /// The settings key this backend was resolved from, and the named launch
+    /// profile within it. `None`/`None` for a backend built without settings
+    /// (a bare `Transport::into()`, a test fixture).
+    ///
+    /// These are carried so a chat can be **re-resolved** later rather than
+    /// only replayed: a restore persists this pair and reads `env` back out of
+    /// the current settings, which keeps a corrected base URL effective on the
+    /// next open and keeps env values out of a second on-disk file. `env`
+    /// itself is the already-resolved answer for the live connection.
+    pub adapter_id: Option<String>,
+    /// See [`Self::adapter_id`]. `None` = the adapter's plain entry.
+    pub profile: Option<String>,
 }
 
 impl ChatBackend {
@@ -52,7 +78,14 @@ impl ChatBackend {
 impl From<Transport> for ChatBackend {
     /// A backend that carries only a transport (Claude/Codex — no ACP command).
     fn from(transport: Transport) -> Self {
-        Self { transport, acp_command: None, acp_args: Vec::new() }
+        Self {
+            transport,
+            acp_command: None,
+            acp_args: Vec::new(),
+            env: Vec::new(),
+            adapter_id: None,
+            profile: None,
+        }
     }
 }
 
@@ -151,6 +184,12 @@ pub struct ConnectSpec {
     ///
     /// [`HostInjection::fresh_session_id`]: super::claude_stream_json::HostInjection::fresh_session_id
     pub fresh_session_id: Option<String>,
+    /// Claude's fast mode at spawn (only read by the `StreamJson` arm): merged
+    /// into [`Self::settings_json`] as `{"fastMode": ..}` so a session that had
+    /// it on keeps it across a respawn. `None` leaves the CLI to its own
+    /// setting — the value for every launch that never touched the toggle, and
+    /// for a model whose catalog row does not support it.
+    pub claude_fast_mode: Option<bool>,
 }
 
 impl ConnectSpec {
@@ -175,9 +214,10 @@ impl ConnectSpec {
             effort,
             acp_command: backend.acp_command.clone(),
             acp_args: backend.acp_args.clone(),
-            // Set only by the EnvVar-auth respawn (see `respawn_with_env`);
-            // every other launch carries no extra env and no auto-authenticate.
-            env: Vec::new(),
+            // The adapter/profile env the user configured. A respawn that also
+            // carries EnvVar-auth credentials appends them AFTER these, so the
+            // credentials win on a key collision (see `respawn_spec`).
+            env: backend.env.clone(),
             auth_method: None,
             // Set only when restoring a Codex chat with a persisted posture; a
             // fresh launch starts at the default posture.
@@ -192,6 +232,7 @@ impl ConnectSpec {
             settings_json: None,
             disallowed_tools: Vec::new(),
             fresh_session_id: None,
+            claude_fast_mode: None,
         }
     }
 }
@@ -203,6 +244,16 @@ impl ConnectSpec {
 pub fn connect(spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<ThreadEvent>)> {
     match spec.transport {
         Transport::StreamJson => {
+            // Fast mode rides the one inline `--settings`, merged over whatever
+            // the host already declared there (the computer-use hook), never
+            // in place of it.
+            let settings = match spec.claude_fast_mode {
+                Some(on) => merge_settings_json(
+                    spec.settings_json.as_deref(),
+                    &serde_json::json!({ "fastMode": on }),
+                ),
+                None => spec.settings_json.clone(),
+            };
             let (conn, rx) = ClaudeStreamJsonConnection::spawn_resumed(
                 &spec.cwd,
                 spec.model.as_deref(),
@@ -211,12 +262,13 @@ pub fn connect(spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<
                 spec.effort.as_deref(),
                 &HostInjection {
                     mcp_servers: &spec.mcp_servers,
-                    settings: spec.settings_json.as_deref(),
+                    settings: settings.as_deref(),
                     disallowed_tools: &spec.disallowed_tools,
                     fresh_session_id: spec.fresh_session_id.as_deref(),
                 },
                 &spec.env,
             )?;
+            conn.seed_fast_mode(spec.claude_fast_mode.unwrap_or(false));
             Ok((Arc::new(conn) as Arc<dyn AgentConnection>, rx))
         }
         Transport::AppServer => {
@@ -289,9 +341,10 @@ pub fn connect(spec: ConnectSpec) -> Result<(Arc<dyn AgentConnection>, Receiver<
 }
 
 /// The model vocabulary a short-lived *catalog probe* pulls from an agent whose
-/// models are only known after it spawns (Codex, ACP) — so the unbound *New
-/// Agent* draft can offer a real model picker before the user commits. Claude's
-/// models are static (declared in the roster) and never probed.
+/// models are only known after it spawns (Codex, ACP) or, for Claude, from the
+/// installed CLI's own `/model` list — so the unbound *New Agent* draft can
+/// offer a real model picker before the user commits, and a Claude picker
+/// follows the CLI release rather than a list copied from one.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProbedCatalog {
     pub models: Vec<ModelChoice>,
@@ -313,7 +366,22 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Blocking (it waits on the handshake) — run it off the UI thread. Errors when
 /// the agent can't spawn, the handshake fails, the process exits early, or the
 /// probe times out; the caller renders those as "no models" rather than a picker.
+///
+/// Claude is the exception to "open a session": its CLI answers a `list_models`
+/// control request without starting a turn, so the `StreamJson` arm runs that
+/// cheap probe instead (`claude_catalog`). A non-empty answer is also published
+/// to the process-wide Claude catalog slot here, so every live Claude
+/// connection — and the phone, through `SessionHandle::models()` — serves the
+/// CLI's rows from then on. An empty answer (a CLI that predates the request)
+/// publishes nothing and comes back as an empty catalog, which the caller's
+/// seed-preservation rule turns into "keep what is shown".
 pub fn probe_catalog(spec: ConnectSpec) -> Result<ProbedCatalog> {
+    if spec.transport == Transport::StreamJson {
+        let catalog = super::claude_catalog::probe_claude_catalog()?;
+        let probed = ProbedCatalog::from(&catalog);
+        super::claude_catalog::publish_claude_catalog(catalog);
+        return Ok(probed);
+    }
     let (conn, rx) = connect(spec)?;
     let deadline = Instant::now() + PROBE_TIMEOUT;
     loop {
@@ -366,6 +434,7 @@ mod tests {
             settings_json: None,
             disallowed_tools: vec![],
             fresh_session_id: None,
+            claude_fast_mode: None,
         };
         // Can't `expect_err` — the Ok payload (`Box<dyn AgentConnection>`) isn't
         // `Debug`; match instead.
@@ -402,6 +471,7 @@ mod tests {
             settings_json: None,
             disallowed_tools: vec![],
             fresh_session_id: None,
+            claude_fast_mode: None,
         };
         let err = probe_catalog(spec).expect_err("probe must fail without a command");
         assert!(err.to_string().contains("acp_command"), "unexpected error: {err}");

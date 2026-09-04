@@ -16,8 +16,7 @@ use gpui_component::{
     input::{Enter as InputEnter, Input},
 };
 
-use super::{BrowserView, CopyKind, PageAppearance};
-use crate::actions::SendTextToActiveAgent;
+use super::{BrowserView, CopyKind, PageAppearance, ShotDest};
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -46,12 +45,11 @@ impl Render for BrowserView {
         }
         self.address_focused = editing;
 
-        // Deliver a picked element to the active agent terminal. Stashed in the
-        // IPC callback (which has no `Window`); dispatched here where one
-        // exists, via the same action the terminal/diff views use.
-        if let Some(text) = self.pending_agent_text.take() {
-            window.dispatch_action(Box::new(SendTextToActiveAgent { text }), cx);
-        }
+        // Record the window so a picked element can be delivered later without a
+        // `&mut Window` of its own. Delivery deliberately does NOT happen here:
+        // an inactive tab never renders, and switching to the chat tab right
+        // after picking would leave the capture queued until the user came back.
+        self.window_handle = Some(window.window_handle());
 
         // Apply a deferred profiles-menu choice now that a `Window` exists to
         // rebuild the webview (the IPC callback had none).
@@ -173,13 +171,15 @@ impl Render for BrowserView {
             // silent. Picker reads keys in the page, so it focuses the webview.
             .child(
                 probe_btn("browser-pick", "icons/crosshair.svg", CopyKind::Pick)
-                    .tooltip("Pick element — click copies its context, then ⋯ for more (S screenshot · A → agent)")
+                    .tooltip("Pick element — click copies its context, then ⋯ for more (S screenshot · A → chat with screenshot)")
                     .on_click(cx.listener(|this, _, _window, _cx| this.start_element_picker())),
             )
             .child(
                 probe_btn("browser-shot", "icons/camera.svg", CopyKind::Screenshot)
                     .tooltip("Screenshot page (image → clipboard)")
-                    .on_click(cx.listener(|this, _, _window, _cx| this.capture_screenshot(None))),
+                    .on_click(cx.listener(|this, _, _window, _cx| {
+                        let _ = this.capture_screenshot(None, ShotDest::Clipboard);
+                    })),
             )
             .child(
                 probe_btn("browser-dom", "icons/file-code.svg", CopyKind::Dom)

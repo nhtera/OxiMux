@@ -4,6 +4,122 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-04 — Large scanned PDFs: fit to the pane, open off the UI thread (`feat/enhancement`)
+
+- **A page never renders wider than the pane can show.** Measured against a
+  bilevel scan whose page box is in pixels (2480 × 3508 pt, as scanner drivers
+  emit): at retina scale that was a 4960 × 7016 bitmap, 139 MB for one page,
+  and the edge clamp shipped with the viewer would have allowed 268 MB. The
+  page body now carries a zero-paint layout probe that reports its width to
+  the view; the render scale is one point per logical pixel, reduced to fit
+  the pane width when the page is wider than that, times the editor zoom —
+  so ⌘+ still magnifies from the fitted size — and nothing is requested
+  until the probe has reported, so an oversized page is never rasterized at
+  a size the pane cannot show, not even for the first frame. The probe
+  reports in 32 px steps: a rasterization that has started cannot be
+  cancelled, so a resize drag must not queue one per pixel. On top of that
+  the rasterizer request is capped at 16 Mpx of area (64 MB) and 16 384 px
+  per edge. A real A4 page is ~2 Mpx at retina and unaffected.
+- **A `.pdf` opens without a synchronous read.** It opens as Loading; a
+  background task reads and parses it and lands through the same path a
+  retried read uses, and a file mid-export — which reads back truncated and
+  fails to parse — is retried on the same backoff schedule as a transient
+  read error while its size keeps changing, and reported once it stops. A 283 MB scan read in ~50 ms
+  warm and parsed in 0 ms in
+  the measurement, so the parse was never the cost — the read was, and it
+  scales with the file. A `.pdf` that fails to parse shows the reason with
+  Retry, and Retry re-runs the asynchronous loader. Memory-mapping the file
+  was measured (63 MB resident instead of file size + 75 MB) and rejected:
+  a mapped file truncated in place by a build tool is a fatal signal.
+  Report: `plans/reports/research-260904-2137-very-large-scanned-pdf-support.md`.
+- **Reading a page, not just seeing it.** A fitted page is usually taller
+  than the pane, so the keys now follow a reader: ↑/↓ scroll within the
+  page, PageUp/PageDown (and Space, ⇧Space) scroll a viewport and step to
+  the neighbouring page once the current one is at its edge — landing at
+  the bottom when going backwards — while ←/→ step pages outright and
+  Home/End jump to the first and last. A page step always opens the new
+  page at its top rather than wherever the previous one was scrolled. The
+  page itself now has a hairline edge and a soft shadow so it reads as paper
+  under both themes, and a page zoomed wider than the pane scrolls
+  horizontally instead of being centred and clipped (the scroll surface's
+  wrapper is sized to the content, not stretched to the pane).
+
+### 2026-09-04 — PDFs open in the editor pane (`feat/enhancement`)
+
+- **A `.pdf` opens and renders instead of being refused.** The editor gained
+  an `EditorContent::Pdf` arm backed by `hayro`, a pure-Rust rasterizer
+  (Apache-2.0/MIT, no native library), chosen over the alternatives that ship
+  a native blob per target or carry a copyleft licence.
+  The document is parsed once; each page is rasterized off the UI thread at
+  the window's scale factor times the editor zoom, handed to gpui as a
+  `RenderImage`, and the previous page's texture is dropped from the atlas on
+  swap and when the tab closes. The breadcrumb shows `‹ N / M ›`; ← → ↑ ↓,
+  PageUp/PageDown, Home and End step pages while the pane is focused.
+  Detection is by `.pdf` extension, or by a `%PDF-` header in the first KiB
+  for a PDF with the wrong extension (a small hand-written one is pure ASCII
+  and would otherwise open as text). A `.pdf` that fails to parse shows the
+  reason with Retry; a file that only mentions the marker in prose — this
+  changelog, now — falls through to the text editor. `pdf` left the refuse
+  list in `openable_text_file.rs` last.
+- **Cost, measured:** +4.3 MB on the stripped release binary, 23 new lockfile
+  entries (20 new permissively-licensed crates plus second versions of
+  `read-fonts`, `skrifa` and `vello_common` beside the ones gpui already
+  pulls), about eight seconds of cold build. The
+  workspace `rust-version` now reads 1.92 (hayro's floor); the toolchain was
+  already pinned at 1.95 on every CI target. Spike table and fixtures in
+  `plans/260827-2313-oximux-gap-closure/phase-11-pdf-viewer.md`.
+
+### 2026-09-04 — The Claude model picker follows the installed CLI (`feat/enhancement`)
+
+- **The chat's Claude model list is no longer copied from one CLI build.** The
+  installed `claude` answers a `list_models` control request over stream-json
+  with the same rows its own `/model` picker shows — wire value, display name,
+  blurb, effort levels, fast-mode support — without starting an API turn.
+  `crates/agents/src/thread/claude_catalog.rs` runs that probe (with
+  `--setting-sources ""`, so the user's SessionStart hooks do not fire and
+  OxiMux's own status hook cannot paint a phantom session) and publishes the
+  parsed catalog into a process-wide slot that every live Claude connection
+  reads. `SessionHandle::models()` is `conn.models()`, so the phone sees the
+  same rows with no extra plumbing. The static list in `claude_stream_json.rs`
+  is now the seed painted until a probe lands and the fallback when one never
+  does (a CLI that predates the request answers `error` and exits 0; the probe
+  treats that as empty and the existing seed-preservation fold keeps what is
+  shown).
+- **The fast-mode toggle mirrors what the CLI reports.** The connection's
+  fast-mode flag is shared with the stdout reader, which reads
+  `fast_mode_state` off the CLI's `system/init` line (`on` / `off` /
+  `cooldown`) and overwrites the spawn seed. Verified against 2.1.260: that
+  line arrives only with the first turn, and in `-p` stream-json mode a
+  `fastMode` key in the user's or project's settings files is NOT honoured —
+  only the inline `--settings` overlay and the live `apply_flag_settings`
+  request turn it on — so the reader changes nothing visible today and exists
+  so the app follows the CLI if that ever changes. The toggle's glyph is a
+  bolt (`icons/zap.svg`); the sparkle stays on the effort picker beside it.
+- **Desktop wiring rides the catalog machinery that already existed.** The
+  "static list means never probe" gate is gone for Claude; the probe runs on a
+  draft pick and when a bound Claude tab connects, through the same raw
+  `std::thread` seam and `CatalogCache` stale-while-revalidate path Codex and
+  the ACP agents use, cached under `claude-code`. Onboarding runs the same probe
+  once detection finds `claude`, so a fresh install's first picker already shows
+  the CLI's rows with its default preselected instead of the static seed.
+- **The preselected model is the CLI's default** (the `Default (recommended)`
+  row's resolved target, Opus 1M today), shown checked while no `--model` flag
+  is sent until the user picks. Effort levels are per model — Haiku takes none,
+  so its effort row hides. A tab that persisted a bare alias (`opus`, `fable`)
+  keeps its value and shows the checkmark on the catalog row of the same family.
+- **Fast mode has a toggle.** Offered only for a model whose catalog row says
+  `supportsFastMode`, switched live with an `apply_flag_settings` control
+  request (no respawn), and carried across a respawn by merging
+  `{"fastMode":..}` into the one inline `--settings` object — merged, never
+  replaced, so the computer-use hook declaration that already lives there
+  survives. Persisted with the chat as `claude_fast_mode`.
+- **The agent picker shows a model count** beside each agent (`Claude · 4
+  models`), `…` while a probe runs and `Error` where one failed.
+- The secondary static copies moved with it: the commit-message spec validates
+  against the catalog when one is published (so Fable is a valid choice there),
+  the settings chips offer the catalog's wires, and the terminal launcher's
+  static list gains `fable`.
+
 ### 2026-08-27 — About + Check for Updates in the menu, and Windows updates itself
 
 - **The menus both grew what they were missing.** macOS gets a

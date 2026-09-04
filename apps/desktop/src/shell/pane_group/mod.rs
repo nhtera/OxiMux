@@ -67,6 +67,10 @@ pub enum PaneGroupTabKind {
         effort: Option<String>,
         session_id: AgentSessionId,
         status_rx: AgentStatusStream,
+        /// Named launch profile this agent was spawned under (`None` = the
+        /// adapter's plain entry). Held so a session snapshot can persist it
+        /// and a restore respawns against the same endpoint/account.
+        profile: Option<String>,
     },
     Editor {
         path: PathBuf,
@@ -122,6 +126,30 @@ pub enum PaneGroupTabKind {
         cwd: PathBuf,
         model: Option<String>,
     },
+}
+
+/// A chat tab resolved as a routing destination: the view to stage into, and
+/// the name to report back so a delivery into a tab the user isn't looking at
+/// says where it went. Without the name a pick into a background chat is
+/// indistinguishable from one that was dropped.
+#[derive(Clone)]
+pub struct ChatTarget {
+    pub view: Entity<crate::shell::agent_chat::AgentChatView>,
+    pub name: SharedString,
+}
+
+impl ChatTarget {
+    /// `Some` when `tab` is an Agent Chat. The name follows the tab chip: a
+    /// user-set `custom_title` wins over the generated `label`.
+    pub fn of(tab: &PaneGroupTab) -> Option<Self> {
+        match &tab.content {
+            PaneContent::AgentChat(view) => Some(Self {
+                view: view.clone(),
+                name: tab.custom_title.clone().unwrap_or_else(|| tab.label.clone()),
+            }),
+            _ => None,
+        }
+    }
 }
 
 pub struct PaneGroupTab {

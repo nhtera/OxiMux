@@ -180,6 +180,8 @@ mod tests {
 }
 
 pub mod agent_context;
+pub mod agent_hooks;
+pub mod agent_status;
 pub mod attach;
 pub mod git;
 pub mod heartbeat;
@@ -192,6 +194,7 @@ pub mod schedule;
 pub mod send;
 pub mod session_ctl;
 pub mod sessions;
+pub mod skills;
 pub mod state;
 pub mod status;
 pub mod team;

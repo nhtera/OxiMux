@@ -26,6 +26,10 @@ pub const TERMINAL_MAX_LINES: usize = 200;
 pub const DIFF_MAX_LINES: usize = 400;
 /// Cap on attached `@clipboard` text — a paste can be arbitrarily large.
 pub const CLIPBOARD_MAX_BYTES: usize = 32 * 1024;
+/// Cap on a `@browser` element capture. The picker already clamps `outerHTML` to
+/// 4 KiB in-page, but a deeply nested element's ancestor + DOM paths sit on top
+/// of that, so the assembled block gets its own ceiling.
+pub const BROWSER_MAX_BYTES: usize = 16 * 1024;
 
 /// One entry offered in the composer's `@` menu "Context" section. Cheap display
 /// data plus the [`ContextRequest`] the composer emits back to the view when the
@@ -171,9 +175,88 @@ pub fn terminal_chip(title: &str, text: String, capture_truncated: bool) -> Opti
     Some(ContextChip::new(ContextKind::Terminal, source, text, capture_truncated))
 }
 
+/// Build the `@browser` chip from an element picked in the embedded browser.
+/// `markdown` is the block already formatted by
+/// `browser_view::agent_context::format_pick` (identity, styles, HTML, paths);
+/// `selector` becomes the chip's source so the label reads `@browser a#go`.
+///
+/// Unlike `@terminal`, the cap is applied here rather than at capture: the
+/// picker is a page script and cannot be trusted to have bounded what it sent.
+/// `None` when the capture was empty.
+pub fn browser_chip(selector: &str, markdown: String) -> Option<ContextChip> {
+    if markdown.trim().is_empty() {
+        return None;
+    }
+    let source = {
+        let s = selector.trim();
+        if s.is_empty() { None } else { Some(s.to_string()) }
+    };
+    let (content, truncated) = cap_head_bytes(&markdown, BROWSER_MAX_BYTES);
+    Some(ContextChip::new(ContextKind::Browser, source, content, truncated))
+}
+
+/// Trim `text` to at most `max_bytes`, keeping the HEAD and never splitting a
+/// char. Returns `(text, truncated)`. The mirror of [`cap_tail_bytes`], used
+/// where the *front* of the capture is the meaningful part — a picked element
+/// leads with its identity and styles, and trails with its DOM path.
+pub fn cap_head_bytes(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_string(), false);
+    }
+    // Walk back to the previous char boundary so the kept prefix is valid UTF-8.
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_string(), true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_chip_labels_with_the_selector() {
+        let c = browser_chip("a#go", "Selected element:\n<a id=\"go\">x</a>".to_string()).unwrap();
+        assert_eq!(c.kind, ContextKind::Browser);
+        assert_eq!(c.source.as_deref(), Some("a#go"));
+        assert!(!c.truncated);
+        assert!(c.label().starts_with("@browser a#go · "));
+    }
+
+    #[test]
+    fn browser_chip_is_none_for_an_empty_capture() {
+        assert!(browser_chip("a#go", String::new()).is_none());
+        assert!(browser_chip("a#go", "   \n ".to_string()).is_none());
+    }
+
+    #[test]
+    fn browser_chip_without_a_selector_has_no_source() {
+        let c = browser_chip("  ", "body".to_string()).unwrap();
+        assert!(c.source.is_none());
+        assert!(c.label().starts_with("@browser · "));
+    }
+
+    #[test]
+    fn browser_chip_caps_an_oversized_capture() {
+        let huge = "x".repeat(BROWSER_MAX_BYTES + 10);
+        let c = browser_chip("div", huge).unwrap();
+        assert!(c.truncated);
+        assert_eq!(c.content.len(), BROWSER_MAX_BYTES);
+    }
+
+    #[test]
+    fn cap_head_bytes_never_splits_a_char() {
+        // "aéb" is 4 bytes: a | é(2) | b. A cap of 2 lands inside `é`, so the
+        // kept prefix must back off to 1 byte rather than slice mid-char.
+        let (out, trunc) = cap_head_bytes("aéb", 2);
+        assert!(trunc);
+        assert_eq!(out, "a");
+        // A cap that already sits on a boundary keeps everything up to it.
+        let (out, trunc) = cap_head_bytes("aéb", 3);
+        assert!(trunc);
+        assert_eq!(out, "aé");
+    }
 
     #[test]
     fn cap_head_lines_keeps_all_when_under_limit() {

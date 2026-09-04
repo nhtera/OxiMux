@@ -48,11 +48,49 @@ impl Transport {
             Transport::OmpRpc => "omp",
         }
     }
+
+    /// Whether a session on this transport can be told its model **at spawn**.
+    ///
+    /// True for every transport whose arm in
+    /// [`connect`](super::connect::connect) reads `ConnectSpec.model` — which
+    /// is all of them but ACP. `AcpConnection::spawn_with_env` takes no model:
+    /// the protocol has no first-class model concept, so an ACP agent is moved
+    /// with `session/set_config_option` *after* its session exists
+    /// (`AcpConnection::set_model`).
+    ///
+    /// Callers that can only apply a model at spawn must refuse rather than
+    /// launch: passing one to an ACP agent is silently dropped, which leaves a
+    /// session running its default while every record says otherwise. That is
+    /// the one outcome worse than an error, because nothing ever contradicts
+    /// it.
+    pub fn takes_model_at_spawn(self) -> bool {
+        match self {
+            Transport::StreamJson
+            | Transport::AppServer
+            | Transport::Rpc
+            | Transport::OmpRpc => true,
+            Transport::Acp => false,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exhaustive on purpose: this predicate is a claim about `connect`'s match
+    /// arms, and the two can only be kept honest by being read together. A new
+    /// transport must make a deliberate choice here rather than inherit one.
+    #[test]
+    fn acp_is_the_only_transport_that_cannot_take_a_model_at_spawn() {
+        for t in [Transport::StreamJson, Transport::AppServer, Transport::Rpc, Transport::OmpRpc] {
+            assert!(t.takes_model_at_spawn(), "{t:?} passes spec.model to its spawn");
+        }
+        assert!(
+            !Transport::Acp.takes_model_at_spawn(),
+            "ACP has no model at spawn — it is set on the session afterwards"
+        );
+    }
 
     #[test]
     fn default_is_stream_json() {

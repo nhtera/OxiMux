@@ -241,7 +241,14 @@ pub enum PersistedTabKind {
     Terminal,
     /// Editor tab — `path` is the absolute filesystem path. Restore
     /// reopens the file (or surfaces a missing-file warning if gone).
-    Editor { path: String },
+    /// `pdf_page` is the 0-based page a PDF was left on, so a restored PDF
+    /// tab opens where the reader was; absent / `None` for every other file
+    /// (and for blobs written before the field existed).
+    Editor {
+        path: String,
+        #[serde(default)]
+        pdf_page: Option<usize>,
+    },
     /// Embedded browser tab — `url` is the last-known address. Restore
     /// reopens a browser tab navigated to it. `profile_id` selects the
     /// isolated cookie/cache store (a browser profile); absent / `None`
@@ -304,6 +311,13 @@ pub struct PersistedAgentTab {
     /// the PTY is gone, so the tab respawns fresh instead of re-attaching.
     #[serde(default)]
     pub relay_session: Option<String>,
+    /// Named launch profile this tab was spawned under (`None` = the plain
+    /// `[agents.<id>]` entry). Carried so a respawn on restore reaches the same
+    /// endpoint/account instead of silently falling back to the default — the
+    /// failure mode is an agent that comes back pointed at the wrong provider.
+    /// `#[serde(default)]` keeps pre-existing blobs (no field) readable.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 /// Mirrors `PaneTree` but without GPUI-side `PaneId`s (regenerated on
@@ -551,6 +565,7 @@ mod tests {
                     effort: Some("high".into()),
                     relay_external_id: None,
                     relay_session: None,
+                    profile: None,
                 }),
                 kind: PersistedTabKind::Terminal,
                 ..PersistedTab::default()
@@ -571,14 +586,15 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_editor_tab_carries_path() {
+    fn round_trip_editor_tab_carries_path_and_pdf_page() {
         let blob = PersistedTabs {
             tabs: vec![PersistedTab {
-                label: "README.md".into(),
+                label: "manual.pdf".into(),
                 tree: PersistedTree::Leaf,
                 agent: None,
                 kind: PersistedTabKind::Editor {
-                    path: "/tmp/proj/README.md".into(),
+                    path: "/tmp/proj/manual.pdf".into(),
+                    pdf_page: Some(41),
                 },
                 ..PersistedTab::default()
             }],
@@ -591,7 +607,22 @@ mod tests {
         let back: PersistedTabs = serde_json::from_str(&s).unwrap();
         assert!(matches!(
             back.tabs[0].kind,
-            PersistedTabKind::Editor { ref path } if path == "/tmp/proj/README.md"
+            PersistedTabKind::Editor { ref path, pdf_page: Some(41) }
+                if path == "/tmp/proj/manual.pdf"
+        ));
+    }
+
+    /// A blob written before the field existed still parses — the editor
+    /// variant is append-only, like every other tab kind here.
+    #[test]
+    fn editor_tab_without_pdf_page_still_parses() {
+        let json = r#"{"tabs":[{"label":"README.md","tree":"Leaf","agent":null,
+            "kind":{"Editor":{"path":"/tmp/proj/README.md"}}}],
+            "active":0,"next_label_n":2,"tab_order":[0]}"#;
+        let back: PersistedTabs = serde_json::from_str(json).expect("old blob parses");
+        assert!(matches!(
+            back.tabs[0].kind,
+            PersistedTabKind::Editor { pdf_page: None, .. }
         ));
     }
 

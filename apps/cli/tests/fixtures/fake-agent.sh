@@ -28,6 +28,11 @@ report="${OXIMUX_FAKE_AGENT_REPORT:-}"
 cli="${OXIMUX_FAKE_AGENT_CLI:-}"
 dir="${OXIMUX_FAKE_AGENT_DIR:-}"
 sid="${OXIMUX_FAKE_AGENT_SESSION:-fake-session-1}"
+# The `--model` we were spawned with, or empty. Recorded because it is the only
+# place a test can see that a model reached the *process*: Claude and Codex take
+# it here and refuse to change it afterwards, so a host that applies a model as
+# a later switch silently leaves them on their default.
+spawn_model=""
 
 # Adopt the id the host named, exactly as the CLI we stand in for does.
 #
@@ -51,6 +56,15 @@ while [ $# -gt 0 ]; do
         ;;
     --session-id=* | --resume=*)
         sid="${1#*=}"
+        ;;
+    --model)
+        if [ $# -gt 1 ] && [ -n "${2:-}" ]; then
+            spawn_model="$2"
+            shift
+        fi
+        ;;
+    --model=*)
+        spawn_model="${1#*=}"
         ;;
     esac
     shift
@@ -88,6 +102,7 @@ for marker in CLAUDECODE CLAUDE_CODE CLAUDE_CODE_CHILD_SESSION \
     fi
 done
 note "leaked_markers=${leaked:-none}"
+note "spawn_model=${spawn_model:-none}"
 
 # 2. Announce ourselves. The launcher blocks on this line to learn the session
 #    id it will register, so nothing before it may fail.

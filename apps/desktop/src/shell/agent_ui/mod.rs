@@ -1,6 +1,7 @@
 //! Agent UI concern — sidebar/tab status presentation, ambient agent scanning,
 //! and per-session live state stores.
 
+pub mod agent_catalog;
 pub mod agent_presentation;
 pub mod agent_process_scan;
 pub mod agent_session_persistence;

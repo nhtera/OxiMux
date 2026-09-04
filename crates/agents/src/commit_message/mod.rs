@@ -35,7 +35,7 @@ pub use prompt::{
 pub use spawn::{GENERATION_TIMEOUT, GenerationError, MAX_OUTPUT_BYTES, run_plan};
 pub use spec::{
     AgentId, AgentSpec, BUILTIN_SPECS, CLAUDE_SPEC, CODEX_SPEC, Model, PromptDelivery,
-    ThinkingLevel, get_model, get_spec,
+    ThinkingLevel, get_model, get_spec, models_for,
 };
 
 use crate::commit_message_heuristic;

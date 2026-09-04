@@ -22,6 +22,7 @@ pub mod import_transcript_pi;
 pub mod session_index;
 pub mod session_preview;
 pub mod usage;
+pub mod usage_codex;
 pub mod usage_oauth;
 pub mod usage_probe;
 

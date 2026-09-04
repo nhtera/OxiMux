@@ -14,6 +14,7 @@
 
 pub(crate) mod agent_binary;
 pub mod acp;
+pub mod claude_catalog;
 pub mod claude_stream_json;
 pub mod codex;
 pub mod codex_session_import;
@@ -39,7 +40,14 @@ pub use oximux_agent_core::thread::{
 };
 
 pub use acp::AcpConnection;
-pub use claude_stream_json::{build_args, claude_model_choices, ClaudeStreamJsonConnection};
+pub use claude_catalog::{
+    parse_list_models, probe_claude_catalog, publish_claude_catalog, shared_claude_catalog,
+    ClaudeCatalog, ClaudeListedModel,
+};
+pub use claude_stream_json::{
+    build_args, claude_model_choices, merge_settings_json, ClaudeStreamJsonConnection,
+    FEATURE_FAST_MODE,
+};
 pub use codex::CodexAppServerConnection;
 pub use pi::PiRpcConnection;
 pub use connect::{connect, probe_catalog, ChatBackend, ConnectSpec, ProbedCatalog};

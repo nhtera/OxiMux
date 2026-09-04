@@ -17,7 +17,7 @@ use oximux_remote_host::{
     registration_proof,
 };
 use oximux_remote_proto::Transport;
-use oximux_remote_proto::messages::{HelloReq, RegisterReq, WorktreeWire};
+use oximux_remote_proto::messages::{HelloReq, RegisterReq, WorktreeProgressWire, WorktreeWire};
 use oximux_remote_proto::proto::{Request, Response, RpcError};
 use oximux_remote_proto::testing::duplex_pair;
 
@@ -49,6 +49,7 @@ fn register_req(pubkey: [u8; 32]) -> RegisterReq {
 struct CountingWorktrees {
     creates: AtomicUsize,
     removes: AtomicUsize,
+    progress_writes: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -71,6 +72,21 @@ impl WorktreeService for CountingWorktrees {
     async fn remove(&self, _id: &str) -> Result<(), WorktreeError> {
         self.removes.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+    async fn set_progress(
+        &self,
+        _id: &str,
+        _comment: Option<&str>,
+        _phase: Option<&str>,
+    ) -> Result<(), WorktreeError> {
+        self.progress_writes.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn list_progress(
+        &self,
+        _project_path: Option<&str>,
+    ) -> Result<Vec<WorktreeProgressWire>, WorktreeError> {
+        Ok(vec![])
     }
 }
 
@@ -140,6 +156,153 @@ fn local_session_scope_is_refused_every_worktree_verb() {
     block_on(join(serve, script));
     assert_eq!(service.creates.load(Ordering::SeqCst), 0, "create never reached the service");
     assert_eq!(service.removes.load(Ordering::SeqCst), 0, "remove never reached the service");
+}
+
+/// **The reason the progress board has its own gate.** A session-scoped caller
+/// is refused every worktree verb (the test above), yet it is precisely the
+/// caller this feature exists for: an agent, confined to its own session,
+/// describing the work it is doing. If the progress verbs shared the worktree
+/// gates, the primary author could never write.
+///
+/// What makes the wider reach defensible is what crosses: an id the caller
+/// already holds plus text it wrote itself — no host path, no branch name, no
+/// session content. Same trade the coordination blackboard makes.
+#[test]
+fn a_session_scoped_agent_can_describe_its_own_work() {
+    let service = Arc::new(CountingWorktrees::default());
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), Arc::new(AuthStore::new()))
+        .with_worktrees(service.clone())
+        .with_clock(clock);
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve_local(&server, LocalScope::Session("sess-1".into()));
+    let script = async move {
+        assert_eq!(
+            call(
+                &client,
+                Request::SetWorktreeProgress {
+                    id: "wt-1".into(),
+                    comment: Some("rebasing onto main".into()),
+                    phase: Some("in-progress".into()),
+                },
+            )
+            .await,
+            Response::Ack,
+            "the caller this feature is for must be able to write"
+        );
+        assert!(
+            matches!(
+                call(&client, Request::ListWorktreeProgress { project_path: None }).await,
+                Response::WorktreeProgress(_)
+            ),
+            "and to read the board back"
+        );
+        drop(client);
+    };
+    block_on(join(serve, script));
+    assert_eq!(service.progress_writes.load(Ordering::SeqCst), 1, "the write reached the service");
+}
+
+/// An unknown phase is refused at the write edge, and refused *before* the
+/// service is consulted — a typo must not become a stored phase no reader
+/// understands, and the refusal must not depend on the host having worktrees.
+#[test]
+fn an_unknown_phase_is_refused_without_reaching_the_service() {
+    let service = Arc::new(CountingWorktrees::default());
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), Arc::new(AuthStore::new()))
+        .with_worktrees(service.clone())
+        .with_clock(clock);
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve_local(&server, LocalScope::Full);
+    let script = async move {
+        let reply = call(
+            &client,
+            Request::SetWorktreeProgress {
+                id: "wt-1".into(),
+                comment: None,
+                phase: Some("shipped".into()),
+            },
+        )
+        .await;
+        match reply {
+            Response::Error(RpcError::BadRequest(msg)) => {
+                // The message must carry the vocabulary — a bare "invalid"
+                // leaves the caller guessing at a closed list it cannot see.
+                assert!(msg.contains("in-progress"), "the refusal must name the options: {msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+        // An empty phase is a *clear*, not an unknown value.
+        assert_eq!(
+            call(
+                &client,
+                Request::SetWorktreeProgress {
+                    id: "wt-1".into(),
+                    comment: None,
+                    phase: Some(String::new()),
+                },
+            )
+            .await,
+            Response::Ack,
+            "clearing the phase must not be mistaken for an invalid one"
+        );
+        drop(client);
+    };
+    block_on(join(serve, script));
+    assert_eq!(
+        service.progress_writes.load(Ordering::SeqCst),
+        1,
+        "only the clear reached the service; the bad phase stopped at the edge"
+    );
+}
+
+/// A read-only device may read the board but not write it — a watcher must not
+/// be able to steer other agents by editing what they coordinate on.
+#[test]
+fn a_read_only_device_reads_the_board_but_cannot_write_it() {
+    let service = Arc::new(CountingWorktrees::default());
+    let auth = Arc::new(AuthStore::new());
+    auth.set_pairing(PairingSlot::new(SECRET, None, false));
+    let dispatcher = Dispatcher::new(Arc::new(SessionRegistry::new()), auth.clone())
+        .with_worktrees(service.clone())
+        .with_clock(clock);
+    let (client, server) = duplex_pair();
+    let serve = dispatcher.serve(&server);
+    let script = async move {
+        // The same byte pattern the sibling read-only test uses: `app_pubkey`
+        // is parsed as an ed25519 `VerifyingKey`, so it must be a valid curve
+        // point — most arbitrary 32-byte fills are not, and register them and
+        // registration fails with `Unauthorized` for a reason that looks like
+        // a policy refusal. Each test owns its own `AuthStore`, so reuse is free.
+        let pubkey = [0x33; 32];
+        let reg = call(&client, Request::Register(register_req(pubkey))).await;
+        let Response::Registered { .. } = reg else {
+            panic!("registration failed: {reg:?}");
+        };
+        auth.set_read_only(&pubkey, true);
+        assert!(
+            matches!(
+                call(&client, Request::ListWorktreeProgress { project_path: None }).await,
+                Response::WorktreeProgress(_)
+            ),
+            "reading changes nothing, so the read-only tier is admitted"
+        );
+        assert_eq!(
+            call(
+                &client,
+                Request::SetWorktreeProgress {
+                    id: "wt-1".into(),
+                    comment: Some("hijacked".into()),
+                    phase: None,
+                },
+            )
+            .await,
+            Response::Error(RpcError::Unauthorized),
+            "a device that may only watch must not steer what agents coordinate on"
+        );
+        drop(client);
+    };
+    block_on(join(serve, script));
+    assert_eq!(service.progress_writes.load(Ordering::SeqCst), 0, "nothing reached the service");
 }
 
 /// A read-only full device may list but not create or remove — the same tier

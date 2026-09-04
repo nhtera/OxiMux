@@ -24,7 +24,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use gpui::{
-    App, AppContext, BorrowAppContext, Bounds, ClipboardItem, Context, FocusHandle, Focusable,
+    AnyWindowHandle, App, AppContext, BorrowAppContext, Bounds, ClipboardItem, Context,
+    FocusHandle, Focusable,
     Image, ImageFormat, Pixels, SharedString, Task, Window,
 };
 use gpui_component::input::InputState;
@@ -32,6 +33,8 @@ use oximux_settings::{Density, Theme, Typography};
 use wry::PageLoadEvent;
 
 use agent_context::{IpcMessage, PickRect};
+
+use crate::actions::SendPickToActiveChat;
 use native::{NativeWebview, ParentSurface, WebviewCallbacks};
 
 use crate::browser_profiles::{BrowserProfile, BrowserProfiles};
@@ -66,8 +69,25 @@ enum ChromeEvent {
     LoadFinished(String),
     /// Raw `window.ipc.postMessage` body from an agent-context probe.
     Ipc(String),
-    /// PNG bytes from an async screenshot, bound for the clipboard.
-    Screenshot(Vec<u8>),
+    /// PNG bytes from an async screenshot, tagged with where they are bound.
+    Screenshot { png: Vec<u8>, dest: ShotDest },
+}
+
+/// Where a finished screenshot goes. The capture itself is identical; only the
+/// delivery differs, and the async snapshot callback has no way to remember
+/// which button asked for it — so the request carries the answer through.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ShotDest {
+    /// The page/element shot buttons — PNG onto the clipboard.
+    Clipboard,
+    /// The picker's `A` — PNG joins the held element capture and both go to the
+    /// active Agent Chat as one message.
+    ///
+    /// Tagged with the pick that asked for it. Two picks can be in flight at
+    /// once (pick, pick again before the first crop lands), and a crop attached
+    /// to the wrong one would pair an element with a *different* element's
+    /// screenshot — silently wrong, and worse than no image at all.
+    Chat { seq: u64 },
 }
 
 /// Which agent-context probe most recently produced a result — drives the
@@ -80,7 +100,8 @@ enum CopyKind {
     Console,
     /// Picked element copied to the clipboard.
     Pick,
-    /// Picked element piped into the active agent terminal.
+    /// Picked element piped into the active agent — the chat composer when one
+    /// is open, otherwise a bracketed paste into an agent terminal.
     PickToAgent,
 }
 
@@ -151,10 +172,83 @@ impl From<agent_context::AppearanceValue> for PageAppearance {
     }
 }
 
+/// A picked element held between the IPC callback that captured it and the
+/// render that can dispatch it. `png` starts empty and is filled by the crop
+/// that the same key press requested; `waited` counts renders so a snapshot
+/// that never arrives cannot strand the capture forever.
+struct PendingPick {
+    /// Matches the `ShotDest::Chat` tag of the crop this pick is waiting for.
+    seq: u64,
+    markdown: String,
+    selector: String,
+    png: Vec<u8>,
+    /// Set once the crop is no longer worth waiting for — by the deadline task,
+    /// or at creation when no snapshot backend answered at all.
+    expired: bool,
+    /// Holds the deadline timer alive for this pick's lifetime. Dropped with the
+    /// pick, which cancels a timer that is no longer needed.
+    _deadline: Option<Task<()>>,
+}
+
+impl PendingPick {
+    /// Whether this pick should go now: its crop has landed, or its deadline
+    /// passed and it goes text-only. The element the user picked must reach the
+    /// agent either way.
+    fn ready(&self) -> bool {
+        !self.png.is_empty() || self.expired
+    }
+}
+
+/// Attach a finished crop to the pick that asked for it, matched by `seq`.
+///
+/// Free-standing so the test suite drives the *same* matcher production does —
+/// a hand-copied `find` in a test would keep passing if this one regressed to
+/// "the first pick", which is exactly the bug the `seq` tag exists to prevent.
+/// A crop whose pick has already been delivered matches nothing and is dropped.
+fn attach_crop(picks: &mut [PendingPick], seq: u64, png: Vec<u8>) {
+    if let Some(pick) = picks.iter_mut().find(|p| p.seq == seq) {
+        pick.png = png;
+    }
+}
+
+/// Give up on the crop for one pick, so it goes text-only. Matched by `seq` for
+/// the same reason [`attach_crop`] is: a deadline belongs to one pick, and two
+/// can be in flight.
+fn expire_pick(picks: &mut [PendingPick], seq: u64) {
+    if let Some(pick) = picks.iter_mut().find(|p| p.seq == seq) {
+        pick.expired = true;
+    }
+}
+
+/// Take the leading run of ready picks, oldest first.
+///
+/// Strictly FIFO — it stops at the first pick still waiting rather than reaching
+/// past it. Letting a fast second pick overtake a slow first one would decouple
+/// the chips from the images: if the first times out image-less and the second
+/// carries a crop, the composer shows two chips and one picture with nothing
+/// saying which element it belongs to. The delay this costs is bounded by
+/// [`PICK_SHOT_WAIT`].
+fn drain_ready(picks: &mut Vec<PendingPick>) -> Vec<PendingPick> {
+    let ready = picks.iter().take_while(|p| p.ready()).count();
+    picks.drain(..ready).collect()
+}
+
+/// How long a held pick waits for its crop before going without it. The snapshot
+/// is a main-thread WebKit round-trip that normally lands in a frame or two;
+/// this is the ceiling that keeps a failed capture from swallowing the element
+/// the user picked.
+///
+/// A wall-clock timer rather than a render counter, because a render counter
+/// cannot drive itself: `cx.notify()` issued *during* render is dropped by GPUI
+/// (`WindowInvalidator::invalidate_view` inserts into `dirty_views` and returns
+/// `false` once `draw_phase != None`, never setting `dirty`), so on an idle page
+/// no further render would arrive to advance it.
+const PICK_SHOT_WAIT: Duration = Duration::from_millis(750);
+
 /// A profiles-menu choice deferred to the next render. Switching or creating a
 /// profile rebuilds the webview, which needs a `&Window`; the IPC callback has
 /// none, so the choice is stashed and applied in `render` (mirrors
-/// `pending_agent_text`).
+/// `pending_pick`).
 enum ProfileRequest {
     /// Switch to this store (`None` = the shared default).
     Switch(Option<uuid::Uuid>),
@@ -219,10 +313,31 @@ pub struct BrowserView {
     appearance: PageAppearance,
     /// `true` while the WebKit inspector is open for this tab.
     devtools_open: bool,
-    /// Picked-element text awaiting delivery to the active agent terminal.
+    /// Picked elements awaiting delivery to the active agent, oldest first.
     /// Stashed from the IPC callback (no `Window` there) and dispatched on the
-    /// next render via `SendTextToActiveAgent`.
-    pending_agent_text: Option<String>,
+    /// next render.
+    ///
+    /// Two-stage: the `A` key pushes an entry and *also* kicks off a crop of the
+    /// element's box, so the entry sits here with `png` empty until the async
+    /// snapshot lands and fills it. [`PendingPick::ready`] decides when to stop
+    /// waiting, so a platform with no native snapshot still delivers the text
+    /// rather than stranding it.
+    ///
+    /// A queue rather than a slot: a second `A` inside the first one's wait
+    /// window must not evict the first, which would drop an element the user
+    /// explicitly sent.
+    pending_picks: Vec<PendingPick>,
+    /// Monotonic tag handed to each pick and to the crop it awaits, so a crop
+    /// can never land on the wrong pick.
+    next_pick_seq: u64,
+    /// The window this view last rendered into, recorded each render.
+    ///
+    /// A pick outlives this view's own renders: an inactive tab's content is
+    /// never rendered (`pane_group/render.rs` renders only `active_tab()`), and
+    /// switching to the chat tab to type the question is exactly the flow this
+    /// feature exists for. So delivery must not run from `render` — it needs a
+    /// `Window` of its own, and this is it.
+    window_handle: Option<AnyWindowHandle>,
     /// Active browser profile (cookie/cache store). `None` = the shared default
     /// store. Persisted per tab; switching rebuilds the webview.
     profile_id: Option<uuid::Uuid>,
@@ -301,7 +416,9 @@ impl BrowserView {
             _confirm: None,
             appearance: PageAppearance::default(),
             devtools_open: false,
-            pending_agent_text: None,
+            pending_picks: Vec::new(),
+            next_pick_seq: 0,
+            window_handle: None,
             profile_id,
             pending_profile: None,
             appearance_anchor: Rc::new(Cell::new(None)),
@@ -427,15 +544,28 @@ impl BrowserView {
                 self.on_ipc(&body, cx);
                 return;
             }
-            ChromeEvent::Screenshot(png) => {
-                let image = Image::from_bytes(ImageFormat::Png, png);
-                cx.write_to_clipboard(ClipboardItem::new_image(&image));
+            ChromeEvent::Screenshot { png, dest } => {
+                match dest {
+                    ShotDest::Clipboard => {
+                        let image = Image::from_bytes(ImageFormat::Png, png);
+                        cx.write_to_clipboard(ClipboardItem::new_image(&image));
+                        self.flash_confirm(CopyKind::Screenshot, cx);
+                    }
+                    // The crop belongs to a held pick. Attach it and let the
+                    // next render dispatch both together; if the pick already
+                    // went without it (wait expired), drop the bytes rather
+                    // than sending a second, imageless-looking message.
+                    ShotDest::Chat { seq } => {
+                        attach_crop(&mut self.pending_picks, seq, png);
+                        self.deliver_ready_picks(cx);
+                    }
+                }
                 // Flash the page white once the capture has landed (so the
-                // flash is never in the shot) and confirm on the toolbar.
+                // flash is never in the shot).
                 if let Some(native) = &self.native {
                     native.eval_script(agent_context::SCREENSHOT_FLASH_JS);
                 }
-                self.flash_confirm(CopyKind::Screenshot, cx);
+                cx.notify();
                 return;
             }
         }
@@ -466,13 +596,44 @@ impl BrowserView {
                 self.flash_confirm(CopyKind::Pick, cx);
                 self.release_webview_focus();
             }
+            // `A` sends the element to the agent. Unlike the clipboard paths
+            // this one is two-part: hold the formatted capture and ask for a
+            // crop of the same element's box, so the chat gets the text and the
+            // picture as one message instead of the user pasting a screenshot.
             IpcMessage::PickToAgent(payload) => {
-                self.pending_agent_text = Some(agent_context::format_pick(&payload));
+                let seq = self.next_pick_seq;
+                self.next_pick_seq += 1;
+                let armed = self.capture_screenshot(Some(payload.rect), ShotDest::Chat { seq });
+                // A snapshot can be requested and never answered — WebKit hands
+                // back a null image for an off-viewport or oversized rect, and
+                // `native.rs` then sends nothing at all. Arm a deadline so that
+                // silence releases the pick text-only instead of swallowing the
+                // element the user explicitly sent.
+                let deadline = armed.then(|| {
+                    cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(PICK_SHOT_WAIT).await;
+                        let _ = this.update(cx, |view, cx| {
+                            expire_pick(&mut view.pending_picks, seq);
+                            view.deliver_ready_picks(cx);
+                        });
+                    })
+                });
+                self.pending_picks.push(PendingPick {
+                    seq,
+                    markdown: agent_context::format_pick(&payload),
+                    selector: payload.selector.clone(),
+                    png: Vec::new(),
+                    // No snapshot coming — nothing to wait for.
+                    expired: !armed,
+                    _deadline: deadline,
+                });
                 self.flash_confirm(CopyKind::PickToAgent, cx);
                 self.release_webview_focus();
+                // Nothing to wait for when no snapshot was armed — go now.
+                self.deliver_ready_picks(cx);
             }
             IpcMessage::PickShot { rect } => {
-                self.capture_screenshot(Some(rect));
+                let _ = self.capture_screenshot(Some(rect), ShotDest::Clipboard);
                 self.release_webview_focus();
             }
             IpcMessage::PickCancel => self.release_webview_focus(),
@@ -535,14 +696,68 @@ impl BrowserView {
 
     /// Capture the webview (or a sub-`rect`) to a PNG on the clipboard. The
     /// snapshot is async; the result returns over the event channel.
-    pub fn capture_screenshot(&self, rect: Option<PickRect>) {
+    /// Dispatch every pick that is ready to the workspace.
+    ///
+    /// Called from the paths that *release* a pick — the crop arriving, the
+    /// deadline firing, or a pick created with nothing to wait for. Never from
+    /// `render`: an inactive browser tab does not render, and a pick must not
+    /// sit queued until the user navigates back to it.
+    fn deliver_ready_picks(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.window_handle else {
+            // Not yet rendered, so there is no window to dispatch into. Leave
+            // the picks queued rather than dropping them.
+            return;
+        };
+        for pick in drain_ready(&mut self.pending_picks) {
+            let action = SendPickToActiveChat {
+                markdown: pick.markdown,
+                selector: pick.selector,
+                png: pick.png,
+            };
+            let _ = handle.update(cx, |_, window, cx| {
+                window.dispatch_action(Box::new(action), cx);
+            });
+        }
+    }
+
+    /// Report where a picked element ended up, drawn *in the page*.
+    ///
+    /// It has to be in the page: the webview is a native view layered over the
+    /// GPU canvas, so a host-drawn toast renders underneath it and is invisible
+    /// exactly when a pick happens — while the browser tab is the active one.
+    pub fn confirm_pick_sent(&self, destination: &str) {
         let Some(native) = &self.native else {
             return;
         };
+        native.eval_script(&agent_context::confirm_toast_js(destination));
+    }
+
+    /// Returns whether a snapshot was actually requested. Only macOS has a
+    /// native one (see [`native::NativeWebview::screenshot`]); elsewhere the
+    /// call is a no-op that never answers, and a caller waiting on the result
+    /// needs to know that rather than sit out a timeout for a callback that
+    /// cannot come.
+    pub fn capture_screenshot(&self, rect: Option<PickRect>, dest: ShotDest) -> bool {
+        let Some(native) = &self.native else {
+            return false;
+        };
+        if !cfg!(target_os = "macos") {
+            return false;
+        }
+        // A zero-area crop is a request WebKit cannot answer: it returns an
+        // image that fails PNG encoding, so the caller would wait out the whole
+        // deadline for a crop that was never possible. The picker fills a
+        // degenerate box from the nearest ancestor (see `boxOf`), so reaching
+        // here means even that found nothing to shoot.
+        if rect.is_some_and(|r| r.w <= 0.0 || r.h <= 0.0) {
+            tracing::debug!(?rect, "skipping a zero-area screenshot request");
+            return false;
+        }
         let tx = self.events_tx.clone();
         native.screenshot(rect, move |png| {
-            let _ = tx.unbounded_send(ChromeEvent::Screenshot(png));
+            let _ = tx.unbounded_send(ChromeEvent::Screenshot { png, dest });
         });
+        true
     }
 
     /// Show/hide the webview. The host computes `active && !covered` each
@@ -1026,6 +1241,150 @@ fn host_of(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pick(png: Vec<u8>) -> PendingPick {
+        pick_seq(0, png)
+    }
+
+    fn pick_seq(seq: u64, png: Vec<u8>) -> PendingPick {
+        PendingPick {
+            seq,
+            markdown: format!("Selected element #{seq}:"),
+            selector: "a#go".to_string(),
+            png,
+            expired: false,
+            _deadline: None,
+        }
+    }
+
+    /// The zero-area guard in `capture_screenshot`, as a predicate.
+    fn is_degenerate(r: PickRect) -> bool {
+        r.w <= 0.0 || r.h <= 0.0
+    }
+
+    #[test]
+    fn a_zero_area_rect_is_refused_before_it_reaches_webkit() {
+        // What a `display:contents` span reports. WebKit answers this with an
+        // image that cannot be PNG-encoded, so the crop never arrives and the
+        // pick would wait out the full deadline for nothing.
+        assert!(is_degenerate(PickRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 }));
+        // A zero on either axis alone is just as unshootable.
+        assert!(is_degenerate(PickRect { x: 4.0, y: 8.0, w: 120.0, h: 0.0 }));
+        assert!(is_degenerate(PickRect { x: 4.0, y: 8.0, w: 0.0, h: 20.0 }));
+        // A real element's box goes through.
+        assert!(!is_degenerate(PickRect { x: 4.0, y: 8.0, w: 120.0, h: 20.0 }));
+    }
+
+    #[test]
+    fn a_crop_lands_on_the_pick_that_asked_for_it() {
+        // Pick A, then pick B before A's crop returns. A's crop must not be
+        // pinned to B — pairing an element with another element's screenshot is
+        // silently wrong data, worse than sending no image.
+        let mut picks = [pick_seq(0, Vec::new()), pick_seq(1, Vec::new())];
+        attach_crop(&mut picks, 0, vec![0xA]);
+        assert_eq!(picks[0].png, vec![0xA]);
+        assert!(picks[1].png.is_empty(), "B must not take A's crop");
+        attach_crop(&mut picks, 1, vec![0xB]);
+        assert_eq!(picks[1].png, vec![0xB]);
+    }
+
+    #[test]
+    fn a_crop_for_an_already_delivered_pick_is_dropped() {
+        // A's deadline passed and it went text-only; its late crop must find no
+        // home rather than attaching to whatever is queued now.
+        let mut picks = [pick_seq(1, Vec::new())];
+        attach_crop(&mut picks, 0, vec![0xA]);
+        assert!(picks[0].png.is_empty());
+    }
+
+    #[test]
+    fn a_deadline_expires_only_its_own_pick() {
+        let mut picks = [pick_seq(0, Vec::new()), pick_seq(1, Vec::new())];
+        expire_pick(&mut picks, 1);
+        assert!(!picks[0].expired, "A's deadline has not passed");
+        assert!(picks[1].expired);
+    }
+
+    #[test]
+    fn a_ready_pick_does_not_overtake_a_waiting_one() {
+        // B is ready, A is not. Releasing B first would put two chips and one
+        // image in the composer with nothing saying which element the image
+        // shows. B waits for A — bounded by PICK_SHOT_WAIT.
+        let mut queue = vec![pick_seq(0, Vec::new()), pick_seq(1, vec![0xB])];
+        assert!(drain_ready(&mut queue).is_empty(), "B must not jump ahead of A");
+        assert_eq!(queue.len(), 2);
+
+        expire_pick(&mut queue, 0); // A gives up on its crop
+        let out = drain_ready(&mut queue);
+        assert_eq!(out.len(), 2, "both go once the head is ready");
+        assert_eq!(out[0].seq, 0, "and in the order they were picked");
+        assert_eq!(out[1].seq, 1);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn draining_leaves_a_still_waiting_tail_queued() {
+        let mut queue = vec![pick_seq(0, vec![0xA]), pick_seq(1, Vec::new())];
+        let out = drain_ready(&mut queue);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].seq, 0);
+        assert_eq!(queue.len(), 1, "B keeps waiting for its own crop");
+        assert_eq!(queue[0].seq, 1);
+    }
+
+    #[test]
+    fn draining_an_empty_queue_is_a_no_op() {
+        let mut queue: Vec<PendingPick> = Vec::new();
+        assert!(drain_ready(&mut queue).is_empty());
+    }
+
+    #[test]
+    fn a_pick_with_its_crop_goes_immediately() {
+        assert!(pick(vec![1, 2, 3]).ready());
+    }
+
+    #[test]
+    fn a_pick_waits_for_its_crop() {
+        let mut p = pick(Vec::new());
+        assert!(!p.ready(), "must not send before the crop lands");
+        p.png = vec![1];
+        assert!(p.ready(), "the crop landing releases it");
+    }
+
+    #[test]
+    fn a_platform_with_no_snapshot_sends_the_pick_at_once() {
+        // `capture_screenshot` returning false marks the pick expired on
+        // creation, so a build with no native snapshot delivers the element on
+        // the next render instead of holding it for a callback that cannot come.
+        let mut p = pick(Vec::new());
+        p.expired = true;
+        assert!(p.ready());
+        assert!(p.png.is_empty());
+    }
+
+    #[test]
+    fn a_crop_that_never_lands_does_not_strand_the_pick() {
+        // WebKit can answer a snapshot request with a null image, in which case
+        // `native.rs` sends nothing at all. The deadline task marks the pick
+        // expired and the element still reaches the agent, text-only.
+        let mut queue = vec![pick(Vec::new())];
+        assert!(drain_ready(&mut queue).is_empty());
+        expire_pick(&mut queue, 0); // what the deadline task calls
+        let out = drain_ready(&mut queue);
+        assert_eq!(out.len(), 1, "the deadline must release it, not hold it forever");
+        assert!(out[0].png.is_empty());
+    }
+
+    #[test]
+    fn a_crop_arriving_after_the_deadline_still_rides_along() {
+        // Expiry only means "stop waiting"; a crop that lands in the same frame
+        // is still the right image for this pick, so it must not be discarded.
+        let mut p = pick(Vec::new());
+        p.expired = true;
+        p.png = vec![0xA];
+        assert!(p.ready());
+        assert_eq!(p.png, vec![0xA]);
+    }
 
     #[test]
     fn normalize_keeps_full_urls() {

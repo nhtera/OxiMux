@@ -54,6 +54,39 @@ struct PendingTranscript {
     send_after: bool,
 }
 
+/// One agent in the draft's agent picker: its adapter id, display name, and
+/// how many models the draft knows for it (see [`AgentModelCount`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPickerRow {
+    pub id: String,
+    pub display: String,
+    pub models: AgentModelCount,
+}
+
+/// What the agent picker shows beside an agent's name about its model list.
+/// `Known(n)` renders muted (`· 4 models`), `Loading` an ellipsis, `Failed` an
+/// `Error` badge in the warning colour, `Unknown` nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentModelCount {
+    Known(usize),
+    Loading,
+    Unknown,
+    Failed,
+}
+
+impl AgentModelCount {
+    /// The trailing text and whether it is a warning. `None` renders nothing.
+    fn label(&self) -> Option<(String, bool)> {
+        match self {
+            AgentModelCount::Known(1) => Some(("· 1 model".to_string(), false)),
+            AgentModelCount::Known(n) => Some((format!("· {n} models"), false)),
+            AgentModelCount::Loading => Some(("…".to_string(), false)),
+            AgentModelCount::Failed => Some(("Error".to_string(), true)),
+            AgentModelCount::Unknown => None,
+        }
+    }
+}
+
 /// The model/mode/effort options plus their "current when unset" defaults,
 /// sourced from the live [`oximux_agents::thread::AgentConnection`] and pushed
 /// into the composer so the bottom-toolbar pickers render whatever the backend
@@ -403,7 +436,7 @@ pub struct ComposerView {
     unbound: bool,
     /// The pickable coding agents for the unbound draft's dropdown, `(id,
     /// display)` in roster order. Empty when bound.
-    agent_options: Vec<(String, String)>,
+    agent_options: Vec<AgentPickerRow>,
     /// The currently-picked agent `(id, display)`, for the agent-picker button
     /// label + the menu checkmark. `None` when bound / not yet seeded.
     current_agent: Option<(String, String)>,
@@ -636,6 +669,30 @@ impl ComposerView {
         cx.notify();
     }
 
+    /// Append `@path ` mentions to the end of the draft — the same inline form
+    /// [`Self::mention_accept`] produces when a file is picked from the `@`
+    /// overlay, so a dropped file and a typed mention reach the agent
+    /// identically. A separating space is inserted when the draft doesn't
+    /// already end in whitespace, so a drop can't fuse onto the last word.
+    ///
+    /// Deliberately NOT a [`ContextChip`]: a chip inlines the file's *content*
+    /// into the message, and dropping a 5000-line source file should hand the
+    /// agent a reference it can choose to read, not silently spend the context
+    /// window on it.
+    pub fn append_mentions(
+        &mut self,
+        paths: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if paths.is_empty() {
+            return;
+        }
+        let next = with_mentions_appended(&self.input.read(cx).value(), paths);
+        self.set_draft_end(next, window, cx);
+        cx.notify();
+    }
+
     /// Attach image files chosen from the native file dialog. `rfd`'s async
     /// dialog runs off the main thread; the read + decode also happens on a
     /// background executor (decoding a large image is not cheap), then the staged
@@ -842,7 +899,7 @@ impl ComposerView {
     pub fn set_agent_picker(
         &mut self,
         unbound: bool,
-        agents: Vec<(String, String)>,
+        agents: Vec<AgentPickerRow>,
         current: Option<(String, String)>,
         cx: &mut Context<Self>,
     ) {
@@ -1728,6 +1785,7 @@ impl ComposerView {
     /// read together ("Claude ▾  opus ▾").
     fn render_agent_picker(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
+        let theme = self.theme;
         let agents = self.agent_options.clone();
         let current_id =
             self.current_agent.as_ref().map(|(id, _)| id.clone()).unwrap_or_default();
@@ -1750,7 +1808,8 @@ impl ComposerView {
         // same Popover + centered/self-hiding tooltip via `render_dropdown_shell`.
         let build_menu =
             move |mut menu: PopupMenu, window: &mut Window, _cx: &mut Context<PopupMenu>| {
-                for (id, display) in &agents {
+                for row in &agents {
+                    let (id, display) = (&row.id, &row.display);
                     let selected = current_id == *id;
                     let icon_path = adapter_icon_path(id);
                     let text = if selected {
@@ -1758,17 +1817,25 @@ impl ComposerView {
                     } else {
                         display.clone()
                     };
+                    // The model count trails the name, muted — or `Error` in
+                    // the warning colour when that agent's probe failed.
+                    let count = row.models.label();
                     let choice = id.to_string();
                     let entity = entity.clone();
                     menu = menu.item(
                         PopupMenuItem::element(move |_w, _c| {
-                            div()
+                            let mut item = div()
                                 .flex()
                                 .flex_row()
                                 .items_center()
                                 .gap(px(6.0))
                                 .child(Icon::default().path(icon_path).size(px(14.0)))
-                                .child(text.clone())
+                                .child(text.clone());
+                            if let Some((label, is_error)) = count.clone() {
+                                let color = if is_error { theme.status_warn } else { theme.fg_muted };
+                                item = item.child(div().text_color(color).child(label));
+                            }
+                            item
                         })
                         .on_click(window.listener_for(
                             &entity,
@@ -2178,7 +2245,7 @@ impl ComposerView {
     /// UI asset path; unknown/`None` hints fall back to a neutral settings glyph.
     fn feature_icon_path(hint: Option<&str>) -> &'static str {
         match hint {
-            Some("zap" | "fast") => "icons/sparkles.svg",
+            Some("zap" | "fast") => "icons/zap.svg",
             Some("plan" | "list-todo" | "list") => "icons/list-tree.svg",
             Some("bot" | "check" | "auto-accept") => "icons/check.svg",
             Some("shield" | "lock" | "permission") => "icons/lock.svg",
@@ -3254,7 +3321,15 @@ impl Render for ComposerView {
             self.model_select.update(cx, |s, cx| s.set_items(SearchableVec::new(items), window, cx));
             self.model_select_current = None; // re-apply selection against the new list
         }
-        let current_model = self.model.clone().or_else(|| self.vocab.default_model.clone());
+        // A persisted legacy wire (`opus`, `fable`) is still a valid `--model`
+        // but is no longer a catalog row once the CLI's list has landed, so it
+        // is shown as the row of the same family. Display only: the stored
+        // value is never rewritten, and a pick sends the row's real wire.
+        let current_model = self
+            .model
+            .clone()
+            .or_else(|| self.vocab.default_model.clone())
+            .map(|m| resolve_display_wire(&m, &self.vocab.models).unwrap_or(m));
         if self.model_select_current != current_model {
             self.model_select_current = current_model.clone();
             if let Some(wire) = current_model {
@@ -3672,9 +3747,68 @@ impl ComposerView {
     }
 }
 
+
+/// Append `@path ` tokens to `draft`, inserting a separating space when the
+/// draft doesn't already end in whitespace so a drop can't fuse onto the last
+/// word the user typed (`fix this@src/main.rs`). Each token carries its own
+/// trailing space, so consecutive drops stay separated and the caret lands
+/// ready for the next word.
+fn with_mentions_appended(draft: &str, paths: &[String]) -> String {
+    let mut next = draft.to_string();
+    for path in paths {
+        if !next.is_empty() && !next.ends_with(char::is_whitespace) {
+            next.push(' ');
+        }
+        next.push('@');
+        next.push_str(path);
+        next.push(' ');
+    }
+    next
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mention_never_fuses_onto_the_last_typed_word() {
+        // The failure this guards: dropping a file after "fix this" producing
+        // `fix this@src/main.rs`, which is neither a mention nor prose.
+        assert_eq!(
+            with_mentions_appended("fix this", &["src/main.rs".into()]),
+            "fix this @src/main.rs "
+        );
+        // A draft that already ends in whitespace gets no second space.
+        assert_eq!(
+            with_mentions_appended("fix this ", &["src/main.rs".into()]),
+            "fix this @src/main.rs "
+        );
+        assert_eq!(
+            with_mentions_appended("fix this\n", &["src/main.rs".into()]),
+            "fix this\n@src/main.rs "
+        );
+    }
+
+    #[test]
+    fn an_empty_draft_takes_no_leading_space() {
+        assert_eq!(with_mentions_appended("", &["a.rs".into()]), "@a.rs ");
+    }
+
+    #[test]
+    fn several_dropped_files_stay_separated() {
+        // A multi-file drop is one gesture; the tokens must not run together.
+        assert_eq!(
+            with_mentions_appended("", &["a.rs".into(), "b/c.rs".into()]),
+            "@a.rs @b/c.rs "
+        );
+    }
+
+    #[test]
+    fn no_paths_leaves_the_draft_untouched() {
+        assert_eq!(with_mentions_appended("keep me", &[]), "keep me");
+    }
+
     use gpui::TestAppContext;
 
     #[test]
@@ -3863,6 +3997,81 @@ mod tests {
             .expect("window update");
     }
 
+    /// End-to-end for Design Mode: an element picked in the embedded browser is
+    /// staged exactly as `AgentChatView::stage_browser_pick` stages it, then sent.
+    ///
+    /// This is the seam a unit test cannot reach and a webview is not needed for:
+    /// it proves the capture survives chip staging, image decode, and submit, and
+    /// that both halves reach the wire together.
+    #[gpui::test]
+    async fn a_picked_browser_element_reaches_the_wire_with_its_screenshot(
+        cx: &mut TestAppContext,
+    ) {
+        // A 1x1 red PNG — the smallest thing `pending_from_bytes` will accept.
+        use base64::Engine as _;
+        let png: Vec<u8> = base64::engine::general_purpose::STANDARD
+            .decode(concat!(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8",
+                "z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+            ))
+            .expect("valid base64 fixture");
+
+        let window = test_composer(cx);
+        let sent = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let seen = sent.clone();
+        cx.update(|cx| {
+            let root = window.root(cx).expect("root view");
+            cx.subscribe(
+                &root,
+                move |_, ev: &ComposerEvent, _| {
+                    if let ComposerEvent::Submit { text, images } = ev {
+                        *seen.borrow_mut() = Some((text.clone(), images.clone()));
+                    }
+                },
+            )
+            .detach();
+        });
+
+        window
+            .update(cx, |c, window, cx| {
+                // Exactly what `stage_browser_pick` does with a pick.
+                let chip = crate::shell::agent_chat::context_providers::browser_chip(
+                    "a#go",
+                    "Selected element: <a id=\"go\">x</a>\ncolor: rgb(0, 0, 0)".to_string(),
+                )
+                .expect("a non-empty capture makes a chip");
+                assert!(chip.label().starts_with("@browser a#go · "));
+                c.add_context_chip(chip, cx);
+                let staged = image_attach::pending_from_bytes(png, None)
+                    .expect("a 1x1 PNG decodes");
+                c.add_pending_images(vec![staged], cx);
+
+                // The capture is staged, not sent — the user still types the ask.
+                assert_eq!(c.context_chips_len_for_test(), 1);
+                assert_eq!(c.current_images().len(), 1);
+
+                c.set_draft_for_test("why is this misaligned?", window, cx);
+                c.submit(window, cx);
+            })
+            .expect("window update");
+        cx.run_until_parked();
+
+        let (text, images) = sent.borrow_mut().take().expect("a submit was emitted");
+        // The element rides as a tagged context block naming its selector...
+        assert!(
+            text.starts_with("<context name=\"browser\" source=\"a#go\">\n"),
+            "wire text was: {text}"
+        );
+        assert!(text.contains("<a id=\"go\">x</a>"), "the HTML must survive");
+        assert!(text.contains("color: rgb(0, 0, 0)"), "the computed CSS must survive");
+        // ...and the user's own question is still the tail of the message.
+        assert!(text.ends_with("why is this misaligned?"));
+        // ...with the crop attached, not left on the clipboard.
+        assert_eq!(images.len(), 1, "the screenshot must travel with the text");
+        assert_eq!(images[0].media_type, "image/png");
+        assert!(!images[0].data.is_empty());
+    }
+
     /// Restored queued chips (`seed_queued`) re-render without auto-sending; a
     /// seeded draft respects the no-clobber guard.
     #[gpui::test]
@@ -3977,5 +4186,107 @@ mod tests {
         assert_eq!(rank_context_sources(&sources, "clip"), vec![1]);
         // No match.
         assert!(rank_context_sources(&sources, "zzz").is_empty());
+    }
+}
+
+/// The catalog row a model wire should show as selected.
+///
+/// `model` itself when it is a catalog wire. Otherwise the first row of the
+/// same *family* — `opus` → `opus[1m]`, `fable` → `claude-fable-5-1[1m]` — so
+/// a tab or launch profile that persisted a bare alias before the picker
+/// started reading the CLI's own list still shows its checkmark. `None` when
+/// nothing in the catalog is of that family (the picker then shows no
+/// selection rather than a wrong one). Pure so it is testable without a
+/// window; never used to rewrite the persisted value.
+pub(crate) fn resolve_display_wire(model: &str, catalog: &[ModelChoice]) -> Option<String> {
+    if catalog.iter().any(|m| m.wire == model) {
+        return Some(model.to_string());
+    }
+    let family = model_family(model)?;
+    catalog.iter().find(|m| model_family(&m.wire) == Some(family)).map(|m| m.wire.clone())
+}
+
+/// The Claude families a legacy alias can name. Only these map: the picker
+/// serves every agent, and a Codex or ACP wire that has left its catalog
+/// (`gpt-5.4` beside `gpt-5.5`) must show no selection rather than a wrong one.
+const CLAUDE_FAMILIES: [&str; 4] = ["opus", "sonnet", "haiku", "fable"];
+
+/// The family token of a Claude model wire: the bracket suffix and any
+/// `claude-` prefix dropped, then the first dash-separated word —
+/// `opus[1m]` → `opus`, `claude-fable-5-1[1m]` → `fable`, `sonnet` → `sonnet`.
+/// `None` for anything that is not a Claude family.
+fn model_family(wire: &str) -> Option<&'static str> {
+    let bare = wire.split('[').next().unwrap_or(wire);
+    let bare = bare.strip_prefix("claude-").unwrap_or(bare);
+    let token = bare.split('-').next().unwrap_or(bare);
+    CLAUDE_FAMILIES.iter().copied().find(|f| *f == token)
+}
+
+#[cfg(test)]
+mod agent_count_tests {
+    use super::AgentModelCount;
+
+    #[test]
+    fn count_labels() {
+        assert_eq!(AgentModelCount::Known(4).label(), Some(("· 4 models".into(), false)));
+        assert_eq!(AgentModelCount::Known(1).label(), Some(("· 1 model".into(), false)));
+        assert_eq!(AgentModelCount::Loading.label(), Some(("…".into(), false)));
+        assert_eq!(AgentModelCount::Failed.label(), Some(("Error".into(), true)));
+        assert_eq!(AgentModelCount::Unknown.label(), None);
+    }
+}
+
+#[cfg(test)]
+mod display_wire_tests {
+    use super::*;
+
+    fn catalog() -> Vec<ModelChoice> {
+        ["opus[1m]", "claude-fable-5[1m]", "claude-fable-5-1[1m]", "sonnet", "haiku"]
+            .into_iter()
+            .map(|w| ModelChoice { wire: w.to_string(), label: w.to_string(), description: None })
+            .collect()
+    }
+
+    #[test]
+    fn a_catalog_wire_is_itself() {
+        assert_eq!(resolve_display_wire("sonnet", &catalog()).as_deref(), Some("sonnet"));
+        assert_eq!(resolve_display_wire("opus[1m]", &catalog()).as_deref(), Some("opus[1m]"));
+    }
+
+    #[test]
+    fn a_legacy_alias_maps_to_its_family_row() {
+        assert_eq!(resolve_display_wire("opus", &catalog()).as_deref(), Some("opus[1m]"));
+        // Two Fable rows: the first listed wins, which is display-only anyway.
+        assert_eq!(
+            resolve_display_wire("fable", &catalog()).as_deref(),
+            Some("claude-fable-5[1m]")
+        );
+        assert_eq!(
+            resolve_display_wire("claude-opus-4-1", &catalog()).as_deref(),
+            Some("opus[1m]")
+        );
+    }
+
+    #[test]
+    fn an_unrelated_wire_selects_nothing() {
+        assert_eq!(resolve_display_wire("gpt", &catalog()), None);
+        assert_eq!(resolve_display_wire("", &catalog()), None);
+        assert_eq!(resolve_display_wire("opus", &[]), None);
+        // A non-Claude catalog: a wire that left it must not pick a sibling.
+        let codex: Vec<ModelChoice> = ["gpt-5.5", "gpt-5.5-codex"]
+            .into_iter()
+            .map(|w| ModelChoice { wire: w.to_string(), label: w.to_string(), description: None })
+            .collect();
+        assert_eq!(resolve_display_wire("gpt-5.4", &codex), None);
+        assert_eq!(resolve_display_wire("gpt-5.5", &codex).as_deref(), Some("gpt-5.5"));
+    }
+
+    #[test]
+    fn family_token_shapes() {
+        assert_eq!(model_family("opus[1m]"), Some("opus"));
+        assert_eq!(model_family("claude-fable-5-1[1m]"), Some("fable"));
+        assert_eq!(model_family("claude-sonnet-5"), Some("sonnet"));
+        assert_eq!(model_family("haiku"), Some("haiku"));
+        assert_eq!(model_family("gpt-5.4"), None);
     }
 }

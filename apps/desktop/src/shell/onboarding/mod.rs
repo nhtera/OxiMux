@@ -14,6 +14,7 @@ mod view;
 mod view_step;
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ use std::time::{Duration, Instant};
 use gpui::{AppContext as _, Context, Entity, EventEmitter, FocusHandle, Subscription, Window};
 use gpui_component::searchable_list::SearchableVec;
 use gpui_component::select::{SelectEvent, SelectState};
+use oximux_agents::thread::{probe_catalog, ChatBackend, ConnectSpec};
 use oximux_agents::AdapterRegistry;
 use oximux_settings::{AgentLaunchSettings, Density, OpenMode, Theme, Typography};
 use oximux_storage::SettingsRepo;
@@ -115,6 +117,12 @@ pub struct OnboardingWizard {
     /// re-renders don't reset an open dropdown (composer's signature guard).
     model_select_sig: Vec<(String, String, Option<String>)>,
     _model_select_sub: Option<Subscription>,
+    /// Whether [`Self::spawn_claude_probe`] may spawn the real `claude`. Off
+    /// in tests, where a probe thread would outlive the test and abort the run.
+    probe_live: bool,
+    /// Set once the Claude catalog probe has been started from this wizard, so
+    /// a detection re-run or a reopen never spawns a second one.
+    claude_probe_started: bool,
     /// How long the wizard still reclaims keyboard focus on render. See
     /// [`FOCUS_CLAIM_WINDOW`] for why the reclaim is bounded at all.
     pub(self) focus_claim_until: Option<Instant>,
@@ -187,6 +195,8 @@ impl OnboardingWizard {
             model_select: None,
             model_select_sig: Vec::new(),
             _model_select_sub: None,
+            probe_live: true,
+            claude_probe_started: false,
             focus_claim_until: None,
             #[cfg(target_os = "macos")]
             driver_status: crate::shell::settings_modal::DriverStatus::Unknown,
@@ -299,7 +309,70 @@ impl OnboardingWizard {
                         .map(|r| r.id.clone());
                     wizard.sync_model_select(window, cx);
                 }
+                // Detection just said whether `claude` is there; if it is, ask
+                // it for its model list so the Claude row offers the CLI's own
+                // rows rather than the static seed.
+                if claude_row_installed(&wizard.rows) {
+                    wizard.spawn_claude_probe(window, cx);
+                }
                 cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Ask the installed `claude` for its `/model` list, once per wizard, so
+    /// the Claude row shows the CLI's own rows and preselects the CLI's default.
+    ///
+    /// The wizard only ever appears on a fresh install, which is exactly when
+    /// the catalog cache — the only source `selected_model_source` prefers over
+    /// the static seed — is cold; without this the first picker a new user
+    /// sees is the one list that can be a release behind. Same cheap probe and
+    /// same raw-thread seam as the chat's `maybe_probe_catalog`: the result is
+    /// recorded in the shared `CatalogCache` (which `sync_model_select` reads,
+    /// and which the chat then trusts as fresh), and the probe itself publishes
+    /// the slot every live Claude connection serves from. An empty answer (a
+    /// CLI that predates `list_models`) or a failure leaves the seed painted.
+    fn spawn_claude_probe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        const ID: &str = "claude-code";
+        if !self.probe_live || self.claude_probe_started {
+            return;
+        }
+        if cx
+            .try_global::<crate::catalog_cache::CatalogCache>()
+            .is_some_and(|c| c.is_fresh(ID))
+        {
+            return; // a chat already probed live this session; the cache is current
+        }
+        self.claude_probe_started = true;
+        // The Claude arm of `probe_catalog` reads only the transport; the cwd
+        // is a required field it never touches.
+        let spec = ConnectSpec::for_backend(
+            &ChatBackend::stream_json(),
+            PathBuf::from("."),
+            None,
+            None,
+            None,
+            None,
+        );
+        let (tx, rx) = futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe_catalog(spec));
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(result) = rx.await else { return };
+            let _ = this.update_in(cx, |wizard, window, cx| match result {
+                Ok(catalog) if !catalog.models.is_empty() => {
+                    if let Some(cache) = cx.try_global::<crate::catalog_cache::CatalogCache>() {
+                        cache.record(ID, catalog);
+                    }
+                    wizard.sync_model_select(window, cx);
+                    cx.notify();
+                }
+                Ok(_) => {
+                    tracing::debug!("onboarding: claude list_models answered empty; keeping the seed")
+                }
+                Err(e) => tracing::warn!(error = %e, "onboarding: claude catalog probe failed"),
             });
         })
         .detach();
@@ -611,5 +684,30 @@ mod tests {
         launch.entry_mut("opencode").transport = oximux_settings::Transport::Acp;
         apply_finish(&mut launch, "opencode", Some("m"), OpenMode::Chat);
         assert_eq!(launch.for_agent("opencode").unwrap().acp_command, "my-custom-opencode");
+    }
+}
+
+/// Whether the detection pass found the native Claude adapter on PATH — the
+/// gate for asking it for its model list.
+fn claude_row_installed(rows: &[AgentRow]) -> bool {
+    rows.iter().any(|r| r.id == "claude-code" && r.available == Some(true))
+}
+
+#[cfg(test)]
+mod claude_probe_tests {
+    use super::*;
+
+    #[test]
+    fn probe_gate_needs_a_detected_claude_row() {
+        let mut rows = agent_step::assemble_roster(
+            &[("claude-code".to_string(), "Claude Code".to_string())],
+            |_| true,
+        );
+        assert!(!claude_row_installed(&rows), "undetected → no probe");
+        rows[0].available = Some(false);
+        assert!(!claude_row_installed(&rows), "missing binary → no probe");
+        rows[0].available = Some(true);
+        assert!(claude_row_installed(&rows));
+        assert!(!claude_row_installed(&[]));
     }
 }

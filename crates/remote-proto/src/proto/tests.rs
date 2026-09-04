@@ -1,5 +1,6 @@
 use super::*;
 use oximux_agent_core::thread::{PermissionDecision, ThreadEvent};
+use serde::Deserialize;
 use serde_json::json;
 
 /// A `ThreadEvent` variant that carries a populated `serde_json::Value` — the
@@ -17,9 +18,12 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 20,
-        "v20 = ThreadEvent::PermissionEdited (operator-edited approvals recorded in the \
-         transcript; older peers get the Notice downgrade)"
+        PROTOCOL_VERSION, 23,
+        "v23 = cron schedules (CreateScheduleV2 / ListSchedulesV2, answered by \
+         ScheduleCreatedV2 / SchedulesV2). A fourth RecurrenceWire variant was not an \
+         option: that enum rides inside Vec<ScheduleWire> replies as well as inside \
+         CreateSchedule, so one cron schedule would make every ListSchedules reply \
+         undecodable for a pre-v23 peer — every row, not just the cron one"
     );
 }
 
@@ -473,4 +477,245 @@ fn early_variants_keep_their_literal_ordinals() {
         entry: None,
     });
     assert_eq!(changed_at.to_bytes().expect("encode")[0], 47);
+
+    // v21: the worktree progress sidecar — `SetWorktreeProgress` (62),
+    // `ListWorktreeProgress` (63), and `WorktreeProgress` (48).
+    let set_progress =
+        Request::SetWorktreeProgress { id: String::new(), comment: None, phase: None };
+    assert_eq!(set_progress.to_bytes().expect("encode")[0], 62);
+    let list_progress = Request::ListWorktreeProgress { project_path: None };
+    assert_eq!(list_progress.to_bytes().expect("encode")[0], 63);
+    assert_eq!(Response::WorktreeProgress(vec![]).to_bytes().expect("encode")[0], 48);
+
+    // v22: per-role agents — `TeamRunCreateV2` (64), `TeamStatusV2` (65), and
+    // `TeamRunV2` (49). The v18 team verbs (53-56) and `TeamRun` (40) keep
+    // their ordinals above: a stale CLI must go on speaking what it spoke.
+    let create_v2 = Request::TeamRunCreateV2(TeamRunCreateV2Req {
+        name: String::new(),
+        cwd: String::new(),
+        agent_id: None,
+        worktree_each: false,
+        roles: vec![],
+    });
+    assert_eq!(create_v2.to_bytes().expect("encode")[0], 64);
+    let status_v2 = Request::TeamStatusV2 { run_id: String::new() };
+    assert_eq!(status_v2.to_bytes().expect("encode")[0], 65);
+    let run_v2 = TeamRunV2Wire {
+        id: String::new(),
+        name: String::new(),
+        cwd: String::new(),
+        created_at: String::new(),
+        closed: false,
+        roles: vec![],
+    };
+    assert_eq!(Response::TeamRunV2(run_v2).to_bytes().expect("encode")[0], 49);
+
+    // v23: cron schedules — `CreateScheduleV2` (66), `ListSchedulesV2` (67),
+    // and the `SchedulesV2` (50) / `ScheduleCreatedV2` (51) replies. The v10
+    // schedule verbs (`ListSchedules` 32, `CreateSchedule` 33) and their
+    // replies keep their ordinals: a stale phone must go on speaking what it
+    // spoke, and it is the one the stand-in recurrence exists for.
+    assert_eq!(Request::ListSchedules.to_bytes().expect("encode")[0], 32);
+    let create_v1 = Request::CreateSchedule {
+        name: String::new(),
+        cwd: String::new(),
+        prompt: String::new(),
+        agent_id: None,
+        recurrence: RecurrenceWire::EveryMinutes { minutes: 5 },
+    };
+    assert_eq!(create_v1.to_bytes().expect("encode")[0], 33);
+    let create_sched_v2 = Request::CreateScheduleV2 {
+        name: String::new(),
+        cwd: String::new(),
+        prompt: String::new(),
+        agent_id: None,
+        recurrence: RecurrenceV2Wire::Cron { expr: "0 9 * * 1-5".into() },
+    };
+    assert_eq!(create_sched_v2.to_bytes().expect("encode")[0], 66);
+    assert_eq!(Request::ListSchedulesV2.to_bytes().expect("encode")[0], 67);
+    assert_eq!(Response::SchedulesV2(vec![]).to_bytes().expect("encode")[0], 50);
+    let sched_v2 = ScheduleV2Wire {
+        id: String::new(),
+        name: String::new(),
+        cwd: String::new(),
+        prompt: String::new(),
+        agent_id: None,
+        recurrence: RecurrenceV2Wire::EveryMinutes { minutes: 5 },
+        enabled: false,
+        next_fire_at: String::new(),
+        summary: String::new(),
+    };
+    assert_eq!(Response::ScheduleCreatedV2(sched_v2).to_bytes().expect("encode")[0], 51);
 }
+
+/// The v10 schedule shape is frozen, byte for byte.
+///
+/// The twin of `the_v18_team_shape_is_frozen`. It catches a field inserted or
+/// appended anywhere in `ScheduleWire`, and a `RecurrenceWire` variant
+/// reordered — the mistakes that silently shift every later byte.
+///
+/// It deliberately does **not** catch a variant *appended* to
+/// `RecurrenceWire`, and cannot: postcard leaves the existing ordinals where
+/// they are, so an encoder emitting `WeeklyAt` produces identical bytes either
+/// way. That danger lives on the decode side and is guarded separately by
+/// [`a_recurrence_wire_variant_may_never_be_appended`] and
+/// [`a_v10_decoder_cannot_read_a_cron_recurrence`].
+#[test]
+fn the_v10_schedule_shape_is_frozen() {
+    let wire = ScheduleWire {
+        id: "s".into(),
+        name: "n".into(),
+        cwd: "/".into(),
+        prompt: "p".into(),
+        agent_id: None,
+        recurrence: RecurrenceWire::WeeklyAt { weekday: 4, hour: 17, minute: 15 },
+        enabled: true,
+        next_fire_at: "t".into(),
+        summary: "u".into(),
+    };
+    let bytes = postcard::to_allocvec(&wire).expect("encode");
+    assert_eq!(
+        bytes,
+        vec![
+            1, b's', // id
+            1, b'n', // name
+            1, b'/', // cwd
+            1, b'p', // prompt
+            0,       // agent_id: None
+            2, 4, 17, 15, // recurrence: WeeklyAt (variant 2) + weekday/hour/minute
+            1,       // enabled: true
+            1, b't', // next_fire_at
+            1, b'u', // summary
+        ],
+        "a v10 phone decodes these exact bytes; nothing may be inserted or appended"
+    );
+
+    // And the third variant is still ordinal 2 — a fourth appended here would
+    // not move it, which is precisely why the danger is invisible without this.
+    assert_eq!(
+        postcard::to_allocvec(&RecurrenceWire::WeeklyAt { weekday: 0, hour: 0, minute: 0 })
+            .expect("encode"),
+        vec![2, 0, 0, 0]
+    );
+}
+
+/// The reason both team shapes exist: a v18 `TeamRunWire` frame must decode
+/// identically under this build, byte for byte, as the shape it always was.
+///
+/// If someone "simplifies" this later by adding `agent_id` to `TeamRoleWire`
+/// instead, this fails — which is the entire point. Postcard encodes struct
+/// fields positionally, so the appended field would make a stale CLI misparse
+/// every role after the first and drop the connection.
+#[test]
+fn the_v18_team_shape_is_frozen() {
+    let v18 = Response::TeamRun(TeamRunWire {
+        id: "run-1".into(),
+        name: "sweep".into(),
+        cwd: "/w".into(),
+        created_at: "t".into(),
+        closed: false,
+        roles: vec![TeamRoleWire {
+            name: "impl".into(),
+            session_id: None,
+            status: TeamRoleStatusWire::Running,
+            summary: None,
+            updated_at: "t".into(),
+        }],
+    });
+    let bytes = v18.to_bytes().expect("encode");
+    // Hand-computed from the v18 field order: ordinal 40, then id/name/cwd/
+    // created_at as length-prefixed strings, `closed` as 0, one role, and that
+    // role's five fields. A change to any field's position or presence moves
+    // these bytes.
+    assert_eq!(
+        bytes,
+        vec![
+            40, // Response::TeamRun
+            5, b'r', b'u', b'n', b'-', b'1', //
+            5, b's', b'w', b'e', b'e', b'p', //
+            2, b'/', b'w', //
+            1, b't',  //
+            0,    // closed
+            1,    // one role
+            4, b'i', b'm', b'p', b'l', //
+            0, // session_id: None
+            0, // status: Running
+            0, // summary: None
+            1, b't', //
+        ],
+        "the v18 team reply is frozen — a field added to it strands every stale CLI"
+    );
+    assert_eq!(Response::from_bytes(&bytes).expect("decode"), v18);
+}
+
+/// **A fourth `RecurrenceWire` variant must not compile.**
+///
+/// The obvious "simplification" of this phase is to append `Cron` here instead
+/// of adding v23 verbs, and it is invisible to every byte-level test: postcard
+/// keeps the existing ordinals, so nothing an encoder produces changes. The
+/// breakage is on the far side — see
+/// [`a_v10_decoder_cannot_read_a_cron_recurrence`] — and by the time a phone
+/// hits it there is no test left to run.
+///
+/// So the guard is the compiler. Adding a variant makes this match
+/// non-exhaustive, and the build stops with this comment attached to it.
+#[test]
+fn a_recurrence_wire_variant_may_never_be_appended() {
+    fn exhaustive(w: &RecurrenceWire) -> &'static str {
+        match w {
+            RecurrenceWire::EveryMinutes { .. } => "interval",
+            RecurrenceWire::DailyAt { .. } => "daily",
+            RecurrenceWire::WeeklyAt { .. } => "weekly",
+        }
+    }
+    assert_eq!(exhaustive(&RecurrenceWire::EveryMinutes { minutes: 5 }), "interval");
+    assert_eq!(exhaustive(&RecurrenceWire::DailyAt { hour: 9, minute: 0 }), "daily");
+    assert_eq!(
+        exhaustive(&RecurrenceWire::WeeklyAt { weekday: 0, hour: 9, minute: 0 }),
+        "weekly"
+    );
+}
+
+/// The reason v23 needed new verbs, stated as an executable fact.
+///
+/// `OldRecurrence` is a stand-in for the enum a paired phone was built with:
+/// exactly three variants. A cron recurrence encodes as ordinal 3, and that
+/// decoder rejects the frame — not the one field, the **frame**. Since
+/// `RecurrenceWire` rides inside `Vec<ScheduleWire>`, one cron schedule would
+/// have taken every other row down with it.
+#[test]
+fn a_v10_decoder_cannot_read_a_cron_recurrence() {
+    #[derive(Debug, Deserialize)]
+    enum OldRecurrence {
+        #[allow(dead_code)]
+        EveryMinutes { minutes: u32 },
+        #[allow(dead_code)]
+        DailyAt { hour: u8, minute: u8 },
+        #[allow(dead_code)]
+        WeeklyAt { weekday: u8, hour: u8, minute: u8 },
+    }
+
+    // What a v23 host would put on the wire if cron rode the old enum.
+    let cron = postcard::to_allocvec(&RecurrenceV2Wire::Cron { expr: "0 9 * * 1-5".into() })
+        .expect("encode");
+    assert_eq!(cron[0], 3, "cron would be the fourth ordinal");
+    assert!(
+        postcard::from_bytes::<OldRecurrence>(&cron).is_err(),
+        "a three-variant decoder must reject ordinal 3 — this is the whole reason for v23"
+    );
+
+    // And the three it does know still decode, so the rejection is about the
+    // new ordinal rather than the stand-in decoder being broken.
+    for known in [
+        RecurrenceV2Wire::EveryMinutes { minutes: 5 },
+        RecurrenceV2Wire::DailyAt { hour: 9, minute: 0 },
+        RecurrenceV2Wire::WeeklyAt { weekday: 4, hour: 17, minute: 15 },
+    ] {
+        let bytes = postcard::to_allocvec(&known).expect("encode");
+        assert!(
+            postcard::from_bytes::<OldRecurrence>(&bytes).is_ok(),
+            "{known:?} is one the old decoder knows"
+        );
+    }
+}
+

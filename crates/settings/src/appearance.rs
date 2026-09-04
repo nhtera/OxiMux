@@ -186,6 +186,44 @@ impl UiScale {
     }
 }
 
+/// How much of each account's usage the status-bar meter spells out.
+///
+/// Both modes show every configured provider — this is about how much room
+/// each one takes, not which ones appear. With one account the difference is
+/// cosmetic; with several it is the difference between a readable status bar
+/// and a wall of numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UsageDetail {
+    /// Every window, spelled out: `12% 5h · 4% wk`.
+    #[default]
+    Verbose,
+    /// Only the window closest to its ceiling, with how long until it resets:
+    /// `12% 4h12m`. The other windows stay one click away in the popover.
+    Compact,
+}
+
+impl UsageDetail {
+    /// Every mode, in the order a picker should offer them (fullest first).
+    pub const ALL: [Self; 2] = [Self::Verbose, Self::Compact];
+
+    /// Name for a settings control.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Verbose => "Verbose",
+            Self::Compact => "Compact",
+        }
+    }
+
+    /// One line saying what picking it does, for the row under the control.
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Verbose => "Every rate-limit window for each account.",
+            Self::Compact => "Only the window nearest its limit, and when it resets.",
+        }
+    }
+}
+
 /// The user's appearance choices, together.
 ///
 /// Small and `Copy` so a resolved [`Density`](crate::Density) can carry the
@@ -200,6 +238,8 @@ pub struct Appearance {
     pub density: DensityPreset,
     /// How big. See [`UiScale`].
     pub scale: UiScale,
+    /// How much the status-bar usage meter spells out. See [`UsageDetail`].
+    pub usage_detail: UsageDetail,
 }
 
 impl Appearance {
@@ -400,10 +440,13 @@ mod tests {
 
     #[test]
     fn a_settings_file_round_trips() {
+        // Every field set away from its default, so a key the writer forgets
+        // to emit fails here instead of silently reverting on next launch.
         let original = Appearance {
-            theme: ThemeChoice::default(),
+            theme: ThemeChoice::Paper,
             density: DensityPreset::Comfortable,
             scale: UiScale::from_percent(130),
+            usage_detail: UsageDetail::Compact,
         };
         let doc = to_toml_string(&original, &crate::fonts::FontChoice::default());
         let parsed = Appearance::from_toml_str(&doc).expect("round-trip parse");
@@ -420,6 +463,7 @@ mod tests {
             theme: ThemeChoice::Paper,
             density: DensityPreset::Comfortable,
             scale: UiScale::from_percent(120),
+            usage_detail: UsageDetail::Compact,
         };
         let fonts = crate::fonts::FontChoice {
             ui: Some("Inter".into()),

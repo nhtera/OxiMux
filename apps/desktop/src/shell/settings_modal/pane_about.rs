@@ -24,7 +24,7 @@ use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use oximux_auto_update::{CheckTrigger, UpdateStatus};
 #[cfg(any(target_os = "macos", windows))]
 use oximux_settings::AutoUpdateSettings;
-use oximux_settings::{Density, DensityPreset, Theme, ThemeChoice, Typography};
+use oximux_settings::{Density, DensityPreset, Theme, ThemeChoice, Typography, UsageDetail};
 
 use super::controls::info_row;
 #[cfg(any(target_os = "macos", windows))]
@@ -185,6 +185,23 @@ fn appearance_controls(
         cx,
     );
 
+    let usage_detail_pick = segmented(
+        "appearance-usage-detail",
+        UsageDetail::ALL
+            .iter()
+            .map(|mode| {
+                let mode = *mode;
+                Segment::new(mode.label(), current.usage_detail == mode, move |_this, _w, cx| {
+                    crate::appearance_settings::set_usage_detail(cx, mode);
+                })
+            })
+            .collect(),
+        theme,
+        density,
+        typography,
+        cx,
+    );
+
     let zoom = stepper(
         "appearance-zoom",
         current.scale.label(),
@@ -240,6 +257,14 @@ fn appearance_controls(
             "Interface zoom",
             "Scales the whole cockpit — text and chrome together.",
             zoom,
+        ),
+        entry(
+            "Usage meter",
+            // Says what changes and what does not: the control trims each
+            // account's numbers, it does not hide an account.
+            "How much of each account's usage the status bar spells out. Every \
+             configured account is shown either way.",
+            usage_detail_pick,
         ),
         entry(
             "UI font",

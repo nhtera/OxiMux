@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use oximux_git::{Repository, validate_slug};
 use oximux_remote_host::{WorktreeError, WorktreeService};
-use oximux_remote_proto::messages::WorktreeWire;
+use oximux_remote_proto::messages::{WorktreeProgressWire, WorktreeWire};
 use oximux_storage::{ProjectRepo, WorkspaceRepo};
 
 use crate::{CreateOutcome, create_workspace_with_rollback, run_cleanup_before_remove, worktree_path};
@@ -137,6 +137,74 @@ impl WorktreeService for RepoWorktrees {
         Ok(rows)
     }
 
+    async fn set_progress(
+        &self,
+        id: &str,
+        comment: Option<&str>,
+        phase: Option<&str>,
+    ) -> Result<(), WorktreeError> {
+        // Two statements rather than one dynamic UPDATE: `None` means "leave
+        // this alone", and composing that into SQL costs more than it saves
+        // for two columns. A caller setting both is one extra round trip
+        // against a local SQLite file.
+        //
+        // The id is checked by whichever write runs first, so a request that
+        // sets nothing at all (both `None`) is a no-op rather than a validated
+        // one — harmless, and the CLI refuses that shape before it gets here.
+        let mut matched = None;
+        if let Some(text) = comment {
+            matched = Some(self.workspaces.set_comment(id, text).map_err(|err| {
+                tracing::warn!(?err, "worktree service: comment write failed");
+                WorktreeError::Unavailable
+            })?);
+        }
+        if let Some(text) = phase {
+            let hit = self.workspaces.set_phase(id, text).map_err(|err| {
+                tracing::warn!(?err, "worktree service: phase write failed");
+                WorktreeError::Unavailable
+            })?;
+            matched = Some(matched.unwrap_or(true) && hit);
+        }
+        match matched {
+            Some(false) => Err(WorktreeError::UnknownWorktree),
+            _ => Ok(()),
+        }
+    }
+
+    async fn list_progress(
+        &self,
+        project_path: Option<&str>,
+    ) -> Result<Vec<WorktreeProgressWire>, WorktreeError> {
+        let projects = match project_path {
+            Some(path) => vec![self.project_by_path(path)?],
+            None => self.projects.list_ordered(usize::MAX).map_err(|err| {
+                tracing::warn!(?err, "worktree service: project list failed");
+                WorktreeError::Unavailable
+            })?,
+        };
+        let mut rows = Vec::new();
+        for project in projects {
+            let list = self.workspaces.list_for_project(&project.id).map_err(|err| {
+                tracing::warn!(?err, "worktree service: workspace list failed");
+                WorktreeError::Unavailable
+            })?;
+            // Silent rows are omitted: a worktree nobody has described yet has
+            // nothing to say, and shipping a row of empty strings for each one
+            // would make "no progress reported" indistinguishable from "every
+            // worktree reported emptiness".
+            rows.extend(
+                list.into_iter()
+                    .filter(|w| !w.comment.is_empty() || !w.phase.is_empty())
+                    .map(|w| WorktreeProgressWire {
+                        id: w.id,
+                        comment: w.comment,
+                        phase: w.phase,
+                    }),
+            );
+        }
+        Ok(rows)
+    }
+
     async fn remove(&self, id: &str) -> Result<(), WorktreeError> {
         let row = self.workspaces.get_by_id(id).map_err(|err| {
             tracing::warn!(?err, "worktree service: workspace lookup failed");
@@ -186,5 +254,90 @@ impl WorktreeService for RepoWorktrees {
             tracing::warn!(?err, id, "remote worktree remove: row delete failed");
             WorktreeError::RemoveFailed
         })
+    }
+}
+
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use oximux_storage::db::open_memory;
+    use oximux_storage::repositories::{ProjectRepo, WorkspaceRepo};
+
+    /// A service over an in-memory database with one project and two
+    /// worktrees. Returns the service, the project root, and both ids.
+    fn fixture() -> (RepoWorktrees, String, String, String) {
+        let db = open_memory().expect("db");
+        let projects = ProjectRepo::new(db.clone());
+        let workspaces = WorkspaceRepo::new(db.clone());
+        let project = projects.insert("p", "/p", "main").expect("project");
+        let a = workspaces.insert(&project.id, "a", "a", "oximux/a", "/p/a").expect("a");
+        let b = workspaces.insert(&project.id, "b", "b", "oximux/b", "/p/b").expect("b");
+        let service = RepoWorktrees::new(projects, workspaces, "/data".into());
+        (service, project.root_path, a.id, b.id)
+    }
+
+    /// Only worktrees that have said something appear. A silent worktree must
+    /// not ship a row of empty strings, or "nobody reported" and "everybody
+    /// reported nothing" become the same answer.
+    #[tokio::test]
+    async fn the_board_lists_only_worktrees_that_have_spoken() {
+        let (service, root, a, _b) = fixture();
+        assert!(service.list_progress(None).await.expect("list").is_empty());
+
+        service.set_progress(&a, Some("rebasing"), Some("in-progress")).await.expect("set");
+        let rows = service.list_progress(Some(&root)).await.expect("list");
+        assert_eq!(rows.len(), 1, "the silent worktree must not appear");
+        assert_eq!(rows[0].id, a);
+        assert_eq!(rows[0].comment, "rebasing");
+        assert_eq!(rows[0].phase, "in-progress");
+    }
+
+    /// `None` means "leave this alone". An agent advancing its phase must not
+    /// blank the sentence it wrote earlier — the reason both fields are
+    /// `Option` rather than plain strings.
+    #[tokio::test]
+    async fn setting_one_field_leaves_the_other_standing() {
+        let (service, _root, a, _b) = fixture();
+        service.set_progress(&a, Some("running the suite"), Some("in-progress")).await.expect("a");
+        service.set_progress(&a, None, Some("in-review")).await.expect("b");
+
+        let rows = service.list_progress(None).await.expect("list");
+        assert_eq!(rows[0].comment, "running the suite", "the phase write clobbered the comment");
+        assert_eq!(rows[0].phase, "in-review");
+    }
+
+    /// An empty string is a clear, distinct from `None`'s "leave it".
+    #[tokio::test]
+    async fn an_empty_string_clears_and_drops_the_row() {
+        let (service, _root, a, _b) = fixture();
+        service.set_progress(&a, Some("done here"), None).await.expect("set");
+        service.set_progress(&a, Some(""), None).await.expect("clear");
+        assert!(
+            service.list_progress(None).await.expect("list").is_empty(),
+            "a cleared worktree has nothing to say and leaves the board"
+        );
+    }
+
+    /// Naming a row that does not exist is an error, not a silent success —
+    /// otherwise `worktree set` on a typo'd id reports that it worked.
+    #[tokio::test]
+    async fn writing_an_unknown_id_is_refused() {
+        let (service, _root, _a, _b) = fixture();
+        assert!(matches!(
+            service.set_progress("no-such-id", Some("hello"), None).await,
+            Err(WorktreeError::UnknownWorktree)
+        ));
+    }
+
+    /// The store keeps a phase this build does not know. Validation lives at
+    /// the write edges; if the store rejected unknown values, a newer peer's
+    /// phase would be erased by an older one that merely read and rewrote it.
+    #[tokio::test]
+    async fn a_phase_from_a_newer_peer_survives_this_build() {
+        let (service, _root, a, _b) = fixture();
+        service.set_progress(&a, None, Some("shipped")).await.expect("set");
+        let rows = service.list_progress(None).await.expect("list");
+        assert_eq!(rows[0].phase, "shipped");
     }
 }

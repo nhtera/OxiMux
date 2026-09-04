@@ -1118,6 +1118,10 @@ impl WorkspaceRoot {
         // `(program, argv)` to spawn as a `Custom` PTY (its resume handle rides
         // in the argv). `None` for a native launch/resume.
         custom_command: Option<(String, Vec<String>)>,
+        // Which named launch profile of `adapter_id` to spawn under. `None` (and
+        // `"default"`) is the plain `[agents.<id>]` entry, i.e. exactly the
+        // behavior every caller had before profiles existed.
+        profile: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1125,14 +1129,17 @@ impl WorkspaceRoot {
             return;
         };
         // Apply per-agent launch defaults from `agent_launch.toml`: fill the
-        // model when the caller didn't pin one, and append the configured
-        // extra flags (e.g. a skip-permissions default). The global is unset
-        // until the settings layer seeds it, in which case defaults are empty.
-        let (model, mut extra_args, status_hooks_on) = {
+        // model when the caller didn't pin one, append the configured extra
+        // flags (e.g. a skip-permissions default), and layer the profile's env
+        // over the spawn. The global is unset until the settings layer seeds
+        // it, in which case defaults are empty.
+        let (model, mut extra_args, env, status_hooks_on) = {
             let defaults = cx.try_global::<oximux_settings::AgentLaunchSettings>();
+            let sel = profile.as_deref();
             (
-                model.or_else(|| defaults.and_then(|d| d.model_for(adapter_id))),
-                defaults.map(|d| d.args_for(adapter_id)).unwrap_or_default(),
+                model.or_else(|| defaults.and_then(|d| d.model_for_in(adapter_id, sel))),
+                defaults.map(|d| d.args_for_in(adapter_id, sel)).unwrap_or_default(),
+                defaults.map(|d| d.env_for(adapter_id, sel)).unwrap_or_default(),
                 // On by default (mirrors `AgentLaunchSettings::default`); also
                 // on when the global isn't seeded yet, so a very early launch
                 // still gets status. A user's explicit `false` flows through.
@@ -1161,7 +1168,7 @@ impl WorkspaceRoot {
                 model: model.clone(),
                 effort: effort.clone(),
                 extra_args,
-                env: Vec::new(),
+                env,
                 cols: DEFAULT_COLS,
                 rows: DEFAULT_ROWS,
                 custom_command,
@@ -1258,6 +1265,7 @@ impl WorkspaceRoot {
                     backend,
                     term_id,
                     None,
+                    profile,
                     window,
                     cx,
                 );

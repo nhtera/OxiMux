@@ -120,6 +120,9 @@ impl ScheduleFirer for DesktopFirer {
             .create_with_prompt(
                 &schedule.cwd,
                 schedule.agent_id.as_deref(),
+                // A schedule names no model; its session opens on the agent's
+                // own default.
+                None,
                 Some(schedule.prompt.clone()),
             )
             .await
@@ -258,6 +261,8 @@ fn launch_error_detail(err: &LaunchError) -> &'static str {
         // Not recorded (the fire path treats it as "not yet"), but the match
         // must be total.
         LaunchError::Unavailable => "the desktop could not start a session right now",
+        // Unreachable: a schedule names no model, so it never asks for one.
+        LaunchError::ModelUnsupported => "this agent cannot be given a model when it starts",
     }
 }
 

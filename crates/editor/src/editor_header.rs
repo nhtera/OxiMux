@@ -85,6 +85,13 @@ pub fn clickable_path(label: String, path: &Path, cx: &Context<EditorView>) -> A
     let path = path.to_path_buf();
     div()
         .id(("ed-breadcrumb-path", cx.entity_id()))
+        // The path yields the row to whatever sits beside it — a PDF's page
+        // and zoom toolbar is far more useful than the middle of a long
+        // path — and elides from the START so the file name survives.
+        .flex_shrink()
+        .min_w(gpui::px(0.0))
+        .overflow_hidden()
+        .text_ellipsis_start()
         .cursor_pointer()
         .hover(|s| s.text_color(fg))
         .on_click(cx.listener(move |_view, _, window, cx| {

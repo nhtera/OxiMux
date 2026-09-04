@@ -515,6 +515,7 @@ impl oximux_remote_host::SessionLauncher for ScriptedLauncher {
         &self,
         cwd: &str,
         agent_id: Option<&str>,
+        _model: Option<&str>,
     ) -> Result<String, oximux_remote_host::LaunchError> {
         self.calls.lock().unwrap().push((cwd.to_string(), agent_id.map(str::to_string)));
         self.result

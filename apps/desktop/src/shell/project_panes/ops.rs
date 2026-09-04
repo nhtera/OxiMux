@@ -448,6 +448,7 @@ impl ProjectPanes {
         backend: SharedBackend,
         term_id: TerminalSessionId,
         label_override: Option<String>,
+        profile: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -466,6 +467,7 @@ impl ProjectPanes {
                 backend,
                 term_id,
                 label_override,
+                profile,
                 window,
                 cx,
             );
@@ -519,12 +521,24 @@ impl ProjectPanes {
             for (idx, tab) in group_ref.tabs().iter().enumerate() {
                 let (agent, kind) = match &tab.kind {
                     PaneGroupTabKind::Terminal => (None, PersistedTabKind::Terminal),
-                    PaneGroupTabKind::Editor { path } => (
-                        None,
-                        PersistedTabKind::Editor {
-                            path: path.display().to_string(),
-                        },
-                    ),
+                    // A PDF editor tab persists the page it is showing, read
+                    // live from the `EditorView`, so a restored tab reopens
+                    // where the reader left off. `None` for every other file.
+                    PaneGroupTabKind::Editor { path } => {
+                        let pdf_page = match &tab.content {
+                            crate::shell::pane_content::PaneContent::Editor(view) => {
+                                view.read(cx).pdf_page()
+                            }
+                            _ => None,
+                        };
+                        (
+                            None,
+                            PersistedTabKind::Editor {
+                                path: path.display().to_string(),
+                                pdf_page,
+                            },
+                        )
+                    }
                     // Diff, commit-detail, and Tasks tabs are intentionally NOT
                     // persisted. Diff/commit regenerate from current git state;
                     // Tasks reopens from the nav rail after restore.
@@ -631,6 +645,7 @@ impl ProjectPanes {
                         worktree_path,
                         model,
                         effort,
+                        profile,
                         ..
                     } => {
                         if matches!(adapter, AgentAdapter::Custom) {
@@ -664,6 +679,7 @@ impl ProjectPanes {
                                 effort: effort.clone(),
                                 relay_external_id,
                                 relay_session,
+                                profile: profile.clone(),
                             }),
                             PersistedTabKind::Terminal,
                         )
@@ -888,6 +904,7 @@ impl ProjectPanes {
                 backend,
                 term_id,
                 Some(label),
+                persisted.profile.clone(),
                 window,
                 cx,
             );
@@ -1125,6 +1142,7 @@ impl ProjectPanes {
                 backend,
                 term_id,
                 Some(label),
+                persisted.profile.clone(),
                 window,
                 cx,
             );

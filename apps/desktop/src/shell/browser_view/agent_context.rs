@@ -11,7 +11,8 @@
 //!   `@ref1…` so the agent can refer to them compactly.
 //! - **element picker** — an injected shadow-overlay highlights the element
 //!   under the cursor; `C` copies a formatted payload, `S` screenshots its
-//!   rect, `Esc` cancels. All read-only — the picker never mutates the page.
+//!   rect, `A` sends the payload plus that crop to the active Agent Chat,
+//!   `Esc` cancels. All read-only — the picker never mutates the page.
 //! - **screenshot** — native (see [`super::native`]); the picker's `S` path
 //!   routes a rect through it.
 //!
@@ -310,8 +311,10 @@ pub fn profile_menu_js(items_json: &str) -> String {
 /// element, HTML, styles, or text, copy a screenshot of its rect, or send it
 /// to the agent. The chip + popover live in their own shadow root (a
 /// host-drawn popover would render *under* the native webview). Bare `C` / `A`
-/// / `S` keyboard accelerators copy element / send to agent / screenshot
-/// directly while hovering; `Esc` cancels. Listeners are capture-phase +
+/// / `S` keyboard accelerators copy element / send to chat / screenshot
+/// directly while hovering; `Esc` cancels. `A` differs from the other two: it
+/// sends the element *and* a crop of its box to the active Agent Chat, so the
+/// agent gets the markup and the picture together. Listeners are capture-phase +
 /// `stopPropagation` so the page's own handlers never see the picker's clicks
 /// or keys.
 pub const PICKER_JS: &str = r#"
@@ -325,7 +328,7 @@ pub const PICKER_JS: &str = r#"
   var label = document.createElement('div');
   label.style.cssText = 'position:fixed;pointer-events:none;font:12px monospace;background:#111;color:#fff;padding:2px 6px;border-radius:3px;white-space:nowrap;';
   var hint = document.createElement('div');
-  hint.textContent = 'Click to copy element · ⋯ for more · S screenshot · A → agent · Esc';
+  hint.textContent = 'Click to copy element · ⋯ for more · S screenshot · A → chat (with screenshot) · Esc';
   hint.style.cssText = 'position:fixed;left:50%;bottom:16px;transform:translateX(-50%);pointer-events:none;font:11px system-ui,sans-serif;background:rgba(17,17,17,0.92);color:#fff;padding:4px 10px;border-radius:999px;white-space:nowrap;';
   shadow.appendChild(box);
   shadow.appendChild(label);
@@ -422,8 +425,35 @@ pub const PICKER_JS: &str = r#"
     label.style.left = r.left + 'px';
     label.style.top = Math.max(0, r.top - 20) + 'px';
   }
-  function payload(el) {
+  // The box to screenshot for `el`. An element can be visible yet have a
+  // zero-area `getBoundingClientRect()` — `display:contents` generates no box
+  // of its own, and an inline element can report an empty rect — and asking
+  // WebKit to snapshot a 0x0 region yields an image that cannot be encoded, so
+  // the crop silently never arrives. Fall back to the union of the element's
+  // own client rects, then to the nearest ancestor that has real area: when
+  // someone points at a button's label, the button is what they meant.
+  function boxOf(el) {
     var r = el.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0) return r;
+    var rects = el.getClientRects && el.getClientRects();
+    if (rects && rects.length) {
+      var l = Infinity, t = Infinity, rt = -Infinity, b = -Infinity;
+      for (var i = 0; i < rects.length; i++) {
+        l = Math.min(l, rects[i].left); t = Math.min(t, rects[i].top);
+        rt = Math.max(rt, rects[i].right); b = Math.max(b, rects[i].bottom);
+      }
+      if (rt > l && b > t) return { left: l, top: t, width: rt - l, height: b - t };
+    }
+    var n = el.parentElement, hops = 0;
+    while (n && hops < 8) {
+      var pr = n.getBoundingClientRect();
+      if (pr.width > 0 && pr.height > 0) return pr;
+      n = n.parentElement; hops++;
+    }
+    return r;
+  }
+  function payload(el) {
+    var r = boxOf(el);
     var cs = getComputedStyle(el);
     var styles = {};
     ['color', 'background-color', 'font-size', 'font-family', 'display', 'padding', 'margin'].forEach(function (k) {

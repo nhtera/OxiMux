@@ -241,6 +241,40 @@ pub struct WorktreeWire {
     pub path: String,
 }
 
+/// One worktree's progress line — the [`Response::WorktreeProgress`] row,
+/// joined to a [`WorktreeWire`] by `id`.
+///
+/// Named *progress*, not *status*: this crate already spends that word on
+/// [`WorktreeStatusWire`] (a path's git state) and the desktop spends it on a
+/// workspace's archive lifecycle. A third meaning would make every mention
+/// ambiguous.
+///
+/// **A sidecar rather than two more fields on `WorktreeWire`.** That type
+/// travels inside `Response::Worktrees`, a `Vec` reply v16 peers already
+/// request, and postcard encodes struct fields positionally — appending one
+/// would make every older decoder misparse each element after the first and
+/// drop the connection. Types inside an existing `Vec` reply are frozen; new
+/// information gets a new type and a new verb.
+///
+/// Both fields are agent-authored display text. Neither carries a host path, a
+/// branch name, or session content, which is what lets this ride the
+/// coordination gates rather than the full-scope worktree ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeProgressWire {
+    /// The [`WorktreeWire::id`] this describes.
+    pub id: String,
+    /// The status snapshot, or `""` when unset. Last write wins; no history.
+    pub comment: String,
+    /// The work phase in its stored spelling, or `""` when unset.
+    ///
+    /// **Carried as a string, not an enum.** A closed enum would encode as an
+    /// ordinal, so a phase added by a newer peer would decode as a *different*
+    /// existing phase on an older one — silently wrong rather than merely
+    /// unknown. As a string, an unrecognised value is recognisably unknown and
+    /// renders as no phase. Parse with `oximux_core::WorkPhase::parse`.
+    pub phase: String,
+}
+
 /// A freshly-minted pairing window — the
 /// [`Response::PairingIssued`](crate::proto::Response::PairingIssued) payload.
 ///
@@ -567,6 +601,35 @@ pub struct ScheduleWire {
     pub cwd: String,
     pub prompt: String,
     pub agent_id: Option<String>,
+    /// **A stand-in for a cron schedule.** This enum has no cron variant and
+    /// cannot gain one (see [`RecurrenceV2Wire`]), so a cron schedule reaches a
+    /// pre-v23 peer as a `DailyAt` at the wall-clock time of its next fire.
+    ///
+    /// Deliberately still sent, rather than omitting the row: `summary` and
+    /// `next_fire_at` below are host-rendered strings and stay exact, so the
+    /// peer displays the schedule correctly. Verified live against the released
+    /// v20 CLI, which lists a cron schedule with the right phrasing and the
+    /// right next fire.
+    ///
+    /// What keeps the stand-in from becoming a lie that matters: **nothing
+    /// reads it.** The phone's row renders `summary` verbatim
+    /// (`schedule-row.tsx`); its picker is initialised from `defaultRecurrence`,
+    /// never from a listed row; the desktop reads its own store type; and the
+    /// CLI's v10 JSON drops the field entirely.
+    ///
+    /// **If you are adding an edit or duplicate flow, read this.** The safe
+    /// invariant is *no UI prefills a recurrence from a listed row* — not "no
+    /// edit verb exists". There is no edit verb today, but `DeleteSchedule` +
+    /// `CreateSchedule` are both already exposed to the phone, so a
+    /// delete-and-recreate edit built from them needs no new verb and would
+    /// write this stand-in back over a real cron rule, silently — and
+    /// `mobile-core`'s ffi conversion already carries this value across into
+    /// `Schedule.recurrence`, so it is one prefill away from a picker. Prefill
+    /// from [`ScheduleV2Wire`] instead, or refuse to edit a schedule this shape
+    /// cannot describe.
+    ///
+    /// A v23 peer asks [`Request::ListSchedulesV2`](crate::proto::Request::ListSchedulesV2)
+    /// and gets the expression itself.
     pub recurrence: RecurrenceWire,
     pub enabled: bool,
     /// RFC-3339 next-fire instant in the **desktop's** local zone. Formatted
@@ -576,6 +639,63 @@ pub struct ScheduleWire {
     /// The desktop's own human phrasing of the recurrence (e.g. "Weekdays at
     /// 09:00"). Carried rather than re-derived on the phone so both surfaces read
     /// identically — the same reason the fold runs once, on the desktop.
+    pub summary: String,
+}
+
+/// How often a schedule repeats, with cron. The v23 successor to
+/// [`RecurrenceWire`].
+///
+/// A second enum rather than a fourth variant on [`RecurrenceWire`], because
+/// that type rides inside `Vec<ScheduleWire>` replies as well as inside
+/// [`Request::CreateSchedule`](crate::proto::Request::CreateSchedule). Postcard
+/// encodes a variant as an ordinal, so a pre-v23 peer handed ordinal 3 fails the
+/// **whole frame** — one cron schedule anywhere would make every `ListSchedules`
+/// reply undecodable for it, not just the cron row.
+///
+/// The first three variants mirror [`RecurrenceWire`] exactly, so the mapping
+/// between them is total in the v1 -> v2 direction and lossy in only one place
+/// (see [`ScheduleWire::recurrence`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecurrenceV2Wire {
+    /// Every N minutes, measured from the previous fire.
+    EveryMinutes { minutes: u32 },
+    /// Every day at a wall-clock time.
+    DailyAt { hour: u8, minute: u8 },
+    /// Every week on one weekday at a wall-clock time. `weekday` is 0=Monday.
+    WeeklyAt { weekday: u8, hour: u8, minute: u8 },
+    /// A five-field cron expression (`minute hour day-of-month month
+    /// day-of-week`), evaluated in the **host's** local zone — schedules carry
+    /// no timezone of their own.
+    ///
+    /// Validated host-side on create through the same constructor the desktop
+    /// uses: a pattern that will not parse, one that can never fire, and one
+    /// tighter than the interval floor are all refused rather than stored.
+    /// Note cron's own weekday numbering, where both 0 and 7 mean Sunday --
+    /// unrelated to `WeeklyAt`'s 0=Monday.
+    Cron { expr: String },
+}
+
+/// A stored schedule that can carry a cron recurrence. The v23 successor to
+/// [`ScheduleWire`].
+///
+/// Identical to [`ScheduleWire`] but for the recurrence type. Its own struct
+/// rather than an appended field for the usual reason: `ScheduleWire` is
+/// positional, and a v22 client decoding `Vec<ScheduleWire>` would misparse
+/// every element after the first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleV2Wire {
+    pub id: String,
+    pub name: String,
+    pub cwd: String,
+    pub prompt: String,
+    pub agent_id: Option<String>,
+    pub recurrence: RecurrenceV2Wire,
+    pub enabled: bool,
+    /// RFC-3339 next-fire instant in the **desktop's** local zone.
+    pub next_fire_at: String,
+    /// The desktop's own human phrasing of the recurrence. Exact for every
+    /// recurrence including cron, which is why the v1 shape stays useful even
+    /// where its structured field cannot be.
     pub summary: String,
 }
 
@@ -694,6 +814,89 @@ pub struct TeamRoleWire {
     pub summary: Option<String>,
     /// RFC-3339 instant the role last changed state, host-local.
     pub updated_at: String,
+}
+
+/// Open a team run whose roles each choose their own agent.
+///
+/// A separate type from [`TeamRunCreateReq`] rather than an extension of it —
+/// see [`crate::proto::Request::TeamRunCreateV2`] for why the v18 shape is
+/// frozen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRunCreateV2Req {
+    /// A name for the run, shown in listings.
+    pub name: String,
+    /// The project root every role's session opens in (or the base for its
+    /// worktree). Validated by the host exactly as `CreateSession`'s cwd is.
+    pub cwd: String,
+    /// The agent for roles that name none of their own. `None` = the host's
+    /// default. Unchanged in meaning from `TeamRunCreateReq.agent_id`.
+    pub agent_id: Option<String>,
+    /// Give each role its own worktree under the project, so roles editing the
+    /// same files do not collide. The host derives each path — never the
+    /// client.
+    pub worktree_each: bool,
+    /// The roles, in order. At least one; the host caps how many.
+    pub roles: Vec<TeamRoleSpecV2Wire>,
+}
+
+/// One role's name, opening instruction, and the agent to work it with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRoleSpecV2Wire {
+    pub name: String,
+    pub prompt: String,
+    /// Which configured agent runs this role. `None` falls back to the run's
+    /// `agent_id`, and then to the host's default.
+    pub agent_id: Option<String>,
+    /// The model to open this role's session on. `None` leaves the agent on its
+    /// own default.
+    ///
+    /// Applied **at spawn**, not as a switch afterwards: Claude and Codex take
+    /// `--model` on the command line and refuse to change it at runtime, and a
+    /// headless host has no view to respawn them through, so a later switch
+    /// would silently fail for exactly those two.
+    ///
+    /// An agent that cannot be given a model at spawn — ACP, whose protocol has
+    /// no model at connect time — fails *that role* rather than opening on its
+    /// default while this field says otherwise.
+    pub model: Option<String>,
+}
+
+/// A team run and every role in it, with the agent each role was worked by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRunV2Wire {
+    pub id: String,
+    pub name: String,
+    pub cwd: String,
+    /// RFC-3339 creation instant, host-local.
+    pub created_at: String,
+    /// `true` once every role has reported.
+    pub closed: bool,
+    pub roles: Vec<TeamRoleV2Wire>,
+}
+
+/// One role's live state, plus what it was launched with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamRoleV2Wire {
+    pub name: String,
+    /// The session working this role, when one started. `None` means the
+    /// session could not be opened — the role's status says why.
+    pub session_id: Option<String>,
+    pub status: TeamRoleStatusWire,
+    /// What the role reported, or why it could not start.
+    pub summary: Option<String>,
+    /// RFC-3339 instant the role last changed state, host-local.
+    pub updated_at: String,
+    /// The agent this role was **asked** to be worked by: its own choice, or
+    /// the run's. Present even when the role failed to start, which is the
+    /// point — a board that dropped the name of the agent that could not launch
+    /// would hide the most useful fact about the failure. `None` means none was
+    /// recorded: the run predates this verb, or nobody named one and the host
+    /// resolved its own default, whose id it does not report.
+    pub agent_id: Option<String>,
+    /// The model this role was launched on, when one was asked for. Recorded
+    /// for a failed role too, for the same reason as `agent_id` — including a
+    /// role that failed *because* its agent could not be given one at spawn.
+    pub model: Option<String>,
 }
 
 /// Where a role stands.

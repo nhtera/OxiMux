@@ -146,6 +146,15 @@ const EMBEDDED_TERMINAL_HEIGHT: f32 = 260.0;
 /// mount/reap machinery as tool-call terminals.
 const AUTH_TERMINAL_KEY: &str = "__acp_auth_terminal__";
 
+/// The registry id of the native Claude adapter — the key its probed catalog is
+/// cached under and the id the unbound draft starts on.
+const CLAUDE_ADAPTER_ID: &str = "claude-code";
+
+/// Whether a Claude catalog probe has been started this launch (see
+/// `maybe_probe_catalog`). Process-wide because the catalog it fills is.
+static CLAUDE_PROBE_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// How many frames to keep re-pinning the transcript to the bottom after a
 /// content change (see [`AgentChatView::follow_frames`]). ~10 frames (≈160ms at
 /// 60fps) comfortably outlasts the async markdown parse/layout of a normal reply
@@ -286,6 +295,46 @@ fn fold_probe_result(
     }
 }
 
+/// The fast-mode value to hand a Claude spawn, if any: the stored pick, only
+/// when the CLI's catalog marks `model` (or, with no `--model`, the CLI's
+/// default row) as supporting fast mode. `None` otherwise — the pick is kept
+/// but not applied, so switching to a model without fast mode drops the
+/// toggle rather than sending the CLI a setting it did not advertise, and a
+/// spawn before any catalog is known leaves the CLI to its own setting (the
+/// probe fold re-applies it live once the catalog lands).
+fn claude_fast_mode_to_apply(stored: Option<bool>, model: Option<&str>) -> Option<bool> {
+    let on = stored?;
+    let catalog = oximux_agents::thread::shared_claude_catalog()?;
+    let wire = model.map(str::to_string).or_else(|| catalog.default_wire.clone())?;
+    catalog.supports_fast_mode(&wire).then_some(on)
+}
+
+/// The model count shown beside an agent in the draft's agent picker, from
+/// the sources the draft has for that agent, best first: a landed probe, the
+/// process-wide cache (a disk seed), the roster's static list. With none of
+/// those, the probe's own state says whether it is still running, failed, or
+/// was never started.
+fn agent_model_count(
+    probe: Option<&ProbeState>,
+    cached: Option<usize>,
+    roster_len: usize,
+) -> AgentModelCount {
+    if let Some(ProbeState::Ready(catalog)) = probe {
+        return AgentModelCount::Known(catalog.models.len());
+    }
+    if let Some(n) = cached {
+        return AgentModelCount::Known(n);
+    }
+    if roster_len > 0 {
+        return AgentModelCount::Known(roster_len);
+    }
+    match probe {
+        Some(ProbeState::Loading) => AgentModelCount::Loading,
+        Some(ProbeState::Failed) => AgentModelCount::Failed,
+        _ => AgentModelCount::Unknown,
+    }
+}
+
 /// Decoded user-attached image thumbnails, memoized by `(entry index, image
 /// index)`. Interior-mutable so the immutable `render` path can fill it lazily.
 use image_cache::ImageCache;
@@ -378,6 +427,9 @@ pub struct ChatTerminalSpec {
     pub cwd: PathBuf,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// The chat's named launch profile, so the companion terminal resumes
+    /// against the same endpoint/account the chat is bound to.
+    pub profile: Option<String>,
 }
 
 /// Why the "Switch to Terminal View" affordance is (un)available for a chat —
@@ -441,7 +493,7 @@ impl ThinkingLevel {
     }
 }
 
-use composer::{ComposerEvent, ComposerView, ControlVocab};
+use composer::{AgentModelCount, AgentPickerRow, ComposerEvent, ComposerView, ControlVocab};
 use context_providers::{ContextRequest, ContextSource};
 use question_card::{QuestionCard, QuestionCardEvent};
 use tool_grouping::{
@@ -778,6 +830,16 @@ pub struct AgentChatView {
     /// shifted index never tints the wrong bubble.
     flash_entry: Option<usize>,
     flash_frames: u8,
+    /// While a file drag hovers this chat, the label its drop overlay shows —
+    /// `None` when no drag is over it.
+    ///
+    /// A view flag rather than a `drag_over` style refinement, because that
+    /// refinement only changes THIS element's own background and every child
+    /// that paints its own (the transcript list, the composer) masks it. The
+    /// result was a tint covering the whole surface or only the gap below the
+    /// transcript depending on how far the conversation had scrolled — one
+    /// gesture reading as two different affordances.
+    drop_hint: Option<SharedString>,
     /// Entry index whose Copy action just fired — swaps that bubble's copy glyph
     /// to a ✓ for a beat as confirmation. Transient/cosmetic, so an index that
     /// shifts under a rewind at worst mistints for <1.5s. Reverted by
@@ -882,7 +944,7 @@ impl AgentChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::assemble(
+        let mut view = Self::assemble(
             cwd,
             model,
             backend,
@@ -894,7 +956,11 @@ impl AgentChatView {
             typography,
             window,
             cx,
-        )
+        );
+        // A Claude tab opened straight from the launcher refreshes the CLI's
+        // model list too, not only the draft that picks Claude by hand.
+        view.probe_claude_catalog_if_bound(cx);
+        view
     }
 
     /// Construct an **unbound** chat view for the unified *New Agent* entry: no
@@ -1146,6 +1212,8 @@ impl AgentChatView {
             spec.codex_posture = posture.codex.clone();
             spec.pi_posture = posture.pi.clone();
             spec.omp_posture = posture.omp;
+            spec.claude_fast_mode =
+                claude_fast_mode_to_apply(posture.claude_fast_mode, model.as_deref());
             match computer_use::connect_declaring(spec, &screen_control, cx) {
                 Ok((conn, rx)) => {
                     connection = Some(conn);
@@ -1404,6 +1472,7 @@ impl AgentChatView {
             show_background_tasks: false,
             flash_entry: None,
             flash_frames: 0,
+            drop_hint: None,
             recently_copied: None,
             _copied_clear_task: None,
             rows: RefCell::new(Vec::new()),
@@ -1476,7 +1545,12 @@ impl AgentChatView {
             self.permission_mode.clone(),
             self.effort.clone(),
         );
-        spec.env = env;
+        // `for_backend` already seeded the adapter/profile env. Append rather
+        // than assign so an EnvVar-auth respawn keeps the configured base URL /
+        // proxy and merely adds (or, on a key collision, overrides) the
+        // credentials the user just typed — assigning here silently respawned
+        // the agent against the default endpoint.
+        spec.env.extend(env);
         spec.auth_method = auth_method;
         // Preserve the chosen Codex posture across the respawn (Stop-resume, a
         // rewind fork), so it isn't silently reset to the default on reconnect.
@@ -1493,7 +1567,44 @@ impl AgentChatView {
         // downstream (omp's own default is yolo), so a `None` here means the
         // deliberate Write default, never "whatever omp feels like".
         spec.omp_posture = self.omp_posture_snapshot();
+        // Claude's fast mode is re-applied at spawn through the inline settings
+        // overlay, so a session that had it on keeps it after a model switch or
+        // a Stop-then-resume — when the new model supports it.
+        spec.claude_fast_mode =
+            claude_fast_mode_to_apply(self.claude_fast_mode_snapshot(), self.model.as_deref());
         spec
+    }
+
+    /// Claude's fast-mode pick as the user last set it, read from the composer's
+    /// feature picks. `None` for a non-Claude chat or when the toggle was never
+    /// touched. This is what persists; whether it is *applied* to a spawn is
+    /// [`claude_fast_mode_to_apply`]'s call.
+    fn claude_fast_mode_snapshot(&self) -> Option<bool> {
+        if self.backend.transport != Transport::StreamJson {
+            return None;
+        }
+        match self.feature_values.get(oximux_agents::thread::FEATURE_FAST_MODE) {
+            Some(FeatureValue::Bool(on)) => Some(*on),
+            _ => None,
+        }
+    }
+
+    /// Push the stored fast-mode pick onto the live Claude session once the
+    /// CLI's catalog says the model supports it. Needed because a restored tab
+    /// can connect before the catalog is known — the spawn then carries no
+    /// overlay — and the toggle would show the stored value while the CLI ran
+    /// without it. Sent through the live path, so nothing respawns; a repeat
+    /// on a session already in that state is a no-op for the CLI.
+    fn reapply_claude_fast_mode(&self) {
+        let Some(on) = claude_fast_mode_to_apply(self.claude_fast_mode_snapshot(), self.model.as_deref())
+        else {
+            return;
+        };
+        if let Some(conn) = self.connection.as_ref()
+            && let Err(e) = conn.set_feature(oximux_agents::thread::FEATURE_FAST_MODE, FeatureValue::Bool(on))
+        {
+            tracing::warn!(error = %e, "could not re-apply claude fast mode");
+        }
     }
 
     /// Pi's tool posture, read from the composer's feature picks. `None` for a
@@ -1649,6 +1760,84 @@ impl AgentChatView {
         self.companion_session
     }
 
+
+    /// Arm or clear the drop affordance for a drag currently over this chat.
+    ///
+    /// `inside` is the bounds test — a `DragMoveEvent` fires for a drag anywhere
+    /// in the window once this element has a handler, so without it the overlay
+    /// would appear while dragging over a sibling pane.
+    ///
+    /// The label is derived from what is actually being dragged, because this
+    /// chat does two different things with a drop: an image is attached, and
+    /// anything else becomes an `@path` mention. A single "Drop to attach"
+    /// would be a lie for a source file, which is the more common drag here.
+    fn set_drop_hint(&mut self, inside: bool, paths: &[PathBuf], cx: &mut Context<Self>) {
+        let next = inside.then(|| Self::drop_hint_for(paths));
+        if next != self.drop_hint {
+            self.drop_hint = next;
+            cx.notify();
+        }
+    }
+
+    /// The overlay label for a set of dragged paths. Empty (a drag that reports
+    /// no paths yet) falls back to the neutral wording rather than guessing.
+    fn drop_hint_for(paths: &[PathBuf]) -> SharedString {
+        if !paths.is_empty() && paths.iter().all(|p| image_attach::is_image_path(p)) {
+            SharedString::from("Drop to attach")
+        } else {
+            SharedString::from("Drop to add")
+        }
+    }
+
+    /// The drop affordance: a scrim over the whole chat plus a centred pill.
+    ///
+    /// An overlay rather than a background tint, because a tint on the root is
+    /// masked by any child that paints its own background — which made the same
+    /// gesture look like two different affordances depending on how far the
+    /// transcript had scrolled.
+    fn render_drop_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Self-healing clear: a drag that ends anywhere other than on a
+        // listening target (dropped on empty space, released off-window,
+        // cancelled with Escape) dumps the active drag with no callback, so the
+        // flag has to be reconciled at paint. Same guard, same reason, as the
+        // pane group's drop-zone overlay.
+        let hint = self.drop_hint.clone()?;
+        if !cx.has_active_drag() {
+            return None;
+        }
+        let theme = self.theme;
+        let typo = &self.typography;
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                // Above the transcript and composer; a modal layer added after
+                // this one still paints over it.
+                .bg(gpui::Hsla { a: 0.55, ..theme.bg_panel })
+                .border_2()
+                .border_color(theme.border_active)
+                .rounded(px(self.density.r_card))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .px(px(14.0))
+                        .py(px(8.0))
+                        .rounded(px(self.density.r_chip))
+                        .bg(theme.bg_panel_alt)
+                        .border_1()
+                        .border_color(theme.border_active)
+                        .text_size(px(typo.t_body_md))
+                        .text_color(theme.fg_base)
+                        .child(hint),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Parameters for spawning a companion terminal that resumes THIS chat's
     /// session interactively, or `None` when the chat can't be mirrored to a
     /// terminal: it's an unbound draft, hasn't minted a session id yet, or runs
@@ -1709,6 +1898,9 @@ impl AgentChatView {
             cwd: self.cwd.clone(),
             model: self.model.clone(),
             effort: self.effort.clone(),
+            // The chat's own launch profile, so the companion terminal resumes
+            // against the same endpoint/account rather than the default.
+            profile: self.backend.profile.clone(),
         })
     }
 
@@ -1933,8 +2125,22 @@ impl AgentChatView {
     /// construction and after every agent/model pick while unbound.
     fn sync_unbound_composer(&self, cx: &mut Context<Self>) {
         let roster = roster::chat_roster_from_cx(cx);
-        let agents: Vec<(String, String)> =
-            roster.iter().map(|e| (e.id.clone(), e.display.clone())).collect();
+        // Each row carries how many models the draft knows for that agent, so
+        // the picker reads `Claude · 4 models` the way the reference cockpit's
+        // does — and `Error` where a probe failed.
+        let cache = cx.try_global::<crate::catalog_cache::CatalogCache>().cloned();
+        let agents: Vec<AgentPickerRow> = roster
+            .iter()
+            .map(|e| AgentPickerRow {
+                id: e.id.clone(),
+                display: e.display.clone(),
+                models: agent_model_count(
+                    self.probed_catalogs.get(&e.id),
+                    cache.as_ref().and_then(|c| c.get(&e.id)).map(|c| c.models.len()),
+                    e.models.len(),
+                ),
+            })
+            .collect();
         let current = self.unbound_agent_id.as_ref().and_then(|id| {
             roster.iter().find(|e| &e.id == id).map(|e| (e.id.clone(), e.display.clone()))
         });
@@ -2001,11 +2207,20 @@ impl AgentChatView {
         };
         // Preselect the new agent's default model; drop the prior mode/effort so
         // the draft doesn't carry a selector the new agent may not support.
+        // Claude is the exception: the draft holds no model, so the picker
+        // shows whatever the vocab's default is (the static seed's first row
+        // until the CLI's catalog lands, then the CLI's own default) and the
+        // bind sends no `--model` — otherwise the toolbar would read
+        // `Opus (1M context)` while the bind sent the bare `opus` alias.
         let roster = roster::chat_roster_from_cx(cx);
-        self.model = roster
-            .iter()
-            .find(|e| e.id == id)
-            .and_then(|e| e.default_model().map(str::to_string));
+        self.model = if id == CLAUDE_ADAPTER_ID {
+            None
+        } else {
+            roster
+                .iter()
+                .find(|e| e.id == id)
+                .and_then(|e| e.default_model().map(str::to_string))
+        };
         self.thread.model = self.model.clone();
         self.permission_mode = None;
         self.effort = None;
@@ -2017,13 +2232,17 @@ impl AgentChatView {
         cx.notify();
     }
 
-    /// Kick off a throwaway catalog probe for the picked agent so the draft's
-    /// model picker can fill before the user commits. No-op for an agent with a
-    /// static roster list (Claude), one already probed/probing, or a view with
-    /// [`Self::probe_catalogs_live`] off (tests). The blocking
-    /// probe runs on a dedicated thread — the connection spawns its own workers,
-    /// so no GPUI executor or tokio reactor is touched — and its result is folded
-    /// back on the UI thread, re-syncing the composer only if the pick still holds.
+    /// Kick off a throwaway catalog probe for `id` so its model picker can fill
+    /// with the agent's real list. Two callers: the unbound draft on an agent
+    /// pick (Codex/ACP — no static list; Claude — a static seed the installed
+    /// CLI's own `/model` rows replace), and a bound Claude tab on connect, so a
+    /// chat opened straight from the launcher also refreshes. No-op for an id
+    /// already probed/probing in this view, any other agent with a static
+    /// roster list, or a view with [`Self::probe_catalogs_live`] off (tests).
+    /// The blocking probe runs on a dedicated thread — the connection spawns its
+    /// own workers, so no GPUI executor or tokio reactor is touched — and its
+    /// result is folded back on the UI thread, re-syncing whichever composer
+    /// still shows this agent.
     fn maybe_probe_catalog(&mut self, id: String, cx: &mut Context<Self>) {
         if !self.probe_catalogs_live {
             return; // a view built on a stub connection has no real binary to probe
@@ -2031,11 +2250,35 @@ impl AgentChatView {
         if self.probed_catalogs.contains_key(&id) {
             return; // already probing, ready, or a settled failure — don't re-run
         }
-        let roster = roster::chat_roster_from_cx(cx);
-        match roster.iter().find(|e| e.id == id) {
-            // A static model list (Claude) needs no probe; an unknown id is skipped.
-            Some(entry) if entry.models.is_empty() => {}
-            _ => return,
+        let is_claude = id == CLAUDE_ADAPTER_ID;
+        // A bound view only ever refreshes Claude: a bound Codex/ACP session
+        // already serves its live list from the connection.
+        if !self.unbound && !is_claude {
+            return;
+        }
+        // One Claude probe per launch, across views. A restore with several
+        // Claude tabs would otherwise spawn one `claude` per tab before the
+        // first could warm the cache, and a CLI that answers empty (nothing
+        // cached, nothing marked fresh) would be re-asked by every new tab.
+        // Later views seed from the cache below and read the shared slot
+        // through their connection; they need no fold of their own.
+        if is_claude && CLAUDE_PROBE_STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            if let Some(catalog) = cx
+                .try_global::<crate::catalog_cache::CatalogCache>()
+                .and_then(|c| c.get(&id))
+            {
+                self.probed_catalogs.insert(id.clone(), ProbeState::Ready(catalog));
+                self.resync_pickers_for(&id, cx);
+            }
+            return;
+        }
+        if !is_claude {
+            let roster = roster::chat_roster_from_cx(cx);
+            match roster.iter().find(|e| e.id == id) {
+                // Any other static model list needs no probe; an unknown id is skipped.
+                Some(entry) if entry.models.is_empty() => {}
+                _ => return,
+            }
         }
         // Consult the process-wide catalog cache (seeded from disk at boot). A hit
         // paints the picker instantly — the difference between a ~5s cold spawn and
@@ -2046,16 +2289,17 @@ impl AgentChatView {
             self.probed_catalogs.insert(id.clone(), ProbeState::Ready(catalog));
             if cache.as_ref().is_some_and(|c| c.is_fresh(&id)) {
                 // Already probed live this session — trust it, spawn nothing.
-                self.sync_unbound_composer(cx);
+                self.resync_pickers_for(&id, cx);
                 return;
             }
             // A stale disk seed: keep it painted, revalidate below without a
             // `Loading` flicker.
         } else {
-            // Nothing cached — the picker stays hidden until the probe lands.
+            // Nothing cached — a dynamic agent's picker stays hidden until the
+            // probe lands; Claude keeps showing its static seed.
             self.probed_catalogs.insert(id.clone(), ProbeState::Loading);
         }
-        self.sync_unbound_composer(cx);
+        self.resync_pickers_for(&id, cx);
         let spec = ConnectSpec::for_backend(&self.backend, self.cwd.clone(), None, None, None, None);
         let (tx, rx) = futures::channel::oneshot::channel();
         std::thread::spawn(move || {
@@ -2067,10 +2311,15 @@ impl AgentChatView {
                 if let Err(e) = &result {
                     tracing::warn!(agent = %id, error = %e, "pre-bind catalog probe failed");
                 }
-                let has_good_seed = matches!(
-                    this.probed_catalogs.get(&id),
-                    Some(ProbeState::Ready(c)) if !c.models.is_empty()
-                );
+                // Claude's seed is the roster's static list, not a `Ready`
+                // entry, so it counts as good too: an empty answer from a CLI
+                // that predates `list_models` must leave the seed painted, not
+                // install `Ready(empty)` and hide the picker.
+                let has_good_seed = id == CLAUDE_ADAPTER_ID
+                    || matches!(
+                        this.probed_catalogs.get(&id),
+                        Some(ProbeState::Ready(c)) if !c.models.is_empty()
+                    );
                 let (next, to_cache) = fold_probe_result(has_good_seed, result);
                 // Warm the shared cache (only a non-empty success is worth caching —
                 // an empty result would hide the picker and mask a transient failure).
@@ -2082,27 +2331,79 @@ impl AgentChatView {
                 if let Some(state) = next {
                     this.probed_catalogs.insert(id.clone(), state);
                 }
-                // Only refresh the picker if this agent is still the draft's pick.
-                if this.unbound && this.unbound_agent_id.as_deref() == Some(id.as_str()) {
-                    this.sync_unbound_composer(cx);
-                    cx.notify();
-                }
+                this.resync_pickers_for(&id, cx);
             });
         })
         .detach();
     }
 
+    /// Repaint whichever composer shows agent `id`'s catalog, after a probe
+    /// state change. A draft still on that pick re-seeds from `probed_catalogs`;
+    /// a bound Claude tab re-reads its connection, whose `models()` now serves
+    /// the catalog the probe published. Any other view is left alone.
+    fn resync_pickers_for(&self, id: &str, cx: &mut Context<Self>) {
+        if self.unbound {
+            if self.unbound_agent_id.as_deref() == Some(id) {
+                self.sync_unbound_composer(cx);
+                cx.notify();
+            }
+        } else if id == CLAUDE_ADAPTER_ID && self.backend.transport == Transport::StreamJson {
+            self.reapply_claude_fast_mode();
+            self.sync_composer(cx);
+            cx.notify();
+        }
+    }
+
+    /// Refresh the Claude catalog for a bound Claude session, once per view.
+    /// Called on every connect (eager construction, the draft's first bind, a
+    /// dormant wake, a respawn): the per-view probe map and the process-wide
+    /// cache's freshness mark make all but the first a no-op, so this costs one
+    /// probe per launch however many Claude tabs open.
+    fn probe_claude_catalog_if_bound(&mut self, cx: &mut Context<Self>) {
+        if !self.unbound && self.backend.transport == Transport::StreamJson {
+            self.maybe_probe_catalog(CLAUDE_ADAPTER_ID.to_string(), cx);
+        }
+    }
+
     /// Stage image files dropped onto the chat surface into the composer. The
     /// read + decode runs on a background executor (an image can be large), then
     /// the staged attachments are handed to the composer on the foreground.
-    fn attach_dropped_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+    fn attach_dropped_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Two outcomes, split by what the file IS. An image is staged as an
+        // attachment (the agent can look at it); anything else becomes an
+        // `@path` mention (the agent can read it if it decides to). Before this
+        // split, a dropped source file was silently discarded — the drag
+        // completed, the drop landed, and nothing happened.
+        // The drop consumed the drag, so retire the affordance now rather than
+        // leaving it to the next paint's self-heal — a visible frame of "Drop
+        // to add" after the file has already landed reads as a failed drop.
+        self.drop_hint = None;
+        let (images, others): (Vec<PathBuf>, Vec<PathBuf>) = paths
+            .into_iter()
+            .partition(|p| image_attach::is_image_path(p));
+
+        // Mentions need no I/O, so they land synchronously — the text appears
+        // under the cursor on drop rather than a frame later.
+        let mentions: Vec<String> = others.iter().map(|p| self.mention_form(p)).collect();
+        if !mentions.is_empty() {
+            self.composer
+                .update(cx, |c, cx| c.append_mentions(&mentions, window, cx));
+        }
+
+        if images.is_empty() {
+            return;
+        }
         let composer = self.composer.clone();
         cx.spawn(async move |_this, cx| {
             let staged = cx
                 .background_spawn(async move {
-                    paths
+                    images
                         .iter()
-                        .filter(|p| image_attach::is_image_path(p))
                         .filter_map(|p| image_attach::pending_from_path(p))
                         .collect::<Vec<_>>()
                 })
@@ -2110,6 +2411,19 @@ impl AgentChatView {
             composer.update(cx, |c, cx| c.add_pending_images(staged, cx));
         })
         .detach();
+    }
+
+    /// How a dropped path is written into the prompt: relative to the chat's cwd
+    /// when it lives inside it, absolute otherwise.
+    ///
+    /// Relative is the form the `@` overlay offers (its candidates come from
+    /// `scan_candidates(cwd)`), and it is what the agent's own tools resolve
+    /// against — so a drop and a typed mention produce the same token for the
+    /// same file. A path outside the cwd has no relative form the agent could
+    /// resolve, so it stays absolute rather than becoming a `../../..` chain
+    /// that reads as noise.
+    fn mention_form(&self, path: &std::path::Path) -> String {
+        mention_form_in(&self.cwd, path)
     }
 
     /// Record + transmit a submitted prompt (from the composer's Submit event).
@@ -2968,6 +3282,9 @@ impl AgentChatView {
                 // draft, so its palette metadata arrives here or not at all.
                 let (composer, cwd) = (self.composer.clone(), self.cwd.clone());
                 push_slash_catalog(self.connection.as_deref(), &composer, &cwd, cx);
+                // Same for the Claude model list: a restored tab's first connect
+                // happens here, and so does the draft's bind.
+                self.probe_claude_catalog_if_bound(cx);
             }
             Err(e) => {
                 // The old connection was already shut down above and the respawn
@@ -3187,6 +3504,33 @@ impl AgentChatView {
         sources
     }
 
+    /// Stage an element picked in the embedded browser: its formatted capture as
+    /// a `@browser` context chip, and the crop of its box as an image
+    /// attachment. Nothing is sent — the chips sit above the composer so the
+    /// user types the actual question ("why is this misaligned?") before
+    /// pressing Enter.
+    ///
+    /// `png` may be empty when the crop failed or the platform has no native
+    /// snapshot; the chip still lands, because the element's HTML and computed
+    /// styles are the half the agent needs most.
+    pub fn stage_browser_pick(
+        &mut self,
+        selector: &str,
+        markdown: String,
+        png: Vec<u8>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(chip) = context_providers::browser_chip(selector, markdown) {
+            self.composer.update(cx, |c, cx| c.add_context_chip(chip, cx));
+        }
+        if png.is_empty() {
+            return;
+        }
+        if let Some(staged) = image_attach::pending_from_bytes(png, None) {
+            self.composer.update(cx, |c, cx| c.add_pending_images(vec![staged], cx));
+        }
+    }
+
     /// Capture a picked context provider and hand the resulting chip back to the
     /// composer. Clipboard is synchronous; diff shells out to git off-thread;
     /// terminal re-resolves the tab by its PTY id (it may have closed since the
@@ -3377,6 +3721,7 @@ impl AgentChatView {
             show_background_tasks: false,
             flash_entry: None,
             flash_frames: 0,
+            drop_hint: None,
             recently_copied: None,
             _copied_clear_task: None,
             rows: RefCell::new(Vec::new()),
@@ -5168,6 +5513,10 @@ impl Render for AgentChatView {
             .flex()
             .flex_col()
             .size_full()
+            // Positioning context for the drop overlay below. Set here rather
+            // than on the overlay's parent-of-convenience so the overlay spans
+            // the whole chat, which is what the drop handlers accept.
+            .relative()
             .bg(theme.bg_panel)
             // Escape is bound app-wide to `DismissOverlay` (not the input's own
             // Escape action), so a staged-edit cancel must hook THAT. This
@@ -5279,10 +5628,52 @@ impl Render for AgentChatView {
                     cx.stop_propagation();
                 }
             }))
-            // Drop image files anywhere on the chat surface to attach them.
-            .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
-                this.attach_dropped_paths(paths.paths().to_vec(), cx);
+            // Drop files anywhere on the chat surface: images attach, everything
+            // else becomes an `@path` mention.
+            //
+            // `on_drag_move` (not `drag_over`) drives the affordance: it sets a
+            // view flag that renders a real overlay above every child, so the
+            // whole surface reads as one target no matter what the transcript
+            // happens to be painting underneath. Both payload types feed the
+            // same flag, so a Finder drag and an explorer drag look identical.
+            .on_drag_move(cx.listener(
+                |this, ev: &gpui::DragMoveEvent<ExternalPaths>, _window, cx| {
+                    // Copy the payload out first: `ev.drag(cx)` borrows `cx`
+                    // immutably and `set_drop_hint` needs it mutably.
+                    let inside = ev.bounds.contains(&ev.event.position);
+                    let paths = ev.drag(cx).paths().to_vec();
+                    this.set_drop_hint(inside, &paths, cx);
+                },
+            ))
+            .on_drag_move(cx.listener(
+                |this,
+                 ev: &gpui::DragMoveEvent<
+                    crate::shell::pane_group::file_drag::FilePathDragPayload,
+                >,
+                 _window,
+                 cx| {
+                    let path = ev.drag(cx).path.clone();
+                    this.set_drop_hint(
+                        ev.bounds.contains(&ev.event.position),
+                        std::slice::from_ref(&path),
+                        cx,
+                    );
+                },
+            ))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                this.attach_dropped_paths(paths.paths().to_vec(), window, cx);
             }))
+            // The same, for a drag that started in OxiMux's own file explorer.
+            // The explorer emits `FilePathDragPayload` while Finder emits
+            // `ExternalPaths`, so the surface has to register both — but they
+            // converge on one handler, or the two drop sources drift apart.
+            .on_drop(cx.listener(
+                |this, payload: &crate::shell::pane_group::file_drag::FilePathDragPayload,
+                 window,
+                 cx| {
+                    this.attach_dropped_paths(vec![payload.path.clone()], window, cx);
+                },
+            ))
             .child(transcript)
             // A pinned "awaiting approval — jump" banner when a pending card is
             // scrolled off above the composer.
@@ -5306,12 +5697,22 @@ impl Render for AgentChatView {
             } else {
                 self.composer.clone().into_any_element()
             })
+            // The drop affordance, above the transcript and composer but below
+            // the modal layers — a lightbox or sheet that is already open stays
+            // on top of a stray drag.
+            .children(self.render_drop_overlay(cx))
             // The image lightbox overlays everything when a thumbnail is opened.
             .children(self.render_image_preview(cx))
             // The fullscreen tool-payload sheet overlays everything when open.
             .children(self.render_tool_sheet(cx))
             .into_any_element()
     }
+}
+
+/// See [`AgentChatView::mention_form`]. Free-standing so the cwd-relative rule
+/// is testable without constructing a chat view.
+fn mention_form_in(cwd: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(cwd).unwrap_or(path).to_string_lossy().into_owned()
 }
 
 /// A live "<provider> is working…" row shown at the tail of the transcript while

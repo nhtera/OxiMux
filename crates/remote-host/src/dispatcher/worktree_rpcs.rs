@@ -7,6 +7,7 @@
 //! capability cannot be probed without the scope to use it. Only an authorized
 //! caller on a service-less host sees `Unsupported`.
 
+use oximux_core::WorkPhase;
 use oximux_remote_proto::proto::{Response, RpcError};
 
 use super::Dispatcher;
@@ -20,7 +21,8 @@ fn worktree_failure(err: WorktreeError) -> Response {
         // The client can fix these by asking differently.
         WorktreeError::UnknownProject
         | WorktreeError::BadSlug
-        | WorktreeError::AlreadyExists => Response::Error(RpcError::BadRequest(err.to_string())),
+        | WorktreeError::AlreadyExists
+        | WorktreeError::UnknownWorktree => Response::Error(RpcError::BadRequest(err.to_string())),
         // The host failed; detail was logged by the service.
         WorktreeError::CreateFailed
         | WorktreeError::RemoveFailed
@@ -80,6 +82,73 @@ impl Dispatcher {
         };
         match service.remove(id).await {
             Ok(()) => Response::Ack,
+            Err(err) => worktree_failure(err),
+        }
+    }
+
+    /// Set a worktree's progress line and/or work phase.
+    ///
+    /// **Gated as coordination state, not worktree management.** The gates the
+    /// three RPCs above use are full-scope because they write the filesystem
+    /// and the repository; this writes neither. Its primary caller is a
+    /// session-confined agent describing its own work — exactly the caller
+    /// full scope excludes — so it shares the coordination blackboard's reach,
+    /// which exists for the same reason: the payload is agent-authored text
+    /// carrying no host path, no branch name, and no session content.
+    ///
+    /// The phase vocabulary is closed **here**, at the write edge, and nowhere
+    /// on the read path. That asymmetry is deliberate: a typo must not become
+    /// a stored phase no reader understands, while a phase a newer peer knows
+    /// must still survive being read and rewritten by this build.
+    pub(super) async fn set_worktree_progress(
+        &self,
+        peer: &Peer,
+        id: &str,
+        comment: Option<&str>,
+        phase: Option<&str>,
+    ) -> Response {
+        if !self.auth.may_write_state(peer) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        // Validate before reaching for the service, so a bad phase reads the
+        // same whether or not this host manages worktrees at all.
+        if let Some(raw) = phase
+            && !raw.is_empty()
+            && WorkPhase::parse(raw).is_none()
+        {
+            let known: Vec<&str> = WorkPhase::ALL.iter().map(|p| p.as_str()).collect();
+            return Response::Error(RpcError::BadRequest(format!(
+                "unknown phase `{raw}` — expected one of: {}",
+                known.join(", ")
+            )));
+        }
+        let Some(service) = self.worktrees.as_ref() else {
+            return Response::Error(RpcError::Unsupported);
+        };
+        match service.set_progress(id, comment, phase).await {
+            Ok(()) => Response::Ack,
+            Err(err) => worktree_failure(err),
+        }
+    }
+
+    /// The progress rows for a project's worktrees, or for every project.
+    ///
+    /// Read-gated as coordination state rather than as a worktree listing:
+    /// these rows carry only an id and agent-authored text, never the host
+    /// paths and branch names that make [`Self::list_worktrees`] full-scope.
+    pub(super) async fn list_worktree_progress(
+        &self,
+        peer: &Peer,
+        project_path: Option<&str>,
+    ) -> Response {
+        if !self.auth.may_read_state(peer) {
+            return Response::Error(RpcError::Unauthorized);
+        }
+        let Some(service) = self.worktrees.as_ref() else {
+            return Response::Error(RpcError::Unsupported);
+        };
+        match service.list_progress(project_path).await {
+            Ok(rows) => Response::WorktreeProgress(rows),
             Err(err) => worktree_failure(err),
         }
     }

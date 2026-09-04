@@ -256,6 +256,17 @@ pub enum Command {
         #[command(subcommand)]
         command: TermCommand,
     },
+    /// Install, remove, and inspect the status hooks that let agent CLIs
+    /// report what they are doing.
+    ///
+    /// Offline: reads and writes the agents' own config files on this machine
+    /// and never contacts a host, so it answers when the app is down — which
+    /// is exactly when a misbehaving hook is being chased.
+    #[command(verbatim_doc_comment)]
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     /// Create, list, and remove project worktrees on the host.
     Worktree {
         #[command(subcommand)]
@@ -403,6 +414,15 @@ pub enum Command {
         /// Report what a release offers and exit without changing anything.
         #[arg(long)]
         check: bool,
+    },
+    /// The agent-facing guides that teach an agent to drive OxiMux.
+    ///
+    /// Offline: the guides are built into this binary, so what `get` prints
+    /// always matches the verbs this binary accepts. A guide fetched from
+    /// anywhere else can be a release out of date, and an agent cannot tell.
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
     },
     /// Print the full command schema as JSON, for agents driving this CLI
     /// (offline — never touches the host).
@@ -582,6 +602,98 @@ pub enum TermCommand {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum AgentCommand {
+    /// Turn the status hooks on, off, or report what is installed.
+    Hooks {
+        #[command(subcommand)]
+        command: HooksCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HooksCommand {
+    /// Report, per agent, whether OxiMux's hooks are installed and which file
+    /// was read to decide.
+    ///
+    /// Never writes. The path is printed whether or not anything was found
+    /// there: "not installed" is not actionable on its own, and the file named
+    /// is what catches a `CODEX_HOME` pointing somewhere unexpected.
+    #[command(verbatim_doc_comment)]
+    Status {
+        /// One agent slug (see `agent hooks status`). Default: all of them.
+        #[arg(long, value_name = "SLUG")]
+        agent: Option<String>,
+    },
+    /// Install the hooks, merging them into whatever is already in each file.
+    ///
+    /// Only into agents that are actually on this machine: OxiMux adds to an
+    /// agent's config directory and never conjures one, so an agent you have
+    /// never run is reported and skipped rather than given a dotfile.
+    ///
+    /// Idempotent — a second run writes nothing, because the agents watch
+    /// these files and a rewrite with no change is a reload for nothing.
+    #[command(verbatim_doc_comment)]
+    On {
+        /// One agent slug. Default: all of them.
+        #[arg(long, value_name = "SLUG")]
+        agent: Option<String>,
+    },
+    /// Remove the hooks, leaving anything OxiMux did not write exactly where
+    /// it is — including in a file OxiMux would otherwise delete outright,
+    /// which is read first and kept if it holds someone else's hooks.
+    ///
+    /// A file left holding nothing at all is removed too, so `off` undoes `on`
+    /// for an agent that had no hooks file to begin with. The one-time
+    /// `*.oximux-bak` copy taken before the first edit is deliberately NOT
+    /// removed: it is the only record of what the file looked like beforehand.
+    #[command(verbatim_doc_comment)]
+    Off {
+        /// One agent slug. Default: all of them.
+        #[arg(long, value_name = "SLUG")]
+        agent: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SkillsCommand {
+    /// List the guides this binary carries, with a one-line summary each.
+    Ls,
+    /// Print one guide on stdout.
+    ///
+    /// Prints the prose. `--full` prints the file exactly as `install` would
+    /// write it, YAML frontmatter and all — that header is skill-discovery
+    /// metadata for an agent runtime, not something a reader asked for.
+    #[command(verbatim_doc_comment)]
+    Get {
+        /// The topic (see `skills ls`).
+        topic: String,
+        /// Include the YAML frontmatter, as installed.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Install the guides into the agents on this machine.
+    ///
+    /// Writes `<agent home>/skills/<topic>/SKILL.md`. Only into agents that
+    /// are actually here: OxiMux adds to an agent's own config directory and
+    /// never conjures one, so an agent you have never run is an error rather
+    /// than a dotfile it did not ask for.
+    ///
+    /// With no --agent the targets are the agents that already keep a skills
+    /// directory. Naming one installs there regardless, creating the directory.
+    ///
+    /// A guide OxiMux wrote before is overwritten — that is the point, since a
+    /// stale guide is the failure this verb exists to prevent. A file OxiMux
+    /// did NOT write, or a symlink, is reported and left alone.
+    #[command(verbatim_doc_comment)]
+    Install {
+        /// One agent slug (see `agent hooks status`). Default: every agent
+        /// here that already keeps skills.
+        #[arg(long, value_name = "SLUG")]
+        agent: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum WorktreeCommand {
     /// Create a worktree (and its branch) under a project. The host derives
     /// the on-disk location; the reply carries it.
@@ -610,6 +722,24 @@ pub enum WorktreeCommand {
     Rm {
         /// The worktree id (from `worktree ls`).
         id: String,
+    },
+    /// Say what is happening in a worktree — a one-line comment, a work phase,
+    /// or both. Meant to be called by the agent working there, as it works.
+    ///
+    /// A snapshot, not a log: the last write wins and no history is kept.
+    /// Passing an empty string clears that field; omitting a flag leaves it
+    /// alone, so setting the phase never blanks the comment.
+    #[command(verbatim_doc_comment)]
+    Set {
+        /// The worktree id (from `worktree ls`).
+        id: String,
+        /// The status line — what is happening here right now. `""` clears it.
+        #[arg(long, value_name = "TEXT")]
+        comment: Option<String>,
+        /// The work phase: todo, in-progress, in-review, or done. `""` clears
+        /// it. An unrecognised value is refused.
+        #[arg(long, value_name = "PHASE")]
+        phase: Option<String>,
     },
 }
 
@@ -709,6 +839,17 @@ pub enum TeamCommand {
         /// Which configured agent runs every role (default: the host's).
         #[arg(long, value_name = "AGENT_ID")]
         agent: Option<String>,
+        /// Give one role its own agent, as NAME=AGENT_ID. Repeat per role.
+        /// A role named here overrides `--agent`; the rest still use it.
+        #[arg(long = "role-agent", value_name = "NAME=AGENT_ID")]
+        role_agents: Vec<String>,
+        /// Give one role its own model, as NAME=MODEL. Repeat per role.
+        ///
+        /// Applied once the role's session is open. A backend that fixes its
+        /// model at spawn respawns to honour it; a model the session does not
+        /// offer fails that role rather than running it on another one.
+        #[arg(long = "role-model", value_name = "NAME=MODEL")]
+        role_models: Vec<String>,
         /// Give each role its own worktree, so roles editing the same files do
         /// not collide. The host derives each path.
         #[arg(long)]
@@ -813,14 +954,24 @@ pub enum ScheduleCommand {
         #[arg(long, value_name = "AGENT_ID")]
         agent: Option<String>,
         /// Fire every N minutes (minimum 5).
-        #[arg(long, value_name = "MINUTES", conflicts_with_all = ["daily", "weekly"])]
+        #[arg(long, value_name = "MINUTES", conflicts_with_all = ["daily", "weekly", "cron"])]
         every: Option<u32>,
         /// Fire daily at this local time, e.g. 09:00.
-        #[arg(long, value_name = "HH:MM", conflicts_with = "weekly")]
+        #[arg(long, value_name = "HH:MM", conflicts_with_all = ["weekly", "cron"])]
         daily: Option<String>,
         /// Fire weekly at this day and local time, e.g. "mon 09:00".
-        #[arg(long, value_name = "DAY HH:MM")]
+        #[arg(long, value_name = "DAY HH:MM", conflicts_with = "cron")]
         weekly: Option<String>,
+        /// Fire on a 5-field cron expression, e.g. "0 9 * * 1-5" for weekdays
+        /// at 09:00. Evaluated in the HOST's local time, like every other
+        /// cadence. Needs a host on protocol v23 or newer.
+        ///
+        /// Fields are `minute hour day-of-month month day-of-week`; there is no
+        /// seconds field. Cron's own weekday numbering applies, where both 0
+        /// and 7 mean Sunday. The 5-minute floor still holds, so `* * * * *` is
+        /// refused.
+        #[arg(long, value_name = "EXPR", verbatim_doc_comment)]
+        cron: Option<String>,
     },
     /// List schedules with cadence, next fire, and state.
     Ls,

@@ -16,7 +16,7 @@ use oximux_remote_host::{
 use oximux_remote_local::{
     LocalClaim, LocalControlListener, generate_token, token_path, write_token_file,
 };
-use oximux_remote_proto::messages::WorktreeWire;
+use oximux_remote_proto::messages::{WorktreeProgressWire, WorktreeWire};
 
 fn bin(runtime_dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximux-cli"));
@@ -55,7 +55,12 @@ struct StubLauncher {
 
 #[async_trait::async_trait]
 impl SessionLauncher for StubLauncher {
-    async fn create(&self, _cwd: &str, _agent_id: Option<&str>) -> Result<String, LaunchError> {
+    async fn create(
+        &self,
+        _cwd: &str,
+        _agent_id: Option<&str>,
+        _model: Option<&str>,
+    ) -> Result<String, LaunchError> {
         let id = format!("run-{}", self.counter.fetch_add(1, Ordering::SeqCst) + 1);
         self.registry.register(id.clone(), Arc::new(StubConnection::default()));
         Ok(id)
@@ -83,6 +88,20 @@ impl WorktreeService for StubWorktrees {
     }
     async fn remove(&self, _id: &str) -> Result<(), WorktreeError> {
         Ok(())
+    }
+    async fn set_progress(
+        &self,
+        _id: &str,
+        _comment: Option<&str>,
+        _phase: Option<&str>,
+    ) -> Result<(), WorktreeError> {
+        Ok(())
+    }
+    async fn list_progress(
+        &self,
+        _project_path: Option<&str>,
+    ) -> Result<Vec<WorktreeProgressWire>, WorktreeError> {
+        Ok(vec![])
     }
 }
 

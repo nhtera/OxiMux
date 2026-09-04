@@ -25,6 +25,7 @@ use cli::{
     TermCommand, WorktreeCommand,
 };
 use client::Client;
+use oximux_remote_proto::proto::{SCHEDULE_CRON_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION};
 use output::render;
 
 /// Leaf verbs that erase something. A typo is never nudged toward one of
@@ -83,6 +84,15 @@ fn tighten_destructive_suggestions(mut err: clap::Error) -> clap::Error {
 }
 
 fn main() -> std::process::ExitCode {
+    // Before clap, and before anything else: the verb an installed agent hook
+    // runs. Its flags come from a file OxiMux wrote and may include one this
+    // binary has never heard of, which must be ignored rather than answered
+    // with clap's usage error — a hook must never fail the agent's turn. See
+    // the module.
+    if commands::agent_status::is_hook_invocation() {
+        return std::process::ExitCode::from(commands::agent_status::run());
+    }
+
     // Usage errors exit 2 here, printing clap's own message — before any I/O.
     let args = match Cli::try_parse() {
         Ok(args) => args,
@@ -148,6 +158,33 @@ fn main() -> std::process::ExitCode {
                 ),
             }
         }
+        // Offline, like `agent-context`: reads and writes the agents' own
+        // config files on this machine. It must answer with no host running,
+        // which is when a misbehaving hook is actually chased.
+        Command::Agent { command } => {
+            let outcome = match command {
+                cli::AgentCommand::Hooks { command } => match command {
+                    cli::HooksCommand::Status { agent } => {
+                        commands::agent_hooks::status(agent.as_deref())
+                    }
+                    cli::HooksCommand::On { agent } => {
+                        commands::agent_hooks::set(true, agent.as_deref())
+                    }
+                    cli::HooksCommand::Off { agent } => {
+                        commands::agent_hooks::set(false, agent.as_deref())
+                    }
+                },
+            };
+            render(args.json, outcome)
+        }
+        Command::Skills { command } => {
+            let outcome = match command {
+                cli::SkillsCommand::Ls => commands::skills::list(),
+                cli::SkillsCommand::Get { topic, full } => commands::skills::get(topic, *full),
+                cli::SkillsCommand::Install { agent } => commands::skills::install(agent.as_deref()),
+            };
+            render(args.json, outcome)
+        }
         Command::AgentContext => {
             // Schema output is FOR machines; both modes print JSON, `--json`
             // merely wraps it in the standard envelope.
@@ -195,17 +232,40 @@ fn main() -> std::process::ExitCode {
 /// Only verbs whose RPCs were *appended* appear here. That is the point of the
 /// gate: an old host serves everything below its own version perfectly well, so
 /// refusing wholesale would break the compatibility this protocol is designed
-/// for. What it must not do is send an ordinal the host cannot decode — postcard
-/// answers that by dropping the connection, which surfaces to the user as "the
-/// host closed the connection" with nothing to act on.
+/// for. What it must not do is send an ordinal the host cannot decode. Measured
+/// against a released v20 host (2026-09-04): postcard fails to decode the frame
+/// and the host answers `BadRequest("undecodable request frame")`, keeping the
+/// connection open — so the user gets `error: undecodable request frame` at
+/// exit 1, a complaint about the frame for what is really a version problem,
+/// with nothing in it to act on.
 fn required_version(command: &Command) -> Option<(u32, &'static str)> {
     match command {
         // v19: the watch cursor. `state watch` sends `StateWatchFrom`, an
-        // ordinal a v18 host answers by dropping the connection — so it needs
+        // ordinal a v18 host cannot decode — so it needs
         // its own floor above the rest of its family, exactly as
         // `schedule run-once` does. Must stay ABOVE the catch-all `State` arm
         // below, which would otherwise match it first and claim v18.
         Command::State { command: StateCommand::Watch { .. } } => Some((19, "state watch")),
+        // v22: per-role agents. Only a run that actually names one needs the
+        // newer verb — `team run` with neither flag is the v18 request, and an
+        // older host serves it exactly. Refusing on the *shape* of the command
+        // rather than on what it asks for would strand callers who never wanted
+        // the feature. Must stay ABOVE the catch-all `Team` arm below.
+        //
+        // Without this the caller would get "undecodable request frame" from a
+        // host that cannot decode the ordinal — a message about a malformed
+        // request, for a version problem, with nothing actionable in it.
+        Command::Team { command: TeamCommand::Run { role_agents, role_models, .. } }
+            if !role_agents.is_empty() || !role_models.is_empty() =>
+        {
+            Some((TEAM_PER_ROLE_MIN_VERSION, "team run --role-agent/--role-model"))
+        }
+        // v23: a cron recurrence. Gated on the flag, not the family — a
+        // `schedule create --daily` still speaks v10 to a v10 host, and only
+        // `--cron` needs a host that can decode `CreateScheduleV2` at all.
+        Command::Schedule { command: ScheduleCommand::Create { cron: Some(_), .. } } => {
+            Some((SCHEDULE_CRON_MIN_VERSION, "schedule create --cron"))
+        }
         // v18: the automation surface.
         Command::Heartbeat { .. } => Some((18, "heartbeat")),
         Command::Team { .. } => Some((18, "team")),
@@ -325,9 +385,9 @@ fn host_verb(mut args: Cli) -> u8 {
             .await?;
             // The compat gate. `Hello` already refused a host outside the
             // mutually-compatible range; this catches the narrower case of a
-            // host inside it that predates a specific verb — where postcard
-            // would answer an appended ordinal by dropping the connection
-            // rather than erroring. Only the verbs that need a floor are
+            // host inside it that predates a specific verb — where the host
+            // rejects an appended ordinal as an undecodable frame rather than
+            // saying anything about versions. Only the verbs that need a floor are
             // gated, so reads a v15 host can still serve keep working.
             if let Some((needed, verb)) = required_version(&args.command) {
                 client.require_version(needed, verb)?;
@@ -339,7 +399,7 @@ fn host_verb(mut args: Cli) -> u8 {
                     commands::sessions::projects_ls(&client).await
                 }
                 Command::Schedule { command } => match command {
-                    ScheduleCommand::Create { prompt, name, cwd, agent, every, daily, weekly } => {
+                    ScheduleCommand::Create { prompt, name, cwd, agent, every, daily, weekly, cron } => {
                         let create_args = commands::schedule::CreateArgs {
                             prompt,
                             name,
@@ -348,6 +408,7 @@ fn host_verb(mut args: Cli) -> u8 {
                             every,
                             daily,
                             weekly,
+                            cron,
                         };
                         commands::schedule::create(&client, create_args).await
                     }
@@ -491,6 +552,9 @@ fn host_verb(mut args: Cli) -> u8 {
                         commands::worktree::ls(&client, project).await
                     }
                     WorktreeCommand::Rm { id } => commands::worktree::rm(&client, &id).await,
+                    WorktreeCommand::Set { id, comment, phase } => {
+                        commands::worktree::set(&client, &id, comment, phase).await
+                    }
                 },
                 Command::Heartbeat { command } => match command {
                     HeartbeatCommand::Create { prompt, name, cron, session } => {
@@ -502,12 +566,22 @@ fn host_verb(mut args: Cli) -> u8 {
                     HeartbeatCommand::Rm { id } => commands::heartbeat::rm(&client, &id).await,
                 },
                 Command::Team { command } => match command {
-                    TeamCommand::Run { name, roles, cwd, agent, worktree_each } => {
+                    TeamCommand::Run {
+                        name,
+                        roles,
+                        cwd,
+                        agent,
+                        role_agents,
+                        role_models,
+                        worktree_each,
+                    } => {
                         let args = commands::team::RunArgs {
                             name,
                             roles,
                             cwd,
                             agent,
+                            role_agents,
+                            role_models,
                             worktree_each,
                         };
                         commands::team::run(&client, args).await
@@ -539,6 +613,8 @@ fn host_verb(mut args: Cli) -> u8 {
                 Command::Version
                 | Command::Update { .. }
                 | Command::AgentContext
+                | Command::Skills { .. }
+                | Command::Agent { .. }
                 | Command::Completions { .. }
                 | Command::Serve { .. }
                 | Command::Pair { .. }
@@ -560,8 +636,8 @@ mod tests {
 
     /// The gate covers exactly the appended surfaces, and nothing else. A verb
     /// wrongly listed here would refuse a host that can serve it perfectly
-    /// well; one wrongly omitted would send an ordinal an old host answers by
-    /// dropping the connection.
+    /// well; one wrongly omitted would send an ordinal an old host rejects as
+    /// an undecodable frame.
     #[test]
     fn only_appended_verbs_declare_a_version_floor() {
         for (argv, expected) in [
@@ -721,15 +797,75 @@ mod tests {
         assert_eq!(prompt, "do the thing");
     }
 
-    /// `schedule` is the one family split across versions: only the manual fire
-    /// is v17, and gating the whole family would strand a v10 host's list.
+    /// `team` is split the same way: only a run that actually names a per-role
+    /// agent or model needs v22.
+    ///
+    /// Gating the whole family on the flag's *existence* would strand every
+    /// caller who never wanted the feature the moment this CLI shipped — the
+    /// exact fleet-wide break `MIN_COMPATIBLE_VERSION` exists to avoid. What a
+    /// pre-v22 host cannot do is honour a per-role choice, so that is the only
+    /// thing refused; everything else falls back to the v18 verbs.
     #[test]
-    fn only_run_once_gates_the_schedule_family() {
-        assert!(required_version(&command_of(&["oximux", "schedule", "ls"])).is_none());
-        assert!(required_version(&command_of(&["oximux", "schedule", "rm", "s"])).is_none());
+    fn only_a_per_role_run_gates_the_team_family() {
+        let plain = ["oximux", "team", "run", "--name", "s", "--role", "a=go"];
         assert_eq!(
-            required_version(&command_of(&["oximux", "schedule", "run-once", "s"])).map(|(v, _)| v),
-            Some(17)
+            required_version(&command_of(&plain)).map(|(v, _)| v),
+            Some(18),
+            "a run naming no per-role agent is the v18 request"
+        );
+        assert_eq!(
+            required_version(&command_of(&["oximux", "team", "status", "--run", "r"]))
+                .map(|(v, _)| v),
+            Some(18),
+            "and reading a board never needs the newer verb"
+        );
+
+        let with_agent =
+            ["oximux", "team", "run", "--name", "s", "--role", "a=go", "--role-agent", "a=claude"];
+        assert_eq!(required_version(&command_of(&with_agent)).map(|(v, _)| v), Some(22));
+        let with_model =
+            ["oximux", "team", "run", "--name", "s", "--role", "a=go", "--role-model", "a=opus"];
+        assert_eq!(required_version(&command_of(&with_model)).map(|(v, _)| v), Some(22));
+    }
+
+    /// `schedule` is the family most split across versions: the bulk is v10,
+    /// the manual fire is v17, and a cron cadence is v23. Gating the whole
+    /// family at its newest member would strand a v10 host's list.
+    ///
+    /// The cron arm's **position** is load-bearing — it must sit above the
+    /// `run-once` arm, because a guard that matches on a flag has to be tried
+    /// before the catch-all for its command. Nothing but this test enforces
+    /// that: a later broad `Command::Schedule { .. } => Some(17)` inserted
+    /// above it would silently ungate `--cron`, and the only other thing that
+    /// would notice is the skew suite, which skips itself unless
+    /// `OXIMUX_SKEW_CLI` is set.
+    #[test]
+    fn only_run_once_and_cron_gate_the_schedule_family() {
+        let v = |args: &[&str]| required_version(&command_of(args)).map(|(v, _)| v);
+
+        assert!(v(&["oximux", "schedule", "ls"]).is_none());
+        assert!(v(&["oximux", "schedule", "rm", "s"]).is_none());
+        assert_eq!(v(&["oximux", "schedule", "run-once", "s"]), Some(17));
+
+        // Every preset cadence still speaks v10 — this is the half that keeps
+        // an existing user working against an existing host.
+        for cadence in [
+            vec!["--every", "30"],
+            vec!["--daily", "09:00"],
+            vec!["--weekly", "mon 09:00"],
+        ] {
+            let mut args = vec!["oximux", "schedule", "create", "p", "--name", "n"];
+            args.extend(cadence.iter().copied());
+            assert!(
+                v(&args).is_none(),
+                "a preset cadence must not require a newer host: {cadence:?}"
+            );
+        }
+
+        // ...and only `--cron` asks for v23.
+        assert_eq!(
+            v(&["oximux", "schedule", "create", "p", "--name", "n", "--cron", "0 9 * * 1-5"]),
+            Some(23)
         );
     }
 

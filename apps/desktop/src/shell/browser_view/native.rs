@@ -544,15 +544,27 @@ impl NativeWebview {
         // The block bound is `Fn` (ObjC blocks may be retained); a once-guard
         // keeps a stray double-invocation from writing the clipboard twice.
         let fired = Arc::new(AtomicBool::new(false));
-        let handler = RcBlock::new(move |image: *mut NSImage, _err: *mut NSError| {
+        // Every early return here means a capture the caller asked for silently
+        // never arrives, so each one says why. WebKit refuses some rects (see
+        // the `rect` clamp above) and reports it by handing back a null image
+        // plus an error — discarding that error is what made an element that
+        // never screenshots look like a feature that simply did nothing.
+        let handler = RcBlock::new(move |image: *mut NSImage, err: *mut NSError| {
             if fired.swap(true, Ordering::AcqRel) {
                 return;
             }
             if image.is_null() {
+                let reason = if err.is_null() {
+                    "no error given".to_string()
+                } else {
+                    unsafe { &*err }.localizedDescription().to_string()
+                };
+                tracing::warn!(?rect, %reason, "webview snapshot returned no image");
                 return;
             }
             let image: &NSImage = unsafe { &*image };
             let Some(png) = png_bytes(image) else {
+                tracing::warn!(?rect, "webview snapshot could not be encoded to PNG");
                 return;
             };
             on_png(png);

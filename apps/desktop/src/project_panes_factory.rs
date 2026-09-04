@@ -243,6 +243,7 @@ fn restore_chat_posture(
         codex: t.codex_posture.clone(),
         pi: t.pi_posture.clone(),
         omp: t.omp_posture,
+        claude_fast_mode: t.claude_fast_mode,
     }
 }
 
@@ -251,9 +252,18 @@ fn restore_chat_posture(
 /// to the Claude stream-json backend when the blob predates these fields or the
 /// session isn't found. The ACP command + args come from the transcript, not
 /// settings, so restore is self-contained.
+///
+/// The one thing read from **live** settings is the adapter's configured env,
+/// keyed by the transcript's `(adapter_id, launch_profile)`. That pair is
+/// persisted; the values are not — see [`PersistedChatTranscript::adapter_id`].
+/// A blob written before those fields existed resolves to no env, which is its
+/// pre-existing behavior.
+///
+/// [`PersistedChatTranscript::adapter_id`]: crate::session_restore::persisted_chat::PersistedChatTranscript::adapter_id
 fn restore_chat_backend(
     snap: &PersistedTabs,
     session_id: Option<&str>,
+    launch: Option<&oximux_settings::AgentLaunchSettings>,
 ) -> oximux_agents::thread::ChatBackend {
     session_id
         .and_then(|sid| snap.chat_transcripts.iter().find(|t| t.session_id == sid))
@@ -261,6 +271,12 @@ fn restore_chat_backend(
             transport: t.provider,
             acp_command: t.acp_command.clone(),
             acp_args: t.acp_args.clone(),
+            env: match (launch, t.adapter_id.as_deref()) {
+                (Some(s), Some(id)) => s.env_for(id, t.launch_profile.as_deref()),
+                _ => Vec::new(),
+            },
+            adapter_id: t.adapter_id.clone(),
+            profile: t.launch_profile.clone(),
         })
         .unwrap_or_default()
 }
@@ -358,7 +374,7 @@ pub(crate) fn build_project_panes(
         // looking exactly as the user left it.
         let meta = restored_meta(tab, rank_in(&snap.tab_order, flat_idx));
         match &tab.kind {
-            PersistedTabKind::Editor { path } => {
+            PersistedTabKind::Editor { path, pdf_page } => {
                 let path_buf = PathBuf::from(path);
                 if !path_buf.exists() {
                     // Drop the tab + log; the user can reopen via Cmd+P.
@@ -375,6 +391,11 @@ pub(crate) fn build_project_panes(
                     continue;
                 }
                 panes_entity.update(cx, |p, cx| {
+                    // Seed the page memory before the tab opens — the PDF
+                    // loader reads it when the document lands.
+                    if let Some(page) = pdf_page {
+                        oximux_editor::pdf_preview::remember_pdf_page(cx, &path_buf, *page);
+                    }
                     p.open_or_activate_editor_tab(path_buf, window, cx);
                     p.place_restored_last_tab(None, meta, cx);
                 });
@@ -412,7 +433,11 @@ pub(crate) fn build_project_panes(
                             let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
                             let session_meta = restore_chat_session_meta(&snap, session_id.as_deref());
                             let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
-                            let backend = restore_chat_backend(&snap, session_id.as_deref());
+                            let backend = restore_chat_backend(
+                                &snap,
+                                session_id.as_deref(),
+                                cx.try_global::<oximux_settings::AgentLaunchSettings>(),
+                            );
                             let resume_id = restore_chat_resume_id(&snap, session_id.as_deref());
                             let posture = restore_chat_posture(&snap, session_id.as_deref());
                             group.update(cx, |g, cx| {
@@ -554,7 +579,7 @@ fn restore_multi_group(
             // position within the group (= its local index).
             let meta = restored_meta(tab, rank_in(&group_snap.tab_order, local_idx));
             match &tab.kind {
-                PersistedTabKind::Editor { path } => {
+                PersistedTabKind::Editor { path, pdf_page } => {
                     let path_buf = PathBuf::from(path);
                     if !path_buf.exists() {
                         tracing::warn!(
@@ -564,6 +589,9 @@ fn restore_multi_group(
                         continue;
                     }
                     panes_entity.update(cx, |p, cx| {
+                        if let Some(page) = pdf_page {
+                            oximux_editor::pdf_preview::remember_pdf_page(cx, &path_buf, *page);
+                        }
                         p.open_editor_in_group_restore(group_id, path_buf, window, cx);
                         p.place_restored_last_tab(Some(group_id), meta, cx);
                     });
@@ -591,7 +619,11 @@ fn restore_multi_group(
                             let slash_commands = restore_chat_slash_commands(&snap, session_id.as_deref());
                             let session_meta = restore_chat_session_meta(&snap, session_id.as_deref());
                             let thinking_level = restore_chat_thinking_level(&snap, session_id.as_deref());
-                            let backend = restore_chat_backend(&snap, session_id.as_deref());
+                            let backend = restore_chat_backend(
+                                &snap,
+                                session_id.as_deref(),
+                                cx.try_global::<oximux_settings::AgentLaunchSettings>(),
+                            );
                             let resume_id = restore_chat_resume_id(&snap, session_id.as_deref());
                             let posture = restore_chat_posture(&snap, session_id.as_deref());
                             p.open_agent_chat_in_group_restore(
@@ -714,9 +746,17 @@ fn restore_agent_tab(
     // per-agent launch flags so a restored agent comes back with the same
     // defaults a fresh launch would use. Ignored on warm re-attach, which
     // adopts the already-running process and never reads cfg.
-    let extra_args = cx
+    // The profile the tab was launched under, so a respawn reaches the same
+    // endpoint/account rather than silently falling back to `default`.
+    let profile = persisted.profile.clone();
+    let (extra_args, env) = cx
         .try_global::<oximux_settings::AgentLaunchSettings>()
-        .map(|d| d.args_for(adapter_id))
+        .map(|d| {
+            (
+                d.args_for_in(adapter_id, profile.as_deref()),
+                d.env_for(adapter_id, profile.as_deref()),
+            )
+        })
         .unwrap_or_default();
     let cfg = AgentSessionConfig {
         adapter: persisted.adapter,
@@ -725,7 +765,7 @@ fn restore_agent_tab(
         model: persisted.model.clone(),
         effort: persisted.effort.clone(),
         extra_args,
-        env: Vec::new(),
+        env,
         cols: DEFAULT_AGENT_COLS,
         rows: DEFAULT_AGENT_ROWS,
         custom_command: None,
@@ -2063,11 +2103,14 @@ mod tests {
             slash_commands: vec!["compact".into()],
             thinking_level: Default::default(),
             provider: oximux_agents::thread::Transport::StreamJson,
+            adapter_id: None,
+            launch_profile: None,
             acp_command: None,
             acp_args: vec![],
             codex_posture: None,
             pi_posture: None,
             omp_posture: None,
+            claude_fast_mode: None,
             choices: Default::default(),
         };
         let snap = PersistedTabs {
@@ -2152,11 +2195,14 @@ mod tests {
                 session_meta: Default::default(),
                 thinking_level: Default::default(),
                 provider: oximux_agents::thread::Transport::StreamJson,
+                adapter_id: None,
+                launch_profile: None,
                 acp_command: None,
                 acp_args: vec![],
                 codex_posture: None,
                 pi_posture: None,
                 omp_posture: None,
+                claude_fast_mode: None,
                 choices: Default::default(),
             }],
             ..PersistedTabs::default()
@@ -2197,11 +2243,14 @@ mod tests {
             slash_commands: vec![],
             thinking_level: Default::default(),
             provider: oximux_agents::thread::Transport::StreamJson,
+            adapter_id: None,
+            launch_profile: None,
             acp_command: None,
             acp_args: vec![],
             codex_posture: None,
             pi_posture: None,
             omp_posture: None,
+            claude_fast_mode: None,
             choices: Default::default(),
         };
         let snap =
@@ -2217,7 +2266,7 @@ mod tests {
         let orphan = "ses_0abea54daffeD0XIbY7b2Cpslg";
         assert_eq!(restore_chat_resume_id(&snap, Some(orphan)), None);
         assert_eq!(
-            restore_chat_backend(&snap, Some(orphan)),
+            restore_chat_backend(&snap, Some(orphan), None),
             oximux_agents::thread::ChatBackend::default()
         );
         // No pointer at all (a bound chat that never minted a session) → None.

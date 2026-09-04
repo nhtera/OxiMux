@@ -66,6 +66,8 @@ pub struct WorkspaceRow {
     pub tint: Option<String>,
     pub sort_order: f64,
     pub pinned: bool,
+    pub comment: String,
+    pub phase: String,
 }
 
 impl WorkspaceRow {
@@ -84,6 +86,8 @@ impl WorkspaceRow {
             tint: row.get("tint")?,
             sort_order: row.get("sort_order")?,
             pinned: row.get("pinned")?,
+            comment: row.get("comment")?,
+            phase: row.get("phase")?,
         })
     }
 }
@@ -104,6 +108,8 @@ impl From<WorkspaceRow> for Workspace {
             tint: r.tint,
             sort_order: r.sort_order,
             pinned: r.pinned,
+            comment: r.comment,
+            phase: r.phase,
         }
     }
 }

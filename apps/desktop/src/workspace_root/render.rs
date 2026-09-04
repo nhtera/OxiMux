@@ -477,6 +477,68 @@ impl Render for WorkspaceRoot {
                 },
             ))
             .on_action(cx.listener(
+                |this, action: &SendPickToActiveChat, _window, cx| {
+                    // An element picked in the embedded browser. Prefer a chat
+                    // composer: only it can stage the crop alongside the text,
+                    // and the capture sits there as chips so the user adds the
+                    // actual question before sending.
+                    let Some(panes) = this.active_project_panes() else {
+                        tracing::debug!("send-pick: no active project");
+                        return;
+                    };
+                    if let Some(target) = panes.read(cx).target_agent_chat_view(cx) {
+                        let (selector, markdown, png) =
+                            (action.selector.clone(), action.markdown.clone(), action.png.clone());
+                        let had_crop = !png.is_empty();
+                        target.view.update(cx, |chat, cx| {
+                            chat.stage_browser_pick(&selector, markdown, png, cx)
+                        });
+                        // Say where it went. The destination is usually a tab
+                        // the user is not looking at — they picked in the
+                        // browser — so without this a delivered pick is
+                        // indistinguishable from one that was dropped.
+                        //
+                        // Drawn in the page, not as a host toast: the webview is
+                        // a native view layered over the GPU canvas, so a host
+                        // toast is occluded exactly while a browser tab is
+                        // active, which is always when a pick happens.
+                        let what = if had_crop { "Element + screenshot" } else { "Element" };
+                        let note = format!("{what} → {}", target.name);
+                        if let Some(browser) =
+                            panes.read(cx).active_group().and_then(|g| g.read(cx).active_browser_view())
+                        {
+                            browser.read(cx).confirm_pick_sent(&note);
+                        } else {
+                            this.push_toast(ToastKind::Info, note, cx);
+                        }
+                        return;
+                    }
+                    // No chat tab open. Fall back to the pre-existing behavior —
+                    // a bracketed paste of the text into an agent terminal — so
+                    // a terminal-only workspace keeps working. The crop is
+                    // dropped: a PTY has nowhere to put an image.
+                    let Some(session_id) = panes.read(cx).target_agent_session(cx) else {
+                        tracing::debug!("send-pick: no agent session available");
+                        return;
+                    };
+                    let runtime = this.cli_runtime.clone();
+                    let text = action.markdown.clone();
+                    // Same reactor requirement as the `SendTextToActiveAgent`
+                    // arm above: `send_agent_paste` offloads the PTY write via
+                    // `spawn_blocking`, which aborts without a live Tokio
+                    // runtime, so this must not use `background_spawn`.
+                    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                        tracing::warn!(?session_id, "no tokio runtime; send-pick dropped");
+                        return;
+                    };
+                    handle.spawn(async move {
+                        if let Err(err) = runtime.send_agent_paste(session_id, &text).await {
+                            tracing::warn!(?session_id, %err, "send-pick to terminal failed");
+                        }
+                    });
+                },
+            ))
+            .on_action(cx.listener(
                 |this, action: &CreateWorktreeWorkspaceForActiveChat, _window, cx| {
                     // A *New Agent* worktree draft sent: make the worktree a
                     // first-class `Workspace` (DB row + git worktree via
@@ -678,6 +740,9 @@ impl Render for WorkspaceRoot {
                     None,
                     resumption,
                     custom_command,
+                    // A history relaunch reuses the adapter's default profile;
+                    // the persisted history row records no profile.
+                    None,
                     window,
                     cx,
                 );
@@ -1664,7 +1729,9 @@ impl Render for WorkspaceRoot {
                     port_count,
                     git_state.as_ref(),
                     primary,
-                    self.usage_state.as_ref(),
+                    &self.usage,
+                    crate::appearance_settings::active(cx).usage_detail,
+                    oximux_agents::session_log::now_unix_ms(),
                     update_ready,
                     move |window, cx| {
                         if let Some(sc) = scm_for_click.clone() {
@@ -1717,12 +1784,9 @@ impl Render for WorkspaceRoot {
             // outside click; z-band above the floating terminal, below the
             // palette overlays that follow.
             .when(self.usage_popover_open, |parent| {
-                let Some(state) = self.usage_state.as_ref() else {
-                    return parent;
-                };
                 let weak_close = cx.entity().downgrade();
                 let card = crate::shell::usage_meter::render_usage_popover(
-                    state,
+                    &self.usage,
                     oximux_agents::session_log::now_unix_ms(),
                     theme,
                     density,
@@ -1747,6 +1811,19 @@ impl Render for WorkspaceRoot {
                                 .absolute()
                                 .right(px(8.0))
                                 .bottom(px(density.h_status_bar + 6.0))
+                                // The card fills its host, which on macOS is a
+                                // window sized to the same measurement. Here the
+                                // host is this box, so it has to be given that
+                                // size explicitly — an auto-sized parent leaves
+                                // the card's `size_full` nothing to resolve
+                                // against, and the height now varies with how
+                                // many accounts are configured.
+                                .w(px(crate::shell::usage_meter::POPOVER_WIDTH))
+                                .h(px(crate::shell::usage_meter::popover_height(
+                                    &self.usage,
+                                    density,
+                                    typography,
+                                )))
                                 // Clicks on the card must not bubble to the
                                 // backdrop's dismiss handler — the user may
                                 // click while reading the numbers.

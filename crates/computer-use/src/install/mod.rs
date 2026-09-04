@@ -317,6 +317,22 @@ pub fn spawn_install(
 mod tests {
     use super::*;
 
+    /// Serializes the tests that touch the process-global install state.
+    ///
+    /// `INSTALLING` and the stage slot are `static`s shared by every test in
+    /// this binary, and cargo runs tests on parallel threads — so without this
+    /// one test's `store(true)` lands inside another's `compare_exchange`
+    /// window and the CAS legitimately fails. That showed up as a ~1-in-6
+    /// failure of the whole workspace suite and looked like a product bug.
+    ///
+    /// Poisoning is recovered rather than propagated: if a test panics while
+    /// holding this, the *other* test should still report its own result
+    /// instead of a confusing `PoisonError`.
+    fn install_state_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// The anchor a test passes when the install never reaches the gate.
     #[cfg(windows)]
     fn test_anchor() -> Anchor {
@@ -330,6 +346,7 @@ mod tests {
 
     #[test]
     fn second_concurrent_install_is_refused_without_side_effects() {
+        let _serial = install_state_lock();
         // Hold the lock as a running install would, then try to start another.
         assert!(INSTALLING
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -341,6 +358,7 @@ mod tests {
 
     #[test]
     fn run_guard_clears_lock_and_stage() {
+        let _serial = install_state_lock();
         INSTALLING.store(true, Ordering::SeqCst);
         set_stage(Some(InstallStage::Resolving));
         drop(RunGuard);

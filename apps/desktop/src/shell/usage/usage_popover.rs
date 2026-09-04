@@ -19,7 +19,7 @@ use gpui::{
     WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, point, px, size,
 };
 use oximux_agents::session_log::now_unix_ms;
-use oximux_agents::session_log::usage::UsageState;
+use oximux_agents::session_log::usage::ProviderUsage;
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::usage_meter;
@@ -36,13 +36,12 @@ pub const REOPEN_DEBOUNCE_MS: i64 = 300;
 /// toggle to swallow the same click that dismissed the popover.
 pub static LAST_CLOSED_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
-const POPOVER_SIZE: (f32, f32) = (264.0, 210.0);
 const MARGIN: f32 = 8.0;
 
 /// The popup window's root view: renders the shared usage card and owns the
 /// dismiss triggers (resign-key + Escape).
 pub struct UsagePopover {
-    state: UsageState,
+    rows: Vec<ProviderUsage>,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -56,7 +55,7 @@ pub struct UsagePopover {
 
 impl UsagePopover {
     fn new(
-        state: UsageState,
+        rows: Vec<ProviderUsage>,
         theme: Theme,
         density: Density,
         typography: Typography,
@@ -74,7 +73,7 @@ impl UsagePopover {
             }
         });
         Self {
-            state,
+            rows,
             theme,
             density,
             typography,
@@ -121,7 +120,7 @@ impl Render for UsagePopover {
                 }
             }))
             .child(usage_meter::render_usage_popover(
-                &self.state,
+                &self.rows,
                 now_unix_ms(),
                 self.theme,
                 self.density,
@@ -134,7 +133,7 @@ impl Render for UsagePopover {
 /// corner, returning its handle for the owner to track (so a second chip click
 /// can dismiss it). The card data is snapshotted at open time.
 pub fn open(
-    state: UsageState,
+    rows: Vec<ProviderUsage>,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -142,8 +141,14 @@ pub fn open(
     window: &mut Window,
     cx: &mut App,
 ) -> Option<gpui::WindowHandle<UsagePopover>> {
-    let (w, h) = POPOVER_SIZE;
-    let popover = size(px(w), px(h));
+    // Sized to the content: a second account roughly doubles the card, and a
+    // fixed height would either clip it or leave a slab of empty panel under a
+    // single one. The window has to be sized before anything renders, so the
+    // card's own measurement function is the only place this can come from.
+    let popover = size(
+        px(usage_meter::POPOVER_WIDTH),
+        px(usage_meter::popover_height(&rows, density, &typography)),
+    );
     let main = window.bounds();
     // Bottom-right of the main window, just above the status bar.
     let origin = point(
@@ -170,7 +175,7 @@ pub fn open(
     };
 
     cx.open_window(options, move |window, cx| {
-        cx.new(|cx| UsagePopover::new(state, theme, density, typography, owner, window, cx))
+        cx.new(|cx| UsagePopover::new(rows, theme, density, typography, owner, window, cx))
     })
     .ok()
 }

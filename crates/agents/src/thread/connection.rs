@@ -454,6 +454,21 @@ pub fn set_permission_mode_json(mode: &str) -> Value {
            "request": {"subtype": "set_permission_mode", "mode": mode}})
 }
 
+/// Build the stdin `control_request` JSON that overlays session settings in
+/// place (`{subtype:"apply_flag_settings", settings}`), the wire the Agent
+/// SDK's `applyFlagSettings` writes. Verified live on claude-code 2.1.260:
+/// `{"fastMode":true}` is answered `success` and applies to the running session
+/// with no respawn. Fire-and-forget like the other control requests: the ack is
+/// dropped by the decoder, and the `request_id` is minted from a process
+/// counter because nothing correlates the reply.
+pub fn apply_flag_settings_json(settings: Value) -> Value {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+    let request_id = format!("oximux-apply-settings-{}", REQ_SEQ.fetch_add(1, Ordering::Relaxed));
+    json!({"type": "control_request", "request_id": request_id,
+           "request": {"subtype": "apply_flag_settings", "settings": settings}})
+}
+
 /// Build the stdin `control_request` JSON that interrupts the in-flight turn
 /// (`{subtype:"interrupt"}`).
 ///
@@ -662,6 +677,18 @@ mod tests {
         let id1 = v["request_id"].as_str().unwrap().to_string();
         let id2 = set_permission_mode_json("plan")["request_id"].as_str().unwrap().to_string();
         assert!(id1.starts_with("oximux-set-mode-"));
+        assert_ne!(id1, id2, "each request mints a fresh id");
+    }
+
+    #[test]
+    fn apply_flag_settings_json_shape() {
+        let v = apply_flag_settings_json(json!({"fastMode": true}));
+        assert_eq!(v["type"], "control_request");
+        assert_eq!(v["request"]["subtype"], "apply_flag_settings");
+        assert_eq!(v["request"]["settings"]["fastMode"], true);
+        let id1 = v["request_id"].as_str().unwrap().to_string();
+        let id2 = apply_flag_settings_json(json!({}))["request_id"].as_str().unwrap().to_string();
+        assert!(id1.starts_with("oximux-apply-settings-"));
         assert_ne!(id1, id2, "each request mints a fresh id");
     }
 

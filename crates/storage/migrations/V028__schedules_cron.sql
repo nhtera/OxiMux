@@ -1,0 +1,12 @@
+-- Cron expressions for schedules.
+--
+-- Nullable, and no default: a preset schedule has no expression, and that is a
+-- permanent fact about it rather than a value not filled in yet. `kind` already
+-- discriminates ('interval' / 'daily' / 'weekly', now also 'cron'), so a NULL
+-- here is never ambiguous.
+--
+-- A binary predating this migration reads a 'cron' row through
+-- `row_to_schedule`, whose unknown-`kind` arm returns None and skips it. That
+-- is the existing, deliberate behaviour: a schedule whose real rule cannot be
+-- read is omitted rather than defaulted to something plausible and wrong.
+ALTER TABLE schedules ADD COLUMN cron_expr TEXT;

@@ -14,10 +14,12 @@
 //! `rewinder` need. Wire ↔ store conversion lives here, keeping `remote-proto`
 //! free of any `oximux-agents` dependency.
 
-use chrono::{DateTime, Local, TimeZone};
+use chrono::{DateTime, Local, TimeZone, Timelike};
 
 use oximux_agents::schedule::{NewSchedule, Recurrence, Schedule, ScheduleRun, describe};
-use oximux_remote_proto::messages::{RecurrenceWire, ScheduleRunWire, ScheduleWire};
+use oximux_remote_proto::messages::{
+    RecurrenceV2Wire, RecurrenceWire, ScheduleRunWire, ScheduleV2Wire, ScheduleWire,
+};
 use oximux_remote_proto::proto::{Response, RpcError};
 
 use super::Dispatcher;
@@ -34,21 +36,35 @@ impl Dispatcher {
     /// as an ordinary schedule offering edits — change the cwd, change the agent
     /// — that mean nothing for a session already open. They have their own verb.
     pub(super) fn list_schedules(&self, peer: &Peer) -> Response {
-        if !self.auth.may_read_schedules(peer) {
-            return Response::Error(RpcError::Unauthorized);
-        }
-        let Some(store) = self.schedules.as_ref() else {
-            // Same answer a device lacking scope gets: whether this desktop keeps
-            // schedules is not something an unauthorized client should probe.
-            return Response::Error(RpcError::Unauthorized);
-        };
-        match store.list_spawning() {
+        match self.readable_schedules(peer) {
             Ok(rows) => Response::Schedules(rows.iter().map(to_wire).collect()),
-            Err(e) => {
-                tracing::warn!(error = %e, "listing schedules failed");
-                Response::Error(RpcError::Internal("could not read schedules".into()))
-            }
+            Err(e) => Response::Error(e),
         }
+    }
+
+    /// [`Self::list_schedules`] for a v23 peer: the same rows, with cron
+    /// expressions intact rather than the stand-in the v18 shape must use.
+    pub(super) fn list_schedules_v2(&self, peer: &Peer) -> Response {
+        match self.readable_schedules(peer) {
+            Ok(rows) => Response::SchedulesV2(rows.iter().map(to_wire_v2).collect()),
+            Err(e) => Response::Error(e),
+        }
+    }
+
+    /// The scope check, the store lookup and the read, shared by both list
+    /// verbs so the two shapes can never disagree about *which* schedules a
+    /// peer may see — only about how they are rendered.
+    fn readable_schedules(&self, peer: &Peer) -> Result<Vec<Schedule>, RpcError> {
+        if !self.auth.may_read_schedules(peer) {
+            return Err(RpcError::Unauthorized);
+        }
+        // Same answer a device lacking scope gets: whether this desktop keeps
+        // schedules is not something an unauthorized client should probe.
+        let store = self.schedules.as_ref().ok_or(RpcError::Unauthorized)?;
+        store.list_spawning().map_err(|e| {
+            tracing::warn!(error = %e, "listing schedules failed");
+            RpcError::Internal("could not read schedules".into())
+        })
     }
 
     /// Create a schedule from a recurrence the phone chose.
@@ -66,28 +82,63 @@ impl Dispatcher {
         agent_id: Option<String>,
         recurrence: RecurrenceWire,
     ) -> Response {
-        if !self.auth.may_manage_schedules(peer) {
-            return Response::Error(RpcError::Unauthorized);
-        }
-        let Some(store) = self.schedules.as_ref() else {
-            return Response::Error(RpcError::Unauthorized);
-        };
-        let recurrence = match from_wire(recurrence) {
-            Ok(r) => r,
-            // The constructor's message ("interval must be at least 5 minutes")
-            // is safe to forward: it names no host path, only the rule broken.
-            Err(e) => return Response::Error(RpcError::BadRequest(e.to_string())),
-        };
-        let new = NewSchedule { name, cwd, prompt, agent_id, recurrence };
-        match store.create(new, self.now_local()) {
+        match self.store_schedule(peer, name, cwd, prompt, agent_id, from_wire(recurrence)) {
             Ok(schedule) => Response::ScheduleCreated(to_wire(&schedule)),
-            Err(e) => {
-                // A store error here is a disk/SQL failure, whose text can name
-                // the database path — logged, not forwarded.
-                tracing::warn!(error = %e, "creating schedule failed");
-                Response::Error(RpcError::Internal("could not create the schedule".into()))
-            }
+            Err(e) => Response::Error(e),
         }
+    }
+
+    /// [`Self::create_schedule`] for a v23 peer, whose recurrence may be cron.
+    ///
+    /// Same gate, same constructors, same store call — the only difference is
+    /// which wire enum arrives and which reply shape leaves. Cron changes *when*
+    /// a schedule fires, never what it is allowed to do, so it earns no
+    /// different privilege.
+    pub(super) fn create_schedule_v2(
+        &self,
+        peer: &Peer,
+        name: String,
+        cwd: String,
+        prompt: String,
+        agent_id: Option<String>,
+        recurrence: RecurrenceV2Wire,
+    ) -> Response {
+        match self.store_schedule(peer, name, cwd, prompt, agent_id, from_wire_v2(recurrence)) {
+            Ok(schedule) => Response::ScheduleCreatedV2(to_wire_v2(&schedule)),
+            Err(e) => Response::Error(e),
+        }
+    }
+
+    /// The write gate, the recurrence validation and the insert, shared by both
+    /// create verbs.
+    ///
+    /// Takes the recurrence already converted, as a `Result`, so each verb owns
+    /// only its own wire mapping — and so neither can skip the constructors
+    /// that enforce the floor.
+    fn store_schedule(
+        &self,
+        peer: &Peer,
+        name: String,
+        cwd: String,
+        prompt: String,
+        agent_id: Option<String>,
+        recurrence: Result<Recurrence, oximux_agents::schedule::RecurrenceError>,
+    ) -> Result<Schedule, RpcError> {
+        if !self.auth.may_manage_schedules(peer) {
+            return Err(RpcError::Unauthorized);
+        }
+        let store = self.schedules.as_ref().ok_or(RpcError::Unauthorized)?;
+        // The constructor's message ("interval must be at least 5 minutes", or
+        // croner's own "Pattern must have 5 fields") is safe to forward: it
+        // names no host path, only the rule broken.
+        let recurrence = recurrence.map_err(|e| RpcError::BadRequest(e.to_string()))?;
+        let new = NewSchedule { name, cwd, prompt, agent_id, recurrence };
+        store.create(new, self.now_local()).map_err(|e| {
+            // A store error here is a disk/SQL failure, whose text can name the
+            // database path — logged, not forwarded.
+            tracing::warn!(error = %e, "creating schedule failed");
+            RpcError::Internal("could not create the schedule".into())
+        })
     }
 
     /// Delete a schedule. Idempotent — deleting one already gone is success.
@@ -224,7 +275,7 @@ fn to_wire(s: &Schedule) -> ScheduleWire {
         cwd: s.cwd.clone(),
         prompt: s.prompt.clone(),
         agent_id: s.agent_id.clone(),
-        recurrence: recurrence_to_wire(&s.recurrence),
+        recurrence: recurrence_to_wire(&s.recurrence, s.next_fire_at),
         enabled: s.enabled,
         next_fire_at: s.next_fire_at.to_rfc3339(),
         summary: describe(&s.recurrence),
@@ -235,13 +286,70 @@ fn run_to_wire(r: &ScheduleRun) -> ScheduleRunWire {
     crate::schedule_runner::schedule_run_to_wire(r)
 }
 
-fn recurrence_to_wire(r: &Recurrence) -> RecurrenceWire {
+fn to_wire_v2(s: &Schedule) -> ScheduleV2Wire {
+    ScheduleV2Wire {
+        id: s.id.clone(),
+        name: s.name.clone(),
+        cwd: s.cwd.clone(),
+        prompt: s.prompt.clone(),
+        agent_id: s.agent_id.clone(),
+        recurrence: recurrence_to_wire_v2(&s.recurrence),
+        enabled: s.enabled,
+        next_fire_at: s.next_fire_at.to_rfc3339(),
+        summary: describe(&s.recurrence),
+    }
+}
+
+/// Store → the v18 wire enum, which has no cron variant and cannot gain one.
+///
+/// **This is the single place a cron schedule is degraded**, and both the
+/// schedule and heartbeat surfaces route through it so the two can never grow
+/// different stand-ins. A cron schedule becomes a `DailyAt` at the wall-clock
+/// time of its next fire: the closest thing the v18 vocabulary can say, and
+/// close enough to read sensibly if a peer ever surfaced it.
+///
+/// It is safe *because* nothing acts on it. `ScheduleWire.summary` and
+/// `.next_fire_at` travel beside it and stay exact, and every consumer of a
+/// listed schedule reads those instead of this field.
+///
+/// The invariant that keeps it safe is **"no UI prefills a recurrence from a
+/// listed row"** — deliberately stated that way rather than as "no edit verb
+/// exists". No edit verb does exist, but `DeleteSchedule` + `CreateSchedule`
+/// would compose into one without any wire change at all, and such an edit
+/// would write this stand-in back over a real cron rule. See the note on
+/// [`ScheduleWire::recurrence`] before building one.
+/// `next_fire_at` is the schedule's **stored** next fire — the same value that
+/// ships in the frame beside this field — and not a freshly computed one. Those
+/// two differ for any pattern with more than one fire a day: `0 9,17 * * *`
+/// listed at 10:00 would recompute to 17:00 while the frame's `next_fire_at`
+/// still reads 09:00, giving one frame two answers about one schedule. Taking
+/// it as an argument also keeps this function off the system clock, which the
+/// injected [`Dispatcher::now_local`] exists to avoid.
+pub(super) fn recurrence_to_wire(
+    r: &Recurrence,
+    next_fire_at: DateTime<Local>,
+) -> RecurrenceWire {
     match *r {
         Recurrence::EveryMinutes(minutes) => RecurrenceWire::EveryMinutes { minutes },
         Recurrence::DailyAt { hour, minute } => RecurrenceWire::DailyAt { hour, minute },
         Recurrence::WeeklyAt { weekday, hour, minute } => {
             RecurrenceWire::WeeklyAt { weekday, hour, minute }
         }
+        Recurrence::Cron(_) => RecurrenceWire::DailyAt {
+            hour: next_fire_at.hour() as u8,
+            minute: next_fire_at.minute() as u8,
+        },
+    }
+}
+
+fn recurrence_to_wire_v2(r: &Recurrence) -> RecurrenceV2Wire {
+    match *r {
+        Recurrence::EveryMinutes(minutes) => RecurrenceV2Wire::EveryMinutes { minutes },
+        Recurrence::DailyAt { hour, minute } => RecurrenceV2Wire::DailyAt { hour, minute },
+        Recurrence::WeeklyAt { weekday, hour, minute } => {
+            RecurrenceV2Wire::WeeklyAt { weekday, hour, minute }
+        }
+        Recurrence::Cron(ref expr) => RecurrenceV2Wire::Cron { expr: expr.clone() },
     }
 }
 
@@ -254,5 +362,23 @@ fn from_wire(w: RecurrenceWire) -> Result<Recurrence, oximux_agents::schedule::R
         RecurrenceWire::WeeklyAt { weekday, hour, minute } => {
             Recurrence::weekly_at(weekday, hour, minute)
         }
+    }
+}
+
+/// The v23 wire → a validated store recurrence.
+///
+/// `Recurrence::cron` is where a bad expression is refused, so this is the only
+/// path a cron pattern may reach the store by — the same reason [`from_wire`]
+/// goes through constructors rather than enum literals.
+fn from_wire_v2(
+    w: RecurrenceV2Wire,
+) -> Result<Recurrence, oximux_agents::schedule::RecurrenceError> {
+    match w {
+        RecurrenceV2Wire::EveryMinutes { minutes } => Recurrence::every_minutes(minutes),
+        RecurrenceV2Wire::DailyAt { hour, minute } => Recurrence::daily_at(hour, minute),
+        RecurrenceV2Wire::WeeklyAt { weekday, hour, minute } => {
+            Recurrence::weekly_at(weekday, hour, minute)
+        }
+        RecurrenceV2Wire::Cron { expr } => Recurrence::cron(&expr),
     }
 }

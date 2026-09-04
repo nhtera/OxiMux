@@ -1,7 +1,8 @@
 [toolchain]
 # Pinned to the GPUI framework's required toolchain (zed-industries/zed).
 # GPUI + many transitive deps (smol_str, image, icu_*, heapless, home) demand
-# >= 1.89. Bump together with the GPUI SHA tuple — see docs/gpui-pins.md.
+# >= 1.89; the PDF renderer (hayro 0.7) lifts the floor to 1.92. Bump together
+# with the GPUI SHA tuple — see docs/gpui-pins.md.
 channel = "1.95.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

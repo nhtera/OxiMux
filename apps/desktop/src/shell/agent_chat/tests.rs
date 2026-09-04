@@ -89,6 +89,28 @@
         assert!(matches!(state, Some(ProbeState::Failed)));
     }
 
+    /// The picker's model count prefers a landed probe, then the cache's disk
+    /// seed, then the roster's static list; with none of those the probe state
+    /// itself is the answer.
+    #[test]
+    fn agent_model_count_prefers_probe_then_cache_then_roster() {
+        use super::composer::AgentModelCount;
+        use oximux_agents::thread::ModelChoice;
+        let m = |n: usize| ProbedCatalog {
+            models: (0..n)
+                .map(|i| ModelChoice { wire: i.to_string(), label: i.to_string(), description: None })
+                .collect(),
+            default_model: None,
+        };
+        let ready = ProbeState::Ready(m(4));
+        assert_eq!(agent_model_count(Some(&ready), Some(9), 9), AgentModelCount::Known(4));
+        assert_eq!(agent_model_count(Some(&ProbeState::Loading), Some(3), 0), AgentModelCount::Known(3));
+        assert_eq!(agent_model_count(None, None, 4), AgentModelCount::Known(4));
+        assert_eq!(agent_model_count(Some(&ProbeState::Loading), None, 0), AgentModelCount::Loading);
+        assert_eq!(agent_model_count(Some(&ProbeState::Failed), None, 0), AgentModelCount::Failed);
+        assert_eq!(agent_model_count(None, None, 0), AgentModelCount::Unknown);
+    }
+
     #[gpui::test]
     async fn disconnect_fails_closed_pending_permission(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
@@ -1634,10 +1656,12 @@
                 assert_eq!(view.model_for_test(), None);
                 assert!(!view.is_bound_for_test());
 
-                // Back to Claude, then switch the model on the draft: it records
-                // the pick (no respawn) and still hasn't bound.
+                // Back to Claude: the draft holds no model (the picker shows the
+                // vocab's default and the bind sends no `--model`, so the CLI's
+                // own default applies). Then switch the model on the draft: it
+                // records the pick (no respawn) and still hasn't bound.
                 view.change_agent("claude-code".into(), cx);
-                assert_eq!(view.model_for_test(), Some("opus"));
+                assert_eq!(view.model_for_test(), None);
                 view.change_model("sonnet".into(), cx);
                 assert_eq!(view.model_for_test(), Some("sonnet"));
                 assert!(!view.is_bound_for_test(), "a model pick on a draft must not bind");
@@ -1669,9 +1693,11 @@
         window
             .update(cx, |view, _window, cx| {
                 view.make_unbound_for_test();
-                // Codex/ACP are exactly the dynamic-model agents a live probe targets.
+                // Codex/ACP are exactly the dynamic-model agents a live probe targets;
+                // Claude joined them when its list started coming from the CLI.
                 view.change_agent("codex".into(), cx);
                 view.change_agent("opencode".into(), cx);
+                view.change_agent("claude-code".into(), cx);
                 assert!(
                     view.probed_catalogs.is_empty(),
                     "a stub-connection view must not spawn a live catalog probe"
@@ -2448,3 +2474,362 @@
             })
             .expect("window update");
     }
+
+#[test]
+fn a_dropped_path_inside_the_cwd_becomes_a_relative_mention() {
+    // Relative is the form the `@` overlay offers (its candidates come from a
+    // cwd scan) and the form the agent's own tools resolve against, so a drop
+    // and a typed mention must produce the SAME token for the same file.
+    use std::path::Path;
+    assert_eq!(
+        super::mention_form_in(Path::new("/proj"), Path::new("/proj/src/main.rs")),
+        "src/main.rs"
+    );
+    // The cwd itself has no useful relative form; an empty token would be worse
+    // than the directory name, but this is the degenerate case — assert the
+    // behavior rather than pretend it can't happen.
+    assert_eq!(super::mention_form_in(Path::new("/proj"), Path::new("/proj")), "");
+}
+
+#[test]
+fn a_dropped_path_outside_the_cwd_stays_absolute() {
+    // No relative form the agent could resolve, so it must not become a
+    // `../../..` chain that reads as noise and points somewhere else if the
+    // agent's own cwd differs.
+    use std::path::Path;
+    assert_eq!(
+        super::mention_form_in(Path::new("/proj"), Path::new("/etc/hosts")),
+        "/etc/hosts"
+    );
+    assert_eq!(
+        super::mention_form_in(Path::new("/proj/a"), Path::new("/proj/b/x.rs")),
+        "/proj/b/x.rs"
+    );
+}
+
+/// End-to-end cover for the explorer/Finder drop path, through the real
+/// composer rather than the string helper.
+///
+/// The bug class this pins is not arithmetic: it is a drop that lands, consumes
+/// the drag, and produces nothing — which is exactly what the explorer drag did
+/// before this handler existed, and what a non-image Finder drop did before the
+/// helper learned to insert paths. Only driving the real view catches a
+/// regression back to silence.
+#[gpui::test]
+fn dropping_a_source_file_puts_a_mention_in_the_composer(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| {
+        AgentChatView::with_connection_for_test(
+            std::sync::Arc::new(StubConnection::default()),
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            window,
+            cx,
+        )
+    });
+    window
+        .update(cx, |view, window, cx| {
+            view.cwd = std::path::PathBuf::from("/proj");
+
+            // Inside the cwd → relative, the same token the `@` overlay makes.
+            view.attach_dropped_paths(
+                vec![std::path::PathBuf::from("/proj/src/main.rs")],
+                window,
+                cx,
+            );
+            assert_eq!(
+                view.composer.read(cx).current_draft(cx),
+                "@src/main.rs ",
+                "a dropped source file must reach the prompt"
+            );
+
+            // A second drop appends rather than replacing.
+            view.attach_dropped_paths(
+                vec![std::path::PathBuf::from("/proj/README.md")],
+                window,
+                cx,
+            );
+            assert_eq!(
+                view.composer.read(cx).current_draft(cx),
+                "@src/main.rs @README.md ",
+                "a second drop appends"
+            );
+
+            // Outside the cwd → absolute, never a `../..` chain.
+            view.attach_dropped_paths(vec![std::path::PathBuf::from("/etc/hosts")], window, cx);
+            assert_eq!(
+                view.composer.read(cx).current_draft(cx),
+                "@src/main.rs @README.md @/etc/hosts ",
+                "an outside path stays absolute"
+            );
+        })
+        .expect("drop non-image files");
+}
+
+/// An image drop must NOT put its path in the prompt — it is staged as an
+/// attachment instead. The split is the whole point of the handler, and getting
+/// it backwards would send the agent a path where it expected to see a picture.
+#[gpui::test]
+fn dropping_an_image_does_not_write_its_path_into_the_prompt(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| {
+        AgentChatView::with_connection_for_test(
+            std::sync::Arc::new(StubConnection::default()),
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            window,
+            cx,
+        )
+    });
+    window
+        .update(cx, |view, window, cx| {
+            view.cwd = std::path::PathBuf::from("/proj");
+            view.attach_dropped_paths(
+                vec![
+                    std::path::PathBuf::from("/proj/shot.png"),
+                    std::path::PathBuf::from("/proj/src/main.rs"),
+                ],
+                window,
+                cx,
+            );
+            // Only the source file is a mention. The png routes to the image
+            // staging path (which reads the file on a background executor and
+            // stages nothing for a path that does not exist — irrelevant here;
+            // what matters is that it never becomes prompt text).
+            assert_eq!(
+                view.composer.read(cx).current_draft(cx),
+                "@src/main.rs ",
+                "an image path must not be written into the prompt"
+            );
+        })
+        .expect("drop a mixed selection");
+}
+
+/// A respawn must LAYER the EnvVar-auth credentials over the adapter's
+/// configured launch env, not replace it.
+///
+/// This pins a real defect. `respawn_spec` did `spec.env = env`, which was
+/// harmless while nothing else populated `spec.env` — and became silent
+/// breakage the moment launch env started riding on `ChatBackend`: an
+/// authenticated respawn would drop the configured base URL and reconnect to
+/// the default endpoint, with no error anywhere. The pill would say connected
+/// and the traffic would go to the wrong provider.
+#[gpui::test]
+fn a_respawn_layers_auth_env_over_the_configured_launch_env(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| {
+        AgentChatView::with_connection_for_test(
+            std::sync::Arc::new(StubConnection::default()),
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            window,
+            cx,
+        )
+    });
+    window
+        .update(cx, |view, _window, _cx| {
+            view.backend.env = vec![
+                ("ANTHROPIC_BASE_URL".into(), "https://proxy.internal/v1".into()),
+                ("HTTPS_PROXY".into(), "http://corp:3128".into()),
+            ];
+
+            // A plain respawn (model switch, Stop-then-send) carries the
+            // configured env and nothing else.
+            let plain = view.respawn_spec(Vec::new(), None);
+            assert_eq!(
+                plain.env,
+                vec![
+                    ("ANTHROPIC_BASE_URL".to_string(), "https://proxy.internal/v1".to_string()),
+                    ("HTTPS_PROXY".to_string(), "http://corp:3128".to_string()),
+                ],
+                "a respawn must carry the adapter's configured env"
+            );
+
+            // An EnvVar-auth respawn adds the typed credential and keeps the rest.
+            let authed = view.respawn_spec(
+                vec![("ANTHROPIC_API_KEY".into(), "sk-typed".into())],
+                Some("api-key".into()),
+            );
+            assert!(
+                authed.env.contains(&(
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    "https://proxy.internal/v1".to_string()
+                )),
+                "auth env must not wipe the configured base URL: {:?}",
+                authed.env
+            );
+            assert!(
+                authed
+                    .env
+                    .contains(&("ANTHROPIC_API_KEY".to_string(), "sk-typed".to_string())),
+                "the typed credential must reach the respawn"
+            );
+            assert_eq!(authed.auth_method.as_deref(), Some("api-key"));
+
+            // On a key collision the credential wins — it is applied last, and
+            // `Command::envs` takes the final value for a repeated key.
+            let collide = view.respawn_spec(
+                vec![("ANTHROPIC_BASE_URL".into(), "https://auth-supplied/v1".into())],
+                None,
+            );
+            let last = collide
+                .env
+                .iter()
+                .rfind(|(k, _)| k == "ANTHROPIC_BASE_URL")
+                .expect("base url present");
+            assert_eq!(
+                last.1, "https://auth-supplied/v1",
+                "the auth-supplied value must be the effective one"
+            );
+        })
+        .expect("respawn spec");
+}
+
+/// The drop overlay's label has to describe what a drop will actually DO, and
+/// this chat does two different things: an image is attached, anything else
+/// becomes an `@path` mention. A single "Drop to attach" — the wording the
+/// reference app uses, because it only ever attaches — would be a lie for a
+/// source file, which is the more common drag here.
+#[test]
+fn the_drop_label_describes_what_the_drop_will_do() {
+    use std::path::PathBuf;
+    let img = |n: &str| PathBuf::from(n);
+    // Every path an image → it attaches.
+    assert_eq!(
+        AgentChatView::drop_hint_for(&[img("a.png"), img("b.JPEG")]).to_string(),
+        "Drop to attach"
+    );
+    // Any non-image in the set → at least one becomes a mention, so the
+    // narrower word would be wrong.
+    assert_eq!(
+        AgentChatView::drop_hint_for(&[img("a.png"), img("main.rs")]).to_string(),
+        "Drop to add"
+    );
+    assert_eq!(AgentChatView::drop_hint_for(&[img("main.rs")]).to_string(), "Drop to add");
+    // A drag reporting no paths yet falls back to the neutral wording rather
+    // than claiming an attach it cannot promise.
+    assert_eq!(AgentChatView::drop_hint_for(&[]).to_string(), "Drop to add");
+}
+
+/// The affordance arms only while the pointer is actually over this chat.
+///
+/// `on_drag_move` fires for a drag anywhere in the window once the element has
+/// a handler, so without the bounds test the overlay would light up while
+/// dragging over a sibling pane — telling the user they can drop somewhere they
+/// cannot.
+#[gpui::test]
+fn the_drop_overlay_arms_only_while_the_pointer_is_inside(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| {
+        AgentChatView::with_connection_for_test(
+            std::sync::Arc::new(StubConnection::default()),
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            window,
+            cx,
+        )
+    });
+    window
+        .update(cx, |view, _window, cx| {
+            let png = [std::path::PathBuf::from("shot.png")];
+            let rs = [std::path::PathBuf::from("main.rs")];
+            assert!(view.drop_hint.is_none(), "idle chat shows no affordance");
+
+            view.set_drop_hint(true, &png, cx);
+            assert_eq!(view.drop_hint.as_deref(), Some("Drop to attach"));
+
+            // Moving onto a different payload updates the label in place.
+            view.set_drop_hint(true, &rs, cx);
+            assert_eq!(view.drop_hint.as_deref(), Some("Drop to add"));
+
+            // Leaving the bounds retires it.
+            view.set_drop_hint(false, &rs, cx);
+            assert!(view.drop_hint.is_none(), "a drag outside the chat must not arm it");
+        })
+        .expect("drag tracking");
+}
+
+/// A completed drop retires the affordance immediately rather than leaving it
+/// to the next paint's self-heal — a visible frame of "Drop to add" after the
+/// file has already landed reads as a drop that failed.
+#[gpui::test]
+fn a_completed_drop_retires_the_overlay(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| {
+        AgentChatView::with_connection_for_test(
+            std::sync::Arc::new(StubConnection::default()),
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            window,
+            cx,
+        )
+    });
+    window
+        .update(cx, |view, window, cx| {
+            view.cwd = std::path::PathBuf::from("/proj");
+            view.set_drop_hint(true, &[std::path::PathBuf::from("/proj/main.rs")], cx);
+            assert!(view.drop_hint.is_some(), "armed while hovering");
+
+            view.attach_dropped_paths(
+                vec![std::path::PathBuf::from("/proj/main.rs")],
+                window,
+                cx,
+            );
+            assert!(view.drop_hint.is_none(), "the drop clears it");
+            assert_eq!(view.composer.read(cx).current_draft(cx), "@main.rs ");
+        })
+        .expect("drop clears the overlay");
+}
+
+/// The drop overlay lays out and paints inside a real frame.
+///
+/// It is an absolutely-positioned child of a flex column, which is precisely
+/// the shape GPUI faults on when the positioning context is missing — and a
+/// layout fault is a runtime panic that neither `cargo check` nor the state
+/// tests above would report.
+#[gpui::test]
+fn the_drop_overlay_paints(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| {
+        AgentChatView::with_connection_for_test(
+            std::sync::Arc::new(StubConnection::default()),
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            window,
+            cx,
+        )
+    });
+    // Some transcript content, so the overlay is painted over children that
+    // draw their own backgrounds — the exact condition the old background-tint
+    // approach failed under.
+    window
+        .update(cx, |view, _window, cx| {
+            view.thread.push_user_message_with_images("question", Vec::new());
+            view.on_event(
+                oximux_agents::thread::ThreadEvent::AssistantText("reply\n".repeat(40)),
+                cx,
+            );
+            view.set_drop_hint(true, &[std::path::PathBuf::from("main.rs")], cx);
+        })
+        .expect("arm the overlay");
+
+    let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+    vcx.simulate_resize(gpui::size(gpui::px(1000.0), gpui::px(700.0)));
+    vcx.run_until_parked();
+
+    window
+        .update(&mut vcx.cx, |view, _window, _cx| {
+            assert_eq!(
+                view.drop_hint.as_deref(),
+                Some("Drop to add"),
+                "the affordance survives a paint"
+            );
+        })
+        .expect("painted");
+}

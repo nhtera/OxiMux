@@ -74,7 +74,8 @@ impl ChatRosterEntry {
 
 /// The pre-bind model vocabulary for a built-in adapter. Claude's static list
 /// carries pretty labels + capability blurbs (the single source lives in
-/// `oximux-agents`).
+/// `oximux-agents`); it is the seed painted until the draft's catalog probe
+/// brings back the installed CLI's own `/model` rows, which then replace it.
 ///
 /// Codex offers **no** pre-bind models on purpose: its real catalog only arrives
 /// from the `codex app-server` `model/list` handshake, and its terminal-launcher

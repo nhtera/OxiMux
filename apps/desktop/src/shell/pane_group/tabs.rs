@@ -1366,12 +1366,19 @@ impl PaneGroup {
         cx: &mut Context<Self>,
     ) {
         let runtime = self.cli_runtime.clone();
-        // Per-agent launch defaults (model fallback + extra args).
-        let (model, extra_args) = {
+        // Per-agent launch defaults (model fallback + extra args + env), read
+        // under the chat's own profile so the companion terminal reaches the
+        // same endpoint/account as the chat it is resuming.
+        let profile = spec.profile.clone();
+        let (model, extra_args, env) = {
             let defaults = cx.try_global::<AgentLaunchSettings>();
+            let sel = profile.as_deref();
             (
-                spec.model.clone().or_else(|| defaults.and_then(|d| d.model_for(spec.adapter_id))),
-                defaults.map(|d| d.args_for(spec.adapter_id)).unwrap_or_default(),
+                spec.model
+                    .clone()
+                    .or_else(|| defaults.and_then(|d| d.model_for_in(spec.adapter_id, sel))),
+                defaults.map(|d| d.args_for_in(spec.adapter_id, sel)).unwrap_or_default(),
+                defaults.map(|d| d.env_for(spec.adapter_id, sel)).unwrap_or_default(),
             )
         };
         let adapter = spec.adapter;
@@ -1408,7 +1415,7 @@ impl PaneGroup {
                 model,
                 effort,
                 extra_args,
-                env: Vec::new(),
+                env,
                 cols: DEFAULT_COLS,
                 rows: DEFAULT_ROWS,
                 custom_command,
@@ -2094,6 +2101,7 @@ impl PaneGroup {
         backend: SharedBackend,
         term_id: TerminalSessionId,
         label_override: Option<String>,
+        profile: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -2143,6 +2151,7 @@ impl PaneGroup {
                 effort,
                 session_id,
                 status_rx,
+                profile,
             },
             color: None,
             custom_title: None,

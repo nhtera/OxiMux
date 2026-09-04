@@ -13,6 +13,15 @@
 //! postcard would misparse every element after a new variant. So an expression
 //! outside the mappable set is refused by name rather than silently rounded to
 //! something near it — see [`parse_cron`].
+//!
+//! **Schedules moved past this in v23; heartbeats have not.** A full cron
+//! expression now has a host-side home (`Recurrence::Cron`) and a wire to ride
+//! on, but only for schedules: `Request::CreateScheduleV2` carries
+//! `RecurrenceV2Wire`, while `Request::CreateHeartbeat` still carries the closed
+//! `RecurrenceWire` and has no v2 twin. So `heartbeat --cron` and
+//! `schedule --cron` accept different grammars for now — a known wart, not an
+//! oversight. Widening this one means giving heartbeats the same V2 treatment
+//! schedules got, degradation path included.
 
 use oximux_agents::schedule::recurrence::MIN_INTERVAL_MINUTES;
 use oximux_remote_proto::messages::{CreateHeartbeatReq, HeartbeatWire, RecurrenceWire};
@@ -29,6 +38,15 @@ use crate::output::Failure;
 const SUPPORTED_CRON: &str = "supported: \"*/N * * * *\" (every N minutes, N ≥ 5), \
      \"M H * * *\" (daily at H:M), \"M H * * DOW\" (weekly)";
 
+/// Where a full cron expression *is* accepted, named in every refusal so the
+/// error points somewhere rather than only saying no. A heartbeat wakes a
+/// session that already exists and a schedule opens a fresh one, so this is a
+/// redirection with a real trade-off — but a user who wrote `0 9 * * 1-5`
+/// wants that cadence, and it exists.
+const CRON_LIVES_AT: &str =
+    "a full five-field expression (ranges, lists, day-of-month) works on \
+     `oximux schedule create --cron`, which opens a new session per fire";
+
 /// The `N ≥ 5` above is written out in prose, which a `const &str` cannot
 /// interpolate — so pin it here instead of letting the help text drift away
 /// from the rule it claims to teach.
@@ -40,10 +58,17 @@ const _: () = assert!(
 /// Parse a five-field cron expression into the host's recurrence vocabulary.
 ///
 /// Deliberately narrow. Ranges, lists, step values outside the minute field,
-/// and day-of-month/month constraints have no representation host-side, and
-/// accepting them would mean firing on a cadence the user did not write.
+/// and day-of-month/month constraints cannot be expressed by the closed
+/// `RecurrenceWire` this verb sends, and accepting them would mean firing on a
+/// cadence the user did not write.
+///
+/// The narrowness is now a **wire** limit, not a host one. Until v23 the host
+/// genuinely could not store such a rule; `Recurrence::Cron` can, and
+/// `schedule --cron` reaches it. `CreateHeartbeat` has no v2 twin to carry it,
+/// so this stays narrow until one exists — and the refusal points at
+/// `schedule --cron` rather than pretending the shape is unrepresentable.
 pub fn parse_cron(expr: &str) -> Result<RecurrenceWire, Failure> {
-    let refuse = |msg: String| Failure::new("usage", exit::USAGE, msg).with_steps([SUPPORTED_CRON.into()]);
+    let refuse = |msg: String| Failure::new("usage", exit::USAGE, msg).with_steps([SUPPORTED_CRON.into(), CRON_LIVES_AT.into()]);
     let fields: Vec<&str> = expr.split_whitespace().collect();
     if fields.len() != 5 {
         return Err(refuse(format!(
@@ -297,5 +322,29 @@ mod tests {
             parse_cron("*/5 * * * *").unwrap(),
             RecurrenceWire::EveryMinutes { minutes: MIN_INTERVAL_MINUTES }
         );
+    }
+
+    /// A shape this verb cannot take must say where it *can* be taken.
+    ///
+    /// Since v23 the host can store a full cron expression — just not through
+    /// `CreateHeartbeat`, whose `RecurrenceWire` is closed. A bare "unsupported"
+    /// would now be misleading: the cadence the user wrote is representable,
+    /// only on the other verb. Pinned because the split is a known wart, and a
+    /// wart with a signpost is very different from one without.
+    #[test]
+    fn a_shape_this_verb_cannot_take_points_at_the_one_that_can() {
+        for full_cron in ["0 9 * * 1-5", "0 9 1 * *", "0 9,17 * * *"] {
+            let err = parse_cron(full_cron).expect_err("outside the mappable set");
+            assert_eq!(err.exit, exit::USAGE, "{full_cron}");
+            assert!(
+                err.next_steps.iter().any(|s| s.contains("schedule create --cron")),
+                "{full_cron}: the refusal must name where a full expression works, got {:?}",
+                err.next_steps
+            );
+            assert!(
+                err.next_steps.iter().any(|s| s.contains("supported:")),
+                "{full_cron}: and still teach this verb's own set"
+            );
+        }
     }
 }

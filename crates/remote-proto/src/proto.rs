@@ -93,12 +93,36 @@ pub use crate::messages::*;
 /// `StateWatch` is untouched and still served: a v18 peer keeps working exactly
 /// as before, and gets the cursor-less push it has a decoder for.
 ///
+/// v22: appended **per-role agents in a team run** (`TeamRunCreateV2` and
+/// `TeamStatusV2`, answered by `TeamRunV2`). v18 put one `--agent` on the whole
+/// run because that is what the launcher took; the loop teams are built around
+/// is one agent planning while another implements, which makes the choice a
+/// property of the role. New verbs and new wire types rather than fields on the
+/// v18 ones, for the reason stated on `ListWorktreeProgress`: everything in
+/// `TeamRunCreateReq.roles` and `TeamRunWire.roles` is a positional postcard
+/// struct a v18 CLI already sends and decodes. The v18 verbs are untouched and
+/// still served.
+///
+/// v23: appended **cron schedules** (`CreateScheduleV2` and `ListSchedulesV2`,
+/// answered by `ScheduleCreatedV2` / `SchedulesV2`). The three preset
+/// recurrences cannot say "weekdays at 09:00", which until now needed a
+/// heartbeat workaround. New verbs and a new `RecurrenceV2Wire` rather than a
+/// fourth variant on `RecurrenceWire`, and here the reason is sharper than
+/// usual: `RecurrenceWire` rides inside `Vec<ScheduleWire>` *replies* as well as
+/// inside `CreateSchedule`, so a fourth ordinal would make one cron schedule
+/// render every `ListSchedules` reply undecodable for a pre-v23 peer — every
+/// row, not just the cron one. The v18 verbs are untouched and still served;
+/// a cron schedule reaches them as the stand-in documented on
+/// `ScheduleWire::recurrence`. Heartbeats are deliberately not included: nothing
+/// asks for a cron heartbeat, and leaving them out means `HeartbeatWire` needs
+/// no degradation path at all.
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -125,6 +149,31 @@ pub const STATE_PUSH_MIN_VERSION: u32 = 18;
 /// that — but the gate is stated so it is a property of the push rather than an
 /// inference about who could have subscribed.
 pub const STATE_CURSOR_PUSH_MIN_VERSION: u32 = 19;
+
+/// The oldest host that serves the per-role team verbs
+/// ([`Request::TeamRunCreateV2`], [`Request::TeamStatusV2`]).
+///
+/// Unlike the push gates above, this one is read by the **client**: an older
+/// host cannot decode an ordinal it does not know, and answers
+/// [`RpcError::BadRequest`] with "undecodable request frame" — a message about
+/// a malformed request, for what is really a version problem, and one a caller
+/// has no way to act on. So a client must not send these to one. A client that
+/// wants only what v18 could
+/// do falls back to the v18 verbs rather than refusing — the older host can
+/// honour that request exactly, and the board it returns simply has no agent
+/// column. Only a request that actually names a per-role agent or model is
+/// refused, because that one it genuinely cannot serve.
+pub const TEAM_PER_ROLE_MIN_VERSION: u32 = 22;
+
+/// The oldest host that understands a cron recurrence.
+///
+/// Read by the **client**, like [`TEAM_PER_ROLE_MIN_VERSION`] and for the same
+/// reason: a host below this cannot decode `Request::CreateScheduleV2` at all,
+/// and answers an undecodable frame rather than a refusal a user could read.
+/// Gate on what the command *asks for* — a plain `schedule create` with a
+/// preset recurrence still works against any v10 host, so only `--cron` may
+/// require this.
+pub const SCHEDULE_CRON_MIN_VERSION: u32 = 23;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the
@@ -624,6 +673,94 @@ pub enum Request {
     /// encodes a struct-like variant positionally: widening the existing one
     /// would misparse on every peer that predates the change.
     StateWatchFrom { prefix: Option<String>, since_seq: Option<u64> },
+
+    // ---- v21: worktree progress board ----
+    /// Set a worktree's progress line and/or work phase — the agent-writable
+    /// answer to "what is happening in this worktree".
+    ///
+    /// `None` leaves a field untouched; `Some("")` clears it. That distinction
+    /// is the whole reason both are `Option<String>`: an agent updating only
+    /// its phase must not blank the comment it wrote a minute ago.
+    ///
+    /// **Gated as coordination state, not as worktree management.** The
+    /// worktree gates ([`AuthStore::may_manage_worktrees`]) are full-scope
+    /// because creating and removing worktrees writes the filesystem and the
+    /// repository. Writing a status line does neither, and the primary caller
+    /// is a *session-confined agent describing its own work* — precisely the
+    /// caller full scope excludes. So this shares the coordination
+    /// blackboard's reach instead, for the same reason the blackboard has it:
+    /// the payload is agent-authored text, carrying no host path, no branch
+    /// name, and no session content.
+    ///
+    /// An unrecognised `phase` is refused with [`RpcError::BadRequest`] — the
+    /// vocabulary is closed at the write edge, while readers stay lenient. The
+    /// reply is [`Response::Ack`]; an id no worktree holds is a
+    /// [`RpcError::BadRequest`] rather than a silent success, since the caller
+    /// asked for a specific row to change.
+    SetWorktreeProgress { id: String, comment: Option<String>, phase: Option<String> },
+    /// The progress lines of a project's worktrees (or of every project when
+    /// `None`) — a sidecar to [`Request::ListWorktrees`], joined by id.
+    ///
+    /// **Why a second call rather than fields on [`WorktreeWire`].** That type
+    /// travels inside [`Response::Worktrees`], a `Vec` reply that v16 peers
+    /// already request. Postcard encodes struct fields positionally, so an
+    /// appended field makes every older decoder misparse each element after the
+    /// first — at best a decode error, at worst rows that parse into plausible
+    /// garbage, and never a skipped field. Frozen types get a new verb; only
+    /// the envelope enums tolerate appends.
+    ///
+    /// Rows whose comment and phase are both unset are omitted, so the common
+    /// case costs an empty vector.
+    ListWorktreeProgress { project_path: Option<String> },
+
+    // ---- v22: per-role agents in a team run ----
+    /// Open a team run whose roles each name their own agent and model.
+    ///
+    /// Gated exactly as [`Request::TeamRunCreate`], which it does not replace:
+    /// that verb still works and still opens a run where one agent covers
+    /// every role.
+    ///
+    /// **Why a second verb rather than fields on [`TeamRoleSpecWire`].** That
+    /// type travels inside `TeamRunCreateReq.roles`, a `Vec` a v18 CLI already
+    /// sends. Postcard encodes struct fields positionally, so a host expecting
+    /// an appended field would misparse every element after the first of an
+    /// older client's request — a rejected frame, not a skipped field. The
+    /// direction is reversed from [`Request::ListWorktreeProgress`]'s case,
+    /// and the conclusion is the same: frozen types get a new verb.
+    TeamRunCreateV2(TeamRunCreateV2Req),
+    /// One run's board, including which agent worked each role.
+    ///
+    /// Same read gate and same answer as [`Request::TeamStatus`], in the
+    /// [`TeamRunV2Wire`] shape. Both verbs are served: a v18 CLI keeps asking
+    /// the old one and gets a board with no agent column, which is the honest
+    /// reading — it has no field to put one in.
+    TeamStatusV2 { run_id: String },
+    /// Create a schedule whose recurrence may be a cron expression.
+    ///
+    /// The v23 successor to [`Request::CreateSchedule`], carrying
+    /// [`RecurrenceV2Wire`] instead of [`RecurrenceWire`]. Gated identically —
+    /// full scope and not read-only — because it is the same standing grant to
+    /// run an agent unattended; cron changes when it fires, not what it may do.
+    ///
+    /// The expression is validated host-side through the same constructor the
+    /// desktop uses. A pattern that will not parse as five fields, one that can
+    /// never fire (`0 9 30 2 *`), and one tighter than the interval floor are
+    /// all refused rather than stored.
+    CreateScheduleV2 {
+        name: String,
+        cwd: String,
+        prompt: String,
+        agent_id: Option<String>,
+        recurrence: RecurrenceV2Wire,
+    },
+    /// Every schedule, with cron expressions intact.
+    ///
+    /// The v23 successor to [`Request::ListSchedules`], same read gate. A client
+    /// that can decode this should always prefer it: the v18 reply substitutes a
+    /// stand-in recurrence for any cron schedule (see
+    /// [`ScheduleWire::recurrence`]), which is fine to *display* and wrong to
+    /// reason about.
+    ListSchedulesV2,
 }
 
 /// Host → client.
@@ -828,6 +965,27 @@ pub enum Response {
     /// subscribed with the cursor-less [`Request::StateWatch`] — that peer has
     /// no decoder for this ordinal.
     StateChangedAt(StateChangeWire),
+    /// Reply to [`Request::ListWorktreeProgress`]. Empty is a normal answer —
+    /// no worktree has said anything about itself yet.
+    WorktreeProgress(Vec<WorktreeProgressWire>),
+
+    // ---- v22: per-role agents in a team run ----
+    /// Reply to [`Request::TeamRunCreateV2`] and [`Request::TeamStatusV2`] —
+    /// one run with every role's state and the agent that worked it.
+    ///
+    /// A run opened through the v18 verb answers here too when asked through
+    /// [`Request::TeamStatusV2`]: its roles simply name no agent, which is
+    /// what they recorded.
+    TeamRunV2(TeamRunV2Wire),
+    /// Reply to [`Request::ListSchedulesV2`]. Empty is a normal answer.
+    ///
+    /// Carries every schedule, not only the cron ones: a client asking the v2
+    /// verb wants one list in one shape, and splitting them across two replies
+    /// would make ordering and paging the client's problem for no gain.
+    SchedulesV2(Vec<ScheduleV2Wire>),
+    /// Reply to [`Request::CreateScheduleV2`] — the stored row, so the client
+    /// can show the resolved next fire without a second round trip.
+    ScheduleCreatedV2(ScheduleV2Wire),
 }
 
 /// What a session's backend offers for its model and permission-mode pickers.

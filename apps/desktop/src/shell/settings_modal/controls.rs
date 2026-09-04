@@ -16,8 +16,10 @@
 
 use gpui::{
     AnyElement, Context, ElementId, Hsla, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, SharedString, Styled, Window, div, prelude::FluentBuilder, px,
+    ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
+    prelude::FluentBuilder, px, svg,
 };
+use gpui_component::tooltip::Tooltip;
 use oximux_settings::{Density, Theme, Typography};
 
 use super::SettingsModal;
@@ -58,6 +60,55 @@ pub(crate) fn value_chip<V: 'static>(
             cx.listener(move |this, _ev, window, cx| on_click(this, window, cx)),
         )
         .child(text.into())
+        .into_any_element()
+}
+
+/// A square icon-only button: an SVG glyph in a bordered tile, with `tip` as
+/// its tooltip. `danger` tints the glyph to the error colour on hover, for an
+/// action that destroys something.
+///
+/// Icon-only because the profile list carries three of these per row and three
+/// text chips would leave the profile's own name and résumé no width to wrap
+/// into — the exact squeeze this card has failed twice. The tooltip is not
+/// decoration: it is the only place the action is named.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn icon_button(
+    id: impl Into<ElementId>,
+    icon: &'static str,
+    tip: impl Into<SharedString>,
+    danger: bool,
+    theme: Theme,
+    density: Density,
+    on_click: impl Fn(&mut SettingsModal, &mut Window, &mut Context<SettingsModal>) + 'static,
+    cx: &mut Context<SettingsModal>,
+) -> AnyElement {
+    let tip = tip.into();
+    // A destructive action reads through the tile, not the glyph: `svg()` does
+    // not inherit `text_color` from its parent (it paints transparent, which is
+    // how this button first shipped as an empty box), and a colour set on the
+    // svg itself cannot follow the parent's hover.
+    let hover_border = if danger { theme.status_error } else { theme.border_active };
+    div()
+        .id(id.into())
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_none()
+        .size(px(density.h_overlay_item))
+        .rounded(px(density.r_chip))
+        .border_1()
+        .border_color(theme.border_inactive)
+        .bg(theme.bg_panel_alt)
+        .cursor_pointer()
+        .hover(|s| {
+            s.border_color(hover_border).bg(Hsla { a: 0.10, ..hover_border })
+        })
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _ev, window, cx| on_click(this, window, cx)),
+        )
+        .child(svg().path(icon).size(px(14.0)).flex_none().text_color(theme.fg_muted))
         .into_any_element()
 }
 

@@ -24,6 +24,7 @@ use oximux_core::AgentAdapter;
 use oximux_settings::{AgentLaunchSettings, Density, Theme, Typography};
 
 use crate::shell::agent_presentation::adapter_icon_path;
+use crate::shell::agent_ui::agent_catalog::{AdapterDetection, agent_catalog};
 use crate::keymap_registry::display_chord_for;
 use crate::ui::FloatingSurface;
 
@@ -60,10 +61,13 @@ pub enum AdapterSelection {
     /// on the first message. Distinct from the per-agent rows below, which bind
     /// eagerly to a specific agent.
     NewAgentDraft,
-    /// One of the registry's available agent adapters.
+    /// One of the registry's available agent adapters, under one of its named
+    /// launch profiles. `profile: None` is the adapter's plain entry — the only
+    /// thing this variant carried before profiles existed.
     Adapter {
         kind: AgentAdapter,
         id: &'static str,
+        profile: Option<String>,
     },
     /// A built-in ACP preset (Cursor/Amp). Chat-only by nature, so the owner
     /// opens it straight as a structured chat tab (via the generic ACP backend)
@@ -165,10 +169,11 @@ impl AdapterPicker {
         &mut self,
         kind: AgentAdapter,
         id: &'static str,
+        profile: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        (self.on_select)(AdapterSelection::Adapter { kind, id }, window, cx);
+        (self.on_select)(AdapterSelection::Adapter { kind, id, profile }, window, cx);
         self.close(cx);
     }
 
@@ -244,12 +249,31 @@ impl AdapterPicker {
 /// returned by `AdapterRegistry::detect_available`, including Custom. This
 /// helper is the only path that filters Custom. Any future code touching
 /// the cache directly must NOT assume cache contents equal display rows.
+/// [`render_rows`] for the catalog's cross-surface invariant test, which lives
+/// beside the catalog rather than here — the property it asserts is about the
+/// two surfaces agreeing, not about this popover.
+#[cfg(test)]
+pub(crate) fn render_rows_for_test<'a>(
+    entries: &'a [RegistryEntry],
+    launch: &AgentLaunchSettings,
+) -> Vec<&'a RegistryEntry> {
+    render_rows(entries, launch)
+}
+
 fn render_rows<'a>(
     entries: &'a [RegistryEntry],
     launch: &AgentLaunchSettings,
 ) -> Vec<&'a RegistryEntry> {
+    // Membership comes from the catalog, which is also what the Agents
+    // settings pane reads — the two lists drifting apart is what let `Custom`
+    // and every ACP agent end up configurable in neither place. What stays
+    // here is the launcher's own DISPLAY filter: it hides `Custom` (which
+    // needs a program/args flow this popover does not have) and anything the
+    // user disabled, neither of which is a statement about what exists.
+    let catalog = agent_catalog(AdapterDetection::Done(entries), None, launch);
     let mut rows: Vec<&RegistryEntry> = entries
         .iter()
+        .filter(|e| catalog.iter().any(|c| c.id == e.adapter_id))
         .filter(|e| e.adapter_enum != AgentAdapter::Custom)
         .filter(|e| !launch.is_disabled(e.adapter_id))
         .collect();
@@ -454,9 +478,13 @@ fn append_preset_rows(
     // of the id, but FALSE when a non-ACP `[agents.<id>]` entry has taken the id
     // over — in which case resolution would fall back to stream-json and silently
     // launch the wrong agent, so the row is omitted rather than misrouting.
+    // Same split as `render_rows`: the catalog decides which presets exist,
+    // this filter decides which of them the launcher offers right now.
+    let catalog = agent_catalog(AdapterDetection::Pending(&[]), None, &launch);
     let rows: Vec<(usize, &oximux_settings::AcpPreset)> = oximux_settings::ACP_PRESETS
         .iter()
         .enumerate()
+        .filter(|(_, p)| catalog.iter().any(|c| c.id == p.id))
         .filter(|(_, p)| !launch.is_disabled(p.id) && launch.chat_capable(p.id))
         .collect();
     if rows.is_empty() {
@@ -543,7 +571,7 @@ fn append_adapter_rows(
         };
         let handler = cx.listener(move |this, _: &MouseDownEvent, window, cx| {
             if matches!(state, RowState::Active) {
-                this.select_adapter(kind, id, window, cx);
+                this.select_adapter(kind, id, None, window, cx);
             }
         });
         card = card.child(picker_row(
@@ -557,6 +585,39 @@ fn append_adapter_rows(
             typography.clone(),
             handler,
         ));
+
+        // One extra row per named launch profile, directly under its agent, so
+        // an alternate endpoint or second account is reachable in the same
+        // click the agent itself is. A profile of an unavailable agent stays
+        // unavailable — the profile changes the environment, not whether the
+        // binary is installed.
+        //
+        // Only agents the user actually configured a profile for grow rows, so
+        // the picker is unchanged for everyone else.
+        for (px, profile) in launch
+            .profile_names(id)
+            .into_iter()
+            .filter(|n| n != oximux_settings::DEFAULT_PROFILE)
+            .enumerate()
+        {
+            let for_handler = profile.clone();
+            let handler = cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                if matches!(state, RowState::Active) {
+                    this.select_adapter(kind, id, Some(for_handler.clone()), window, cx);
+                }
+            });
+            card = card.child(picker_row(
+                ("adapter-profile-row", ix * 100 + px),
+                Some(adapter_icon_path(id)),
+                SharedString::from(format!("{} — {profile}", entry.display_name)),
+                None,
+                state,
+                theme,
+                density,
+                typography.clone(),
+                handler,
+            ));
+        }
     }
     card
 }

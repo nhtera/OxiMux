@@ -20,7 +20,7 @@ use gpui::{
     div, prelude::FluentBuilder, px, svg,
 };
 use gpui_component::input::{Enter as InputEnter, Escape as InputEscape, Input, InputState};
-use oximux_core::Workspace;
+use oximux_core::{WorkPhase, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::left_rail::LeftRail;
@@ -190,6 +190,35 @@ pub fn render_workspace_card(
             .child(issue.clone())
     });
 
+    // Work-phase chip: the agent's declared position in the task, beside the
+    // issue badge. Colored by phase so a glance across the rail separates
+    // "someone is on this" from "this is waiting on me" without reading.
+    // Absent for an unset — or unrecognised — phase; see `WorkspaceCardPlan`.
+    let phase_chip = plan.phase.map(|phase| {
+        let color = match phase {
+            WorkPhase::Todo => theme.status_muted,
+            WorkPhase::InProgress => theme.status_info,
+            WorkPhase::InReview => theme.status_warning,
+            WorkPhase::Done => theme.status_added,
+        };
+        div()
+            .flex()
+            // Never shrink. This chip holds one of four short, known strings,
+            // and a clipped one ("In progr") reads as damage rather than as a
+            // label. The branch chip beside it carries an arbitrary-length name
+            // that stays useful truncated, so on a narrow rail that is the one
+            // that should yield — which is what happens once this refuses to.
+            .flex_shrink_0()
+            .items_center()
+            .px(px(5.0))
+            .h(px(15.0))
+            .rounded(px(density.r_chip))
+            .bg(theme.bg_overlay)
+            .text_size(px(typography.t_sub_label))
+            .text_color(color)
+            .child(phase.label())
+    });
+
     // "Folder" pill for non-git folder projects — shown in line 1 subtext slot.
     let folder_pill = plan.row.is_folder.then(|| {
         div()
@@ -290,6 +319,7 @@ pub fn render_workspace_card(
         .children(primary_badge)
         .children(branch_chip)
         .children(issue_chip)
+        .children(phase_chip)
         .children(folder_pill);
 
     // Line 2 — [agent name ·] agent verb + diff chip. All optional; when
@@ -347,6 +377,25 @@ pub fn render_workspace_card(
             )
     });
 
+    // The worktree's own progress line, in the same slot and shape as the live
+    // title. Truncates identically — one line, ellipsis, never wrapping.
+    let comment_elem = plan.comment.as_ref().map(|comment| {
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_row()
+            .items_center()
+            .child(
+                div()
+                    .min_w_0()
+                    .text_size(px(typography.t_sub_label))
+                    .text_color(theme.fg_base)
+                    .truncate()
+                    .child(comment.clone()),
+            )
+    });
+
     // Diff chip: "+A −B" using status_added / status_removed colors.
     // Clean worktrees (0/0) suppress the chip — an all-zero stat row is
     // noise on every resting workspace.
@@ -377,7 +426,19 @@ pub fn render_workspace_card(
     // When a live title is present it takes the whole line (the prompt is the
     // headline); otherwise fall back to the `name · verb` summary. The diff
     // chip rides along either way.
-    let line2 = if title_elem.is_some() {
+    let line2 = if comment_elem.is_some() {
+        // A progress line the agent wrote about itself outranks the prompt it
+        // was handed: the prompt says what was asked, the comment says where
+        // the work actually is. The dot still carries live status either way.
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .gap(px(density.gap_inline))
+            .children(comment_elem)
+            .children(diff_elem)
+    } else if title_elem.is_some() {
         div()
             .flex()
             .flex_row()

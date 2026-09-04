@@ -35,6 +35,7 @@ async-trait = { workspace = true }
 # standard-base64 `ChatImage` shape the transcript + thumbnail renderer expect.
 base64 = { workspace = true }
 chrono = { workspace = true }
+croner = { workspace = true }
 # Read-only scan of ACP-preset agents' own SQLite session stores for the
 # history/import picker: OpenCode (`~/.local/share/opencode/opencode.db`) and
 # Copilot (`~/.copilot/session-store.db`). Bundled build so no system libsqlite

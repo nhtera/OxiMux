@@ -92,6 +92,86 @@ fn spawn_echo_drains_marker_and_exit() {
     );
 }
 
+/// The launch-env ordering contract, asserted against a real spawn rather than
+/// trusted to a comment.
+///
+/// A per-agent `env` map (an alternate base URL, a proxy) is layered onto the
+/// spawn by the caller. Three things have to hold, and each has a distinct
+/// failure that is silent in production:
+///
+/// 1. **The caller's entries reach the child.** Otherwise the configured
+///    endpoint is simply ignored and the agent talks to the default one.
+/// 2. **The caller wins over the backend's own identity defaults.** The backend
+///    sets `TERM`/`COLORTERM`/`TERM_PROGRAM` and seeds a UTF-8 locale before
+///    reading `cfg.env`; if that order ever flips, a caller override is
+///    overwritten by a default and the user's setting appears to do nothing.
+/// 3. **The inherited environment survives.** No `env_clear` anywhere on this
+///    path — a cleared environment drops `PATH`, and an agent CLI that a
+///    GUI-launched app located via the login shell then fails to spawn at all.
+#[test]
+fn caller_env_reaches_the_child_and_wins_over_backend_defaults() {
+    const CUSTOM: &str = "OXIMUX_ENV_PROBE";
+    const OVERRIDE: &str = "oximux-overridden-term";
+    let mut backend = PortablePtyBackend::new();
+    let id = backend
+        .spawn(SpawnConfig {
+            shell: test_shell(),
+            // One line per fact, each tagged so a partial environment is
+            // distinguishable from a missing one in the failure message.
+            args: run_script(&[
+                &format!("echo probe=${CUSTOM}"),
+                "echo term=$TERM",
+                // `-n` so an inherited-but-empty PATH reads as absent, which is
+                // the failure this line is here to catch.
+                "if [ -n \"$PATH\" ]; then echo path=present; else echo path=EMPTY; fi",
+            ]),
+            env: vec![
+                (CUSTOM.to_string(), "reached".to_string()),
+                // Deliberately collides with an identity default the backend
+                // sets before the caller loop.
+                ("TERM".to_string(), OVERRIDE.to_string()),
+            ],
+            ..SpawnConfig::default()
+        })
+        .expect("spawn env probe shell");
+
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    let mut acc: Vec<u8> = Vec::new();
+    let mut saw_exit = false;
+    while Instant::now() < deadline && !saw_exit {
+        for event in backend.drain_events() {
+            match event {
+                TerminalEvent::Output { id: eid, bytes } if eid == id => {
+                    acc.extend_from_slice(&bytes)
+                }
+                TerminalEvent::Exit { id: eid, .. } if eid == id => saw_exit = true,
+                _ => {}
+            }
+        }
+        if !saw_exit {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+    backend.close(id).expect("close session");
+
+    let out = String::from_utf8_lossy(&acc);
+    assert!(saw_exit, "probe shell did not exit within {TEST_TIMEOUT:?}; got: {out:?}");
+    assert!(
+        out.contains("probe=reached"),
+        "caller env did not reach the child; got: {out:?}"
+    );
+    assert!(
+        out.contains(&format!("term={OVERRIDE}")),
+        "backend identity default overwrote the caller's TERM — cfg.env must be \
+         applied AFTER the defaults; got: {out:?}"
+    );
+    assert!(
+        out.contains("path=present"),
+        "inherited PATH did not survive the spawn (an env_clear on this path); \
+         got: {out:?}"
+    );
+}
+
 #[test]
 fn status_drain_does_not_consume_renderer_output_or_exit() {
     const STATUS_MARKER: &[u8] = b"STATUS_MARKER";

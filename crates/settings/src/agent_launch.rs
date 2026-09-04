@@ -80,6 +80,23 @@ pub struct PerAgentLaunch {
     /// The ACP presets set this to `Chat` so Cursor/Amp open as a structured chat
     /// even when the global default is `Terminal`; any agent can set it too.
     pub default_open_mode: Option<OpenMode>,
+    /// Environment variables layered onto this agent's spawn, applied on top of
+    /// the inherited (and shell-resolved) environment so a key here wins. This
+    /// is how an adapter reaches an alternate base URL, a proxy, or a second
+    /// account without patching source.
+    ///
+    /// **Plaintext.** `agent_launch.toml` is an ordinary file on disk with no
+    /// encryption, so a credential put here is stored in the clear. The settings
+    /// pane says so; this is settings data, not a vault.
+    ///
+    /// `BTreeMap` so TOML serialization is key-sorted and round-trips
+    /// deterministically, matching [`AgentLaunchSettings::agents`].
+    ///
+    /// Skipped when empty: this file is documented as hand-editable, and every
+    /// agent otherwise grows a bare `[agents.<id>.env]` header the moment the
+    /// app rewrites it — noise in a file the user is invited to read.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 /// How a new agent launch opens by default. `Terminal` = the classic raw-PTY
@@ -92,6 +109,92 @@ pub enum OpenMode {
     #[default]
     Terminal,
     Chat,
+}
+
+/// Environment variables a launch profile may not override, each with the
+/// thing that breaks when it does.
+///
+/// This is data with reasons attached, deliberately: a blocklist whose entries
+/// have no stated cause rots into a list nobody dares change. If a real use
+/// case for one of these appears, delete the entry **and its reason together**
+/// rather than adding an escape hatch that disarms the guard for every key.
+///
+/// The `OXIMUX_` prefix is blocked separately — see
+/// [`RESERVED_ENV_PREFIX`].
+pub const RESERVED_ENV_KEYS: [&str; 7] = [
+    // The spawn resolves the agent binary through `PATH`. Replacing it is the
+    // difference between "the agent launched" and "command not found", with no
+    // message that points at this field.
+    "PATH",
+    // Every agent CLI keeps its credentials and config under the home
+    // directory. Repointing it does not give the agent a second account — it
+    // gives it no account, and silently.
+    "HOME",
+    // Read by tooling the agent shells out to (git authorship among them).
+    // A launch is not the place to become a different person.
+    "USER",
+    // The PTY's shell is chosen by the terminal settings, which resolve it
+    // themselves; an override here disagrees with what actually spawned.
+    "SHELL",
+    // The terminal emulator sets this to describe the capabilities it actually
+    // has. A value that claims otherwise produces unreadable output.
+    "TERM",
+    // OxiMux reads `$CODEX_HOME` from its own environment to find Codex's
+    // rollout logs (the usage meter) and to install its status hooks. A launch
+    // that moves it leaves both looking in the wrong directory, and the agent
+    // simply appears to stop reporting.
+    "CODEX_HOME",
+    // Same for Claude Code: the usage meter and hook installer resolve
+    // `$CLAUDE_CONFIG_DIR` app-side, so a per-launch override desynchronises
+    // them from the agent without any error.
+    "CLAUDE_CONFIG_DIR",
+];
+
+/// Variables under this prefix belong to OxiMux itself and are never a
+/// profile's to set. `OXIMUX_SESSION_ID` is the credential a spawned agent
+/// presents to claim its own scope — a profile that could set it could hand
+/// one agent another's authority.
+pub const RESERVED_ENV_PREFIX: &str = "OXIMUX_";
+
+/// Whether `key` is refused by [`AgentLaunchSettings::env_for`]. Exported so
+/// the settings UI can say so before the user commits, rather than leaving
+/// resolution as the only place the rule is known.
+///
+/// Compared case-sensitively after trimming, matching how the environment is
+/// applied: on Unix `path` and `PATH` are different variables, and refusing
+/// the former would be a guess about intent.
+pub fn is_reserved_env_key(key: &str) -> bool {
+    let key = key.trim();
+    RESERVED_ENV_KEYS.contains(&key) || key.starts_with(RESERVED_ENV_PREFIX)
+}
+
+/// The name of the implicit first profile — the plain `[agents.<id>]` entry
+/// every existing config already carries. Reserved: a named profile may not
+/// reuse it, so "default" always resolves to that entry and never to a
+/// user-defined one.
+pub const DEFAULT_PROFILE: &str = "default";
+
+/// One additional named configuration of an adapter, beyond its `default`.
+///
+/// Profiles exist so the same agent can run under a second base URL, a proxy,
+/// or a second account without a source patch and without displacing the
+/// configuration already in use. The `default` profile is NOT stored here — it
+/// is the adapter's plain [`AgentLaunchSettings::agents`] entry, so every
+/// settings file written before profiles existed keeps working unchanged and
+/// reports exactly one profile.
+///
+/// `launch` is a nested table rather than a flattened one: `serde(flatten)`
+/// over a type that itself contains a map (`PerAgentLaunch::env`) does not
+/// round-trip through TOML reliably, and a silently-dropped env map is the one
+/// failure this type exists to prevent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NamedLaunchProfile {
+    /// Display name, unique per adapter and never `default`. Blank names are
+    /// dropped at resolution rather than shadowing the default entry.
+    pub name: String,
+    /// The launch configuration this profile selects.
+    pub launch: PerAgentLaunch,
 }
 
 /// A built-in ACP agent preset: a ready-to-launch chat agent that needs no
@@ -264,8 +367,19 @@ pub struct AgentLaunchSettings {
     /// (their agents push a native title). A missing key picks up this `true`
     /// default via the container-level `#[serde(default)]`.
     pub auto_title_enabled: bool,
-    /// Per-agent overrides keyed by adapter id.
+    /// Per-agent overrides keyed by adapter id. This IS the `default` profile
+    /// for each adapter — see [`NamedLaunchProfile`].
     pub agents: BTreeMap<String, PerAgentLaunch>,
+    /// Additional named profiles per adapter id, beyond the `default` entry in
+    /// [`Self::agents`]. Absent for every config written before profiles
+    /// existed, which is why it is a separate field rather than a change to
+    /// `agents`: an old file loads with no migration and reports one profile.
+    ///
+    /// Skipped when empty for the same reason as [`PerAgentLaunch::env`] — a
+    /// config that has never defined a profile should not grow a `[profiles]`
+    /// header telling the user about a feature they did not use.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, Vec<NamedLaunchProfile>>,
 }
 
 impl Default for AgentLaunchSettings {
@@ -280,6 +394,7 @@ impl Default for AgentLaunchSettings {
             // On by default — see the field docs. An explicit `false` still wins.
             auto_title_enabled: true,
             agents: BTreeMap::new(),
+            profiles: BTreeMap::new(),
         }
     }
 }
@@ -306,10 +421,13 @@ impl AgentLaunchSettings {
     pub fn sanitized(mut self) -> Self {
         self.default_agent = self.default_agent.trim().to_string();
         for v in self.agents.values_mut() {
-            v.args = v.args.trim().to_string();
-            v.model = v.model.trim().to_string();
-            v.acp_command = v.acp_command.trim().to_string();
-            v.acp_args = v.acp_args.trim().to_string();
+            sanitize_launch(v);
+        }
+        for list in self.profiles.values_mut() {
+            for p in list.iter_mut() {
+                p.name = p.name.trim().to_string();
+                sanitize_launch(&mut p.launch);
+            }
         }
         self
     }
@@ -364,8 +482,231 @@ impl AgentLaunchSettings {
     }
 
     /// The launch entry for `adapter_id`, if the user has configured one.
+    /// The `default` profile — see [`Self::for_agent_in`] for a named one.
     pub fn for_agent(&self, adapter_id: &str) -> Option<&PerAgentLaunch> {
         self.agents.get(adapter_id)
+    }
+
+    /// The launch entry for `adapter_id` under `profile`.
+    ///
+    /// `None`, blank, or [`DEFAULT_PROFILE`] resolves to the plain
+    /// [`Self::agents`] entry, so every caller that names no profile behaves
+    /// exactly as it did before profiles existed.
+    ///
+    /// An **unknown** profile name falls back to the default entry rather than
+    /// resolving to nothing. A stale selection (a profile the user renamed or
+    /// deleted while a launcher row still pointed at it) must not silently
+    /// launch the agent bare — dropping the user's model and flags is a worse
+    /// outcome than ignoring a name that no longer exists.
+    pub fn for_agent_in(&self, adapter_id: &str, profile: Option<&str>) -> Option<&PerAgentLaunch> {
+        match Self::named_profile(profile) {
+            None => self.agents.get(adapter_id),
+            Some(name) => self
+                .profiles
+                .get(adapter_id)
+                .and_then(|list| list.iter().find(|p| p.name.trim() == name))
+                .map(|p| &p.launch)
+                .or_else(|| self.agents.get(adapter_id)),
+        }
+    }
+
+    /// Normalize a profile selection to `Some(name)` only when it names a
+    /// profile other than the default. Blank and `default` both mean "the
+    /// plain entry", which is the one thing every accessor must agree on.
+    fn named_profile(profile: Option<&str>) -> Option<&str> {
+        let name = profile?.trim();
+        (!name.is_empty() && name != DEFAULT_PROFILE).then_some(name)
+    }
+
+    /// Every profile name configured for `adapter_id`, always beginning with
+    /// [`DEFAULT_PROFILE`]. A config that has never defined a profile reports
+    /// exactly `["default"]`, which is what the picker shows.
+    ///
+    /// Blank names and any entry that re-declares `default` are dropped: the
+    /// default is the `agents` entry, and a second row claiming that name would
+    /// be unreachable through [`Self::for_agent_in`] anyway.
+    pub fn profile_names(&self, adapter_id: &str) -> Vec<String> {
+        let mut out = vec![DEFAULT_PROFILE.to_string()];
+        if let Some(list) = self.profiles.get(adapter_id) {
+            for p in list {
+                let name = p.name.trim();
+                if !name.is_empty() && name != DEFAULT_PROFILE && !out.iter().any(|n| n == name) {
+                    out.push(name.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Mutable launch entry for `adapter_id` under `profile`, inserting the
+    /// profile if absent. The settings UI edits through this.
+    ///
+    /// A default/blank profile routes to [`Self::entry_mut`] so the ACP-preset
+    /// seeding there still applies. A named profile is seeded from the
+    /// adapter's default entry across the three fields a profile actually
+    /// varies — a second profile is nearly always "the same agent, one thing
+    /// changed", so starting it blank would drop the model and flags the user
+    /// already set.
+    ///
+    /// The backend fields (`transport`, `acp_command`, `acp_args`,
+    /// `default_open_mode`, `disabled`) are deliberately **not** carried: see
+    /// [`Self::profile_axes`] for why a profile does not change the backend.
+    pub fn profile_entry_mut(
+        &mut self,
+        adapter_id: &str,
+        profile: Option<&str>,
+    ) -> &mut PerAgentLaunch {
+        let Some(name) = Self::named_profile(profile) else {
+            return self.entry_mut(adapter_id);
+        };
+        let seed = self
+            .agents
+            .get(adapter_id)
+            .map(|d| PerAgentLaunch {
+                args: d.args.clone(),
+                model: d.model.clone(),
+                env: d.env.clone(),
+                ..PerAgentLaunch::default()
+            })
+            .unwrap_or_default();
+        let name = name.to_string();
+        let list = self.profiles.entry(adapter_id.to_string()).or_default();
+        let idx = match list.iter().position(|p| p.name.trim() == name) {
+            Some(i) => i,
+            None => {
+                list.push(NamedLaunchProfile { name, launch: seed });
+                list.len() - 1
+            }
+        };
+        &mut list[idx].launch
+    }
+
+    /// Remove the named profile from `adapter_id`. Returns `true` when one was
+    /// removed. Removing [`DEFAULT_PROFILE`] is a no-op — it is the `agents`
+    /// entry, cleared through the existing per-agent controls, not here.
+    pub fn remove_profile(&mut self, adapter_id: &str, profile: &str) -> bool {
+        let Some(name) = Self::named_profile(Some(profile)) else {
+            return false;
+        };
+        let Some(list) = self.profiles.get_mut(adapter_id) else {
+            return false;
+        };
+        let before = list.len();
+        list.retain(|p| p.name.trim() != name);
+        let removed = list.len() != before;
+        if list.is_empty() {
+            self.profiles.remove(adapter_id);
+        }
+        removed
+    }
+
+    /// Rename `from` to `to` for `adapter_id`. Returns `true` when a profile
+    /// was renamed.
+    ///
+    /// Refuses the same three things the create path refuses, for the same
+    /// reasons: a blank or [`DEFAULT_PROFILE`] name on either side (the default
+    /// is the `agents` entry, not a row in this list), and a target name the
+    /// adapter already carries — [`Self::for_agent_in`] resolves by name, so
+    /// two rows sharing one would make the second unreachable.
+    ///
+    /// A rename does **not** rewrite the profile selection held by anything
+    /// already launched under the old name. That is deliberate rather than
+    /// unhandled: `for_agent_in` falls back to the adapter's default entry for
+    /// an unknown name, so a live tab degrades to the plain configuration
+    /// instead of losing its model and flags entirely.
+    pub fn rename_profile(&mut self, adapter_id: &str, from: &str, to: &str) -> bool {
+        let (Some(from), Some(to)) =
+            (Self::named_profile(Some(from)), Self::named_profile(Some(to)))
+        else {
+            return false;
+        };
+        let (from, to) = (from.to_string(), to.to_string());
+        let Some(list) = self.profiles.get_mut(adapter_id) else {
+            return false;
+        };
+        // Covers rename-to-self as well, which is a no-op worth reporting as a
+        // refusal rather than a silent success.
+        if list.iter().any(|p| p.name.trim() == to) {
+            return false;
+        }
+        let Some(existing) = list.iter_mut().find(|p| p.name.trim() == from) else {
+            return false;
+        };
+        existing.name = to;
+        true
+    }
+
+    /// Copy `from` into a new profile called `new_name` for `adapter_id`.
+    /// Returns `true` when one was created.
+    ///
+    /// `from` may be [`DEFAULT_PROFILE`] (or blank), which copies the adapter's
+    /// plain entry — that is the only way to seed a profile from the default
+    /// without editing the default itself. An unknown source name is refused
+    /// rather than silently resolved through [`Self::for_agent_in`]'s
+    /// default-entry fallback, which would make a typo look like a successful
+    /// duplicate of the wrong thing.
+    ///
+    /// Only the three [`Self::profile_axes`] are copied, for the same reason
+    /// [`Self::profile_entry_mut`] seeds only those: a profile varies the
+    /// account and endpoint, never the backend.
+    pub fn duplicate_profile(&mut self, adapter_id: &str, from: &str, new_name: &str) -> bool {
+        let Some(to) = Self::named_profile(Some(new_name)) else {
+            return false;
+        };
+        let to = to.to_string();
+        if self.profile_names(adapter_id).contains(&to) {
+            return false;
+        }
+        let source = match Self::named_profile(Some(from)) {
+            None => self.agents.get(adapter_id).cloned().unwrap_or_default(),
+            Some(name) => {
+                let found = self
+                    .profiles
+                    .get(adapter_id)
+                    .and_then(|list| list.iter().find(|p| p.name.trim() == name));
+                match found {
+                    Some(p) => p.launch.clone(),
+                    None => return false,
+                }
+            }
+        };
+        self.profiles
+            .entry(adapter_id.to_string())
+            .or_default()
+            .push(NamedLaunchProfile {
+                name: to,
+                launch: PerAgentLaunch {
+                    args: source.args,
+                    model: source.model,
+                    env: source.env,
+                    ..PerAgentLaunch::default()
+                },
+            });
+        true
+    }
+
+    /// Environment overrides for `adapter_id` under `profile`, as the
+    /// `(key, value)` pairs both spawn seams take. Key-sorted (the field is a
+    /// `BTreeMap`) so a launch is reproducible, and blank keys are dropped —
+    /// a half-typed row in the settings table must not reach the spawn.
+    ///
+    /// Empty when the agent has no configured env, which is every existing
+    /// config, so those launches are byte-identical to before.
+    pub fn env_for(&self, adapter_id: &str, profile: Option<&str>) -> Vec<(String, String)> {
+        self.for_agent_in(adapter_id, profile)
+            .map(|a| {
+                a.env
+                    .iter()
+                    // Reserved keys are filtered HERE, at resolution, rather
+                    // than on the way into the file: a hand-written
+                    // `agent_launch.toml` must be guarded too, and dropping the
+                    // line on load would delete input the user typed instead of
+                    // telling them it cannot be applied.
+                    .filter(|(k, _)| !k.trim().is_empty() && !is_reserved_env_key(k))
+                    .map(|(k, v)| (k.trim().to_string(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The adapter a launch that names **no** agent should use: the configured
@@ -419,17 +760,44 @@ impl AgentLaunchSettings {
         })
     }
 
+    /// The fields a named profile varies: `args`, `model`, and `env`.
+    ///
+    /// Everything else on [`PerAgentLaunch`] describes the **backend** — which
+    /// protocol the adapter speaks (`transport`), what binary speaks it
+    /// (`acp_command`/`acp_args`), whether it opens as a chat, whether it is
+    /// hidden — and a profile is an account/endpoint variation of one agent,
+    /// not a different agent. Keeping the backend adapter-level is also what
+    /// lets [`Self::chat_capable`] and [`Self::transport_for`] stay answerable
+    /// before a profile is chosen, which the launch routing gate needs.
+    ///
+    /// This is documentation of an invariant, not a runtime switch: the
+    /// profile-aware accessors below read exactly these three.
+    pub const fn profile_axes() -> [&'static str; 3] {
+        ["args", "model", "env"]
+    }
+
     /// Extra CLI args for `adapter_id`, shell-split into argv tokens. Empty
-    /// when the agent has no configured args.
+    /// when the agent has no configured args. The `default` profile.
     pub fn args_for(&self, adapter_id: &str) -> Vec<String> {
-        self.for_agent(adapter_id)
+        self.args_for_in(adapter_id, None)
+    }
+
+    /// Extra CLI args for `adapter_id` under `profile`. See [`Self::for_agent_in`].
+    pub fn args_for_in(&self, adapter_id: &str, profile: Option<&str>) -> Vec<String> {
+        self.for_agent_in(adapter_id, profile)
             .map(|a| split_args(&a.args))
             .unwrap_or_default()
     }
 
-    /// Default model for `adapter_id`, or `None` when unset/blank.
+    /// Default model for `adapter_id`, or `None` when unset/blank. The
+    /// `default` profile.
     pub fn model_for(&self, adapter_id: &str) -> Option<String> {
-        self.for_agent(adapter_id)
+        self.model_for_in(adapter_id, None)
+    }
+
+    /// Default model for `adapter_id` under `profile`. See [`Self::for_agent_in`].
+    pub fn model_for_in(&self, adapter_id: &str, profile: Option<&str>) -> Option<String> {
+        self.for_agent_in(adapter_id, profile)
             .map(|a| a.model.trim())
             .filter(|m| !m.is_empty())
             .map(str::to_string)
@@ -509,6 +877,22 @@ impl AgentLaunchSettings {
     }
 }
 
+/// Trim whitespace on one entry's string fields, including its env keys — a
+/// hand-edited TOML can leave stray spaces, and a key with a trailing space is
+/// a different environment variable than the one the user meant to set.
+fn sanitize_launch(v: &mut PerAgentLaunch) {
+    v.args = v.args.trim().to_string();
+    v.model = v.model.trim().to_string();
+    v.acp_command = v.acp_command.trim().to_string();
+    v.acp_args = v.acp_args.trim().to_string();
+    if v.env.keys().any(|k| k.trim() != k) {
+        v.env = std::mem::take(&mut v.env)
+            .into_iter()
+            .map(|(k, val)| (k.trim().to_string(), val))
+            .collect();
+    }
+}
+
 /// Split a free-text CLI fragment into argv tokens. Whitespace separates
 /// tokens; single and double quotes group a run (the quotes are stripped,
 /// whitespace inside is preserved). Deliberately minimal — no backslash
@@ -554,6 +938,374 @@ pub fn split_args(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_round_trips_and_is_key_sorted() {
+        let toml = r#"
+[agents.claude-code]
+model = "opus"
+[agents.claude-code.env]
+ZED_LAST = "z"
+ANTHROPIC_BASE_URL = "https://proxy.internal/v1"
+"#;
+        let s = AgentLaunchSettings::from_toml_str(toml).expect("parse");
+        let env = s.env_for("claude-code", None);
+        // BTreeMap ordering: a launch is reproducible, not hash-ordered.
+        assert_eq!(
+            env,
+            vec![
+                ("ANTHROPIC_BASE_URL".to_string(), "https://proxy.internal/v1".to_string()),
+                ("ZED_LAST".to_string(), "z".to_string()),
+            ]
+        );
+        // Survives a serialize/parse cycle unchanged.
+        let again = AgentLaunchSettings::from_toml_str(&s.to_toml_string()).expect("round-trip");
+        assert_eq!(again.env_for("claude-code", None), env);
+        // The model still resolves alongside it.
+        assert_eq!(s.model_for("claude-code").as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn a_config_written_before_profiles_loads_and_reports_one_profile() {
+        // The exact shape every existing `agent_launch.toml` has: no `env`
+        // table, no `profiles` key. It must load with no migration.
+        let toml = r#"
+default_agent = "claude-code"
+yolo_defaults_migrated = true
+[agents.claude-code]
+args = "--dangerously-skip-permissions"
+model = "opus"
+"#;
+        let s = AgentLaunchSettings::from_toml_str(toml).expect("old config parses");
+        assert_eq!(s.profile_names("claude-code"), vec![DEFAULT_PROFILE]);
+        assert!(s.profiles.is_empty(), "no profiles are invented");
+        assert!(s.env_for("claude-code", None).is_empty(), "no env means no env");
+        // Every pre-existing accessor answers exactly as before.
+        assert_eq!(s.args_for("claude-code"), vec!["--dangerously-skip-permissions"]);
+        assert_eq!(s.model_for("claude-code").as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn a_rewrite_adds_no_empty_env_or_profiles_headers() {
+        // `agent_launch.toml` is documented as hand-editable, so what the app
+        // writes back is user-facing. An agent with no env must not grow a bare
+        // `[agents.<id>.env]`, and a config with no profiles must not grow a
+        // `[profiles]` header advertising a feature it does not use.
+        let mut s = AgentLaunchSettings::default();
+        s.entry_mut("claude-code").model = "sonnet".into();
+        let text = s.to_toml_string();
+        assert!(!text.contains("[agents.claude-code.env]"), "empty env header:\n{text}");
+        assert!(!text.contains("[profiles]"), "empty profiles header:\n{text}");
+        // Still round-trips, and a NON-empty env is still written.
+        assert_eq!(AgentLaunchSettings::from_toml_str(&text).expect("reparse"), s);
+        s.entry_mut("claude-code").env.insert("K".into(), "v".into());
+        let text = s.to_toml_string();
+        assert!(text.contains("[agents.claude-code.env]"), "real env dropped:\n{text}");
+        assert_eq!(AgentLaunchSettings::from_toml_str(&text).expect("reparse"), s);
+    }
+
+    #[test]
+    fn a_named_profile_resolves_its_own_env_and_model() {
+        let toml = r#"
+[agents.claude-code]
+model = "opus"
+[agents.claude-code.env]
+ANTHROPIC_BASE_URL = "https://first.example/v1"
+
+[[profiles.claude-code]]
+name = "proxy"
+[profiles.claude-code.launch]
+model = "sonnet"
+args = "--verbose"
+[profiles.claude-code.launch.env]
+ANTHROPIC_BASE_URL = "https://second.example/v1"
+"#;
+        let s = AgentLaunchSettings::from_toml_str(toml).expect("parse");
+        assert_eq!(s.profile_names("claude-code"), vec!["default", "proxy"]);
+        // Two profiles of the same adapter carry different env and model.
+        assert_eq!(
+            s.env_for("claude-code", None),
+            vec![("ANTHROPIC_BASE_URL".into(), "https://first.example/v1".to_string())]
+        );
+        assert_eq!(
+            s.env_for("claude-code", Some("proxy")),
+            vec![("ANTHROPIC_BASE_URL".into(), "https://second.example/v1".to_string())]
+        );
+        assert_eq!(s.model_for_in("claude-code", Some("proxy")).as_deref(), Some("sonnet"));
+        assert_eq!(s.args_for_in("claude-code", Some("proxy")), vec!["--verbose"]);
+        // `default` and blank both mean the plain entry, never a named one.
+        for sel in [Some("default"), Some(""), Some("  "), None] {
+            assert_eq!(s.model_for_in("claude-code", sel).as_deref(), Some("opus"), "sel={sel:?}");
+        }
+        // Round-trips: the nested `launch` table survives serialization.
+        let again = AgentLaunchSettings::from_toml_str(&s.to_toml_string()).expect("round-trip");
+        assert_eq!(again, s);
+    }
+
+    #[test]
+    fn an_unknown_profile_falls_back_to_default_rather_than_launching_bare() {
+        // A launcher row can hold a profile the user has since renamed or
+        // deleted. Dropping the user's model and flags is worse than ignoring
+        // a name that no longer exists.
+        let toml = r#"
+[agents.codex]
+model = "gpt-5"
+args = "--dangerously-bypass-approvals-and-sandbox"
+"#;
+        let s = AgentLaunchSettings::from_toml_str(toml).expect("parse");
+        assert_eq!(s.model_for_in("codex", Some("deleted")).as_deref(), Some("gpt-5"));
+        assert_eq!(s.args_for_in("codex", Some("deleted")).len(), 1);
+        // An adapter with no entry at all still resolves to nothing, not a panic.
+        assert!(s.for_agent_in("nope", Some("deleted")).is_none());
+    }
+
+    #[test]
+    fn profile_names_drops_blanks_duplicates_and_a_redeclared_default() {
+        let mut s = AgentLaunchSettings::default();
+        s.profiles.insert(
+            "codex".into(),
+            vec![
+                NamedLaunchProfile { name: "  ".into(), ..Default::default() },
+                NamedLaunchProfile { name: "work".into(), ..Default::default() },
+                NamedLaunchProfile { name: "work".into(), ..Default::default() },
+                // The default lives in `agents`; a row claiming the name is
+                // unreachable through `for_agent_in`, so it must not be listed.
+                NamedLaunchProfile { name: DEFAULT_PROFILE.into(), ..Default::default() },
+            ],
+        );
+        assert_eq!(s.profile_names("codex"), vec!["default", "work"]);
+    }
+
+    #[test]
+    fn profile_entry_mut_seeds_only_the_three_profile_axes() {
+        let mut s = AgentLaunchSettings::default();
+        {
+            let d = s.entry_mut("gemini");
+            d.transport = Transport::Acp;
+            d.acp_command = "gemini".into();
+            d.acp_args = "--acp".into();
+            d.model = "flash".into();
+            d.args = "--yolo".into();
+            d.env.insert("GEMINI_HOST".into(), "a".into());
+            d.disabled = true;
+        }
+        let p = s.profile_entry_mut("gemini", Some("second"));
+        // Carried: the account/endpoint axes.
+        assert_eq!(p.model, "flash");
+        assert_eq!(p.args, "--yolo");
+        assert_eq!(p.env.get("GEMINI_HOST").map(String::as_str), Some("a"));
+        // Not carried: the backend is adapter-level, so a profile never
+        // shadows it with a stale copy.
+        assert_eq!(p.transport, Transport::default());
+        assert!(p.acp_command.is_empty());
+        assert!(p.acp_args.is_empty());
+        assert!(!p.disabled);
+        // The backend still resolves off the adapter entry regardless of profile.
+        assert_eq!(s.transport_for("gemini"), Transport::Acp);
+        assert_eq!(s.acp_command_for("gemini").as_deref(), Some("gemini"));
+        // Editing the profile leaves the default entry untouched.
+        s.profile_entry_mut("gemini", Some("second")).model = "pro".into();
+        assert_eq!(s.model_for_in("gemini", Some("second")).as_deref(), Some("pro"));
+        assert_eq!(s.model_for("gemini").as_deref(), Some("flash"));
+    }
+
+    #[test]
+    fn remove_profile_drops_the_named_one_and_never_the_default() {
+        let mut s = AgentLaunchSettings::default();
+        s.entry_mut("codex").model = "gpt-5".into();
+        s.profile_entry_mut("codex", Some("work"));
+        assert_eq!(s.profile_names("codex"), vec!["default", "work"]);
+        // `default` is the `agents` entry — not removable here.
+        assert!(!s.remove_profile("codex", DEFAULT_PROFILE));
+        assert!(!s.remove_profile("codex", ""));
+        assert_eq!(s.model_for("codex").as_deref(), Some("gpt-5"));
+        // A real removal empties the map rather than leaving a dangling key.
+        assert!(s.remove_profile("codex", "work"));
+        assert!(!s.remove_profile("codex", "work"), "removing twice is not an error");
+        assert!(s.profiles.is_empty());
+        assert_eq!(s.profile_names("codex"), vec!["default"]);
+    }
+
+    #[test]
+    fn rename_profile_refuses_blank_default_and_a_taken_name() {
+        let mut s = AgentLaunchSettings::default();
+        s.profile_entry_mut("codex", Some("work")).model = "gpt-5".into();
+        s.profile_entry_mut("codex", Some("home"));
+
+        // The same three the create path refuses.
+        assert!(!s.rename_profile("codex", "work", ""), "blank target");
+        assert!(!s.rename_profile("codex", "work", "  "), "whitespace target");
+        assert!(!s.rename_profile("codex", "work", DEFAULT_PROFILE), "reserved target");
+        assert!(!s.rename_profile("codex", "work", "home"), "target already taken");
+        assert!(!s.rename_profile("codex", "work", "work"), "rename to self is a no-op");
+        // The default entry is not a row in this list, so it is not renamable.
+        assert!(!s.rename_profile("codex", DEFAULT_PROFILE, "anything"));
+        // An unknown source, and an adapter with no profiles at all.
+        assert!(!s.rename_profile("codex", "missing", "anything"));
+        assert!(!s.rename_profile("pi", "work", "anything"));
+        assert_eq!(s.profile_names("codex"), vec!["default", "work", "home"]);
+
+        // A real rename moves the configuration with the name.
+        assert!(s.rename_profile("codex", "work", " proxy "), "trims and accepts");
+        assert_eq!(s.profile_names("codex"), vec!["default", "proxy", "home"]);
+        assert_eq!(s.model_for_in("codex", Some("proxy")).as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn a_renamed_profile_leaves_a_stale_selection_on_the_default_entry() {
+        // The orphaned-tab path: something launched under the old name still
+        // holds it. Resolution must degrade to the plain configuration rather
+        // than launch the agent bare.
+        let mut s = AgentLaunchSettings::default();
+        s.entry_mut("codex").model = "gpt-5-codex".into();
+        s.profile_entry_mut("codex", Some("work")).model = "o3".into();
+        assert!(s.rename_profile("codex", "work", "proxy"));
+        assert_eq!(
+            s.model_for_in("codex", Some("work")).as_deref(),
+            Some("gpt-5-codex"),
+            "a stale name falls back to the default entry, not to nothing",
+        );
+    }
+
+    #[test]
+    fn duplicate_profile_copies_only_the_profile_axes() {
+        let mut s = AgentLaunchSettings::default();
+        {
+            let src = s.profile_entry_mut("codex", Some("work"));
+            src.args = "--search".into();
+            src.model = "o3".into();
+            src.env.insert("OPENAI_BASE_URL".into(), "https://proxy/v1".into());
+            // Backend fields a profile never varies — they must not be copied.
+            src.transport = Transport::Acp;
+            src.acp_command = "acp-codex".into();
+            src.disabled = true;
+        }
+
+        assert!(!s.duplicate_profile("codex", "work", ""), "blank target");
+        assert!(!s.duplicate_profile("codex", "work", DEFAULT_PROFILE), "reserved target");
+        assert!(!s.duplicate_profile("codex", "work", "work"), "target already taken");
+        assert!(!s.duplicate_profile("codex", "missing", "copy"), "unknown source");
+
+        assert!(s.duplicate_profile("codex", "work", "work-copy"));
+        assert_eq!(s.profile_names("codex"), vec!["default", "work", "work-copy"]);
+        assert_eq!(s.args_for_in("codex", Some("work-copy")), vec!["--search"]);
+        assert_eq!(s.model_for_in("codex", Some("work-copy")).as_deref(), Some("o3"));
+        assert_eq!(
+            s.env_for("codex", Some("work-copy")),
+            vec![("OPENAI_BASE_URL".to_string(), "https://proxy/v1".to_string())],
+        );
+        let copy = s
+            .profiles
+            .get("codex")
+            .and_then(|l| l.iter().find(|p| p.name == "work-copy"))
+            .expect("the copy exists");
+        assert_eq!(copy.launch.transport, Transport::default());
+        assert!(copy.launch.acp_command.is_empty());
+        assert!(!copy.launch.disabled);
+    }
+
+    #[test]
+    fn duplicating_the_default_seeds_a_profile_from_the_plain_entry() {
+        // The only way to start a profile from the default without editing the
+        // default itself — which is what the "duplicate" affordance on the
+        // `default` row means.
+        let mut s = AgentLaunchSettings::default();
+        let d = s.entry_mut("claude-code");
+        d.model = "opus".into();
+        d.env.insert("ANTHROPIC_BASE_URL".into(), "https://proxy/v1".into());
+
+        assert!(s.duplicate_profile("claude-code", DEFAULT_PROFILE, "second"));
+        assert_eq!(s.model_for_in("claude-code", Some("second")).as_deref(), Some("opus"));
+        assert_eq!(s.env_for("claude-code", Some("second")).len(), 1);
+        // Editing the copy leaves the default entry alone.
+        s.profile_entry_mut("claude-code", Some("second")).model = "haiku".into();
+        assert_eq!(s.model_for("claude-code").as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn a_reserved_key_never_reaches_a_spawn_however_it_got_into_the_file() {
+        // The hand-edited case: this TOML was never written by the UI, so the
+        // guard has to live at resolution or it does not exist.
+        let toml = r#"
+[agents.claude-code]
+[agents.claude-code.env]
+PATH = "/nowhere"
+HOME = "/tmp/elsewhere"
+CODEX_HOME = "/tmp/codex"
+CLAUDE_CONFIG_DIR = "/tmp/claude"
+OXIMUX_SESSION_ID = "borrowed"
+ANTHROPIC_BASE_URL = "https://proxy/v1"
+"#;
+        let s: AgentLaunchSettings = toml::from_str(toml).expect("parses");
+        assert_eq!(
+            s.env_for("claude-code", None),
+            vec![("ANTHROPIC_BASE_URL".to_string(), "https://proxy/v1".to_string())],
+            "only the one key that is the user's to set survives",
+        );
+        // The lines are still IN the file — filtered on the way out, not
+        // deleted on the way in, so nothing the user typed vanishes.
+        assert_eq!(s.for_agent("claude-code").expect("entry").env.len(), 6);
+    }
+
+    #[test]
+    fn the_reserved_rule_is_prefix_plus_an_exact_list() {
+        for k in RESERVED_ENV_KEYS {
+            assert!(is_reserved_env_key(k), "{k} is on the list");
+        }
+        assert!(is_reserved_env_key("  PATH  "), "trimmed before comparing");
+        assert!(is_reserved_env_key("OXIMUX_SESSION_ID"));
+        assert!(is_reserved_env_key("OXIMUX_ANYTHING_AT_ALL"), "the whole prefix is ours");
+        // Case-sensitive: on Unix these are different variables, and refusing
+        // the lowercase one would be a guess about what was meant.
+        assert!(!is_reserved_env_key("path"));
+        assert!(!is_reserved_env_key("oximux_session_id"));
+        // The things a profile exists to set are not on it.
+        assert!(!is_reserved_env_key("ANTHROPIC_BASE_URL"));
+        assert!(!is_reserved_env_key("OPENAI_API_KEY"));
+        assert!(!is_reserved_env_key("HOMEBREW_PREFIX"), "a prefix match on HOME would be wrong");
+    }
+
+    #[test]
+    fn a_profile_cannot_reintroduce_a_reserved_key_the_default_lacks() {
+        let mut s = AgentLaunchSettings::default();
+        s.profile_entry_mut("claude-code", Some("proxy"))
+            .env
+            .insert("PATH".into(), "/nowhere".into());
+        assert!(s.env_for("claude-code", Some("proxy")).is_empty());
+    }
+
+    #[test]
+    fn env_keys_are_trimmed_and_blank_keys_never_reach_a_spawn() {
+        // A half-typed row in the settings table (blank key) and a hand-edited
+        // TOML with a stray space must not produce a bogus variable.
+        let mut s = AgentLaunchSettings::default();
+        let e = &mut s.entry_mut("claude-code").env;
+        e.insert("  PADDED  ".into(), "v".into());
+        e.insert("".into(), "orphan".into());
+        e.insert("   ".into(), "orphan2".into());
+        let s = s.sanitized();
+        assert_eq!(
+            s.env_for("claude-code", None),
+            vec![("PADDED".to_string(), "v".to_string())],
+        );
+    }
+
+    #[test]
+    fn sanitized_trims_inside_named_profiles_too() {
+        let mut s = AgentLaunchSettings::default();
+        {
+            let p = s.profile_entry_mut("codex", Some("  work  "));
+            p.model = "  gpt-5  ".into();
+            p.env.insert(" KEY ".into(), "v".into());
+        }
+        let s = s.sanitized();
+        assert_eq!(s.profile_names("codex"), vec!["default", "work"]);
+        assert_eq!(s.model_for_in("codex", Some("work")).as_deref(), Some("gpt-5"));
+        assert_eq!(
+            s.env_for("codex", Some("work")),
+            vec![("KEY".to_string(), "v".to_string())]
+        );
+    }
 
     #[test]
     fn default_is_empty_and_round_trips() {

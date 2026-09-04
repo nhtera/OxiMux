@@ -20,6 +20,10 @@ pub enum ContextKind {
     Diff,
     /// The current text clipboard.
     Clipboard,
+    /// An element picked in the embedded browser: its HTML, computed styles and
+    /// surrounding page context. The cropped screenshot rides the message's
+    /// image attachments, not this chip — a chip is text only.
+    Browser,
 }
 
 impl ContextKind {
@@ -30,6 +34,7 @@ impl ContextKind {
             ContextKind::Terminal => "terminal",
             ContextKind::Diff => "diff",
             ContextKind::Clipboard => "clipboard",
+            ContextKind::Browser => "browser",
         }
     }
 }
@@ -188,6 +193,14 @@ mod tests {
         let clip_at = out.find("name=\"clipboard\"").unwrap();
         assert!(diff_at < clip_at, "diff must serialize before clipboard");
         assert!(out.ends_with("go"));
+    }
+
+    #[test]
+    fn browser_block_carries_the_selector_as_its_source() {
+        let c = chip(ContextKind::Browser, Some("a#go"), "Selected element:\n<a id=\"go\">x</a>", false);
+        let out = prepend_context(std::slice::from_ref(&c), "why is it misaligned?");
+        assert!(out.starts_with("<context name=\"browser\" source=\"a#go\">\n"));
+        assert!(out.ends_with("why is it misaligned?"));
     }
 
     #[test]

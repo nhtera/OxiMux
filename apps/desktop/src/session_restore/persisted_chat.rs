@@ -108,6 +108,24 @@ pub struct PersistedChatTranscript {
     /// `#[serde(default)]` (→ empty) for older / non-ACP blobs.
     #[serde(default)]
     pub acp_args: Vec<String>,
+    /// The launch-settings key this chat was opened under, and the named
+    /// profile within it, so a restore can re-resolve the adapter's configured
+    /// environment from **current** settings.
+    ///
+    /// The env values themselves are deliberately NOT persisted here. They can
+    /// hold credentials, and `agent_launch.toml` is already the one plaintext
+    /// place they live — copying them into every session blob would multiply
+    /// that exposure. Re-resolving also means a corrected base URL takes effect
+    /// on the next open instead of being pinned to whatever was set the day the
+    /// session started.
+    ///
+    /// `#[serde(default)]` (→ `None`) keeps every older blob loadable; those
+    /// restore with no env, which is exactly their pre-existing behavior.
+    #[serde(default)]
+    pub adapter_id: Option<String>,
+    /// See [`Self::adapter_id`]. `None` = the adapter's plain entry.
+    #[serde(default)]
+    pub launch_profile: Option<String>,
     /// The Codex posture `(approval_policy, sandbox)` chosen via the composer's
     /// Approvals/Sandbox selects, so a reopened Codex chat resumes under the same
     /// posture. `#[serde(default)]` (→ `None`) keeps older / non-Codex blobs
@@ -135,6 +153,12 @@ pub struct PersistedChatTranscript {
     /// restored session may do, so it is persisted rather than re-derived.
     #[serde(default)]
     pub omp_posture: Option<oximux_agents::thread::omp::posture::OmpPosture>,
+    /// Claude's fast-mode toggle as last set in the composer, so a reopened
+    /// Claude chat respawns with the same `fastMode` overlay. `None` = never
+    /// touched (the CLI's own setting applies). `#[serde(default)]` keeps
+    /// older blobs loadable.
+    #[serde(default)]
+    pub claude_fast_mode: Option<bool>,
     /// What this session's pickers offer, so a remote client can render them
     /// without a backend to ask. `#[serde(default)]` (→ empty) keeps blobs
     /// written before this field loadable; their pickers stay hidden until the
@@ -191,6 +215,38 @@ mod tests {
         SettingsRepo::new(open_memory().expect("in-memory db"))
     }
 
+    /// The fast-mode pick survives the blob, and an older blob without the
+    /// field loads as "never touched".
+    #[test]
+    fn claude_fast_mode_round_trips_and_defaults_to_none() {
+        let repo = repo();
+        let mut t = PersistedChatTranscript {
+            session_id: "sid-fast".into(),
+            model: Some("opus[1m]".into()),
+            entries: vec![],
+            slash_commands: vec![],
+            session_meta: Default::default(),
+            thinking_level: Default::default(),
+            provider: Default::default(),
+            acp_command: None,
+            acp_args: vec![],
+            adapter_id: None,
+            launch_profile: None,
+            codex_posture: None,
+            pi_posture: None,
+            omp_posture: None,
+            claude_fast_mode: Some(true),
+            choices: Default::default(),
+        };
+        save_chat_transcript(&repo, &t);
+        let loaded = load_chat_transcript(&repo, "sid-fast").expect("saved blob loads");
+        assert_eq!(loaded.claude_fast_mode, Some(true));
+        t.claude_fast_mode = None;
+        let json = serde_json::to_string(&t).unwrap();
+        let stripped: PersistedChatTranscript = serde_json::from_str(&json).unwrap();
+        assert_eq!(stripped.claude_fast_mode, None);
+    }
+
     #[test]
     fn pi_posture_round_trips_so_a_restore_cannot_silently_widen_it() {
         use oximux_agents::thread::pi::posture::{PiPosture, TOOLS_READ_ONLY};
@@ -205,9 +261,12 @@ mod tests {
             provider: Transport::Rpc,
             acp_command: None,
             acp_args: vec![],
+            adapter_id: None,
+            launch_profile: None,
             codex_posture: None,
             pi_posture: Some(PiPosture { tools: TOOLS_READ_ONLY.into(), context_files: false }),
             omp_posture: None,
+            claude_fast_mode: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -236,9 +295,12 @@ mod tests {
             provider: Transport::OmpRpc,
             acp_command: None,
             acp_args: vec![],
+            adapter_id: None,
+            launch_profile: None,
             codex_posture: None,
             pi_posture: None,
             omp_posture: Some(OmpPosture::AlwaysAsk),
+            claude_fast_mode: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -280,9 +342,12 @@ mod tests {
             provider: Transport::StreamJson,
             acp_command: None,
             acp_args: vec![],
+            adapter_id: None,
+            launch_profile: None,
             codex_posture: None,
             pi_posture: None,
             omp_posture: None,
+            claude_fast_mode: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -314,9 +379,12 @@ mod tests {
             provider: Transport::Acp,
             acp_command: Some("gemini".into()),
             acp_args: vec!["--experimental-acp".into()],
+            adapter_id: None,
+            launch_profile: None,
             codex_posture: None,
             pi_posture: None,
             omp_posture: None,
+            claude_fast_mode: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);

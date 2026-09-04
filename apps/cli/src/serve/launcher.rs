@@ -232,16 +232,32 @@ fn spawn_and_settle_id(
 
 #[async_trait::async_trait]
 impl SessionLauncher for HeadlessLauncher {
-    async fn create(&self, cwd: &str, agent_id: Option<&str>) -> Result<String, LaunchError> {
+    async fn create(
+        &self,
+        cwd: &str,
+        agent_id: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<String, LaunchError> {
         if self.draining.load(Ordering::SeqCst) {
             return Err(LaunchError::Unavailable);
         }
         let cwd = usable_working_directory(cwd)?;
         let transport = transport_for(agent_id)?;
+        // Unreachable today — `transport_for` admits only claude/codex/pi, and
+        // all three take a model at spawn. Checked anyway, beside the spawn it
+        // guards: a transport added to that list without a model at spawn would
+        // otherwise start silently ignoring one.
+        if model.is_some() && !transport.takes_model_at_spawn() {
+            return Err(LaunchError::ModelUnsupported);
+        }
+        // The model goes in the spawn, which is the only place a headless host
+        // can put it: there is no view here to respawn a backend that fixes its
+        // model at the command line, so a switch afterwards would bail for
+        // exactly Claude and Codex. See `SessionLauncher::create`.
         let mut spec = ConnectSpec::for_backend(
             &oximux_agents::thread::ChatBackend::from(transport),
             cwd.clone(),
-            None,
+            model.map(str::to_string),
             None,
             None,
             None,

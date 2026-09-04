@@ -430,9 +430,12 @@ mod tests {
             provider: oximux_agents::thread::Transport::StreamJson,
             acp_command: None,
             acp_args: vec![],
+            adapter_id: None,
+            launch_profile: None,
             codex_posture: None,
             pi_posture: None,
             omp_posture: None,
+            claude_fast_mode: None,
             choices,
         }
     }

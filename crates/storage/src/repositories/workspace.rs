@@ -60,6 +60,8 @@ impl WorkspaceRepo {
             tint: None,
             sort_order,
             pinned: false,
+            comment: String::new(),
+            phase: String::new(),
         })
     }
 
@@ -177,10 +179,40 @@ impl WorkspaceRepo {
         Ok(())
     }
 
+    /// Set a worktree's status line — the agent-writable snapshot of what is
+    /// happening here. `""` clears it.
+    ///
+    /// Returns whether a row matched. Unlike the setters above, which only
+    /// warn, this reports the miss: the caller is an RPC that must answer an
+    /// unknown id with an error rather than an `Ack` that claims a write which
+    /// never landed.
+    pub fn set_comment(&self, id: &str, comment: &str) -> Result<bool, StorageError> {
+        let affected = self.db.with_conn(|c| {
+            c.execute("UPDATE workspaces SET comment = ?1 WHERE id = ?2", params![comment, id])
+        })?;
+        Ok(affected > 0)
+    }
+
+    /// Set a worktree's work phase. `""` clears it.
+    ///
+    /// **Stores `phase` verbatim and validates nothing** — the closed
+    /// vocabulary is enforced at the write edges (the CLI argument, the RPC
+    /// handler) so that a value from a newer peer is preserved rather than
+    /// rejected by an older store. See [`oximux_core::WorkPhase`].
+    ///
+    /// Returns whether a row matched, for the reason given on
+    /// [`set_comment`](Self::set_comment).
+    pub fn set_phase(&self, id: &str, phase: &str) -> Result<bool, StorageError> {
+        let affected = self.db.with_conn(|c| {
+            c.execute("UPDATE workspaces SET phase = ?1 WHERE id = ?2", params![phase, id])
+        })?;
+        Ok(affected > 0)
+    }
+
     pub fn get_by_id(&self, id: &str) -> Result<Option<Workspace>, StorageError> {
         let row = self.db.with_conn(|c| {
             c.query_row(
-                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned \
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned, comment, phase \
                  FROM workspaces WHERE id = ?1",
                 [id],
                 WorkspaceRow::from_row,
@@ -197,7 +229,7 @@ impl WorkspaceRepo {
     pub fn get_by_worktree_path(&self, path: &str) -> Result<Option<Workspace>, StorageError> {
         let row = self.db.with_conn(|c| {
             c.query_row(
-                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned \
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned, comment, phase \
                  FROM workspaces \
                  WHERE worktree_path = ?1 AND archived_at IS NULL \
                  ORDER BY created_at DESC LIMIT 1",
@@ -213,7 +245,7 @@ impl WorkspaceRepo {
     pub fn list_for_project(&self, project_id: &str) -> Result<Vec<Workspace>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned \
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned, comment, phase \
                  FROM workspaces \
                  WHERE project_id = ?1 AND archived_at IS NULL \
                  ORDER BY created_at DESC",
@@ -268,7 +300,7 @@ impl WorkspaceRepo {
     ) -> Result<Vec<Workspace>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned \
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned, comment, phase \
                  FROM workspaces \
                  WHERE project_id = ?1 AND archived_at IS NULL \
                  ORDER BY sort_order ASC, created_at ASC",
@@ -460,6 +492,77 @@ mod tests {
         repo.reorder_to_target(&a.id, &x.id, &p1).expect("noop");
         assert_eq!(ordered_ids(&repo, &p1), [a.id, b.id]);
         assert_eq!(ordered_ids(&repo, &p2), [x.id]);
+    }
+
+    #[test]
+    fn a_new_workspace_starts_with_nothing_to_say() {
+        let db = open_memory().expect("db");
+        let p = project(&db);
+        let repo = WorkspaceRepo::new(db.clone());
+        let a = ws(&repo, &p, "a");
+        // The struct `insert` returns and the row it wrote must agree — an
+        // in-memory default that the DEFAULT clause contradicts would show a
+        // fresh worktree one way before a reload and another way after.
+        assert_eq!(a.comment, "");
+        assert_eq!(a.phase, "");
+        let loaded = repo.get_by_id(&a.id).expect("get").expect("row");
+        assert_eq!(loaded.comment, "");
+        assert_eq!(loaded.phase, "");
+    }
+
+    #[test]
+    fn comment_and_phase_round_trip_and_are_independent() {
+        let db = open_memory().expect("db");
+        let p = project(&db);
+        let repo = WorkspaceRepo::new(db.clone());
+        let a = ws(&repo, &p, "a");
+
+        assert!(repo.set_comment(&a.id, "rebasing onto main").expect("comment"));
+        assert!(repo.set_phase(&a.id, "in-progress").expect("phase"));
+        let loaded = repo.get_by_id(&a.id).expect("get").expect("row");
+        assert_eq!(loaded.comment, "rebasing onto main");
+        assert_eq!(loaded.phase, "in-progress");
+
+        // Writing one must not disturb the other — an agent advancing its
+        // phase must not blank the sentence it wrote a minute ago.
+        assert!(repo.set_phase(&a.id, "in-review").expect("phase"));
+        let loaded = repo.get_by_id(&a.id).expect("get").expect("row");
+        assert_eq!(loaded.comment, "rebasing onto main", "the phase write clobbered the comment");
+        assert_eq!(loaded.phase, "in-review");
+    }
+
+    #[test]
+    fn an_empty_write_clears_rather_than_being_ignored() {
+        let db = open_memory().expect("db");
+        let p = project(&db);
+        let repo = WorkspaceRepo::new(db.clone());
+        let a = ws(&repo, &p, "a");
+        repo.set_comment(&a.id, "done for now").expect("set");
+        assert!(repo.set_comment(&a.id, "").expect("clear"));
+        assert_eq!(repo.get_by_id(&a.id).expect("get").expect("row").comment, "");
+    }
+
+    #[test]
+    fn the_store_keeps_a_phase_it_does_not_recognise() {
+        // Validation lives at the write edges, never here. A value a newer
+        // build wrote must survive being read and rewritten by this one, or a
+        // mixed-version pair silently erases each other's phases.
+        let db = open_memory().expect("db");
+        let p = project(&db);
+        let repo = WorkspaceRepo::new(db.clone());
+        let a = ws(&repo, &p, "a");
+        repo.set_phase(&a.id, "shipped").expect("set");
+        assert_eq!(repo.get_by_id(&a.id).expect("get").expect("row").phase, "shipped");
+    }
+
+    #[test]
+    fn a_write_to_an_unknown_id_reports_the_miss() {
+        // The RPC turns this `false` into a BadRequest. If it ever returned
+        // `true`, `worktree set` on a typo'd id would report success.
+        let db = open_memory().expect("db");
+        let repo = WorkspaceRepo::new(db.clone());
+        assert!(!repo.set_comment("no-such-id", "hello").expect("comment"));
+        assert!(!repo.set_phase("no-such-id", "done").expect("phase"));
     }
 
     #[test]

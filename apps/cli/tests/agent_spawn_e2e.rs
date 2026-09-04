@@ -346,3 +346,72 @@ fn a_turn_that_never_ends_is_bounded_by_turn_timeout() {
 
     serve.kill_hard();
 }
+
+
+/// `--role-model` reaches the spawned **process**, on a headless host.
+///
+/// The gate this phase most needed and nearly shipped without. The obvious
+/// implementation applies a role's model as a switch after the session opens,
+/// which passes against any stub — but Claude and Codex take `--model` on the
+/// command line and refuse it at runtime, and a headless host has no desktop
+/// view to respawn them through. So the switch silently bails for exactly the
+/// two agents a team run is most likely to combine, and the role dies before
+/// doing anything.
+///
+/// Nothing short of this proves the fix: the fixture records the `--model` it
+/// was actually spawned with, so the assertion is about the argv of a real
+/// process started by the real headless launcher.
+#[test]
+fn a_role_model_reaches_the_spawned_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().join("data");
+    let shim_dir = dir.path().join("shim");
+    let report = dir.path().join("report.txt");
+
+    install_claude_shim(&shim_dir);
+    let _serve =
+        boot_serve(&data_dir, &shim_dir, &report, "fake-session-model", AgentBehaviour::default());
+
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let out = cli(&data_dir)
+        .args([
+            "team",
+            "run",
+            "--name",
+            "modelled",
+            "--role",
+            "impl=go",
+            "--role-model",
+            "impl=opus-5",
+            "--cwd",
+            cwd.to_str().unwrap(),
+        ])
+        .output()
+        .expect("team run");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "team run: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert_eq!(
+        await_report(&report, "spawn_model", Duration::from_secs(30)).as_deref(),
+        Some("opus-5"),
+        "the role's model must be on the agent's command line, not applied afterwards"
+    );
+
+    // And the board agrees with what was actually spawned.
+    let board = cli(&data_dir)
+        .args([
+            "team",
+            "status",
+            "--run",
+            json_of(&out)["data"]["id"].as_str().expect("a run id"),
+        ])
+        .output()
+        .expect("team status");
+    let roles = json_of(&board)["data"]["roles"].clone();
+    assert_eq!(roles[0]["model"], "opus-5");
+}

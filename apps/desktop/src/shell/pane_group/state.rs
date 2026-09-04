@@ -320,6 +320,42 @@ impl PaneGroup {
         }
     }
 
+    /// The active tab's browser view, if the active tab is a browser. The pick
+    /// that raised a send came from there, so that is where its confirmation
+    /// has to be drawn.
+    pub fn active_browser_view(&self) -> Option<Entity<crate::shell::browser_view::BrowserView>> {
+        match &self.active_tab()?.content {
+            PaneContent::Browser(view) => Some(view.clone()),
+            _ => None,
+        }
+    }
+
+    /// The active tab as a routing target, carrying the name to report back.
+    pub fn active_chat_target(&self) -> Option<ChatTarget> {
+        ChatTarget::of(self.active_tab()?)
+    }
+
+    /// The most-recently-active Agent Chat view in this group, wherever it sits.
+    /// Walks the same `mru` list [`Self::mru_agent_session`] uses, so "the chat
+    /// I last worked in" resolves identically for chat-only routing (a picked
+    /// browser element) as it does for text sends.
+    ///
+    /// Distinct from [`Self::mru_agent_session`]: that returns an id for *any*
+    /// agent tab including PTY-backed ones, which cannot take an image.
+    pub fn mru_agent_chat_view(&self) -> Option<ChatTarget> {
+        self.mru
+            .iter()
+            .find_map(|&idx| ChatTarget::of(self.tabs.get(idx)?))
+    }
+
+    /// First Agent Chat view in this group's tab list, regardless of active or
+    /// MRU state. The last-resort target, mirroring [`Self::first_agent_session`]
+    /// — every tab-creation site bumps MRU today, so this covers a chat that
+    /// somehow reached `tabs` without doing so rather than a known path.
+    pub fn first_agent_chat_view(&self) -> Option<ChatTarget> {
+        self.tabs.iter().find_map(ChatTarget::of)
+    }
+
     /// The chat view bound to `remote_session_id`, wherever it sits in this
     /// group — active tab or not.
     ///

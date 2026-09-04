@@ -4,7 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
-use oximux_remote_proto::messages::WorktreeWire;
+use oximux_core::WorkPhase;
+use oximux_remote_proto::messages::{WorktreeProgressWire, WorktreeWire};
 use oximux_remote_proto::proto::{Request, Response};
 use serde_json::{Value, json};
 
@@ -103,21 +104,134 @@ pub async fn ls(client: &Client, project: Option<PathBuf>) -> Result<(Value, Str
         Some(p) => Some(resolve_project_root(client, p).await),
         None => None,
     };
-    let reply = client.call(Request::ListWorktrees { project_path }).await?;
+    let reply = client.call(Request::ListWorktrees { project_path: project_path.clone() }).await?;
     let rows = match reply {
         Response::Worktrees(rows) => rows,
         Response::Error(e) => return Err(rpc_failure(e)),
         other => return Err(unexpected_reply("ListWorktrees", &other)),
     };
+    let progress = list_progress(client, project_path).await;
     let human = if rows.is_empty() {
         "no worktrees".to_string()
     } else {
         rows.iter()
-            .map(|r| format!("{}  {}  ({})  {}", r.id, r.slug, r.branch, r.path))
+            .map(|r| {
+                let p = progress.iter().find(|s| s.id == r.id);
+                let phase = p
+                    .and_then(|s| WorkPhase::parse(&s.phase))
+                    .map(|p| format!("  [{}]", p.as_str()))
+                    .unwrap_or_default();
+                let comment = match p.map(|s| s.comment.as_str()).unwrap_or("") {
+                    "" => String::new(),
+                    c => format!("  {c}"),
+                };
+                format!("{}  {}  ({}){phase}  {}{comment}", r.id, r.slug, r.branch, r.path)
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
-    Ok((json!(rows.iter().map(wire_json).collect::<Vec<_>>()), human))
+    let json_rows: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            let mut v = wire_json(r);
+            let p = progress.iter().find(|s| s.id == r.id);
+            // Always present in JSON, even when unset: a consumer testing
+            // `.comment` should not have to distinguish "absent key" from
+            // "nothing said". The human listing omits them; a script cannot.
+            v["comment"] = json!(p.map(|s| s.comment.as_str()).unwrap_or(""));
+            v["phase"] = json!(p.map(|s| s.phase.as_str()).unwrap_or(""));
+            v
+        })
+        .collect();
+    Ok((json!(json_rows), human))
+}
+
+/// The progress sidecar for a listing, or empty if the host cannot serve it.
+///
+/// **Degrades rather than failing.** `ListWorktreeProgress` is a v21 verb; a
+/// v16–v20 host answers it with an error, and an older `worktree ls` that
+/// still works is a far better outcome than one that stops working against a
+/// host it has always been able to list. The columns simply do not appear.
+async fn list_progress(client: &Client, project_path: Option<String>) -> Vec<WorktreeProgressWire> {
+    match client.call(Request::ListWorktreeProgress { project_path }).await {
+        Ok(Response::WorktreeProgress(rows)) => rows,
+        _ => Vec::new(),
+    }
+}
+
+/// Set a worktree's progress line and/or phase.
+///
+/// Refuses a call that sets nothing: `worktree set <id>` with no flags almost
+/// certainly means the flags were forgotten, and answering "ok" to it would
+/// report a write that never happened.
+///
+/// The phase is validated here as well as host-side. The host's check is the
+/// trust boundary (it serves callers that are not this CLI); this one exists
+/// so a typo fails immediately, with the vocabulary in the message, instead of
+/// after a connection attempt. Both read the same `WorkPhase` list.
+pub async fn set(
+    client: &Client,
+    id: &str,
+    comment: Option<String>,
+    phase: Option<String>,
+) -> Result<(Value, String), Failure> {
+    if comment.is_none() && phase.is_none() {
+        return Err(Failure::new(
+            "usage",
+            exit::USAGE,
+            "nothing to set — pass --comment, --phase, or both".to_string(),
+        ));
+    }
+    if let Some(raw) = phase.as_deref()
+        && !raw.is_empty()
+        && WorkPhase::parse(raw).is_none()
+    {
+        let known: Vec<&str> = WorkPhase::ALL.iter().map(|p| p.as_str()).collect();
+        return Err(Failure::new(
+            "usage",
+            exit::USAGE,
+            format!("unknown phase `{raw}` — expected one of: {}", known.join(", ")),
+        ));
+    }
+    // Normalise before sending so the stored value is the canonical spelling
+    // whatever case it was typed in — a listing should not show `In-Progress`
+    // for one worktree and `in-progress` for the next.
+    let phase = phase.map(|raw| match WorkPhase::parse(&raw) {
+        Some(p) => p.as_str().to_string(),
+        None => raw,
+    });
+    let reply = client
+        .call(Request::SetWorktreeProgress {
+            id: id.into(),
+            comment: comment.clone(),
+            phase: phase.clone(),
+        })
+        .await?;
+    match reply {
+        Response::Ack => {
+            let mut parts = Vec::new();
+            if let Some(c) = &comment {
+                parts.push(if c.is_empty() {
+                    "comment cleared".to_string()
+                } else {
+                    format!("comment: {c}")
+                });
+            }
+            if let Some(p) = &phase {
+                parts.push(if p.is_empty() {
+                    "phase cleared".to_string()
+                } else {
+                    format!("phase: {p}")
+                });
+            }
+            Ok((
+                json!({ "id": id, "comment": comment, "phase": phase }),
+                format!("{id}  {}", parts.join("  ")),
+            ))
+        }
+        Response::Error(e) => Err(rpc_failure(e)),
+        other => Err(unexpected_reply("SetWorktreeProgress", &other)),
+    }
 }
 
 /// Removal is idempotent by design — the service treats an id that is already
@@ -134,5 +248,44 @@ pub async fn rm(client: &Client, id: &str) -> Result<(Value, String), Failure> {
         )),
         Response::Error(e) => Err(rpc_failure(e)),
         other => Err(unexpected_reply("RemoveWorktree", &other)),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The canonicalisation `set` applies before sending, isolated so it can be
+    /// tested without a host. A listing must not show `In-Progress` for one
+    /// worktree and `in-progress` for the next.
+    fn canonical(raw: &str) -> String {
+        match WorkPhase::parse(raw) {
+            Some(p) => p.as_str().to_string(),
+            None => raw.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_phase_is_stored_in_one_spelling_however_it_was_typed() {
+        assert_eq!(canonical("In-Progress"), "in-progress");
+        assert_eq!(canonical("DONE"), "done");
+        assert_eq!(canonical(" todo "), "todo");
+    }
+
+    /// Every spelling the CLI accepts is one the host also accepts — the two
+    /// validators read the same `WorkPhase::ALL`, and this pins that they
+    /// cannot drift into a state where the CLI passes something the host
+    /// refuses.
+    #[test]
+    fn every_accepted_phase_is_one_the_host_accepts() {
+        for phase in WorkPhase::ALL {
+            let sent = canonical(phase.as_str());
+            assert_eq!(
+                WorkPhase::parse(&sent),
+                Some(phase),
+                "the CLI must not send a spelling the host cannot parse"
+            );
+        }
     }
 }

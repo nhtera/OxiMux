@@ -279,6 +279,42 @@ Attach to a terminal: keystrokes go to the host, output comes back. Ctrl+] detac
 | --- | --- | --- |
 | `<PTY>` | yes | The terminal id (see `term ls`) |
 
+### `oximux agent`
+
+Install, remove, and inspect the status hooks that let agent CLIs report what they are doing.
+
+_No arguments._
+
+#### `oximux agent hooks`
+
+Turn the status hooks on, off, or report what is installed
+
+_No arguments._
+
+##### `oximux agent hooks status`
+
+Report, per agent, whether OxiMux's hooks are installed and which file was read to decide.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--agent` | yes | One agent slug (see `agent hooks status`). Default: all of them |
+
+##### `oximux agent hooks on`
+
+Install the hooks, merging them into whatever is already in each file.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--agent` | yes | One agent slug. Default: all of them |
+
+##### `oximux agent hooks off`
+
+Remove the hooks, leaving anything OxiMux did not write exactly where it is — including in a file OxiMux would otherwise delete outright, which is read first and kept if it holds someone else's hooks.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--agent` | yes | One agent slug. Default: all of them |
+
 ### `oximux worktree`
 
 Create, list, and remove project worktrees on the host
@@ -309,6 +345,16 @@ Remove a worktree by id (see `worktree ls`). Refused (not forced) when the workt
 | Argument | Takes a value | Description |
 | --- | --- | --- |
 | `<ID>` | yes | The worktree id (from `worktree ls`) |
+
+#### `oximux worktree set`
+
+Say what is happening in a worktree — a one-line comment, a work phase, or both. Meant to be called by the agent working there, as it works.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<ID>` | yes | The worktree id (from `worktree ls`) |
+| `--comment` | yes | The status line — what is happening here right now. `""` clears it |
+| `--phase` | yes | The work phase: todo, in-progress, in-review, or done. `""` clears it. An unrecognised value is refused |
 
 ### `oximux projects`
 
@@ -341,6 +387,7 @@ Create a schedule. Exactly one cadence flag is required
 | `--every` | yes | Fire every N minutes (minimum 5) |
 | `--daily` | yes | Fire daily at this local time, e.g. 09:00 |
 | `--weekly` | yes | Fire weekly at this day and local time, e.g. "mon 09:00" |
+| `--cron` | yes | Fire on a 5-field cron expression, e.g. "0 9 * * 1-5" for weekdays at 09:00. Evaluated in the HOST's local time, like every other cadence. Needs a host on protocol v23 or newer. |
 
 #### `oximux schedule ls`
 
@@ -488,6 +535,8 @@ Start one session per role and open a run to track them.
 | `--role` | yes | A role, as NAME=PROMPT. Repeat for each (1–8) |
 | `--cwd` | yes | The project every role works in (default: the current directory) |
 | `--agent` | yes | Which configured agent runs every role (default: the host's) |
+| `--role-agent` | yes | Give one role its own agent, as NAME=AGENT_ID. Repeat per role. A role named here overrides `--agent`; the rest still use it |
+| `--role-model` | yes | Give one role its own model, as NAME=MODEL. Repeat per role |
 | `--worktree-each` | no | Give each role its own worktree, so roles editing the same files do not collide. The host derives each path |
 
 #### `oximux team report`
@@ -601,6 +650,35 @@ Replace this installation with the latest signed release
 | Argument | Takes a value | Description |
 | --- | --- | --- |
 | `--check` | no | Report what a release offers and exit without changing anything |
+
+### `oximux skills`
+
+The agent-facing guides that teach an agent to drive OxiMux
+
+_No arguments._
+
+#### `oximux skills ls`
+
+List the guides this binary carries, with a one-line summary each
+
+_No arguments._
+
+#### `oximux skills get`
+
+Print one guide on stdout.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `<TOPIC>` | yes | The topic (see `skills ls`) |
+| `--full` | no | Include the YAML frontmatter, as installed |
+
+#### `oximux skills install`
+
+Install the guides into the agents on this machine.
+
+| Argument | Takes a value | Description |
+| --- | --- | --- |
+| `--agent` | yes | One agent slug (see `agent hooks status`). Default: every agent here that already keeps skills |
 
 ### `oximux agent-context`
 
