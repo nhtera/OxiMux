@@ -25,7 +25,7 @@ use cli::{
     TermCommand, WorktreeCommand,
 };
 use client::Client;
-use oximux_remote_proto::proto::TEAM_PER_ROLE_MIN_VERSION;
+use oximux_remote_proto::proto::{SCHEDULE_CRON_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION};
 use output::render;
 
 /// Leaf verbs that erase something. A typo is never nudged toward one of
@@ -260,6 +260,12 @@ fn required_version(command: &Command) -> Option<(u32, &'static str)> {
         {
             Some((TEAM_PER_ROLE_MIN_VERSION, "team run --role-agent/--role-model"))
         }
+        // v23: a cron recurrence. Gated on the flag, not the family — a
+        // `schedule create --daily` still speaks v10 to a v10 host, and only
+        // `--cron` needs a host that can decode `CreateScheduleV2` at all.
+        Command::Schedule { command: ScheduleCommand::Create { cron: Some(_), .. } } => {
+            Some((SCHEDULE_CRON_MIN_VERSION, "schedule create --cron"))
+        }
         // v18: the automation surface.
         Command::Heartbeat { .. } => Some((18, "heartbeat")),
         Command::Team { .. } => Some((18, "team")),
@@ -393,7 +399,7 @@ fn host_verb(mut args: Cli) -> u8 {
                     commands::sessions::projects_ls(&client).await
                 }
                 Command::Schedule { command } => match command {
-                    ScheduleCommand::Create { prompt, name, cwd, agent, every, daily, weekly } => {
+                    ScheduleCommand::Create { prompt, name, cwd, agent, every, daily, weekly, cron } => {
                         let create_args = commands::schedule::CreateArgs {
                             prompt,
                             name,
@@ -402,6 +408,7 @@ fn host_verb(mut args: Cli) -> u8 {
                             every,
                             daily,
                             weekly,
+                            cron,
                         };
                         commands::schedule::create(&client, create_args).await
                     }
@@ -821,15 +828,44 @@ mod tests {
         assert_eq!(required_version(&command_of(&with_model)).map(|(v, _)| v), Some(22));
     }
 
-    /// `schedule` is the one family split across versions: only the manual fire
-    /// is v17, and gating the whole family would strand a v10 host's list.
+    /// `schedule` is the family most split across versions: the bulk is v10,
+    /// the manual fire is v17, and a cron cadence is v23. Gating the whole
+    /// family at its newest member would strand a v10 host's list.
+    ///
+    /// The cron arm's **position** is load-bearing — it must sit above the
+    /// `run-once` arm, because a guard that matches on a flag has to be tried
+    /// before the catch-all for its command. Nothing but this test enforces
+    /// that: a later broad `Command::Schedule { .. } => Some(17)` inserted
+    /// above it would silently ungate `--cron`, and the only other thing that
+    /// would notice is the skew suite, which skips itself unless
+    /// `OXIMUX_SKEW_CLI` is set.
     #[test]
-    fn only_run_once_gates_the_schedule_family() {
-        assert!(required_version(&command_of(&["oximux", "schedule", "ls"])).is_none());
-        assert!(required_version(&command_of(&["oximux", "schedule", "rm", "s"])).is_none());
+    fn only_run_once_and_cron_gate_the_schedule_family() {
+        let v = |args: &[&str]| required_version(&command_of(args)).map(|(v, _)| v);
+
+        assert!(v(&["oximux", "schedule", "ls"]).is_none());
+        assert!(v(&["oximux", "schedule", "rm", "s"]).is_none());
+        assert_eq!(v(&["oximux", "schedule", "run-once", "s"]), Some(17));
+
+        // Every preset cadence still speaks v10 — this is the half that keeps
+        // an existing user working against an existing host.
+        for cadence in [
+            vec!["--every", "30"],
+            vec!["--daily", "09:00"],
+            vec!["--weekly", "mon 09:00"],
+        ] {
+            let mut args = vec!["oximux", "schedule", "create", "p", "--name", "n"];
+            args.extend(cadence.iter().copied());
+            assert!(
+                v(&args).is_none(),
+                "a preset cadence must not require a newer host: {cadence:?}"
+            );
+        }
+
+        // ...and only `--cron` asks for v23.
         assert_eq!(
-            required_version(&command_of(&["oximux", "schedule", "run-once", "s"])).map(|(v, _)| v),
-            Some(17)
+            v(&["oximux", "schedule", "create", "p", "--name", "n", "--cron", "0 9 * * 1-5"]),
+            Some(23)
         );
     }
 

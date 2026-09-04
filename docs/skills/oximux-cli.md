@@ -182,6 +182,30 @@ oximux heartbeat rm <ID>
 A heartbeat is a session's own wake-up: each fire sends the prompt into that
 session. `--session` defaults to the session the command runs in.
 
+A **schedule** is the other half: each fire opens a *fresh* session instead of
+waking one that exists.
+
+```sh
+oximux schedule create "write the standup note" --name standup --cron "0 9 * * 1-5"
+oximux schedule create "nightly report" --name nightly --daily 23:30
+oximux schedule ls
+oximux schedule logs <ID>
+```
+
+Cadence is exactly one of `--every N`, `--daily HH:MM`, `--weekly "DAY HH:MM"`,
+or `--cron` with a five-field expression. Times are the **host's** local clock,
+cron included — a schedule carries no timezone of its own.
+
+`--cron` needs a host on protocol v23 or newer; against an older one the CLI
+refuses with the version it needs rather than sending a frame that host cannot
+decode. The five-minute floor applies to cron too, so `* * * * *` is refused,
+as is an expression that parses but can never come around (`0 9 30 2 *`).
+
+Note the two `--cron` flags differ: `heartbeat --cron` takes only the shapes
+that map onto the preset cadences (`*/N * * * *`, `M H * * *`, `M H * * DOW`),
+because its wire message predates full cron. Ranges and lists like
+`0 9 * * 1-5` work on `schedule --cron` only.
+
 ## When you are the agent inside a session
 
 If `OXIMUX_SESSION_ID` is set in your environment, this CLI reaches **only that

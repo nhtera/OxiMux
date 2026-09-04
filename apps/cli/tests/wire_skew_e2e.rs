@@ -402,3 +402,79 @@ fn a_new_client_runs_a_team_on_an_old_host() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+/// The v23 twin of [`a_new_client_runs_a_team_on_an_old_host`]: every preset
+/// cadence keeps working against a pre-cron host, and only `--cron` is refused
+/// — with a sentence naming the version, never a complaint about the frame.
+#[test]
+fn a_new_client_schedules_on_an_old_host() {
+    let Some(old) = old_cli() else {
+        eprintln!("skipped: OXIMUX_SKEW_CLI is unset");
+        return;
+    };
+    let host_version = protocol_of(&old);
+    if host_version >= oximux_remote_proto::proto::SCHEDULE_CRON_MIN_VERSION {
+        eprintln!("skipped: the released peer already speaks v{host_version}");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data = tmp.path().join("data");
+    let shim = tmp.path().join("bin");
+    let cwd = tmp.path().join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    common::install_claude_shim(&shim);
+    let (mut child, dir) = boot_released_serve(&old, &data, &shim, tmp.path());
+
+    // A preset cadence IS the v10 request, so it must still work untouched —
+    // this is what `create_request` sending V2 only for cron buys.
+    let out = common::bin()
+        .args([
+            "--dir", &dir, "--json", "schedule", "create", "run the report", "--name", "skew",
+            "--daily", "09:00", "--cwd", cwd.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a preset cadence must keep speaking v10: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let created = json_stdout(&out);
+    assert!(created["data"]["id"].as_str().is_some(), "a schedule id comes back");
+    assert!(
+        created["data"].get("cron").is_some(),
+        "the `cron` key is present even on the v10 path, so a script reads it the same way"
+    );
+    assert!(created["data"]["cron"].is_null(), "and it is null, because v10 cannot say");
+
+    // The listing degrades too, rather than demanding a verb the host lacks.
+    let out = common::bin().args(["--dir", &dir, "--json", "schedule", "ls"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "schedule ls must degrade: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Only cron itself is refused.
+    let out = common::bin()
+        .args([
+            "--dir", &dir, "schedule", "create", "run the report", "--name", "skew2",
+            "--cron", "0 9 * * 1-5", "--cwd", cwd.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "unreachable-class, not a crash: {stderr}");
+    assert!(stderr.contains("protocol v23"), "it names the version needed: {stderr}");
+    assert!(
+        !stderr.contains("undecodable"),
+        "and never blames the frame for what is a version problem: {stderr}"
+    );
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+

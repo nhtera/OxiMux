@@ -954,14 +954,24 @@ pub enum ScheduleCommand {
         #[arg(long, value_name = "AGENT_ID")]
         agent: Option<String>,
         /// Fire every N minutes (minimum 5).
-        #[arg(long, value_name = "MINUTES", conflicts_with_all = ["daily", "weekly"])]
+        #[arg(long, value_name = "MINUTES", conflicts_with_all = ["daily", "weekly", "cron"])]
         every: Option<u32>,
         /// Fire daily at this local time, e.g. 09:00.
-        #[arg(long, value_name = "HH:MM", conflicts_with = "weekly")]
+        #[arg(long, value_name = "HH:MM", conflicts_with_all = ["weekly", "cron"])]
         daily: Option<String>,
         /// Fire weekly at this day and local time, e.g. "mon 09:00".
-        #[arg(long, value_name = "DAY HH:MM")]
+        #[arg(long, value_name = "DAY HH:MM", conflicts_with = "cron")]
         weekly: Option<String>,
+        /// Fire on a 5-field cron expression, e.g. "0 9 * * 1-5" for weekdays
+        /// at 09:00. Evaluated in the HOST's local time, like every other
+        /// cadence. Needs a host on protocol v23 or newer.
+        ///
+        /// Fields are `minute hour day-of-month month day-of-week`; there is no
+        /// seconds field. Cron's own weekday numbering applies, where both 0
+        /// and 7 mean Sunday. The 5-minute floor still holds, so `* * * * *` is
+        /// refused.
+        #[arg(long, value_name = "EXPR", verbatim_doc_comment)]
+        cron: Option<String>,
     },
     /// List schedules with cadence, next fire, and state.
     Ls,

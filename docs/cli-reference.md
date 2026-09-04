@@ -387,6 +387,7 @@ Create a schedule. Exactly one cadence flag is required
 | `--every` | yes | Fire every N minutes (minimum 5) |
 | `--daily` | yes | Fire daily at this local time, e.g. 09:00 |
 | `--weekly` | yes | Fire weekly at this day and local time, e.g. "mon 09:00" |
+| `--cron` | yes | Fire on a 5-field cron expression, e.g. "0 9 * * 1-5" for weekdays at 09:00. Evaluated in the HOST's local time, like every other cadence. Needs a host on protocol v23 or newer. |
 
 #### `oximux schedule ls`
 
