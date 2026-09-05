@@ -37,8 +37,8 @@
         "structured": {
           "content": [
             {
-              "type": "text",
-              "text": "Tool call denied by user: bash"
+              "text": "Tool call denied by user: bash",
+              "type": "text"
             }
           ],
           "details": {}

@@ -504,4 +504,28 @@ mod tests {
         }
     }
 
+
+    /// The shared transcript invariants, run against omp's captures.
+    ///
+    /// Separate from the snapshot test: a snapshot pins today's behaviour
+    /// including any bug in it, while these assert what a transcript must never
+    /// be. Same oracle for every agent, which is the point — the drift these
+    /// catch is a rule holding in four mappers and failing in the fifth.
+    #[test]
+    fn every_captured_turn_satisfies_the_transcript_invariants() {
+        for fixture in [
+            "omp-approval-deny-turn",
+            "omp-simple-turn",
+        ] {
+            let (events, _) = replay(&format!("{fixture}.jsonl"));
+            // "A turn ran and finished", never `!turn_active` — an idle thread
+            // also reports no active turn.
+            let settled = events
+                .iter()
+                .any(|e| matches!(e, ThreadEvent::TurnEnded { .. }));
+            let thread = render(&events);
+            oximux_agent_core::thread::invariants::assert_holds(fixture, &thread, settled);
+        }
+    }
+
 }

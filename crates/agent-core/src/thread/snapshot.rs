@@ -21,6 +21,7 @@
 use std::path::Path;
 
 use serde::Serialize;
+use serde_json::Value;
 
 use super::entry::{ChatImage, ThreadEntry};
 use super::event::{ThreadEvent, TurnUsage};
@@ -97,12 +98,44 @@ fn redact_entry(entry: ThreadEntry) -> ThreadEntry {
     let mut entry = entry;
     match &mut entry {
         ThreadEntry::User { images, .. } => redact(images),
-        ThreadEntry::ToolCall(call) => redact(&mut call.images),
+        ThreadEntry::ToolCall(call) => {
+            redact(&mut call.images);
+            // A tool call's `input`/`structured` are free-form `Value`s, and
+            // their key order is a build-configuration detail — see
+            // [`canonical`].
+            call.input = canonical(std::mem::take(&mut call.input));
+            call.structured = call.structured.take().map(canonical);
+        }
         ThreadEntry::Assistant(_)
         | ThreadEntry::ContextCompaction { .. }
         | ThreadEntry::TurnDiff { .. } => {}
     }
     entry
+}
+
+/// Sort every object key, recursively.
+///
+/// `serde_json` maps preserve *insertion* order when anything in the build
+/// graph turns on `preserve_order` (something in this workspace does — the
+/// lockfile shows `serde_json` pulling `indexmap`) and sort keys when nothing
+/// does. Cargo unifies features per build, so the same fixture serialized
+/// differently depending on whether `agent-core` was built alone or as part of
+/// the workspace, and the snapshot failed only in the full run.
+///
+/// Sorting here makes the snapshot a property of the transcript rather than of
+/// the build graph. Found the honest way: the workspace suite failed while the
+/// crate suite passed.
+fn canonical(v: Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> =
+                map.into_iter().map(|(k, v)| (k, canonical(v))).collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(entries.into_iter().collect())
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(canonical).collect()),
+        other => other,
+    }
 }
 
 /// FNV-1a. Inline rather than a dependency: `agent-core` is deliberately

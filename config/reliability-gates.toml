@@ -819,3 +819,106 @@ assertions = [
   "rate_limit_fixture_decodes_every_status",
   "only_known_window_kinds_are_waitable",
 ]
+
+[[gate]]
+id = "thread.transcript-invariants-hold-for-every-agent"
+title = "No agent leaves a spinner running or a row duplicated"
+status = "stable"
+owner = "agent-core"
+invariant = """
+Once a turn has settled, no tool row is still rendering as in-flight; no two \
+rows share a tool-call id; and no assistant row folds to nothing. These hold \
+for every agent, checked by one oracle rather than per-mapper conventions."""
+oracle = """
+Fold each captured fixture with the real decoder and the real fold, then run \
+the shared checker over the result. The failure this catches is the one nine \
+rounds of render-fidelity work kept rediscovering: a rule that holds in four \
+mappers and quietly fails in the fifth. It is invisible to a type checker and \
+to any test asserting only that events were produced — a card simply spins \
+forever, and the turn looks hung rather than finished. \
+\
+Verified non-vacuous by mutation: making the Codex mapper never terminalize an \
+item is caught here, naming the row and the rule."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only, for the reason recorded on the retry gates: `oximux-agents` and \
+`oximux-agent-core` are `cargo check`ed on Linux (ci.yml:216-217) and absent \
+from the Windows test list (ci.yml:648-654), so only the macOS `--workspace \
+--all-targets` job runs them. Pure fold logic with no clock, filesystem or \
+process, so there is no platform-specific behaviour to miss. \
+\
+**Covers Claude, Codex, Pi and omp — not ACP**, which has no committed fixture. \
+That is a real hole, not an oversight: the checker is wired to run per agent, so \
+adding an ACP capture is the whole cost of closing it. \
+\
+The oracle itself has been wrong once and the mistake is worth keeping: it first \
+derived "turn settled" from `!turn_active` and reported a violation against a \
+one-line fixture that never opened a turn. An idle thread also reports no active \
+turn. "Settled" now means a `TurnEnded` was observed."""
+test_files = [
+  "crates/agent-core/src/thread/invariants.rs",
+  "crates/agent-core/tests/transcript_snapshots.rs",
+  "crates/agents/src/thread/codex/map.rs",
+  "crates/agents/src/thread/pi/map.rs",
+  "crates/agents/src/thread/omp/map.rs",
+]
+assertions = [
+  "every_claude_fixture_satisfies_the_transcript_invariants",
+  "every_captured_turn_satisfies_the_transcript_invariants",
+  "a_row_still_in_flight_after_the_turn_settled_is_a_violation",
+  "an_in_flight_row_during_a_live_turn_is_not_a_violation",
+  "two_rows_sharing_a_tool_call_id_are_a_violation",
+  "rows_without_an_id_are_not_duplicates_of_each_other",
+]
+
+[[gate]]
+id = "thread.rendered-transcript-is-pinned"
+title = "A mapper change that alters what the user sees fails a test"
+status = "stable"
+owner = "agent-core"
+invariant = """
+Every committed fixture folds to a byte-identical committed transcript, so a \
+change to any mapper that alters rendered output has to be noticed and named \
+rather than discovered later in the UI."""
+oracle = """
+Decode each fixture, fold it, and compare the result against a committed \
+snapshot. Pins the *folded transcript* rather than the event stream on purpose: \
+event coalescing is a legitimate future change that would rewrite the stream \
+without changing a pixel, and pinning the stream would report that as a \
+regression. \
+\
+Verified non-vacuous by mutation twice, and the first attempt FAILED: a mutant \
+dropping `usage` from every `TurnEnded` passed all thirteen snapshots because \
+the projection omitted `usage`, which renders in the transcript footer. A \
+snapshot is only a net over the fields it projects. A second mutant prefixing \
+Codex tool names fails Codex's snapshot alone, so the pins are per-agent rather \
+than all keying on one shared path."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only, same CI reason as the invariants gate above. \
+\
+13 fixtures: 7 Claude, 2 each Codex/Pi/omp. Note the plan this came from claimed \
+Codex/Pi/omp were "barely" covered by fixtures; there are in fact two committed \
+captures each, and ACP that has none. \
+\
+Snapshots are canonicalised (object keys sorted, image payloads replaced by a \
+length+hash marker). Both matter: `serde_json` preserves insertion order when \
+anything in the build graph enables `preserve_order` and sorts otherwise, so \
+before canonicalisation the same fixture serialised differently depending on \
+whether the crate was built alone or in the workspace — the crate suite passed \
+while the workspace suite failed. Sorting makes the snapshot a property of the \
+transcript rather than of the build graph."""
+test_files = [
+  "crates/agent-core/src/thread/snapshot.rs",
+  "crates/agent-core/tests/transcript_snapshots.rs",
+  "crates/agents/src/thread/codex/map.rs",
+  "crates/agents/src/thread/pi/map.rs",
+  "crates/agents/src/thread/omp/map.rs",
+]
+assertions = [
+  "every_claude_fixture_renders_the_pinned_transcript",
+  "every_captured_turn_renders_the_pinned_transcript",
+  "every_fixture_decodes_to_at_least_one_event",
+]

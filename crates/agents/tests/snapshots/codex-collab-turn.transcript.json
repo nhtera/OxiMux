@@ -20,19 +20,19 @@
         "id": "call_7LG5kEHGdhe7YTviKbxPqHhs",
         "name": "Agent activity",
         "input": {
-          "type": "subAgentActivity",
+          "agentPath": "/root/verify_scratch_file",
+          "agentThreadId": "019f68e7-2f5a-72d2-842d-324e7b8bae78",
           "id": "call_7LG5kEHGdhe7YTviKbxPqHhs",
           "kind": "started",
-          "agentThreadId": "019f68e7-2f5a-72d2-842d-324e7b8bae78",
-          "agentPath": "/root/verify_scratch_file"
+          "type": "subAgentActivity"
         },
         "status": "Completed",
         "result": "started · /root/verify_scratch_file",
         "structured": {
-          "type": "subAgentActivity",
-          "status": "started",
           "agentPath": "/root/verify_scratch_file",
-          "agentThreadId": "019f68e7-2f5a-72d2-842d-324e7b8bae78"
+          "agentThreadId": "019f68e7-2f5a-72d2-842d-324e7b8bae78",
+          "status": "started",
+          "type": "subAgentActivity"
         },
         "images": [],
         "terminal_id": null,
@@ -51,25 +51,25 @@
         "id": "call_uQMjDqyqRz3ZqGTv76OrnCCS",
         "name": "Agent",
         "input": {
-          "type": "collabAgentToolCall",
+          "agentsStates": {},
           "id": "call_uQMjDqyqRz3ZqGTv76OrnCCS",
-          "tool": "wait",
-          "status": "inProgress",
-          "senderThreadId": "019f68e6-f6d4-7341-b59c-94984172beac",
-          "receiverThreadIds": [],
-          "prompt": null,
           "model": null,
+          "prompt": null,
           "reasoningEffort": null,
-          "agentsStates": {}
+          "receiverThreadIds": [],
+          "senderThreadId": "019f68e6-f6d4-7341-b59c-94984172beac",
+          "status": "inProgress",
+          "tool": "wait",
+          "type": "collabAgentToolCall"
         },
         "status": "Completed",
         "result": "completed",
         "structured": {
-          "type": "collabAgentToolCall",
-          "tool": "wait",
-          "status": "completed",
+          "agents": [],
           "callStatus": "completed",
-          "agents": []
+          "status": "completed",
+          "tool": "wait",
+          "type": "collabAgentToolCall"
         },
         "images": [],
         "terminal_id": null,

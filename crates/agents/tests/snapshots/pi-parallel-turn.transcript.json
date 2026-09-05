@@ -34,8 +34,8 @@
         "structured": {
           "content": [
             {
-              "type": "text",
-              "text": "alpha file contents\n"
+              "text": "alpha file contents\n",
+              "type": "text"
             }
           ]
         },
@@ -59,8 +59,8 @@
         "structured": {
           "content": [
             {
-              "type": "text",
-              "text": "beta file contents\n"
+              "text": "beta file contents\n",
+              "type": "text"
             }
           ]
         },

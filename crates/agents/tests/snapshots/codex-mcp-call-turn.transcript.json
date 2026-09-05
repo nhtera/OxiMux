@@ -27,14 +27,14 @@
         "status": "Completed",
         "result": "42",
         "structured": {
+          "_meta": null,
           "content": [
             {
-              "type": "text",
-              "text": "42"
+              "text": "42",
+              "type": "text"
             }
           ],
-          "structuredContent": null,
-          "_meta": null
+          "structuredContent": null
         },
         "images": [],
         "terminal_id": null,

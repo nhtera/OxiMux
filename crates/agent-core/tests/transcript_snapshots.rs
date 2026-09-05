@@ -16,7 +16,9 @@
 //! ```
 
 use oximux_agent_core::thread::event::ThreadEvent;
+use oximux_agent_core::thread::invariants;
 use oximux_agent_core::thread::snapshot::assert_transcript_snapshot;
+use oximux_agent_core::thread::state::ChatThread;
 use oximux_agent_core::thread::stream_json::decode_line;
 
 /// Every fixture in `src/thread/testdata/`. Listed rather than globbed so a new
@@ -61,3 +63,25 @@ fn every_fixture_decodes_to_at_least_one_event() {
         );
     }
 }
+
+/// Every Claude fixture must satisfy the shared transcript invariants.
+///
+/// Separate from the snapshot test on purpose: a snapshot pins whatever the
+/// code does today, including a bug. These assert what the transcript must
+/// *never* be, so a pinned bug still fails here.
+#[test]
+fn every_claude_fixture_satisfies_the_transcript_invariants() {
+    for name in FIXTURES {
+        let events = decode_fixture(name);
+        // "A turn ran and finished", not "no turn is in flight" — see
+        // `invariants::check`. A fixture that never opens a turn leaves cards
+        // legitimately open.
+        let settled = events.iter().any(|e| matches!(e, ThreadEvent::TurnEnded { .. }));
+        let mut thread = ChatThread::default();
+        for ev in &events {
+            thread.apply(ev);
+        }
+        invariants::assert_holds(name, &thread, settled);
+    }
+}
+
