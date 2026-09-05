@@ -182,6 +182,30 @@ pub(super) fn entries(
         .collect()
 }
 
+/// The container the row's action chips sit in.
+///
+/// **It must not wrap.** [`super::layout::setting_row_desc`] pins the control
+/// column right at its *intrinsic* width, and a wrapping flex container reports
+/// its widest single item rather than its full line as that width. The install
+/// row — the only one that ever carries three chips — therefore resolved to the
+/// width of "Install with brew" alone: the three chips stacked one per line,
+/// the whole cluster sat 163px left of where every other row's controls sit,
+/// and because the row had reserved height for the single line the parent
+/// measured, the two extra lines were painted straight over the row beneath.
+///
+/// Not wrapping is safe because the cluster is bounded and the card is not
+/// elastic: the settings card is a fixed `CARD_WIDTH`, and the widest state
+/// this row reaches is three chips — install, copy, docs — at roughly 300px in
+/// a ~690px row.
+fn actions_row(density: Density) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .justify_end()
+        .items_center()
+        .gap(px(density.gap_inline))
+}
+
 /// The right-hand side of one row: the status pill, then whatever action the
 /// state calls for.
 #[allow(clippy::too_many_arguments)]
@@ -225,13 +249,7 @@ fn controls(
         );
     }
 
-    let mut actions = div()
-        .flex()
-        .flex_row()
-        .flex_wrap()
-        .justify_end()
-        .items_center()
-        .gap(px(density.gap_inline));
+    let mut actions = actions_row(density);
 
     if running {
         actions = actions
@@ -588,6 +606,174 @@ mod tests {
             .map(|t| row(t, Health::Ready { version: None }, false))
             .collect();
         assert!(summary(&healthy).contains("present and working"));
+    }
+
+    /// The install row is the only one that carries three chips, and it is the
+    /// one that broke: pinned right at its intrinsic width by
+    /// `setting_row_desc`, a *wrapping* cluster reports its widest single item
+    /// as that width, so the chips stacked one per line, the column sat well
+    /// left of every other row's, and the overflow painted over the row below.
+    ///
+    /// Measured rather than asserted structurally, because the element tree is
+    /// identical either way — only the geometry differs. `BODY_W` is above the
+    /// width at which the fault appears (it does not reproduce in a narrow
+    /// body), and the row is built through the same `actions_row` the shipped
+    /// pane uses, so re-adding `flex_wrap` to it fails this test.
+    mod geometry {
+        use super::super::actions_row;
+        use crate::shell::settings_modal::layout::{card_surface, entries_card, entry};
+        use gpui::{
+            Bounds, Context, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
+            Render, SharedString, StatefulInteractiveElement as _, Styled as _, TestAppContext,
+            Window, canvas, div, px, size,
+        };
+        use oximux_settings::{Density, Theme, Typography};
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        /// Wide enough to reproduce the fault. The real body is ~690px; the
+        /// mis-measurement needs a little more room than that to show, and a
+        /// guard that cannot fail on the broken code is worth nothing.
+        const BODY_W: f32 = 900.0;
+
+        /// The row's three chips, longest first — the shape the GitLab row
+        /// reaches on a machine with `brew` and no `glab`.
+        const CHIPS: [(&str, &str); 3] = [
+            ("install", "Install with brew"),
+            ("copy", "Copy command"),
+            ("docs", "Docs"),
+        ];
+
+        /// Renders one install row inside the real card + scroll body the pane
+        /// lives in, recording where the control column and the card's content
+        /// box actually landed.
+        struct RowProbe {
+            col: Rc<Cell<Option<Bounds<Pixels>>>>,
+            card: Rc<Cell<Option<Bounds<Pixels>>>>,
+        }
+
+        /// A zero-height, out-of-flow ruler: `absolute` keeps it out of the
+        /// flex line it is parented to, so it measures its parent's content box
+        /// without perturbing the layout under test.
+        fn ruler(sink: Rc<Cell<Option<Bounds<Pixels>>>>) -> gpui::AnyElement {
+            canvas(
+                |_, _, _| (),
+                move |b: Bounds<Pixels>, _: (), _w, _c| sink.set(Some(b)),
+            )
+            .absolute()
+            .w_full()
+            .h(px(0.0))
+            .into_any_element()
+        }
+
+        impl Render for RowProbe {
+            fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = Theme::default();
+                let typography = Typography::default();
+                let density = Density::default();
+
+                let mut actions = actions_row(density);
+                for (id, label) in CHIPS {
+                    actions = actions.child(
+                        div()
+                            .id(id)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(density.h_overlay_item))
+                            .px(px(10.0))
+                            .rounded(px(density.r_chip))
+                            .border_1()
+                            .text_size(px(typography.t_body_sm))
+                            .child(SharedString::from(label)),
+                    );
+                }
+
+                let col = div()
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .text_size(px(typography.t_body_sm))
+                            .font_weight(typography.w_semibold)
+                            .child("Not installed"),
+                    )
+                    .child(ruler(self.col.clone()))
+                    .child(actions)
+                    .into_any_element();
+
+                let rows = vec![entry(
+                    "GitLab CLI",
+                    super::super::row_detail(&super::row(
+                        crate::shell::integrations::catalog::Tool::GitlabCli,
+                        crate::shell::integrations::probe::Health::Missing,
+                        true,
+                    )),
+                    col,
+                )];
+                let card = card_surface(
+                    theme,
+                    density,
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w_full()
+                        .child(ruler(self.card.clone()))
+                        .child(entries_card(theme, density, &typography, rows))
+                        .into_any_element(),
+                );
+                div()
+                    .id("settings-body")
+                    .w(px(BODY_W))
+                    .flex()
+                    .flex_col()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .w_full()
+                            .child(div().flex().flex_col().gap(px(10.0)).child(card)),
+                    )
+            }
+        }
+
+        #[gpui::test]
+        fn an_install_rows_three_chips_stay_on_one_line_at_the_cards_edge(
+            cx: &mut TestAppContext,
+        ) {
+            let col = Rc::new(Cell::new(None));
+            let card = Rc::new(Cell::new(None));
+            let (c, k) = (col.clone(), card.clone());
+            let w = cx.add_window(move |_w, _c| RowProbe { col: c, card: k });
+            let vcx = gpui::VisualTestContext::from_window(w.into(), cx);
+            vcx.simulate_resize(size(px(1400.0), px(900.0)));
+            vcx.run_until_parked();
+
+            let col = col.get().expect("the control column painted");
+            let card = card.get().expect("the card painted");
+            let (col_right, card_right) = (f32::from(col.right()), f32::from(card.right()));
+            assert!(
+                (col_right - card_right).abs() < 0.5,
+                "the controls stopped {:.0}px short of the card's edge — the cluster \
+                 collapsed to its widest chip instead of its full line",
+                card_right - col_right,
+            );
+            // Belt and braces on the flush-edge check above. Measured in this
+            // probe: the wrapped column collapsed to 135px and the correct one
+            // is 298px in an ~872px card, so a quarter of the card sits well
+            // clear of both — it fails on the fault without riding on the exact
+            // text metrics of three particular labels.
+            assert!(
+                f32::from(col.size.width) > f32::from(card.size.width) / 4.0,
+                "the control column is only {:.0}px wide in a {:.0}px card — the chips \
+                 stacked one per line",
+                f32::from(col.size.width),
+                f32::from(card.size.width),
+            );
+        }
     }
 
     #[test]
