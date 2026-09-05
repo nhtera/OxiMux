@@ -14862,6 +14862,8 @@ version = "0.1.18"
 dependencies = [
  "anyhow",
  "image",
+ "serde",
+ "toml 0.8.23",
 ]
 
 [[package]]

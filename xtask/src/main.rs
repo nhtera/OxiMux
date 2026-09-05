@@ -12,6 +12,10 @@
 //!   xtask appearance-lint  Fail if a view caches `Density`/`Typography` but
 //!                          its `render` never pulls the current appearance —
 //!                          that view goes stale on a density or zoom change.
+//!   xtask reliability-gates
+//!                          Validate `config/reliability-gates.toml` — the
+//!                          reliability claims ledger. Shape and internal
+//!                          consistency only; it never runs a test.
 //!   xtask icon             Regenerate the Windows .ico from the macOS .icns.
 //!   xtask icon --check     Fail if the checked-in .ico is stale.
 //!   xtask ci-check         Run all xtask checks back-to-back.
@@ -26,6 +30,7 @@ mod appearance_lint;
 mod data_dir_lint;
 mod icon;
 mod literal_lint;
+mod reliability_gates;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -51,6 +56,7 @@ fn main() -> ExitCode {
         "data-dir-lint" => data_dir_lint(),
         "literal-lint" => literal_lint(),
         "appearance-lint" => appearance_lint(),
+        "reliability-gates" => reliability_gates(),
         "icon" => icon::run(check),
         // Every check CI should run, in one command. `icon --check` is here
         // rather than in a Windows-only job because the icon is derived from a
@@ -63,6 +69,7 @@ fn main() -> ExitCode {
             .and_then(|()| data_dir_lint())
             .and_then(|()| literal_lint())
             .and_then(|()| appearance_lint())
+            .and_then(|()| reliability_gates())
             .and_then(|()| icon::run(true)),
         "help" | "--help" | "-h" => {
             print_help();
@@ -96,8 +103,9 @@ fn print_help() {
            data-dir-lint    Keep data/cache path choices inside app_paths\n\
            literal-lint     Keep radius/type sizes on the Density + Typography scales\n\
            appearance-lint  Keep token-caching views pulling the current appearance\n\
+           reliability-gates  Validate config/reliability-gates.toml (shape only, runs no tests)\n\
            icon [--check]   Derive assets/windows/OxiMux.ico from assets/AppIcon.icns\n\
-           ci-check         Run all checks (file-size-lint, data-dir-lint, icon --check)\n\
+           ci-check         Run all checks: file-size-lint, data-dir-lint, literal-lint, appearance-lint, reliability-gates, icon --check\n\
            help             Print this message"
     );
 }
@@ -157,6 +165,11 @@ fn appearance_lint() -> Result<(), Box<dyn std::error::Error>> {
         files.push((shown, text));
     }
     appearance_lint::run(&files)
+}
+
+fn reliability_gates() -> Result<(), Box<dyn std::error::Error>> {
+    let root = workspace_root()?;
+    reliability_gates::run(&root)
 }
 
 fn file_size_lint() -> Result<(), Box<dyn std::error::Error>> {

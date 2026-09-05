@@ -1,0 +1,566 @@
+# OxiMux reliability gates.
+#
+# A gate is a reliability claim with its evidence attached. It records what must
+# be true, how you would notice it stopped being true, and — the field that does
+# the real work — the gap between where the invariant must hold and where it is
+# actually proven.
+#
+# Validated by `cargo run -p xtask -- reliability-gates`. The validator checks
+# shape and internal consistency ONLY. It never asserts a test passes; that is
+# `cargo test`'s job. An uncovered platform is data, not a failure.
+#
+# Add a gate when something breaks, not speculatively. A small honest ledger is
+# worth more than a large stale one — see docs/reliability-gates.md.
+
+schema_version = 1
+
+# ---------------------------------------------------------------------------
+# relay / PTY
+# ---------------------------------------------------------------------------
+
+[[gate]]
+id = "relay.reattach-input-reaches-child"
+title = "A reattached client can type"
+status = "stable"
+owner = "relay"
+invariant = """
+A client that detaches and reattaches to a live PTY can send keystrokes that \
+reach the child process, and a second simultaneous subscriber does not steal \
+the first one's input path."""
+oracle = """
+Attach two subscribers to one PTY and assert both receive output; detach and \
+reattach a fresh client and assert it gets scrollback and can still write. The \
+regression is silent and therefore expensive: the UI accepts every keystroke \
+and echoes nothing, which reads as a hung agent rather than as a lost input \
+route."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos", "windows", "linux"]
+coverage_notes = """
+Genuinely covered on all three: the macOS job runs the workspace all-targets, \
+and the Linux and Windows jobs each name `-p oximux-relay --test \
+relay_integration` as their own step. The Windows run is the load-bearing one \
+— it boots the daemon over a real named pipe and runs the v8 mutual handshake \
+from both ends, which is where this invariant would break if it broke."""
+test_files = ["crates/relay/tests/relay_integration.rs"]
+assertions = [
+  "two_simultaneous_subscribers_both_receive_output",
+  "detach_then_fresh_client_reattach_gets_scrollback",
+  "unclean_disconnect_releases_attachment_and_grows_back",
+]
+
+[[gate]]
+id = "relay.attachment-min-size"
+title = "PTY size follows the real attachments, not a phantom one"
+status = "stable"
+owner = "relay"
+invariant = """
+The daemon drives a PTY at the element-wise minimum across its live \
+attachments. Detaching grows it back; a `Replay` does not register an \
+attachment and so cannot pin the size."""
+oracle = """
+Attach two clients at different sizes and assert the min; detach one and assert \
+it grows back; replay, then resize, and assert the PTY still follows the one \
+real attachment. A regression shows as the user's terminal visibly resizing \
+itself after an unrelated client disconnects — a phone that once fit a session \
+shrinking the desktop PTY is the shipped instance of this."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos", "windows", "linux"]
+coverage_notes = """
+Covered wherever `relay_integration` runs, which is all three jobs — see \
+`relay.reattach-input-reaches-child`."""
+test_files = ["crates/relay/tests/relay_integration.rs"]
+assertions = [
+  "multi_attach_min_size_and_detach_grows_back",
+  "replay_returns_the_ring_without_adding_an_attachment",
+]
+
+[[gate]]
+id = "relay.spawn-argv-reaches-child"
+title = "Spawn args reach the child's argv"
+status = "flaky"
+owner = "relay"
+invariant = """
+`Spawn.args` reaches the spawned program's argv. The daemon runs the named \
+program directly, so an agent launch passes its flags without a shell \
+wrapper."""
+oracle = """
+Spawn an `echo MARKER` program and assert the marker appears. On unix that is \
+`/bin/echo` invoked directly — never an interactive shell, because running \
+through one would make the assertion pass on the echoed command line even with \
+argv dropped entirely. The Windows arm goes through `cmd.exe /c echo` (see \
+`echo_program` in `crates/shell-env`), so there the test proves argv reaches \
+`cmd` rather than reaching a bare program; that is weaker and worth knowing \
+when reading a Windows pass."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos", "windows", "linux"]
+coverage_notes = """
+STILL FLAKY — do not read a green run as proof. `cargo test --workspace` can \
+abort with exit 101 here, panicking `child argv missing the spawned arg; got \
+""`. The cause is contention, not the argv path: this file runs 18 \
+daemon-and-subprocess-spawning tests in parallel and the argv readback races to \
+empty. It passes reliably in isolation \
+(`cargo test -p oximux-relay --test relay_integration \
+spawn_args_reach_child_process -- --exact`). Two consequences worth carrying: \
+`cargo test --workspace` is fail-fast, so one trip here aborts the run before \
+later crates and yields a short, misleading count — always verify with \
+`--no-fail-fast`; and if this is the only failure, it is this flake rather than \
+a regression. Runs on all three jobs, and can flake on any of them. No fix \
+commit exists; an earlier draft of this row claimed one and was wrong."""
+test_files = ["crates/relay/tests/relay_integration.rs"]
+assertions = ["spawn_args_reach_child_process", "spawn_env_reaches_child_process"]
+
+[[gate]]
+id = "pty.exit-code-drain-race"
+title = "Exit status survives the output drain"
+status = "stable"
+owner = "pty"
+invariant = """
+Draining status events does not consume the renderer's output or the child's \
+exit event. A process that has exited reports its exit exactly once, after its \
+final output."""
+oracle = """
+Spawn a program that writes and exits, drain status separately from render \
+output, and assert both the marker and the exit are observed. The regression \
+presents as a terminal that finished but never shows the exit banner, or one \
+that loses its last line — both read to the user as a hang, not as a dropped \
+event."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos", "windows"]
+coverage_notes = """
+The gap is Linux, not Windows — the reverse of the intuition. Windows names \
+`-p oximux-pty --test backend_smoke` as its own step precisely because the \
+workspace sweep there is `--lib` and would skip it, so ConPTY's drain shape is \
+asserted. The Linux job tests six named crates and `oximux-pty` is not among \
+them, so this suite never runs on Linux at all."""
+test_files = ["crates/pty/tests/backend_smoke.rs"]
+assertions = [
+  "spawn_echo_drains_marker_and_exit",
+  "status_drain_does_not_consume_renderer_output_or_exit",
+]
+
+# ---------------------------------------------------------------------------
+# agent runtime
+# ---------------------------------------------------------------------------
+
+[[gate]]
+id = "agents.stream-json-decode-fidelity"
+title = "Claude stream-json decodes to the rendered timeline"
+status = "stable"
+owner = "agent-core"
+invariant = """
+`decode_line` turns a captured Claude stream-json transcript into the \
+`ThreadEvent` sequence the transcript renders, including tool-input deltas that \
+grow into a final card, subagent nesting, and the exit-plan-mode control \
+request."""
+oracle = """
+Replay each committed fixture and assert the event sequence. A regression is \
+invisible to the type checker — the events still decode, they just mean \
+something else — so the fixtures are the only thing standing between a \
+provider wording change and a silently wrong transcript."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos", "windows"]
+agents = ["claude", "codex", "acp", "pi", "omp"]
+covered_agents = ["claude", "codex", "pi", "omp"]
+coverage_notes = """
+ACP is the only agent with no captured transcript fixture, so its decode path \
+is covered by whatever a manual pass happens to exercise. The others are \
+fixture-backed, but not evenly, and the imbalance is the real content of this \
+row: Claude has six fixtures under `agent-core/src/thread/testdata/` \
+(tool-input deltas, subagent nesting, rich tools, exit-plan-mode, two error \
+shapes), while Codex, Pi and omp have two apiece under \
+`agents/src/thread/testdata/`, replayed by each mapper's own `replay()` helper. \
+Two fixtures cover a happy path and one variation; they do not cover the error \
+and control-request shapes Claude's six do. An earlier draft of this row said \
+these agents had no fixtures at all, which was false. Platforms: these are lib tests, reached by \
+the macOS all-targets run and the Windows `--workspace --lib` sweep; the Linux \
+job names six crates and `oximux-agent-core` is not one, so Linux is listed \
+uncovered rather than assumed. The logic is platform-independent, which is an \
+argument that the Linux gap is low-risk — not that it is covered. This row is \
+the baseline Phase 4 of \
+plans/260905-1031-agent-runtime-and-reliability-enhancements/ migrates \
+against; each agent gets its own gate as it moves to the assembler."""
+test_files = [
+  "crates/agent-core/src/thread/stream_json.rs",
+  "crates/agent-core/src/thread/testdata/stream_json_tool_input_delta.jsonl",
+  "crates/agent-core/src/thread/testdata/stream_json_exit_plan_mode.jsonl",
+  "crates/agent-core/src/thread/testdata/stream_json_subagent.jsonl",
+  "crates/agent-core/src/thread/testdata/stream_json_richtools.jsonl",
+  "crates/agent-core/src/thread/testdata/stream_json_error_api.jsonl",
+  "crates/agent-core/src/thread/testdata/stream_json_error_stale_resume.jsonl",
+]
+assertions = ["tool_input_delta_fixture_replays_into_growing_then_final_card"]
+
+[[gate]]
+id = "agents.usage-window-void-past-reset"
+title = "A usage window past its reset is void"
+status = "stable"
+owner = "agents"
+invariant = """
+A `UsageWindow` whose `resets_at_ms` is in the past is not current and must not \
+be reported as the tightest window. The meter reports the most-used window \
+among those still live."""
+oracle = """
+Build windows either side of `now_ms` and assert the expired one is excluded \
+and the most-used live one wins. A regression pins the usage meter to a stale \
+window, so it reads full forever — which looks like a rate limit the user \
+cannot clear, and is the input Phase 3's retry scheduling will trust."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos", "windows"]
+agents = ["claude", "codex"]
+covered_agents = ["claude", "codex"]
+coverage_notes = """
+Pure time arithmetic over parsed values, so it is platform-agnostic in fact; \
+Linux is listed uncovered because the Linux job does not test `oximux-agents`, \
+not because the arithmetic differs there. \
+Note what is NOT covered here: acquiring the numbers. Claude's come from an \
+OAuth probe that dies at token expiry and Codex's are read from an on-disk \
+rollout JSONL with no API behind it — see \
+`agents.codex-usage-from-disk`."""
+test_files = ["crates/agents/src/session_log/usage.rs"]
+assertions = [
+  "a_window_past_its_reset_is_no_longer_current",
+  "tightest_is_the_most_used_window",
+]
+
+[[gate]]
+id = "agents.codex-usage-from-disk"
+title = "Codex usage is read from the rollout JSONL, not an API"
+status = "accepted-gap"
+owner = "agents"
+invariant = """
+Codex exposes no usage API and no credential to call one. Its window figures \
+come from the rollout JSONL on disk, so the reader must tolerate a missing, \
+truncated, or concurrently-written file and report nothing rather than \
+guessing."""
+oracle = """
+Point the reader at an absent file, a half-written line, and a well-formed one, \
+and assert it degrades to "unknown" instead of fabricating a window. The \
+regression to fear is a plausible wrong number: an invented window would be \
+believed by the usage meter and, once Phase 3 lands, used to schedule a \
+retry."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = []
+coverage_notes = """
+Deliberately listed with no evidence. The on-disk read has no dedicated test \
+and no committed fixture — it is exercised only incidentally. Recorded as an \
+accepted gap rather than omitted, because Phase 3 of the agent-runtime plan is \
+about to schedule real retries off these numbers and the reader's failure modes \
+should be known before that lands. Closing it means one captured rollout JSONL \
+fixture plus a malformed-input case."""
+
+[[gate]]
+id = "agents.hook-path-must-not-wedge"
+title = "A status hook never points at a raw target/debug binary"
+status = "stable"
+owner = "agent-hooks"
+invariant = """
+Hooks OxiMux writes are distinguishable from hand-written ones and are never \
+adopted by mistake. A hook command must resolve through the guarded dispatcher \
+rather than naming a build-tree binary directly."""
+oracle = """
+Write a hand-authored hook alongside ours and assert the inspector counts it as \
+foreign and never as ours. The failure this prevents is severe and hard to \
+diagnose: a hook pointing at a raw `target/debug` binary produced processes \
+that could not be killed, and the relay ignoring an unknown PTY meant the hook \
+could hang forever with no surface anywhere in the UI."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos", "windows"]
+coverage_notes = """
+Nine agent hook dialects are supported and they disagree in ways that break \
+across platforms — two use a hooks directory rather than a file, one takes its \
+timeout in milliseconds, one matches on a regex, one is a TypeScript extension. \
+The ownership test is a lib test, so the macOS all-targets run and the Windows \
+`--workspace --lib` sweep both reach it; the Linux job does not test \
+`oximux-agent-hooks`. What no job asserts on any platform is the per-dialect \
+writers — the inspector is shared, the nine writers are not, and they are where \
+the dialects actually diverge."""
+test_files = ["crates/agent-hooks/src/inspect.rs"]
+assertions = ["a_hand_written_hook_is_counted_as_foreign_and_never_as_ours"]
+
+# ---------------------------------------------------------------------------
+# worktrees / workspace
+# ---------------------------------------------------------------------------
+
+[[gate]]
+id = "worktree.cleanup-cannot-trap-the-user"
+title = "A hung cleanup script never blocks worktree removal"
+status = "stable"
+owner = "worktree-ops"
+invariant = """
+`ScriptKind::Cleanup` runs before worktree removal bounded by `CLEANUP_TIMEOUT`, \
+with `kill_on_drop`. A missing, slow, or failing script is logged and ignored — \
+removal proceeds regardless."""
+oracle = """
+Run with a script that sleeps past the timeout and assert removal still \
+completes promptly; run with no script and assert it returns immediately. The \
+regression traps the user behind a delete that never finishes, with no way out \
+of the UI."""
+platforms = ["macos", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+`platforms` deliberately excludes Windows: the script runner is `sh -lc` and \
+project scripts are a unix-shell feature today. This is a scope boundary, not \
+an untested claim — if Windows support lands, this row must gain the platform \
+first and the coverage second. Linux is declared and uncovered: the Linux job \
+tests six named crates and `oximux-worktree-ops` is not among them, so only the \
+macOS run reaches these tests. One asymmetry the subset rule cannot express: \
+these tests carry no `cfg` gate, so they do in fact execute in the Windows \
+`--workspace --lib` sweep — but Windows is not a declared platform here, so \
+that real coverage has nowhere to go in the fields above. Note the inverted \
+policy in Phase 2 of the \
+agent-runtime plan: Setup failure MUST fail worktree creation, exactly opposite \
+to Cleanup here, and that asymmetry is deliberate."""
+test_files = ["crates/worktree-ops/src/lib.rs"]
+assertions = [
+  "hung_cleanup_is_bounded_by_timeout",
+  "no_cleanup_script_returns_immediately",
+  "fast_cleanup_completes_normally",
+]
+
+[[gate]]
+id = "worktree.create-rolls-back-completely"
+title = "A failed worktree creation leaves nothing behind"
+status = "stable"
+owner = "worktree-ops"
+invariant = """
+When `create_workspace_with_rollback` fails, it leaves no worktree, no branch, \
+and no database row. The rollback distinguishes a clean unwind from a dirty \
+one and reports which happened."""
+oracle = """
+Fail creation at each stage and assert the tree, the branch list, and the \
+workspace table are all as they were. A partial rollback is worse than no \
+rollback: a branch with no worktree, or a row pointing at a path that does not \
+exist, is state the user cannot see and cannot clear from the UI."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+The rollback test runs in the desktop test suite, which is macOS-only. Path \
+handling is the part most likely to diverge on Windows, and it is exactly the \
+part not covered. Phase 2 of the agent-runtime plan extends this test with a \
+setup-failure arm."""
+test_files = ["apps/desktop/tests/workspace_create_rollback.rs"]
+assertions = [
+  "rollback_on_insert_conflict_removes_worktree_and_branch",
+  "create_workspace_happy_path_inserts_row_and_keeps_worktree",
+]
+
+# ---------------------------------------------------------------------------
+# platform / paths
+# ---------------------------------------------------------------------------
+
+[[gate]]
+id = "paths.data-dir-choice-lives-in-app-paths"
+title = "Nothing outside app_paths picks its own data directory"
+status = "accepted-gap"
+owner = "desktop"
+invariant = """
+`dirs::data_dir()`, `dirs::data_local_dir()` and `dirs::cache_dir()` are named \
+only inside `app_paths`. The CLI/desktop socket naming contract in \
+`remote-local` is the one allowed exception, and its agreement with `app_paths` \
+is asserted by test."""
+oracle = """
+`xtask data-dir-lint` fails on any other file naming them. This is a source \
+property and cannot be a unit test — on macOS `data_dir` and `data_local_dir` \
+are the same directory, so the obvious assertion is vacuously true on the only \
+platform that runs it. On Windows they differ: `data_dir` is the roaming \
+profile. The real cost was the relay writing scrollback checkpoints to the \
+local runtime dir while the reader looked in the roaming one, so crash restore \
+reported "nothing to restore" — indistinguishable from an empty store. The \
+screen-control grant store landed in roaming too, where on a domain-joined \
+machine it follows the user to other machines."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = []
+coverage_notes = """
+Covered nowhere, and that is a wiring bug rather than a missing test. \
+`data-dir-lint` is a source-text property, so running it on any one platform \
+would honestly prove it for all three — but it runs on none: `xtask ci-check` \
+includes it, and `ci.yml` never calls `ci-check`, invoking the subcommands \
+individually instead. `appearance-lint` is in the same position. So the lint \
+exists, passes locally, and gates nothing. Listed with empty coverage rather \
+than the three platforms an earlier draft claimed, because a check CI does not \
+run is not evidence. Closing this is one step in `ci.yml` per lint; it was left \
+out of the phase that added this row to keep that phase's scope, and should be \
+done next."""
+test_files = ["apps/desktop/src/app_paths.rs", "xtask/src/data_dir_lint.rs"]
+assertions = ["control_socket_convention_matches_the_data_dir"]
+
+[[gate]]
+id = "desktop.single-instance-guard"
+title = "A second launch activates the running app instead of racing it"
+status = "accepted-gap"
+owner = "desktop"
+invariant = """
+Launching OxiMux while an instance is running activates the existing window \
+rather than starting a second process. Two instances would contend for the \
+same database, relay socket, and single-instance lock file."""
+oracle = """
+Launch twice and assert one process and a focused window. A regression is \
+rarely reported as "two instances" — it presents as data loss or a dead relay \
+socket, because the second process takes over resources the first still \
+believes it owns."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = []
+coverage_notes = """
+No automated coverage, and honestly so: the guard is a process-level property \
+that a test binary cannot assert without launching the real app, and the guard \
+actively blocks a dev build while a release build is running — which makes it \
+the one mechanism that interferes with its own verification. Verified by hand. \
+Closing this needs a harness that can launch and observe two real processes; \
+until then this row exists to stop the gap being forgotten rather than to \
+claim anything."""
+
+# ---------------------------------------------------------------------------
+# computer use
+# ---------------------------------------------------------------------------
+
+[[gate]]
+id = "computer-use.untrusted-binary-never-executes"
+title = "The gate refuses an unapproved driver before running it"
+status = "stable"
+owner = "computer-use"
+invariant = """
+A driver binary that the user has not pinned is refused before it is ever \
+executed, and rewriting an approved binary shuts the gate again until it is \
+re-approved."""
+oracle = """
+Stage an unapproved binary and assert refusal without execution; approve, \
+assert it runs; rewrite it in place, assert refusal returns. The ordering is \
+the whole point — a check that runs the binary and then validates it has \
+already lost. A driver that was never installed must read as "not installed", \
+not as a trust failure, or the UI will accuse the user of something they did \
+not do."""
+platforms = ["macos", "windows"]
+covered_platforms = ["macos", "windows"]
+coverage_notes = """
+Covered on both declared platforms: the Windows job runs `-p \
+oximux-computer-use` all-targets rather than `--lib`, specifically so the \
+suites under `tests/` are reached. `platforms` omits linux: there is no driver \
+there. One caveat that is coverage rather than a gap — the two `live_driver` \
+tests self-ignore without a real driver binary, which is correct on Windows \
+(no Windows driver worth trusting yet) and would be a hole on macOS.
+
+Local-run hazard, and the reason this row spells out how a failure *presents*: \
+`approving_lets_the_gate_run_the_binary_it_now_trusts` and \
+`re_approving_after_an_update_reopens_the_gate` stage a copy of a real \
+executable and exec it. On a macOS host whose XProtect scan has wedged, exec of \
+any freshly-copied binary hangs in uninterruptible `UE` state — SIGKILL does \
+nothing and a reboot is the only clear. So on a wedged host this suite does not \
+fail, it *stops*, taking the whole `cargo test --workspace` run with it and \
+leaving unkillable corpses behind. Read a local hang here as a host problem, \
+not a code one; skip with `--skip approving_lets_the_gate_run --skip \
+re_approving_after_an_update`. CI hosts are clean, so this never presents \
+there."""
+test_files = ["crates/computer-use/tests/user_pinned_trust.rs"]
+assertions = [
+  "an_unapproved_binary_is_refused_before_it_is_ever_executed",
+  "rewriting_an_approved_binary_shuts_the_gate_again",
+  "re_approving_after_an_update_reopens_the_gate",
+  "a_driver_that_was_never_installed_is_not_a_trust_failure",
+]
+
+[[gate]]
+id = "computer-use.install-swap-is-safe-under-use"
+title = "Updating the driver does not kill a running one"
+status = "stable"
+owner = "computer-use"
+invariant = """
+Renaming a driver bundle out from under a running process leaves that process \
+running. An install swaps by rename so an in-flight session is never truncated \
+mid-action."""
+oracle = """
+Start a process from a staged bundle, rename the bundle, assert the process \
+survives. A regression kills an agent mid-action, which surfaces as an \
+unexplained driver crash rather than as an update."""
+platforms = ["macos"]
+covered_platforms = ["macos"]
+coverage_notes = """
+`platforms` is macOS alone, and Windows is excluded on purpose rather than as a \
+gap. This is a POSIX property — an open vnode outliving the rename and unlink \
+of its directory entry — and Windows does the opposite: without \
+`FILE_SHARE_DELETE`, which Rust's `File` does not request, the OS refuses to \
+rename or delete a file any process holds open. The evidence file is \
+`#![cfg(unix)]` and its own header says the installer's assumption "does not \
+carry to Windows", so a Windows installer needs a different design rather than \
+the same one recompiled. An earlier draft of this row claimed Windows coverage \
+from this file; the validator's cfg rule now rejects that automatically."""
+test_files = ["crates/computer-use/tests/install_swap_semantics.rs"]
+assertions = ["renaming_a_bundle_out_from_under_a_running_process_leaves_it_running"]
+
+[[gate]]
+id = "computer-use.install-lock-is-serialized"
+title = "Concurrent installs are refused, and the tests for it do not race"
+status = "stable"
+owner = "computer-use"
+invariant = """
+A second install attempted while one is in flight is refused without side \
+effects, and the run guard clears both the `INSTALLING` flag and the stage slot \
+on the way out."""
+oracle = """
+Drive two installs and assert the second is refused and touched nothing; run \
+the guard and assert the lock and stage are clear afterwards. Its history is \
+the more transferable half: `INSTALLING` and the stage slot are process-global \
+`static`s and cargo runs tests on parallel threads, so one test's \
+`store(true)` landed inside another's `compare_exchange` window and the CAS \
+legitimately failed. That surfaced as a ~1-in-6 failure of the whole workspace \
+suite and read as a product bug rather than a test bug."""
+platforms = ["macos", "windows"]
+covered_platforms = ["macos", "windows"]
+coverage_notes = """
+Fixed 2026-09-03 by `b6b5caa5`, which added a serializing mutex in \
+`crates/computer-use/src/install/mod.rs` — the whole change, and the reason \
+this is `stable` rather than `flaky`. The generalisable rule is the point of \
+keeping the gate: **any test touching a `static` needs a serializing lock**, \
+and poisoning should be recovered rather than propagated so a panicking test \
+does not turn its neighbour's result into a `PoisonError`. These are lib tests, \
+so the macOS all-targets run and the Windows `--workspace --lib` sweep both \
+reach them; the Linux job does not test `oximux-computer-use`, and linux is not \
+declared because there is no driver there."""
+test_files = ["crates/computer-use/src/install/mod.rs"]
+assertions = [
+  "second_concurrent_install_is_refused_without_side_effects",
+  "run_guard_clears_lock_and_stage",
+]
+
+# ---------------------------------------------------------------------------
+# wire compatibility
+# ---------------------------------------------------------------------------
+
+[[gate]]
+id = "wire.new-verbs-gated-client-side"
+title = "A new client does not send a verb an old host cannot parse"
+status = "stable"
+owner = "cli"
+# platforms includes windows: the CLI ships there and the skew contract is the
+# same one. Only the macOS job proves it.
+invariant = """
+Version gating happens on the CLIENT and keys on what the command asks for, not \
+on the command family. A new client drives an old host through a full turn, a \
+team run, and a schedule, sending only what that host's protocol version \
+accepts; an old client survives a new host's full stream."""
+oracle = """
+Run the released binary from the latest GitHub release against the working tree \
+in both directions and assert every flow completes. The postcard encoding is \
+append-only, so the failure mode is not a clean rejection — a type added to a \
+`Vec` in a reply deserializes as garbage on the old peer. Gating by family \
+rather than by request is the specific mistake: `run` and `ls` are the only \
+verbs the skew suite drives, so a gate placed at family granularity looks \
+correct here and fails on everything else."""
+platforms = ["macos", "linux", "windows"]
+covered_platforms = ["macos"]
+coverage_notes = """
+The skew job downloads the previous release and runs both directions, on macOS \
+only. The evidence is sound in CI — the step always sets `OXIMUX_SKEW_CLI` under \
+`set -euo pipefail`, so a failed download fails the job. The hazard is \
+everywhere else: `old_cli()` returns `None` when that variable is unset and each \
+test then returns early, so a local `cargo test --workspace` reports all four \
+GREEN having asserted nothing. This is not hypothetical: the Linux and Windows \
+jobs both run `cargo test -p oximux-cli`, which compiles and "passes" all four \
+of these without the variable set. Read a pass as evidence only from the macOS \
+skew step."""
+test_files = ["apps/cli/tests/wire_skew_e2e.rs"]
+assertions = [
+  "an_old_client_survives_a_new_hosts_full_stream",
+  "a_new_client_drives_an_old_host_through_a_full_turn",
+  "a_new_client_runs_a_team_on_an_old_host",
+  "a_new_client_schedules_on_an_old_host",
+]
