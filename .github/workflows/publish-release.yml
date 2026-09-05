@@ -1,0 +1,190 @@
+# Publish a draft release: set its notes, flip it public, tag it.
+#
+# `release.yml` deliberately stops at a DRAFT — the deployment guide's step 5
+# is "curate the release notes, publish the draft", and that step was a human
+# clicking the green button in the GitHub UI. This workflow is that click,
+# with the checks a click cannot make.
+#
+# It exists because publishing is the moment several promises start being
+# kept at once, and every one of them fails silently:
+#
+#   * The landing page links `releases/latest/download/OxiMux-macos-arm64.dmg`
+#     and `.../OxiMux-windows-x64-setup.exe`. Those URLs resolve against the
+#     LATEST release, so publishing one that is missing a stable-name asset
+#     does not break that release — it breaks the download buttons.
+#   * `oximux update` fetches `manifest.json` and refuses it without
+#     `manifest.json.minisig`. A release published with the manifest but not
+#     the signature is a release nobody can update to.
+#   * `publish-tap.yml` fires on `release: published` and pushes the formula
+#     to the tap. Publishing an older tag AFTER a newer one therefore walks
+#     the tap backwards, so the order the drafts go out in matters.
+#
+# The pre-flight below turns each of those into a red run instead. Nothing
+# here builds or replaces an asset: what the tagged build produced is what
+# ships, and a release missing something is a release to re-run `release.yml`
+# for, not one to paper over here.
+#
+# Usage: Actions → publish-release → Run workflow, tag `v0.1.18`. Publish the
+# oldest draft first and let its tap push finish before the next one.
+
+name: publish-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Draft release tag to publish (e.g. v0.1.18)"
+        required: true
+        type: string
+      latest:
+        description: "Mark it the repository's latest release"
+        type: boolean
+        default: true
+      notes_file:
+        description: "Repo path to the notes body (blank keeps the generated notes)"
+        type: string
+        default: ""
+      title:
+        description: "Release title (blank keeps the current one)"
+        type: string
+        default: ""
+
+# The only write this needs. `gh release edit` is a contents-scoped write, and
+# publishing creates the tag if the draft is still untagged.
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Publish ${{ inputs.tag }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      # Only for `notes_file` — the release's own assets are read through the
+      # API, never rebuilt from this checkout.
+      - uses: actions/checkout@v4
+
+      # Read the draft ONCE and decide from that snapshot. `gh release view`
+      # resolves a draft by its tag_name even though the git tag does not
+      # exist yet, which is why every step below addresses it by tag.
+      - name: Read the draft
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$TAG" --json isDraft > release.json 2>/dev/null; then
+            echo "::error::no release found for $TAG — has release.yml run for this tag?"
+            exit 1
+          fi
+          # Already public is not a failure: re-running to fix notes on a
+          # published release is a legitimate reason to be here. It only means
+          # the asset gate has nothing left to protect.
+          if [[ "$(jq -r .isDraft release.json)" == "true" ]]; then
+            echo "was_draft=true" >> "$GITHUB_OUTPUT"
+            echo "$TAG is a draft — the asset checks below decide whether it ships"
+          else
+            echo "was_draft=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$TAG is already published — editing it in place"
+          fi
+
+      # The gate. Named assets, checked by exact name, because every one of
+      # them is a URL somebody else has already written down.
+      - name: Check the release carries what its links promise
+        if: steps.draft.outputs.was_draft == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          assets="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          echo "--- assets on $TAG ---"
+          echo "$assets"
+          echo "----------------------"
+
+          missing=()
+          # Stable names first: these are the landing page's two download
+          # buttons, and they are the assets a build most easily leaves off,
+          # since they are copies made at upload time rather than build output.
+          for name in OxiMux-macos-arm64.dmg OxiMux-windows-x64-setup.exe; do
+            grep -qx "$name" <<<"$assets" || missing+=("$name")
+          done
+          # Versioned originals. Matched as patterns because the version is in
+          # the filename and this workflow is given a tag, not a version — and
+          # a tag is not required to equal "v" plus the Cargo version.
+          grep -qE '^OxiMux-.*-macos-arm64\.dmg$'  <<<"$assets" || missing+=("the versioned macOS DMG")
+          grep -qE '^OxiMux-.*-windows-x64\.zip$'  <<<"$assets" || missing+=("the Windows zip")
+          grep -qE '^OxiMux-.*-x64-setup\.exe$'    <<<"$assets" || missing+=("the versioned Windows installer")
+
+          # The updater's pair. A manifest alone is worse than neither: clients
+          # fetch it, find no signature, and refuse the update — so the two are
+          # required together or not at all. A desktop-only release carries
+          # neither, and that is allowed; release.yml's own header says the CLI
+          # half can be absent.
+          has_manifest=$(grep -qx 'manifest.json'         <<<"$assets" && echo yes || echo no)
+          has_minisig=$(grep -qx 'manifest.json.minisig'  <<<"$assets" && echo yes || echo no)
+          if [[ "$has_minisig" == no && "$has_manifest" == yes ]]; then
+            missing+=("manifest.json.minisig — a manifest without its signature is an update every client refuses")
+          elif [[ "$has_manifest" == no && "$has_minisig" == yes ]]; then
+            missing+=("manifest.json — the release carries a signature with nothing to verify")
+          fi
+
+          if (( ${#missing[@]} )); then
+            printf '::error::%s is missing %s\n' "$TAG" "${missing[0]}"
+            printf 'missing: %s\n' "${missing[@]}" >&2
+            echo "re-run release.yml on $TAG rather than publishing an incomplete release" >&2
+            exit 1
+          fi
+          echo "every promised asset is attached"
+
+      # Notes and title go on BEFORE the release goes public, in a separate
+      # call from the publish below. Publishing fires `publish-tap.yml` and
+      # sends watchers a notification; doing both in one edit would still be
+      # one API call, but a failure partway through this workflow would then
+      # leave a release that is public and wrong rather than a draft that is
+      # merely un-curated.
+      - name: Set the notes
+        if: inputs.notes_file != '' || inputs.title != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          NOTES_FILE: ${{ inputs.notes_file }}
+          TITLE: ${{ inputs.title }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ -n "$NOTES_FILE" ]]; then
+            if [[ ! -f "$NOTES_FILE" ]]; then
+              echo "::error::$NOTES_FILE is not in this ref — dispatch the workflow on the branch that carries it"
+              exit 1
+            fi
+            args+=(--notes-file "$NOTES_FILE")
+            echo "--- notes ---"
+            cat "$NOTES_FILE"
+            echo "-------------"
+          fi
+          # Not `[[ -n "$TITLE" ]] && args+=(...)`: with no title that list
+          # ends non-zero and `set -e` would take the whole step down.
+          if [[ -n "$TITLE" ]]; then
+            args+=(--title "$TITLE")
+          fi
+          gh release edit "$TAG" "${args[@]}"
+
+      # The click. `--draft=false` publishes and, for a draft that was never
+      # tagged, creates the tag at its target commit.
+      #
+      # `--latest` is passed explicitly in both directions rather than left to
+      # GitHub's default, which infers "latest" from semver and would hand the
+      # title to whichever tag sorts highest — wrong while an older draft is
+      # being published after a newer one has already shipped.
+      - name: Publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          LATEST: ${{ inputs.latest }}
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --draft=false --latest="$LATEST"
+          gh release view "$TAG" --json isDraft,isLatest,tagName,url \
+            --template '{{.tagName}} published: draft={{.isDraft}} latest={{.isLatest}}{{"\n"}}{{.url}}{{"\n"}}'
