@@ -573,8 +573,15 @@ impl Render for WorkspaceRoot {
                     let project_id = project.id.clone();
                     cx.spawn(async move |weak_root, cx| {
                         use crate::shell::workspace_ops::{
-                            ChatWorktreeOutcome, CreateOutcome, create_workspace_with_rollback,
+                            ChatWorktreeOutcome, CreateOutcome, Provision,
+                            create_workspace_with_rollback, provisioning_transcript_path,
+                            stream_provisioning,
                         };
+                        let transcript_path = provisioning_transcript_path(&project_id, &slug);
+                        let (provision_tx, provision_rx) = tokio::sync::mpsc::unbounded_channel();
+                        let writer = cx.background_spawn(async move {
+                            stream_provisioning(transcript_path, provision_rx).await
+                        });
                         // `name` = slug: the human label derived from the branch
                         // slug (collision handled inside `insert`).
                         let outcome = create_workspace_with_rollback(
@@ -585,8 +592,26 @@ impl Render for WorkspaceRoot {
                             &worktree_path,
                             None,
                             &workspace_repo,
+                            // The chat's own worktree: the project's setting
+                            // decides. This path runs unattended more than any
+                            // other, so it still writes the transcript even
+                            // though the chat surface only shows the one-line
+                            // outcome — otherwise a failure here would be the
+                            // hardest one to diagnose and the least visible.
+                            // No `reclaiming_orphans()` here on purpose. This
+                            // path targets a sibling `oximux-wt-<slug>` beside
+                            // the project root — a location a person may well
+                            // own — and it never checks for an existing row.
+                            // Both of the reclaim's safety premises are false
+                            // here, so a collision must stay an ordinary
+                            // `add_worktree` failure.
+                            &Provision::new(
+                                oximux_settings::SetupDecision::Inherit,
+                                provision_tx,
+                            ),
                         )
                         .await;
+                        writer.await;
                         let chat_outcome = match outcome {
                             CreateOutcome::Created(ws) => ChatWorktreeOutcome::Created {
                                 path: std::path::PathBuf::from(&ws.worktree_path),
@@ -602,6 +627,9 @@ impl Render for WorkspaceRoot {
                             } => ChatWorktreeOutcome::GitFailed(format!(
                                 "{insert_error}; rollback: {rollback_error}"
                             )),
+                            CreateOutcome::SetupFailed { transcript, .. } => {
+                                ChatWorktreeOutcome::GitFailed(transcript.outcome.summary())
+                            }
                         };
                         // Refresh the rail so the new workspace card + ⌘J entry
                         // appear without a manual reload.

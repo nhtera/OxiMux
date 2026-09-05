@@ -330,18 +330,151 @@ oracle = """
 Fail creation at each stage and assert the tree, the branch list, and the \
 workspace table are all as they were. A partial rollback is worse than no \
 rollback: a branch with no worktree, or a row pointing at a path that does not \
-exist, is state the user cannot see and cannot clear from the UI."""
+exist, is state the user cannot see and cannot clear from the UI.
+
+The orphan reclaim added in Phase 2 inverts the risk and needs its own reading. \
+Its regression is not "the wedge came back" but "it deleted something it should \
+not have": a force-removed worktree takes uncommitted work with it and there is \
+no undo. So the two refusal assertions carry more weight here than the healing \
+one — a green `..._is_reclaimed_on_retry` alone would say nothing about whether \
+the guard still holds. Both refusals are written to fail loudly, by asserting a \
+file's contents survive rather than by asserting an enum variant."""
 platforms = ["macos", "windows", "linux"]
 covered_platforms = ["macos"]
 coverage_notes = """
-The rollback test runs in the desktop test suite, which is macOS-only. Path \
-handling is the part most likely to diverge on Windows, and it is exactly the \
-part not covered. Phase 2 of the agent-runtime plan extends this test with a \
-setup-failure arm."""
+The rollback test runs in the desktop test suite, which is macOS-only \
+(`apps/desktop/tests/` is reached by the macOS `--workspace --all-targets` \
+step; the Windows job runs `-p oximux-app --lib`, and the Linux job does not \
+build this crate at all). Path handling is the part most likely to diverge on \
+Windows, and it is exactly the part not covered. Phase 2 added the \
+setup-failure arm this note previously anticipated."""
 test_files = ["apps/desktop/tests/workspace_create_rollback.rs"]
 assertions = [
   "rollback_on_insert_conflict_removes_worktree_and_branch",
   "create_workspace_happy_path_inserts_row_and_keeps_worktree",
+  "a_failing_setup_script_rolls_back_worktree_branch_and_row",
+  "an_orphaned_worktree_from_an_interrupted_create_is_reclaimed_on_retry",
+  "reclaim_refuses_a_path_a_workspace_row_still_names",
+  "a_caller_that_did_not_opt_in_never_has_its_path_reclaimed",
+]
+
+[[gate]]
+id = "worktree.provisioning-precedes-a-created-worktree"
+title = "A worktree reported created has been provisioned"
+status = "stable"
+owner = "worktree-ops"
+invariant = """
+Worktree creation copies the project's `.oximuxinclude` files and then runs its \
+`setup` script, in that order, before the workspace row is inserted. A setup \
+failure — non-zero exit, signal, or timeout — fails creation. A project that \
+has not set `auto_setup` runs no setup at all."""
+oracle = """
+The order is the part a careless test cannot see: asserting the included file \
+exists *after* creation passes even if the copy ran last, so the ordering \
+assertion is made by the setup script itself (`test -f .env`) rather than by \
+the test body.
+
+A regression presents as a worktree that opens with missing dependencies and no \
+error — creation reported success and the failure surfaces minutes later as a \
+broken build in an unrelated tab. The inverse regression is louder and matters \
+more: creation starting to fail for a project that never opted in, which is \
+what `a_failing_setup_script_is_not_run_when_the_project_did_not_opt_in` \
+guards. A hang is the third, and the subtle version of it is not the script's fault: \
+if either captured pipe stops being drained, the child blocks writing into a \
+full buffer and a script that exited in seconds is reported as a 15-minute \
+timeout. Code review found exactly that — one non-UTF-8 byte retired the stdout \
+reader — so the two pipe-drain assertions are the load-bearing ones here, not \
+the `sleep 60` case."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos", "windows"]
+coverage_notes = """
+Split coverage, and the halves are not equivalent. The bounded-execution unit \
+tests live in `oximux-worktree-ops`, whose lib tests run on macOS \
+(`--workspace --all-targets`) and Windows (`--workspace --lib`) but not on \
+Linux, which never builds this crate. The end-to-end ordering and rollback \
+arms live under `apps/desktop/tests/` and run on macOS only.
+
+So Windows proves the timeout, the closed stdin, and the non-zero exit; it \
+proves nothing about the order, the rollback, or the opt-in default. Closing \
+the Linux half means adding `oximux-worktree-ops` to the Linux job; closing the \
+Windows half means an integration harness that does not depend on the desktop \
+test target.
+
+Both `run_setup_bounded` and `run_cleanup_before_remove` shell out via `sh -lc` \
+on every platform, which resolves on the Windows runner through Git Bash. The \
+evidence for that is `a_non_zero_exit_is_reported_as_a_failure`, which asserts \
+a specific exit code and therefore cannot pass if the shell never ran.
+
+An earlier draft of this row cited the *cleanup* tests instead. That was a \
+vacuous claim of exactly the kind this ledger exists to reject: all three pass \
+identically when the spawn fails instantly, because none of them asserts \
+anything the shell produced. It is recorded here rather than quietly corrected, \
+since the mistake is the argument for the rule.
+
+Note this is a dependency on the runner image, not on Windows. A Windows host \
+without `sh` on PATH fails these tests rather than skipping them — and, per \
+`SetupOutcome::FailedToStart`, fails worktree creation for any project with \
+`auto_setup` on."""
+test_files = [
+  "crates/worktree-ops/src/setup.rs",
+  "apps/desktop/tests/workspace_create_rollback.rs",
+]
+assertions = [
+  "a_hanging_script_times_out_and_is_killed",
+  "a_child_writing_past_the_pipe_buffer_still_completes",
+  "non_utf8_output_does_not_abandon_the_pipe",
+  "a_script_reading_stdin_fails_fast_rather_than_hanging",
+  "a_non_zero_exit_is_reported_as_a_failure",
+  "output_before_a_timeout_is_kept",
+  "included_files_are_present_before_the_setup_script_runs",
+  "a_failing_setup_script_is_not_run_when_the_project_did_not_opt_in",
+  "an_include_pattern_matching_nothing_does_not_fail_creation",
+]
+
+[[gate]]
+id = "worktree.include-copy-cannot-write-outside-the-worktree"
+title = "The .oximuxinclude copy is a containment boundary"
+status = "stable"
+owner = "worktree-ops"
+invariant = """
+Copying `.oximuxinclude` files into a new worktree never reads through a source \
+symlink, never writes through a symlink in the destination path, never \
+overwrites a file git already checked out, and never resolves a pattern outside \
+the project root."""
+oracle = """
+Each clause fails silently and looks like success, which is why they are tested \
+one at a time rather than by a happy-path copy. A dereferenced source symlink \
+produces a *correct-looking* file in the worktree whose content came from \
+outside the project. A destination symlink produces a worktree that appears to \
+be missing the file, because the write landed wherever the link pointed — the \
+assertion for that clause checks the outside directory is still empty, not just \
+that the copy was skipped.
+
+Overwriting a tracked file is the quiet one: the worktree looks right and \
+builds, but a committed config has been replaced by a developer's local copy, \
+and git reports the diff as their edit."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+The four containment clauses are asserted with `#[cfg(unix)]` tests, so on \
+Windows they compile to nothing — `--workspace --lib` runs this crate there and \
+still proves none of them. This is a real gap and not a small one: Windows has \
+its own link types (junctions, and symlinks that need a privilege or developer \
+mode), and the reparse-point behavior of `symlink_metadata` is exactly the kind \
+of thing that differs. Linux runs nothing from this crate at all.
+
+Closing it needs `std::os::windows::fs::symlink_dir` fixtures guarded on the \
+runner actually being able to create one, which is a Windows-CI question before \
+it is a test question. Until then the clause is enforced by code review on that \
+platform, which is what this row exists to say out loud."""
+test_files = ["crates/worktree-ops/src/include.rs"]
+assertions = [
+  "clause2_tracked_file_wins_and_the_skip_is_reported",
+  "clause3_a_source_symlink_is_skipped_not_dereferenced",
+  "clause3_a_symlink_out_of_the_project_copies_nothing",
+  "clause4_a_symlinked_target_directory_is_refused",
+  "a_pattern_leaving_the_project_root_is_refused",
+  "dot_git_is_never_copied_even_when_a_pattern_names_it",
 ]
 
 # ---------------------------------------------------------------------------

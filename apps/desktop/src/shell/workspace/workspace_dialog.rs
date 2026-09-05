@@ -24,7 +24,7 @@ use gpui_component::{
 };
 use oximux_core::{AgentAdapter, Project, Workspace};
 use oximux_git::derive_slug;
-use oximux_settings::{Density, Theme, Typography};
+use oximux_settings::{Density, SetupDecision, Theme, Typography};
 
 use crate::shell::forge::ref_parse::parse_forge_ref;
 use crate::shell::forge::{Forge, fetch_ref_title};
@@ -77,6 +77,12 @@ pub struct WorkspaceDialogSubmit {
     pub linked_issue: Option<String>,
     /// Optional agent to auto-spawn after Created. `None` = Skip.
     pub agent: Option<AgentAdapter>,
+    /// Per-request answer for the project's `setup` script. Defaults to
+    /// [`SetupDecision::Inherit`], which is the project's committed
+    /// `auto_setup` — the dropdown exists so a throwaway worktree can skip a
+    /// ten-minute install, and a one-off can opt in, without editing a file
+    /// the whole team shares.
+    pub setup: SetupDecision,
 }
 
 pub type OnSubmit = Box<dyn Fn(WorkspaceDialogSubmit, &mut Window, &mut App) + Send + 'static>;
@@ -94,6 +100,8 @@ pub struct WorkspaceDialog {
     /// `None` = "Skip (no agent)".
     selected_agent: Option<AgentAdapter>,
     agent_dropdown_open: bool,
+    selected_setup: SetupDecision,
+    setup_dropdown_open: bool,
     /// Forge reference the current name was prefilled from (`"#42"`).
     /// Cleared the moment the user edits the name again — their text wins.
     linked_issue: Option<String>,
@@ -148,6 +156,8 @@ impl WorkspaceDialog {
             project_dropdown_open: false,
             selected_agent: None,
             agent_dropdown_open: false,
+            selected_setup: SetupDecision::Inherit,
+            setup_dropdown_open: false,
             linked_issue: None,
             fetch_epoch: 0,
             fetching_title: false,
@@ -253,6 +263,8 @@ impl WorkspaceDialog {
         self.project_dropdown_open = false;
         self.selected_agent = None;
         self.agent_dropdown_open = false;
+        self.selected_setup = SetupDecision::Inherit;
+        self.setup_dropdown_open = false;
         self.linked_issue = None;
         self.fetch_epoch += 1;
         self.fetching_title = false;
@@ -278,6 +290,7 @@ impl WorkspaceDialog {
             .update(cx, |s, cx| s.set_value(&existing_name, window, cx));
         self.project_dropdown_open = false;
         self.agent_dropdown_open = false;
+        self.setup_dropdown_open = false;
         let input_focus = self.name_input.read(cx).focus_handle(cx);
         window.focus(&input_focus, cx);
         cx.notify();
@@ -294,6 +307,7 @@ impl WorkspaceDialog {
         self.linked_issue = None;
         self.project_dropdown_open = false;
         self.agent_dropdown_open = false;
+        self.setup_dropdown_open = false;
         cx.notify();
     }
 
@@ -331,6 +345,7 @@ impl WorkspaceDialog {
             WorkspaceDialogMode::Rename(_) => None,
         };
         let agent = self.selected_agent;
+        let setup = self.selected_setup;
         let linked_issue = self.linked_issue.clone();
         self.close(cx);
         (self.on_submit)(
@@ -339,6 +354,7 @@ impl WorkspaceDialog {
                 name,
                 project,
                 agent,
+                setup,
                 linked_issue,
             },
             window,
@@ -402,9 +418,10 @@ impl Render for WorkspaceDialog {
                 cx.stop_propagation();
                 // First Escape collapses an open dropdown; only a bare
                 // Escape dismisses the whole dialog.
-                if this.project_dropdown_open || this.agent_dropdown_open {
+                if this.project_dropdown_open || this.agent_dropdown_open || this.setup_dropdown_open {
                     this.project_dropdown_open = false;
                     this.agent_dropdown_open = false;
+                    this.setup_dropdown_open = false;
                     cx.notify();
                 } else {
                     this.close(cx);
@@ -463,6 +480,7 @@ impl Render for WorkspaceDialog {
 
         if is_create {
             card = card.child(self.render_agent_section(cx));
+            card = card.child(self.render_setup_section(cx));
         }
 
         card = card.child(
@@ -552,6 +570,7 @@ impl WorkspaceDialog {
                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                             this.project_dropdown_open = !this.project_dropdown_open;
                             this.agent_dropdown_open = false;
+                            this.setup_dropdown_open = false;
                             cx.notify();
                         }),
                     ),
@@ -629,6 +648,7 @@ impl WorkspaceDialog {
                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                             this.agent_dropdown_open = !this.agent_dropdown_open;
                             this.project_dropdown_open = false;
+                            this.setup_dropdown_open = false;
                             cx.notify();
                         }),
                     ),
@@ -657,6 +677,113 @@ impl WorkspaceDialog {
         }
         col
     }
+
+    /// The per-request Setup override. Deliberately the last field: the
+    /// default answer ("Project default") is right almost always, and putting
+    /// it above the agent picker would make every create look like a decision
+    /// about setup.
+    fn render_setup_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
+                div()
+                    .text_size(px(typography.t_label_caps))
+                    .text_color(theme.fg_subtle)
+                    .child("Setup script"),
+            )
+            .child(
+                div()
+                    .id("ws-dialog-setup-trigger")
+                    .flex()
+                    .items_center()
+                    .h(px(FIELD_HEIGHT))
+                    .px(px(8.0))
+                    .bg(theme.bg_panel)
+                    .border_1()
+                    .border_color(theme.border_inactive)
+                    .rounded(px(density.r_xs))
+                    .cursor_pointer()
+                    .text_size(px(typography.t_body_sm))
+                    .text_color(theme.fg_base)
+                    .child(setup_label(self.selected_setup))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.setup_dropdown_open = !this.setup_dropdown_open;
+                            this.project_dropdown_open = false;
+                            this.agent_dropdown_open = false;
+                            cx.notify();
+                        }),
+                    ),
+            );
+
+        if self.setup_dropdown_open {
+            let mut list = div()
+                .flex()
+                .flex_col()
+                .bg(theme.bg_panel)
+                .border_1()
+                .border_color(theme.border_inactive)
+                .rounded(px(density.r_xs));
+            for choice in SETUP_CHOICES {
+                list = list.child(setup_option_row(*choice, theme, &typography, cx));
+            }
+            col = col.child(list);
+        }
+        col
+    }
+}
+
+/// Order matters: `Inherit` first because it is the default and the answer a
+/// user should have to actively leave.
+const SETUP_CHOICES: &[SetupDecision] =
+    &[SetupDecision::Inherit, SetupDecision::Run, SetupDecision::Skip];
+
+/// Human-readable label for the setup dropdown.
+pub fn setup_label(decision: SetupDecision) -> &'static str {
+    match decision {
+        SetupDecision::Inherit => "Project default",
+        SetupDecision::Run => "Run setup",
+        SetupDecision::Skip => "Skip setup",
+    }
+}
+
+fn setup_option_row(
+    decision: SetupDecision,
+    theme: Theme,
+    typography: &Typography,
+    cx: &mut Context<WorkspaceDialog>,
+) -> impl IntoElement {
+    let id: usize = match decision {
+        SetupDecision::Inherit => 0,
+        SetupDecision::Run => 1,
+        SetupDecision::Skip => 2,
+    };
+    div()
+        .id(("ws-dialog-setup-opt", id))
+        .flex()
+        .items_center()
+        .h(px(FIELD_HEIGHT))
+        .px(px(8.0))
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.hover_overlay))
+        .text_size(px(typography.t_body_sm))
+        .text_color(theme.fg_base)
+        .child(setup_label(decision))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                this.selected_setup = decision;
+                this.setup_dropdown_open = false;
+                cx.notify();
+            }),
+        )
 }
 
 fn agent_option_row(
@@ -751,11 +878,30 @@ mod tests {
             name: "fix-login".to_string(),
             project: Some(project("p1", "Acme")),
             agent: Some(AgentAdapter::ClaudeCode),
+            setup: SetupDecision::Inherit,
             linked_issue: None,
         };
         assert_eq!(payload.mode, WorkspaceDialogMode::Create);
         assert!(payload.project.is_some());
         assert_eq!(payload.agent, Some(AgentAdapter::ClaudeCode));
+    }
+
+    /// The dropdown's default must be the project's answer, or opening the
+    /// dialog and pressing Enter would silently override what the team
+    /// committed — the exact behavior change this phase is careful not to make.
+    #[test]
+    fn the_setup_dropdown_defaults_to_the_project_answer() {
+        assert_eq!(SETUP_CHOICES[0], SetupDecision::Inherit);
+        assert_eq!(setup_label(SetupDecision::Inherit), "Project default");
+        assert!(SetupDecision::Inherit.resolve(true));
+        assert!(!SetupDecision::Inherit.resolve(false));
+    }
+
+    #[test]
+    fn every_setup_choice_has_a_distinct_label() {
+        let labels: std::collections::BTreeSet<_> =
+            SETUP_CHOICES.iter().map(|c| setup_label(*c)).collect();
+        assert_eq!(labels.len(), SETUP_CHOICES.len());
     }
 
     #[test]
@@ -765,6 +911,7 @@ mod tests {
             name: "new".to_string(),
             project: None,
             agent: None,
+            setup: SetupDecision::Inherit,
             linked_issue: None,
         };
         assert!(payload.project.is_none());

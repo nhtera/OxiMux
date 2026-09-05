@@ -32,6 +32,12 @@ oximux-remote-proto = { workspace = true }
 # `no_window` on the cleanup subprocess: a teardown script must not flash a
 # console on Windows.
 oximux-no-window = { workspace = true }
+# `.oximuxinclude` matching. Already in the tree (the file-tree backend uses
+# it), and gitignore semantics are exactly what the include file promises —
+# hand-rolling globs here would diverge from the syntax users already know.
+# Only `gitignore::Gitignore` is used: the walk is our own, because it has to
+# be anchored and budgeted (see `include.rs`).
+ignore = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

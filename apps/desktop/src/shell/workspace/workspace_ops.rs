@@ -145,8 +145,115 @@ pub(crate) fn build_add_project_dialog(
 // second implementation of the same rollback ladder. Re-exported here
 // because this module is the desktop's door to it.
 pub use oximux_worktree_ops::{
-    CreateOutcome, create_workspace_with_rollback, run_cleanup_before_remove,
+    CreateOutcome, Provision, ProvisionEvent, SetupTranscript, create_workspace_with_rollback,
+    run_cleanup_before_remove,
 };
+
+/// Upper bound on `default_tabs`. The list is repo-controlled and needs no
+/// opt-in, so it is bounded at roughly the number of tabs a person would open
+/// by hand rather than at what a config file may declare.
+const MAX_DEFAULT_TABS: usize = 8;
+
+/// Upper bound on one `default_tabs` title, in characters.
+const MAX_TAB_TITLE_CHARS: usize = 64;
+
+/// Provisioning transcripts retained per workspace slug.
+const KEEP_TRANSCRIPTS: usize = 3;
+
+/// Where one worktree's provisioning transcript lives:
+/// `<data_dir>/projects/<project_id>/provisioning/<slug>-<millis>.log`.
+///
+/// Outside the worktree deliberately. The transcript matters most when setup
+/// failed, and that is exactly when the worktree has been rolled back — a file
+/// written inside it would be deleted by the rollback that made it interesting.
+///
+/// A fresh path per attempt, not one file per slug. Overwriting in place looks
+/// tidier and is wrong: the editor activates an already-open tab for a path
+/// without re-reading it, so a second failed create would show the user the
+/// *first* failure's output while the file on disk said otherwise. Older
+/// transcripts for the same slug are pruned so this stays a log and not an
+/// archive.
+pub(crate) fn provisioning_transcript_path(project_id: &str, slug: &str) -> PathBuf {
+    let dir = crate::app_paths::data_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("projects")
+        .join(project_id)
+        .join("provisioning");
+    prune_transcripts(&dir, slug, KEEP_TRANSCRIPTS);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    dir.join(format!("{slug}-{stamp}.log"))
+}
+
+/// Keep the `keep` newest transcripts for `slug`, delete the rest.
+///
+/// By name, not by mtime: the name carries the timestamp, and lexicographic
+/// order over a fixed-width millisecond stamp is chronological order. Every
+/// failure here is ignored — pruning a log must never be able to affect a
+/// worktree create.
+fn prune_transcripts(dir: &Path, slug: &str, keep: usize) {
+    let prefix = format!("{slug}-");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // first run for this project: nothing to prune
+    };
+    let mut mine: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "log")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .collect();
+    if mine.len() < keep {
+        return;
+    }
+    mine.sort();
+    // `keep - 1`: one slot is about to be taken by the transcript this call is
+    // making a path for.
+    for stale in mine.iter().take(mine.len().saturating_sub(keep - 1)) {
+        let _ = std::fs::remove_file(stale);
+    }
+}
+
+/// Drain [`ProvisionEvent`]s into the transcript file until the sender drops.
+///
+/// Flushed per event rather than at the end so `tail -f` shows a long install
+/// progressing, and so a hard kill mid-setup still leaves the lines that
+/// explain where it got to. Every IO error here is swallowed: failing to write
+/// a log must not be able to fail a worktree creation that otherwise worked.
+pub(crate) async fn stream_provisioning(
+    path: PathBuf,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<ProvisionEvent>,
+) {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut file = match std::fs::File::create(&path) {
+        Ok(f) => f,
+        Err(err) => {
+            tracing::warn!(?err, path = %path.display(), "provisioning transcript unavailable");
+            // Still drain, or the unbounded channel grows for the whole run.
+            while rx.recv().await.is_some() {}
+            return;
+        }
+    };
+    while let Some(event) = rx.recv().await {
+        let line = match event {
+            ProvisionEvent::IncludeCopied(p) => format!("include: copied {}", p.display()),
+            ProvisionEvent::IncludeSkipped(skip) => format!("include: skipped {skip}"),
+            ProvisionEvent::SetupStarted(script) => format!("$ {script}"),
+            ProvisionEvent::SetupLine(line) => line,
+            ProvisionEvent::SetupFinished(outcome) => format!("== {}", outcome.summary()),
+        };
+        let _ = writeln!(file, "{line}");
+        let _ = file.flush();
+    }
+}
 
 /// Body of [`WorkspaceRoot::workspaces_with_primary`] as a free function so
 /// the rail gather can run it on the background executor (SQLite + a
@@ -1628,6 +1735,7 @@ impl WorkspaceRoot {
                     // prompt prefill (the linked-issue badge still records it).
                     None,
                     submit.linked_issue,
+                    submit.setup,
                     false,
                     window,
                     cx,
@@ -1650,6 +1758,10 @@ impl WorkspaceRoot {
         agent: Option<AgentAdapter>,
         agent_prompt: Option<String>,
         linked_issue: Option<String>,
+        // Per-request override for the project's `setup` script. `Inherit` —
+        // every caller but the create dialog — defers to the project's
+        // committed `auto_setup`.
+        setup_decision: oximux_settings::SetupDecision,
         activate_after: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1710,6 +1822,19 @@ impl WorkspaceRoot {
                 );
                 return;
             }
+            // Provisioning transcript. Written to the data dir rather than
+            // into the worktree because the case that most needs reading is
+            // the one where the worktree no longer exists — a failed setup
+            // rolls it back, and a transcript inside it would go with it.
+            let transcript_path = provisioning_transcript_path(&project_id, &slug);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ProvisionEvent>();
+            // Drained on the background executor so the file grows while setup
+            // runs: a 10-minute `pnpm install` is watchable with `tail -f`
+            // instead of appearing as a frozen window.
+            let writer = {
+                let transcript_path = transcript_path.clone();
+                cx.background_spawn(async move { stream_provisioning(transcript_path, rx).await })
+            };
             let outcome = create_workspace_with_rollback(
                 &project_root,
                 &project_id,
@@ -1718,8 +1843,18 @@ impl WorkspaceRoot {
                 &worktree_path,
                 linked_issue.as_deref(),
                 &workspace_repo,
+                // No per-request override from this path yet: the create dialog
+                // has no setup toggle, so the project's `auto_setup` decides.
+                // Reclaim opted into here and nowhere else in the desktop:
+                // this path is host-derived under the data dir, and the flow
+                // above has already looked for a workspace row naming it.
+                &Provision::new(setup_decision, tx).reclaiming_orphans(),
             )
             .await;
+            // The sender is gone with `Provision`, so the drain has ended or is
+            // about to; awaiting it means the file is complete before anything
+            // below offers to open it.
+            writer.await;
             match outcome {
                 CreateOutcome::Created(workspace) => {
                     tracing::info!(
@@ -1763,16 +1898,94 @@ impl WorkspaceRoot {
                                 cx,
                             );
                         }
-                        // Opt-in: run the project's setup script in a terminal
-                        // tab right after the worktree exists. `auto_setup`
-                        // defaults off; the Setup row is always available
-                        // manually regardless of this flag. Opened after the
-                        // agent tab, so when both fire the setup tab is the
-                        // active one — the user opted into setup, so seeing it
-                        // run is the intended focus.
-                        if crate::project_scripts_loader::load_for_project(&cwd).auto_setup {
-                            this.run_workspace_script(workspace, ScriptKind::Setup, window, cx);
+                        // `auto_setup` no longer opens a terminal tab here.
+                        // Setup now runs inside `create_workspace_with_rollback`
+                        // as provisioning, so a failure rolls the worktree back
+                        // instead of leaving a red tab beside a worktree that
+                        // reported success. By the time this runs, setup has
+                        // already succeeded — running it again would repeat a
+                        // `pnpm install`. The manual "Run setup" row is
+                        // unchanged and remains the way to re-run it.
+                        //
+                        // `default_tabs` is what opens here instead: the shell
+                        // layout a project declares every new worktree starts
+                        // in. Opened after the agent tab so the agent is not
+                        // buried, and each is a plain terminal at the worktree.
+                        // Capped because `default_tabs` comes from a committed
+                        // file and, unlike `setup`, needs no opt-in — cloning a
+                        // repo and creating a worktree is enough to act on it.
+                        // One PTY per entry with no bound would let a checked-in
+                        // list of any length spawn that many processes.
+                        let mut tabs =
+                            crate::project_scripts_loader::load_for_project(&cwd).default_tabs;
+                        if tabs.len() > MAX_DEFAULT_TABS {
+                            tracing::warn!(
+                                declared = tabs.len(),
+                                cap = MAX_DEFAULT_TABS,
+                                "default_tabs exceeds the cap; opening the first {MAX_DEFAULT_TABS}"
+                            );
+                            tabs.truncate(MAX_DEFAULT_TABS);
                         }
+                        if !tabs.is_empty()
+                            && let Some(panes) = this.active_project_panes()
+                        {
+                            panes.update(cx, |p, cx| {
+                                for title in tabs {
+                                    // Titles are repo-controlled too; a tab
+                                    // label is not a place to render a kilobyte.
+                                    let title: String =
+                                        title.chars().take(MAX_TAB_TITLE_CHARS).collect();
+                                    p.open_script_terminal_tab_in_active_group(
+                                        cwd.clone(),
+                                        title.into(),
+                                        // No command: a declared tab is a shell
+                                        // to work in, not a script to run. The
+                                        // scripts are `.oximux/scripts.toml`.
+                                        "",
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            });
+                        }
+                    });
+                }
+                CreateOutcome::SetupFailed {
+                    transcript,
+                    rollback_error,
+                } => {
+                    tracing::warn!(
+                        slug = %slug,
+                        outcome = %transcript.outcome.summary(),
+                        ?rollback_error,
+                        transcript = %transcript_path.display(),
+                        "workspace create: setup failed, worktree rolled back"
+                    );
+                    let _ = weak.update_in(cx, |this, window, cx| {
+                        this.mark_rail_dirty(cx);
+                        // The transcript, not the summary, is what the user
+                        // needs — the compiler error or the missing binary is
+                        // in the script's own output. Opened in the editor so
+                        // it stays reachable after the toast goes. The path is
+                        // unique per attempt, so this is always this attempt's
+                        // output and never a cached tab from the last one.
+                        if let Some(panes) = this.active_project_panes() {
+                            panes.update(cx, |p, cx| {
+                                p.open_or_activate_editor_tab(transcript_path.clone(), window, cx);
+                            });
+                        }
+                        let detail = match &rollback_error {
+                            Some(err) => format!(
+                                "{}. Rollback also failed ({err}) — manual cleanup required.",
+                                transcript.outcome.summary()
+                            ),
+                            None => transcript.outcome.summary(),
+                        };
+                        crate::shell::toast::toast_op_error(
+                            cx,
+                            &format!("Set up workspace \u{201c}{slug}\u{201d}"),
+                            &detail,
+                        );
                     });
                 }
                 CreateOutcome::GitFailed(msg) => {
