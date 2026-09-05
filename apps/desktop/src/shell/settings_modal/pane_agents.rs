@@ -9,6 +9,8 @@ use oximux_settings::{CommitMessageAiMode, Density, Theme, Typography};
 use super::SettingsModal;
 use super::controls::value_chip;
 use super::layout::{SettingEntry, card_surface, entries_card, entry, section_title};
+use oximux_settings::agent_retry::MaxAutomaticWait;
+
 use super::segmented::{Segment, segmented};
 
 /// Agent CLIs the segmented picker exposes.
@@ -227,6 +229,48 @@ fn ai_entries(
         cx,
     );
 
+    // Rate-limit retry. Lives on the agents pane rather than a pane of its own:
+    // it is one behaviour of the agent conversation, and burying it a click
+    // deeper would hide the only control over something that spends time (and,
+    // if the classifier were ever wrong, money) on the user's behalf.
+    let retry_enabled = segmented(
+        "retry-enabled",
+        [true, false]
+            .into_iter()
+            .map(|on| {
+                Segment::new(
+                    if on { "On" } else { "Off" },
+                    modal.retry.enabled == on,
+                    move |this, _w, cx| {
+                        this.retry.enabled = on;
+                        this.persist_retry(cx);
+                    },
+                )
+            })
+            .collect(),
+        theme,
+        density,
+        typography,
+        cx,
+    );
+    let retry_wait = segmented(
+        "retry-wait",
+        MaxAutomaticWait::ALL
+            .iter()
+            .copied()
+            .map(|w| {
+                Segment::new(w.label(), modal.retry.max_automatic_wait == w, move |this, _w, cx| {
+                    this.retry.max_automatic_wait = w;
+                    this.persist_retry(cx);
+                })
+            })
+            .collect(),
+        theme,
+        density,
+        typography,
+        cx,
+    );
+
     let mut entries = vec![entry(
         "Commit-message AI",
         "How commit messages are generated from the staged diff.",
@@ -240,6 +284,19 @@ fn ai_entries(
             agent_id,
         ));
         entries.push(entry("Model", "Model name passed to the agent CLI.", model));
+    }
+
+    entries.push(entry(
+        "Retry after a rate limit",
+        "Re-send a turn by itself when a usage window closes. Spend limits are never retried.",
+        retry_enabled,
+    ));
+    if modal.retry.enabled {
+        entries.push(entry(
+            "Maximum automatic wait",
+            "A reset farther out than this is reported as an error instead of being held.",
+            retry_wait,
+        ));
     }
 
     entries

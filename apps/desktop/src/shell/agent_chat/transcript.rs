@@ -1175,6 +1175,27 @@ impl AgentChatView {
             // actionable version of the same state.
             let action = self.open_login_terminal_button(cx);
             col = col.child(login_card::login_card(self.provider_label(), theme, &typo, density, action));
+        } else if let Some((wake_at_ms, reason, attempt)) = self
+            .retry
+            .pending
+            .as_ref()
+            .map(|p| (p.wake_at_ms, p.reason.clone(), self.retry.attempt))
+        {
+            // A turn held for a provider limit. Takes precedence over the error
+            // card below: the failure is real, but it is being handled, and
+            // showing a bare error next to a countdown would read as two
+            // different states at once.
+            let remaining = wake_at_ms - chrono::Utc::now().timestamp_millis();
+            let send_now = self.retry_send_now_button(cx);
+            let cancel = self.retry_cancel_button(cx);
+            col = col.child(retry_card::retry_card(
+                retry_card::Held { reason: &reason, remaining_ms: remaining, attempt },
+                theme,
+                &typo,
+                density,
+                send_now,
+                cancel,
+            ));
         } else if let Some(err) = self.thread.last_error.clone() {
             // An idle turn that ended in error: surface it inline at the tail
             // with a Retry. This is the ONLY place a failure after the first

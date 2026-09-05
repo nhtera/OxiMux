@@ -6,6 +6,7 @@
 //! Phase 0 ships dark-only. Light mode is a Phase 8+ decision.
 
 pub mod agent_launch;
+pub mod agent_retry;
 pub mod appearance;
 pub mod auto_update;
 pub mod autosave;

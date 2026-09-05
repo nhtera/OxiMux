@@ -697,3 +697,125 @@ assertions = [
   "a_new_client_runs_a_team_on_an_old_host",
   "a_new_client_schedules_on_an_old_host",
 ]
+
+[[gate]]
+id = "agent.rate-limit-retry-never-spends"
+title = "A retried turn waits for a window and never for money"
+status = "stable"
+owner = "agents"
+invariant = """
+A turn that fails on a provider usage window is rescheduled at that window's \
+reported reset; a turn that fails because the account is billing past its plan \
+(an overage), on an unrecognised limit kind, or on a limit whose reset the \
+provider withheld, is never rescheduled at all. The cap is four attempts and \
+a user-stopped turn is never retried."""
+oracle = """
+Drive the classifier with each `rateLimitType` the provider's own schema \
+defines and assert the class; then drive the pure policy and assert a window \
+schedules past its reset, an overage and an unknown kind schedule nothing, and \
+the fifth attempt schedules nothing. The failure this catches is not a crash — \
+a mis-classified overage retries silently and spends the user's money, which \
+surfaces on a bill rather than in a log."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+**macOS only, and the first draft of this row claimed all three.** The claim \
+was wrong in the way this ledger exists to catch: `oximux-agents` appears in \
+the Linux job only under `cargo check --all-targets` (ci.yml:216-217), which \
+compiles the tests without running them, and it is absent from the Windows \
+test list entirely (ci.yml:648-654 names six unrelated crates). Reading either \
+job's crate list rather than trusting the memory of it is what corrected this. \
+\
+The gap is low-risk and deliberately not closed here: the classifier and policy \
+are pure arithmetic over data with no clock, filesystem, process or path in \
+them, so there is no plausible platform-specific divergence. Adding \
+`-p oximux-agents` to the Linux test step would close it for the cost of one \
+line, and is worth doing the next time that job is touched. \
+\
+The vocabulary is the load-bearing part and is NOT captured from a live rate \
+limit — a real one cannot be provoked on demand. It is read from the shipped \
+`claude` CLI's own zod schema (2.1.261), which defines `rateLimitType` as \
+`five_hour | seven_day | seven_day_opus | seven_day_sonnet | \
+seven_day_overage_included | overage` and derives `retry-after` from \
+`resetsAt` in **seconds**. If the provider adds a kind, the unknown-kind \
+assertion is what keeps it from being retried by accident."""
+test_files = [
+  "crates/agents/src/retry/classify.rs",
+  "crates/agents/src/retry/mod.rs",
+  "crates/agents/tests/retry_from_stream.rs",
+]
+assertions = [
+  "an_overage_on_the_wire_schedules_nothing",
+  "a_closed_window_on_the_wire_becomes_a_wake_time_past_its_reset",
+  "an_overage_is_spend_and_is_never_retried",
+  "an_unknown_limit_kind_is_not_retried",
+  "a_known_window_without_a_reset_is_not_retried",
+  "a_closed_window_with_a_reset_is_waitable",
+  "spend_and_other_are_never_scheduled",
+  "the_cap_is_four_attempts",
+  "a_window_is_scheduled_past_its_reset_never_before",
+]
+
+[[gate]]
+id = "agent.retry-jitter-spreads-the-herd"
+title = "Threads sharing one reset do not wake together"
+status = "stable"
+owner = "agents"
+invariant = """
+Every thread scheduling against the same window reset gets its own wake time, \
+spread across the jitter span."""
+oracle = """
+Schedule twenty threads against one reset and assert twenty DISTINCT wake \
+times whose spread exceeds thirty seconds. Asserting only that jitter is \
+non-zero would pass an implementation returning the same constant offset for \
+every thread — which is precisely the broken case, since every thread on one \
+account sees the same reset and would re-limit the account in the same second \
+it reopened."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only, for the same reason as `agent.rate-limit-retry-never-spends`: \
+`oximux-agents` is checked but not tested on Linux, and not named at all in \
+the Windows test step. Pure caller-seeded arithmetic, so the distribution is \
+asserted deterministically and would behave identically anywhere it ran. \
+\
+The spread assertion, not the distinctness one, is what would fail a weak mix \
+such as `seed % span` — twenty consecutive seeds through that would still be \
+twenty distinct values, all inside twenty milliseconds."""
+test_files = ["crates/agents/src/retry/mod.rs"]
+assertions = [
+  "twenty_threads_against_one_reset_get_twenty_distinct_wake_times",
+  "jitter_stays_inside_its_span",
+]
+
+[[gate]]
+id = "agent.rate-limit-reset-units"
+title = "The provider's reset seconds become milliseconds exactly once"
+status = "stable"
+owner = "agent-core"
+invariant = """
+`rate_limit_event.resetsAt` arrives in unix seconds and is stored as unix \
+milliseconds, matching every other reset time in the app."""
+oracle = """
+Decode a line with a known `resetsAt` and assert the stored value is exactly \
+one thousand times it. This is the one decoding mistake in the retry path that \
+fails silently in both directions: unconverted, every reset looks like 1970 and \
+fires instantly; double-converted, it lands fifty thousand years out and the \
+turn is never retried. Neither reads as a units bug from the UI."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only: `oximux-agent-core` is `cargo check`ed on Linux (ci.yml:216) and \
+absent from the Windows test list, so only the macOS `--workspace \
+--all-targets` run executes it. \
+\
+The unit is asserted against a literal (`1_788_462_000` in, \
+`1_788_462_000_000` out) rather than against a round-trip through the same \
+constant, so a wrong multiplier cannot cancel itself out — which a \
+`secs * K / K` style assertion would happily let it do."""
+test_files = ["crates/agent-core/src/thread/stream_json.rs"]
+assertions = [
+  "resets_at_is_converted_from_seconds_to_milliseconds",
+  "rate_limit_fixture_decodes_every_status",
+  "only_known_window_kinds_are_waitable",
+]

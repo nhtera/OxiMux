@@ -307,6 +307,7 @@ impl AgentChatView {
             backend,
             composer,
             session_detail_open: false,
+            retry: super::retry::ChatRetry::default(),
             last_notify: std::time::Instant::now(),
             flush_scheduled: false,
             focus_handle: focus.clone(),

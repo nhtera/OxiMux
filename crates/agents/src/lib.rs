@@ -15,6 +15,7 @@ pub mod coord;
 pub mod osc_sideband;
 pub mod poll_helpers;
 pub mod registry;
+pub mod retry;
 pub mod runtime;
 pub mod schedule;
 pub mod session_registry;

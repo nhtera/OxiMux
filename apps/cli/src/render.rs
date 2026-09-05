@@ -219,6 +219,13 @@ pub fn render_event(event: &ThreadEvent) -> Option<String> {
         ThreadEvent::Diagnostic(text) => Some(format!("! {}", one_line(text))),
         ThreadEvent::Error(text) => Some(format!("✗ {}", one_line(text))),
         ThreadEvent::Rewound { ordinal } => Some(format!("— rewound to turn {ordinal} —")),
+        // Only a refusal is worth a line. `allowed` and `allowed_warning`
+        // readings arrive every time a percentage ticks over, and printing them
+        // would bury the transcript in meter noise.
+        ThreadEvent::RateLimitUpdated(info) if info.is_rejected() => Some(match &info.limit_type {
+            Some(kind) => format!("· rate limited ({kind})"),
+            None => "· rate limited".into(),
+        }),
         // Streaming deltas: the finalized event carries the authoritative text.
         ThreadEvent::AssistantTextDelta(_)
         | ThreadEvent::ThinkingDelta(_)
@@ -239,6 +246,10 @@ pub fn render_event(event: &ThreadEvent) -> Option<String> {
         | ThreadEvent::AuthOutcome { .. }
         | ThreadEvent::ModeChanged { .. }
         | ThreadEvent::ControlsUpdated
+        | ThreadEvent::RateLimitUpdated(_)
+        // Typed detail for the `TurnEnded` right behind it, which prints the
+        // message a person reads.
+        | ThreadEvent::TurnFailed { .. }
         | ThreadEvent::TitleUpdated { .. } => None,
     }
 }

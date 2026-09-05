@@ -112,6 +112,61 @@ pub struct McpServerStatus {
     pub status: String,
 }
 
+/// The provider's current rate-limit state, as reported on its own wire line
+/// rather than as part of a turn's result.
+///
+/// Vocabulary and units are taken from the shipped Claude CLI's own schema
+/// (2.1.261), not inferred from an error message: `status` is one of
+/// `allowed | allowed_warning | rejected`, and `rateLimitType` one of
+/// `five_hour | seven_day | seven_day_opus | seven_day_sonnet |
+/// seven_day_overage_included | overage`.
+///
+/// Both tokens are kept verbatim rather than parsed into enums. The provider
+/// adds window kinds (the two `overage` variants are recent), and a value this
+/// build has never heard of must degrade to "unknown, do not retry" instead of
+/// failing to deserialize a persisted transcript written by a newer build.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RateLimitInfo {
+    /// Verbatim `status` token. `rejected` is the only value that means a
+    /// request was actually refused.
+    pub status: String,
+    /// When the limiting window resets, unix **milliseconds**.
+    ///
+    /// The wire reports `resetsAt` in unix **seconds** — the CLI derives its own
+    /// `retry-after` header as `resetsAt - now_seconds`. The decoder converts on
+    /// the way in so every reset time inside OxiMux is milliseconds, matching
+    /// [`crate::thread::event`]'s neighbours and `UsageWindow::resets_at_ms`.
+    /// Getting this wrong does not fail loudly — it schedules a retry either
+    /// immediately or tens of thousands of years out.
+    pub resets_at_ms: Option<i64>,
+    /// Verbatim `rateLimitType` token, when the provider named one.
+    pub limit_type: Option<String>,
+    /// Percentage of the limiting window consumed, when reported.
+    pub utilization: Option<f64>,
+}
+
+impl RateLimitInfo {
+    /// Whether the provider is currently refusing requests.
+    pub fn is_rejected(&self) -> bool {
+        self.status == "rejected"
+    }
+
+    /// Whether this rejection is one that waiting for the reset actually
+    /// clears.
+    ///
+    /// The two `overage` kinds are deliberately excluded. Overage means the
+    /// account has passed its plan allowance and further requests are billed —
+    /// so a retry there is not "wait for a window to reopen", it is spending the
+    /// user's money without asking. An unrecognised kind is excluded for the
+    /// same reason: the safe default is to surface the error, not to retry it.
+    pub fn is_waitable_window(&self) -> bool {
+        matches!(
+            self.limit_type.as_deref(),
+            Some("five_hour" | "seven_day" | "seven_day_opus" | "seven_day_sonnet")
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ThreadEvent {
     /// Session bootstrap (`system/init`).
@@ -454,6 +509,32 @@ pub enum ThreadEvent {
     /// attempt that fails leaves the transcript alone, matching what the desktop
     /// shows itself.
     Rewound { ordinal: usize },
+    /// The provider's rate-limit state changed (Claude `rate_limit_event`).
+    ///
+    /// Arrives on its own line whenever a window's rounded utilization or reset
+    /// time moves — including the moment a window starts refusing requests — so
+    /// it is *not* tied to a turn and carries no result of its own. The fold
+    /// keeps the latest reading on the thread; the retry engine reads it when a
+    /// turn fails, which is what lets a rate-limited turn be told apart from an
+    /// ordinary error without matching on error prose.
+    RateLimitUpdated(RateLimitInfo),
+    /// Typed detail for the failure the **immediately following**
+    /// `TurnEnded { is_error: true }` reports.
+    ///
+    /// Emitted only when the backend gave something machine-readable to carry —
+    /// the CLI's `api_error_status` and `terminal_reason` — so an overloaded
+    /// provider can be told from a bad request without matching on the error
+    /// text a provider is free to reword. Follows the `SessionResumeStale`
+    /// precedent of riding just ahead of the settle event rather than widening
+    /// `TurnEnded`, whose shape 48 construction sites depend on.
+    TurnFailed {
+        /// HTTP status the backend reported (`api_error_status`).
+        status: Option<u16>,
+        /// Verbatim `terminal_reason` token (`api_error`, `aborted_streaming`,
+        /// …). Kept as text: it is matched on for the cases we know and
+        /// displayed for the ones we do not.
+        terminal_reason: Option<String>,
+    },
 }
 
 impl ThreadEvent {
