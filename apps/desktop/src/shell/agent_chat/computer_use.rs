@@ -544,6 +544,13 @@ mod view_tests {
     /// them passes or fails on which other tests happen to be running
     /// alongside, which is how the first version of these tests came to be
     /// flaky.
+    ///
+    /// Same shape as the install-lock flake recorded under
+    /// `computer-use.install-lock-is-serialized` in
+    /// `config/reliability-gates.toml`, and the shared rule is worth knowing:
+    /// process-global state plus cargo's parallel test threads means a test
+    /// reading that state sees its neighbours. Scope the read (as here) or
+    /// serialize the tests.
     fn captured_by(view: &AgentChatView) -> Vec<u32> {
         let mine = view.screen_control.session.as_str();
         view.screen_control

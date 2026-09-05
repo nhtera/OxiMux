@@ -23,3 +23,14 @@ anyhow = { workspace = true }
 # workspace's `image` by hand; cargo resolves both to one entry in the lock, so
 # a drift shows up as a second `image` there rather than silently.
 image = { version = "0.25", default-features = false, features = ["ico", "png", "bmp"] }
+# `xtask reliability-gates` validates `config/reliability-gates.toml`. Two
+# dependencies on a runner that had only `anyhow` and `image` is a real cost,
+# taken deliberately: a gate carries multi-line `invariant` / `oracle` prose and
+# four list fields, so the hand-parsed `<path> <loc>` shape that serves
+# `file-size-allow.txt` would have to grow an escaping story. Most of the
+# validator's value is `deny_unknown_fields` plus enum parsing — a typo'd
+# `status` or a renamed field fails at parse rather than being silently ignored,
+# which is the whole point of a ledger that claims things. Both inherit from the
+# workspace, so no new entry appears in the lockfile.
+serde = { workspace = true }
+toml = { workspace = true }

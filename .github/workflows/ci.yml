@@ -136,6 +136,14 @@ jobs:
       - name: xtask literal-lint
         run: cargo run -p xtask -- literal-lint
 
+      # The reliability ledger records what OxiMux claims to be true and where
+      # that claim is actually proven. It is checked here rather than left to
+      # review because the failure it exists to catch — a claim of coverage with
+      # nothing behind it — reads exactly like a claim with everything behind
+      # it. Shape and internal consistency only; it runs no tests of its own.
+      - name: xtask reliability-gates
+        run: cargo run -p xtask -- reliability-gates
+
       # The Windows icon is derived from the macOS one, so it goes stale on
       # whichever machine edits `assets/AppIcon.icns` — which is this one, not
       # the Windows runner. Checking it here is what makes "regenerate the .ico"

@@ -1456,6 +1456,14 @@ async fn spawn_env_reaches_child_process() {
 // `/bin/echo MARKER` and asserts the marker — only present if argv actually
 // reached `echo`. This is the only end-to-end check of the argv path; every
 // other Spawn here passes an empty args vec.
+//
+// KNOWN FLAKY under a parallel workspace run: 18 daemon-spawning tests in this
+// file contend, and the argv readback races to empty ("child argv missing the
+// spawned arg; got \"\""). Passes in isolation. Because `cargo test --workspace`
+// is fail-fast, a trip here aborts the run before later crates and yields a
+// misleading count — verify with `--no-fail-fast`. Tracked as
+// `relay.spawn-argv-reaches-child` (status = "flaky") in
+// `config/reliability-gates.toml`.
 #[tokio::test]
 async fn spawn_args_reach_child_process() {
     let relay = boot_relay().await;
