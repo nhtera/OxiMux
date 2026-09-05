@@ -34,6 +34,19 @@ pub enum Violation {
     /// `ToolCallStarted` opened a fresh card instead of updating the open one,
     /// so the user sees the same call twice, usually with one stuck pending.
     DuplicateToolCallId { first: usize, second: usize, id: String },
+    /// A compaction divider with no summary text.
+    ///
+    /// The divider renders as a centered rule with its summary; with an empty
+    /// summary the user gets a bare line across the transcript and no
+    /// indication that history was truncated behind it.
+    EmptyCompactionDivider { index: usize },
+    /// A turn-diff card listing no files.
+    ///
+    /// The card exists to say what a turn changed, and is only meant to be
+    /// pushed when a turn changed something. With no files it renders as an
+    /// empty card claiming a turn edited nothing — worse than absent, because
+    /// it asserts something false.
+    EmptyTurnDiffCard { index: usize },
     /// An assistant row folded to nothing at all.
     ///
     /// An empty bubble renders as a blank gap. It usually means text was
@@ -54,6 +67,12 @@ impl std::fmt::Display for Violation {
             }
             Self::EmptyAssistantRow { index } => {
                 write!(f, "entry {index}: assistant row has neither text nor thinking")
+            }
+            Self::EmptyCompactionDivider { index } => {
+                write!(f, "entry {index}: compaction divider carries no summary")
+            }
+            Self::EmptyTurnDiffCard { index } => {
+                write!(f, "entry {index}: turn-diff card lists no files")
             }
         }
     }
@@ -129,6 +148,12 @@ pub fn check(thread: &ChatThread, turn_settled: bool) -> Vec<Violation> {
             }
             ThreadEntry::Assistant(msg) if msg.is_empty() => {
                 out.push(Violation::EmptyAssistantRow { index });
+            }
+            ThreadEntry::ContextCompaction { summary } if summary.trim().is_empty() => {
+                out.push(Violation::EmptyCompactionDivider { index });
+            }
+            ThreadEntry::TurnDiff { files, .. } if files.is_empty() => {
+                out.push(Violation::EmptyTurnDiffCard { index });
             }
             _ => {}
         }
@@ -232,6 +257,24 @@ mod tests {
         let msg = AssistantMessage { text: String::new(), thinking: "hmm".into() };
         let t = thread(vec![ThreadEntry::Assistant(msg)]);
         assert_eq!(check(&t, true), Vec::new());
+    }
+
+    #[test]
+    fn a_compaction_divider_with_no_summary_is_a_violation() {
+        let t = thread(vec![ThreadEntry::ContextCompaction { summary: "   ".into() }]);
+        assert_eq!(check(&t, true), vec![Violation::EmptyCompactionDivider { index: 0 }]);
+    }
+
+    #[test]
+    fn a_compaction_divider_with_a_summary_is_fine() {
+        let t = thread(vec![ThreadEntry::ContextCompaction { summary: "older messages".into() }]);
+        assert_eq!(check(&t, true), Vec::new());
+    }
+
+    #[test]
+    fn a_turn_diff_card_listing_no_files_is_a_violation() {
+        let t = thread(vec![ThreadEntry::TurnDiff { files: Vec::new(), diff: None }]);
+        assert_eq!(check(&t, true), vec![Violation::EmptyTurnDiffCard { index: 0 }]);
     }
 
     /// Every violation is reported, not just the first — a mapper that breaks

@@ -827,8 +827,10 @@ status = "stable"
 owner = "agent-core"
 invariant = """
 Once a turn has settled, no tool row is still rendering as in-flight; no two \
-rows share a tool-call id; and no assistant row folds to nothing. These hold \
-for every agent, checked by one oracle rather than per-mapper conventions."""
+rows share a tool-call id; and no row renders as an empty shell — an assistant \
+bubble with neither text nor thinking, a compaction divider with no summary, or \
+a turn-diff card listing no files. These hold for every agent, checked by one \
+oracle rather than by per-mapper convention."""
 oracle = """
 Fold each captured fixture with the real decoder and the real fold, then run \
 the shared checker over the result. The failure this catches is the one nine \
@@ -848,9 +850,14 @@ from the Windows test list (ci.yml:648-654), so only the macOS `--workspace \
 --all-targets` job runs them. Pure fold logic with no clock, filesystem or \
 process, so there is no platform-specific behaviour to miss. \
 \
-**Covers Claude, Codex, Pi and omp — not ACP**, which has no committed fixture. \
-That is a real hole, not an oversight: the checker is wired to run per agent, so \
-adding an ACP capture is the whole cost of closing it. \
+Covers all five agents, but **not equally**. Claude, Codex, Pi and omp run \
+against captured wire bytes; **ACP runs against a synthetic turn** built from \
+typed protocol values, because no ACP capture is committed and its tests were \
+never fixture-driven. Synthetic is weaker evidence than a capture and is named \
+here rather than blended into the same claim. ACP therefore also carries a \
+negative control — the same turn with its tool left in flight must be caught — \
+so the row asserts the oracle is wired to that agent, not merely that some \
+transcript passes. \
 \
 The oracle itself has been wrong once and the mistake is worth keeping: it first \
 derived "turn settled" from `!turn_active` and reported a violation against a \
@@ -862,6 +869,7 @@ test_files = [
   "crates/agents/src/thread/codex/map.rs",
   "crates/agents/src/thread/pi/map.rs",
   "crates/agents/src/thread/omp/map.rs",
+  "crates/agents/src/thread/acp/map.rs",
 ]
 assertions = [
   "every_claude_fixture_satisfies_the_transcript_invariants",
@@ -870,6 +878,10 @@ assertions = [
   "an_in_flight_row_during_a_live_turn_is_not_a_violation",
   "two_rows_sharing_a_tool_call_id_are_a_violation",
   "rows_without_an_id_are_not_duplicates_of_each_other",
+  "a_settled_acp_turn_satisfies_the_transcript_invariants",
+  "an_acp_turn_that_leaves_a_tool_running_is_caught",
+  "a_compaction_divider_with_no_summary_is_a_violation",
+  "a_turn_diff_card_listing_no_files_is_a_violation",
 ]
 
 [[gate]]

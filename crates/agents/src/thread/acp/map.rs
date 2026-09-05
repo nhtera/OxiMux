@@ -729,4 +729,73 @@ mod tests {
             other => panic!("expected ToolCallStarted, got {other:?}"),
         }
     }
+
+    /// The shared transcript invariants, for the one agent with no captured
+    /// fixture.
+    ///
+    /// ACP's tests are built from typed protocol values rather than replayed
+    /// JSONL, and no ACP capture is committed, so this turn is **synthetic** —
+    /// stated plainly because a synthetic turn is weaker evidence than a
+    /// capture and the ledger should not imply otherwise. It is still worth
+    /// having: without it ACP is the only agent the oracle never runs against,
+    /// and the drift this catches is precisely a rule that holds everywhere
+    /// except the one place nobody checks.
+    ///
+    /// `TurnEnded` is appended by hand because ACP emits it from the worker,
+    /// not the mapper.
+    #[test]
+    fn a_settled_acp_turn_satisfies_the_transcript_invariants() {
+        let mut events = Vec::new();
+        let tc = ToolCall::new("call-1", "Read a file")
+            .kind(ToolKind::Read)
+            .raw_input(serde_json::json!({"path": "src/main.rs"}));
+        events.extend(map_session_update(SessionUpdate::ToolCall(tc)));
+        let done = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::from(ContentBlock::Text(TextContent::new(
+                "fn main() {}".to_string(),
+            )))]);
+        events.extend(map_session_update(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+            "call-1", done,
+        ))));
+        events.extend(map_session_update(SessionUpdate::AgentMessageChunk(text_chunk(
+            "Read it.",
+        ))));
+        events.push(ThreadEvent::TurnEnded {
+            result: None,
+            usage: None,
+            is_error: false,
+            turn_diff: None,
+        });
+
+        let mut thread = oximux_agent_core::thread::state::ChatThread::default();
+        for ev in &events {
+            thread.apply(ev);
+        }
+        oximux_agent_core::thread::invariants::assert_holds("acp-settled-turn", &thread, true);
+    }
+
+    /// Negative control: the same turn with the tool left in-flight MUST be
+    /// caught. Without this the test above proves only that some transcript
+    /// passes, not that the oracle is wired to ACP at all — the failure mode
+    /// that made two earlier oracles in this phase vacuous.
+    #[test]
+    fn an_acp_turn_that_leaves_a_tool_running_is_caught() {
+        let tc = ToolCall::new("call-stuck", "Read a file")
+            .raw_input(serde_json::json!({"path": "src/main.rs"}));
+        let mut events = map_session_update(SessionUpdate::ToolCall(tc));
+        events.push(ThreadEvent::TurnEnded {
+            result: None,
+            usage: None,
+            is_error: false,
+            turn_diff: None,
+        });
+        let mut thread = oximux_agent_core::thread::state::ChatThread::default();
+        for ev in &events {
+            thread.apply(ev);
+        }
+        let violations = oximux_agent_core::thread::invariants::check(&thread, true);
+        assert_eq!(violations.len(), 1, "a spinner surviving the turn must be caught: {violations:?}");
+    }
+
 }
