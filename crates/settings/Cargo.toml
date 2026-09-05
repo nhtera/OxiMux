@@ -17,6 +17,9 @@ gpui = ["dep:gpui"]
 
 [dependencies]
 gpui = { workspace = true, optional = true }
+# The Windows-shell choice enums persisted in `terminal.toml` live in
+# shell-env (one source of truth with the resolver that consumes them).
+oximux-shell-env = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }

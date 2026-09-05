@@ -13,6 +13,7 @@
 use std::path::PathBuf;
 
 use oximux_pty::SpawnConfig;
+use oximux_shell_env::ResolvedShell;
 
 /// Process-wide mirror of `TerminalSettings::scrollback_lines`. The PTY spawn
 /// helpers are `cx`-less free functions, so they read scrollback here instead
@@ -48,43 +49,67 @@ pub(crate) fn shell_integration_enabled() -> bool {
     SHELL_INTEGRATION_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Process-wide mirror of `TerminalSettings::shell`. Same reason as the two
-/// above: the spawn helpers are `cx`-less. Empty means the user set no
-/// override, and the spawning process picks.
-static SPAWN_SHELL: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+/// Process-wide mirror of the resolved spawn shell. Same reason as the two
+/// above: the spawn helpers are `cx`-less. `None` means "no explicit pick"
+/// and the spawn falls back to `SpawnConfig::default().shell`.
+///
+/// Unlike the bare-string it replaced, this carries the argv and env a shell
+/// needs to launch (Git Bash's `-i` / `MSYSTEM` / `CHERE_INVOKING`), resolved
+/// once by the settings loader from the user's [`WindowsShell`] choice.
+static SPAWN_SHELL: std::sync::RwLock<Option<ResolvedShell>> = std::sync::RwLock::new(None);
 
-/// Update the shell-override mirror from settings. Called once at startup and
-/// on every settings reload.
-pub fn set_spawn_shell(shell: String) {
+/// Set the resolved spawn shell from settings. Called once at startup and on
+/// every settings reload. `None` clears any prior override.
+pub fn set_spawn_shell_resolved(shell: Option<ResolvedShell>) {
     let mut slot = SPAWN_SHELL
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *slot = shell;
 }
 
-/// The user's shell override, or `None` when they have not set one.
-fn spawn_shell() -> Option<String> {
-    let slot = SPAWN_SHELL
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    (!slot.is_empty()).then(|| slot.clone())
+/// Back-compat setter for a bare program path (used by tests and any caller
+/// that only knows a path). Empty clears the override.
+pub fn set_spawn_shell(shell: String) {
+    set_spawn_shell_resolved((!shell.is_empty()).then(|| ResolvedShell {
+        program: shell,
+        args: Vec::new(),
+        env: Vec::new(),
+    }));
 }
 
-/// A [`SpawnConfig`] whose shell honors the user's override, falling back to
-/// whatever the platform resolver picked.
+/// The resolved spawn shell, or `None` when none was set.
+fn spawn_shell() -> Option<ResolvedShell> {
+    SPAWN_SHELL
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+/// A [`SpawnConfig`] whose shell honors the user's resolved choice, falling
+/// back to whatever the platform resolver picked.
+///
+/// The resolved shell's own env is prepended so the caller's context env
+/// (passed in `env`) still wins on any key collision — the backend applies
+/// `cfg.env` last, so a later duplicate key overrides an earlier one.
 ///
 /// Only for interactive shells. A spawn that names its own program — an agent
 /// CLI, an ACP embedded terminal — must not have the user's shell substituted
 /// under it.
 pub(super) fn shell_spawn_config(cwd: PathBuf, env: Vec<(String, String)>, cols: u16, rows: u16) -> SpawnConfig {
     let base = SpawnConfig::default();
+    let (shell, args, mut merged_env) = match spawn_shell() {
+        Some(resolved) => (resolved.program, resolved.args, resolved.env),
+        None => (base.shell, base.args.clone(), Vec::new()),
+    };
+    merged_env.extend(env);
     SpawnConfig {
         cwd,
-        env,
+        env: merged_env,
         cols,
         rows,
         scrollback: spawn_scrollback(),
-        shell: spawn_shell().unwrap_or(base.shell),
+        shell,
+        args,
         ..base
     }
 }

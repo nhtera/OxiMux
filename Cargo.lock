@@ -8332,6 +8332,7 @@ dependencies = [
  "anyhow",
  "dunce",
  "gpui",
+ "oximux-shell-env",
  "serde",
  "tempfile",
  "toml 0.8.23",
@@ -8343,6 +8344,8 @@ name = "oximux-shell-env"
 version = "0.1.18"
 dependencies = [
  "portable-pty",
+ "serde",
+ "serde_json",
  "which 6.0.3",
 ]
 

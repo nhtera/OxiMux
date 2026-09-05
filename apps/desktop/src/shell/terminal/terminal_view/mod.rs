@@ -154,7 +154,9 @@ pub fn terminal_settings(cx: &App) -> TerminalSettings {
 }
 
 mod spawn_settings;
-pub use spawn_settings::{set_shell_integration_enabled, set_spawn_scrollback, set_spawn_shell};
+pub use spawn_settings::{
+    set_shell_integration_enabled, set_spawn_scrollback, set_spawn_shell, set_spawn_shell_resolved,
+};
 pub(crate) use spawn_settings::shell_integration_enabled;
 use spawn_settings::{shell_spawn_config, spawn_scrollback};
 
