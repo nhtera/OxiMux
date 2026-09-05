@@ -17,7 +17,15 @@ test-support = []
 # depend on portable-pty, so this adds nothing to either dependency graph.
 portable-pty = { workspace = true }
 
+# Derive on the Windows-shell choice enums so `oximux-settings` can persist
+# them in `terminal.toml` without a parallel copy of the same variants.
+serde = { workspace = true }
+
 # PATH + PATHEXT resolution for the Windows shell probe. The same crate the
 # agent-CLI detector uses, so `.exe`/`.cmd` handling has one implementation.
 [target.'cfg(windows)'.dependencies]
 which = { workspace = true }
+
+[dev-dependencies]
+# Round-trips the Windows-shell enums to assert their stable TOML spellings.
+serde_json = { workspace = true }

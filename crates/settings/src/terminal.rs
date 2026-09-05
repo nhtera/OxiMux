@@ -12,6 +12,7 @@
 
 #[cfg(feature = "gpui")]
 use gpui::Global;
+pub use oximux_shell_env::{WindowsPowerShell, WindowsShell};
 use serde::{Deserialize, Serialize};
 
 /// How a terminal bell (BEL / `\a`) is surfaced.
@@ -75,6 +76,13 @@ pub struct TerminalSettings {
     /// the spawning process, which for a relay-backed terminal is the daemon,
     /// whose `PATH` need not match the app's.
     pub shell: String,
+    /// Which shell family new panes run on Windows: PowerShell (default),
+    /// Command Prompt, Git Bash, or Auto (Git Bash when installed, else
+    /// PowerShell). Ignored off Windows and overridden by a non-empty `shell`.
+    pub windows_shell: WindowsShell,
+    /// Which PowerShell binary the PowerShell family resolves to on Windows:
+    /// Auto (pwsh 7 when present, else inbox), Pwsh, or Windows PowerShell.
+    pub windows_powershell: WindowsPowerShell,
     /// How a bell is surfaced.
     pub bell: BellStyle,
 }
@@ -99,6 +107,8 @@ impl Default for TerminalSettings {
             copy_on_select: false,
             shell_integration: true,
             shell: String::new(),
+            windows_shell: WindowsShell::default(),
+            windows_powershell: WindowsPowerShell::default(),
             bell: BellStyle::Visual,
         }
     }
@@ -226,6 +236,27 @@ mod tests {
             .expect("parse")
             .sanitized();
         assert!(blank.shell.is_empty());
+    }
+
+    #[test]
+    fn windows_shell_defaults_to_powershell_and_round_trips() {
+        // Default follows the prior behavior (PowerShell / auto pwsh).
+        let d = TerminalSettings::default();
+        assert_eq!(d.windows_shell, WindowsShell::PowerShell);
+        assert_eq!(d.windows_powershell, WindowsPowerShell::Auto);
+
+        // A file selecting Git Bash keeps every other default.
+        let s = TerminalSettings::from_toml_str(
+            "windows_shell = \"git-bash\"\nwindows_powershell = \"pwsh\"\n",
+        )
+        .expect("parse");
+        assert_eq!(s.windows_shell, WindowsShell::GitBash);
+        assert_eq!(s.windows_powershell, WindowsPowerShell::Pwsh);
+        assert_eq!(s.scrollback_lines, 5000);
+
+        // Full default round-trips through TOML unchanged.
+        let toml = d.to_toml_string();
+        assert_eq!(TerminalSettings::from_toml_str(&toml).expect("round-trip"), d);
     }
 
     #[test]

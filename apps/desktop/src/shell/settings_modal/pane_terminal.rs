@@ -3,7 +3,7 @@
 //! `terminal.toml`; the live-reload watcher re-applies to open panes.
 
 use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
-use oximux_settings::{BellStyle, Density, Theme, Typography};
+use oximux_settings::{BellStyle, Density, Theme, Typography, WindowsPowerShell, WindowsShell};
 
 use super::SettingsModal;
 use super::controls::{stepper, toggle_switch};
@@ -123,6 +123,81 @@ pub(super) fn entries(
         cx,
     );
 
+    // Windows-only: which shell family new panes run, and which PowerShell
+    // binary the PowerShell family resolves to. Built unconditionally (the
+    // enums are cross-platform) but only surfaced as rows on Windows below.
+    let windows_shell = segmented(
+        "term-winshell",
+        vec![
+            Segment::new(
+                "PowerShell",
+                t.windows_shell == WindowsShell::PowerShell,
+                |this, _w, cx| {
+                    this.terminal.windows_shell = WindowsShell::PowerShell;
+                    this.persist_terminal(cx);
+                },
+            ),
+            Segment::new(
+                "Command Prompt",
+                t.windows_shell == WindowsShell::CommandPrompt,
+                |this, _w, cx| {
+                    this.terminal.windows_shell = WindowsShell::CommandPrompt;
+                    this.persist_terminal(cx);
+                },
+            ),
+            Segment::new(
+                "Git Bash",
+                t.windows_shell == WindowsShell::GitBash,
+                |this, _w, cx| {
+                    this.terminal.windows_shell = WindowsShell::GitBash;
+                    this.persist_terminal(cx);
+                },
+            ),
+            Segment::new("Auto", t.windows_shell == WindowsShell::Auto, |this, _w, cx| {
+                this.terminal.windows_shell = WindowsShell::Auto;
+                this.persist_terminal(cx);
+            }),
+        ],
+        theme,
+        density,
+        typography,
+        cx,
+    );
+
+    let windows_powershell = segmented(
+        "term-winps",
+        vec![
+            Segment::new(
+                "Auto",
+                t.windows_powershell == WindowsPowerShell::Auto,
+                |this, _w, cx| {
+                    this.terminal.windows_powershell = WindowsPowerShell::Auto;
+                    this.persist_terminal(cx);
+                },
+            ),
+            Segment::new(
+                "pwsh 7",
+                t.windows_powershell == WindowsPowerShell::Pwsh,
+                |this, _w, cx| {
+                    this.terminal.windows_powershell = WindowsPowerShell::Pwsh;
+                    this.persist_terminal(cx);
+                },
+            ),
+            Segment::new(
+                "Windows",
+                t.windows_powershell == WindowsPowerShell::Windows,
+                |this, _w, cx| {
+                    this.terminal.windows_powershell = WindowsPowerShell::Windows;
+                    this.persist_terminal(cx);
+                },
+            ),
+        ],
+        theme,
+        density,
+        typography,
+        cx,
+    );
+
     let cursor_blink = toggle_switch(
         "term-cursorblink",
         t.cursor_blink,
@@ -167,7 +242,28 @@ pub(super) fn entries(
         cx,
     );
 
-    vec![
+    let mut rows: Vec<SettingEntry> = Vec::new();
+
+    // The Windows shell picker leads the pane, matching the "Windows Shell"
+    // section other terminals surface. Only meaningful on Windows; off it the
+    // shell is `$SHELL` / the POSIX default, so these rows are hidden.
+    if cfg!(windows) {
+        rows.push(entry(
+            "Default shell",
+            "Shell new terminal panes run on Windows. Auto prefers Git Bash when Git for Windows is installed.",
+            windows_shell,
+        ));
+        rows.push(entry(
+            "PowerShell edition",
+            "Which PowerShell the PowerShell option uses: Auto (pwsh 7 when present), pwsh 7, or inbox Windows PowerShell.",
+            windows_powershell,
+        ));
+    } else {
+        // Keep the controls "used" on non-Windows without rendering them.
+        let _ = (&windows_shell, &windows_powershell);
+    }
+
+    rows.extend([
         entry(
             "Scrollback",
             "Maximum lines kept in scrollback history.",
@@ -204,5 +300,7 @@ pub(super) fn entries(
             "Copy text to the clipboard as soon as a selection is made.",
             copy_on_select,
         ),
-    ]
+    ]);
+
+    rows
 }

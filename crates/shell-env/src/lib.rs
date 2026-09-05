@@ -8,6 +8,73 @@
 //! no other dependency (the daemon deliberately avoids the grid emulator).
 
 use portable_pty::CommandBuilder;
+use serde::{Deserialize, Serialize};
+
+/// Which shell family a new terminal pane runs on Windows.
+///
+/// Stored in `terminal.toml` (via `oximux-settings`) and surfaced as a
+/// segmented control in the settings UI. Ignored off Windows, where the shell
+/// is the inherited `$SHELL` or the POSIX fallback chain (see [`default_shell`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum WindowsShell {
+    /// Windows PowerShell or PowerShell 7, per [`WindowsPowerShell`]. The
+    /// default, matching every prior release.
+    #[default]
+    #[serde(rename = "powershell")]
+    PowerShell,
+    /// The classic command processor, `cmd.exe`.
+    #[serde(rename = "cmd")]
+    CommandPrompt,
+    /// Git for Windows' `bash.exe`, resolved from the standard install
+    /// locations (or `OXIMUX_GIT_BASH_PATH`). Falls back to PowerShell when
+    /// Git for Windows is not installed.
+    #[serde(rename = "git-bash")]
+    GitBash,
+    /// Prefer Git Bash when Git for Windows is installed, else PowerShell.
+    #[serde(rename = "auto")]
+    Auto,
+}
+
+/// Which PowerShell binary the `PowerShell` family resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WindowsPowerShell {
+    /// PowerShell 7+ (`pwsh.exe`) when present, else inbox Windows PowerShell.
+    #[default]
+    Auto,
+    /// Force PowerShell 7+ (`pwsh.exe`); still falls back to inbox PowerShell
+    /// if `pwsh.exe` cannot be found, so a terminal always opens.
+    Pwsh,
+    /// Force inbox Windows PowerShell 5.1 (`powershell.exe`).
+    #[serde(rename = "powershell")]
+    Windows,
+}
+
+/// A resolved shell to spawn: the program plus the argv and environment its
+/// launch needs. `args`/`env` are empty for shells that need neither.
+///
+/// The shell-integration layer may still prepend its own argv (bash
+/// `--rcfile`, PowerShell `-Command`) on top of these — see the desktop app's
+/// `augment_spawn_config`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedShell {
+    pub program: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
+// Only the Windows resolver builds a program-only shell; gate the helper so
+// it isn't dead code on other platforms (CI builds with `-D warnings`).
+#[cfg(windows)]
+impl ResolvedShell {
+    fn program(program: String) -> Self {
+        Self {
+            program,
+            args: Vec::new(),
+            env: Vec::new(),
+        }
+    }
+}
 
 /// The program a new terminal runs when the caller asks for a plain shell.
 ///
@@ -55,25 +122,215 @@ fn unix_shell() -> String {
 /// inside their own root — no Win32 API can spawn it. Honoring `$SHELL` on
 /// Windows therefore turns "user has Git for Windows installed", which is
 /// nearly all of them, into "terminals do not open".
+///
+/// This is the daemon/relay fallback and the `SpawnConfig::default` shell; the
+/// desktop app resolves the user's [`WindowsShell`] choice through
+/// [`resolve_windows_shell`] instead. Both keep PowerShell as the default.
 #[cfg(windows)]
 fn windows_shell() -> String {
-    // PATHEXT resolution lives in the `which` crate, so `pwsh` finds `pwsh.exe`
-    // and would equally find a `.cmd` shim if someone installed one.
-    for name in ["pwsh", "powershell"] {
-        if let Ok(path) = which::which(name) {
-            return path.to_string_lossy().into_owned();
+    resolve_windows_shell(WindowsShell::PowerShell, WindowsPowerShell::Auto).program
+}
+
+/// Resolve a Windows shell choice into a spawnable program + argv + env.
+///
+/// - `GitBash` / `Auto` probe for Git for Windows and fall back to PowerShell
+///   when it is absent, so the terminal always opens.
+/// - Git Bash launches interactive and NON-login (`-i`, no `-l`): the login
+///   profile ignores the `--rcfile` the shell-integration layer prepends,
+///   which would drop the OSC 133 marks. A non-login interactive shell still
+///   rebuilds the full MSYS `PATH` via `/etc/bash.bashrc`. `CHERE_INVOKING`
+///   keeps it in the pane's cwd; `MSYSTEM`/`LANG` seed the MSYS locale that
+///   the (skipped) login profile would otherwise set.
+/// - PowerShell/cmd carry no argv here; the shell-integration layer adds
+///   PowerShell's `-Command` bootstrap, and an empty argv is what lets it.
+#[cfg(windows)]
+pub fn resolve_windows_shell(shell: WindowsShell, powershell: WindowsPowerShell) -> ResolvedShell {
+    match shell {
+        WindowsShell::CommandPrompt => ResolvedShell::program(cmd_path()),
+        WindowsShell::PowerShell => ResolvedShell::program(powershell_path(powershell)),
+        WindowsShell::GitBash | WindowsShell::Auto => git_bash_shell()
+            .unwrap_or_else(|| ResolvedShell::program(powershell_path(powershell))),
+    }
+}
+
+/// A [`ResolvedShell`] for Git for Windows' bash, or `None` when it is not
+/// installed. See [`resolve_windows_shell`] for why these args/env are chosen.
+#[cfg(windows)]
+fn git_bash_shell() -> Option<ResolvedShell> {
+    let program = git_bash_path()?;
+    Some(ResolvedShell {
+        program,
+        // `-i` only; `--rcfile` (added later) is honoured only for a non-login
+        // interactive shell.
+        args: vec!["-i".to_string()],
+        env: vec![
+            // 64-bit MSYS runtime — Git for Windows' default. Without it a
+            // non-login shell can pick the wrong mount table.
+            ("MSYSTEM".to_string(), "MINGW64".to_string()),
+            // Stay in the directory the pane was spawned in rather than $HOME.
+            ("CHERE_INVOKING".to_string(), "1".to_string()),
+            // The login profile would set this; seed it so multibyte paths and
+            // output are UTF-8 rather than the C locale.
+            ("LANG".to_string(), "en_US.UTF-8".to_string()),
+        ],
+    })
+}
+
+/// Locate Git for Windows' `bash.exe`.
+///
+/// Order: `OXIMUX_GIT_BASH_PATH` override, then the standard per-machine and
+/// per-user install roots, then the install `git` on `PATH` resolves to. Only
+/// a real Git-for-Windows layout counts, so a WSL/Cygwin `bash.exe` on `PATH`
+/// is never mistaken for it.
+#[cfg(windows)]
+fn git_bash_path() -> Option<String> {
+    use std::path::{Path, PathBuf};
+
+    // 1. Operator override for a non-standard install (mirrors Claude Code's
+    //    CLAUDE_CODE_GIT_BASH_PATH).
+    if let Ok(custom) = std::env::var("OXIMUX_GIT_BASH_PATH")
+        && Path::new(&custom).is_file()
+    {
+        return Some(custom);
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // 2. Standard install roots. `ProgramW6432` is the 64-bit Program Files
+    //    even for a 32-bit process; `Programs\Git` under LOCALAPPDATA is the
+    //    per-user (winget) install.
+    for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+        let Ok(root) = std::env::var(var) else { continue };
+        let root = PathBuf::from(root);
+        for suffix in [
+            r"Git\bin\bash.exe",
+            r"Git\usr\bin\bash.exe",
+            r"Programs\Git\bin\bash.exe",
+            r"Programs\Git\usr\bin\bash.exe",
+        ] {
+            candidates.push(root.join(suffix));
         }
     }
-    // A sparse PATH is a real possibility for a GUI-launched process, and both
-    // remaining candidates ship at fixed locations, so fall back to those
-    // rather than to a bare name the spawn would have to resolve itself.
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    let windows_powershell = std::path::Path::new(&root)
-        .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
-    if windows_powershell.exists() {
-        return windows_powershell.to_string_lossy().into_owned();
+
+    // 3. Whatever install the `git` on PATH belongs to (Scoop, Chocolatey,
+    //    PortableGit). Climb the ancestors of `git.exe` and probe the two
+    //    bash locations under each — the root is a couple of levels up
+    //    (`<root>\cmd\git.exe`, `<root>\mingw64\bin\git.exe`).
+    if let Ok(git) = which::which("git") {
+        let mut dir = git.parent();
+        let mut hops = 0;
+        while let Some(d) = dir {
+            candidates.push(d.join(r"bin\bash.exe"));
+            candidates.push(d.join(r"usr\bin\bash.exe"));
+            hops += 1;
+            if hops >= 4 {
+                break;
+            }
+            dir = d.parent();
+        }
     }
+
+    candidates
+        .into_iter()
+        .find(|c| c.is_file() && is_git_for_windows_bash(c))
+        .map(|c| c.to_string_lossy().into_owned())
+}
+
+/// True when `path` is a Git-for-Windows (or PortableGit) `bash.exe`, as
+/// opposed to a WSL/Cygwin/MSYS2-standalone one. The Git layout always places
+/// bash under `...\bin\bash.exe` or `...\usr\bin\bash.exe` with `git` or
+/// `portablegit` in an ancestor directory name.
+#[cfg(windows)]
+fn is_git_for_windows_bash(path: &std::path::Path) -> bool {
+    let lower = path.to_string_lossy().to_ascii_lowercase();
+    (lower.ends_with(r"\bin\bash.exe") || lower.ends_with(r"\usr\bin\bash.exe"))
+        && (lower.contains(r"\git\") || lower.contains(r"\portablegit\"))
+}
+
+/// Resolve the `PowerShell` family to a concrete, spawnable exe.
+///
+/// `Auto`/`Pwsh` prefer PowerShell 7 (`pwsh.exe`) from its standard install
+/// roots (skipping the Microsoft Store app-execution-alias stubs that ConPTY
+/// cannot launch), then fall back to inbox Windows PowerShell, then `cmd.exe`
+/// so a terminal always opens.
+#[cfg(windows)]
+fn powershell_path(powershell: WindowsPowerShell) -> String {
+    match powershell {
+        WindowsPowerShell::Windows => windows_powershell_path(),
+        WindowsPowerShell::Auto | WindowsPowerShell::Pwsh => {
+            pwsh_path().unwrap_or_else(windows_powershell_path)
+        }
+    }
+}
+
+/// PowerShell 7+ (`pwsh.exe`), or `None` if not installed. Rejects the
+/// zero-byte Store app-execution-alias reparse points under `\WindowsApps\`,
+/// which ConPTY's `CreateProcessW(lpApplicationName)` refuses with
+/// ERROR_ACCESS_DENIED.
+#[cfg(windows)]
+fn pwsh_path() -> Option<String> {
+    use std::path::{Path, PathBuf};
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(root) = std::env::var(var) {
+            for major in ["7", "8", "6"] {
+                candidates.push(Path::new(&root).join("PowerShell").join(major).join("pwsh.exe"));
+            }
+        }
+    }
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        for major in ["7", "8", "6"] {
+            candidates.push(
+                Path::new(&local)
+                    .join(r"Microsoft\PowerShell")
+                    .join(major)
+                    .join("pwsh.exe"),
+            );
+        }
+    }
+    if let Ok(on_path) = which::which("pwsh") {
+        candidates.push(on_path);
+    }
+    candidates
+        .into_iter()
+        .find(|c| is_real_executable(c))
+        .map(|c| c.to_string_lossy().into_owned())
+}
+
+/// Inbox Windows PowerShell 5.1 at its fixed location, then a PATH lookup,
+/// then `cmd.exe` as the last resort.
+#[cfg(windows)]
+fn windows_powershell_path() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let inbox = std::path::Path::new(&root).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    if inbox.exists() {
+        return inbox.to_string_lossy().into_owned();
+    }
+    if let Ok(on_path) = which::which("powershell") {
+        return on_path.to_string_lossy().into_owned();
+    }
+    cmd_path()
+}
+
+/// `%ComSpec%`, else `cmd.exe` at its fixed location.
+#[cfg(windows)]
+fn cmd_path() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     std::env::var("COMSPEC").unwrap_or_else(|_| format!(r"{root}\System32\cmd.exe"))
+}
+
+/// True for a real, launchable exe. Rejects the Microsoft Store
+/// app-execution-alias stubs (zero-byte reparse points under `\WindowsApps\`)
+/// that resolve on PATH but cannot be spawned via ConPTY.
+#[cfg(windows)]
+fn is_real_executable(path: &std::path::Path) -> bool {
+    if path.to_string_lossy().to_ascii_lowercase().contains(r"\windowsapps\") {
+        return false;
+    }
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
 }
 
 /// Seed a UTF-8 locale on a spawned shell when the environment supplies none.
@@ -236,6 +493,87 @@ mod tests {
         } else {
             assert!(!seeded, "nothing should seed LANG off unix");
         }
+    }
+
+    #[test]
+    fn windows_shell_choices_have_stable_toml_spellings() {
+        // These strings are what lands in `terminal.toml`; changing one
+        // silently invalidates every user's saved choice.
+        for (choice, spelling) in [
+            (WindowsShell::PowerShell, "\"powershell\""),
+            (WindowsShell::CommandPrompt, "\"cmd\""),
+            (WindowsShell::GitBash, "\"git-bash\""),
+            (WindowsShell::Auto, "\"auto\""),
+        ] {
+            let json = serde_json::to_string(&choice).expect("serialize");
+            assert_eq!(json, spelling, "{choice:?} serialized wrong");
+            let back: WindowsShell = serde_json::from_str(spelling).expect("deserialize");
+            assert_eq!(back, choice);
+        }
+        for (choice, spelling) in [
+            (WindowsPowerShell::Auto, "\"auto\""),
+            (WindowsPowerShell::Pwsh, "\"pwsh\""),
+            (WindowsPowerShell::Windows, "\"powershell\""),
+        ] {
+            let json = serde_json::to_string(&choice).expect("serialize");
+            assert_eq!(json, spelling, "{choice:?} serialized wrong");
+        }
+    }
+
+    #[test]
+    fn windows_shell_and_powershell_default_to_powershell_auto() {
+        assert_eq!(WindowsShell::default(), WindowsShell::PowerShell);
+        assert_eq!(WindowsPowerShell::default(), WindowsPowerShell::Auto);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_resolves_to_an_exe_that_exists() {
+        // The default family must always land on a spawnable program.
+        let resolved = resolve_windows_shell(WindowsShell::PowerShell, WindowsPowerShell::Auto);
+        assert!(
+            std::path::Path::new(&resolved.program).exists(),
+            "resolved PowerShell {:?} does not exist",
+            resolved.program
+        );
+        assert!(resolved.args.is_empty(), "PowerShell carries no argv here");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_bash_choice_resolves_and_carries_msys_env_when_installed() {
+        // Self-skipping: only asserts when Git for Windows is actually present,
+        // exactly like the NO_COLOR wiring test.
+        let resolved = resolve_windows_shell(WindowsShell::GitBash, WindowsPowerShell::Auto);
+        let name = std::path::Path::new(&resolved.program)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if name == "bash.exe" {
+            assert!(is_git_for_windows_bash(std::path::Path::new(&resolved.program)));
+            assert_eq!(resolved.args, vec!["-i".to_string()]);
+            assert!(
+                resolved.env.iter().any(|(k, _)| k == "CHERE_INVOKING"),
+                "git bash must stay in the pane cwd"
+            );
+        } else {
+            // No Git for Windows here — must have fallen back to PowerShell.
+            assert!(
+                name == "pwsh.exe" || name == "powershell.exe",
+                "git-bash fallback should be PowerShell, got {name:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_store_alias_stub_is_never_a_real_executable() {
+        // Any path under \WindowsApps\ is rejected outright, whether or not it
+        // exists, because ConPTY cannot spawn the alias reparse points there.
+        assert!(!is_real_executable(std::path::Path::new(
+            r"C:\Users\x\AppData\Local\Microsoft\WindowsApps\pwsh.exe"
+        )));
     }
 }
 
