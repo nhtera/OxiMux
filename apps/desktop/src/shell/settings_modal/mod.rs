@@ -146,6 +146,11 @@ pub struct SettingsModal {
     pub(super) driver_install_ui: crate::shell::driver_install::DriverInstallUi,
     /// Guards against stacking poll timers across repaints/reopens.
     pub(super) driver_poll_running: bool,
+    /// Whether a background driver re-check is in flight. Guards against
+    /// stacking `codesign` sweeps when the modal is reopened faster than one
+    /// resolve takes — the same shape as `agent_detect_running`.
+    #[cfg(any(target_os = "macos", windows))]
+    pub(super) driver_status_running: bool,
     /// Set when the install replaced an existing driver — gates the one-line
     /// "old version until the daemon respawns" note.
     pub(super) driver_upgraded: bool,
@@ -324,6 +329,8 @@ impl SettingsModal {
             driver_install: None,
             driver_install_ui: crate::shell::driver_install::DriverInstallUi::Idle,
             driver_poll_running: false,
+            #[cfg(any(target_os = "macos", windows))]
+            driver_status_running: false,
             integrations: Vec::new(),
             integration_install: std::collections::HashMap::new(),
             integration_handles: std::collections::HashMap::new(),
@@ -406,20 +413,12 @@ impl SettingsModal {
         // Integrations pane reports on. Off the UI thread: this is a PATH walk
         // plus a couple of short spawns per tool.
         self.refresh_integrations(cx);
-        #[cfg(target_os = "macos")]
-        {
-            // Re-checked per open rather than once at boot: the user may have
-            // installed or updated the driver since, and "not installed" is the
-            // status most likely to be stale.
-            self.driver_status = pane_computer_use::DriverStatus::resolve();
-        }
-        #[cfg(windows)]
-        {
-            // Same reasoning as the macOS resolve above: the user may have
-            // installed — or re-installed, which is the interesting case here —
-            // the driver since the modal was last open.
-            self.driver_trust = pane_driver_trust::TrustState::resolve();
-        }
+        // Re-checked per open rather than once at boot: the user may have
+        // installed or updated the driver since, and "not installed" is the
+        // status most likely to be stale. Off the UI thread, for the reason
+        // spelled out on `refresh_driver_status`.
+        #[cfg(any(target_os = "macos", windows))]
+        self.refresh_driver_status(cx);
         // A modal reopened mid-install shows live progress: attach to the
         // backend's pull-style status (cheap, unlike a resolve per tick) and
         // restart the poll loop. A stale failure from a previous open is
@@ -798,6 +797,58 @@ impl SettingsModal {
             }
         };
         agent_catalog(adapters, self.preset_detect.as_deref(), &self.agent_launch)
+    }
+
+    /// Re-check the driver's health on a background thread.
+    ///
+    /// Inline, this was by far the most expensive thing `open()` did:
+    /// `prepare()` runs two `codesign` subprocesses, executes the driver to
+    /// read its version, and SHA-256s the whole ~50 MB binary — measured at
+    /// ~206 ms in a release build and ~1.5 s in a debug one, all of it on the
+    /// UI thread and all of it *before* `self.open = true`, so the modal could
+    /// not paint until it finished. That is the delay between pressing the cog
+    /// and seeing the card.
+    ///
+    /// Nothing gates on the answer at open time — the pane renders it, and
+    /// renders `Unknown` as "Checking…" — so the resolve is exactly the shape
+    /// `refresh_integrations` already uses two lines above: spawn, await,
+    /// assign, notify. The previous verdict stays on screen meanwhile rather
+    /// than flickering back to "Checking…", because a reopen's most likely
+    /// answer is the one already shown.
+    #[cfg(any(target_os = "macos", windows))]
+    pub(super) fn refresh_driver_status(&mut self, cx: &mut Context<Self>) {
+        if self.driver_status_running {
+            return;
+        }
+        self.driver_status_running = true;
+        cx.spawn(async move |weak, cx| {
+            let resolved = cx
+                .background_executor()
+                .spawn(async move {
+                    #[cfg(target_os = "macos")]
+                    {
+                        pane_computer_use::DriverStatus::resolve()
+                    }
+                    #[cfg(windows)]
+                    {
+                        pane_driver_trust::TrustState::resolve()
+                    }
+                })
+                .await;
+            let _ = weak.update(cx, |modal, cx| {
+                #[cfg(target_os = "macos")]
+                {
+                    modal.driver_status = resolved;
+                }
+                #[cfg(windows)]
+                {
+                    modal.driver_trust = resolved;
+                }
+                modal.driver_status_running = false;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Probe which agent CLIs are actually installed.

@@ -463,7 +463,10 @@ fn driver_control(
         density,
         typography,
         |this, _w, cx| {
-            this.driver_status = DriverStatus::resolve();
+            // Backgrounded for the same reason the open-time check is: this
+            // spawns `codesign` and hashes the whole binary, and doing that
+            // inline froze the card for as long as it took.
+            this.refresh_driver_status(cx);
             this.driver_install_ui = DriverInstallUi::Idle;
             cx.notify();
         },
