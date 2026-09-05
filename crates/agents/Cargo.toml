@@ -64,6 +64,10 @@ futures = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
+# Transcript snapshot harness shared with `agent-core`, so Codex/Pi/omp are
+# pinned by the same code that pins Claude rather than by a second harness that
+# could drift from it. Dev-only; nothing ships with this on.
+oximux-agent-core = { workspace = true, features = ["test-support"] }
 oximux-git = { workspace = true }
 # The shell spellings the spawn/runtime tests drive their fixture programs
 # through. Same crate the shipping build already depends on; the feature only

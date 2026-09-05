@@ -1,0 +1,26 @@
+{
+  "session_id": null,
+  "model": null,
+  "permission_mode": null,
+  "turn_active": false,
+  "compacting": false,
+  "title": null,
+  "last_error": null,
+  "last_summary": null,
+  "usage": {
+    "input_tokens": 36164,
+    "output_tokens": 5,
+    "cache_read_tokens": 0,
+    "cache_creation_tokens": 0,
+    "context_window": 272000,
+    "cost_usd": 0.18097
+  },
+  "entries": [
+    {
+      "Assistant": {
+        "text": "DONE",
+        "thinking": ""
+      }
+    }
+  ]
+}

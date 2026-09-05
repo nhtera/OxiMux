@@ -1843,4 +1843,33 @@ mod tests {
         assert_eq!(s["status"], "started");
         assert_eq!(s["agentPath"], "reviewer");
     }
+
+    /// Baseline for the assembler extraction (plan phase 4): the transcript
+    /// every committed codex fixture folds to, pinned before the mapper is
+    /// rewritten. Uses the same harness as the Claude fixtures in `agent-core`,
+    /// so all five agents are measured the same way.
+    ///
+    /// Regenerate a deliberate change with
+    /// `UPDATE_TRANSCRIPT_SNAPSHOTS=1 cargo test -p oximux-agents`, then read
+    /// the diff — the point of the pin is that a render change has to be
+    /// noticed and named, not accepted silently.
+    #[test]
+    fn every_captured_turn_renders_the_pinned_transcript() {
+        for fixture in [
+            "codex-collab-turn",
+            "codex-mcp-call-turn",
+        ] {
+            let (events, _) = replay(&format!("{fixture}.jsonl"));
+            assert!(!events.is_empty(), "{fixture} decoded to nothing");
+            let thread = render(&events);
+            oximux_agent_core::thread::snapshot::assert_thread_snapshot(
+                format!(
+                    "{}/tests/snapshots/{fixture}.transcript.json",
+                    env!("CARGO_MANIFEST_DIR")
+                ),
+                &thread,
+            );
+        }
+    }
+
 }

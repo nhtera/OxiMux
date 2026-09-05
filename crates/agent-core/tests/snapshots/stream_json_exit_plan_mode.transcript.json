@@ -1,0 +1,39 @@
+{
+  "session_id": null,
+  "model": null,
+  "permission_mode": null,
+  "turn_active": false,
+  "compacting": false,
+  "title": null,
+  "last_error": null,
+  "last_summary": null,
+  "usage": null,
+  "entries": [
+    {
+      "ToolCall": {
+        "id": "toolu_exitplan_1",
+        "name": "ExitPlanMode",
+        "input": {
+          "plan": "# Plan: Add `hello()` to `src/lib.rs`\n\n## Steps\n1. Create `hello()` returning a greeting.\n2. Verify with `cargo check`.\n",
+          "planFilePath": "/Users/x/.claude/plans/add-hello.md"
+        },
+        "status": {
+          "WaitingForConfirmation": {
+            "request_id": "req-exitplan-1",
+            "kind": "plan",
+            "description": "# Plan: Add `hello()` to `src/lib.rs`\n\n## Steps\n1. Create `hello()` returning a greeting.\n2. Verify with `cargo check`.\n",
+            "suggestions": []
+          }
+        },
+        "result": null,
+        "structured": null,
+        "images": [],
+        "terminal_id": null,
+        "kind": null,
+        "approved_input": null,
+        "redact_result": false,
+        "subagent_log": []
+      }
+    }
+  ]
+}

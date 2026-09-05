@@ -1,0 +1,26 @@
+{
+  "session_id": null,
+  "model": null,
+  "permission_mode": null,
+  "turn_active": false,
+  "compacting": false,
+  "title": null,
+  "last_error": "There's an issue with the selected model (this-model-does-not-exist-xyz). It may not exist or you may not have access to it.",
+  "last_summary": null,
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_tokens": 0,
+    "cache_creation_tokens": 0,
+    "context_window": null,
+    "cost_usd": 0.0
+  },
+  "entries": [
+    {
+      "Assistant": {
+        "text": "There's an issue with the selected model (this-model-does-not-exist-xyz). It may not exist or you may not have access to it.",
+        "thinking": ""
+      }
+    }
+  ]
+}

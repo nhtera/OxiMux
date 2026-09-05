@@ -1,0 +1,83 @@
+{
+  "session_id": null,
+  "model": null,
+  "permission_mode": null,
+  "turn_active": false,
+  "compacting": false,
+  "title": null,
+  "last_error": null,
+  "last_summary": null,
+  "usage": null,
+  "entries": [
+    {
+      "Assistant": {
+        "text": "I’ll delegate the file check exactly as requested, then wait for the collaborator’s report.",
+        "thinking": ""
+      }
+    },
+    {
+      "ToolCall": {
+        "id": "call_7LG5kEHGdhe7YTviKbxPqHhs",
+        "name": "Agent activity",
+        "input": {
+          "type": "subAgentActivity",
+          "id": "call_7LG5kEHGdhe7YTviKbxPqHhs",
+          "kind": "started",
+          "agentThreadId": "019f68e7-2f5a-72d2-842d-324e7b8bae78",
+          "agentPath": "/root/verify_scratch_file"
+        },
+        "status": "Completed",
+        "result": "started · /root/verify_scratch_file",
+        "structured": {
+          "type": "subAgentActivity",
+          "status": "started",
+          "agentPath": "/root/verify_scratch_file",
+          "agentThreadId": "019f68e7-2f5a-72d2-842d-324e7b8bae78"
+        },
+        "images": [],
+        "terminal_id": null,
+        "kind": null,
+        "approved_input": null,
+        "redact_result": false,
+        "subagent_log": [
+          "I’ll read the requested file exactly as-is and report its contents without making changes.",
+          "Bash /bin/zsh -lc \"sed -n '1,200p' scratch-verify.txt\"",
+          "The exact contents are `hello` followed by a newline."
+        ]
+      }
+    },
+    {
+      "ToolCall": {
+        "id": "call_uQMjDqyqRz3ZqGTv76OrnCCS",
+        "name": "Agent",
+        "input": {
+          "type": "collabAgentToolCall",
+          "id": "call_uQMjDqyqRz3ZqGTv76OrnCCS",
+          "tool": "wait",
+          "status": "inProgress",
+          "senderThreadId": "019f68e6-f6d4-7341-b59c-94984172beac",
+          "receiverThreadIds": [],
+          "prompt": null,
+          "model": null,
+          "reasoningEffort": null,
+          "agentsStates": {}
+        },
+        "status": "Completed",
+        "result": "completed",
+        "structured": {
+          "type": "collabAgentToolCall",
+          "tool": "wait",
+          "status": "completed",
+          "callStatus": "completed",
+          "agents": []
+        },
+        "images": [],
+        "terminal_id": null,
+        "kind": null,
+        "approved_input": null,
+        "redact_result": false,
+        "subagent_log": []
+      }
+    }
+  ]
+}

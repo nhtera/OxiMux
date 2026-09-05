@@ -22,6 +22,8 @@ pub mod entry;
 pub mod event;
 pub mod mcp_server_spec;
 pub mod question;
+#[cfg(feature = "test-support")]
+pub mod snapshot;
 pub mod state;
 pub mod stream_json;
 pub mod tool_call;

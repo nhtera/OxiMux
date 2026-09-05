@@ -1,0 +1,70 @@
+{
+  "session_id": "a069e022-d7e3-4957-b039-0b8ed90f5fba",
+  "model": "claude-opus-4-8[1m]",
+  "permission_mode": "acceptEdits",
+  "turn_active": false,
+  "compacting": false,
+  "title": null,
+  "last_error": null,
+  "last_summary": "created /tmp/claude_fixtures/poem.txt with 12-line ocean poem",
+  "usage": {
+    "input_tokens": 4,
+    "output_tokens": 307,
+    "cache_read_tokens": 62031,
+    "cache_creation_tokens": 62344,
+    "context_window": 1000000,
+    "cost_usd": 0.6621505000000001
+  },
+  "entries": [
+    {
+      "Assistant": {
+        "text": "I'll create the file directly with the Write tool.",
+        "thinking": ""
+      }
+    },
+    {
+      "ToolCall": {
+        "id": "toolu_016qUUDrGs8C2Cd54J2Mn9sP",
+        "name": "Write",
+        "input": {
+          "content": "Beneath the moon the ocean breathes,\na silver tide that softly weaves.\nIt pulls the shore, then lets it go,\na rhythm only currents know.\n\nThe gulls trace arcs above the foam,\nwhere restless waves forget their home.\nSalt on the wind, a distant sail,\na whisper caught in every gale.\n\nAnd when the sun dips down to rest,\nthe water burns from east to west.\nThe deep holds secrets none can keep,\nand rocks the world, and rocks the world, to sleep.\n",
+          "file_path": "/tmp/claude_fixtures/poem.txt"
+        },
+        "status": "Completed",
+        "result": "File created successfully at: /tmp/claude_fixtures/poem.txt (file state is current in your context — no need to Read it back)",
+        "structured": {
+          "content": "Beneath the moon the ocean breathes,\na silver tide that softly weaves.\nIt pulls the shore, then lets it go,\na rhythm only currents know.\n\nThe gulls trace arcs above the foam,\nwhere restless waves forget their home.\nSalt on the wind, a distant sail,\na whisper caught in every gale.\n\nAnd when the sun dips down to rest,\nthe water burns from east to west.\nThe deep holds secrets none can keep,\nand rocks the world, and rocks the world, to sleep.\n",
+          "filePath": "/tmp/claude_fixtures/poem.txt",
+          "originalFile": null,
+          "structuredPatch": [],
+          "type": "create",
+          "userModified": false
+        },
+        "images": [],
+        "terminal_id": null,
+        "kind": null,
+        "approved_input": null,
+        "redact_result": false,
+        "subagent_log": []
+      }
+    },
+    {
+      "Assistant": {
+        "text": "Done. Created `/tmp/claude_fixtures/poem.txt` with a 12-line poem about the ocean.",
+        "thinking": ""
+      }
+    },
+    {
+      "TurnDiff": {
+        "files": [
+          {
+            "path": "/tmp/claude_fixtures/poem.txt",
+            "added": 14,
+            "removed": 0
+          }
+        ],
+        "diff": null
+      }
+    }
+  ]
+}

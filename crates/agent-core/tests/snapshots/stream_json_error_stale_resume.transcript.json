@@ -1,0 +1,25 @@
+{
+  "session_id": null,
+  "model": null,
+  "permission_mode": null,
+  "turn_active": false,
+  "compacting": false,
+  "title": null,
+  "last_error": "No conversation found with session ID: 00000000-0000-0000-0000-000000000000",
+  "last_summary": null,
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_tokens": 0,
+    "cache_creation_tokens": 0,
+    "context_window": null,
+    "cost_usd": 0.0
+  },
+  "entries": [
+    {
+      "ContextCompaction": {
+        "summary": "Session no longer resumable — starting fresh"
+      }
+    }
+  ]
+}

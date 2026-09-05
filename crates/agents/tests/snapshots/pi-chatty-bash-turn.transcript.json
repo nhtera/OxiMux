@@ -1,0 +1,51 @@
+{
+  "session_id": null,
+  "model": null,
+  "permission_mode": null,
+  "turn_active": false,
+  "compacting": false,
+  "title": null,
+  "last_error": null,
+  "last_summary": null,
+  "usage": {
+    "input_tokens": 397,
+    "output_tokens": 5,
+    "cache_read_tokens": 3072,
+    "cache_creation_tokens": 0,
+    "context_window": 272000,
+    "cost_usd": 0.003671
+  },
+  "entries": [
+    {
+      "ToolCall": {
+        "id": "call_lfQ7gRrtSnxFtOCqvUxYzf6b|fc_05f57dd2f341d620016a574e848c5081918f1d8ab9a536ee2d",
+        "name": "bash",
+        "input": {
+          "command": "for i in $(seq 1 60); do echo line-$i; sleep 0.05; done"
+        },
+        "status": "Completed",
+        "result": "line-1\nline-2\nline-3\nline-4\nline-5\nline-6\nline-7\nline-8\nline-9\nline-10\nline-11\nline-12\nline-13\nline-14\nline-15\nline-16\nline-17\nline-18\nline-19\nline-20\nline-21\nline-22\nline-23\nline-24\nline-25\nline-26\nline-27\nline-28\nline-29\nline-30\nline-31\nline-32\nline-33\nline-34\nline-35\nline-36\nline-37\nline-38\nline-39\nline-40\nline-41\nline-42\nline-43\nline-44\nline-45\nline-46\nline-47\nline-48\nline-49\nline-50\nline-51\nline-52\nline-53\nline-54\nline-55\nline-56\nline-57\nline-58\nline-59\nline-60\n",
+        "structured": {
+          "content": [
+            {
+              "type": "text",
+              "text": "line-1\nline-2\nline-3\nline-4\nline-5\nline-6\nline-7\nline-8\nline-9\nline-10\nline-11\nline-12\nline-13\nline-14\nline-15\nline-16\nline-17\nline-18\nline-19\nline-20\nline-21\nline-22\nline-23\nline-24\nline-25\nline-26\nline-27\nline-28\nline-29\nline-30\nline-31\nline-32\nline-33\nline-34\nline-35\nline-36\nline-37\nline-38\nline-39\nline-40\nline-41\nline-42\nline-43\nline-44\nline-45\nline-46\nline-47\nline-48\nline-49\nline-50\nline-51\nline-52\nline-53\nline-54\nline-55\nline-56\nline-57\nline-58\nline-59\nline-60\n"
+            }
+          ]
+        },
+        "images": [],
+        "terminal_id": null,
+        "kind": null,
+        "approved_input": null,
+        "redact_result": false,
+        "subagent_log": []
+      }
+    },
+    {
+      "Assistant": {
+        "text": "DONE",
+        "thinking": ""
+      }
+    }
+  ]
+}

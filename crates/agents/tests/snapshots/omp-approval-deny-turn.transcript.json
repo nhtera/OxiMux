@@ -1,0 +1,61 @@
+{
+  "session_id": null,
+  "model": null,
+  "permission_mode": null,
+  "turn_active": false,
+  "compacting": false,
+  "title": null,
+  "last_error": null,
+  "last_summary": null,
+  "usage": {
+    "input_tokens": 36261,
+    "output_tokens": 42,
+    "cache_read_tokens": 0,
+    "cache_creation_tokens": 0,
+    "context_window": 272000,
+    "cost_usd": 0.18256500000000003
+  },
+  "entries": [
+    {
+      "Assistant": {
+        "text": "",
+        "thinking": "**Planning exact bash compliance**"
+      }
+    },
+    {
+      "ToolCall": {
+        "id": "call_JC2x1t0e1NYOEuYHQ6K2UyfB|fc_009310381652633d016a8d4edf8c2c87d0b188600af0533a74",
+        "name": "bash",
+        "input": {
+          "command": "echo touched > /tmp/ompprobe/proj1/marker.txt",
+          "cwd": "/tmp/ompprobe/proj1"
+        },
+        "status": {
+          "Failed": "Tool call denied by user: bash"
+        },
+        "result": "Tool call denied by user: bash",
+        "structured": {
+          "content": [
+            {
+              "type": "text",
+              "text": "Tool call denied by user: bash"
+            }
+          ],
+          "details": {}
+        },
+        "images": [],
+        "terminal_id": null,
+        "kind": null,
+        "approved_input": null,
+        "redact_result": false,
+        "subagent_log": []
+      }
+    },
+    {
+      "Assistant": {
+        "text": "Unable to run the command: the Bash tool call was denied. No file change was made.",
+        "thinking": ""
+      }
+    }
+  ]
+}

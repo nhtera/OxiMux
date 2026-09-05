@@ -12,6 +12,12 @@ rust-version.workspace = true
 # agent-client-protocol / gpui deps. Both the desktop `oximux-agents` crate and
 # the phone's Rust core (`mobile-core`/`remote-session`) depend on this, so the
 # fold that renders a transcript is shared verbatim across desktop and mobile.
+[features]
+# Transcript snapshot harness (`thread::snapshot`). Test-only: `oximux-agents`
+# enables it from dev-dependencies so both crates pin transcripts with one
+# harness instead of growing two. Off in every shipping build.
+test-support = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
