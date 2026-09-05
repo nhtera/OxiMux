@@ -43,7 +43,23 @@ direct-zip distribution only — don't run both for a DMG release.
 3. Commit `chore(release): vX.Y.Z`, tag `vX.Y.Z`, push both.
 4. The `release` workflow builds, signs, notarizes, and attaches the DMG to a
    **draft** release with generated notes.
-5. Curate the release notes, publish the draft.
+5. Write the notes into `docs/release-notes/vX.Y.Z.md`.
+6. Publish it: Actions → **publish-release** → Run workflow, with the tag and
+   `notes_file: docs/release-notes/vX.Y.Z.md`. Dispatch it on the ref that
+   carries the notes file — the job checks that ref out to read it.
+
+`publish-release` refuses to publish a release that is missing an asset
+somebody else's URL already points at: the two stable-name downloads the
+landing page links (`releases/latest/download/OxiMux-macos-arm64.dmg` and
+`.../OxiMux-windows-x64-setup.exe`), their versioned originals, and
+`manifest.json` without the `manifest.json.minisig` that `oximux update`
+refuses to proceed without. It never rebuilds or replaces an asset — an
+incomplete release is one to re-run `release.yml` for.
+
+Publish the OLDEST draft first and let its run finish before the next one:
+`publish-tap.yml` fires on `release: published`, so two publishes in flight
+race to decide what the Homebrew tap ends up pointing at. Pass
+`latest: false` for every draft but the newest.
 
 The workflow hard-fails (in `make-dmg.sh`) on `stapler validate` and
 `spctl -a -t open --context context:primary-signature` — an un-notarized DMG
