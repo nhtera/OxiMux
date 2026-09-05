@@ -63,6 +63,9 @@ pub struct ResolvedShell {
     pub env: Vec<(String, String)>,
 }
 
+// Only the Windows resolver builds a program-only shell; gate the helper so
+// it isn't dead code on other platforms (CI builds with `-D warnings`).
+#[cfg(windows)]
 impl ResolvedShell {
     fn program(program: String) -> Self {
         Self {
