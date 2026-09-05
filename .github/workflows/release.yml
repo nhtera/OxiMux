@@ -40,6 +40,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Same reasoning as ci.yml: incremental state is never reused across runners,
+  # and its artifacts are the bulk of what a cached `target` would carry.
+  CARGO_INCREMENTAL: 0
 
 jobs:
   release-macos:
@@ -54,8 +57,25 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
-      # Same cache layout and versioned key as ci.yml — see the comment there
-      # for why `target` and the sherpa-onnx prebuilts are one entry.
+      # NOT the same layout as ci.yml: the release jobs deliberately cache the
+      # registry, the git checkouts and the sherpa-onnx prebuilts but NOT
+      # `target`. The repo has a single 10 GB Actions cache quota shared with
+      # ci.yml, and nine entries at 1-2.5 GB each do not fit — GitHub evicts
+      # least-recently-used, and the losers were ci.yml's macOS and Windows
+      # entries. That is what made the Windows gate rebuild from zero on every
+      # push: "Cache not found", 85 minutes, then a save that was evicted before
+      # the next run. release.yml runs on a tag; ci.yml runs on every push, so
+      # ci.yml is the one that must win the quota.
+      #
+      # `target` is also the half worth losing here. These jobs build `--release`
+      # and ci.yml builds debug, so the two share no compiled artifacts at all,
+      # and tags are far enough apart that a release-to-release `target` is
+      # usually stale anyway. The prebuilts are the expensive-to-fetch,
+      # cheap-to-store part, and they stay — which is why the "Ensure the
+      # dictation libraries are present" step below still earns its place.
+      #
+      # Key version bumped because what is cached changed, per the rule in
+      # ci.yml: bump when the layout changes, not when dependencies do.
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -63,8 +83,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ~/Library/Caches/sherpa-rs
-            target
-          key: ${{ runner.os }}-cargo-release-v1-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-release-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-v2-
 
       - name: Ensure the dictation libraries are present
         run: |
@@ -222,8 +243,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             ~/AppData/Local/sherpa-rs
-            target
-          key: ${{ runner.os }}-cargo-release-v2-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-release-v3-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-v3-
 
       # Belt to the cache's braces, transposed from windows-check: a cache that
       # comes back with the build-script output but without the libraries would
@@ -408,8 +430,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-cli-v1-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-cli-v2-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-cli-v2-${{ matrix.target }}-
 
       # Same reasoning as the other jobs: catch a tag that disagrees with
       # Cargo.toml before paying for the build, not after.

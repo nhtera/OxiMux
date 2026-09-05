@@ -14,6 +14,27 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # Incremental compilation is pure waste here and actively harmful. Nothing
+  # reuses the incremental state across jobs — each runner starts from the
+  # restored cache and exits — while the artifacts it leaves behind dominate
+  # `target`: a local debug tree carried 19 GB of `target/debug/incremental`
+  # against 39 GB of everything else. Since `target` is what we cache, that
+  # weight is paid twice more, on the cache upload and the next download, and
+  # it is what pushes this repo over the 10 GB Actions cache quota (see the
+  # `concurrency` note below and the restore-keys on each cache step).
+  CARGO_INCREMENTAL: 0
+
+# Only the newest run per ref is interesting: a push that supersedes another
+# makes the earlier run's answer irrelevant, but without this it still runs to
+# completion — on the desktop jobs that is over an hour of runner time spent
+# proving something about a commit nobody will look at again.
+#
+# `main` is deliberately NOT cancellable: its runs are the ones that populate
+# the caches every later branch restores from, and cancelling one loses that
+# save. Keyed by ref so a cancel can never reach across branches.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   check:
@@ -48,6 +69,8 @@ jobs:
             ~/Library/Caches/sherpa-rs
             target
           key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-v2-
 
       # Insurance against the same failure returning by another route: any cache
       # that comes back with the build-script output but without the libraries
@@ -72,9 +95,12 @@ jobs:
       # rewrite 417 files). A gate that is always red is not a gate; match the
       # surrounding code by hand instead.
 
-      - name: cargo check
-        run: cargo check --workspace --all-targets
-
+      # No separate `cargo check` step. `cargo clippy --all-targets` runs the
+      # same front-end over the same crate graph and reports every compile
+      # error `check` would — so a check step ahead of it is a second full-
+      # workspace pass that can only ever fail where clippy is about to. It
+      # bought a marginally earlier, marginally plainer error message and cost
+      # a whole traversal of the graph on the slowest runner in the file.
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -159,6 +185,8 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-v1-
 
       # `oximux-settings` is deliberately missing from this list: with default
       # features it links gpui, which is exactly what a headless consumer must
@@ -362,6 +390,8 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-v1-
 
       - name: cargo build (oximux-cli)
         run: cargo build -p oximux-cli
@@ -423,6 +453,8 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-arm-musl-cargo-v1-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-arm-musl-cargo-v1-
 
       - name: musl build gate (release parity, aarch64)
         env:
@@ -538,6 +570,8 @@ jobs:
             ~/AppData/Local/sherpa-rs
             target
           key: ${{ runner.os }}-cargo-v2-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-v2-
 
       # The macOS counterpart of this step, transposed: any cache that comes
       # back with the build-script output but without the libraries would link
