@@ -5,7 +5,8 @@
 //! Mirrors the `agent_launch` settings contract: `from_toml_str` /
 //! `to_toml_string` / `sanitized`, a `FILE_NAME`, and a live-reload watcher in
 //! the app crate. Defaults are deliberately usable out of the box: dictation
-//! enabled, the Vietnamese-capable `whisper-small` model, language auto-detect.
+//! enabled, the `whisper-turbo` model (the one whisper tier that is accurate in
+//! Vietnamese as well as English), language auto-detect.
 //! The model still has to be downloaded before the mic works — the setting only
 //! records *which* model, not that it is present on disk.
 
@@ -16,8 +17,9 @@ use serde::{Deserialize, Serialize};
 /// The default model id. Kept in sync with the dictation crate's catalog
 /// `DEFAULT_MODEL_ID` (the settings crate must not depend on the engine crate,
 /// so the string is duplicated — a drift here only means a bad default that the
-/// use-site clamps back when the id isn't in the live catalog).
-pub const DEFAULT_MODEL_ID: &str = "whisper-small";
+/// use-site clamps back when the id isn't in the live catalog). See that
+/// constant for why it is `whisper-turbo` and not the smaller `whisper-small`.
+pub const DEFAULT_MODEL_ID: &str = "whisper-turbo";
 
 use crate::dictation_languages;
 
@@ -249,10 +251,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_enabled_whisper_small_auto() {
+    fn default_is_enabled_multilingual_auto() {
+        // `auto` + a model that is good at BOTH English and Vietnamese is the
+        // contract for a bilingual user: pinning a language mistranscribes the
+        // other one, so the default model has to carry both.
         let d = DictationSettings::default();
         assert!(d.enabled);
-        assert_eq!(d.model_id, "whisper-small");
+        assert_eq!(d.model_id, "whisper-turbo");
         assert_eq!(d.language, "auto");
         assert_eq!(d.language_param(), None);
     }
@@ -286,6 +291,10 @@ mod tests {
         // A pre-existing dictation.toml (before these fields existed) must load.
         let legacy = "enabled = true\nmodel_id = \"whisper-small\"\nlanguage = \"auto\"\n";
         let s = DictationSettings::from_toml_str(legacy).expect("legacy parses");
+        // An existing store keeps the model it recorded — changing the default
+        // must never silently re-point a user at a model they have not
+        // downloaded, nor discard one they have.
+        assert_eq!(s.model_id, "whisper-small");
         assert_eq!(s.input_device, None);
         assert_eq!(s.mode, DictationMode::Toggle);
         assert_eq!(s.device_name(), None);
@@ -355,7 +364,7 @@ mod tests {
     fn missing_keys_take_defaults() {
         let s = DictationSettings::from_toml_str("").expect("empty parses");
         assert!(s.enabled);
-        assert_eq!(s.model_id, "whisper-small");
+        assert_eq!(s.model_id, "whisper-turbo");
     }
 
     #[test]
@@ -369,7 +378,7 @@ mod tests {
             ..Default::default()
         }
         .sanitized();
-        assert_eq!(s.model_id, "whisper-small", "blank model → default");
+        assert_eq!(s.model_id, "whisper-turbo", "blank model → default");
         assert_eq!(s.language, "auto", "unknown language → auto");
     }
 

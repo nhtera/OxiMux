@@ -912,3 +912,36 @@ fn open_mic_settings() {
         .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
         .spawn();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default model id is written down twice — once in the dictation
+    /// catalog, once in the settings crate (which must not depend on the engine
+    /// crate). This pane is the only place both are in scope, so it is the only
+    /// place the drift can be caught. Drift means a fresh install records a
+    /// model id and the pane resolves a different one.
+    #[test]
+    fn settings_and_catalog_agree_on_the_default_model() {
+        assert_eq!(
+            oximux_settings::dictation::DEFAULT_MODEL_ID,
+            DEFAULT_MODEL_ID,
+            "settings default drifted from the catalog default"
+        );
+        assert!(
+            spec_for(DEFAULT_MODEL_ID).is_some(),
+            "the default model id must resolve in the live catalog"
+        );
+    }
+
+    /// A fresh install has `language = "auto"`, so the badge must land on the
+    /// model the install actually gets — otherwise the pane recommends a model
+    /// the user has to download while the one they have looks second-best.
+    #[test]
+    fn the_default_language_recommends_the_default_model() {
+        let fresh = oximux_settings::dictation::DictationSettings::default();
+        assert_eq!(fresh.language, "auto");
+        assert_eq!(recommended_model_id(&fresh.language), fresh.model_id);
+    }
+}

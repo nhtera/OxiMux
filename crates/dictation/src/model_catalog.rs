@@ -80,11 +80,27 @@ impl ModelSpec {
     }
 }
 
-/// The default model id — the safe multilingual starting point (whisper-small
-/// covers every language incl. `vi`). This is what an untouched install uses and
-/// what a deleted-model fallback lands on; it is NOT always the *best* model for
-/// a given language — see [`recommended_model_id`].
-pub const DEFAULT_MODEL_ID: &str = "whisper-small";
+/// The default model id — the multilingual starting point that has to be right
+/// for a user who dictates in *more than one* language, since that is what
+/// `language = "auto"` means. This is what an untouched install uses and what a
+/// deleted-model fallback lands on; it is NOT always the *best* model for a
+/// single pinned language — see [`recommended_model_id`].
+///
+/// `whisper-turbo` (large-v3-turbo) rather than `whisper-small`, because small
+/// is measurably weak at Vietnamese while turbo is not:
+/// - **19.8 % vs 31.7 % WER** on 40 clips of real Vietnamese speech (FPT FOSD;
+///   see `plans/260717-0203-…/phase-06-eval-findings.md`).
+/// - Reproduced on the shipping sherpa CPU path: on a 5 s Vietnamese utterance
+///   `whisper-small` drops `giọng`→`rọng` and `ứng dụng`→`ứng dụ`, while turbo
+///   returns the sentence intact. Both are word-perfect on English.
+/// - It is also the **smaller download** (537 MB vs 610 MB).
+///
+/// The cost is decode latency, and it is real: whisper pads every recording to a
+/// 30 s window, so the encoder cost is near-constant per dictation — measured
+/// ≈2.5 s for turbo against ≈0.9 s for small (M-series, release build, int8).
+/// Correctness wins that trade for a press-to-dictate flow: a wrong word has to
+/// be retyped, 1.6 s does not.
+pub const DEFAULT_MODEL_ID: &str = "whisper-turbo";
 
 /// The best model to steer a user toward when they have pinned `language`
 /// (a whisper language code, or `"auto"`).
@@ -101,6 +117,12 @@ pub const DEFAULT_MODEL_ID: &str = "whisper-small";
 /// Both dedicated models are single-language and cannot code-switch, which is
 /// exactly why this is keyed off an explicitly *pinned* language: `auto` implies
 /// the user may mix languages, so it keeps the multilingual default.
+///
+/// Pinning is not a free accuracy win either — it is a promise about the audio.
+/// Measured: `whisper-small` pinned to `vi` transcribes English as Vietnamese
+/// homophones ("The quick brown fox" → "Quyệt Brown Fox chụp thật ra"), so a
+/// bilingual user must stay on `auto` and needs the default to be good at *both*
+/// languages. That is the constraint [`DEFAULT_MODEL_ID`] answers.
 pub fn recommended_model_id(language: &str) -> &'static str {
     match language.trim().to_lowercase().as_str() {
         "vi" => "zipformer-vi",
@@ -113,28 +135,11 @@ pub fn recommended_model_id(language: &str) -> &'static str {
 /// HEAD/range-verified against the live k2-fsa `asr-models` release; in-archive
 /// file names were read from the actual `tar.bz2` listings, not guessed.
 pub const CATALOG: &[ModelSpec] = &[
-    // Default: multilingual incl. Vietnamese. 610 MB (only the fp32 archive is
-    // published; the `.int8` archive 404s). Uses the int8 graphs bundled inside.
-    ModelSpec {
-        id: "whisper-small",
-        label: "Whisper Small",
-        family: Family::Whisper,
-        langs: "Multilingual · Vietnamese",
-        size_mb: 610,
-        archive_url:
-            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-small.tar.bz2",
-        archive_sha256: None,
-        encoder: "small-encoder.int8.onnx",
-        decoder: "small-decoder.int8.onnx",
-        joiner: None,
-        tokens: "small-tokens.txt",
-        model: None,
-        uppercase_output: false,
-    },
-    // Whisper large-v3-turbo — top-tier accuracy at roughly half large-v3's size
-    // (the encoder is distilled), multilingual incl. Vietnamese. Same file layout
-    // as the other whisper tiers (prefix `turbo-`), so it reuses the whisper
-    // engine unchanged. 537 MB.
+    // Default: whisper large-v3-turbo. Top-tier multilingual accuracy at roughly
+    // half large-v3's size (the encoder is distilled), and the only whisper tier
+    // that is reliable on Vietnamese — 19.8 % WER vs small's 31.7 %, while being
+    // 73 MB smaller. Same file layout as the other whisper tiers (prefix
+    // `turbo-`), so it reuses the whisper engine unchanged. 537 MB.
     ModelSpec {
         id: "whisper-turbo",
         label: "Whisper Turbo",
@@ -148,6 +153,27 @@ pub const CATALOG: &[ModelSpec] = &[
         decoder: "turbo-decoder.int8.onnx",
         joiner: None,
         tokens: "turbo-tokens.txt",
+        model: None,
+        uppercase_output: false,
+    },
+    // The lighter multilingual tier: ~3x faster to decode than turbo, but it
+    // garbles Vietnamese (31.7 % WER). Kept for machines where turbo's ~2.5 s
+    // per dictation is too slow, and for English-leaning users. 610 MB (only the
+    // fp32 archive is published; the `.int8` archive 404s). Uses the int8 graphs
+    // bundled inside.
+    ModelSpec {
+        id: "whisper-small",
+        label: "Whisper Small",
+        family: Family::Whisper,
+        langs: "Multilingual · faster · weak Vietnamese",
+        size_mb: 610,
+        archive_url:
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-small.tar.bz2",
+        archive_sha256: None,
+        encoder: "small-encoder.int8.onnx",
+        decoder: "small-decoder.int8.onnx",
+        joiner: None,
+        tokens: "small-tokens.txt",
         model: None,
         uppercase_output: false,
     },
@@ -310,6 +336,30 @@ mod tests {
     fn default_model_is_in_catalog_and_whisper() {
         let d = spec_for(DEFAULT_MODEL_ID).expect("default model in catalog");
         assert_eq!(d.family, Family::Whisper, "default supports Vietnamese");
+    }
+
+    #[test]
+    fn default_model_covers_both_english_and_vietnamese_well() {
+        // The default is the model a bilingual user is stuck with, because
+        // pinning `vi` mistranscribes their English and pinning `en` drops their
+        // Vietnamese. So it must be multilingual AND not one of the tiers whose
+        // own blurb admits weak Vietnamese.
+        let d = spec_for(DEFAULT_MODEL_ID).expect("default model in catalog");
+        let langs = d.langs.to_lowercase();
+        assert!(langs.contains("multilingual"), "default must code-switch: {langs}");
+        assert!(langs.contains("vietnamese"), "default must cover vi: {langs}");
+        assert!(
+            !langs.contains("weak"),
+            "the default cannot be a tier we document as weak at Vietnamese: {langs}"
+        );
+    }
+
+    #[test]
+    fn default_model_leads_the_display_order() {
+        // The catalog doc promises "display order (default first)", and the
+        // Voice pane iterates it verbatim — a default buried mid-list reads as
+        // an also-ran next to whatever sits on top.
+        assert_eq!(catalog()[0].id, DEFAULT_MODEL_ID);
     }
 
     #[test]
