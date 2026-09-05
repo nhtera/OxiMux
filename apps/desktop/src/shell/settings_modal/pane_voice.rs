@@ -30,7 +30,7 @@ use oximux_settings::{
 
 use super::SettingsModal;
 use super::controls::{toggle_switch, value_chip};
-use super::layout::{SettingEntry, entries_card, entry, section_card, section_title};
+use super::layout::{SettingEntry, entries_card, entry, entry_stacked, section_card, section_title};
 use super::segmented::{Segment, segmented};
 use crate::shell::agent_chat::{
     HistoryEntry, cancel_model_download, clear_dictation_history, delete_model,
@@ -331,8 +331,12 @@ pub(super) fn entries(
     // Custom words: a comma/space-separated dictionary the transcript is
     // fuzzy-corrected toward. The InputState lives on the modal (built on open);
     // its Change subscription parses + persists.
+    //
+    // Stacked, not pinned right: the field is the one control in this card with
+    // no intrinsic width, and the pinned column never stretches it — see
+    // `entry_stacked`.
     if let Some(state) = modal.custom_words_input.as_ref() {
-        rows.push(entry(
+        rows.push(entry_stacked(
             "Custom words",
             "Brand, command, or proper names to correct toward (comma-separated).",
             Input::new(state)

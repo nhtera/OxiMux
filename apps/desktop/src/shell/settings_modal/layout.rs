@@ -97,6 +97,9 @@ pub(super) struct SettingEntry {
     pub label: SharedString,
     pub description: SharedString,
     pub control: AnyElement,
+    /// Render the control full-width *beneath* the label rather than pinned
+    /// right. See [`entry_stacked`] for when a row needs it.
+    pub stacked: bool,
 }
 
 /// Build a [`SettingEntry`] from a label, description, and control element.
@@ -109,7 +112,25 @@ pub(super) fn entry(
         label: label.into(),
         description: description.into(),
         control: control.into_any_element(),
+        stacked: false,
     }
+}
+
+/// [`entry`] for a control with no intrinsic width — a text field, an editor,
+/// a growing cluster — rendered full-width under the label instead of pinned
+/// right.
+///
+/// The pinned column is `flex_none`, so it is measured on the control's own
+/// terms and never stretched. A widget that sizes itself `w_full` (every
+/// `Input` does) has no definite parent width there and collapses to its
+/// padding: the Voice pane's "Custom words" field shipped as a ~24px box you
+/// could not read or aim at. Anything that wants the row must say so here.
+pub(super) fn entry_stacked(
+    label: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    control: impl IntoElement,
+) -> SettingEntry {
+    SettingEntry { stacked: true, ..entry(label, description, control) }
 }
 
 /// Case-insensitive substring match of `query` against a row's label or
@@ -137,7 +158,13 @@ pub(super) fn entries_card(
 ) -> AnyElement {
     let rows: Vec<AnyElement> = entries
         .into_iter()
-        .map(|e| setting_row_desc(e.label, e.description, e.control, theme, typography))
+        .map(|e| {
+            if e.stacked {
+                setting_row_stack(e.label, e.description, e.control, theme, typography)
+            } else {
+                setting_row_desc(e.label, e.description, e.control, theme, typography)
+            }
+        })
         .collect();
     section_card(theme, density, rows)
 }
@@ -181,7 +208,9 @@ pub(super) fn search_results(
 }
 
 /// One global-search result row: a small source-pane tag above the stacked
-/// label + description, with the live control pinned right.
+/// label + description, with the live control pinned right — or, for an
+/// [`entry_stacked`] entry, full-width beneath the text, for the same reason
+/// its card row stacks.
 fn result_row(
     pane: &'static str,
     e: SettingEntry,
@@ -189,6 +218,45 @@ fn result_row(
     typography: &Typography,
 ) -> AnyElement {
     let description = e.description;
+    let text = div()
+        .flex()
+        .flex_col()
+        .gap(px(3.0))
+        .child(
+            div()
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_subtle)
+                .child(SharedString::from(pane)),
+        )
+        .child(
+            div()
+                .text_size(px(typography.t_body_sm))
+                .text_color(theme.fg_base)
+                .child(e.label),
+        )
+        .when(!description.is_empty(), |c| {
+            c.child(
+                div()
+                    .text_size(px(typography.t_sub_label))
+                    .text_color(theme.fg_subtle)
+                    .child(description),
+            )
+        });
+
+    if e.stacked {
+        // No `flex_1` on the text here: this parent is a column, so it would
+        // stretch the label block vertically rather than share a row.
+        return div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .py(px(12.0))
+            .gap(px(8.0))
+            .child(text.w_full().min_w_0())
+            .child(div().w_full().min_w_0().child(e.control))
+            .into_any_element();
+    }
+
     div()
         .flex()
         .flex_row()
@@ -197,36 +265,9 @@ fn result_row(
         .w_full()
         .py(px(12.0))
         .gap(px(16.0))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(3.0))
-                .flex_1()
-                // See `setting_row_desc` — same wrap floor, same rows.
-                .min_w_0()
-                .child(
-                    div()
-                        .text_size(px(typography.t_sub_label))
-                        .text_color(theme.fg_subtle)
-                        .child(SharedString::from(pane)),
-                )
-                .child(
-                    div()
-                        .text_size(px(typography.t_body_sm))
-                        .text_color(theme.fg_base)
-                        .child(e.label),
-                )
-                .when(!description.is_empty(), |c| {
-                    c.child(
-                        div()
-                            .text_size(px(typography.t_sub_label))
-                            .text_color(theme.fg_subtle)
-                            .child(description),
-                    )
-                }),
-        )
-        .child(e.control)
+        // See `setting_row_desc` — same wrap floor, same rows.
+        .child(text.flex_1().min_w_0())
+        .child(div().flex_none().child(e.control))
         .into_any_element()
 }
 
@@ -555,8 +596,8 @@ pub(super) fn notice_text(
 #[cfg(test)]
 mod tests {
     use super::{
-        hint_text, list_row, query_matches, setting_row_desc, setting_row_desc_hint,
-        setting_row_stack,
+        entries_card, entry, entry_stacked, hint_text, list_row, query_matches, setting_row_desc,
+        setting_row_desc_hint, setting_row_stack,
     };
     use gpui::{
         Bounds, Context, IntoElement, ParentElement as _, Pixels, Render, Styled as _,
@@ -879,6 +920,75 @@ mod tests {
             stacked < 110.0,
             "a stacked row is a label line, a description line and a 24px body; \
              {stacked}px means the label wrapped when it should not have",
+        );
+    }
+
+    /// A text field carries no intrinsic width of its own — `Input` sizes
+    /// itself `size_full` — so it is the mirror image of the wide cluster
+    /// above: pinned right it does not overflow, it VANISHES, collapsing to
+    /// its padding while the row looks otherwise correct.
+    ///
+    /// Rendered through [`entries_card`] rather than a row helper directly, so
+    /// the probe covers the dispatch as well as the shape: an entry built with
+    /// [`entry`] must collapse and one built with [`entry_stacked`] must fill.
+    struct FieldProbe {
+        field: Rc<Cell<Option<Bounds<Pixels>>>>,
+        stacked: bool,
+    }
+
+    impl Render for FieldProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let sink = self.field.clone();
+            let theme = Theme::default();
+            let typography = Typography::default();
+            // Stands in for `Input`: no intrinsic size, fills whatever
+            // definite width its parent gives it.
+            let field = div().w_full().h(px(24.0)).child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds: Bounds<Pixels>, _: (), _window, _cx| sink.set(Some(bounds)),
+                )
+                .w_full()
+                .h(px(24.0)),
+            );
+            let e = if self.stacked {
+                entry_stacked("Custom words", "Names to correct toward.", field)
+            } else {
+                entry("Custom words", "Names to correct toward.", field)
+            };
+            div()
+                .w(px(ROW_W))
+                .child(entries_card(theme, Density::default(), &typography, vec![e]))
+        }
+    }
+
+    fn field_width(cx: &mut TestAppContext, stacked: bool) -> f32 {
+        let field = Rc::new(Cell::new(None));
+        let sink = field.clone();
+        let w = cx.add_window(move |_window, _cx| FieldProbe { field: sink, stacked });
+        let vcx = gpui::VisualTestContext::from_window(w.into(), cx);
+        vcx.simulate_resize(size(px(900.0), px(600.0)));
+        vcx.run_until_parked();
+        f32::from(field.get().expect("the field painted").size.width)
+    }
+
+    /// The Voice pane's "Custom words" field shipped as an unusable ~24px box.
+    /// Both halves are asserted: that the stacked row actually gives the field
+    /// the row, and that the pinned row is still the shape that starves it —
+    /// the second half is what keeps the first from passing vacuously.
+    #[gpui::test]
+    fn a_text_field_pinned_right_collapses_and_stacked_fills_the_row(cx: &mut TestAppContext) {
+        let stacked = field_width(cx, true);
+        let pinned = field_width(cx, false);
+        assert!(
+            stacked >= ROW_W - 0.5,
+            "a stacked field got {stacked}px of the {ROW_W}px row",
+        );
+        assert!(
+            pinned < ROW_W / 4.0,
+            "the probe no longer reproduces the fault: a pinned field took {pinned}px of \
+             the {ROW_W}px row. Either `desc_row` stopped starving width-less controls \
+             (good: rewrite this test) or the stand-in stopped behaving like `Input`.",
         );
     }
 
