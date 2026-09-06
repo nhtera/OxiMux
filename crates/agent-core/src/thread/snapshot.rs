@@ -1,13 +1,20 @@
-//! Transcript snapshot harness — the safety net for the assembler extraction.
+//! Transcript snapshot harness — the fidelity floor under the agent mappers.
 //!
-//! The assembler moves lifecycle decisions (id minting, turn/item boundaries,
-//! close dedupe, text accumulation, coalescing) out of five agent mappers and
-//! into one place. The thing that must not change while that happens is what
-//! the user sees, and *that* is the folded [`ChatThread`] — not the event
-//! stream. Coalescing deliberately alters the event stream: it merges deltas,
-//! so a pinned `Vec<ThreadEvent>` would report a false regression on the first
-//! migration. The fold is where "rendered output is unchanged" is actually
-//! decidable, because it is what every render path reads.
+//! Written as the safety net for a five-way `Assembler` extraction, which was
+//! then declined on measurement: the mappers turned out not to be five copies
+//! of one lifecycle (Claude's decoder is stateless, Codex is item-lifecycle
+//! native, and the one real duplicate already shares `snapshot_diff`). The
+//! harness outlived the plan that motivated it, because the evidence behind
+//! that plan — nine rounds of render-fidelity work — was never about the
+//! assembler. It was about mapper changes altering what the user sees without
+//! failing anything.
+//!
+//! What is pinned is the folded [`ChatThread`], not the event stream. That is
+//! deliberate and still load-bearing: event coalescing remains a legitimate
+//! future change that would rewrite the stream without moving a pixel, and a
+//! pinned `Vec<ThreadEvent>` would report it as a regression. The fold is where
+//! "rendered output is unchanged" is actually decidable, because it is what
+//! every render path reads.
 //!
 //! Behind the `test-support` feature so none of this ships: `oximux-agents`
 //! turns it on in dev-dependencies so both crates pin transcripts identically
@@ -187,7 +194,7 @@ fn assert_snapshot_text(path: impl AsRef<Path>, actual: &str) {
     panic!(
         "transcript changed for {}\n\n{}\n\n\
          If this change is intended, regenerate with `{UPDATE_VAR}=1 cargo test` \
-         and name the change in the phase log. If it is not, the assembler \
+         and name the change in the commit. If it is not, a mapper change \
          altered what the user sees.",
         path.display(),
         first_difference(&expected, actual)
@@ -196,10 +203,68 @@ fn assert_snapshot_text(path: impl AsRef<Path>, actual: &str) {
 
 /// The first differing line with a little context — enough to see what moved
 /// without printing two full transcripts into the test output.
+///
+/// Reports a difference `str::lines()` cannot see *as such*, rather than
+/// rendering a window for it. `lines()` discards `\r` and the trailing newline,
+/// so two strings that differ only in those compare equal line by line: the
+/// scan finds nothing, and a naive fallback prints the tail of each side —
+/// two halves that are character-identical, under a message saying the
+/// transcript changed. That reads like a bug in the fold, and the natural
+/// response is to regenerate the snapshot, which "fixes" it by committing the
+/// wrong bytes and silently destroys the byte-exactness this harness exists to
+/// provide. It has happened once already (CRLF on the Windows runner), so the
+/// invisible cases are named here instead of being drawn.
 fn first_difference(expected: &str, actual: &str) -> String {
     let exp: Vec<&str> = expected.lines().collect();
     let act: Vec<&str> = actual.lines().collect();
-    let at = exp.iter().zip(&act).position(|(a, b)| a != b).unwrap_or(exp.len().min(act.len()));
+
+    if let Some(at) = exp.iter().zip(&act).position(|(a, b)| a != b) {
+        return window_around(at, &exp, &act);
+    }
+
+    // Every line the two share is equal, so the difference is either past the
+    // end of the shorter side or in bytes `lines()` threw away.
+    if exp.len() != act.len() {
+        return format!(
+            "{}\n\n(expected has {} lines, actual has {} — they agree up to line {})",
+            window_around(exp.len().min(act.len()), &exp, &act),
+            exp.len(),
+            act.len(),
+            exp.len().min(act.len())
+        );
+    }
+
+    format!(
+        "every line is equal, so the difference is in bytes `lines()` discards:\n\
+         {}\n\
+         This is a line-ending or trailing-newline difference, NOT a change to \
+         the transcript. Do NOT regenerate with `{UPDATE_VAR}=1` — that would \
+         commit the wrong bytes. Fix it where it comes from: a checkout that \
+         rewrote the file (see the `text eol=lf` rules in `.gitattributes`) or \
+         an editor that added a final newline.",
+        invisible_differences(expected, actual)
+    )
+}
+
+/// The concrete evidence for a difference no rendered line can show.
+fn invisible_differences(expected: &str, actual: &str) -> String {
+    let describe = |s: &str| {
+        let endings = match (s.contains("\r\n"), s.contains('\n')) {
+            (true, _) => "CRLF",
+            (false, true) => "LF",
+            (false, false) => "no line breaks",
+        };
+        let trailing = if s.ends_with('\n') { "yes" } else { "no" };
+        format!("{endings}, trailing newline: {trailing}, {} bytes", s.len())
+    };
+    format!(
+        "  expected: {}\n  actual:   {}",
+        describe(expected),
+        describe(actual)
+    )
+}
+
+fn window_around(at: usize, exp: &[&str], act: &[&str]) -> String {
     let from = at.saturating_sub(3);
     let window = |lines: &[&str]| {
         lines
@@ -214,7 +279,60 @@ fn first_difference(expected: &str, actual: &str) -> String {
     format!(
         "first difference at line {}\n--- expected ---\n{}\n--- actual ---\n{}",
         at + 1,
-        window(&exp),
-        window(&act)
+        window(exp),
+        window(act)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_difference;
+
+    /// The failure that actually shipped: a CRLF checkout of an LF snapshot.
+    ///
+    /// The old reporter answered this with "first difference at line 4" and two
+    /// windows that printed identically, because `lines()` strips `\r`.
+    #[test]
+    fn a_crlf_checkout_is_named_rather_than_drawn() {
+        let report = first_difference("a\r\nb\r\nc\r\n", "a\nb\nc\n");
+
+        assert!(report.contains("every line is equal"), "{report}");
+        assert!(report.contains("expected: CRLF"), "{report}");
+        assert!(report.contains("actual:   LF"), "{report}");
+        // The whole point: do not send the reader to the regenerate command.
+        assert!(report.contains("Do NOT regenerate"), "{report}");
+        assert!(!report.contains("first difference at line"), "{report}");
+    }
+
+    #[test]
+    fn a_trailing_newline_difference_is_named_too() {
+        let report = first_difference("a\nb\n", "a\nb");
+
+        assert!(report.contains("every line is equal"), "{report}");
+        assert!(report.contains("trailing newline: yes"), "{report}");
+        assert!(report.contains("trailing newline: no"), "{report}");
+    }
+
+    /// Negative control. A reporter that called everything invisible would pass
+    /// both tests above, so a real content change must still be drawn.
+    #[test]
+    fn a_real_content_change_is_still_drawn_with_a_window() {
+        let report = first_difference("a\nb\nc\n", "a\nB\nc\n");
+
+        assert!(report.contains("first difference at line 2"), "{report}");
+        assert!(report.contains("     2 | b"), "{report}");
+        assert!(report.contains("     2 | B"), "{report}");
+        assert!(!report.contains("every line is equal"), "{report}");
+    }
+
+    /// A truncated side shares every line it has, so it reaches the same branch
+    /// as the invisible cases — but it is a genuine content difference and must
+    /// not be reported as line endings.
+    #[test]
+    fn a_shorter_actual_reports_the_line_counts_not_line_endings() {
+        let report = first_difference("a\nb\nc\n", "a\nb\n");
+
+        assert!(report.contains("expected has 3 lines, actual has 2"), "{report}");
+        assert!(!report.contains("every line is equal"), "{report}");
+    }
 }

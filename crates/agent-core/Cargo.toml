@@ -25,3 +25,10 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+# This crate's own integration test (`tests/transcript_snapshots.rs`) uses
+# `thread::snapshot`, which is behind `test-support`. Without this line the
+# feature reached it only by Cargo unifying features across a `--workspace`
+# build, borrowed from `oximux-agents`'s dev-dependency — so `cargo test -p
+# oximux-agent-core` failed to compile while CI stayed green. A crate's tests
+# must not depend on which *other* crate happens to be in the same build.
+oximux-agent-core = { path = ".", features = ["test-support"] }
