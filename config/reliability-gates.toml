@@ -850,9 +850,11 @@ The Windows job runs `-p oximux-app --lib`, which does include these tests; it \
 is listed uncovered because that has not been observed for this gate, not \
 because the code is macOS-specific. \
 \
-What is NOT covered: the timer firing. These assert the arm/drop decision and \
-the persisted round trip, not that a rebuilt countdown reaches zero and re-sends \
-— that needs a real held turn, which cannot be provoked on demand. \
+What is NOT covered: the retry actually re-sending. A GUI pass on 2026-09-06 \
+did observe the rebuilt card, its live countdown (39m → 38m) and the restored \
+attempt number, plus a slept-through reset being dropped — but the countdown was \
+cancelled rather than allowed to fire, because firing spends against a live \
+provider and appends a real turn to a real conversation. \
 Mutation-checked: resetting the attempt count, widening the grace to thirty \
 days, dropping either dirty-mark, and leaving the dormant mark set each fail \
 exactly one of these, and a different one each time. \
