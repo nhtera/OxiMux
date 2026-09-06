@@ -134,3 +134,14 @@ while the desktop quietly retried its own, which is a worse surface than no
 verbs. Making the CLI's answer true means moving retry into the host layer
 first; the wire change (a new verb plus a protocol version bump) is the smaller
 half of that job.
+
+What is *not* missing is the policy. `oximux_agents::retry::schedule()` and
+`classify_failure` are already pure and host-agnostic — no clock, no randomness,
+no view — so what has to move is the driver that arms a timer and re-sends, not
+the rules about when a retry is allowed. Two shipped things give that driver its
+shape: `schedule::ScheduleFirer` is the same host-agnostic-trait-plus-per-host-
+implementation pattern, and `serve`'s pump already holds the folded thread, the
+`SessionHandle` that can re-send, and a Tokio loop to time it from. The open
+design question is what a headless host should do in place of the desktop's
+`dormant` check — in particular whether it should re-send into a session whose
+agent process has exited.
