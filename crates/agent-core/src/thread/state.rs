@@ -14,7 +14,7 @@
 
 use super::background_task::{BackgroundTask, TaskStatus};
 use super::entry::{AssistantMessage, ChatImage, CheckpointState, ThreadEntry};
-use super::event::{PlanEntryLite, SessionMeta, ThreadEvent, TurnUsage};
+use super::event::{PlanEntryLite, RateLimitInfo, SessionMeta, ThreadEvent, TurnUsage};
 use super::question::QuestionRequest;
 use super::tool_call::{PermissionRequest, ToolCall, ToolCallStatus};
 use super::turn_diff;
@@ -63,6 +63,20 @@ pub struct ChatThread {
     pub last_summary: Option<String>,
     /// Latest transport/protocol error, surfaced non-fatally.
     pub last_error: Option<String>,
+    /// Typed detail for the most recent failed turn, from the `TurnFailed` that
+    /// rides just ahead of an errored `TurnEnded`.
+    ///
+    /// In-memory only, and cleared when a turn starts, so it always describes
+    /// the turn that just failed rather than an older one.
+    pub last_turn_failure: Option<(Option<u16>, Option<String>)>,
+    /// The provider's most recent rate-limit reading (Claude `rate_limit_event`).
+    ///
+    /// In-memory only, like [`Self::plan`]: a restored thread starts with no
+    /// reading and gets one on the next event. That is the honest state — a
+    /// reading persisted across a restart could name a window that has since
+    /// reset, and a stale "rejected" is exactly the fabricated claim the usage
+    /// meter already refuses to make.
+    pub last_rate_limit: Option<RateLimitInfo>,
     /// Whether a turn is currently in flight (between a user send and
     /// `TurnEnded`). Drives the composer's send/stop affordance.
     pub turn_active: bool,
@@ -241,6 +255,7 @@ impl ChatThread {
         self.live_usage = None;
         self.last_summary = None;
         self.last_error = None;
+        self.last_turn_failure = None;
         self.turn_active = true;
     }
 
@@ -530,6 +545,12 @@ impl ChatThread {
                 self.compacting = false;
                 self.end_assistant_window();
                 self.entries.push(ThreadEntry::ContextCompaction { summary: summary.clone() });
+            }
+            ThreadEvent::TurnFailed { status, terminal_reason } => {
+                self.last_turn_failure = Some((*status, terminal_reason.clone()));
+            }
+            ThreadEvent::RateLimitUpdated(info) => {
+                self.last_rate_limit = Some(info.clone());
             }
             ThreadEvent::TurnEnded { is_error, result, usage, turn_diff } => {
                 self.turn_active = false;

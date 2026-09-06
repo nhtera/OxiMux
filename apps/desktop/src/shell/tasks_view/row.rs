@@ -426,6 +426,9 @@ pub(super) fn create_action(
                         Some(AgentAdapter::ClaudeCode),
                         Some(issue_url.clone()),
                         Some(linked_issue.clone()),
+                        // No setup picker on a task row — the project's
+                        // `auto_setup` decides, same as before this existed.
+                        oximux_settings::SetupDecision::Inherit,
                         true,
                         window,
                         cx,

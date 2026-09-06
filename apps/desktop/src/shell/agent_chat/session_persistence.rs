@@ -155,7 +155,7 @@ impl AgentChatView {
     /// Whether the persisted blob is out of date: the thread's own mutation
     /// counter moved past the last saved revision, or a view-held blob field
     /// (model pick, permission mode, thinking level, posture) was touched.
-    fn transcript_out_of_date(&self) -> bool {
+    pub(super) fn transcript_out_of_date(&self) -> bool {
         self.thread.revision() != self.last_saved_revision.get() || self.meta_dirty.get()
     }
 
@@ -229,6 +229,9 @@ impl AgentChatView {
             // opening this session once it is dormant has no backend to ask, and
             // making the desktop spawn one to fill two dropdowns would undo
             // serving its history from disk.
+            // The armed retry, so a turn held for a five-hour window resumes
+            // at its reset even across a quit. `None` whenever nothing is armed.
+            pending_retry: self.retry.persisted(),
             choices: PersistedChoices {
                 models: self.connection.as_ref().map(|c| c.models()).unwrap_or_default(),
                 modes: self.connection.as_ref().map(|c| c.permission_modes()).unwrap_or_default(),

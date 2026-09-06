@@ -8393,6 +8393,7 @@ name = "oximux-worktree-ops"
 version = "0.1.19"
 dependencies = [
  "async-trait",
+ "ignore",
  "oximux-core",
  "oximux-git",
  "oximux-no-window",

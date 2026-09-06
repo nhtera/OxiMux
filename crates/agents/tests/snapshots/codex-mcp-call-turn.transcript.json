@@ -1,0 +1,54 @@
+{
+  "session_id": null,
+  "model": null,
+  "permission_mode": null,
+  "turn_active": false,
+  "compacting": false,
+  "title": null,
+  "last_error": null,
+  "last_summary": null,
+  "usage": {
+    "input_tokens": 30848,
+    "output_tokens": 5,
+    "cache_read_tokens": 30464,
+    "cache_creation_tokens": 0,
+    "context_window": 258400,
+    "cost_usd": null
+  },
+  "entries": [
+    {
+      "ToolCall": {
+        "id": "exec-8059a8f9-c24d-4465-9e76-932f9b48c5b1",
+        "name": "mcp__node_repl__js",
+        "input": {
+          "code": "nodeRepl.write(6*7)",
+          "title": "Evaluate 6×7"
+        },
+        "status": "Completed",
+        "result": "42",
+        "structured": {
+          "_meta": null,
+          "content": [
+            {
+              "text": "42",
+              "type": "text"
+            }
+          ],
+          "structuredContent": null
+        },
+        "images": [],
+        "terminal_id": null,
+        "kind": null,
+        "approved_input": null,
+        "redact_result": false,
+        "subagent_log": []
+      }
+    },
+    {
+      "Assistant": {
+        "text": "42",
+        "thinking": ""
+      }
+    }
+  ]
+}

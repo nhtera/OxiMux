@@ -6,6 +6,7 @@
 //! Phase 0 ships dark-only. Light mode is a Phase 8+ decision.
 
 pub mod agent_launch;
+pub mod agent_retry;
 pub mod appearance;
 pub mod auto_update;
 pub mod autosave;
@@ -45,7 +46,7 @@ pub use dictation_languages::{WHISPER_LANGUAGES, display_name as language_displa
 pub use fonts::FontChoice;
 pub use keybindings::KeybindingOverrides;
 pub use motion::{Motion, ease_out_spring};
-pub use project_scripts::{ProjectScripts, ScriptKind, load_for_project};
+pub use project_scripts::{ProjectScripts, ScriptKind, SetupDecision, load_for_project};
 pub use terminal::{BellStyle, TerminalSettings, WindowsPowerShell, WindowsShell};
 #[cfg(feature = "gpui")]
 pub use theme::{GitDecorations, SyntaxPalette, Theme};

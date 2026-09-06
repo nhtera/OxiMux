@@ -1,0 +1,97 @@
+{
+  "session_id": "sid-rich",
+  "model": "claude-opus-4-8",
+  "permission_mode": "default",
+  "turn_active": false,
+  "compacting": false,
+  "title": null,
+  "last_error": null,
+  "last_summary": null,
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 5,
+    "cache_read_tokens": 0,
+    "cache_creation_tokens": 0,
+    "context_window": null,
+    "cost_usd": 0.05
+  },
+  "entries": [
+    {
+      "ToolCall": {
+        "id": "srv_1",
+        "name": "web_search",
+        "input": {
+          "query": "latest rust version"
+        },
+        "status": "Completed",
+        "result": "Rust 1.95.0 is the latest stable release.",
+        "structured": null,
+        "images": [],
+        "terminal_id": null,
+        "kind": null,
+        "approved_input": null,
+        "redact_result": false,
+        "subagent_log": []
+      }
+    },
+    {
+      "ToolCall": {
+        "id": "mcp_1",
+        "name": "context7.query-docs",
+        "input": {
+          "q": "tokio"
+        },
+        "status": "Completed",
+        "result": "tokio is an async runtime.",
+        "structured": null,
+        "images": [],
+        "terminal_id": null,
+        "kind": null,
+        "approved_input": null,
+        "redact_result": false,
+        "subagent_log": []
+      }
+    },
+    {
+      "ToolCall": {
+        "id": "toolu_01QQuQESAQdiugq3rrv1rQ4J",
+        "name": "Read",
+        "input": {
+          "file_path": "./red.png"
+        },
+        "status": "Completed",
+        "result": "[image]",
+        "structured": {
+          "file": {
+            "base64": "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAEklEQVR42mNk+M9Qz0BkYBxUAgBHBQr9Wj6PIQAAAABJRU5ErkJggg==",
+            "originalSize": 76,
+            "type": "image/png"
+          },
+          "type": "image"
+        },
+        "images": [
+          {
+            "media_type": "image/png",
+            "data": "<104 bytes, fnv=42fdc4196053b0bd>"
+          }
+        ],
+        "terminal_id": null,
+        "kind": null,
+        "approved_input": null,
+        "redact_result": false,
+        "subagent_log": []
+      }
+    },
+    {
+      "Assistant": {
+        "text": "",
+        "thinking": "[redacted reasoning]"
+      }
+    },
+    {
+      "ContextCompaction": {
+        "summary": "Context compacted (auto)"
+      }
+    }
+  ]
+}

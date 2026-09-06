@@ -1,0 +1,82 @@
+{
+  "session_id": null,
+  "model": null,
+  "permission_mode": null,
+  "turn_active": false,
+  "compacting": false,
+  "title": null,
+  "last_error": null,
+  "last_summary": null,
+  "usage": {
+    "input_tokens": 3314,
+    "output_tokens": 21,
+    "cache_read_tokens": 0,
+    "cache_creation_tokens": 0,
+    "context_window": 272000,
+    "cost_usd": 0.0172
+  },
+  "entries": [
+    {
+      "Assistant": {
+        "text": "I’ll read both files in parallel and then summarize their contents in one sentence.",
+        "thinking": "**Planning response structure and file inspection**"
+      }
+    },
+    {
+      "ToolCall": {
+        "id": "call_x85NYgwkQDjet14rXUlIjiU8|fc_02ea43d362f49e5a016a574e398568819180c93765458827b0",
+        "name": "read",
+        "input": {
+          "path": "alpha.txt"
+        },
+        "status": "Completed",
+        "result": "alpha file contents\n",
+        "structured": {
+          "content": [
+            {
+              "text": "alpha file contents\n",
+              "type": "text"
+            }
+          ]
+        },
+        "images": [],
+        "terminal_id": null,
+        "kind": null,
+        "approved_input": null,
+        "redact_result": false,
+        "subagent_log": []
+      }
+    },
+    {
+      "ToolCall": {
+        "id": "call_i1Hg5F0Vt1SiBnoiGPj6HuCr|fc_02ea43d362f49e5a016a574e39857c8191952fbfc6b90f5ae3",
+        "name": "read",
+        "input": {
+          "path": "beta.txt"
+        },
+        "status": "Completed",
+        "result": "beta file contents\n",
+        "structured": {
+          "content": [
+            {
+              "text": "beta file contents\n",
+              "type": "text"
+            }
+          ]
+        },
+        "images": [],
+        "terminal_id": null,
+        "kind": null,
+        "approved_input": null,
+        "redact_result": false,
+        "subagent_log": []
+      }
+    },
+    {
+      "Assistant": {
+        "text": "alpha.txt contains “alpha file contents,” and beta.txt contains “beta file contents.”",
+        "thinking": ""
+      }
+    }
+  ]
+}

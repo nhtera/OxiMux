@@ -9,7 +9,7 @@
 use serde_json::Value;
 
 use super::background_task::BackgroundTaskKind;
-use super::event::{McpServerStatus, SessionMeta, ThreadEvent, TurnUsage};
+use super::event::{McpServerStatus, RateLimitInfo, SessionMeta, ThreadEvent, TurnUsage};
 use super::question::parse_questions;
 use super::tool_call::{
     PermissionKind, PermissionSuggestion, extract_tool_result_images, flatten_tool_result_content,
@@ -17,7 +17,7 @@ use super::tool_call::{
 
 /// Decode one newline-delimited stream-json line. Returns the events it
 /// yields (possibly empty for noise: `system/hook_*`, `system/status`,
-/// `rate_limit_event`, message framing, or malformed input).
+/// message framing, or malformed input).
 pub fn decode_line(line: &str) -> Vec<ThreadEvent> {
     let line = line.trim();
     if line.is_empty() {
@@ -49,6 +49,7 @@ fn decode_value(v: &Value) -> Vec<ThreadEvent> {
         Some("user") => decode_user(v),
         Some("control_request") => decode_control_request(v),
         Some("result") => decode_result(v),
+        Some("rate_limit_event") => decode_rate_limit(v),
         _ => Vec::new(),
     }
 }
@@ -564,8 +565,42 @@ fn decode_result(v: &Value) -> Vec<ThreadEvent> {
             attempted_id: str_field(v, "session_id"),
         });
     }
+    // Typed failure detail rides just ahead of the settle event, like the
+    // stale-resume recovery above. Only when the backend actually said
+    // something machine-readable — an errored result with neither field carries
+    // no more than `is_error` already does.
+    if is_error {
+        let status = v.get("api_error_status").and_then(Value::as_u64).and_then(|s| u16::try_from(s).ok());
+        let terminal_reason = str_field_opt(v, "terminal_reason");
+        if status.is_some() || terminal_reason.is_some() {
+            out.push(ThreadEvent::TurnFailed { status, terminal_reason });
+        }
+    }
     out.push(ThreadEvent::TurnEnded { result, usage: decode_usage(v), is_error, turn_diff: None });
     out
+}
+
+/// Decode a `rate_limit_event` line into the provider's current limit state.
+///
+/// The CLI emits this on its own line whenever a window's rounded utilization
+/// or reset time moves, which includes the transition into `rejected`. OxiMux
+/// discarded it until now; it is the only *typed* signal the wire gives for
+/// "this turn failed because a limit is closed", and reading it is what keeps
+/// the retry engine off error-message prose.
+///
+/// `resetsAt` is unix **seconds** on the wire and unix **milliseconds** in
+/// [`RateLimitInfo`]. A line with no `rate_limit_info` object, or one with no
+/// `status`, decodes to nothing rather than to a default-constructed reading
+/// that would claim the account is fine.
+fn decode_rate_limit(v: &Value) -> Vec<ThreadEvent> {
+    let Some(info) = v.get("rate_limit_info") else { return Vec::new() };
+    let Some(status) = info.get("status").and_then(Value::as_str) else { return Vec::new() };
+    vec![ThreadEvent::RateLimitUpdated(RateLimitInfo {
+        status: status.to_string(),
+        resets_at_ms: info.get("resetsAt").and_then(Value::as_i64).map(|secs| secs * 1000),
+        limit_type: info.get("rateLimitType").and_then(Value::as_str).map(str::to_string),
+        utilization: info.get("utilization").and_then(Value::as_f64),
+    })]
 }
 
 /// Join a result's `errors[]` string entries (the CLI's primary error-text
@@ -622,6 +657,12 @@ fn str_field(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
 }
 
+/// Like [`str_field`] but distinguishes "absent" from "empty" — the caller
+/// decides whether a missing token is worth an event.
+fn str_field_opt(v: &Value, key: &str) -> Option<String> {
+    v.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
 /// Decode a JSON array of strings into `Vec<String>`. Missing key or non-array
 /// → empty; non-string array entries are skipped (defensive against a wire
 /// shape drift). Used for `init.slash_commands`.
@@ -666,7 +707,12 @@ mod tests {
         assert!(decode_line("not json").is_empty());
         assert!(decode_line(&json!({"type":"system","subtype":"status","status":"requesting"}).to_string()).is_empty());
         assert!(decode_line(&json!({"type":"system","subtype":"hook_response"}).to_string()).is_empty());
+        // A rate_limit_event with no payload carries no reading to fold.
         assert!(decode_line(&json!({"type":"rate_limit_event"}).to_string()).is_empty());
+        assert!(
+            decode_line(&json!({"type":"rate_limit_event","rate_limit_info":{}}).to_string()).is_empty(),
+            "a rate_limit_info with no status must not fold as a default reading"
+        );
         // unknown type + unknown fields must not panic
         assert!(decode_line(&json!({"type":"brand_new","x":{"y":[1,2]}}).to_string()).is_empty());
     }
@@ -1088,6 +1134,72 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// The fixture's shape and vocabulary come from the shipped `claude` CLI's
+    /// own schema (2.1.261) — the `rate_limit_info` zod definition and the code
+    /// that derives `retry-after` from `resetsAt` — not from a live capture and
+    /// not from guessing at an error message. A real rate limit cannot be
+    /// provoked on demand, so the provenance is stated rather than implied.
+    #[test]
+    fn rate_limit_fixture_decodes_every_status() {
+        let fixture = include_str!("testdata/stream_json_rate_limit.jsonl");
+        let events: Vec<ThreadEvent> = fixture.lines().flat_map(decode_line).collect();
+        assert_eq!(events.len(), 5, "every line carries a reading");
+        let readings: Vec<&RateLimitInfo> = events
+            .iter()
+            .map(|e| match e {
+                ThreadEvent::RateLimitUpdated(i) => i,
+                other => panic!("expected a rate-limit reading, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(readings[0].status, "allowed");
+        assert_eq!(readings[1].status, "allowed_warning");
+        assert!(readings[2].is_rejected());
+        assert_eq!(readings[2].utilization, Some(100.0));
+    }
+
+    /// The wire reports `resetsAt` in seconds; every reset time inside OxiMux is
+    /// milliseconds. This is the one decoding mistake that fails silently — a
+    /// retry lands either instantly or fifty thousand years out, and neither
+    /// looks like a units bug from the UI.
+    #[test]
+    fn resets_at_is_converted_from_seconds_to_milliseconds() {
+        let line = json!({"type":"rate_limit_event",
+            "rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","resetsAt":1788462000}})
+        .to_string();
+        match decode_line(&line).as_slice() {
+            [ThreadEvent::RateLimitUpdated(info)] => {
+                assert_eq!(info.resets_at_ms, Some(1_788_462_000_000));
+            }
+            other => panic!("expected one reading, got {other:?}"),
+        }
+    }
+
+    /// Waiting clears a window; it does not clear an overage, and it cannot
+    /// clear a limit kind this build does not recognise. Both must fall through
+    /// to "surface the error" rather than to "retry".
+    #[test]
+    fn only_known_window_kinds_are_waitable() {
+        let fixture = include_str!("testdata/stream_json_rate_limit.jsonl");
+        let readings: Vec<RateLimitInfo> = fixture
+            .lines()
+            .flat_map(decode_line)
+            .filter_map(|e| match e {
+                ThreadEvent::RateLimitUpdated(i) => Some(i),
+                _ => None,
+            })
+            .collect();
+        // five_hour / seven_day are waitable windows...
+        assert!(readings[0].is_waitable_window());
+        assert!(readings[1].is_waitable_window());
+        assert!(readings[2].is_waitable_window());
+        // ...an overage is the account paying past its plan, not a closed window.
+        assert_eq!(readings[3].limit_type.as_deref(), Some("overage"));
+        assert!(!readings[3].is_waitable_window(), "an overage must never be waited out");
+        // ...and an unrecognised kind is not assumed to be safe.
+        assert!(readings[4].is_rejected());
+        assert!(!readings[4].is_waitable_window(), "an unknown limit kind must not be retried");
     }
 
     #[test]

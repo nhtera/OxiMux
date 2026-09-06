@@ -83,6 +83,8 @@ pub struct SettingsModal {
     pub(crate) terminal: TerminalSettings,
     /// Working copy of the AI commit-message settings; same contract.
     pub(crate) ai: CommitMessageAiSettings,
+    /// Working copy of the rate-limit retry settings.
+    pub(crate) retry: oximux_settings::agent_retry::AgentRetrySettings,
     /// Working copy of the per-agent launch defaults; reseeded from the live
     /// global at each `open()`. Edits mutate this, then write
     /// `agent_launch.toml`; the watcher reloads + swaps the global.
@@ -319,6 +321,7 @@ impl SettingsModal {
             typography,
             terminal: TerminalSettings::default(),
             ai: CommitMessageAiSettings::default(),
+            retry: oximux_settings::agent_retry::AgentRetrySettings::shipped(),
             agent_launch: AgentLaunchSettings::default(),
             dictation: DictationSettings::default(),
             computer_use: ComputerUseSettings::default(),
@@ -397,6 +400,10 @@ impl SettingsModal {
             .try_global::<CommitMessageAiSettings>()
             .cloned()
             .unwrap_or_default();
+        self.retry = cx
+            .try_global::<oximux_settings::agent_retry::AgentRetrySettings>()
+            .copied()
+            .unwrap_or_else(oximux_settings::agent_retry::AgentRetrySettings::shipped);
         self.agent_launch = cx
             .try_global::<AgentLaunchSettings>()
             .cloned()
@@ -756,6 +763,18 @@ impl SettingsModal {
     }
 
     /// Persist the AI working copy to `commit_message_ai.toml`.
+    /// Persist the retry settings and swap the global, so an armed chat reads
+    /// the new ceiling on its next failure rather than after a restart.
+    pub(super) fn persist_retry(&mut self, cx: &mut Context<Self>) {
+        let settings = self.retry;
+        // `save` swaps the global itself, so an armed chat reads the new
+        // ceiling on its next failure rather than after a restart.
+        if let Err(err) = crate::agent_retry_settings::save(&settings, cx) {
+            tracing::warn!(%err, "settings modal: failed to write agent_retry.toml");
+        }
+        cx.notify();
+    }
+
     pub(super) fn persist_ai(&mut self, cx: &mut Context<Self>) {
         if let Err(err) = crate::commit_message_ai_settings::save(&self.ai) {
             tracing::warn!(%err, "settings modal: failed to write commit_message_ai.toml");

@@ -1,0 +1,12 @@
+{
+  "session_id": null,
+  "model": null,
+  "permission_mode": null,
+  "turn_active": false,
+  "compacting": false,
+  "title": null,
+  "last_error": null,
+  "last_summary": null,
+  "usage": null,
+  "entries": []
+}

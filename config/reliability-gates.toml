@@ -330,18 +330,151 @@ oracle = """
 Fail creation at each stage and assert the tree, the branch list, and the \
 workspace table are all as they were. A partial rollback is worse than no \
 rollback: a branch with no worktree, or a row pointing at a path that does not \
-exist, is state the user cannot see and cannot clear from the UI."""
+exist, is state the user cannot see and cannot clear from the UI.
+
+The orphan reclaim added in Phase 2 inverts the risk and needs its own reading. \
+Its regression is not "the wedge came back" but "it deleted something it should \
+not have": a force-removed worktree takes uncommitted work with it and there is \
+no undo. So the two refusal assertions carry more weight here than the healing \
+one — a green `..._is_reclaimed_on_retry` alone would say nothing about whether \
+the guard still holds. Both refusals are written to fail loudly, by asserting a \
+file's contents survive rather than by asserting an enum variant."""
 platforms = ["macos", "windows", "linux"]
 covered_platforms = ["macos"]
 coverage_notes = """
-The rollback test runs in the desktop test suite, which is macOS-only. Path \
-handling is the part most likely to diverge on Windows, and it is exactly the \
-part not covered. Phase 2 of the agent-runtime plan extends this test with a \
-setup-failure arm."""
+The rollback test runs in the desktop test suite, which is macOS-only \
+(`apps/desktop/tests/` is reached by the macOS `--workspace --all-targets` \
+step; the Windows job runs `-p oximux-app --lib`, and the Linux job does not \
+build this crate at all). Path handling is the part most likely to diverge on \
+Windows, and it is exactly the part not covered. Phase 2 added the \
+setup-failure arm this note previously anticipated."""
 test_files = ["apps/desktop/tests/workspace_create_rollback.rs"]
 assertions = [
   "rollback_on_insert_conflict_removes_worktree_and_branch",
   "create_workspace_happy_path_inserts_row_and_keeps_worktree",
+  "a_failing_setup_script_rolls_back_worktree_branch_and_row",
+  "an_orphaned_worktree_from_an_interrupted_create_is_reclaimed_on_retry",
+  "reclaim_refuses_a_path_a_workspace_row_still_names",
+  "a_caller_that_did_not_opt_in_never_has_its_path_reclaimed",
+]
+
+[[gate]]
+id = "worktree.provisioning-precedes-a-created-worktree"
+title = "A worktree reported created has been provisioned"
+status = "stable"
+owner = "worktree-ops"
+invariant = """
+Worktree creation copies the project's `.oximuxinclude` files and then runs its \
+`setup` script, in that order, before the workspace row is inserted. A setup \
+failure — non-zero exit, signal, or timeout — fails creation. A project that \
+has not set `auto_setup` runs no setup at all."""
+oracle = """
+The order is the part a careless test cannot see: asserting the included file \
+exists *after* creation passes even if the copy ran last, so the ordering \
+assertion is made by the setup script itself (`test -f .env`) rather than by \
+the test body.
+
+A regression presents as a worktree that opens with missing dependencies and no \
+error — creation reported success and the failure surfaces minutes later as a \
+broken build in an unrelated tab. The inverse regression is louder and matters \
+more: creation starting to fail for a project that never opted in, which is \
+what `a_failing_setup_script_is_not_run_when_the_project_did_not_opt_in` \
+guards. A hang is the third, and the subtle version of it is not the script's fault: \
+if either captured pipe stops being drained, the child blocks writing into a \
+full buffer and a script that exited in seconds is reported as a 15-minute \
+timeout. Code review found exactly that — one non-UTF-8 byte retired the stdout \
+reader — so the two pipe-drain assertions are the load-bearing ones here, not \
+the `sleep 60` case."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos", "windows"]
+coverage_notes = """
+Split coverage, and the halves are not equivalent. The bounded-execution unit \
+tests live in `oximux-worktree-ops`, whose lib tests run on macOS \
+(`--workspace --all-targets`) and Windows (`--workspace --lib`) but not on \
+Linux, which never builds this crate. The end-to-end ordering and rollback \
+arms live under `apps/desktop/tests/` and run on macOS only.
+
+So Windows proves the timeout, the closed stdin, and the non-zero exit; it \
+proves nothing about the order, the rollback, or the opt-in default. Closing \
+the Linux half means adding `oximux-worktree-ops` to the Linux job; closing the \
+Windows half means an integration harness that does not depend on the desktop \
+test target.
+
+Both `run_setup_bounded` and `run_cleanup_before_remove` shell out via `sh -lc` \
+on every platform, which resolves on the Windows runner through Git Bash. The \
+evidence for that is `a_non_zero_exit_is_reported_as_a_failure`, which asserts \
+a specific exit code and therefore cannot pass if the shell never ran.
+
+An earlier draft of this row cited the *cleanup* tests instead. That was a \
+vacuous claim of exactly the kind this ledger exists to reject: all three pass \
+identically when the spawn fails instantly, because none of them asserts \
+anything the shell produced. It is recorded here rather than quietly corrected, \
+since the mistake is the argument for the rule.
+
+Note this is a dependency on the runner image, not on Windows. A Windows host \
+without `sh` on PATH fails these tests rather than skipping them — and, per \
+`SetupOutcome::FailedToStart`, fails worktree creation for any project with \
+`auto_setup` on."""
+test_files = [
+  "crates/worktree-ops/src/setup.rs",
+  "apps/desktop/tests/workspace_create_rollback.rs",
+]
+assertions = [
+  "a_hanging_script_times_out_and_is_killed",
+  "a_child_writing_past_the_pipe_buffer_still_completes",
+  "non_utf8_output_does_not_abandon_the_pipe",
+  "a_script_reading_stdin_fails_fast_rather_than_hanging",
+  "a_non_zero_exit_is_reported_as_a_failure",
+  "output_before_a_timeout_is_kept",
+  "included_files_are_present_before_the_setup_script_runs",
+  "a_failing_setup_script_is_not_run_when_the_project_did_not_opt_in",
+  "an_include_pattern_matching_nothing_does_not_fail_creation",
+]
+
+[[gate]]
+id = "worktree.include-copy-cannot-write-outside-the-worktree"
+title = "The .oximuxinclude copy is a containment boundary"
+status = "stable"
+owner = "worktree-ops"
+invariant = """
+Copying `.oximuxinclude` files into a new worktree never reads through a source \
+symlink, never writes through a symlink in the destination path, never \
+overwrites a file git already checked out, and never resolves a pattern outside \
+the project root."""
+oracle = """
+Each clause fails silently and looks like success, which is why they are tested \
+one at a time rather than by a happy-path copy. A dereferenced source symlink \
+produces a *correct-looking* file in the worktree whose content came from \
+outside the project. A destination symlink produces a worktree that appears to \
+be missing the file, because the write landed wherever the link pointed — the \
+assertion for that clause checks the outside directory is still empty, not just \
+that the copy was skipped.
+
+Overwriting a tracked file is the quiet one: the worktree looks right and \
+builds, but a committed config has been replaced by a developer's local copy, \
+and git reports the diff as their edit."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+The four containment clauses are asserted with `#[cfg(unix)]` tests, so on \
+Windows they compile to nothing — `--workspace --lib` runs this crate there and \
+still proves none of them. This is a real gap and not a small one: Windows has \
+its own link types (junctions, and symlinks that need a privilege or developer \
+mode), and the reparse-point behavior of `symlink_metadata` is exactly the kind \
+of thing that differs. Linux runs nothing from this crate at all.
+
+Closing it needs `std::os::windows::fs::symlink_dir` fixtures guarded on the \
+runner actually being able to create one, which is a Windows-CI question before \
+it is a test question. Until then the clause is enforced by code review on that \
+platform, which is what this row exists to say out loud."""
+test_files = ["crates/worktree-ops/src/include.rs"]
+assertions = [
+  "clause2_tracked_file_wins_and_the_skip_is_reported",
+  "clause3_a_source_symlink_is_skipped_not_dereferenced",
+  "clause3_a_symlink_out_of_the_project_copies_nothing",
+  "clause4_a_symlinked_target_directory_is_refused",
+  "a_pattern_leaving_the_project_root_is_refused",
+  "dot_git_is_never_copied_even_when_a_pattern_names_it",
 ]
 
 # ---------------------------------------------------------------------------
@@ -563,4 +696,303 @@ assertions = [
   "a_new_client_drives_an_old_host_through_a_full_turn",
   "a_new_client_runs_a_team_on_an_old_host",
   "a_new_client_schedules_on_an_old_host",
+]
+
+[[gate]]
+id = "agent.rate-limit-retry-never-spends"
+title = "A retried turn waits for a window and never for money"
+status = "stable"
+owner = "agents"
+invariant = """
+A turn that fails on a provider usage window is rescheduled at that window's \
+reported reset; a turn that fails because the account is billing past its plan \
+(an overage), on an unrecognised limit kind, or on a limit whose reset the \
+provider withheld, is never rescheduled at all. The cap is four attempts and \
+a user-stopped turn is never retried."""
+oracle = """
+Drive the classifier with each `rateLimitType` the provider's own schema \
+defines and assert the class; then drive the pure policy and assert a window \
+schedules past its reset, an overage and an unknown kind schedule nothing, and \
+the fifth attempt schedules nothing. The failure this catches is not a crash — \
+a mis-classified overage retries silently and spends the user's money, which \
+surfaces on a bill rather than in a log."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+**macOS only, and the first draft of this row claimed all three.** The claim \
+was wrong in the way this ledger exists to catch: `oximux-agents` appears in \
+the Linux job only under `cargo check --all-targets` (ci.yml:216-217), which \
+compiles the tests without running them, and it is absent from the Windows \
+test list entirely (ci.yml:648-654 names six unrelated crates). Reading either \
+job's crate list rather than trusting the memory of it is what corrected this. \
+\
+The gap is low-risk and deliberately not closed here: the classifier and policy \
+are pure arithmetic over data with no clock, filesystem, process or path in \
+them, so there is no plausible platform-specific divergence. Adding \
+`-p oximux-agents` to the Linux test step would close it for the cost of one \
+line, and is worth doing the next time that job is touched. \
+\
+The vocabulary is the load-bearing part and is NOT captured from a live rate \
+limit — a real one cannot be provoked on demand. It is read from the shipped \
+`claude` CLI's own zod schema (2.1.261), which defines `rateLimitType` as \
+`five_hour | seven_day | seven_day_opus | seven_day_sonnet | \
+seven_day_overage_included | overage` and derives `retry-after` from \
+`resetsAt` in **seconds**. If the provider adds a kind, the unknown-kind \
+assertion is what keeps it from being retried by accident."""
+test_files = [
+  "crates/agents/src/retry/classify.rs",
+  "crates/agents/src/retry/mod.rs",
+  "crates/agents/tests/retry_from_stream.rs",
+]
+assertions = [
+  "an_overage_on_the_wire_schedules_nothing",
+  "a_closed_window_on_the_wire_becomes_a_wake_time_past_its_reset",
+  "an_overage_is_spend_and_is_never_retried",
+  "an_unknown_limit_kind_is_not_retried",
+  "a_known_window_without_a_reset_is_not_retried",
+  "a_closed_window_with_a_reset_is_waitable",
+  "spend_and_other_are_never_scheduled",
+  "the_cap_is_four_attempts",
+  "a_window_is_scheduled_past_its_reset_never_before",
+]
+
+[[gate]]
+id = "agent.retry-jitter-spreads-the-herd"
+title = "Threads sharing one reset do not wake together"
+status = "stable"
+owner = "agents"
+invariant = """
+Every thread scheduling against the same window reset gets its own wake time, \
+spread across the jitter span."""
+oracle = """
+Schedule twenty threads against one reset and assert twenty DISTINCT wake \
+times whose spread exceeds thirty seconds. Asserting only that jitter is \
+non-zero would pass an implementation returning the same constant offset for \
+every thread — which is precisely the broken case, since every thread on one \
+account sees the same reset and would re-limit the account in the same second \
+it reopened."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only, for the same reason as `agent.rate-limit-retry-never-spends`: \
+`oximux-agents` is checked but not tested on Linux, and not named at all in \
+the Windows test step. Pure caller-seeded arithmetic, so the distribution is \
+asserted deterministically and would behave identically anywhere it ran. \
+\
+The spread assertion, not the distinctness one, is what would fail a weak mix \
+such as `seed % span` — twenty consecutive seeds through that would still be \
+twenty distinct values, all inside twenty milliseconds."""
+test_files = ["crates/agents/src/retry/mod.rs"]
+assertions = [
+  "twenty_threads_against_one_reset_get_twenty_distinct_wake_times",
+  "jitter_stays_inside_its_span",
+]
+
+[[gate]]
+id = "agent.rate-limit-reset-units"
+title = "The provider's reset seconds become milliseconds exactly once"
+status = "stable"
+owner = "agent-core"
+invariant = """
+`rate_limit_event.resetsAt` arrives in unix seconds and is stored as unix \
+milliseconds, matching every other reset time in the app."""
+oracle = """
+Decode a line with a known `resetsAt` and assert the stored value is exactly \
+one thousand times it. This is the one decoding mistake in the retry path that \
+fails silently in both directions: unconverted, every reset looks like 1970 and \
+fires instantly; double-converted, it lands fifty thousand years out and the \
+turn is never retried. Neither reads as a units bug from the UI."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only: `oximux-agent-core` is `cargo check`ed on Linux (ci.yml:216) and \
+absent from the Windows test list, so only the macOS `--workspace \
+--all-targets` run executes it. \
+\
+The unit is asserted against a literal (`1_788_462_000` in, \
+`1_788_462_000_000` out) rather than against a round-trip through the same \
+constant, so a wrong multiplier cannot cancel itself out — which a \
+`secs * K / K` style assertion would happily let it do."""
+test_files = ["crates/agent-core/src/thread/stream_json.rs"]
+assertions = [
+  "resets_at_is_converted_from_seconds_to_milliseconds",
+  "rate_limit_fixture_decodes_every_status",
+  "only_known_window_kinds_are_waitable",
+]
+
+[[gate]]
+id = "agent.retry-survives-a-restart-without-surprising"
+title = "A held turn comes back armed, and a slept-through one does not"
+status = "stable"
+owner = "desktop"
+invariant = """
+A retry armed when the app quit is rebuilt on restore with the attempts it had \
+already spent, and is dropped rather than fired when its reset passed while the \
+app was closed."""
+oracle = """
+Restore a saved retry on each side of the grace boundary and assert the near \
+one arms while the far one does not; assert the attempt count comes back with \
+it. Both halves are load-bearing in opposite directions, which is why neither \
+alone is the gate. Without the rebuild, a five-hour window — the case the \
+feature exists for — outlives the app session that hit it and nothing resumes. \
+Without the drop, an app opened the next morning sends a turn the user last saw \
+the night before, unattended and against a limit that expired without them. \
+Without the attempt count, the cap of four counts only the attempts made since \
+the last launch, so a chat that relaunches between attempts can exceed it while \
+no single session ever shows a fifth."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only, and for a sharper reason than the usual one: retry exists **only in \
+the desktop app**. `oximux serve` — the host the CLI actually talks to — has no \
+retry at all, so there is no second platform's implementation to cover here. \
+The Windows job runs `-p oximux-app --lib`, which does include these tests; it \
+is listed uncovered because that has not been observed for this gate, not \
+because the code is macOS-specific. \
+\
+What is NOT covered: the retry actually re-sending. A GUI pass on 2026-09-06 \
+did observe the rebuilt card, its live countdown (39m → 38m) and the restored \
+attempt number, plus a slept-through reset being dropped — but the countdown was \
+cancelled rather than allowed to fire, because firing spends against a live \
+provider and appends a real turn to a real conversation. \
+Mutation-checked: resetting the attempt count, widening the grace to thirty \
+days, dropping either dirty-mark, and leaving the dormant mark set each fail \
+exactly one of these, and a different one each time. \
+\
+The back-compat case is derived from the struct (serialize, delete the one key, \
+reload) rather than pinned as a hand-written literal, so it cannot drift out of \
+date and start passing for the wrong reason. Checked once against the 122 real \
+blobs in the author's own database: 120 load, and the 2 that do not fail on a \
+pre-existing `ThreadEntry::User` shape change unrelated to this field."""
+test_files = [
+  "apps/desktop/src/shell/agent_chat/retry.rs",
+  "apps/desktop/src/session_restore/persisted_chat.rs",
+]
+assertions = [
+  "a_retry_whose_reset_is_still_ahead_comes_back_armed",
+  "a_retry_the_app_slept_through_is_dropped",
+  "a_reset_that_passed_moments_ago_still_fires",
+  "a_disabled_setting_refuses_the_rebuild",
+  "a_wait_longer_than_the_current_setting_is_refused",
+  "restoring_a_retry_leaves_the_blob_clean",
+  "arming_a_retry_marks_the_blob_for_saving",
+  "a_cancelled_retry_leaves_nothing_in_the_blob",
+  "a_retry_firing_before_first_render_consumes_the_dormant_mark",
+  "blobs_predating_pending_retry_still_load",
+  "an_armed_retry_round_trips_through_the_blob",
+]
+
+[[gate]]
+id = "thread.transcript-invariants-hold-for-every-agent"
+title = "No agent leaves a spinner running or a row duplicated"
+status = "stable"
+owner = "agent-core"
+invariant = """
+Once a turn has settled, no tool row is still rendering as in-flight; no two \
+rows share a tool-call id; and no row renders as an empty shell — an assistant \
+bubble with neither text nor thinking, a compaction divider with no summary, or \
+a turn-diff card listing no files. These hold for every agent, checked by one \
+oracle rather than by per-mapper convention."""
+oracle = """
+Fold each captured fixture with the real decoder and the real fold, then run \
+the shared checker over the result. The failure this catches is the one nine \
+rounds of render-fidelity work kept rediscovering: a rule that holds in four \
+mappers and quietly fails in the fifth. It is invisible to a type checker and \
+to any test asserting only that events were produced — a card simply spins \
+forever, and the turn looks hung rather than finished. \
+\
+Verified non-vacuous by mutation: making the Codex mapper never terminalize an \
+item is caught here, naming the row and the rule."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only, for the reason recorded on the retry gates: `oximux-agents` and \
+`oximux-agent-core` are `cargo check`ed on Linux (ci.yml:216-217) and absent \
+from the Windows test list (ci.yml:648-654), so only the macOS `--workspace \
+--all-targets` job runs them. Pure fold logic with no clock, filesystem or \
+process, so there is no platform-specific behaviour to miss. \
+\
+Covers all five agents, but **not equally**. Claude, Codex, Pi and omp run \
+against captured wire bytes; **ACP runs against a synthetic turn** built from \
+typed protocol values, because no ACP capture is committed and its tests were \
+never fixture-driven. Synthetic is weaker evidence than a capture and is named \
+here rather than blended into the same claim. ACP therefore also carries a \
+negative control — the same turn with its tool left in flight must be caught — \
+so the row asserts the oracle is wired to that agent, not merely that some \
+transcript passes. \
+\
+The oracle itself has been wrong once and the mistake is worth keeping: it first \
+derived "turn settled" from `!turn_active` and reported a violation against a \
+one-line fixture that never opened a turn. An idle thread also reports no active \
+turn. "Settled" now means a `TurnEnded` was observed."""
+test_files = [
+  "crates/agent-core/src/thread/invariants.rs",
+  "crates/agent-core/tests/transcript_snapshots.rs",
+  "crates/agents/src/thread/codex/map.rs",
+  "crates/agents/src/thread/pi/map.rs",
+  "crates/agents/src/thread/omp/map.rs",
+  "crates/agents/src/thread/acp/map.rs",
+]
+assertions = [
+  "every_claude_fixture_satisfies_the_transcript_invariants",
+  "every_captured_turn_satisfies_the_transcript_invariants",
+  "a_row_still_in_flight_after_the_turn_settled_is_a_violation",
+  "an_in_flight_row_during_a_live_turn_is_not_a_violation",
+  "two_rows_sharing_a_tool_call_id_are_a_violation",
+  "rows_without_an_id_are_not_duplicates_of_each_other",
+  "a_settled_acp_turn_satisfies_the_transcript_invariants",
+  "an_acp_turn_that_leaves_a_tool_running_is_caught",
+  "a_compaction_divider_with_no_summary_is_a_violation",
+  "a_turn_diff_card_listing_no_files_is_a_violation",
+]
+
+[[gate]]
+id = "thread.rendered-transcript-is-pinned"
+title = "A mapper change that alters what the user sees fails a test"
+status = "stable"
+owner = "agent-core"
+invariant = """
+Every committed fixture folds to a byte-identical committed transcript, so a \
+change to any mapper that alters rendered output has to be noticed and named \
+rather than discovered later in the UI."""
+oracle = """
+Decode each fixture, fold it, and compare the result against a committed \
+snapshot. Pins the *folded transcript* rather than the event stream on purpose: \
+event coalescing is a legitimate future change that would rewrite the stream \
+without changing a pixel, and pinning the stream would report that as a \
+regression. \
+\
+Verified non-vacuous by mutation twice, and the first attempt FAILED: a mutant \
+dropping `usage` from every `TurnEnded` passed all thirteen snapshots because \
+the projection omitted `usage`, which renders in the transcript footer. A \
+snapshot is only a net over the fields it projects. A second mutant prefixing \
+Codex tool names fails Codex's snapshot alone, so the pins are per-agent rather \
+than all keying on one shared path."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only, same CI reason as the invariants gate above. \
+\
+13 fixtures: 7 Claude, 2 each Codex/Pi/omp. Note the plan this came from claimed \
+Codex/Pi/omp were "barely" covered by fixtures; there are in fact two committed \
+captures each, and ACP that has none. \
+\
+Snapshots are canonicalised (object keys sorted, image payloads replaced by a \
+length+hash marker). Both matter: `serde_json` preserves insertion order when \
+anything in the build graph enables `preserve_order` and sorts otherwise, so \
+before canonicalisation the same fixture serialised differently depending on \
+whether the crate was built alone or in the workspace — the crate suite passed \
+while the workspace suite failed. Sorting makes the snapshot a property of the \
+transcript rather than of the build graph."""
+test_files = [
+  "crates/agent-core/src/thread/snapshot.rs",
+  "crates/agent-core/tests/transcript_snapshots.rs",
+  "crates/agents/src/thread/codex/map.rs",
+  "crates/agents/src/thread/pi/map.rs",
+  "crates/agents/src/thread/omp/map.rs",
+]
+assertions = [
+  "every_claude_fixture_renders_the_pinned_transcript",
+  "every_captured_turn_renders_the_pinned_transcript",
+  "every_fixture_decodes_to_at_least_one_event",
 ]

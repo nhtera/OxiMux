@@ -222,6 +222,22 @@ fn restore_chat_thinking_level(
         .unwrap_or_default()
 }
 
+/// The retry a restored chat had armed when it was last saved, so a turn held
+/// for a provider window resumes at its reset across a quit. `None` when the
+/// blob predates the field, the session isn't found, or nothing was armed.
+///
+/// Whether the retry is actually re-armed is decided by
+/// [`AgentChatView::restore_pending_retry`], which re-reads the current settings
+/// and drops a wake time the app slept through — this only carries the record.
+fn restore_chat_pending_retry(
+    snap: &PersistedTabs,
+    session_id: Option<&str>,
+) -> Option<crate::persisted_chat::PersistedRetry> {
+    session_id
+        .and_then(|sid| snap.chat_transcripts.iter().find(|t| t.session_id == sid))
+        .and_then(|t| t.pending_retry.clone())
+}
+
 /// The persisted backend posture for a restored chat, so a reopened session
 /// resumes under the same choice rather than a default. Empty when the blob
 /// predates the fields, the session isn't found, or the backend has no posture.
@@ -440,11 +456,13 @@ pub(crate) fn build_project_panes(
                             );
                             let resume_id = restore_chat_resume_id(&snap, session_id.as_deref());
                             let posture = restore_chat_posture(&snap, session_id.as_deref());
+                            let pending_retry =
+                                restore_chat_pending_retry(&snap, session_id.as_deref());
                             group.update(cx, |g, cx| {
                                 g.open_agent_chat_tab_restored(
                                     chat_cwd, model, backend, resume_id, entries, slash_commands,
-                                    session_meta, thinking_level, posture, draft, queued, window,
-                                    cx,
+                                    session_meta, thinking_level, posture, pending_retry, draft,
+                                    queued, window, cx,
                                 );
                             });
                         }
@@ -626,9 +644,12 @@ fn restore_multi_group(
                             );
                             let resume_id = restore_chat_resume_id(&snap, session_id.as_deref());
                             let posture = restore_chat_posture(&snap, session_id.as_deref());
+                            let pending_retry =
+                                restore_chat_pending_retry(&snap, session_id.as_deref());
                             p.open_agent_chat_in_group_restore(
                                 group_id, chat_cwd, model, backend, resume_id, entries, slash_commands,
-                                session_meta, thinking_level, posture, draft, queued, window, cx,
+                                session_meta, thinking_level, posture, pending_retry, draft, queued,
+                                window, cx,
                             );
                         }
                         p.place_restored_last_tab(Some(group_id), meta, cx);
@@ -2111,6 +2132,7 @@ mod tests {
             pi_posture: None,
             omp_posture: None,
             claude_fast_mode: None,
+            pending_retry: None,
             choices: Default::default(),
         };
         let snap = PersistedTabs {
@@ -2203,6 +2225,7 @@ mod tests {
                 pi_posture: None,
                 omp_posture: None,
                 claude_fast_mode: None,
+                pending_retry: None,
                 choices: Default::default(),
             }],
             ..PersistedTabs::default()
@@ -2251,6 +2274,7 @@ mod tests {
             pi_posture: None,
             omp_posture: None,
             claude_fast_mode: None,
+            pending_retry: None,
             choices: Default::default(),
         };
         let snap =

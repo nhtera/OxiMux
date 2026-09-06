@@ -1,0 +1,5 @@
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","rateLimitType":"five_hour","utilization":41,"resetsAt":1788462000},"uuid":"1c2f0a9e-0000-4000-8000-000000000001","session_id":"sid-rl"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed_warning","rateLimitType":"seven_day","utilization":92,"resetsAt":1788890400},"uuid":"1c2f0a9e-0000-4000-8000-000000000002","session_id":"sid-rl"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","utilization":100,"resetsAt":1788462000},"uuid":"1c2f0a9e-0000-4000-8000-000000000003","session_id":"sid-rl"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"overage","utilization":100},"uuid":"1c2f0a9e-0000-4000-8000-000000000004","session_id":"sid-rl"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"a_window_kind_this_build_has_never_seen","resetsAt":1788462000},"uuid":"1c2f0a9e-0000-4000-8000-000000000005","session_id":"sid-rl"}

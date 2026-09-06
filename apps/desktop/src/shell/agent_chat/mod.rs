@@ -47,6 +47,8 @@ mod jump_menu;
 mod login_card;
 mod message_rail;
 mod pending_edit;
+mod retry;
+mod retry_card;
 mod plan_approval_card;
 mod plan_panel;
 mod publish_throttle;
@@ -652,6 +654,8 @@ pub struct AgentChatView {
     /// respawns with `--resume`. Distinct from `disconnected` (an unexpected
     /// crash, which stays unavailable), so an intentional Stop shows no error.
     interrupted: bool,
+    /// Automatic re-send of a turn that failed on a provider limit.
+    retry: retry::ChatRetry,
     /// A restored chat that has not spawned its subprocess yet. Restoring a
     /// layout with many chat tabs must not launch one agent CLI per tab — a
     /// resumed CLI re-reads its whole session file, so a boot with several
@@ -1950,6 +1954,10 @@ impl AgentChatView {
         if text.is_empty() && images.is_empty() {
             return;
         }
+        // The user is driving again: drop any armed retry and reset the attempt
+        // count. The cap is per turn, so a conversation that hits a limit once
+        // an hour must not eventually lock itself out.
+        self.retry.clear();
         // `/clear` is a UI command (blank the transcript + free context), not
         // agent input — reset in place rather than transmitting the literal text
         // to the subprocess (matching the CLI's own TUI). `/compact` stays a
@@ -2110,100 +2118,6 @@ impl AgentChatView {
                 });
             }
         }));
-    }
-
-    /// Re-send the last user prompt after a turn ended in error (or the child
-    /// crashed). Reachable only from the idle error / disconnected tail cards —
-    /// gated on `!turn_active` so it never double-sends mid-turn. A crashed or
-    /// stopped child is respawned (via `--resume`) before the prompt is
-    /// retransmitted; the prompt bubble is already the tail entry, so it is NOT
-    /// pushed again.
-    fn retry_last_turn(&mut self, cx: &mut Context<Self>) {
-        if self.thread.turn_active {
-            return; // a turn is already streaming — nothing to retry
-        }
-        // A crashed / stopped child can't receive input — bring it back first.
-        if self.disconnected || self.interrupted {
-            self.respawn(cx);
-            if self.disconnected {
-                // Respawn failed (e.g. the resume file is gone); `respawn` left
-                // its own error text — keep the card rather than silently no-op.
-                cx.notify();
-                return;
-            }
-        }
-        let last_user_idx = self
-            .thread
-            .entries
-            .iter()
-            .rposition(|e| matches!(e, ThreadEntry::User { .. }));
-        let last_user = last_user_idx.and_then(|i| match &self.thread.entries[i] {
-            ThreadEntry::User { text, images, .. } => Some((i, text.clone(), images.clone())),
-            _ => None,
-        });
-        match last_user {
-            Some((idx, text, images)) => {
-                let sent = match &self.connection {
-                    Some(conn) => match conn.send_user_message_with_images(&text, &images) {
-                        Ok(()) => {
-                            self.thread.last_error = None;
-                            self.thread.turn_active = true;
-                            true
-                        }
-                        Err(e) => {
-                            self.thread.last_error = Some(format!("Send failed: {e}"));
-                            false
-                        }
-                    },
-                    None => false,
-                };
-                // Re-anchor the pre-turn checkpoint to the retried turn (as a
-                // fresh send would), so the "restore files" rewind affordance
-                // keeps tracking repo changes for it.
-                if sent {
-                    self.take_checkpoint_for(idx, cx);
-                }
-            }
-            None => {
-                // No prompt to replay (the connection failed before any turn) —
-                // the respawn above already restored a working, error-free idle
-                // state, so just drop the card.
-                self.thread.last_error = None;
-            }
-        }
-        self.follow_bottom();
-        self.sync_composer(cx);
-        cx.notify();
-    }
-
-    /// A small "Retry" control for the error / disconnected tail cards. Its
-    /// click re-sends the last user prompt (respawning the child first if it
-    /// crashed or was stopped).
-    fn retry_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-        let typo = &self.typography;
-        div()
-            .id("chat-retry-turn")
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(5.0))
-            .px(px(10.0))
-            .py(px(4.0))
-            .rounded(px(self.density.r_xs))
-            .cursor_pointer()
-            .bg(theme.status_error.opacity(0.15))
-            .text_size(px(typo.t_body_sm))
-            .text_color(theme.status_error)
-            .hover(|s| s.bg(theme.status_error.opacity(0.28)))
-            .child(
-                Icon::default()
-                    .path("icons/refresh-cw.svg")
-                    .size(px(13.0))
-                    .text_color(theme.status_error),
-            )
-            .child(SharedString::from("Retry"))
-            .on_click(cx.listener(|this, _e, _window, cx| this.retry_last_turn(cx)))
     }
 
     /// True when the latest turn looks like an auth failure the user can fix by
@@ -3178,6 +3092,7 @@ impl AgentChatView {
             feature_values: HashMap::new(),
             disconnected: false,
             interrupted: false,
+            retry: retry::ChatRetry::default(),
             dormant: false,
             publish_throttle: publish_throttle::PublishThrottle::new(),
             last_saved_revision: std::cell::Cell::new(u64::MAX),
@@ -3628,7 +3543,19 @@ impl AgentChatView {
         // after an intentional Stop (`interrupted`) or a dead process
         // (`disconnected`), where there is nothing live to send to; those leave
         // the queued chips in place, to drain on the next send or be cancelled.
-        if was_active && !self.thread.turn_active && !self.interrupted && !self.disconnected {
+        // A turn that just ended in error may be one a provider limit closed
+        // on. Arm before the queued-message flush below so a retry suppresses
+        // it — releasing the user's next message into an account that is
+        // refusing requests would fail it too, and burn nothing but goodwill.
+        if was_active && !self.thread.turn_active && self.thread.last_error.is_some() {
+            self.arm_retry_if_limited(cx);
+        }
+        if was_active
+            && !self.thread.turn_active
+            && !self.interrupted
+            && !self.disconnected
+            && !self.retry.is_armed()
+        {
             // A turn just completed — decide whether it changed repo state, so
             // the rewind "restore files" affordance only lights up when there's
             // something to restore. Background compare against the pre-turn sha.

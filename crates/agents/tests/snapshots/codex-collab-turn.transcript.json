@@ -1,0 +1,83 @@
+{
+  "session_id": null,
+  "model": null,
+  "permission_mode": null,
+  "turn_active": false,
+  "compacting": false,
+  "title": null,
+  "last_error": null,
+  "last_summary": null,
+  "usage": null,
+  "entries": [
+    {
+      "Assistant": {
+        "text": "I’ll delegate the file check exactly as requested, then wait for the collaborator’s report.",
+        "thinking": ""
+      }
+    },
+    {
+      "ToolCall": {
+        "id": "call_7LG5kEHGdhe7YTviKbxPqHhs",
+        "name": "Agent activity",
+        "input": {
+          "agentPath": "/root/verify_scratch_file",
+          "agentThreadId": "019f68e7-2f5a-72d2-842d-324e7b8bae78",
+          "id": "call_7LG5kEHGdhe7YTviKbxPqHhs",
+          "kind": "started",
+          "type": "subAgentActivity"
+        },
+        "status": "Completed",
+        "result": "started · /root/verify_scratch_file",
+        "structured": {
+          "agentPath": "/root/verify_scratch_file",
+          "agentThreadId": "019f68e7-2f5a-72d2-842d-324e7b8bae78",
+          "status": "started",
+          "type": "subAgentActivity"
+        },
+        "images": [],
+        "terminal_id": null,
+        "kind": null,
+        "approved_input": null,
+        "redact_result": false,
+        "subagent_log": [
+          "I’ll read the requested file exactly as-is and report its contents without making changes.",
+          "Bash /bin/zsh -lc \"sed -n '1,200p' scratch-verify.txt\"",
+          "The exact contents are `hello` followed by a newline."
+        ]
+      }
+    },
+    {
+      "ToolCall": {
+        "id": "call_uQMjDqyqRz3ZqGTv76OrnCCS",
+        "name": "Agent",
+        "input": {
+          "agentsStates": {},
+          "id": "call_uQMjDqyqRz3ZqGTv76OrnCCS",
+          "model": null,
+          "prompt": null,
+          "reasoningEffort": null,
+          "receiverThreadIds": [],
+          "senderThreadId": "019f68e6-f6d4-7341-b59c-94984172beac",
+          "status": "inProgress",
+          "tool": "wait",
+          "type": "collabAgentToolCall"
+        },
+        "status": "Completed",
+        "result": "completed",
+        "structured": {
+          "agents": [],
+          "callStatus": "completed",
+          "status": "completed",
+          "tool": "wait",
+          "type": "collabAgentToolCall"
+        },
+        "images": [],
+        "terminal_id": null,
+        "kind": null,
+        "approved_input": null,
+        "redact_result": false,
+        "subagent_log": []
+      }
+    }
+  ]
+}

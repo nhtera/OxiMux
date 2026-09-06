@@ -20,7 +20,10 @@ use oximux_remote_host::{WorktreeError, WorktreeService};
 use oximux_remote_proto::messages::{WorktreeProgressWire, WorktreeWire};
 use oximux_storage::{ProjectRepo, WorkspaceRepo};
 
-use crate::{CreateOutcome, create_workspace_with_rollback, run_cleanup_before_remove, worktree_path};
+use crate::{
+    CreateOutcome, Provision, create_workspace_with_rollback, run_cleanup_before_remove,
+    worktree_path,
+};
 
 /// Manages worktrees against the same repos and path scheme the desktop uses.
 pub struct RepoWorktrees {
@@ -92,6 +95,15 @@ impl WorktreeService for RepoWorktrees {
             &target,
             None,
             &self.workspaces,
+            // Headless: no override (the project's `auto_setup` decides) and
+            // nowhere to stream a transcript. A remote client asking for a
+            // worktree gets the same provisioning the desktop does; it just
+            // sees the outcome instead of watching it.
+            //
+            // Reclaim is on: `target` came from `worktree_path(&self.data_dir,
+            // ..)` a few lines up, and the slug collision check above has
+            // already established no row claims it.
+            &Provision::default().reclaiming_orphans(),
         )
         .await;
         match outcome {
@@ -102,6 +114,15 @@ impl WorktreeService for RepoWorktrees {
             }
             CreateOutcome::StorageFailedRollbackClean(err) => {
                 tracing::warn!(?err, slug, "remote worktree create: storage failed, rolled back");
+                Err(WorktreeError::CreateFailed)
+            }
+            CreateOutcome::SetupFailed { transcript, rollback_error } => {
+                tracing::warn!(
+                    slug,
+                    outcome = %transcript.outcome.summary(),
+                    ?rollback_error,
+                    "remote worktree create: setup script failed, worktree rolled back"
+                );
                 Err(WorktreeError::CreateFailed)
             }
             CreateOutcome::StorageFailedRollbackDirty { insert_error, rollback_error } => {

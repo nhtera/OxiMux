@@ -32,3 +32,21 @@ docs/skills/*.md text eol=lf
 *.tiff binary
 *.ico binary
 *.icns binary
+
+# Compared byte-for-byte, so a checkout that rewrites their line endings is a
+# test failure rather than a formatting detail. `assert_snapshot_text` asserts
+# `expected == actual` on the raw string: the pinned file comes off disk, the
+# actual transcript comes from `serde_json` and is always LF, so a CRLF worktree
+# fails every pinned transcript at once. It fails *confusingly*, too — the diff
+# reporter compares with `str::lines()`, which strips `\r`, so every line matches
+# and the first difference is reported one line past the end of both.
+#
+# The fixtures are pinned for a stronger reason than the snapshots: they are
+# captured provider wire bytes. A checkout must not rewrite them, or the thing
+# under test is no longer what the provider actually sent.
+#
+# Same reasoning as `docs/skills/*.md` above, and found the same way — green on
+# macOS and Linux, three failures on the Windows runner.
+*.transcript.json text eol=lf
+**/testdata/*.jsonl text eol=lf
+**/testdata/*.sql text eol=lf

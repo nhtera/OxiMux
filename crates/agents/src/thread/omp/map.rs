@@ -475,4 +475,57 @@ mod tests {
         );
         assert!(out[0].is_delta(), "must ride the existing repaint throttle");
     }
+
+    /// Baseline for the assembler extraction (plan phase 4): the transcript
+    /// every committed omp fixture folds to, pinned before the mapper is
+    /// rewritten. Uses the same harness as the Claude fixtures in `agent-core`,
+    /// so all five agents are measured the same way.
+    ///
+    /// Regenerate a deliberate change with
+    /// `UPDATE_TRANSCRIPT_SNAPSHOTS=1 cargo test -p oximux-agents`, then read
+    /// the diff — the point of the pin is that a render change has to be
+    /// noticed and named, not accepted silently.
+    #[test]
+    fn every_captured_turn_renders_the_pinned_transcript() {
+        for fixture in [
+            "omp-approval-deny-turn",
+            "omp-simple-turn",
+        ] {
+            let (events, _) = replay(&format!("{fixture}.jsonl"));
+            assert!(!events.is_empty(), "{fixture} decoded to nothing");
+            let thread = render(&events);
+            oximux_agent_core::thread::snapshot::assert_thread_snapshot(
+                format!(
+                    "{}/tests/snapshots/{fixture}.transcript.json",
+                    env!("CARGO_MANIFEST_DIR")
+                ),
+                &thread,
+            );
+        }
+    }
+
+
+    /// The shared transcript invariants, run against omp's captures.
+    ///
+    /// Separate from the snapshot test: a snapshot pins today's behaviour
+    /// including any bug in it, while these assert what a transcript must never
+    /// be. Same oracle for every agent, which is the point — the drift these
+    /// catch is a rule holding in four mappers and failing in the fifth.
+    #[test]
+    fn every_captured_turn_satisfies_the_transcript_invariants() {
+        for fixture in [
+            "omp-approval-deny-turn",
+            "omp-simple-turn",
+        ] {
+            let (events, _) = replay(&format!("{fixture}.jsonl"));
+            // "A turn ran and finished", never `!turn_active` — an idle thread
+            // also reports no active turn.
+            let settled = events
+                .iter()
+                .any(|e| matches!(e, ThreadEvent::TurnEnded { .. }));
+            let thread = render(&events);
+            oximux_agent_core::thread::invariants::assert_holds(fixture, &thread, settled);
+        }
+    }
+
 }
