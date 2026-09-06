@@ -39,6 +39,46 @@ use std::process::ExitCode;
 const WARN_LOC: usize = 1500;
 const FAIL_LOC: usize = 3000;
 const ALLOW_FILE: &str = "xtask/file-size-allow.txt";
+/// The workflow [`CI_CHECKS`] is asserted against. Test-only: nothing in a
+/// normal `xtask` run reads the workflow, it only has to agree with it.
+#[cfg(test)]
+const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
+
+type Check = fn() -> Result<(), Box<dyn std::error::Error>>;
+
+/// Every check `ci-check` runs, paired with the argv CI must invoke it by.
+///
+/// A table rather than a chain of `and_then`s because the names are asserted
+/// against the workflow file: `ci.yml` calls each lint as its own step so a
+/// failure names itself in the job list, and nothing then kept the two lists in
+/// agreement. They had already drifted — `data-dir-lint` and `appearance-lint`
+/// sat in the chain, fully implemented and unit-tested, while CI ran neither for
+/// months. The dispatch comment even argued that the data-dir lint "has to run
+/// on every platform's CI", which was true and had never happened, because
+/// `ci-check` itself is invoked nowhere in the workflow.
+///
+/// So this is the source of truth, and [`tests::every_ci_check_runs_in_ci`] is
+/// what makes adding a row here enough.
+///
+/// `icon --check` is in the list rather than in a Windows-only job because the
+/// icon is derived from a file in the repo, not from the host: it goes stale on
+/// whichever platform edits the source, and that is usually not Windows. The
+/// data-dir lint is here for the inverted reason — the mistake it catches is
+/// invisible on macOS, so it must run everywhere rather than on Windows alone.
+const CI_CHECKS: &[(&str, Check)] = &[
+    ("file-size-lint", file_size_lint),
+    ("data-dir-lint", data_dir_lint),
+    ("literal-lint", literal_lint),
+    ("appearance-lint", appearance_lint),
+    ("reliability-gates", reliability_gates),
+    ("icon --check", icon_check),
+];
+
+/// `icon::run` takes the flag the others do not, so it is adapted rather than
+/// widening every signature in [`CI_CHECKS`].
+fn icon_check() -> Result<(), Box<dyn std::error::Error>> {
+    icon::run(true)
+}
 
 /// Repo-relative directories the lint walks, enumerated rather than globbed.
 ///
@@ -58,19 +98,7 @@ fn main() -> ExitCode {
         "appearance-lint" => appearance_lint(),
         "reliability-gates" => reliability_gates(),
         "icon" => icon::run(check),
-        // Every check CI should run, in one command. `icon --check` is here
-        // rather than in a Windows-only job because the icon is derived from a
-        // file in the repo, not from the host — it goes stale on whichever
-        // platform edits the source, and that is usually not Windows. The
-        // data-dir lint is here for the same reason inverted: the mistake it
-        // catches is invisible on macOS, so it has to run on every platform's
-        // CI rather than Windows'.
-        "ci-check" => file_size_lint()
-            .and_then(|()| data_dir_lint())
-            .and_then(|()| literal_lint())
-            .and_then(|()| appearance_lint())
-            .and_then(|()| reliability_gates())
-            .and_then(|()| icon::run(true)),
+        "ci-check" => CI_CHECKS.iter().try_for_each(|(_, run)| run()),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -317,4 +345,55 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Box<dyn std::error::Er
 fn count_loc(path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
     let text = std::fs::read_to_string(path)?;
     Ok(text.lines().filter(|l| !l.trim().is_empty()).count())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CI_CHECKS, CI_WORKFLOW, workspace_root};
+
+    /// Every check in [`CI_CHECKS`] is actually invoked by the workflow.
+    ///
+    /// The failure this exists to catch has already happened twice and cost
+    /// months: a lint is written, unit-tested, added to the `ci-check` chain,
+    /// and gates nothing — because `ci-check` is not what CI runs. It reads as
+    /// covered from inside the xtask crate and is invisible from the workflow,
+    /// which is the same "looks like coverage" shape the reliability ledger
+    /// exists to reject.
+    ///
+    /// Asserting the argv rather than the step name on purpose: a step can be
+    /// renamed freely, but the command is what runs.
+    #[test]
+    fn every_ci_check_runs_in_ci() {
+        let root = workspace_root().expect("workspace root");
+        let workflow = std::fs::read_to_string(root.join(CI_WORKFLOW))
+            .expect("ci.yml is readable from the workspace root");
+
+        let missing: Vec<&str> = CI_CHECKS
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| !workflow.contains(&format!("cargo run -p xtask -- {name}")))
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "these checks are in the ci-check chain but never run in CI: {missing:?}\n\
+             Add `cargo run -p xtask -- <name>` as a step in {CI_WORKFLOW}, or drop \
+             the row from CI_CHECKS. A lint that gates nothing is worse than no lint."
+        );
+    }
+
+    /// Negative control: the assertion above must be able to fail. A `contains`
+    /// against a workflow that mentions almost every cargo invocation somewhere
+    /// could easily match by accident.
+    #[test]
+    fn a_check_absent_from_the_workflow_would_be_caught() {
+        let root = workspace_root().expect("workspace root");
+        let workflow = std::fs::read_to_string(root.join(CI_WORKFLOW))
+            .expect("ci.yml is readable from the workspace root");
+
+        assert!(
+            !workflow.contains("cargo run -p xtask -- a-lint-that-does-not-exist"),
+            "the probe name was expected to be absent from the workflow"
+        );
+    }
 }

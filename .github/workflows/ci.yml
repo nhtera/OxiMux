@@ -130,11 +130,25 @@ jobs:
       - name: xtask file-size-lint
         run: cargo run -p xtask -- file-size-lint
 
+      # Where OxiMux keeps its data is one decision owned by `app_paths`. A
+      # direct `dirs::data_dir()` elsewhere reads correctly on the machine that
+      # wrote it and silently splits the data directory on the platform whose
+      # convention differs — which is why this is a lint and not a review note.
+      - name: xtask data-dir-lint
+        run: cargo run -p xtask -- data-dir-lint
+
       # Radius and type sizes belong to `Density` / `Typography`. A raw
       # `px(N)` cannot scale, which is what would break UI zoom — so the
       # allowlist is a ratchet and this step is what keeps it going down.
       - name: xtask literal-lint
         run: cargo run -p xtask -- literal-lint
+
+      # A view that caches appearance tokens but never re-pulls them keeps
+      # rendering the old theme after a change, and a type scale resolved
+      # without the chosen faces silently ignores the font setting. Both look
+      # correct in the code and wrong only on screen, after a setting changes.
+      - name: xtask appearance-lint
+        run: cargo run -p xtask -- appearance-lint
 
       # The reliability ledger records what OxiMux claims to be true and where
       # that claim is actually proven. It is checked here rather than left to

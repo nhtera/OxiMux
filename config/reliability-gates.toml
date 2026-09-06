@@ -996,3 +996,46 @@ assertions = [
   "every_captured_turn_renders_the_pinned_transcript",
   "every_fixture_decodes_to_at_least_one_event",
 ]
+
+[[gate]]
+id = "ci.every-xtask-check-actually-runs"
+title = "A lint in the ci-check chain cannot silently gate nothing"
+status = "stable"
+owner = "xtask"
+invariant = """
+Every check listed in `CI_CHECKS` — the chain `xtask ci-check` runs — is \
+invoked by `.github/workflows/ci.yml` as its own step. Adding a lint to the \
+chain is therefore enough to make CI enforce it."""
+oracle = """
+Read the workflow and assert each check's argv appears in it. Asserts the \
+command rather than the step name, because a step is free to be renamed and \
+the command is what actually runs. \
+\
+This is a checker for the checkers, and it is registered because the failure \
+already happened and lasted months: `data-dir-lint` and `appearance-lint` were \
+written, unit-tested (19 tests between them) and added to the chain, while CI \
+ran neither — `ci-check` is invoked nowhere in the workflow, which lists its \
+lints individually so a failure names itself. The dispatch even carried a \
+comment arguing the data-dir lint 'has to run on every platform's CI'. That was \
+the intent, it was never true, and nothing said so. \
+\
+Verified non-vacuous by mutation: deleting the `appearance-lint` step from \
+`ci.yml` fails the test and names the missing check. A negative control also \
+pins that the probe string is genuinely absent, since a `contains` against a \
+workflow full of cargo invocations could otherwise match by accident."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only, and that is sufficient here rather than a gap worth closing: the \
+assertion reads two files in the repo and has no platform behaviour at all. \
+`xtask` is built and tested in the macOS `--workspace --all-targets` job; the \
+Linux jobs scope to the CLI crates and the Windows job runs a named crate list \
+that does not include it. \
+\
+What this gate does NOT prove is that the lints it counts are themselves \
+meaningful, only that they run. It is a wiring check."""
+test_files = ["xtask/src/main.rs"]
+assertions = [
+  "every_ci_check_runs_in_ci",
+  "a_check_absent_from_the_workflow_would_be_caught",
+]
