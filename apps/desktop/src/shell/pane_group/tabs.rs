@@ -900,6 +900,7 @@ impl PaneGroup {
         session_meta: oximux_agents::thread::SessionMeta,
         thinking_level: crate::shell::agent_chat::ThinkingLevel,
         posture: crate::shell::agent_chat::RestoredPosture,
+        pending_retry: Option<crate::persisted_chat::PersistedRetry>,
         draft: Option<String>,
         queued: Vec<String>,
         window: &mut Window,
@@ -930,6 +931,12 @@ impl PaneGroup {
         });
         if draft.is_some() || !queued.is_empty() {
             view.update(cx, |v, cx| v.seed_draft_and_queue(draft, queued, window, cx));
+        }
+        // After construction, for the same reason the draft is: `new_resumed`
+        // is shared with paths that have no persisted blob behind them (fork,
+        // import), and only a real restore can have a retry to rebuild.
+        if let Some(saved) = pending_retry {
+            view.update(cx, |v, cx| v.restore_pending_retry(saved, cx));
         }
         self.push_agent_chat_view(view, cwd, model, window, cx)
     }
@@ -1134,6 +1141,9 @@ impl PaneGroup {
                     session_meta.clone(),
                     *thinking_level,
                     Default::default(), // posture — Fork is Claude-only
+                    // pending retry — a fork or a history reopen has no armed
+                    // retry to rebuild; only a real session restore can.
+                    None,
                     None,
                     Vec::new(),
                     window,
@@ -1552,6 +1562,9 @@ impl PaneGroup {
                     // policy isn't re-applied, so the user re-picks via the
                     // composer's Approvals/Sandbox controls if they want it stricter.
                     Default::default(),
+                    // pending retry — a fork or a history reopen has no armed
+                    // retry to rebuild; only a real session restore can.
+                    None,
                     None,
                     Vec::new(),
                     window,
@@ -1578,6 +1591,9 @@ impl PaneGroup {
                     Default::default(),
                     crate::shell::agent_chat::ThinkingLevel::default(),
                     Default::default(), // posture — Claude session-history reopen
+                    // pending retry — a fork or a history reopen has no armed
+                    // retry to rebuild; only a real session restore can.
+                    None,
                     None,
                     Vec::new(),
                     window,
@@ -1655,6 +1671,9 @@ impl PaneGroup {
             // like the Codex arm above: the session file records no posture, and
             // inventing one would misreport what the agent may do.
             Default::default(),
+            // pending retry — a fork or a history reopen has no armed
+            // retry to rebuild; only a real session restore can.
+            None,
             None,
             Vec::new(),
             window,
@@ -1738,6 +1757,9 @@ impl PaneGroup {
             // spawn flag is always explicit, so omp's own yolo default is
             // unreachable). The rollout records no posture to restore.
             Default::default(),
+            // pending retry — a fork or a history reopen has no armed
+            // retry to rebuild; only a real session restore can.
+            None,
             None,
             Vec::new(),
             window,

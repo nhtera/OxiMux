@@ -102,8 +102,35 @@ once, in the decoder, and is asserted against a literal — get it wrong and a
 retry fires either instantly or tens of thousands of years out, neither of which
 looks like a units bug from the UI.
 
+## Quitting with a turn held
+
+A five-hour window usually outlasts the app session that hit it, so an armed
+retry is written into the chat's transcript and rebuilt on the next launch —
+with the attempts it had already spent, so the cap of four counts the whole
+turn rather than restarting at every launch.
+
+Three things stop the rebuild, and each is a case where firing would be wrong
+rather than merely late:
+
+- **The reset passed while OxiMux was closed.** More than five minutes past and
+  the retry is dropped. A lid closed over the reset still fires; a night away
+  does not. Nothing sends unattended for a limit that expired without you — the
+  turn is still there, and the Retry button still works.
+- **Auto-retry was switched off in the meantime.** The setting is read at
+  restore, not baked into what was saved.
+- **`max_automatic_wait` was shortened.** A seven-day reset armed under *No
+  limit* is refused by a session that now allows at most six hours.
+
+The countdown itself is not persisted, only the decision behind it: when to
+fire, why, and how many attempts the turn has cost.
+
 ## Not covered yet
 
-`oximux agent retry status|now|cancel` is not implemented. Retry state currently
-lives in the desktop host only; exposing it to the CLI needs a new relay verb
-and a protocol version bump.
+`oximux agent retry status|now|cancel` is not implemented, and it is blocked by
+more than the work of adding three verbs. Retry lives in the **desktop app
+only** — `oximux serve`, the host the CLI actually talks to, has no retry at
+all. Verbs added today would answer "nothing armed" for every `serve` session
+while the desktop quietly retried its own, which is a worse surface than no
+verbs. Making the CLI's answer true means moving retry into the host layer
+first; the wire change (a new verb plus a protocol version bump) is the smaller
+half of that job.

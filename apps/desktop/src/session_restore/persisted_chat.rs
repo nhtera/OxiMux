@@ -166,6 +166,31 @@ pub struct PersistedChatTranscript {
     /// that offers no choices.
     #[serde(default)]
     pub choices: PersistedChoices,
+    /// A retry this chat had armed when it was last saved, so a turn held for a
+    /// five-hour or seven-day window resumes at its reset even if the app was
+    /// quit in between — which is the ordinary case for a window that long.
+    ///
+    /// Persisting it also carries the attempt count across the restart. Without
+    /// that the cap would silently reset on every relaunch, and a chat that
+    /// relaunched between attempts could exceed the four the policy allows.
+    ///
+    /// `#[serde(default)]` (→ `None`) keeps every older blob loadable; those
+    /// restore with nothing armed, which is the pre-existing behaviour.
+    #[serde(default)]
+    pub pending_retry: Option<PersistedRetry>,
+}
+
+/// A retry armed at save time. Deliberately the *decision* (when, why, how many
+/// attempts are spent) and not the timer: the timer is a `gpui::Task` that dies
+/// with the process, and is rebuilt from these three fields on restore.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PersistedRetry {
+    /// Unix ms the retry was scheduled to fire at.
+    pub wake_at_ms: i64,
+    /// The short human reason shown on the card ("Usage limit reached").
+    pub reason: String,
+    /// Automatic attempts already spent on the held turn.
+    pub attempt: u32,
 }
 
 /// Write one transcript blob. A serialize failure is logged and skipped rather
@@ -236,6 +261,7 @@ mod tests {
             pi_posture: None,
             omp_posture: None,
             claude_fast_mode: Some(true),
+            pending_retry: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -267,6 +293,7 @@ mod tests {
             pi_posture: Some(PiPosture { tools: TOOLS_READ_ONLY.into(), context_files: false }),
             omp_posture: None,
             claude_fast_mode: None,
+            pending_retry: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -301,6 +328,7 @@ mod tests {
             pi_posture: None,
             omp_posture: Some(OmpPosture::AlwaysAsk),
             claude_fast_mode: None,
+            pending_retry: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -326,6 +354,80 @@ mod tests {
         assert_eq!(loaded.provider, Transport::StreamJson);
     }
 
+    /// Every blob already on disk predates `pending_retry`, so the field must be
+    /// defaultable or a restore would drop the whole transcript rather than one
+    /// unknown key. Checked against the shapes that actually exist: the oldest
+    /// (three keys, from before providers were recorded) and the newest.
+    #[test]
+    fn blobs_predating_pending_retry_still_load() {
+        let repo = repo();
+        let oldest = r#"{"session_id":"old","model":"sonnet","entries":[]}"#;
+        repo.set(&chat_settings_key("old"), oldest).expect("seed");
+        let loaded = load_chat_transcript(&repo, "old").expect("oldest shape must still load");
+        assert_eq!(loaded.pending_retry, None, "absent means nothing armed, not a parse error");
+
+        // The current shape with exactly this one key deleted — derived from the
+        // struct rather than hand-written, so it cannot drift out of date and
+        // start passing for the wrong reason.
+        let full = serde_json::to_value(transcript("new")).expect("serialize");
+        let mut obj = full.as_object().expect("object").clone();
+        assert!(obj.remove("pending_retry").is_some(), "the field must be there to remove");
+        repo.set(&chat_settings_key("new"), &serde_json::Value::Object(obj).to_string())
+            .expect("seed");
+        let loaded = load_chat_transcript(&repo, "new").expect("current shape minus the key");
+        assert_eq!(loaded.pending_retry, None);
+    }
+
+    /// A transcript with every field at its default, for tests that need a
+    /// current-shaped blob without pinning one by hand.
+    fn transcript(session_id: &str) -> PersistedChatTranscript {
+        PersistedChatTranscript {
+            session_id: session_id.into(),
+            model: None,
+            entries: vec![ThreadEntry::User {
+                text: "hi".into(),
+                images: vec![],
+                checkpoint: None,
+            }],
+            slash_commands: vec![],
+            session_meta: Default::default(),
+            thinking_level: Default::default(),
+            provider: Transport::StreamJson,
+            acp_command: None,
+            acp_args: vec![],
+            adapter_id: None,
+            launch_profile: None,
+            codex_posture: None,
+            pi_posture: None,
+            omp_posture: None,
+            claude_fast_mode: None,
+            pending_retry: None,
+            choices: Default::default(),
+        }
+    }
+
+    /// And a blob that *does* carry one round-trips all three fields. The
+    /// attempt count is the one worth asserting: losing it silently resets the
+    /// cap on every launch, which no single session's behaviour would reveal.
+    #[test]
+    fn an_armed_retry_round_trips_through_the_blob() {
+        let repo = repo();
+        let mut t = transcript("held");
+        t.pending_retry = Some(PersistedRetry {
+            wake_at_ms: 1_788_462_000_000,
+            reason: "Usage limit reached".into(),
+            attempt: 3,
+        });
+        save_chat_transcript(&repo, &t);
+        let loaded = load_chat_transcript(&repo, "held").expect("blob loads");
+        assert_eq!(loaded.pending_retry, t.pending_retry);
+
+        t.pending_retry = None;
+        save_chat_transcript(&repo, &t);
+        let loaded = load_chat_transcript(&repo, "held").expect("blob loads");
+        assert_eq!(loaded.pending_retry, None, "clearing must not leave a stale retry behind");
+    }
+
     #[test]
     fn round_trips_a_transcript() {
         let repo = repo();
@@ -348,6 +450,7 @@ mod tests {
             pi_posture: None,
             omp_posture: None,
             claude_fast_mode: None,
+            pending_retry: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);
@@ -385,6 +488,7 @@ mod tests {
             pi_posture: None,
             omp_posture: None,
             claude_fast_mode: None,
+            pending_retry: None,
             choices: Default::default(),
         };
         save_chat_transcript(&repo, &t);

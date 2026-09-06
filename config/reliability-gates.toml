@@ -821,6 +821,66 @@ assertions = [
 ]
 
 [[gate]]
+id = "agent.retry-survives-a-restart-without-surprising"
+title = "A held turn comes back armed, and a slept-through one does not"
+status = "stable"
+owner = "desktop"
+invariant = """
+A retry armed when the app quit is rebuilt on restore with the attempts it had \
+already spent, and is dropped rather than fired when its reset passed while the \
+app was closed."""
+oracle = """
+Restore a saved retry on each side of the grace boundary and assert the near \
+one arms while the far one does not; assert the attempt count comes back with \
+it. Both halves are load-bearing in opposite directions, which is why neither \
+alone is the gate. Without the rebuild, a five-hour window — the case the \
+feature exists for — outlives the app session that hit it and nothing resumes. \
+Without the drop, an app opened the next morning sends a turn the user last saw \
+the night before, unattended and against a limit that expired without them. \
+Without the attempt count, the cap of four counts only the attempts made since \
+the last launch, so a chat that relaunches between attempts can exceed it while \
+no single session ever shows a fifth."""
+platforms = ["macos", "windows", "linux"]
+covered_platforms = ["macos"]
+coverage_notes = """
+macOS only, and for a sharper reason than the usual one: retry exists **only in \
+the desktop app**. `oximux serve` — the host the CLI actually talks to — has no \
+retry at all, so there is no second platform's implementation to cover here. \
+The Windows job runs `-p oximux-app --lib`, which does include these tests; it \
+is listed uncovered because that has not been observed for this gate, not \
+because the code is macOS-specific. \
+\
+What is NOT covered: the timer firing. These assert the arm/drop decision and \
+the persisted round trip, not that a rebuilt countdown reaches zero and re-sends \
+— that needs a real held turn, which cannot be provoked on demand. \
+Mutation-checked: resetting the attempt count, widening the grace to thirty \
+days, dropping either dirty-mark, and leaving the dormant mark set each fail \
+exactly one of these, and a different one each time. \
+\
+The back-compat case is derived from the struct (serialize, delete the one key, \
+reload) rather than pinned as a hand-written literal, so it cannot drift out of \
+date and start passing for the wrong reason. Checked once against the 122 real \
+blobs in the author's own database: 120 load, and the 2 that do not fail on a \
+pre-existing `ThreadEntry::User` shape change unrelated to this field."""
+test_files = [
+  "apps/desktop/src/shell/agent_chat/retry.rs",
+  "apps/desktop/src/session_restore/persisted_chat.rs",
+]
+assertions = [
+  "a_retry_whose_reset_is_still_ahead_comes_back_armed",
+  "a_retry_the_app_slept_through_is_dropped",
+  "a_reset_that_passed_moments_ago_still_fires",
+  "a_disabled_setting_refuses_the_rebuild",
+  "a_wait_longer_than_the_current_setting_is_refused",
+  "restoring_a_retry_leaves_the_blob_clean",
+  "arming_a_retry_marks_the_blob_for_saving",
+  "a_cancelled_retry_leaves_nothing_in_the_blob",
+  "a_retry_firing_before_first_render_consumes_the_dormant_mark",
+  "blobs_predating_pending_retry_still_load",
+  "an_armed_retry_round_trips_through_the_blob",
+]
+
+[[gate]]
 id = "thread.transcript-invariants-hold-for-every-agent"
 title = "No agent leaves a spinner running or a row duplicated"
 status = "stable"
