@@ -579,54 +579,90 @@ fn worker_loop(
     };
     let posture = protocol::Posture { approval_policy: &approval, sandbox: &sandbox };
 
-    // Resume the persisted thread when restoring; else start fresh. A failed
-    // resume (thread gone / experimental) degrades to a fresh start.
+    // Resume the persisted thread when restoring; else start fresh.
+    //
+    // A resume that FAILS is never answered with `thread/start`. That seats a
+    // thread the agent has no memory of underneath the transcript the user is
+    // reading, writing a different rollout, with nothing on screen to say so —
+    // and the failures that reach here are mostly not "this thread is gone"
+    // anyway: a writer conflict means someone else holds it, `database is
+    // locked` is transient sqlite contention, and an archived thread is one
+    // `thread/unarchive` away from resuming exactly where it left off. The one
+    // genuinely-gone case (a deleted rollout) is still better shown than
+    // silently replaced, because the conversation is on screen either way.
     let resume_id = resume.as_deref().filter(|s| !s.is_empty());
-    let started = match resume_id {
-        Some(tid) => rpc.request(
-            protocol::M_THREAD_RESUME,
-            protocol::thread_resume_params(tid, model.as_deref(), posture),
-            HANDSHAKE_TIMEOUT,
-        ),
-        None => rpc.request(
+    let res = match resume_id {
+        None => match rpc.request(
             protocol::M_THREAD_START,
             protocol::thread_start_params(model.as_deref(), &cwd, posture),
             HANDSHAKE_TIMEOUT,
-        ),
-    };
-    let res = match started {
-        Ok(r) => Some(r),
-        // A thread another process is writing is NOT a thread to replace. Fail
-        // the connection so the user sees why, rather than silently seating a
-        // memory-less fresh thread under the transcript they are reading
-        // (see `protocol::is_thread_writer_conflict`).
-        Err(e) if resume_id.is_some() && protocol::is_thread_writer_conflict(&e.to_string()) => {
-            tracing::warn!(error = %e, "codex thread/resume refused: another writer holds the thread");
-            abandon_handshake(
-                &rpc,
-                &event_tx,
-                "This Codex session is open somewhere else — another window, tab, \
-                 or terminal is holding it. Close that one, then reconnect.",
-            );
-            return;
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                abandon_handshake(&rpc, &event_tx, format!("codex thread/start failed: {e}"));
+                return;
+            }
+        },
+        Some(tid) => {
+            let params = protocol::thread_resume_params(tid, model.as_deref(), posture);
+            match rpc.request(protocol::M_THREAD_RESUME, params.clone(), HANDSHAKE_TIMEOUT) {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = e.to_string();
+                    if protocol::is_thread_writer_conflict(&err) {
+                        tracing::warn!(error = %e, "codex thread/resume refused: another writer holds the thread");
+                        abandon_handshake(
+                            &rpc,
+                            &event_tx,
+                            "This Codex session is open somewhere else — another window, tab, \
+                             or terminal is holding it. Close that one, then reconnect.",
+                        );
+                        return;
+                    }
+                    if !protocol::is_archived_thread(&err, tid) {
+                        tracing::warn!(error = %e, "codex thread/resume failed");
+                        abandon_handshake(
+                            &rpc,
+                            &event_tx,
+                            format!("Codex could not reopen this session: {err}"),
+                        );
+                        return;
+                    }
+                    // Archived: unarchive, then resume for real. A racing
+                    // unarchive (or a thread that was never archived) reports
+                    // "no archived rollout found" — nothing left to do, so the
+                    // retry below simply goes ahead.
+                    tracing::info!(thread_id = %tid, "unarchiving an archived codex thread to resume it");
+                    match rpc.request(
+                        protocol::M_THREAD_UNARCHIVE,
+                        json!({ "threadId": tid }),
+                        HANDSHAKE_TIMEOUT,
+                    ) {
+                        Ok(_) => {}
+                        Err(ue) if protocol::is_already_unarchived(&ue.to_string(), tid) => {}
+                        Err(ue) => {
+                            abandon_handshake(
+                                &rpc,
+                                &event_tx,
+                                format!("Codex could not unarchive this session: {ue}"),
+                            );
+                            return;
+                        }
+                    }
+                    match rpc.request(protocol::M_THREAD_RESUME, params, HANDSHAKE_TIMEOUT) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            abandon_handshake(
+                                &rpc,
+                                &event_tx,
+                                format!("Codex could not reopen this unarchived session: {e}"),
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
         }
-        Err(e) if resume_id.is_some() => {
-            tracing::warn!(error = %e, "codex thread/resume failed; starting a fresh thread");
-            rpc.request(
-                protocol::M_THREAD_START,
-                protocol::thread_start_params(model.as_deref(), &cwd, posture),
-                HANDSHAKE_TIMEOUT,
-            )
-            .ok()
-        }
-        Err(e) => {
-            abandon_handshake(&rpc, &event_tx, format!("codex thread/start failed: {e}"));
-            return;
-        }
-    };
-    let Some(res) = res else {
-        abandon_handshake(&rpc, &event_tx, "codex thread/start failed after resume");
-        return;
     };
     // A handshake with no thread id is a hard failure — every later turn/cancel
     // would target an empty id. Surface it rather than pretending to connect.
@@ -901,11 +937,15 @@ while read line; do :; done
         drop(inbound);
     }
 
-    /// The other resume failures still degrade to a fresh thread — a rollout
-    /// that is gone really is a thread to replace, and narrowing that to the
-    /// writer conflict is the whole point of classifying.
+    /// An ARCHIVED thread is unarchived and resumed, not replaced.
+    ///
+    /// codex refuses the resume with "session <id> is archived. Run `codex
+    /// unarchive <id>` to unarchive it first." — a thread that is one call away
+    /// from reopening exactly where the user left it, which the old
+    /// degrade-to-`thread/start` answered with an empty one.
     #[test]
-    fn a_missing_thread_still_degrades_to_a_fresh_start() {
+    fn an_archived_thread_is_unarchived_and_resumed() {
+        // ids: 1 initialize, 2 model/list, 3 resume (archived), 4 unarchive, 5 resume.
         let script = r#"
 read line
 printf '{"id":1,"result":{}}\n'
@@ -913,9 +953,11 @@ read line
 printf '{"id":2,"result":{}}\n'
 read line
 read line
-printf '{"id":3,"error":{"code":-32600,"message":"no rollout found for thread id t-1"}}\n'
+printf '{"id":3,"error":{"code":-32600,"message":"session t-1 is archived. Run `codex unarchive t-1` to unarchive it first."}}\n'
 read line
-printf '{"id":4,"result":{"thread":{"id":"fresh-thread"},"model":"m"}}\n'
+printf '{"id":4,"result":{}}\n'
+read line
+printf '{"id":5,"result":{"thread":{"id":"t-1"},"model":"m"}}\n'
 sleep 0.5
 "#;
         let (rpc, _inbound, _child) =
@@ -938,8 +980,51 @@ sleep 0.5
         let _ = out_tx.send(Outbound::Shutdown);
         let _ = worker.join();
         assert!(
-            matches!(init, Ok(ThreadEvent::SessionInit { ref session_id, .. }) if session_id == "fresh-thread"),
-            "a vanished thread still starts fresh, got {init:?}"
+            matches!(init, Ok(ThreadEvent::SessionInit { ref session_id, .. }) if session_id == "t-1"),
+            "the archived thread itself must come back, got {init:?}"
+        );
+    }
+
+    /// Every other resume failure is reported, never answered with a fresh
+    /// thread. `database is locked` stands in for the whole class: transient,
+    /// retryable, and emphatically not a reason to replace the conversation the
+    /// user is looking at.
+    #[test]
+    fn an_unrecoverable_resume_is_reported_not_replaced() {
+        let script = r#"
+read line
+printf '{"id":1,"result":{}}\n'
+read line
+printf '{"id":2,"result":{}}\n'
+read line
+read line
+printf '{"id":3,"error":{"code":-32600,"message":"database is locked"}}\n'
+read line
+printf '{"id":4,"result":{"thread":{"id":"fresh-thread"},"model":"m"}}\n'
+sleep 0.5
+"#;
+        let (rpc, _inbound, _child) =
+            transport::RpcClient::spawn_command(crate::thread::sh_fixture::sh_script(script))
+                .expect("spawn fake app-server");
+        let (event_tx, events) = mpsc::channel();
+        let (_out_tx, out_rx) = mpsc::channel();
+        worker_loop(
+            rpc,
+            event_tx,
+            Arc::new(Mutex::new(CodexState::default())),
+            out_rx,
+            std::path::PathBuf::from("."),
+            None,
+            Some("t-1".to_string()),
+        );
+        let seen: Vec<ThreadEvent> = events.try_iter().collect();
+        assert!(
+            !seen.iter().any(|e| matches!(e, ThreadEvent::SessionInit { .. })),
+            "a failed resume must not seat a fresh thread: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|e| matches!(e, ThreadEvent::Error(m) if m.contains("database is locked"))),
+            "the real reason must reach the user: {seen:?}"
         );
     }
 

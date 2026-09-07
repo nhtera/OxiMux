@@ -24,6 +24,7 @@ pub const M_INITIALIZE: &str = "initialize";
 pub const M_THREAD_START: &str = "thread/start";
 pub const M_THREAD_RESUME: &str = "thread/resume";
 pub const M_THREAD_FORK: &str = "thread/fork";
+pub const M_THREAD_UNARCHIVE: &str = "thread/unarchive";
 pub const M_MODEL_LIST: &str = "model/list";
 pub const M_TURN_START: &str = "turn/start";
 pub const M_TURN_INTERRUPT: &str = "turn/interrupt";
@@ -188,6 +189,26 @@ pub fn is_thread_writer_conflict(err: &str) -> bool {
     err.contains("already has an active writer")
 }
 
+/// Whether a `thread/resume` failure is codex saying the thread is ARCHIVED
+/// rather than gone: `session <id> is archived. Run `codex unarchive <id>` to
+/// unarchive it first.` The caller answers it with
+/// [`M_THREAD_UNARCHIVE`] and retries, so an archived session reopens where the
+/// user left it instead of being replaced by an empty one.
+///
+/// Requires the thread id as well as the phrase, so a message about some OTHER
+/// session cannot be mistaken for this one's.
+pub fn is_archived_thread(err: &str, thread_id: &str) -> bool {
+    err.contains("is archived") && err.contains(thread_id)
+}
+
+/// Whether a `thread/unarchive` failure means there was nothing to unarchive —
+/// someone else got there first, or the thread was never archived. Success as
+/// far as the caller is concerned: the resume it was clearing the way for can
+/// go ahead.
+pub fn is_already_unarchived(err: &str, thread_id: &str) -> bool {
+    err.contains("no archived rollout found") && err.contains(thread_id)
+}
+
 /// Pull `thread.id` out of a `thread/start` (or `thread/resume`) response.
 pub fn thread_id_from_start_response(result: &Value) -> Option<String> {
     result.get("thread")?.get("id")?.as_str().map(String::from)
@@ -302,6 +323,21 @@ mod tests {
             assert!(!is_thread_writer_conflict(other), "{other} is not a writer conflict");
         }
         assert!(!is_thread_writer_conflict("codex thread/resume timed out"));
+    }
+
+    #[test]
+    fn archived_and_already_unarchived_are_told_apart() {
+        // codex 0.153.4's wording, verbatim.
+        let archived = r#"{"code":-32600,"message":"session t-1 is archived. Run `codex unarchive t-1` to unarchive it first."}"#;
+        assert!(is_archived_thread(archived, "t-1"));
+        // Another session's archive notice is not this session's problem.
+        assert!(!is_archived_thread(archived, "t-2"));
+        assert!(!is_archived_thread(r#"{"message":"database is locked"}"#, "t-1"));
+        // Nothing to unarchive = the resume may proceed.
+        let none = r#"{"message":"no archived rollout found for thread id t-1"}"#;
+        assert!(is_already_unarchived(none, "t-1"));
+        assert!(!is_already_unarchived(none, "t-2"));
+        assert!(!is_already_unarchived(archived, "t-1"));
     }
 
     #[test]
