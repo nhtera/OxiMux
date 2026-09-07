@@ -255,6 +255,8 @@ fn usage_of(message: Option<&Value>, context_window: Option<u64>) -> Option<Turn
         context_window,
         // pi reports real dollars, unlike backends that only expose tokens.
         cost_usd: u.get("cost").and_then(|c| c.get("total")).and_then(Value::as_f64),
+        // Pi bills cache reads beside `input`, so the breakdown sums correctly.
+        total_tokens: None,
     })
 }
 

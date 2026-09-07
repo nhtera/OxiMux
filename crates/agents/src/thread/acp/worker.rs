@@ -755,6 +755,9 @@ fn usage_from_acp(u: &UsageUpdate) -> TurnUsage {
         cache_creation_tokens: 0,
         context_window: Some(u.size),
         cost_usd: u.cost.as_ref().map(|c| c.amount),
+        // `used` already IS the occupancy, and it lands in `input_tokens` with
+        // every other count zero — so the sum reproduces it exactly.
+        total_tokens: None,
     }
 }
 

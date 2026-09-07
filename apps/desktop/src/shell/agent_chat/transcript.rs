@@ -1574,8 +1574,9 @@ fn usage_footer(usage: &TurnUsage, theme: Theme, typo: &Typography) -> AnyElemen
         format!("{} out", fmt_tokens(usage.output_tokens)),
     ];
     if let Some(window) = usage.context_window.filter(|w| *w > 0) {
-        let used = usage.input_tokens + usage.cache_read_tokens + usage.cache_creation_tokens;
-        let pct = ((used as f64 / window as f64) * 100.0).round() as u64;
+        // Shares `context_used()` with the composer's meter so the footer and
+        // the meter cannot report two different percentages for one turn.
+        let pct = ((usage.context_used() as f64 / window as f64) * 100.0).round() as u64;
         parts.push(format!("{pct}% ctx"));
     }
     if let Some(cost) = usage.cost_usd.filter(|c| *c > 0.0) {

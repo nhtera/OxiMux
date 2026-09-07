@@ -1584,6 +1584,7 @@ mod tests {
                 input_tokens: 714, output_tokens: 7,
                 cache_read_tokens: 16681, cache_creation_tokens: 5571,
                 context_window: Some(200000), cost_usd: Some(0.33),
+                total_tokens: None,
             }),
             is_error: false, turn_diff: None });
         let u = t.usage.as_ref().expect("usage stored");
