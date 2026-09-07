@@ -17,12 +17,13 @@
 
 use std::path::PathBuf;
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
     div, px, relative, AnyElement, AppContext as _, Context, Entity, Focusable as _,
     InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, MoveDown, MoveUp};
 use oximux_core::ForgeRefKind;
 
 use crate::shell::forge::{Forge, ForgeKind, ForgeListFilter, ForgeProvider as _, ItemDetail};
@@ -84,6 +85,10 @@ pub(super) struct ForgePicker {
     /// Bumped on each open so a listing the user has already dismissed (or
     /// reopened past) is discarded when it lands.
     pub generation: u64,
+    /// Index into the CURRENTLY VISIBLE rows (not into `rows`) of the row ↑/↓
+    /// have moved to, which Enter stages. Reset to 0 whenever the query changes,
+    /// because the row that was active is usually not in the new result set.
+    pub selected: usize,
 }
 
 /// Rank `rows` against `query`, returning indices in display order.
@@ -133,6 +138,18 @@ pub(super) fn rows_from_listings(
         .collect();
     rows.truncate(MAX_ROWS);
     rows
+}
+
+/// The row ↑/↓ moves to, wrapping at both ends.
+///
+/// `current` is clamped first: the filter can shrink under a selection made
+/// against a longer list, and an out-of-range index would otherwise wrap from a
+/// position that no longer exists. `len` must be non-zero — callers handle the
+/// empty list before reaching here.
+fn next_index(current: usize, delta: isize, len: usize) -> usize {
+    debug_assert!(len > 0, "next_index needs a non-empty list");
+    let clamped = current.min(len - 1) as isize;
+    (clamped + delta).rem_euclid(len as isize) as usize
 }
 
 /// Elide `title` to [`TITLE_MAX`] characters. Char-wise, not byte-wise, so a
@@ -194,8 +211,12 @@ impl AgentChatView {
         // The filter runs against what was typed, so each keystroke has to
         // repaint THIS view — the input's own entity notifying itself would
         // redraw the field and leave the list showing the previous query.
-        let _sub = cx.subscribe(&query, |_this, _input, ev: &InputEvent, cx| {
+        let _sub = cx.subscribe(&query, |this, _input, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
+                // The active row rarely survives a new query, so start over.
+                if let Some(p) = this.forge_picker.as_mut() {
+                    p.selected = 0;
+                }
                 cx.notify();
             }
         });
@@ -207,6 +228,7 @@ impl AgentChatView {
             loading: true,
             forge: forge_kind,
             generation,
+            selected: 0,
         });
         // Focused after the picker is staged, so the field the user types into
         // is the one that is actually on screen.
@@ -315,6 +337,66 @@ impl AgentChatView {
         }));
     }
 
+    /// Move the picker's active row by `delta`, wrapping at both ends.
+    ///
+    /// Returns whether the key was consumed. An empty result set still consumes
+    /// it: the picker is open and owns ↑/↓ while it is, and letting the key fall
+    /// through to the composer underneath would move a caret the user cannot see.
+    fn forge_picker_move(&mut self, delta: isize, len: usize, cx: &mut Context<Self>) -> bool {
+        let Some(picker) = self.forge_picker.as_mut() else {
+            return false;
+        };
+        if len == 0 {
+            return true;
+        }
+        picker.selected = next_index(picker.selected, delta, len);
+        cx.notify();
+        true
+    }
+
+    /// Stage the picker's active row (Enter). `visible` maps visible position →
+    /// index into `rows`, so it must be the same list the render just built.
+    fn forge_picker_accept(
+        &mut self,
+        visible: &[usize],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(picker) = self.forge_picker.as_ref() else {
+            return false;
+        };
+        // Consume Enter even with nothing to accept, so it cannot reach the
+        // composer and send a half-typed message from behind the picker.
+        let Some(&idx) = visible.get(picker.selected) else {
+            return true;
+        };
+        let Some(row) = picker.rows.get(idx).cloned() else {
+            return true;
+        };
+        self.stage_forge_item(row, window, cx);
+        true
+    }
+
+    /// Stage the picker's active row (Enter).
+    ///
+    /// Called from the chat root's `InputEnter` handler rather than from the
+    /// overlay: capture phase runs ancestor-first, so the root sees Enter before
+    /// anything this module could attach and would otherwise route it to the
+    /// composer. The visible set is recomputed from the live query here so the
+    /// row Enter takes is the row the list is currently showing.
+    pub(super) fn forge_picker_accept_active(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(picker) = self.forge_picker.as_ref() else {
+            return false;
+        };
+        let query = picker.query.read(cx).value().to_string();
+        let visible = filter_rows(&picker.rows, &query);
+        self.forge_picker_accept(&visible, window, cx)
+    }
+
     /// The picker overlay: a dark backdrop plus a centred card. `None` when the
     /// picker is closed.
     ///
@@ -327,6 +409,8 @@ impl AgentChatView {
         let density = self.density;
         let query = picker.query.read(cx).value().to_string();
         let visible = filter_rows(&picker.rows, &query);
+        // The filter can shrink under a selection made against a longer list.
+        let active = picker.selected.min(visible.len().saturating_sub(1));
 
         let heading = match picker.forge {
             ForgeKind::Github => "Add an issue or pull request",
@@ -355,8 +439,9 @@ impl AgentChatView {
             .max_h(px(LIST_MAX_H))
             .overflow_y_scroll();
 
-        for i in visible {
+        for (pos, i) in visible.iter().copied().enumerate() {
             let row = &picker.rows[i];
+            let is_active = pos == active;
             let number = format!("#{}", row.number);
             let title = elide(&row.title);
             let meta = if row.author.is_empty() {
@@ -377,6 +462,9 @@ impl AgentChatView {
                     .py(px(7.0))
                     .rounded(px(density.r_xs))
                     .cursor_pointer()
+                    // The keyboard's active row carries the same tint the pointer
+                    // gives, so both ways of choosing look like one affordance.
+                    .when(is_active, |s| s.bg(theme.bg_overlay))
                     .hover(|s| s.bg(theme.bg_overlay))
                     .child(
                         div()
@@ -447,6 +535,27 @@ impl AgentChatView {
                     MouseButton::Left,
                     cx.listener(|this, _e, window, cx| this.close_forge_picker(window, cx)),
                 )
+                // ↑/↓/Enter are captured here rather than left to the focused
+                // query field, which would otherwise move its caret instead of
+                // the list. Capture phase runs ancestor-first, so these see the
+                // key before the input does.
+                .capture_action(cx.listener({
+                    let len = visible.len();
+                    move |this, _: &MoveUp, _window, cx| {
+                        if this.forge_picker_move(-1, len, cx) {
+                            cx.stop_propagation();
+                        }
+                    }
+                }))
+                .capture_action(cx.listener({
+                    let len = visible.len();
+                    move |this, _: &MoveDown, _window, cx| {
+                        if this.forge_picker_move(1, len, cx) {
+                            cx.stop_propagation();
+                        }
+                    }
+                }))
+
                 .child(card)
                 .into_any_element(),
         )
@@ -545,6 +654,27 @@ mod tests {
         let out = elide(&title);
         assert!(out.ends_with('…'));
         assert_eq!(out.chars().count(), TITLE_MAX);
+    }
+
+    #[test]
+    fn arrow_keys_wrap_at_both_ends() {
+        assert_eq!(next_index(0, 1, 3), 1);
+        assert_eq!(next_index(2, 1, 3), 0, "down past the end wraps to the top");
+        assert_eq!(next_index(0, -1, 3), 2, "up past the top wraps to the end");
+    }
+
+    /// The filter can shrink under a selection made against a longer list, so a
+    /// stale index must clamp rather than wrap from a row that is gone.
+    #[test]
+    fn a_stale_selection_clamps_into_the_shorter_list() {
+        assert_eq!(next_index(9, 1, 3), 0, "clamp to 2, then step to 0");
+        assert_eq!(next_index(9, -1, 3), 1, "clamp to 2, then step to 1");
+    }
+
+    #[test]
+    fn a_single_row_list_stays_put() {
+        assert_eq!(next_index(0, 1, 1), 0);
+        assert_eq!(next_index(0, -1, 1), 0);
     }
 
     #[test]

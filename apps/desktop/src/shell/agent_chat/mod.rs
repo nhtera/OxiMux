@@ -5051,6 +5051,15 @@ impl Render for AgentChatView {
             // we stop propagation (otherwise the field inserts the newline). An
             // open slash/mention overlay makes ↵ accept the highlighted item.
             .capture_action(cx.listener(|this, _action: &InputEnter, window, cx| {
+                // The issue picker owns Enter while it is open: ↵ stages the
+                // active row. Checked first because this handler is the one that
+                // wins — capture runs ancestor-first, so a handler on the picker
+                // overlay itself would never be reached.
+                if this.forge_picker.is_some() {
+                    this.forge_picker_accept_active(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 // The find bar owns Enter while its input is focused: ↵ steps to
                 // the next match, ⇧↵ to the previous. Otherwise route to the
                 // composer as before.
