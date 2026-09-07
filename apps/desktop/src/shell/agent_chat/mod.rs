@@ -720,6 +720,13 @@ pub struct AgentChatView {
     /// The chat sent a prompt after the companion spawned — its CLI loaded the
     /// session at spawn and is now missing turns; see `companion_sync`.
     chat_advanced_since_companion: bool,
+    /// A companion spawn is in flight. `terminal` and `view_mode` are only set
+    /// when the spawn LANDS, so without this every toggle-guard still passes
+    /// while one is running and a second ⌃⇧V schedules a second companion —
+    /// which on a single-writer backend resumes a session the first spawn has
+    /// already taken the connection for. Set at the toggle, cleared on attach
+    /// or on any failure that ends the attempt.
+    companion_spawn_pending: bool,
     /// Repaints this view when the companion terminal notifies (PTY output /
     /// scroll). Held alongside `terminal`; dropped when the companion is dropped.
     _terminal_observer: Option<Subscription>,
@@ -3104,6 +3111,7 @@ impl AgentChatView {
             terminal: None,
             companion_session: None,
             chat_advanced_since_companion: false,
+            companion_spawn_pending: false,
             _terminal_observer: None,
             expanded_thinking: HashSet::new(),
             collapsed_thinking: HashSet::new(),

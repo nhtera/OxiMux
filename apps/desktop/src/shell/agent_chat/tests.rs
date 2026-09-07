@@ -1895,6 +1895,55 @@
             .expect("window update");
     }
 
+    /// A second ⌃⇧V while the first spawn is still in flight must not schedule
+    /// a second companion.
+    ///
+    /// `terminal` and `view_mode` are only set when a spawn LANDS, so every
+    /// toggle guard still passes during the async `start_session` — and on a
+    /// single-writer backend the second spawn would resume a session whose
+    /// connection the first spawn had already taken and shut down, then
+    /// overwrite its terminal and orphan the CLI. Found in review of the
+    /// handoff, which is what made the window damaging rather than merely
+    /// wasteful.
+    #[gpui::test]
+    async fn a_second_toggle_mid_spawn_is_refused(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                assert!(!view.companion_spawn_pending(), "nothing in flight to begin with");
+                // The host marks the spawn before scheduling it.
+                view.set_companion_spawn_pending(true);
+                assert!(
+                    view.companion_spawn_pending(),
+                    "a toggle arriving now must be refused, not scheduled"
+                );
+                // Still no companion and still in Chat view — i.e. every OTHER
+                // guard would have let the second toggle through.
+                assert!(!view.has_companion_terminal());
+                assert_eq!(view.view_mode(), ChatViewMode::Chat);
+                // A failed spawn clears it, so the next toggle can try again.
+                view.set_companion_spawn_pending(false);
+                assert!(!view.companion_spawn_pending());
+                // So does a companion that lands (via drop, the reap path).
+                view.set_companion_spawn_pending(true);
+                view.drop_companion_terminal(cx);
+                assert!(!view.companion_spawn_pending(), "a dropped companion ends the attempt");
+            })
+            .expect("window update");
+    }
+
     /// The ACP session id is an external, agent-supplied string; only ids safe to
     /// place on a resume command line are accepted (the rest leave the toggle off).
     #[test]

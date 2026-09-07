@@ -1375,6 +1375,15 @@ impl PaneGroup {
             );
             return;
         };
+        // One spawn at a time. `terminal`/`view_mode` are only set when the
+        // spawn LANDS, so until then every guard above still passes and a second
+        // ⌃⇧V would schedule a second companion — which on a single-writer
+        // backend resumes a session the first spawn has already taken the
+        // connection for, then overwrites its terminal and orphans the CLI.
+        if view.read(cx).companion_spawn_pending() {
+            return;
+        }
+        view.update(cx, |v, _cx| v.set_companion_spawn_pending(true));
         self.spawn_companion_terminal(view, spec, stale, window, cx);
     }
 
@@ -1526,6 +1535,7 @@ impl PaneGroup {
                     let _ = cx.update(|_, cx| {
                         crate::shell::toast::toast_op_error(cx, "Terminal view", &err.to_string());
                     });
+                    let _ = view.update_in(cx, |v, _window, _cx| v.set_companion_spawn_pending(false));
                     return;
                 }
             };
@@ -1534,6 +1544,7 @@ impl PaneGroup {
                 Err(err) => {
                     tracing::warn!(?err, "companion terminal backend_for failed");
                     let _ = runtime.cancel(session).await;
+                    let _ = view.update_in(cx, |v, _window, _cx| v.set_companion_spawn_pending(false));
                     return;
                 }
             };
@@ -1542,6 +1553,7 @@ impl PaneGroup {
                 Err(err) => {
                     tracing::warn!(?err, "companion terminal terminal_session_id failed");
                     let _ = runtime.cancel(session).await;
+                    let _ = view.update_in(cx, |v, _window, _cx| v.set_companion_spawn_pending(false));
                     return;
                 }
             };

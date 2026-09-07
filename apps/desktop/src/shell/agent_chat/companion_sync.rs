@@ -48,6 +48,7 @@ impl AgentChatView {
         self.terminal = Some(terminal);
         self.companion_session = Some(session);
         self.chat_advanced_since_companion = false;
+        self.companion_spawn_pending = false;
         self.view_mode = ChatViewMode::Terminal;
         self.focus_active_surface(window, cx);
         cx.notify();
@@ -106,6 +107,19 @@ impl AgentChatView {
         self.sync_composer(cx);
     }
 
+    /// Whether a companion spawn is already in flight, so the host can refuse a
+    /// second toggle rather than schedule a duplicate.
+    pub fn companion_spawn_pending(&self) -> bool {
+        self.companion_spawn_pending
+    }
+
+    /// Mark (or clear) an in-flight companion spawn. The host sets it
+    /// synchronously before scheduling, and clears it on every path that ends
+    /// the attempt without an attach.
+    pub fn set_companion_spawn_pending(&mut self, pending: bool) {
+        self.companion_spawn_pending = pending;
+    }
+
     /// Record that the chat sent a prompt while a companion terminal exists.
     /// The running interactive CLI loaded the session at spawn time and never
     /// re-reads the log, so from this moment its context is missing turns —
@@ -130,6 +144,7 @@ impl AgentChatView {
         self.companion_session = None;
         self._terminal_observer = None;
         self.chat_advanced_since_companion = false;
+        self.companion_spawn_pending = false;
         cx.notify();
     }
 

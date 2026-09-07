@@ -346,6 +346,7 @@ impl AgentChatView {
             terminal: None,
             companion_session: None,
             chat_advanced_since_companion: false,
+            companion_spawn_pending: false,
             _terminal_observer: None,
             expanded_thinking: HashSet::new(),
             collapsed_thinking: HashSet::new(),
