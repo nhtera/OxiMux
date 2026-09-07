@@ -377,6 +377,19 @@ impl PaneGroup {
         })
     }
 
+    /// Whether any chat tab here is bound to the agent session `session_id`.
+    ///
+    /// Keyed on the AGENT session id (Codex's thread id, Claude's session id),
+    /// not the remote id [`Self::agent_chat_view_by_remote_id`] matches — the
+    /// caller is asking "would resuming this session collide with a chat that
+    /// already owns it", and it is the agent's own id the CLI would resume.
+    pub fn has_agent_chat_for_session(&self, session_id: &str, cx: &gpui::App) -> bool {
+        self.tabs.iter().any(|tab| {
+            matches!(&tab.content, PaneContent::AgentChat(view)
+                if view.read(cx).session_id() == Some(session_id))
+        })
+    }
+
     /// The active tab's agent session id, if the active tab is an agent.
     /// Used by "send to active agent" actions to route directly to the
     /// agent in the focused tab — the most common layout has terminal +

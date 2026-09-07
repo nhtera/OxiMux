@@ -272,6 +272,8 @@ fn usage_of(message: Option<&Value>, context_window: Option<u64>) -> Option<Turn
         cache_creation_tokens: n("cacheWrite"),
         context_window,
         cost_usd: u.get("cost").and_then(|c| c.get("total")).and_then(Value::as_f64),
+        // Same additive cache convention as Pi, whose fields these mirror.
+        total_tokens: None,
     })
 }
 

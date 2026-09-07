@@ -346,6 +346,7 @@ impl AgentChatView {
             terminal: None,
             companion_session: None,
             chat_advanced_since_companion: false,
+            companion_spawn_pending: false,
             _terminal_observer: None,
             expanded_thinking: HashSet::new(),
             collapsed_thinking: HashSet::new(),
@@ -448,17 +449,16 @@ impl AgentChatView {
         // constructed with the generic "Agent" placeholder).
         let provider_label = self.provider_label().to_string();
         // Live context-meter inputs: prefer the mid-turn `live_usage`, fall back
-        // to the settled `usage`; total token occupancy = input + cache + output
-        // (ACP folds its whole "used" count into `input_tokens`). The window is
-        // the cross-turn cached denominator; cost is the session accumulator.
+        // to the settled `usage`. Occupancy comes from `context_used()` and must
+        // not be recomputed here — the cache counts mean different things per
+        // backend. The window is the cross-turn cached denominator; cost is the
+        // session accumulator.
         let meter_used = self
             .thread
             .live_usage
             .as_ref()
             .or(self.thread.usage.as_ref())
-            .map(|u| {
-                u.input_tokens + u.cache_read_tokens + u.cache_creation_tokens + u.output_tokens
-            });
+            .map(TurnUsage::context_used);
         let meter_window = self.thread.last_known_context_window;
         let meter_cost = self.thread.session_cost_usd;
         // An unbound draft has no `connection`, so `caps`/`vocab` above are the

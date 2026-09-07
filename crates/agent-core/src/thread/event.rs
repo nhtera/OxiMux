@@ -15,6 +15,15 @@ use super::tool_call::{PermissionKind, PermissionSuggestion};
 /// Per-turn token/cost usage, decoded from the final `result` event. All counts
 /// are best-effort (0 when the field is absent); `cost_usd`/`context_window` are
 /// optional because not every turn reports them.
+///
+/// **Never sum these fields by hand — call [`TurnUsage::context_used`].** The
+/// cache counts follow Anthropic's convention, where a cache read is billed
+/// *beside* `input_tokens` and so adds to occupancy. Codex uses the opposite
+/// convention: its `cachedInputTokens` is a *subset* of its `inputTokens` (the
+/// app-server publishes a separate `netNewInputTokens` for the difference), so
+/// adding them double-counts the cache — which is exactly what the context
+/// meter used to do, reporting 61% for a thread sitting at 31%. Backends on the
+/// subset convention publish their own occupancy in `total_tokens` instead.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct TurnUsage {
     pub input_tokens: u64,
@@ -24,6 +33,32 @@ pub struct TurnUsage {
     /// The model's context-window size (from `modelUsage`), for a "% of Nk" readout.
     pub context_window: Option<u64>,
     pub cost_usd: Option<f64>,
+    /// The backend's *own* total-occupancy count, when it publishes one. Set
+    /// only by backends whose breakdown cannot be summed (see the type doc);
+    /// `None` everywhere else, which is why it is the preferred numerator
+    /// rather than a redundant one. Codex also fills this on turns where every
+    /// component field is zero but the total is real — 224 of 56,074 readings
+    /// in a live rollout corpus — so reconstructing it would read those as 0%.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+}
+
+impl TurnUsage {
+    /// Total context occupancy in tokens — the one numerator every meter and
+    /// footer must use, so the two can never drift apart again (they had:
+    /// one summed the output tokens, the other didn't).
+    ///
+    /// Prefers the backend's published [`total_tokens`](Self::total_tokens) and
+    /// otherwise sums the breakdown, which is correct for every backend on the
+    /// additive cache convention.
+    pub fn context_used(&self) -> u64 {
+        self.total_tokens.unwrap_or_else(|| {
+            self.input_tokens
+                + self.cache_read_tokens
+                + self.cache_creation_tokens
+                + self.output_tokens
+        })
+    }
 }
 
 /// One authentication method an ACP agent advertises when it needs login, in a
@@ -564,6 +599,53 @@ impl ThreadEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn occupancy_prefers_a_published_total_over_the_breakdown() {
+        // Codex's shape: the cache read is already inside `input_tokens`.
+        let codex = TurnUsage {
+            input_tokens: 81_099,
+            output_tokens: 11,
+            cache_read_tokens: 75_776,
+            total_tokens: Some(81_110),
+            ..Default::default()
+        };
+        assert_eq!(codex.context_used(), 81_110, "summing would give 156,886");
+    }
+
+    #[test]
+    fn occupancy_sums_the_breakdown_for_additive_backends() {
+        // Anthropic's shape: the cache read is billed beside the input, so it
+        // genuinely adds to what the window holds.
+        let claude = TurnUsage {
+            input_tokens: 1_000,
+            output_tokens: 200,
+            cache_read_tokens: 5_000,
+            cache_creation_tokens: 300,
+            ..Default::default()
+        };
+        assert_eq!(claude.context_used(), 6_500);
+    }
+
+    #[test]
+    fn a_published_total_survives_a_persistence_round_trip() {
+        // The field is `skip_serializing_if`, so it must both stay absent for
+        // the additive backends and come back for the ones that publish it.
+        let codex = TurnUsage { total_tokens: Some(81_110), ..Default::default() };
+        let json = serde_json::to_string(&codex).unwrap();
+        assert_eq!(serde_json::from_str::<TurnUsage>(&json).unwrap(), codex);
+        let claude = TurnUsage { input_tokens: 7, ..Default::default() };
+        assert!(!serde_json::to_string(&claude).unwrap().contains("total_tokens"));
+    }
+
+    #[test]
+    fn a_blob_written_before_the_field_existed_still_loads() {
+        let legacy = r#"{"input_tokens":10,"output_tokens":2,"cache_read_tokens":0,
+                         "cache_creation_tokens":0,"context_window":null,"cost_usd":null}"#;
+        let u: TurnUsage = serde_json::from_str(legacy).unwrap();
+        assert_eq!(u.total_tokens, None);
+        assert_eq!(u.context_used(), 12);
+    }
 
     #[test]
     fn only_content_extending_events_are_deltas() {

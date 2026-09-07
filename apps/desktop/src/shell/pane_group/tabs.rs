@@ -1323,10 +1323,39 @@ impl PaneGroup {
     ) {
         // In terminal view → back to chat (no spawn).
         if view.read(cx).view_mode() == ChatViewMode::Terminal {
+            // A single-writer backend handed the session to the terminal on the
+            // way in; hand it back the same way — reap the CLI first, then
+            // reconnect once its exit is observed.
+            if view.read(cx).needs_session_handoff() {
+                self.return_session_from_companion(view, window, cx);
+                return;
+            }
             view.update(cx, |v, cx| v.set_view_mode(ChatViewMode::Chat, window, cx));
             self.focus_active(window, cx);
             return;
         }
+        // Never hand the session over mid-answer: the chat is streaming a turn
+        // the user asked for, and killing the connection under it strands the
+        // reply half-written with no way to get the rest back. Checked before
+        // anything is reaped or dropped, so a refused toggle changes nothing.
+        if view.read(cx).needs_session_handoff() && view.read(cx).turn_active() {
+            crate::shell::toast::toast_op_error(
+                cx,
+                "Terminal view",
+                "Wait for this turn to finish (or Stop it) — only one process at a time can hold a Codex session.",
+            );
+            return;
+        }
+        // A companion the chat has outrun must be replaced rather than shown:
+        // its CLI loaded the session at spawn and never re-reads the log, so
+        // chat-sent turns are missing from BOTH its display and its context and
+        // it would answer the next terminal prompt without them. Reaped below,
+        // before the fresh spawn whose `--resume` re-reads the full log.
+        //
+        // On a single-writer backend the chat never has a live companion here
+        // at all (the toggle back reaps it), so `stale` only ever carries the
+        // other backends' outrun CLI.
+        let mut stale = None;
         if view.read(cx).has_companion_terminal() {
             // Current companion → just show it (instant, the CLI stayed alive).
             if !view.read(cx).companion_terminal_stale() {
@@ -1334,21 +1363,7 @@ impl PaneGroup {
                 self.focus_active(window, cx);
                 return;
             }
-            // The chat sent prompts after this companion spawned. Its CLI
-            // loaded the session at spawn and never re-reads the log, so those
-            // turns are missing from BOTH its display and its context — it
-            // would answer the next terminal prompt without them. Reap it and
-            // fall through to a fresh spawn, whose `--resume` re-reads the
-            // full log.
-            if let Some(stale) = view.read(cx).companion_session_id() {
-                let runtime = self.cli_runtime.clone();
-                cx.spawn_in(window, async move |_this, _cx| {
-                    if let Err(err) = runtime.cancel(stale).await {
-                        tracing::warn!(?err, "stale companion terminal cancel failed");
-                    }
-                })
-                .detach();
-            }
+            stale = view.read(cx).companion_session_id();
             view.update(cx, |v, cx| v.drop_companion_terminal(cx));
         }
         // First switch: spawn the resume terminal, then attach it.
@@ -1360,7 +1375,80 @@ impl PaneGroup {
             );
             return;
         };
-        self.spawn_companion_terminal(view, spec, window, cx);
+        // One spawn at a time. `terminal`/`view_mode` are only set when the
+        // spawn LANDS, so until then every guard above still passes and a second
+        // ⌃⇧V would schedule a second companion — which on a single-writer
+        // backend resumes a session the first spawn has already taken the
+        // connection for, then overwrites its terminal and orphans the CLI.
+        if view.read(cx).companion_spawn_pending() {
+            return;
+        }
+        view.update(cx, |v, _cx| v.set_companion_spawn_pending(true));
+        self.spawn_companion_terminal(view, spec, stale, window, cx);
+    }
+
+    /// Take the session back from a companion terminal on a backend where only
+    /// one process may write it (Codex). Reap the CLI, wait for its exit to be
+    /// observed, then fold its turns in and reconnect the chat.
+    ///
+    /// The order is the whole point. The terminal's lock outlives a `cancel()`
+    /// that is merely *sent*, so reconnecting before the exit lands would race
+    /// the chat's own `thread/resume` against a lock still held — and the fold
+    /// would read a rollout the CLI had not finished flushing.
+    fn return_session_from_companion(
+        &mut self,
+        view: Entity<crate::shell::agent_chat::AgentChatView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let companion = view.read(cx).companion_session_id();
+        let runtime = self.cli_runtime.clone();
+        cx.spawn_in(window, async move |group, cx| {
+            if let Some(session) = companion
+                && let Err(err) = runtime.cancel(session).await
+            {
+                tracing::warn!(?err, "companion terminal cancel failed on session handback");
+            }
+            let _ = view.update_in(cx, |v, window, cx| {
+                // Fold first (the mode switch is what triggers it), while the
+                // companion is still registered — then drop it, then reconnect.
+                // The fold reads the rollout on a background thread and applies
+                // its tail after this returns, so a session that grew in the
+                // terminal respawns once more when that lands. Redundant (this
+                // reconnect already re-read the log, the CLI having been reaped
+                // above) but harmless — the respawn reaps before it connects,
+                // so the two never hold the thread at once.
+                v.set_view_mode(ChatViewMode::Chat, window, cx);
+                v.drop_companion_terminal(cx);
+                v.reconnect_after_handoff(cx);
+            });
+            let _ = group.update_in(cx, |g, window, cx| g.focus_active(window, cx));
+        })
+        .detach();
+    }
+
+    /// Abandon an in-flight companion spawn, leaving the chat usable.
+    ///
+    /// Clearing the pending flag is only half of it. When the spawn began with
+    /// a handoff, the chat already gave up its connection and shut it down so
+    /// the companion could take the thread's writer lock — so a failure after
+    /// that point strands the tab in Chat mode with no agent behind it, and the
+    /// user cannot type. Taking the session back is what makes a failed
+    /// terminal launch a non-event rather than a dead chat.
+    ///
+    /// `handoff` gates the reconnect because without one the chat never let go,
+    /// and respawning a connection it still holds would be a second agent.
+    fn abandon_spawn(
+        view: &Entity<crate::shell::agent_chat::AgentChatView>,
+        handoff: bool,
+        cx: &mut gpui::AsyncWindowContext,
+    ) {
+        let _ = view.update_in(cx, |v, _window, cx| {
+            v.set_companion_spawn_pending(false);
+            if handoff {
+                v.reconnect_after_handoff(cx);
+            }
+        });
     }
 
     /// Spawn a companion terminal that resumes the chat's session interactively
@@ -1372,10 +1460,12 @@ impl PaneGroup {
         &mut self,
         view: Entity<crate::shell::agent_chat::AgentChatView>,
         spec: ChatTerminalSpec,
+        stale: Option<AgentSessionId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let runtime = self.cli_runtime.clone();
+        let handoff = view.read(cx).needs_session_handoff();
         // Per-agent launch defaults (model fallback + extra args + env), read
         // under the chat's own profile so the companion terminal reaches the
         // same endpoint/account as the chat it is resuming.
@@ -1418,6 +1508,29 @@ impl PaneGroup {
             })
             .flatten();
         cx.spawn_in(window, async move |group, cx| {
+            // Reap an outrun companion before its replacement resumes the same
+            // session — awaited, not detached, because on a single-writer
+            // backend the two would otherwise contend for the same lock.
+            if let Some(session) = stale
+                && let Err(err) = runtime.cancel(session).await
+            {
+                tracing::warn!(?err, "stale companion terminal cancel failed");
+            }
+            // Codex 0.153.4 took a per-thread writer lock
+            // (`$CODEX_HOME/thread-writer-locks/<thread>.lock`), and the chat's
+            // own app-server is holding this thread's. The companion's
+            // `thread/resume` is refused while it does — `-32600 already has an
+            // active writer`, and the terminal dies on its first frame — so the
+            // chat gives the session up here and takes it back on the way out
+            // (`return_session_from_companion`). Shutdown reaps: it returns
+            // once the child is confirmed dead, which is what makes the lock
+            // provably free rather than probably free.
+            if handoff
+                && let Ok(Some(conn)) =
+                    view.update_in(cx, |v, _window, cx| v.take_connection_for_handoff(cx))
+            {
+                cx.background_spawn(async move { conn.shutdown() }).await;
+            }
             let cfg = AgentSessionConfig {
                 adapter,
                 worktree_path: cwd,
@@ -1446,6 +1559,7 @@ impl PaneGroup {
                     let _ = cx.update(|_, cx| {
                         crate::shell::toast::toast_op_error(cx, "Terminal view", &err.to_string());
                     });
+                    Self::abandon_spawn(&view, handoff, cx);
                     return;
                 }
             };
@@ -1454,6 +1568,7 @@ impl PaneGroup {
                 Err(err) => {
                     tracing::warn!(?err, "companion terminal backend_for failed");
                     let _ = runtime.cancel(session).await;
+                    Self::abandon_spawn(&view, handoff, cx);
                     return;
                 }
             };
@@ -1462,6 +1577,7 @@ impl PaneGroup {
                 Err(err) => {
                     tracing::warn!(?err, "companion terminal terminal_session_id failed");
                     let _ = runtime.cancel(session).await;
+                    Self::abandon_spawn(&view, handoff, cx);
                     return;
                 }
             };
@@ -2670,4 +2786,43 @@ impl PaneGroup {
 /// empty transcript seed — the thread resume still works).
 fn codex_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".codex"))
+}
+
+#[cfg(test)]
+mod companion_spawn_recovery_tests {
+    /// Every abandoned companion spawn must go through `abandon_spawn`.
+    ///
+    /// The behavioural half of this lives in `agent_chat::tests`
+    /// (`a_failed_spawn_after_handoff_gives_the_chat_back`), which proves the
+    /// recovery works. What it cannot reach is the *wiring*: driving the real
+    /// `spawn_companion_terminal` to each of its three failure points needs a
+    /// runtime that fails on demand. So this pins the invariant that makes the
+    /// wiring correct by construction — the pending flag is cleared in exactly
+    /// one place in this file, and that place also offers the chat its session
+    /// back. A new failure path that clears the flag inline would reintroduce
+    /// the dead-chat bug and fail here.
+    #[test]
+    fn the_pending_flag_is_only_ever_cleared_by_abandon_spawn() {
+        // Scan only the production half — this module's own assertions quote
+        // the very strings being counted.
+        let src = include_str!("tabs.rs")
+            .split("mod companion_spawn_recovery_tests")
+            .next()
+            .expect("source before this test module");
+        assert_eq!(
+            src.matches("set_companion_spawn_pending(false)").count(),
+            1,
+            "clear the flag via abandon_spawn, so the handed-off connection comes back too"
+        );
+        let helper = src
+            .split_once("fn abandon_spawn(")
+            .expect("abandon_spawn exists")
+            .1;
+        let body = &helper[..helper.find("\n    }").expect("helper body ends")];
+        assert!(
+            body.contains("set_companion_spawn_pending(false)")
+                && body.contains("reconnect_after_handoff"),
+            "abandon_spawn must do both halves: clear the flag AND restore the chat"
+        );
+    }
 }

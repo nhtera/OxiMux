@@ -24,6 +24,7 @@ pub const M_INITIALIZE: &str = "initialize";
 pub const M_THREAD_START: &str = "thread/start";
 pub const M_THREAD_RESUME: &str = "thread/resume";
 pub const M_THREAD_FORK: &str = "thread/fork";
+pub const M_THREAD_UNARCHIVE: &str = "thread/unarchive";
 pub const M_MODEL_LIST: &str = "model/list";
 pub const M_TURN_START: &str = "turn/start";
 pub const M_TURN_INTERRUPT: &str = "turn/interrupt";
@@ -168,6 +169,46 @@ pub fn thread_fork_params(thread_id: &str, last_turn_id: Option<&str>) -> Value 
     p
 }
 
+/// Whether a `thread/resume` failure is codex refusing a SECOND writer for a
+/// thread some other process already owns.
+///
+/// codex 0.153.4 took a per-thread writer lock (`$CODEX_HOME/thread-writer-locks/
+/// <thread-id>.lock`, plus a `.coordination.lock` for stale sweeps) — before
+/// that, two writers on one rollout were merely discouraged. A resume that
+/// loses the race comes back as `{"code":-32600,"message":"thread <id> already
+/// has an active writer"}`, and unlike every other resume failure it says the
+/// thread is FINE — someone else is simply holding it. Falling back to
+/// `thread/start` there mints a fresh thread under a transcript the user is
+/// looking at: an agent that remembers none of it, writing to a different
+/// rollout, with no visible sign either happened.
+///
+/// Matched on the message, never on the code: codex spends `-32600` on
+/// unrelated refusals too (a missing rollout, an unparseable one, a locked
+/// state db, an auth failure), and those genuinely are "this thread is gone".
+pub fn is_thread_writer_conflict(err: &str) -> bool {
+    err.contains("already has an active writer")
+}
+
+/// Whether a `thread/resume` failure is codex saying the thread is ARCHIVED
+/// rather than gone: `session <id> is archived. Run `codex unarchive <id>` to
+/// unarchive it first.` The caller answers it with
+/// [`M_THREAD_UNARCHIVE`] and retries, so an archived session reopens where the
+/// user left it instead of being replaced by an empty one.
+///
+/// Requires the thread id as well as the phrase, so a message about some OTHER
+/// session cannot be mistaken for this one's.
+pub fn is_archived_thread(err: &str, thread_id: &str) -> bool {
+    err.contains("is archived") && err.contains(thread_id)
+}
+
+/// Whether a `thread/unarchive` failure means there was nothing to unarchive —
+/// someone else got there first, or the thread was never archived. Success as
+/// far as the caller is concerned: the resume it was clearing the way for can
+/// go ahead.
+pub fn is_already_unarchived(err: &str, thread_id: &str) -> bool {
+    err.contains("no archived rollout found") && err.contains(thread_id)
+}
+
 /// Pull `thread.id` out of a `thread/start` (or `thread/resume`) response.
 pub fn thread_id_from_start_response(result: &Value) -> Option<String> {
     result.get("thread")?.get("id")?.as_str().map(String::from)
@@ -263,6 +304,41 @@ pub fn parse_model_list(result: &Value) -> Vec<CodexModel> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn writer_conflict_is_told_apart_from_the_other_refusals() {
+        // The real refusal, verbatim off the wire (the transport hands the whole
+        // error object through as a string, code included).
+        assert!(is_thread_writer_conflict(
+            r#"codex thread/resume error: {"code":-32600,"message":"thread 01a07133-8b0b-7c51-b2a3-720cc04fe4c4 already has an active writer"}"#
+        ));
+        // -32600 is NOT the discriminator: codex spends it on refusals that DO
+        // mean the thread is gone or unusable, and those must keep degrading to
+        // a fresh start rather than dead-ending the chat.
+        for other in [
+            r#"{"code":-32600,"message":"no rollout found for thread id t-1"}"#,
+            r#"{"code":-32600,"message":"failed to parse rollout"}"#,
+            r#"{"code":-32600,"message":"database is locked"}"#,
+        ] {
+            assert!(!is_thread_writer_conflict(other), "{other} is not a writer conflict");
+        }
+        assert!(!is_thread_writer_conflict("codex thread/resume timed out"));
+    }
+
+    #[test]
+    fn archived_and_already_unarchived_are_told_apart() {
+        // codex 0.153.4's wording, verbatim.
+        let archived = r#"{"code":-32600,"message":"session t-1 is archived. Run `codex unarchive t-1` to unarchive it first."}"#;
+        assert!(is_archived_thread(archived, "t-1"));
+        // Another session's archive notice is not this session's problem.
+        assert!(!is_archived_thread(archived, "t-2"));
+        assert!(!is_archived_thread(r#"{"message":"database is locked"}"#, "t-1"));
+        // Nothing to unarchive = the resume may proceed.
+        let none = r#"{"message":"no archived rollout found for thread id t-1"}"#;
+        assert!(is_already_unarchived(none, "t-1"));
+        assert!(!is_already_unarchived(none, "t-2"));
+        assert!(!is_already_unarchived(archived, "t-1"));
+    }
 
     #[test]
     fn account_read_detects_logged_out() {

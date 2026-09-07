@@ -1833,6 +1833,169 @@
             .expect("window update");
     }
 
+    /// Which backends make the chat and its companion terminal take turns
+    /// owning the session, and what handing it over actually does.
+    ///
+    /// Codex is the one that must: since 0.153.4 it holds a per-thread writer
+    /// lock, so a companion spawned while the chat's app-server is live is
+    /// refused (`-32600 already has an active writer`) and dies on its first
+    /// frame. Every other backend tolerates a second reader of the session log
+    /// and keeps its companion alive underneath the chat for an instant
+    /// re-toggle — a handoff there would cost a respawn each way for nothing.
+    #[gpui::test]
+    async fn codex_alone_hands_the_session_to_its_companion_terminal(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                for transport in [
+                    Transport::StreamJson,
+                    Transport::Rpc,
+                    Transport::OmpRpc,
+                    Transport::Acp,
+                ] {
+                    view.backend.transport = transport;
+                    assert!(
+                        !view.needs_session_handoff(),
+                        "{transport:?} has no single-writer lock — keep the instant re-toggle"
+                    );
+                }
+                view.backend.transport = Transport::AppServer;
+                assert!(view.needs_session_handoff(), "codex must hand the session over");
+
+                // Handing over yields the live connection for the caller to reap
+                // — the terminal must not spawn until that process is gone.
+                let handed = view.take_connection_for_handoff(cx);
+                assert!(handed.is_some(), "a connected chat hands its connection over");
+                assert!(
+                    view.take_connection_for_handoff(cx).is_none(),
+                    "nothing left to hand over twice"
+                );
+
+                // Taking it back is refused while the chat is a draft — there is
+                // no session to resume, so a respawn would mint a stray agent.
+                view.make_unbound_for_test();
+                view.reconnect_after_handoff(cx);
+                assert!(
+                    view.take_connection_for_handoff(cx).is_none(),
+                    "an unbound draft stays down rather than spawning a stray agent"
+                );
+            })
+            .expect("window update");
+    }
+
+    /// A companion spawn that fails after the handoff must give the chat its
+    /// connection back.
+    ///
+    /// The handoff shuts the chat's connection down so the companion can take
+    /// the thread's writer lock. If the spawn then fails, clearing the pending
+    /// flag alone leaves the tab in Chat mode with no agent behind it and the
+    /// user unable to type — the failure turns a working chat into a dead one.
+    #[gpui::test]
+    async fn a_failed_spawn_after_handoff_gives_the_chat_back(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _window, cx| {
+                view.backend.transport = Transport::AppServer;
+                // The spawn hands the connection over, then fails downstream.
+                assert!(
+                    view.take_connection_for_handoff(cx).is_some(),
+                    "a connected chat hands its connection over"
+                );
+                assert!(
+                    !view.has_connection_for_test(),
+                    "the chat is now agentless — this is the window the fix covers"
+                );
+
+                // What every failure path now does on the way out.
+                view.set_companion_spawn_pending(false);
+                view.reconnect_after_handoff(cx);
+
+                // The respawn is attempted rather than refused. It cannot
+                // succeed here — there is no agent binary to spawn — so the
+                // attempt shows as a connect error, which is precisely the
+                // signal we want: a chat that silently stayed dead would leave
+                // both of these untouched.
+                assert!(
+                    view.disconnected && view.thread.last_error.is_some(),
+                    "the chat must try to take its session back, not stay silently dead"
+                );
+                assert!(!view.companion_spawn_pending(), "and accept a retry");
+            })
+            .expect("window update");
+    }
+
+    /// A second ⌃⇧V while the first spawn is still in flight must not schedule
+    /// a second companion.
+    ///
+    /// `terminal` and `view_mode` are only set when a spawn LANDS, so every
+    /// toggle guard still passes during the async `start_session` — and on a
+    /// single-writer backend the second spawn would resume a session whose
+    /// connection the first spawn had already taken and shut down, then
+    /// overwrite its terminal and orphan the CLI. Found in review of the
+    /// handoff, which is what made the window damaging rather than merely
+    /// wasteful.
+    #[gpui::test]
+    async fn a_second_toggle_mid_spawn_is_refused(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                assert!(!view.companion_spawn_pending(), "nothing in flight to begin with");
+                // The host marks the spawn before scheduling it.
+                view.set_companion_spawn_pending(true);
+                assert!(
+                    view.companion_spawn_pending(),
+                    "a toggle arriving now must be refused, not scheduled"
+                );
+                // Still no companion and still in Chat view — i.e. every OTHER
+                // guard would have let the second toggle through.
+                assert!(!view.has_companion_terminal());
+                assert_eq!(view.view_mode(), ChatViewMode::Chat);
+                // A failed spawn clears it, so the next toggle can try again.
+                view.set_companion_spawn_pending(false);
+                assert!(!view.companion_spawn_pending());
+                // So does a companion that lands (via drop, the reap path).
+                view.set_companion_spawn_pending(true);
+                view.drop_companion_terminal(cx);
+                assert!(!view.companion_spawn_pending(), "a dropped companion ends the attempt");
+            })
+            .expect("window update");
+    }
+
     /// The ACP session id is an external, agent-supplied string; only ids safe to
     /// place on a resume command line are accepted (the rest leave the toggle off).
     #[test]

@@ -39,7 +39,8 @@ type Pending = Arc<Mutex<HashMap<u64, Sender<Result<Value, String>>>>>;
 /// registry. Cloning shares the same child (all fields are `Arc`).
 #[derive(Clone)]
 pub struct RpcClient {
-    stdin: Arc<Mutex<ChildStdin>>,
+    /// `None` once [`RpcClient::close_stdin`] has ended the session.
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
     next_id: Arc<AtomicU64>,
     pending: Pending,
     /// Cleared by the reader thread when the child's stdout hits EOF (the
@@ -120,7 +121,7 @@ impl RpcClient {
 
         Ok((
             RpcClient {
-                stdin: Arc::new(Mutex::new(stdin)),
+                stdin: Arc::new(Mutex::new(Some(stdin))),
                 next_id: Arc::new(AtomicU64::new(1)),
                 pending,
                 alive,
@@ -181,11 +182,31 @@ impl RpcClient {
         self.write_msg(&json!({"id": id, "result": result}))
     }
 
+    /// End the session by closing the child's stdin.
+    ///
+    /// `codex app-server` reads newline-delimited JSON from stdin, so EOF is how
+    /// it is asked to exit. That exit is what the rest of the stack is waiting
+    /// for: stdout closes → the reader marks the client dead and drops
+    /// `inbound_tx` → the mapper ends → the last `ThreadEvent` sender drops →
+    /// the app's disconnect handler runs. A worker that gives up on the
+    /// handshake must call this, or it leaves a live child nobody is talking to
+    /// and a chat that can never notice it is disconnected (see `is_alive`'s
+    /// note above — the same freeze, arrived at from the other direction).
+    ///
+    /// Idempotent; every later `write_msg` fails rather than silently
+    /// pretending to have sent.
+    pub fn close_stdin(&self) {
+        if let Ok(mut stdin) = self.stdin.lock() {
+            stdin.take();
+        }
+    }
+
     fn write_msg(&self, v: &Value) -> Result<()> {
-        let mut stdin = self
+        let mut guard = self
             .stdin
             .lock()
             .map_err(|_| anyhow!("codex stdin lock poisoned"))?;
+        let stdin = guard.as_mut().ok_or_else(|| anyhow!("codex stdin is closed"))?;
         let line = serde_json::to_string(v).context("serialize codex message")?;
         stdin.write_all(line.as_bytes()).context("write codex stdin")?;
         stdin.write_all(b"\n").context("write codex newline")?;

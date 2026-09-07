@@ -325,6 +325,8 @@ impl OmpRpcConnection {
                 cache_creation_tokens: 0,
                 context_window: u.context_window.or(context_window),
                 cost_usd: None,
+                // `tokens` is omp's occupancy and lands in `input_tokens` alone.
+                total_tokens: None,
             }));
         }
         if let Some(n) = notice {

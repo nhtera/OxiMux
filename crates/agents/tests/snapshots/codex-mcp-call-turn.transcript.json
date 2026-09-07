@@ -13,7 +13,8 @@
     "cache_read_tokens": 30464,
     "cache_creation_tokens": 0,
     "context_window": 258400,
-    "cost_usd": null
+    "cost_usd": null,
+    "total_tokens": 30853
   },
   "entries": [
     {

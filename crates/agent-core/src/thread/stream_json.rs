@@ -347,6 +347,7 @@ fn live_usage(usage: Option<&Value>) -> Vec<ThreadEvent> {
         cache_creation_tokens: count("cache_creation_input_tokens"),
         context_window: None,
         cost_usd: None,
+        total_tokens: None,
     })]
 }
 
@@ -640,6 +641,8 @@ fn decode_usage(v: &Value) -> Option<TurnUsage> {
         cache_creation_tokens: count("cache_creation_input_tokens"),
         context_window,
         cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
+        // Anthropic bills cache reads beside `input_tokens`; the sum is right.
+        total_tokens: None,
     })
 }
 

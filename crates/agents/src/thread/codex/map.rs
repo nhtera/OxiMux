@@ -856,6 +856,15 @@ fn web_search_action(action: Option<&Value>) -> String {
 
 /// Parse `thread/tokenUsage/updated` → `TurnUsage` from the `.tokenUsage.last`
 /// breakdown (the most recent turn's counts).
+///
+/// `cachedInputTokens` is a **subset** of `inputTokens`, not an addition to it —
+/// codex publishes `netNewInputTokens` alongside them for the difference. So the
+/// occupancy the meter needs is codex's own `totalTokens`, carried through
+/// verbatim; summing the breakdown here would count the cache twice. Codex also
+/// reports a `cacheWriteInputTokens`, deliberately left unmapped: its subset
+/// relationship to `inputTokens` is unverifiable from the field alone (it is 0
+/// in all 12,864 readings of a live rollout corpus), and `totalTokens` already
+/// accounts for it.
 fn parse_usage(params: &Value) -> Option<TurnUsage> {
     let usage = params.get("tokenUsage")?;
     let last = usage.get("last")?;
@@ -864,9 +873,10 @@ fn parse_usage(params: &Value) -> Option<TurnUsage> {
         input_tokens: get("inputTokens"),
         output_tokens: get("outputTokens"),
         cache_read_tokens: get("cachedInputTokens"),
-        cache_creation_tokens: 0, // Codex reports no separate cache-creation count.
+        cache_creation_tokens: 0,
         context_window: usage.get("modelContextWindow").and_then(|v| v.as_u64()),
         cost_usd: None, // Codex doesn't report per-turn cost here.
+        total_tokens: last.get("totalTokens").and_then(|v| v.as_u64()),
     })
 }
 
@@ -1197,6 +1207,61 @@ mod tests {
         // The stash is still present for turn/completed to fold into the footer.
         let ended = map_notification("turn/completed", &json!({"turn": {"status": "completed"}}), &mut s);
         assert!(matches!(&ended[..], [ThreadEvent::TurnEnded { usage: Some(_), .. }]), "footer still fed");
+    }
+
+    #[test]
+    fn cached_input_is_a_subset_so_occupancy_is_codex_own_total() {
+        // The real numbers from a live rollout: cached (75,776) is part of the
+        // 81,099 input, and codex's own total agrees — 81,099 + 11 = 81,110.
+        // Summing the breakdown instead gave 156,886, which showed a thread at
+        // 31% of its window as 61% full.
+        let mut s = st();
+        let evs = map_notification(
+            "thread/tokenUsage/updated",
+            &json!({"tokenUsage": {"last": {"inputTokens": 81099, "outputTokens": 11,
+                                            "cachedInputTokens": 75776, "cacheWriteInputTokens": 0,
+                                            "totalTokens": 81110},
+                                    "modelContextWindow": 258400}}),
+            &mut s,
+        );
+        let [ThreadEvent::LiveUsage(u)] = &evs[..] else { panic!("expected LiveUsage, got {evs:?}") };
+        assert_eq!(u.total_tokens, Some(81110), "codex's own total is carried verbatim");
+        assert_eq!(u.context_used(), 81110, "not 156886 — the cache is not added twice");
+        let pct = (u.context_used() as f64 / 258400.0 * 100.0).round() as u64;
+        assert_eq!(pct, 31, "the meter reads 31%, as codex itself reports");
+    }
+
+    #[test]
+    fn an_all_zero_breakdown_still_reports_its_total() {
+        // 224 of 56,074 readings in a live corpus zero every component field
+        // while carrying a real total. Reconstructing occupancy reads those as
+        // an empty context; codex's total is the only truth on such a turn.
+        let mut s = st();
+        let evs = map_notification(
+            "thread/tokenUsage/updated",
+            &json!({"tokenUsage": {"last": {"inputTokens": 0, "outputTokens": 0,
+                                            "cachedInputTokens": 0, "totalTokens": 11506},
+                                    "modelContextWindow": 258400}}),
+            &mut s,
+        );
+        let [ThreadEvent::LiveUsage(u)] = &evs[..] else { panic!("expected LiveUsage, got {evs:?}") };
+        assert_eq!(u.context_used(), 11506, "a zeroed breakdown is not an empty context");
+    }
+
+    #[test]
+    fn a_payload_without_a_total_falls_back_to_the_breakdown() {
+        // Older app-servers omit `totalTokens`; the meter must still read
+        // something rather than collapsing to zero.
+        let mut s = st();
+        let evs = map_notification(
+            "thread/tokenUsage/updated",
+            &json!({"tokenUsage": {"last": {"inputTokens": 40, "outputTokens": 8},
+                                    "modelContextWindow": 272000}}),
+            &mut s,
+        );
+        let [ThreadEvent::LiveUsage(u)] = &evs[..] else { panic!("expected LiveUsage, got {evs:?}") };
+        assert_eq!(u.total_tokens, None);
+        assert_eq!(u.context_used(), 48);
     }
 
     #[test]
