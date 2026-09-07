@@ -30,6 +30,10 @@ pub const CLIPBOARD_MAX_BYTES: usize = 32 * 1024;
 /// 4 KiB in-page, but a deeply nested element's ancestor + DOM paths sit on top
 /// of that, so the assembled block gets its own ceiling.
 pub const BROWSER_MAX_BYTES: usize = 16 * 1024;
+/// Cap on an attached issue / pull-request body. A long thread's description can
+/// run to thousands of words, and the user asked for a reference, not a
+/// context-window transfer.
+pub const FORGE_MAX_BYTES: usize = 16 * 1024;
 
 /// One entry offered in the composer's `@` menu "Context" section. Cheap display
 /// data plus the [`ContextRequest`] the composer emits back to the view when the
@@ -118,6 +122,44 @@ pub fn cap_tail_bytes(text: &str, max_bytes: usize) -> (String, bool) {
         start += 1;
     }
     (text[start..].to_string(), true)
+}
+
+/// Build the chip for an issue / pull request attached from the composer's
+/// attach menu.
+///
+/// The number + title ride in `source` (so the label reads `@issue #42 Parser
+/// drops a token`) and the body is the content, capped to [`FORGE_MAX_BYTES`].
+/// An attribution line always leads the content, which keeps a body-less item —
+/// common for a one-line bug report — from serializing as an empty
+/// `<context>` block that tells the model nothing.
+pub fn forge_chip(
+    kind: oximux_core::ForgeRefKind,
+    number: u64,
+    title: &str,
+    author: &str,
+    body: &str,
+) -> ContextChip {
+    let chip_kind = match kind {
+        oximux_core::ForgeRefKind::Issue => ContextKind::Issue,
+        oximux_core::ForgeRefKind::Pull => ContextKind::Pull,
+    };
+    let source = format!("#{number} {}", title.trim());
+    let (body, truncated) = cap_head_bytes(body.trim(), FORGE_MAX_BYTES);
+    let mut content = String::new();
+    if !author.trim().is_empty() {
+        content.push_str("opened by @");
+        content.push_str(author.trim());
+        content.push('\n');
+    }
+    if body.is_empty() {
+        content.push_str("(no description)");
+    } else {
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&body);
+    }
+    ContextChip::new(chip_kind, Some(source.trim_end().to_string()), content, truncated)
 }
 
 /// Build the `@clipboard` chip from the clipboard's current text, or `None` when
@@ -214,6 +256,47 @@ pub fn cap_head_bytes(text: &str, max_bytes: usize) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use oximux_core::ForgeRefKind;
+
+    #[test]
+    fn forge_chip_labels_with_the_number_and_title() {
+        let c = forge_chip(ForgeRefKind::Issue, 42, "Parser drops a token", "nhtera", "repro:\n1. x");
+        assert_eq!(c.kind, ContextKind::Issue);
+        assert_eq!(c.source.as_deref(), Some("#42 Parser drops a token"));
+        assert!(!c.truncated);
+        assert!(c.label().starts_with("@issue #42 Parser drops a token · "));
+    }
+
+    #[test]
+    fn forge_chip_maps_a_pull_request_to_its_own_kind() {
+        let c = forge_chip(ForgeRefKind::Pull, 7, "Add the menu", "nhtera", "body");
+        assert_eq!(c.kind, ContextKind::Pull);
+    }
+
+    /// A body-less item is the common one-line bug report. It must still carry
+    /// something, or the chip serializes an empty block that costs a tag and
+    /// says nothing.
+    #[test]
+    fn a_body_less_item_still_carries_content() {
+        let c = forge_chip(ForgeRefKind::Issue, 1, "Crash on open", "nhtera", "   ");
+        assert!(c.content.contains("opened by @nhtera"));
+        assert!(c.content.contains("(no description)"));
+    }
+
+    #[test]
+    fn a_missing_author_is_omitted_rather_than_left_blank() {
+        let c = forge_chip(ForgeRefKind::Issue, 1, "Crash", "", "the body");
+        assert_eq!(c.content, "the body");
+    }
+
+    #[test]
+    fn an_oversized_body_is_capped_and_marked() {
+        let body = "x".repeat(FORGE_MAX_BYTES + 500);
+        let c = forge_chip(ForgeRefKind::Issue, 1, "Big", "", &body);
+        assert!(c.truncated);
+        assert!(c.content.len() <= FORGE_MAX_BYTES);
+    }
 
     #[test]
     fn browser_chip_labels_with_the_selector() {

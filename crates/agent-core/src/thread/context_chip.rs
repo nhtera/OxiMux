@@ -24,6 +24,14 @@ pub enum ContextKind {
     /// surrounding page context. The cropped screenshot rides the message's
     /// image attachments, not this chip — a chip is text only.
     Browser,
+    /// An issue on the repo's forge, attached from the composer's attach menu:
+    /// its title and body.
+    Issue,
+    /// A pull request (GitLab: merge request) on the repo's forge. Split from
+    /// [`ContextKind::Issue`] rather than folded into one "forge" kind because
+    /// the wire name is what tells the model which of the two it is reading, and
+    /// "issue" vs "pull-request" is a difference it acts on.
+    Pull,
 }
 
 impl ContextKind {
@@ -35,6 +43,8 @@ impl ContextKind {
             ContextKind::Diff => "diff",
             ContextKind::Clipboard => "clipboard",
             ContextKind::Browser => "browser",
+            ContextKind::Issue => "issue",
+            ContextKind::Pull => "pull-request",
         }
     }
 }
@@ -193,6 +203,28 @@ mod tests {
         let clip_at = out.find("name=\"clipboard\"").unwrap();
         assert!(diff_at < clip_at, "diff must serialize before clipboard");
         assert!(out.ends_with("go"));
+    }
+
+    /// An issue and a pull request must not share a wire name: the tag is the
+    /// only thing telling the model which of the two it is reading.
+    #[test]
+    fn issue_and_pull_carry_distinct_wire_names() {
+        assert_eq!(ContextKind::Issue.wire_name(), "issue");
+        assert_eq!(ContextKind::Pull.wire_name(), "pull-request");
+    }
+
+    #[test]
+    fn issue_block_carries_its_number_and_title_as_source() {
+        let c = chip(ContextKind::Issue, Some("#42 Parser drops a token"), "Steps to repro:\n1. …", false);
+        let out = prepend_context(std::slice::from_ref(&c), "fix this");
+        assert!(out.starts_with("<context name=\"issue\" source=\"#42 Parser drops a token\">\n"));
+        assert!(out.ends_with("fix this"));
+    }
+
+    #[test]
+    fn pull_request_chip_labels_itself_with_its_number() {
+        let c = chip(ContextKind::Pull, Some("#7 Add the menu"), "body\nmore", false);
+        assert_eq!(c.label(), "@pull-request #7 Add the menu · 2 lines");
     }
 
     #[test]

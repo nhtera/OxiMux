@@ -5,6 +5,30 @@
 
 use super::*;
 
+/// The attach menu's forge row.
+#[cfg(test)]
+mod attach_menu {
+    use crate::shell::agent_chat::composer::attach_menu::forge_attach_label;
+    use crate::shell::forge::ForgeKind;
+
+    /// A GitLab repo has merge requests, not pull requests. Getting this wrong
+    /// sends the user looking for a thing their host does not have.
+    #[test]
+    fn the_forge_row_is_worded_for_its_host() {
+        assert_eq!(forge_attach_label(ForgeKind::Github), "Add issue or pull request…");
+        assert_eq!(forge_attach_label(ForgeKind::Gitlab), "Add issue or merge request…");
+    }
+
+    /// The row is gated on a detected forge: on a repo no forge claims it must
+    /// not be offered, because its picker could only ever come back empty.
+    #[test]
+    fn no_detected_forge_means_no_forge_row() {
+        let rows = |kind: Option<ForgeKind>| kind.map(forge_attach_label);
+        assert!(rows(None).is_none());
+        assert!(rows(Some(ForgeKind::Github)).is_some());
+    }
+}
+
 #[cfg(test)]
 impl ComposerView {
     /// The composer's OWN `unbound` flag — distinct from the parent view's, and
