@@ -119,6 +119,13 @@ impl ProjectPanes {
             .find_map(|g| g.read(cx).agent_chat_view_by_remote_id(remote_session_id, cx))
     }
 
+    /// Whether any chat tab in any of this project's groups is bound to the
+    /// agent session `session_id` — a split pane counts, so the answer does not
+    /// depend on which group happens to be focused.
+    pub fn has_agent_chat_for_session(&self, session_id: &str, cx: &App) -> bool {
+        self.groups.values().any(|g| g.read(cx).has_agent_chat_for_session(session_id, cx))
+    }
+
     pub fn group(&self, id: PaneGroupId) -> Option<Entity<PaneGroup>> {
         self.groups.get(&id).cloned()
     }

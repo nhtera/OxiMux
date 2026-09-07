@@ -722,6 +722,35 @@ impl Render for WorkspaceRoot {
                     );
                     return;
                 }
+                // Codex lets only ONE process write a thread (its
+                // `thread-writer-locks/<id>.lock`, new in 0.153.4). Resuming
+                // one a chat tab already owns spawns a TUI whose
+                // `thread/resume` is refused — `-32600 already has an active
+                // writer` — and the tab is dead on arrival. Say so instead.
+                //
+                // Resume only: a FORK opens a new thread and takes only the new
+                // lock, so it never collides (probed on codex 0.153.4). Every
+                // other adapter tolerates a second reader of one session log
+                // and keeps this path.
+                //
+                // Scoped to this window's projects. A holder elsewhere — another
+                // window, the ChatGPT app, an editor extension — is not ours to
+                // see, and those still land on codex's own error in the terminal.
+                if resume_collides_with_open_chat(action.adapter, action.fork, || {
+                    this.all_project_panes()
+                        .iter()
+                        .any(|p| p.read(cx).has_agent_chat_for_session(&action.session_id, cx))
+                }) {
+                    // Kept short on purpose: the toast renders ONE line and
+                    // clips around 70 characters, so a longer message loses
+                    // exactly the half that says what to do about it.
+                    crate::shell::toast::toast_op_error(
+                        cx,
+                        "Resume",
+                        "that session is open in a chat tab — use ⌃⇧V there",
+                    );
+                    return;
+                }
                 let (adapter, adapter_id, resumption, custom_command) = match action
                     .preset_id
                     .as_deref()
@@ -2032,5 +2061,59 @@ impl Render for WorkspaceRoot {
             // (e.g. the editor breadcrumb's copy/reveal actions) need it here
             // or their toasts never paint.
             .children(gpui_component::Root::render_notification_layer(window, cx))
+    }
+}
+
+/// Whether a session-history relaunch must be refused because a chat tab in
+/// this window already owns the session.
+///
+/// Codex holds a per-thread writer lock (0.153.4+), so a second process
+/// resuming the same thread is refused (`-32600 already has an active writer`)
+/// and its tab dies on the first frame. `chat_holds_session` is lazy: the pane
+/// walk only runs for the adapter that can actually collide.
+///
+/// The two carve-outs are the whole point of the predicate:
+/// - **fork never collides** — it opens a NEW thread and takes only the new
+///   thread's lock (probed on codex 0.153.4, parent lock undisturbed);
+/// - **every other adapter** tolerates a second reader of one session log, and
+///   resuming one in a terminal beside its chat is supported behavior.
+fn resume_collides_with_open_chat(
+    adapter: oximux_core::AgentAdapter,
+    fork: bool,
+    chat_holds_session: impl FnOnce() -> bool,
+) -> bool {
+    adapter == oximux_core::AgentAdapter::Codex && !fork && chat_holds_session()
+}
+
+#[cfg(test)]
+mod resume_guard_tests {
+    use super::resume_collides_with_open_chat;
+    use oximux_core::AgentAdapter;
+
+    #[test]
+    fn only_a_codex_resume_onto_an_open_chat_is_refused() {
+        // The case that produced a dead tab: resume, Codex, chat owns it.
+        assert!(resume_collides_with_open_chat(AgentAdapter::Codex, false, || true));
+        // A fork opens its own thread — never blocked, even with the chat open.
+        assert!(!resume_collides_with_open_chat(AgentAdapter::Codex, true, || true));
+        // No chat owns it: the ordinary resume-in-terminal must still work.
+        assert!(!resume_collides_with_open_chat(AgentAdapter::Codex, false, || false));
+        // Lockless adapters keep resuming beside their chat.
+        for adapter in [AgentAdapter::ClaudeCode, AgentAdapter::Pi, AgentAdapter::Omp] {
+            assert!(
+                !resume_collides_with_open_chat(adapter, false, || true),
+                "{adapter:?} has no writer lock — must not be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pane_walk_is_skipped_when_the_adapter_cannot_collide() {
+        let mut walked = false;
+        let _ = resume_collides_with_open_chat(AgentAdapter::ClaudeCode, false, || {
+            walked = true;
+            true
+        });
+        assert!(!walked, "no reason to scan every pane for an adapter with no lock");
     }
 }
