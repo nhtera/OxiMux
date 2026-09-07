@@ -3166,6 +3166,14 @@ impl AgentChatView {
         }
     }
 
+    /// Test-only: whether an agent connection is live behind this view. Lets a
+    /// test assert the chat is usable, rather than inferring it from a method
+    /// that would consume the connection to look.
+    #[cfg(test)]
+    pub(super) fn has_connection_for_test(&self) -> bool {
+        self.connection.is_some()
+    }
+
     /// Test-only: put this view into the unbound *New Agent* draft state (no
     /// connection, Claude picked) so a `#[gpui::test]` can drive `change_agent` /
     /// `change_model` on a draft without spawning a subprocess.

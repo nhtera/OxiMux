@@ -1427,6 +1427,30 @@ impl PaneGroup {
         .detach();
     }
 
+    /// Abandon an in-flight companion spawn, leaving the chat usable.
+    ///
+    /// Clearing the pending flag is only half of it. When the spawn began with
+    /// a handoff, the chat already gave up its connection and shut it down so
+    /// the companion could take the thread's writer lock — so a failure after
+    /// that point strands the tab in Chat mode with no agent behind it, and the
+    /// user cannot type. Taking the session back is what makes a failed
+    /// terminal launch a non-event rather than a dead chat.
+    ///
+    /// `handoff` gates the reconnect because without one the chat never let go,
+    /// and respawning a connection it still holds would be a second agent.
+    fn abandon_spawn(
+        view: &Entity<crate::shell::agent_chat::AgentChatView>,
+        handoff: bool,
+        cx: &mut gpui::AsyncWindowContext,
+    ) {
+        let _ = view.update_in(cx, |v, _window, cx| {
+            v.set_companion_spawn_pending(false);
+            if handoff {
+                v.reconnect_after_handoff(cx);
+            }
+        });
+    }
+
     /// Spawn a companion terminal that resumes the chat's session interactively
     /// (`--resume`), then hand it to the chat view. Mirrors `spawn_agent_tab`'s
     /// runtime dance but mounts into the existing chat tab instead of a new tab,
@@ -1535,7 +1559,7 @@ impl PaneGroup {
                     let _ = cx.update(|_, cx| {
                         crate::shell::toast::toast_op_error(cx, "Terminal view", &err.to_string());
                     });
-                    let _ = view.update_in(cx, |v, _window, _cx| v.set_companion_spawn_pending(false));
+                    Self::abandon_spawn(&view, handoff, cx);
                     return;
                 }
             };
@@ -1544,7 +1568,7 @@ impl PaneGroup {
                 Err(err) => {
                     tracing::warn!(?err, "companion terminal backend_for failed");
                     let _ = runtime.cancel(session).await;
-                    let _ = view.update_in(cx, |v, _window, _cx| v.set_companion_spawn_pending(false));
+                    Self::abandon_spawn(&view, handoff, cx);
                     return;
                 }
             };
@@ -1553,7 +1577,7 @@ impl PaneGroup {
                 Err(err) => {
                     tracing::warn!(?err, "companion terminal terminal_session_id failed");
                     let _ = runtime.cancel(session).await;
-                    let _ = view.update_in(cx, |v, _window, _cx| v.set_companion_spawn_pending(false));
+                    Self::abandon_spawn(&view, handoff, cx);
                     return;
                 }
             };
@@ -2762,4 +2786,43 @@ impl PaneGroup {
 /// empty transcript seed — the thread resume still works).
 fn codex_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".codex"))
+}
+
+#[cfg(test)]
+mod companion_spawn_recovery_tests {
+    /// Every abandoned companion spawn must go through `abandon_spawn`.
+    ///
+    /// The behavioural half of this lives in `agent_chat::tests`
+    /// (`a_failed_spawn_after_handoff_gives_the_chat_back`), which proves the
+    /// recovery works. What it cannot reach is the *wiring*: driving the real
+    /// `spawn_companion_terminal` to each of its three failure points needs a
+    /// runtime that fails on demand. So this pins the invariant that makes the
+    /// wiring correct by construction — the pending flag is cleared in exactly
+    /// one place in this file, and that place also offers the chat its session
+    /// back. A new failure path that clears the flag inline would reintroduce
+    /// the dead-chat bug and fail here.
+    #[test]
+    fn the_pending_flag_is_only_ever_cleared_by_abandon_spawn() {
+        // Scan only the production half — this module's own assertions quote
+        // the very strings being counted.
+        let src = include_str!("tabs.rs")
+            .split("mod companion_spawn_recovery_tests")
+            .next()
+            .expect("source before this test module");
+        assert_eq!(
+            src.matches("set_companion_spawn_pending(false)").count(),
+            1,
+            "clear the flag via abandon_spawn, so the handed-off connection comes back too"
+        );
+        let helper = src
+            .split_once("fn abandon_spawn(")
+            .expect("abandon_spawn exists")
+            .1;
+        let body = &helper[..helper.find("\n    }").expect("helper body ends")];
+        assert!(
+            body.contains("set_companion_spawn_pending(false)")
+                && body.contains("reconnect_after_handoff"),
+            "abandon_spawn must do both halves: clear the flag AND restore the chat"
+        );
+    }
 }

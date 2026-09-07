@@ -1895,6 +1895,58 @@
             .expect("window update");
     }
 
+    /// A companion spawn that fails after the handoff must give the chat its
+    /// connection back.
+    ///
+    /// The handoff shuts the chat's connection down so the companion can take
+    /// the thread's writer lock. If the spawn then fails, clearing the pending
+    /// flag alone leaves the tab in Chat mode with no agent behind it and the
+    /// user unable to type — the failure turns a working chat into a dead one.
+    #[gpui::test]
+    async fn a_failed_spawn_after_handoff_gives_the_chat_back(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |view, _window, cx| {
+                view.backend.transport = Transport::AppServer;
+                // The spawn hands the connection over, then fails downstream.
+                assert!(
+                    view.take_connection_for_handoff(cx).is_some(),
+                    "a connected chat hands its connection over"
+                );
+                assert!(
+                    !view.has_connection_for_test(),
+                    "the chat is now agentless — this is the window the fix covers"
+                );
+
+                // What every failure path now does on the way out.
+                view.set_companion_spawn_pending(false);
+                view.reconnect_after_handoff(cx);
+
+                // The respawn is attempted rather than refused. It cannot
+                // succeed here — there is no agent binary to spawn — so the
+                // attempt shows as a connect error, which is precisely the
+                // signal we want: a chat that silently stayed dead would leave
+                // both of these untouched.
+                assert!(
+                    view.disconnected && view.thread.last_error.is_some(),
+                    "the chat must try to take its session back, not stay silently dead"
+                );
+                assert!(!view.companion_spawn_pending(), "and accept a retry");
+            })
+            .expect("window update");
+    }
+
     /// A second ⌃⇧V while the first spawn is still in flight must not schedule
     /// a second companion.
     ///
