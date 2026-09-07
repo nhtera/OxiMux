@@ -168,6 +168,26 @@ pub fn thread_fork_params(thread_id: &str, last_turn_id: Option<&str>) -> Value 
     p
 }
 
+/// Whether a `thread/resume` failure is codex refusing a SECOND writer for a
+/// thread some other process already owns.
+///
+/// codex 0.153.4 took a per-thread writer lock (`$CODEX_HOME/thread-writer-locks/
+/// <thread-id>.lock`, plus a `.coordination.lock` for stale sweeps) — before
+/// that, two writers on one rollout were merely discouraged. A resume that
+/// loses the race comes back as `{"code":-32600,"message":"thread <id> already
+/// has an active writer"}`, and unlike every other resume failure it says the
+/// thread is FINE — someone else is simply holding it. Falling back to
+/// `thread/start` there mints a fresh thread under a transcript the user is
+/// looking at: an agent that remembers none of it, writing to a different
+/// rollout, with no visible sign either happened.
+///
+/// Matched on the message, never on the code: codex spends `-32600` on
+/// unrelated refusals too (a missing rollout, an unparseable one, a locked
+/// state db, an auth failure), and those genuinely are "this thread is gone".
+pub fn is_thread_writer_conflict(err: &str) -> bool {
+    err.contains("already has an active writer")
+}
+
 /// Pull `thread.id` out of a `thread/start` (or `thread/resume`) response.
 pub fn thread_id_from_start_response(result: &Value) -> Option<String> {
     result.get("thread")?.get("id")?.as_str().map(String::from)
@@ -263,6 +283,26 @@ pub fn parse_model_list(result: &Value) -> Vec<CodexModel> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn writer_conflict_is_told_apart_from_the_other_refusals() {
+        // The real refusal, verbatim off the wire (the transport hands the whole
+        // error object through as a string, code included).
+        assert!(is_thread_writer_conflict(
+            r#"codex thread/resume error: {"code":-32600,"message":"thread 01a07133-8b0b-7c51-b2a3-720cc04fe4c4 already has an active writer"}"#
+        ));
+        // -32600 is NOT the discriminator: codex spends it on refusals that DO
+        // mean the thread is gone or unusable, and those must keep degrading to
+        // a fresh start rather than dead-ending the chat.
+        for other in [
+            r#"{"code":-32600,"message":"no rollout found for thread id t-1"}"#,
+            r#"{"code":-32600,"message":"failed to parse rollout"}"#,
+            r#"{"code":-32600,"message":"database is locked"}"#,
+        ] {
+            assert!(!is_thread_writer_conflict(other), "{other} is not a writer conflict");
+        }
+        assert!(!is_thread_writer_conflict("codex thread/resume timed out"));
+    }
 
     #[test]
     fn account_read_detects_logged_out() {
