@@ -1833,6 +1833,68 @@
             .expect("window update");
     }
 
+    /// Which backends make the chat and its companion terminal take turns
+    /// owning the session, and what handing it over actually does.
+    ///
+    /// Codex is the one that must: since 0.153.4 it holds a per-thread writer
+    /// lock, so a companion spawned while the chat's app-server is live is
+    /// refused (`-32600 already has an active writer`) and dies on its first
+    /// frame. Every other backend tolerates a second reader of the session log
+    /// and keeps its companion alive underneath the chat for an instant
+    /// re-toggle — a handoff there would cost a respawn each way for nothing.
+    #[gpui::test]
+    async fn codex_alone_hands_the_session_to_its_companion_terminal(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|window, cx| {
+            AgentChatView::with_connection_for_test(
+                Arc::new(StubConnection::default()),
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _window, cx| {
+                for transport in [
+                    Transport::StreamJson,
+                    Transport::Rpc,
+                    Transport::OmpRpc,
+                    Transport::Acp,
+                ] {
+                    view.backend.transport = transport;
+                    assert!(
+                        !view.needs_session_handoff(),
+                        "{transport:?} has no single-writer lock — keep the instant re-toggle"
+                    );
+                }
+                view.backend.transport = Transport::AppServer;
+                assert!(view.needs_session_handoff(), "codex must hand the session over");
+
+                // Handing over yields the live connection for the caller to reap
+                // — the terminal must not spawn until that process is gone.
+                let handed = view.take_connection_for_handoff(cx);
+                assert!(handed.is_some(), "a connected chat hands its connection over");
+                assert!(
+                    view.take_connection_for_handoff(cx).is_none(),
+                    "nothing left to hand over twice"
+                );
+
+                // Taking it back is refused while the chat is a draft — there is
+                // no session to resume, so a respawn would mint a stray agent.
+                view.make_unbound_for_test();
+                view.reconnect_after_handoff(cx);
+                assert!(
+                    view.take_connection_for_handoff(cx).is_none(),
+                    "an unbound draft stays down rather than spawning a stray agent"
+                );
+            })
+            .expect("window update");
+    }
+
     /// The ACP session id is an external, agent-supplied string; only ids safe to
     /// place on a resume command line are accepted (the rest leave the toggle off).
     #[test]

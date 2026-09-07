@@ -9,10 +9,11 @@
 //! the log off the UI thread and append the suffix the thread hasn't seen.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use gpui::{AppContext as _, Context, Window};
 
-use oximux_agents::thread::{ThreadEntry, Transport};
+use oximux_agents::thread::{AgentConnection, ThreadEntry, Transport};
 use oximux_agents::SharedBackend;
 use oximux_core::AgentSessionId;
 use oximux_pty::TerminalSessionId;
@@ -50,6 +51,59 @@ impl AgentChatView {
         self.view_mode = ChatViewMode::Terminal;
         self.focus_active_surface(window, cx);
         cx.notify();
+    }
+
+    /// Whether this chat's backend lets only ONE process write the session at a
+    /// time, so the chat and its companion terminal must take turns owning it
+    /// rather than both running.
+    ///
+    /// Codex does: since 0.153.4 it holds a per-thread writer lock, and the
+    /// second `thread/resume` is refused (see `is_thread_writer_conflict` in
+    /// the codex protocol module).
+    /// Every other backend tolerates two readers of one session log — Claude,
+    /// Pi, omp and OpenCode all keep their instant re-toggle, with the
+    /// companion CLI alive underneath the chat.
+    pub fn needs_session_handoff(&self) -> bool {
+        self.backend.transport == Transport::AppServer
+    }
+
+    /// Whether a turn is streaming right now. The host reads it to refuse a
+    /// session handoff mid-answer.
+    pub fn turn_active(&self) -> bool {
+        self.thread.turn_active
+    }
+
+    /// Give up the live connection so a companion terminal can own the session.
+    ///
+    /// The caller MUST shut down what it gets back — off the UI thread, because
+    /// the reap blocks until the child is confirmed dead — and must not spawn
+    /// the terminal until it has. Handing the lock over on a promise rather
+    /// than on an observed exit is the same race in slower clothes.
+    ///
+    /// Returns `None` when there is nothing to hand over (a dormant chat that
+    /// never connected, or one whose spawn failed); the terminal is free to
+    /// spawn either way.
+    pub fn take_connection_for_handoff(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<dyn AgentConnection>> {
+        let conn = self.connection.take();
+        cx.notify();
+        conn
+    }
+
+    /// Take the session back after the companion terminal has been reaped.
+    ///
+    /// Only reconnects a chat that actually gave its connection away — a
+    /// backend without a handoff never lost one, and an unbound draft or import
+    /// bridge has none to rebuild. The respawn's `thread/resume` re-reads the
+    /// session log, so it also picks up whatever was typed in the terminal.
+    pub fn reconnect_after_handoff(&mut self, cx: &mut Context<Self>) {
+        if self.connection.is_some() || self.unbound || self.import_bridge.is_some() {
+            return;
+        }
+        self.respawn(cx);
+        self.sync_composer(cx);
     }
 
     /// Record that the chat sent a prompt while a companion terminal exists.
