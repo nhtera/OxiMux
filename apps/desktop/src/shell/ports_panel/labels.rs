@@ -6,6 +6,8 @@
 
 use std::path::Path;
 
+use super::scan::Attribution;
+
 /// `"1 port"` / `"N ports"`. The status bar's metric, plural-aware to match
 /// the `N agents` / `N panes` segments beside it.
 pub(crate) fn port_metric_label(count: usize) -> String {
@@ -50,6 +52,41 @@ pub(crate) fn reach_label(loopback: bool) -> &'static str {
     }
 }
 
+/// The whole second line of a row: what holds the port, and who can reach it.
+///
+/// One string rather than two elements because the two facts are read
+/// together and a row that wraps between them reads as two rows.
+pub(crate) fn detail_label(process: &str, pid: u32, loopback: bool) -> String {
+    format!("{} · {}", origin_label(process, pid), reach_label(loopback))
+}
+
+/// Why the panel filed a port under a project — the tooltip on an owned row.
+///
+/// Shown rather than kept internal because "why is this listed under my other
+/// worktree" is a real question with a real answer, and the answer is short.
+pub(crate) fn attribution_tooltip(how: Attribution) -> &'static str {
+    match how {
+        Attribution::Terminal => "Started in a terminal in this window",
+        Attribution::Cwd => "Running in this project's directory",
+        Attribution::Command => "This project's path is in the command line",
+    }
+}
+
+/// Heading for the section holding everything no project claimed.
+pub(crate) fn external_section_label() -> &'static str {
+    "EXTERNAL"
+}
+
+/// Shown above the external section when the machine is serving things but
+/// none of them are yours.
+///
+/// Distinct from the fully-empty state on purpose: "nothing at all is
+/// listening" and "plenty is listening, none of it yours" look identical if
+/// they share copy, and only one of them means a dev server failed to start.
+pub(crate) fn no_owned_hint() -> &'static str {
+    "Nothing listening in your projects"
+}
+
 /// Heading for a project's section: the directory's own name.
 ///
 /// Falls back to the full path for a root or a path that ends in `..` — rare,
@@ -77,26 +114,19 @@ pub(crate) fn row_title(label: Option<&str>, process: &str, port: u16) -> String
     format!("port {port}")
 }
 
-/// Headline for the panel when nothing is listening.
+/// Headline for the panel when *nothing on the machine* is listening.
 ///
-/// The two cases are genuinely different and must not share copy: no
-/// terminals open at all is a "do this first"; terminals open with nothing
-/// serving is the ordinary resting state and needs no instruction.
-pub(crate) fn empty_headline(has_terminals: bool) -> &'static str {
-    if has_terminals {
-        "Nothing listening"
-    } else {
-        "No terminals open"
-    }
+/// Genuinely rare now that the scan is machine-wide — a desktop with no
+/// listening TCP socket at all is a quiet one — which is why there is a single
+/// state rather than the pair this had while the scan was scoped to open
+/// terminals.
+pub(crate) fn empty_headline() -> &'static str {
+    "Nothing listening"
 }
 
 /// Second line under [`empty_headline`].
-pub(crate) fn empty_detail(has_terminals: bool) -> &'static str {
-    if has_terminals {
-        "Start a dev server in a terminal and its port appears here."
-    } else {
-        "Ports are found by looking inside the terminals you have open."
-    }
+pub(crate) fn empty_detail() -> &'static str {
+    "No process on this machine is accepting connections."
 }
 
 #[cfg(test)]
@@ -161,8 +191,40 @@ mod tests {
     }
 
     #[test]
-    fn the_two_empty_states_do_not_share_copy() {
-        assert_ne!(empty_headline(true), empty_headline(false));
-        assert_ne!(empty_detail(true), empty_detail(false));
+    fn the_empty_state_never_promises_a_terminal_is_needed() {
+        // The scan is machine-wide: telling a user to open a terminal would be
+        // instructing them to do something that is not what finds a port.
+        assert!(!empty_headline().to_lowercase().contains("terminal"));
+        assert!(!empty_detail().to_lowercase().contains("terminal"));
+    }
+
+    #[test]
+    fn nothing_of_yours_is_not_the_same_as_nothing_at_all() {
+        assert_ne!(no_owned_hint(), empty_headline());
+    }
+
+    #[test]
+    fn a_detail_line_carries_both_facts() {
+        assert_eq!(
+            detail_label("node", 21044, true),
+            "node · pid 21044 · local only"
+        );
+        assert_eq!(detail_label("", 7, false), "pid 7 · on your network");
+    }
+
+    #[test]
+    fn every_attribution_explains_itself() {
+        for how in [Attribution::Terminal, Attribution::Cwd, Attribution::Command] {
+            assert!(!attribution_tooltip(how).is_empty());
+        }
+        // Three distinct reasons must read as three distinct sentences.
+        assert_ne!(
+            attribution_tooltip(Attribution::Cwd),
+            attribution_tooltip(Attribution::Command)
+        );
+        assert_ne!(
+            attribution_tooltip(Attribution::Terminal),
+            attribution_tooltip(Attribution::Cwd)
+        );
     }
 }

@@ -13,6 +13,10 @@
 //! this slow and lossy, `-iTCP -sTCP:LISTEN` narrows to listeners, `-a`
 //! combines that with `-p` rather than unioning with it, and `-F pn` selects
 //! the two fields the parser reads.
+//!
+//! The unscoped query is the same command with `-a -p <list>` left off. It is
+//! not meaningfully more expensive here — `lsof` walks every process either
+//! way to answer `-iTCP`, and the filter only decides what it prints.
 
 use std::process::{Command, Stdio};
 
@@ -27,14 +31,20 @@ use crate::parse;
 /// is the worst of both.
 const LSOF: &str = "/usr/sbin/lsof";
 
-pub(crate) fn listening_ports_of(pids: &[u32]) -> Vec<ListeningPort> {
-    let list = pids
-        .iter()
-        .map(u32::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
+pub(crate) fn listening_ports(pids: Option<&[u32]>) -> Vec<ListeningPort> {
+    let list = pids.map(|pids| {
+        pids.iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+    let mut args: Vec<&str> = vec!["-nP", "-iTCP", "-sTCP:LISTEN"];
+    if let Some(list) = list.as_deref() {
+        args.extend(["-a", "-p", list]);
+    }
+    args.extend(["-F", "pn"]);
     let output = Command::new(LSOF)
-        .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-a", "-p", &list, "-F", "pn"])
+        .args(&args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output();
@@ -47,8 +57,8 @@ pub(crate) fn listening_ports_of(pids: &[u32]) -> Vec<ListeningPort> {
     parse::lsof(&text)
         .into_iter()
         // `-p` is a filter, not a promise: re-check rather than trust it, so a
-        // future flag change cannot quietly widen what this crate reports.
-        .filter(|row| pids.contains(&row.pid))
+        // future flag change cannot quietly widen what a scoped query reports.
+        .filter(|row| pids.is_none_or(|pids| pids.contains(&row.pid)))
         .map(|row| ListeningPort {
             pid: row.pid,
             port: row.port,
@@ -70,7 +80,7 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         let me = std::process::id();
 
-        let found = listening_ports_of(&[me]);
+        let found = listening_ports(Some(&[me]));
         let ours = found
             .iter()
             .find(|p| p.port == port)
@@ -84,8 +94,22 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
         assert!(
-            !listening_ports_of(&[u32::MAX]).iter().any(|p| p.port == port),
+            !listening_ports(Some(&[u32::MAX])).iter().any(|p| p.port == port),
             "the query is scoped to the pids asked for"
+        );
+    }
+
+    /// The unscoped query must find the same socket without being told whose
+    /// it is — the half that makes a port started outside the app visible.
+    #[test]
+    fn an_unscoped_query_finds_a_listener_it_was_not_told_about() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        assert!(
+            listening_ports(None)
+                .iter()
+                .any(|p| p.port == port && p.pid == std::process::id()),
+            "an unfiltered lsof must report every listener, ours included"
         );
     }
 }

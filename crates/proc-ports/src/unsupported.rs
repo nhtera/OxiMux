@@ -6,6 +6,6 @@
 
 use crate::ListeningPort;
 
-pub(crate) fn listening_ports_of(_pids: &[u32]) -> Vec<ListeningPort> {
+pub(crate) fn listening_ports(_pids: Option<&[u32]>) -> Vec<ListeningPort> {
     Vec::new()
 }

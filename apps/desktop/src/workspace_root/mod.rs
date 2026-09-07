@@ -58,14 +58,23 @@ const LAYOUT_AUTOSAVE_TICK: Duration = Duration::from_secs(15);
 /// ~2 s" without measurable IO churn.
 const AGENT_ACTIVITY_TICK: Duration = Duration::from_secs(2);
 
-/// Cadence of the listening-ports scan. Set by how long it is tolerable to
-/// wait after `npm run dev` prints its URL — a couple of seconds reads as
-/// "immediately", ten does not — rather than by cost: the socket read is one
-/// kernel call on Windows and one small `/proc` read on Linux. Like the diff
-/// refresh, it pauses while the window is unfocused and is kicked once on
-/// focus regain, so a server started while you were away is listed by the
-/// time you have looked back.
-const PORT_SCAN_TICK: Duration = Duration::from_secs(3);
+/// Cadence of the listening-ports scan.
+///
+/// Set by how long it is tolerable to wait after `npm run dev` prints its URL
+/// — a few seconds reads as "immediately", ten does not — traded against a
+/// cost that is no longer negligible. The scan reads the whole machine's
+/// socket table now rather than a handful of pids (see
+/// [`crate::shell::ports_panel::scan`] for why), which is a `lsof` spawn on
+/// macOS and a `/proc` pass on Linux: measured at ~50ms on a laptop with
+/// eighty listeners. At this cadence that is well under a percent of one core,
+/// and the per-pid metadata behind it is cached across polls so a steady state
+/// costs only the socket read.
+///
+/// Like the diff refresh, it pauses while the window is unfocused and is
+/// kicked once on focus regain, so a server started while you were away is
+/// listed by the time you have looked back. The panel's Rescan button is the
+/// out-of-cadence escape hatch for the seconds in between.
+const PORT_SCAN_TICK: Duration = Duration::from_secs(5);
 
 /// Cadence of the usage-meter sample. The probe re-parses only logs whose
 /// (mtime, len) changed since the previous sample, so a steady-state tick
@@ -498,6 +507,14 @@ pub struct WorkspaceRoot {
     /// background executor, and a slow one must not have a second stacked
     /// behind it.
     pub(crate) port_scan_in_flight: bool,
+    /// What the kernel said about each listening pid, kept between polls.
+    ///
+    /// Lives on the root rather than in a `static` because the scan runs on
+    /// the background executor and has to carry the map with it; an `Arc` that
+    /// one place owns is testable in a way a process-wide global is not.
+    port_meta_cache: std::sync::Arc<
+        std::sync::Mutex<crate::shell::ports_panel::scan::PidMetaCache>,
+    >,
     /// Periodic listening-ports scan (focus-gated). Dropping cancels.
     _port_scan_task: Task<()>,
 }
@@ -1332,6 +1349,9 @@ impl WorkspaceRoot {
             _usage_meter_task: usage_meter_task,
             ports_panel,
             port_scan_in_flight: false,
+            port_meta_cache: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::shell::ports_panel::scan::PidMetaCache::default(),
+            )),
             _port_scan_task: port_scan_task,
         };
         // Seed the sidebar's DB-backed caches (workspace rows + agent

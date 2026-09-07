@@ -1,17 +1,24 @@
 //! Linux listening sockets via `/proc/net/tcp` and the candidates' fd links.
 //!
-//! Linux is the platform that makes this crate's scoped API necessary. The
-//! socket table names an *inode*, never an owner, so the pid has to be found
-//! by asking which process holds a file descriptor pointing at that inode —
-//! and the only way to ask is to read the fd directory of a process and see.
-//! Doing that for every process on the machine, every poll, is the design this
-//! crate exists to avoid; doing it for the caller's handful of candidates is a
-//! few dozen `readlink` calls.
+//! Linux is the platform where the scoped and unscoped queries genuinely
+//! differ. The socket table names an *inode*, never an owner, so the pid has
+//! to be found by asking which process holds a file descriptor pointing at
+//! that inode — and the only way to ask is to read the fd directory of a
+//! process and see. For the caller's handful of candidates that is a few dozen
+//! `readlink` calls; for the whole machine it is one pass over `/proc`.
 //!
-//! The order matters: the socket table is read *first*, so the inode set is
-//! small and the fd walk is a hash lookup per descriptor rather than a scan.
+//! The order matters, and it is what keeps the unscoped pass affordable: the
+//! socket table is read *first*, so the inode set is small and every
+//! descriptor examined is a hash lookup rather than a scan. The walk also
+//! stops as soon as every listening inode has an owner — on a normal machine
+//! that is long before `/proc` runs out of processes.
+//!
+//! Processes owned by another user answer `EACCES` and are skipped. Their
+//! ports are still reported by [`crate::listening_ports`] where the socket
+//! table lists them, they simply arrive without an owning pid to name — so
+//! nothing is invented, and the row is dropped rather than misattributed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ListeningPort;
 use crate::parse;
@@ -24,7 +31,7 @@ use crate::parse;
 /// matter.
 const MAX_FDS: usize = 4096;
 
-pub(crate) fn listening_ports_of(pids: &[u32]) -> Vec<ListeningPort> {
+pub(crate) fn listening_ports(pids: Option<&[u32]>) -> Vec<ListeningPort> {
     let mut sockets: HashMap<u64, (u16, bool)> = HashMap::new();
     for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
         // A missing table is an IPv6-less kernel, not a failure.
@@ -39,10 +46,36 @@ pub(crate) fn listening_ports_of(pids: &[u32]) -> Vec<ListeningPort> {
         return Vec::new();
     }
 
+    let candidates: Vec<u32> = match pids {
+        Some(pids) => pids.to_vec(),
+        None => all_pids(),
+    };
+
     let mut out = Vec::new();
-    for &pid in pids {
+    // Inodes that have found an owner. A set rather than a countdown because
+    // one process can hold the same socket on two descriptors (a server that
+    // `dup`ed its listener), and counting those twice would end the walk with
+    // sockets still unattributed.
+    let mut claimed: HashSet<u64> = HashSet::with_capacity(sockets.len());
+    // Only an *unscoped* walk may stop once every listening inode has an
+    // owner. It is walking the whole process table to answer a question about
+    // inodes, so once none are left there is nothing further to learn — and
+    // that early exit is the entire reason the unscoped pass is affordable.
+    //
+    // A scoped walk must not take that shortcut. Its candidate list is a
+    // handful of pids, so the exit saves nothing, and it can lose a row: a
+    // parent and a forked child share one *inode* for an inherited listener,
+    // so the first of them claims it and the second would never be examined.
+    // `collapse` deliberately keeps both of those as separate rows, and this
+    // is the only place that could quietly drop one.
+    let may_stop_early = pids.is_none();
+    for pid in candidates {
+        if may_stop_early && claimed.len() == sockets.len() {
+            break;
+        }
         // A process that exited between the caller's tree walk and this read
-        // is the common case, not an error.
+        // is the common case, not an error. So is another user's process,
+        // which answers `EACCES`.
         let Ok(dir) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
             continue;
         };
@@ -55,10 +88,31 @@ pub(crate) fn listening_ports_of(pids: &[u32]) -> Vec<ListeningPort> {
             };
             if let Some(&(port, loopback)) = sockets.get(&inode) {
                 out.push(ListeningPort { pid, port, loopback });
+                claimed.insert(inode);
             }
         }
     }
     out
+}
+
+/// Every pid `/proc` currently names.
+///
+/// Sorted, because the walk stops early once every listening inode has an
+/// owner and directory order is not stable across reads — an unsorted walk
+/// would attribute a socket shared by a parent and a forked worker to
+/// whichever of them the filesystem happened to list first, and that answer
+/// would change between polls. Ascending pid means the parent, which is the
+/// older process, is found first.
+fn all_pids() -> Vec<u32> {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut pids: Vec<u32> = dir
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse().ok())
+        .collect();
+    pids.sort_unstable();
+    pids
 }
 
 #[cfg(test)]
@@ -74,7 +128,7 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         let me = std::process::id();
 
-        let found = listening_ports_of(&[me]);
+        let found = listening_ports(Some(&[me]));
         let ours = found
             .iter()
             .find(|p| p.port == port)
@@ -88,8 +142,22 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
         assert!(
-            !listening_ports_of(&[u32::MAX]).iter().any(|p| p.port == port),
+            !listening_ports(Some(&[u32::MAX])).iter().any(|p| p.port == port),
             "the fd walk is scoped to the pids asked for"
+        );
+    }
+
+    /// The unscoped query must find the same socket without being told whose
+    /// it is — the half that makes a port started outside the app visible.
+    #[test]
+    fn an_unscoped_query_finds_a_listener_it_was_not_told_about() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        assert!(
+            listening_ports(None)
+                .iter()
+                .any(|p| p.port == port && p.pid == std::process::id()),
+            "a full /proc walk must reach our own fd table"
         );
     }
 }
