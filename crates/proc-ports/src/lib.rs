@@ -13,19 +13,27 @@
 //! both of those are: dependency-light kernel introspection whose consumers
 //! share nothing else with each other.
 //!
-//! ## Why the query takes a pid set
+//! ## Two queries, and why both exist
 //!
-//! [`listening_ports_of`] answers for pids the caller names rather than
-//! returning every listener on the machine. Two reasons, the second decisive:
+//! [`listening_ports_of`] answers for pids the caller names;
+//! [`listening_ports`] answers for the whole machine. They are the same read
+//! with and without a filter, and the choice is a real trade:
 //!
-//! * A caller only wants ports it can attribute to a terminal it owns. A panel
-//!   that also listed the OS's own listeners would be a security dashboard
-//!   nobody asked for, and it would bury the one row that matters.
-//! * On Linux the owning pid is *not in the socket table*. `/proc/net/tcp`
-//!   names an inode, and turning an inode into a pid means reading
-//!   `/proc/<pid>/fd` for every process on the system. Scoped to a handful of
-//!   candidates that is a few dozen `readlink` calls; unscoped it is thousands
-//!   of them, on a cadence, forever.
+//! * The scoped query is cheap and self-limiting. On Linux especially: the
+//!   owning pid is *not in the socket table*, so `/proc/net/tcp` names an
+//!   inode and turning an inode into a pid means reading `/proc/<pid>/fd`.
+//!   Scoped to a handful of candidates that is a few dozen `readlink` calls;
+//!   unscoped it is one pass over every process on the system.
+//! * The unscoped query is the only one that can see a server the caller did
+//!   not start — a dev server launched from another terminal app, a database
+//!   in a container, a daemon holding the port a build is about to want. A
+//!   caller that only ever asks about its own children cannot tell "nothing is
+//!   running" apart from "it is running, somewhere else", and those are
+//!   different answers to the only question a person opens a ports list to ask.
+//!
+//! Attribution — deciding which of those rows belongs to which of the caller's
+//! projects — is the caller's job, not this crate's. This crate reports what
+//! the kernel says and stops there.
 //!
 //! ## Per platform
 //!
@@ -99,7 +107,23 @@ pub fn listening_ports_of(pids: &[u32]) -> Vec<ListeningPort> {
     wanted.sort_unstable();
     wanted.dedup();
     wanted.truncate(MAX_PIDS);
-    collapse(imp::listening_ports_of(&wanted))
+    collapse(imp::listening_ports(Some(&wanted)))
+}
+
+/// Every local TCP port anything on this machine is listening on.
+///
+/// The unscoped sibling of [`listening_ports_of`], with the same guarantees
+/// about the result — one row per pid+port, sorted, empty rather than an error
+/// — and the same silence about failure.
+///
+/// Costs more than the scoped query, and how much more is platform-shaped:
+/// on macOS and Windows it is the identical single call with the filter left
+/// off, while on Linux it adds a pass over every readable `/proc/<pid>/fd`.
+/// Callers polling this on a cadence should cache what they derive *from* each
+/// pid (name, working directory, argument vector) rather than re-deriving it,
+/// because that — not this call — is where an unscoped scan gets expensive.
+pub fn listening_ports() -> Vec<ListeningPort> {
+    collapse(imp::listening_ports(None))
 }
 
 /// Fold per-socket rows into one row per pid+port.

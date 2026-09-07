@@ -251,27 +251,63 @@ impl WorkspaceRoot {
         if self.port_scan_in_flight {
             return;
         }
-        let mut roots: Vec<(std::path::PathBuf, u32)> = Vec::new();
+        let mut terminal_roots: Vec<(std::path::PathBuf, u32)> = Vec::new();
         for panes in self.project_panes_by_project.values() {
-            roots.extend(panes.read(cx).terminal_roots(cx));
+            terminal_roots.extend(panes.read(cx).terminal_roots(cx));
         }
-        let has_terminals = !roots.is_empty();
+        let project_roots = self.port_attribution_roots();
+        let cache = self.port_meta_cache.clone();
         self.port_scan_in_flight = true;
         cx.spawn(async move |weak, cx| {
             let inventory = cx
                 .background_executor()
                 .spawn(async move {
-                    crate::shell::ports_panel::scan::gather(roots)
+                    // The cache is held across the await only by this closure,
+                    // and `port_scan_in_flight` guarantees one scan at a time,
+                    // so the lock is never contended — it is here to move the
+                    // map to the background thread, not to arbitrate.
+                    let mut cache = cache.lock().expect("port metadata cache");
+                    crate::shell::ports_panel::scan::gather(
+                        terminal_roots,
+                        project_roots,
+                        &mut cache,
+                    )
                 })
                 .await;
             let _ = weak.update(cx, |this, cx| {
                 this.port_scan_in_flight = false;
                 this.ports_panel.update(cx, |panel, cx| {
-                    panel.apply(inventory, has_terminals, cx);
+                    panel.apply(inventory, cx);
                 });
             });
         })
         .detach();
+    }
+
+    /// Every path a listening process could be running under and still count as
+    /// "one of mine": each known project root, and each of its worktrees.
+    ///
+    /// Both, not just the worktrees: a server started in the repository itself
+    /// — the common shape before anyone makes a worktree — has to land
+    /// somewhere, and the deepest-match rule in
+    /// [`crate::shell::ports_panel::scan`] means listing the parent cannot
+    /// steal a row from the worktree underneath it.
+    fn port_attribution_roots(&self) -> Vec<std::path::PathBuf> {
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        for project in &self.app_state.recent_projects {
+            roots.push(std::path::PathBuf::from(&project.root_path));
+            for workspace in self
+                .rail_workspaces_by_project
+                .get(&project.id)
+                .into_iter()
+                .flatten()
+            {
+                roots.push(std::path::PathBuf::from(&workspace.worktree_path));
+            }
+        }
+        roots.sort();
+        roots.dedup();
+        roots
     }
 
     /// Open Settings at the About pane — version, install paths, and every

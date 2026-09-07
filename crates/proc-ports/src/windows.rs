@@ -26,13 +26,13 @@ use crate::ListeningPort;
 /// slow poll, and a poll that returns nothing is already a supported answer.
 const ATTEMPTS: usize = 3;
 
-pub(crate) fn listening_ports_of(pids: &[u32]) -> Vec<ListeningPort> {
+pub(crate) fn listening_ports(pids: Option<&[u32]>) -> Vec<ListeningPort> {
     let mut out = v4(pids);
     out.extend(v6(pids));
     out
 }
 
-fn v4(pids: &[u32]) -> Vec<ListeningPort> {
+fn v4(pids: Option<&[u32]>) -> Vec<ListeningPort> {
     let buf = table(AF_INET as u32);
     // SAFETY: `table` returns either an empty buffer or one the kernel filled
     // for this family and class, which is `MIB_TCPTABLE_OWNER_PID` by
@@ -43,7 +43,7 @@ fn v4(pids: &[u32]) -> Vec<ListeningPort> {
         return Vec::new();
     };
     rows.iter()
-        .filter(|row| pids.contains(&row.dwOwningPid))
+        .filter(|row| pids.is_none_or(|pids| pids.contains(&row.dwOwningPid)))
         .map(|row| ListeningPort {
             pid: row.dwOwningPid,
             port: port_of(row.dwLocalPort),
@@ -52,7 +52,7 @@ fn v4(pids: &[u32]) -> Vec<ListeningPort> {
         .collect()
 }
 
-fn v6(pids: &[u32]) -> Vec<ListeningPort> {
+fn v6(pids: Option<&[u32]>) -> Vec<ListeningPort> {
     let buf = table(AF_INET6 as u32);
     // SAFETY: as `v4`, for the v6 table class.
     let Some(rows) = (unsafe { rows::<MIB_TCP6TABLE_OWNER_PID, MIB_TCP6ROW_OWNER_PID>(&buf) })
@@ -60,7 +60,7 @@ fn v6(pids: &[u32]) -> Vec<ListeningPort> {
         return Vec::new();
     };
     rows.iter()
-        .filter(|row| pids.contains(&row.dwOwningPid))
+        .filter(|row| pids.is_none_or(|pids| pids.contains(&row.dwOwningPid)))
         .map(|row| ListeningPort {
             pid: row.dwOwningPid,
             port: port_of(row.dwLocalPort),
@@ -206,7 +206,7 @@ mod tests {
         let port = listener.local_addr().expect("local addr").port();
         let me = std::process::id();
 
-        let found = listening_ports_of(&[me]);
+        let found = listening_ports(Some(&[me]));
         let ours = found
             .iter()
             .find(|p| p.port == port)
@@ -220,7 +220,25 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
         // Scoped to a pid that is not ours, the socket we are holding must not
-        // come back — the filter is the whole contract of this crate.
-        assert!(!listening_ports_of(&[u32::MAX]).iter().any(|p| p.port == port));
+        // come back — an unscoped query is the only one allowed to widen.
+        assert!(
+            !listening_ports(Some(&[u32::MAX]))
+                .iter()
+                .any(|p| p.port == port)
+        );
+    }
+
+    /// The unscoped query must find the same socket without being told whose
+    /// it is — the half that makes a port started outside the app visible.
+    #[test]
+    fn an_unscoped_query_finds_a_listener_it_was_not_told_about() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        assert!(
+            listening_ports(None)
+                .iter()
+                .any(|p| p.port == port && p.pid == std::process::id()),
+            "the listener table is the whole machine's when no filter is given"
+        );
     }
 }
