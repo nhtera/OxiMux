@@ -636,14 +636,23 @@ mod tests {
     }
 
     /// Against the real kernel: our own process must resolve to something
-    /// nameable with a working directory. Guards the metadata read from
-    /// silently returning blanks, which would make every row unattributable.
+    /// nameable. Guards the metadata read from silently returning blanks,
+    /// which would make every row unattributable.
+    ///
+    /// The name is asserted everywhere because every platform can supply one.
+    /// The working directory is asserted only where `oximux-proc-cwd`
+    /// implements it — macOS via `PROC_PIDVNODEPATHINFO`, Linux via
+    /// `/proc/<pid>/cwd`. It has no Windows implementation and answers `None`
+    /// there, which is a documented gap rather than a failure: attribution on
+    /// Windows falls back to the terminal-tree signal, and demanding a cwd
+    /// here would only assert that the gap has been closed.
     #[test]
     fn our_own_process_resolves_to_real_metadata() {
         let mut cache = PidMetaCache::default();
         let me = std::process::id();
         let meta = cache.resolve(&[me]).get(&me).cloned().expect("our own pid");
         assert!(!meta.name.is_empty(), "the kernel names our own process");
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         assert!(meta.cwd.is_some(), "our own working directory is readable");
     }
 }

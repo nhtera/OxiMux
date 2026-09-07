@@ -182,10 +182,18 @@ fn signal(pid: u32, which: Signal) -> Result<(), Refusal> {
         .stderr(std::process::Stdio::null())
         .status()
     {
-        // A non-zero status is nearly always "the process is already gone",
-        // which the caller treats the same as success for the same reason
-        // ESRCH is fine above.
-        Ok(_) => Ok(()),
+        // 0 is "the request was delivered". 128 is `taskkill`'s "no such
+        // process", which is the ESRCH case above: it exited between the
+        // re-check and the signal, which is the outcome the click wanted.
+        //
+        // Every other status is a refusal — most often access denied on a
+        // process owned by another user or running elevated — and must be
+        // reported as one. Treating them all as success was a lie the panel
+        // showed as "Stopping the process on 3000" while the port stayed up.
+        Ok(status) => match status.code() {
+            Some(0) | Some(128) => Ok(()),
+            _ => Err(Refusal::Denied),
+        },
         Err(_) => Err(Refusal::Denied),
     }
 }

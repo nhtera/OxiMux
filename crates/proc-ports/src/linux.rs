@@ -52,15 +52,25 @@ pub(crate) fn listening_ports(pids: Option<&[u32]>) -> Vec<ListeningPort> {
     };
 
     let mut out = Vec::new();
-    // Inodes that have found an owner. An unscoped walk can stop once every
-    // listening inode is in here — the inodes are the question, and the
-    // remaining processes have nothing left to answer. A set rather than a
-    // countdown because one process can hold the same socket on two
-    // descriptors (a server that `dup`ed its listener), and counting those
-    // twice would end the walk with sockets still unattributed.
+    // Inodes that have found an owner. A set rather than a countdown because
+    // one process can hold the same socket on two descriptors (a server that
+    // `dup`ed its listener), and counting those twice would end the walk with
+    // sockets still unattributed.
     let mut claimed: HashSet<u64> = HashSet::with_capacity(sockets.len());
+    // Only an *unscoped* walk may stop once every listening inode has an
+    // owner. It is walking the whole process table to answer a question about
+    // inodes, so once none are left there is nothing further to learn — and
+    // that early exit is the entire reason the unscoped pass is affordable.
+    //
+    // A scoped walk must not take that shortcut. Its candidate list is a
+    // handful of pids, so the exit saves nothing, and it can lose a row: a
+    // parent and a forked child share one *inode* for an inherited listener,
+    // so the first of them claims it and the second would never be examined.
+    // `collapse` deliberately keeps both of those as separate rows, and this
+    // is the only place that could quietly drop one.
+    let may_stop_early = pids.is_none();
     for pid in candidates {
-        if claimed.len() == sockets.len() {
+        if may_stop_early && claimed.len() == sockets.len() {
             break;
         }
         // A process that exited between the caller's tree walk and this read

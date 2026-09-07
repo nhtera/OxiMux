@@ -689,20 +689,29 @@ impl PortsPanel {
             );
         }
         if owned {
-            actions = actions.child(
-                Button::new(SharedString::from(format!("port-stop-{key}")))
-                    .ghost()
-                    .xsmall()
-                    .icon(
-                        Icon::default()
-                            .path("icons/trash.svg")
-                            .text_color(theme.status_error),
-                    )
-                    .tooltip("Stop this process")
-                    .on_click(
-                        cx.listener(move |this, _: &ClickEvent, _w, cx| this.stop_port(pid, port, cx)),
-                    ),
-            );
+            actions = actions
+                // A gap, not a confirmation step. Stop is one click from Copy
+                // in a cluster of small icons, and an accidental SIGTERM to a
+                // dev server is a real cost — but it is a recoverable one
+                // (restart it), so the proportionate answer is to stop the
+                // destructive verb sitting flush against the harmless ones
+                // rather than to put a dialog in front of every deliberate
+                // use.
+                .child(div().flex_none().w(px(density.gap_inline)))
+                .child(
+                    Button::new(SharedString::from(format!("port-stop-{key}")))
+                        .ghost()
+                        .xsmall()
+                        .icon(
+                            Icon::default()
+                                .path("icons/trash.svg")
+                                .text_color(theme.status_error),
+                        )
+                        .tooltip("Stop this process")
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _w, cx| {
+                            this.stop_port(pid, port, cx)
+                        })),
+                );
         }
 
         let headline: AnyElement = if editing {
