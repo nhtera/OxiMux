@@ -145,6 +145,17 @@ const APP_ICONS: &[(&str, &[u8])] = &[
         "icons/image.svg",
         include_bytes!("../assets/icons/image.svg"),
     ),
+    // Attach glyph for the chat composer's attachment menu trigger.
+    (
+        "icons/paperclip.svg",
+        include_bytes!("../assets/icons/paperclip.svg"),
+    ),
+    // "Paste image" row in that menu — a clipboard, distinct from the plain
+    // copy glyph the upstream catalog ships.
+    (
+        "icons/clipboard-paste.svg",
+        include_bytes!("../assets/icons/clipboard-paste.svg"),
+    ),
     (
         "icons/chevron-down.svg",
         include_bytes!("../assets/icons/chevron-down.svg"),

@@ -2696,7 +2696,7 @@ fn dropping_a_source_file_puts_a_mention_in_the_composer(cx: &mut TestAppContext
             view.cwd = std::path::PathBuf::from("/proj");
 
             // Inside the cwd → relative, the same token the `@` overlay makes.
-            view.attach_dropped_paths(
+            view.attach_paths(
                 vec![std::path::PathBuf::from("/proj/src/main.rs")],
                 window,
                 cx,
@@ -2708,7 +2708,7 @@ fn dropping_a_source_file_puts_a_mention_in_the_composer(cx: &mut TestAppContext
             );
 
             // A second drop appends rather than replacing.
-            view.attach_dropped_paths(
+            view.attach_paths(
                 vec![std::path::PathBuf::from("/proj/README.md")],
                 window,
                 cx,
@@ -2720,7 +2720,7 @@ fn dropping_a_source_file_puts_a_mention_in_the_composer(cx: &mut TestAppContext
             );
 
             // Outside the cwd → absolute, never a `../..` chain.
-            view.attach_dropped_paths(vec![std::path::PathBuf::from("/etc/hosts")], window, cx);
+            view.attach_paths(vec![std::path::PathBuf::from("/etc/hosts")], window, cx);
             assert_eq!(
                 view.composer.read(cx).current_draft(cx),
                 "@src/main.rs @README.md @/etc/hosts ",
@@ -2728,6 +2728,35 @@ fn dropping_a_source_file_puts_a_mention_in_the_composer(cx: &mut TestAppContext
             );
         })
         .expect("drop non-image files");
+}
+
+/// The attach menu's "Add folder" row hands a directory down this same path.
+/// A directory is not an image, so it must land as a mention — the agent can
+/// then list or read under it, which is the whole point of naming a folder.
+#[gpui::test]
+fn a_picked_folder_becomes_a_mention(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let window = cx.add_window(|window, cx| {
+        AgentChatView::with_connection_for_test(
+            std::sync::Arc::new(StubConnection::default()),
+            Theme::default(),
+            Density::default(),
+            Typography::default(),
+            window,
+            cx,
+        )
+    });
+    window
+        .update(cx, |view, window, cx| {
+            view.cwd = std::path::PathBuf::from("/proj");
+            view.attach_paths(vec![std::path::PathBuf::from("/proj/crates/git")], window, cx);
+            assert_eq!(
+                view.composer.read(cx).current_draft(cx),
+                "@crates/git ",
+                "a picked folder must reach the prompt as a mention"
+            );
+        })
+        .expect("pick a folder");
 }
 
 /// An image drop must NOT put its path in the prompt — it is staged as an
@@ -2749,7 +2778,7 @@ fn dropping_an_image_does_not_write_its_path_into_the_prompt(cx: &mut TestAppCon
     window
         .update(cx, |view, window, cx| {
             view.cwd = std::path::PathBuf::from("/proj");
-            view.attach_dropped_paths(
+            view.attach_paths(
                 vec![
                     std::path::PathBuf::from("/proj/shot.png"),
                     std::path::PathBuf::from("/proj/src/main.rs"),
@@ -2938,7 +2967,7 @@ fn a_completed_drop_retires_the_overlay(cx: &mut TestAppContext) {
             view.set_drop_hint(true, &[std::path::PathBuf::from("/proj/main.rs")], cx);
             assert!(view.drop_hint.is_some(), "armed while hovering");
 
-            view.attach_dropped_paths(
+            view.attach_paths(
                 vec![std::path::PathBuf::from("/proj/main.rs")],
                 window,
                 cx,

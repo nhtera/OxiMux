@@ -89,8 +89,18 @@ impl AgentChatView {
                 ComposerEvent::CaptureContext(request) => {
                     this.capture_context(request.clone(), cx)
                 }
+                ComposerEvent::PathsPicked(paths) => {
+                    this.attach_paths(paths.clone(), window, cx)
+                }
+                ComposerEvent::OpenForgePicker => this.open_forge_picker(window, cx),
             },
         )];
+
+        // Which forge hosts this repo decides whether the composer's attach menu
+        // offers an issue row at all, and how it words it. Fire-and-forget: the
+        // answer lands well before a user opens the menu, and its absence just
+        // leaves the row hidden.
+        Self::spawn_forge_detect(cwd.clone(), composer.clone(), cx);
 
         // A resumed thread carries the prior session id; a fresh one is `None`
         // (spawn a new session). Either way the subprocess is spawned the same.
@@ -355,6 +365,9 @@ impl AgentChatView {
             expanded_tool_runs: HashSet::new(),
             image_cache: ImageCache::new(),
             preview: None,
+            forge_picker: None,
+            forge_picker_gen: 0,
+            _forge_task: None,
             open_tool_sheet: None,
             sheet_copied: false,
             _sheet_copy_task: None,

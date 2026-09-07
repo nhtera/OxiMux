@@ -41,6 +41,7 @@ mod context_providers;
 mod diff_card;
 mod error_card;
 mod find_bar;
+mod forge_picker;
 mod image_attach;
 mod image_cache;
 mod jump_menu;
@@ -756,6 +757,17 @@ pub struct AgentChatView {
     /// that one message's images (a per-message group); the backdrop / ✕ clears
     /// it.
     preview: Option<(usize, usize)>,
+    /// The "Add issue or pull request" picker, open when `Some`. Owned here
+    /// rather than by the composer because the listing needs the chat cwd and
+    /// the forge CLI — the same reason `@diff` capture lives on this side.
+    forge_picker: Option<forge_picker::ForgePicker>,
+    /// Bumped on each picker open so a listing whose request the user has
+    /// already dismissed (or superseded by reopening) is dropped when it lands
+    /// instead of repopulating a closed picker.
+    forge_picker_gen: u64,
+    /// Keeps the picker's in-flight listing / detail fetch alive. Dropping the
+    /// picker drops the task with it.
+    _forge_task: Option<gpui::Task<()>>,
     /// When `Some(tool_call_id)`, a fullscreen tool-payload sheet is open on that
     /// tool call — a large diff / shell output / read slice rendered full-height
     /// and scrollable (virtualized for diffs). The backdrop / ✕ / Esc clears it;
@@ -1878,10 +1890,15 @@ impl AgentChatView {
         }
     }
 
-    /// Stage image files dropped onto the chat surface into the composer. The
+    /// Route paths that arrived from a drop or from the composer's attach-menu
+    /// picker into the composer. One function for both, deliberately: what a
+    /// path becomes must not depend on whether it was dragged in or chosen in a
+    /// dialog.
+    ///
+    /// The
     /// read + decode runs on a background executor (an image can be large), then
     /// the staged attachments are handed to the composer on the foreground.
-    fn attach_dropped_paths(
+    fn attach_paths(
         &mut self,
         paths: Vec<PathBuf>,
         window: &mut Window,
@@ -3120,6 +3137,9 @@ impl AgentChatView {
             expanded_tool_runs: HashSet::new(),
             image_cache: ImageCache::new(),
             preview: None,
+            forge_picker: None,
+            forge_picker_gen: 0,
+            _forge_task: None,
             open_tool_sheet: None,
             sheet_copied: false,
             _sheet_copy_task: None,
@@ -4983,6 +5003,11 @@ impl Render for AgentChatView {
                         return;
                     }
                 }
+                if this.forge_picker.is_some() {
+                    this.close_forge_picker(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.preview.is_some() {
                     this.close_image_preview(cx);
                     cx.stop_propagation();
@@ -5026,6 +5051,15 @@ impl Render for AgentChatView {
             // we stop propagation (otherwise the field inserts the newline). An
             // open slash/mention overlay makes ↵ accept the highlighted item.
             .capture_action(cx.listener(|this, _action: &InputEnter, window, cx| {
+                // The issue picker owns Enter while it is open: ↵ stages the
+                // active row. Checked first because this handler is the one that
+                // wins — capture runs ancestor-first, so a handler on the picker
+                // overlay itself would never be reached.
+                if this.forge_picker.is_some() {
+                    this.forge_picker_accept_active(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 // The find bar owns Enter while its input is focused: ↵ steps to
                 // the next match, ⇧↵ to the previous. Otherwise route to the
                 // composer as before.
@@ -5064,6 +5098,11 @@ impl Render for AgentChatView {
                         cx.stop_propagation();
                         return;
                     }
+                }
+                if this.forge_picker.is_some() {
+                    this.close_forge_picker(window, cx);
+                    cx.stop_propagation();
+                    return;
                 }
                 if this.preview.is_some() {
                     this.close_image_preview(cx);
@@ -5106,7 +5145,7 @@ impl Render for AgentChatView {
                 },
             ))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
-                this.attach_dropped_paths(paths.paths().to_vec(), window, cx);
+                this.attach_paths(paths.paths().to_vec(), window, cx);
             }))
             // The same, for a drag that started in OxiMux's own file explorer.
             // The explorer emits `FilePathDragPayload` while Finder emits
@@ -5116,7 +5155,7 @@ impl Render for AgentChatView {
                 |this, payload: &crate::shell::pane_group::file_drag::FilePathDragPayload,
                  window,
                  cx| {
-                    this.attach_dropped_paths(vec![payload.path.clone()], window, cx);
+                    this.attach_paths(vec![payload.path.clone()], window, cx);
                 },
             ))
             .child(transcript)
@@ -5148,6 +5187,8 @@ impl Render for AgentChatView {
             .children(self.render_drop_overlay(cx))
             // The image lightbox overlays everything when a thumbnail is opened.
             .children(self.render_image_preview(cx))
+            // The issue / pull-request picker, opened from the attach menu.
+            .children(self.render_forge_picker(cx))
             // The fullscreen tool-payload sheet overlays everything when open.
             .children(self.render_tool_sheet(cx))
             .into_any_element()

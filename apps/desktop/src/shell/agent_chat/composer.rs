@@ -54,6 +54,8 @@ struct PendingTranscript {
     send_after: bool,
 }
 
+mod attach_menu;
+
 /// One agent in the draft's agent picker: its adapter id, display name, and
 /// how many models the draft knows for it (see [`AgentModelCount`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,7 +112,7 @@ use oximux_settings::{Density, Theme, Typography};
 use super::composer_history::PromptHistory;
 use super::context_meter;
 use super::context_providers::{ContextRequest, ContextSource};
-use super::image_attach::{self, PendingImage, pending_from_bytes, pending_from_path};
+use super::image_attach::{self, PendingImage, pending_from_bytes};
 use super::slash_command_catalog::{CommandCatalog, CommandGroup};
 use super::slash_palette::{completed_command, detect_slash_trigger, rank_commands};
 use crate::shell::agent_ui::agent_presentation::adapter_icon_path;
@@ -314,6 +316,17 @@ pub enum ComposerEvent {
     /// the content (clipboard / git diff / terminal scrollback) and hands the
     /// resulting chip back via [`ComposerView::add_context_chip`].
     CaptureContext(ContextRequest),
+    /// The user chose files or a folder in the attach menu's native picker.
+    ///
+    /// The composer does not route these itself: what a path *becomes* (an image
+    /// attachment vs an `@path` mention) depends on the chat's cwd, which only
+    /// the parent knows. Handing the raw paths up means a picked file and a
+    /// dropped file travel exactly one code path.
+    PathsPicked(Vec<std::path::PathBuf>),
+    /// The user chose "Add issue or pull request" in the attach menu. The parent
+    /// owns the picker (listing needs the chat cwd and the forge CLI) and hands
+    /// the chosen item back via [`ComposerView::add_context_chip`].
+    OpenForgePicker,
 }
 
 /// The *New Agent* draft's worktree-isolation state, projected by the parent for
@@ -445,6 +458,12 @@ pub struct ComposerView {
     /// [`Self::set_worktree_draft`]; the parent owns the truth, this only renders
     /// the pill and emits [`ComposerEvent::WorktreeIsolationPicked`].
     worktree_draft: Option<WorktreeDraft>,
+    /// Which forge (if any) hosts this chat's repo, pushed by the parent after a
+    /// local `git remote` sniff. Drives the attach menu's issue row: its wording
+    /// ("pull request" vs "merge request") and brand glyph follow the host, and
+    /// the row is hidden entirely on a repo no forge claims — offering it there
+    /// would open a picker that can only ever come back empty.
+    forge_kind: Option<crate::shell::forge::ForgeKind>,
     /// Images staged for the next send (via the paperclip, ⌘V, or drag-drop).
     /// Each holds both its wire/persist [`ChatImage`] and a pre-decoded thumbnail
     /// so the chip row doesn't re-decode on every keystroke repaint. Cleared on
@@ -632,6 +651,7 @@ impl ComposerView {
             agent_options: Vec::new(),
             current_agent: None,
             worktree_draft: None,
+            forge_kind: None,
             pending_images: Vec::new(),
             dictation: DictationUiState::Idle,
             dictation_waveform: WaveformBuffer::default(),
@@ -691,28 +711,6 @@ impl ComposerView {
         let next = with_mentions_appended(&self.input.read(cx).value(), paths);
         self.set_draft_end(next, window, cx);
         cx.notify();
-    }
-
-    /// Attach image files chosen from the native file dialog. `rfd`'s async
-    /// dialog runs off the main thread; the read + decode also happens on a
-    /// background executor (decoding a large image is not cheap), then the staged
-    /// results are handed back to this view on the foreground.
-    fn attach_from_picker(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let files = rfd::AsyncFileDialog::new()
-                .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff"])
-                .pick_files()
-                .await;
-            let Some(files) = files else { return };
-            let paths: Vec<_> = files.into_iter().map(|f| f.path().to_path_buf()).collect();
-            let staged = cx
-                .background_spawn(async move {
-                    paths.iter().filter_map(|p| pending_from_path(p)).collect::<Vec<_>>()
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| this.add_pending_images(staged, cx));
-        })
-        .detach();
     }
 
     /// Handle ⌘V: if the clipboard holds an image, stage it and report `true`
@@ -2372,18 +2370,6 @@ impl ComposerView {
             // question is where the work lands.
             .children(self.render_worktree_picker(cx))
             .child(self.render_import_session_button(cx))
-    }
-
-    /// The image-attach control (far left of the toolbar): a flat ghost button
-    /// that opens the native image picker. Always enabled — attachments stage
-    /// for the next send even while a turn streams.
-    fn render_attach_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        Button::new("chat-attach-btn")
-            .icon(Icon::default().path("icons/image.svg"))
-            .ghost()
-            .small()
-            .tooltip("Attach image")
-            .on_click(cx.listener(|this, _ev, _window, cx| this.attach_from_picker(cx)))
     }
 
     /// The idle mic control: the mic button plus a chevron opening the
