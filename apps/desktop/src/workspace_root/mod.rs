@@ -413,6 +413,12 @@ pub struct WorkspaceRoot {
     /// reconciliation net) — `refresh_left_rail` only READS this, so
     /// render never touches SQLite.
     pub(crate) rail_workspaces_by_project: HashMap<String, Vec<oximux_core::Workspace>>,
+    /// Cached sidebar DB data: each project's ARCHIVED workspace rows, newest
+    /// archived first. Same lifecycle as [`Self::rail_workspaces_by_project`]
+    /// and gathered in the same background pass, so the rail's `Archived (N)`
+    /// header has its count without a second query path to invalidate. Usually
+    /// empty; archived rows are cold data.
+    pub(crate) rail_archived_by_project: HashMap<String, Vec<oximux_core::Workspace>>,
     /// Cached latest agent-session status per workspace id — same
     /// lifecycle as [`Self::rail_workspaces_by_project`].
     pub(crate) rail_latest_status: crate::shell::left_rail::LatestStatusMap,
@@ -1325,6 +1331,7 @@ impl WorkspaceRoot {
             diff_counts: HashMap::new(),
             force_delete_offer: None,
             rail_workspaces_by_project: HashMap::new(),
+            rail_archived_by_project: HashMap::new(),
             rail_latest_status: HashMap::new(),
             rail_latest_adapter: HashMap::new(),
             rail_last_active: HashMap::new(),

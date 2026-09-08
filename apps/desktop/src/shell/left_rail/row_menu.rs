@@ -56,6 +56,7 @@ pub enum WorkspaceRowAction {
     RunCleanup,
     Rename,
     Archive,
+    Unarchive,
     Delete,
 }
 
@@ -67,6 +68,7 @@ impl WorkspaceRowAction {
             Self::RunCleanup => "Run cleanup",
             Self::Rename => "Rename",
             Self::Archive => "Archive",
+            Self::Unarchive => "Unarchive",
             Self::Delete => "Delete",
         }
     }
@@ -100,6 +102,31 @@ const ACTIONS: &[WorkspaceRowAction] = &[
     WorkspaceRowAction::Archive,
     WorkspaceRowAction::Delete,
 ];
+
+/// Management actions offered on an ARCHIVED row.
+const ARCHIVED_ACTIONS: &[WorkspaceRowAction] =
+    &[WorkspaceRowAction::Unarchive, WorkspaceRowAction::Delete];
+
+/// The menu's action list for one row, in surface order — the pure half of
+/// `Render`, so the gating is testable without a window.
+///
+/// An archived row offers only `Unarchive` and `Delete`. Everything else is
+/// meaningless there: the `Run *` scripts and `Rename` act on a worktree the
+/// user cannot activate, `Archive` is a no-op on an already-archived row, and
+/// `Pin` / `Color` order and tag a row that does not appear in the live list.
+/// If triage later turns out to need one of them back, this gate is the only
+/// thing to widen.
+fn menu_actions(is_archived: bool, avail: ScriptAvail) -> Vec<WorkspaceRowAction> {
+    if is_archived {
+        return ARCHIVED_ACTIONS.to_vec();
+    }
+    SCRIPT_ACTIONS
+        .iter()
+        .copied()
+        .filter(|a| a.script_kind().is_some_and(|k| avail.has(k)))
+        .chain(ACTIONS.iter().copied())
+        .collect()
+}
 
 pub struct WorkspaceRowMenu {
     /// `None` when closed; `Some` carries the target workspace, which
@@ -163,6 +190,7 @@ impl WorkspaceRowMenu {
             match action {
                 WorkspaceRowAction::Rename => root.request_rename_workspace(workspace, window, cx),
                 WorkspaceRowAction::Archive => root.archive_workspace(workspace, cx),
+                WorkspaceRowAction::Unarchive => root.unarchive_workspace(workspace, cx),
                 WorkspaceRowAction::Delete => root.request_delete_workspace(workspace, window, cx),
                 // Script actions handled above.
                 WorkspaceRowAction::RunSetup
@@ -180,7 +208,8 @@ impl WorkspaceRowMenu {
         let Some((workspace, ..)) = self.open_for.clone() else {
             return div().into_any_element();
         };
-        if workspace.id.starts_with("primary:") {
+        // Pinning orders a row within the live list; an archived row is not in it.
+        if workspace.id.starts_with("primary:") || workspace.archived_at.is_some() {
             return div().into_any_element();
         }
         let theme = self.theme;
@@ -220,8 +249,9 @@ impl WorkspaceRowMenu {
             return div().into_any_element();
         };
         // Synthesized "primary:<proj>" rows aren't real workspace rows — tinting
-        // them would no-op against the DB, so omit the picker entirely.
-        if workspace.id.starts_with("primary:") {
+        // them would no-op against the DB, so omit the picker entirely. Archived
+        // rows are omitted too: the hue tags a row in the live list.
+        if workspace.id.starts_with("primary:") || workspace.archived_at.is_some() {
             return div().into_any_element();
         }
         let theme = self.theme;
@@ -293,7 +323,7 @@ impl WorkspaceRowMenu {
 impl Render for WorkspaceRowMenu {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
-        let Some((_, avail, x, y)) = self.open_for.clone() else {
+        let Some((workspace, avail, x, y)) = self.open_for.clone() else {
             return div().into_any_element();
         };
         let theme = self.theme;
@@ -301,13 +331,9 @@ impl Render for WorkspaceRowMenu {
         let typography = self.typography.clone();
 
         // Surface only the script rows that are actually defined for this
-        // workspace, followed by the always-present management actions.
-        let actions: Vec<WorkspaceRowAction> = SCRIPT_ACTIONS
-            .iter()
-            .copied()
-            .filter(|a| a.script_kind().is_some_and(|k| avail.has(k)))
-            .chain(ACTIONS.iter().copied())
-            .collect();
+        // workspace, followed by the always-present management actions — or,
+        // on an archived row, the reduced pair. See `menu_actions`.
+        let actions = menu_actions(workspace.archived_at.is_some(), avail);
 
         let mut card = div()
             .flex()
@@ -391,6 +417,60 @@ mod tests {
         assert_eq!(WorkspaceRowAction::Rename.label(), "Rename");
         assert_eq!(WorkspaceRowAction::Archive.label(), "Archive");
         assert_eq!(WorkspaceRowAction::Delete.label(), "Delete");
+    }
+
+    /// An archived row is restore-or-delete and nothing else — the gate that
+    /// keeps `Rename` and the lifecycle scripts off a worktree the user cannot
+    /// activate.
+    #[test]
+    fn archived_row_offers_only_unarchive_and_delete() {
+        let all_scripts = ScriptAvail {
+            setup: true,
+            run: true,
+            cleanup: true,
+        };
+        assert_eq!(
+            menu_actions(true, all_scripts),
+            vec![WorkspaceRowAction::Unarchive, WorkspaceRowAction::Delete],
+        );
+        // The reduction does not depend on which scripts happen to be defined.
+        assert_eq!(
+            menu_actions(true, ScriptAvail::default()),
+            menu_actions(true, all_scripts),
+        );
+    }
+
+    /// The archived gate must not change what a live row offers.
+    #[test]
+    fn active_row_keeps_defined_scripts_then_management_actions() {
+        let avail = ScriptAvail {
+            setup: true,
+            run: false,
+            cleanup: true,
+        };
+        assert_eq!(
+            menu_actions(false, avail),
+            vec![
+                WorkspaceRowAction::RunSetup,
+                WorkspaceRowAction::RunCleanup,
+                WorkspaceRowAction::Rename,
+                WorkspaceRowAction::Archive,
+                WorkspaceRowAction::Delete,
+            ],
+        );
+        // No scripts defined → management actions only.
+        assert_eq!(
+            menu_actions(false, ScriptAvail::default()),
+            ACTIONS.to_vec(),
+        );
+    }
+
+    /// `Unarchive` restores; it must never be painted in the destructive colour.
+    #[test]
+    fn unarchive_is_not_destructive() {
+        assert!(!WorkspaceRowAction::Unarchive.is_destructive());
+        assert!(WorkspaceRowAction::Unarchive.script_kind().is_none());
+        assert_eq!(WorkspaceRowAction::Unarchive.label(), "Unarchive");
     }
 
     #[test]
