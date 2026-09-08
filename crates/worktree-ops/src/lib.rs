@@ -12,10 +12,15 @@
 //! its own root instead of the desktop's.
 
 pub mod include;
+pub mod rename;
 mod service;
 pub mod setup;
 
 pub use include::{CopyReport, Skip};
+pub use rename::{
+    RenameOutcome, RenamePlan, RenameRefusal, apply_rename, preflight_rename,
+    rename_with_rollback,
+};
 pub use service::RepoWorktrees;
 pub use setup::{SETUP_TIMEOUT, SetupOutcome, SetupTranscript};
 

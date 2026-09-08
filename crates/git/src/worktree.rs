@@ -120,6 +120,42 @@ impl Repository {
         cmd.arg(path.as_os_str()).run().await?;
         Ok(())
     }
+
+    /// Move a linked worktree from `from` to `to`, letting git update its own
+    /// `gitdir` bookkeeping.
+    ///
+    /// Never do this with a plain `mv`: a linked worktree's `.git` file and the
+    /// `.git/worktrees/<name>/gitdir` pointer reference each other by absolute
+    /// path, and moving the directory behind git's back desynchronises them
+    /// into exactly the wedged state a rename is supposed to remove.
+    ///
+    /// Git refuses on a locked worktree and can refuse on submodules; the error
+    /// carries git's own text so the caller can surface the reason verbatim
+    /// rather than guessing at it.
+    pub async fn move_worktree(&self, from: &Path, to: &Path) -> Result<()> {
+        // Refuse the main worktree early, for the reason `remove_worktree`
+        // gives: git errors too, but a guaranteed mistake need not spawn git.
+        let source = std::fs::canonicalize(from)
+            .map_err(|e| GitError::parse(format!("canonicalize worktree path: {e}")))?;
+        let main = std::fs::canonicalize(self.workdir())
+            .map_err(|e| GitError::parse(format!("canonicalize workdir: {e}")))?;
+        if source == main {
+            return Err(GitError::invalid_input("cannot move main worktree"));
+        }
+        if to.exists() {
+            return Err(GitError::invalid_input(format!(
+                "destination already exists: {}",
+                to.display()
+            )));
+        }
+        GitCmd::new(self.workdir())
+            .args(["worktree", "move"])
+            .arg(from.as_os_str())
+            .arg(to.as_os_str())
+            .run()
+            .await?;
+        Ok(())
+    }
 }
 
 /// Reject slug values that would either be ambiguous as a branch component

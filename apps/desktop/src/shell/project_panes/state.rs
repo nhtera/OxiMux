@@ -1044,4 +1044,15 @@ impl ProjectPanes {
         }
         set
     }
+
+    /// Live working directory of every terminal PTY across this project's
+    /// groups. See `PaneGroupState::live_terminal_cwds` for why this is not the
+    /// same question as `live_worktree_paths`.
+    pub fn live_terminal_cwds(&self, cx: &gpui::App) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for group in self.groups.values() {
+            out.extend(group.read(cx).live_terminal_cwds(cx));
+        }
+        out
+    }
 }

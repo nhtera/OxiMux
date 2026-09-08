@@ -365,14 +365,20 @@ impl LeftRail {
         // Lazily build the field (and wire its blur→commit) the first time.
         if self.rename_input.is_none() {
             let input = cx.new(|cx| InputState::new(window, cx));
-            let sub = cx.subscribe(&input, |this, _input, event: &InputEvent, cx| {
-                // Losing focus commits the edit — but only if a rename is still
-                // in flight (Enter/Escape clear it first, so their blur is a
-                // no-op and Escape stays a cancel).
-                if matches!(event, InputEvent::Blur) {
-                    this.commit_rename(cx);
-                }
-            });
+            // `subscribe_in` rather than `subscribe`: committing a rename can
+            // now refuse and raise a dialog, which needs a window.
+            let sub = cx.subscribe_in(
+                &input,
+                window,
+                |this, _input, event: &InputEvent, window, cx| {
+                    // Losing focus commits the edit — but only if a rename is
+                    // still in flight (Enter/Escape clear it first, so their
+                    // blur is a no-op and Escape stays a cancel).
+                    if matches!(event, InputEvent::Blur) {
+                        this.commit_rename(window, cx);
+                    }
+                },
+            );
             self.rename_input = Some(input);
             self._rename_sub = Some(sub);
         }
@@ -389,7 +395,7 @@ impl LeftRail {
 
     /// Commit the in-flight inline rename via the shared rename path, then
     /// dismiss the field. No-op when nothing is being renamed.
-    pub(crate) fn commit_rename(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = self.renaming_workspace.take() else {
             return;
         };
@@ -401,9 +407,9 @@ impl LeftRail {
         // Skip the DB write + rail refresh when nothing actually changed (e.g.
         // the field lost focus without an edit).
         if new_name.trim() != workspace.name {
-            let _ = self
-                .weak_root
-                .update(cx, |root, cx| root.rename_workspace_now(workspace, new_name, cx));
+            let _ = self.weak_root.update(cx, |root, cx| {
+                root.rename_workspace_now(workspace, new_name, window, cx)
+            });
         }
         cx.notify();
     }

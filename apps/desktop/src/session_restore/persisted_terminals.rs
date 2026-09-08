@@ -1042,3 +1042,270 @@ mod tests {
         assert_eq!(back, full);
     }
 }
+
+/// Rewrite every stored path under `old_root` to sit under `new_root`.
+///
+/// A worktree rename moves the directory, but `worktree_path` and the per-pane
+/// `cwd`s in this blob are *join keys* as well as locations: left alone, the
+/// next launch restores tabs at a path that no longer exists, agent sessions
+/// never re-attach because `get_by_worktree_path` finds nothing, and the row
+/// renders idle with no diff chip. Nothing errors anywhere — the state simply
+/// disagrees with itself, which is the failure this rewrite exists to prevent.
+///
+/// Sub-paths are rewritten too, not just exact matches: a terminal that had
+/// `cd`-ed into `<worktree>/src` must land in the renamed tree's `src`, not at
+/// a dead absolute path.
+///
+/// Returns how many fields were changed, so a caller can skip the write when
+/// nothing matched.
+pub fn repoint_worktree_paths(tabs: &mut PersistedTabs, old_root: &str, new_root: &str) -> usize {
+    let mut changed = 0;
+    for tab in &mut tabs.tabs {
+        if let Some(agent) = tab.agent.as_mut()
+            && let Some(next) = repointed(&agent.worktree_path, old_root, new_root)
+        {
+            agent.worktree_path = next;
+            changed += 1;
+        }
+        // The tab-kind tag carries paths of its own. A chat respawns in `cwd`
+        // and an editor reopens `path`; both are absolute, and both restore to
+        // a directory that no longer exists if they are left behind.
+        match &mut tab.kind {
+            PersistedTabKind::AgentChat { cwd, .. } => {
+                if let Some(next) = repointed(cwd, old_root, new_root) {
+                    *cwd = next;
+                    changed += 1;
+                }
+            }
+            PersistedTabKind::Editor { path, .. } => {
+                if let Some(next) = repointed(path, old_root, new_root) {
+                    *path = next;
+                    changed += 1;
+                }
+            }
+            // Terminal carries its paths in `sub_panes` (below); a browser tab's
+            // `url` is not a filesystem path.
+            PersistedTabKind::Terminal | PersistedTabKind::Browser { .. } => {}
+        }
+        for sub in &mut tab.sub_panes {
+            if let Some(cwd) = sub.cwd.as_ref()
+                && let Some(next) = repointed(cwd, old_root, new_root)
+            {
+                sub.cwd = Some(next);
+                changed += 1;
+            }
+            for leaf in &mut sub.tabs {
+                if let Some(cwd) = leaf.cwd.as_ref()
+                    && let Some(next) = repointed(cwd, old_root, new_root)
+                {
+                    leaf.cwd = Some(next);
+                    changed += 1;
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// `path` rebased from `old_root` onto `new_root`, or `None` when it is not
+/// under `old_root` at all.
+///
+/// The separator check is what stops `/wt/feat` from swallowing `/wt/feature`:
+/// a prefix match alone would rewrite a sibling worktree's paths into the
+/// renamed one's tree.
+fn repointed(path: &str, old_root: &str, new_root: &str) -> Option<String> {
+    if path == old_root {
+        return Some(new_root.to_string());
+    }
+    let rest = path.strip_prefix(old_root)?;
+    let sep = std::path::MAIN_SEPARATOR;
+    if !rest.starts_with(sep) && !rest.starts_with('/') {
+        return None;
+    }
+    Some(format!("{new_root}{rest}"))
+}
+
+#[cfg(test)]
+mod repoint_tests {
+    use super::*;
+
+    fn sub_pane(cwd: &str) -> PersistedSubPane {
+        PersistedSubPane {
+            cwd: Some(cwd.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn agent_tab(worktree: &str) -> PersistedAgentTab {
+        PersistedAgentTab {
+            adapter: AgentAdapter::ClaudeCode,
+            adapter_id: "claude-code".to_string(),
+            worktree_path: worktree.to_string(),
+            model: None,
+            effort: None,
+            relay_external_id: None,
+            relay_session: None,
+            profile: None,
+        }
+    }
+
+    #[test]
+    fn an_exact_worktree_path_is_repointed() {
+        let mut tabs = PersistedTabs {
+            tabs: vec![PersistedTab {
+                agent: Some(agent_tab("/wt/fix-lgoin")),
+                sub_panes: vec![sub_pane("/wt/fix-lgoin")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let n = repoint_worktree_paths(&mut tabs, "/wt/fix-lgoin", "/wt/fix-login");
+        assert_eq!(n, 2);
+        assert_eq!(
+            tabs.tabs[0].agent.as_ref().unwrap().worktree_path,
+            "/wt/fix-login"
+        );
+        assert_eq!(tabs.tabs[0].sub_panes[0].cwd.as_deref(), Some("/wt/fix-login"));
+    }
+
+    #[test]
+    fn a_terminal_inside_the_worktree_keeps_its_subdirectory() {
+        // A shell that had `cd`-ed into a subdirectory must land in the renamed
+        // tree's subdirectory, not at a dead absolute path.
+        let mut tabs = PersistedTabs {
+            tabs: vec![PersistedTab {
+                sub_panes: vec![PersistedSubPane {
+                    cwd: Some("/wt/old/src/deep".to_string()),
+                    tabs: vec![PersistedLeafTab {
+                        cwd: Some("/wt/old/tests".to_string()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let n = repoint_worktree_paths(&mut tabs, "/wt/old", "/wt/new");
+        assert_eq!(n, 2, "both the sub-pane and its leaf tab");
+        assert_eq!(
+            tabs.tabs[0].sub_panes[0].cwd.as_deref(),
+            Some("/wt/new/src/deep")
+        );
+        assert_eq!(
+            tabs.tabs[0].sub_panes[0].tabs[0].cwd.as_deref(),
+            Some("/wt/new/tests")
+        );
+    }
+
+    /// The bug a bare `starts_with` would introduce: renaming `/wt/feat` must
+    /// not drag a sibling worktree named `/wt/feature` along with it.
+    #[test]
+    fn a_sibling_with_a_shared_prefix_is_left_alone() {
+        let mut tabs = PersistedTabs {
+            tabs: vec![PersistedTab {
+                agent: Some(agent_tab("/wt/feature")),
+                sub_panes: vec![sub_pane("/wt/feature/src")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let n = repoint_worktree_paths(&mut tabs, "/wt/feat", "/wt/renamed");
+        assert_eq!(n, 0, "a shared prefix is not containment");
+        assert_eq!(
+            tabs.tabs[0].agent.as_ref().unwrap().worktree_path,
+            "/wt/feature"
+        );
+        assert_eq!(
+            tabs.tabs[0].sub_panes[0].cwd.as_deref(),
+            Some("/wt/feature/src")
+        );
+    }
+
+    /// A chat tab is a live subprocess rooted at `cwd`; an editor tab reopens
+    /// an absolute `path`. Both live on the tab-KIND tag rather than in
+    /// `sub_panes`, so a walk that only visits agent + sub-pane fields restores
+    /// them into a directory that no longer exists.
+    #[test]
+    fn chat_and_editor_tab_paths_are_repointed_too() {
+        let mut tabs = PersistedTabs {
+            tabs: vec![
+                PersistedTab {
+                    kind: PersistedTabKind::AgentChat {
+                        cwd: "/wt/old".to_string(),
+                        model: None,
+                        session_id: None,
+                        draft: None,
+                        queued: Vec::new(),
+                        unbound: false,
+                    },
+                    ..Default::default()
+                },
+                PersistedTab {
+                    kind: PersistedTabKind::Editor {
+                        path: "/wt/old/src/main.rs".to_string(),
+                        pdf_page: None,
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(repoint_worktree_paths(&mut tabs, "/wt/old", "/wt/new"), 2);
+        match &tabs.tabs[0].kind {
+            PersistedTabKind::AgentChat { cwd, .. } => assert_eq!(cwd, "/wt/new"),
+            other => panic!("kind changed: {other:?}"),
+        }
+        match &tabs.tabs[1].kind {
+            PersistedTabKind::Editor { path, .. } => assert_eq!(path, "/wt/new/src/main.rs"),
+            other => panic!("kind changed: {other:?}"),
+        }
+    }
+
+    /// A browser tab's `url` is not a filesystem path and must never be
+    /// rewritten, however much it looks like one.
+    #[test]
+    fn a_browser_tabs_url_is_never_treated_as_a_path() {
+        let mut tabs = PersistedTabs {
+            tabs: vec![PersistedTab {
+                kind: PersistedTabKind::Browser {
+                    url: "file:///wt/old/index.html".to_string(),
+                    profile_id: None,
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(repoint_worktree_paths(&mut tabs, "/wt/old", "/wt/new"), 0);
+    }
+
+    #[test]
+    fn unrelated_paths_and_empty_blobs_are_untouched() {
+        let mut tabs = PersistedTabs {
+            tabs: vec![PersistedTab {
+                agent: Some(agent_tab("/elsewhere/proj")),
+                sub_panes: vec![sub_pane("/elsewhere/proj")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(repoint_worktree_paths(&mut tabs, "/wt/old", "/wt/new"), 0);
+
+        let mut empty = PersistedTabs::default();
+        assert_eq!(repoint_worktree_paths(&mut empty, "/wt/old", "/wt/new"), 0);
+    }
+
+    #[test]
+    fn a_sub_pane_with_no_recorded_cwd_is_skipped_not_defaulted() {
+        let mut tabs = PersistedTabs {
+            tabs: vec![PersistedTab {
+                sub_panes: vec![PersistedSubPane::default()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(repoint_worktree_paths(&mut tabs, "/wt/old", "/wt/new"), 0);
+        assert_eq!(tabs.tabs[0].sub_panes[0].cwd, None);
+    }
+}

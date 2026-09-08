@@ -83,6 +83,67 @@ impl Repository {
         Ok(())
     }
 
+    /// Rename local branch `old` to `new`, via `git branch -m`.
+    ///
+    /// Cheap and locally reversible — renaming back restores the previous state
+    /// exactly — which is why a rollback-bearing caller does this AFTER the
+    /// worktree move, the step that can half-fail.
+    ///
+    /// Git refuses when `new` already exists (no `--force` is offered here on
+    /// purpose: silently overwriting another branch is never what a rename
+    /// meant). Renaming a branch that has been pushed orphans its remote ref;
+    /// that judgement belongs to the caller, so check
+    /// [`upstream_of`](Self::upstream_of) first.
+    pub async fn rename_branch(&self, old: &str, new: &str) -> Result<()> {
+        if old.is_empty() || new.is_empty() {
+            return Err(GitError::invalid_input("branch name is empty"));
+        }
+        GitCmd::new(self.workdir())
+            .args(["branch", "-m", "--", old, new])
+            .run()
+            .await?;
+        Ok(())
+    }
+
+    /// The upstream ref `branch` tracks (e.g. `origin/feat`), or `None` when it
+    /// tracks nothing.
+    ///
+    /// `None` is the only state in which renaming the branch is safe: renaming
+    /// a pushed branch leaves the remote ref behind and breaks any open PR that
+    /// points at it. A branch pushed to a remote that has since been removed
+    /// reads as `None` and will be renamed — accepted, because its remote ref
+    /// is already orphaned.
+    ///
+    /// A non-zero exit means "no upstream configured", which is a normal
+    /// answer here rather than a failure, so it maps to `Ok(None)`.
+    pub async fn upstream_of(&self, branch: &str) -> Result<Option<String>> {
+        if branch.is_empty() {
+            return Err(GitError::invalid_input("branch name is empty"));
+        }
+        let out = GitCmd::new(self.workdir())
+            .args([
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                &format!("{branch}@{{upstream}}"),
+            ])
+            .run()
+            .await;
+        match out {
+            Ok(out) => {
+                let text = String::from_utf8(out.stdout).map_err(|e| {
+                    GitError::parse(format!("non-utf8 in `git rev-parse @{{upstream}}`: {e}"))
+                })?;
+                let upstream = text.trim();
+                Ok((!upstream.is_empty()).then(|| upstream.to_string()))
+            }
+            // `git rev-parse` exits non-zero when no upstream is configured.
+            // Anything else (a broken repo, git missing) is still an error.
+            Err(GitError::NonZero { .. }) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Most-recently-visited local branches in MRU order, capped at `limit`.
     ///
     /// Parses HEAD's reflog (`git reflog show --pretty=%gs HEAD`) for

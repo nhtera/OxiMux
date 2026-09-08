@@ -276,8 +276,8 @@ pub fn render_workspace_card(
             div()
                 .flex_1()
                 .min_w_0()
-                .capture_action(move |_: &InputEnter, _window, cx| {
-                    rail_commit.update(cx, |r, cx| r.commit_rename(cx));
+                .capture_action(move |_: &InputEnter, window, cx| {
+                    rail_commit.update(cx, |r, cx| r.commit_rename(window, cx));
                 })
                 .capture_action(move |_: &InputEscape, _window, cx| {
                     rail_cancel.update(cx, |r, cx| r.cancel_rename(cx));

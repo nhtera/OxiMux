@@ -309,6 +309,32 @@ impl WorkspaceRepo {
         Ok(())
     }
 
+    /// Rewrite the four fields a full rename moves together: display `name`,
+    /// `slug`, `branch` and `worktree_path`.
+    ///
+    /// One statement, so the row can never be left half-renamed — a row whose
+    /// `slug` and `branch` disagree is exactly the silent divergence a cosmetic
+    /// rename produced. Callers that only want the label keep using
+    /// [`rename`](Self::rename).
+    pub fn rename_full(
+        &self,
+        id: &str,
+        new_name: &str,
+        new_slug: &str,
+        new_branch: &str,
+        new_worktree_path: &str,
+    ) -> Result<(), StorageError> {
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE workspaces SET name = ?1, slug = ?2, branch = ?3, worktree_path = ?4 \
+                 WHERE id = ?5",
+                params![new_name, new_slug, new_branch, new_worktree_path, id],
+            )
+            .map(|_| ())
+        })?;
+        Ok(())
+    }
+
     pub fn rename(&self, id: &str, new_name: &str) -> Result<(), StorageError> {
         self.db.with_conn(|c| {
             c.execute(

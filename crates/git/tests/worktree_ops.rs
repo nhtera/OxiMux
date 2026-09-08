@@ -255,3 +255,168 @@ async fn a_directory_that_is_not_a_repository_resolves_to_nothing() {
         None
     );
 }
+
+// ---------------------------------------------------------------------------
+// Rename primitives: `move_worktree`, `rename_branch`, `upstream_of`.
+// ---------------------------------------------------------------------------
+
+/// Init a repo with one commit and one linked worktree, and return
+/// `(repo_root_tempdir, worktree_root_tempdir, worktree_path)`.
+async fn repo_with_worktree(
+    slug: &str,
+) -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("a.txt"), "v1\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+
+    let wt_root = tempfile::tempdir().unwrap();
+    let wt_path = wt_root.path().join(slug);
+    let repo = Repository::open(p).await.unwrap();
+    repo.add_worktree(&wt_path, slug).await.unwrap();
+    (tmp, wt_root, wt_path)
+}
+
+#[tokio::test]
+async fn move_worktree_relocates_the_directory_and_git_agrees() {
+    let (tmp, wt_root, from) = repo_with_worktree("fix-lgoin").await;
+    let to = wt_root.path().join("fix-login");
+
+    let repo = Repository::open(tmp.path()).await.unwrap();
+    repo.move_worktree(&from, &to).await.unwrap();
+
+    assert!(!from.exists(), "old directory must be gone");
+    assert!(to.join("a.txt").exists(), "content must have moved");
+
+    // The point of using `git worktree move` rather than `mv`: git's own
+    // bookkeeping follows, so the worktree is still a worktree afterwards.
+    let listed = repo.list_worktrees().await.unwrap();
+    let moved = listed
+        .iter()
+        .find(|w| !w.is_main)
+        .expect("linked worktree still listed");
+    assert_eq!(
+        std::fs::canonicalize(&moved.path).unwrap(),
+        std::fs::canonicalize(&to).unwrap(),
+    );
+    assert_eq!(moved.branch.as_deref(), Some("oximux/fix-lgoin"));
+}
+
+#[tokio::test]
+async fn move_worktree_refuses_an_existing_destination() {
+    let (tmp, wt_root, from) = repo_with_worktree("feat-a").await;
+    let to = wt_root.path().join("occupied");
+    std::fs::create_dir(&to).unwrap();
+
+    let repo = Repository::open(tmp.path()).await.unwrap();
+    let err = repo.move_worktree(&from, &to).await.unwrap_err();
+    assert!(matches!(err, GitError::InvalidInput { .. }), "got {err:?}");
+    // Refused before touching anything.
+    assert!(from.join("a.txt").exists(), "source must be untouched");
+}
+
+#[tokio::test]
+async fn move_worktree_refuses_the_main_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("a.txt"), "v1\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+    let dest = tempfile::tempdir().unwrap().path().join("elsewhere");
+
+    let repo = Repository::open(p).await.unwrap();
+    let err = repo.move_worktree(p, &dest).await.unwrap_err();
+    assert!(matches!(err, GitError::InvalidInput { .. }), "got {err:?}");
+    assert!(p.join("a.txt").exists());
+}
+
+#[tokio::test]
+async fn rename_branch_renames_and_is_reversible() {
+    let (tmp, _wt_root, _wt) = repo_with_worktree("fix-lgoin").await;
+    let repo = Repository::open(tmp.path()).await.unwrap();
+
+    repo.rename_branch("oximux/fix-lgoin", "oximux/fix-login")
+        .await
+        .unwrap();
+    let names: Vec<String> = repo
+        .list_branches()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|b| b.name)
+        .collect();
+    assert!(names.iter().any(|n| n == "oximux/fix-login"));
+    assert!(
+        !names.iter().any(|n| n == "oximux/fix-lgoin"),
+        "old name must be gone, not aliased"
+    );
+
+    // Reversibility is what lets a rollback walk this step back.
+    repo.rename_branch("oximux/fix-login", "oximux/fix-lgoin")
+        .await
+        .unwrap();
+    let names: Vec<String> = repo
+        .list_branches()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|b| b.name)
+        .collect();
+    assert!(names.iter().any(|n| n == "oximux/fix-lgoin"));
+}
+
+#[tokio::test]
+async fn rename_branch_refuses_to_overwrite_an_existing_branch() {
+    let (tmp, _wt_root, _wt) = repo_with_worktree("feat-a").await;
+    let repo = Repository::open(tmp.path()).await.unwrap();
+    repo.create_branch("oximux/feat-b", None).await.unwrap();
+
+    let err = repo
+        .rename_branch("oximux/feat-a", "oximux/feat-b")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GitError::NonZero { .. }), "got {err:?}");
+    // Both branches survive an attempted collision.
+    let names: Vec<String> = repo
+        .list_branches()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|b| b.name)
+        .collect();
+    assert!(names.iter().any(|n| n == "oximux/feat-a"));
+    assert!(names.iter().any(|n| n == "oximux/feat-b"));
+}
+
+#[tokio::test]
+async fn upstream_of_is_none_for_a_local_only_branch() {
+    let (tmp, _wt_root, _wt) = repo_with_worktree("feat-a").await;
+    let repo = Repository::open(tmp.path()).await.unwrap();
+    // No upstream configured is a normal answer, not an error — this is the
+    // only state in which renaming the branch is safe.
+    assert_eq!(repo.upstream_of("oximux/feat-a").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn upstream_of_names_the_remote_ref_once_the_branch_is_pushed() {
+    let (tmp, _wt_root, _wt) = repo_with_worktree("feat-a").await;
+    let p = tmp.path();
+
+    // A bare repo on disk stands in for `origin`; no network involved.
+    let remote = tempfile::tempdir().unwrap();
+    run_git(remote.path(), &["init", "--bare", "-q"]);
+    run_git(
+        p,
+        &["remote", "add", "origin", &remote.path().to_string_lossy()],
+    );
+    run_git(p, &["push", "-q", "-u", "origin", "oximux/feat-a"]);
+
+    let repo = Repository::open(p).await.unwrap();
+    assert_eq!(
+        repo.upstream_of("oximux/feat-a").await.unwrap().as_deref(),
+        Some("origin/oximux/feat-a"),
+    );
+}

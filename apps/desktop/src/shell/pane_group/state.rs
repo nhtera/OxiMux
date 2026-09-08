@@ -501,6 +501,10 @@ impl PaneGroup {
                 PaneGroupTabKind::Agent { worktree_path, .. } => {
                     paths.push(worktree_path.clone());
                 }
+                // A chat tab is a live headless CLI subprocess rooted at `cwd`,
+                // with a checkpoint engine bound to that directory — every bit
+                // as capable of being orphaned by a directory move as a PTY.
+                PaneGroupTabKind::AgentChat { cwd, .. } => paths.push(cwd.clone()),
                 PaneGroupTabKind::Terminal => has_terminal = true,
                 _ => {}
             }
@@ -509,6 +513,34 @@ impl PaneGroup {
             paths.push(self.cwd.clone());
         }
         paths
+    }
+
+    /// The LIVE working directory of every terminal PTY in this group.
+    ///
+    /// Distinct from [`Self::live_worktree_paths`], which reports the group's
+    /// static `cwd` (set at group creation) for terminal tabs. A shell that has
+    /// `cd`-ed elsewhere — into a worktree from a group rooted at the project
+    /// root, say — is invisible to that, because the recorded path is an
+    /// *ancestor* of where the shell actually is. Reads each view's own cwd, the
+    /// same source [`Self::ambient_agents`] uses.
+    ///
+    /// Used by the rename refusal, not by the rail: the rail's green dot means
+    /// "this group is rooted here and has a live PTY", which is a different and
+    /// still-correct question.
+    pub fn live_terminal_cwds(&self, cx: &gpui::App) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for tab in &self.tabs {
+            if !matches!(tab.kind, PaneGroupTabKind::Terminal) {
+                continue;
+            }
+            let PaneContent::Terminal(tree) = &tab.content else {
+                continue;
+            };
+            for (_, _, view) in tree.iter_all_views() {
+                out.push(super::terminal_view_cwd(view.read(cx), &self.cwd));
+            }
+        }
+        out
     }
 
     /// One [`AmbientAgentEntry`] per terminal PTY running a hand-launched agent
