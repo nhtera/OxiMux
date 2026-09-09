@@ -64,7 +64,7 @@ pub use usage::usage_meter;
 pub use usage::usage_popover;
 pub use welcome::{welcome_actions, welcome_flow, welcome_view};
 pub use workspace::{
-    add_project_dialog, project_picker, session_merge, workspace_dialog, workspace_ops,
+    add_project_dialog, project_picker, rename_ops, session_merge, workspace_dialog, workspace_ops,
 };
 
 // `confirm_dialog` is a generic, app-agnostic widget now living in oximux-ui.

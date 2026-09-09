@@ -18,7 +18,7 @@ use oximux_app::session_restore::persisted_terminals::{
     PersistedAgentTab, PersistedLeafTab, PersistedSubPane, PersistedTab, PersistedTabs,
     settings_key,
 };
-use oximux_app::shell::workspace_ops::repoint_persisted_tabs_in;
+use oximux_app::shell::rename_ops::repoint_persisted_tabs_in;
 use oximux_core::AgentAdapter;
 use oximux_storage::{SettingsRepo, open_memory};
 
