@@ -131,10 +131,14 @@ impl Repository {
         Ok(())
     }
 
-    /// Full HEAD SHA. Tiny helper used by `commit` / `commit_paths` to surface
-    /// the freshly-minted commit. `git rev-parse HEAD` is locale-stable and
-    /// doesn't depend on the noisy `git commit` stdout format.
-    pub(crate) async fn head_sha(&self) -> Result<String> {
+    /// Full HEAD SHA. `git rev-parse HEAD` is locale-stable and doesn't
+    /// depend on the noisy `git commit` stdout format.
+    ///
+    /// `pub` (not `pub(crate)`) because the merge pre-flight outside this
+    /// crate samples HEAD, then samples it again immediately before running
+    /// the merge: an unsynchronized pre-flight can only prove that nothing
+    /// moved by comparing the two.
+    pub async fn head_sha(&self) -> Result<String> {
         let out = GitCmd::new(self.workdir())
             .args(["rev-parse", "HEAD"])
             .run()

@@ -420,3 +420,77 @@ async fn upstream_of_names_the_remote_ref_once_the_branch_is_pushed() {
         Some("origin/oximux/feat-a"),
     );
 }
+
+/// The default branch is what a merge lands in, and it is NOT "main" by
+/// convention — a repo initialised on `master`, or a remote that declares
+/// something else, has to be read rather than assumed. Getting this wrong makes
+/// the merge action refuse with the name of a branch that does not exist.
+#[tokio::test]
+async fn default_branch_reads_master_when_that_is_what_the_repo_has() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    run_git(root, &["init", "-b", "master"]);
+    run_git(root, &["config", "user.name", "Test"]);
+    run_git(root, &["config", "user.email", "test@example.com"]);
+    run_git(root, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(root.join("a.txt"), "v1\n").expect("seed");
+    run_git(root, &["add", "a.txt"]);
+    run_git(root, &["commit", "-m", "init"]);
+
+    let repo = Repository::open(root).await.expect("open");
+    assert_eq!(
+        repo.default_branch().await.expect("detect"),
+        Some("master".to_string()),
+        "a master-default repo must not be reported as main"
+    );
+}
+
+/// `origin/HEAD` outranks the local-name guess, and its remote prefix is
+/// stripped — a merge target is a LOCAL branch name.
+#[tokio::test]
+async fn default_branch_prefers_what_the_remote_declares() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let origin = tmp.path().join("origin.git");
+    run_git(tmp.path(), &["init", "--bare", "-b", "trunk", "origin.git"]);
+
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).expect("mkdir");
+    run_git(&work, &["init", "-b", "trunk"]);
+    run_git(&work, &["config", "user.name", "Test"]);
+    run_git(&work, &["config", "user.email", "test@example.com"]);
+    run_git(&work, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(work.join("a.txt"), "v1\n").expect("seed");
+    run_git(&work, &["add", "a.txt"]);
+    run_git(&work, &["commit", "-m", "init"]);
+    run_git(&work, &["remote", "add", "origin", &origin.to_string_lossy()]);
+    run_git(&work, &["push", "-u", "origin", "trunk"]);
+    run_git(&work, &["remote", "set-head", "origin", "trunk"]);
+    // A local `main` exists too, so the local-name fallback would answer wrong.
+    run_git(&work, &["branch", "main"]);
+
+    let repo = Repository::open(&work).await.expect("open");
+    assert_eq!(
+        repo.default_branch().await.expect("detect"),
+        Some("trunk".to_string()),
+        "origin/HEAD outranks the local main/master guess"
+    );
+}
+
+/// Nothing resolvable means `None`, never a guess. A caller that receives a
+/// name it cannot verify would refuse merges against a branch that is not
+/// there.
+#[tokio::test]
+async fn default_branch_is_none_when_nothing_conventional_resolves() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    run_git(root, &["init", "-b", "trunk"]);
+    run_git(root, &["config", "user.name", "Test"]);
+    run_git(root, &["config", "user.email", "test@example.com"]);
+    run_git(root, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(root.join("a.txt"), "v1\n").expect("seed");
+    run_git(root, &["add", "a.txt"]);
+    run_git(root, &["commit", "-m", "init"]);
+
+    let repo = Repository::open(root).await.expect("open");
+    assert_eq!(repo.default_branch().await.expect("detect"), None);
+}

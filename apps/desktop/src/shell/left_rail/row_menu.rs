@@ -54,6 +54,7 @@ pub enum WorkspaceRowAction {
     RunSetup,
     Run,
     RunCleanup,
+    Merge,
     Rename,
     Archive,
     Unarchive,
@@ -66,10 +67,27 @@ impl WorkspaceRowAction {
             Self::RunSetup => "Run setup",
             Self::Run => "Run",
             Self::RunCleanup => "Run cleanup",
+            // Never rendered: `Merge` is labelled with the real default-branch
+            // name via `label_with`. A generic "Merge" would not say what it
+            // merges into, which is the only thing the user needs to know
+            // before clicking it.
+            Self::Merge => "Merge",
             Self::Rename => "Rename",
             Self::Archive => "Archive",
             Self::Unarchive => "Unarchive",
             Self::Delete => "Delete",
+        }
+    }
+
+    /// The row's label, given the project's default branch.
+    ///
+    /// `Merge` is the only action whose label depends on the project, and it
+    /// has to: "Merge" alone leaves "into what?" unanswered, and the answer is
+    /// the one thing worth checking before landing a branch.
+    fn label_with(self, default_branch: &str) -> String {
+        match self {
+            Self::Merge => format!("Merge into {default_branch}"),
+            other => other.label().to_string(),
         }
     }
 
@@ -98,6 +116,7 @@ const SCRIPT_ACTIONS: &[WorkspaceRowAction] = &[
 
 /// Always-present management actions, rendered below any script actions.
 const ACTIONS: &[WorkspaceRowAction] = &[
+    WorkspaceRowAction::Merge,
     WorkspaceRowAction::Rename,
     WorkspaceRowAction::Archive,
     WorkspaceRowAction::Delete,
@@ -116,7 +135,11 @@ const ARCHIVED_ACTIONS: &[WorkspaceRowAction] =
 /// `Pin` / `Color` order and tag a row that does not appear in the live list.
 /// If triage later turns out to need one of them back, this gate is the only
 /// thing to widen.
-fn menu_actions(is_archived: bool, avail: ScriptAvail) -> Vec<WorkspaceRowAction> {
+fn menu_actions(
+    is_archived: bool,
+    is_primary: bool,
+    avail: ScriptAvail,
+) -> Vec<WorkspaceRowAction> {
     if is_archived {
         return ARCHIVED_ACTIONS.to_vec();
     }
@@ -125,13 +148,17 @@ fn menu_actions(is_archived: bool, avail: ScriptAvail) -> Vec<WorkspaceRowAction
         .copied()
         .filter(|a| a.script_kind().is_some_and(|k| avail.has(k)))
         .chain(ACTIONS.iter().copied())
+        // A primary row IS the default branch's checkout. "Merge into main"
+        // on it would mean merging main into itself.
+        .filter(|a| !(is_primary && *a == WorkspaceRowAction::Merge))
         .collect()
 }
 
 pub struct WorkspaceRowMenu {
     /// `None` when closed; `Some` carries the target workspace, which
-    /// lifecycle scripts are defined for it, and the screen-pixel anchor.
-    open_for: Option<(Workspace, ScriptAvail, f32, f32)>,
+    /// lifecycle scripts are defined for it, its project's default branch (the
+    /// `Merge into <x>` label), and the screen-pixel anchor.
+    open_for: Option<(Workspace, ScriptAvail, String, f32, f32)>,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
@@ -160,16 +187,18 @@ impl WorkspaceRowMenu {
 
     /// Open the menu anchored at (x, y) for the given workspace. `avail`
     /// is the set of lifecycle scripts defined for it (computed by the
-    /// caller from `.oximux/scripts.toml`).
+    /// caller from `.oximux/scripts.toml`); `default_branch` names the branch
+    /// the `Merge into <x>` row would land the work in.
     pub fn open(
         &mut self,
         workspace: Workspace,
         avail: ScriptAvail,
+        default_branch: String,
         x: f32,
         y: f32,
         cx: &mut Context<Self>,
     ) {
-        self.open_for = Some((workspace, avail, x, y + ANCHOR_Y_OFFSET));
+        self.open_for = Some((workspace, avail, default_branch, x, y + ANCHOR_Y_OFFSET));
         cx.notify();
     }
 
@@ -188,6 +217,9 @@ impl WorkspaceRowMenu {
                 return;
             }
             match action {
+                WorkspaceRowAction::Merge => {
+                    root.merge_workspace_into_default(workspace, window, cx)
+                }
                 WorkspaceRowAction::Rename => root.request_rename_workspace(workspace, window, cx),
                 WorkspaceRowAction::Archive => root.archive_workspace(workspace, cx),
                 WorkspaceRowAction::Unarchive => root.unarchive_workspace(workspace, cx),
@@ -323,7 +355,7 @@ impl WorkspaceRowMenu {
 impl Render for WorkspaceRowMenu {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         oximux_settings::appearance::sync(&mut self.theme, &mut self.density, &mut self.typography, cx);
-        let Some((workspace, avail, x, y)) = self.open_for.clone() else {
+        let Some((workspace, avail, default_branch, x, y)) = self.open_for.clone() else {
             return div().into_any_element();
         };
         let theme = self.theme;
@@ -333,7 +365,11 @@ impl Render for WorkspaceRowMenu {
         // Surface only the script rows that are actually defined for this
         // workspace, followed by the always-present management actions — or,
         // on an archived row, the reduced pair. See `menu_actions`.
-        let actions = menu_actions(workspace.archived_at.is_some(), avail);
+        let actions = menu_actions(
+            workspace.archived_at.is_some(),
+            workspace.id.starts_with("primary:"),
+            avail,
+        );
 
         let mut card = div()
             .flex()
@@ -367,7 +403,7 @@ impl Render for WorkspaceRowMenu {
                 .hover(|s| s.bg(theme.hover_overlay))
                 .text_size(px(typography.t_body_md))
                 .text_color(fg)
-                .child(action.label())
+                .child(action.label_with(&default_branch))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -430,13 +466,13 @@ mod tests {
             cleanup: true,
         };
         assert_eq!(
-            menu_actions(true, all_scripts),
+            menu_actions(true, false, all_scripts),
             vec![WorkspaceRowAction::Unarchive, WorkspaceRowAction::Delete],
         );
         // The reduction does not depend on which scripts happen to be defined.
         assert_eq!(
-            menu_actions(true, ScriptAvail::default()),
-            menu_actions(true, all_scripts),
+            menu_actions(true, false, ScriptAvail::default()),
+            menu_actions(true, false, all_scripts),
         );
     }
 
@@ -449,10 +485,11 @@ mod tests {
             cleanup: true,
         };
         assert_eq!(
-            menu_actions(false, avail),
+            menu_actions(false, false, avail),
             vec![
                 WorkspaceRowAction::RunSetup,
                 WorkspaceRowAction::RunCleanup,
+                WorkspaceRowAction::Merge,
                 WorkspaceRowAction::Rename,
                 WorkspaceRowAction::Archive,
                 WorkspaceRowAction::Delete,
@@ -460,7 +497,7 @@ mod tests {
         );
         // No scripts defined → management actions only.
         assert_eq!(
-            menu_actions(false, ScriptAvail::default()),
+            menu_actions(false, false, ScriptAvail::default()),
             ACTIONS.to_vec(),
         );
     }
@@ -474,15 +511,69 @@ mod tests {
     }
 
     #[test]
-    fn action_list_order_is_rename_archive_delete() {
+    fn action_list_order_is_merge_rename_archive_delete() {
         assert_eq!(
             ACTIONS,
             &[
+                WorkspaceRowAction::Merge,
                 WorkspaceRowAction::Rename,
                 WorkspaceRowAction::Archive,
                 WorkspaceRowAction::Delete,
             ]
         );
+    }
+
+    /// The label has to name the branch. "Merge" alone leaves "into what?"
+    /// unanswered, and on a rail showing several projects at once that is the
+    /// only thing worth checking before clicking.
+    #[test]
+    fn the_merge_row_is_labelled_with_the_real_default_branch() {
+        assert_eq!(
+            WorkspaceRowAction::Merge.label_with("main"),
+            "Merge into main"
+        );
+        assert_eq!(
+            WorkspaceRowAction::Merge.label_with("develop"),
+            "Merge into develop"
+        );
+        // Every other row ignores it.
+        assert_eq!(WorkspaceRowAction::Rename.label_with("main"), "Rename");
+        assert_eq!(WorkspaceRowAction::Delete.label_with("develop"), "Delete");
+    }
+
+    /// A primary row IS the default branch's checkout, so "Merge into main"
+    /// there would mean merging main into itself.
+    #[test]
+    fn a_primary_row_is_not_offered_a_merge() {
+        let actions = menu_actions(false, true, ScriptAvail::default());
+        assert!(!actions.contains(&WorkspaceRowAction::Merge), "{actions:?}");
+        assert_eq!(
+            actions,
+            vec![
+                WorkspaceRowAction::Rename,
+                WorkspaceRowAction::Archive,
+                WorkspaceRowAction::Delete,
+            ],
+            "the primary gate must remove ONLY the merge row"
+        );
+    }
+
+    /// An archived row's reduced pair has no merge either, and gets there by a
+    /// different gate — assert it rather than assuming the two agree.
+    #[test]
+    fn an_archived_row_is_not_offered_a_merge() {
+        for primary in [false, true] {
+            let actions = menu_actions(true, primary, ScriptAvail::default());
+            assert!(!actions.contains(&WorkspaceRowAction::Merge));
+        }
+    }
+
+    /// Landing a branch is consequential but not destructive — it must not
+    /// paint in the delete colour.
+    #[test]
+    fn merge_is_not_destructive_and_runs_no_script() {
+        assert!(!WorkspaceRowAction::Merge.is_destructive());
+        assert!(WorkspaceRowAction::Merge.script_kind().is_none());
     }
 
     #[test]

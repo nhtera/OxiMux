@@ -12,11 +12,16 @@
 //! its own root instead of the desktop's.
 
 pub mod include;
+pub mod merge;
 pub mod rename;
+mod paths;
 mod service;
 pub mod setup;
 
 pub use include::{CopyReport, Skip};
+pub use merge::{
+    MergePlan, MergeRefusal, MergeResult, apply_merge, merge_into_default, preflight_merge,
+};
 pub use rename::{
     RenameOutcome, RenamePlan, RenameRefusal, apply_rename, preflight_rename,
     rename_with_rollback,

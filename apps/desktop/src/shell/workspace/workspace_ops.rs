@@ -889,6 +889,23 @@ impl WorkspaceRoot {
         defer_focus_active(window, cx, panes);
         cx.notify();
 
+        // A merge in this project may have left the user's uncommitted work in
+        // the stash stack. Re-offer to restore it until they act on it — the
+        // toast that first said so is long gone, and possibly so is the app
+        // session it appeared in. Deferred so it mounts after activation has
+        // settled rather than into the middle of it.
+        let weak_for_notices: WeakEntity<WorkspaceRoot> = cx.weak_entity();
+        let project_for_notices = project.clone();
+        window.defer(cx, move |window, cx| {
+            let _ = weak_for_notices.update(cx, |this, cx| {
+                this.offer_pending_stash_notices(&project_for_notices, window, cx);
+                // Replace the `"main"` placeholder written at project-add with
+                // what the repository actually says, so the `Merge into <x>`
+                // row is labelled — and gated — on a branch that exists.
+                this.heal_default_branch(&project_for_notices, window, cx);
+            });
+        });
+
         // Fast path: reuse a sidebar already built for this project this
         // session (cache-and-revalidate, like the terminal panes above)
         // instead of tearing it down and rebuilding. Carry the global open
@@ -1466,8 +1483,16 @@ impl WorkspaceRoot {
             run: scripts.script(ScriptKind::Run).is_some(),
             cleanup: scripts.script(ScriptKind::Cleanup).is_some(),
         };
+        // The `Merge into <x>` row is labelled with the row's OWN project's
+        // default branch, not the active project's — the rail shows every
+        // project's workspaces at once, and merging into the wrong repository's
+        // main is the mistake Phase 1 already had to fix once for Delete.
+        let default_branch =
+            resolve_project_for_workspace(&self.app_state.recent_projects, &workspace)
+                .map(|p| p.default_branch)
+                .unwrap_or_default();
         self.row_menu
-            .update(cx, |m, cx| m.open(workspace, avail, x, y, cx));
+            .update(cx, |m, cx| m.open(workspace, avail, default_branch, x, y, cx));
     }
 
     /// Run a per-project lifecycle script (setup/run/cleanup) for `workspace`
@@ -2161,6 +2186,39 @@ impl WorkspaceRoot {
 
 
 
+
+    /// Mount `prompt` as the modal confirm dialog and arrange its teardown.
+    ///
+    /// The observer, not the callbacks, clears `confirm_dialog`: a callback
+    /// that forgets leaves a dialog the user cannot dismiss, and every
+    /// resolution path (confirm, secondary, Escape, click-outside) passes
+    /// through the entity's own state.
+    pub(crate) fn mount_confirm_dialog(
+        &mut self,
+        prompt: ConfirmPrompt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let dialog = cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
+        self._discard_dialog_observer = None;
+        self._discard_dialog_observer = Some(cx.observe_in(
+            &dialog,
+            window,
+            |root, dialog, _window, cx| {
+                let d = dialog.read(cx);
+                if d.is_confirmed() || d.is_cancelled() {
+                    root.confirm_dialog = None;
+                    root._discard_dialog_observer = None;
+                    cx.notify();
+                }
+            },
+        ));
+        self.confirm_dialog = Some(dialog);
+        cx.notify();
+    }
 
 
 

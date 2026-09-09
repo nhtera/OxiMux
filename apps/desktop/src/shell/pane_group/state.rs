@@ -515,6 +515,43 @@ impl PaneGroup {
         paths
     }
 
+    /// Directories where an agent has a turn IN FLIGHT.
+    ///
+    /// Narrower than [`Self::live_worktree_paths`] on two axes, and both
+    /// matter:
+    ///
+    /// - **No terminals.** That set answers "would moving this directory
+    ///   orphan something?", where a shell sitting at a prompt counts. This one
+    ///   answers "is something writing files here right now?", where it does
+    ///   not — a merge invalidates no cwd.
+    /// - **No parked agents.** An agent tab open at its prompt is the cockpit's
+    ///   resting state. Blocking on the tab's mere existence would refuse a
+    ///   merge in the project root essentially always, with a remedy ("close
+    ///   it") the user should not have to perform.
+    ///
+    /// What is left is the real hazard: an agent mid-turn, whose half-written
+    /// edits an auto-stash would sweep up. `NeedsApproval` counts — that is a
+    /// paused tool call inside a turn, not a finished one.
+    ///
+    /// **Chat tabs count unconditionally.** `PaneGroupTabKind::AgentChat`
+    /// carries no status stream, so there is nothing here to read; treating one
+    /// as always in flight is the safe direction, and a chat tab rooted at the
+    /// project root is rarer than a terminal there.
+    pub fn agent_cwds(&self) -> Vec<PathBuf> {
+        self.tabs
+            .iter()
+            .filter_map(|tab| match &tab.kind {
+                PaneGroupTabKind::Agent {
+                    worktree_path,
+                    status_rx,
+                    ..
+                } => turn_in_flight(&status_rx.borrow().status).then(|| worktree_path.clone()),
+                PaneGroupTabKind::AgentChat { cwd, .. } => Some(cwd.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The LIVE working directory of every terminal PTY in this group.
     ///
     /// Distinct from [`Self::live_worktree_paths`], which reports the group's
@@ -813,5 +850,59 @@ impl PaneGroup {
             return true;
         }
         f32::from(offset.x).abs() >= max_x - 1.0
+    }
+}
+
+/// Is this agent in the middle of a turn — the state in which an auto-stash
+/// would take edits it has not finished writing?
+///
+/// `Running` and `NeedsApproval` are in flight (the latter is a tool call
+/// paused for permission, inside a turn). `Idle` and `WaitingForInput` are an
+/// agent at its prompt, which is where an agent spends most of its life and is
+/// not a reason to refuse anything. `Done`, `Failed` and `Interrupted` are a
+/// process that has gone.
+pub(crate) fn turn_in_flight(status: &oximux_core::AgentStatus) -> bool {
+    use oximux_core::AgentStatus;
+    match status {
+        AgentStatus::Running | AgentStatus::NeedsApproval(_) => true,
+        AgentStatus::Idle
+        | AgentStatus::WaitingForInput
+        | AgentStatus::Done { .. }
+        | AgentStatus::Failed(_)
+        | AgentStatus::Interrupted => false,
+    }
+}
+
+#[cfg(test)]
+mod turn_in_flight_tests {
+    use super::turn_in_flight;
+    use oximux_core::AgentStatus;
+
+    /// The merge refusal's whole usability rests on this line. An agent tab
+    /// open at its prompt is the cockpit's resting state; if that counted as a
+    /// holder, a merge in the project root would be refused essentially always,
+    /// with "close the tab" as the only remedy.
+    #[test]
+    fn a_parked_agent_does_not_hold_the_directory() {
+        assert!(!turn_in_flight(&AgentStatus::Idle));
+        assert!(!turn_in_flight(&AgentStatus::WaitingForInput));
+    }
+
+    /// The real hazard: an auto-stash sweeping up edits a turn has not finished
+    /// writing. `NeedsApproval` is a tool call paused INSIDE a turn, not after
+    /// one.
+    #[test]
+    fn an_agent_mid_turn_holds_it() {
+        assert!(turn_in_flight(&AgentStatus::Running));
+        assert!(turn_in_flight(&AgentStatus::NeedsApproval("write".into())));
+    }
+
+    /// A process that has gone cannot be editing anything.
+    #[test]
+    fn a_finished_agent_does_not_hold_it() {
+        assert!(!turn_in_flight(&AgentStatus::Done { code: Some(0) }));
+        assert!(!turn_in_flight(&AgentStatus::Done { code: None }));
+        assert!(!turn_in_flight(&AgentStatus::Failed("boom".into())));
+        assert!(!turn_in_flight(&AgentStatus::Interrupted));
     }
 }

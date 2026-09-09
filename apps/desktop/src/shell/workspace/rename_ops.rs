@@ -13,10 +13,10 @@
 
 use std::path::{Path, PathBuf};
 
-use gpui::{AppContext, Context, WeakEntity, Window};
+use gpui::{Context, WeakEntity, Window};
 use oximux_core::Workspace;
 
-use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
+use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmPrompt};
 use crate::shell::workspace::workspace_ops::resolve_project_for_workspace;
 use crate::workspace_root::WorkspaceRoot;
 
@@ -345,25 +345,7 @@ impl WorkspaceRoot {
             on_cancel: None,
             secondary: None,
         };
-        let theme = self.theme;
-        let density = self.density;
-        let typography = self.typography.clone();
-        let dialog = cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
-        self._discard_dialog_observer = None;
-        self._discard_dialog_observer = Some(cx.observe_in(
-            &dialog,
-            window,
-            |root, dialog, _window, cx| {
-                let d = dialog.read(cx);
-                if d.is_confirmed() || d.is_cancelled() {
-                    root.confirm_dialog = None;
-                    root._discard_dialog_observer = None;
-                    cx.notify();
-                }
-            },
-        ));
-        self.confirm_dialog = Some(dialog);
-        cx.notify();
+        self.mount_confirm_dialog(prompt, window, cx);
     }
 
     /// Change only the display label, leaving branch and directory alone.

@@ -19,6 +19,10 @@ mod actions;
 mod state;
 mod tabs;
 
+/// Whether an agent has a turn in flight — the merge refusal's liveness test.
+/// Re-exported because `state` is private to this module.
+pub(crate) use state::turn_in_flight;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

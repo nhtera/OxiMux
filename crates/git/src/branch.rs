@@ -144,6 +144,74 @@ impl Repository {
         }
     }
 
+    /// The repository's default branch — the one work is meant to land in.
+    ///
+    /// Order, best evidence first:
+    ///
+    /// 1. `refs/remotes/origin/HEAD`, which the remote itself declares. Read
+    ///    with `symbolic-ref` and stripped of its remote prefix, so `origin/dev`
+    ///    answers `dev`.
+    /// 2. A local branch called `main`, then `master` — the two conventions,
+    ///    checked in that order and only if they actually exist.
+    ///
+    /// `None` when none of those resolve (a bare local repo on some other
+    /// name). Callers fall back to whatever they already had rather than
+    /// guessing: naming a branch that does not exist produces a refusal the
+    /// user cannot act on, which is worse than not offering the action.
+    ///
+    /// Not `current_branch`: where HEAD happens to be is what a merge
+    /// pre-flight *compares against*, so using it as the target would make that
+    /// comparison vacuous.
+    pub async fn default_branch(&self) -> Result<Option<String>> {
+        if let Ok(out) = GitCmd::new(self.workdir())
+            .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+            .run()
+            .await
+        {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if let Some(name) = text.strip_prefix("origin/")
+                && !name.is_empty()
+            {
+                return Ok(Some(name.to_string()));
+            }
+        }
+        for cand in ["main", "master"] {
+            let raw = GitCmd::new(self.workdir())
+                .args([
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{cand}"),
+                ])
+                .run_raw()
+                .await?;
+            if raw.status.success() {
+                return Ok(Some(cand.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The branch HEAD is on, or `None` when HEAD is detached.    /// The branch HEAD is on, or `None` when HEAD is detached.
+    ///
+    /// One `git rev-parse --abbrev-ref HEAD`, deliberately cheaper than
+    /// [`status`](Self::status): callers that only need to answer "is this
+    /// checkout on the branch I expect?" should not pay for a full porcelain
+    /// v2 parse plus its ahead/behind and branch-diff enrichment.
+    ///
+    /// A detached HEAD prints the literal `HEAD`, which is not a branch name,
+    /// so it maps to `None` rather than being handed back as one.
+    pub async fn current_branch(&self) -> Result<Option<String>> {
+        let out = GitCmd::new(self.workdir())
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .run()
+            .await?;
+        let text = String::from_utf8(out.stdout)
+            .map_err(|e| GitError::parse(format!("non-utf8 in `git rev-parse HEAD`: {e}")))?;
+        let name = text.trim();
+        Ok((!name.is_empty() && name != "HEAD").then(|| name.to_string()))
+    }
+
     /// Most-recently-visited local branches in MRU order, capped at `limit`.
     ///
     /// Parses HEAD's reflog (`git reflog show --pretty=%gs HEAD`) for
