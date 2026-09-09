@@ -430,6 +430,10 @@ impl AgentChatView {
             return None;
         }
         let enabled = self.worktree_draft_enabled;
+        // An unbound draft's `cwd` IS the project root — the worktree it would
+        // create is cut there — so it is the root whose `user.name` decides
+        // the prefix.
+        let root = Some(self.cwd.as_path());
         let (hint, hint_is_error) = match self.worktree_slug_input.as_ref() {
             Some(input) if enabled => {
                 let slug_text = input.read(cx).value().to_string();
@@ -438,9 +442,9 @@ impl AgentChatView {
                 // `git_settings::branch_for_slug`.
                 match validate_slug(trimmed) {
                     Ok(()) if !trimmed.is_empty() => {
-                        (crate::git_settings::branch_for_slug(trimmed, cx), false)
+                        (crate::git_settings::branch_for_slug(trimmed, root, cx), false)
                     }
-                    Ok(()) => (crate::git_settings::branch_for_slug("…", cx), false),
+                    Ok(()) => (crate::git_settings::branch_for_slug("…", root, cx), false),
                     Err(err) => (err.to_string(), true),
                 }
             }
@@ -501,7 +505,11 @@ impl AgentChatView {
                     .worktree_slug_input
                     .as_ref()
                     .map(|i| {
-                        crate::git_settings::branch_for_slug(i.read(cx).value().trim(), cx)
+                        crate::git_settings::branch_for_slug(
+                            i.read(cx).value().trim(),
+                            Some(self.cwd.as_path()),
+                            cx,
+                        )
                     })
                     .unwrap_or_else(|| "the branch".to_string());
                 let (headline, detail) = humanize_worktree_error(msg, &branch);

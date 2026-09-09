@@ -224,6 +224,21 @@ impl Repository {
         Ok(())
     }
 
+    /// `git fetch <remote> <branch>` — update one remote-tracking ref.
+    ///
+    /// Deliberately narrower than [`fetch`](Self::fetch), which is
+    /// `--all --prune` across every configured remote: a caller that only
+    /// needs to know where one branch has got to should not pay for every
+    /// other remote, nor prune refs as a side effect of asking.
+    pub async fn fetch_remote_branch(&self, remote: &str, branch: &str) -> Result<()> {
+        GitCmd::new(self.workdir())
+            .args(["fetch", "--no-tags", remote, branch])
+            .timeout(std::time::Duration::from_secs(30))
+            .run()
+            .await?;
+        Ok(())
+    }
+
     /// Fast-forward a local branch that is **not** checked out, by fetching
     /// the remote branch straight onto it.
     ///

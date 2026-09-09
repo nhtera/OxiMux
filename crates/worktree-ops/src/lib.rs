@@ -51,6 +51,13 @@ pub enum ProvisionEvent {
     IncludeCopied(PathBuf),
     /// An `.oximuxinclude` path did not, with the reason.
     IncludeSkipped(Skip),
+    /// The default branch is about to be fetched and fast-forwarded. Emitted
+    /// because this is the one step that can sit on the network for tens of
+    /// seconds before anything else happens, and a "creating…" state with no
+    /// explanation is indistinguishable from a hang.
+    FreshenStarted(String),
+    /// What the freshen did — moved the branch, or skipped, with the reason.
+    FreshenFinished(String),
     /// The setup script is about to run. Carries the script itself, because
     /// "which command produced this output" is the first question a failing
     /// transcript raises.
@@ -79,9 +86,11 @@ pub struct Provision {
     /// Off by default, and deliberately so: the default has to be the one that
     /// cannot destroy anything.
     pub reclaim_orphan: bool,
-    /// Fetch and fast-forward the default branch before branching off it, so
-    /// the new worktree starts from current work. Mirrors the user's
-    /// `keep_default_up_to_date` setting; see [`crate::freshen`].
+    /// Fetch and fast-forward the local default branch before the worktree is
+    /// cut. Mirrors the user's `keep_default_up_to_date` setting.
+    ///
+    /// Whether that changes what the new worktree is *based on* depends on
+    /// where HEAD is — see [`crate::freshen`], which spells out both cases.
     ///
     /// Off by default for the same reason as `reclaim_orphan`, plus one more:
     /// it makes creating a worktree touch the network.
@@ -243,21 +252,30 @@ pub async fn create_workspace_with_rollback(
         Ok(r) => r,
         Err(err) => return CreateOutcome::GitFailed(format!("open project repo: {err}")),
     };
+    // Reclaim is asked about the branch we are ABOUT to make. A retry after the
+    // prefix setting changed therefore clears the directory but leaves the
+    // interrupted create's old branch (`oximux/foo` when the retry is
+    // `alice/foo`) dangling — the reclaim cannot know a name nothing recorded.
+    // Accepted rather than guessed at: deleting a branch whose name we inferred
+    // from a directory is how a reclaim destroys work it did not create.
     if provision.reclaim_orphan
         && let Some(err) = reclaim_orphan(&repo, worktree_path, branch, workspace_repo).await
     {
         return CreateOutcome::GitFailed(err);
     }
 
-    // Optional, off by default, and unable to fail the create: `git worktree
-    // add` branches from HEAD, so a default branch last pulled a week ago
-    // hands every new worktree a week-old base. Every refusal inside is
-    // silent and ordinary — see `freshen`.
+    // Optional, off by default, and unable to fail the create. `git worktree
+    // add` branches from HEAD, so this changes the new worktree's base only
+    // when the root checkout is on the default branch — which is the usual
+    // state, and the case the setting is for. Every refusal inside is silent
+    // and ordinary; see `freshen` for both.
     if provision.freshen_default {
         match repo.default_branch().await {
             Ok(Some(default)) => {
+                provision.emit(ProvisionEvent::FreshenStarted(default.clone()));
                 let outcome = freshen::freshen_default_branch(&repo, &default).await;
                 tracing::debug!(?outcome, %default, "freshen default branch before create");
+                provision.emit(ProvisionEvent::FreshenFinished(outcome.summary()));
             }
             _ => tracing::debug!("freshen skipped: no default branch detected"),
         }

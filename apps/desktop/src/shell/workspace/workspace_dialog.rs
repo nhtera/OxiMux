@@ -402,7 +402,8 @@ impl Render for WorkspaceDialog {
         // The configured prefix, from the same global the create path reads —
         // so this line is a promise the create keeps rather than a second
         // derivation of the same rule.
-        let branch = crate::git_settings::branch_for_slug(&slug, cx);
+        let project_root = self.selected_project.as_ref().map(|p| std::path::PathBuf::from(&p.root_path));
+        let branch = crate::git_settings::branch_for_slug(&slug, project_root.as_deref(), cx);
         let slug_line = if self.fetching_title {
             format!("Branch: {branch} · fetching title…")
         } else if let Some(issue) = &self.linked_issue {

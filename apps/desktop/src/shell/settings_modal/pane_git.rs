@@ -1,9 +1,10 @@
 //! Git & Source Control pane — how OxiMux names the branches it creates, where
 //! it puts worktrees, and whether it freshens the default branch first.
 //!
-//! Every control applies immediately: it mutates the working copy, writes
-//! `git.toml`, and re-resolves the branch prefix so the preview line under the
-//! segmented control answers on the same frame.
+//! Every control applies immediately: it mutates the working copy and writes
+//! `git.toml`. The preview line reads that working copy — not the saved
+//! global — which is what lets it answer on the same frame as the keystroke,
+//! while still running the resolver the create path runs.
 
 use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
 use gpui_component::{Sizable as _, input::Input};
@@ -95,10 +96,17 @@ pub(super) fn entries(
         ));
     }
 
-    // The preview is the whole point of the pane: it is the same string the
-    // create path will use, read from the same global, so what it shows is
-    // what the next branch is called.
-    let preview = crate::git_settings::branch_for_slug("fix-login", cx);
+    // Previewed from the WORKING COPY, not the saved global — that is what
+    // makes it live. Every keystroke in the custom field and every segment
+    // click mutates `modal.git`, so the line answers on the same frame. It is
+    // still the one resolver the create path runs, over the same cached
+    // username, so agreeing here is not a coincidence.
+    //
+    // No project root: the pane is app-wide and does not know which project a
+    // window is on, so `Git username` previews against the global git config.
+    // A repo that overrides `user.name` will differ, and the dialog's own
+    // preview line — which does have the root — is the one that governs.
+    let preview = crate::git_settings::branch_for(&modal.git, None, "fix-login", cx);
     rows.push(entry(
         "Preview",
         "What a worktree named \"Fix login\" would be branched as.",

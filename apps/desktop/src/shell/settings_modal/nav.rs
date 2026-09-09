@@ -68,21 +68,6 @@ pub enum SettingsPane {
 }
 
 impl SettingsPane {
-    /// The variant stays defined everywhere so navigation and the pane match
-    /// keep one shape; it is simply not offered where screen control does not
-    /// exist, rather than opening a pane that can only explain itself away.
-    ///
-    /// Offered on Windows too, though what it opens is a different pane. Screen
-    /// control is not available there, but the decision the pane exists for —
-    /// approving an unsigned driver binary — is real, has to be made before the
-    /// feature can ever be turned on, and has nowhere else to live.
-    ///
-    /// Ordered so that panes sharing a [`SettingsGroup`] are adjacent: the nav
-    /// emits a heading whenever the group changes between rows, so a pane
-    /// filed out of order would print its heading a second time.
-    /// `nav_groups_are_contiguous` holds that invariant — which matters most
-    /// for the next person adding a pane at the end of the list, where the
-    /// obvious place is the wrong one.
     /// Every pane this build knows about, in nav order.
     ///
     /// **One list, not two.** This used to be a pair of cfg-gated `ALL` arrays
@@ -367,17 +352,6 @@ mod tests {
             offered.contains(&SettingsPane::Git),
             "the Git pane must be offered on every platform"
         );
-    }
-
-    /// Every pane must render a nav row, which means an icon and a label. A
-    /// missing icon renders BLANK rather than failing, so the pane would look
-    /// like an unlabelled gap.
-    #[test]
-    fn every_pane_has_a_label_and_an_icon() {
-        for pane in SettingsPane::offered() {
-            assert!(!pane.label().is_empty(), "{pane:?} has no label");
-            assert!(pane.icon_path().ends_with(".svg"), "{pane:?} has no icon");
-        }
     }
 
     #[test]

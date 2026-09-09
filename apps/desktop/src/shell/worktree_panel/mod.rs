@@ -159,7 +159,7 @@ impl WorktreePanel {
         // still compiles and still calls `add_worktree` — so it resolves the
         // prefix like every other create rather than being the one path that
         // could reintroduce a hardcoded `oximux/`.
-        let branch = crate::git_settings::branch_for_slug(&slug, cx);
+        let branch = crate::git_settings::branch_for_slug(&slug, Some(self.repo.workdir()), cx);
         let (tx, rx) = oneshot::channel::<Result<PathBuf, String>>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {

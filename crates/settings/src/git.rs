@@ -117,6 +117,13 @@ impl GitSettings {
     /// fallback behaviour, the log line, and the file name to drift. This is
     /// the same reason `load_for_project` lives beside its own type rather
     /// than in each caller.
+    ///
+    /// **One directory, not one machine.** A `serve` started with its own
+    /// `--data-dir` reads that directory's `git.toml`, which the desktop never
+    /// writes — so it mints the shipped prefix while the desktop mints the
+    /// configured one. That is the correct reading of `--data-dir` (a server
+    /// with its own root is a separate installation, not a view onto this
+    /// one), but it does mean the two agree only when they share a directory.
     pub fn load_from_dir(dir: &std::path::Path) -> Self {
         let path = dir.join(Self::FILE_NAME);
         let Ok(text) = std::fs::read_to_string(&path) else {

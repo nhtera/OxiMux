@@ -124,6 +124,53 @@ async fn a_default_branch_that_is_not_checked_out_still_fast_forwards() {
     );
 }
 
+/// The point of the whole feature, asserted end to end: with the root on the
+/// default branch — the usual state for a worktree workflow — a worktree
+/// created after a freshen is cut from the freshened commit, not the stale one.
+///
+/// Nothing else in this file proves that. Every other test asserts the *ref*
+/// moved, which is a step short of the user-visible outcome the setting
+/// promises.
+#[tokio::test]
+async fn a_worktree_created_after_a_freshen_starts_from_the_fresh_commit() {
+    let (tmp, clone, upstream) = clone_behind_by_one();
+    let repo = Repository::open(&clone).await.expect("open");
+    let stale = sha(&clone, "HEAD");
+    let fresh = sha(&upstream, "main");
+    assert_ne!(stale, fresh, "fixture must start behind");
+
+    freshen_default_branch(&repo, "main").await;
+
+    let wt = tmp.path().join("wt");
+    repo.add_worktree(&wt, "oximux/feat").await.expect("add worktree");
+
+    assert_eq!(sha(&wt, "HEAD"), fresh, "the worktree was cut from the stale commit");
+    assert_eq!(std::fs::read_to_string(wt.join("a.txt")).expect("read"), "v2\n");
+}
+
+/// The counterpart, and the honest limit: with the root on some other branch
+/// the local ref moves but the new worktree is still cut from HEAD. Named so
+/// the limit is a decision on record rather than a surprise — choosing a start
+/// point explicitly belongs to the base-ref phase.
+#[tokio::test]
+async fn a_freshen_does_not_reach_a_worktree_cut_while_head_is_elsewhere() {
+    let (tmp, clone, upstream) = clone_behind_by_one();
+    run_git(&clone, &["checkout", "-q", "-b", "feature"]);
+    let repo = Repository::open(&clone).await.expect("open");
+    let head_before = sha(&clone, "HEAD");
+
+    freshen_default_branch(&repo, "main").await;
+
+    assert_eq!(sha(&clone, "main"), sha(&upstream, "main"), "the ref should still move");
+    let wt = tmp.path().join("wt");
+    repo.add_worktree(&wt, "oximux/feat").await.expect("add worktree");
+    assert_eq!(
+        sha(&wt, "HEAD"),
+        head_before,
+        "the worktree is cut from HEAD, which the freshen did not touch"
+    );
+}
+
 /// The single most important skip: uncommitted work in the tree being
 /// fast-forwarded. Creating a worktree must never touch it.
 #[tokio::test]
@@ -141,6 +188,36 @@ async fn a_dirty_default_checkout_is_skipped_and_left_alone() {
         std::fs::read_to_string(clone.join("a.txt")).expect("read"),
         "my uncommitted edit\n",
         "the user's edit was disturbed"
+    );
+}
+
+/// **Untracked files do NOT block the fast-forward**, and that is deliberate.
+///
+/// `is_dirty` runs `status --porcelain --untracked-files=no`, so a checkout
+/// whose only local state is untracked scratch files reads as clean and gets
+/// fast-forwarded. This is safe rather than lucky: git refuses to overwrite an
+/// untracked file that an incoming commit would add, so the fast-forward either
+/// leaves the file alone or fails and is reported as `Refused` — it cannot
+/// silently destroy it. Blocking on untracked files instead would mean a single
+/// stray `.DS_Store` or build artifact permanently disables the setting.
+///
+/// Pinned as a test because the module doc says "never touch a working tree
+/// that might hold the user's edits", and this is the documented boundary of
+/// that claim.
+#[tokio::test]
+async fn untracked_files_do_not_block_the_fast_forward_and_survive_it() {
+    let (_tmp, clone, upstream) = clone_behind_by_one();
+    std::fs::write(clone.join("scratch.txt"), "notes\n").expect("write");
+    let repo = Repository::open(&clone).await.expect("open");
+
+    let outcome = freshen_default_branch(&repo, "main").await;
+
+    assert!(matches!(outcome, Freshened::FastForwarded { .. }), "got {outcome:?}");
+    assert_eq!(sha(&clone, "main"), sha(&upstream, "main"));
+    assert_eq!(
+        std::fs::read_to_string(clone.join("scratch.txt")).expect("read"),
+        "notes\n",
+        "the untracked file was destroyed"
     );
 }
 
@@ -183,11 +260,11 @@ async fn an_already_current_branch_reports_it_rather_than_running_a_merge() {
 /// The overwhelmingly common case for a local-only repository: no remote at
 /// all. It must change nothing.
 ///
-/// Note where it skips. `git fetch --all --prune` *succeeds* in a repo with no
-/// remotes — there is nothing to fetch, which is not an error — so this lands
-/// on `NoRemoteCounterpart`, one step later than the name `FetchFailed` would
-/// suggest. That variant is still reachable, by a repo that has a remote it
-/// cannot reach; this one simply is not it.
+/// Skips at the fetch, because the fetch is targeted: `git fetch origin main`
+/// fails outright with no `origin`, where the older `--all --prune` would have
+/// succeeded (nothing to fetch is not an error) and left the skip to be
+/// discovered a step later. Failing at the first command with the specific
+/// reason is the better answer.
 #[tokio::test]
 async fn a_repository_with_no_remote_changes_nothing() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -197,8 +274,40 @@ async fn a_repository_with_no_remote_changes_nothing() {
 
     let outcome = freshen_default_branch(&repo, "main").await;
 
-    assert_eq!(outcome, Freshened::Skipped(SkipReason::NoRemoteCounterpart));
+    assert!(
+        matches!(outcome, Freshened::Skipped(SkipReason::FetchFailed(_))),
+        "got {outcome:?}"
+    );
     assert_eq!(sha(tmp.path(), "main"), before);
+}
+
+/// `NoRemoteCounterpart` is reached when the fetch SUCCEEDS and the local side
+/// is what is missing — the remote has the branch, we have never checked it
+/// out. Creating it is a different operation from freshening it, and not what
+/// the setting promises.
+///
+/// Named because the targeted fetch moved the other two no-remote cases onto
+/// `FetchFailed`; without this the variant would be unreachable in the suite
+/// and nothing would say whether it was still reachable at all.
+#[tokio::test]
+async fn a_branch_the_remote_has_and_we_do_not_is_skipped_rather_than_created() {
+    let (_tmp, clone, upstream) = clone_behind_by_one();
+    // Upstream grows a branch the clone has no local ref for.
+    run_git(&upstream, &["branch", "release"]);
+    let repo = Repository::open(&clone).await.expect("open");
+
+    let outcome = freshen_default_branch(&repo, "release").await;
+
+    assert_eq!(outcome, Freshened::Skipped(SkipReason::NoRemoteCounterpart));
+    assert!(
+        !std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", "refs/heads/release"])
+            .current_dir(&clone)
+            .status()
+            .expect("git")
+            .success(),
+        "a local branch was created"
+    );
 }
 
 /// A remote that is configured but unreachable — the offline case. This is
@@ -224,18 +333,22 @@ async fn an_unreachable_remote_is_skipped_at_the_fetch() {
     assert_eq!(sha(tmp.path(), "main"), before);
 }
 
-/// A remote that exists but has no branch by that name. Distinct from "no
-/// remote": the fetch succeeds and there is simply nothing to compare against.
+/// A remote that exists but has no branch by that name. The targeted fetch
+/// asks for that specific branch, so git refuses and this skips at the fetch —
+/// where the old `--all` fetch would have succeeded and deferred the answer.
 #[tokio::test]
-async fn a_remote_without_that_branch_is_skipped_after_a_successful_fetch() {
+async fn a_remote_without_that_branch_is_skipped_at_the_fetch() {
     let (_tmp, clone, _upstream) = clone_behind_by_one();
     let before = sha(&clone, "main");
     let repo = Repository::open(&clone).await.expect("open");
 
-    // `develop` exists nowhere. The fetch still succeeds.
+    // `develop` exists nowhere.
     let outcome = freshen_default_branch(&repo, "develop").await;
 
-    assert_eq!(outcome, Freshened::Skipped(SkipReason::NoRemoteCounterpart));
+    assert!(
+        matches!(outcome, Freshened::Skipped(SkipReason::FetchFailed(_))),
+        "got {outcome:?}"
+    );
     assert_eq!(sha(&clone, "main"), before, "an unrelated branch was touched");
 }
 

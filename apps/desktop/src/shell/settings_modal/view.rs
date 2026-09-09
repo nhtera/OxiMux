@@ -104,7 +104,7 @@ impl SettingsModal {
             SettingsPane::ScreenControl => {
                 pane_computer_use::render(self, theme, density, typography, cx)
             }
-            // Not reachable: the pane is absent from `SettingsPane::ALL` here.
+            // Not reachable: `offered()` withholds the pane here.
             #[cfg(not(any(target_os = "macos", windows)))]
             SettingsPane::ScreenControl => gpui::div().into_any_element(),
             SettingsPane::Notifications => {

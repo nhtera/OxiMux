@@ -246,6 +246,8 @@ pub(crate) async fn stream_provisioning(
         let line = match event {
             ProvisionEvent::IncludeCopied(p) => format!("include: copied {}", p.display()),
             ProvisionEvent::IncludeSkipped(skip) => format!("include: skipped {skip}"),
+            ProvisionEvent::FreshenStarted(branch) => format!("fetching {branch}…"),
+            ProvisionEvent::FreshenFinished(summary) => format!("== {summary}"),
             ProvisionEvent::SetupStarted(script) => format!("$ {script}"),
             ProvisionEvent::SetupLine(line) => line,
             ProvisionEvent::SetupFinished(outcome) => format!("== {}", outcome.summary()),
@@ -882,7 +884,7 @@ impl WorkspaceRoot {
         // prefix is a property of the project, not of the app. Re-resolve it
         // on the switch; until it lands the previous project's answer stands,
         // which is the same value the previews were already showing.
-        crate::git_settings::refresh_prefix(Some(project_root.clone()), cx);
+        crate::git_settings::refresh_username(Some(project_root.clone()), cx);
         // Lazy-build the project's panes entity on first activation. Subsequent
         // switches just resolve the existing entity via `active_project_panes()`
         // — pane-group + tab state survives the switch.
@@ -1972,7 +1974,7 @@ impl WorkspaceRoot {
         // preview line read — so the branch the user was shown is the branch
         // that gets made. Re-resolving inside the spawn would reintroduce the
         // gap this phase closed.
-        let branch = crate::git_settings::branch_for_slug(&slug, cx);
+        let branch = crate::git_settings::branch_for_slug(&slug, Some(&project_root), cx);
         let freshen_default = crate::git_settings::settings(cx).keep_default_up_to_date;
 
         cx.spawn(async move |weak, cx| {

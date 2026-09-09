@@ -507,9 +507,9 @@ impl SettingsModal {
         self.custom_words_input = Some(cw_input);
 
         // Custom branch prefix. Same persist-on-commit contract as custom
-        // words: the working copy follows every keystroke so the preview line
-        // updates live, but only blur/Enter writes `git.toml` — a per-keystroke
-        // write here would also re-resolve the prefix on every character.
+        // words: the working copy follows every keystroke — which is what the
+        // preview line renders from, so it updates as you type — but only
+        // blur/Enter writes `git.toml`, keeping typing off the filesystem.
         let prefix_seed = self.git.custom_prefix.clone();
         self.git_prefix_seed = prefix_seed.clone();
         let prefix_input = cx.new(|cx| {
@@ -522,8 +522,8 @@ impl SettingsModal {
             |this, input, ev: &InputEvent, cx| match ev {
                 InputEvent::Change => {
                     this.git.custom_prefix = input.read(cx).value().to_string();
-                    // Notify without persisting so the preview row re-renders
-                    // as the user types.
+                    // Repaint without persisting: the preview row reads
+                    // `this.git`, so this is the whole update path.
                     cx.notify();
                 }
                 InputEvent::Blur | InputEvent::PressEnter { .. } => this.persist_git(cx),

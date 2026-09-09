@@ -1,38 +1,58 @@
-//! App-side loader + persistence for [`GitSettings`], plus the resolved branch
-//! prefix the UI previews with.
+//! App-side loader + persistence for [`GitSettings`], plus the cached git
+//! username the branch-name previews resolve against.
 //!
-//! **Two globals, and the second one is the point.** [`GitSettings`] is what
-//! the user configured; [`ResolvedBranchPrefix`] is what that currently
-//! resolves to. They differ because `Git username` is a *rule* — it means
-//! `git config user.name`, which costs a subprocess and can be repo-scoped,
-//! and neither the workspace dialog nor the chat pill can await anything while
-//! painting a preview line.
+//! **What is cached is the username, not the answer.** An earlier shape cached
+//! the *resolved prefix*, which meant the settings pane's own preview could not
+//! reflect the control the user was operating: the working copy changed on
+//! every keystroke while the preview read a global that only a completed async
+//! re-resolution would move. Caching the one genuinely expensive input instead
+//! — `git config user.name`, a subprocess, occasionally repo-scoped — lets
+//! every caller run the real resolver
+//! ([`resolve_prefix_with`](oximux_worktree_ops::branch_name::resolve_prefix_with))
+//! synchronously, against whichever settings it means: the pane against its
+//! unsaved working copy, everyone else against the saved global.
 //!
-//! So the resolution happens on the three events that can change the answer —
-//! boot, a settings edit, a project switch — and both the preview and the
-//! create read the same cached string. That is what makes "the preview and the
-//! branch actually created always agree" a property of the code rather than a
-//! promise: there is one value, and disagreeing with it would take two.
+//! That is what makes "the preview and the branch actually created agree" a
+//! property of the code. There is one resolver and one cached input; two
+//! callers holding the same settings cannot compute different names.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{App, AsyncApp, Global};
 use oximux_settings::git::GitSettings;
+use oximux_worktree_ops::branch_name::{branch_name, resolve_prefix_with};
 
-/// The branch prefix as currently resolved — `prefix: None` meaning a bare
-/// slug — together with the repository it was resolved against.
+/// `git config user.name` per repository root, as last resolved.
 ///
-/// The root is carried because `user.name` can be repo-scoped, so "re-resolve"
-/// is only a well-formed request if something remembers *where*. Keeping it
-/// here rather than asking the caller means the settings pane — which has no
-/// idea which project is open — can still ask for a correct re-resolution.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ResolvedBranchPrefix {
-    pub prefix: Option<String>,
-    pub root: Option<PathBuf>,
+/// Keyed by root rather than held as one value because `user.name` is commonly
+/// set per repository — a work identity in one checkout, a personal one in
+/// another — and because each window owns its own active project. A single
+/// app-wide value would let the window you switched projects in decide what
+/// the *other* window's branches are called.
+///
+/// `None` for a root means "asked, and there is no usable name" — a distinct
+/// answer from an absent key, which means "not asked yet".
+#[derive(Debug, Clone, Default)]
+pub struct GitUsernames {
+    by_root: HashMap<PathBuf, Option<String>>,
+    /// The name resolved with no project in hand, for surfaces that paint
+    /// before any project is open (the settings pane at first launch).
+    global: Option<String>,
 }
 
-impl Global for ResolvedBranchPrefix {}
+impl Global for GitUsernames {}
+
+/// Monotonic stamp so a slow resolution cannot overwrite a newer one.
+///
+/// Two refreshes are in flight routinely — `install` fires one with no project
+/// and the first project activation fires another — and only the
+/// `Git username` mode has await points, so it is exactly the mode this
+/// matters for that races. Without the stamp the boot-time answer (resolved
+/// against the current directory, which for a GUI launch is `/`) can land
+/// *after* the project's and stick.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn settings_path() -> Option<PathBuf> {
     crate::app_paths::data_dir().map(|d| d.join(GitSettings::FILE_NAME))
@@ -49,96 +69,199 @@ pub fn settings(cx: &App) -> GitSettings {
     cx.try_global::<GitSettings>().cloned().unwrap_or_else(GitSettings::shipped)
 }
 
-/// The prefix to put in front of the next branch, already resolved.
-///
-/// Read by the previews *and* by the create paths — see the module note. Falls
-/// back to the shipped prefix when the global has not been installed, which is
-/// the state a test that never called [`install`] is in; answering `None` there
-/// would silently mint bare branches.
-pub fn resolved_prefix(cx: &App) -> Option<String> {
-    match cx.try_global::<ResolvedBranchPrefix>() {
-        Some(p) => p.prefix.clone(),
-        None => Some(oximux_settings::git::DEFAULT_PREFIX.to_string()),
+/// The cached username for `root`, falling back to the project-less one.
+fn username(root: Option<&Path>, cx: &App) -> Option<String> {
+    let cache = cx.try_global::<GitUsernames>()?;
+    match root.and_then(|r| cache.by_root.get(r)) {
+        Some(name) => name.clone(),
+        None => cache.global.clone(),
     }
 }
 
-/// The branch name the next worktree with this slug would get.
-pub fn branch_for_slug(slug: &str, cx: &App) -> String {
-    oximux_worktree_ops::branch_name::branch_name(resolved_prefix(cx).as_deref(), slug)
+/// The prefix `settings` currently resolves to for `root`.
+pub fn prefix_for(settings: &GitSettings, root: Option<&Path>, cx: &App) -> Option<String> {
+    resolve_prefix_with(settings, username(root, cx).as_deref())
 }
 
-/// Persist `settings`, swap the global, and re-resolve the prefix.
+/// The branch name `settings` would give a worktree with this slug.
+pub fn branch_for(settings: &GitSettings, root: Option<&Path>, slug: &str, cx: &App) -> String {
+    branch_name(prefix_for(settings, root, cx).as_deref(), slug)
+}
+
+/// [`branch_for`] against the saved settings — what every create path uses.
+pub fn branch_for_slug(slug: &str, root: Option<&Path>, cx: &App) -> String {
+    branch_for(&settings(cx), root, slug, cx)
+}
+
+/// Persist `settings` and swap the global.
 ///
-/// Re-resolution is not optional here: switching to `Git username` changes the
-/// preview line the user is looking at *while* they look at it, and a settings
-/// pane whose own preview lags its control is worse than no preview.
+/// No re-resolution here: the username cache is the only thing that could need
+/// refreshing, and changing a *setting* cannot change the user's git identity.
+/// Every reader recomputes from the new settings on its next paint.
 pub fn save(settings: &GitSettings, cx: &mut App) -> std::io::Result<()> {
-    cx.set_global(settings.clone());
-    // Against the same repository as last time: the settings pane does not
-    // know which project is open, and re-resolving against nothing would
-    // silently answer for the global git config instead of this repo's.
-    let root = cx.try_global::<ResolvedBranchPrefix>().and_then(|p| p.root.clone());
-    refresh_prefix(root, cx);
     let path =
         settings_path().ok_or_else(|| std::io::Error::other("no app data dir for git.toml"))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    std::fs::write(&path, settings.to_toml_string())
+    // Written before the global is swapped, so a failed write leaves memory
+    // agreeing with disk rather than promising a prefix the headless host —
+    // which reads the file, not the global — would never use.
+    std::fs::write(&path, settings.to_toml_string())?;
+    cx.set_global(settings.clone());
+    Ok(())
 }
 
-/// Re-resolve the prefix against `project_root` and install the result.
+/// Resolve `git config user.name` for `project_root` and cache it.
 ///
-/// `None` for the root means "no project open": there is no repository to ask
-/// for a `user.name`, so `Git username` resolves against the global git config
-/// via the current directory instead. That is the same answer git itself would
-/// give, and it keeps the pane's preview honest before any project is opened.
-pub fn refresh_prefix(project_root: Option<PathBuf>, cx: &mut App) {
-    let settings = settings(cx);
+/// Called at boot and on every project activation. Cheap to repeat: one
+/// subprocess, off the paint path, and the answer only changes when the user
+/// edits their git config.
+pub fn refresh_username(project_root: Option<PathBuf>, cx: &mut App) {
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     cx.spawn(async move |cx: &mut AsyncApp| {
-        let prefix = resolve(&settings, project_root.as_deref()).await;
-        cx.update(|cx| cx.set_global(ResolvedBranchPrefix { prefix, root: project_root }));
+        let name = read_user_name(project_root.as_deref()).await;
+        cx.update(|cx| {
+            // A resolution that started earlier and finished later must not
+            // overwrite a newer one — see `GENERATION`.
+            if GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let mut cache = cx.try_global::<GitUsernames>().cloned().unwrap_or_default();
+            match project_root {
+                Some(root) => {
+                    cache.by_root.insert(root, name);
+                }
+                None => cache.global = name,
+            }
+            cx.set_global(cache);
+        });
     })
     .detach();
 }
 
-/// Resolve without touching any global — the async half, off the paint path.
-async fn resolve(settings: &GitSettings, project_root: Option<&Path>) -> Option<String> {
-    use oximux_settings::git::BranchPrefixMode;
-    use oximux_worktree_ops::branch_name::{resolve_prefix, resolve_prefix_with};
-
-    // Only `Git username` needs a repository; asking for one in the other two
-    // modes would cost a `Repository::open` whose answer is discarded, and
-    // would make a project-less window resolve differently from one with a
-    // project open — for a setting that does not depend on the project.
-    if settings.branch_prefix != BranchPrefixMode::GitUsername {
-        return resolve_prefix_with(settings, None);
-    }
-    // No project open: fall through to the current directory, which is what
-    // git itself would consult for a global `user.name`.
-    let root = project_root.map(Path::to_path_buf).or_else(|| std::env::current_dir().ok());
-    match root {
-        Some(root) => match oximux_git::Repository::open(&root).await {
-            Ok(repo) => resolve_prefix(settings, &repo).await,
-            // Not a repository, or git is missing. `resolve_prefix_with(None)`
-            // is the documented degradation — the shipped prefix — and going
-            // through it keeps that rule in one place.
-            Err(_) => resolve_prefix_with(settings, None),
-        },
-        None => resolve_prefix_with(settings, None),
-    }
+/// One `git config user.name`, or `None` for every way that can fail.
+///
+/// A project-less caller falls through to the current directory, which is what
+/// git itself would consult for a global `user.name`.
+async fn read_user_name(project_root: Option<&Path>) -> Option<String> {
+    let root = project_root.map(Path::to_path_buf).or_else(|| std::env::current_dir().ok())?;
+    let repo = oximux_git::Repository::open(&root).await.ok()?;
+    repo.user_name().await.ok().flatten()
 }
 
 /// Load settings and install both globals. Call once from the app's `run`
 /// closure, before the first window paints.
+///
+/// The username cache starts empty rather than seeded, and an empty cache
+/// resolves `Git username` to the shipped prefix — its documented degradation.
+/// Nothing here spawns a subprocess on the boot path.
 pub fn install(cx: &mut App) {
-    let settings = load();
-    // Seeded with the no-username answer so the first paint is already correct
-    // for Custom and None, and the spawn below only ever corrects
-    // `Git username` — whose seed is the shipped prefix, its documented
-    // degradation, rather than a blank.
-    let prefix = oximux_worktree_ops::branch_name::resolve_prefix_with(&settings, None);
-    cx.set_global(settings);
-    cx.set_global(ResolvedBranchPrefix { prefix, root: None });
-    refresh_prefix(None, cx);
+    cx.set_global(load());
+    cx.set_global(GitUsernames::default());
+    refresh_username(None, cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oximux_settings::git::{BranchPrefixMode, DEFAULT_PREFIX};
+
+    fn custom(prefix: &str) -> GitSettings {
+        GitSettings {
+            branch_prefix: BranchPrefixMode::Custom,
+            custom_prefix: prefix.to_string(),
+            ..GitSettings::shipped()
+        }
+    }
+
+    fn by_mode(mode: BranchPrefixMode) -> GitSettings {
+        GitSettings { branch_prefix: mode, ..GitSettings::shipped() }
+    }
+
+    /// The state every headless test is in: no globals installed at all.
+    /// Answering `None` there would silently mint bare branches in a suite
+    /// that has always asserted `oximux/<slug>`.
+    #[gpui::test]
+    fn an_uninstalled_cache_resolves_to_the_shipped_prefix(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            assert_eq!(branch_for_slug("feat", None, cx), format!("{DEFAULT_PREFIX}/feat"));
+        });
+    }
+
+    /// The blocker this module was restructured to fix: the settings pane
+    /// previews against its unsaved working copy, so the preview line answers
+    /// on the same frame as the keystroke that changed it.
+    #[gpui::test]
+    fn an_unsaved_working_copy_previews_without_being_saved(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(GitSettings::shipped());
+            cx.set_global(GitUsernames::default());
+            // Saved settings still say `oximux`; the working copy says `team`.
+            assert_eq!(branch_for_slug("feat", None, cx), "oximux/feat");
+            assert_eq!(branch_for(&custom("team"), None, "feat", cx), "team/feat");
+        });
+    }
+
+    /// The agreement claim as a property rather than a promise: given the same
+    /// settings and the same root, two callers cannot compute different names,
+    /// because both run the one resolver over the one cached input.
+    #[gpui::test]
+    fn two_readers_of_the_same_settings_cannot_disagree(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(GitUsernames {
+                global: Some("Ada Lovelace".to_string()),
+                ..Default::default()
+            });
+            cx.set_global(by_mode(BranchPrefixMode::GitUsername));
+
+            let previewed = branch_for_slug("fix-login", None, cx);
+            let created = branch_for_slug("fix-login", None, cx);
+            assert_eq!(previewed, created);
+            assert_eq!(previewed, "ada-lovelace/fix-login");
+        });
+    }
+
+    /// `user.name` is commonly per repository, and each window has its own
+    /// active project. A per-root cache is what stops the window you last
+    /// switched projects in from naming the other window's branches.
+    #[gpui::test]
+    fn each_repository_gets_its_own_username(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mut cache = GitUsernames::default();
+            cache.by_root.insert(PathBuf::from("/work"), Some("acme-alice".to_string()));
+            cache.by_root.insert(PathBuf::from("/oss"), Some("alice".to_string()));
+            cache.global = Some("fallback".to_string());
+            cx.set_global(cache);
+            cx.set_global(by_mode(BranchPrefixMode::GitUsername));
+
+            assert_eq!(branch_for_slug("fix", Some(Path::new("/work")), cx), "acme-alice/fix");
+            assert_eq!(branch_for_slug("fix", Some(Path::new("/oss")), cx), "alice/fix");
+            // A root nobody has resolved yet falls back rather than guessing.
+            assert_eq!(branch_for_slug("fix", Some(Path::new("/new")), cx), "fallback/fix");
+        });
+    }
+
+    /// An unset `user.name` is an ordinary state, not a reason to mint `/slug`.
+    #[gpui::test]
+    fn a_root_with_no_username_degrades_to_the_shipped_prefix(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mut cache = GitUsernames::default();
+            cache.by_root.insert(PathBuf::from("/bare"), None);
+            cx.set_global(cache);
+            cx.set_global(by_mode(BranchPrefixMode::GitUsername));
+            assert_eq!(
+                branch_for_slug("fix", Some(Path::new("/bare")), cx),
+                format!("{DEFAULT_PREFIX}/fix")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn the_none_mode_mints_a_bare_slug(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(GitUsernames::default());
+            assert_eq!(branch_for(&by_mode(BranchPrefixMode::None), None, "fix", cx), "fix");
+        });
+    }
 }

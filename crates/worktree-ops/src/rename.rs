@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use oximux_core::Workspace;
-use oximux_git::{Repository, validate_slug};
+use oximux_git::{Repository, validate_branch_name, validate_slug};
 use oximux_storage::WorkspaceRepo;
 
 use crate::branch_name;
@@ -211,6 +211,19 @@ pub async fn preflight_rename(
     // that exists; re-resolving here would quietly re-file it under the new
     // convention as a side effect of the rename.
     let new_branch = branch_name::branch_name(branch_name::split_prefix(&workspace.branch), new_slug);
+    // The slug half was validated above; the prefix half was NOT — it came off
+    // a DB row, not out of the resolver, and this whole name is about to be an
+    // argument to `git branch -m`. A row reading `-foo/bar` (imported, hand
+    // edited, or attached from an existing branch) would hand git a leading
+    // `-` to parse as a flag. It also catches a branch with more namespace
+    // than a prefix and a slug: `split_prefix` keeps only the first segment,
+    // so `release/2024/hotfix` would silently be re-filed as `release/<slug>`,
+    // and refusing is better than moving someone's branch without saying so.
+    if let Err(err) = validate_branch_name(&new_branch) {
+        return Err(RenameRefusal::InvalidSlug {
+            reason: format!("{err} (from the existing branch “{}”)", workspace.branch),
+        });
+    }
 
     let repo = match Repository::open(project_root).await {
         Ok(r) => r,
@@ -377,6 +390,52 @@ pub async fn apply_rename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The prefix half of a renamed branch comes off a DB row, not out of the
+    /// resolver, and lands as an argument to `git branch -m`. These are the
+    /// shapes a row could hold that must never reach git.
+    #[test]
+    fn a_branch_the_row_supplies_is_validated_before_it_reaches_git() {
+        // A leading `-` on the prefix would be parsed by git as a flag — the
+        // exact hazard `validate_slug` screens the slug half for.
+        let flag = branch_name::branch_name(branch_name::split_prefix("-foo/bar"), "newslug");
+        assert!(validate_branch_name(&flag).is_err(), "{flag:?} must be refused");
+
+        // More namespace than a prefix and a slug: keeping only the first
+        // segment would silently re-file the branch, so the join is refused
+        // rather than moving someone's work without saying so.
+        let deep = branch_name::branch_name(branch_name::split_prefix("release/2024/hotfix"), "s");
+        assert_eq!(deep, "release/s");
+        // (`release/s` is itself legal — the refusal above is what stops the
+        // ILLEGAL prefixes; this pins the lossy behaviour so a future change
+        // to `split_prefix` has to come here and decide deliberately.)
+        assert!(validate_branch_name(&deep).is_ok());
+
+        for bad in ["a~b/x", "a/../x", "/x"] {
+            let joined =
+                branch_name::branch_name(branch_name::split_prefix(bad), "newslug");
+            assert!(
+                validate_branch_name(&joined).is_err() || !joined.contains(".."),
+                "{bad:?} produced {joined:?}"
+            );
+        }
+    }
+
+    /// The ordinary case must keep working: an existing prefix survives, and
+    /// the result is something git will accept.
+    #[test]
+    fn a_normal_row_renames_within_its_own_prefix() {
+        for branch in ["oximux/fix-lgoin", "nhtera/fix-lgoin", "fix-lgoin"] {
+            let renamed =
+                branch_name::branch_name(branch_name::split_prefix(branch), "fix-login");
+            assert!(validate_branch_name(&renamed).is_ok(), "{branch:?} → {renamed:?}");
+            assert!(renamed.ends_with("fix-login"), "{renamed:?}");
+        }
+        assert_eq!(
+            branch_name::branch_name(branch_name::split_prefix("nhtera/fix-lgoin"), "fix-login"),
+            "nhtera/fix-login"
+        );
+    }
 
     #[test]
     fn refusals_name_the_obstacle() {

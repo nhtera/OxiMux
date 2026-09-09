@@ -574,7 +574,8 @@ impl Render for WorkspaceRoot {
                     // The same resolved prefix the chat pill previewed with —
                     // read synchronously here so the pill's `<prefix>/<slug>`
                     // line and the branch this creates cannot disagree.
-                    let branch = crate::git_settings::branch_for_slug(&slug, cx);
+                    let branch =
+                        crate::git_settings::branch_for_slug(&slug, Some(&project_root), cx);
                     let freshen_default =
                         crate::git_settings::settings(cx).keep_default_up_to_date;
                     cx.spawn(async move |weak_root, cx| {
