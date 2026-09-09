@@ -419,7 +419,8 @@ impl WorkspaceRoot {
                 // just recorded resolves the stash by message instead, and the
                 // raw text is in the log above for anyone debugging.
                 let detail = if stranded_auto_stash {
-                    "Your uncommitted changes could not be put back and are still stashed \u{2014}                      OxiMux will offer to restore them."
+                    "Your uncommitted changes could not be put back and are still stashed \
+                     \u{2014} OxiMux will offer to restore them."
                         .to_string()
                 } else {
                     error

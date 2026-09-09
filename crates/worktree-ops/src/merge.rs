@@ -140,6 +140,10 @@ pub enum MergeResult {
 pub struct MergePlan {
     project_root: PathBuf,
     branch: String,
+    /// The branch the root must still be on when the merge runs. Recorded
+    /// because HEAD's SHA cannot stand in for it: `switch -c` and a detaching
+    /// `checkout <sha>` both leave the SHA exactly where it was.
+    default_branch: String,
     /// HEAD at pre-flight time. [`apply_merge`] refuses if it has moved.
     head_before: String,
 }
@@ -246,6 +250,7 @@ pub async fn preflight_merge(
     Ok(MergePlan {
         project_root: project_root.to_path_buf(),
         branch: workspace.branch.clone(),
+        default_branch: default_branch.to_string(),
         head_before,
     })
 }
@@ -280,6 +285,28 @@ pub async fn apply_merge(plan: &MergePlan, holders_now: &HashSet<PathBuf>) -> Me
     // it. This one is a stat, so there is no reason not to.
     if let Some(operation) = repo.current_operation() {
         return MergeResult::Refused(MergeRefusal::OperationInProgress { operation });
+    }
+    // Re-checked for the same reason as the operation sentinel, and it must be
+    // its own check rather than a corollary of the HEAD compare below: a branch
+    // switch does not have to move the SHA. `git switch -c release` opens a new
+    // branch at the current commit, and `git checkout <that sha>` detaches HEAD
+    // at it — in both cases the SHA is unchanged, so the compare passes and the
+    // merge lands on a ref the user never asked for. That is precisely what
+    // `RootNotOnDefault` exists to prevent, and the pre-flight's answer to it
+    // goes stale the moment it returns.
+    match repo.current_branch().await {
+        Ok(Some(on)) if on == plan.default_branch => {}
+        Ok(on) => {
+            return MergeResult::Refused(MergeRefusal::RootNotOnDefault {
+                on,
+                default: plan.default_branch.clone(),
+            });
+        }
+        Err(err) => {
+            return MergeResult::Refused(MergeRefusal::PreflightFailed {
+                error: format!("re-read current branch: {err}"),
+            });
+        }
     }
     let head_now = match repo.head_sha().await {
         Ok(sha) => sha,

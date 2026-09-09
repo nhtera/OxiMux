@@ -324,14 +324,21 @@ impl WorkspaceRepo {
         new_branch: &str,
         new_worktree_path: &str,
     ) -> Result<(), StorageError> {
-        self.db.with_conn(|c| {
-            c.execute(
-                "UPDATE workspaces SET name = ?1, slug = ?2, branch = ?3, worktree_path = ?4 \
-                 WHERE id = ?5",
-                params![new_name, new_slug, new_branch, new_worktree_path, id],
-            )
-            .map(|_| ())
-        })?;
+        // `(project_id, slug)` is unique, and renaming onto a sibling's slug is
+        // a thing a user can do by hand. Without this mapping that arrives as a
+        // generic `Query` error, and the caller rolls the worktree and branch
+        // back reporting nothing the user can act on — the same collision the
+        // insert path has always named properly.
+        self.db
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE workspaces SET name = ?1, slug = ?2, branch = ?3, worktree_path = ?4 \
+                     WHERE id = ?5",
+                    params![new_name, new_slug, new_branch, new_worktree_path, id],
+                )
+                .map(|_| ())
+            })
+            .map_err(|e| classify_unique("workspaces", "project_id_slug", e))?;
         Ok(())
     }
 

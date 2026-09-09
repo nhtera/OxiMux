@@ -586,6 +586,60 @@ async fn a_head_that_moved_between_preflight_and_merge_aborts() {
     assert!(!f.project_root.join("b.txt").exists(), "nothing was merged");
 }
 
+/// A branch switch does not have to move HEAD's SHA, so the HEAD compare cannot
+/// stand in for the branch check. `git switch -c` opens a new branch at the
+/// current commit: the SHA is identical, and without its own re-check the merge
+/// would advance a branch the user never named.
+#[tokio::test]
+async fn a_branch_switched_at_the_same_commit_after_the_preflight_aborts() {
+    let f = fixture("feat").await;
+    f.commit_in_worktree("b.txt", "b\n", "add b");
+
+    let plan = preflight_merge(&f.project_root, &f.workspace, "main", &HashSet::new())
+        .await
+        .expect("pre-flight passes");
+    let was = f.head().await;
+
+    // A new branch at the SAME commit — HEAD's SHA does not move.
+    run_git(&f.project_root, &["switch", "-c", "release"]);
+    assert_eq!(f.head().await, was, "precondition: the SHA is unchanged");
+
+    let r = refusal(apply_merge(&plan, &HashSet::new()).await);
+    let MergeRefusal::RootNotOnDefault { on, default } = &r else {
+        panic!("expected RootNotOnDefault, got {r:?}");
+    };
+    assert_eq!(on.as_deref(), Some("release"));
+    assert_eq!(default, "main");
+    assert!(
+        !f.project_root.join("b.txt").exists(),
+        "nothing was merged onto release"
+    );
+}
+
+/// The same hole, reached the other way: a detaching checkout also leaves the
+/// SHA alone, and a merge commit landing on a detached HEAD becomes unreachable
+/// at the next checkout.
+#[tokio::test]
+async fn a_head_detached_at_the_same_commit_after_the_preflight_aborts() {
+    let f = fixture("feat").await;
+    f.commit_in_worktree("b.txt", "b\n", "add b");
+
+    let plan = preflight_merge(&f.project_root, &f.workspace, "main", &HashSet::new())
+        .await
+        .expect("pre-flight passes");
+    let was = f.head().await;
+
+    run_git(&f.project_root, &["checkout", "--detach", "HEAD"]);
+    assert_eq!(f.head().await, was, "precondition: the SHA is unchanged");
+
+    let r = refusal(apply_merge(&plan, &HashSet::new()).await);
+    assert!(
+        matches!(r, MergeRefusal::RootNotOnDefault { .. }),
+        "expected RootNotOnDefault, got {r:?}"
+    );
+    assert!(!f.project_root.join("b.txt").exists(), "nothing was merged");
+}
+
 /// An agent that starts during the pre-flight's git round-trips is invisible to
 /// the snapshot the pre-flight used. The second read is the only thing that can
 /// catch it.

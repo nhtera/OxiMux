@@ -462,13 +462,25 @@ async fn a_failure_at_the_row_step_walks_back_both_earlier_steps() {
     let f = fixture("fix-lgoin").await;
     let new_path = f.wt_path.with_file_name("fix-login");
 
-    // A repo pointed at a database that is gone: every write fails, while the
-    // git steps before it genuinely succeed.
-    let dead_db = oximux_storage::open_memory().expect("open memory");
-    let dead_repo = WorkspaceRepo::new(dead_db);
-    // The workspace row does not exist in THIS database, so `rename_full`
-    // matches nothing. SQLite calls that success, so drive a real error instead
-    // by handing the rename a workspace id that violates the schema on write.
+    // The row step has to fail for real, and it has to fail AFTER the two git
+    // steps have genuinely succeeded — that is the only ordering that exercises
+    // the walk-back. Pointing the rename at an empty database does not do it:
+    // the `UPDATE` simply matches no rows, which SQLite reports as success, so
+    // the test passes on the happy path while claiming to prove rollback.
+    //
+    // Collide on `(project_id, slug)` instead — a real UNIQUE constraint. A
+    // sibling row already holding the target slug makes `rename_full` fail
+    // deterministically, with the directory moved and the branch renamed.
+    f.workspace_repo
+        .insert(
+            &f.workspace.project_id,
+            "Fix login",
+            "fix-login",
+            "oximux/already-taken",
+            &new_path.to_string_lossy(),
+        )
+        .expect("seed the sibling already holding the target slug");
+
     let outcome = rename_with_rollback(
         &f.project_root,
         &f.workspace,
@@ -476,9 +488,16 @@ async fn a_failure_at_the_row_step_walks_back_both_earlier_steps() {
         "fix-login",
         &new_path,
         &HashSet::new(),
-        &dead_repo,
+        &f.workspace_repo,
     )
     .await;
+
+    // The whole point of the test: the row step must have FAILED. Without this
+    // the assertions below are satisfied by a rename that simply worked.
+    assert!(
+        matches!(outcome, RenameOutcome::RolledBack { .. }),
+        "the row step must fail and walk back, got {outcome:?}"
+    );
 
     // Whatever the storage layer reports, the invariant is the same: the caller
     // is never left with a half-applied rename. Either everything applied, or
