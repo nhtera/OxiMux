@@ -94,7 +94,8 @@ impl MergeRefusal {
                 holder.display()
             ),
             Self::NothingToMerge => format!(
-                "\u{201c}{branch}\u{201d} has nothing the default branch is missing."
+                "Nothing to merge \u{2014} the default branch already has everything on \
+                 \u{201c}{branch}\u{201d}."
             ),
             Self::HeadMoved { .. } => {
                 "The project folder changed while this was being checked, so nothing was merged. \
@@ -391,6 +392,12 @@ mod tests {
 
         let nothing = MergeRefusal::NothingToMerge.message("oximux/feat");
         assert!(nothing.contains("oximux/feat"), "{nothing}");
+        // Naming the branch is not enough — this one shipped as "…has nothing
+        // the default branch is missing", which parses only on the second read.
+        // Live verification caught it; the assertion now pins the phrasing that
+        // matches the equivalent outcome headline.
+        assert!(nothing.starts_with("Nothing to merge"), "{nothing}");
+        assert!(nothing.contains("already has everything"), "{nothing}");
     }
 
     /// A detached HEAD is not a branch, and the message must not print one.
