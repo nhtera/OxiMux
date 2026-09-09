@@ -43,9 +43,37 @@ const EMPTY_STATE_HEIGHT: f32 = 80.0;
 const MAX_VISIBLE_ROWS: usize = 20;
 /// Fallback name when `path.file_name()` returns None (root paths).
 const FALLBACK_PROJECT_NAME: &str = "untitled";
-/// Default branch stored at insert time; step 6's workspace dialog
-/// detects the real HEAD branch via `oximux_git`.
-const DEFAULT_BRANCH_PLACEHOLDER: &str = "main";
+/// What a project's default branch falls back to when the folder is not a
+/// repository, or is one whose HEAD says nothing useful.
+///
+/// A fallback, no longer a placeholder: [`detect_default_branch`] runs before
+/// every insert now. This matters more than it used to — the stored value is
+/// what a new worktree is based on, and what decides whether a chosen base
+/// counts as reviewed, so a repo that renamed `master` to `main` (or never had
+/// either) must not silently carry a branch that does not exist.
+pub(crate) const DEFAULT_BRANCH_FALLBACK: &str = "main";
+
+/// The default branch of the repository at `path`, or
+/// [`DEFAULT_BRANCH_FALLBACK`] when there is nothing to read.
+///
+/// Async because it shells out to git, and called from the folder-pick spawn
+/// rather than from the handler it feeds: the handler runs inside
+/// `update_in` on the foreground executor, where a subprocess would stall the
+/// window on every project add.
+///
+/// Every failure resolves to the fallback. Adding a project must not be
+/// refusable because a folder is not a repository — plain folders are a
+/// supported kind of project.
+pub async fn detect_default_branch(path: &Path) -> String {
+    let Ok(repo) = oximux_git::Repository::open(path).await else {
+        return DEFAULT_BRANCH_FALLBACK.to_string();
+    };
+    repo.default_branch()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| DEFAULT_BRANCH_FALLBACK.to_string())
+}
 
 /// Handler the owner registers to receive the picked `Project`. Boxed so
 /// the picker is constructed without a `Context<WorkspaceRoot>`.
@@ -171,8 +199,13 @@ impl ProjectPickerModal {
         cx.spawn(async move |this, cx| {
             let folder = rfd::AsyncFileDialog::new().pick_folder().await;
             let path = folder.map(|h| h.path().to_path_buf());
+            // Detected HERE, in the spawn, before the foreground handler runs.
+            let default_branch = match &path {
+                Some(p) => detect_default_branch(p).await,
+                None => String::new(),
+            };
             let _ = this.update_in(cx, |this, window, cx| match path {
-                Some(p) => this.handle_folder_pick(p, window, cx),
+                Some(p) => this.handle_folder_pick(p, default_branch, window, cx),
                 None => {
                     this.pending_folder_pick = false;
                     cx.notify();
@@ -182,7 +215,13 @@ impl ProjectPickerModal {
         .detach();
     }
 
-    fn handle_folder_pick(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_folder_pick(
+        &mut self,
+        path: PathBuf,
+        default_branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // User may have dismissed the picker via Escape (or another
         // Cmd+O toggle) while NSOpenPanel was still open. NSOpenPanel
         // is a separate macOS window, so its resolution races against
@@ -193,11 +232,10 @@ impl ProjectPickerModal {
         }
         self.pending_folder_pick = false;
         let path_str = path.to_string_lossy().to_string();
-        // TODO(step-6): detect HEAD branch via `oximux_git` before insert.
         let name = name_from_path(&path);
         match self
             .project_repo
-            .insert_or_touch(&name, &path_str, DEFAULT_BRANCH_PLACEHOLDER)
+            .insert_or_touch(&name, &path_str, &default_branch)
         {
             Ok(project) => {
                 // Close before invoking the callback so any modal the
@@ -483,7 +521,7 @@ mod tests {
         let db = oximux_storage::open_memory().expect("memory");
         let repo = ProjectRepo::new(db);
         let project = repo
-            .insert_or_touch("Acme", "/p/acme", DEFAULT_BRANCH_PLACEHOLDER)
+            .insert_or_touch("Acme", "/p/acme", DEFAULT_BRANCH_FALLBACK)
             .expect("resolve");
         assert_eq!(project.name, "Acme");
         assert_eq!(project.root_path, "/p/acme");
@@ -497,7 +535,7 @@ mod tests {
             .insert("Acme", "/p/acme", "main")
             .expect("first insert");
         let resolved = repo
-            .insert_or_touch("Acme-renamed", "/p/acme", DEFAULT_BRANCH_PLACEHOLDER)
+            .insert_or_touch("Acme-renamed", "/p/acme", DEFAULT_BRANCH_FALLBACK)
             .expect("resolve");
         assert_eq!(resolved.id, first.id);
         let fetched = repo.get_by_id(&first.id).expect("get").expect("present");

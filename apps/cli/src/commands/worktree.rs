@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use oximux_core::WorkPhase;
-use oximux_remote_proto::messages::{WorktreeProgressWire, WorktreeWire};
+use oximux_remote_proto::messages::{CreateBaseWire, WorktreeProgressWire, WorktreeWire};
 use oximux_remote_proto::proto::{Request, Response};
 use serde_json::{Value, json};
 
@@ -75,15 +75,73 @@ fn wire_json(row: &WorktreeWire) -> Value {
     })
 }
 
+/// The base the flags add up to, and the slug that names the directory.
+///
+/// `--branch` makes the positional slug optional: adopting a branch takes its
+/// name, so the only thing left for a slug to name is the directory. **The
+/// derivation is the host's**, not this side's — `derive_slug` lives in
+/// `oximux-git`, which is deliberately not on the CLI's dependency path (the
+/// same edge `oximux-worktree-ops` was extracted to keep the git process layer
+/// off `oximux-cli`). Reimplementing it here would put two copies of a naming
+/// rule in the tree and let them disagree, so an omitted slug travels as an
+/// empty string and the host fills it in. An explicit slug still wins: a user
+/// may want the directory named something other than the branch.
+///
+/// Clap already enforces `conflicts_with = "branch"` on `--from`; the arm below
+/// is what makes that a property of this function rather than of its caller, so
+/// the unit tests can state the rule directly.
+pub(crate) fn base_and_slug(
+    slug: Option<&str>,
+    from: Option<&str>,
+    branch: Option<&str>,
+) -> Result<(String, CreateBaseWire), Failure> {
+    let usage = |msg: &str| Failure::new("usage", exit::USAGE, msg.to_string());
+    match (from, branch) {
+        (Some(_), Some(_)) => Err(usage(
+            "`--from` and `--branch` are mutually exclusive: --from cuts a NEW branch \
+             from a ref, --branch adopts one that already exists",
+        )),
+        (from, None) => {
+            let Some(slug) = slug else {
+                return Err(usage(
+                    "`worktree create` wants a slug, or `--branch <NAME>` to adopt an \
+                     existing branch",
+                ));
+            };
+            let base = match from {
+                Some(r) => CreateBaseWire::From(r.to_string()),
+                None => CreateBaseWire::Default,
+            };
+            Ok((slug.to_string(), base))
+        }
+        (None, Some(branch)) => Ok((
+            slug.unwrap_or_default().to_string(),
+            CreateBaseWire::Existing(branch.to_string()),
+        )),
+    }
+}
+
 pub async fn create(
     client: &Client,
-    slug: &str,
+    slug: Option<&str>,
     project: Option<PathBuf>,
+    from: Option<&str>,
+    branch: Option<&str>,
 ) -> Result<(Value, String), Failure> {
+    let (slug, base) = base_and_slug(slug, from, branch)?;
     let project_path = resolve_project(client, project).await?;
-    let reply = client
-        .call(Request::CreateWorktree { project_path, slug: slug.into() })
-        .await?;
+    // **V2 only when the base needs it.** A plain create keeps taking the v16
+    // verb even against a v24 host, so every invocation that worked before this
+    // phase encodes byte-for-byte as it did. `--from`/`--branch` are separately
+    // refused against an older host by `required_version`, so a non-default
+    // base reaching here already implies a v24 host — the base *is* the
+    // decision, which is why this reads no version.
+    let request = if base.is_default() {
+        Request::CreateWorktree { project_path, slug }
+    } else {
+        Request::CreateWorktreeV2 { project_path, slug, base }
+    };
+    let reply = client.call(request).await?;
     match reply {
         Response::WorktreeCreated(row) => {
             let human = format!(
@@ -287,5 +345,64 @@ mod tests {
                 "the CLI must not send a spelling the host cannot parse"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod base_tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_create_asks_for_the_default_base() {
+        let (slug, base) = base_and_slug(Some("feat-x"), None, None).expect("valid");
+        assert_eq!(slug, "feat-x");
+        assert_eq!(base, CreateBaseWire::Default);
+        // The property the version gate rests on: a plain create still encodes
+        // as the v16 verb, so it keeps working against a v16-v23 host.
+        assert!(base.is_default());
+    }
+
+    #[test]
+    fn from_cuts_a_new_branch_and_needs_the_v2_verb() {
+        let (slug, base) = base_and_slug(Some("feat-x"), Some("release/1.4"), None).expect("valid");
+        assert_eq!(slug, "feat-x");
+        assert_eq!(base, CreateBaseWire::From("release/1.4".into()));
+        assert!(!base.is_default());
+    }
+
+    #[test]
+    fn branch_adopts_and_leaves_the_slug_for_the_host_to_derive() {
+        let (slug, base) = base_and_slug(None, None, Some("feature/api/retry")).expect("valid");
+        assert_eq!(
+            slug, "",
+            "the CLI must not derive the slug — `derive_slug` lives on the host side"
+        );
+        assert_eq!(base, CreateBaseWire::Existing("feature/api/retry".into()));
+        assert!(!base.is_default());
+    }
+
+    #[test]
+    fn an_explicit_slug_still_names_the_directory_when_adopting() {
+        let (slug, base) = base_and_slug(Some("retry"), None, Some("feature/api/retry")).unwrap();
+        assert_eq!(slug, "retry");
+        assert_eq!(base, CreateBaseWire::Existing("feature/api/retry".into()));
+    }
+
+    #[test]
+    fn from_and_branch_are_mutually_exclusive_and_say_so() {
+        let err = base_and_slug(Some("x"), Some("main"), Some("side")).expect_err("refused");
+        assert_eq!(err.code, "usage");
+        assert!(
+            err.message.contains("mutually exclusive"),
+            "the refusal must name the rule: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn a_create_with_neither_a_slug_nor_a_branch_is_a_usage_error() {
+        let err = base_and_slug(None, None, None).expect_err("refused");
+        assert_eq!(err.code, "usage");
+        assert!(err.message.contains("wants a slug"), "{}", err.message);
     }
 }

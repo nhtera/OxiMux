@@ -16,14 +16,15 @@
 use std::path::PathBuf;
 
 use oximux_git::{Repository, validate_slug};
+use oximux_git::worktree::{derive_slug, validate_ref_name};
 use oximux_remote_host::{WorktreeError, WorktreeService};
-use oximux_remote_proto::messages::{WorktreeProgressWire, WorktreeWire};
+use oximux_remote_proto::messages::{CreateBaseWire, WorktreeProgressWire, WorktreeWire};
 use oximux_storage::{ProjectRepo, WorkspaceRepo};
 
 use crate::branch_name;
 use crate::{
-    CreateOutcome, Provision, create_workspace_with_rollback, run_cleanup_before_remove,
-    worktree_path,
+    CreateBase, CreateOutcome, Provision, create_workspace_with_rollback,
+    run_cleanup_before_remove, worktree_path,
 };
 
 /// Manages worktrees against the same repos and path scheme the desktop uses.
@@ -55,6 +56,30 @@ impl RepoWorktrees {
     }
 }
 
+/// The slug that will name the directory and the row.
+///
+/// The slug names both in **every** mode — only the branch changes — so
+/// adopting a branch still needs one. An empty slug in that mode means "derive
+/// it from the branch": a client asking for `--branch feature/api/retry` should
+/// not have to say the directory twice.
+///
+/// **The derivation lives here, on the host, deliberately.** `derive_slug` is
+/// in `oximux-git`, which is kept off `oximux-cli`'s dependency path — the same
+/// edge this crate was extracted to protect. A client-side copy of the rule
+/// would be a second naming implementation free to disagree with this one, and
+/// the disagreement would only show up as a directory named something the user
+/// did not expect.
+///
+/// The result is validated by the caller exactly as an explicit slug is, so a
+/// branch that derives to something `validate_slug` refuses is refused too,
+/// rather than reaching git.
+fn effective_slug(slug: &str, base: &CreateBaseWire) -> String {
+    match (slug, base) {
+        ("", CreateBaseWire::Existing(branch)) => derive_slug(branch),
+        (slug, _) => slug.to_string(),
+    }
+}
+
 /// One DB row as the wire shows it.
 fn wire(row: oximux_core::Workspace, project_path: &str) -> WorktreeWire {
     WorktreeWire {
@@ -69,8 +94,25 @@ fn wire(row: oximux_core::Workspace, project_path: &str) -> WorktreeWire {
 
 #[async_trait::async_trait]
 impl WorktreeService for RepoWorktrees {
-    async fn create(&self, project_path: &str, slug: &str)
-    -> Result<WorktreeWire, WorktreeError> {
+    async fn create(
+        &self,
+        project_path: &str,
+        slug: &str,
+        base: &CreateBaseWire,
+    ) -> Result<WorktreeWire, WorktreeError> {
+        // A base ref is validated here as well as at the git layer: `BadSlug`
+        // is a refusal the client can act on, where a git failure two layers
+        // down arrives as the opaque `CreateFailed`.
+        match base {
+            CreateBaseWire::Default => {}
+            CreateBaseWire::From(r) | CreateBaseWire::Existing(r) => {
+                if validate_ref_name(r).is_err() {
+                    return Err(WorktreeError::BadSlug);
+                }
+            }
+        }
+        let slug = effective_slug(slug, base);
+        let slug = slug.as_str();
         if validate_slug(slug).is_err() {
             return Err(WorktreeError::BadSlug);
         }
@@ -95,19 +137,32 @@ impl WorktreeService for RepoWorktrees {
         // `reclaim_orphan` would stop recognising its own debris.
         let root = std::path::Path::new(&project.root_path);
         let git_settings = oximux_settings::git::GitSettings::load_from_dir(&self.data_dir);
-        let branch = match Repository::open(root).await {
-            Ok(repo) => branch_name::resolve_branch_name(&git_settings, &repo, slug).await,
-            // The create below opens the same repository and reports the real
-            // failure; naming the branch the shipped way here keeps that the
-            // error the caller sees.
-            Err(_) => branch_name::branch_name(Some(oximux_settings::git::DEFAULT_PREFIX), slug),
+        // Existing-branch mode mints no name at all — it adopts one — so the
+        // resolver runs only for the two modes that create a branch.
+        let create_base = match base {
+            CreateBaseWire::Existing(name) => CreateBase::existing(name.clone()),
+            CreateBaseWire::Default | CreateBaseWire::From(_) => {
+                let branch = match Repository::open(root).await {
+                    Ok(repo) => branch_name::resolve_branch_name(&git_settings, &repo, slug).await,
+                    // The create below opens the same repository and reports the
+                    // real failure; naming the branch the shipped way here keeps
+                    // that the error the caller sees.
+                    Err(_) => {
+                        branch_name::branch_name(Some(oximux_settings::git::DEFAULT_PREFIX), slug)
+                    }
+                };
+                match base {
+                    CreateBaseWire::From(r) => CreateBase::new_branch_from(branch, r.clone()),
+                    _ => CreateBase::new_branch(branch),
+                }
+            }
         };
         let outcome = create_workspace_with_rollback(
             root,
             &project.id,
             slug,
             slug,
-            &branch,
+            &create_base,
             &target,
             None,
             &self.workspaces,
@@ -378,5 +433,40 @@ mod progress_tests {
         service.set_progress(&a, None, Some("shipped")).await.expect("set");
         let rows = service.list_progress(None).await.expect("list");
         assert_eq!(rows[0].phase, "shipped");
+    }
+}
+
+#[cfg(test)]
+mod slug_tests {
+    use super::*;
+
+    #[test]
+    fn an_explicit_slug_is_used_verbatim_in_every_mode() {
+        for base in [
+            CreateBaseWire::Default,
+            CreateBaseWire::From("main".into()),
+            CreateBaseWire::Existing("feature/api/retry".into()),
+        ] {
+            assert_eq!(effective_slug("retry", &base), "retry", "base {base:?}");
+        }
+    }
+
+    #[test]
+    fn an_omitted_slug_is_derived_from_the_adopted_branch() {
+        let base = CreateBaseWire::Existing("feature/api/retry".into());
+        // `derive_slug` flattens the slashes the branch is allowed to carry —
+        // a slug is one path component, and `validate_slug` would refuse the
+        // branch name as written.
+        assert_eq!(effective_slug("", &base), "feature-api-retry");
+    }
+
+    #[test]
+    fn an_omitted_slug_is_not_derived_in_a_mode_that_mints_a_branch() {
+        // Nothing to derive from: these modes name the branch after the slug,
+        // so an empty one stays empty and `validate_slug` refuses it upstream.
+        // Deriving `main` from `--from main` would silently name the worktree
+        // after its base.
+        assert_eq!(effective_slug("", &CreateBaseWire::Default), "");
+        assert_eq!(effective_slug("", &CreateBaseWire::From("main".into())), "");
     }
 }

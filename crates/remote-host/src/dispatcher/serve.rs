@@ -8,6 +8,7 @@ use futures::future::{Either, select};
 use futures::stream::{BoxStream, SelectAll, StreamExt};
 use oximux_agents::session_registry::{ChoiceKind, Seq, SessionId};
 use oximux_remote_proto::Transport;
+use oximux_remote_proto::messages::CreateBaseWire;
 use oximux_remote_proto::proto::{Request, Response, RpcError};
 
 use super::stream::{Live, forward_terminal};
@@ -467,7 +468,19 @@ impl Dispatcher {
             let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
                 return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
             };
-            let response = self.create_worktree(&peer, &project_path, &slug).await;
+            // The v16 verb is the v24 verb with a `Default` base. Served
+            // unchanged and forever: a stale CLI must go on speaking what it
+            // spoke.
+            let response = self
+                .create_worktree(&peer, &project_path, &slug, &CreateBaseWire::Default)
+                .await;
+            return self.send(transport, response).await;
+        }
+        if let Request::CreateWorktreeV2 { project_path, slug, base } = req {
+            let Some(peer) = authorized_peer(&state.authn, &self.auth) else {
+                return self.send(transport, Response::Error(RpcError::Unauthorized)).await;
+            };
+            let response = self.create_worktree(&peer, &project_path, &slug, &base).await;
             return self.send(transport, response).await;
         }
         if let Request::ListWorktrees { project_path } = req {

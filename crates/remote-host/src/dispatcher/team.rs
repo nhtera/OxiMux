@@ -351,8 +351,11 @@ impl Dispatcher {
         // The host derives the path from the slug; the client never supplies
         // one, exactly as `CreateWorktree` requires.
         let slug = format!("{}-{}", slugify(run_name), slugify(role));
+        // `Default`: a team run is unattended, and "wherever the host's HEAD
+        // was" is the behaviour this path has always had. Choosing a base for
+        // it is a decision with an owner, and that owner is not this call site.
         worktrees
-            .create(project, &slug)
+            .create(project, &slug, &oximux_remote_proto::messages::CreateBaseWire::Default)
             .await
             .map(|row| row.path)
             .map_err(|_| "the role's worktree could not be created".to_string())

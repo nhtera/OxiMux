@@ -48,6 +48,30 @@ default_tabs = ["server", "logs"]
 The manual **Run setup** row in the rail's context menu is unchanged and is
 still how you re-run setup in an existing worktree.
 
+### Setup is skipped on a base you have not reviewed
+
+Provisioning runs the worktree's **own committed** `scripts.toml`, so the
+script that runs is the one on the branch you are checking out — not the one on
+your default branch. That is safe while a worktree is cut from your own
+checkout, and it stops being safe the moment you base one on somebody else's
+branch: `--from origin/pr-4711` would otherwise run a contributor's script on
+your machine, unattended, on any project with `auto_setup = true`.
+
+So when the base is **not already part of your default branch**, setup is
+skipped and the reason is shown before you commit in the dialog, and written to
+the provisioning transcript afterwards:
+
+```
+Setup skipped: `pr-4711` is not based on `main`. Review the branch, then Run setup.
+```
+
+Read the script, then use **Run setup** from the row menu — or choose **Run
+setup** in the dialog, which overrides the guard deliberately. The skip is a
+default, not a prohibition.
+
+A base that *is* an ancestor of the default branch provisions exactly as
+before, and so does an ordinary create that names no base at all.
+
 > Do not put secrets in `scripts.toml`. It is meant to be committed, the same
 > trust boundary as `commands.toml`.
 

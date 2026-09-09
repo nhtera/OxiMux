@@ -64,13 +64,124 @@ impl Repository {
     /// `path` must not already exist; `branch` must pass
     /// [`validate_branch_name`]. The branch must not already exist (git
     /// refuses with `NonZero` if it does).
+    ///
+    /// **Branches from whatever HEAD happens to be.** The desktop and the CLI
+    /// no longer call this — they name a base explicitly through
+    /// [`add_worktree_from`](Self::add_worktree_from), because "wherever HEAD
+    /// was" silently bases a new worktree on a half-finished feature branch.
+    /// This form stays for callers that genuinely mean the current HEAD.
     pub async fn add_worktree(&self, path: &Path, branch: &str) -> Result<WorktreeInfo> {
         validate_branch_name(branch)?;
         GitCmd::new(self.workdir())
-            .args(["worktree", "add", "-b", branch])
+            .args(["worktree", "add", "-b", branch, "--"])
             .arg(path.as_os_str())
             .run()
             .await?;
+        self.worktree_at(path).await
+    }
+
+    /// Create a linked worktree at `path` on a new `branch` cut from
+    /// `start_point`, rather than from the main checkout's HEAD.
+    ///
+    /// `start_point` is anything git resolves as a commit-ish — a branch, a
+    /// tag, a SHA. It must pass [`validate_ref_name`]; `branch` must pass
+    /// [`validate_branch_name`] and must not already exist.
+    ///
+    /// Both positionals sit after a `--` terminator. Git would treat a
+    /// flag-shaped ref as a reference name even without it (it fails with
+    /// `invalid reference: --force`), but the terminator is what makes that a
+    /// property of the argv rather than of git's current option parser, and it
+    /// matches `merge.rs` and `branch.rs`.
+    ///
+    /// # The start point is resolved to a SHA first, and that is load-bearing
+    ///
+    /// `git worktree add` DWIMs a commit-ish that names no local branch but
+    /// exactly one remote-tracking branch into `--track -b <that name>` — and
+    /// **that override beats an explicit `-b`**. Verified on git 2.55:
+    ///
+    /// ```text
+    /// $ git worktree add -b oximux/x -- ../wt main   # local `main` deleted,
+    /// Preparing worktree (new branch 'main')          # origin/main present
+    /// branch 'main' set up to track 'origin/main'.
+    /// ```
+    ///
+    /// The worktree lands on `main`, `oximux/x` is never created, and nothing
+    /// reports a problem. The `workspaces` row would then name a branch that
+    /// does not exist, breaking the three-way agreement the crate is built on —
+    /// and a worktree-centric user who deleted their local `main` hits it on an
+    /// ordinary create with no flags at all.
+    ///
+    /// Passing a raw SHA removes the ambiguity DWIM keys on, so `-b` is
+    /// honoured. A start point that does not resolve is refused here rather
+    /// than silently reinterpreted.
+    pub async fn add_worktree_from(
+        &self,
+        path: &Path,
+        branch: &str,
+        start_point: &str,
+    ) -> Result<WorktreeInfo> {
+        validate_branch_name(branch)?;
+        validate_ref_name(start_point)?;
+        let sha = self.sha_of(start_point).await?.ok_or_else(|| {
+            GitError::invalid_input(format!("start point {start_point:?} does not resolve"))
+        })?;
+        GitCmd::new(self.workdir())
+            .args(["worktree", "add", "-b", branch, "--"])
+            .arg(path.as_os_str())
+            .arg(&sha)
+            .run()
+            .await?;
+        self.worktree_at(path).await
+    }
+
+    /// Check an **existing** `branch` out into a new linked worktree at `path`.
+    ///
+    /// No `-b`, so no branch is created and no prefix applies: the worktree
+    /// adopts the branch under whatever name it already has. `branch` must pass
+    /// [`validate_ref_name`] rather than [`validate_branch_name`] — an adopted
+    /// branch is somebody else's name and may carry more than one prefix
+    /// segment (`feature/api/retry`), which the one-segment branch rule exists
+    /// to forbid only for names OxiMux itself mints.
+    ///
+    /// Git refuses when the branch is already checked out in another worktree,
+    /// and its message names that worktree; the error carries git's own text so
+    /// the caller can surface the reason verbatim.
+    ///
+    /// # Why this insists the local branch already exists
+    ///
+    /// "Adopt" has to mean adopt. Handed a name git resolves some other way,
+    /// `git worktree add <path> <name>` quietly does something else — and both
+    /// alternatives break a caller that has already decided this branch was not
+    /// minted here:
+    ///
+    /// - a name that exists only as `origin/<name>` **creates** a local branch
+    ///   (`Preparing worktree (new branch 'main')`), which the create path then
+    ///   declines to clean up on rollback, because it believes it adopted one;
+    /// - a **tag** or a raw SHA produces a detached HEAD, leaving the
+    ///   `workspaces` row naming a branch the worktree is not on.
+    ///
+    /// So the check is `refs/heads/<branch>`, not "does this resolve".
+    /// Rejecting here costs the user an explicit `--from` for the cases they
+    /// probably meant; accepting silently costs them the invariant.
+    pub async fn add_worktree_existing(&self, path: &Path, branch: &str) -> Result<WorktreeInfo> {
+        validate_ref_name(branch)?;
+        if self.sha_of(&format!("refs/heads/{branch}")).await?.is_none() {
+            return Err(GitError::invalid_input(format!(
+                "no local branch named {branch:?} \
+                 (a remote-only branch or a tag needs `--from` instead)"
+            )));
+        }
+        GitCmd::new(self.workdir())
+            .args(["worktree", "add", "--"])
+            .arg(path.as_os_str())
+            .arg(branch)
+            .run()
+            .await?;
+        self.worktree_at(path).await
+    }
+
+    /// The freshly-added worktree at `path`, looked up in `git worktree list`.
+    async fn worktree_at(&self, path: &Path) -> Result<WorktreeInfo> {
         // Look up the newly-added worktree by path. BOTH sides are
         // canonicalized: the caller may have passed a relative or symlinked
         // path, and git's `--porcelain` output is not `fs::canonicalize`'s
@@ -243,6 +354,82 @@ pub fn validate_branch_name(branch: &str) -> Result<()> {
         }
         None => validate_slug(first),
     }
+}
+
+/// Reject ref names OxiMux would not be able to hand to git safely.
+///
+/// A *ref* is not a branch OxiMux minted, so neither of the existing validators
+/// fits. [`validate_slug`] rejects `/`, which every remote-tracking ref and most
+/// real branch names contain. [`validate_branch_name`] allows exactly one `/`,
+/// because that is the shape of `<prefix>/<slug>` — but a base ref the user
+/// chose (`feature/api/retry`, `origin/main`, `v1.2.0`) legitimately carries
+/// more, and refusing it would refuse the feature.
+///
+/// So this validates the whole name at once against the subset of
+/// `check-ref-format` that is actually dangerous rather than merely unusual,
+/// plus the shapes that are ambiguous as *arguments*:
+/// - Non-empty, and no empty segment (`a//b`, `/a`, `a/`)
+/// - No leading `-` — an argument git's option parser could claim. The `--`
+///   terminator on every call site already covers this; the check makes it a
+///   property of the value, so a future call site that forgets the terminator
+///   is not a force-reset waiting to happen.
+/// - No whitespace, no ASCII control characters
+/// - No `..` (relative-ref-path injection), no `@{` (reflog selector)
+/// - No `~` `^` `:` `?` `*` `[` `\` (revision-modifier and glob syntax git's
+///   own `check-ref-format` forbids)
+/// - No segment starting or ending with `.`, and no `.lock` suffix
+/// - Not a bare `@`
+///
+/// This is deliberately a front-load, not a replacement: git's own
+/// `check-ref-format` remains the authority, and anything that slips through
+/// here is refused by git with its own message rather than misinterpreted.
+pub fn validate_ref_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(GitError::invalid_input("ref name is empty"));
+    }
+    if name.starts_with('-') {
+        return Err(GitError::invalid_input(format!(
+            "ref name {name:?} starts with '-' (would be parsed as a flag)"
+        )));
+    }
+    if name == "@" {
+        return Err(GitError::invalid_input("ref name is a bare '@'"));
+    }
+    if name.chars().any(|c| c.is_whitespace() || c.is_ascii_control()) {
+        return Err(GitError::invalid_input(format!(
+            "ref name {name:?} contains whitespace or a control character"
+        )));
+    }
+    for bad in ["..", "@{", "~", "^", ":", "?", "*", "[", "\\"] {
+        if name.contains(bad) {
+            return Err(GitError::invalid_input(format!(
+                "ref name {name:?} contains forbidden sequence {bad:?}"
+            )));
+        }
+    }
+    if name.ends_with(".lock") {
+        return Err(GitError::invalid_input(format!(
+            "ref name {name:?} ends with '.lock' (collides with git lockfile naming)"
+        )));
+    }
+    for segment in name.split('/') {
+        if segment.is_empty() {
+            return Err(GitError::invalid_input(format!(
+                "ref name {name:?} has an empty path segment"
+            )));
+        }
+        if segment.starts_with('.') || segment.ends_with('.') {
+            return Err(GitError::invalid_input(format!(
+                "ref name {name:?} has a segment starting or ending with '.'"
+            )));
+        }
+        if segment.ends_with(".lock") {
+            return Err(GitError::invalid_input(format!(
+                "ref name {name:?} has a segment ending with '.lock'"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Derive a slug from a human-readable workspace name.

@@ -171,6 +171,15 @@ impl Repository {
             let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if let Some(name) = text.strip_prefix("origin/")
                 && !name.is_empty()
+                // `origin/HEAD` names the REMOTE's default, which need not
+                // exist locally at all — a worktree-centric user routinely
+                // deletes the `main` they never sit on. Reporting a name with
+                // no `refs/heads/` entry used to be harmless (it only labelled
+                // a menu); it is now an argument to `git worktree add`, where
+                // git DWIMs it into `--track -b <name>` and silently overrides
+                // an explicit `-b`. Fall through to the conventional names
+                // rather than hand back something that does not resolve.
+                && self.sha_of(&format!("refs/heads/{name}")).await.ok().flatten().is_some()
             {
                 return Ok(Some(name.to_string()));
             }

@@ -25,7 +25,7 @@ use cli::{
     TermCommand, WorktreeCommand,
 };
 use client::Client;
-use oximux_remote_proto::proto::{SCHEDULE_CRON_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION};
+use oximux_remote_proto::proto::{CREATE_WORKTREE_BASE_MIN_VERSION, SCHEDULE_CRON_MIN_VERSION, TEAM_PER_ROLE_MIN_VERSION};
 use output::render;
 
 /// Leaf verbs that erase something. A typo is never nudged toward one of
@@ -266,6 +266,17 @@ fn required_version(command: &Command) -> Option<(u32, &'static str)> {
         Command::Schedule { command: ScheduleCommand::Create { cron: Some(_), .. } } => {
             Some((SCHEDULE_CRON_MIN_VERSION, "schedule create --cron"))
         }
+        // v24: a worktree base ref. Gated on the flags, not the family — a
+        // plain `worktree create` still speaks v16 to a v16 host, and only
+        // `--from`/`--branch` needs one that can decode `CreateWorktreeV2`.
+        // Must stay ABOVE the catch-all `Worktree` arm below, which would
+        // otherwise match first and claim v16.
+        Command::Worktree {
+            command: WorktreeCommand::Create { from: Some(_), .. },
+        } => Some((CREATE_WORKTREE_BASE_MIN_VERSION, "worktree create --from")),
+        Command::Worktree {
+            command: WorktreeCommand::Create { branch: Some(_), .. },
+        } => Some((CREATE_WORKTREE_BASE_MIN_VERSION, "worktree create --branch")),
         // v18: the automation surface.
         Command::Heartbeat { .. } => Some((18, "heartbeat")),
         Command::Team { .. } => Some((18, "team")),
@@ -321,6 +332,16 @@ fn precheck(command: &mut Command, json_mode: bool) -> Result<(), output::Failur
     // avoid.
     if let Command::Permit { command: PermitCommand::Allow { input: Some(raw), .. } } = command {
         commands::permit::parse_input_override(raw)?;
+    }
+    // `worktree create` with neither a slug nor `--branch` is the same class of
+    // mistake, and was the same defect: the check lives inside the verb, which
+    // runs past `resolve_and_connect`, so a missing argument was reported as an
+    // unreachable host. Validated here against the argv alone; the verb still
+    // owns the rule and is still what builds the request from it.
+    if let Command::Worktree { command: WorktreeCommand::Create { slug, from, branch, .. } } =
+        command
+    {
+        commands::worktree::base_and_slug(slug.as_deref(), from.as_deref(), branch.as_deref())?;
     }
     match command {
         Command::Run { prompt, .. } | Command::Send { prompt, .. } => {
@@ -545,8 +566,15 @@ fn host_verb(mut args: Cli) -> u8 {
                     TermCommand::Attach { pty } => commands::term::attach(&client, &pty).await,
                 },
                 Command::Worktree { command } => match command {
-                    WorktreeCommand::Create { slug, project } => {
-                        commands::worktree::create(&client, &slug, project).await
+                    WorktreeCommand::Create { slug, project, from, branch } => {
+                        commands::worktree::create(
+                            &client,
+                            slug.as_deref(),
+                            project,
+                            from.as_deref(),
+                            branch.as_deref(),
+                        )
+                        .await
                     }
                     WorktreeCommand::Ls { project } => {
                         commands::worktree::ls(&client, project).await

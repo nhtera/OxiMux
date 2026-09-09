@@ -429,6 +429,10 @@ pub(super) fn create_action(
                         // No setup picker on a task row — the project's
                         // `auto_setup` decides, same as before this existed.
                         oximux_settings::SetupDecision::Inherit,
+                        // No base picker on a task row either: a new branch off
+                        // the project's default branch, which is what this path
+                        // meant all along and did not previously get.
+                        crate::shell::workspace::base_choice::BaseChoice::default(),
                         true,
                         window,
                         cx,

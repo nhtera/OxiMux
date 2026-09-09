@@ -29,6 +29,7 @@ use gpui_component::{
 use oximux_core::Project;
 use oximux_settings::{Density, Theme, Typography};
 
+use crate::shell::workspace::project_picker::detect_default_branch;
 use crate::ui::FloatingSurface;
 use oximux_storage::ProjectRepo;
 use tokio::sync::oneshot;
@@ -41,8 +42,6 @@ const MODAL_TOP_OFFSET: f32 = 120.0;
 const CARD_HEIGHT: f32 = 120.0;
 /// Fallback name when `path.file_name()` returns None.
 const FALLBACK_PROJECT_NAME: &str = "untitled";
-/// Branch stored at insert time; real HEAD detection lands later.
-pub(crate) const DEFAULT_BRANCH_PLACEHOLDER: &str = "main";
 
 /// Owner callback fired after a project is added (Browse or Clone).
 pub type OnPick = Box<dyn Fn(Project, &mut Window, &mut App) + Send + 'static>;
@@ -176,8 +175,15 @@ impl AddProjectDialog {
         cx.spawn_in(window, async move |this, cx| {
             let folder = rfd::AsyncFileDialog::new().pick_folder().await;
             let path = folder.map(|h| h.path().to_path_buf());
+            // Detected in the spawn — `register_and_open` runs on the
+            // foreground executor, where a git subprocess would stall the
+            // window. See `project_picker::detect_default_branch`.
+            let default_branch = match &path {
+                Some(p) => detect_default_branch(p).await,
+                None => String::new(),
+            };
             let _ = this.update_in(cx, |this, window, cx| match path {
-                Some(p) => this.handle_folder_pick(p, window, cx),
+                Some(p) => this.handle_folder_pick(p, default_branch, window, cx),
                 None => {
                     this.pending_folder_pick = false;
                     cx.notify();
@@ -187,13 +193,19 @@ impl AddProjectDialog {
         .detach();
     }
 
-    fn handle_folder_pick(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn handle_folder_pick(
+        &mut self,
+        path: PathBuf,
+        default_branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // NSOpenPanel races against close(); discard stale results.
         if !self.open {
             return;
         }
         self.pending_folder_pick = false;
-        self.register_and_open(path, window, cx);
+        self.register_and_open(path, default_branch, window, cx);
     }
 
     /// Kick off a clone: validate the URL, derive a folder name, pick a
@@ -252,10 +264,17 @@ impl AddProjectDialog {
                 );
             });
             let outcome = rx.await;
+            // A fresh clone has the truest default branch of all — it is
+            // whatever the remote just told git — so read it before the
+            // foreground handler registers the project.
+            let default_branch = match &outcome {
+                Ok(Ok(path)) => detect_default_branch(path).await,
+                _ => String::new(),
+            };
             let _ = this.update_in(cx, |this, window, cx| {
                 this.cloning = false;
                 match outcome {
-                    Ok(Ok(path)) => this.register_and_open(path, window, cx),
+                    Ok(Ok(path)) => this.register_and_open(path, default_branch, window, cx),
                     Ok(Err(msg)) => {
                         this.clone_error = Some(msg);
                         cx.notify();
@@ -274,7 +293,13 @@ impl AddProjectDialog {
     /// Shared by Browse and Clone. Closes the dialog before firing
     /// `on_pick` so a modal the callback opens isn't wiped by a trailing
     /// close.
-    fn register_and_open(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    fn register_and_open(
+        &mut self,
+        path: PathBuf,
+        default_branch: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.open {
             return;
         }
@@ -282,7 +307,7 @@ impl AddProjectDialog {
         let name = name_from_path(&path);
         match self
             .project_repo
-            .insert_or_touch(&name, &path_str, DEFAULT_BRANCH_PLACEHOLDER)
+            .insert_or_touch(&name, &path_str, &default_branch)
         {
             Ok(project) => {
                 self.close(cx);

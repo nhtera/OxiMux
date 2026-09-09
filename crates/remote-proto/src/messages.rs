@@ -214,6 +214,43 @@ pub struct TranscriptPageWire {
     pub model: Option<String>,
 }
 
+/// What a new worktree is cut from, as
+/// [`Request::CreateWorktreeV2`](crate::proto::Request::CreateWorktreeV2)
+/// carries it.
+///
+/// **A new type on a new verb, never a field on the old one.** Postcard is not
+/// self-describing and ordinal 43's `CreateWorktree { project_path, slug }`
+/// payload is pinned; an appended `Option` would cost a byte even when `None`
+/// and break every pre-v24 host on a *plain* create. This rides
+/// `CreateWorktreeV2` instead, so the version gate keys on which verb to send.
+///
+/// [`Default`](Self::Default) exists so the V2 verb can carry an ordinary
+/// create — a client that speaks v24 sends V2 for everything, and the two verbs
+/// mean exactly the same thing when the base is `Default`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CreateBaseWire {
+    /// Whatever the host would have cut before base refs existed. Byte-for-byte
+    /// the behaviour of [`Request::CreateWorktree`](crate::proto::Request::CreateWorktree).
+    Default,
+    /// A new branch cut from this ref.
+    From(String),
+    /// Adopt this existing branch — no branch created, no prefix applied.
+    Existing(String),
+}
+
+impl CreateBaseWire {
+    /// Whether this asks for anything an ordinal-43 create could not express.
+    ///
+    /// Read in two places for two reasons that must not drift apart: the client
+    /// gates *which verb to send* on it, and the host gates *who may ask* on it
+    /// — a paired remote device is confined to `Default`, because naming a ref
+    /// is naming something the host must then resolve and check out on the
+    /// user's machine.
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Default)
+    }
+}
+
 /// One worktree (workspace) row — the
 /// [`Response::WorktreeCreated`](crate::proto::Response::WorktreeCreated) /
 /// [`Response::Worktrees`](crate::proto::Response::Worktrees) payload.

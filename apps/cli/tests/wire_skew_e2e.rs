@@ -478,3 +478,92 @@ fn a_new_client_schedules_on_an_old_host() {
     let _ = child.wait();
 }
 
+
+/// The v24 twin of [`a_new_client_schedules_on_an_old_host`]: a plain
+/// `worktree create` keeps speaking v16 to a pre-v24 host, and only a base ref
+/// is refused — by version, never by blaming the frame.
+///
+/// **What "keeps speaking v16" is proven by.** The CLI has no `projects add`,
+/// so a released `serve` in a tempdir knows no project and cannot actually cut
+/// a worktree. That makes a successful create untestable here — but it also
+/// makes the available assertion the more precise one: an old host that
+/// answers *about the project* has decoded ordinal 43 and run its own
+/// validation, where a host that could not decode the frame answers
+/// `BadRequest("undecodable request frame")` and never reaches a project at
+/// all. Those two outcomes are exactly the two sides of the append-only claim,
+/// and they are distinguishable in the error text.
+#[test]
+fn a_new_client_creates_worktrees_on_an_old_host() {
+    let Some(old) = old_cli() else {
+        eprintln!("skipped: OXIMUX_SKEW_CLI is unset");
+        return;
+    };
+    let host_version = protocol_of(&old);
+    if host_version >= oximux_remote_proto::proto::CREATE_WORKTREE_BASE_MIN_VERSION {
+        eprintln!("skipped: the released peer already speaks v{host_version}");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data = tmp.path().join("data");
+    let shim = tmp.path().join("bin");
+    let cwd = tmp.path().join("proj");
+    std::fs::create_dir_all(&cwd).unwrap();
+    common::install_claude_shim(&shim);
+    let (mut child, dir) = boot_released_serve(&old, &data, &shim, tmp.path());
+
+    // A plain create IS the v16 request. It must reach the host's own project
+    // validation — which is what "the frame decoded" looks like from here.
+    let out = common::bin()
+        .args([
+            "--dir", &dir, "worktree", "create", "feat", "--project", cwd.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("undecodable"),
+        "a plain create must still decode on a v{host_version} host: {stderr}"
+    );
+    assert!(
+        !stderr.contains("protocol v"),
+        "and must not be version-gated — only a base ref is: {stderr}"
+    );
+
+    // `worktree ls` is a v16 read and must be untouched by the bump.
+    let out = common::bin().args(["--dir", &dir, "--json", "worktree", "ls"]).output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "worktree ls must keep working: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Only a base ref is refused, and the refusal names the version.
+    for (flag, value) in [("--from", "main"), ("--branch", "side")] {
+        let out = common::bin()
+            .args([
+                "--dir", &dir, "worktree", "create", "feat", "--project",
+                cwd.to_str().unwrap(), flag, value,
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "{flag} must be unreachable-class, not a crash: {stderr}"
+        );
+        assert!(
+            stderr.contains("protocol v24"),
+            "{flag} must name the version needed: {stderr}"
+        );
+        assert!(
+            !stderr.contains("undecodable"),
+            "{flag} must never blame the frame for a version problem: {stderr}"
+        );
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
