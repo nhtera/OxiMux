@@ -347,9 +347,11 @@ src/
 ├── stage.rs        stage/unstage file + hunk (git apply --cached)
 ├── commit.rs       Repository::commit + commit_paths
 ├── stash.rs        push/list/apply/pop/drop + is_dirty precheck
-├── branch.rs       list/create/switch
+├── branch.rs       list/create/switch; current_branch + default_branch
+│                   (origin/HEAD → local main/master → None, never a guess)
 ├── worktree.rs     add/list/remove (branch convention oximux/<slug>)
-├── merge.rs        merge with auto-stash recovery; MergeOutcome
+├── merge.rs        merge with auto-stash recovery; MergeOutcome; is_ancestor;
+│                   AUTO_STASH_MESSAGE (the stash label callers resolve by)
 └── gh.rs           GhCmd wrapper for gh CLI: available / is_github_remote / has_open_pr /
                     pr_create (--fill, opens browser) / pr_checks / CheckRun;
                     serde+serde_json used for CheckRun deserialization
