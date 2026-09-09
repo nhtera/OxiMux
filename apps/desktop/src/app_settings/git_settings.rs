@@ -257,6 +257,38 @@ mod tests {
         });
     }
 
+    /// The settings pane and the New Workspace dialog must answer with the
+    /// same prefix for the same project.
+    ///
+    /// Found live, not by a test: the pane resolved against the global git
+    /// config while the dialog resolved against the project's, so one setting
+    /// previewed `oximux/…` in Settings and `ada-lovelace/…` in the dialog.
+    /// Both were individually correct, which is exactly why it read as a bug.
+    /// The pane now carries its window's active project root.
+    #[gpui::test]
+    fn the_pane_and_the_dialog_agree_for_the_same_project(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mut cache = GitUsernames::default();
+            cache.by_root.insert(PathBuf::from("/proj"), Some("Ada Lovelace".to_string()));
+            // A different, global identity — the value the pane used to show.
+            cache.global = Some("someone-else".to_string());
+            cx.set_global(cache);
+
+            // Saved AND working copy both on `Git username`, so the only
+            // variable left is the root — which is what this is about.
+            let settings = by_mode(BranchPrefixMode::GitUsername);
+            cx.set_global(settings.clone());
+            let root = Path::new("/proj");
+            let pane = branch_for(&settings, Some(root), "fix-login", cx);
+            let dialog = branch_for_slug("fix-login", Some(root), cx);
+            assert_eq!(pane, dialog);
+            assert_eq!(pane, "ada-lovelace/fix-login");
+            // Without the root the pane would have shown the global identity —
+            // the disagreement this test exists to prevent.
+            assert_eq!(branch_for(&settings, None, "fix-login", cx), "someone-else/fix-login");
+        });
+    }
+
     #[gpui::test]
     fn the_none_mode_mints_a_bare_slug(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {

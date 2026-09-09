@@ -885,6 +885,9 @@ impl WorkspaceRoot {
         // on the switch; until it lands the previous project's answer stands,
         // which is the same value the previews were already showing.
         crate::git_settings::refresh_username(Some(project_root.clone()), cx);
+        // ...and tell the settings modal which repository its Git pane should
+        // preview against, so its branch line agrees with the dialog's.
+        self.settings_modal.update(cx, |m, _| m.set_project_root(Some(project_root.clone())));
         // Lazy-build the project's panes entity on first activation. Subsequent
         // switches just resolve the existing entity via `active_project_panes()`
         // — pane-group + tab state survives the switch.

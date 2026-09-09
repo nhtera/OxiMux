@@ -102,11 +102,13 @@ pub(super) fn entries(
     // still the one resolver the create path runs, over the same cached
     // username, so agreeing here is not a coincidence.
     //
-    // No project root: the pane is app-wide and does not know which project a
-    // window is on, so `Git username` previews against the global git config.
-    // A repo that overrides `user.name` will differ, and the dialog's own
-    // preview line — which does have the root — is the one that governs.
-    let preview = crate::git_settings::branch_for(&modal.git, None, "fix-login", cx);
+    // Against the window's active project, so `Git username` resolves the same
+    // repository the New Workspace dialog will. Previewing against the global
+    // git config instead showed `oximux/…` here and `ada-lovelace/…` there for
+    // one setting — correct in both places and unreadable as anything but a
+    // bug. `None` (no project open) still falls back to the global config.
+    let preview =
+        crate::git_settings::branch_for(&modal.git, modal.project_root.as_deref(), "fix-login", cx);
     rows.push(entry(
         "Preview",
         "What a worktree named \"Fix login\" would be branched as.",

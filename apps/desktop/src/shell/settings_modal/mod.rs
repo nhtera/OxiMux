@@ -86,6 +86,19 @@ pub struct SettingsModal {
     pub(crate) ai: CommitMessageAiSettings,
     /// Working copy of the git settings; same contract, writing `git.toml`.
     pub(crate) git: oximux_settings::git::GitSettings,
+    /// The window's active project root, pushed by [`WorkspaceRoot`] on every
+    /// project switch.
+    ///
+    /// The Git pane's branch preview needs it: `git config user.name` is
+    /// commonly set per repository, so previewing against the global config
+    /// would show one prefix while the New Workspace dialog — which does have
+    /// the root — shows another, for the same setting. Held per modal rather
+    /// than as a global because each window owns its own `SettingsModal` and
+    /// its own active project.
+    ///
+    /// `None` before any project is opened; the preview then falls back to the
+    /// global git config, which is the only thing there is to answer with.
+    pub(crate) project_root: Option<std::path::PathBuf>,
     /// The custom-prefix field, lazily built on `open()` (it needs a `Window`).
     pub(super) git_prefix_input: Option<Entity<InputState>>,
     /// Live while the field exists.
@@ -332,6 +345,7 @@ impl SettingsModal {
             terminal: TerminalSettings::default(),
             ai: CommitMessageAiSettings::default(),
             git: oximux_settings::git::GitSettings::shipped(),
+            project_root: None,
             git_prefix_input: None,
             git_prefix_seed: String::new(),
             _git_prefix_sub: None,
@@ -809,6 +823,15 @@ impl SettingsModal {
             tracing::warn!(%err, "settings modal: failed to write terminal.toml");
         }
         cx.notify();
+    }
+
+    /// Point the Git pane's preview at this window's active project.
+    ///
+    /// Called on every project switch, not just the first: a window that
+    /// changes projects changes which repository's `user.name` the preview
+    /// should answer with.
+    pub(crate) fn set_project_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.project_root = root;
     }
 
     /// Persist the git working copy to `git.toml` and re-resolve the branch
