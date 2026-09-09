@@ -126,7 +126,7 @@ async fn fixture(slug: &str) -> Fixture {
     Repository::open(&project_root)
         .await
         .expect("open repo")
-        .add_worktree(&wt_path, slug)
+        .add_worktree(&wt_path, &format!("oximux/{slug}"))
         .await
         .expect("add worktree");
 

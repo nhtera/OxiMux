@@ -878,6 +878,11 @@ impl WorkspaceRoot {
         self.palette
             .update(cx, |p, cx| p.invalidate_file_index(cx));
         let project_root = PathBuf::from(&project.root_path);
+        // `git config user.name` can be set per repository, so the branch
+        // prefix is a property of the project, not of the app. Re-resolve it
+        // on the switch; until it lands the previous project's answer stands,
+        // which is the same value the previews were already showing.
+        crate::git_settings::refresh_prefix(Some(project_root.clone()), cx);
         // Lazy-build the project's panes entity on first activation. Subsequent
         // switches just resolve the existing entity via `active_project_panes()`
         // — pane-group + tab state survives the switch.
@@ -1963,6 +1968,12 @@ impl WorkspaceRoot {
         let project_root = PathBuf::from(&project.root_path);
         let project_id = project.id.clone();
         let name_trimmed = name.trim().to_string();
+        // Resolved HERE, synchronously, from the same global the dialog's
+        // preview line read — so the branch the user was shown is the branch
+        // that gets made. Re-resolving inside the spawn would reintroduce the
+        // gap this phase closed.
+        let branch = crate::git_settings::branch_for_slug(&slug, cx);
+        let freshen_default = crate::git_settings::settings(cx).keep_default_up_to_date;
 
         cx.spawn(async move |weak, cx| {
             if let Some(parent) = worktree_path.parent()
@@ -1993,6 +2004,7 @@ impl WorkspaceRoot {
                 &project_id,
                 &name_trimmed,
                 &slug,
+                &branch,
                 &worktree_path,
                 linked_issue.as_deref(),
                 &workspace_repo,
@@ -2001,7 +2013,9 @@ impl WorkspaceRoot {
                 // Reclaim opted into here and nowhere else in the desktop:
                 // this path is host-derived under the data dir, and the flow
                 // above has already looked for a workspace row naming it.
-                &Provision::new(setup_decision, tx).reclaiming_orphans(),
+                &Provision::new(setup_decision, tx)
+                    .reclaiming_orphans()
+                    .freshening_default(freshen_default),
             )
             .await;
             // The sender is gone with `Provision`, so the drain has ended or is

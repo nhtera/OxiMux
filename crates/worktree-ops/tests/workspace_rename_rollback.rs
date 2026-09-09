@@ -56,7 +56,7 @@ async fn fixture(slug: &str) -> Fixture {
     let wt_root = tempfile::tempdir().expect("wt tempdir");
     let wt_path = wt_root.path().join(slug);
     let repo = Repository::open(&project_root).await.expect("open repo");
-    repo.add_worktree(&wt_path, slug).await.expect("add worktree");
+    repo.add_worktree(&wt_path, &format!("oximux/{slug}")).await.expect("add worktree");
 
     let db = open_memory().expect("open memory");
     let project = ProjectRepo::new(db.clone())

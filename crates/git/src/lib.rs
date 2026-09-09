@@ -12,6 +12,7 @@ pub mod branch_diff;
 pub mod checkpoint;
 pub mod clone;
 pub mod commit;
+pub mod config;
 pub mod diff;
 pub mod error;
 pub(crate) mod forge_cli;

@@ -192,7 +192,55 @@ impl Repository {
         Ok(None)
     }
 
-    /// The branch HEAD is on, or `None` when HEAD is detached.    /// The branch HEAD is on, or `None` when HEAD is detached.
+    /// Resolve any revision to a commit sha; `None` when it does not exist.
+    ///
+    /// Absence is an ordinary answer here, not an error: callers ask about
+    /// refs that legitimately may not be there — a local `main` in a repo
+    /// that only has `master`, an `origin/main` in a repo with no remote.
+    /// `--verify --quiet` makes git exit 1 for those instead of printing a
+    /// diagnostic.
+    pub async fn sha_of(&self, rev: &str) -> Result<Option<String>> {
+        let raw = GitCmd::new(self.workdir())
+            .args(["rev-parse", "--verify", "--quiet", rev])
+            .run_raw()
+            .await?;
+        if !raw.status.success() {
+            return Ok(None);
+        }
+        let sha = String::from_utf8_lossy(&raw.stdout).trim().to_string();
+        Ok((!sha.is_empty()).then_some(sha))
+    }
+
+    /// `git merge --ff-only <rev>` in this checkout.
+    ///
+    /// Fast-forward or nothing: git refuses rather than creating a merge
+    /// commit, which is what makes this safe to run unattended on a branch
+    /// the user is sitting on. Never `--force`, never a plain merge.
+    pub async fn fast_forward_to(&self, rev: &str) -> Result<()> {
+        GitCmd::new(self.workdir())
+            .args(["merge", "--ff-only", rev])
+            .run()
+            .await?;
+        Ok(())
+    }
+
+    /// Fast-forward a local branch that is **not** checked out, by fetching
+    /// the remote branch straight onto it.
+    ///
+    /// `git fetch <remote> <branch>:<branch>` updates the local ref only when
+    /// the move is a fast-forward, and refuses outright when that branch is
+    /// checked out in any worktree. Both refusals are git's, not ours — which
+    /// is the point: the safety check lives where it cannot be got wrong.
+    pub async fn fetch_branch_fast_forward(&self, remote: &str, branch: &str) -> Result<()> {
+        GitCmd::new(self.workdir())
+            .args(["fetch", remote, &format!("{branch}:{branch}")])
+            .timeout(std::time::Duration::from_secs(60))
+            .run()
+            .await?;
+        Ok(())
+    }
+
+    /// The branch HEAD is on, or `None` when HEAD is detached.
     ///
     /// One `git rev-parse --abbrev-ref HEAD`, deliberately cheaper than
     /// [`status`](Self::status): callers that only need to answer "is this

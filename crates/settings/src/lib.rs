@@ -17,6 +17,7 @@ pub mod density;
 pub mod dictation;
 pub mod dictation_languages;
 pub mod fonts;
+pub mod git;
 pub mod keybindings;
 pub mod motion;
 pub mod project_scripts;
@@ -38,6 +39,7 @@ pub use appearance::{Appearance, DensityPreset, ThemeChoice, UiScale, UsageDetai
 pub use auto_update::AutoUpdateSettings;
 pub use autosave::AutosaveSettings;
 pub use commit_message_ai::{AgentSettings, CommitMessageAiMode, CommitMessageAiSettings};
+pub use git::{BranchPrefixMode, GitSettings};
 pub use computer_use::{AppGrant, ComputerUseSettings};
 pub use custom_commands::{CustomCommand, CustomCommandsFile, load_and_merge};
 pub use density::Density;

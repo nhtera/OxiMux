@@ -35,6 +35,15 @@ fn init_repo(cwd: &Path) {
     run_git(cwd, &["commit", "-m", "init"]);
 }
 
+/// The branch these tests expect: the shipped prefix, spelled once.
+///
+/// The tests assert on `oximux/<slug>` throughout — they are about the
+/// rollback ladder, not about naming — so they pin the shipped prefix rather
+/// than resolving settings that no headless test has.
+fn branch_of(slug: &str) -> String {
+    format!("{}/{slug}", oximux_settings::git::DEFAULT_PREFIX)
+}
+
 #[tokio::test]
 async fn rollback_on_insert_conflict_removes_worktree_and_branch() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -70,6 +79,7 @@ async fn rollback_on_insert_conflict_removes_worktree_and_branch() {
         &project.id,
         "Fix Login",
         slug,
+        &branch_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -123,6 +133,7 @@ async fn create_workspace_happy_path_inserts_row_and_keeps_worktree() {
         &project.id,
         "New Feat",
         slug,
+        &branch_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -197,6 +208,7 @@ async fn a_failing_setup_script_rolls_back_worktree_branch_and_row() {
         &project.id,
         "Bad Setup",
         slug,
+        &branch_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -268,6 +280,7 @@ async fn a_failing_setup_script_is_not_run_when_the_project_did_not_opt_in() {
         &project.id,
         "Opted Out",
         slug,
+        &branch_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -313,6 +326,7 @@ async fn included_files_are_present_before_the_setup_script_runs() {
         &project.id,
         "With Env",
         slug,
+        &branch_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -355,6 +369,7 @@ async fn an_include_pattern_matching_nothing_does_not_fail_creation() {
         &project.id,
         "No Match",
         slug,
+        &branch_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -395,6 +410,7 @@ async fn an_orphaned_worktree_from_an_interrupted_create_is_reclaimed_on_retry()
         &project.id,
         "Interrupted",
         slug,
+        &branch_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -416,6 +432,7 @@ async fn an_orphaned_worktree_from_an_interrupted_create_is_reclaimed_on_retry()
         &project.id,
         "Interrupted",
         slug,
+        &branch_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -458,6 +475,7 @@ async fn reclaim_refuses_a_path_a_workspace_row_still_names() {
         &project.id,
         "Live Work",
         slug,
+        &branch_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -475,6 +493,7 @@ async fn reclaim_refuses_a_path_a_workspace_row_still_names() {
         &project.id,
         "Live Work",
         slug,
+        &branch_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -521,6 +540,7 @@ async fn a_caller_that_did_not_opt_in_never_has_its_path_reclaimed() {
         &project.id,
         "Mine",
         slug,
+        &branch_of(slug),
         &worktree_path,
         None,
         &workspace_repo,

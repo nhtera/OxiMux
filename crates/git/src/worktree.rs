@@ -53,16 +53,21 @@ pub fn main_worktree_of(dir: &Path) -> Option<PathBuf> {
 
 impl Repository {
     /// Create a new linked worktree at `path` checked out on a brand-new
-    /// branch `oximux/<slug>` (created from the current HEAD).
+    /// `branch` (created from the current HEAD).
     ///
-    /// `path` must not already exist; `slug` must pass [`validate_slug`].
-    /// The corresponding branch must not already exist (git refuses with
-    /// `NonZero` if it does).
-    pub async fn add_worktree(&self, path: &Path, slug: &str) -> Result<WorktreeInfo> {
-        validate_slug(slug)?;
-        let branch = format!("oximux/{slug}");
+    /// **The caller names the branch.** This used to derive `oximux/<slug>`
+    /// itself, which made the prefix unconfigurable from the one place that
+    /// could see the user's settings — and left the dialog's preview deriving
+    /// the same name a second time, free to disagree. Resolution now happens
+    /// once, above, in `oximux_worktree_ops::branch_name`.
+    ///
+    /// `path` must not already exist; `branch` must pass
+    /// [`validate_branch_name`]. The branch must not already exist (git
+    /// refuses with `NonZero` if it does).
+    pub async fn add_worktree(&self, path: &Path, branch: &str) -> Result<WorktreeInfo> {
+        validate_branch_name(branch)?;
         GitCmd::new(self.workdir())
-            .args(["worktree", "add", "-b", &branch])
+            .args(["worktree", "add", "-b", branch])
             .arg(path.as_os_str())
             .run()
             .await?;
@@ -204,6 +209,40 @@ pub fn validate_slug(slug: &str) -> Result<()> {
         return Err(GitError::invalid_input("slug contains whitespace"));
     }
     Ok(())
+}
+
+/// Reject branch names OxiMux would not be able to hand to git safely.
+///
+/// [`validate_slug`] deliberately rejects `/`, because a slug is one path
+/// component. A *branch name* is one optional prefix segment plus that slug —
+/// `oximux/feat`, `nhtera/feat`, or a bare `feat` when the user has turned the
+/// prefix off. So the resolved name cannot go through `validate_slug` at all,
+/// and the check that replaces it has to allow exactly one more segment and no
+/// further.
+///
+/// Each segment is held to `validate_slug`'s rules, which is what keeps the
+/// prefix half from smuggling in the revision syntax (`~`, `^`, `:`, `@{`,
+/// `..`) that the slug half is screened for. Empty segments are rejected
+/// explicitly: `/feat`, `oximux/`, and `a//b` all reach git as refs it either
+/// refuses or, worse, accepts as something other than what was meant.
+pub fn validate_branch_name(branch: &str) -> Result<()> {
+    let mut segments = branch.split('/');
+    let first = segments.next().unwrap_or_default();
+    let second = segments.next();
+    if segments.next().is_some() {
+        return Err(GitError::invalid_input(format!(
+            "branch name {branch:?} has more than one prefix segment"
+        )));
+    }
+    match second {
+        // `a/b`: both halves must independently be a valid slug. The prefix is
+        // checked first so its own error names the half that is wrong.
+        Some(slug) => {
+            validate_slug(first)?;
+            validate_slug(slug)
+        }
+        None => validate_slug(first),
+    }
 }
 
 /// Derive a slug from a human-readable workspace name.

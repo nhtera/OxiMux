@@ -37,7 +37,7 @@ async fn add_worktree_creates_dir_and_branch() {
     let wt_path = wt_root.path().join("feat-x");
 
     let repo = Repository::open(p).await.unwrap();
-    let info = repo.add_worktree(&wt_path, "feat-x").await.unwrap();
+    let info = repo.add_worktree(&wt_path, "oximux/feat-x").await.unwrap();
     assert!(wt_path.exists());
     assert!(!info.is_main);
     assert_eq!(info.branch.as_deref(), Some("oximux/feat-x"));
@@ -59,7 +59,7 @@ async fn add_worktree_appears_in_list() {
     let wt_path = wt_root.path().join("wt");
 
     let repo = Repository::open(p).await.unwrap();
-    repo.add_worktree(&wt_path, "wt-slug").await.unwrap();
+    repo.add_worktree(&wt_path, "oximux/wt-slug").await.unwrap();
 
     let ws = repo.list_worktrees().await.unwrap();
     assert_eq!(ws.len(), 2);
@@ -80,7 +80,7 @@ async fn remove_worktree_clean() {
     let wt_path = wt_root.path().join("wt");
 
     let repo = Repository::open(p).await.unwrap();
-    repo.add_worktree(&wt_path, "remove-clean").await.unwrap();
+    repo.add_worktree(&wt_path, "oximux/remove-clean").await.unwrap();
     repo.remove_worktree(&wt_path, false).await.unwrap();
 
     let ws = repo.list_worktrees().await.unwrap();
@@ -101,7 +101,7 @@ async fn remove_worktree_dirty_without_force_errors() {
     let wt_path = wt_root.path().join("wt");
 
     let repo = Repository::open(p).await.unwrap();
-    repo.add_worktree(&wt_path, "dirty-no-force").await.unwrap();
+    repo.add_worktree(&wt_path, "oximux/dirty-no-force").await.unwrap();
     // Dirty the worktree (modify the checked-out copy of a.txt).
     write(&wt_path.join("a.txt"), "modified\n");
 
@@ -123,7 +123,7 @@ async fn remove_worktree_dirty_with_force_succeeds() {
     let wt_path = wt_root.path().join("wt");
 
     let repo = Repository::open(p).await.unwrap();
-    repo.add_worktree(&wt_path, "dirty-force").await.unwrap();
+    repo.add_worktree(&wt_path, "oximux/dirty-force").await.unwrap();
     write(&wt_path.join("a.txt"), "modified\n");
 
     repo.remove_worktree(&wt_path, true).await.unwrap();
@@ -160,12 +160,16 @@ async fn add_worktree_path_already_exists_errors() {
     write(&wt_path.join("blocker"), "exists\n");
 
     let repo = Repository::open(p).await.unwrap();
-    let err = repo.add_worktree(&wt_path, "exists").await.unwrap_err();
+    let err = repo.add_worktree(&wt_path, "oximux/exists").await.unwrap_err();
     assert!(matches!(err, GitError::NonZero { .. }), "got {err:?}");
 }
 
+/// `add_worktree` now names a *branch*, so `foo/bar` is legal where it used to
+/// be rejected — one prefix segment is the whole point of the configurable
+/// prefix. What must still be refused, before any side effect, is a name with
+/// more structure than a prefix and a slug, or ref syntax in either half.
 #[tokio::test]
-async fn add_worktree_slug_with_slash_errors_before_git_call() {
+async fn add_worktree_rejects_an_unusable_branch_name_before_the_git_call() {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path();
     init_repo(p);
@@ -177,10 +181,17 @@ async fn add_worktree_slug_with_slash_errors_before_git_call() {
     let wt_path = wt_root.path().join("wt");
 
     let repo = Repository::open(p).await.unwrap();
-    let err = repo.add_worktree(&wt_path, "foo/bar").await.unwrap_err();
-    assert!(matches!(err, GitError::InvalidInput { .. }), "got {err:?}");
-    // Defense-in-depth: validation runs before any side effect.
-    assert!(!wt_path.exists());
+    for bad in ["a/b/c", "oximux/feat^1", "oximux/../escape", "/feat", "oximux/"] {
+        let err = repo.add_worktree(&wt_path, bad).await.unwrap_err();
+        assert!(matches!(err, GitError::InvalidInput { .. }), "{bad:?} got {err:?}");
+        // Defense-in-depth: validation runs before any side effect.
+        assert!(!wt_path.exists(), "{bad:?} created something");
+    }
+
+    // ...and the one that used to be rejected is now the ordinary case.
+    repo.add_worktree(&wt_path, "nhtera/bar").await.expect("one prefix segment is legal");
+    let listed = repo.list_worktrees().await.unwrap();
+    assert!(listed.iter().any(|w| w.branch.as_deref() == Some("nhtera/bar")));
 }
 
 #[tokio::test]
@@ -199,7 +210,7 @@ async fn add_worktree_existing_branch_errors() {
 
     let repo = Repository::open(p).await.unwrap();
     let err = repo
-        .add_worktree(&wt_path, "already-here")
+        .add_worktree(&wt_path, "oximux/already-here")
         .await
         .unwrap_err();
     assert!(matches!(err, GitError::NonZero { .. }), "got {err:?}");
@@ -221,7 +232,7 @@ async fn a_linked_worktree_resolves_back_to_its_main_repository() {
     let wt_root = tempfile::tempdir().unwrap();
     let wt_path = wt_root.path().join("oximux-wt-feat-x");
     let repo = Repository::open(p).await.unwrap();
-    repo.add_worktree(&wt_path, "feat-x").await.unwrap();
+    repo.add_worktree(&wt_path, "oximux/feat-x").await.unwrap();
 
     let main = oximux_git::main_worktree_of(&wt_path).expect("a linked worktree resolves");
     assert_eq!(main, p.canonicalize().unwrap());
@@ -275,7 +286,7 @@ async fn repo_with_worktree(
     let wt_root = tempfile::tempdir().unwrap();
     let wt_path = wt_root.path().join(slug);
     let repo = Repository::open(p).await.unwrap();
-    repo.add_worktree(&wt_path, slug).await.unwrap();
+    repo.add_worktree(&wt_path, &format!("oximux/{slug}")).await.unwrap();
     (tmp, wt_root, wt_path)
 }
 

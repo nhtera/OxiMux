@@ -434,9 +434,13 @@ impl AgentChatView {
             Some(input) if enabled => {
                 let slug_text = input.read(cx).value().to_string();
                 let trimmed = slug_text.trim();
+                // Same resolved prefix the create will use — see
+                // `git_settings::branch_for_slug`.
                 match validate_slug(trimmed) {
-                    Ok(()) if !trimmed.is_empty() => (format!("oximux/{trimmed}"), false),
-                    Ok(()) => ("oximux/…".to_string(), false),
+                    Ok(()) if !trimmed.is_empty() => {
+                        (crate::git_settings::branch_for_slug(trimmed, cx), false)
+                    }
+                    Ok(()) => (crate::git_settings::branch_for_slug("…", cx), false),
                     Err(err) => (err.to_string(), true),
                 }
             }
@@ -496,7 +500,9 @@ impl AgentChatView {
                 let branch = self
                     .worktree_slug_input
                     .as_ref()
-                    .map(|i| format!("oximux/{}", i.read(cx).value().trim()))
+                    .map(|i| {
+                        crate::git_settings::branch_for_slug(i.read(cx).value().trim(), cx)
+                    })
                     .unwrap_or_else(|| "the branch".to_string());
                 let (headline, detail) = humanize_worktree_error(msg, &branch);
                 // Matches `error_card.rs`'s established failure look rather than

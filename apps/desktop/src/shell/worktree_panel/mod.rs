@@ -155,12 +155,17 @@ impl WorktreePanel {
         self.create_state = CreateState::Creating;
         let repo = self.repo.clone();
         let path_for_op = path.clone();
+        // This panel is never instantiated (Phase 12 decides its fate), but it
+        // still compiles and still calls `add_worktree` — so it resolves the
+        // prefix like every other create rather than being the one path that
+        // could reintroduce a hardcoded `oximux/`.
+        let branch = crate::git_settings::branch_for_slug(&slug, cx);
         let (tx, rx) = oneshot::channel::<Result<PathBuf, String>>();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
                     let r = repo
-                        .add_worktree(&path_for_op, &slug)
+                        .add_worktree(&path_for_op, &branch)
                         .await
                         .map(|info| info.path)
                         .map_err(|e| e.to_string());

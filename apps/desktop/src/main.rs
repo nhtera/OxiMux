@@ -369,6 +369,7 @@ fn main() {
         // performed the upgrade; the settings install itself still has to run.
         #[cfg_attr(not(any(target_os = "macos", windows)), allow(unused_variables))]
         oximux_app::agent_retry_settings::install(cx);
+        oximux_app::git_settings::install(cx);
         let upgraded_this_boot = oximux_app::auto_update_settings::install(cx);
         // The indicator that appears while an agent can drive the screen — a
         // menu-bar item on macOS, a notification-area icon on Windows. Watches

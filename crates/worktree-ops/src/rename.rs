@@ -22,6 +22,7 @@ use oximux_core::Workspace;
 use oximux_git::{Repository, validate_slug};
 use oximux_storage::WorkspaceRepo;
 
+use crate::branch_name;
 use crate::paths::{path_is_within, paths_equal};
 
 /// Why a rename was declined, with enough detail for the UI to say so.
@@ -205,7 +206,11 @@ pub async fn preflight_rename(
     }
 
     let old_path = PathBuf::from(&workspace.worktree_path);
-    let new_branch = format!("oximux/{new_slug}");
+    // The row's OWN prefix, not the configured one. Someone who has since
+    // switched the branch-prefix setting is still fixing a typo in a branch
+    // that exists; re-resolving here would quietly re-file it under the new
+    // convention as a side effect of the rename.
+    let new_branch = branch_name::branch_name(branch_name::split_prefix(&workspace.branch), new_slug);
 
     let repo = match Repository::open(project_root).await {
         Ok(r) => r,

@@ -11,6 +11,8 @@
 //! data directory explicitly so `oximux serve --data-dir` puts worktrees under
 //! its own root instead of the desktop's.
 
+pub mod branch_name;
+pub mod freshen;
 pub mod include;
 pub mod merge;
 pub mod rename;
@@ -77,6 +79,13 @@ pub struct Provision {
     /// Off by default, and deliberately so: the default has to be the one that
     /// cannot destroy anything.
     pub reclaim_orphan: bool,
+    /// Fetch and fast-forward the default branch before branching off it, so
+    /// the new worktree starts from current work. Mirrors the user's
+    /// `keep_default_up_to_date` setting; see [`crate::freshen`].
+    ///
+    /// Off by default for the same reason as `reclaim_orphan`, plus one more:
+    /// it makes creating a worktree touch the network.
+    pub freshen_default: bool,
 }
 
 impl Provision {
@@ -86,7 +95,14 @@ impl Provision {
             setup,
             sink: Some(sink),
             reclaim_orphan: false,
+            freshen_default: false,
         }
+    }
+
+    /// Opt in to freshening the default branch before the worktree is cut.
+    pub fn freshening_default(mut self, freshen: bool) -> Self {
+        self.freshen_default = freshen;
+        self
     }
 
     /// Opt in to clearing a directory already sitting at the target path.
@@ -205,34 +221,48 @@ pub fn worktree_path(data_dir: &Path, project_id: &str, slug: &str) -> PathBuf {
 /// rollback ladder that was already here for the storage case.
 #[allow(
     clippy::too_many_arguments,
-    reason = "Seven of the eight are irreducible inputs to one operation: where the repo is, \
-              what the workspace is called, where it goes, and what to write it into. Bundling \
-              them into a params struct moves the same fields behind a name that means nothing \
-              more than the function's own — and every one of the five call sites would then \
-              build a struct to immediately destructure it. The eighth, `provision`, is already \
-              the grouped form of what would otherwise be three."
+    reason = "Eight of the nine are irreducible inputs to one operation: where the repo is, \
+              what the workspace is called, what its branch is called, where it goes, and what \
+              to write it into. Bundling them into a params struct moves the same fields behind \
+              a name that means nothing more than the function's own — and every one of the five \
+              call sites would then build a struct to immediately destructure it. The ninth, \
+              `provision`, is already the grouped form of what would otherwise be three."
 )]
 pub async fn create_workspace_with_rollback(
     project_root: &Path,
     project_id: &str,
     name: &str,
     slug: &str,
+    branch: &str,
     worktree_path: &Path,
     linked_issue: Option<&str>,
     workspace_repo: &WorkspaceRepo,
     provision: &Provision,
 ) -> CreateOutcome {
-    let branch = format!("oximux/{slug}");
     let repo = match Repository::open(project_root).await {
         Ok(r) => r,
         Err(err) => return CreateOutcome::GitFailed(format!("open project repo: {err}")),
     };
     if provision.reclaim_orphan
-        && let Some(err) = reclaim_orphan(&repo, worktree_path, &branch, workspace_repo).await
+        && let Some(err) = reclaim_orphan(&repo, worktree_path, branch, workspace_repo).await
     {
         return CreateOutcome::GitFailed(err);
     }
-    if let Err(err) = repo.add_worktree(worktree_path, slug).await {
+
+    // Optional, off by default, and unable to fail the create: `git worktree
+    // add` branches from HEAD, so a default branch last pulled a week ago
+    // hands every new worktree a week-old base. Every refusal inside is
+    // silent and ordinary — see `freshen`.
+    if provision.freshen_default {
+        match repo.default_branch().await {
+            Ok(Some(default)) => {
+                let outcome = freshen::freshen_default_branch(&repo, &default).await;
+                tracing::debug!(?outcome, %default, "freshen default branch before create");
+            }
+            _ => tracing::debug!("freshen skipped: no default branch detected"),
+        }
+    }
+    if let Err(err) = repo.add_worktree(worktree_path, branch).await {
         return CreateOutcome::GitFailed(format!("add_worktree: {err}"));
     }
 
@@ -283,7 +313,7 @@ pub async fn create_workspace_with_rollback(
                 outcome = %transcript.outcome.summary(),
                 "setup failed during provisioning; rolling back"
             );
-            let rollback_error = rollback(&repo, worktree_path, &branch).await;
+            let rollback_error = rollback(&repo, worktree_path, branch).await;
             return CreateOutcome::SetupFailed {
                 transcript,
                 rollback_error,
@@ -292,7 +322,7 @@ pub async fn create_workspace_with_rollback(
     }
 
     let path_str = worktree_path.to_string_lossy().to_string();
-    match workspace_repo.insert(project_id, name, slug, &branch, &path_str) {
+    match workspace_repo.insert(project_id, name, slug, branch, &path_str) {
         Ok(mut workspace) => {
             // Best-effort metadata write — the worktree + row already exist, so
             // a failure here only loses the issue badge, not the workspace. The
@@ -307,7 +337,7 @@ pub async fn create_workspace_with_rollback(
             }
             CreateOutcome::Created(workspace)
         }
-        Err(insert_error) => match rollback(&repo, worktree_path, &branch).await {
+        Err(insert_error) => match rollback(&repo, worktree_path, branch).await {
             Some(rollback_error) => CreateOutcome::StorageFailedRollbackDirty {
                 insert_error,
                 rollback_error,
