@@ -83,6 +83,198 @@ impl Repository {
         Ok(())
     }
 
+    /// Rename local branch `old` to `new`, via `git branch -m`.
+    ///
+    /// Cheap and locally reversible — renaming back restores the previous state
+    /// exactly — which is why a rollback-bearing caller does this AFTER the
+    /// worktree move, the step that can half-fail.
+    ///
+    /// Git refuses when `new` already exists (no `--force` is offered here on
+    /// purpose: silently overwriting another branch is never what a rename
+    /// meant). Renaming a branch that has been pushed orphans its remote ref;
+    /// that judgement belongs to the caller, so check
+    /// [`upstream_of`](Self::upstream_of) first.
+    pub async fn rename_branch(&self, old: &str, new: &str) -> Result<()> {
+        if old.is_empty() || new.is_empty() {
+            return Err(GitError::invalid_input("branch name is empty"));
+        }
+        GitCmd::new(self.workdir())
+            .args(["branch", "-m", "--", old, new])
+            .run()
+            .await?;
+        Ok(())
+    }
+
+    /// The upstream ref `branch` tracks (e.g. `origin/feat`), or `None` when it
+    /// tracks nothing.
+    ///
+    /// `None` is the only state in which renaming the branch is safe: renaming
+    /// a pushed branch leaves the remote ref behind and breaks any open PR that
+    /// points at it. A branch pushed to a remote that has since been removed
+    /// reads as `None` and will be renamed — accepted, because its remote ref
+    /// is already orphaned.
+    ///
+    /// A non-zero exit means "no upstream configured", which is a normal
+    /// answer here rather than a failure, so it maps to `Ok(None)`.
+    pub async fn upstream_of(&self, branch: &str) -> Result<Option<String>> {
+        if branch.is_empty() {
+            return Err(GitError::invalid_input("branch name is empty"));
+        }
+        let out = GitCmd::new(self.workdir())
+            .args([
+                "rev-parse",
+                "--abbrev-ref",
+                "--symbolic-full-name",
+                &format!("{branch}@{{upstream}}"),
+            ])
+            .run()
+            .await;
+        match out {
+            Ok(out) => {
+                let text = String::from_utf8(out.stdout).map_err(|e| {
+                    GitError::parse(format!("non-utf8 in `git rev-parse @{{upstream}}`: {e}"))
+                })?;
+                let upstream = text.trim();
+                Ok((!upstream.is_empty()).then(|| upstream.to_string()))
+            }
+            // `git rev-parse` exits non-zero when no upstream is configured.
+            // Anything else (a broken repo, git missing) is still an error.
+            Err(GitError::NonZero { .. }) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The repository's default branch — the one work is meant to land in.
+    ///
+    /// Order, best evidence first:
+    ///
+    /// 1. `refs/remotes/origin/HEAD`, which the remote itself declares. Read
+    ///    with `symbolic-ref` and stripped of its remote prefix, so `origin/dev`
+    ///    answers `dev`.
+    /// 2. A local branch called `main`, then `master` — the two conventions,
+    ///    checked in that order and only if they actually exist.
+    ///
+    /// `None` when none of those resolve (a bare local repo on some other
+    /// name). Callers fall back to whatever they already had rather than
+    /// guessing: naming a branch that does not exist produces a refusal the
+    /// user cannot act on, which is worse than not offering the action.
+    ///
+    /// Not `current_branch`: where HEAD happens to be is what a merge
+    /// pre-flight *compares against*, so using it as the target would make that
+    /// comparison vacuous.
+    pub async fn default_branch(&self) -> Result<Option<String>> {
+        if let Ok(out) = GitCmd::new(self.workdir())
+            .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+            .run()
+            .await
+        {
+            let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if let Some(name) = text.strip_prefix("origin/")
+                && !name.is_empty()
+            {
+                return Ok(Some(name.to_string()));
+            }
+        }
+        for cand in ["main", "master"] {
+            let raw = GitCmd::new(self.workdir())
+                .args([
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{cand}"),
+                ])
+                .run_raw()
+                .await?;
+            if raw.status.success() {
+                return Ok(Some(cand.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Resolve any revision to a commit sha; `None` when it does not exist.
+    ///
+    /// Absence is an ordinary answer here, not an error: callers ask about
+    /// refs that legitimately may not be there — a local `main` in a repo
+    /// that only has `master`, an `origin/main` in a repo with no remote.
+    /// `--verify --quiet` makes git exit 1 for those instead of printing a
+    /// diagnostic.
+    pub async fn sha_of(&self, rev: &str) -> Result<Option<String>> {
+        let raw = GitCmd::new(self.workdir())
+            .args(["rev-parse", "--verify", "--quiet", rev])
+            .run_raw()
+            .await?;
+        if !raw.status.success() {
+            return Ok(None);
+        }
+        let sha = String::from_utf8_lossy(&raw.stdout).trim().to_string();
+        Ok((!sha.is_empty()).then_some(sha))
+    }
+
+    /// `git merge --ff-only <rev>` in this checkout.
+    ///
+    /// Fast-forward or nothing: git refuses rather than creating a merge
+    /// commit, which is what makes this safe to run unattended on a branch
+    /// the user is sitting on. Never `--force`, never a plain merge.
+    pub async fn fast_forward_to(&self, rev: &str) -> Result<()> {
+        GitCmd::new(self.workdir())
+            .args(["merge", "--ff-only", rev])
+            .run()
+            .await?;
+        Ok(())
+    }
+
+    /// `git fetch <remote> <branch>` — update one remote-tracking ref.
+    ///
+    /// Deliberately narrower than [`fetch`](Self::fetch), which is
+    /// `--all --prune` across every configured remote: a caller that only
+    /// needs to know where one branch has got to should not pay for every
+    /// other remote, nor prune refs as a side effect of asking.
+    pub async fn fetch_remote_branch(&self, remote: &str, branch: &str) -> Result<()> {
+        GitCmd::new(self.workdir())
+            .args(["fetch", "--no-tags", remote, branch])
+            .timeout(std::time::Duration::from_secs(30))
+            .run()
+            .await?;
+        Ok(())
+    }
+
+    /// Fast-forward a local branch that is **not** checked out, by fetching
+    /// the remote branch straight onto it.
+    ///
+    /// `git fetch <remote> <branch>:<branch>` updates the local ref only when
+    /// the move is a fast-forward, and refuses outright when that branch is
+    /// checked out in any worktree. Both refusals are git's, not ours — which
+    /// is the point: the safety check lives where it cannot be got wrong.
+    pub async fn fetch_branch_fast_forward(&self, remote: &str, branch: &str) -> Result<()> {
+        GitCmd::new(self.workdir())
+            .args(["fetch", remote, &format!("{branch}:{branch}")])
+            .timeout(std::time::Duration::from_secs(60))
+            .run()
+            .await?;
+        Ok(())
+    }
+
+    /// The branch HEAD is on, or `None` when HEAD is detached.
+    ///
+    /// One `git rev-parse --abbrev-ref HEAD`, deliberately cheaper than
+    /// [`status`](Self::status): callers that only need to answer "is this
+    /// checkout on the branch I expect?" should not pay for a full porcelain
+    /// v2 parse plus its ahead/behind and branch-diff enrichment.
+    ///
+    /// A detached HEAD prints the literal `HEAD`, which is not a branch name,
+    /// so it maps to `None` rather than being handed back as one.
+    pub async fn current_branch(&self) -> Result<Option<String>> {
+        let out = GitCmd::new(self.workdir())
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .run()
+            .await?;
+        let text = String::from_utf8(out.stdout)
+            .map_err(|e| GitError::parse(format!("non-utf8 in `git rev-parse HEAD`: {e}")))?;
+        let name = text.trim();
+        Ok((!name.is_empty() && name != "HEAD").then(|| name.to_string()))
+    }
+
     /// Most-recently-visited local branches in MRU order, capped at `limit`.
     ///
     /// Parses HEAD's reflog (`git reflog show --pretty=%gs HEAD`) for

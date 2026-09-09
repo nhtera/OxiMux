@@ -399,12 +399,17 @@ impl Render for WorkspaceDialog {
         let is_create = matches!(self.mode, Some(WorkspaceDialogMode::Create));
         // Inline prefill state rides the slug line: pending fetch shows a
         // quiet hint, a successful prefill shows the linked reference.
+        // The configured prefix, from the same global the create path reads —
+        // so this line is a promise the create keeps rather than a second
+        // derivation of the same rule.
+        let project_root = self.selected_project.as_ref().map(|p| std::path::PathBuf::from(&p.root_path));
+        let branch = crate::git_settings::branch_for_slug(&slug, project_root.as_deref(), cx);
         let slug_line = if self.fetching_title {
-            format!("Branch: oximux/{slug} · fetching title…")
+            format!("Branch: {branch} · fetching title…")
         } else if let Some(issue) = &self.linked_issue {
-            format!("Branch: oximux/{slug} · linked {issue}")
+            format!("Branch: {branch} · linked {issue}")
         } else {
-            format!("Branch: oximux/{slug}")
+            format!("Branch: {branch}")
         };
 
         let mut card = div()

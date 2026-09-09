@@ -28,6 +28,9 @@ const MAX_VISIBLE: usize = 4;
 pub enum ToastKind {
     Info,
     Success,
+    /// A hazard the user has to act on, but not a failure. A conflicted merge
+    /// is the case: nothing went wrong, and the work is still waiting.
+    Warning,
     Error,
 }
 
@@ -37,6 +40,7 @@ impl ToastKind {
         match self {
             ToastKind::Info => theme.status_info,
             ToastKind::Success => theme.status_ok,
+            ToastKind::Warning => theme.status_warn,
             ToastKind::Error => theme.status_error,
         }
     }

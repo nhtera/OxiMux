@@ -20,6 +20,7 @@ use oximux_remote_host::{WorktreeError, WorktreeService};
 use oximux_remote_proto::messages::{WorktreeProgressWire, WorktreeWire};
 use oximux_storage::{ProjectRepo, WorkspaceRepo};
 
+use crate::branch_name;
 use crate::{
     CreateOutcome, Provision, create_workspace_with_rollback, run_cleanup_before_remove,
     worktree_path,
@@ -87,11 +88,26 @@ impl WorktreeService for RepoWorktrees {
         // Host-derived target: `<data_dir>/projects/<project_id>/worktrees/<slug>`
         // — the client never supplies a path.
         let target = worktree_path(&self.data_dir, &project.id, slug);
+        // Same branch name the desktop would mint for this slug: one resolver,
+        // reading the same `git.toml`. A remote-created worktree that carried
+        // the hardcoded `oximux/` prefix while the sidebar minted the
+        // configured one would put two conventions in one rail — and
+        // `reclaim_orphan` would stop recognising its own debris.
+        let root = std::path::Path::new(&project.root_path);
+        let git_settings = oximux_settings::git::GitSettings::load_from_dir(&self.data_dir);
+        let branch = match Repository::open(root).await {
+            Ok(repo) => branch_name::resolve_branch_name(&git_settings, &repo, slug).await,
+            // The create below opens the same repository and reports the real
+            // failure; naming the branch the shipped way here keeps that the
+            // error the caller sees.
+            Err(_) => branch_name::branch_name(Some(oximux_settings::git::DEFAULT_PREFIX), slug),
+        };
         let outcome = create_workspace_with_rollback(
-            std::path::Path::new(&project.root_path),
+            root,
             &project.id,
             slug,
             slug,
+            &branch,
             &target,
             None,
             &self.workspaces,
@@ -103,7 +119,9 @@ impl WorktreeService for RepoWorktrees {
             // Reclaim is on: `target` came from `worktree_path(&self.data_dir,
             // ..)` a few lines up, and the slug collision check above has
             // already established no row claims it.
-            &Provision::default().reclaiming_orphans(),
+            &Provision::default()
+                .reclaiming_orphans()
+                .freshening_default(git_settings.keep_default_up_to_date),
         )
         .await;
         match outcome {

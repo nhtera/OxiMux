@@ -80,6 +80,29 @@ fn compact_agent_glyph(
     Some(crate::shell::agent_presentation::adapter_icon_path(adapter))
 }
 
+/// Whether a row offers its `…` actions menu, and whether a row menu is open
+/// anywhere in the rail.
+///
+/// The second half exists for one reason: the trigger's tooltip is **sticky**.
+/// `occlude` on the menu overlay stops new hovers, but an already-visible
+/// tooltip is only cleared by a hover-out, which needs a mouse *move* — and
+/// after clicking `…` the pointer is parked exactly where it was. gpui's own
+/// escape hatch is to stop declaring the tooltip (`Interactivity::prepaint`
+/// takes the active tooltip when the builder is gone), so that is what `open`
+/// drives. Without it the tooltip paints over the menu's first item: `Pin` on a
+/// live row, and `Unarchive` on an archived one, where it is one of only two
+/// actions and restore looks absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RowMenu {
+    /// Show the trailing `…` button at all. Primary rows suppress it — the main
+    /// worktree goes away with the project, not on its own.
+    pub show: bool,
+    /// A row menu is open somewhere in the rail. Global rather than per-row
+    /// because while one is open its overlay occludes every other trigger, so
+    /// no other tooltip can be showing anyway.
+    pub open: bool,
+}
+
 /// Render the rich two-line workspace card.
 ///
 /// `row_id` and `group_name` must be stable and unique per workspace — callers
@@ -96,7 +119,7 @@ pub fn render_workspace_card(
     // `name · verb` line-2 summary (matches the reference cockpit, which shows
     // the branch then "N agents" rather than repeating an agent summary).
     suppress_agent_summary: bool,
-    show_menu: bool,
+    menu: RowMenu,
     locate_glow_seq: u64,
     drag: Option<WorkspaceDragConfig>,
     rename: Option<RowRenameConfig>,
@@ -119,7 +142,7 @@ pub fn render_workspace_card(
     // Trailing "…" button — invisible at rest, revealed on row hover via
     // `group_hover`. Primary (main worktree) rows suppress this because the
     // main worktree is removed by removing the project, not here.
-    let trailing_btn = show_menu.then(|| {
+    let trailing_btn = menu.show.then(|| {
         div()
             .id(menu_id)
             .flex()
@@ -137,8 +160,13 @@ pub fn render_workspace_card(
                     .size(px(FOLDER_ICON_SIZE))
                     .text_color(theme.fg_muted),
             )
-            .tooltip(|window, cx| {
-                gpui_component::tooltip::Tooltip::new("Workspace actions").build(window, cx)
+            // Suppressed while a menu is open — see `RowMenu::open`. A
+            // `.when` rather than a no-op builder: gpui only drops an active
+            // tooltip when the builder itself is absent.
+            .when(!menu.open, |el| {
+                el.tooltip(|window, cx| {
+                    gpui_component::tooltip::Tooltip::new("Workspace actions").build(window, cx)
+                })
             })
             .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                 cx.stop_propagation();
@@ -276,8 +304,8 @@ pub fn render_workspace_card(
             div()
                 .flex_1()
                 .min_w_0()
-                .capture_action(move |_: &InputEnter, _window, cx| {
-                    rail_commit.update(cx, |r, cx| r.commit_rename(cx));
+                .capture_action(move |_: &InputEnter, window, cx| {
+                    rail_commit.update(cx, |r, cx| r.commit_rename(window, cx));
                 })
                 .capture_action(move |_: &InputEscape, _window, cx| {
                     rail_cancel.update(cx, |r, cx| r.cancel_rename(cx));
@@ -556,7 +584,7 @@ pub fn render_workspace_card(
         .on_mouse_down(MouseButton::Left, on_row_click)
         // Right-click opens the same row popover at the cursor (DRY with the
         // `…` button). Gated to rows that have a menu (non-primary).
-        .when(show_menu, |el| {
+        .when(menu.show, |el| {
             el.on_mouse_down(MouseButton::Right, move |ev, window, cx| {
                 cx.stop_propagation();
                 on_menu_click(ev, window, cx);
@@ -716,5 +744,30 @@ mod tests {
     #[test]
     fn a_workspace_with_no_agent_shows_no_glyph() {
         assert_eq!(compact_agent_glyph(true, false, None), None);
+    }
+}
+
+#[cfg(test)]
+mod row_menu_tests {
+    use super::RowMenu;
+
+    /// The trigger's tooltip is what paints over the menu's first item, so the
+    /// two flags are independent: a row can show its `…` button while the
+    /// tooltip is suppressed, and that combination is the whole point.
+    #[test]
+    fn showing_the_button_and_suppressing_its_tooltip_are_separate() {
+        let open = RowMenu { show: true, open: true };
+        assert!(open.show, "the button stays on screen while its menu is up");
+        assert!(open.open, "...and its tooltip is suppressed");
+
+        let closed = RowMenu { show: true, open: false };
+        assert!(closed.show);
+        assert!(!closed.open, "tooltip comes back once the menu closes");
+    }
+
+    /// A primary row has no menu at all, so nothing to suppress.
+    #[test]
+    fn a_row_without_a_menu_defaults_to_no_suppression() {
+        assert_eq!(RowMenu::default(), RowMenu { show: false, open: false });
     }
 }

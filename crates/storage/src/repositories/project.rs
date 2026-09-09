@@ -201,6 +201,23 @@ impl ProjectRepo {
         })
     }
 
+    /// Correct a project's recorded default branch.
+    ///
+    /// The column is seeded with a placeholder at project-add (nothing has
+    /// opened the repository at that point), so it is wrong for every repo that
+    /// is not on the convention. This is how the real name gets in once the
+    /// repository has actually been read.
+    pub fn set_default_branch(&self, id: &str, branch: &str) -> Result<(), StorageError> {
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE projects SET default_branch = ?1 WHERE id = ?2",
+                params![branch, id],
+            )
+            .map(|_| ())
+        })?;
+        Ok(())
+    }
+
     pub fn update_last_opened_at(&self, id: &str) -> Result<(), StorageError> {
         let ts = now();
         self.db.with_conn(|c| {

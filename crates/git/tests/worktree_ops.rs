@@ -37,7 +37,7 @@ async fn add_worktree_creates_dir_and_branch() {
     let wt_path = wt_root.path().join("feat-x");
 
     let repo = Repository::open(p).await.unwrap();
-    let info = repo.add_worktree(&wt_path, "feat-x").await.unwrap();
+    let info = repo.add_worktree(&wt_path, "oximux/feat-x").await.unwrap();
     assert!(wt_path.exists());
     assert!(!info.is_main);
     assert_eq!(info.branch.as_deref(), Some("oximux/feat-x"));
@@ -59,7 +59,7 @@ async fn add_worktree_appears_in_list() {
     let wt_path = wt_root.path().join("wt");
 
     let repo = Repository::open(p).await.unwrap();
-    repo.add_worktree(&wt_path, "wt-slug").await.unwrap();
+    repo.add_worktree(&wt_path, "oximux/wt-slug").await.unwrap();
 
     let ws = repo.list_worktrees().await.unwrap();
     assert_eq!(ws.len(), 2);
@@ -80,7 +80,7 @@ async fn remove_worktree_clean() {
     let wt_path = wt_root.path().join("wt");
 
     let repo = Repository::open(p).await.unwrap();
-    repo.add_worktree(&wt_path, "remove-clean").await.unwrap();
+    repo.add_worktree(&wt_path, "oximux/remove-clean").await.unwrap();
     repo.remove_worktree(&wt_path, false).await.unwrap();
 
     let ws = repo.list_worktrees().await.unwrap();
@@ -101,7 +101,7 @@ async fn remove_worktree_dirty_without_force_errors() {
     let wt_path = wt_root.path().join("wt");
 
     let repo = Repository::open(p).await.unwrap();
-    repo.add_worktree(&wt_path, "dirty-no-force").await.unwrap();
+    repo.add_worktree(&wt_path, "oximux/dirty-no-force").await.unwrap();
     // Dirty the worktree (modify the checked-out copy of a.txt).
     write(&wt_path.join("a.txt"), "modified\n");
 
@@ -123,7 +123,7 @@ async fn remove_worktree_dirty_with_force_succeeds() {
     let wt_path = wt_root.path().join("wt");
 
     let repo = Repository::open(p).await.unwrap();
-    repo.add_worktree(&wt_path, "dirty-force").await.unwrap();
+    repo.add_worktree(&wt_path, "oximux/dirty-force").await.unwrap();
     write(&wt_path.join("a.txt"), "modified\n");
 
     repo.remove_worktree(&wt_path, true).await.unwrap();
@@ -160,12 +160,16 @@ async fn add_worktree_path_already_exists_errors() {
     write(&wt_path.join("blocker"), "exists\n");
 
     let repo = Repository::open(p).await.unwrap();
-    let err = repo.add_worktree(&wt_path, "exists").await.unwrap_err();
+    let err = repo.add_worktree(&wt_path, "oximux/exists").await.unwrap_err();
     assert!(matches!(err, GitError::NonZero { .. }), "got {err:?}");
 }
 
+/// `add_worktree` now names a *branch*, so `foo/bar` is legal where it used to
+/// be rejected — one prefix segment is the whole point of the configurable
+/// prefix. What must still be refused, before any side effect, is a name with
+/// more structure than a prefix and a slug, or ref syntax in either half.
 #[tokio::test]
-async fn add_worktree_slug_with_slash_errors_before_git_call() {
+async fn add_worktree_rejects_an_unusable_branch_name_before_the_git_call() {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path();
     init_repo(p);
@@ -177,10 +181,17 @@ async fn add_worktree_slug_with_slash_errors_before_git_call() {
     let wt_path = wt_root.path().join("wt");
 
     let repo = Repository::open(p).await.unwrap();
-    let err = repo.add_worktree(&wt_path, "foo/bar").await.unwrap_err();
-    assert!(matches!(err, GitError::InvalidInput { .. }), "got {err:?}");
-    // Defense-in-depth: validation runs before any side effect.
-    assert!(!wt_path.exists());
+    for bad in ["a/b/c", "oximux/feat^1", "oximux/../escape", "/feat", "oximux/"] {
+        let err = repo.add_worktree(&wt_path, bad).await.unwrap_err();
+        assert!(matches!(err, GitError::InvalidInput { .. }), "{bad:?} got {err:?}");
+        // Defense-in-depth: validation runs before any side effect.
+        assert!(!wt_path.exists(), "{bad:?} created something");
+    }
+
+    // ...and the one that used to be rejected is now the ordinary case.
+    repo.add_worktree(&wt_path, "nhtera/bar").await.expect("one prefix segment is legal");
+    let listed = repo.list_worktrees().await.unwrap();
+    assert!(listed.iter().any(|w| w.branch.as_deref() == Some("nhtera/bar")));
 }
 
 #[tokio::test]
@@ -199,7 +210,7 @@ async fn add_worktree_existing_branch_errors() {
 
     let repo = Repository::open(p).await.unwrap();
     let err = repo
-        .add_worktree(&wt_path, "already-here")
+        .add_worktree(&wt_path, "oximux/already-here")
         .await
         .unwrap_err();
     assert!(matches!(err, GitError::NonZero { .. }), "got {err:?}");
@@ -221,7 +232,7 @@ async fn a_linked_worktree_resolves_back_to_its_main_repository() {
     let wt_root = tempfile::tempdir().unwrap();
     let wt_path = wt_root.path().join("oximux-wt-feat-x");
     let repo = Repository::open(p).await.unwrap();
-    repo.add_worktree(&wt_path, "feat-x").await.unwrap();
+    repo.add_worktree(&wt_path, "oximux/feat-x").await.unwrap();
 
     let main = oximux_git::main_worktree_of(&wt_path).expect("a linked worktree resolves");
     assert_eq!(main, p.canonicalize().unwrap());
@@ -254,4 +265,243 @@ async fn a_directory_that_is_not_a_repository_resolves_to_nothing() {
         oximux_git::main_worktree_of(std::path::Path::new("/definitely/not/here")),
         None
     );
+}
+
+// ---------------------------------------------------------------------------
+// Rename primitives: `move_worktree`, `rename_branch`, `upstream_of`.
+// ---------------------------------------------------------------------------
+
+/// Init a repo with one commit and one linked worktree, and return
+/// `(repo_root_tempdir, worktree_root_tempdir, worktree_path)`.
+async fn repo_with_worktree(
+    slug: &str,
+) -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("a.txt"), "v1\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+
+    let wt_root = tempfile::tempdir().unwrap();
+    let wt_path = wt_root.path().join(slug);
+    let repo = Repository::open(p).await.unwrap();
+    repo.add_worktree(&wt_path, &format!("oximux/{slug}")).await.unwrap();
+    (tmp, wt_root, wt_path)
+}
+
+#[tokio::test]
+async fn move_worktree_relocates_the_directory_and_git_agrees() {
+    let (tmp, wt_root, from) = repo_with_worktree("fix-lgoin").await;
+    let to = wt_root.path().join("fix-login");
+
+    let repo = Repository::open(tmp.path()).await.unwrap();
+    repo.move_worktree(&from, &to).await.unwrap();
+
+    assert!(!from.exists(), "old directory must be gone");
+    assert!(to.join("a.txt").exists(), "content must have moved");
+
+    // The point of using `git worktree move` rather than `mv`: git's own
+    // bookkeeping follows, so the worktree is still a worktree afterwards.
+    let listed = repo.list_worktrees().await.unwrap();
+    let moved = listed
+        .iter()
+        .find(|w| !w.is_main)
+        .expect("linked worktree still listed");
+    assert_eq!(
+        std::fs::canonicalize(&moved.path).unwrap(),
+        std::fs::canonicalize(&to).unwrap(),
+    );
+    assert_eq!(moved.branch.as_deref(), Some("oximux/fix-lgoin"));
+}
+
+#[tokio::test]
+async fn move_worktree_refuses_an_existing_destination() {
+    let (tmp, wt_root, from) = repo_with_worktree("feat-a").await;
+    let to = wt_root.path().join("occupied");
+    std::fs::create_dir(&to).unwrap();
+
+    let repo = Repository::open(tmp.path()).await.unwrap();
+    let err = repo.move_worktree(&from, &to).await.unwrap_err();
+    assert!(matches!(err, GitError::InvalidInput { .. }), "got {err:?}");
+    // Refused before touching anything.
+    assert!(from.join("a.txt").exists(), "source must be untouched");
+}
+
+#[tokio::test]
+async fn move_worktree_refuses_the_main_worktree() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("a.txt"), "v1\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+    let dest = tempfile::tempdir().unwrap().path().join("elsewhere");
+
+    let repo = Repository::open(p).await.unwrap();
+    let err = repo.move_worktree(p, &dest).await.unwrap_err();
+    assert!(matches!(err, GitError::InvalidInput { .. }), "got {err:?}");
+    assert!(p.join("a.txt").exists());
+}
+
+#[tokio::test]
+async fn rename_branch_renames_and_is_reversible() {
+    let (tmp, _wt_root, _wt) = repo_with_worktree("fix-lgoin").await;
+    let repo = Repository::open(tmp.path()).await.unwrap();
+
+    repo.rename_branch("oximux/fix-lgoin", "oximux/fix-login")
+        .await
+        .unwrap();
+    let names: Vec<String> = repo
+        .list_branches()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|b| b.name)
+        .collect();
+    assert!(names.iter().any(|n| n == "oximux/fix-login"));
+    assert!(
+        !names.iter().any(|n| n == "oximux/fix-lgoin"),
+        "old name must be gone, not aliased"
+    );
+
+    // Reversibility is what lets a rollback walk this step back.
+    repo.rename_branch("oximux/fix-login", "oximux/fix-lgoin")
+        .await
+        .unwrap();
+    let names: Vec<String> = repo
+        .list_branches()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|b| b.name)
+        .collect();
+    assert!(names.iter().any(|n| n == "oximux/fix-lgoin"));
+}
+
+#[tokio::test]
+async fn rename_branch_refuses_to_overwrite_an_existing_branch() {
+    let (tmp, _wt_root, _wt) = repo_with_worktree("feat-a").await;
+    let repo = Repository::open(tmp.path()).await.unwrap();
+    repo.create_branch("oximux/feat-b", None).await.unwrap();
+
+    let err = repo
+        .rename_branch("oximux/feat-a", "oximux/feat-b")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, GitError::NonZero { .. }), "got {err:?}");
+    // Both branches survive an attempted collision.
+    let names: Vec<String> = repo
+        .list_branches()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|b| b.name)
+        .collect();
+    assert!(names.iter().any(|n| n == "oximux/feat-a"));
+    assert!(names.iter().any(|n| n == "oximux/feat-b"));
+}
+
+#[tokio::test]
+async fn upstream_of_is_none_for_a_local_only_branch() {
+    let (tmp, _wt_root, _wt) = repo_with_worktree("feat-a").await;
+    let repo = Repository::open(tmp.path()).await.unwrap();
+    // No upstream configured is a normal answer, not an error — this is the
+    // only state in which renaming the branch is safe.
+    assert_eq!(repo.upstream_of("oximux/feat-a").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn upstream_of_names_the_remote_ref_once_the_branch_is_pushed() {
+    let (tmp, _wt_root, _wt) = repo_with_worktree("feat-a").await;
+    let p = tmp.path();
+
+    // A bare repo on disk stands in for `origin`; no network involved.
+    let remote = tempfile::tempdir().unwrap();
+    run_git(remote.path(), &["init", "--bare", "-q"]);
+    run_git(
+        p,
+        &["remote", "add", "origin", &remote.path().to_string_lossy()],
+    );
+    run_git(p, &["push", "-q", "-u", "origin", "oximux/feat-a"]);
+
+    let repo = Repository::open(p).await.unwrap();
+    assert_eq!(
+        repo.upstream_of("oximux/feat-a").await.unwrap().as_deref(),
+        Some("origin/oximux/feat-a"),
+    );
+}
+
+/// The default branch is what a merge lands in, and it is NOT "main" by
+/// convention — a repo initialised on `master`, or a remote that declares
+/// something else, has to be read rather than assumed. Getting this wrong makes
+/// the merge action refuse with the name of a branch that does not exist.
+#[tokio::test]
+async fn default_branch_reads_master_when_that_is_what_the_repo_has() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    run_git(root, &["init", "-b", "master"]);
+    run_git(root, &["config", "user.name", "Test"]);
+    run_git(root, &["config", "user.email", "test@example.com"]);
+    run_git(root, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(root.join("a.txt"), "v1\n").expect("seed");
+    run_git(root, &["add", "a.txt"]);
+    run_git(root, &["commit", "-m", "init"]);
+
+    let repo = Repository::open(root).await.expect("open");
+    assert_eq!(
+        repo.default_branch().await.expect("detect"),
+        Some("master".to_string()),
+        "a master-default repo must not be reported as main"
+    );
+}
+
+/// `origin/HEAD` outranks the local-name guess, and its remote prefix is
+/// stripped — a merge target is a LOCAL branch name.
+#[tokio::test]
+async fn default_branch_prefers_what_the_remote_declares() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let origin = tmp.path().join("origin.git");
+    run_git(tmp.path(), &["init", "--bare", "-b", "trunk", "origin.git"]);
+
+    let work = tmp.path().join("work");
+    std::fs::create_dir(&work).expect("mkdir");
+    run_git(&work, &["init", "-b", "trunk"]);
+    run_git(&work, &["config", "user.name", "Test"]);
+    run_git(&work, &["config", "user.email", "test@example.com"]);
+    run_git(&work, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(work.join("a.txt"), "v1\n").expect("seed");
+    run_git(&work, &["add", "a.txt"]);
+    run_git(&work, &["commit", "-m", "init"]);
+    run_git(&work, &["remote", "add", "origin", &origin.to_string_lossy()]);
+    run_git(&work, &["push", "-u", "origin", "trunk"]);
+    run_git(&work, &["remote", "set-head", "origin", "trunk"]);
+    // A local `main` exists too, so the local-name fallback would answer wrong.
+    run_git(&work, &["branch", "main"]);
+
+    let repo = Repository::open(&work).await.expect("open");
+    assert_eq!(
+        repo.default_branch().await.expect("detect"),
+        Some("trunk".to_string()),
+        "origin/HEAD outranks the local main/master guess"
+    );
+}
+
+/// Nothing resolvable means `None`, never a guess. A caller that receives a
+/// name it cannot verify would refuse merges against a branch that is not
+/// there.
+#[tokio::test]
+async fn default_branch_is_none_when_nothing_conventional_resolves() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    run_git(root, &["init", "-b", "trunk"]);
+    run_git(root, &["config", "user.name", "Test"]);
+    run_git(root, &["config", "user.email", "test@example.com"]);
+    run_git(root, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(root.join("a.txt"), "v1\n").expect("seed");
+    run_git(root, &["add", "a.txt"]);
+    run_git(root, &["commit", "-m", "init"]);
+
+    let repo = Repository::open(root).await.expect("open");
+    assert_eq!(repo.default_branch().await.expect("detect"), None);
 }

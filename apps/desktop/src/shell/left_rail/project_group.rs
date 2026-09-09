@@ -52,6 +52,15 @@ const HEADER_ICON_SIZE: f32 = 14.0;
 /// Plus button square size.
 const PLUS_BTN_SIZE: f32 = 18.0;
 
+/// Height of the `Archived (N)` sub-header. Shorter than the project header —
+/// it is a subordinate disclosure, not a peer of the project row.
+const ARCHIVED_HEADER_HEIGHT: f32 = 24.0;
+/// Opacity applied to the whole archived block. Archived rows stay legible
+/// (branch and phase still read) but recede from the live rows above them.
+const ARCHIVED_OPACITY: f32 = 0.55;
+/// Left inset that nests the archived disclosure under its project.
+const ARCHIVED_INDENT: f32 = 8.0;
+
 /// Pure plan for one project group's header. Workspace rows are computed
 /// separately by `workspace_row::build_workspace_row_plan`.
 #[derive(Debug, Clone, PartialEq)]
@@ -95,9 +104,14 @@ pub fn render_project_group(
     project_index: usize,
     sort_mode: WorkspaceSortMode,
     workspaces: Vec<Workspace>,
+    // `archived`: this project's archived rows, newest archived first (empty
+    // renders nothing at all); `archived_expanded`: whether its disclosure is open.
+    archived: Vec<Workspace>,
+    archived_expanded: bool,
     latest_status_for: impl Fn(&str) -> Option<AgentStatus>,
     latest_adapter_for: impl Fn(&str) -> Option<&'static str>,
     active_workspace_id: Option<&str>,
+    row_menu_open: bool,
     live_worktrees: &std::collections::HashSet<String>,
     ambient_by_path: &std::collections::HashMap<String, AmbientAgent>,
     diff_counts: &std::collections::HashMap<String, DiffCounts>,
@@ -148,6 +162,7 @@ pub fn render_project_group(
             &latest_status_for,
             &latest_adapter_for,
             active_workspace_id,
+            row_menu_open,
             live_worktrees,
             ambient_by_path,
             diff_counts,
@@ -168,7 +183,164 @@ pub fn render_project_group(
         ));
     }
 
+    col = col.child(render_archived_section(
+        &project.id,
+        archived
+            .into_iter()
+            .map(|w| (project.clone(), w))
+            .collect(),
+        archived_expanded,
+        active_workspace_id,
+        row_menu_open,
+        &rail,
+        &weak_root,
+        &on_row_menu,
+        compact,
+        theme,
+        density,
+        typography,
+    ));
+
     col
+}
+
+/// Reserved [`LeftRail::toggle_archived_expanded`] key for the flat
+/// (ungrouped) list's single, cross-project archived disclosure. Project ids
+/// are UUIDs, so this cannot collide with a grouped-mode key.
+pub(crate) const FLAT_ARCHIVED_KEY: &str = "flat:archived";
+
+/// The collapsed `Archived (N)` disclosure.
+///
+/// In grouped mode one of these sits below each project's active rows, keyed by
+/// project id. In flat mode there is a single cross-project one at the end of
+/// the list, keyed by [`FLAT_ARCHIVED_KEY`] — archived work has to be reachable
+/// in BOTH modes, or `Archive` is still a one-way door for anyone who prefers
+/// the flat rail. Each row carries its own owning `Project`, which is what lets
+/// the flat variant mix projects in one section.
+///
+/// Renders nothing when there are no archived workspaces — an empty header
+/// would be noise on a rail that has none today.
+///
+/// Archived rows reuse `render_workspace_block` unchanged. The muted variant is
+/// produced by what is fed in rather than by a flag on the card: an archived
+/// workspace has no live agent by definition, so the status lookup, the live
+/// set, the ambient map and the diff cache are all supplied empty. That
+/// suppresses the agent verb line and the (now stale) diff chip; the status dot
+/// still paints, in its neutral idle grey, because the card paints it
+/// unconditionally. The whole block then carries a reduced opacity, which is
+/// what actually reads as "muted".
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_archived_section(
+    toggle_key: &str,
+    archived: Vec<(Project, Workspace)>,
+    expanded: bool,
+    active_workspace_id: Option<&str>,
+    row_menu_open: bool,
+    rail: &Entity<LeftRail>,
+    weak_root: &WeakEntity<WorkspaceRoot>,
+    on_row_menu: &(impl Fn(Workspace, f32, f32, &mut gpui::Window, &mut gpui::App) + Clone + 'static),
+    compact: bool,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+) -> impl IntoElement {
+    let count = archived.len();
+    if count == 0 {
+        return div();
+    }
+
+    let header_id: SharedString = format!("archived-header-{toggle_key}").into();
+    let chevron_path = if expanded {
+        "icons/chevron-down.svg"
+    } else {
+        "icons/chevron-right.svg"
+    };
+    let rail_for_toggle = rail.clone();
+    let toggle_key = toggle_key.to_string();
+    let header = div()
+        .id(header_id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.0))
+        .h(px(ARCHIVED_HEADER_HEIGHT))
+        .pl(px(ARCHIVED_INDENT))
+        .pr(px(density.gap_inline))
+        .cursor_pointer()
+        .hover(|st| st.bg(theme.hover_overlay))
+        .text_size(px(typography.t_body_sm))
+        .text_color(theme.fg_muted)
+        .child(
+            svg()
+                .path(chevron_path)
+                .size(px(CHEVRON_ICON_SIZE))
+                .text_color(theme.fg_muted),
+        )
+        .child(SharedString::from(format!("Archived ({count})")))
+        .on_click(move |_ev, _window, cx| {
+            rail_for_toggle.update(cx, |r, cx| {
+                r.toggle_archived_expanded(&toggle_key);
+                cx.notify();
+            });
+        });
+
+    let mut section = div().flex().flex_col().w_full().child(header);
+    if !expanded {
+        return section;
+    }
+
+    // Empty lookups: an archived workspace has no live agent, and its cached
+    // diff belongs to a worktree nobody is working in.
+    let no_status = |_: &str| None;
+    let no_adapter = |_: &str| None;
+    let empty_live: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let empty_ambient: std::collections::HashMap<String, AmbientAgent> =
+        std::collections::HashMap::new();
+    let empty_diffs: std::collections::HashMap<String, DiffCounts> = std::collections::HashMap::new();
+    let empty_agents = crate::shell::left_rail::WorkspaceAgentList::new();
+    let empty_expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut rows = div().flex().flex_col().w_full().opacity(ARCHIVED_OPACITY);
+    for (row_index, (project, workspace)) in archived.into_iter().enumerate() {
+        rows = rows.child(render_workspace_block(
+            workspace,
+            row_index,
+            &project,
+            // Only reaches `drag_config`, which is disabled below — any mode
+            // would do; ordering here is the query's `archived_at DESC`.
+            WorkspaceSortMode::Recent,
+            &no_status,
+            &no_adapter,
+            // `activate_workspace` refuses archived rows, so a click here never
+            // MAKES one active — but archiving the currently-active workspace
+            // does, and that row keeps its panes until the user moves on. Pass
+            // the real id through so that row still reads as selected instead
+            // of the rail losing its highlight entirely.
+            active_workspace_id,
+            row_menu_open,
+            &empty_live,
+            &empty_ambient,
+            &empty_diffs,
+            &empty_agents,
+            &empty_expanded,
+            None,
+            rail,
+            weak_root,
+            on_row_menu,
+            // No drag-to-reorder: archived rows have no manual rank.
+            false,
+            // No locate glow, and never the inline-rename target.
+            0,
+            None,
+            &None,
+            compact,
+            theme,
+            density,
+            typography,
+        ));
+    }
+    section = section.child(rows);
+    section
 }
 
 /// Render one workspace's block: the card plus, for multi-agent workspaces,
@@ -186,6 +358,7 @@ pub(crate) fn render_workspace_block(
     latest_status_for: &impl Fn(&str) -> Option<AgentStatus>,
     latest_adapter_for: &impl Fn(&str) -> Option<&'static str>,
     active_workspace_id: Option<&str>,
+    row_menu_open: bool,
     live_worktrees: &std::collections::HashSet<String>,
     ambient_by_path: &std::collections::HashMap<String, AmbientAgent>,
     diff_counts: &std::collections::HashMap<String, DiffCounts>,
@@ -374,7 +547,10 @@ pub(crate) fn render_workspace_block(
             row_group,
             !active_agent_wrap,
             multi_agent,
-            !is_primary,
+            crate::shell::left_rail::workspace_card::RowMenu {
+                show: !is_primary,
+                open: row_menu_open,
+            },
             locate_glow_seq,
             drag_config,
             rename_config,

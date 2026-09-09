@@ -256,6 +256,29 @@ impl WorkspaceRepo {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// List archived workspaces for a project, most recently archived first.
+    ///
+    /// The inverse of [`list_for_project`](Self::list_for_project), which hard-
+    /// filters `archived_at IS NULL`. Kept as a sibling rather than a flag on
+    /// the existing query because every other caller wants active rows only and
+    /// would have to opt out.
+    pub fn list_archived_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<Workspace>, StorageError> {
+        let rows = self.db.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned, comment, phase \
+                 FROM workspaces \
+                 WHERE project_id = ?1 AND archived_at IS NOT NULL \
+                 ORDER BY archived_at DESC",
+            )?;
+            let iter = stmt.query_map([project_id], WorkspaceRow::from_row)?;
+            iter.collect::<rusqlite::Result<Vec<_>>>()
+        })?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     pub fn mark_archived(&self, id: &str) -> Result<(), StorageError> {
         let ts = now();
         self.db.with_conn(|c| {
@@ -265,6 +288,57 @@ impl WorkspaceRepo {
             )
             .map(|_| ())
         })?;
+        Ok(())
+    }
+
+    /// Restore an archived workspace: clear `archived_at` and return `status`
+    /// to `'active'`. Every other column is untouched, so tint, pin,
+    /// `sort_order`, comment, phase and `linked_issue` survive the round trip.
+    ///
+    /// `archived_at` is the single source of truth for archived-ness; `status`
+    /// is written in lockstep only for the forward-extensibility reason its
+    /// column doc gives.
+    pub fn unarchive(&self, id: &str) -> Result<(), StorageError> {
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE workspaces SET archived_at = NULL, status = 'active' WHERE id = ?1",
+                [id],
+            )
+            .map(|_| ())
+        })?;
+        Ok(())
+    }
+
+    /// Rewrite the four fields a full rename moves together: display `name`,
+    /// `slug`, `branch` and `worktree_path`.
+    ///
+    /// One statement, so the row can never be left half-renamed — a row whose
+    /// `slug` and `branch` disagree is exactly the silent divergence a cosmetic
+    /// rename produced. Callers that only want the label keep using
+    /// [`rename`](Self::rename).
+    pub fn rename_full(
+        &self,
+        id: &str,
+        new_name: &str,
+        new_slug: &str,
+        new_branch: &str,
+        new_worktree_path: &str,
+    ) -> Result<(), StorageError> {
+        // `(project_id, slug)` is unique, and renaming onto a sibling's slug is
+        // a thing a user can do by hand. Without this mapping that arrives as a
+        // generic `Query` error, and the caller rolls the worktree and branch
+        // back reporting nothing the user can act on — the same collision the
+        // insert path has always named properly.
+        self.db
+            .with_conn(|c| {
+                c.execute(
+                    "UPDATE workspaces SET name = ?1, slug = ?2, branch = ?3, worktree_path = ?4 \
+                     WHERE id = ?5",
+                    params![new_name, new_slug, new_branch, new_worktree_path, id],
+                )
+                .map(|_| ())
+            })
+            .map_err(|e| classify_unique("workspaces", "project_id_slug", e))?;
         Ok(())
     }
 

@@ -246,6 +246,8 @@ pub(crate) async fn stream_provisioning(
         let line = match event {
             ProvisionEvent::IncludeCopied(p) => format!("include: copied {}", p.display()),
             ProvisionEvent::IncludeSkipped(skip) => format!("include: skipped {skip}"),
+            ProvisionEvent::FreshenStarted(branch) => format!("fetching {branch}…"),
+            ProvisionEvent::FreshenFinished(summary) => format!("== {summary}"),
             ProvisionEvent::SetupStarted(script) => format!("$ {script}"),
             ProvisionEvent::SetupLine(line) => line,
             ProvisionEvent::SetupFinished(outcome) => format!("== {}", outcome.summary()),
@@ -325,11 +327,67 @@ fn workspaces_with_primary_for(repo: &WorkspaceRepo, project: &Project) -> Vec<W
 /// live↔history merge consumes — each keyed as documented on those fields.
 type RailDbData = (
     HashMap<String, Vec<Workspace>>,
+    HashMap<String, Vec<Workspace>>,
     LatestStatusMap,
     HashMap<String, String>,
     HashMap<String, String>,
     HashMap<String, Vec<AgentSession>>,
 );
+
+/// Find the [`Project`] that owns `workspace`, by its `project_id` — NOT from
+/// `WorkspaceRoot::active_project`.
+///
+/// The rail renders every open project's groups at once, so a row the user
+/// clicks may belong to a project that is not active. Any handler that opens a
+/// git repository for a row must resolve through here: opening the active
+/// project's repo instead runs the row's git commands in the wrong repository
+/// (a force delete would run `git branch -D <other project's branch>` in this
+/// one). Returns `None` when the owning project is not open — the caller must
+/// then decline the action rather than fall back to whichever project happens
+/// to be active.
+pub(crate) fn resolve_project_for_workspace(
+    projects: &[Project],
+    workspace: &Workspace,
+) -> Option<Project> {
+    projects
+        .iter()
+        .find(|p| p.id == workspace.project_id)
+        .cloned()
+}
+
+
+
+
+/// Everything a workspace delete needs to name, resolved from the row.
+///
+/// This exists so the wrong-repository guard has something a test can hold.
+/// `request_delete_workspace` is GPUI-bound and cannot be driven from a unit
+/// test, so without this the only assertion possible would be on
+/// [`resolve_project_for_workspace`] — which a revert of the handler back to
+/// `self.active_project` would leave passing. Routing the handler through here
+/// means such a revert has to delete this function, and the test stops
+/// compiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceDeleteTarget {
+    /// The repository to open — the ROW's project root, never the active one.
+    project_root: PathBuf,
+    worktree_path: PathBuf,
+    branch: String,
+}
+
+/// Resolve what a delete of `workspace` should operate on, or `None` when its
+/// owning project is not open (decline rather than fall back).
+fn workspace_delete_target(
+    projects: &[Project],
+    workspace: &Workspace,
+) -> Option<WorkspaceDeleteTarget> {
+    let project = resolve_project_for_workspace(projects, workspace)?;
+    Some(WorkspaceDeleteTarget {
+        project_root: PathBuf::from(&project.root_path),
+        worktree_path: PathBuf::from(&workspace.worktree_path),
+        branch: workspace.branch.clone(),
+    })
+}
 
 fn gather_rail_db_data(
     workspace_repo: &WorkspaceRepo,
@@ -337,6 +395,12 @@ fn gather_rail_db_data(
     projects: &[Project],
 ) -> RailDbData {
     let mut workspaces_by_project: HashMap<String, Vec<Workspace>> =
+        HashMap::with_capacity(projects.len());
+    // Archived rows ride along in this same background pass rather than
+    // loading lazily on group expansion: the group header shows a count, so
+    // they are needed whether or not the group is open, and one extra indexed
+    // SELECT per project is noise beside the per-workspace session query below.
+    let mut archived_by_project: HashMap<String, Vec<Workspace>> =
         HashMap::with_capacity(projects.len());
     let mut latest_status: LatestStatusMap = HashMap::new();
     let mut latest_adapter: HashMap<String, String> = HashMap::new();
@@ -375,9 +439,18 @@ fn gather_rail_db_data(
             workspace_sessions.insert(workspace.id.clone(), sessions);
         }
         workspaces_by_project.insert(project.id.clone(), list);
+        let archived = match workspace_repo.list_archived_for_project(&project.id) {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(?err, project_id = %project.id, "list_archived_for_project failed");
+                Vec::new()
+            }
+        };
+        archived_by_project.insert(project.id.clone(), archived);
     }
     (
         workspaces_by_project,
+        archived_by_project,
         latest_status,
         latest_adapter,
         last_active,
@@ -807,6 +880,14 @@ impl WorkspaceRoot {
         self.palette
             .update(cx, |p, cx| p.invalidate_file_index(cx));
         let project_root = PathBuf::from(&project.root_path);
+        // `git config user.name` can be set per repository, so the branch
+        // prefix is a property of the project, not of the app. Re-resolve it
+        // on the switch; until it lands the previous project's answer stands,
+        // which is the same value the previews were already showing.
+        crate::git_settings::refresh_username(Some(project_root.clone()), cx);
+        // ...and tell the settings modal which repository its Git pane should
+        // preview against, so its branch line agrees with the dialog's.
+        self.settings_modal.update(cx, |m, _| m.set_project_root(Some(project_root.clone())));
         // Lazy-build the project's panes entity on first activation. Subsequent
         // switches just resolve the existing entity via `active_project_panes()`
         // — pane-group + tab state survives the switch.
@@ -817,6 +898,23 @@ impl WorkspaceRoot {
         self._project_panes_observer = Some(cx.observe(&panes, |_, _, cx| cx.notify()));
         defer_focus_active(window, cx, panes);
         cx.notify();
+
+        // A merge in this project may have left the user's uncommitted work in
+        // the stash stack. Re-offer to restore it until they act on it — the
+        // toast that first said so is long gone, and possibly so is the app
+        // session it appeared in. Deferred so it mounts after activation has
+        // settled rather than into the middle of it.
+        let weak_for_notices: WeakEntity<WorkspaceRoot> = cx.weak_entity();
+        let project_for_notices = project.clone();
+        window.defer(cx, move |window, cx| {
+            let _ = weak_for_notices.update(cx, |this, cx| {
+                this.offer_pending_stash_notices(&project_for_notices, window, cx);
+                // Replace the `"main"` placeholder written at project-add with
+                // what the repository actually says, so the `Merge into <x>`
+                // row is labelled — and gated — on a branch that exists.
+                this.heal_default_branch(&project_for_notices, window, cx);
+            });
+        });
 
         // Fast path: reuse a sidebar already built for this project this
         // session (cache-and-revalidate, like the terminal panes above)
@@ -967,6 +1065,23 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // An archived row is hidden, not open: it renders only inside a
+        // collapsed disclosure, it is absent from the flat list's live section,
+        // and the tab-strip tint resolves against active rows only. Activating
+        // one would leave the rail pointing at a workspace it cannot show as
+        // selected. Say so and make `Unarchive` the way back in, rather than
+        // swallowing the click.
+        if workspace.archived_at.is_some() {
+            crate::shell::toast::toast(
+                cx,
+                crate::shell::toast::ToastKind::Info,
+                format!(
+                    "\u{201c}{}\u{201d} is archived \u{2014} restore it first to open its worktree",
+                    workspace.name,
+                ),
+            );
+            return;
+        }
         // Switch to the owning project first so the correct ProjectPanes
         // is live before we search it for the worktree's tab.
         let already_active =
@@ -1378,8 +1493,22 @@ impl WorkspaceRoot {
             run: scripts.script(ScriptKind::Run).is_some(),
             cleanup: scripts.script(ScriptKind::Cleanup).is_some(),
         };
+        // The `Merge into <x>` row is labelled with the row's OWN project's
+        // default branch, not the active project's — the rail shows every
+        // project's workspaces at once, and merging into the wrong repository's
+        // main is the mistake Phase 1 already had to fix once for Delete.
+        let default_branch =
+            resolve_project_for_workspace(&self.app_state.recent_projects, &workspace)
+                .map(|p| p.default_branch)
+                .unwrap_or_default();
         self.row_menu
-            .update(cx, |m, cx| m.open(workspace, avail, x, y, cx));
+            .update(cx, |m, cx| m.open(workspace, avail, default_branch, x, y, cx));
+        // The rail suppresses the `…` trigger's tooltip while this is up. An
+        // already-visible tooltip is sticky — `occlude` stops new hovers, but
+        // clearing a live one needs a hover-out, which needs a mouse move, and
+        // the pointer is parked on the trigger the user just clicked.
+        self.left_rail
+            .update(cx, |rail, cx| rail.set_row_menu_open(true, cx));
     }
 
     /// Run a per-project lifecycle script (setup/run/cleanup) for `workspace`
@@ -1467,6 +1596,32 @@ impl WorkspaceRoot {
     /// `LeftRail`. Called at the top of `WorkspaceRoot::render` — LeftRail
     /// never reads `WorkspaceRoot` directly because doing so re-enters
     /// the entity slot during rendering and panics.
+    /// Worktree directories that currently have an open PTY tab (terminal or
+    /// agent), across every project whose panes have been built.
+    ///
+    /// Lifted out of [`Self::refresh_left_rail`] so it is callable from an
+    /// action handler, not only from the render path. The rail's green "live"
+    /// dot and `rename`'s in-use refusal must agree about what "live" means,
+    /// and they only do so by reading the same function — a second
+    /// implementation would drift and let the app refuse a rename for a
+    /// worktree it is simultaneously drawing as idle.
+    ///
+    /// Ambient (hand-launched) agents are NOT included here: they are detected
+    /// from terminal titles during the rail refresh and folded in there. A
+    /// caller that needs them too must add them, which
+    /// [`Self::rename_holders`] does.
+    pub(crate) fn live_worktree_paths(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> std::collections::HashSet<String> {
+        let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for panes in self.project_panes_by_project.values() {
+            live.extend(panes.read(cx).live_worktree_paths(cx));
+        }
+        live
+    }
+
+
     pub(crate) fn refresh_left_rail(&mut self, cx: &mut Context<Self>) {
         let projects = self.app_state.recent_projects.clone();
         let active_project_id = self.active_project.as_ref().map(|p| p.id.clone());
@@ -1476,19 +1631,25 @@ impl WorkspaceRoot {
         // panes have been built, so a worktree stays green while its session
         // lives even after switching to another project. Pure entity reads.
         let mut live_worktrees: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        for panes in self.project_panes_by_project.values() {
-            live_worktrees.extend(panes.read(cx).live_worktree_paths(cx));
-        }
+            self.live_worktree_paths(cx);
         // Workspace rows + latest agent statuses come from the rail caches
         // (gathered on the background executor by `mark_rail_dirty`) —
         // render never touches SQLite or stats the filesystem.
         let mut workspaces_by_project: HashMap<String, Vec<Workspace>> =
             HashMap::with_capacity(projects.len());
+        let mut archived_by_project: HashMap<String, Vec<Workspace>> =
+            HashMap::with_capacity(projects.len());
         for project in &projects {
             workspaces_by_project.insert(
                 project.id.clone(),
                 self.rail_workspaces_by_project
+                    .get(&project.id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            archived_by_project.insert(
+                project.id.clone(),
+                self.rail_archived_by_project
                     .get(&project.id)
                     .cloned()
                     .unwrap_or_default(),
@@ -1593,6 +1754,7 @@ impl WorkspaceRoot {
                 active_project_id,
                 active_workspace_id,
                 workspaces_by_project,
+                archived_by_project,
                 latest_status,
                 live_worktrees,
                 ambient_status,
@@ -1638,7 +1800,7 @@ impl WorkspaceRoot {
                 // All SQLite + the per-project `.git` stat run off the main
                 // thread (cx.spawn itself stays on the main thread — known
                 // footgun).
-                let (workspaces, statuses, adapters, last_active, sessions) = cx
+                let (workspaces, archived, statuses, adapters, last_active, sessions) = cx
                     .background_executor()
                     .spawn(async move {
                         gather_rail_db_data(&workspace_repo, &agent_repo, &projects)
@@ -1646,6 +1808,7 @@ impl WorkspaceRoot {
                     .await;
                 let run_again = weak.update(cx, |this, cx| {
                     this.rail_workspaces_by_project = workspaces;
+                    this.rail_archived_by_project = archived;
                     this.rail_latest_status = statuses;
                     this.rail_latest_adapter = adapters;
                     this.rail_last_active = last_active;
@@ -1742,7 +1905,7 @@ impl WorkspaceRoot {
                 );
             }
             WorkspaceDialogMode::Rename(workspace) => {
-                self.rename_workspace_now(*workspace, submit.name, cx);
+                self.rename_workspace_now(*workspace, submit.name, window, cx);
             }
         }
     }
@@ -1810,6 +1973,12 @@ impl WorkspaceRoot {
         let project_root = PathBuf::from(&project.root_path);
         let project_id = project.id.clone();
         let name_trimmed = name.trim().to_string();
+        // Resolved HERE, synchronously, from the same global the dialog's
+        // preview line read — so the branch the user was shown is the branch
+        // that gets made. Re-resolving inside the spawn would reintroduce the
+        // gap this phase closed.
+        let branch = crate::git_settings::branch_for_slug(&slug, Some(&project_root), cx);
+        let freshen_default = crate::git_settings::settings(cx).keep_default_up_to_date;
 
         cx.spawn(async move |weak, cx| {
             if let Some(parent) = worktree_path.parent()
@@ -1840,6 +2009,7 @@ impl WorkspaceRoot {
                 &project_id,
                 &name_trimmed,
                 &slug,
+                &branch,
                 &worktree_path,
                 linked_issue.as_deref(),
                 &workspace_repo,
@@ -1848,7 +2018,9 @@ impl WorkspaceRoot {
                 // Reclaim opted into here and nowhere else in the desktop:
                 // this path is host-derived under the data dir, and the flow
                 // above has already looked for a workspace row naming it.
-                &Provision::new(setup_decision, tx).reclaiming_orphans(),
+                &Provision::new(setup_decision, tx)
+                    .reclaiming_orphans()
+                    .freshening_default(freshen_default),
             )
             .await;
             // The sender is gone with `Provision`, so the drain has ended or is
@@ -2037,51 +2209,80 @@ impl WorkspaceRoot {
         .detach();
     }
 
-    /// Rename a workspace (DB only — no git or filesystem changes). Shared by
-    /// the rename dialog and the left rail's inline double-click rename, so the
-    /// trim + empty-guard + error-toast contract stays in one place.
-    pub(crate) fn rename_workspace_now(
+
+
+
+    /// Mount `prompt` as the modal confirm dialog and arrange its teardown.
+    ///
+    /// The observer, not the callbacks, clears `confirm_dialog`: a callback
+    /// that forgets leaves a dialog the user cannot dismiss, and every
+    /// resolution path (confirm, secondary, Escape, click-outside) passes
+    /// through the entity's own state.
+    pub(crate) fn mount_confirm_dialog(
         &mut self,
-        workspace: Workspace,
-        new_name: String,
+        prompt: ConfirmPrompt,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let new_name = new_name.trim();
-        if new_name.is_empty() {
-            return;
-        }
-        if let Err(err) = self
-            .app_state
-            .workspace_repo
-            .rename(&workspace.id, new_name)
-        {
-            tracing::warn!(?err, workspace_id = %workspace.id, "rename failed");
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let dialog = cx.new(|cx| ConfirmDialog::new(prompt, theme, density, typography, window, cx));
+        self._discard_dialog_observer = None;
+        self._discard_dialog_observer = Some(cx.observe_in(
+            &dialog,
+            window,
+            |root, dialog, _window, cx| {
+                let d = dialog.read(cx);
+                if d.is_confirmed() || d.is_cancelled() {
+                    root.confirm_dialog = None;
+                    root._discard_dialog_observer = None;
+                    cx.notify();
+                }
+            },
+        ));
+        self.confirm_dialog = Some(dialog);
+        cx.notify();
+    }
+
+
+
+
+    /// Restore an archived workspace to its project's active group.
+    ///
+    /// The worktree directory was never removed by `Archive`, so restoring is
+    /// a DB flip — but the directory may have been deleted by hand in the
+    /// meantime. Stat it first and say so, rather than producing a row that
+    /// looks live and cannot be activated.
+    pub(crate) fn unarchive_workspace(&mut self, workspace: Workspace, cx: &mut Context<Self>) {
+        if let Err(err) = self.app_state.workspace_repo.unarchive(&workspace.id) {
+            tracing::warn!(?err, workspace_id = %workspace.id, "unarchive failed");
             crate::shell::toast::toast_op_error(
                 cx,
-                &format!("Rename workspace \u{201c}{}\u{201d}", workspace.name),
+                &format!("Restore workspace \u{201c}{}\u{201d}", workspace.slug),
                 &err.to_string(),
+            );
+            return;
+        }
+        // The row is back either way; the toast tells the user the directory
+        // behind it is gone so they can Delete rather than wonder why nothing
+        // opens.
+        if !Path::new(&workspace.worktree_path).is_dir() {
+            crate::shell::toast::toast(
+                cx,
+                crate::shell::toast::ToastKind::Error,
+                format!(
+                    "Restored \u{201c}{}\u{201d}, but its worktree at {} is missing \u{2014} delete the row or recreate the worktree",
+                    workspace.slug, workspace.worktree_path,
+                ),
             );
         }
         self.mark_rail_dirty(cx);
         cx.notify();
     }
 
-    /// Open the rename dialog pre-filled with the workspace's current
-    /// name. Step 7's sidebar context menu will route here.
-    #[allow(dead_code)]
-    pub(crate) fn request_rename_workspace(
-        &mut self,
-        workspace: Workspace,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.workspace_dialog
-            .update(cx, |d, cx| d.open_rename(workspace, window, cx));
-    }
-
     /// Archive a workspace — `archived_at` + status='archived'. The
     /// sidebar will hide archived workspaces by default.
-    #[allow(dead_code)]
     pub(crate) fn archive_workspace(&mut self, workspace: Workspace, cx: &mut Context<Self>) {
         if let Err(err) = self.app_state.workspace_repo.mark_archived(&workspace.id) {
             tracing::warn!(?err, workspace_id = %workspace.id, "mark_archived failed");
@@ -2139,15 +2340,23 @@ impl WorkspaceRoot {
     /// therefore returns the NEXT attempt to a normal delete, which is
     /// intentional: the row still exists, so normal-first stays the
     /// default and force remains a deliberate two-step escalation.
-    #[allow(dead_code)]
     pub(crate) fn request_delete_workspace(
         &mut self,
         workspace: Workspace,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(project) = self.active_project.clone() else {
-            tracing::info!("request_delete_workspace: no active project, ignoring");
+        // Resolve the repository from the ROW's project, not the active one:
+        // the rail shows every project's rows, so deleting project `api`'s row
+        // while `web` is active would otherwise run `remove_worktree` — and on
+        // the force retry `git branch -D <api's branch>` — inside `web`.
+        let Some(target) = workspace_delete_target(&self.app_state.recent_projects, &workspace)
+        else {
+            tracing::info!(
+                workspace_id = %workspace.id,
+                project_id = %workspace.project_id,
+                "request_delete_workspace: workspace's project not open, ignoring"
+            );
             return;
         };
         // Second attempt after a failed worktree removal → the dialog
@@ -2158,14 +2367,16 @@ impl WorkspaceRoot {
         self.force_delete_offer = None;
         let weak: WeakEntity<WorkspaceRoot> = cx.weak_entity();
         let workspace_for_cb = workspace.clone();
-        let project_root = PathBuf::from(&project.root_path);
+        let target_for_cb = target.clone();
         let workspace_repo = self.app_state.workspace_repo.clone();
         let on_confirm: ConfirmCallback = std::rc::Rc::new(move |_window, cx| {
-            let project_root = project_root.clone();
+            let WorkspaceDeleteTarget {
+                project_root,
+                worktree_path,
+                branch,
+            } = target_for_cb.clone();
             let workspace_repo = workspace_repo.clone();
             let workspace = workspace_for_cb.clone();
-            let branch = workspace.branch.clone();
-            let worktree_path = PathBuf::from(&workspace.worktree_path);
             let weak = weak.clone();
             // Clear the confirm dialog up-front so the user can never get
             // stuck behind it on an early-return failure path (C1 — code-
@@ -2488,8 +2699,11 @@ impl WorkspaceRoot {
 
 #[cfg(test)]
 mod nav_history_tests {
-    use super::{WorkspaceNavRef, push_nav_entry, workspace_path_for_ambient_terminal};
-    use oximux_core::Workspace;
+    use super::{
+        WorkspaceNavRef, push_nav_entry, resolve_project_for_workspace, workspace_delete_target,
+        workspace_path_for_ambient_terminal,
+    };
+    use oximux_core::{Project, Workspace};
     use std::collections::HashMap;
 
     fn r(id: &str) -> WorkspaceNavRef {
@@ -2518,6 +2732,98 @@ mod nav_history_tests {
             phase: String::new(),
         }
     }
+
+    fn project(id: &str, root: &str) -> Project {
+        Project {
+            id: id.to_string(),
+            name: id.to_string(),
+            root_path: root.to_string(),
+            default_branch: "main".to_string(),
+            created_at: String::new(),
+            last_opened_at: None,
+            sort_order: 0.0,
+        }
+    }
+
+    fn workspace_in(project_id: &str, branch: &str) -> Workspace {
+        Workspace {
+            id: format!("ws-{project_id}"),
+            project_id: project_id.to_string(),
+            name: "w".to_string(),
+            slug: "w".to_string(),
+            branch: branch.to_string(),
+            worktree_path: format!("/wt/{project_id}"),
+            status: "active".to_string(),
+            created_at: String::new(),
+            archived_at: None,
+            linked_issue: None,
+            tint: None,
+            sort_order: 0.0,
+            pinned: false,
+            comment: String::new(),
+            phase: String::new(),
+        }
+    }
+
+    /// The rail renders every open project's rows at once, so a destructive row
+    /// action can be reached while a DIFFERENT project is active. Resolution
+    /// must follow the row, not the active project: otherwise deleting `api`'s
+    /// row while `web` is active opens `web`'s repository and the force retry
+    /// runs `git branch -D <api's branch>` inside `web`.
+    ///
+    /// This asserts on `workspace_delete_target` specifically because that is
+    /// what `WorkspaceRoot::request_delete_workspace` calls. The handler is
+    /// GPUI-bound and cannot be driven from here, so binding the test to the
+    /// function it actually uses is what makes a revert to `self.active_project`
+    /// fail rather than pass — that revert has to delete this function.
+    #[test]
+    fn delete_target_resolves_the_rows_own_project_not_the_active_one() {
+        let api = project("api", "/repos/api");
+        let web = project("web", "/repos/web");
+        // `web` is first — an "active project" fallback would pick it.
+        let open = vec![web.clone(), api.clone()];
+
+        let row = workspace_in("api", "oximux/api-fix");
+        let target = workspace_delete_target(&open, &row).expect("delete target");
+        assert_eq!(
+            target.project_root,
+            std::path::PathBuf::from("/repos/api"),
+            "the repository opened for this row must be its OWN project's"
+        );
+        assert_ne!(
+            target.project_root,
+            std::path::PathBuf::from(&web.root_path),
+            "never the active project's"
+        );
+        // The branch that `git branch -D` would take on the force retry, and
+        // the directory `remove_worktree` would take, both come from the row.
+        assert_eq!(target.branch, "oximux/api-fix");
+        assert_eq!(
+            target.worktree_path,
+            std::path::PathBuf::from("/wt/api")
+        );
+        assert_eq!(
+            resolve_project_for_workspace(&open, &row).map(|p| p.id),
+            Some(api.id)
+        );
+    }
+
+    /// When the owning project is not open, the action must decline rather than
+    /// silently fall through to another repository.
+    #[test]
+    fn unknown_project_yields_no_delete_target_rather_than_a_fallback() {
+        let open = vec![project("web", "/repos/web")];
+        let orphan = workspace_in("api", "oximux/api-fix");
+        assert!(workspace_delete_target(&open, &orphan).is_none());
+        assert!(resolve_project_for_workspace(&open, &orphan).is_none());
+    }
+
+
+
+
+
+
+
 
     #[test]
     fn append_advances_cursor() {

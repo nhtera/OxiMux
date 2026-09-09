@@ -571,6 +571,13 @@ impl Render for WorkspaceRoot {
                     );
                     let workspace_repo = this.app_state.workspace_repo.clone();
                     let project_id = project.id.clone();
+                    // The same resolved prefix the chat pill previewed with —
+                    // read synchronously here so the pill's `<prefix>/<slug>`
+                    // line and the branch this creates cannot disagree.
+                    let branch =
+                        crate::git_settings::branch_for_slug(&slug, Some(&project_root), cx);
+                    let freshen_default =
+                        crate::git_settings::settings(cx).keep_default_up_to_date;
                     cx.spawn(async move |weak_root, cx| {
                         use crate::shell::workspace_ops::{
                             ChatWorktreeOutcome, CreateOutcome, Provision,
@@ -589,6 +596,7 @@ impl Render for WorkspaceRoot {
                             &project_id,
                             &slug,
                             &slug,
+                            &branch,
                             &worktree_path,
                             None,
                             &workspace_repo,
@@ -608,7 +616,8 @@ impl Render for WorkspaceRoot {
                             &Provision::new(
                                 oximux_settings::SetupDecision::Inherit,
                                 provision_tx,
-                            ),
+                            )
+                            .freshening_default(freshen_default),
                         )
                         .await;
                         writer.await;

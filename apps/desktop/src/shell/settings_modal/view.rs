@@ -11,7 +11,7 @@ use oximux_settings::{Density, Typography};
 
 use super::{
     CARD_HEIGHT, CARD_WIDTH, SettingsModal, SettingsPane, layout, nav, pane_about, pane_agents,
-    pane_integrations, pane_keybindings, pane_notifications, pane_remote, pane_schedules,
+    pane_git, pane_integrations, pane_keybindings, pane_notifications, pane_remote, pane_schedules,
     pane_terminal, pane_voice,
 };
 #[cfg(any(target_os = "macos", windows))]
@@ -69,6 +69,10 @@ impl SettingsModal {
                     pane_remote::entries(self, theme, density, typography, cx),
                 ),
                 (
+                    SettingsPane::Git.label(),
+                    pane_git::entries(self, theme, density, typography, cx),
+                ),
+                (
                     SettingsPane::Integrations.label(),
                     pane_integrations::entries(self, theme, density, typography, cx),
                 ),
@@ -92,6 +96,7 @@ impl SettingsModal {
         }
 
         match self.selected {
+            SettingsPane::Git => pane_git::render(self, theme, density, typography, cx),
             SettingsPane::Terminal => pane_terminal::render(self, theme, density, typography, cx),
             SettingsPane::Agents => pane_agents::render(self, theme, density, typography, cx),
             SettingsPane::Voice => pane_voice::render(self, theme, density, typography, cx),
@@ -99,7 +104,7 @@ impl SettingsModal {
             SettingsPane::ScreenControl => {
                 pane_computer_use::render(self, theme, density, typography, cx)
             }
-            // Not reachable: the pane is absent from `SettingsPane::ALL` here.
+            // Not reachable: `offered()` withholds the pane here.
             #[cfg(not(any(target_os = "macos", windows)))]
             SettingsPane::ScreenControl => gpui::div().into_any_element(),
             SettingsPane::Notifications => {

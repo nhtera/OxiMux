@@ -140,6 +140,20 @@ impl GitOperation {
         }
     }
 
+    /// The operation's bare name, for prose that supplies its own verb
+    /// ("a rebase is already in progress"). Separate from
+    /// [`banner_label`](Self::banner_label), whose text is snapshot-tested in
+    /// the UI layer and therefore cannot be reshaped for a sentence.
+    pub fn noun(self) -> &'static str {
+        match self {
+            GitOperation::Merge => "merge",
+            GitOperation::Rebase => "rebase",
+            GitOperation::CherryPick => "cherry-pick",
+            GitOperation::Revert => "revert",
+            GitOperation::Bisect => "bisect",
+        }
+    }
+
     /// Whether the operation has a `--continue` step that resumes it after
     /// the user resolves conflicts. The sequencer operations (rebase,
     /// cherry-pick, revert) replay one commit at a time and pause on

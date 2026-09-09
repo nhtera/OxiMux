@@ -25,6 +25,7 @@ mod pane_computer_use;
 #[cfg(windows)]
 mod pane_driver_trust;
 mod pane_agents_launch;
+mod pane_git;
 mod pane_integrations;
 mod pane_keybindings;
 mod pane_notifications;
@@ -83,6 +84,28 @@ pub struct SettingsModal {
     pub(crate) terminal: TerminalSettings,
     /// Working copy of the AI commit-message settings; same contract.
     pub(crate) ai: CommitMessageAiSettings,
+    /// Working copy of the git settings; same contract, writing `git.toml`.
+    pub(crate) git: oximux_settings::git::GitSettings,
+    /// The window's active project root, pushed by [`WorkspaceRoot`] on every
+    /// project switch.
+    ///
+    /// The Git pane's branch preview needs it: `git config user.name` is
+    /// commonly set per repository, so previewing against the global config
+    /// would show one prefix while the New Workspace dialog — which does have
+    /// the root — shows another, for the same setting. Held per modal rather
+    /// than as a global because each window owns its own `SettingsModal` and
+    /// its own active project.
+    ///
+    /// `None` before any project is opened; the preview then falls back to the
+    /// global git config, which is the only thing there is to answer with.
+    pub(crate) project_root: Option<std::path::PathBuf>,
+    /// The custom-prefix field, lazily built on `open()` (it needs a `Window`).
+    pub(super) git_prefix_input: Option<Entity<InputState>>,
+    /// Live while the field exists.
+    pub(super) _git_prefix_sub: Option<Subscription>,
+    /// The custom prefix as it was at `open()`, so close can tell an
+    /// uncommitted edit from no edit at all.
+    pub(super) git_prefix_seed: String,
     /// Working copy of the rate-limit retry settings.
     pub(crate) retry: oximux_settings::agent_retry::AgentRetrySettings,
     /// Working copy of the per-agent launch defaults; reseeded from the live
@@ -321,6 +344,11 @@ impl SettingsModal {
             typography,
             terminal: TerminalSettings::default(),
             ai: CommitMessageAiSettings::default(),
+            git: oximux_settings::git::GitSettings::shipped(),
+            project_root: None,
+            git_prefix_input: None,
+            git_prefix_seed: String::new(),
+            _git_prefix_sub: None,
             retry: oximux_settings::agent_retry::AgentRetrySettings::shipped(),
             agent_launch: AgentLaunchSettings::default(),
             dictation: DictationSettings::default(),
@@ -400,6 +428,7 @@ impl SettingsModal {
             .try_global::<CommitMessageAiSettings>()
             .cloned()
             .unwrap_or_default();
+        self.git = crate::git_settings::settings(cx);
         self.retry = cx
             .try_global::<oximux_settings::agent_retry::AgentRetrySettings>()
             .copied()
@@ -490,6 +519,32 @@ impl SettingsModal {
                 }),
             );
         self.custom_words_input = Some(cw_input);
+
+        // Custom branch prefix. Same persist-on-commit contract as custom
+        // words: the working copy follows every keystroke — which is what the
+        // preview line renders from, so it updates as you type — but only
+        // blur/Enter writes `git.toml`, keeping typing off the filesystem.
+        let prefix_seed = self.git.custom_prefix.clone();
+        self.git_prefix_seed = prefix_seed.clone();
+        let prefix_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("e.g. oximux")
+                .default_value(prefix_seed)
+        });
+        self._git_prefix_sub = Some(cx.subscribe(
+            &prefix_input,
+            |this, input, ev: &InputEvent, cx| match ev {
+                InputEvent::Change => {
+                    this.git.custom_prefix = input.read(cx).value().to_string();
+                    // Repaint without persisting: the preview row reads
+                    // `this.git`, so this is the whole update path.
+                    cx.notify();
+                }
+                InputEvent::Blur | InputEvent::PressEnter { .. } => this.persist_git(cx),
+                _ => {}
+            },
+        ));
+        self.git_prefix_input = Some(prefix_input);
 
         // Agents pane's environment editor. Reset the selection first: a reopen
         // must not land on a profile deleted since, which would silently edit
@@ -706,6 +761,14 @@ impl SettingsModal {
         self._search_sub = None;
         self.custom_words_input = None;
         self._custom_words_sub = None;
+        // Same flush-before-drop hazard: typing a prefix then closing via
+        // ✕/Esc does not blur the field, and the working copy is only written
+        // on blur/Enter.
+        if self.git_prefix_input.is_some() && self.git.custom_prefix != self.git_prefix_seed {
+            self.persist_git(cx);
+        }
+        self.git_prefix_input = None;
+        self._git_prefix_sub = None;
         // Same flush-before-drop hazard as custom words: the working copy is
         // synced on every keystroke, but only blur/Enter writes the file, and
         // clicking dead space doesn't blur a gpui input. Without this, typing an
@@ -758,6 +821,26 @@ impl SettingsModal {
     pub(super) fn persist_terminal(&mut self, cx: &mut Context<Self>) {
         if let Err(err) = crate::terminal_settings::save(&self.terminal) {
             tracing::warn!(%err, "settings modal: failed to write terminal.toml");
+        }
+        cx.notify();
+    }
+
+    /// Point the Git pane's preview at this window's active project.
+    ///
+    /// Called on every project switch, not just the first: a window that
+    /// changes projects changes which repository's `user.name` the preview
+    /// should answer with.
+    pub(crate) fn set_project_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.project_root = root;
+    }
+
+    /// Persist the git working copy to `git.toml` and re-resolve the branch
+    /// prefix, so the pane's own preview line answers on the next frame.
+    pub(super) fn persist_git(&mut self, cx: &mut Context<Self>) {
+        let settings = self.git.clone();
+        self.git_prefix_seed = settings.custom_prefix.clone();
+        if let Err(err) = crate::git_settings::save(&settings, cx) {
+            tracing::warn!(%err, "settings modal: failed to write git.toml");
         }
         cx.notify();
     }

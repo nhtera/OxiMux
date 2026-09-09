@@ -48,7 +48,8 @@ pub use shell::agent_chat::clear_stale_screen_control_grants;
 pub use app_settings::{
     agent_launch_settings, agent_retry_settings, appearance_settings, auto_update_settings,
     commit_message_ai_settings,
-    computer_use_settings, dictation_settings, font_settings, keybindings_settings, motion_settings,
+    computer_use_settings, dictation_settings, font_settings, git_settings, keybindings_settings,
+    motion_settings,
     port_label_settings, scm_layout_settings, terminal_settings,
 };
 #[doc(inline)]

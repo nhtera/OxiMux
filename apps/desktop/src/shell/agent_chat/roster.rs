@@ -430,13 +430,21 @@ impl AgentChatView {
             return None;
         }
         let enabled = self.worktree_draft_enabled;
+        // An unbound draft's `cwd` IS the project root — the worktree it would
+        // create is cut there — so it is the root whose `user.name` decides
+        // the prefix.
+        let root = Some(self.cwd.as_path());
         let (hint, hint_is_error) = match self.worktree_slug_input.as_ref() {
             Some(input) if enabled => {
                 let slug_text = input.read(cx).value().to_string();
                 let trimmed = slug_text.trim();
+                // Same resolved prefix the create will use — see
+                // `git_settings::branch_for_slug`.
                 match validate_slug(trimmed) {
-                    Ok(()) if !trimmed.is_empty() => (format!("oximux/{trimmed}"), false),
-                    Ok(()) => ("oximux/…".to_string(), false),
+                    Ok(()) if !trimmed.is_empty() => {
+                        (crate::git_settings::branch_for_slug(trimmed, root, cx), false)
+                    }
+                    Ok(()) => (crate::git_settings::branch_for_slug("…", root, cx), false),
                     Err(err) => (err.to_string(), true),
                 }
             }
@@ -496,7 +504,13 @@ impl AgentChatView {
                 let branch = self
                     .worktree_slug_input
                     .as_ref()
-                    .map(|i| format!("oximux/{}", i.read(cx).value().trim()))
+                    .map(|i| {
+                        crate::git_settings::branch_for_slug(
+                            i.read(cx).value().trim(),
+                            Some(self.cwd.as_path()),
+                            cx,
+                        )
+                    })
                     .unwrap_or_else(|| "the branch".to_string());
                 let (headline, detail) = humanize_worktree_error(msg, &branch);
                 // Matches `error_card.rs`'s established failure look rather than

@@ -1044,4 +1044,25 @@ impl ProjectPanes {
         }
         set
     }
+
+    /// Directories with a live agent in them across this project's groups. See
+    /// `PaneGroupState::agent_cwds` for why terminals are excluded.
+    pub fn agent_cwds(&self, cx: &gpui::App) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for group in self.groups.values() {
+            out.extend(group.read(cx).agent_cwds());
+        }
+        out
+    }
+
+    /// Live working directory of every terminal PTY across this project's
+    /// groups. See `PaneGroupState::live_terminal_cwds` for why this is not the
+    /// same question as `live_worktree_paths`.
+    pub fn live_terminal_cwds(&self, cx: &gpui::App) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for group in self.groups.values() {
+            out.extend(group.read(cx).live_terminal_cwds(cx));
+        }
+        out
+    }
 }

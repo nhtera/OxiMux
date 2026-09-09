@@ -15,6 +15,7 @@ pub mod auto_update_settings;
 pub mod computer_use_settings;
 pub mod dictation_settings;
 pub mod font_settings;
+pub mod git_settings;
 pub mod keybindings_settings;
 pub mod motion_settings;
 pub mod port_label_settings;

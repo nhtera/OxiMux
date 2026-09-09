@@ -149,6 +149,10 @@ pub struct LeftRail {
     /// down by `refresh_left_rail` alongside the rest of the snapshot.
     active_workspace_id: Option<String>,
     workspaces_by_project: HashMap<String, Vec<Workspace>>,
+    /// Each project's archived workspace rows, newest archived first. Rendered
+    /// as a collapsed `Archived (N)` disclosure below the project's active
+    /// rows; a project with none renders no header at all.
+    archived_by_project: HashMap<String, Vec<Workspace>>,
     latest_status: LatestStatusMap,
     /// Agents inferred live from plain-terminal OSC titles, keyed by worktree
     /// path (status + display name). A hand-launched agent (typed
@@ -192,6 +196,15 @@ pub struct LeftRail {
     /// clicking the "N agents" summary line; in-memory only (not persisted),
     /// and survives rail rebuilds since it lives on the entity.
     expanded_workspaces: HashSet<String>,
+    /// Project ids whose `Archived (N)` disclosure is open. Collapsed by
+    /// default so restoring visibility to already-archived rows is opt-in on
+    /// first expansion — nothing pops into view unbidden. In-memory only, like
+    /// [`Self::expanded_workspaces`].
+    expanded_archived: HashSet<String>,
+    /// A workspace row menu is open. Drives only one thing: suppressing the
+    /// `…` trigger's tooltip, which is sticky and would otherwise paint over
+    /// the menu's first item. See `workspace_card::RowMenu`.
+    row_menu_open: bool,
     /// The agent whose tab is the active pane, so its disclosure sub-row stays
     /// lit (the reference cockpit's focused-pane row). `None` when the active
     /// tab is not an agent surface. Pushed down with the snapshot.
@@ -291,6 +304,7 @@ impl LeftRail {
             active_project_id: None,
             active_workspace_id: None,
             workspaces_by_project: HashMap::new(),
+            archived_by_project: HashMap::new(),
             latest_status: HashMap::new(),
             ambient_status: HashMap::new(),
             latest_adapter: HashMap::new(),
@@ -301,6 +315,8 @@ impl LeftRail {
             last_active: HashMap::new(),
             workspace_agents: HashMap::new(),
             expanded_workspaces: HashSet::new(),
+            expanded_archived: HashSet::new(),
+            row_menu_open: false,
             focused_agent: None,
             width: px(density.w_left_rail),
             resizing: false,
@@ -337,26 +353,37 @@ impl LeftRail {
     /// Begin an inline rename of `workspace`: lazily create + focus the shared
     /// edit field, seed it with the current name, and select it for replace.
     /// Primary (synthesized) rows are not renamable and are ignored.
+    ///
+    /// Archived rows are ignored too. Their menu deliberately omits `Rename`,
+    /// and the archived section never renders the edit field — so without this
+    /// guard the double-click would focus an INVISIBLE input whose blur then
+    /// commits a rename the user could not see themselves typing.
     pub(crate) fn begin_rename_workspace(
         &mut self,
         workspace: Workspace,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if workspace.id.starts_with("primary:") {
+        if workspace.id.starts_with("primary:") || workspace.archived_at.is_some() {
             return;
         }
         // Lazily build the field (and wire its blur→commit) the first time.
         if self.rename_input.is_none() {
             let input = cx.new(|cx| InputState::new(window, cx));
-            let sub = cx.subscribe(&input, |this, _input, event: &InputEvent, cx| {
-                // Losing focus commits the edit — but only if a rename is still
-                // in flight (Enter/Escape clear it first, so their blur is a
-                // no-op and Escape stays a cancel).
-                if matches!(event, InputEvent::Blur) {
-                    this.commit_rename(cx);
-                }
-            });
+            // `subscribe_in` rather than `subscribe`: committing a rename can
+            // now refuse and raise a dialog, which needs a window.
+            let sub = cx.subscribe_in(
+                &input,
+                window,
+                |this, _input, event: &InputEvent, window, cx| {
+                    // Losing focus commits the edit — but only if a rename is
+                    // still in flight (Enter/Escape clear it first, so their
+                    // blur is a no-op and Escape stays a cancel).
+                    if matches!(event, InputEvent::Blur) {
+                        this.commit_rename(window, cx);
+                    }
+                },
+            );
             self.rename_input = Some(input);
             self._rename_sub = Some(sub);
         }
@@ -373,7 +400,7 @@ impl LeftRail {
 
     /// Commit the in-flight inline rename via the shared rename path, then
     /// dismiss the field. No-op when nothing is being renamed.
-    pub(crate) fn commit_rename(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn commit_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = self.renaming_workspace.take() else {
             return;
         };
@@ -385,9 +412,9 @@ impl LeftRail {
         // Skip the DB write + rail refresh when nothing actually changed (e.g.
         // the field lost focus without an edit).
         if new_name.trim() != workspace.name {
-            let _ = self
-                .weak_root
-                .update(cx, |root, cx| root.rename_workspace_now(workspace, new_name, cx));
+            let _ = self.weak_root.update(cx, |root, cx| {
+                root.rename_workspace_now(workspace, new_name, window, cx)
+            });
         }
         cx.notify();
     }
@@ -804,6 +831,7 @@ impl LeftRail {
         active_project_id: Option<String>,
         active_workspace_id: Option<String>,
         workspaces_by_project: HashMap<String, Vec<Workspace>>,
+        archived_by_project: HashMap<String, Vec<Workspace>>,
         latest_status: LatestStatusMap,
         live_worktrees: HashSet<String>,
         ambient_status: HashMap<String, AmbientAgent>,
@@ -847,6 +875,7 @@ impl LeftRail {
             || self.active_project_id != active_project_id
             || self.active_workspace_id != active_workspace_id
             || self.workspaces_by_project != workspaces_by_project
+            || self.archived_by_project != archived_by_project
             || self.latest_status != latest_status
             || self.ambient_status != ambient_status
             || self.latest_adapter != latest_adapter
@@ -868,6 +897,7 @@ impl LeftRail {
         }
         self.active_workspace_id = active_workspace_id;
         self.workspaces_by_project = workspaces_by_project;
+        self.archived_by_project = archived_by_project;
         self.latest_status = latest_status;
         self.ambient_status = ambient_status;
         self.latest_adapter = latest_adapter;
@@ -897,6 +927,28 @@ impl LeftRail {
     pub(crate) fn toggle_workspace_expanded(&mut self, workspace_key: &str) {
         if !self.expanded_workspaces.remove(workspace_key) {
             self.expanded_workspaces.insert(workspace_key.to_string());
+        }
+    }
+
+    /// Flip one project's `Archived (N)` disclosure. Same shape and contract as
+    /// [`Self::toggle_workspace_expanded`]: the caller notifies.
+    /// Record that a row menu opened or closed.
+    ///
+    /// The rail's only use for this is suppressing the `…` trigger's tooltip
+    /// while the menu is up — an already-visible tooltip is sticky until a
+    /// mouse *move* produces a hover-out, and after clicking `…` the pointer
+    /// has not moved. See `workspace_card::RowMenu`.
+    pub(crate) fn set_row_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.row_menu_open == open {
+            return;
+        }
+        self.row_menu_open = open;
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_archived_expanded(&mut self, project_id: &str) {
+        if !self.expanded_archived.remove(project_id) {
+            self.expanded_archived.insert(project_id.to_string());
         }
     }
 
@@ -1062,6 +1114,7 @@ impl Render for LeftRail {
                 self.group_mode,
                 entity.clone(),
                 self.workspaces_by_project.clone(),
+                self.archived_by_project.clone(),
                 self.latest_status.clone(),
                 self.live_worktrees.clone(),
                 self.ambient_status.clone(),
@@ -1069,6 +1122,8 @@ impl Render for LeftRail {
                 self.diff_counts.clone(),
                 self.workspace_agents.clone(),
                 self.expanded_workspaces.clone(),
+                self.expanded_archived.clone(),
+                self.row_menu_open,
                 self.focused_agent.clone(),
                 self.weak_root.clone(),
                 self.locate_glow_seq,
@@ -1178,6 +1233,7 @@ fn render_workspace_list(
     group_mode: WorkspaceGroupMode,
     rail: gpui::Entity<LeftRail>,
     workspaces_by_project: HashMap<String, Vec<Workspace>>,
+    archived_by_project: HashMap<String, Vec<Workspace>>,
     latest_status: LatestStatusMap,
     live_worktrees: HashSet<String>,
     ambient_status: HashMap<String, AmbientAgent>,
@@ -1185,6 +1241,8 @@ fn render_workspace_list(
     diff_counts: HashMap<String, DiffCounts>,
     workspace_agents: WorkspaceAgentList,
     expanded_workspaces: HashSet<String>,
+    expanded_archived: HashSet<String>,
+    row_menu_open: bool,
     focused_agent: Option<RailAgentTarget>,
     weak_root: WeakEntity<WorkspaceRoot>,
     locate_glow_seq: u64,
@@ -1314,6 +1372,7 @@ fn render_workspace_list(
                 &latest_status_for,
                 &latest_adapter_for,
                 active_workspace_id.as_deref(),
+                row_menu_open,
                 &live_worktrees,
                 &ambient_status,
                 &diff_counts,
@@ -1333,6 +1392,36 @@ fn render_workspace_list(
                 typography,
             ));
         }
+        // One cross-project archived disclosure at the end of the flat list.
+        // Grouped mode nests one per project; flat mode has no project groups
+        // to nest under, and without this `Archive` would be a one-way door
+        // for anyone who prefers the flat rail.
+        let mut flat_archived: Vec<(Project, Workspace)> = Vec::new();
+        for project in projects.iter() {
+            if let Some(rows) = archived_by_project.get(&project.id) {
+                for w in rows {
+                    flat_archived.push((project.clone(), w.clone()));
+                }
+            }
+        }
+        // Newest archived first across every project, matching the per-project
+        // query's own `archived_at DESC`.
+        flat_archived.sort_by(|a, b| b.1.archived_at.cmp(&a.1.archived_at));
+        col = col.child(crate::shell::left_rail::project_group::render_archived_section(
+            crate::shell::left_rail::project_group::FLAT_ARCHIVED_KEY,
+            flat_archived,
+            expanded_archived
+                .contains(crate::shell::left_rail::project_group::FLAT_ARCHIVED_KEY),
+            active_workspace_id.as_deref(),
+            row_menu_open,
+            &rail,
+            &weak_root,
+            &on_row_menu,
+            compact,
+            theme,
+            density,
+            typography,
+        ));
         return col.into_any_element();
     }
 
@@ -1356,6 +1445,11 @@ fn render_workspace_list(
         };
         let is_active = active_project_id.as_deref() == Some(project.id.as_str());
         let is_collapsed = collapsed.contains(&project.id);
+        let archived = archived_by_project
+            .get(&project.id)
+            .cloned()
+            .unwrap_or_default();
+        let archived_expanded = expanded_archived.contains(&project.id);
         let plan = build_project_group_plan(&project, &workspaces, is_active, is_collapsed);
 
         let status_for_group = latest_status.clone();
@@ -1398,9 +1492,12 @@ fn render_workspace_list(
             project_index,
             sort_mode,
             workspaces,
+            archived,
+            archived_expanded,
             latest_status_for,
             latest_adapter_for,
             active_workspace_id.as_deref(),
+            row_menu_open,
             &live_worktrees,
             &ambient_status,
             &diff_counts,

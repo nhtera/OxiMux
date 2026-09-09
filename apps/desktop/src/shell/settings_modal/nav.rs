@@ -50,6 +50,8 @@ impl SettingsGroup {
 /// `Keybindings` is a read-only reference list.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SettingsPane {
+    /// Branch naming, worktree location, and default-branch freshness.
+    Git,
     Terminal,
     Agents,
     Voice,
@@ -66,26 +68,26 @@ pub enum SettingsPane {
 }
 
 impl SettingsPane {
-    /// The variant stays defined everywhere so navigation and the pane match
-    /// keep one shape; it is simply not offered where screen control does not
-    /// exist, rather than opening a pane that can only explain itself away.
+    /// Every pane this build knows about, in nav order.
     ///
-    /// Offered on Windows too, though what it opens is a different pane. Screen
-    /// control is not available there, but the decision the pane exists for —
-    /// approving an unsigned driver binary — is real, has to be made before the
-    /// feature can ever be turned on, and has nowhere else to live.
+    /// **One list, not two.** This used to be a pair of cfg-gated `ALL` arrays
+    /// with hardcoded lengths, which meant a Mac compiled only one of them:
+    /// adding a pane to the array you can see and forgetting the other
+    /// compiled clean locally and shipped a settings modal missing that pane
+    /// on Linux, with `nav_groups_are_contiguous` vouching for the arm it was
+    /// built for. Filtering one list at runtime removes the second place to
+    /// forget, and the length constants with it.
     ///
-    /// Ordered so that panes sharing a [`SettingsGroup`] are adjacent: the nav
+    /// Panes sharing a [`SettingsGroup`] must stay adjacent here: the nav
     /// emits a heading whenever the group changes between rows, so a pane
-    /// filed out of order would print its heading a second time.
-    /// `nav_groups_are_contiguous` holds that invariant — which matters most
-    /// for the next person adding a pane at the end of the list, where the
-    /// obvious place is the wrong one.
-    #[cfg(any(target_os = "macos", windows))]
-    pub(super) const ALL: [SettingsPane; 11] = [
+    /// filed out of order prints its heading twice. `nav_groups_are_contiguous`
+    /// holds that invariant — which matters most for the next person adding a
+    /// pane at the end of the list, where the obvious place is the wrong one.
+    const EVERY: [SettingsPane; 12] = [
         SettingsPane::Agents,
         SettingsPane::Voice,
         SettingsPane::ScreenControl,
+        SettingsPane::Git,
         SettingsPane::Terminal,
         SettingsPane::Schedules,
         SettingsPane::Remote,
@@ -96,19 +98,27 @@ impl SettingsPane {
         SettingsPane::About,
     ];
 
-    #[cfg(not(any(target_os = "macos", windows)))]
-    pub(super) const ALL: [SettingsPane; 10] = [
-        SettingsPane::Agents,
-        SettingsPane::Voice,
-        SettingsPane::Terminal,
-        SettingsPane::Schedules,
-        SettingsPane::Remote,
-        SettingsPane::Integrations,
-        SettingsPane::Appearance,
-        SettingsPane::Keybindings,
-        SettingsPane::Notifications,
-        SettingsPane::About,
-    ];
+    /// Whether this pane is offered on the platform being compiled.
+    ///
+    /// The variant stays defined everywhere so navigation and the pane match
+    /// keep one shape; it is simply not offered where screen control does not
+    /// exist, rather than opening a pane that can only explain itself away.
+    ///
+    /// Offered on Windows too, though what it opens is a different pane.
+    /// Screen control is not available there, but the decision the pane exists
+    /// for — approving an unsigned driver binary — is real, has to be made
+    /// before the feature can ever be turned on, and has nowhere else to live.
+    fn is_available(self) -> bool {
+        match self {
+            SettingsPane::ScreenControl => cfg!(any(target_os = "macos", windows)),
+            _ => true,
+        }
+    }
+
+    /// The panes this platform actually shows, in nav order.
+    pub(super) fn offered() -> Vec<SettingsPane> {
+        Self::EVERY.into_iter().filter(|p| p.is_available()).collect()
+    }
 
     /// Which section this pane files under.
     pub(super) fn group(self) -> SettingsGroup {
@@ -116,7 +126,8 @@ impl SettingsPane {
             SettingsPane::Agents | SettingsPane::Voice | SettingsPane::ScreenControl => {
                 SettingsGroup::Ai
             }
-            SettingsPane::Terminal
+            SettingsPane::Git
+            | SettingsPane::Terminal
             | SettingsPane::Schedules
             | SettingsPane::Remote
             | SettingsPane::Integrations => SettingsGroup::Workspace,
@@ -129,6 +140,7 @@ impl SettingsPane {
 
     pub(super) fn label(self) -> &'static str {
         match self {
+            SettingsPane::Git => "Git & Source Control",
             SettingsPane::Terminal => "Terminal",
             SettingsPane::Agents => "Agents / AI",
             SettingsPane::Voice => "Voice",
@@ -154,6 +166,7 @@ impl SettingsPane {
     /// `keyboard.svg`.
     fn icon_path(self) -> &'static str {
         match self {
+            SettingsPane::Git => "icons/git-branch.svg",
             SettingsPane::Terminal => "icons/square-terminal.svg",
             SettingsPane::Agents => "icons/sparkles.svg",
             SettingsPane::Voice => "icons/mic.svg",
@@ -200,7 +213,7 @@ pub(super) fn render_nav(
     // grouping into buckets keeps the row indices — and so the element ids —
     // identical to the flat list.
     let mut prev: Option<SettingsGroup> = None;
-    for (idx, pane) in SettingsPane::ALL.into_iter().enumerate() {
+    for (idx, pane) in SettingsPane::offered().into_iter().enumerate() {
         let group = pane.group();
         if prev != Some(group) {
             col = col.child(group_heading(group, theme, density, typography));
@@ -315,11 +328,37 @@ mod tests {
     /// heading a second time further down the list. Ordering is the invariant
     /// that keeps one heading per group, and it is easy to break by adding a
     /// pane in the "obvious" place at the end of `ALL`.
+    /// Nothing but Computer use may be platform-gated, and the Git pane in
+    /// particular must appear everywhere.
+    ///
+    /// The old failure this replaces: two cfg-gated arrays meant a pane could
+    /// be added to the one your machine compiles and missed in the other,
+    /// shipping a settings modal without it on Linux. There is one list now,
+    /// so that specific mistake is unrepresentable — this guards the filter
+    /// that survived.
+    #[test]
+    fn only_the_platform_specific_pane_is_ever_withheld() {
+        // Screen control is the only pane that is ever withheld, so on the
+        // platforms that offer it the two lists are identical, and on the
+        // ones that do not they differ by exactly that pane.
+        let offered = SettingsPane::offered();
+        let withheld: Vec<SettingsPane> =
+            SettingsPane::EVERY.into_iter().filter(|p| !offered.contains(p)).collect();
+        assert!(
+            withheld.iter().all(|p| matches!(p, SettingsPane::ScreenControl)),
+            "a pane other than Computer use is being withheld: {withheld:?}"
+        );
+        assert!(
+            offered.contains(&SettingsPane::Git),
+            "the Git pane must be offered on every platform"
+        );
+    }
+
     #[test]
     fn nav_groups_are_contiguous() {
         let mut seen: Vec<SettingsGroup> = Vec::new();
         let mut prev: Option<SettingsGroup> = None;
-        for pane in SettingsPane::ALL {
+        for pane in SettingsPane::offered() {
             let group = pane.group();
             if prev != Some(group) {
                 assert!(
@@ -345,7 +384,7 @@ mod tests {
             SettingsGroup::App,
         ] {
             assert!(
-                SettingsPane::ALL.iter().any(|p| p.group() == group),
+                SettingsPane::offered().iter().any(|p| p.group() == group),
                 "{group:?} has no panes"
             );
         }
@@ -355,7 +394,7 @@ mod tests {
     /// unreachable rather than merely hidden.
     #[test]
     fn every_pane_is_reachable_and_labelled() {
-        for pane in SettingsPane::ALL {
+        for pane in SettingsPane::offered() {
             assert!(!pane.label().is_empty());
             assert!(!pane.icon_path().is_empty());
         }

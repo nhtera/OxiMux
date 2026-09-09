@@ -7,6 +7,14 @@
 //! BOTH the clean-merge and conflict paths so the caller can always restore
 //! the pre-merge state.
 //!
+//! The caller is the desktop's `Merge into <default>` row action
+//! (`apps/desktop/src/shell/workspace/merge_ops.rs`), which merges a
+//! worktree's branch into the project's default branch by opening a
+//! `Repository` at the PROJECT ROOT — `merge_branch` merges the named branch
+//! into the repository it is called on, so opening the worktree instead would
+//! merge main into the feature branch. The pre-flight that guards it lives in
+//! `oximux-worktree-ops::merge`.
+//!
 //! Error-recovery contract (locked 2026-05-17, Q1):
 //! When the merge fails with a NonZero exit (e.g. unknown branch) AFTER an
 //! auto-stash was pushed, we pop the stash before returning `Err`. Atomic:
@@ -19,6 +27,15 @@ use crate::process::GitCmd;
 use crate::repository::Repository;
 use oximux_core::{MergeOutcome, StashRef};
 use std::path::PathBuf;
+
+/// The `-m` text `merge_branch` gives its auto-stash.
+///
+/// Public because it is the only durable handle on that stash: `StashRef.index`
+/// renumbers, so a caller that has to point a user back at a stash minutes or
+/// hours later must match `git stash list` on this string. Hard-coding it a
+/// second time at the call site would let the two drift apart silently, and the
+/// symptom would be a recovery notice that can never resolve.
+pub const AUTO_STASH_MESSAGE: &str = "oximux: auto-stash before merge";
 
 impl Repository {
     /// Merge `branch` into the current HEAD with auto-stash recovery.
@@ -36,7 +53,7 @@ impl Repository {
         }
         let auto_stash = if self.is_dirty().await? {
             Some(
-                self.stash_push(Some("oximux: auto-stash before merge"), false)
+                self.stash_push(Some(AUTO_STASH_MESSAGE), false)
                     .await?,
             )
         } else {
@@ -100,6 +117,39 @@ impl Repository {
             });
         }
         Err(GitError::NonZero { code, stderr })
+    }
+
+    /// Is `ancestor` reachable from `descendant`? (`git merge-base
+    /// --is-ancestor`.)
+    ///
+    /// The merge pre-flight's "nothing to merge" test: when the worktree
+    /// branch is already an ancestor of the default branch, merging it would
+    /// report `AlreadyUpToDate` after mutating nothing — but it would still
+    /// auto-stash a dirty tree on the way there. Answering the question first
+    /// means a no-op merge never touches the user's working tree.
+    ///
+    /// Exit 1 is git's honest "no", not a failure, so it maps to `Ok(false)`.
+    /// Any other non-zero (an unknown ref, a broken repo) stays an error —
+    /// treating those as "no" would silently run a merge the caller believed
+    /// it had ruled out.
+    pub async fn is_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        if ancestor.is_empty() || descendant.is_empty() {
+            return Err(GitError::invalid_input("revision is empty"));
+        }
+        let raw = GitCmd::new(self.workdir())
+            .args(["merge-base", "--is-ancestor", ancestor, descendant])
+            .run_raw()
+            .await?;
+        if raw.status.success() {
+            return Ok(true);
+        }
+        match raw.status.code() {
+            Some(1) => Ok(false),
+            code => Err(GitError::NonZero {
+                code: code.unwrap_or(-1),
+                stderr: trim_stderr_lossy(&raw.stderr),
+            }),
+        }
     }
 
     /// Files that still have unresolved conflict markers, per
