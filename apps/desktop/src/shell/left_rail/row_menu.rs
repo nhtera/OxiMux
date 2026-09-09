@@ -204,7 +204,35 @@ impl WorkspaceRowMenu {
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.open_for = None;
+        self.release_trigger_tooltip(cx);
         cx.notify();
+    }
+
+    /// Hand the `…` trigger's tooltip back to the rail, once this menu is
+    /// really closed. Paired with the suppression in
+    /// [`WorkspaceRoot::open_row_menu`].
+    ///
+    /// **Deferred, and re-checked.** Deferred because `close` is also called
+    /// from inside `WorkspaceRoot`'s own update (`close_modal_overlays`), and
+    /// reaching back into an entity that is mid-update aborts. Re-checked
+    /// because opening any row menu closes the others first: without the
+    /// re-check this clear would land *after* the new menu opened and
+    /// un-suppress the very tooltip it exists to hide.
+    fn release_trigger_tooltip(&self, cx: &mut Context<Self>) {
+        let this = cx.weak_entity();
+        let weak_root = self.weak_root.clone();
+        cx.defer(move |cx| {
+            let reopened = this
+                .upgrade()
+                .is_some_and(|menu| menu.read(cx).is_open());
+            if reopened {
+                return;
+            }
+            let _ = weak_root.update(cx, |root, cx| {
+                root.left_rail
+                    .update(cx, |rail, cx| rail.set_row_menu_open(false, cx));
+            });
+        });
     }
 
     fn dispatch(&self, action: WorkspaceRowAction, window: &mut Window, cx: &mut gpui::App) {

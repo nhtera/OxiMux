@@ -201,6 +201,10 @@ pub struct LeftRail {
     /// first expansion — nothing pops into view unbidden. In-memory only, like
     /// [`Self::expanded_workspaces`].
     expanded_archived: HashSet<String>,
+    /// A workspace row menu is open. Drives only one thing: suppressing the
+    /// `…` trigger's tooltip, which is sticky and would otherwise paint over
+    /// the menu's first item. See `workspace_card::RowMenu`.
+    row_menu_open: bool,
     /// The agent whose tab is the active pane, so its disclosure sub-row stays
     /// lit (the reference cockpit's focused-pane row). `None` when the active
     /// tab is not an agent surface. Pushed down with the snapshot.
@@ -312,6 +316,7 @@ impl LeftRail {
             workspace_agents: HashMap::new(),
             expanded_workspaces: HashSet::new(),
             expanded_archived: HashSet::new(),
+            row_menu_open: false,
             focused_agent: None,
             width: px(density.w_left_rail),
             resizing: false,
@@ -927,6 +932,20 @@ impl LeftRail {
 
     /// Flip one project's `Archived (N)` disclosure. Same shape and contract as
     /// [`Self::toggle_workspace_expanded`]: the caller notifies.
+    /// Record that a row menu opened or closed.
+    ///
+    /// The rail's only use for this is suppressing the `…` trigger's tooltip
+    /// while the menu is up — an already-visible tooltip is sticky until a
+    /// mouse *move* produces a hover-out, and after clicking `…` the pointer
+    /// has not moved. See `workspace_card::RowMenu`.
+    pub(crate) fn set_row_menu_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.row_menu_open == open {
+            return;
+        }
+        self.row_menu_open = open;
+        cx.notify();
+    }
+
     pub(crate) fn toggle_archived_expanded(&mut self, project_id: &str) {
         if !self.expanded_archived.remove(project_id) {
             self.expanded_archived.insert(project_id.to_string());
@@ -1104,6 +1123,7 @@ impl Render for LeftRail {
                 self.workspace_agents.clone(),
                 self.expanded_workspaces.clone(),
                 self.expanded_archived.clone(),
+                self.row_menu_open,
                 self.focused_agent.clone(),
                 self.weak_root.clone(),
                 self.locate_glow_seq,
@@ -1222,6 +1242,7 @@ fn render_workspace_list(
     workspace_agents: WorkspaceAgentList,
     expanded_workspaces: HashSet<String>,
     expanded_archived: HashSet<String>,
+    row_menu_open: bool,
     focused_agent: Option<RailAgentTarget>,
     weak_root: WeakEntity<WorkspaceRoot>,
     locate_glow_seq: u64,
@@ -1351,6 +1372,7 @@ fn render_workspace_list(
                 &latest_status_for,
                 &latest_adapter_for,
                 active_workspace_id.as_deref(),
+                row_menu_open,
                 &live_worktrees,
                 &ambient_status,
                 &diff_counts,
@@ -1391,6 +1413,7 @@ fn render_workspace_list(
             expanded_archived
                 .contains(crate::shell::left_rail::project_group::FLAT_ARCHIVED_KEY),
             active_workspace_id.as_deref(),
+            row_menu_open,
             &rail,
             &weak_root,
             &on_row_menu,
@@ -1474,6 +1497,7 @@ fn render_workspace_list(
             latest_status_for,
             latest_adapter_for,
             active_workspace_id.as_deref(),
+            row_menu_open,
             &live_worktrees,
             &ambient_status,
             &diff_counts,

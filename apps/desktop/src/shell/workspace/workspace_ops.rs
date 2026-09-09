@@ -1493,6 +1493,12 @@ impl WorkspaceRoot {
                 .unwrap_or_default();
         self.row_menu
             .update(cx, |m, cx| m.open(workspace, avail, default_branch, x, y, cx));
+        // The rail suppresses the `…` trigger's tooltip while this is up. An
+        // already-visible tooltip is sticky — `occlude` stops new hovers, but
+        // clearing a live one needs a hover-out, which needs a mouse move, and
+        // the pointer is parked on the trigger the user just clicked.
+        self.left_rail
+            .update(cx, |rail, cx| rail.set_row_menu_open(true, cx));
     }
 
     /// Run a per-project lifecycle script (setup/run/cleanup) for `workspace`
