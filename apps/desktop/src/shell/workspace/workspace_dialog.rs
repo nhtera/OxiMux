@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, Styled,
-    Subscription, Task, Window, div, px,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, px,
 };
 use gpui_component::{
     Disableable,
@@ -26,6 +26,7 @@ use oximux_core::{AgentAdapter, Project, Workspace};
 use oximux_git::derive_slug;
 use oximux_settings::{Density, SetupDecision, Theme, Typography};
 
+use crate::shell::workspace::base_choice::{BaseChoice, BaseMode};
 use crate::shell::forge::ref_parse::parse_forge_ref;
 use crate::shell::forge::{Forge, fetch_ref_title};
 use crate::ui::FloatingSurface;
@@ -83,6 +84,10 @@ pub struct WorkspaceDialogSubmit {
     /// ten-minute install, and a one-off can opt in, without editing a file
     /// the whole team shares.
     pub setup: SetupDecision,
+    /// What the worktree is cut from. Defaults to a new branch based on the
+    /// project's default branch — the answer that used to be "wherever the
+    /// main checkout's HEAD happened to be".
+    pub base: BaseChoice,
 }
 
 pub type OnSubmit = Box<dyn Fn(WorkspaceDialogSubmit, &mut Window, &mut App) + Send + 'static>;
@@ -102,6 +107,29 @@ pub struct WorkspaceDialog {
     agent_dropdown_open: bool,
     selected_setup: SetupDecision,
     setup_dropdown_open: bool,
+    /// The **From** control's state. See [`BaseChoice`].
+    base: BaseChoice,
+    /// Local branches, most-recent-first, as `list_branches` already sorts
+    /// them. Capped at [`MAX_BRANCH_CHOICES`]: a repo with thousands of refs
+    /// makes an uncapped dropdown useless, and the ones a person wants to base
+    /// work on are the ones they touched recently.
+    branches: Vec<String>,
+    from_dropdown_open: bool,
+    existing_dropdown_open: bool,
+    /// The setup-skip notice for the current base, shown BEFORE the user
+    /// commits — the same sentence provisioning would write afterwards.
+    base_warning: Option<String>,
+    /// Cancel-on-change token for the base-warning lookup, mirroring
+    /// `fetch_epoch`: a completed lookup only applies if its epoch is current.
+    ///
+    /// The branch list has **no** epoch and its own task slot. The two are
+    /// independent — the list depends on the project, the warning on the
+    /// selection — and sharing either would make choosing a base cancel the
+    /// fetch of the list you chose it from, leaving the dropdown empty for the
+    /// rest of the dialog's life.
+    base_epoch: u64,
+    _warning_load: Option<Task<()>>,
+    _branch_load: Option<Task<()>>,
     /// Forge reference the current name was prefilled from (`"#42"`).
     /// Cleared the moment the user edits the name again — their text wins.
     linked_issue: Option<String>,
@@ -158,6 +186,14 @@ impl WorkspaceDialog {
             agent_dropdown_open: false,
             selected_setup: SetupDecision::Inherit,
             setup_dropdown_open: false,
+            base: BaseChoice::default(),
+            branches: Vec::new(),
+            from_dropdown_open: false,
+            existing_dropdown_open: false,
+            base_warning: None,
+            base_epoch: 0,
+            _warning_load: None,
+            _branch_load: None,
             linked_issue: None,
             fetch_epoch: 0,
             fetching_title: false,
@@ -265,6 +301,8 @@ impl WorkspaceDialog {
         self.agent_dropdown_open = false;
         self.selected_setup = SetupDecision::Inherit;
         self.setup_dropdown_open = false;
+        self.reset_base();
+        self.reload_branches(cx);
         self.linked_issue = None;
         self.fetch_epoch += 1;
         self.fetching_title = false;
@@ -291,6 +329,7 @@ impl WorkspaceDialog {
         self.project_dropdown_open = false;
         self.agent_dropdown_open = false;
         self.setup_dropdown_open = false;
+        self.reset_base();
         let input_focus = self.name_input.read(cx).focus_handle(cx);
         window.focus(&input_focus, cx);
         cx.notify();
@@ -308,7 +347,23 @@ impl WorkspaceDialog {
         self.project_dropdown_open = false;
         self.agent_dropdown_open = false;
         self.setup_dropdown_open = false;
+        self.reset_base();
         cx.notify();
+    }
+
+    /// Clear the base selection and cancel anything in flight for it.
+    ///
+    /// The epoch bump is what makes this a cancel rather than a hope: a lookup
+    /// that lands after a close (or into a later open) finds its epoch stale
+    /// and applies nothing. Same contract as `fetch_epoch`.
+    fn reset_base(&mut self) {
+        self.base = BaseChoice::default();
+        self.from_dropdown_open = false;
+        self.existing_dropdown_open = false;
+        self.base_warning = None;
+        self.base_epoch += 1;
+        self._warning_load = None;
+        self._branch_load = None;
     }
 
     fn current_name(&self, cx: &App) -> String {
@@ -326,7 +381,11 @@ impl WorkspaceDialog {
             return false;
         }
         match &self.mode {
-            Some(WorkspaceDialogMode::Create) => self.selected_project.is_some(),
+            // Adopting a branch requires naming one — `is_complete` is the
+            // only state that can be half-made.
+            Some(WorkspaceDialogMode::Create) => {
+                self.selected_project.is_some() && self.base.is_complete()
+            }
             Some(WorkspaceDialogMode::Rename(_)) => true,
             None => false,
         }
@@ -346,6 +405,7 @@ impl WorkspaceDialog {
         };
         let agent = self.selected_agent;
         let setup = self.selected_setup;
+        let base = self.base.clone();
         let linked_issue = self.linked_issue.clone();
         self.close(cx);
         (self.on_submit)(
@@ -355,6 +415,7 @@ impl WorkspaceDialog {
                 project,
                 agent,
                 setup,
+                base,
                 linked_issue,
             },
             window,
@@ -404,6 +465,14 @@ impl Render for WorkspaceDialog {
         // derivation of the same rule.
         let project_root = self.selected_project.as_ref().map(|p| std::path::PathBuf::from(&p.root_path));
         let branch = crate::git_settings::branch_for_slug(&slug, project_root.as_deref(), cx);
+        // In existing-branch mode the name field no longer names the branch —
+        // the worktree adopts one. Previewing the minted `<prefix>/<slug>`
+        // there would promise a branch the create will never make.
+        let branch = match (&self.base.mode, self.base.existing.as_deref()) {
+            (BaseMode::ExistingBranch, Some(existing)) => existing.to_string(),
+            (BaseMode::ExistingBranch, None) => "—".to_string(),
+            (BaseMode::NewBranch, _) => branch,
+        };
         let slug_line = if self.fetching_title {
             format!("Branch: {branch} · fetching title…")
         } else if let Some(issue) = &self.linked_issue {
@@ -423,10 +492,8 @@ impl Render for WorkspaceDialog {
                 cx.stop_propagation();
                 // First Escape collapses an open dropdown; only a bare
                 // Escape dismisses the whole dialog.
-                if this.project_dropdown_open || this.agent_dropdown_open || this.setup_dropdown_open {
-                    this.project_dropdown_open = false;
-                    this.agent_dropdown_open = false;
-                    this.setup_dropdown_open = false;
+                if this.any_dropdown_open() {
+                    this.close_dropdowns();
                     cx.notify();
                 } else {
                     this.close(cx);
@@ -484,6 +551,7 @@ impl Render for WorkspaceDialog {
             );
 
         if is_create {
+            card = card.child(self.render_base_section(cx));
             card = card.child(self.render_agent_section(cx));
             card = card.child(self.render_setup_section(cx));
         }
@@ -605,8 +673,22 @@ impl WorkspaceDialog {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                let changed = this.selected_project.as_ref().map(|p| &p.id)
+                                    != Some(&p_clone.id);
                                 this.selected_project = Some(p_clone.clone());
                                 this.project_dropdown_open = false;
+                                // Everything under the Name field is keyed to a
+                                // project: the branch list, the chosen base, and
+                                // the ancestry notice. Carrying any of them across
+                                // a switch offers refs the new project does not
+                                // have — and in existing-branch mode it would submit
+                                // a branch name from the OLD repository, which fails
+                                // the create at best. `open_create` runs exactly
+                                // these two; a project change is the same event.
+                                if changed {
+                                    this.reset_base();
+                                    this.reload_branches(cx);
+                                }
                                 cx.notify();
                             }),
                         ),
@@ -683,6 +765,267 @@ impl WorkspaceDialog {
         col
     }
 
+
+    /// Whether any dropdown in the card is expanded. Escape collapses one
+    /// before it dismisses the dialog, so this has to know about all of them —
+    /// a new dropdown that forgets to register here makes Escape close the
+    /// whole dialog out from under an open list.
+    fn any_dropdown_open(&self) -> bool {
+        self.project_dropdown_open
+            || self.agent_dropdown_open
+            || self.setup_dropdown_open
+            || self.from_dropdown_open
+            || self.existing_dropdown_open
+    }
+
+    fn close_dropdowns(&mut self) {
+        self.project_dropdown_open = false;
+        self.agent_dropdown_open = false;
+        self.setup_dropdown_open = false;
+        self.from_dropdown_open = false;
+        self.existing_dropdown_open = false;
+    }
+
+    /// The selected project's default branch, or `""` when there is none to
+    /// read. Empty is a real answer here — see [`BaseChoice::resolve`].
+    fn default_branch(&self) -> &str {
+        self.selected_project
+            .as_ref()
+            .map(|p| p.default_branch.as_str())
+            .unwrap_or_default()
+    }
+
+    /// Reload the branch list for the selected project.
+    ///
+    /// On the background executor because `git branch --list` is a subprocess
+    /// and this is called from `open_create` — a synchronous read there would
+    /// stall the window on every ⌘N in a cold repository.
+    fn reload_branches(&mut self, cx: &mut Context<Self>) {
+        self.branches.clear();
+        let Some(project) = self.selected_project.clone() else {
+            return;
+        };
+        let project_id = project.id.clone();
+        let root = std::path::PathBuf::from(&project.root_path);
+        self._branch_load = Some(cx.spawn(async move |this, cx| {
+            let names = match oximux_git::Repository::open(&root).await {
+                Ok(repo) => repo
+                    .list_branches()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|b| b.name)
+                    .take(MAX_BRANCH_CHOICES)
+                    .collect::<Vec<_>>(),
+                // A project that is not a repository has no branches to offer.
+                // The From control still works: it falls back to the default
+                // branch, which is what an empty list means here.
+                Err(_) => Vec::new(),
+            };
+            let _ = this.update(cx, |d, cx| {
+                // Keyed on the project rather than an epoch: the only thing
+                // that invalidates a branch list is asking about a different
+                // project, and holding the slot means a later reload replaces
+                // this task rather than racing it.
+                if d.selected_project.as_ref().map(|p| p.id.as_str()) != Some(&project_id) {
+                    return;
+                }
+                d.branches = names;
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Recompute the setup-skip notice for the current base.
+    ///
+    /// Runs on every base change rather than once at submit, because the whole
+    /// point is to say so **before** the user commits. One `merge-base` per
+    /// change is acceptable on a user-driven control; it is not a polling path.
+    ///
+    /// **This asks the create path's own function.** An earlier draft
+    /// reimplemented the ancestry rule here, which is precisely how a preview
+    /// comes to promise one thing while the create does another — the same
+    /// failure `branch_name` was extracted to end. `setup_decision` returns the
+    /// decision *and* the sentence, so the dialog renders the string
+    /// provisioning would have written, not a paraphrase of it.
+    fn refresh_base_warning(&mut self, cx: &mut Context<Self>) {
+        self.base_warning = None;
+        self.base_epoch += 1;
+        let epoch = self.base_epoch;
+        let Some(project) = self.selected_project.clone() else {
+            return;
+        };
+        // No named base means nothing to warn about, and no subprocess to
+        // spend finding that out.
+        let Some(base) = self.base.resolve(String::new()) else {
+            return;
+        };
+        if base.named_base().is_none() {
+            return;
+        }
+        let default = project.default_branch.clone();
+        let root = std::path::PathBuf::from(&project.root_path);
+        self._warning_load = Some(cx.spawn(async move |this, cx| {
+            let Ok(repo) = oximux_git::Repository::open(&root).await else {
+                return;
+            };
+            let default = (!default.is_empty()).then_some(default);
+            let (_, reason) = oximux_worktree_ops::setup_decision(
+                &repo,
+                &base,
+                oximux_settings::SetupDecision::Inherit,
+                default.as_deref(),
+            )
+            .await;
+            let Some(reason) = reason else {
+                return;
+            };
+            let _ = this.update(cx, |d, cx| {
+                if d.base_epoch != epoch {
+                    return;
+                }
+                // Future tense here, past tense in the transcript — same rule,
+                // same refs, read at the moment each is true.
+                d.base_warning = Some(reason.replacen("Setup skipped:", "Setup will be skipped:", 1));
+                cx.notify();
+            });
+        }));
+    }
+
+    /// The **From** / **Existing branch** control, and the setup-skip notice
+    /// the current base implies.
+    ///
+    /// Sits directly under Name because it changes what the branch line above
+    /// it means: in existing-branch mode the name no longer names the branch.
+    fn render_base_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let density = self.density;
+        let typography = self.typography.clone();
+        let adopting = self.base.mode == BaseMode::ExistingBranch;
+
+        let segmented = div()
+            .flex()
+            .flex_row()
+            .gap(px(4.0))
+            .child(base_mode_tab(BaseMode::NewBranch, "New branch", adopting, theme, density, &typography, cx))
+            .child(base_mode_tab(BaseMode::ExistingBranch, "Existing branch", adopting, theme, density, &typography, cx));
+
+        let (label, trigger_id, open) = if adopting {
+            (
+                self.base
+                    .existing
+                    .as_deref()
+                    .unwrap_or("Choose a branch…")
+                    .to_string(),
+                "ws-dialog-existing-trigger",
+                self.existing_dropdown_open,
+            )
+        } else {
+            (
+                self.base.from_label(self.default_branch()).to_string(),
+                "ws-dialog-from-trigger",
+                self.from_dropdown_open,
+            )
+        };
+
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(
+                div()
+                    .text_size(px(typography.t_label_caps))
+                    .text_color(theme.fg_subtle)
+                    .child(if adopting { "Branch" } else { "From" }),
+            )
+            .child(segmented)
+            .child(
+                div()
+                    .id(trigger_id)
+                    .flex()
+                    .items_center()
+                    .h(px(FIELD_HEIGHT))
+                    .px(px(8.0))
+                    .bg(theme.bg_panel)
+                    .border_1()
+                    .border_color(theme.border_inactive)
+                    .rounded(px(density.r_xs))
+                    .cursor_pointer()
+                    .text_size(px(typography.t_body_sm))
+                    .text_color(theme.fg_base)
+                    .child(label)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                            let was = if adopting {
+                                this.existing_dropdown_open
+                            } else {
+                                this.from_dropdown_open
+                            };
+                            this.close_dropdowns();
+                            if adopting {
+                                this.existing_dropdown_open = !was;
+                            } else {
+                                this.from_dropdown_open = !was;
+                            }
+                            cx.notify();
+                        }),
+                    ),
+            );
+
+        if open {
+            let mut list = div()
+                .id("ws-dialog-branch-list")
+                .flex()
+                .flex_col()
+                .max_h(px(BRANCH_LIST_MAX_HEIGHT))
+                .overflow_y_scroll()
+                .bg(theme.bg_panel)
+                .border_1()
+                .border_color(theme.border_inactive)
+                .rounded(px(density.r_xs));
+            // "Default branch" is offered only when cutting a new branch:
+            // adopting one means naming it, and there is no default to adopt.
+            if !adopting {
+                list = list.child(branch_option_row(
+                    None,
+                    self.default_branch(),
+                    theme,
+                    &typography,
+                    cx,
+                ));
+            }
+            for (i, name) in self.branches.iter().enumerate() {
+                list = list.child(
+                    branch_option_row(Some((i, name.clone())), "", theme, &typography, cx),
+                );
+            }
+            if self.branches.is_empty() {
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .h(px(FIELD_HEIGHT))
+                        .px(px(8.0))
+                        .text_size(px(typography.t_body_sm))
+                        .text_color(theme.fg_muted)
+                        .child("no local branches"),
+                );
+            }
+            col = col.child(list);
+        }
+
+        if let Some(warning) = &self.base_warning {
+            col = col.child(
+                div()
+                    .text_size(px(typography.t_body_sm))
+                    .text_color(theme.status_warn)
+                    .child(warning.clone()),
+            );
+        }
+        col
+    }
+
     /// The per-request Setup override. Deliberately the last field: the
     /// default answer ("Project default") is right almost always, and putting
     /// it above the agent picker would make every create look like a decision
@@ -743,6 +1086,106 @@ impl WorkspaceDialog {
         }
         col
     }
+}
+
+
+/// Cap on the **From** dropdown. A repo with thousands of refs makes an
+/// uncapped list useless; `list_branches` sorts by `-committerdate`, so the
+/// survivors are the branches someone actually touched.
+const MAX_BRANCH_CHOICES: usize = 50;
+
+/// Keeps the branch list a list rather than a second modal.
+const BRANCH_LIST_MAX_HEIGHT: f32 = 220.0;
+
+/// One half of the New-branch / Existing-branch segmented control.
+fn base_mode_tab(
+    mode: BaseMode,
+    label: &'static str,
+    adopting: bool,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut Context<WorkspaceDialog>,
+) -> impl IntoElement {
+    let selected = (mode == BaseMode::ExistingBranch) == adopting;
+    div()
+        .id(("ws-dialog-base-mode", mode as usize))
+        .flex()
+        .items_center()
+        .h(px(FIELD_HEIGHT))
+        .px(px(10.0))
+        .cursor_pointer()
+        .rounded(px(density.r_xs))
+        .border_1()
+        .border_color(if selected { theme.border_active } else { theme.border_inactive })
+        .bg(if selected { theme.bg_panel } else { theme.bg_base })
+        .hover(|s| s.bg(theme.hover_overlay))
+        .text_size(px(typography.t_body_sm))
+        .text_color(if selected { theme.fg_base } else { theme.fg_muted })
+        .child(label)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                if this.base.mode == mode {
+                    return;
+                }
+                this.base.mode = mode;
+                this.close_dropdowns();
+                // The other mode's answer is deliberately kept, not cleared: a
+                // user toggling to look at the other list and back should find
+                // their choice where they left it. `BaseChoice::resolve` reads
+                // only the field its mode names, so the stale one cannot leak
+                // into the result.
+                this.refresh_base_warning(cx);
+                cx.notify();
+            }),
+        )
+}
+
+/// One row of the branch dropdown. `None` is the "default branch" row, which
+/// exists only in new-branch mode.
+fn branch_option_row(
+    branch: Option<(usize, String)>,
+    default_branch: &str,
+    theme: Theme,
+    typography: &Typography,
+    cx: &mut Context<WorkspaceDialog>,
+) -> impl IntoElement {
+    let (id, label, value) = match &branch {
+        Some((i, name)) => (i + 1, name.clone(), Some(name.clone())),
+        None => (
+            0,
+            if default_branch.is_empty() {
+                "Default branch (current checkout)".to_string()
+            } else {
+                format!("Default branch ({default_branch})")
+            },
+            None,
+        ),
+    };
+    div()
+        .id(("ws-dialog-branch-opt", id))
+        .flex()
+        .items_center()
+        .h(px(FIELD_HEIGHT))
+        .px(px(8.0))
+        .cursor_pointer()
+        .hover(|s| s.bg(theme.hover_overlay))
+        .text_size(px(typography.t_body_sm))
+        .text_color(theme.fg_base)
+        .child(label)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                match this.base.mode {
+                    BaseMode::ExistingBranch => this.base.existing = value.clone(),
+                    BaseMode::NewBranch => this.base.from = value.clone(),
+                }
+                this.close_dropdowns();
+                this.refresh_base_warning(cx);
+                cx.notify();
+            }),
+        )
 }
 
 /// Order matters: `Inherit` first because it is the default and the answer a
@@ -835,6 +1278,9 @@ mod tests {
         Workspace {
             id: "id".to_string(),
             project_id: "pid".to_string(),
+            // Not a branch OxiMux minted: a synthesized row or a
+            // fixture. `false` is the reading that never deletes.
+            branch_minted: false,
             name: "old".to_string(),
             slug: "old".to_string(),
             branch: "oximux/old".to_string(),
@@ -884,6 +1330,7 @@ mod tests {
             project: Some(project("p1", "Acme")),
             agent: Some(AgentAdapter::ClaudeCode),
             setup: SetupDecision::Inherit,
+            base: BaseChoice::default(),
             linked_issue: None,
         };
         assert_eq!(payload.mode, WorkspaceDialogMode::Create);
@@ -917,6 +1364,7 @@ mod tests {
             project: None,
             agent: None,
             setup: SetupDecision::Inherit,
+            base: BaseChoice::default(),
             linked_issue: None,
         };
         assert!(payload.project.is_none());

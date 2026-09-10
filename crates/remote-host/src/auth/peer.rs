@@ -97,6 +97,30 @@ impl Peer {
         }
     }
 
+    /// Whether this caller is a **full-scope operator on the local socket** —
+    /// somebody sitting at the machine, not a paired remote device and not a
+    /// session-confined agent.
+    ///
+    /// Not a capability, and never a substitute for one: every use sits *after*
+    /// an ACL predicate has already answered "may this peer do this at all",
+    /// and narrows a capability the peer demonstrably holds. It exists because
+    /// a small number of requests are safe to serve to somebody sitting at the
+    /// machine and not to a device across a network — naming a git ref the host
+    /// will resolve and check out is the first of them.
+    ///
+    /// Local authority is minted only by this crate's own serve path
+    /// ([`Peer::local`] is `pub(crate)`), so no remote handshake can claim it.
+    ///
+    /// **Full scope is part of the test, not an accident of the caller.** A
+    /// bare "is it local" would answer `true` for [`LocalScope::Session`] — a
+    /// confined agent, which is exactly the caller that scope exists to box in.
+    /// Today every use sits behind a predicate that already requires full
+    /// scope, so the distinction is invisible; naming it here is what keeps the
+    /// next use from inheriting a hole its author never looked for.
+    pub fn is_local_operator(&self) -> bool {
+        matches!(&self.0, PeerKind::Local(scope) if scope.is_full())
+    }
+
     /// The session this caller IS, when it is a confined agent.
     ///
     /// The one place a scope is read as a *value* rather than asked a yes/no

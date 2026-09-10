@@ -17,7 +17,9 @@ use oximux_remote_host::{
     registration_proof,
 };
 use oximux_remote_proto::Transport;
-use oximux_remote_proto::messages::{HelloReq, RegisterReq, WorktreeProgressWire, WorktreeWire};
+use oximux_remote_proto::messages::{
+    CreateBaseWire, HelloReq, RegisterReq, WorktreeProgressWire, WorktreeWire,
+};
 use oximux_remote_proto::proto::{Request, Response, RpcError};
 use oximux_remote_proto::testing::duplex_pair;
 
@@ -54,15 +56,25 @@ struct CountingWorktrees {
 
 #[async_trait::async_trait]
 impl WorktreeService for CountingWorktrees {
-    async fn create(&self, project_path: &str, slug: &str)
-    -> Result<WorktreeWire, WorktreeError> {
+    async fn create(
+        &self,
+        project_path: &str,
+        slug: &str,
+        base: &CreateBaseWire,
+    ) -> Result<WorktreeWire, WorktreeError> {
         self.creates.fetch_add(1, Ordering::SeqCst);
+        // The base is reflected into `branch` so a test can tell which mode the
+        // dispatcher actually forwarded — the counter alone cannot.
+        let branch = match base {
+            CreateBaseWire::Existing(name) => name.clone(),
+            CreateBaseWire::Default | CreateBaseWire::From(_) => format!("oximux/{slug}"),
+        };
         Ok(WorktreeWire {
             id: "wt-1".into(),
             project_path: project_path.into(),
             name: slug.into(),
             slug: slug.into(),
-            branch: format!("oximux/{slug}"),
+            branch,
             path: format!("/data/worktrees/{slug}"),
         })
     }

@@ -117,12 +117,24 @@ pub use crate::messages::*;
 /// asks for a cron heartbeat, and leaving them out means `HeartbeatWire` needs
 /// no degradation path at all.
 ///
+/// v24: appended **base refs on worktree creation** (`CreateWorktreeV2`,
+/// answered by the existing `WorktreeCreated`). Every worktree used to branch
+/// off whatever the main checkout's HEAD happened to be, which silently based
+/// new work on a half-finished feature branch. A new verb rather than a field
+/// on ordinal 43 for the usual reason, sharpened by postcard's non-descriptive
+/// framing: an appended `Option` costs a byte even when `None`, so a v24 client
+/// making a *plain* create would become undecodable to every v23 host — the
+/// common case broken by the rare one. `CreateWorktree` is untouched and still
+/// served, and the client gates on which verb to send. The V2 verb also carries
+/// a narrower authorization than its payload alone implies: see
+/// [`Request::CreateWorktreeV2`].
+///
 /// Appending variants is *not* a breaking change — postcard ordinals of the
 /// existing ones are untouched, and an older peer simply never sends or receives
 /// the new calls. So this bumps while the transport ALPN
 /// (`remote_iroh::OXIMUX_ALPN`) deliberately does not: that tracks breaking
 /// changes only, and bumping it would refuse otherwise-compatible peers.
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// The oldest peer whose event decoder knows `ThreadEvent::PermissionEdited`.
 ///
@@ -174,6 +186,21 @@ pub const TEAM_PER_ROLE_MIN_VERSION: u32 = 22;
 /// preset recurrence still works against any v10 host, so only `--cron` may
 /// require this.
 pub const SCHEDULE_CRON_MIN_VERSION: u32 = 23;
+
+/// The oldest host that understands a worktree base ref.
+///
+/// Read by the **client**, like [`TEAM_PER_ROLE_MIN_VERSION`] and
+/// [`SCHEDULE_CRON_MIN_VERSION`], and gated the same way: on what the command
+/// *asks for*, not on the verb family. A plain `worktree create` still goes out
+/// as [`Request::CreateWorktree`] and still works against any v16 host; only
+/// `--from` or `--branch` requires this, and only that form is refused by name
+/// against an older one.
+///
+/// Sending `CreateWorktreeV2` to a v23 host would not be a graceful
+/// downgrade — the host cannot decode an ordinal it does not know and answers
+/// [`RpcError::BadRequest`] with "undecodable request frame", a message about
+/// malformed bytes for what is really a version problem.
+pub const CREATE_WORKTREE_BASE_MIN_VERSION: u32 = 24;
 
 /// The oldest peer that can decode [`Response::ScheduleRunsChanged`]. Hosts
 /// must not push it to a connection whose declared version is older — see the
@@ -761,6 +788,29 @@ pub enum Request {
     /// [`ScheduleWire::recurrence`]), which is fine to *display* and wrong to
     /// reason about.
     ListSchedulesV2,
+    /// Create a worktree, naming what it is cut from.
+    ///
+    /// The v24 successor to [`Request::CreateWorktree`], same gate plus one:
+    /// a base other than [`CreateBaseWire::Default`] additionally requires a
+    /// **local** peer. `CreateWorktree`'s ordinal-43 payload is untouched and
+    /// still served, so an older client keeps working against a v24 host and a
+    /// v24 client sending `Default` could equally have sent either verb.
+    ///
+    /// **Why the extra gate.** Everything the worktree surface exposes today is
+    /// derived by the host from a project it already knows and a slug it
+    /// validates — the client never names a location or a ref. A base ref
+    /// breaks that: it is a string the host resolves and checks out, and the
+    /// worktree's own committed setup script is what provisioning then runs.
+    /// The unreviewed-ref guard in `oximux-worktree-ops` stops that script from
+    /// running by default, but the narrower property — *a paired device cannot
+    /// name a ref at all* — is worth keeping for peers that are not sitting at
+    /// the machine. A remote peer asking for a non-default base gets
+    /// [`RpcError::Unauthorized`].
+    CreateWorktreeV2 {
+        project_path: String,
+        slug: String,
+        base: CreateBaseWire,
+    },
 }
 
 /// Host → client.

@@ -203,6 +203,11 @@ pub(crate) fn chat_backend_for_profile(
 }
 
 pub struct WorkspaceRoot {
+    /// Cancel-on-supersede token for `add_project_from_drop`, which reads a
+    /// project's default branch in a spawn before registering it. Without this,
+    /// two folders dropped in quick succession activate whichever git call
+    /// returned first rather than the one dropped last.
+    pub(crate) drop_epoch: u64,
     pub(crate) theme: Theme,
     pub(crate) density: Density,
     pub(crate) typography: Typography,
@@ -1265,6 +1270,7 @@ impl WorkspaceRoot {
         // entities the original subscriptions would otherwise orphan.
 
         let mut this = Self {
+            drop_epoch: 0,
             theme,
             density,
             typography,

@@ -18,12 +18,12 @@ fn value_bearing_event() -> ThreadEvent {
 #[test]
 fn protocol_version_is_pinned() {
     assert_eq!(
-        PROTOCOL_VERSION, 23,
-        "v23 = cron schedules (CreateScheduleV2 / ListSchedulesV2, answered by \
-         ScheduleCreatedV2 / SchedulesV2). A fourth RecurrenceWire variant was not an \
-         option: that enum rides inside Vec<ScheduleWire> replies as well as inside \
-         CreateSchedule, so one cron schedule would make every ListSchedules reply \
-         undecodable for a pre-v23 peer — every row, not just the cron one"
+        PROTOCOL_VERSION, 24,
+        "v24 = worktree base refs (CreateWorktreeV2, answered by the existing \
+         WorktreeCreated). A field on CreateWorktree was not an option: postcard is \
+         not self-describing, so an appended Option costs a byte even when None — a \
+         v24 client making a PLAIN create would become undecodable to every v23 host, \
+         breaking the common case for the sake of the rare one"
     );
 }
 
@@ -533,6 +533,17 @@ fn early_variants_keep_their_literal_ordinals() {
     };
     assert_eq!(create_sched_v2.to_bytes().expect("encode")[0], 66);
     assert_eq!(Request::ListSchedulesV2.to_bytes().expect("encode")[0], 67);
+
+    // v24: worktree base refs — `CreateWorktreeV2` (68), answered by the
+    // existing `WorktreeCreated` (32). `CreateWorktree` (43) is pinned above
+    // and stays served; the two verbs are interchangeable when the base is
+    // `Default`, which is what lets the client gate on the verb.
+    let create_wt_v2 = Request::CreateWorktreeV2 {
+        project_path: String::new(),
+        slug: String::new(),
+        base: CreateBaseWire::Default,
+    };
+    assert_eq!(create_wt_v2.to_bytes().expect("encode")[0], 68);
     assert_eq!(Response::SchedulesV2(vec![]).to_bytes().expect("encode")[0], 50);
     let sched_v2 = ScheduleV2Wire {
         id: String::new(),

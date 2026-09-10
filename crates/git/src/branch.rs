@@ -162,6 +162,20 @@ impl Repository {
     /// Not `current_branch`: where HEAD happens to be is what a merge
     /// pre-flight *compares against*, so using it as the target would make that
     /// comparison vacuous.
+    /// **The returned name may have no local ref.** `origin/HEAD` names the
+    /// *remote's* default, and a worktree-centric checkout routinely has no
+    /// local `main` at all — the user deleted the branch they never sit on.
+    /// This still reports `main`, because that IS the project's default branch
+    /// and the name is what a merge target, a menu label, and an ancestry
+    /// comparison all want.
+    ///
+    /// A caller that needs something it can *check out* must resolve the name
+    /// first; `oximux_worktree_ops::resolvable_default` is that resolution, and
+    /// it tries the remote-tracking spelling before giving up. An earlier
+    /// attempt to verify `refs/heads/<name>` here instead was worse: it turned
+    /// "the default is main, held at origin/main" into `None`, and the create
+    /// path then based new work on whatever the checkout was parked on — the
+    /// exact defect base refs exist to close. Caught by live verification.
     pub async fn default_branch(&self) -> Result<Option<String>> {
         if let Ok(out) = GitCmd::new(self.workdir())
             .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])

@@ -580,7 +580,7 @@ impl Render for WorkspaceRoot {
                         crate::git_settings::settings(cx).keep_default_up_to_date;
                     cx.spawn(async move |weak_root, cx| {
                         use crate::shell::workspace_ops::{
-                            ChatWorktreeOutcome, CreateOutcome, Provision,
+                            ChatWorktreeOutcome, CreateBase, CreateOutcome, Provision,
                             create_workspace_with_rollback, provisioning_transcript_path,
                             stream_provisioning,
                         };
@@ -591,12 +591,19 @@ impl Render for WorkspaceRoot {
                         });
                         // `name` = slug: the human label derived from the branch
                         // slug (collision handled inside `insert`).
+                        // The project's default branch, not "wherever HEAD is" —
+                        // `new_branch` means exactly that, resolved with git at
+                        // create time. This path runs UNATTENDED (a chat pill
+                        // the user clicked once), so inheriting a half-finished
+                        // feature branch here is the defect with the fewest
+                        // ways for anyone to notice.
+                        let base = CreateBase::new_branch(branch);
                         let outcome = create_workspace_with_rollback(
                             &project_root,
                             &project_id,
                             &slug,
                             &slug,
-                            &branch,
+                            &base,
                             &worktree_path,
                             None,
                             &workspace_repo,

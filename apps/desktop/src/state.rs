@@ -243,7 +243,7 @@ mod tests {
 
         let project = project_repo.insert("p", "/p", "main").expect("project");
         let workspace = workspace_repo
-            .insert(&project.id, "ws", "ws", "oximux/ws", "/p/ws")
+            .insert(&project.id, "ws", "ws", "oximux/ws", "/p/ws", true)
             .expect("workspace");
         let alive_1 = agent_repo
             .insert(&workspace.id, "claude", None, None)
@@ -334,13 +334,13 @@ mod tests {
         let a = project_repo.insert("a", "/a", "main").expect("a");
         let b = project_repo.insert("b", "/b", "main").expect("b");
         workspace_repo
-            .insert(&a.id, "wa", "wa", "oximux/wa", "/a/wa")
+            .insert(&a.id, "wa", "wa", "oximux/wa", "/a/wa", true)
             .expect("wa");
         workspace_repo
-            .insert(&b.id, "wb1", "wb1", "oximux/wb1", "/b/wb1")
+            .insert(&b.id, "wb1", "wb1", "oximux/wb1", "/b/wb1", true)
             .expect("wb1");
         workspace_repo
-            .insert(&b.id, "wb2", "wb2", "oximux/wb2", "/b/wb2")
+            .insert(&b.id, "wb2", "wb2", "oximux/wb2", "/b/wb2", true)
             .expect("wb2");
 
         let state = hydrate(db).expect("hydrate");
@@ -357,7 +357,7 @@ mod tests {
         let agent_repo = AgentSessionRepo::new(db.clone());
         let project = project_repo.insert("p", "/p", "main").expect("project");
         let workspace = workspace_repo
-            .insert(&project.id, "ws", "ws", "oximux/ws", "/p/ws")
+            .insert(&project.id, "ws", "ws", "oximux/ws", "/p/ws", true)
             .expect("workspace");
         let session = agent_repo
             .insert(&workspace.id, "claude", None, None)

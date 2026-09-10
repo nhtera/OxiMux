@@ -48,6 +48,67 @@ default_tabs = ["server", "logs"]
 The manual **Run setup** row in the rail's context menu is unchanged and is
 still how you re-run setup in an existing worktree.
 
+## Verifying a change to any of this
+
+`scripts/live-verify-worktree.sh` drives the real `oximux serve` and
+`oximux worktree` against a real git repository:
+
+```sh
+cargo build -p oximux-cli
+./scripts/live-verify-worktree.sh
+```
+
+Run it after touching `crates/git/src/worktree.rs`, `crates/worktree-ops`, or
+the CLI's worktree verbs — **before** believing a green `cargo test`.
+
+The reason it exists is that this engine is a pile of `git` subprocesses whose
+behaviour depends on the *shape* of the repository they run in, and a fixture is
+a shape somebody chose. When base refs shipped, 5761 unit tests passed over a
+worktree being cut from the wrong branch entirely: every fixture had a local
+`main`, and the field frequently does not. So the repo the script builds is
+shaped like the failure — default branch only at `origin/main`, checkout parked
+on a feature branch, a second branch to adopt — and it asserts the things that
+actually broke, including that an adopted branch survives a delete.
+
+### An adopted branch is never deleted for you
+
+A worktree can check out a branch that already exists (`--branch <NAME>`, or
+**Existing branch** in the create dialog) instead of cutting a new one. When it
+does, OxiMux records that it did not create that branch — and every path that
+later removes the worktree leaves the branch alone, including **Force Delete**.
+
+Removing a worktree is not permission to delete the branch it was sitting on.
+For a worktree whose branch OxiMux minted (`<prefix>/<slug>`, the ordinary
+case), deletion still removes the branch as it always has: that branch has no
+life outside the worktree.
+
+Worktrees created before this shipped are all treated as minted, which is what
+they are — adopting a branch did not exist yet.
+
+### Setup is skipped on a base you have not reviewed
+
+Provisioning runs the worktree's **own committed** `scripts.toml`, so the
+script that runs is the one on the branch you are checking out — not the one on
+your default branch. That is safe while a worktree is cut from your own
+checkout, and it stops being safe the moment you base one on somebody else's
+branch: `--from origin/pr-4711` would otherwise run a contributor's script on
+your machine, unattended, on any project with `auto_setup = true`.
+
+So when the base is **not already part of your default branch**, setup is
+skipped and the reason is shown before you commit in the dialog, and written to
+the provisioning transcript afterwards:
+
+```
+Setup skipped: `pr-4711` is not based on `main`. Review the branch, then Run setup.
+```
+
+Read the script, then use **Run setup** from the row menu — or choose **Run
+setup** in the dialog, which overrides the guard deliberately. The skip is a
+default, not a prohibition.
+
+A base that *is* an ancestor of the default branch provisions exactly as
+before, and so does an ordinary create that names no base at all.
+
 > Do not put secrets in `scripts.toml`. It is meant to be committed, the same
 > trust boundary as `commands.toml`.
 

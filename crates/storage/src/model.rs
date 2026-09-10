@@ -68,6 +68,7 @@ pub struct WorkspaceRow {
     pub pinned: bool,
     pub comment: String,
     pub phase: String,
+    pub branch_minted: bool,
 }
 
 impl WorkspaceRow {
@@ -88,6 +89,7 @@ impl WorkspaceRow {
             pinned: row.get("pinned")?,
             comment: row.get("comment")?,
             phase: row.get("phase")?,
+            branch_minted: row.get("branch_minted")?,
         })
     }
 }
@@ -110,6 +112,7 @@ impl From<WorkspaceRow> for Workspace {
             pinned: r.pinned,
             comment: r.comment,
             phase: r.phase,
+            branch_minted: r.branch_minted,
         }
     }
 }

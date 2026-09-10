@@ -16,7 +16,7 @@ use oximux_remote_host::{
 use oximux_remote_local::{
     LocalClaim, LocalControlListener, generate_token, token_path, write_token_file,
 };
-use oximux_remote_proto::messages::{WorktreeProgressWire, WorktreeWire};
+use oximux_remote_proto::messages::{CreateBaseWire, WorktreeProgressWire, WorktreeWire};
 
 fn bin(runtime_dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_oximux-cli"));
@@ -72,15 +72,34 @@ struct StubWorktrees;
 
 #[async_trait::async_trait]
 impl WorktreeService for StubWorktrees {
-    async fn create(&self, project_path: &str, slug: &str)
-    -> Result<WorktreeWire, WorktreeError> {
+    async fn create(
+        &self,
+        project_path: &str,
+        slug: &str,
+        base: &CreateBaseWire,
+    ) -> Result<WorktreeWire, WorktreeError> {
+        // The stub reflects the base back into the row so the CLI tests can
+        // assert what actually crossed the wire. Without this the two modes are
+        // indistinguishable from the client side, and a `--from` that silently
+        // sent `Default` would pass every test.
+        let (branch, path) = match base {
+            CreateBaseWire::Default => {
+                (format!("oximux/{slug}"), format!("/stub/worktrees/{slug}"))
+            }
+            CreateBaseWire::From(r) => {
+                (format!("oximux/{slug}"), format!("/stub/worktrees/{slug}@{r}"))
+            }
+            CreateBaseWire::Existing(name) => {
+                (name.clone(), format!("/stub/worktrees/{slug}"))
+            }
+        };
         Ok(WorktreeWire {
             id: format!("wt-{slug}"),
             project_path: project_path.into(),
             name: slug.into(),
             slug: slug.into(),
-            branch: format!("oximux/{slug}"),
-            path: format!("/stub/worktrees/{slug}"),
+            branch,
+            path,
         })
     }
     async fn list(&self, _project_path: Option<&str>) -> Result<Vec<WorktreeWire>, WorktreeError> {

@@ -15,7 +15,7 @@
 //! RPC on this surface ever turns a client-supplied string into a filesystem
 //! path.
 
-use oximux_remote_proto::messages::{WorktreeProgressWire, WorktreeWire};
+use oximux_remote_proto::messages::{CreateBaseWire, WorktreeProgressWire, WorktreeWire};
 
 /// Why a worktree operation could not happen.
 ///
@@ -33,6 +33,15 @@ pub enum WorktreeError {
     /// A worktree (or branch) with that slug already exists for the project.
     #[error("a worktree with that name already exists")]
     AlreadyExists,
+    /// Adoption was asked for a name that is not a local branch.
+    ///
+    /// Client-fixable, so it must NOT collapse into [`Self::CreateFailed`]:
+    /// that arm answers `Internal("the worktree could not be created")`, which
+    /// tells a user who typed `--branch origin/main` nothing at all. Naming the
+    /// rule and the alternative is the difference between a dead end and a
+    /// correction — and `--from` is the verb that does what they meant.
+    #[error("no local branch by that name (a remote-tracking branch or a tag needs `--from`)")]
+    NoSuchLocalBranch,
     /// The create failed past validation. Detail is logged host-side.
     #[error("the worktree could not be created")]
     CreateFailed,
@@ -60,14 +69,25 @@ pub enum WorktreeError {
 #[async_trait::async_trait]
 pub trait WorktreeService: Send + Sync {
     /// Create a worktree under the project rooted at `project_path`, on a fresh
-    /// branch derived from `slug`. The implementation validates both arguments:
-    /// the project must resolve against its own records, and the slug must pass
-    /// the same validation the app's own UI applies.
+    /// branch derived from `slug`. The implementation validates every argument:
+    /// the project must resolve against its own records, the slug must pass the
+    /// same validation the app's own UI applies, and a named `base` must pass
+    /// the ref-name validation before it reaches `git`.
+    ///
+    /// `base` says what the worktree is cut from.
+    /// [`CreateBaseWire::Default`] is the pre-v24 behaviour and the only value
+    /// a non-local peer may ask for — the dispatcher enforces that, because the
+    /// authorization question ("may this peer name a ref?") is about the peer
+    /// and the implementation only sees the request.
     ///
     /// Returns the created row, whose `path` the caller may hand straight to a
     /// `CreateSession`.
-    async fn create(&self, project_path: &str, slug: &str)
-    -> Result<WorktreeWire, WorktreeError>;
+    async fn create(
+        &self,
+        project_path: &str,
+        slug: &str,
+        base: &CreateBaseWire,
+    ) -> Result<WorktreeWire, WorktreeError>;
 
     /// The worktrees of one project (or of every project when `None`).
     /// Synthesized primary rows (the project root itself) are **not** listed —

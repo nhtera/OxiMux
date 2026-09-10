@@ -235,6 +235,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "schedules_cron",
         sql: include_str!("../migrations/V028__schedules_cron.sql"),
     },
+    // V029: minted-vs-adopted, so a worktree that merely checked out somebody's
+    // existing branch does not have it force-deleted on the way out.
+    Migration {
+        version: 29,
+        name: "workspace_branch_minted",
+        sql: include_str!("../migrations/V029__workspace_branch_minted.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.
@@ -595,6 +602,55 @@ mod tests {
         assert_eq!(session.as_deref(), Some("s-1"), "existing data must survive");
         assert_eq!(agent, None, "an upgraded role names no agent");
         assert_eq!(model, None, "an upgraded role names no model");
+    }
+
+    /// The upgrade proof for V029: a worktree created before adoption existed
+    /// must open as **minted**, not adopted.
+    ///
+    /// The direction matters. `branch_minted` gates branch deletion, so a
+    /// pre-V029 row defaulting to `false` would silently stop cleaning up
+    /// branches OxiMux itself made — leaking a dangling branch per delete,
+    /// forever, with nothing to point at. `DEFAULT 1` is the correct reading of
+    /// history (adoption shipped with the column), not a convenience.
+    #[test]
+    fn a_pre_v029_workspace_upgrades_as_minted() {
+        let mut conn = mem_conn();
+        let upto_28: Vec<Migration> =
+            MIGRATIONS.iter().filter(|m| m.version <= 28).cloned().collect();
+        run_migrations(&mut conn, &upto_28).expect("ladder through V028");
+
+        conn.execute(
+            "INSERT INTO projects (id, name, root_path, default_branch, created_at) \
+             VALUES ('p-1', 'Acme', '/p', 'main', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("seed project");
+        conn.execute(
+            "INSERT INTO workspaces \
+             (id, project_id, name, slug, branch, worktree_path, status, created_at) \
+             VALUES ('ws-1', 'p-1', 'Feat', 'feat', 'oximux/feat', '/wt/feat', 'active', \
+                     '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("seed workspace");
+
+        // Guard against a vacuous test: V028 must not already have the column.
+        let has_column: bool = conn
+            .prepare("SELECT * FROM workspaces LIMIT 0")
+            .expect("prepare")
+            .column_names()
+            .contains(&"branch_minted");
+        assert!(
+            !has_column,
+            "V028 must not already have `branch_minted` — this test would be vacuous"
+        );
+
+        run_migrations(&mut conn, MIGRATIONS).expect("upgrade to head");
+
+        let minted: i64 = conn
+            .query_row("SELECT branch_minted FROM workspaces WHERE id = 'ws-1'", [], |r| r.get(0))
+            .expect("read back");
+        assert_eq!(minted, 1, "a pre-adoption worktree was minted by OxiMux");
     }
 
     /// The same upgrade proof for V028, on the table schedules live in: a

@@ -70,6 +70,8 @@ async fn fixture(slug: &str) -> Fixture {
             slug,
             &format!("oximux/{slug}"),
             &wt_path.to_string_lossy(),
+            // Minted: these tests are about renaming a worktree OxiMux made.
+            true,
         )
         .expect("workspace row");
 
@@ -478,6 +480,7 @@ async fn a_failure_at_the_row_step_walks_back_both_earlier_steps() {
             "fix-login",
             "oximux/already-taken",
             &new_path.to_string_lossy(),
+            true,
         )
         .expect("seed the sibling already holding the target slug");
 

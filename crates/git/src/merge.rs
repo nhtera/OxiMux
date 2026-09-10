@@ -137,7 +137,10 @@ impl Repository {
             return Err(GitError::invalid_input("revision is empty"));
         }
         let raw = GitCmd::new(self.workdir())
-            .args(["merge-base", "--is-ancestor", ancestor, descendant])
+            // `--` before the revisions: both are caller-supplied, and this is
+            // the one comparison that runs BEFORE `add_worktree_from`'s own
+            // validation on the create path.
+            .args(["merge-base", "--is-ancestor", "--", ancestor, descendant])
             .run_raw()
             .await?;
         if raw.status.success() {

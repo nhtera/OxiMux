@@ -18,7 +18,7 @@ fn fixture() -> (
 
     let p = projects.insert("Acme", "/r", "main").expect("project");
     let w = workspaces
-        .insert(&p.id, "F", "f", "oximux/f", "/wt/f")
+        .insert(&p.id, "F", "f", "oximux/f", "/wt/f", true)
         .expect("workspace");
     (w.id, panes, agents, db)
 }

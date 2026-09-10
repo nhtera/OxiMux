@@ -8,7 +8,9 @@
 use std::path::Path;
 use std::process::Command;
 
-use oximux_app::shell::workspace_ops::{CreateOutcome, Provision, create_workspace_with_rollback};
+use oximux_app::shell::workspace_ops::{
+    CreateBase, CreateOutcome, Provision, create_workspace_with_rollback,
+};
 use oximux_git::Repository;
 use oximux_storage::{ProjectRepo, WorkspaceRepo, open_memory};
 
@@ -44,6 +46,15 @@ fn branch_of(slug: &str) -> String {
     format!("{}/{slug}", oximux_settings::git::DEFAULT_PREFIX)
 }
 
+/// The base every pre-existing test in this file means: a new branch named the
+/// shipped way, cut where `git worktree add -b` used to cut it. Keeping these
+/// on `new_branch` rather than `new_branch_from` is deliberate — it is the
+/// no-start-point argv, so the guards these tests pin stay pinned against the
+/// same git invocation they were written for.
+fn base_of(slug: &str) -> CreateBase {
+    CreateBase::new_branch(branch_of(slug))
+}
+
 #[tokio::test]
 async fn rollback_on_insert_conflict_removes_worktree_and_branch() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -63,13 +74,7 @@ async fn rollback_on_insert_conflict_removes_worktree_and_branch() {
     // orchestration tries to insert after the git step.
     let slug = "fix-login";
     workspace_repo
-        .insert(
-            &project.id,
-            "Pre-existing",
-            slug,
-            "oximux/fix-login",
-            "/dummy",
-        )
+        .insert(&project.id, "Pre-existing", slug, "oximux/fix-login", "/dummy", true)
         .expect("pre-insert");
 
     let worktree_path = tmp.path().join("worktrees").join(slug);
@@ -79,7 +84,7 @@ async fn rollback_on_insert_conflict_removes_worktree_and_branch() {
         &project.id,
         "Fix Login",
         slug,
-        &branch_of(slug),
+        &base_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -133,7 +138,7 @@ async fn create_workspace_happy_path_inserts_row_and_keeps_worktree() {
         &project.id,
         "New Feat",
         slug,
-        &branch_of(slug),
+        &base_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -208,7 +213,7 @@ async fn a_failing_setup_script_rolls_back_worktree_branch_and_row() {
         &project.id,
         "Bad Setup",
         slug,
-        &branch_of(slug),
+        &base_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -280,7 +285,7 @@ async fn a_failing_setup_script_is_not_run_when_the_project_did_not_opt_in() {
         &project.id,
         "Opted Out",
         slug,
-        &branch_of(slug),
+        &base_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -326,7 +331,7 @@ async fn included_files_are_present_before_the_setup_script_runs() {
         &project.id,
         "With Env",
         slug,
-        &branch_of(slug),
+        &base_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -369,7 +374,7 @@ async fn an_include_pattern_matching_nothing_does_not_fail_creation() {
         &project.id,
         "No Match",
         slug,
-        &branch_of(slug),
+        &base_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -410,7 +415,7 @@ async fn an_orphaned_worktree_from_an_interrupted_create_is_reclaimed_on_retry()
         &project.id,
         "Interrupted",
         slug,
-        &branch_of(slug),
+        &base_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -432,7 +437,7 @@ async fn an_orphaned_worktree_from_an_interrupted_create_is_reclaimed_on_retry()
         &project.id,
         "Interrupted",
         slug,
-        &branch_of(slug),
+        &base_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -475,7 +480,7 @@ async fn reclaim_refuses_a_path_a_workspace_row_still_names() {
         &project.id,
         "Live Work",
         slug,
-        &branch_of(slug),
+        &base_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -493,7 +498,7 @@ async fn reclaim_refuses_a_path_a_workspace_row_still_names() {
         &project.id,
         "Live Work",
         slug,
-        &branch_of(slug),
+        &base_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -540,7 +545,7 @@ async fn a_caller_that_did_not_opt_in_never_has_its_path_reclaimed() {
         &project.id,
         "Mine",
         slug,
-        &branch_of(slug),
+        &base_of(slug),
         &worktree_path,
         None,
         &workspace_repo,
@@ -557,4 +562,554 @@ async fn a_caller_that_did_not_opt_in_never_has_its_path_reclaimed() {
         "not yours\n",
         "a non-opted-in create deleted a directory it did not own"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Base ref + existing branch (phase 2)
+// ---------------------------------------------------------------------------
+
+/// A repo whose committed setup script writes a marker file, plus a `side`
+/// branch that carries the same script but is NOT an ancestor of `main`.
+///
+/// The marker is the whole point: "did setup run" has to be a fact on disk,
+/// not an absence in a log. `create_workspace_with_rollback` reports a setup
+/// failure loudly and a setup *skip* quietly, so a test that only checked the
+/// outcome would pass whether or not the guard did anything.
+fn repo_with_a_marker_script_and_a_side_branch(root: &Path) {
+    init_repo(root);
+    commit_scripts(
+        root,
+        "auto_setup = true\nsetup = \"touch setup-ran.marker\"\n",
+    );
+    // `side` diverges: it commits something `main` does not have, so it is not
+    // an ancestor of `main` and reads as an unreviewed base.
+    run_git(root, &["checkout", "-q", "-b", "side"]);
+    std::fs::write(root.join("theirs.txt"), "contributed\n").expect("write");
+    run_git(root, &["add", "theirs.txt"]);
+    run_git(root, &["commit", "-m", "their work"]);
+    run_git(root, &["checkout", "-q", "main"]);
+}
+
+fn seed_project(root: &Path) -> (WorkspaceRepo, oximux_core::Project) {
+    let db = open_memory().expect("open memory");
+    let project_repo = ProjectRepo::new(db.clone());
+    let workspace_repo = WorkspaceRepo::new(db);
+    let project = project_repo
+        .insert("Acme", root.to_str().unwrap(), "main")
+        .expect("project");
+    (workspace_repo, project)
+}
+
+/// The guard: provisioning runs the *worktree's own committed* setup script,
+/// which is safe only while every worktree branches off the user's own HEAD.
+/// A base the user has not reviewed must not run its author's script.
+#[tokio::test]
+async fn a_base_that_is_not_an_ancestor_of_the_default_skips_the_setup_script() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path();
+    repo_with_a_marker_script_and_a_side_branch(project_root);
+    let (workspace_repo, project) = seed_project(project_root);
+
+    let slug = "review-theirs";
+    let worktree_path = tmp.path().join("worktrees").join(slug);
+    let outcome = create_workspace_with_rollback(
+        project_root,
+        &project.id,
+        "Review Theirs",
+        slug,
+        &CreateBase::new_branch_from(branch_of(slug), "side"),
+        &worktree_path,
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, CreateOutcome::Created(_)),
+        "the guard skips setup; it does not fail the create: {outcome:?}"
+    );
+    assert!(
+        !worktree_path.join("setup-ran.marker").exists(),
+        "an unreviewed base ran its own committed setup script"
+    );
+    // The worktree is real and based where it was asked to be — skipping setup
+    // must not have skipped the create.
+    assert!(worktree_path.join("theirs.txt").exists());
+}
+
+/// The other arm, and the one that proves the guard is not simply "never run
+/// setup any more": a base already contained in the default branch is one the
+/// user lives on, and provisioning is unchanged for it.
+#[tokio::test]
+async fn a_base_that_is_an_ancestor_of_the_default_still_runs_setup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path();
+    repo_with_a_marker_script_and_a_side_branch(project_root);
+    let (workspace_repo, project) = seed_project(project_root);
+
+    let slug = "ordinary";
+    let worktree_path = tmp.path().join("worktrees").join(slug);
+    let outcome = create_workspace_with_rollback(
+        project_root,
+        &project.id,
+        "Ordinary",
+        slug,
+        &CreateBase::new_branch_from(branch_of(slug), "main"),
+        &worktree_path,
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await;
+
+    assert!(matches!(outcome, CreateOutcome::Created(_)), "{outcome:?}");
+    assert!(
+        worktree_path.join("setup-ran.marker").exists(),
+        "a reviewed base must provision exactly as before"
+    );
+}
+
+/// The skip is a default, not a prohibition — `Run setup` from the row menu is
+/// how a user opts in after reading the script, and it has to actually win.
+#[tokio::test]
+async fn an_explicit_run_setup_overrides_the_unreviewed_base_guard() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path();
+    repo_with_a_marker_script_and_a_side_branch(project_root);
+    let (workspace_repo, project) = seed_project(project_root);
+
+    let slug = "opted-in";
+    let worktree_path = tmp.path().join("worktrees").join(slug);
+    let outcome = create_workspace_with_rollback(
+        project_root,
+        &project.id,
+        "Opted In",
+        slug,
+        &CreateBase::new_branch_from(branch_of(slug), "side"),
+        &worktree_path,
+        None,
+        &workspace_repo,
+        &Provision {
+            setup: oximux_settings::SetupDecision::Run,
+            ..Provision::default()
+        },
+    )
+    .await;
+
+    assert!(matches!(outcome, CreateOutcome::Created(_)), "{outcome:?}");
+    assert!(
+        worktree_path.join("setup-ran.marker").exists(),
+        "an explicit Run must override the guard"
+    );
+}
+
+/// The reason reaches whoever is watching. A silent skip is indistinguishable
+/// from a project with no setup script, which is exactly the confusion the
+/// event exists to prevent.
+#[tokio::test]
+async fn the_skip_reason_reaches_the_provisioning_transcript() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path();
+    repo_with_a_marker_script_and_a_side_branch(project_root);
+    let (workspace_repo, project) = seed_project(project_root);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let slug = "watched";
+    let worktree_path = tmp.path().join("worktrees").join(slug);
+    let outcome = create_workspace_with_rollback(
+        project_root,
+        &project.id,
+        "Watched",
+        slug,
+        &CreateBase::new_branch_from(branch_of(slug), "side"),
+        &worktree_path,
+        None,
+        &workspace_repo,
+        &Provision::new(oximux_settings::SetupDecision::Inherit, tx),
+    )
+    .await;
+    assert!(matches!(outcome, CreateOutcome::Created(_)), "{outcome:?}");
+
+    let mut reason = None;
+    while let Ok(event) = rx.try_recv() {
+        if let oximux_app::shell::workspace_ops::ProvisionEvent::SetupSkipped(text) = event {
+            reason = Some(text);
+        }
+    }
+    let reason = reason.expect("no SetupSkipped event was emitted");
+    assert!(
+        reason.contains("side") && reason.contains("main"),
+        "the reason must name both refs so the user can judge it: {reason}"
+    );
+    assert!(
+        reason.contains("Run setup"),
+        "the reason must name the way out: {reason}"
+    );
+}
+
+/// An adopted branch is the row's branch. No `oximux/`-prefixed branch is
+/// minted, because the user named the branch and we did not.
+#[tokio::test]
+async fn an_adopted_branch_becomes_the_rows_branch_with_no_prefix_applied() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path();
+    repo_with_a_marker_script_and_a_side_branch(project_root);
+    let (workspace_repo, project) = seed_project(project_root);
+
+    let slug = "adopted";
+    let worktree_path = tmp.path().join("worktrees").join(slug);
+    let outcome = create_workspace_with_rollback(
+        project_root,
+        &project.id,
+        "Adopted",
+        slug,
+        &CreateBase::existing("side"),
+        &worktree_path,
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await;
+
+    match outcome {
+        CreateOutcome::Created(row) => assert_eq!(row.branch, "side"),
+        other => panic!("expected Created, got {other:?}"),
+    }
+    let repo = Repository::open(project_root).await.expect("open");
+    let branches = repo.list_branches().await.expect("branches");
+    assert!(
+        !branches.iter().any(|b| b.name.starts_with("oximux/")),
+        "adopting a branch minted one anyway: {branches:?}"
+    );
+}
+
+/// **The data-loss guard.** Rollback force-deletes the branch — correct for one
+/// this create minted a moment ago, and a week of someone's work for one it
+/// merely adopted. A failed create must leave an adopted branch exactly as it
+/// found it.
+#[tokio::test]
+async fn a_failed_create_never_deletes_the_branch_it_adopted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path();
+    repo_with_a_marker_script_and_a_side_branch(project_root);
+    let (workspace_repo, project) = seed_project(project_root);
+
+    // Force the UNIQUE conflict on `(project_id, slug)` so the insert fails
+    // AFTER the git step — the exact window the rollback ladder exists for.
+    let slug = "adopted-conflict";
+    workspace_repo
+        .insert(&project.id, "Pre-existing", slug, "side", "/dummy", false)
+        .expect("pre-insert");
+
+    let worktree_path = tmp.path().join("worktrees").join(slug);
+    let outcome = create_workspace_with_rollback(
+        project_root,
+        &project.id,
+        "Adopted Conflict",
+        slug,
+        &CreateBase::existing("side"),
+        &worktree_path,
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, CreateOutcome::StorageFailedRollbackClean(_)),
+        "expected a clean rollback, got {outcome:?}"
+    );
+    // The worktree is gone — the rollback did run.
+    assert!(!worktree_path.exists(), "rollback left the worktree behind");
+    // And the branch survived it.
+    let repo = Repository::open(project_root).await.expect("open");
+    let branches = repo.list_branches().await.expect("branches");
+    assert!(
+        branches.iter().any(|b| b.name == "side"),
+        "rollback deleted the adopted branch: {branches:?}"
+    );
+    // Its commit is still reachable, which is the thing that actually matters.
+    run_git(project_root, &["rev-parse", "--verify", "side"]);
+}
+
+/// **The unattended path.** The chat pill creates a worktree from a draft the
+/// user clicked once; it runs with no dialog, no preview, and nobody watching.
+/// Basing it on "wherever the main checkout's HEAD happened to be" is the
+/// defect with the fewest ways for anyone to notice — the work looks fine
+/// until review, when it turns out to carry somebody's half-finished feature
+/// branch underneath.
+///
+/// `workspace_root/render.rs` passes `project.default_branch` explicitly for
+/// exactly this reason. This pins the property that choice buys, at the layer
+/// where it can be asserted: the render-path listener itself is a GPUI closure
+/// with no seam to call.
+#[tokio::test]
+async fn an_unattended_create_does_not_inherit_a_feature_branch_head() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path();
+    init_repo(project_root);
+    let main_tip = {
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(project_root)
+            .output()
+            .expect("git");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    // The main checkout wanders off onto a feature branch, as it does all day.
+    run_git(project_root, &["checkout", "-q", "-b", "wip"]);
+    std::fs::write(project_root.join("half-done.txt"), "wip\n").expect("write");
+    run_git(project_root, &["add", "half-done.txt"]);
+    run_git(project_root, &["commit", "-m", "half done"]);
+
+    let (workspace_repo, project) = seed_project(project_root);
+    let slug = "from-chat";
+    let worktree_path = tmp.path().join("worktrees").join(slug);
+    let outcome = create_workspace_with_rollback(
+        project_root,
+        &project.id,
+        "From Chat",
+        slug,
+        // What the chat pill passes.
+        &CreateBase::new_branch_from(branch_of(slug), &project.default_branch),
+        &worktree_path,
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await;
+    assert!(matches!(outcome, CreateOutcome::Created(_)), "{outcome:?}");
+
+    // The new branch sits on `main`'s tip, not on `wip`'s.
+    let out = Command::new("git")
+        .args(["rev-parse", &branch_of(slug)])
+        .current_dir(project_root)
+        .output()
+        .expect("git");
+    let tip = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    assert_eq!(tip, main_tip, "an unattended create inherited the wip HEAD");
+    assert!(
+        !worktree_path.join("half-done.txt").exists(),
+        "the feature branch's work leaked into a worktree that never asked for it"
+    );
+}
+
+/// **The end-to-end C1 regression.** A project whose default branch exists only
+/// as `origin/main` — the ordinary state of a worktree-centric checkout after
+/// the user deletes the local `main` they never sit on.
+///
+/// `git worktree add` DWIMs such a name into `--track -b <name>`, overriding an
+/// explicit `-b`, so an unguarded create landed the worktree on `main`, never
+/// made `oximux/<slug>`, and inserted a row naming a branch that did not exist.
+///
+/// The create path must still produce a working worktree on the branch it
+/// promised: an unresolvable default degrades to HEAD rather than failing, per
+/// the plan's own risk note ("fall back … rather than failing creation").
+#[tokio::test]
+async fn a_default_branch_that_exists_only_on_the_remote_still_creates_the_named_branch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let origin = tmp.path().join("origin");
+    std::fs::create_dir_all(&origin).unwrap();
+    run_git(&origin, &["init", "-q", "--bare"]);
+
+    let project_root = tmp.path().join("work");
+    std::fs::create_dir_all(&project_root).unwrap();
+    init_repo(&project_root);
+    run_git(&project_root, &["remote", "add", "origin", origin.to_str().unwrap()]);
+    run_git(&project_root, &["push", "-q", "origin", "main"]);
+    run_git(&project_root, &["checkout", "-q", "-b", "dev"]);
+    run_git(&project_root, &["branch", "-D", "main"]);
+    run_git(&project_root, &["remote", "set-head", "origin", "main"]);
+
+    let db = open_memory().expect("open memory");
+    let project_repo = ProjectRepo::new(db.clone());
+    let workspace_repo = WorkspaceRepo::new(db);
+    // The stored default is `main` — captured when the local branch still
+    // existed, which is exactly how this goes stale in the field.
+    let project = project_repo
+        .insert("Acme", project_root.to_str().unwrap(), "main")
+        .expect("project");
+
+    let slug = "feat";
+    let worktree_path = tmp.path().join("worktrees").join(slug);
+    let outcome = create_workspace_with_rollback(
+        &project_root,
+        &project.id,
+        "Feat",
+        slug,
+        // What ⌘N with every control left alone produces.
+        &base_of(slug),
+        &worktree_path,
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await;
+
+    let row = match outcome {
+        CreateOutcome::Created(row) => row,
+        other => panic!("a stale default branch must not fail the create: {other:?}"),
+    };
+    // The row names the branch we minted — not the one git's DWIM wanted.
+    assert_eq!(row.branch, branch_of(slug));
+    // And that branch actually exists, which is the half the DWIM used to break.
+    let repo = Repository::open(&project_root).await.expect("open");
+    let branches = repo.list_branches().await.expect("branches");
+    assert!(
+        branches.iter().any(|b| b.name == branch_of(slug)),
+        "the row names a branch that was never created: {branches:?}"
+    );
+    assert!(
+        !branches.iter().any(|b| b.name == "main"),
+        "git minted a local `main` behind our back: {branches:?}"
+    );
+    // The worktree is on our branch, not on `main`.
+    let out = Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(&worktree_path)
+        .output()
+        .expect("git");
+    assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), branch_of(slug));
+}
+
+/// **H3, closed end to end.** Create-time rollback already refused to delete an
+/// adopted branch, but *deleting the workspace later* went through a different
+/// door and ran `git branch -D` unconditionally — the same data loss, reached
+/// by the gesture a user actually performs.
+///
+/// The fix is that the create records which it did. This asserts the record is
+/// what a delete path would read, in both directions: an adopted branch is
+/// marked so the branch survives, and a minted one is marked so cleanup still
+/// happens. Without the second half the guard would leak a dangling branch on
+/// every ordinary delete, forever.
+#[tokio::test]
+async fn the_row_records_whether_the_branch_was_minted_or_adopted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path();
+    repo_with_a_marker_script_and_a_side_branch(project_root);
+    let (workspace_repo, project) = seed_project(project_root);
+
+    // Adopted: `side` existed before OxiMux ever saw it.
+    let adopted = match create_workspace_with_rollback(
+        project_root,
+        &project.id,
+        "Adopted",
+        "adopted",
+        &CreateBase::existing("side"),
+        &tmp.path().join("worktrees").join("adopted"),
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await
+    {
+        CreateOutcome::Created(row) => row,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    assert_eq!(adopted.branch, "side");
+    assert!(
+        !adopted.branch_minted,
+        "adopting a branch must record that we did NOT create it — otherwise \
+         deleting the workspace force-deletes the user's branch"
+    );
+
+    // Minted: ours, and cleanup must still remove it.
+    let minted = match create_workspace_with_rollback(
+        project_root,
+        &project.id,
+        "Minted",
+        "minted",
+        &base_of("minted"),
+        &tmp.path().join("worktrees").join("minted"),
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await
+    {
+        CreateOutcome::Created(row) => row,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    assert!(
+        minted.branch_minted,
+        "an ordinary create must stay cleanable, or every delete leaks a branch"
+    );
+
+    // And both survive the trip through storage, which is where the delete
+    // paths read them from.
+    let reread = |id: &str| {
+        workspace_repo
+            .get_by_id(id)
+            .expect("get")
+            .expect("row")
+            .branch_minted
+    };
+    assert!(!reread(&adopted.id));
+    assert!(reread(&minted.id));
+}
+
+/// **Adopting a branch must be judged against the real default branch.**
+///
+/// `default_branch` was briefly not read at all in existing-branch mode — it
+/// looked like a saved subprocess. But `named_base()` is `Some` for an adopted
+/// branch, so the guard hit its "no default branch" arm every time and told the
+/// user *"could not verify `behind` against the default branch (this repository
+/// has no default branch)"* on a repo that plainly had one. Two things followed
+/// from the same line: an adopted branch that IS an ancestor could never
+/// provision, and `freshen_default` became a no-op for adopts.
+///
+/// `behind` here points at an earlier commit of `main`, so it is contained in
+/// the default branch's history — reviewed by definition, and setup must run.
+#[tokio::test]
+async fn adopting_a_branch_contained_in_the_default_still_runs_setup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path();
+    repo_with_a_marker_script_and_a_side_branch(project_root);
+    // Move `main` on by one, then point `behind` at the commit before it: an
+    // ancestor of `main`, unlike `side`, and — critically — one that already
+    // carries `.oximux/scripts.toml`, or there would be no setup script to run
+    // and the assertion below would pass for the wrong reason.
+    let scripts_commit = {
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(project_root)
+            .output()
+            .expect("git");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    std::fs::write(project_root.join("later.txt"), "later\n").expect("write");
+    run_git(project_root, &["add", "later.txt"]);
+    run_git(project_root, &["commit", "-m", "later"]);
+    run_git(project_root, &["branch", "behind", &scripts_commit]);
+    let (workspace_repo, project) = seed_project(project_root);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let slug = "adopt-behind";
+    let worktree_path = tmp.path().join("worktrees").join(slug);
+    let outcome = create_workspace_with_rollback(
+        project_root,
+        &project.id,
+        "Adopt Behind",
+        slug,
+        &CreateBase::existing("behind"),
+        &worktree_path,
+        None,
+        &workspace_repo,
+        &Provision::new(oximux_settings::SetupDecision::Inherit, tx),
+    )
+    .await;
+    assert!(matches!(outcome, CreateOutcome::Created(_)), "{outcome:?}");
+
+    assert!(
+        worktree_path.join("setup-ran.marker").exists(),
+        "an adopted branch already contained in the default branch is reviewed \
+         by definition; setup must run"
+    );
+    // And nothing claimed the repository has no default branch.
+    while let Ok(event) = rx.try_recv() {
+        if let oximux_app::shell::workspace_ops::ProvisionEvent::SetupSkipped(text) = event {
+            panic!("setup was skipped for a reviewed base: {text}");
+        }
+    }
 }

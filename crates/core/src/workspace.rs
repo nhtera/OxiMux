@@ -59,6 +59,31 @@ pub struct Workspace {
     /// anything unrecognised.
     #[serde(default)]
     pub phase: String,
+    /// Whether OxiMux **minted** this worktree's branch, as opposed to
+    /// adopting one that already existed.
+    ///
+    /// **A data-loss guard, and the only durable record of the distinction.**
+    /// Every lifecycle path that removes a worktree also removes its branch —
+    /// correct for a branch created by the same call that made the worktree,
+    /// and destructive for one the user has had for a week. The create path is
+    /// the only place that knows which happened, and nothing downstream can
+    /// work it out afterwards: inferring from the configured prefix is wrong
+    /// for a user who turned the prefix off, and wrong again for an adopted
+    /// branch that happens to match it.
+    ///
+    /// `#[serde(default = "default_true")]` because every workspace that
+    /// predates this field was necessarily minted — adopting a branch shipped
+    /// with the field itself — so `true` is the correct reading of an old
+    /// snapshot, not merely a safe one.
+    #[serde(default = "default_true")]
+    pub branch_minted: bool,
+}
+
+/// `true`, for [`Workspace::branch_minted`]'s serde default. A bare `default`
+/// would give `false` — "adopted" — which is the destructive reading of every
+/// pre-field snapshot.
+fn default_true() -> bool {
+    true
 }
 
 /// The closed vocabulary a worktree's [`Workspace::phase`] is written with.

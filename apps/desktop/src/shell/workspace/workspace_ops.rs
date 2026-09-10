@@ -144,9 +144,10 @@ pub(crate) fn build_add_project_dialog(
 // `oximux serve` creates the same worktree this flow does rather than a
 // second implementation of the same rollback ladder. Re-exported here
 // because this module is the desktop's door to it.
+use crate::shell::workspace::base_choice::BaseChoice;
 pub use oximux_worktree_ops::{
-    CreateOutcome, Provision, ProvisionEvent, SetupTranscript, create_workspace_with_rollback,
-    run_cleanup_before_remove,
+    CreateBase, CreateOutcome, Provision, ProvisionEvent, SetupTranscript,
+    create_workspace_with_rollback, run_cleanup_before_remove,
 };
 
 /// Upper bound on `default_tabs`. The list is repo-controlled and needs no
@@ -248,6 +249,7 @@ pub(crate) async fn stream_provisioning(
             ProvisionEvent::IncludeSkipped(skip) => format!("include: skipped {skip}"),
             ProvisionEvent::FreshenStarted(branch) => format!("fetching {branch}…"),
             ProvisionEvent::FreshenFinished(summary) => format!("== {summary}"),
+            ProvisionEvent::SetupSkipped(reason) => format!("== {reason}"),
             ProvisionEvent::SetupStarted(script) => format!("$ {script}"),
             ProvisionEvent::SetupLine(line) => line,
             ProvisionEvent::SetupFinished(outcome) => format!("== {}", outcome.summary()),
@@ -288,6 +290,9 @@ fn workspaces_with_primary_for(repo: &WorkspaceRepo, project: &Project) -> Vec<W
             Workspace {
                 id: format!("primary:{}", project.id),
                 project_id: project.id.clone(),
+                // Not a branch OxiMux minted: a synthesized row or a
+                // fixture. `false` is the reading that never deletes.
+                branch_minted: false,
                 name,
                 slug,
                 branch,
@@ -659,21 +664,38 @@ impl WorkspaceRoot {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let path_str = path.to_string_lossy().to_string();
-        let name = crate::shell::add_project_dialog::name_from_path(&path);
-        match self.app_state.project_repo.insert_or_touch(
-            &name,
-            &path_str,
-            crate::shell::add_project_dialog::DEFAULT_BRANCH_PLACEHOLDER,
-        ) {
-            Ok(project) => {
-                self.refresh_recent_projects();
-                self.set_active_project(project, window, cx);
-            }
-            Err(err) => {
-                tracing::warn!(?err, path = %path_str, "dropped-folder registration failed");
-            }
-        }
+        // Detected in a spawn, like both add-project paths: `default_branch`
+        // is what a new worktree gets based on, so a dropped folder must not
+        // register with a guess — and reading it is a git subprocess, which
+        // has no business on the foreground executor.
+        // Two folders dropped in quick succession would otherwise activate
+        // whichever `detect_default_branch` returned first rather than the one
+        // dropped last. The token makes the last drop win, the same way the
+        // dialog's `base_epoch` does.
+        self.drop_epoch = self.drop_epoch.wrapping_add(1);
+        let epoch = self.drop_epoch;
+        cx.spawn_in(window, async move |this, cx| {
+            let default_branch =
+                crate::shell::workspace::project_picker::detect_default_branch(&path).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.drop_epoch != epoch {
+                    tracing::debug!("dropped-folder registration superseded by a later drop");
+                    return;
+                }
+                let path_str = path.to_string_lossy().to_string();
+                let name = crate::shell::add_project_dialog::name_from_path(&path);
+                match this.app_state.project_repo.insert_or_touch(&name, &path_str, &default_branch) {
+                    Ok(project) => {
+                        this.refresh_recent_projects();
+                        this.set_active_project(project, window, cx);
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, path = %path_str, "dropped-folder registration failed");
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     /// Push hidden-state to every project's terminals except `active_id`, so a
@@ -1351,6 +1373,9 @@ impl WorkspaceRoot {
         let workspace = Workspace {
             id: workspace_id,
             project_id,
+            // A stub built to name a row by id and path — it carries no branch,
+            // so nothing can act on this field. `false` never deletes.
+            branch_minted: false,
             name: String::new(),
             slug: String::new(),
             branch: String::new(),
@@ -1899,6 +1924,7 @@ impl WorkspaceRoot {
                     None,
                     submit.linked_issue,
                     submit.setup,
+                    submit.base,
                     false,
                     window,
                     cx,
@@ -1925,6 +1951,10 @@ impl WorkspaceRoot {
         // every caller but the create dialog — defers to the project's
         // committed `auto_setup`.
         setup_decision: oximux_settings::SetupDecision,
+        // What the worktree is cut from. The create dialog passes the user's
+        // **From** selection; every other caller passes the default, which is
+        // a new branch based on the project's default branch.
+        base: BaseChoice,
         activate_after: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1979,6 +2009,15 @@ impl WorkspaceRoot {
         // gap this phase closed.
         let branch = crate::git_settings::branch_for_slug(&slug, Some(&project_root), cx);
         let freshen_default = crate::git_settings::settings(cx).keep_default_up_to_date;
+        // Folded HERE, beside the branch resolution, for the same reason: the
+        // dialog showed the user a base, and re-deriving it inside the spawn
+        // would let the preview and the create disagree.
+        let Some(base) = base.resolve(branch) else {
+            // Submit is disabled on an incomplete choice, so this is a bug
+            // rather than a user error — log it instead of failing silently.
+            tracing::warn!(slug = %slug, "workspace create: incomplete base choice");
+            return;
+        };
 
         cx.spawn(async move |weak, cx| {
             if let Some(parent) = worktree_path.parent()
@@ -2009,7 +2048,7 @@ impl WorkspaceRoot {
                 &project_id,
                 &name_trimmed,
                 &slug,
-                &branch,
+                &base,
                 &worktree_path,
                 linked_issue.as_deref(),
                 &workspace_repo,
@@ -2431,11 +2470,27 @@ impl WorkspaceRoot {
                     tracing::warn!(?err, slug = %workspace.slug, "force delete: remove_worktree still failed");
                     leftovers.push(format!("worktree at {}", workspace.worktree_path));
                 }
-                if let Err(err) = repo.delete_branch(&branch, force).await {
-                    tracing::warn!(?err, branch = %branch, "delete_branch failed");
-                    // Don't bail — DB cleanup still wanted to keep
-                    // state in sync.
-                    leftovers.push(format!("branch {branch}"));
+                // ONLY a branch this workspace's create minted.
+                //
+                // `delete_branch(_, force)` is `git branch -D` on the force
+                // path, which is correct for a branch created by the same call
+                // that made the worktree and is a week of somebody's work for
+                // one the worktree merely adopted. The create path recorded
+                // which it did (`Workspace::branch_minted`); this is the guard
+                // that create-time rollback has always had, on the door the
+                // user actually walks through.
+                if workspace.branch_minted {
+                    if let Err(err) = repo.delete_branch(&branch, force).await {
+                        tracing::warn!(?err, branch = %branch, "delete_branch failed");
+                        // Don't bail — DB cleanup still wanted to keep
+                        // state in sync.
+                        leftovers.push(format!("branch {branch}"));
+                    }
+                } else {
+                    tracing::info!(
+                        branch = %branch,
+                        "keeping an adopted branch: this worktree checked it out, it did not create it"
+                    );
                 }
                 let row_deleted = match workspace_repo.delete(&workspace.id) {
                     Ok(()) => true,
@@ -2717,6 +2772,9 @@ mod nav_history_tests {
         Workspace {
             id: id.to_string(),
             project_id: "p".to_string(),
+            // Not a branch OxiMux minted: a synthesized row or a
+            // fixture. `false` is the reading that never deletes.
+            branch_minted: false,
             name: id.to_string(),
             slug: id.to_string(),
             branch: "main".to_string(),
@@ -2749,6 +2807,9 @@ mod nav_history_tests {
         Workspace {
             id: format!("ws-{project_id}"),
             project_id: project_id.to_string(),
+            // Not a branch OxiMux minted: a synthesized row or a
+            // fixture. `false` is the reading that never deletes.
+            branch_minted: false,
             name: "w".to_string(),
             slug: "w".to_string(),
             branch: branch.to_string(),

@@ -1,10 +1,13 @@
 //! The worktree lifecycle, shared by every host.
 //!
 //! A worktree is three things that must agree: a git worktree on disk, the
-//! `oximux/<slug>` branch it checks out, and the `workspaces` row that names
-//! both. [`create_workspace_with_rollback`] is what keeps them in agreement
-//! when the third step fails after the first two succeeded, and it is the
-//! reason this module exists as one implementation rather than two.
+//! branch it checks out, and the `workspaces` row that names both. That branch
+//! used to be `oximux/<slug>` by construction; it is now whatever the row
+//! records, because a worktree may be cut on a configured prefix or may adopt
+//! an existing branch outright (see [`CreateBase`]).
+//! [`create_workspace_with_rollback`] is what keeps them in agreement when the
+//! third step fails after the first two succeeded, and it is the reason this
+//! module exists as one implementation rather than two.
 //!
 //! The path scheme is host-derived on purpose: a client names a project and a
 //! slug, never a location. [`worktree_path`] is that derivation, taking the
@@ -12,6 +15,7 @@
 //! its own root instead of the desktop's.
 
 pub mod branch_name;
+pub mod create_base;
 pub mod freshen;
 pub mod include;
 pub mod merge;
@@ -20,6 +24,7 @@ mod paths;
 mod service;
 pub mod setup;
 
+pub use create_base::{CreateBase, setup_decision};
 pub use include::{CopyReport, Skip};
 pub use merge::{
     MergePlan, MergeRefusal, MergeResult, apply_merge, merge_into_default, preflight_merge,
@@ -58,6 +63,11 @@ pub enum ProvisionEvent {
     FreshenStarted(String),
     /// What the freshen did — moved the branch, or skipped, with the reason.
     FreshenFinished(String),
+    /// The setup script will NOT run, and why. Distinct from simply not
+    /// emitting `SetupStarted`: a silent skip is indistinguishable from a
+    /// project that has no setup script, and this one is a decision OxiMux made
+    /// on the user's behalf that they may want to reverse with `Run setup`.
+    SetupSkipped(String),
     /// The setup script is about to run. Carries the script itself, because
     /// "which command produced this output" is the first question a failing
     /// transcript raises.
@@ -199,14 +209,24 @@ pub fn worktree_path(data_dir: &Path, project_id: &str, slug: &str) -> PathBuf {
         .join(slug)
 }
 
-/// Open the project repo, create a new worktree on branch `oximux/<slug>`,
+/// Open the project repo, create the worktree [`base`](CreateBase) describes,
 /// and insert the workspace row. On storage failure, runs the rollback
-/// (force-remove worktree + force-delete branch) so that the next listing
-/// reflects the on-disk truth.
+/// (force-remove worktree, and force-delete the branch **only if this create
+/// minted it**) so that the next listing reflects the on-disk truth.
 ///
 /// `name` is the human label (caller has already trimmed); `slug` MUST
-/// pre-validate via `validate_slug` upstream — this function assumes the
-/// slug is safe to pass to `git worktree add -b oximux/<slug>`.
+/// pre-validate via `validate_slug` upstream — it names the directory and the
+/// row in every mode. `base` carries the branch name, already resolved by
+/// [`branch_name`], and says where the branch is cut from; the git layer
+/// validates it again before `git` sees it.
+///
+/// # The base and the setup script
+///
+/// Provisioning runs the *worktree's own committed* setup script, which is
+/// safe only while every worktree branches off the user's own HEAD — the
+/// invariant `base` removes. So a base the user has not reviewed skips the
+/// script and says why; see [`create_base::setup_decision`], which owns that
+/// rule and every degradation in it.
 ///
 /// # Preconditions
 ///
@@ -231,7 +251,7 @@ pub fn worktree_path(data_dir: &Path, project_id: &str, slug: &str) -> PathBuf {
 #[allow(
     clippy::too_many_arguments,
     reason = "Eight of the nine are irreducible inputs to one operation: where the repo is, \
-              what the workspace is called, what its branch is called, where it goes, and what \
+              what the workspace is called, what it is cut from, where it goes, and what \
               to write it into. Bundling them into a params struct moves the same fields behind \
               a name that means nothing more than the function's own — and every one of the five \
               call sites would then build a struct to immediately destructure it. The ninth, \
@@ -242,7 +262,7 @@ pub async fn create_workspace_with_rollback(
     project_id: &str,
     name: &str,
     slug: &str,
-    branch: &str,
+    base: &CreateBase,
     worktree_path: &Path,
     linked_issue: Option<&str>,
     workspace_repo: &WorkspaceRepo,
@@ -259,28 +279,75 @@ pub async fn create_workspace_with_rollback(
     // Accepted rather than guessed at: deleting a branch whose name we inferred
     // from a directory is how a reclaim destroys work it did not create.
     if provision.reclaim_orphan
-        && let Some(err) = reclaim_orphan(&repo, worktree_path, branch, workspace_repo).await
+        && let Some(err) = reclaim_orphan(&repo, worktree_path, base, workspace_repo).await
     {
         return CreateOutcome::GitFailed(err);
     }
 
-    // Optional, off by default, and unable to fail the create. `git worktree
-    // add` branches from HEAD, so this changes the new worktree's base only
-    // when the root checkout is on the default branch — which is the usual
-    // state, and the case the setting is for. Every refusal inside is silent
-    // and ordinary; see `freshen` for both.
+    // Read once and used twice: to decide whether the chosen base is one the
+    // user has already reviewed, and (below) as the freshen target. A
+    // repository that cannot name one degrades to "provision normally" inside
+    // `setup_decision` rather than failing the create.
+    //
+    // Read unconditionally: every mode needs it, so there is nothing to be
+    // lazy about. An unnamed create is *based* on it; a named base and an
+    // adopted branch are both *checked against* it; and the freshen step below
+    // targets it.
+    //
+    // An earlier version skipped the read for `ExistingBranch`, which looked
+    // like a saved subprocess and was a bug: `named_base()` is `Some` for that
+    // variant, so `setup_decision` hit its "no default branch" arm every time
+    // and told the user "could not verify `<branch>` against the default branch
+    // (this repository has no default branch)" on repositories that plainly had
+    // one — while also making an adopted ancestor branch unable to provision at
+    // all, and `freshen_default` a no-op for adopts.
+    let default_branch = repo.default_branch().await.ok().flatten();
+    let (setup, setup_skip_reason) =
+        create_base::setup_decision(&repo, base, provision.setup, default_branch.as_deref()).await;
+
+    // Optional, off by default, and unable to fail the create. Whether it
+    // changes what the new worktree is *based on* now depends on the base: it
+    // does when the base IS the default branch (the common case, and the one
+    // the setting is for), and does not when the base names something else or
+    // when a no-start-point create leaves the root checkout's HEAD in charge.
+    // Every refusal inside is silent and ordinary; see `freshen` for both.
     if provision.freshen_default {
-        match repo.default_branch().await {
-            Ok(Some(default)) => {
-                provision.emit(ProvisionEvent::FreshenStarted(default.clone()));
-                let outcome = freshen::freshen_default_branch(&repo, &default).await;
+        match default_branch.as_deref() {
+            Some(default) => {
+                provision.emit(ProvisionEvent::FreshenStarted(default.to_string()));
+                let outcome = freshen::freshen_default_branch(&repo, default).await;
                 tracing::debug!(?outcome, %default, "freshen default branch before create");
                 provision.emit(ProvisionEvent::FreshenFinished(outcome.summary()));
             }
-            _ => tracing::debug!("freshen skipped: no default branch detected"),
+            None => tracing::debug!("freshen skipped: no default branch detected"),
         }
     }
-    if let Err(err) = repo.add_worktree(worktree_path, branch).await {
+    let added = match base {
+        // Explicit, therefore strict: a start point the user named by hand and
+        // that does not resolve is an error, never a silent substitution.
+        CreateBase::NewBranch {
+            branch,
+            from: Some(start_point),
+        } => repo.add_worktree_from(worktree_path, branch, start_point).await,
+        // No base named: the repository's default branch — and HEAD only when
+        // that default does not resolve *locally*.
+        //
+        // The degradation is not hypothetical. `default_branch()` reports the
+        // name behind `origin/HEAD`, which on a worktree-centric checkout is
+        // routinely a branch with no `refs/heads/` entry at all (the user
+        // deleted the local `main` they never sit on). Refusing to create a
+        // worktree because a piece of captured metadata went stale is the
+        // failure this fallback exists to avoid — the plan's own risk note
+        // calls for exactly it.
+        CreateBase::NewBranch { branch, from: None } => {
+            match resolvable_default(&repo, default_branch.as_deref()).await {
+                Some(default) => repo.add_worktree_from(worktree_path, branch, &default).await,
+                None => repo.add_worktree(worktree_path, branch).await,
+            }
+        }
+        CreateBase::ExistingBranch { name } => repo.add_worktree_existing(worktree_path, name).await,
+    };
+    if let Err(err) = added {
         return CreateOutcome::GitFailed(format!("add_worktree: {err}"));
     }
 
@@ -317,7 +384,16 @@ pub async fn create_workspace_with_rollback(
     // `run_cleanup_before_remove` uses — it is committed, so the branch's own
     // copy is the one that will actually run.
     let scripts = oximux_settings::load_for_project(worktree_path);
-    if provision.setup.resolve(scripts.auto_setup)
+    // The guard only has something to say when a script would otherwise have
+    // run — telling the user setup was skipped on a project that has no setup
+    // script is noise about a decision that changed nothing.
+    if let Some(reason) = setup_skip_reason
+        && scripts.script(ScriptKind::Setup).is_some()
+    {
+        tracing::info!(worktree = %worktree_path.display(), %reason, "setup skipped: unreviewed base");
+        provision.emit(ProvisionEvent::SetupSkipped(reason));
+    }
+    if setup.resolve(scripts.auto_setup)
         && let Some(script) = scripts.script(ScriptKind::Setup)
     {
         provision.emit(ProvisionEvent::SetupStarted(script.to_string()));
@@ -331,7 +407,7 @@ pub async fn create_workspace_with_rollback(
                 outcome = %transcript.outcome.summary(),
                 "setup failed during provisioning; rolling back"
             );
-            let rollback_error = rollback(&repo, worktree_path, branch).await;
+            let rollback_error = rollback(&repo, worktree_path, base).await;
             return CreateOutcome::SetupFailed {
                 transcript,
                 rollback_error,
@@ -340,7 +416,13 @@ pub async fn create_workspace_with_rollback(
     }
 
     let path_str = worktree_path.to_string_lossy().to_string();
-    match workspace_repo.insert(project_id, name, slug, branch, &path_str) {
+    // The branch the ROW names — the minted one, or the adopted one. This is
+    // the clause the module doc's three-way agreement turns on.
+    let branch = base.branch();
+    // Recorded, not inferred: `creates_branch()` is a create-time fact, and
+    // every later path that removes this worktree needs it to tell cleanup from
+    // data loss. See `Workspace::branch_minted`.
+    match workspace_repo.insert(project_id, name, slug, branch, &path_str, base.creates_branch()) {
         Ok(mut workspace) => {
             // Best-effort metadata write — the worktree + row already exist, so
             // a failure here only loses the issue badge, not the workspace. The
@@ -355,7 +437,7 @@ pub async fn create_workspace_with_rollback(
             }
             CreateOutcome::Created(workspace)
         }
-        Err(insert_error) => match rollback(&repo, worktree_path, branch).await {
+        Err(insert_error) => match rollback(&repo, worktree_path, base).await {
             Some(rollback_error) => CreateOutcome::StorageFailedRollbackDirty {
                 insert_error,
                 rollback_error,
@@ -363,6 +445,47 @@ pub async fn create_workspace_with_rollback(
             None => CreateOutcome::StorageFailedRollbackClean(insert_error),
         },
     }
+}
+
+/// A ref naming the project's default branch that `git` can actually resolve.
+///
+/// [`Repository::default_branch`] answers with a *name* — `main` — which on a
+/// worktree-centric checkout may have no `refs/heads/` entry at all, because
+/// the user deleted the local branch they never sit on. So the name is tried in
+/// two spellings, and the order matters:
+///
+/// 1. `main` — the local branch, when it exists. What the user's own work is
+///    based on.
+/// 2. `origin/main` — the remote-tracking form. Still the default branch, just
+///    held somewhere else, and the correct base when there is no local copy.
+///
+/// **Only when neither resolves does this give up**, and `None` means "base on
+/// HEAD" rather than "fail" — a stale captured default must not make creating a
+/// worktree impossible.
+///
+/// Live verification is what established the second spelling is required: with
+/// only step 1, a repo whose default lives at `origin/main` degraded straight to
+/// HEAD and based new work on whatever feature branch the checkout was parked
+/// on. That is the defect base refs exist to close, reintroduced through the
+/// fallback — and no unit test caught it, because they all had a local `main`.
+async fn resolvable_default(repo: &Repository, default_branch: Option<&str>) -> Option<String> {
+    let default = default_branch?;
+    // `origin/` matches `default_branch`'s own source (`refs/remotes/origin/HEAD`).
+    for candidate in [default.to_string(), format!("origin/{default}")] {
+        match repo.sha_of(&candidate).await {
+            Ok(Some(_)) => return Some(candidate),
+            Ok(None) => continue,
+            Err(err) => {
+                tracing::warn!(?err, %candidate, "could not resolve a default-branch candidate");
+                continue;
+            }
+        }
+    }
+    tracing::info!(
+        %default,
+        "default branch resolves neither locally nor as a remote-tracking ref; basing on HEAD"
+    );
+    None
 }
 
 /// Clear a worktree directory left behind by an interrupted create, so a retry
@@ -388,9 +511,10 @@ pub async fn create_workspace_with_rollback(
 async fn reclaim_orphan(
     repo: &Repository,
     worktree_path: &Path,
-    branch: &str,
+    base: &CreateBase,
     workspace_repo: &WorkspaceRepo,
 ) -> Option<String> {
+    let branch = base.branch();
     if !worktree_path.exists() {
         return None;
     }
@@ -421,7 +545,7 @@ async fn reclaim_orphan(
     // The same ladder the failure paths use: git knows about this worktree, so
     // let git detach it and drop the branch rather than tearing the directory
     // out from under `.git/worktrees`.
-    let rollback_err = rollback(repo, worktree_path, branch).await;
+    let rollback_err = rollback(repo, worktree_path, base).await;
     // Git can decline a path it never registered (a create killed between
     // `mkdir` and `worktree add`). The directory still has to go.
     if worktree_path.exists()
@@ -445,12 +569,19 @@ async fn reclaim_orphan(
 ///
 /// Shared by the storage-failure and setup-failure arms: two rollback ladders
 /// for the same two artifacts would be two chances to drift.
-async fn rollback(repo: &Repository, worktree_path: &Path, branch: &str) -> Option<String> {
+async fn rollback(repo: &Repository, worktree_path: &Path, base: &CreateBase) -> Option<String> {
     let mut err = None;
     if let Err(e) = repo.remove_worktree(worktree_path, true).await {
         err = Some(format!("remove_worktree: {e}"));
     }
-    if let Err(e) = repo.delete_branch(branch, true).await {
+    // ONLY a branch this create minted. `delete_branch(_, true)` is
+    // `git branch -D` — correct for a branch that did not exist a moment ago,
+    // and a week of someone's work for a branch the worktree merely adopted.
+    // Undoing a checkout means removing the worktree; it never means deleting
+    // the branch that was checked out.
+    if base.creates_branch()
+        && let Err(e) = repo.delete_branch(base.branch(), true).await
+    {
         err = Some(match err {
             Some(prev) => format!("{prev}; delete_branch: {e}"),
             None => format!("delete_branch: {e}"),

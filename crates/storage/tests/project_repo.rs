@@ -68,7 +68,7 @@ fn project_delete_cascades_to_workspaces() {
     let (projects, workspaces) = repo();
     let p = projects.insert("A", "/a", "main").expect("project");
     workspaces
-        .insert(&p.id, "feat", "feat", "oximux/feat", "/wt/feat")
+        .insert(&p.id, "feat", "feat", "oximux/feat", "/wt/feat", true)
         .expect("workspace");
     projects.delete(&p.id).expect("delete project");
     let remaining = workspaces.list_for_project(&p.id).expect("list");

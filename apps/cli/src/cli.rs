@@ -698,12 +698,33 @@ pub enum WorktreeCommand {
     /// Create a worktree (and its branch) under a project. The host derives
     /// the on-disk location; the reply carries it.
     Create {
-        /// The worktree slug (becomes branch `oximux/<slug>`).
-        slug: String,
+        /// The worktree slug (becomes the branch, under the configured prefix).
+        ///
+        /// Not required with `--branch`: adopting an existing branch takes its
+        /// name, and the slug would then name only the directory.
+        slug: Option<String>,
         /// The project's root path (default: the current directory). Must be a
         /// project the host knows (see `projects ls`).
         #[arg(long, value_name = "DIR")]
         project: Option<PathBuf>,
+        /// Cut the new branch from this ref instead of the repository's
+        /// default branch — a branch, a tag, or a SHA.
+        ///
+        /// A base that is not already part of the default branch is treated as
+        /// unreviewed: the worktree is created, and its committed setup script
+        /// is NOT run. Use the row's `Run setup` after reading it.
+        #[arg(long, value_name = "REF", conflicts_with = "branch")]
+        from: Option<String>,
+        /// Check out an existing LOCAL branch into the new worktree. No branch
+        /// is created and no prefix is applied.
+        ///
+        /// A remote-tracking name (`origin/side`) or a tag is refused, because
+        /// neither is a branch to adopt: git would mint a local branch for the
+        /// first and detach HEAD for the second, and the worktree's row would
+        /// then name something that is not checked out. Use `--from` for those
+        /// — it cuts a new branch from any ref.
+        #[arg(long, value_name = "NAME")]
+        branch: Option<String>,
     },
     /// List worktrees (all projects unless --project narrows it).
     Ls {
