@@ -48,6 +48,28 @@ default_tabs = ["server", "logs"]
 The manual **Run setup** row in the rail's context menu is unchanged and is
 still how you re-run setup in an existing worktree.
 
+## Verifying a change to any of this
+
+`scripts/live-verify-worktree.sh` drives the real `oximux serve` and
+`oximux worktree` against a real git repository:
+
+```sh
+cargo build -p oximux-cli
+./scripts/live-verify-worktree.sh
+```
+
+Run it after touching `crates/git/src/worktree.rs`, `crates/worktree-ops`, or
+the CLI's worktree verbs — **before** believing a green `cargo test`.
+
+The reason it exists is that this engine is a pile of `git` subprocesses whose
+behaviour depends on the *shape* of the repository they run in, and a fixture is
+a shape somebody chose. When base refs shipped, 5761 unit tests passed over a
+worktree being cut from the wrong branch entirely: every fixture had a local
+`main`, and the field frequently does not. So the repo the script builds is
+shaped like the failure — default branch only at `origin/main`, checkout parked
+on a feature branch, a second branch to adopt — and it asserts the things that
+actually broke, including that an adopted branch survives a delete.
+
 ### An adopted branch is never deleted for you
 
 A worktree can check out a branch that already exists (`--branch <NAME>`, or
