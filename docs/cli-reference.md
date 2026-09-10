@@ -329,7 +329,7 @@ Create a worktree (and its branch) under a project. The host derives the on-disk
 | --- | --- | --- |
 | `<SLUG>` | yes | The worktree slug (becomes the branch, under the configured prefix) |
 | `--project` | yes | The project's root path (default: the current directory). Must be a project the host knows (see `projects ls`) |
-| `--from` | yes | Cut the new branch from this ref instead of the host's current checkout — a branch, a tag, or a SHA |
+| `--from` | yes | Cut the new branch from this ref instead of the repository's default branch — a branch, a tag, or a SHA |
 | `--branch` | yes | Check out an EXISTING branch into the new worktree. No branch is created and no prefix is applied |
 
 #### `oximux worktree ls`

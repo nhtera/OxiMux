@@ -1048,3 +1048,68 @@ async fn the_row_records_whether_the_branch_was_minted_or_adopted() {
     assert!(!reread(&adopted.id));
     assert!(reread(&minted.id));
 }
+
+/// **Adopting a branch must be judged against the real default branch.**
+///
+/// `default_branch` was briefly not read at all in existing-branch mode — it
+/// looked like a saved subprocess. But `named_base()` is `Some` for an adopted
+/// branch, so the guard hit its "no default branch" arm every time and told the
+/// user *"could not verify `behind` against the default branch (this repository
+/// has no default branch)"* on a repo that plainly had one. Two things followed
+/// from the same line: an adopted branch that IS an ancestor could never
+/// provision, and `freshen_default` became a no-op for adopts.
+///
+/// `behind` here points at an earlier commit of `main`, so it is contained in
+/// the default branch's history — reviewed by definition, and setup must run.
+#[tokio::test]
+async fn adopting_a_branch_contained_in_the_default_still_runs_setup() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path();
+    repo_with_a_marker_script_and_a_side_branch(project_root);
+    // Move `main` on by one, then point `behind` at the commit before it: an
+    // ancestor of `main`, unlike `side`, and — critically — one that already
+    // carries `.oximux/scripts.toml`, or there would be no setup script to run
+    // and the assertion below would pass for the wrong reason.
+    let scripts_commit = {
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(project_root)
+            .output()
+            .expect("git");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    std::fs::write(project_root.join("later.txt"), "later\n").expect("write");
+    run_git(project_root, &["add", "later.txt"]);
+    run_git(project_root, &["commit", "-m", "later"]);
+    run_git(project_root, &["branch", "behind", &scripts_commit]);
+    let (workspace_repo, project) = seed_project(project_root);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let slug = "adopt-behind";
+    let worktree_path = tmp.path().join("worktrees").join(slug);
+    let outcome = create_workspace_with_rollback(
+        project_root,
+        &project.id,
+        "Adopt Behind",
+        slug,
+        &CreateBase::existing("behind"),
+        &worktree_path,
+        None,
+        &workspace_repo,
+        &Provision::new(oximux_settings::SetupDecision::Inherit, tx),
+    )
+    .await;
+    assert!(matches!(outcome, CreateOutcome::Created(_)), "{outcome:?}");
+
+    assert!(
+        worktree_path.join("setup-ran.marker").exists(),
+        "an adopted branch already contained in the default branch is reviewed \
+         by definition; setup must run"
+    );
+    // And nothing claimed the repository has no default branch.
+    while let Ok(event) = rx.try_recv() {
+        if let oximux_app::shell::workspace_ops::ProvisionEvent::SetupSkipped(text) = event {
+            panic!("setup was skipped for a reviewed base: {text}");
+        }
+    }
+}

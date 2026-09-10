@@ -707,8 +707,8 @@ pub enum WorktreeCommand {
         /// project the host knows (see `projects ls`).
         #[arg(long, value_name = "DIR")]
         project: Option<PathBuf>,
-        /// Cut the new branch from this ref instead of the host's current
-        /// checkout — a branch, a tag, or a SHA.
+        /// Cut the new branch from this ref instead of the repository's
+        /// default branch — a branch, a tag, or a SHA.
         ///
         /// A base that is not already part of the default branch is treated as
         /// unreviewed: the worktree is created, and its committed setup script

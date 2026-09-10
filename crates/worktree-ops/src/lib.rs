@@ -289,14 +289,19 @@ pub async fn create_workspace_with_rollback(
     // repository that cannot name one degrades to "provision normally" inside
     // `setup_decision` rather than failing the create.
     //
-    // Read for every mode except the two that name their own base outright, so
-    // an unnamed create can be based on the default branch rather than on
-    // whatever the checkout happens to be sitting on.
-    let default_branch = if matches!(base, CreateBase::ExistingBranch { .. }) {
-        None
-    } else {
-        repo.default_branch().await.ok().flatten()
-    };
+    // Read unconditionally: every mode needs it, so there is nothing to be
+    // lazy about. An unnamed create is *based* on it; a named base and an
+    // adopted branch are both *checked against* it; and the freshen step below
+    // targets it.
+    //
+    // An earlier version skipped the read for `ExistingBranch`, which looked
+    // like a saved subprocess and was a bug: `named_base()` is `Some` for that
+    // variant, so `setup_decision` hit its "no default branch" arm every time
+    // and told the user "could not verify `<branch>` against the default branch
+    // (this repository has no default branch)" on repositories that plainly had
+    // one — while also making an adopted ancestor branch unable to provision at
+    // all, and `freshen_default` a no-op for adopts.
+    let default_branch = repo.default_branch().await.ok().flatten();
     let (setup, setup_skip_reason) =
         create_base::setup_decision(&repo, base, provision.setup, default_branch.as_deref()).await;
 
