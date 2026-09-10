@@ -48,6 +48,21 @@ default_tabs = ["server", "logs"]
 The manual **Run setup** row in the rail's context menu is unchanged and is
 still how you re-run setup in an existing worktree.
 
+### An adopted branch is never deleted for you
+
+A worktree can check out a branch that already exists (`--branch <NAME>`, or
+**Existing branch** in the create dialog) instead of cutting a new one. When it
+does, OxiMux records that it did not create that branch — and every path that
+later removes the worktree leaves the branch alone, including **Force Delete**.
+
+Removing a worktree is not permission to delete the branch it was sitting on.
+For a worktree whose branch OxiMux minted (`<prefix>/<slug>`, the ordinary
+case), deletion still removes the branch as it always has: that branch has no
+life outside the worktree.
+
+Worktrees created before this shipped are all treated as minted, which is what
+they are — adopting a branch did not exist yet.
+
 ### Setup is skipped on a base you have not reviewed
 
 Provisioning runs the worktree's **own committed** `scripts.toml`, so the

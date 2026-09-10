@@ -74,13 +74,7 @@ async fn rollback_on_insert_conflict_removes_worktree_and_branch() {
     // orchestration tries to insert after the git step.
     let slug = "fix-login";
     workspace_repo
-        .insert(
-            &project.id,
-            "Pre-existing",
-            slug,
-            "oximux/fix-login",
-            "/dummy",
-        )
+        .insert(&project.id, "Pre-existing", slug, "oximux/fix-login", "/dummy", true)
         .expect("pre-insert");
 
     let worktree_path = tmp.path().join("worktrees").join(slug);
@@ -805,7 +799,7 @@ async fn a_failed_create_never_deletes_the_branch_it_adopted() {
     // AFTER the git step — the exact window the rollback ladder exists for.
     let slug = "adopted-conflict";
     workspace_repo
-        .insert(&project.id, "Pre-existing", slug, "side", "/dummy")
+        .insert(&project.id, "Pre-existing", slug, "side", "/dummy", false)
         .expect("pre-insert");
 
     let worktree_path = tmp.path().join("worktrees").join(slug);
@@ -977,4 +971,80 @@ async fn a_default_branch_that_exists_only_on_the_remote_still_creates_the_named
         .output()
         .expect("git");
     assert_eq!(String::from_utf8(out.stdout).unwrap().trim(), branch_of(slug));
+}
+
+/// **H3, closed end to end.** Create-time rollback already refused to delete an
+/// adopted branch, but *deleting the workspace later* went through a different
+/// door and ran `git branch -D` unconditionally — the same data loss, reached
+/// by the gesture a user actually performs.
+///
+/// The fix is that the create records which it did. This asserts the record is
+/// what a delete path would read, in both directions: an adopted branch is
+/// marked so the branch survives, and a minted one is marked so cleanup still
+/// happens. Without the second half the guard would leak a dangling branch on
+/// every ordinary delete, forever.
+#[tokio::test]
+async fn the_row_records_whether_the_branch_was_minted_or_adopted() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path();
+    repo_with_a_marker_script_and_a_side_branch(project_root);
+    let (workspace_repo, project) = seed_project(project_root);
+
+    // Adopted: `side` existed before OxiMux ever saw it.
+    let adopted = match create_workspace_with_rollback(
+        project_root,
+        &project.id,
+        "Adopted",
+        "adopted",
+        &CreateBase::existing("side"),
+        &tmp.path().join("worktrees").join("adopted"),
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await
+    {
+        CreateOutcome::Created(row) => row,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    assert_eq!(adopted.branch, "side");
+    assert!(
+        !adopted.branch_minted,
+        "adopting a branch must record that we did NOT create it — otherwise \
+         deleting the workspace force-deletes the user's branch"
+    );
+
+    // Minted: ours, and cleanup must still remove it.
+    let minted = match create_workspace_with_rollback(
+        project_root,
+        &project.id,
+        "Minted",
+        "minted",
+        &base_of("minted"),
+        &tmp.path().join("worktrees").join("minted"),
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await
+    {
+        CreateOutcome::Created(row) => row,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    assert!(
+        minted.branch_minted,
+        "an ordinary create must stay cleanable, or every delete leaks a branch"
+    );
+
+    // And both survive the trip through storage, which is where the delete
+    // paths read them from.
+    let reread = |id: &str| {
+        workspace_repo
+            .get_by_id(id)
+            .expect("get")
+            .expect("row")
+            .branch_minted
+    };
+    assert!(!reread(&adopted.id));
+    assert!(reread(&minted.id));
 }

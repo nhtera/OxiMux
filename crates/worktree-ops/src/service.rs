@@ -341,8 +341,18 @@ impl WorktreeService for RepoWorktrees {
         // Best-effort, like the desktop flow: a surviving branch is reported in
         // logs but must not strand the row, or the listing would keep showing a
         // worktree whose directory is gone.
-        if let Err(err) = repo.delete_branch(&row.branch, false).await {
-            tracing::warn!(?err, branch = %row.branch, "remote worktree remove: branch survives");
+        // Only a branch this worktree's create minted — the same guard the
+        // desktop delete applies, for the same reason: an adopted branch is
+        // the user's, and removing a worktree is not permission to delete it.
+        if row.branch_minted {
+            if let Err(err) = repo.delete_branch(&row.branch, false).await {
+                tracing::warn!(?err, branch = %row.branch, "remote worktree remove: branch survives");
+            }
+        } else {
+            tracing::info!(
+                branch = %row.branch,
+                "keeping an adopted branch: this worktree checked it out, it did not create it"
+            );
         }
         self.workspaces.delete(&row.id).map_err(|err| {
             tracing::warn!(?err, id, "remote worktree remove: row delete failed");
@@ -365,8 +375,8 @@ mod progress_tests {
         let projects = ProjectRepo::new(db.clone());
         let workspaces = WorkspaceRepo::new(db.clone());
         let project = projects.insert("p", "/p", "main").expect("project");
-        let a = workspaces.insert(&project.id, "a", "a", "oximux/a", "/p/a").expect("a");
-        let b = workspaces.insert(&project.id, "b", "b", "oximux/b", "/p/b").expect("b");
+        let a = workspaces.insert(&project.id, "a", "a", "oximux/a", "/p/a", true).expect("a");
+        let b = workspaces.insert(&project.id, "b", "b", "oximux/b", "/p/b", true).expect("b");
         let service = RepoWorktrees::new(projects, workspaces, "/data".into());
         (service, project.root_path, a.id, b.id)
     }

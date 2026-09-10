@@ -382,6 +382,7 @@ mod tests {
             name: "Feat".into(),
             slug: "feat".into(),
             branch: branch.into(),
+            branch_minted: true,
             worktree_path: "/wt/feat".into(),
             status: "active".into(),
             created_at: String::new(),

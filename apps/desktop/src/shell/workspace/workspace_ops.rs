@@ -290,6 +290,9 @@ fn workspaces_with_primary_for(repo: &WorkspaceRepo, project: &Project) -> Vec<W
             Workspace {
                 id: format!("primary:{}", project.id),
                 project_id: project.id.clone(),
+                // Not a branch OxiMux minted: a synthesized row or a
+                // fixture. `false` is the reading that never deletes.
+                branch_minted: false,
                 name,
                 slug,
                 branch,
@@ -1370,6 +1373,9 @@ impl WorkspaceRoot {
         let workspace = Workspace {
             id: workspace_id,
             project_id,
+            // A stub built to name a row by id and path — it carries no branch,
+            // so nothing can act on this field. `false` never deletes.
+            branch_minted: false,
             name: String::new(),
             slug: String::new(),
             branch: String::new(),
@@ -2464,11 +2470,27 @@ impl WorkspaceRoot {
                     tracing::warn!(?err, slug = %workspace.slug, "force delete: remove_worktree still failed");
                     leftovers.push(format!("worktree at {}", workspace.worktree_path));
                 }
-                if let Err(err) = repo.delete_branch(&branch, force).await {
-                    tracing::warn!(?err, branch = %branch, "delete_branch failed");
-                    // Don't bail — DB cleanup still wanted to keep
-                    // state in sync.
-                    leftovers.push(format!("branch {branch}"));
+                // ONLY a branch this workspace's create minted.
+                //
+                // `delete_branch(_, force)` is `git branch -D` on the force
+                // path, which is correct for a branch created by the same call
+                // that made the worktree and is a week of somebody's work for
+                // one the worktree merely adopted. The create path recorded
+                // which it did (`Workspace::branch_minted`); this is the guard
+                // that create-time rollback has always had, on the door the
+                // user actually walks through.
+                if workspace.branch_minted {
+                    if let Err(err) = repo.delete_branch(&branch, force).await {
+                        tracing::warn!(?err, branch = %branch, "delete_branch failed");
+                        // Don't bail — DB cleanup still wanted to keep
+                        // state in sync.
+                        leftovers.push(format!("branch {branch}"));
+                    }
+                } else {
+                    tracing::info!(
+                        branch = %branch,
+                        "keeping an adopted branch: this worktree checked it out, it did not create it"
+                    );
                 }
                 let row_deleted = match workspace_repo.delete(&workspace.id) {
                     Ok(()) => true,
@@ -2750,6 +2772,9 @@ mod nav_history_tests {
         Workspace {
             id: id.to_string(),
             project_id: "p".to_string(),
+            // Not a branch OxiMux minted: a synthesized row or a
+            // fixture. `false` is the reading that never deletes.
+            branch_minted: false,
             name: id.to_string(),
             slug: id.to_string(),
             branch: "main".to_string(),
@@ -2782,6 +2807,9 @@ mod nav_history_tests {
         Workspace {
             id: format!("ws-{project_id}"),
             project_id: project_id.to_string(),
+            // Not a branch OxiMux minted: a synthesized row or a
+            // fixture. `false` is the reading that never deletes.
+            branch_minted: false,
             name: "w".to_string(),
             slug: "w".to_string(),
             branch: branch.to_string(),

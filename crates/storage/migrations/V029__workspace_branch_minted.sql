@@ -1,0 +1,26 @@
+-- V029: record whether OxiMux MINTED this worktree's branch or ADOPTED one
+-- that already existed.
+--
+-- Until now the answer was structural: a worktree's branch was always
+-- `<prefix>/<slug>`, created by the same call that made the worktree, so every
+-- lifecycle path could delete it on the way out without asking. Base refs end
+-- that — a worktree may now check out a branch the user has had for a week —
+-- and `git branch -D` on one of those is not cleanup, it is data loss.
+--
+-- The create path knows which it did and nothing downstream can work it out
+-- afterwards. Inferring from the configured prefix would be wrong twice: for a
+-- user who turned the prefix off, and for an adopted branch that happens to
+-- match it. So the fact is written down where the delete paths can read it.
+--
+-- `DEFAULT 1` is correct for every existing row, not merely convenient:
+-- adopting a branch is new in this migration's own release, so every worktree
+-- that predates it was necessarily minted by OxiMux. Existing behaviour is
+-- preserved exactly.
+--
+-- INTEGER rather than BOOLEAN because SQLite has no boolean type; NOT NULL
+-- because "we do not know" is not a state this can be in — the only writer is
+-- the create path, which always knows.
+--
+-- Additive with a default, matching V011/V012/V015/V016/V026 on this table.
+
+ALTER TABLE workspaces ADD COLUMN branch_minted INTEGER NOT NULL DEFAULT 1;

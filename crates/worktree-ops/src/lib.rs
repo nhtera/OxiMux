@@ -414,7 +414,10 @@ pub async fn create_workspace_with_rollback(
     // The branch the ROW names — the minted one, or the adopted one. This is
     // the clause the module doc's three-way agreement turns on.
     let branch = base.branch();
-    match workspace_repo.insert(project_id, name, slug, branch, &path_str) {
+    // Recorded, not inferred: `creates_branch()` is a create-time fact, and
+    // every later path that removes this worktree needs it to tell cleanup from
+    // data loss. See `Workspace::branch_minted`.
+    match workspace_repo.insert(project_id, name, slug, branch, &path_str, base.creates_branch()) {
         Ok(mut workspace) => {
             // Best-effort metadata write — the worktree + row already exist, so
             // a failure here only loses the issue badge, not the workspace. The

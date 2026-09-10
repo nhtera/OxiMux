@@ -395,6 +395,9 @@ mod tests {
         Workspace {
             id: id.to_string(),
             project_id: "p1".to_string(),
+            // Not a branch OxiMux minted: a synthesized row or a
+            // fixture. `false` is the reading that never deletes.
+            branch_minted: false,
             name: id.to_string(),
             slug: id.to_string(),
             branch: format!("oximux/{id}"),

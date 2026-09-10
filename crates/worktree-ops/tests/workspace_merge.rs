@@ -137,6 +137,7 @@ async fn fixture(slug: &str) -> Fixture {
         slug: slug.into(),
         branch: format!("oximux/{slug}"),
         worktree_path: wt_path.to_string_lossy().into_owned(),
+        branch_minted: true,
         status: "active".into(),
         created_at: String::new(),
         archived_at: None,

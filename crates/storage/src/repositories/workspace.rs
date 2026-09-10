@@ -24,6 +24,12 @@ impl WorkspaceRepo {
     /// `(project_id, slug)` pair already exists — callers (step 6) should
     /// catch this before invoking `git worktree add` to avoid a half-baked
     /// state.
+    /// Insert a workspace row.
+    ///
+    /// `branch_minted` says whether this create made `branch` or adopted a
+    /// branch that already existed. It is not a display field: every path that
+    /// removes a worktree reads it to decide whether removing the branch is
+    /// cleanup or data loss, and the create path is the only place that knows.
     pub fn insert(
         &self,
         project_id: &str,
@@ -31,6 +37,7 @@ impl WorkspaceRepo {
         slug: &str,
         branch: &str,
         worktree_path: &str,
+        branch_minted: bool,
     ) -> Result<Workspace, StorageError> {
         let id = new_id();
         let created_at = now();
@@ -40,9 +47,9 @@ impl WorkspaceRepo {
         self.db
             .with_conn(|c| {
                 c.execute(
-                    "INSERT INTO workspaces (id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, sort_order) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)",
-                    params![id, project_id, name, slug, branch, worktree_path, status, created_at, sort_order],
+                    "INSERT INTO workspaces (id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, sort_order, branch_minted) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10)",
+                    params![id, project_id, name, slug, branch, worktree_path, status, created_at, sort_order, branch_minted],
                 )
             })
             .map_err(|e| classify_unique("workspaces", "project_id_slug", e))?;
@@ -62,6 +69,7 @@ impl WorkspaceRepo {
             pinned: false,
             comment: String::new(),
             phase: String::new(),
+            branch_minted,
         })
     }
 
@@ -212,7 +220,7 @@ impl WorkspaceRepo {
     pub fn get_by_id(&self, id: &str) -> Result<Option<Workspace>, StorageError> {
         let row = self.db.with_conn(|c| {
             c.query_row(
-                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned, comment, phase \
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned, comment, phase, branch_minted \
                  FROM workspaces WHERE id = ?1",
                 [id],
                 WorkspaceRow::from_row,
@@ -229,7 +237,7 @@ impl WorkspaceRepo {
     pub fn get_by_worktree_path(&self, path: &str) -> Result<Option<Workspace>, StorageError> {
         let row = self.db.with_conn(|c| {
             c.query_row(
-                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned, comment, phase \
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned, comment, phase, branch_minted \
                  FROM workspaces \
                  WHERE worktree_path = ?1 AND archived_at IS NULL \
                  ORDER BY created_at DESC LIMIT 1",
@@ -245,7 +253,7 @@ impl WorkspaceRepo {
     pub fn list_for_project(&self, project_id: &str) -> Result<Vec<Workspace>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned, comment, phase \
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned, comment, phase, branch_minted \
                  FROM workspaces \
                  WHERE project_id = ?1 AND archived_at IS NULL \
                  ORDER BY created_at DESC",
@@ -268,7 +276,7 @@ impl WorkspaceRepo {
     ) -> Result<Vec<Workspace>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned, comment, phase \
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned, comment, phase, branch_minted \
                  FROM workspaces \
                  WHERE project_id = ?1 AND archived_at IS NOT NULL \
                  ORDER BY archived_at DESC",
@@ -374,7 +382,7 @@ impl WorkspaceRepo {
     ) -> Result<Vec<Workspace>, StorageError> {
         let rows = self.db.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned, comment, phase \
+                "SELECT id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, linked_issue, tint, sort_order, pinned, comment, phase, branch_minted \
                  FROM workspaces \
                  WHERE project_id = ?1 AND archived_at IS NULL \
                  ORDER BY sort_order ASC, created_at ASC",
@@ -454,7 +462,7 @@ mod tests {
     }
 
     fn ws(repo: &WorkspaceRepo, project_id: &str, slug: &str) -> Workspace {
-        repo.insert(project_id, slug, slug, "main", &format!("/p/{slug}"))
+        repo.insert(project_id, slug, slug, "main", &format!("/p/{slug}"), true)
             .expect("ws")
     }
 
