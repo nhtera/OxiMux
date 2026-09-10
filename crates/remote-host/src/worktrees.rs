@@ -33,6 +33,15 @@ pub enum WorktreeError {
     /// A worktree (or branch) with that slug already exists for the project.
     #[error("a worktree with that name already exists")]
     AlreadyExists,
+    /// Adoption was asked for a name that is not a local branch.
+    ///
+    /// Client-fixable, so it must NOT collapse into [`Self::CreateFailed`]:
+    /// that arm answers `Internal("the worktree could not be created")`, which
+    /// tells a user who typed `--branch origin/main` nothing at all. Naming the
+    /// rule and the alternative is the difference between a dead end and a
+    /// correction — and `--from` is the verb that does what they meant.
+    #[error("no local branch by that name (a remote-tracking branch or a tag needs `--from`)")]
+    NoSuchLocalBranch,
     /// The create failed past validation. Detail is logged host-side.
     #[error("the worktree could not be created")]
     CreateFailed,

@@ -715,8 +715,14 @@ pub enum WorktreeCommand {
         /// is NOT run. Use the row's `Run setup` after reading it.
         #[arg(long, value_name = "REF", conflicts_with = "branch")]
         from: Option<String>,
-        /// Check out an EXISTING branch into the new worktree. No branch is
-        /// created and no prefix is applied.
+        /// Check out an existing LOCAL branch into the new worktree. No branch
+        /// is created and no prefix is applied.
+        ///
+        /// A remote-tracking name (`origin/side`) or a tag is refused, because
+        /// neither is a branch to adopt: git would mint a local branch for the
+        /// first and detach HEAD for the second, and the worktree's row would
+        /// then name something that is not checked out. Use `--from` for those
+        /// — it cuts a new branch from any ref.
         #[arg(long, value_name = "NAME")]
         branch: Option<String>,
     },

@@ -127,6 +127,29 @@ impl WorktreeService for RepoWorktrees {
         if existing.iter().any(|w| w.slug == slug) {
             return Err(WorktreeError::AlreadyExists);
         }
+        // Adoption needs a local branch, and saying so HERE is what makes the
+        // refusal readable. `add_worktree_existing` enforces the same rule, but
+        // its error arrives as `CreateFailed` — i.e. `Internal("the worktree
+        // could not be created")` — which tells a user who typed
+        // `--branch origin/main` nothing. Same reasoning as the slug pre-check
+        // above: classify the common mistake so the client can act on it.
+        if let CreateBaseWire::Existing(name) = base {
+            let root = std::path::Path::new(&project.root_path);
+            let local = match Repository::open(root).await {
+                Ok(repo) => repo
+                    .sha_of(&format!("refs/heads/{name}"))
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some(),
+                // Cannot open the repo: let the create below report the real
+                // failure rather than blaming the branch name for it.
+                Err(_) => true,
+            };
+            if !local {
+                return Err(WorktreeError::NoSuchLocalBranch);
+            }
+        }
         // Host-derived target: `<data_dir>/projects/<project_id>/worktrees/<slug>`
         // — the client never supplies a path.
         let target = worktree_path(&self.data_dir, &project.id, slug);

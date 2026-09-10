@@ -23,6 +23,7 @@ fn worktree_failure(err: WorktreeError) -> Response {
         WorktreeError::UnknownProject
         | WorktreeError::BadSlug
         | WorktreeError::AlreadyExists
+        | WorktreeError::NoSuchLocalBranch
         | WorktreeError::UnknownWorktree => Response::Error(RpcError::BadRequest(err.to_string())),
         // The host failed; detail was logged by the service.
         WorktreeError::CreateFailed
@@ -309,6 +310,25 @@ mod tests {
                 0,
                 "the refusal must be upstream of the service"
             );
+        }
+    }
+
+    /// A client-fixable mistake must reach the client as one.
+    ///
+    /// `--branch origin/main` used to collapse into `CreateFailed`, i.e.
+    /// `Internal("the worktree could not be created")` — a dead end for a user
+    /// whose only error was naming a remote-tracking branch. The refusal has to
+    /// carry the rule and the alternative, or the CLI cannot say anything
+    /// useful about it.
+    #[test]
+    fn adopting_a_name_that_is_not_a_local_branch_is_a_bad_request() {
+        let response = worktree_failure(WorktreeError::NoSuchLocalBranch);
+        match response {
+            Response::Error(RpcError::BadRequest(msg)) => {
+                assert!(msg.contains("--from"), "the refusal must name the way out: {msg}");
+                assert!(msg.contains("local branch"), "and the rule: {msg}");
+            }
+            other => panic!("must be client-fixable, not Internal: {other:?}"),
         }
     }
 

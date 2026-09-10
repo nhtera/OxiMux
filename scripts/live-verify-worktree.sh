@@ -136,6 +136,19 @@ B=$(echo "$OUT" | branch_of 2>/dev/null); ADOPTED_ID=$(echo "$OUT" | id_of 2>/de
 git branch --format='%(refname:short)' | grep -q '^oximux/side$' \
   && bad "a prefixed branch was minted anyway" || ok "no prefixed branch minted"
 
+# Adopt means adopt. A remote-tracking name would make git MINT a local branch,
+# and a tag would detach HEAD — either way the row would name something the
+# worktree is not on. Both must be refused, and the refusal must point at
+# `--from`, which is the verb that actually does what the user meant.
+git tag -f v-live side >/dev/null 2>&1
+for v in origin/main v-live; do
+  OUT=$("$CLI" --dir "$DIR" worktree create adopt-bad --project "$ROOT/repo" --branch "$v" 2>&1)
+  case "$OUT" in
+    *"--from"*) ok "--branch '$v' refused, and the message names --from";;
+    *)          bad "--branch '$v' was not refused with useful guidance -- $OUT";;
+  esac
+done
+
 say "4. flag-shaped and revision-shaped refs are refused before git runs"
 for v in "-B main" "--force" "main..side" "side~1" "main@{1}"; do
   if "$CLI" --dir "$DIR" worktree create probe --project "$ROOT/repo" --from "$v" >/dev/null 2>&1
