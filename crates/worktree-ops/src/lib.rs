@@ -442,28 +442,45 @@ pub async fn create_workspace_with_rollback(
     }
 }
 
-/// The default branch, but only if `git` can actually resolve it here.
+/// A ref naming the project's default branch that `git` can actually resolve.
 ///
-/// `default_branch()` answers with the name behind `origin/HEAD` when there is
-/// one, and that name need not exist as a local ref. Handing an unresolvable
-/// name to `git worktree add` is worse than useless: git DWIMs a name matching
-/// exactly one remote-tracking branch into `--track -b <that name>`, which
-/// **overrides an explicit `-b`** and produces a worktree on the wrong branch
-/// entirely (see [`Repository::add_worktree_from`]). So this asks git, and a
-/// `None` here means "base on HEAD", not "fail".
+/// [`Repository::default_branch`] answers with a *name* — `main` — which on a
+/// worktree-centric checkout may have no `refs/heads/` entry at all, because
+/// the user deleted the local branch they never sit on. So the name is tried in
+/// two spellings, and the order matters:
+///
+/// 1. `main` — the local branch, when it exists. What the user's own work is
+///    based on.
+/// 2. `origin/main` — the remote-tracking form. Still the default branch, just
+///    held somewhere else, and the correct base when there is no local copy.
+///
+/// **Only when neither resolves does this give up**, and `None` means "base on
+/// HEAD" rather than "fail" — a stale captured default must not make creating a
+/// worktree impossible.
+///
+/// Live verification is what established the second spelling is required: with
+/// only step 1, a repo whose default lives at `origin/main` degraded straight to
+/// HEAD and based new work on whatever feature branch the checkout was parked
+/// on. That is the defect base refs exist to close, reintroduced through the
+/// fallback — and no unit test caught it, because they all had a local `main`.
 async fn resolvable_default(repo: &Repository, default_branch: Option<&str>) -> Option<String> {
     let default = default_branch?;
-    match repo.sha_of(default).await {
-        Ok(Some(_)) => Some(default.to_string()),
-        Ok(None) => {
-            tracing::info!(%default, "default branch does not resolve locally; basing on HEAD");
-            None
-        }
-        Err(err) => {
-            tracing::warn!(?err, %default, "could not resolve the default branch; basing on HEAD");
-            None
+    // `origin/` matches `default_branch`'s own source (`refs/remotes/origin/HEAD`).
+    for candidate in [default.to_string(), format!("origin/{default}")] {
+        match repo.sha_of(&candidate).await {
+            Ok(Some(_)) => return Some(candidate),
+            Ok(None) => continue,
+            Err(err) => {
+                tracing::warn!(?err, %candidate, "could not resolve a default-branch candidate");
+                continue;
+            }
         }
     }
+    tracing::info!(
+        %default,
+        "default branch resolves neither locally nor as a remote-tracking ref; basing on HEAD"
+    );
+    None
 }
 
 /// Clear a worktree directory left behind by an interrupted create, so a retry

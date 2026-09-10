@@ -883,3 +883,30 @@ async fn adopting_refuses_a_tag() {
         git_out(p, &["rev-parse", "v1.0^{commit}"])
     );
 }
+
+/// **What live verification caught.** `default_branch()` reports the name
+/// behind `origin/HEAD`, which on a worktree-centric checkout has no local
+/// ref — the user deleted the `main` they never sit on. An earlier fix made
+/// `default_branch()` return `None` in that case, which threw the usable answer
+/// away: the create path then based new work on whatever branch the checkout
+/// was parked on, reintroducing the exact defect base refs exist to close.
+///
+/// So the name is still reported, and resolving it is the caller's job. Every
+/// unit test before this had a local `main`, which is why only driving the real
+/// binaries found it.
+#[tokio::test]
+async fn default_branch_still_names_a_default_that_lives_only_on_the_remote() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = repo_whose_default_is_remote_only(tmp.path());
+    let repo = Repository::open(&work).await.unwrap();
+
+    assert_eq!(
+        repo.default_branch().await.unwrap().as_deref(),
+        Some("main"),
+        "the default branch is `main`; it just lives at origin/main"
+    );
+    // The bare name does not resolve — which is exactly why a caller that needs
+    // something checkoutable has to try the remote-tracking spelling.
+    assert!(repo.sha_of("main").await.unwrap().is_none());
+    assert!(repo.sha_of("origin/main").await.unwrap().is_some());
+}
