@@ -94,12 +94,16 @@ fn compact_agent_glyph(
 /// actions and restore looks absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RowMenu {
-    /// Show the trailing `…` button at all. Primary rows suppress it — the main
-    /// worktree goes away with the project, not on its own.
-    pub show: bool,
     /// A row menu is open somewhere in the rail. Global rather than per-row
     /// because while one is open its overlay occludes every other trigger, so
     /// no other tooltip can be showing anyway.
+    ///
+    /// There is no per-row "has a menu" flag any more. Every row — primary
+    /// included — gets the `…` trigger and the right-click handler; *what*
+    /// the menu offers is decided by `row_menu::menu_actions` from the row's
+    /// capabilities, and that list is never empty (`Copy Path` is on every
+    /// row). The old primary gate hid the whole menu on the one row a fresh
+    /// install has, which made every row action unreachable in practice.
     pub open: bool,
 }
 
@@ -140,10 +144,8 @@ pub fn render_workspace_card(
     let on_menu_click_btn = on_menu_click.clone();
 
     // Trailing "…" button — invisible at rest, revealed on row hover via
-    // `group_hover`. Primary (main worktree) rows suppress this because the
-    // main worktree is removed by removing the project, not here.
-    let trailing_btn = menu.show.then(|| {
-        div()
+    // `group_hover`. On every row, primary included; see `RowMenu`.
+    let trailing_btn = div()
             .id(menu_id)
             .flex()
             .items_center()
@@ -171,8 +173,7 @@ pub fn render_workspace_card(
             .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                 cx.stop_propagation();
                 on_menu_click_btn(ev, window, cx);
-            })
-    });
+            });
 
     // Line 1 — name + optional primary badge + optional branch chip.
     let primary_badge = (plan.row.is_primary && !plan.row.is_folder).then(|| {
@@ -580,15 +581,13 @@ pub fn render_workspace_card(
                 // (agent verb / diff) is dropped to fit a single row height.
                 .when(!compact, |c| c.child(line2)),
         )
-        .children(trailing_btn)
+        .child(trailing_btn)
         .on_mouse_down(MouseButton::Left, on_row_click)
         // Right-click opens the same row popover at the cursor (DRY with the
-        // `…` button). Gated to rows that have a menu (non-primary).
-        .when(menu.show, |el| {
-            el.on_mouse_down(MouseButton::Right, move |ev, window, cx| {
-                cx.stop_propagation();
-                on_menu_click(ev, window, cx);
-            })
+        // `…` button). On every row, primary included; see `RowMenu`.
+        .on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+            cx.stop_propagation();
+            on_menu_click(ev, window, cx);
         })
         // Drag-to-reorder (Manual mode, non-primary rows only). Stateless
         // idiom: the payload carries the source index, `drag_over` paints the
@@ -751,23 +750,18 @@ mod tests {
 mod row_menu_tests {
     use super::RowMenu;
 
-    /// The trigger's tooltip is what paints over the menu's first item, so the
-    /// two flags are independent: a row can show its `…` button while the
-    /// tooltip is suppressed, and that combination is the whole point.
+    /// The trigger's tooltip is what paints over the menu's first item: the
+    /// flag says "suppress it", and nothing else — the `…` button itself is
+    /// unconditional now.
     #[test]
-    fn showing_the_button_and_suppressing_its_tooltip_are_separate() {
-        let open = RowMenu { show: true, open: true };
-        assert!(open.show, "the button stays on screen while its menu is up");
-        assert!(open.open, "...and its tooltip is suppressed");
-
-        let closed = RowMenu { show: true, open: false };
-        assert!(closed.show);
-        assert!(!closed.open, "tooltip comes back once the menu closes");
+    fn open_means_the_trigger_tooltip_is_suppressed() {
+        assert!(RowMenu { open: true }.open, "tooltip suppressed while the menu is up");
+        assert!(!RowMenu { open: false }.open, "tooltip comes back once the menu closes");
     }
 
-    /// A primary row has no menu at all, so nothing to suppress.
+    /// At rest no menu is open, so nothing is suppressed.
     #[test]
-    fn a_row_without_a_menu_defaults_to_no_suppression() {
-        assert_eq!(RowMenu::default(), RowMenu { show: false, open: false });
+    fn the_default_suppresses_nothing() {
+        assert_eq!(RowMenu::default(), RowMenu { open: false });
     }
 }

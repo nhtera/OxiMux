@@ -23,6 +23,7 @@
 
 pub mod dashboard_status_menu;
 pub mod nav_section;
+pub mod open_in;
 pub mod options_menu;
 pub mod project_drag;
 pub mod project_group;

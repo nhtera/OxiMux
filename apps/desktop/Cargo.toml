@@ -124,6 +124,11 @@ libc = "0.2"
 
 # Bringing the already-running instance forward: a registered broadcast message
 # and the foreground-right handoff that lets the holder honour it.
+# `Open in ▸` editor detection off-macOS walks PATH; macOS looks for app
+# bundles and never needs this.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+which = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 # Screen control, and the policing hook that is wider than it.
 #

@@ -8,7 +8,9 @@
 
 use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
 use gpui_component::{Sizable as _, input::Input};
-use oximux_settings::{Density, Theme, Typography, git::BranchPrefixMode, git::GitSettings};
+use oximux_settings::{
+    Density, OpenInApp, Theme, Typography, git::BranchPrefixMode, git::GitSettings,
+};
 
 use super::SettingsModal;
 use super::controls::{toggle_switch, value_chip};
@@ -16,6 +18,7 @@ use super::layout::{
     SettingEntry, entries_card, entry, entry_stacked, entry_stacked_hinted, hint_text, notice_text,
 };
 use super::segmented::{Segment, segmented};
+use crate::shell::left_rail::open_in;
 use crate::shell::workspace::configured_locator::{ConfiguredLocator, DEFAULT_ROOT_UNDER_HOME};
 
 /// Render the Git pane: the settings rows plus a quiet save-location caption.
@@ -196,7 +199,159 @@ pub(super) fn entries(
         keep_fresh,
     ));
 
+    rows.extend(open_in_entries(modal, theme, density, typography, cx));
+
     rows
+}
+
+/// The `Open in` section: the add form under its own label, then one row per
+/// app the workspace row menu will offer, each with `Remove`.
+///
+/// The rows show the *effective* list — the built-in one until the user
+/// edits it — so what the pane lists is what the menu offers. The first
+/// edit materialises the built-in list into `git.toml`; `Reset` empties it
+/// again, which is the spelling of "use the built-in list".
+fn open_in_entries(
+    modal: &SettingsModal,
+    theme: Theme,
+    density: Density,
+    typography: &Typography,
+    cx: &mut gpui::Context<SettingsModal>,
+) -> Vec<SettingEntry> {
+    let mut rows: Vec<SettingEntry> = Vec::new();
+    let configured = !modal.git.open_in.is_empty();
+
+    if let (Some(name), Some(command)) =
+        (modal.git_open_in_name_input.as_ref(), modal.git_open_in_cmd_input.as_ref())
+    {
+        let form = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .w_full()
+            .gap(px(8.0))
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(name).small().text_size(px(typography.t_body_sm)).into_any_element(),
+                ),
+            )
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(command)
+                        .small()
+                        .text_size(px(typography.t_body_sm))
+                        .into_any_element(),
+                ),
+            )
+            .child(value_chip(
+                "git-open-in-add",
+                "Add",
+                theme,
+                density,
+                typography,
+                |this: &mut SettingsModal, window, cx| this.add_open_in_app(window, cx),
+                cx,
+            ));
+        let under = match &modal.git_open_in_notice {
+            Some(reason) => notice_text(false, reason.clone(), theme, typography),
+            None if configured => hint_text(
+                "Your own list. Remove every app, or Reset, to go back to the built-in one.",
+                theme,
+                typography,
+            ),
+            None => hint_text(
+                "The built-in list: your file manager plus the editors found on this machine. \
+                 Adding or removing an app makes the list your own.",
+                theme,
+                typography,
+            ),
+        };
+        rows.push(entry_stacked_hinted(
+            "Open in",
+            "Apps a workspace row's Open in \u{25b8} menu offers. The worktree directory is \
+             passed as the last argument; wrap an argument with spaces in double quotes.",
+            form,
+            under,
+        ));
+    }
+
+    for (idx, app) in modal.git_open_in_shown.iter().enumerate() {
+        rows.push(entry(
+            app.name.clone(),
+            app.command.clone(),
+            value_chip(
+                ("git-open-in-remove", idx),
+                "Remove",
+                theme,
+                density,
+                typography,
+                move |this: &mut SettingsModal, _w, cx| this.remove_open_in_app(idx, cx),
+                cx,
+            ),
+        ));
+    }
+
+    if configured {
+        rows.push(entry(
+            "Built-in list",
+            "Forget the apps above and offer the built-in list again.",
+            value_chip(
+                "git-open-in-reset",
+                "Reset",
+                theme,
+                density,
+                typography,
+                |this: &mut SettingsModal, _w, cx| this.reset_open_in_apps(cx),
+                cx,
+            ),
+        ));
+    }
+
+    rows
+}
+
+/// Append `name` / `command` to `list`, materialising the built-in list
+/// first when `list` is empty so the addition lands *beside* the defaults
+/// rather than replacing them. Refuses a blank name, a blank command, or a
+/// command that cannot be split into a program (an unterminated quote).
+pub(super) fn add_open_in(
+    list: &mut Vec<OpenInApp>,
+    name: &str,
+    command: &str,
+    defaults: impl FnOnce() -> Vec<OpenInApp>,
+) -> Result<(), String> {
+    let name = name.trim();
+    let command = command.trim();
+    if name.is_empty() {
+        return Err("Give the app a name.".to_string());
+    }
+    if command.is_empty() {
+        return Err("Give the app a command.".to_string());
+    }
+    if open_in::parse_command(command).is_none() {
+        return Err("The command needs a program name, with every quote closed.".to_string());
+    }
+    if list.is_empty() {
+        *list = defaults();
+    }
+    list.push(OpenInApp { name: name.to_string(), command: command.to_string() });
+    Ok(())
+}
+
+/// Remove the `idx`-th app of the effective list, materialising the built-in
+/// list first when `list` is empty — the index the pane clicked is an index
+/// into what it showed. Out of range is a no-op.
+pub(super) fn remove_open_in(
+    list: &mut Vec<OpenInApp>,
+    idx: usize,
+    defaults: impl FnOnce() -> Vec<OpenInApp>,
+) {
+    if list.is_empty() {
+        *list = defaults();
+    }
+    if idx < list.len() {
+        list.remove(idx);
+    }
 }
 
 /// The placeholder for an empty directory field: the default root, spelled
@@ -242,4 +397,89 @@ fn landing_hint(text: &str) -> String {
         })
         .unwrap_or_else(default_root_placeholder);
     format!("New worktrees go to {root}/<project>/<slug>.")
+}
+
+#[cfg(test)]
+mod open_in_tests {
+    use super::*;
+
+    fn app(name: &str, command: &str) -> OpenInApp {
+        OpenInApp { name: name.into(), command: command.into() }
+    }
+
+    fn built_in() -> Vec<OpenInApp> {
+        vec![app("Finder", "open"), app("Zed", "zed")]
+    }
+
+    /// Adding to an untouched list keeps the built-in apps: the user asked
+    /// for one more editor, not for a list with only that editor in it.
+    #[test]
+    fn the_first_add_materialises_the_built_in_list_beside_the_new_app() {
+        let mut list = Vec::new();
+        add_open_in(&mut list, "Cursor", "cursor", built_in).expect("added");
+        assert_eq!(list, vec![app("Finder", "open"), app("Zed", "zed"), app("Cursor", "cursor")]);
+    }
+
+    #[test]
+    fn a_later_add_appends_without_touching_the_defaults() {
+        let mut list = vec![app("Only", "only")];
+        add_open_in(&mut list, " Cursor ", " cursor ", || panic!("defaults not consulted"))
+            .expect("added");
+        assert_eq!(list, vec![app("Only", "only"), app("Cursor", "cursor")]);
+    }
+
+    #[test]
+    fn a_blank_name_or_command_is_refused_and_writes_nothing() {
+        let mut list = Vec::new();
+        assert!(add_open_in(&mut list, "", "code", built_in).is_err());
+        assert!(add_open_in(&mut list, "VS Code", "   ", built_in).is_err());
+        assert!(list.is_empty(), "a refused add must not materialise the defaults");
+    }
+
+    /// The one command shape `launch` cannot split is refused here, so the
+    /// menu never offers an entry that fails on click.
+    #[test]
+    fn an_unterminated_quote_is_refused() {
+        let mut list = Vec::new();
+        let err = add_open_in(&mut list, "Code", "open -a \"Visual Studio", built_in).unwrap_err();
+        assert!(err.contains("quote"), "{err}");
+        assert!(list.is_empty());
+    }
+
+    /// `""` and `" "` are non-blank text whose program is nothing; the
+    /// parser refuses them, so the pane must too rather than adding an entry
+    /// that fails on click.
+    #[test]
+    fn a_quoted_empty_program_is_refused() {
+        let mut list = Vec::new();
+        assert!(add_open_in(&mut list, "App", "\"\"", built_in).is_err());
+        assert!(add_open_in(&mut list, "App", "\" \"", built_in).is_err());
+        assert!(list.is_empty());
+    }
+
+    /// Removing from the built-in list must remove the app the user clicked,
+    /// which means materialising the same list the pane showed.
+    #[test]
+    fn removing_from_the_built_in_list_materialises_it_first() {
+        let mut list = Vec::new();
+        remove_open_in(&mut list, 0, built_in);
+        assert_eq!(list, vec![app("Zed", "zed")]);
+    }
+
+    #[test]
+    fn removing_out_of_range_is_a_no_op() {
+        let mut list = vec![app("Only", "only")];
+        remove_open_in(&mut list, 5, || panic!("defaults not consulted"));
+        assert_eq!(list, vec![app("Only", "only")]);
+    }
+
+    /// Removing the last app empties the list, and an empty list means the
+    /// built-in one — the documented way back, stated in the pane's hint.
+    #[test]
+    fn removing_the_last_app_returns_to_the_built_in_list() {
+        let mut list = vec![app("Only", "only")];
+        remove_open_in(&mut list, 0, || panic!("defaults not consulted"));
+        assert!(list.is_empty());
+        assert_eq!(open_in::effective_apps(&GitSettings::shipped()), open_in::default_apps());
+    }
 }
