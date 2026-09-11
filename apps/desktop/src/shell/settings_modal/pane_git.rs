@@ -6,7 +6,14 @@
 //! global — which is what lets it answer on the same frame as the keystroke,
 //! while still running the resolver the create path runs.
 
-use gpui::{AnyElement, IntoElement, ParentElement, Styled, div, px};
+use gpui::{
+    Anchor, AnyElement, ClickEvent, Entity, IntoElement, ParentElement, SharedString, Styled, div,
+    px,
+};
+use gpui_component::button::Button;
+// A plain `Button` carrying its own menu, not `DropdownButton` — see the
+// schedules pane for why: that widget hangs the menu off the chevron alone.
+use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::{Sizable as _, input::Input};
 use oximux_settings::{
     Density, OpenInApp, Theme, Typography, git::BranchPrefixMode, git::GitSettings,
@@ -243,6 +250,7 @@ fn open_in_entries(
                         .into_any_element(),
                 ),
             )
+            .child(presets_dropdown(cx.entity()))
             .child(value_chip(
                 "git-open-in-add",
                 "Add",
@@ -308,6 +316,37 @@ fn open_in_entries(
     }
 
     rows
+}
+
+/// The `Presets ▾` dropdown beside the add form: one row per editor this
+/// build knows how to launch. Picking one fills the two fields; `Add` is
+/// still the commit.
+fn presets_dropdown(entity: Entity<SettingsModal>) -> AnyElement {
+    let presets = open_in::presets();
+    Button::new(SharedString::from("git-open-in-presets"))
+        .label("Presets")
+        .small()
+        .outline()
+        .dropdown_caret(true)
+        .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, window, _cx| {
+            for app in presets.clone() {
+                let entity = entity.clone();
+                let label = app.name.clone();
+                menu = menu.item(
+                    PopupMenuItem::element(move |_w, _cx| {
+                        div().min_w(px(96.0)).child(label.clone())
+                    })
+                    .on_click(window.listener_for(
+                        &entity,
+                        move |m: &mut SettingsModal, _ev: &ClickEvent, window, cx| {
+                            m.prefill_open_in_app(&app, window, cx);
+                        },
+                    )),
+                );
+            }
+            menu
+        })
+        .into_any_element()
 }
 
 /// Append `name` / `command` to `list`, materialising the built-in list

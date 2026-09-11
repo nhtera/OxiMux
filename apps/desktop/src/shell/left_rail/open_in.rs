@@ -68,17 +68,29 @@ const MAC_EDITORS: &[(&str, &str)] = &[
 ];
 
 #[cfg(target_os = "macos")]
+fn mac_editor(name: &str, bundle: &str) -> OpenInApp {
+    OpenInApp { name: name.to_string(), command: format!("open -a \"{bundle}\"") }
+}
+
+#[cfg(target_os = "macos")]
 fn installed_editors() -> Vec<OpenInApp> {
     let mut roots = vec![std::path::PathBuf::from("/Applications")];
     roots.extend(dirs::home_dir().map(|h| h.join("Applications")));
     MAC_EDITORS
         .iter()
         .filter(|(_, bundle)| roots.iter().any(|r| r.join(format!("{bundle}.app")).exists()))
-        .map(|(name, bundle)| OpenInApp {
-            name: (*name).to_string(),
-            command: format!("open -a \"{bundle}\""),
-        })
+        .map(|(name, bundle)| mac_editor(name, bundle))
         .collect()
+}
+
+/// Every editor this module knows how to launch, installed or not — the
+/// settings pane's preset picker, so adding one is a click rather than
+/// knowing that VS Code is `open -a "Visual Studio Code"`. The command is
+/// the platform's shape for that editor; whether it can actually start is
+/// for the click to find out, which is the same contract a typed command has.
+#[cfg(target_os = "macos")]
+pub fn presets() -> Vec<OpenInApp> {
+    MAC_EDITORS.iter().map(|(name, bundle)| mac_editor(name, bundle)).collect()
 }
 
 /// Editors reached by their CLI name off-macOS.
@@ -90,6 +102,16 @@ const CLI_EDITORS: &[(&str, &str)] =
 /// Windows `which` honours `PATHEXT` and matches `code.cmd`, which
 /// `std::process::Command` — resolving by appending `.exe` only — would then
 /// fail to start. Quoted, since an install path routinely contains spaces.
+/// See the macOS `presets`. Off-macOS the preset is the bare CLI name, which
+/// `launch` resolves through the repaired `PATH` like any typed command.
+#[cfg(not(target_os = "macos"))]
+pub fn presets() -> Vec<OpenInApp> {
+    CLI_EDITORS
+        .iter()
+        .map(|(name, bin)| OpenInApp { name: (*name).to_string(), command: (*bin).to_string() })
+        .collect()
+}
+
 #[cfg(not(target_os = "macos"))]
 fn installed_editors() -> Vec<OpenInApp> {
     CLI_EDITORS
@@ -187,6 +209,23 @@ mod tests {
     fn a_configured_list_wins_and_is_not_merged() {
         let settings = GitSettings { open_in: vec![app("Zed", "zed")], ..GitSettings::shipped() };
         assert_eq!(effective_apps(&settings), vec![app("Zed", "zed")]);
+    }
+
+    /// Every preset is launchable as written — the picker must never offer
+    /// a command the parser would refuse — and every detected editor is one
+    /// of the presets, so the two lists cannot drift apart.
+    #[test]
+    fn presets_parse_and_cover_every_detected_editor() {
+        let presets = presets();
+        assert!(!presets.is_empty());
+        for app in &presets {
+            assert!(parse_command(&app.command).is_some(), "{app:?}");
+            assert!(!app.name.is_empty());
+        }
+        let preset_names: Vec<&str> = presets.iter().map(|a| a.name.as_str()).collect();
+        for app in installed_editors() {
+            assert!(preset_names.contains(&app.name.as_str()), "{app:?} is not a preset");
+        }
     }
 
     #[test]

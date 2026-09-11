@@ -613,7 +613,8 @@ impl SettingsModal {
         self.git_open_in_name_input =
             Some(cx.new(|cx| InputState::new(window, cx).placeholder("Name, e.g. VS Code")));
         self.git_open_in_cmd_input = Some(cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Command, e.g. code  or  open -a \"Zed\"")
+            InputState::new(window, cx)
+                .placeholder("Command, as typed in a terminal: code, cursor, zed")
         }));
         self.refresh_open_in_shown();
 
@@ -977,6 +978,27 @@ impl SettingsModal {
                 cx.notify();
             }
         }
+    }
+
+    /// The preset picker: drop a known editor's name and command into the
+    /// add form, ready for `Add`. Prefilled rather than added outright so the
+    /// label can still be changed and so a preset the user then thinks
+    /// better of costs nothing to abandon.
+    pub(super) fn prefill_open_in_app(
+        &mut self,
+        app: &oximux_settings::OpenInApp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(name_input), Some(cmd_input)) =
+            (self.git_open_in_name_input.clone(), self.git_open_in_cmd_input.clone())
+        else {
+            return;
+        };
+        name_input.update(cx, |s, cx| s.set_value(app.name.clone(), window, cx));
+        cmd_input.update(cx, |s, cx| s.set_value(app.command.clone(), window, cx));
+        self.git_open_in_notice = None;
+        cx.notify();
     }
 
     /// Remove the `idx`-th app of the list the pane is showing. Removing
