@@ -100,6 +100,13 @@ pub(super) struct SettingEntry {
     /// Render the control full-width *beneath* the label rather than pinned
     /// right. See [`entry_stacked`] for when a row needs it.
     pub stacked: bool,
+    /// A line under a stacked control — a format rule, a live verdict. Placed
+    /// by [`stacked_row`] as its own full-width child, never nested inside
+    /// the control: a wrapping hint inside a control's own flex column is
+    /// measured against that column's indefinite width, reports a height for
+    /// the wrong number of lines, and pushes every row after it off the card.
+    /// See [`entry_stacked_hinted`].
+    pub hint: Option<AnyElement>,
 }
 
 /// Build a [`SettingEntry`] from a label, description, and control element.
@@ -113,6 +120,7 @@ pub(super) fn entry(
         description: description.into(),
         control: control.into_any_element(),
         stacked: false,
+        hint: None,
     }
 }
 
@@ -131,6 +139,18 @@ pub(super) fn entry_stacked(
     control: impl IntoElement,
 ) -> SettingEntry {
     SettingEntry { stacked: true, ..entry(label, description, control) }
+}
+
+/// [`entry_stacked`] with a line beneath the control — the entry form of
+/// [`setting_row_action_hint`]'s hint slot, for a pane whose rows are
+/// [`SettingEntry`]s so search can list them.
+pub(super) fn entry_stacked_hinted(
+    label: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    control: impl IntoElement,
+    hint: impl IntoElement,
+) -> SettingEntry {
+    SettingEntry { hint: Some(hint.into_any_element()), ..entry_stacked(label, description, control) }
 }
 
 /// Case-insensitive substring match of `query` against a row's label or
@@ -160,7 +180,7 @@ pub(super) fn entries_card(
         .into_iter()
         .map(|e| {
             if e.stacked {
-                setting_row_stack(e.label, e.description, e.control, theme, typography)
+                stacked_row(e.label, e.description, None, e.control, e.hint, theme, typography)
             } else {
                 setting_row_desc(e.label, e.description, e.control, theme, typography)
             }

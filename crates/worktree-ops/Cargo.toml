@@ -39,6 +39,11 @@ oximux-no-window = { workspace = true }
 # be anchored and budgeted (see `include.rs`).
 ignore = { workspace = true }
 async-trait = { workspace = true }
+# Canonical paths WITHOUT the `\\?\` verbatim prefix `std::fs::canonicalize`
+# adds on Windows: a minted path becomes a `git worktree add` argument, a
+# stored `worktree_path`, and the rail's displayed text, and Git for Windows
+# does not take verbatim paths.
+dunce = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

@@ -2,11 +2,16 @@
 //! implementation of remote-host's [`WorktreeService`] seam.
 //!
 //! Reuses the New-Worktree flow's own pieces rather than paralleling them: the
-//! same slug validation, the same host-derived path scheme
-//! ([`worktree_path`]), the same [`create_workspace_with_rollback`] (git
+//! same slug validation, the same [`create_workspace_with_rollback`] (git
 //! worktree + branch + DB row, with rollback on storage failure), and the same
 //! pre-remove cleanup script. A worktree the CLI creates is therefore exactly
 //! the row the desktop sidebar lists, and vice versa.
+//!
+//! **The path scheme here is host-derived, unconditionally.** This service
+//! constructs its own [`HostDerivedLocator`] and takes no locator from a
+//! caller, so a client names a project and a slug and never a location — the
+//! property the remote surface promises, kept even now that the desktop's own
+//! creates resolve a configured root.
 //!
 //! No view state anywhere: everything here is durable data plus git
 //! subprocesses, which is what lets `oximux serve` host it unchanged. The
@@ -23,23 +28,36 @@ use oximux_storage::{ProjectRepo, WorkspaceRepo};
 
 use crate::branch_name;
 use crate::{
-    CreateBase, CreateOutcome, Provision, create_workspace_with_rollback,
-    run_cleanup_before_remove, worktree_path,
+    CreateBase, CreateOutcome, HostDerivedLocator, Provision, WorktreeLocator,
+    create_workspace_with_rollback, run_cleanup_before_remove,
 };
 
 /// Manages worktrees against the same repos and path scheme the desktop uses.
 pub struct RepoWorktrees {
     projects: ProjectRepo,
     workspaces: WorkspaceRepo,
-    /// The root new worktrees are derived under. The desktop passes its app
-    /// data dir; `oximux serve` passes its `--data-dir`, so a server keeps its
-    /// worktrees under its own root.
+    /// The root new worktrees are derived under, and where `git.toml` is
+    /// read from. The desktop passes its app data dir; `oximux serve` passes
+    /// its `--data-dir`, so a server keeps its worktrees under its own root.
     data_dir: PathBuf,
+    /// Host-derived, built here from `data_dir` and nowhere else.
+    locator: HostDerivedLocator,
 }
 
 impl RepoWorktrees {
     pub fn new(projects: ProjectRepo, workspaces: WorkspaceRepo, data_dir: PathBuf) -> Self {
-        Self { projects, workspaces, data_dir }
+        let locator = HostDerivedLocator::new(data_dir.clone());
+        Self { projects, workspaces, data_dir, locator }
+    }
+
+    /// Where a create for `slug` in `project` lands. Host-derived by
+    /// construction; crate-visible so a test can pin that it stays so. The
+    /// `expect` is the contract: [`HostDerivedLocator::locate`] validates
+    /// nothing and cannot refuse.
+    pub(crate) fn target_path(&self, project: &oximux_core::Project, slug: &str) -> PathBuf {
+        self.locator
+            .locate(project, slug)
+            .expect("the host-derived locator validates nothing and cannot refuse")
     }
 
     /// Resolve a client-named project root against the host's own records.
@@ -152,7 +170,7 @@ impl WorktreeService for RepoWorktrees {
         }
         // Host-derived target: `<data_dir>/projects/<project_id>/worktrees/<slug>`
         // — the client never supplies a path.
-        let target = worktree_path(&self.data_dir, &project.id, slug);
+        let target = self.target_path(&project, slug);
         // Same branch name the desktop would mint for this slug: one resolver,
         // reading the same `git.toml`. A remote-created worktree that carried
         // the hardcoded `oximux/` prefix while the sidebar minted the
@@ -181,24 +199,22 @@ impl WorktreeService for RepoWorktrees {
             }
         };
         let outcome = create_workspace_with_rollback(
-            root,
-            &project.id,
+            &project,
             slug,
             slug,
             &create_base,
             &target,
+            // The locator that minted `target`, so an interrupted create's
+            // debris there is reclaimed on retry — the slug collision check
+            // above has already established no row claims it.
+            &self.locator,
             None,
             &self.workspaces,
             // Headless: no override (the project's `auto_setup` decides) and
             // nowhere to stream a transcript. A remote client asking for a
             // worktree gets the same provisioning the desktop does; it just
             // sees the outcome instead of watching it.
-            //
-            // Reclaim is on: `target` came from `worktree_path(&self.data_dir,
-            // ..)` a few lines up, and the slug collision check above has
-            // already established no row claims it.
             &Provision::default()
-                .reclaiming_orphans()
                 .freshening_default(git_settings.keep_default_up_to_date),
         )
         .await;
@@ -466,6 +482,36 @@ mod progress_tests {
         service.set_progress(&a, None, Some("shipped")).await.expect("set");
         let rows = service.list_progress(None).await.expect("list");
         assert_eq!(rows[0].phase, "shipped");
+    }
+}
+
+#[cfg(test)]
+mod locator_tests {
+    use super::*;
+    use oximux_storage::open_memory;
+
+    /// The remote surface's guarantee, pinned: whatever the desktop configures
+    /// for its own creates, a worktree created through this service lands
+    /// under the host's data directory. There is no constructor that takes a
+    /// locator, and this is the test that notices if one appears.
+    #[test]
+    fn the_service_locator_is_host_derived_and_ignores_any_configured_root() {
+        let db = open_memory().expect("db");
+        let projects = ProjectRepo::new(db.clone());
+        let workspaces = WorkspaceRepo::new(db);
+        let project = projects.insert("api", "/repos/api", "main").expect("project");
+        let data_dir = tempfile::tempdir().expect("tempdir");
+        // A configured root the desktop would honour; the service must not.
+        std::fs::write(
+            data_dir.path().join(oximux_settings::git::GitSettings::FILE_NAME),
+            "worktree_dir = \"/somewhere/the/user/chose\"\n",
+        )
+        .expect("write git.toml");
+        let service = RepoWorktrees::new(projects, workspaces, data_dir.path().to_path_buf());
+        assert_eq!(
+            service.target_path(&project, "feat"),
+            crate::worktree_path(data_dir.path(), &project.id, "feat")
+        );
     }
 }
 

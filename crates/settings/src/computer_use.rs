@@ -153,11 +153,11 @@ impl ComputerUseSettings {
     /// project the user enabled, and requiring the two to be spelled identically
     /// would leave the pane listing a project whose chats silently get nothing.
     ///
-    /// Containment is not the whole answer: a linked worktree is a *sibling* of
-    /// its project (`suggest_worktree_path` puts it at `<parent>/oximux-wt-…`),
-    /// so no amount of prefix matching reaches it. Resolving a worktree back to
-    /// its main repository needs git and belongs to the caller; this stays pure
-    /// so it can be tested without one.
+    /// Containment is not the whole answer: a linked worktree lives *outside*
+    /// its project (under the configured worktree root, `~/OxiMux/worktrees`
+    /// by default), so no amount of prefix matching reaches it. Resolving a
+    /// worktree back to its main repository needs git and belongs to the
+    /// caller; this stays pure so it can be tested without one.
     pub fn is_enabled_for(&self, dir: &Path) -> bool {
         self.covering_root(dir).is_some()
     }

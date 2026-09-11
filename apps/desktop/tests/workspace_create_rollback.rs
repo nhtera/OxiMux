@@ -8,9 +8,12 @@
 use std::path::Path;
 use std::process::Command;
 
+use oximux_app::shell::workspace::configured_locator::ConfiguredLocator;
 use oximux_app::shell::workspace_ops::{
-    CreateBase, CreateOutcome, Provision, create_workspace_with_rollback,
+    CreateBase, CreateOutcome, LocateError, Provision, WorktreeLocator,
+    create_workspace_with_rollback, provisioning_marker,
 };
+use oximux_core::Project;
 use oximux_git::Repository;
 use oximux_storage::{ProjectRepo, WorkspaceRepo, open_memory};
 
@@ -44,6 +47,33 @@ fn init_repo(cwd: &Path) {
 /// than resolving settings that no headless test has.
 fn branch_of(slug: &str) -> String {
     format!("{}/{slug}", oximux_settings::git::DEFAULT_PREFIX)
+}
+
+/// The locator every pre-existing test in this file means: one that mints
+/// exactly the `<tmp>/worktrees/<slug>` path the tests were written against.
+///
+/// Rather than a host-derived locator with the paths rewritten to match, so
+/// that a test which deliberately targets a path *nobody minted* (the sibling
+/// `oximux-wt-mine` below) keeps saying so in its own text.
+#[derive(Debug)]
+struct TestLocator(std::path::PathBuf);
+
+impl WorktreeLocator for TestLocator {
+    fn locate(&self, _project: &Project, slug: &str) -> Result<std::path::PathBuf, LocateError> {
+        Ok(self.0.join("worktrees").join(slug))
+    }
+}
+
+fn test_locator(tmp: &Path) -> TestLocator {
+    TestLocator(tmp.to_path_buf())
+}
+
+/// Put a finished worktree back into the state a kill during provisioning
+/// leaves it in: the mark present. A successful create clears the mark after
+/// the row insert, so a test modelling an interruption has to restore it.
+fn leave_mid_provisioning(worktree_path: &Path) {
+    let mark = provisioning_marker(worktree_path).expect("a linked worktree has a gitdir");
+    std::fs::write(&mark, b"").expect("write mark");
 }
 
 /// The base every pre-existing test in this file means: a new branch named the
@@ -80,12 +110,12 @@ async fn rollback_on_insert_conflict_removes_worktree_and_branch() {
     let worktree_path = tmp.path().join("worktrees").join(slug);
 
     let outcome = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Fix Login",
         slug,
         &base_of(slug),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -134,12 +164,12 @@ async fn create_workspace_happy_path_inserts_row_and_keeps_worktree() {
     let worktree_path = tmp.path().join("worktrees").join(slug);
 
     let outcome = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "New Feat",
         slug,
         &base_of(slug),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -209,12 +239,12 @@ async fn a_failing_setup_script_rolls_back_worktree_branch_and_row() {
     let worktree_path = tmp.path().join("worktrees").join(slug);
 
     let outcome = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Bad Setup",
         slug,
         &base_of(slug),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -281,12 +311,12 @@ async fn a_failing_setup_script_is_not_run_when_the_project_did_not_opt_in() {
     let slug = "opted-out";
     let worktree_path = tmp.path().join("worktrees").join(slug);
     let outcome = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Opted Out",
         slug,
         &base_of(slug),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -327,12 +357,12 @@ async fn included_files_are_present_before_the_setup_script_runs() {
     let slug = "with-env";
     let worktree_path = tmp.path().join("worktrees").join(slug);
     let outcome = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "With Env",
         slug,
         &base_of(slug),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -370,12 +400,12 @@ async fn an_include_pattern_matching_nothing_does_not_fail_creation() {
     let slug = "no-match";
     let worktree_path = tmp.path().join("worktrees").join(slug);
     let outcome = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "No Match",
         slug,
         &base_of(slug),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -411,12 +441,12 @@ async fn an_orphaned_worktree_from_an_interrupted_create_is_reclaimed_on_retry()
 
     // First create succeeds, leaving worktree + branch + row.
     let first = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Interrupted",
         slug,
         &base_of(slug),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -427,21 +457,24 @@ async fn an_orphaned_worktree_from_an_interrupted_create_is_reclaimed_on_retry()
         other => panic!("expected Created, got {other:?}"),
     };
 
-    // Simulate the crash: the row never made it (or was lost), but git's half
-    // is on disk. This is exactly the state a kill during setup leaves behind.
+    // Simulate the crash: the row never made it, git's half is on disk, and
+    // the provisioning mark is still there — exactly the state a kill during
+    // setup leaves behind. The mark is re-written because a *finished* create
+    // clears it, and the point of this test is the unfinished one.
     workspace_repo.delete(&created.id).expect("drop the row");
+    leave_mid_provisioning(&worktree_path);
     assert!(worktree_path.exists(), "precondition: the orphan is on disk");
 
     let retry = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Interrupted",
         slug,
         &base_of(slug),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
-        &Provision::default().reclaiming_orphans(),
+        &Provision::default(),
     )
     .await;
 
@@ -456,10 +489,10 @@ async fn an_orphaned_worktree_from_an_interrupted_create_is_reclaimed_on_retry()
     }
 }
 
-/// The reclaim is a delete, so it verifies rather than trusts. A caller that
-/// opts in but is wrong — a workspace row *does* name this path — must not lose
-/// the user's worktree. Without the in-function row check this test destroys a
-/// live workspace and its uncommitted work.
+/// The reclaim is a delete, so it verifies rather than trusts. A locator that
+/// minted the path but is wrong about it being debris — a workspace row *does*
+/// name this path — must not lose the user's worktree. Without the in-function
+/// row check this test destroys a live workspace and its uncommitted work.
 #[tokio::test]
 async fn reclaim_refuses_a_path_a_workspace_row_still_names() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -476,12 +509,12 @@ async fn reclaim_refuses_a_path_a_workspace_row_still_names() {
     let slug = "live-work";
     let worktree_path = tmp.path().join("worktrees").join(slug);
     let first = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Live Work",
         slug,
         &base_of(slug),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -492,17 +525,18 @@ async fn reclaim_refuses_a_path_a_workspace_row_still_names() {
     // Uncommitted work the user would lose if the reclaim went ahead.
     std::fs::write(worktree_path.join("wip.txt"), "hours of work\n").expect("write wip");
 
-    // The row is still there, so opting in must not be enough.
+    // The row is still there, so the locator having minted the path must not
+    // be enough.
     let second = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Live Work",
         slug,
         &base_of(slug),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
-        &Provision::default().reclaiming_orphans(),
+        &Provision::default(),
     )
     .await;
 
@@ -517,10 +551,11 @@ async fn reclaim_refuses_a_path_a_workspace_row_still_names() {
     );
 }
 
-/// A caller that has NOT opted in must never have its target path touched, even
-/// when no row names it. This is the chat-initiated worktree's protection: it
-/// targets a sibling directory beside the project root, where a person's own
-/// worktree can legitimately live.
+/// A path the locator did NOT mint must never be touched, even when no row
+/// names it. There is no boolean to opt in with any more; the only thing that
+/// authorises a reclaim is the locator recognising its own path — and a
+/// sibling directory beside the project root, where a person's own worktree
+/// can legitimately live, is not one.
 #[tokio::test]
 async fn a_caller_that_did_not_opt_in_never_has_its_path_reclaimed() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -541,12 +576,12 @@ async fn a_caller_that_did_not_opt_in_never_has_its_path_reclaimed() {
     std::fs::write(worktree_path.join("notes.txt"), "not yours\n").expect("write");
 
     let outcome = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Mine",
         slug,
         &base_of(slug),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -560,7 +595,7 @@ async fn a_caller_that_did_not_opt_in_never_has_its_path_reclaimed() {
     assert_eq!(
         std::fs::read_to_string(worktree_path.join("notes.txt")).expect("survives"),
         "not yours\n",
-        "a non-opted-in create deleted a directory it did not own"
+        "a create deleted a directory its locator did not mint"
     );
 }
 
@@ -613,12 +648,12 @@ async fn a_base_that_is_not_an_ancestor_of_the_default_skips_the_setup_script() 
     let slug = "review-theirs";
     let worktree_path = tmp.path().join("worktrees").join(slug);
     let outcome = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Review Theirs",
         slug,
         &CreateBase::new_branch_from(branch_of(slug), "side"),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -651,12 +686,12 @@ async fn a_base_that_is_an_ancestor_of_the_default_still_runs_setup() {
     let slug = "ordinary";
     let worktree_path = tmp.path().join("worktrees").join(slug);
     let outcome = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Ordinary",
         slug,
         &CreateBase::new_branch_from(branch_of(slug), "main"),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -682,12 +717,12 @@ async fn an_explicit_run_setup_overrides_the_unreviewed_base_guard() {
     let slug = "opted-in";
     let worktree_path = tmp.path().join("worktrees").join(slug);
     let outcome = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Opted In",
         slug,
         &CreateBase::new_branch_from(branch_of(slug), "side"),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision {
@@ -718,12 +753,12 @@ async fn the_skip_reason_reaches_the_provisioning_transcript() {
     let slug = "watched";
     let worktree_path = tmp.path().join("worktrees").join(slug);
     let outcome = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Watched",
         slug,
         &CreateBase::new_branch_from(branch_of(slug), "side"),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::new(oximux_settings::SetupDecision::Inherit, tx),
@@ -760,12 +795,12 @@ async fn an_adopted_branch_becomes_the_rows_branch_with_no_prefix_applied() {
     let slug = "adopted";
     let worktree_path = tmp.path().join("worktrees").join(slug);
     let outcome = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Adopted",
         slug,
         &CreateBase::existing("side"),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -804,12 +839,12 @@ async fn a_failed_create_never_deletes_the_branch_it_adopted() {
 
     let worktree_path = tmp.path().join("worktrees").join(slug);
     let outcome = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Adopted Conflict",
         slug,
         &CreateBase::existing("side"),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -867,13 +902,13 @@ async fn an_unattended_create_does_not_inherit_a_feature_branch_head() {
     let slug = "from-chat";
     let worktree_path = tmp.path().join("worktrees").join(slug);
     let outcome = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "From Chat",
         slug,
         // What the chat pill passes.
         &CreateBase::new_branch_from(branch_of(slug), &project.default_branch),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -934,13 +969,13 @@ async fn a_default_branch_that_exists_only_on_the_remote_still_creates_the_named
     let slug = "feat";
     let worktree_path = tmp.path().join("worktrees").join(slug);
     let outcome = create_workspace_with_rollback(
-        &project_root,
-        &project.id,
+        &project,
         "Feat",
         slug,
         // What ⌘N with every control left alone produces.
         &base_of(slug),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -992,12 +1027,12 @@ async fn the_row_records_whether_the_branch_was_minted_or_adopted() {
 
     // Adopted: `side` existed before OxiMux ever saw it.
     let adopted = match create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Adopted",
         "adopted",
         &CreateBase::existing("side"),
         &tmp.path().join("worktrees").join("adopted"),
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -1016,12 +1051,12 @@ async fn the_row_records_whether_the_branch_was_minted_or_adopted() {
 
     // Minted: ours, and cleanup must still remove it.
     let minted = match create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Minted",
         "minted",
         &base_of("minted"),
         &tmp.path().join("worktrees").join("minted"),
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::default(),
@@ -1088,12 +1123,12 @@ async fn adopting_a_branch_contained_in_the_default_still_runs_setup() {
     let slug = "adopt-behind";
     let worktree_path = tmp.path().join("worktrees").join(slug);
     let outcome = create_workspace_with_rollback(
-        project_root,
-        &project.id,
+        &project,
         "Adopt Behind",
         slug,
         &CreateBase::existing("behind"),
         &worktree_path,
+        &test_locator(tmp.path()),
         None,
         &workspace_repo,
         &Provision::new(oximux_settings::SetupDecision::Inherit, tx),
@@ -1112,4 +1147,291 @@ async fn adopting_a_branch_contained_in_the_default_still_runs_setup() {
             panic!("setup was skipped for a reviewed base: {text}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Worktree location seam (phase 6)
+// ---------------------------------------------------------------------------
+
+/// A configured locator rooted at `<tmp>/wt`, knowing exactly `projects`.
+fn configured(tmp: &Path, projects: &[Project]) -> ConfiguredLocator {
+    ConfiguredLocator::new(Some(tmp.join("wt")), Some(tmp.join("data")), projects.to_vec())
+}
+
+/// The recovery the first draft of this phase would have deleted: under a
+/// user-chosen root, retrying a slug whose directory was left behind by a
+/// killed create must still succeed rather than failing `already exists`
+/// forever. The locator minted the path, so it may clear it.
+#[tokio::test]
+async fn an_interrupted_create_recovers_on_retry_under_the_configured_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path().join("repo");
+    std::fs::create_dir_all(&project_root).expect("mkdir");
+    init_repo(&project_root);
+    let (workspace_repo, project) = seed_project(&project_root);
+    let locator = configured(tmp.path(), std::slice::from_ref(&project));
+
+    let slug = "interrupted";
+    let worktree_path = locator.locate(&project, slug).expect("locate");
+    // Canonical on both sides: the locator resolves the root (`/private/var`
+    // for a macOS `/var` tempdir), and a literal compare would call that a
+    // different directory.
+    let root = std::fs::canonicalize(tmp.path()).expect("canon").join("wt");
+    assert!(
+        worktree_path.starts_with(&root),
+        "the configured root, not the data dir: {}",
+        worktree_path.display()
+    );
+
+    let first = create_workspace_with_rollback(
+        &project,
+        "Interrupted",
+        slug,
+        &base_of(slug),
+        &worktree_path,
+        &locator,
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await;
+    let created = match first {
+        CreateOutcome::Created(ws) => ws,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    workspace_repo.delete(&created.id).expect("drop the row");
+    leave_mid_provisioning(&worktree_path);
+    assert!(worktree_path.exists(), "precondition: the orphan is on disk");
+
+    let retry = create_workspace_with_rollback(
+        &project,
+        "Interrupted",
+        slug,
+        &base_of(slug),
+        &worktree_path,
+        &locator,
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await;
+    assert!(
+        matches!(retry, CreateOutcome::Created(_)),
+        "retry after an interrupted create must succeed under the configured root, got {retry:?}"
+    );
+}
+
+/// The narrowed rule, pinned. A directory the user made under the configured
+/// root — at a path this locator would not mint for the slug being created —
+/// is never reclaimed, whatever the caller passes. This is the test that
+/// notices if `may_reclaim` ever answers from the locator's kind instead of
+/// the path.
+#[tokio::test]
+async fn a_directory_a_person_made_under_the_configured_root_is_never_reclaimed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path().join("repo");
+    std::fs::create_dir_all(&project_root).expect("mkdir");
+    init_repo(&project_root);
+    let (workspace_repo, project) = seed_project(&project_root);
+    let locator = configured(tmp.path(), std::slice::from_ref(&project));
+
+    // The user's own folder, beside where OxiMux would put `feat`.
+    let slug = "feat";
+    let minted = locator.locate(&project, slug).expect("locate");
+    let users_own = minted.parent().expect("project dir").join("my-notes");
+    std::fs::create_dir_all(&users_own).expect("mkdir");
+    std::fs::write(users_own.join("notes.txt"), "not yours\n").expect("write");
+    assert!(!locator.may_reclaim(&project, slug, &users_own));
+
+    // A caller that targets the user's folder for a create — the shape a
+    // future call site could take by passing the wrong path.
+    let outcome = create_workspace_with_rollback(
+        &project,
+        "Feat",
+        slug,
+        &base_of(slug),
+        &users_own,
+        &locator,
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await;
+    assert!(
+        matches!(outcome, CreateOutcome::GitFailed(_)),
+        "an occupied path the locator did not mint must fail: {outcome:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(users_own.join("notes.txt")).expect("survives"),
+        "not yours\n",
+        "the reclaim deleted a directory a person made"
+    );
+}
+
+/// Two repositories both called `api` do not share a directory under the
+/// configured root, so the same slug in each creates two worktrees.
+#[tokio::test]
+async fn two_projects_with_one_name_do_not_collide_under_the_configured_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db = open_memory().expect("open memory");
+    let project_repo = ProjectRepo::new(db.clone());
+    let workspace_repo = WorkspaceRepo::new(db);
+    let mut projects = Vec::new();
+    for dir in ["work", "oss"] {
+        let root = tmp.path().join(dir).join("api");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        init_repo(&root);
+        projects.push(
+            project_repo.insert("api", root.to_str().unwrap(), "main").expect("project"),
+        );
+    }
+    let locator = configured(tmp.path(), &projects);
+
+    let mut paths = Vec::new();
+    for project in &projects {
+        let slug = "feat";
+        let worktree_path = locator.locate(project, slug).expect("locate");
+        let outcome = create_workspace_with_rollback(
+            project,
+            "Feat",
+            slug,
+            &base_of(slug),
+            &worktree_path,
+            &locator,
+            None,
+            &workspace_repo,
+            &Provision::default(),
+        )
+        .await;
+        match outcome {
+            CreateOutcome::Created(ws) => paths.push(ws.worktree_path),
+            other => panic!("expected Created for {}, got {other:?}", project.root_path),
+        }
+    }
+    assert_ne!(paths[0], paths[1], "same-named projects shared a worktree directory");
+    for path in &paths {
+        assert!(Path::new(path).exists(), "{path} should be on disk");
+        let project_dir = Path::new(path).parent().unwrap().file_name().unwrap().to_string_lossy();
+        assert!(project_dir.starts_with("api-"), "readable first, unique always: {project_dir}");
+    }
+}
+
+/// The other half of the reclaim rule. A worktree that FINISHED and later lost
+/// its row — the project was removed and the same repository re-added under a
+/// fresh id, say — sits at the very path the locator mints, with no row
+/// naming it, and holds the user's work. It must not be mistaken for an
+/// interrupted create: only the provisioning mark says "interrupted", and a
+/// finished create clears it.
+#[tokio::test]
+async fn a_finished_worktree_whose_row_is_gone_is_never_reclaimed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path().join("repo");
+    std::fs::create_dir_all(&project_root).expect("mkdir");
+    init_repo(&project_root);
+    let (workspace_repo, project) = seed_project(&project_root);
+    let locator = configured(tmp.path(), std::slice::from_ref(&project));
+
+    let slug = "kept";
+    let worktree_path = locator.locate(&project, slug).expect("locate");
+    let first = create_workspace_with_rollback(
+        &project,
+        "Kept",
+        slug,
+        &base_of(slug),
+        &worktree_path,
+        &locator,
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await;
+    let created = match first {
+        CreateOutcome::Created(ws) => ws,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    assert!(
+        !provisioning_marker(&worktree_path).expect("gitdir").exists(),
+        "a finished create must clear its mark"
+    );
+    std::fs::write(worktree_path.join("wip.txt"), "hours of work\n").expect("write wip");
+
+    // The row goes away without the worktree: the removed-project cascade,
+    // or an archive (which the row lookup does not see either).
+    workspace_repo.delete(&created.id).expect("drop the row");
+
+    let retry = create_workspace_with_rollback(
+        &project,
+        "Kept",
+        slug,
+        &base_of(slug),
+        &worktree_path,
+        &locator,
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await;
+    assert!(
+        matches!(retry, CreateOutcome::GitFailed(_)),
+        "a finished worktree must not be reclaimed, got {retry:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(worktree_path.join("wip.txt")).expect("wip survives"),
+        "hours of work\n",
+        "the reclaim deleted a finished worktree's work"
+    );
+}
+
+/// Archiving keeps the directory and hides the row from the path lookup, so
+/// an archived workspace is the same shape as the case above — pinned
+/// separately because it is the one a user reaches without ever removing a
+/// project.
+#[tokio::test]
+async fn an_archived_worktree_is_never_reclaimed_by_a_same_slug_create() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let project_root = tmp.path().join("repo");
+    std::fs::create_dir_all(&project_root).expect("mkdir");
+    init_repo(&project_root);
+    let (workspace_repo, project) = seed_project(&project_root);
+    let locator = configured(tmp.path(), std::slice::from_ref(&project));
+
+    let slug = "parked";
+    let worktree_path = locator.locate(&project, slug).expect("locate");
+    let first = create_workspace_with_rollback(
+        &project,
+        "Parked",
+        slug,
+        &base_of(slug),
+        &worktree_path,
+        &locator,
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await;
+    let created = match first {
+        CreateOutcome::Created(ws) => ws,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    std::fs::write(worktree_path.join("wip.txt"), "parked work\n").expect("write wip");
+    workspace_repo.mark_archived(&created.id).expect("archive");
+
+    let again = create_workspace_with_rollback(
+        &project,
+        "Parked",
+        slug,
+        &base_of(slug),
+        &worktree_path,
+        &locator,
+        None,
+        &workspace_repo,
+        &Provision::default(),
+    )
+    .await;
+    assert!(!matches!(again, CreateOutcome::Created(_)), "{again:?}");
+    assert_eq!(
+        std::fs::read_to_string(worktree_path.join("wip.txt")).expect("wip survives"),
+        "parked work\n",
+        "the reclaim deleted an archived worktree's work"
+    );
 }
