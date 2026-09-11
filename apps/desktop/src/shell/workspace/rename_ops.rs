@@ -129,11 +129,12 @@ fn slug_degradation(name: &str, slug: &str, current_branch: &str) -> Option<Stri
 /// Where a renamed worktree's directory should go.
 ///
 /// Keeps the directory's existing naming SHAPE rather than replacing the whole
-/// final component with the new slug: the two creation paths in the app name
-/// their directories differently (`<slug>` under the data dir, `oximux-wt-<slug>`
-/// beside the repo), and a rename should not silently re-shape one into the
-/// other. Only the slug inside the name is swapped; a directory whose name does
-/// not contain the old slug falls back to the plain new slug.
+/// final component with the new slug: rows created before the configured
+/// worktree root existed name their directories differently (`<slug>` under
+/// the data dir, `oximux-wt-<slug>` beside the repo), and a rename should not
+/// silently re-shape one into another. Only the slug inside the name is
+/// swapped; a directory whose name does not contain the old slug falls back to
+/// the plain new slug.
 fn renamed_worktree_dir(old_path: &Path, old_slug: &str, new_slug: &str) -> PathBuf {
     let parent = old_path.parent().map(Path::to_path_buf).unwrap_or_default();
     let current = old_path

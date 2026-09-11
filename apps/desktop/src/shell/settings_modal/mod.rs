@@ -106,6 +106,18 @@ pub struct SettingsModal {
     /// The custom prefix as it was at `open()`, so close can tell an
     /// uncommitted edit from no edit at all.
     pub(super) git_prefix_seed: String,
+    /// The worktree-directory field, lazily built on `open()`.
+    pub(super) git_dir_input: Option<Entity<InputState>>,
+    /// Live while the field exists.
+    pub(super) _git_dir_sub: Option<Subscription>,
+    /// The directory text as last committed (empty for the default), so close
+    /// can tell an uncommitted edit from none.
+    pub(super) git_dir_seed: String,
+    /// Why the directory field's current text is refused, rendered under it.
+    /// `None` while the text is acceptable. Set on every keystroke by the
+    /// same validator the create path runs, so the reason arrives while the
+    /// user is looking at the field — and a refused text is never written.
+    pub(super) git_dir_notice: Option<String>,
     /// Working copy of the rate-limit retry settings.
     pub(crate) retry: oximux_settings::agent_retry::AgentRetrySettings,
     /// Working copy of the per-agent launch defaults; reseeded from the live
@@ -349,6 +361,10 @@ impl SettingsModal {
             git_prefix_input: None,
             git_prefix_seed: String::new(),
             _git_prefix_sub: None,
+            git_dir_input: None,
+            _git_dir_sub: None,
+            git_dir_seed: String::new(),
+            git_dir_notice: None,
             retry: oximux_settings::agent_retry::AgentRetrySettings::shipped(),
             agent_launch: AgentLaunchSettings::default(),
             dictation: DictationSettings::default(),
@@ -545,6 +561,34 @@ impl SettingsModal {
             },
         ));
         self.git_prefix_input = Some(prefix_input);
+
+        // Worktree directory. Validated on every keystroke — the notice under
+        // the field is the fast feedback path — and written only on blur/Enter
+        // and only when it passes. A refused directory stays in the field
+        // with its reason and never reaches `git.toml`: the create path
+        // re-validates anyway, but a setting that fails every create is worse
+        // than one the pane declined to save.
+        let dir_seed = self.git.worktree_dir.clone().unwrap_or_default();
+        self.git_dir_seed = dir_seed.clone();
+        self.git_dir_notice = pane_git::refusal(&dir_seed, false);
+        let dir_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(pane_git::default_root_placeholder())
+                .default_value(dir_seed)
+        });
+        self._git_dir_sub = Some(cx.subscribe(
+            &dir_input,
+            |this, input, ev: &InputEvent, cx| match ev {
+                InputEvent::Change => {
+                    let text = input.read(cx).value().to_string();
+                    this.git_dir_notice = pane_git::refusal(&text, false);
+                    cx.notify();
+                }
+                InputEvent::Blur | InputEvent::PressEnter { .. } => this.commit_git_dir(cx),
+                _ => {}
+            },
+        ));
+        self.git_dir_input = Some(dir_input);
 
         // Agents pane's environment editor. Reset the selection first: a reopen
         // must not land on a profile deleted since, which would silently edit
@@ -769,6 +813,14 @@ impl SettingsModal {
         }
         self.git_prefix_input = None;
         self._git_prefix_sub = None;
+        // Same flush for the directory field. `commit_git_dir` refuses an
+        // invalid text itself, so closing on one drops the edit rather than
+        // saving it.
+        if self.git_dir_input.is_some() && self.git_dir_text(cx) != self.git_dir_seed {
+            self.commit_git_dir(cx);
+        }
+        self.git_dir_input = None;
+        self._git_dir_sub = None;
         // Same flush-before-drop hazard as custom words: the working copy is
         // synced on every keystroke, but only blur/Enter writes the file, and
         // clicking dead space doesn't blur a gpui input. Without this, typing an
@@ -843,6 +895,52 @@ impl SettingsModal {
             tracing::warn!(%err, "settings modal: failed to write git.toml");
         }
         cx.notify();
+    }
+
+    /// The directory field's current text, trimmed; empty when the field is
+    /// not built.
+    pub(super) fn git_dir_text(&self, cx: &Context<Self>) -> String {
+        self.git_dir_input
+            .as_ref()
+            .map(|i| i.read(cx).value().trim().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Commit the directory field: validate, and write `git.toml` only when
+    /// it passes. An empty field means the default root. A refused text
+    /// leaves the saved value alone and keeps its reason under the field.
+    pub(super) fn commit_git_dir(&mut self, cx: &mut Context<Self>) {
+        let text = self.git_dir_text(cx);
+        self.git_dir_notice = pane_git::refusal(&text, true);
+        if self.git_dir_notice.is_some() {
+            cx.notify();
+            return;
+        }
+        self.git.worktree_dir = (!text.is_empty()).then(|| text.clone());
+        self.git_dir_seed = text;
+        self.persist_git(cx);
+    }
+
+    /// Open a native folder picker and drop the chosen path into the
+    /// directory field, then commit it. Same shape as the schedule pane's
+    /// Browse: the panel resolves outside the GPUI window, so the result is
+    /// applied back on the UI thread via `update_in`.
+    pub(super) fn browse_git_dir(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let folder = rfd::AsyncFileDialog::new().pick_folder().await;
+            let Some(path) = folder.map(|h| h.path().to_path_buf()) else {
+                return;
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                if let Some(input) = this.git_dir_input.clone() {
+                    input.update(cx, |s, cx| {
+                        s.set_value(path.to_string_lossy().to_string(), window, cx)
+                    });
+                    this.commit_git_dir(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Persist the AI working copy to `commit_message_ai.toml`.

@@ -560,15 +560,31 @@ impl Render for WorkspaceRoot {
                     let weak_view = view.downgrade();
                     let slug = action.slug.clone();
                     let project_root = std::path::PathBuf::from(&project.root_path);
-                    // Sibling `oximux-wt-<slug>` path — the same convention the
-                    // manual "New Worktree" form and the retired git-only path
-                    // used, so both land in one place.
-                    let worktree_path = std::path::PathBuf::from(
-                        crate::shell::worktree_panel::list_render::suggest_worktree_path(
-                            &project_root,
-                            &slug,
-                        ),
+                    // The same locator the rail's create uses, so a chat-made
+                    // worktree lands beside a rail-made one — the sibling
+                    // `oximux-wt-<slug>` scheme this path used to have is gone.
+                    // A refused root is the chat's own failure banner, not a
+                    // log line: this path runs unattended.
+                    use crate::shell::workspace_ops::WorktreeLocator as _;
+                    let locator = crate::shell::workspace::configured_locator::desktop_locator(
+                        &this.app_state.project_repo,
+                        cx,
                     );
+                    let worktree_path = match locator.locate(&project, &slug) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            tracing::warn!(%err, slug = %slug, "create-worktree-workspace: no worktree location");
+                            view.update(cx, |v, cx| {
+                                v.on_worktree_create_outcome(
+                                    crate::shell::workspace_ops::ChatWorktreeOutcome::GitFailed(
+                                        err.to_string(),
+                                    ),
+                                    cx,
+                                )
+                            });
+                            return;
+                        }
+                    };
                     let workspace_repo = this.app_state.workspace_repo.clone();
                     let project_id = project.id.clone();
                     // The same resolved prefix the chat pill previewed with —
@@ -599,12 +615,18 @@ impl Render for WorkspaceRoot {
                         // ways for anyone to notice.
                         let base = CreateBase::new_branch(branch);
                         let outcome = create_workspace_with_rollback(
-                            &project_root,
-                            &project_id,
+                            &project,
                             &slug,
                             &slug,
                             &base,
                             &worktree_path,
+                            // The locator that minted the path. Reclaim of an
+                            // interrupted create's debris needs that, the
+                            // provisioning mark only an interrupted create
+                            // leaves, and no row naming the path — the
+                            // reclaim checks all three itself, which is what
+                            // lets this unattended path carry a locator at all.
+                            &locator,
                             None,
                             &workspace_repo,
                             // The chat's own worktree: the project's setting
@@ -613,13 +635,6 @@ impl Render for WorkspaceRoot {
                             // though the chat surface only shows the one-line
                             // outcome — otherwise a failure here would be the
                             // hardest one to diagnose and the least visible.
-                            // No `reclaiming_orphans()` here on purpose. This
-                            // path targets a sibling `oximux-wt-<slug>` beside
-                            // the project root — a location a person may well
-                            // own — and it never checks for an existing row.
-                            // Both of the reclaim's safety premises are false
-                            // here, so a collision must stay an ordinary
-                            // `add_worktree` failure.
                             &Provision::new(
                                 oximux_settings::SetupDecision::Inherit,
                                 provision_tx,

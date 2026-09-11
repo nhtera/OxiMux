@@ -69,9 +69,16 @@ pub struct GitSettings {
     /// still there rather than having it silently discarded by a control they
     /// were only looking at.
     pub custom_prefix: String,
-    /// Where new worktrees are created. `None` means the host-derived scheme
-    /// OxiMux has always used. **Inert until Phase 6 wires the seam** — the
-    /// pane renders it disabled and says so.
+    /// Where the desktop creates new worktrees, laid out as
+    /// `<dir>/<project>/<slug>`. `None` means the default,
+    /// `~/OxiMux/worktrees`. A leading `~` is expanded.
+    ///
+    /// Validated when it is *used*, not only when the pane saved it — the
+    /// file is meant to be hand-edited — and refused with a reason when it
+    /// points inside a git working tree, inside the app's data directory, or
+    /// somewhere unwritable. Existing worktrees are never moved by changing
+    /// it. The headless host ignores it: `oximux serve` keeps the host-derived
+    /// scheme under its own data directory.
     pub worktree_dir: Option<String>,
     /// On worktree create, fetch and fast-forward the local default branch so
     /// the new worktree starts from current work rather than from whatever was
@@ -89,8 +96,8 @@ impl GitSettings {
     /// File this is persisted to, beside the other per-app settings.
     pub const FILE_NAME: &'static str = "git.toml";
 
-    /// The shipped default: today's behaviour exactly — `oximux/<slug>`
-    /// branches, host-derived paths, no fetching on create.
+    /// The shipped default: `oximux/<slug>` branches, the default worktree
+    /// directory, no fetching on create.
     pub fn shipped() -> Self {
         Self {
             branch_prefix: BranchPrefixMode::Custom,

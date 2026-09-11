@@ -146,8 +146,9 @@ pub(crate) fn build_add_project_dialog(
 // because this module is the desktop's door to it.
 use crate::shell::workspace::base_choice::BaseChoice;
 pub use oximux_worktree_ops::{
-    CreateBase, CreateOutcome, Provision, ProvisionEvent, SetupTranscript,
-    create_workspace_with_rollback, run_cleanup_before_remove,
+    CreateBase, CreateOutcome, HostDerivedLocator, LocateError, Provision, ProvisionEvent,
+    SetupTranscript, WorktreeLocator, create_workspace_with_rollback, provisioning_marker,
+    run_cleanup_before_remove,
 };
 
 /// Upper bound on `default_tabs`. The list is repo-controlled and needs no
@@ -528,21 +529,6 @@ pub(crate) fn refocus_active_pane(
     window.defer(cx, move |window, app| {
         panes.update(app, |p, cx| p.focus_active(window, cx));
     });
-}
-
-/// Compose the worktree dir path under the desktop's own data root.
-/// Returns `None` when the app data directory is unavailable (sandbox or
-/// unset `$HOME`) — caller surfaces this as a create failure.
-///
-/// The derivation itself is shared with `oximux serve`, which supplies its
-/// own `--data-dir` instead; this wrapper is only the desktop's answer to
-/// "which root?".
-pub(crate) fn worktree_path(project_id: &str, slug: &str) -> Option<PathBuf> {
-    Some(oximux_worktree_ops::worktree_path(
-        &crate::app_paths::data_dir()?,
-        project_id,
-        slug,
-    ))
 }
 
 impl Focusable for WorkspaceRoot {
@@ -1973,21 +1959,36 @@ impl WorkspaceRoot {
             );
             return;
         }
-        let Some(worktree_path) = worktree_path(&project.id, &slug) else {
-            tracing::warn!("workspace create: cannot resolve data dir");
-            return;
+        // Where it goes: the configured root, validated now so a refused
+        // directory is a toast the user reads rather than a create that fails
+        // later with a git error. The locator is also what authorises the
+        // reclaim of an interrupted create's debris at this path.
+        let locator = super::configured_locator::desktop_locator(&self.app_state.project_repo, cx);
+        let worktree_path = match locator.locate(&project, &slug) {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::warn!(%err, slug = %slug, "workspace create: no worktree location");
+                crate::shell::toast::toast_op_error(
+                    cx,
+                    &format!("Create workspace \u{201c}{slug}\u{201d}"),
+                    &err.to_string(),
+                );
+                return;
+            }
         };
         // Detect an existing workspace for this slug and OPEN it instead of
-        // erroring on a duplicate worktree. The worktree path is deterministic
-        // from (project, slug), so a re-create from the same issue resolves to
-        // the same stored row — clicking "+ Workspace" twice should land on the
-        // existing workspace's agent, not fail with `add_worktree` "already
-        // exists".
-        let worktree_path_str = worktree_path.to_string_lossy().to_string();
+        // erroring on a duplicate worktree — clicking "+ Workspace" twice
+        // should land on the existing workspace's agent, not fail with
+        // `add_worktree` "already exists". Looked up by slug, not by path:
+        // the minted path is no longer a pure function of (project, slug),
+        // since the project's directory name gains an id tag the moment
+        // another project shares its name, and a row created before that
+        // still names the old path.
         if let Ok(Some(existing)) = self
             .app_state
             .workspace_repo
-            .get_by_worktree_path(&worktree_path_str)
+            .list_for_project(&project.id)
+            .map(|rows| rows.into_iter().find(|w| w.slug == slug))
         {
             tracing::info!(
                 workspace_id = %existing.id,
@@ -2044,22 +2045,20 @@ impl WorkspaceRoot {
                 cx.background_spawn(async move { stream_provisioning(transcript_path, rx).await })
             };
             let outcome = create_workspace_with_rollback(
-                &project_root,
-                &project_id,
+                &project,
                 &name_trimmed,
                 &slug,
                 &base,
                 &worktree_path,
+                // The locator that minted the path, so debris from an
+                // interrupted create there is reclaimed on retry — the flow
+                // above has already looked for a workspace row naming it.
+                &locator,
                 linked_issue.as_deref(),
                 &workspace_repo,
                 // No per-request override from this path yet: the create dialog
                 // has no setup toggle, so the project's `auto_setup` decides.
-                // Reclaim opted into here and nowhere else in the desktop:
-                // this path is host-derived under the data dir, and the flow
-                // above has already looked for a workspace row naming it.
-                &Provision::new(setup_decision, tx)
-                    .reclaiming_orphans()
-                    .freshening_default(freshen_default),
+                &Provision::new(setup_decision, tx).freshening_default(freshen_default),
             )
             .await;
             // The sender is gone with `Provision`, so the drain has ended or is

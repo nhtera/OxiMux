@@ -8394,6 +8394,7 @@ name = "oximux-worktree-ops"
 version = "0.1.21"
 dependencies = [
  "async-trait",
+ "dunce",
  "ignore",
  "oximux-core",
  "oximux-git",

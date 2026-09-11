@@ -450,9 +450,10 @@ fn plan(
 ///
 /// Two questions, cheapest first. The settings answer covers an opted-in root
 /// and everything beneath it, which is every chat that sits inside the project.
-/// It cannot cover a worktree: OxiMux creates those *beside* the project
-/// (`suggest_worktree_path` → `<parent>/oximux-wt-…`), so no containment rule
-/// reaches one. Resolving the worktree back to the repository that owns it is
+/// It cannot cover a worktree: OxiMux creates those *outside* the project
+/// (under the configured worktree root, `~/OxiMux/worktrees/<project>/<slug>`
+/// by default), so no containment rule reaches one. Resolving the worktree
+/// back to the repository that owns it is
 /// what makes "verify the build you just made" work in the isolation this
 /// feature exists for, rather than that being the one workflow it silently
 /// refuses.
@@ -1343,9 +1344,9 @@ mod enablement_tests {
         );
     }
 
-    /// A committed repo plus a linked worktree beside it — the shape
-    /// `suggest_worktree_path` produces, where the worktree is a *sibling* of
-    /// the project rather than a child.
+    /// A committed repo plus a linked worktree beside it — a worktree that is
+    /// not a child of the project, which is the shape every OxiMux-created
+    /// worktree has.
     fn repo_with_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let project = tmp.path().join("project");

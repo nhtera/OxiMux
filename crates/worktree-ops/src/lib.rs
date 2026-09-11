@@ -9,15 +9,17 @@
 //! third step fails after the first two succeeded, and it is the reason this
 //! module exists as one implementation rather than two.
 //!
-//! The path scheme is host-derived on purpose: a client names a project and a
-//! slug, never a location. [`worktree_path`] is that derivation, taking the
-//! data directory explicitly so `oximux serve --data-dir` puts worktrees under
-//! its own root instead of the desktop's.
+//! Where a worktree goes is a [`WorktreeLocator`]'s answer, and so is whether
+//! a directory already there may be cleared as debris. The remote surface
+//! keeps the host-derived scheme — a client names a project and a slug, never
+//! a location — through [`HostDerivedLocator`]; the desktop, which is the
+//! host, resolves a configured, browsable root instead. See [`locator`].
 
 pub mod branch_name;
 pub mod create_base;
 pub mod freshen;
 pub mod include;
+pub mod locator;
 pub mod merge;
 pub mod rename;
 mod paths;
@@ -26,6 +28,10 @@ pub mod setup;
 
 pub use create_base::{CreateBase, setup_decision};
 pub use include::{CopyReport, Skip};
+pub use locator::{
+    HostDerivedLocator, LocateError, WorktreeLocator, canonicalize_lenient, project_dir_name,
+    validate_worktree_root, validate_worktree_root_shape, worktree_path,
+};
 pub use merge::{
     MergePlan, MergeRefusal, MergeResult, apply_merge, merge_into_default, preflight_merge,
 };
@@ -38,7 +44,7 @@ pub use setup::{SETUP_TIMEOUT, SetupOutcome, SetupTranscript};
 
 use std::path::{Path, PathBuf};
 
-use oximux_core::Workspace;
+use oximux_core::{Project, Workspace};
 use oximux_git::Repository;
 use oximux_settings::{ScriptKind, SetupDecision};
 use oximux_storage::{StorageError, WorkspaceRepo};
@@ -90,20 +96,14 @@ pub struct Provision {
     pub setup: SetupDecision,
     /// Where to stream [`ProvisionEvent`]s, if anyone is watching.
     pub sink: Option<UnboundedSender<ProvisionEvent>>,
-    /// Whether a directory already at the target path may be deleted as debris
-    /// from an interrupted create. See [`Provision::reclaiming_orphans`].
-    ///
-    /// Off by default, and deliberately so: the default has to be the one that
-    /// cannot destroy anything.
-    pub reclaim_orphan: bool,
     /// Fetch and fast-forward the local default branch before the worktree is
     /// cut. Mirrors the user's `keep_default_up_to_date` setting.
     ///
     /// Whether that changes what the new worktree is *based on* depends on
     /// where HEAD is — see [`crate::freshen`], which spells out both cases.
     ///
-    /// Off by default for the same reason as `reclaim_orphan`, plus one more:
-    /// it makes creating a worktree touch the network.
+    /// Off by default because the default has to be the one that does nothing
+    /// surprising, and this one makes creating a worktree touch the network.
     pub freshen_default: bool,
 }
 
@@ -113,7 +113,6 @@ impl Provision {
         Self {
             setup,
             sink: Some(sink),
-            reclaim_orphan: false,
             freshen_default: false,
         }
     }
@@ -121,24 +120,6 @@ impl Provision {
     /// Opt in to freshening the default branch before the worktree is cut.
     pub fn freshening_default(mut self, freshen: bool) -> Self {
         self.freshen_default = freshen;
-        self
-    }
-
-    /// Opt in to clearing a directory already sitting at the target path.
-    ///
-    /// **Only for callers that own the path scheme.** The caller asserts two
-    /// things by calling this: the path is host-derived
-    /// (`<data_dir>/projects/<id>/worktrees/<slug>`, see [`worktree_path`]), so
-    /// nothing a person put there by hand can be at that location; and the
-    /// caller has already looked for a workspace row naming it.
-    ///
-    /// The second half is re-checked here rather than trusted — see
-    /// [`reclaim_orphan`] — but the first half cannot be, which is why this is
-    /// opt-in rather than automatic. The chat-initiated worktree uses a sibling
-    /// `oximux-wt-<slug>` directory beside the project root, exactly where a
-    /// person's own worktree could live, and must never turn this on.
-    pub fn reclaiming_orphans(mut self) -> Self {
-        self.reclaim_orphan = true;
         self
     }
 
@@ -194,21 +175,6 @@ pub enum CreateOutcome {
     },
 }
 
-/// Compose the worktree dir path:
-/// `<data_dir>/projects/<project_id>/worktrees/<slug>`.
-///
-/// `data_dir` is passed rather than resolved here because the two hosts
-/// disagree about it: the desktop always uses its own app data root, while
-/// `oximux serve` honours `--data-dir`. Deriving it internally would put a
-/// server's worktrees under the desktop's directory.
-pub fn worktree_path(data_dir: &Path, project_id: &str, slug: &str) -> PathBuf {
-    data_dir
-        .join("projects")
-        .join(project_id)
-        .join("worktrees")
-        .join(slug)
-}
-
 /// Open the project repo, create the worktree [`base`](CreateBase) describes,
 /// and insert the workspace row. On storage failure, runs the rollback
 /// (force-remove worktree, and force-delete the branch **only if this create
@@ -219,6 +185,19 @@ pub fn worktree_path(data_dir: &Path, project_id: &str, slug: &str) -> PathBuf {
 /// row in every mode. `base` carries the branch name, already resolved by
 /// [`branch_name`], and says where the branch is cut from; the git layer
 /// validates it again before `git` sees it.
+///
+/// # The path and the locator
+///
+/// `worktree_path` is where the worktree goes; `locator` is what named it.
+/// They travel together so that the authority to *clear* the path arrives
+/// with the path: a directory already at `worktree_path` is reclaimed as
+/// debris only when [`WorktreeLocator::may_reclaim`] says this locator minted
+/// exactly that path for exactly this slug, **and** the directory still
+/// carries the provisioning mark an interrupted create leaves behind (see
+/// [`provisioning_marker`]). A caller cannot opt in with a boolean, and
+/// cannot pass a path the locator did not mint and still have it reclaimed —
+/// the locator simply answers no, and the create fails the ordinary way. See
+/// [`locator`] for why the answer is per path, not per kind.
 ///
 /// # The base and the setup script
 ///
@@ -231,9 +210,9 @@ pub fn worktree_path(data_dir: &Path, project_id: &str, slug: &str) -> PathBuf {
 /// # Preconditions
 ///
 /// The caller MUST have established that no workspace row references
-/// `worktree_path`. Given that, a directory already at `worktree_path` is
-/// debris from an interrupted create and is cleared before the git step — see
-/// [`reclaim_orphan`].
+/// `worktree_path`. Given that, a directory already at `worktree_path` that
+/// the locator minted is debris from an interrupted create and is cleared
+/// before the git step — see [`reclaim_orphan`].
 ///
 /// # Provisioning
 ///
@@ -250,24 +229,27 @@ pub fn worktree_path(data_dir: &Path, project_id: &str, slug: &str) -> PathBuf {
 /// rollback ladder that was already here for the storage case.
 #[allow(
     clippy::too_many_arguments,
-    reason = "Eight of the nine are irreducible inputs to one operation: where the repo is, \
-              what the workspace is called, what it is cut from, where it goes, and what \
-              to write it into. Bundling them into a params struct moves the same fields behind \
-              a name that means nothing more than the function's own — and every one of the five \
-              call sites would then build a struct to immediately destructure it. The ninth, \
-              `provision`, is already the grouped form of what would otherwise be three."
+    reason = "Eight of the nine are irreducible inputs to one operation: which project, \
+              what the workspace is called, what it is cut from, where it goes and who named \
+              that place, and what to write it into. Bundling them into a params struct moves \
+              the same fields behind a name that means nothing more than the function's own — \
+              and every one of the call sites would then build a struct to immediately \
+              destructure it. The ninth, `provision`, is already the grouped form of what would \
+              otherwise be three."
 )]
 pub async fn create_workspace_with_rollback(
-    project_root: &Path,
-    project_id: &str,
+    project: &Project,
     name: &str,
     slug: &str,
     base: &CreateBase,
     worktree_path: &Path,
+    locator: &dyn WorktreeLocator,
     linked_issue: Option<&str>,
     workspace_repo: &WorkspaceRepo,
     provision: &Provision,
 ) -> CreateOutcome {
+    let project_root = Path::new(&project.root_path);
+    let project_id = project.id.as_str();
     let repo = match Repository::open(project_root).await {
         Ok(r) => r,
         Err(err) => return CreateOutcome::GitFailed(format!("open project repo: {err}")),
@@ -278,7 +260,13 @@ pub async fn create_workspace_with_rollback(
     // `alice/foo`) dangling — the reclaim cannot know a name nothing recorded.
     // Accepted rather than guessed at: deleting a branch whose name we inferred
     // from a directory is how a reclaim destroys work it did not create.
-    if provision.reclaim_orphan
+    //
+    // Asked only when the path is occupied, and the locator is asked first:
+    // `may_reclaim` canonicalizes both sides, which is cheap, and an occupied
+    // path we did not mint must fail the ordinary way without a row lookup
+    // ever being consulted about it.
+    if worktree_path.exists()
+        && locator.may_reclaim(project, slug, worktree_path)
         && let Some(err) = reclaim_orphan(&repo, worktree_path, base, workspace_repo).await
     {
         return CreateOutcome::GitFailed(err);
@@ -349,6 +337,21 @@ pub async fn create_workspace_with_rollback(
     };
     if let Err(err) = added {
         return CreateOutcome::GitFailed(format!("add_worktree: {err}"));
+    }
+    // From here until the row is written this worktree is *ours to lose*: a
+    // kill during the include copy or the setup script leaves it on disk
+    // with no row. The mark is what lets a retry tell that state from a
+    // finished worktree whose row went away later (project removed,
+    // workspace archived) — which looks identical from the outside and holds
+    // someone's work. Best-effort: a mark that could not be written means a
+    // retry after an interruption fails `already exists` (the pre-mark
+    // behaviour), never that anything is deleted.
+    if let Some(mark) = provisioning_marker(worktree_path) {
+        if let Err(err) = std::fs::write(&mark, b"") {
+            tracing::warn!(?err, mark = %mark.display(), "could not write the provisioning mark");
+        }
+    } else {
+        tracing::warn!(worktree = %worktree_path.display(), "no gitdir for the provisioning mark");
     }
 
     // Include copy: best-effort by contract. Every skip is reported and nothing
@@ -424,6 +427,17 @@ pub async fn create_workspace_with_rollback(
     // data loss. See `Workspace::branch_minted`.
     match workspace_repo.insert(project_id, name, slug, branch, &path_str, base.creates_branch()) {
         Ok(mut workspace) => {
+            // The row exists, so this is a workspace now, not debris. Cleared
+            // AFTER the insert: a kill between the two leaves a live row plus
+            // a stale mark, and the row check below refuses that — the safe
+            // side. Cleared before the insert, the same kill would leave a
+            // rowless, markless worktree that no retry could ever clear.
+            if let Some(mark) = provisioning_marker(worktree_path)
+                && let Err(err) = std::fs::remove_file(&mark)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(?err, mark = %mark.display(), "could not clear the provisioning mark");
+            }
             // Best-effort metadata write — the worktree + row already exist, so
             // a failure here only loses the issue badge, not the workspace. The
             // in-memory field is set ONLY on a confirmed write.
@@ -499,10 +513,17 @@ async fn resolvable_default(repo: &Repository, default_branch: Option<&str>) -> 
 /// fail with "already exists" on every retry from then on. Before this, that
 /// window was a few milliseconds and the case was theoretical.
 ///
-/// **Why deleting is safe here — and the two things that make it so.** Reached
-/// only when the caller opted in via [`Provision::reclaiming_orphans`], which
-/// asserts the path is host-derived and therefore not somewhere a person keeps
-/// work. On top of that, this re-checks that no workspace row names the path.
+/// **Why deleting is safe here — and the three things that make it so.**
+/// Reached only when the caller's [`WorktreeLocator`] confirmed it minted
+/// exactly this path for exactly this slug, so it is not somewhere a person
+/// keeps work. Then the directory must still carry the provisioning mark
+/// ([`provisioning_marker`]), which only an interrupted create leaves behind:
+/// a worktree that *finished* and later lost its row — the project was
+/// removed and the same repository re-added under a fresh id, or the
+/// workspace was archived, which `get_by_worktree_path` does not see — sits at
+/// the same minted path and holds someone's work, and the mark is the one
+/// thing that tells the two apart. Last, this re-checks that no workspace row
+/// names the path.
 ///
 /// The row check is not redundant with the caller's own. A precondition that
 /// lives only in a doc comment is one refactor away from being false, and the
@@ -516,6 +537,18 @@ async fn reclaim_orphan(
 ) -> Option<String> {
     let branch = base.branch();
     if !worktree_path.exists() {
+        return None;
+    }
+    // No mark, no reclaim — whatever else is true. A directory git never
+    // registered (no `.git` pointer) has no mark either, and is refused the
+    // same way: git creates the leaf itself, so a leaf with no pointer is
+    // never our debris.
+    if !provisioning_marker(worktree_path).is_some_and(|mark| mark.exists()) {
+        tracing::warn!(
+            worktree = %worktree_path.display(),
+            "refusing to reclaim: the directory carries no provisioning mark, so it is a \
+             finished worktree or someone's own directory, not an interrupted create"
+        );
         return None;
     }
     // A row naming this path means it is a live workspace, not debris —
@@ -561,6 +594,32 @@ async fn reclaim_orphan(
     }
     None
 }
+
+/// Where an in-progress create leaves its mark: a file in the worktree's own
+/// gitdir (`<main>/.git/worktrees/<name>/oximux-provisioning`).
+///
+/// In the gitdir rather than the working tree because the working tree is
+/// what the setup script sees and what `.oximuxinclude` fills — a stray file
+/// there would be visible to both and to `git status`. The gitdir is private
+/// to this worktree and is removed with it, so the mark can never outlive the
+/// thing it marks. `None` when `worktree_path` is not a linked worktree —
+/// there is no gitdir to write into, and nothing there is ours.
+///
+/// Public so the tests that model an interrupted create can set the state it
+/// leaves behind exactly.
+pub fn provisioning_marker(worktree_path: &Path) -> Option<PathBuf> {
+    // A linked worktree's `.git` is a FILE holding `gitdir: <path>`; a primary
+    // checkout's is a directory, and reading it fails — correctly, since a
+    // primary checkout is never something a create made.
+    let pointer = std::fs::read_to_string(worktree_path.join(".git")).ok()?;
+    let gitdir = pointer.trim().strip_prefix("gitdir:")?.trim();
+    // Absolute in practice; joined so a relative pointer resolves against the
+    // worktree, which is what git means by one.
+    Some(worktree_path.join(gitdir).join(PROVISIONING_MARK))
+}
+
+/// File name of the mark [`provisioning_marker`] resolves to.
+const PROVISIONING_MARK: &str = "oximux-provisioning";
 
 /// Undo the git half of a create: force-remove the worktree, force-delete the
 /// branch. Best-effort — both steps are attempted even when the first fails, so
@@ -646,21 +705,6 @@ async fn run_cleanup_bounded(worktree_path: &Path, timeout: std::time::Duration)
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn worktree_path_is_host_derived_from_the_data_dir() {
-        let path = worktree_path(Path::new("/data"), "proj-1", "feat-x");
-        assert_eq!(path, Path::new("/data/projects/proj-1/worktrees/feat-x"));
-    }
-
-    /// The whole reason `data_dir` is a parameter: two hosts, two roots.
-    #[test]
-    fn a_different_data_dir_relocates_the_worktree() {
-        let serve = worktree_path(Path::new("/srv/oximux"), "proj-1", "feat-x");
-        let desktop = worktree_path(Path::new("/home/u/Library"), "proj-1", "feat-x");
-        assert_ne!(serve, desktop);
-        assert!(serve.starts_with("/srv/oximux"));
-    }
 
     use std::time::{Duration, Instant};
 
