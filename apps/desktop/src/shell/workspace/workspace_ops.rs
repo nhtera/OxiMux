@@ -1587,12 +1587,28 @@ impl WorkspaceRoot {
         // The ROW's project's panes, not the active project's: the rail shows
         // every project's rows, and a script for `api`'s worktree must not
         // land as a tab in `web`'s pane group because `web` happened to be
-        // on screen. A project with no panes in this window is declined.
-        let Some(panes) = self.project_panes_by_project.get(&workspace.project_id).cloned()
-        else {
+        // on screen. A project that has never been activated in this window
+        // has no panes yet, so activate it first — that builds them and puts
+        // the terminal where the user will see it, which is what running a
+        // script from its row asks for anyway.
+        let mut panes = self.project_panes_by_project.get(&workspace.project_id).cloned();
+        if panes.is_none() {
+            let Some(project) =
+                resolve_project_for_workspace(&self.app_state.recent_projects, &workspace)
+            else {
+                tracing::warn!(
+                    project_id = %workspace.project_id,
+                    "run_workspace_script: row's project is not open"
+                );
+                return;
+            };
+            self.set_active_project(project, window, cx);
+            panes = self.project_panes_by_project.get(&workspace.project_id).cloned();
+        }
+        let Some(panes) = panes else {
             tracing::warn!(
                 project_id = %workspace.project_id,
-                "run_workspace_script: row's project has no panes in this window"
+                "run_workspace_script: row's project built no panes on activation"
             );
             return;
         };
