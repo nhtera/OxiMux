@@ -234,7 +234,14 @@ impl ToastLayer {
                 if i == 0 { button.primary() } else { button.ghost() }
             })
             .collect();
+        // `flex_1` + `min_w_0`: without them a long single-line text makes
+        // this flex item report its unwrapped width, the card blows past its
+        // `max_w`, and an offer's buttons paint off the right edge of the
+        // window (seen live on the first auto-rename offer). With them the
+        // text wraps inside the 360px card and the buttons stay visible.
         let body = div()
+            .flex_1()
+            .min_w_0()
             .flex()
             .flex_col()
             .gap(px(8.0))
