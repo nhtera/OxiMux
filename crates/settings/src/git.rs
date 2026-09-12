@@ -52,6 +52,22 @@ impl BranchPrefixMode {
     }
 }
 
+/// One entry of the row menu's `Open in ▸` submenu: a display name and the
+/// command that receives the worktree directory as its final argument.
+///
+/// `command` is a program followed by any fixed arguments, split on
+/// whitespace; an argument containing spaces is wrapped in double quotes,
+/// as in `open -a "Visual Studio Code"`. No shell is involved, so nothing
+/// in it expands. The desktop resolves the program through the process
+/// `PATH`, which a GUI launch has already repaired from the login shell —
+/// the same environment every agent CLI is spawned with.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct OpenInApp {
+    pub name: String,
+    pub command: String,
+}
+
 /// Git and source-control preferences, persisted to `git.toml`.
 ///
 /// `#[serde(default)]` per field so a file written by an older build — or
@@ -84,6 +100,17 @@ pub struct GitSettings {
     /// the new worktree starts from current work rather than from whatever was
     /// last pulled. Off by default: it makes creation touch the network.
     pub keep_default_up_to_date: bool,
+    /// The applications offered by the row menu's `Open in ▸`. **Empty means
+    /// the built-in list** — the platform's file manager plus whichever
+    /// known editors are installed — resolved by the desktop at menu-open
+    /// time so an app installed after the pane was last saved still
+    /// appears. The pane materialises the built-in list into this field the
+    /// first time the user edits it, so a removal sticks.
+    ///
+    /// **Keep this the last field.** It serializes as a TOML array of tables,
+    /// and `toml` refuses to emit a plain value after one — a scalar added
+    /// below it fails `to_toml_string` at runtime, not at compile time.
+    pub open_in: Vec<OpenInApp>,
 }
 
 impl Default for GitSettings {
@@ -104,6 +131,7 @@ impl GitSettings {
             custom_prefix: DEFAULT_PREFIX.to_string(),
             worktree_dir: None,
             keep_default_up_to_date: false,
+            open_in: Vec::new(),
         }
     }
 
@@ -159,6 +187,7 @@ mod tests {
         assert_eq!(s.custom_prefix, "oximux");
         assert_eq!(s.worktree_dir, None);
         assert!(!s.keep_default_up_to_date);
+        assert!(s.open_in.is_empty(), "empty = the built-in Open-in list");
     }
 
     #[test]
@@ -169,6 +198,13 @@ mod tests {
                 custom_prefix: "team".to_string(),
                 worktree_dir: Some("/tmp/wt".to_string()),
                 keep_default_up_to_date: true,
+                open_in: vec![
+                    OpenInApp { name: "VS Code".into(), command: "code".into() },
+                    OpenInApp {
+                        name: "Finder".into(),
+                        command: "open".into(),
+                    },
+                ],
             };
             assert_eq!(GitSettings::from_toml_str(&s.to_toml_string()).expect("parses"), s);
         }
@@ -224,10 +260,28 @@ mod tests {
             custom_prefix: "kept".to_string(),
             worktree_dir: None,
             keep_default_up_to_date: true,
+            open_in: Vec::new(),
         };
         std::fs::write(dir.path().join(GitSettings::FILE_NAME), want.to_toml_string())
             .expect("write");
         assert_eq!(GitSettings::load_from_dir(dir.path()), want);
+    }
+
+    /// The list is written as TOML array-of-tables, which is the shape a
+    /// person hand-editing `git.toml` would reach for — and an entry missing
+    /// one key loads with that key empty rather than failing the file.
+    #[test]
+    fn open_in_apps_are_an_array_of_tables_with_lenient_entries() {
+        let s = GitSettings::from_toml_str(
+            "[[open_in]]\nname = \"Zed\"\ncommand = \"zed\"\n\n[[open_in]]\ncommand = \"code\"\n",
+        )
+        .expect("parses");
+        assert_eq!(s.open_in.len(), 2);
+        assert_eq!(s.open_in[0], OpenInApp { name: "Zed".into(), command: "zed".into() });
+        assert_eq!(s.open_in[1].name, "");
+        assert_eq!(s.open_in[1].command, "code");
+        // And the field round-trips through the writer in that same shape.
+        assert!(s.to_toml_string().contains("[[open_in]]"));
     }
 
     #[test]

@@ -95,6 +95,11 @@ src/
     │   ├── workspace_card.rs render_workspace_card — two-line card painter consuming WorkspaceCardPlan;
     │   │                   CARD_HEIGHT_MULT = 2.2 × h_row (design-guidelines approved exception)
     │   ├── project_group.rs renders project groups; threads diff_counts snapshot into card builder; on_drag/drag_over/on_drop wired for reorder
+    │   ├── row_menu.rs     WorkspaceRowMenu popover (`…` / right-click, EVERY row incl. primary);
+    │   │                   RowCapabilities (row's OWN project) → menu_actions (pure, case-table tested);
+    │   │                   in-place submenus: Open in ▸ (apps), Move to Status ▸ (WorkPhase::ALL + Clear)
+    │   ├── open_in.rs      Open in ▸ app list: git.toml `[[open_in]]` or the built-in list (platform opener +
+    │   │                   installed editors); spawns by name — PATH is repaired once in platform::login_path
     │   ├── project_drag.rs drag payloads, insertion_side, paint_insertion_line (2px accent line),
     │   │                   SidebarDragPreview ghost chip, WorkspaceDragConfig, reorder_slot_value
     │   └── toolbar.rs      Add Project + settings (stubs)

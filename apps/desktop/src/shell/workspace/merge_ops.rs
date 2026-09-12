@@ -194,6 +194,34 @@ fn stranded_from_pop(stash: Option<&StashRef>, pop_failed: bool) -> Option<Notic
     (stash.is_some() && pop_failed).then_some(NoticeReason::PopFailed)
 }
 
+/// Everything a merge needs to name, resolved from the row.
+///
+/// Same reason `WorkspaceDeleteTarget` exists: `merge_workspace_into_default`
+/// is GPUI-bound and cannot be driven from a unit test, so the wrong-repository
+/// guard needs a seam the test can hold — and a revert of the handler to
+/// `self.active_project` has to delete this function to compile.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MergeTarget {
+    /// The row's OWN project.
+    pub(crate) project: Project,
+    /// Its root — the repository the merge runs in.
+    pub(crate) project_root: PathBuf,
+    /// The branch the work lands in.
+    pub(crate) default_branch: String,
+}
+
+/// Resolve what a merge of `workspace` should operate on, or `None` when its
+/// owning project is not open (decline rather than fall back).
+pub(crate) fn merge_target(projects: &[Project], workspace: &Workspace) -> Option<MergeTarget> {
+    let project =
+        crate::shell::workspace_ops::resolve_project_for_workspace(projects, workspace)?;
+    Some(MergeTarget {
+        project_root: PathBuf::from(&project.root_path),
+        default_branch: project.default_branch.clone(),
+        project,
+    })
+}
+
 impl WorkspaceRoot {
     /// Directories with a live **agent** in them, across every project whose
     /// panes this window has built.
@@ -303,18 +331,15 @@ impl WorkspaceRoot {
         // The ROW's project, never the active one: the rail shows every
         // project's rows at once, and merging into the wrong repository's
         // default branch is the same mistake Phase 1 had to fix for Delete.
-        let Some(project) = crate::shell::workspace_ops::resolve_project_for_workspace(
-            &self.app_state.recent_projects,
-            &workspace,
-        ) else {
+        let Some(MergeTarget { project, project_root, default_branch }) =
+            merge_target(&self.app_state.recent_projects, &workspace)
+        else {
             tracing::info!(
                 workspace_id = %workspace.id,
                 "merge: workspace's project not open, ignoring"
             );
             return;
         };
-        let project_root = PathBuf::from(&project.root_path);
-        let default_branch = project.default_branch.clone();
         let holders = self.agent_holders(cx);
         let weak: WeakEntity<WorkspaceRoot> = cx.weak_entity();
         let ws = workspace.clone();
@@ -778,5 +803,69 @@ impl WorkspaceRoot {
             });
         })
         .detach();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn project(id: &str, root: &str, default_branch: &str) -> Project {
+        Project {
+            id: id.into(),
+            name: id.into(),
+            root_path: root.into(),
+            default_branch: default_branch.into(),
+            created_at: String::new(),
+            last_opened_at: None,
+            sort_order: 0.0,
+        }
+    }
+
+    fn workspace_in(project_id: &str) -> Workspace {
+        Workspace {
+            id: format!("ws-{project_id}"),
+            project_id: project_id.into(),
+            branch_minted: true,
+            name: "fix".into(),
+            slug: "fix".into(),
+            branch: "oximux/fix".into(),
+            worktree_path: format!("/repos/{project_id}-wt/fix"),
+            status: "active".into(),
+            created_at: String::new(),
+            archived_at: None,
+            linked_issue: None,
+            tint: None,
+            sort_order: 0.0,
+            pinned: false,
+            comment: String::new(),
+            phase: String::new(),
+        }
+    }
+
+    /// The rail renders every open project's rows at once, so `Merge into` can
+    /// be reached while a DIFFERENT project is active. Resolution must follow
+    /// the row: otherwise landing `api`'s branch while `web` is active runs the
+    /// merge inside `web` and into `web`'s default branch.
+    #[test]
+    fn merge_target_resolves_the_rows_own_project_not_the_active_one() {
+        let api = project("api", "/repos/api", "main");
+        let web = project("web", "/repos/web", "develop");
+        // `web` is first — an "active project" fallback would pick it.
+        let open = vec![web.clone(), api.clone()];
+
+        let target = merge_target(&open, &workspace_in("api")).expect("merge target");
+        assert_eq!(target.project_root, PathBuf::from("/repos/api"));
+        assert_eq!(target.default_branch, "main");
+        assert_eq!(target.project.id, "api");
+        assert_ne!(target.project_root, PathBuf::from(&web.root_path), "never the active project's");
+    }
+
+    /// A row whose project is not open is declined, not merged into whatever
+    /// happens to be active.
+    #[test]
+    fn a_row_with_no_open_project_has_no_merge_target() {
+        let open = vec![project("web", "/repos/web", "main")];
+        assert_eq!(merge_target(&open, &workspace_in("api")), None);
     }
 }

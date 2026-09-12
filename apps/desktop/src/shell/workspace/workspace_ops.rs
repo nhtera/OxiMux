@@ -21,7 +21,8 @@ use oximux_git::{Repository, derive_slug, validate_slug};
 use oximux_settings::{Density, ScriptKind, Theme, Typography};
 use oximux_storage::{AgentSessionRepo, ProjectRepo, WorkspaceRepo};
 
-use crate::shell::left_rail::row_menu::ScriptAvail;
+use crate::shell::left_rail::open_in;
+use crate::shell::left_rail::row_menu::{RowCapabilities, ScriptAvail};
 
 use crate::project_panes_factory::{
     build_project_panes, load_persisted_tabs,
@@ -359,6 +360,20 @@ pub(crate) fn resolve_project_for_workspace(
         .iter()
         .find(|p| p.id == workspace.project_id)
         .cloned()
+}
+
+/// Whether `workspace` is its project's primary row — the repo's main
+/// checkout, which goes away with the project and never on its own.
+///
+/// **One predicate, shared by the rail and the row menu.** The rail paints the
+/// primary badge for a row whose worktree path IS the project root; the
+/// desktop synthesizes such a row with a `primary:<project>` id, but a real
+/// database row at the project root (an adopted checkout, a hand-edited row)
+/// must be treated the same way — it would otherwise paint as primary and
+/// still be offered `Delete`, which is the one case the row menu's gate
+/// exists to prevent. Either signal is enough.
+pub(crate) fn is_primary_row(workspace: &Workspace, project_root: &str) -> bool {
+    workspace.id.starts_with("primary:") || workspace.worktree_path == project_root
 }
 
 
@@ -1504,16 +1519,39 @@ impl WorkspaceRoot {
             run: scripts.script(ScriptKind::Run).is_some(),
             cleanup: scripts.script(ScriptKind::Cleanup).is_some(),
         };
-        // The `Merge into <x>` row is labelled with the row's OWN project's
-        // default branch, not the active project's — the rail shows every
-        // project's workspaces at once, and merging into the wrong repository's
-        // main is the mistake Phase 1 already had to fix once for Delete.
-        let default_branch =
+        // The menu carries the row's OWN project, not the active one — the
+        // rail shows every project's workspaces at once, and acting on the
+        // wrong repository is the mistake Phase 1 already had to fix once for
+        // Delete. A row whose project is not open gets no menu rather than a
+        // menu that would fall back to whichever project is active.
+        let Some(project) =
             resolve_project_for_workspace(&self.app_state.recent_projects, &workspace)
-                .map(|p| p.default_branch)
-                .unwrap_or_default();
+        else {
+            // Should be unreachable — the rail pairs rows with this same
+            // project list — but a right-click that silently does nothing is
+            // the worst possible symptom if it ever is, so say so.
+            tracing::warn!(
+                workspace_id = %workspace.id,
+                project_id = %workspace.project_id,
+                "open_row_menu: row's project is not open; declining"
+            );
+            self.push_toast(
+                crate::shell::toast::ToastKind::Error,
+                format!("\u{201c}{}\u{201d}: its project is not open", workspace.name),
+                cx,
+            );
+            return;
+        };
+        let caps = RowCapabilities {
+            is_primary: is_primary_row(&workspace, &project.root_path),
+            is_archived: workspace.archived_at.is_some(),
+            scripts: avail,
+            can_merge: !project.default_branch.is_empty(),
+            open_in: open_in::effective_apps(&crate::git_settings::settings(cx)),
+            project,
+        };
         self.row_menu
-            .update(cx, |m, cx| m.open(workspace, avail, default_branch, x, y, cx));
+            .update(cx, |m, cx| m.open(workspace, caps, x, y, cx));
         // The rail suppresses the `…` trigger's tooltip while this is up. An
         // already-visible tooltip is sticky — `occlude` stops new hovers, but
         // clearing a live one needs a hover-out, which needs a mouse move, and
@@ -1546,8 +1584,32 @@ impl WorkspaceRoot {
         };
         let title = format!("{}: {}", kind.as_str(), workspace.name);
         let script = script.to_string();
-        let Some(panes) = self.active_project_panes() else {
-            tracing::warn!("run_workspace_script: no active project panes");
+        // The ROW's project's panes, not the active project's: the rail shows
+        // every project's rows, and a script for `api`'s worktree must not
+        // land as a tab in `web`'s pane group because `web` happened to be
+        // on screen. A project that has never been activated in this window
+        // has no panes yet, so activate it first — that builds them and puts
+        // the terminal where the user will see it, which is what running a
+        // script from its row asks for anyway.
+        let mut panes = self.project_panes_by_project.get(&workspace.project_id).cloned();
+        if panes.is_none() {
+            let Some(project) =
+                resolve_project_for_workspace(&self.app_state.recent_projects, &workspace)
+            else {
+                tracing::warn!(
+                    project_id = %workspace.project_id,
+                    "run_workspace_script: row's project is not open"
+                );
+                return;
+            };
+            self.set_active_project(project, window, cx);
+            panes = self.project_panes_by_project.get(&workspace.project_id).cloned();
+        }
+        let Some(panes) = panes else {
+            tracing::warn!(
+                project_id = %workspace.project_id,
+                "run_workspace_script: row's project built no panes on activation"
+            );
             return;
         };
         panes.update(cx, |p, cx| {
@@ -2611,6 +2673,68 @@ impl WorkspaceRoot {
         );
     }
 
+    /// Copy a workspace's absolute worktree path to the clipboard. On a
+    /// primary row that is the project root — the same path `copy_project_path`
+    /// copies, reached from the row instead of the project header.
+    pub(crate) fn copy_workspace_path(&self, workspace: &Workspace, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(workspace.worktree_path.clone()));
+        self.push_toast(crate::shell::toast::ToastKind::Success, "Copied worktree path", cx);
+    }
+
+    /// The row menu's `Move to Status ▸`: write a worktree's phase, or clear
+    /// it with `None`.
+    ///
+    /// Same vocabulary and same store as `oximux worktree set --phase`: the
+    /// picker offers `WorkPhase::ALL` and writes each value's canonical
+    /// spelling, which is exactly what the CLI normalises typed input to.
+    /// There is no second validator because a `WorkPhase` cannot hold
+    /// anything the CLI would refuse. The rail re-reads the row on the next
+    /// render, so the chip updates without a restart.
+    ///
+    /// Deliberately does not touch the comment: a live agent's prompt still
+    /// outranks the comment on the card's second line, and the phase chip is
+    /// on the first.
+    pub(crate) fn set_workspace_phase(
+        &mut self,
+        workspace_id: &str,
+        phase: Option<oximux_core::WorkPhase>,
+        cx: &mut Context<Self>,
+    ) {
+        let stored = phase.map(|p| p.as_str()).unwrap_or("");
+        match self.app_state.workspace_repo.set_phase(workspace_id, stored) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(workspace_id, "set_workspace_phase: no such row");
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(?err, workspace_id, "set_workspace_phase failed");
+                self.push_toast(
+                    crate::shell::toast::ToastKind::Error,
+                    format!("Could not set status: {err}"),
+                    cx,
+                );
+                return;
+            }
+        }
+        self.mark_rail_dirty(cx);
+        cx.notify();
+    }
+
+    /// The primary row's `New workspace here`: what the project-group `+`
+    /// does, from the row. Activates the project first so the create dialog
+    /// opens with it preselected — the single code path every entry point
+    /// shares.
+    pub(crate) fn new_workspace_in_project(
+        &mut self,
+        project: Project,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_active_project(project, window, cx);
+        window.dispatch_action(Box::new(crate::actions::OpenWorkspaceCreate), cx);
+    }
+
     /// Opt `project` in or out of the computer-use tools — the per-project half
     /// of the two switches that decide whether its agents get them.
     ///
@@ -2754,7 +2878,8 @@ impl WorkspaceRoot {
 #[cfg(test)]
 mod nav_history_tests {
     use super::{
-        WorkspaceNavRef, push_nav_entry, resolve_project_for_workspace, workspace_delete_target,
+        WorkspaceNavRef, is_primary_row, push_nav_entry, resolve_project_for_workspace,
+        workspace_delete_target,
         workspace_path_for_ambient_terminal,
     };
     use oximux_core::{Project, Workspace};
@@ -2836,6 +2961,32 @@ mod nav_history_tests {
     /// GPUI-bound and cannot be driven from here, so binding the test to the
     /// function it actually uses is what makes a revert to `self.active_project`
     /// fail rather than pass — that revert has to delete this function.
+    /// The rail decides "primary" by path and the desktop synthesizes the row
+    /// with a `primary:` id; the menu's gate must honour both, or a real row at
+    /// the project root paints as primary and is still offered `Delete`.
+    #[test]
+    fn a_row_is_primary_by_synthesized_id_or_by_living_at_the_project_root() {
+        let synthesized = Workspace {
+            id: "primary:api".into(),
+            worktree_path: "/repos/api".into(),
+            ..workspace_in("api", "main")
+        };
+        assert!(is_primary_row(&synthesized, "/repos/api"));
+        // A real database row whose worktree IS the project root.
+        let adopted = Workspace {
+            id: "ws-adopted".into(),
+            worktree_path: "/repos/api".into(),
+            ..workspace_in("api", "main")
+        };
+        assert!(is_primary_row(&adopted, "/repos/api"));
+        // An ordinary worktree row is not.
+        let ordinary = Workspace {
+            worktree_path: "/repos/api-wt/fix".into(),
+            ..workspace_in("api", "oximux/fix")
+        };
+        assert!(!is_primary_row(&ordinary, "/repos/api"));
+    }
+
     #[test]
     fn delete_target_resolves_the_rows_own_project_not_the_active_one() {
         let api = project("api", "/repos/api");

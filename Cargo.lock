@@ -7868,6 +7868,7 @@ dependencies = [
  "tracing-subscriber",
  "two-face",
  "uuid",
+ "which 6.0.3",
  "widestring",
  "windows-sys 0.61.2",
  "wry",

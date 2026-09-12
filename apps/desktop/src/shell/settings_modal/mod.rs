@@ -51,6 +51,8 @@ use gpui::{
     Subscription, Window, point, px,
 };
 use gpui_component::input::{InputEvent, InputState};
+
+use crate::shell::left_rail::open_in;
 use oximux_settings::{
     AgentLaunchSettings, CommitMessageAiSettings, ComputerUseSettings, Density, DictationSettings,
     TerminalSettings, Theme, Typography,
@@ -118,6 +120,17 @@ pub struct SettingsModal {
     /// same validator the create path runs, so the reason arrives while the
     /// user is looking at the field — and a refused text is never written.
     pub(super) git_dir_notice: Option<String>,
+    /// The `Open in` add form's two fields, lazily built on `open()`.
+    pub(super) git_open_in_name_input: Option<Entity<InputState>>,
+    pub(super) git_open_in_cmd_input: Option<Entity<InputState>>,
+    /// Why the last `Add` was refused, rendered under the form; cleared by
+    /// the next successful edit.
+    pub(super) git_open_in_notice: Option<String>,
+    /// The apps the `Open in` rows show — the effective list, resolved once
+    /// at `open()` and after each edit rather than per frame: resolving the
+    /// built-in list stats application bundles (or walks `PATH`), which is
+    /// not a thing to do on every paint.
+    pub(super) git_open_in_shown: Vec<oximux_settings::OpenInApp>,
     /// Working copy of the rate-limit retry settings.
     pub(crate) retry: oximux_settings::agent_retry::AgentRetrySettings,
     /// Working copy of the per-agent launch defaults; reseeded from the live
@@ -365,6 +378,10 @@ impl SettingsModal {
             _git_dir_sub: None,
             git_dir_seed: String::new(),
             git_dir_notice: None,
+            git_open_in_name_input: None,
+            git_open_in_cmd_input: None,
+            git_open_in_notice: None,
+            git_open_in_shown: Vec::new(),
             retry: oximux_settings::agent_retry::AgentRetrySettings::shipped(),
             agent_launch: AgentLaunchSettings::default(),
             dictation: DictationSettings::default(),
@@ -589,6 +606,17 @@ impl SettingsModal {
             },
         ));
         self.git_dir_input = Some(dir_input);
+
+        // The `Open in` add form: two plain fields read on `Add`, so neither
+        // needs a subscription. Nothing is written until the chip is clicked.
+        self.git_open_in_notice = None;
+        self.git_open_in_name_input =
+            Some(cx.new(|cx| InputState::new(window, cx).placeholder("Name, e.g. VS Code")));
+        self.git_open_in_cmd_input = Some(cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Command, as typed in a terminal: code, cursor, zed")
+        }));
+        self.refresh_open_in_shown();
 
         // Agents pane's environment editor. Reset the selection first: a reopen
         // must not land on a profile deleted since, which would silently edit
@@ -821,6 +849,11 @@ impl SettingsModal {
         }
         self.git_dir_input = None;
         self._git_dir_sub = None;
+        // The add form holds nothing until `Add` is clicked, so dropping it
+        // loses nothing that was ever going to be saved.
+        self.git_open_in_name_input = None;
+        self.git_open_in_cmd_input = None;
+        self.git_open_in_notice = None;
         // Same flush-before-drop hazard as custom words: the working copy is
         // synced on every keystroke, but only blur/Enter writes the file, and
         // clicking dead space doesn't blur a gpui input. Without this, typing an
@@ -919,6 +952,82 @@ impl SettingsModal {
         self.git.worktree_dir = (!text.is_empty()).then(|| text.clone());
         self.git_dir_seed = text;
         self.persist_git(cx);
+    }
+
+    /// The `Open in` add form's `Add`: validate both fields, append the app,
+    /// write `git.toml`, and clear the form. A refusal stays under the form
+    /// with its reason and writes nothing.
+    pub(super) fn add_open_in_app(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(name_input), Some(cmd_input)) =
+            (self.git_open_in_name_input.clone(), self.git_open_in_cmd_input.clone())
+        else {
+            return;
+        };
+        let name = name_input.read(cx).value().to_string();
+        let command = cmd_input.read(cx).value().to_string();
+        // Materialise from what the pane is showing, not a fresh discovery:
+        // an app installed since the pane opened would otherwise appear in
+        // the list the user did not see themselves edit.
+        let shown = self.git_open_in_shown.clone();
+        match pane_git::add_open_in(&mut self.git.open_in, &name, &command, move || shown) {
+            Ok(()) => {
+                self.git_open_in_notice = None;
+                self.refresh_open_in_shown();
+                name_input.update(cx, |s, cx| s.set_value("", window, cx));
+                cmd_input.update(cx, |s, cx| s.set_value("", window, cx));
+                self.persist_git(cx);
+            }
+            Err(reason) => {
+                self.git_open_in_notice = Some(reason);
+                cx.notify();
+            }
+        }
+    }
+
+    /// The preset picker: drop a known editor's name and command into the
+    /// add form, ready for `Add`. Prefilled rather than added outright so the
+    /// label can still be changed and so a preset the user then thinks
+    /// better of costs nothing to abandon.
+    pub(super) fn prefill_open_in_app(
+        &mut self,
+        app: &oximux_settings::OpenInApp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(name_input), Some(cmd_input)) =
+            (self.git_open_in_name_input.clone(), self.git_open_in_cmd_input.clone())
+        else {
+            return;
+        };
+        name_input.update(cx, |s, cx| s.set_value(app.name.clone(), window, cx));
+        cmd_input.update(cx, |s, cx| s.set_value(app.command.clone(), window, cx));
+        self.git_open_in_notice = None;
+        cx.notify();
+    }
+
+    /// Remove the `idx`-th app of the list the pane is showing. Removing
+    /// from the built-in list materialises it first, so the removal sticks.
+    pub(super) fn remove_open_in_app(&mut self, idx: usize, cx: &mut Context<Self>) {
+        // `idx` indexes the list the pane showed; materialise THAT, not a
+        // fresh discovery whose order may have shifted.
+        let shown = self.git_open_in_shown.clone();
+        pane_git::remove_open_in(&mut self.git.open_in, idx, move || shown);
+        self.git_open_in_notice = None;
+        self.refresh_open_in_shown();
+        self.persist_git(cx);
+    }
+
+    /// Drop the configured list and go back to the built-in one.
+    pub(super) fn reset_open_in_apps(&mut self, cx: &mut Context<Self>) {
+        self.git.open_in.clear();
+        self.git_open_in_notice = None;
+        self.refresh_open_in_shown();
+        self.persist_git(cx);
+    }
+
+    /// Re-resolve the list the `Open in` rows show from the working copy.
+    pub(super) fn refresh_open_in_shown(&mut self) {
+        self.git_open_in_shown = open_in::effective_apps(&self.git);
     }
 
     /// Open a native folder picker and drop the chosen path into the
@@ -1493,6 +1602,58 @@ mod env_editor_tests {
     /// The editor's current text, as the user would see it.
     fn editor_text(m: &SettingsModal, cx: &App) -> String {
         m.env_input.as_ref().expect("env editor built").read(cx).value().to_string()
+    }
+
+    /// The Git pane paints with the `Open in` editor in it — the add form
+    /// with both fields, one row per app, and the reset row once the list is
+    /// the user's own — through the window's real draw cycle, for the same
+    /// reason as the Agents-pane test below. Both list states are painted:
+    /// the built-in one and a configured one, since each renders a different
+    /// hint and only the second has a `Reset` row.
+    #[gpui::test]
+    fn the_git_pane_paints_with_the_open_in_editor(cx: &mut TestAppContext) {
+        let (w, m) = modal(cx);
+        w.update(cx, |_root, window, cx| {
+            m.update(cx, |m, cx| {
+                m.open(window, cx);
+                m.selected = SettingsPane::Git;
+                assert!(m.git_open_in_name_input.is_some(), "open() builds the name field");
+                assert!(m.git_open_in_cmd_input.is_some(), "open() builds the command field");
+                m.git_open_in_notice = Some("Give the app a name.".into());
+            });
+        })
+        .expect("open on the Git pane");
+
+        let mut vcx = gpui::VisualTestContext::from_window(w.into(), cx);
+        vcx.simulate_resize(gpui::size(px(1100.0), px(800.0)));
+        vcx.run_until_parked();
+
+        // Now the user's own list: a different hint, and the `Reset` row.
+        w.update(&mut vcx.cx, |_root, _window, cx| {
+            m.update(cx, |m, cx| {
+                m.git.open_in = vec![
+                    oximux_settings::OpenInApp { name: "Zed".into(), command: "zed".into() },
+                    oximux_settings::OpenInApp {
+                        name: "VS Code".into(),
+                        command: "open -a \"Visual Studio Code\"".into(),
+                    },
+                ];
+                m.git_open_in_notice = None;
+                m.refresh_open_in_shown();
+                cx.notify();
+            });
+        })
+        .expect("switch to a configured list");
+        vcx.run_until_parked();
+
+        w.update(&mut vcx.cx, |_root, _window, cx| {
+            m.update(cx, |m, cx| {
+                m.close(cx);
+                assert!(m.git_open_in_name_input.is_none(), "close() drops the add form");
+                assert!(m.git_open_in_cmd_input.is_none());
+            });
+        })
+        .expect("close");
     }
 
     /// The Agents pane paints with the new card in it, through the window's

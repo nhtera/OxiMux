@@ -383,7 +383,10 @@ pub(crate) fn render_workspace_block(
         // The main worktree lives at the project root; that row is the
         // project's primary (the repo's main worktree). A primary
         // row with no branch is a non-git folder project → "Folder" badge.
-        let is_primary = workspace.worktree_path == project.root_path;
+        let is_primary = crate::shell::workspace::workspace_ops::is_primary_row(
+            &workspace,
+            &project.root_path,
+        );
         let is_folder = is_primary && workspace.branch.is_empty();
         let is_live = live_worktrees.contains(&workspace.worktree_path);
         // Combine the tracked session status with any live ambient reading
@@ -547,10 +550,7 @@ pub(crate) fn render_workspace_block(
             row_group,
             !active_agent_wrap,
             multi_agent,
-            crate::shell::left_rail::workspace_card::RowMenu {
-                show: !is_primary,
-                open: row_menu_open,
-            },
+            crate::shell::left_rail::workspace_card::RowMenu { open: row_menu_open },
             locate_glow_seq,
             drag_config,
             rename_config,
