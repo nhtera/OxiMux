@@ -312,18 +312,32 @@ mod tests {
 
     /// Output printed before the hang survives the timeout — it is usually the
     /// only evidence of what the script was doing when it wedged.
+    ///
+    /// The bound is the test's whole wall time, and it has to cover the
+    /// script *reaching* the echo: the runner spawns a login shell (`sh -lc`),
+    /// and on a cold Windows CI runner sourcing the profile alone has taken
+    /// longer than the 500 ms this test used to allow — which failed an
+    /// unrelated PR on the echo never having run. Five seconds is an order of
+    /// magnitude over the slowest start seen; the sibling test above is the
+    /// one that pins the timeout firing promptly.
     #[tokio::test]
     async fn output_before_a_timeout_is_kept() {
         let dir = wt();
+        let start = Instant::now();
         let t = run_setup_bounded(
             dir.path(),
             "echo installing; sleep 60",
-            Duration::from_millis(500),
+            Duration::from_secs(5),
             None,
         )
         .await;
         assert_eq!(t.outcome, SetupOutcome::TimedOut);
         assert!(t.output.contains("installing"), "{:?}", t.output);
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "should return at the bound, took {:?}",
+            start.elapsed()
+        );
     }
 
     /// stdin is closed, so a prompt fails immediately instead of consuming the
