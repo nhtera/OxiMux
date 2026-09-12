@@ -2,6 +2,7 @@
 //! and the project-management dialogs (add-project, project picker).
 
 pub mod add_project_dialog;
+pub mod auto_rename_ops;
 pub mod base_choice;
 pub mod configured_locator;
 pub mod merge_notices;

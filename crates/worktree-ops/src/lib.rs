@@ -15,7 +15,9 @@
 //! a location — through [`HostDerivedLocator`]; the desktop, which is the
 //! host, resolves a configured, browsable root instead. See [`locator`].
 
+pub mod auto_rename;
 pub mod branch_name;
+pub mod codename;
 pub mod create_base;
 pub mod freshen;
 pub mod include;
@@ -26,6 +28,11 @@ mod paths;
 mod service;
 pub mod setup;
 
+pub use auto_rename::{
+    AutoRenameProposal, Ineligible, apply_auto_rename, auto_rename_with_rollback,
+    derive_auto_slug, preflight_auto_rename, propose_auto_rename,
+};
+pub use codename::{CODENAMES, is_generated_codename, select_codename};
 pub use create_base::{CreateBase, setup_decision};
 pub use include::{CopyReport, Skip};
 pub use locator::{

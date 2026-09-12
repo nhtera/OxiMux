@@ -376,6 +376,19 @@ pub struct OpenChatSession {
     pub preset_id: Option<String>,
 }
 
+/// A chat at `cwd` produced its first generated task summary (never the
+/// hook-captured prompt). Raised by the pane group from
+/// `AgentChatEvent::TaskSummaryReady`; `WorkspaceRoot` maps `cwd` to a
+/// workspace row and, if that row still carries a generated codename, offers
+/// to rename its branch from `summary` (Phase 8 auto-rename). A row the user
+/// named, or one already renamed once, is ignored.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct OfferWorkspaceAutoRename {
+    pub cwd: std::path::PathBuf,
+    pub summary: String,
+}
+
 /// Route-up action raised when a *New Agent* draft's "Run in a fresh worktree"
 /// send lands: the leaf chat view carries no `WorkspaceRepo`, so it emits an
 /// `AgentChatEvent` that the pane group turns into this action. `WorkspaceRoot`

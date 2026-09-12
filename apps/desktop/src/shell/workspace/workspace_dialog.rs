@@ -24,6 +24,7 @@ use gpui_component::{
 };
 use oximux_core::{AgentAdapter, Project, Workspace};
 use oximux_git::derive_slug;
+use oximux_worktree_ops::select_codename;
 use oximux_settings::{Density, SetupDecision, Theme, Typography};
 
 use crate::shell::workspace::base_choice::{BaseChoice, BaseMode};
@@ -148,6 +149,11 @@ pub struct WorkspaceDialog {
     _title_fetch: Option<Task<()>>,
     /// Wires `name_input` changes into the forge-reference detection.
     _name_sub: Subscription,
+    /// The name an empty Create submits with. Picked once per `open_create`
+    /// against the slugs that already exist, so the preview line shows the
+    /// same word from the moment the dialog opens to the moment it commits —
+    /// clearing the field again shows this word, not a fresh roll.
+    codename: String,
     theme: Theme,
     density: Density,
     typography: Typography,
@@ -163,7 +169,8 @@ impl WorkspaceDialog {
         cx: &mut Context<Self>,
     ) -> Self {
         let name_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("e.g. fix-login, #42, or an issue URL")
+            InputState::new(window, cx)
+                .placeholder("Optional \u{2014} a name, #42, or an issue URL; blank gets a codename")
         });
         let name_sub = cx.subscribe_in(
             &name_input,
@@ -200,6 +207,7 @@ impl WorkspaceDialog {
             applying_title: false,
             _title_fetch: None,
             _name_sub: name_sub,
+            codename: String::new(),
             theme,
             density,
             typography,
@@ -284,14 +292,21 @@ impl WorkspaceDialog {
 
     /// Open in Create mode with the available projects + the user's
     /// current active project (used as the dropdown default).
+    ///
+    /// `existing_slugs` is every slug already in use across `projects`,
+    /// active and archived — the codename an empty Name commits with is
+    /// picked once here, against that set, so the preview line and the
+    /// create cannot disagree about it.
     pub fn open_create(
         &mut self,
         projects: Vec<Project>,
         active: Option<Project>,
+        existing_slugs: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.mode = Some(WorkspaceDialogMode::Create);
+        self.codename = select_codename(&existing_slugs);
         self.name_input
             .update(cx, |s, cx| s.set_value("", window, cx));
         self.projects = projects;
@@ -370,23 +385,44 @@ impl WorkspaceDialog {
         self.name_input.read(cx).value().to_string()
     }
 
-    pub fn slug_preview(&self, cx: &App) -> String {
-        derive_slug(self.current_name(cx).trim())
+    /// The name this dialog would submit right now: what was typed, or in
+    /// Create mode a fallback when nothing was. The fallback is the codename
+    /// — except when adopting an existing branch, where the name only labels
+    /// the row and names the directory, and the branch's own name is the
+    /// obvious label rather than an unrelated word.
+    fn effective_name(&self, cx: &App) -> String {
+        let typed = self.current_name(cx);
+        match self.mode {
+            Some(WorkspaceDialogMode::Create) => {
+                let fallback = match (&self.base.mode, self.base.existing.as_deref()) {
+                    (BaseMode::ExistingBranch, Some(existing)) => existing,
+                    _ => self.codename.as_str(),
+                };
+                effective_create_name(&typed, fallback)
+            }
+            _ => typed.trim().to_string(),
+        }
     }
 
-    /// Submittable iff name non-empty AND (Rename mode OR Create mode has
-    /// a selected project). Empty-projects state in Create disables submit.
+    /// The slug the `Branch:` line previews — derived from
+    /// [`Self::effective_name`], so an empty Name shows the codename it will
+    /// get rather than a blank.
+    pub fn slug_preview(&self, cx: &App) -> String {
+        derive_slug(&self.effective_name(cx))
+    }
+
+    /// Submittable iff Create mode has a selected project and a complete
+    /// base, or Rename mode has a non-empty name. An empty name no longer
+    /// blocks Create: it means "use the codename" (Phase 8), and the preview
+    /// line already shows which one.
     fn can_submit(&self, cx: &App) -> bool {
-        if self.current_name(cx).trim().is_empty() {
-            return false;
-        }
         match &self.mode {
             // Adopting a branch requires naming one — `is_complete` is the
             // only state that can be half-made.
             Some(WorkspaceDialogMode::Create) => {
                 self.selected_project.is_some() && self.base.is_complete()
             }
-            Some(WorkspaceDialogMode::Rename(_)) => true,
+            Some(WorkspaceDialogMode::Rename(_)) => !self.current_name(cx).trim().is_empty(),
             None => false,
         }
     }
@@ -398,7 +434,7 @@ impl WorkspaceDialog {
         let Some(mode) = self.mode.clone() else {
             return;
         };
-        let name = self.current_name(cx).trim().to_string();
+        let name = self.effective_name(cx);
         let project = match &mode {
             WorkspaceDialogMode::Create => self.selected_project.clone(),
             WorkspaceDialogMode::Rename(_) => None,
@@ -427,6 +463,18 @@ impl WorkspaceDialog {
 impl Focusable for WorkspaceDialog {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+/// What a Create submits as its name: the typed text, trimmed, or `codename`
+/// when nothing usable was typed. Whitespace-only counts as nothing — a
+/// stray space must not turn into a `workspace` slug the user never saw.
+pub fn effective_create_name(typed: &str, codename: &str) -> String {
+    let typed = typed.trim();
+    if typed.is_empty() {
+        codename.to_string()
+    } else {
+        typed.to_string()
     }
 }
 
@@ -1390,5 +1438,16 @@ mod tests {
         let name = "  My Feature  ";
         let trimmed = name.trim();
         assert_eq!(derive_slug(trimmed), "my-feature");
+    }
+
+    /// An empty (or whitespace-only) Name creates on the codename; anything
+    /// typed wins, trimmed. The preview derives from the same answer, so the
+    /// codename branch shown is the codename branch made.
+    #[test]
+    fn an_empty_name_creates_on_the_codename_and_a_typed_one_wins() {
+        assert_eq!(effective_create_name("", "amber"), "amber");
+        assert_eq!(effective_create_name("   ", "amber"), "amber");
+        assert_eq!(effective_create_name("  fix login  ", "amber"), "fix login");
+        assert_eq!(derive_slug(&effective_create_name("", "amber-2")), "amber-2");
     }
 }

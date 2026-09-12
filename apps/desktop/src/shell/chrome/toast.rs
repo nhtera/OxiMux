@@ -8,18 +8,53 @@
 //! seconds; oldest trims when the stack overflows. The layer paints as a
 //! pass-through overlay (no backdrop) so it never blocks clicks beneath it.
 
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt, App, Context, ElementId, Global, Hsla, IntoElement, ParentElement,
-    Render, Styled, WeakEntity, Window, div, ease_out_quint, px,
+    Animation, AnimationExt, AnyElement, App, ClickEvent, Context, ElementId, Global, Hsla,
+    IntoElement, ParentElement, Render, SharedString, Styled, WeakEntity, Window, div,
+    ease_out_quint, px,
 };
+use gpui::prelude::FluentBuilder;
+use gpui_component::button::{Button, ButtonVariants};
 use oximux_settings::{Density, Motion, Theme, Typography};
 
 use crate::ui::FloatingSurface;
 
 /// How long a toast stays before it auto-dismisses.
 const TOAST_TTL: Duration = Duration::from_secs(4);
+/// How long a toast carrying buttons stays. Longer, because it is asking a
+/// question rather than reporting a fact, and the answer on timeout is
+/// always the do-nothing one — so a slow reader loses nothing but the offer.
+const ACTIONABLE_TOAST_TTL: Duration = Duration::from_secs(20);
+
+/// A button on a toast. Clicking runs `on_click` and dismisses the toast;
+/// letting the toast time out is the same as never clicking.
+#[derive(Clone)]
+pub struct ToastAction {
+    pub label: SharedString,
+    pub on_click: Rc<dyn Fn(&mut App)>,
+}
+
+impl ToastAction {
+    /// `on_click` runs inside the toast layer's own update, so it must not
+    /// call [`toast`] / [`toast_with_actions`] synchronously — that re-enters
+    /// the layer and panics. Defer through `cx.spawn` (or an entity update on
+    /// something else) and toast from there.
+    pub fn new(label: impl Into<SharedString>, on_click: impl Fn(&mut App) + 'static) -> Self {
+        Self {
+            label: label.into(),
+            on_click: Rc::new(on_click),
+        }
+    }
+
+    /// A button whose only effect is dismissing the toast — the explicit
+    /// "no" beside an offer, so declining does not mean waiting.
+    pub fn dismiss(label: impl Into<SharedString>) -> Self {
+        Self::new(label, |_| {})
+    }
+}
 /// Cap the visible stack; an older toast is dropped when a new one overflows.
 const MAX_VISIBLE: usize = 4;
 
@@ -56,6 +91,9 @@ struct Toast {
     /// short timer removes it after `m_toast_out`. Lets the exit animate
     /// instead of the card vanishing the instant its TTL fires.
     exiting: bool,
+    /// Buttons under the text. Empty for the ordinary "this just happened"
+    /// toast; an offer (rename this worktree?) carries one or two.
+    actions: Vec<ToastAction>,
 }
 
 /// Bottom-right transient toast stack. Owned at the workspace root and mounted
@@ -91,21 +129,48 @@ impl ToastLayer {
     /// Enqueue a toast and arm its auto-dismiss timer. Trims the oldest when
     /// the stack exceeds [`MAX_VISIBLE`] so a burst can't grow without bound.
     pub fn push(&mut self, kind: ToastKind, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.push_with_actions(kind, text, Vec::new(), cx);
+    }
+
+    /// Enqueue a toast with buttons. Stays longer than a plain toast (see
+    /// [`ACTIONABLE_TOAST_TTL`]); a click runs the action and dismisses.
+    pub fn push_with_actions(
+        &mut self,
+        kind: ToastKind,
+        text: impl Into<String>,
+        actions: Vec<ToastAction>,
+        cx: &mut Context<Self>,
+    ) {
         let id = self.next_id;
         self.next_id += 1;
+        let ttl = if actions.is_empty() {
+            TOAST_TTL
+        } else {
+            ACTIONABLE_TOAST_TTL
+        };
         self.toasts.push(Toast {
             id,
             kind,
             text: text.into(),
             exiting: false,
+            actions,
         });
         if self.toasts.len() > MAX_VISIBLE {
-            self.toasts.remove(0);
+            // Trim the oldest PLAIN toast first: a report can be lost to a
+            // burst, an offer with buttons should not be — its question may
+            // be unrepeatable. Only when every card is an offer does the
+            // oldest one go.
+            let victim = self
+                .toasts
+                .iter()
+                .position(|t| t.actions.is_empty())
+                .unwrap_or(0);
+            self.toasts.remove(victim);
         }
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(TOAST_TTL).await;
+            cx.background_executor().timer(ttl).await;
             let _ = this.update(cx, |layer, cx| layer.dismiss(id, cx));
         })
         .detach();
@@ -144,8 +209,50 @@ impl ToastLayer {
         }
     }
 
-    fn render_card(&self, toast: &Toast, motion: Motion) -> impl IntoElement {
+    // Returns an owned `AnyElement` (not `impl IntoElement`) so the element
+    // is not inferred to borrow `cx` — every card is built in one loop that
+    // reuses the same context.
+    fn render_card(&self, toast: &Toast, motion: Motion, cx: &mut Context<Self>) -> AnyElement {
         let accent = toast.kind.accent(&self.theme);
+        let toast_id = toast.id;
+        // Buttons, when the toast is an offer. The first is the affirmative
+        // and paints primary; the rest are ghosts. Every click dismisses.
+        let buttons: Vec<_> = toast
+            .actions
+            .iter()
+            .enumerate()
+            .map(|(i, action)| {
+                let on_click = action.on_click.clone();
+                let button = Button::new(ElementId::Name(
+                    format!("toast-{toast_id}-action-{i}").into(),
+                ))
+                .label(action.label.clone())
+                .on_click(cx.listener(move |layer, _: &ClickEvent, _window, cx| {
+                    (on_click)(cx);
+                    layer.dismiss(toast_id, cx);
+                }));
+                if i == 0 { button.primary() } else { button.ghost() }
+            })
+            .collect();
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .px(px(12.0))
+            .py(px(8.0))
+            .text_size(px(self.typography.t_body_sm))
+            .text_color(self.theme.fg_base)
+            .child(toast.text.clone())
+            .when(!buttons.is_empty(), |b| {
+                b.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(self.density.gap_inline))
+                        .children(buttons),
+                )
+            });
         let card = div()
             .flex()
             .items_stretch()
@@ -154,14 +261,7 @@ impl ToastLayer {
             .overflow_hidden()
             // 2px status-hue left accent bar — the only color on the card.
             .child(div().w(px(2.0)).bg(accent))
-            .child(
-                div()
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .text_size(px(self.typography.t_body_sm))
-                    .text_color(self.theme.fg_base)
-                    .child(toast.text.clone()),
-            );
+            .child(body);
         // Enter: fade + rise 8px to rest. Exit: fade out in place. Keyed on a
         // phase-specific id so the enter→exit transition starts the fade-out
         // fresh (from full opacity) rather than continuing the enter curve.
@@ -190,6 +290,7 @@ impl ToastLayer {
                 }
             },
         )
+        .into_any_element()
     }
 }
 
@@ -201,11 +302,10 @@ impl Render for ToastLayer {
             return div();
         }
         let motion = crate::motion_settings::active(cx);
-        let cards: Vec<_> = self
-            .toasts
-            .iter()
-            .map(|t| self.render_card(t, motion))
-            .collect();
+        let mut cards = Vec::with_capacity(self.toasts.len());
+        for toast in &self.toasts {
+            cards.push(self.render_card(toast, motion, cx));
+        }
         div()
             .absolute()
             .inset_0()
@@ -263,6 +363,21 @@ pub fn toast(cx: &mut App, kind: ToastKind, text: impl Into<String>) {
     };
     let text = text.into();
     let _ = layer.update(cx, |layer, cx| layer.push(kind, text, cx));
+}
+
+/// Surface an offer on the active window's layer: a toast with buttons. The
+/// first action is the affirmative. Timing out is the same as declining.
+pub fn toast_with_actions(
+    cx: &mut App,
+    kind: ToastKind,
+    text: impl Into<String>,
+    actions: Vec<ToastAction>,
+) {
+    let Some(layer) = cx.try_global::<ToastBus>().and_then(|b| b.active.clone()) else {
+        return;
+    };
+    let text = text.into();
+    let _ = layer.update(cx, |layer, cx| layer.push_with_actions(kind, text, actions, cx));
 }
 
 /// Standard error toast for a failed user-initiated operation:

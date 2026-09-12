@@ -539,6 +539,18 @@ impl Render for WorkspaceRoot {
                 },
             ))
             .on_action(cx.listener(
+                |this, action: &crate::actions::OfferWorkspaceAutoRename, _window, cx| {
+                    // A chat's first generated summary: offer to rename a
+                    // codename worktree from it. Everything that can decline
+                    // does so in the log; only a passing pre-flight toasts.
+                    this.offer_workspace_auto_rename(
+                        action.cwd.clone(),
+                        action.summary.clone(),
+                        cx,
+                    );
+                },
+            ))
+            .on_action(cx.listener(
                 |this, action: &CreateWorktreeWorkspaceForActiveChat, _window, cx| {
                     // A *New Agent* worktree draft sent: make the worktree a
                     // first-class `Workspace` (DB row + git worktree via
@@ -877,9 +889,17 @@ impl Render for WorkspaceRoot {
             .on_action(cx.listener(|this, _: &OpenWorkspaceCreate, window, cx| {
                 let projects = this.app_state.recent_projects.clone();
                 let active = this.active_project.clone();
+                // The codename an empty Name gets is picked against every slug
+                // already in use, so the preview cannot promise a branch that
+                // already exists.
+                let existing_slugs = crate::shell::workspace::workspace_ops::existing_slugs_across(
+                    &this.app_state.workspace_repo,
+                    &projects,
+                );
                 this.close_modal_overlays(cx);
-                this.workspace_dialog
-                    .update(cx, |d, cx| d.open_create(projects, active, window, cx));
+                this.workspace_dialog.update(cx, |d, cx| {
+                    d.open_create(projects, active, existing_slugs, window, cx)
+                });
             }))
             .on_action(cx.listener(|this, _: &OpenAddProjectDialog, window, cx| {
                 this.close_modal_overlays(cx);

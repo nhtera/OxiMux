@@ -341,6 +341,36 @@ type RailDbData = (
     HashMap<String, Vec<AgentSession>>,
 );
 
+/// Every slug already in use across `projects`, active **and archived**, so
+/// a codename can be picked that collides with nothing. Archived rows count:
+/// an archived worktree is still a directory on disk and still a branch. A
+/// project whose rows cannot be listed contributes nothing — the create path
+/// re-checks for a duplicate slug before it touches git anyway.
+///
+/// Wider than it strictly needs to be (slugs are unique per project, this
+/// avoids them across every open project) — a codename taken in one project
+/// is simply skipped in another, which costs nothing from a 64-word list.
+pub(crate) fn existing_slugs_across(
+    repo: &oximux_storage::WorkspaceRepo,
+    projects: &[Project],
+) -> Vec<String> {
+    let mut slugs = Vec::new();
+    for project in projects {
+        for rows in [
+            repo.list_for_project(&project.id),
+            repo.list_archived_for_project(&project.id),
+        ] {
+            match rows {
+                Ok(rows) => slugs.extend(rows.into_iter().map(|w| w.slug)),
+                Err(err) => {
+                    tracing::debug!(?err, project_id = %project.id, "existing_slugs: list failed")
+                }
+            }
+        }
+    }
+    slugs
+}
+
 /// Find the [`Project`] that owns `workspace`, by its `project_id` — NOT from
 /// `WorkspaceRoot::active_project`.
 ///
