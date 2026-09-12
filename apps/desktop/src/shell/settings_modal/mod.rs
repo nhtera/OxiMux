@@ -965,7 +965,11 @@ impl SettingsModal {
         };
         let name = name_input.read(cx).value().to_string();
         let command = cmd_input.read(cx).value().to_string();
-        match pane_git::add_open_in(&mut self.git.open_in, &name, &command, open_in::default_apps) {
+        // Materialise from what the pane is showing, not a fresh discovery:
+        // an app installed since the pane opened would otherwise appear in
+        // the list the user did not see themselves edit.
+        let shown = self.git_open_in_shown.clone();
+        match pane_git::add_open_in(&mut self.git.open_in, &name, &command, move || shown) {
             Ok(()) => {
                 self.git_open_in_notice = None;
                 self.refresh_open_in_shown();
@@ -1004,7 +1008,10 @@ impl SettingsModal {
     /// Remove the `idx`-th app of the list the pane is showing. Removing
     /// from the built-in list materialises it first, so the removal sticks.
     pub(super) fn remove_open_in_app(&mut self, idx: usize, cx: &mut Context<Self>) {
-        pane_git::remove_open_in(&mut self.git.open_in, idx, open_in::default_apps);
+        // `idx` indexes the list the pane showed; materialise THAT, not a
+        // fresh discovery whose order may have shifted.
+        let shown = self.git_open_in_shown.clone();
+        pane_git::remove_open_in(&mut self.git.open_in, idx, move || shown);
         self.git_open_in_notice = None;
         self.refresh_open_in_shown();
         self.persist_git(cx);

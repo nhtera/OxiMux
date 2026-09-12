@@ -19,13 +19,21 @@ use oximux_settings::OpenInApp;
 use oximux_settings::git::GitSettings;
 
 /// The apps the submenu should offer: the configured list, or the built-in
-/// one when nothing is configured.
+/// one when nothing usable is configured.
+///
+/// `git.toml` is meant to be hand-edited and `[[open_in]]` loads a missing
+/// key as an empty string, so a configured entry can have no name (a blank
+/// menu row) or no launchable command (a row that always fails). Those are
+/// dropped here rather than offered; a list that is nothing but those falls
+/// back to the built-in one, the same as an empty list.
 pub fn effective_apps(settings: &GitSettings) -> Vec<OpenInApp> {
-    if settings.open_in.is_empty() {
-        default_apps()
-    } else {
-        settings.open_in.clone()
-    }
+    let usable: Vec<OpenInApp> = settings
+        .open_in
+        .iter()
+        .filter(|app| !app.name.trim().is_empty() && parse_command(&app.command).is_some())
+        .cloned()
+        .collect();
+    if usable.is_empty() { default_apps() } else { usable }
 }
 
 /// The built-in list: the platform opener first, then the editors we can see.
@@ -226,6 +234,20 @@ mod tests {
         for app in installed_editors() {
             assert!(preset_names.contains(&app.name.as_str()), "{app:?} is not a preset");
         }
+    }
+
+    /// A hand-edited entry missing its name or command is dropped, not
+    /// offered; a list of nothing but those behaves like an empty list.
+    #[test]
+    fn unusable_configured_entries_are_dropped_and_an_all_unusable_list_falls_back() {
+        let settings = GitSettings {
+            open_in: vec![app("", "code"), app("Zed", "zed"), app("Broken", ""), app("Odd", "\"\"")],
+            ..GitSettings::shipped()
+        };
+        assert_eq!(effective_apps(&settings), vec![app("Zed", "zed")]);
+        let none_usable =
+            GitSettings { open_in: vec![app("", "code"), app("Broken", "")], ..GitSettings::shipped() };
+        assert_eq!(effective_apps(&none_usable), default_apps());
     }
 
     #[test]

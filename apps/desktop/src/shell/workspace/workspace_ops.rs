@@ -1584,8 +1584,16 @@ impl WorkspaceRoot {
         };
         let title = format!("{}: {}", kind.as_str(), workspace.name);
         let script = script.to_string();
-        let Some(panes) = self.active_project_panes() else {
-            tracing::warn!("run_workspace_script: no active project panes");
+        // The ROW's project's panes, not the active project's: the rail shows
+        // every project's rows, and a script for `api`'s worktree must not
+        // land as a tab in `web`'s pane group because `web` happened to be
+        // on screen. A project with no panes in this window is declined.
+        let Some(panes) = self.project_panes_by_project.get(&workspace.project_id).cloned()
+        else {
+            tracing::warn!(
+                project_id = %workspace.project_id,
+                "run_workspace_script: row's project has no panes in this window"
+            );
             return;
         };
         panes.update(cx, |p, cx| {

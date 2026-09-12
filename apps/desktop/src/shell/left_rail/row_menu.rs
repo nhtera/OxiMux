@@ -217,7 +217,18 @@ fn menu_actions(caps: &RowCapabilities) -> Vec<WorkspaceRowAction> {
     let finding = open_in.into_iter().chain([WorkspaceRowAction::CopyPath]);
 
     if caps.is_archived {
-        return finding.chain(ARCHIVED_ACTIONS.iter().copied()).collect();
+        // A row at the project root can be archived (by the CLI, or before
+        // it was recognised as primary). `Unarchive` only restores the row;
+        // `Delete` on it would take the force path through the project's own
+        // checkout, so the primary rule holds here too.
+        return finding
+            .chain(
+                ARCHIVED_ACTIONS
+                    .iter()
+                    .copied()
+                    .filter(|a| !(caps.is_primary && *a == WorkspaceRowAction::Delete)),
+            )
+            .collect();
     }
 
     let scripts = SCRIPT_ACTIONS
@@ -854,9 +865,16 @@ mod tests {
         // The reduction does not depend on which scripts happen to be defined.
         let no_scripts = RowCapabilities { scripts: ScriptAvail::default(), ..archived() };
         assert_eq!(menu_actions(&no_scripts), menu_actions(&archived()));
-        // Nor on the primary flag, which an archived row cannot carry anyway.
-        let odd = RowCapabilities { is_primary: true, ..archived() };
-        assert_eq!(menu_actions(&odd), menu_actions(&archived()));
+    }
+
+    /// An archived row that is ALSO the project's checkout — possible for a
+    /// persisted row at the project root — keeps `Unarchive` (it only restores
+    /// the row) and loses `Delete` (its force path would go through the
+    /// project's own checkout).
+    #[test]
+    fn an_archived_primary_row_keeps_unarchive_but_not_delete() {
+        let actions = menu_actions(&RowCapabilities { is_primary: true, ..archived() });
+        assert_eq!(actions, vec![A::OpenIn, A::CopyPath, A::Unarchive]);
     }
 
     #[test]
