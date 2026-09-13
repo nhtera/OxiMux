@@ -66,7 +66,7 @@ fn primary_and_all_chords_lookups() {
 
 #[test]
 fn chord_list_parses_dedups_and_rejects_as_a_whole() {
-    let list = parse_chord_list("cmd-n, cmd-shift-n ,cmd-n").unwrap();
+    let list = parse_chord_list("cmd-n, cmd-shift-n,cmd-n").unwrap();
     assert_eq!(list.len(), 2, "duplicates collapse: {list:?}");
     assert_eq!(list[0], normalize_chord("cmd-n").unwrap());
     assert_eq!(parse_chord_list("").unwrap(), Vec::<String>::new());
@@ -99,8 +99,19 @@ fn a_comma_key_is_not_a_separator() {
             normalize_chord(",").unwrap(),
         ]
     );
-    // Whitespace around the separator is not part of a chord.
-    assert_eq!(parse_chord_list("cmd-, , cmd-n").unwrap().len(), 2);
+    // A bare comma as a LATER STROKE of a multi-stroke chord is a key too —
+    // it follows whitespace, not a key character.
+    let two_stroke = normalize_chord("cmd-k ,").unwrap();
+    assert_eq!(two_stroke.split(' ').count(), 2, "{two_stroke:?} is two strokes");
+    assert_eq!(parse_chord_list("cmd-k ,").unwrap(), vec![two_stroke.clone()]);
+    assert_eq!(
+        parse_chord_list("cmd-k ,, cmd-n").unwrap(),
+        vec![two_stroke, normalize_chord("cmd-n").unwrap()]
+    );
+    // Whitespace AFTER the separator is fine; the separator itself is the
+    // comma attached to the preceding chord.
+    assert_eq!(parse_chord_list("cmd-,, cmd-n").unwrap().len(), 2);
+    assert_eq!(parse_chord_list("cmd-n,cmd-shift-n").unwrap().len(), 2);
     // And the shipped Open Settings default round-trips through resolve.
     let out = resolve(&overrides(&[("open_settings", "secondary-,")]));
     assert_eq!(out.effective.get("open_settings").unwrap(), &vec![settings]);

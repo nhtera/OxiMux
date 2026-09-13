@@ -55,15 +55,20 @@ impl ActionSpec {
 /// Separator between chords in a `keybindings.toml` value:
 /// `open_workspace_create = "cmd-n, cmd-shift-n"`.
 ///
-/// The comma is ALSO a key (`secondary-,` opens Settings), so the split is
-/// key-aware rather than a plain `split(',')`: a comma that directly
-/// follows a `-` (`cmd-,`) or that starts a fragment (a bare `,`) is the
-/// comma key; any other comma separates chords. See [`split_chord_list`].
+/// The comma is ALSO a key (`secondary-,` opens Settings; a bare `,` can be
+/// a later stroke of a multi-stroke chord, `cmd-k ,`), so the split is
+/// key-aware rather than a plain `split(',')`. The rule: **a comma is the
+/// separator only when it directly follows a key character** — one that is
+/// not `-`, not whitespace, and not the start of a fragment. Everything
+/// else is the comma key. So `cmd-n, cmd-shift-n` and `cmd-n,cmd-shift-n`
+/// are lists; `cmd-,` is Open Settings; `cmd-k ,` is a two-stroke chord;
+/// `cmd-,, cmd-n` is a list whose first chord is `cmd-,`. Write lists with
+/// the comma attached to the preceding chord, never ` , `.
+/// See [`split_chord_list`].
 pub const CHORD_LIST_SEPARATOR: char = ',';
 
-/// Split an override value into raw chord fragments, treating a comma as
-/// the comma KEY when it directly follows `-` or begins a fragment, and as
-/// the separator otherwise. Fragments are trimmed; empty ones are dropped.
+/// Split an override value into raw chord fragments per the rule on
+/// [`CHORD_LIST_SEPARATOR`]. Fragments are trimmed; empty ones are dropped.
 fn split_chord_list(value: &str) -> Vec<&str> {
     let mut fragments = Vec::new();
     let mut start = 0;
@@ -72,10 +77,13 @@ fn split_chord_list(value: &str) -> Vec<&str> {
         if b != CHORD_LIST_SEPARATOR as u8 {
             continue;
         }
-        let fragment_so_far = value[start..i].trim();
-        let is_key = fragment_so_far.is_empty() || fragment_so_far.ends_with('-');
-        if !is_key {
-            fragments.push(fragment_so_far);
+        // The character immediately before the comma decides. A preceding
+        // `-` makes it the key of a modifier chord; whitespace makes it a
+        // stroke of its own; the fragment start makes it a bare key.
+        let is_separator = i > start
+            && matches!(value[start..i].chars().last(), Some(prev) if prev != '-' && !prev.is_whitespace());
+        if is_separator {
+            fragments.push(value[start..i].trim());
             start = i + 1;
         }
     }
