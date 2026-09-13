@@ -192,6 +192,28 @@ pub(crate) fn default_worktree_slug() -> String {
     oximux_worktree_ops::select_codename(&[])
 }
 
+/// The slug a failed create should Retry with, when it should not be the
+/// same one: a fresh codename iff the current slug is a codename this draft
+/// picked (not something typed) AND the failure was a collision — the one
+/// case where re-submitting the same value can only fail the same way.
+///
+/// A typed slug is left alone even when it collided: Retry means "try what I
+/// wrote again", and swapping a word the user chose for one they did not is
+/// not that. (A typed codename is indistinguishable from a picked one and is
+/// re-rolled too — the same accepted ambiguity as `is_generated_codename`.)
+/// Any other failure (git refused, setup failed) keeps the slug, because the
+/// slug was not the problem.
+pub(crate) fn reroll_slug_for_retry(current: &str, failure: &str) -> Option<String> {
+    let current = current.trim();
+    if !oximux_worktree_ops::is_generated_codename(current) {
+        return None;
+    }
+    if !failure.contains("already exists") {
+        return None;
+    }
+    Some(oximux_worktree_ops::select_codename(&[current.to_string()]))
+}
+
 /// Turn a raw worktree-create failure into a headline a person can act on, plus
 /// an optional second line.
 ///
@@ -417,10 +439,22 @@ impl AgentChatView {
 
     /// The failure banner's Retry: re-attempt worktree creation with the same
     /// staged message (the user may have edited the slug field first).
-    pub(super) fn retry_worktree_create(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// A picked codename that collided is rolled to a fresh one first — see
+    /// [`reroll_slug_for_retry`] — otherwise Retry would resubmit the exact
+    /// value that just failed, forever, until the user edited it by hand.
+    pub(super) fn retry_worktree_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((text, images)) = self.pending_worktree_send.clone() else {
             return;
         };
+        if let (WorktreeCreateState::Failed(failure), Some(input)) =
+            (&self.worktree_create_state, self.worktree_slug_input.clone())
+        {
+            let current = input.read(cx).value().to_string();
+            if let Some(fresh) = reroll_slug_for_retry(&current, failure) {
+                input.update(cx, |s, cx| s.set_value(fresh, window, cx));
+            }
+        }
         self.worktree_create_state = WorktreeCreateState::Idle;
         self.start_worktree_then_send(text, images, cx);
     }
@@ -589,8 +623,8 @@ impl AgentChatView {
                                 .outline()
                                 .small()
                                 .label("Retry")
-                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                    this.retry_worktree_create(cx);
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.retry_worktree_create(window, cx);
                                 })),
                         ),
                 )
@@ -894,6 +928,25 @@ mod tests {
                 "{slug:?} must be a codename"
             );
         }
+    }
+
+    /// Retry rolls a fresh codename only for a picked word that collided;
+    /// a typed slug, or any other failure, keeps what is in the field.
+    #[test]
+    fn retry_rerolls_only_a_colliding_codename() {
+        let collided = "add_worktree: git exited with code 128: fatal: a branch named 'oximux/amber' already exists";
+        let fresh = reroll_slug_for_retry("amber", collided).expect("a codename that collided is re-rolled");
+        assert_ne!(fresh, "amber");
+        assert!(oximux_worktree_ops::is_generated_codename(&fresh));
+        assert!(validate_slug(&fresh).is_ok());
+        // Whitespace around the field's value is not a different slug.
+        assert!(reroll_slug_for_retry("  amber ", collided).is_some());
+        // A typed slug that collided is the user's to change.
+        assert_eq!(reroll_slug_for_retry("fix-login", collided), None);
+        // A codename whose create failed for another reason keeps its word:
+        // the slug was not the problem.
+        assert_eq!(reroll_slug_for_retry("amber", "setup exited 7"), None);
+        assert_eq!(reroll_slug_for_retry("amber", ""), None);
     }
 
     #[test]
