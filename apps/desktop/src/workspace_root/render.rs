@@ -573,7 +573,7 @@ impl Render for WorkspaceRoot {
                     // A codename the leaf picked is re-picked here if it is
                     // already taken — this is the seam with the repository.
                     // See `dedup_codename_slug`.
-                    let slug = crate::shell::workspace::workspace_ops::dedup_codename_slug(
+                    let slug = crate::shell::workspace::codename_ops::dedup_codename_slug(
                         action.slug.clone(),
                         &this.app_state.workspace_repo,
                         &this.app_state.recent_projects,
@@ -899,7 +899,7 @@ impl Render for WorkspaceRoot {
                 // The codename an empty Name gets is picked against every slug
                 // already in use, so the preview cannot promise a branch that
                 // already exists.
-                let existing_slugs = crate::shell::workspace::workspace_ops::existing_slugs_across(
+                let existing_slugs = crate::shell::workspace::codename_ops::existing_slugs_across(
                     &this.app_state.workspace_repo,
                     &projects,
                 );

@@ -18,6 +18,7 @@ mod background_tasks_panel;
 mod bubble;
 mod companion_sync;
 mod composer;
+mod title_gen;
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) mod computer_use;
 // Where computer use does not exist, these three keep their names and answer
@@ -2123,40 +2124,6 @@ impl AgentChatView {
         self.follow_bottom();
         self.sync_composer(cx);
         cx.notify();
-    }
-
-    /// Kick off a one-shot LLM title generation for this chat's first message.
-    /// Owned on `title_task` so a tab close drops it. The generation runs a child
-    /// process needing a tokio reactor, so it's handed to the tokio runtime and
-    /// bridged back via a oneshot (the proven `source_control::ai_generation`
-    /// pattern); a bounded 10s timeout + `kill_on_drop` cap any lingering child.
-    /// Any failure (missing `claude`, timeout, non-JSON reply) silently keeps the
-    /// counter label. On success the result rides the existing, already-safe
-    /// `TitleChanged` sink (a manual rename still wins in the header render).
-    fn spawn_title_generation(&mut self, first_message: String, cx: &mut Context<Self>) {
-        let cwd = self.cwd.clone();
-        self.title_task = Some(cx.spawn(async move |this, cx| {
-            let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                return;
-            };
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            handle.spawn(async move {
-                let title = oximux_agents::tab_title::generate_title(&first_message, &cwd, cancel).await;
-                let _ = tx.send(title);
-            });
-            if let Ok(Some(title)) = rx.await {
-                let _ = this.update(cx, |view, cx| {
-                    cx.emit(AgentChatEvent::TitleChanged(title.clone()));
-                    // A generated summary, so it is also the auto-rename
-                    // signal — see `TaskSummaryReady`.
-                    cx.emit(AgentChatEvent::TaskSummaryReady {
-                        cwd: view.cwd.clone(),
-                        summary: title,
-                    });
-                });
-            }
-        }));
     }
 
     /// True when the latest turn looks like an auth failure the user can fix by
