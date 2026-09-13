@@ -77,7 +77,11 @@ impl SettingsModal {
         let Some(spec) = keymap_registry::spec(id) else {
             return;
         };
-        let default = keymap_registry::normalize_chord(spec.default_chord);
+        let defaults: Vec<String> = spec
+            .default_chords
+            .iter()
+            .filter_map(|c| keymap_registry::normalize_chord(c))
+            .collect();
         match chord {
             Some(raw) => {
                 // A raw chord that fails normalization is dropped, not
@@ -88,14 +92,19 @@ impl SettingsModal {
                     tracing::debug!(%raw, id, "recorded chord failed normalization; ignored");
                     return;
                 };
-                if Some(&normalized) == default.as_ref() {
+                // Recording sets the action's chords to exactly the one
+                // recorded — a multi-chord action collapses to it. A list is
+                // authored in `keybindings.toml` (comma-separated), which the
+                // row's caption names; the pane never guesses which slot a
+                // recorded chord was meant to replace.
+                if defaults.len() == 1 && defaults[0] == normalized {
                     self.keybind_overrides.remove(id);
                 } else {
                     self.keybind_overrides.insert(id.to_string(), normalized);
                 }
             }
             // Unbind: a default-unbound action needs no override line.
-            None if default.is_none() => {
+            None if defaults.is_empty() => {
                 self.keybind_overrides.remove(id);
             }
             None => {
@@ -197,18 +206,23 @@ fn binding_entry(
     typography: &Typography,
     cx: &mut gpui::Context<SettingsModal>,
 ) -> SettingEntry {
-    let chord = outcome.effective.get(spec.id).cloned().flatten();
+    let chords: Vec<String> = outcome.effective.get(spec.id).cloned().unwrap_or_default();
     let recording = modal.recording_action == Some(spec.id);
     let overridden = modal.keybind_overrides.contains_key(spec.id);
-    let conflicted = chord.as_deref().is_some_and(|c| conflicts.contains(c));
+    let conflicted = chords.iter().any(|c| conflicts.contains(c));
 
+    // Every chord on ONE chip, primary first ("⌘N / ⌘⇧N"): a multi-chord
+    // action is one row, never two competing ones.
     let chip_text = if recording {
         "Press keys…".to_string()
+    } else if chords.is_empty() {
+        "—".to_string()
     } else {
-        chord
-            .as_deref()
-            .map(keymap_registry::format_chord)
-            .unwrap_or_else(|| "—".to_string())
+        chords
+            .iter()
+            .map(|c| keymap_registry::format_chord(c))
+            .collect::<Vec<_>>()
+            .join(" / ")
     };
 
     let mut control = div().flex().flex_row().items_center().gap(px(8.0));

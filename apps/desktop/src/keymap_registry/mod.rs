@@ -36,10 +36,43 @@ pub struct ActionSpec {
     /// Human label shown in the settings pane and search.
     pub label: &'static str,
     pub category: Category,
-    /// Default chord in gpui syntax; "" = unbound by default.
-    pub default_chord: &'static str,
+    /// Default chords in gpui syntax, primary first; empty = unbound by
+    /// default. One action may own several chords (`open_workspace_create`
+    /// answers to both ⌘N and ⌘⇧N) — they are ONE row in the pane and ONE
+    /// `keybindings.toml` key, so a user override reaches all of them.
+    pub default_chords: &'static [&'static str],
     /// Build a [`KeyBinding`] for this action at the given chord.
     pub bind: fn(&str) -> KeyBinding,
+}
+
+impl ActionSpec {
+    /// The primary default chord, for callers that show one glyph run.
+    pub fn primary_default(&self) -> Option<&'static str> {
+        self.default_chords.first().copied()
+    }
+}
+
+/// Separator between chords in a `keybindings.toml` value:
+/// `open_workspace_create = "cmd-n, cmd-shift-n"`. A comma never appears in
+/// a chord (a key is one character or a name), so the split is unambiguous.
+pub const CHORD_LIST_SEPARATOR: char = ',';
+
+/// Parse an override value into canonical chords. `""` is the explicit
+/// unbind (`Ok(vec![])`); any chord that fails [`normalize_chord`] rejects
+/// the whole value, so a typo in one chord never silently drops another.
+pub fn parse_chord_list(value: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for raw in value.split(CHORD_LIST_SEPARATOR) {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let chord = normalize_chord(raw).ok_or_else(|| raw.to_string())?;
+        if !out.contains(&chord) {
+            out.push(chord);
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,9 +107,10 @@ impl Category {
     }
 }
 
-/// Effective chord per action id (`None` = unbound), in the canonical
-/// `Keystroke::unparse` form so equality checks are order-insensitive.
-pub type EffectiveMap = HashMap<&'static str, Option<String>>;
+/// Effective chords per action id (empty = unbound), primary first, in the
+/// canonical `Keystroke::unparse` form so equality checks are
+/// order-insensitive.
+pub type EffectiveMap = HashMap<&'static str, Vec<String>>;
 
 /// Result of merging overrides over defaults: the effective map plus any
 /// human-readable problems found in the overrides (unknown ids, bad chords).
@@ -148,24 +182,22 @@ pub fn resolve(overrides: &BTreeMap<String, String>) -> ResolveOutcome {
     let mut warnings = Vec::new();
     let mut effective: EffectiveMap = ACTIONS
         .iter()
-        .map(|s| (s.id, normalize_chord(s.default_chord)))
+        .map(|s| (s.id, default_chords_of(s)))
         .collect();
 
-    for (id, chord) in overrides {
+    for (id, value) in overrides {
         let Some(spec) = spec(id) else {
             warnings.push(format!("keybindings.toml: unknown action id `{id}`"));
             continue;
         };
-        if chord.is_empty() {
-            effective.insert(spec.id, None);
-            continue;
-        }
-        match normalize_chord(chord) {
-            Some(normalized) => {
-                effective.insert(spec.id, Some(normalized));
+        // `""` is the explicit unbind; a list replaces EVERY default chord
+        // of the action, so one key in the file governs all of them.
+        match parse_chord_list(value) {
+            Ok(chords) => {
+                effective.insert(spec.id, chords);
             }
-            None => warnings.push(format!(
-                "keybindings.toml: invalid chord `{chord}` for `{id}` — keeping the default"
+            Err(bad) => warnings.push(format!(
+                "keybindings.toml: invalid chord `{bad}` for `{id}` — keeping the default"
             )),
         }
     }
@@ -175,12 +207,24 @@ pub fn resolve(overrides: &BTreeMap<String, String>) -> ResolveOutcome {
     }
 }
 
+/// A spec's default chords, normalized. An unparsable default is a bug the
+/// inventory test catches; here it is simply skipped rather than panicked on.
+fn default_chords_of(spec: &ActionSpec) -> Vec<String> {
+    spec.default_chords
+        .iter()
+        .filter_map(|c| normalize_chord(c))
+        .collect()
+}
+
 fn bindings_for(effective: &EffectiveMap) -> Vec<KeyBinding> {
     ACTIONS
         .iter()
-        .filter_map(|spec| {
-            let chord = effective.get(spec.id)?.as_deref()?;
-            Some((spec.bind)(chord))
+        .flat_map(|spec| {
+            effective
+                .get(spec.id)
+                .into_iter()
+                .flatten()
+                .map(|chord| (spec.bind)(chord))
         })
         .collect()
 }
@@ -213,33 +257,53 @@ fn read_effective() -> EffectiveMap {
     }
 }
 
-/// The live chord for an action id, canonical form. `None` = unbound or
-/// unknown id.
-pub fn chord_for(id: &str) -> Option<String> {
+/// Every live chord for an action id, primary first, canonical form. Empty
+/// = unbound or unknown id.
+pub fn chords_for(id: &str) -> Vec<String> {
     match state().read() {
-        Ok(g) => g.get(id).cloned().flatten(),
-        Err(poisoned) => poisoned.into_inner().get(id).cloned().flatten(),
+        Ok(g) => g.get(id).cloned().unwrap_or_default(),
+        Err(poisoned) => poisoned.into_inner().get(id).cloned().unwrap_or_default(),
     }
 }
 
-/// The live chord formatted for display ("⌘⇧T"), or `None` when unbound.
+/// The live PRIMARY chord for an action id, canonical form. `None` =
+/// unbound or unknown id. Tooltips, the palette and the welcome screen show
+/// one chord; an action's alternates are listed only in the settings pane.
+pub fn chord_for(id: &str) -> Option<String> {
+    chords_for(id).into_iter().next()
+}
+
+/// The live primary chord formatted for display ("⌘⇧T"), or `None` when
+/// unbound.
 pub fn display_chord_for(id: &str) -> Option<String> {
     chord_for(id).map(|c| format_chord(&c))
 }
 
-/// Per-glyph display tokens for the live chord (["⌘", "⇧", "T"]) — for UI
-/// that renders one chip per key.
+/// Every live chord formatted for display, primary first — for the settings
+/// pane, which is the one place all of an action's chords are shown.
+pub fn display_chords_for(id: &str) -> Vec<String> {
+    chords_for(id).iter().map(|c| format_chord(c)).collect()
+}
+
+/// Per-glyph display tokens for the live primary chord (["⌘", "⇧", "T"]) —
+/// for UI that renders one chip per key.
 pub fn display_tokens_for(id: &str) -> Option<Vec<String>> {
     chord_for(id).map(|c| format_chord_tokens(&c))
 }
 
 /// Chords claimed by two or more actions in `effective` — every owner of a
 /// returned chord should render a conflict badge. Same-context (global)
-/// duplicates are legal in gpui (later wins) but always a user mistake.
+/// duplicates are legal in gpui (later wins) but always a user mistake. An
+/// action listing the same chord twice is not a conflict (and
+/// [`parse_chord_list`] never produces one).
 pub fn conflicting_chords(effective: &EffectiveMap) -> HashSet<String> {
     let mut seen: HashMap<&str, usize> = HashMap::new();
-    for chord in effective.values().flatten() {
-        *seen.entry(chord.as_str()).or_default() += 1;
+    for chords in effective.values() {
+        let mut distinct: Vec<&str> = chords.iter().map(String::as_str).collect();
+        distinct.dedup();
+        for chord in distinct {
+            *seen.entry(chord).or_default() += 1;
+        }
     }
     seen.into_iter()
         .filter(|(_, n)| *n >= 2)

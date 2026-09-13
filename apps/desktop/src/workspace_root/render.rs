@@ -895,6 +895,19 @@ impl Render for WorkspaceRoot {
             }))
             .on_action(cx.listener(|this, _: &OpenWorkspaceCreate, window, cx| {
                 let projects = this.app_state.recent_projects.clone();
+                // Every route lands here — ⌘N, ⌘⇧N, the palette row, the
+                // rail `+` — so this is the one place the precondition is
+                // said. A workspace is a worktree OF a project; with none
+                // open, the dialog would offer an empty project dropdown and
+                // a Create that can never enable. Refuse in words instead.
+                if projects.is_empty() {
+                    crate::shell::toast::toast(
+                        cx,
+                        crate::shell::toast::ToastKind::Info,
+                        "Open a project first \u{2014} a workspace is a worktree of a project.",
+                    );
+                    return;
+                }
                 let active = this.active_project.clone();
                 // The codename an empty Name gets is picked against every slug
                 // already in use, so the preview cannot promise a branch that

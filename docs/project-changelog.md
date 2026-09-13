@@ -4,6 +4,31 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-13 — ⌘N creates a workspace; the palette offers it (`feat/worktree-creation-gestures`)
+
+- **⌘N and ⌘⇧N both open the New Workspace dialog.** The keymap registry
+  now holds several chords per action — one settings row, one
+  `keybindings.toml` key. A user override lists chords comma-separated
+  (`open_workspace_create = "cmd-n, cmd-shift-n"`); `""` unbinds; a single
+  chord replaces every default; one bad chord rejects the whole value so a
+  typo never silently drops the other. Live rebinding and conflict detection
+  cover every chord. Tooltips, the palette and the welcome screen keep
+  showing the primary chord; the settings pane shows them all
+  (`⌘N / ⌘⇧N`), and recording a chord there sets the action to exactly the
+  one recorded.
+- **New Window moved to ⌥⌘N.** A cockpit whose point is one window with
+  tabs rarely needs a second; the create gesture takes the primary chord.
+- **The command palette offers "New Workspace"**, found by "new",
+  "workspace", "worktree" and "branch" (built-in rows can carry search
+  synonyms; the displayed name is unchanged), with the ⌘N hint.
+- **With no project open, every create route refuses in words** — ⌘N,
+  ⌘⇧N, the palette row and the rail `+` all land in one handler, which
+  now toasts *"Open a project first — a workspace is a worktree of a
+  project."* instead of opening a dialog whose Create can never enable.
+- Verified by keypress in a fresh dev build: ⌘N, ⌘⇧N (twice), ⌥⌘N (window
+  count 1 → 2), the palette search and its Enter dispatch, the no-project
+  toast, and the one-row settings display.
+
 ### 2026-09-04 — Large scanned PDFs: fit to the pane, open off the UI thread (`feat/enhancement`)
 
 - **A page never renders wider than the pane can show.** Measured against a

@@ -81,7 +81,8 @@ pub(crate) fn palette_filter(
     custom_commands: &[CustomCommand],
 ) -> Vec<PaletteItem> {
     let all_items = build_palette_items(custom_commands);
-    let names: Vec<&str> = all_items.iter().map(|i| i.name.as_str()).collect();
+    // Scored on `search_text` (name + synonyms), displayed by `name`.
+    let names: Vec<&str> = all_items.iter().map(|i| i.search_text.as_str()).collect();
     let ranked = filter_and_rank(query, &names);
     ranked.into_iter().map(|i| all_items[i].clone()).collect()
 }
