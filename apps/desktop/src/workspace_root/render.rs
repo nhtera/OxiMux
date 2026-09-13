@@ -570,7 +570,14 @@ impl Render for WorkspaceRoot {
                         return;
                     };
                     let weak_view = view.downgrade();
-                    let slug = action.slug.clone();
+                    // A codename the leaf picked is re-picked here if it is
+                    // already taken — this is the seam with the repository.
+                    // See `dedup_codename_slug`.
+                    let slug = crate::shell::workspace::workspace_ops::dedup_codename_slug(
+                        action.slug.clone(),
+                        &this.app_state.workspace_repo,
+                        &this.app_state.recent_projects,
+                    );
                     let project_root = std::path::PathBuf::from(&project.root_path);
                     // The same locator the rail's create uses, so a chat-made
                     // worktree lands beside a rail-made one — the sibling
