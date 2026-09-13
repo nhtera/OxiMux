@@ -20,9 +20,16 @@ use serde::Deserialize;
 
 use crate::commit_message::{AgentId, plan_commit_message, run_plan};
 
-/// ~10s ceiling — a title is a tiny generation; don't let it linger (the
-/// commit-message default is 60s, too long for a cosmetic label).
-const TITLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Ceiling on the title call. A title is a tiny generation, but the cap is
+/// on **wall time from spawn**, and the CLI's own startup dominates it:
+/// measured live, the haiku call took 4–8 s alone and 8–10 s when it was
+/// spawned beside a worktree create and the main agent's own startup (the
+/// *New Agent* draft's fresh-worktree toggle does exactly that). At the old
+/// 10 s cap the result arrived as the app gave up — the CLI finished and
+/// wrote its session, and the tab kept its bind-time label. 30 s is still
+/// far below the commit-message default (60 s) and costs nothing when the
+/// call succeeds early; `run_plan` kills the child on drop either way.
+const TITLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Cap on the final label — defensive against a runaway model.
 const MAX_TITLE_LEN: usize = 80;

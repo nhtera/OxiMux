@@ -75,16 +75,29 @@ pub fn select_codename_seeded(existing: &[String], seed: u64) -> String {
         .expect("an unbounded suffix sequence always finds a free name")
 }
 
-/// True iff `slug` is one this module generated: a codename, optionally with
-/// a `-N` uniquing suffix.
+/// True iff `slug` is one OxiMux generated: a codename, optionally with a
+/// `-N` uniquing suffix — or the legacy `agent-<unix-seconds>` shape the
+/// chat's fresh-worktree toggle minted before it used codenames.
 ///
 /// A user-typed name that happens to be a codename is indistinguishable and
 /// is reported as generated — accepted, see the module doc. A suffix is only
 /// the `-N` shape [`select_codename`] mints: `amber-2` is generated,
-/// `amber-fix` is not, and a bare number is not a codename at all.
+/// `amber-fix` is not, and a bare number is not a codename at all. The
+/// legacy shape is exactly `agent-` followed by digits only; `agent-2` also
+/// matches, which is `agent` uniqued, and `agent` is not in the list — so
+/// the two rules cannot disagree.
 pub fn is_generated_codename(slug: &str) -> bool {
     let base = strip_uniquing_suffix(slug);
-    CODENAMES.contains(&base)
+    CODENAMES.contains(&base) || is_legacy_agent_slug(slug)
+}
+
+/// `agent-<digits>`: what the chat draft's worktree toggle generated before
+/// Phase 8. Kept recognised so those rows get their one offer too.
+fn is_legacy_agent_slug(slug: &str) -> bool {
+    matches!(
+        slug.strip_prefix("agent-"),
+        Some(rest) if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+    )
 }
 
 /// `amber-2` → `amber`; `amber` → `amber`; `amber-fix` → `amber-fix`.
@@ -187,6 +200,19 @@ mod tests {
         assert!(is_generated_codename("amber"));
         assert!(is_generated_codename("amber-2"));
         assert!(is_generated_codename("amber-17"));
+    }
+
+    /// The chat toggle's pre-codename shape still counts as generated, and
+    /// only that exact shape — a typed `agent-fix` or `agent` does not.
+    #[test]
+    fn the_legacy_agent_timestamp_slug_reads_as_generated() {
+        assert!(is_generated_codename("agent-1789272056"));
+        assert!(is_generated_codename("agent-7"));
+        assert!(!is_generated_codename("agent"));
+        assert!(!is_generated_codename("agent-"));
+        assert!(!is_generated_codename("agent-fix"));
+        assert!(!is_generated_codename("agents-123"));
+        assert!(!is_generated_codename("agent-12a"));
     }
 
     #[test]

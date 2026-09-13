@@ -173,16 +173,23 @@ pub(crate) enum WorktreeCreateState {
     Failed(String),
 }
 
-/// A default slug suggestion for the worktree toggle, derived from the
-/// current time so two drafts opened back-to-back don't collide on the same
-/// branch/directory. Format: `agent-<unix-seconds>` — short, always passes
-/// `validate_slug`, and recognizable in `git branch`/the worktree list.
+/// A default slug suggestion for the worktree toggle: a **codename**, the
+/// same vocabulary an empty Name gets in the create dialog.
+///
+/// It used to be `agent-<unix-seconds>`, which the auto-rename half of Phase
+/// 8 does not recognise as generated — so a worktree made from this toggle,
+/// the most natural route to a chat in a worktree, would never have been
+/// offered the name of its work. A codename is. (The legacy shape is still
+/// recognised by `is_generated_codename`, so pre-existing rows get their one
+/// offer too.)
+///
+/// This leaf has no repository handle, so the pick is not de-duplicated
+/// against existing slugs; a collision surfaces through the create's own
+/// failure path (`add_worktree: a branch named … already exists`) and a
+/// retry rolls a fresh word. Always passes `validate_slug`, by the codename
+/// module's own test.
 pub(crate) fn default_worktree_slug() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("agent-{secs}")
+    oximux_worktree_ops::select_codename(&[])
 }
 
 /// Turn a raw worktree-create failure into a headline a person can act on, plus
@@ -875,12 +882,18 @@ mod tests {
     }
 
     #[test]
-    fn default_worktree_slug_passes_validate_slug() {
-        // Whatever the current time produces must always be a legal branch
-        // component — the toggle relies on this being usable without editing.
-        let slug = default_worktree_slug();
-        assert!(validate_slug(&slug).is_ok(), "{slug:?} should validate");
-        assert!(slug.starts_with("agent-"));
+    fn default_worktree_slug_is_a_codename_that_validates() {
+        // The toggle relies on this being usable without editing, AND on it
+        // being something auto-rename recognises as generated — otherwise a
+        // worktree made from the chat never gets offered the name of its work.
+        for _ in 0..8 {
+            let slug = default_worktree_slug();
+            assert!(validate_slug(&slug).is_ok(), "{slug:?} should validate");
+            assert!(
+                oximux_worktree_ops::is_generated_codename(&slug),
+                "{slug:?} must be a codename"
+            );
+        }
     }
 
     #[test]
