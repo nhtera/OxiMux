@@ -70,10 +70,41 @@ fn chord_list_parses_dedups_and_rejects_as_a_whole() {
     assert_eq!(list.len(), 2, "duplicates collapse: {list:?}");
     assert_eq!(list[0], normalize_chord("cmd-n").unwrap());
     assert_eq!(parse_chord_list("").unwrap(), Vec::<String>::new());
-    assert_eq!(parse_chord_list(" , ").unwrap(), Vec::<String>::new());
+    assert_eq!(parse_chord_list("   ").unwrap(), Vec::<String>::new());
+    // A lone comma is the comma KEY, not an empty list — see
+    // `a_comma_key_is_not_a_separator`.
+    assert_eq!(parse_chord_list(" , ").unwrap(), vec![normalize_chord(",").unwrap()]);
     // One bad chord rejects the whole value — a typo must never silently
     // drop the other chord.
     assert_eq!(parse_chord_list("cmd-n, cmd-notakey"), Err("cmd-notakey".to_string()));
+}
+
+/// The comma is a key as well as the separator: `secondary-,` (Open
+/// Settings) must survive the recorder → override → resolve round trip,
+/// and a list may contain it beside other chords.
+#[test]
+fn a_comma_key_is_not_a_separator() {
+    let settings = normalize_chord("secondary-,").unwrap();
+    assert_eq!(parse_chord_list("secondary-,").unwrap(), vec![settings.clone()]);
+    // The recorder stores the normalized form; it must parse back to itself.
+    assert_eq!(parse_chord_list(&settings).unwrap(), vec![settings.clone()]);
+    // A bare comma key, alone and inside a list.
+    assert_eq!(parse_chord_list(",").unwrap(), vec![normalize_chord(",").unwrap()]);
+    let mixed = parse_chord_list("cmd-n, cmd-,, ,").unwrap();
+    assert_eq!(
+        mixed,
+        vec![
+            normalize_chord("cmd-n").unwrap(),
+            normalize_chord("cmd-,").unwrap(),
+            normalize_chord(",").unwrap(),
+        ]
+    );
+    // Whitespace around the separator is not part of a chord.
+    assert_eq!(parse_chord_list("cmd-, , cmd-n").unwrap().len(), 2);
+    // And the shipped Open Settings default round-trips through resolve.
+    let out = resolve(&overrides(&[("open_settings", "secondary-,")]));
+    assert_eq!(out.effective.get("open_settings").unwrap(), &vec![settings]);
+    assert!(out.warnings.is_empty());
 }
 
 /// A list override replaces EVERY default chord of the action; a single

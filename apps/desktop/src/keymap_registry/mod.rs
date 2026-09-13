@@ -53,20 +53,42 @@ impl ActionSpec {
 }
 
 /// Separator between chords in a `keybindings.toml` value:
-/// `open_workspace_create = "cmd-n, cmd-shift-n"`. A comma never appears in
-/// a chord (a key is one character or a name), so the split is unambiguous.
+/// `open_workspace_create = "cmd-n, cmd-shift-n"`.
+///
+/// The comma is ALSO a key (`secondary-,` opens Settings), so the split is
+/// key-aware rather than a plain `split(',')`: a comma that directly
+/// follows a `-` (`cmd-,`) or that starts a fragment (a bare `,`) is the
+/// comma key; any other comma separates chords. See [`split_chord_list`].
 pub const CHORD_LIST_SEPARATOR: char = ',';
+
+/// Split an override value into raw chord fragments, treating a comma as
+/// the comma KEY when it directly follows `-` or begins a fragment, and as
+/// the separator otherwise. Fragments are trimmed; empty ones are dropped.
+fn split_chord_list(value: &str) -> Vec<&str> {
+    let mut fragments = Vec::new();
+    let mut start = 0;
+    let bytes = value.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != CHORD_LIST_SEPARATOR as u8 {
+            continue;
+        }
+        let fragment_so_far = value[start..i].trim();
+        let is_key = fragment_so_far.is_empty() || fragment_so_far.ends_with('-');
+        if !is_key {
+            fragments.push(fragment_so_far);
+            start = i + 1;
+        }
+    }
+    fragments.push(value[start..].trim());
+    fragments.into_iter().filter(|f| !f.is_empty()).collect()
+}
 
 /// Parse an override value into canonical chords. `""` is the explicit
 /// unbind (`Ok(vec![])`); any chord that fails [`normalize_chord`] rejects
 /// the whole value, so a typo in one chord never silently drops another.
 pub fn parse_chord_list(value: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
-    for raw in value.split(CHORD_LIST_SEPARATOR) {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
+    for raw in split_chord_list(value) {
         let chord = normalize_chord(raw).ok_or_else(|| raw.to_string())?;
         if !out.contains(&chord) {
             out.push(chord);
