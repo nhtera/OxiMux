@@ -2428,7 +2428,7 @@
 
                 // Retry re-enters the same path with the same staged text —
                 // still in-flight, still nothing pushed.
-                view.retry_worktree_create(cx);
+                view.retry_worktree_create(window, cx);
                 assert!(matches!(
                     view.worktree_create_state_for_test(),
                     roster::WorktreeCreateState::Creating

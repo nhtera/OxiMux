@@ -35,7 +35,12 @@ pub enum RenameRefusal {
     /// The branch tracks an upstream. Renaming it would orphan the remote ref
     /// and break any open PR pointing at it.
     Pushed { upstream: String },
-    /// A live agent or terminal is holding the worktree directory.
+    /// A live agent or terminal is holding the worktree directory, and the
+    /// rename would move it.
+    ///
+    /// Raised only for a rename whose directory moves — a same-path rename
+    /// (branch and row only; see [`crate::auto_rename`]) is allowed under a
+    /// holder, because `git branch -m` does not disturb a live cwd.
     ///
     /// This is a hard refusal, not advice. POSIX does not lock a directory
     /// because a process's cwd is inside it, so `git worktree move` *succeeds*
@@ -238,7 +243,15 @@ pub async fn preflight_rename(
     // directory, which is often a SUBDIRECTORY of the worktree. An equality
     // check would miss it and — on macOS, where nothing stops the move — leave
     // it running on a path git no longer records.
-    if let Some(holder) = holders.iter().find(|h| path_is_within(h, &old_path)) {
+    //
+    // Only when the directory MOVES. The holder is a hazard to the move, not
+    // to the branch: `git branch -m` on a checked-out branch rewrites the
+    // worktree's HEAD in place and a process whose cwd is inside it notices
+    // nothing. A same-path rename (the auto-rename from a codename, which
+    // fires precisely while an agent is live in the worktree) is therefore
+    // allowed to proceed under a holder.
+    let moved = !paths_equal(new_worktree_path, &old_path);
+    if moved && let Some(holder) = holders.iter().find(|h| path_is_within(h, &old_path)) {
         return Err(RenameRefusal::InUse {
             holders: vec![holder.clone()],
         });
@@ -276,7 +289,7 @@ pub async fn preflight_rename(
 
     Ok(RenamePlan {
         new_slug: new_slug.to_string(),
-        moved: !paths_equal(new_worktree_path, &old_path),
+        moved,
         new_branch,
         old_path,
         new_path: new_worktree_path.to_path_buf(),
@@ -319,8 +332,10 @@ pub async fn apply_rename(
     };
 
     // The fresh holder read. Everything above this line is still reversible by
-    // doing nothing; everything below it is not.
-    if let Some(holder) = holders_now.iter().find(|h| path_is_within(h, old_path)) {
+    // doing nothing; everything below it is not. Gated on `moved` for the
+    // reason `preflight_rename` gives: a branch rename under a live cwd is
+    // harmless, a directory move is not.
+    if moved && let Some(holder) = holders_now.iter().find(|h| path_is_within(h, old_path)) {
         return RenameOutcome::Refused(RenameRefusal::InUse {
             holders: vec![holder.clone()],
         });

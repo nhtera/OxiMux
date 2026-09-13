@@ -3118,3 +3118,4 @@ mod nav_history_tests {
         );
     }
 }
+

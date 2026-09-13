@@ -18,6 +18,7 @@ mod background_tasks_panel;
 mod bubble;
 mod companion_sync;
 mod composer;
+mod title_gen;
 #[cfg(any(target_os = "macos", windows))]
 pub(crate) mod computer_use;
 // Where computer use does not exist, these three keep their names and answer
@@ -350,6 +351,15 @@ pub enum AgentChatEvent {
     /// The agent set a session title (ACP `session_info_update`); the host uses it
     /// as the tab's fallback label (a user's manual rename still wins over it).
     TitleChanged(String),
+    /// The chat's first task has a **generated summary**: the haiku one-shot
+    /// title, or an ACP provider-native title. Deliberately a separate event
+    /// from `TitleChanged`, which also carries the bind-time `"Claude · branch"`
+    /// label — that is not a summary, and a worktree must never be renamed
+    /// from it. Nor is the hook-captured user prompt ever sent here. The host
+    /// may offer to rename a codename worktree at `cwd` from `summary`
+    /// (Phase 8 auto-rename); an adapter that never produces a summary simply
+    /// never raises this.
+    TaskSummaryReady { cwd: PathBuf, summary: String },
     /// "Fork from here": a truncated fork of this session was written to disk;
     /// the host should open it as a NEW chat tab (this tab is left untouched).
     /// Carries everything `open_agent_chat_tab_restored` needs to rehydrate the
@@ -2116,34 +2126,6 @@ impl AgentChatView {
         cx.notify();
     }
 
-    /// Kick off a one-shot LLM title generation for this chat's first message.
-    /// Owned on `title_task` so a tab close drops it. The generation runs a child
-    /// process needing a tokio reactor, so it's handed to the tokio runtime and
-    /// bridged back via a oneshot (the proven `source_control::ai_generation`
-    /// pattern); a bounded 10s timeout + `kill_on_drop` cap any lingering child.
-    /// Any failure (missing `claude`, timeout, non-JSON reply) silently keeps the
-    /// counter label. On success the result rides the existing, already-safe
-    /// `TitleChanged` sink (a manual rename still wins in the header render).
-    fn spawn_title_generation(&mut self, first_message: String, cx: &mut Context<Self>) {
-        let cwd = self.cwd.clone();
-        self.title_task = Some(cx.spawn(async move |this, cx| {
-            let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                return;
-            };
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            handle.spawn(async move {
-                let title = oximux_agents::tab_title::generate_title(&first_message, &cwd, cancel).await;
-                let _ = tx.send(title);
-            });
-            if let Ok(Some(title)) = rx.await {
-                let _ = this.update(cx, |_view, cx| {
-                    cx.emit(AgentChatEvent::TitleChanged(title));
-                });
-            }
-        }));
-    }
-
     /// True when the latest turn looks like an auth failure the user can fix by
     /// signing in from a terminal. Some CLIs answer with a plain "Not logged in
     /// · Please run /login" reply that settles as an ordinary assistant turn
@@ -3491,8 +3473,19 @@ impl AgentChatView {
             ThreadEvent::TitleUpdated { title } => {
                 // A provider-native title wins: mark titled so a later haiku
                 // generation (if one ever races for this transport) can't clobber it.
+                // Provider-native titles are summaries too, so ACP adapters
+                // (the hookless ones) reach auto-rename by the same event —
+                // but only the FIRST one. A provider may retitle on every
+                // turn, and a declined offer must not come back each time.
+                let first_title = !self.title_generated;
                 self.title_generated = true;
                 cx.emit(AgentChatEvent::TitleChanged(title.clone()));
+                if first_title {
+                    cx.emit(AgentChatEvent::TaskSummaryReady {
+                        cwd: self.cwd.clone(),
+                        summary: title.clone(),
+                    });
+                }
             }
             // The agent needs login: mount/refresh the auth card. A retained
             // terminal id (mid terminal-login) survives a re-emit carrying an

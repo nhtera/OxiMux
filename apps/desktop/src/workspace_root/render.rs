@@ -539,6 +539,18 @@ impl Render for WorkspaceRoot {
                 },
             ))
             .on_action(cx.listener(
+                |this, action: &crate::actions::OfferWorkspaceAutoRename, _window, cx| {
+                    // A chat's first generated summary: offer to rename a
+                    // codename worktree from it. Everything that can decline
+                    // does so in the log; only a passing pre-flight toasts.
+                    this.offer_workspace_auto_rename(
+                        action.cwd.clone(),
+                        action.summary.clone(),
+                        cx,
+                    );
+                },
+            ))
+            .on_action(cx.listener(
                 |this, action: &CreateWorktreeWorkspaceForActiveChat, _window, cx| {
                     // A *New Agent* worktree draft sent: make the worktree a
                     // first-class `Workspace` (DB row + git worktree via
@@ -558,7 +570,14 @@ impl Render for WorkspaceRoot {
                         return;
                     };
                     let weak_view = view.downgrade();
-                    let slug = action.slug.clone();
+                    // A codename the leaf picked is re-picked here if it is
+                    // already taken — this is the seam with the repository.
+                    // See `dedup_codename_slug`.
+                    let slug = crate::shell::workspace::codename_ops::dedup_codename_slug(
+                        action.slug.clone(),
+                        &this.app_state.workspace_repo,
+                        &this.app_state.recent_projects,
+                    );
                     let project_root = std::path::PathBuf::from(&project.root_path);
                     // The same locator the rail's create uses, so a chat-made
                     // worktree lands beside a rail-made one — the sibling
@@ -877,9 +896,17 @@ impl Render for WorkspaceRoot {
             .on_action(cx.listener(|this, _: &OpenWorkspaceCreate, window, cx| {
                 let projects = this.app_state.recent_projects.clone();
                 let active = this.active_project.clone();
+                // The codename an empty Name gets is picked against every slug
+                // already in use, so the preview cannot promise a branch that
+                // already exists.
+                let existing_slugs = crate::shell::workspace::codename_ops::existing_slugs_across(
+                    &this.app_state.workspace_repo,
+                    &projects,
+                );
                 this.close_modal_overlays(cx);
-                this.workspace_dialog
-                    .update(cx, |d, cx| d.open_create(projects, active, window, cx));
+                this.workspace_dialog.update(cx, |d, cx| {
+                    d.open_create(projects, active, existing_slugs, window, cx)
+                });
             }))
             .on_action(cx.listener(|this, _: &OpenAddProjectDialog, window, cx| {
                 this.close_modal_overlays(cx);

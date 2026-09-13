@@ -1175,6 +1175,18 @@ impl PaneGroup {
             crate::shell::agent_chat::AgentChatEvent::AttentionNeeded { kind, body } => {
                 self.notify_chat_attention(view, *kind, body.clone());
             }
+            crate::shell::agent_chat::AgentChatEvent::TaskSummaryReady { cwd, summary } => {
+                // Route up to `WorkspaceRoot`, which owns the `WorkspaceRepo`
+                // and can map `cwd` to a row — the same seam the worktree
+                // create request uses. The pane group only forwards.
+                window.dispatch_action(
+                    Box::new(crate::actions::OfferWorkspaceAutoRename {
+                        cwd: cwd.clone(),
+                        summary: summary.clone(),
+                    }),
+                    cx,
+                );
+            }
             crate::shell::agent_chat::AgentChatEvent::WorktreeWorkspaceRequested { slug } => {
                 // Route up to `WorkspaceRoot` (owns `app_state`/`WorkspaceRepo`):
                 // it resolves the active chat, creates the worktree + `Workspace`
