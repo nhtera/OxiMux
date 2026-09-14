@@ -218,6 +218,33 @@ impl ProjectRepo {
         Ok(())
     }
 
+    /// Whether this project hides its "untracked worktrees" group. Absent
+    /// preference row means the default: shown.
+    pub fn hide_untracked(&self, id: &str) -> Result<bool, StorageError> {
+        let v: Option<i64> = self.db.with_conn(|c| {
+            c.query_row(
+                "SELECT hide_untracked FROM project_prefs WHERE project_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+        })?;
+        Ok(v.unwrap_or(0) != 0)
+    }
+
+    /// Set whether this project hides its "untracked worktrees" group.
+    pub fn set_hide_untracked(&self, id: &str, hide: bool) -> Result<(), StorageError> {
+        self.db.with_conn(|c| {
+            c.execute(
+                "INSERT INTO project_prefs (project_id, hide_untracked) VALUES (?1, ?2) \
+                 ON CONFLICT(project_id) DO UPDATE SET hide_untracked = excluded.hide_untracked",
+                params![id, hide],
+            )
+            .map(|_| ())
+        })?;
+        Ok(())
+    }
+
     pub fn update_last_opened_at(&self, id: &str) -> Result<(), StorageError> {
         let ts = now();
         self.db.with_conn(|c| {

@@ -364,6 +364,106 @@ impl WorkspaceRepo {
     /// Delete a workspace row. FK cascade removes `pane_sessions` and
     /// `agent_sessions` for the workspace. Call this in the error branch
     /// of `git worktree add` to keep DB and disk state consistent.
+    /// Adopt a worktree that already exists on disk: insert its row and record
+    /// the adoption **in the same transaction**, so there is no window in
+    /// which the row exists without its un-vetted marker — the marker is what
+    /// keeps the directory's scripts from running unread.
+    ///
+    /// Writes nothing to disk and runs nothing: adoption is a database act.
+    /// `branch_minted` is `false` by definition — the branch was somebody's
+    /// before this row existed, so removing the worktree must never delete it.
+    pub fn adopt(
+        &self,
+        project_id: &str,
+        name: &str,
+        slug: &str,
+        branch: &str,
+        worktree_path: &str,
+    ) -> Result<Workspace, StorageError> {
+        let id = new_id();
+        let created_at = now();
+        let status = "active";
+        let sort_order = self.next_sort_order(project_id)?;
+        self.db
+            .with_conn(|c| {
+                let tx = c.unchecked_transaction()?;
+                tx.execute(
+                    "INSERT INTO workspaces (id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, sort_order, branch_minted) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, 0)",
+                    params![id, project_id, name, slug, branch, worktree_path, status, created_at, sort_order],
+                )?;
+                tx.execute(
+                    "INSERT INTO workspace_adoptions (workspace_id, adopted_at, unvetted) VALUES (?1, ?2, 1)",
+                    params![id, created_at],
+                )?;
+                tx.commit()
+            })
+            .map_err(|e| classify_unique("workspaces", "project_id_slug", e))?;
+        Ok(Workspace {
+            id,
+            project_id: project_id.to_string(),
+            name: name.to_string(),
+            slug: slug.to_string(),
+            branch: branch.to_string(),
+            worktree_path: worktree_path.to_string(),
+            status: status.to_string(),
+            created_at,
+            archived_at: None,
+            linked_issue: None,
+            tint: None,
+            sort_order,
+            pinned: false,
+            comment: String::new(),
+            phase: String::new(),
+            branch_minted: false,
+        })
+    }
+
+    /// Whether this row was adopted from an existing worktree (see
+    /// [`adopt`](Self::adopt)). A row OxiMux provisioned itself is never
+    /// adopted; a missing id reads as not adopted.
+    pub fn is_adopted(&self, id: &str) -> Result<bool, StorageError> {
+        let n: i64 = self.db.with_conn(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM workspace_adoptions WHERE workspace_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+        })?;
+        Ok(n > 0)
+    }
+
+    /// Whether this row's directory carries scripts the user has not yet
+    /// reviewed. `true` only for an adopted row that has not been marked
+    /// reviewed; a provisioned row is vetted by construction.
+    ///
+    /// Every path that would run code out of the worktree on the user's
+    /// behalf — the row menu's script actions, the cleanup step of a delete,
+    /// on the desktop and on the headless host alike — asks this first.
+    pub fn is_unvetted(&self, id: &str) -> Result<bool, StorageError> {
+        let n: i64 = self.db.with_conn(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM workspace_adoptions WHERE workspace_id = ?1 AND unvetted = 1",
+                [id],
+                |r| r.get(0),
+            )
+        })?;
+        Ok(n > 0)
+    }
+
+    /// The user has read the adopted worktree's scripts: clear the marker.
+    /// A no-op for a row that was never adopted.
+    pub fn mark_scripts_reviewed(&self, id: &str) -> Result<(), StorageError> {
+        self.db.with_conn(|c| {
+            c.execute(
+                "UPDATE workspace_adoptions SET unvetted = 0 WHERE workspace_id = ?1",
+                [id],
+            )
+            .map(|_| ())
+        })?;
+        Ok(())
+    }
+
     pub fn delete(&self, id: &str) -> Result<(), StorageError> {
         self.db.with_conn(|c| {
             c.execute("DELETE FROM workspaces WHERE id = ?1", [id])

@@ -205,13 +205,7 @@ impl Repository {
 
     /// List all worktrees (main first, then linked).
     pub async fn list_worktrees(&self) -> Result<Vec<WorktreeInfo>> {
-        let out = GitCmd::new(self.workdir())
-            .args(["worktree", "list", "--porcelain"])
-            .run()
-            .await?;
-        let text = String::from_utf8(out.stdout)
-            .map_err(|e| GitError::parse(format!("non-utf8 in `git worktree list`: {e}")))?;
-        parse_worktree_list(&text)
+        list_worktrees_at(self.workdir()).await
     }
 
     /// Remove a linked worktree. `force=true` passes `--force` (allows
@@ -483,6 +477,26 @@ fn cap_slug_len(slug: &str) -> String {
     let head = &slug[..MAX_SLUG_LEN];
     let cut = head.rfind('-').unwrap_or(MAX_SLUG_LEN);
     slug[..cut].trim_end_matches('-').to_string()
+}
+
+/// List every worktree of the repository that contains `workdir` — the main
+/// checkout first, then each linked one, **wherever on disk it lives**.
+///
+/// A free function rather than a method so a caller that only wants the
+/// listing (the rail's discovery scan, once per project per cadence) pays one
+/// process, not the extra `rev-parse` that [`Repository::open`] spends. Git
+/// keeps the registry in the main repository's `.git/worktrees/`, so a
+/// worktree added from a terminal at an arbitrary path is listed here without
+/// any directory scan — there is no location a linked worktree can be created
+/// at that this does not see.
+pub async fn list_worktrees_at(workdir: &Path) -> Result<Vec<WorktreeInfo>> {
+    let out = GitCmd::new(workdir)
+        .args(["worktree", "list", "--porcelain"])
+        .run()
+        .await?;
+    let text = String::from_utf8(out.stdout)
+        .map_err(|e| GitError::parse(format!("non-utf8 in `git worktree list`: {e}")))?;
+    parse_worktree_list(&text)
 }
 
 /// Parse `git worktree list --porcelain` output. Blocks are delimited by

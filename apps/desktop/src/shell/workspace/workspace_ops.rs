@@ -149,6 +149,7 @@ pub(crate) fn build_add_project_dialog(
 // second implementation of the same rollback ladder. Re-exported here
 // because this module is the desktop's door to it.
 use crate::shell::workspace::base_choice::BaseChoice;
+use crate::shell::workspace::discovery::UntrackedWorktree;
 pub use oximux_worktree_ops::{
     CreateBase, CreateOutcome, HostDerivedLocator, LocateError, Provision, ProvisionEvent,
     SetupTranscript, WorktreeLocator, create_workspace_with_rollback, provisioning_marker,
@@ -244,6 +245,7 @@ type RailDbData = (
     HashMap<String, String>,
     HashMap<String, String>,
     HashMap<String, Vec<AgentSession>>,
+    HashSet<String>,
 );
 
 /// Find the [`Project`] that owns `workspace`, by its `project_id` — NOT from
@@ -318,8 +320,12 @@ fn workspace_delete_target(
 fn gather_rail_db_data(
     workspace_repo: &WorkspaceRepo,
     agent_repo: &AgentSessionRepo,
+    project_repo: &ProjectRepo,
     projects: &[Project],
 ) -> RailDbData {
+    // Which projects hide their untracked-worktrees group. One indexed point
+    // read per project, beside the archived query below.
+    let mut hidden_untracked: HashSet<String> = HashSet::new();
     let mut workspaces_by_project: HashMap<String, Vec<Workspace>> =
         HashMap::with_capacity(projects.len());
     // Archived rows ride along in this same background pass rather than
@@ -373,6 +379,9 @@ fn gather_rail_db_data(
             }
         };
         archived_by_project.insert(project.id.clone(), archived);
+        if project_repo.hide_untracked(&project.id).unwrap_or(false) {
+            hidden_untracked.insert(project.id.clone());
+        }
     }
     (
         workspaces_by_project,
@@ -381,6 +390,7 @@ fn gather_rail_db_data(
         latest_adapter,
         last_active,
         workspace_sessions,
+        hidden_untracked,
     )
 }
 
@@ -1447,9 +1457,17 @@ impl WorkspaceRoot {
             );
             return;
         };
+        // Adoption state gates the script actions and offers `Stop tracking`.
+        // A lookup failure reads as un-vetted: withholding a script action is
+        // the safe direction, running one unread is not.
+        let repo = &self.app_state.workspace_repo;
+        let adopted = repo.is_adopted(&workspace.id).unwrap_or(true);
+        let unvetted = repo.is_unvetted(&workspace.id).unwrap_or(true);
         let caps = RowCapabilities {
             is_primary: is_primary_row(&workspace, &project.root_path),
             is_archived: workspace.archived_at.is_some(),
+            adopted,
+            unvetted,
             scripts: avail,
             can_merge: !project.default_branch.is_empty(),
             open_in: open_in::effective_apps(&crate::git_settings::settings(cx)),
@@ -1533,8 +1551,9 @@ impl WorkspaceRoot {
         cx: &mut Context<Self>,
     ) {
         self.close_modal_overlays(cx);
+        let hide_untracked = self.rail_hidden_untracked.contains(&project.id);
         self.project_menu
-            .update(cx, |m, cx| m.open(project, x, y, cx));
+            .update(cx, |m, cx| m.open(project, x, y, hide_untracked, cx));
     }
 
     /// Open the Agents-page status-filter dropdown at the given screen
@@ -1633,6 +1652,15 @@ impl WorkspaceRoot {
                     .unwrap_or_default(),
             );
         }
+        // Untracked worktrees from the discovery scan, minus any project that
+        // hides the group (the scan already skips those; the filter here
+        // covers the round that was in flight when the preference changed).
+        let untracked_by_project: HashMap<String, Vec<UntrackedWorktree>> = self
+            .untracked_by_project
+            .iter()
+            .filter(|(pid, rows)| !rows.is_empty() && !self.rail_hidden_untracked.contains(*pid))
+            .map(|(pid, rows)| (pid.clone(), rows.clone()))
+            .collect();
         // Ambient agent statuses inferred live from plain-terminal OSC titles
         // (a hand-launched `claude`/`codex`/… with no tracked session). Raw
         // terminal cwd is normalized to the owning workspace root, so a shell
@@ -1733,6 +1761,7 @@ impl WorkspaceRoot {
                 active_workspace_id,
                 workspaces_by_project,
                 archived_by_project,
+                untracked_by_project,
                 latest_status,
                 live_worktrees,
                 ambient_status,
@@ -1765,11 +1794,12 @@ impl WorkspaceRoot {
         self.rail_refresh_inflight = true;
         cx.spawn(async move |weak, cx| {
             loop {
-                let Ok((workspace_repo, agent_repo, projects)) = weak.update(cx, |this, _| {
+                let Ok((workspace_repo, agent_repo, project_repo, projects)) = weak.update(cx, |this, _| {
                     this.rail_dirty = false;
                     (
                         this.app_state.workspace_repo.clone(),
                         this.app_state.agent_session_repo.clone(),
+                        this.app_state.project_repo.clone(),
                         this.app_state.recent_projects.clone(),
                     )
                 }) else {
@@ -1778,15 +1808,16 @@ impl WorkspaceRoot {
                 // All SQLite + the per-project `.git` stat run off the main
                 // thread (cx.spawn itself stays on the main thread — known
                 // footgun).
-                let (workspaces, archived, statuses, adapters, last_active, sessions) = cx
+                let (workspaces, archived, statuses, adapters, last_active, sessions, hidden) = cx
                     .background_executor()
                     .spawn(async move {
-                        gather_rail_db_data(&workspace_repo, &agent_repo, &projects)
+                        gather_rail_db_data(&workspace_repo, &agent_repo, &project_repo, &projects)
                     })
                     .await;
                 let run_again = weak.update(cx, |this, cx| {
                     this.rail_workspaces_by_project = workspaces;
                     this.rail_archived_by_project = archived;
+                    this.rail_hidden_untracked = hidden;
                     this.rail_latest_status = statuses;
                     this.rail_latest_adapter = adapters;
                     this.rail_last_active = last_active;
@@ -2419,6 +2450,16 @@ impl WorkspaceRoot {
         // Requesting delete on a different workspace drops the offer.
         let force = self.force_delete_offer.as_deref() == Some(workspace.id.as_str());
         self.force_delete_offer = None;
+        // An adopted worktree whose scripts the user has not reviewed gets no
+        // cleanup script run on the way out: that script is somebody else's
+        // code in somebody else's directory. Read once, here, so the answer
+        // the user saw when they asked is the one the closure acts on. A
+        // lookup failure withholds the script, never runs it.
+        let skip_cleanup = self
+            .app_state
+            .workspace_repo
+            .is_unvetted(&workspace.id)
+            .unwrap_or(true);
         let weak: WeakEntity<WorkspaceRoot> = cx.weak_entity();
         let workspace_for_cb = workspace.clone();
         let target_for_cb = target.clone();
@@ -2445,7 +2486,11 @@ impl WorkspaceRoot {
                 // touching the worktree, bounded by a timeout so a hung teardown
                 // can't trap the user — on timeout the child is killed and the
                 // removal proceeds regardless (the force-remove escape).
-                run_cleanup_before_remove(&worktree_path).await;
+                if skip_cleanup {
+                    tracing::info!(slug = %workspace.slug, "delete: adopted worktree unreviewed; cleanup script skipped");
+                } else {
+                    run_cleanup_before_remove(&worktree_path).await;
+                }
                 let repo = match Repository::open(&project_root).await {
                     Ok(r) => r,
                     Err(err) => {

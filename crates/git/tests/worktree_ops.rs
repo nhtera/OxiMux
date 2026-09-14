@@ -910,3 +910,31 @@ async fn default_branch_still_names_a_default_that_lives_only_on_the_remote() {
     assert!(repo.sha_of("main").await.unwrap().is_none());
     assert!(repo.sha_of("origin/main").await.unwrap().is_some());
 }
+
+/// The discovery scan's whole premise: a worktree added from a terminal at an
+/// arbitrary location — nowhere near the project or any configured directory
+/// — is in `git worktree list`, because git keeps the registry in the main
+/// repository. No filesystem scan is needed to find it.
+#[tokio::test]
+async fn a_worktree_added_anywhere_is_listed_from_the_main_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("a.txt"), "v1\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+    let far = elsewhere.path().join("deep").join("topic");
+    std::fs::create_dir_all(far.parent().unwrap()).unwrap();
+    run_git(p, &["worktree", "add", "-b", "topic", far.to_str().unwrap()]);
+
+    let ws = oximux_git::list_worktrees_at(p).await.unwrap();
+    assert_eq!(ws.len(), 2);
+    let linked = ws.iter().find(|w| !w.is_main).expect("the linked worktree");
+    assert_eq!(linked.branch.as_deref(), Some("topic"));
+    assert_eq!(
+        std::fs::canonicalize(&linked.path).unwrap(),
+        std::fs::canonicalize(&far).unwrap(),
+        "listed at its real location"
+    );
+}

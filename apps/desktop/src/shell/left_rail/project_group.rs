@@ -23,6 +23,8 @@ use crate::shell::left_rail::workspace_card::{RowRenameConfig, render_workspace_
 use crate::shell::left_rail::workspace_list_render::WorkspaceSortMode;
 use crate::shell::left_rail::workspace_row::build_workspace_card_plan;
 use crate::shell::left_rail::worktree_stats::WorktreeStats;
+use crate::shell::left_rail::untracked_section::render_untracked_section;
+use crate::shell::workspace::discovery::UntrackedWorktree;
 use crate::workspace_root::WorkspaceRoot;
 
 /// Chevron / folder glyph size in the header.
@@ -109,6 +111,10 @@ pub fn render_project_group(
     // renders nothing at all); `archived_expanded`: whether its disclosure is open.
     archived: Vec<Workspace>,
     archived_expanded: bool,
+    // `untracked`: worktrees git lists for this project that no row tracks
+    // (empty renders nothing); `untracked_expanded`: whether its disclosure is open.
+    untracked: Vec<UntrackedWorktree>,
+    untracked_expanded: bool,
     latest_status_for: impl Fn(&str) -> Option<AgentStatus>,
     latest_adapter_for: impl Fn(&str) -> Option<&'static str>,
     active_workspace_id: Option<&str>,
@@ -197,6 +203,19 @@ pub fn render_project_group(
         &weak_root,
         &on_row_menu,
         compact,
+        theme,
+        density,
+        typography,
+    ));
+    col = col.child(render_untracked_section(
+        &project.id,
+        untracked
+            .into_iter()
+            .map(|u| (project.clone(), u))
+            .collect(),
+        untracked_expanded,
+        &rail,
+        &weak_root,
         theme,
         density,
         typography,

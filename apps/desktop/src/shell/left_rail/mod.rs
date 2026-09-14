@@ -32,6 +32,7 @@ pub mod rail_agent_row;
 pub mod resize;
 pub mod row_menu;
 pub mod toolbar;
+pub mod untracked_section;
 pub mod workspace_agent_rows;
 pub mod workspace_card;
 pub mod workspace_list_render;
@@ -53,6 +54,7 @@ use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::SettingsRepo;
 
 use crate::shell::left_rail::worktree_stats::WorktreeStats;
+use crate::shell::workspace::discovery::UntrackedWorktree;
 
 use crate::left_rail_layout;
 
@@ -155,6 +157,10 @@ pub struct LeftRail {
     /// as a collapsed `Archived (N)` disclosure below the project's active
     /// rows; a project with none renders no header at all.
     archived_by_project: HashMap<String, Vec<Workspace>>,
+    /// Each project's worktrees that git lists but no row tracks, from the
+    /// root's discovery scan; projects that hide the group are absent.
+    /// Rendered as a collapsed `Untracked (N)` disclosure below `Archived`.
+    untracked_by_project: HashMap<String, Vec<UntrackedWorktree>>,
     latest_status: LatestStatusMap,
     /// Agents inferred live from plain-terminal OSC titles, keyed by worktree
     /// path (status + display name). A hand-launched agent (typed
@@ -204,6 +210,9 @@ pub struct LeftRail {
     /// first expansion — nothing pops into view unbidden. In-memory only, like
     /// [`Self::expanded_workspaces`].
     expanded_archived: HashSet<String>,
+    /// Project ids whose `Untracked (N)` disclosure is open. Same lifetime and
+    /// default as [`Self::expanded_archived`].
+    expanded_untracked: HashSet<String>,
     /// A workspace row menu is open. Drives only one thing: suppressing the
     /// `…` trigger's tooltip, which is sticky and would otherwise paint over
     /// the menu's first item. See `workspace_card::RowMenu`.
@@ -308,6 +317,7 @@ impl LeftRail {
             active_workspace_id: None,
             workspaces_by_project: HashMap::new(),
             archived_by_project: HashMap::new(),
+            untracked_by_project: HashMap::new(),
             latest_status: HashMap::new(),
             ambient_status: HashMap::new(),
             latest_adapter: HashMap::new(),
@@ -319,6 +329,7 @@ impl LeftRail {
             workspace_agents: HashMap::new(),
             expanded_workspaces: HashSet::new(),
             expanded_archived: HashSet::new(),
+            expanded_untracked: HashSet::new(),
             row_menu_open: false,
             focused_agent: None,
             width: px(density.w_left_rail),
@@ -835,6 +846,7 @@ impl LeftRail {
         active_workspace_id: Option<String>,
         workspaces_by_project: HashMap<String, Vec<Workspace>>,
         archived_by_project: HashMap<String, Vec<Workspace>>,
+        untracked_by_project: HashMap<String, Vec<UntrackedWorktree>>,
         latest_status: LatestStatusMap,
         live_worktrees: HashSet<String>,
         ambient_status: HashMap<String, AmbientAgent>,
@@ -879,6 +891,7 @@ impl LeftRail {
             || self.active_workspace_id != active_workspace_id
             || self.workspaces_by_project != workspaces_by_project
             || self.archived_by_project != archived_by_project
+            || self.untracked_by_project != untracked_by_project
             || self.latest_status != latest_status
             || self.ambient_status != ambient_status
             || self.latest_adapter != latest_adapter
@@ -901,6 +914,7 @@ impl LeftRail {
         self.active_workspace_id = active_workspace_id;
         self.workspaces_by_project = workspaces_by_project;
         self.archived_by_project = archived_by_project;
+        self.untracked_by_project = untracked_by_project;
         self.latest_status = latest_status;
         self.ambient_status = ambient_status;
         self.latest_adapter = latest_adapter;
@@ -952,6 +966,12 @@ impl LeftRail {
     pub(crate) fn toggle_archived_expanded(&mut self, project_id: &str) {
         if !self.expanded_archived.remove(project_id) {
             self.expanded_archived.insert(project_id.to_string());
+        }
+    }
+
+    pub(crate) fn toggle_untracked_expanded(&mut self, key: &str) {
+        if !self.expanded_untracked.remove(key) {
+            self.expanded_untracked.insert(key.to_string());
         }
     }
 
@@ -1118,6 +1138,7 @@ impl Render for LeftRail {
                 entity.clone(),
                 self.workspaces_by_project.clone(),
                 self.archived_by_project.clone(),
+                self.untracked_by_project.clone(),
                 self.latest_status.clone(),
                 self.live_worktrees.clone(),
                 self.ambient_status.clone(),
@@ -1126,6 +1147,7 @@ impl Render for LeftRail {
                 self.workspace_agents.clone(),
                 self.expanded_workspaces.clone(),
                 self.expanded_archived.clone(),
+                self.expanded_untracked.clone(),
                 self.row_menu_open,
                 self.focused_agent.clone(),
                 self.weak_root.clone(),
@@ -1237,6 +1259,7 @@ fn render_workspace_list(
     rail: gpui::Entity<LeftRail>,
     workspaces_by_project: HashMap<String, Vec<Workspace>>,
     archived_by_project: HashMap<String, Vec<Workspace>>,
+    untracked_by_project: HashMap<String, Vec<UntrackedWorktree>>,
     latest_status: LatestStatusMap,
     live_worktrees: HashSet<String>,
     ambient_status: HashMap<String, AmbientAgent>,
@@ -1245,6 +1268,7 @@ fn render_workspace_list(
     workspace_agents: WorkspaceAgentList,
     expanded_workspaces: HashSet<String>,
     expanded_archived: HashSet<String>,
+    expanded_untracked: HashSet<String>,
     row_menu_open: bool,
     focused_agent: Option<RailAgentTarget>,
     weak_root: WeakEntity<WorkspaceRoot>,
@@ -1425,6 +1449,27 @@ fn render_workspace_list(
             density,
             typography,
         ));
+        // The same cross-project treatment for untracked worktrees: flat mode
+        // has no project group to nest the disclosure under.
+        let mut flat_untracked: Vec<(Project, UntrackedWorktree)> = Vec::new();
+        for project in projects.iter() {
+            if let Some(rows) = untracked_by_project.get(&project.id) {
+                for u in rows {
+                    flat_untracked.push((project.clone(), u.clone()));
+                }
+            }
+        }
+        col = col.child(crate::shell::left_rail::untracked_section::render_untracked_section(
+            crate::shell::left_rail::untracked_section::FLAT_UNTRACKED_KEY,
+            flat_untracked,
+            expanded_untracked
+                .contains(crate::shell::left_rail::untracked_section::FLAT_UNTRACKED_KEY),
+            &rail,
+            &weak_root,
+            theme,
+            density,
+            typography,
+        ));
         return col.into_any_element();
     }
 
@@ -1453,6 +1498,11 @@ fn render_workspace_list(
             .cloned()
             .unwrap_or_default();
         let archived_expanded = expanded_archived.contains(&project.id);
+        let untracked = untracked_by_project
+            .get(&project.id)
+            .cloned()
+            .unwrap_or_default();
+        let untracked_expanded = expanded_untracked.contains(&project.id);
         let plan = build_project_group_plan(&project, &workspaces, is_active, is_collapsed);
 
         let status_for_group = latest_status.clone();
@@ -1497,6 +1547,8 @@ fn render_workspace_list(
             workspaces,
             archived,
             archived_expanded,
+            untracked,
+            untracked_expanded,
             latest_status_for,
             latest_adapter_for,
             active_workspace_id.as_deref(),

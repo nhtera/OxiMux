@@ -362,8 +362,19 @@ impl WorktreeService for RepoWorktrees {
         }
         let worktree_dir = std::path::PathBuf::from(&row.worktree_path);
         // The project's cleanup script runs to completion (bounded) before the
-        // directory goes, exactly as the desktop's own delete flow does.
-        run_cleanup_before_remove(&worktree_dir).await;
+        // directory goes, exactly as the desktop's own delete flow does —
+        // unless the row was adopted from a directory somebody else set up
+        // and the user has not reviewed its scripts. Then nothing from that
+        // directory runs on the user's behalf, here or on the desktop.
+        let unvetted = self.workspaces.is_unvetted(id).unwrap_or_else(|err| {
+            tracing::warn!(?err, "worktree service: adoption lookup failed; treating as unvetted");
+            true
+        });
+        if unvetted {
+            tracing::info!(id, "remote worktree remove: adopted worktree unreviewed; cleanup script skipped");
+        } else {
+            run_cleanup_before_remove(&worktree_dir).await;
+        }
         let repo = Repository::open(std::path::Path::new(&project.root_path))
             .await
             .map_err(|err| {

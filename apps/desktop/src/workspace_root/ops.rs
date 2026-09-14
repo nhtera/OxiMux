@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::shell::workspace::discovery::{UntrackedWorktree, reconcile};
+
 impl WorkspaceRoot {
     /// Launch dirs for the *active* project (its root plus each linked git
     /// worktree) — the default same-project scope for the session-history
@@ -72,6 +74,33 @@ impl WorkspaceRoot {
         })
     }
 
+    /// The projects whose worktree registry this round should list: every
+    /// open git project that does not hide its untracked group, each with the
+    /// paths its rows already track (active and archived) so the set
+    /// difference can be taken off the main thread. Synchronous, cache reads
+    /// only — the row caches come from the last rail gather.
+    fn discovery_targets(&self) -> Vec<DiscoveryTarget> {
+        self.app_state
+            .recent_projects
+            .iter()
+            .filter(|p| !self.rail_hidden_untracked.contains(&p.id))
+            .filter(|p| std::path::Path::new(&p.root_path).join(".git").exists())
+            .map(|p| {
+                let mut tracked: Vec<String> = vec![p.root_path.clone()];
+                for cache in [&self.rail_workspaces_by_project, &self.rail_archived_by_project] {
+                    if let Some(rows) = cache.get(&p.id) {
+                        tracked.extend(rows.iter().map(|w| w.worktree_path.clone()));
+                    }
+                }
+                DiscoveryTarget {
+                    project_id: p.id.clone(),
+                    root: p.root_path.clone(),
+                    tracked,
+                }
+            })
+            .collect()
+    }
+
     /// Re-measure every worktree now because something just moved history
     /// — a commit or remote op finished, an agent session ended. Runs a round
     /// immediately when none is in flight; otherwise marks one as owed, and
@@ -112,6 +141,15 @@ impl WorkspaceRoot {
             return;
         }
         let targets = self.worktree_refresh_targets();
+        // Discovery — one `git worktree list` per project — rides every
+        // `DISCOVERY_EVERY`-th round, or the next one when something made the
+        // last answer stale. Same loop, same in-flight guard: this is the
+        // second number the plan wanted and it joins the refresher rather
+        // than starting a poller of its own.
+        let scan = self.discovery_due || self.stats_round.is_multiple_of(DISCOVERY_EVERY);
+        self.stats_round = self.stats_round.wrapping_add(1);
+        self.discovery_due = false;
+        let discovery = if scan { self.discovery_targets() } else { Vec::new() };
         if targets.is_empty() {
             // Nothing left to measure, so nothing cached may survive: the
             // eviction below only runs after a round, and a path re-added
@@ -137,16 +175,28 @@ impl WorkspaceRoot {
             }
         };
         self.diff_refresh_in_flight = true;
-        let (tx, rx) = tokio::sync::oneshot::channel::<Vec<(String, Measured)>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<RoundResults>();
         handle.spawn(async move {
-            let futs = targets.into_iter().map(|target| async move {
+            let stats = futures::future::join_all(targets.into_iter().map(|target| async move {
                 let stats = measure_worktree(&target).await;
                 (target.path, stats)
-            });
-            let _ = tx.send(futures::future::join_all(futs).await);
+            }));
+            let found = futures::future::join_all(discovery.into_iter().map(|t| async move {
+                let root = std::path::Path::new(&t.root);
+                // A listing failure keeps the previous answer, like a stats
+                // hiccup does; the reconcile runs here, off the main thread,
+                // since it canonicalises every path it compares.
+                let untracked = oximux_git::list_worktrees_at(root)
+                    .await
+                    .ok()
+                    .map(|on_disk| reconcile(&t.project_id, root, on_disk, &t.tracked));
+                (t.project_id, untracked)
+            }));
+            let (stats, found) = futures::future::join(stats, found).await;
+            let _ = tx.send(RoundResults { stats, found });
         });
         cx.spawn(async move |weak, cx| {
-            let Ok(results) = rx.await else {
+            let Ok(RoundResults { stats: results, found }) = rx.await else {
                 // Sender dropped (runtime torn down) — clear the flag so a
                 // later round can retry rather than wedging in-flight.
                 let _ = weak.update(cx, |this, _| {
@@ -176,6 +226,17 @@ impl WorkspaceRoot {
                     }
                 }
                 this.worktree_stats.retain(|k, _| current.contains(k));
+                // Discovery results replace each scanned project's entry; a
+                // project that was not scanned this round keeps its last one,
+                // and one that is gone from the project list is dropped.
+                let open: std::collections::HashSet<&str> =
+                    this.app_state.recent_projects.iter().map(|p| p.id.as_str()).collect();
+                this.untracked_by_project.retain(|pid, _| open.contains(pid.as_str()));
+                for (project_id, untracked) in found {
+                    if let Some(list) = untracked {
+                        this.untracked_by_project.insert(project_id, list);
+                    }
+                }
                 this.diff_refresh_in_flight = false;
                 cx.notify();
                 // An eager kick landed while this round ran: what it wanted
@@ -1694,6 +1755,26 @@ impl WorkspaceRoot {
         let text = text.into();
         self.toast_layer.update(cx, |layer, cx| layer.push(kind, text, cx));
     }
+}
+
+/// Every how many stats rounds the discovery scan runs: at the 2 s tick,
+/// once every ten seconds while the window is focused.
+const DISCOVERY_EVERY: u64 = 5;
+
+/// One project's line in the discovery scan.
+struct DiscoveryTarget {
+    project_id: String,
+    root: String,
+    /// Paths the database already tracks for this project — its root and
+    /// every active and archived row — so the scan can subtract them.
+    tracked: Vec<String>,
+}
+
+/// What one round sends back: per-path stats, and per-project untracked
+/// worktrees for the projects it scanned (`None` when the listing failed).
+struct RoundResults {
+    stats: Vec<(String, Measured)>,
+    found: Vec<(String, Option<Vec<UntrackedWorktree>>)>,
 }
 
 /// One worktree's line in the refresh round: where it is, and what its
