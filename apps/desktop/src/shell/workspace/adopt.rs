@@ -296,15 +296,21 @@ mod tests {
     }
 
     /// Every file under the directory, with size and modification time — the
-    /// shape a write of any kind would change.
+    /// shape a write of any kind would change. Directories count by presence
+    /// only: NTFS updates a directory's own mtime lazily after a write inside
+    /// it, so the `.oximux` entry's stamp can move between two snapshots with
+    /// nothing having been written in between (seen on Windows CI). A file
+    /// created, removed, or rewritten still changes the list.
     fn snapshot(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
         fn walk(dir: &Path, out: &mut Vec<(PathBuf, u64, std::time::SystemTime)>) {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let entry = entry.unwrap();
                 let meta = entry.metadata().unwrap();
-                out.push((entry.path(), meta.len(), meta.modified().unwrap()));
                 if meta.is_dir() {
+                    out.push((entry.path(), 0, std::time::UNIX_EPOCH));
                     walk(&entry.path(), out);
+                } else {
+                    out.push((entry.path(), meta.len(), meta.modified().unwrap()));
                 }
             }
         }
