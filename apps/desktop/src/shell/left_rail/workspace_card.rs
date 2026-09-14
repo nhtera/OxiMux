@@ -112,6 +112,26 @@ pub struct RowMenu {
 
 /// Render the rich two-line workspace card.
 ///
+/// The row title as a flex item that yields width to the chips beside it and
+/// clips when it must.
+///
+/// Clipped, not ellipsised, on purpose. A `.truncate()` title measured by the
+/// line's flex layout painted as `…` alone even with room to spare (seen live,
+/// twice): the truncation width is the item's own resolved width, which is
+/// its measured text width, and the fit test at exactly that width rounds
+/// into "does not fit". Nowrap text measures the same in every pass, so the
+/// title keeps its natural width and only loses its tail on a rail too narrow
+/// for it, which is the behaviour the chips beside it need.
+fn truncating_title(name: String, color: Hsla, typography: &Typography) -> gpui::Div {
+    div()
+        .min_w_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_size(px(typography.t_body_sm))
+        .text_color(color)
+        .child(name)
+}
+
 /// `row_id` and `group_name` must be stable and unique per workspace — callers
 /// typically derive them from the workspace id, matching the existing row
 /// pattern in `project_group.rs`.
@@ -325,12 +345,7 @@ pub fn render_workspace_card(
         // Renamable row at rest → title with double-click-to-rename.
         Some(RowRenameConfig {
             rail, workspace, ..
-        }) => div()
-            .min_w_0()
-            .truncate()
-            .text_size(px(typography.t_body_sm))
-            .text_color(plan.row.fg)
-            .child(plan.row.name.clone())
+        }) => truncating_title(plan.row.name.clone(), plan.row.fg, typography)
             .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
                 if ev.click_count >= 2 {
                     cx.stop_propagation();
@@ -340,13 +355,7 @@ pub fn render_workspace_card(
             })
             .into_any_element(),
         // Primary / non-renamable row → plain title.
-        None => div()
-            .min_w_0()
-            .truncate()
-            .text_size(px(typography.t_body_sm))
-            .text_color(plan.row.fg)
-            .child(plan.row.name.clone())
-            .into_any_element(),
+        None => truncating_title(plan.row.name.clone(), plan.row.fg, typography).into_any_element(),
     };
 
     // Diff chip: "~F · +A −B" — changed-file count in the muted tone, then
