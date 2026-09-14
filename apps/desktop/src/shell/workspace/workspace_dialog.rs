@@ -5,7 +5,8 @@
 //! project picker (lets the user choose which project to create the
 //! workspace under without first activating it via Cmd+O) and an agent
 //! picker (auto-spawns the chosen CLI agent in a new tab after the
-//! workspace is created — default "Skip" leaves the workspace empty).
+//! workspace is created; it defaults to the last agent the user chose,
+//! and "Skip" leaves the workspace empty).
 //!
 //! Pattern: full-window overlay (absolute inset-0) for click-outside
 //! dismiss; centered modal card. Mirrors the step 5 project picker shape.
@@ -297,11 +298,17 @@ impl WorkspaceDialog {
     /// active and archived — the codename an empty Name commits with is
     /// picked once here, against that set, so the preview line and the
     /// create cannot disagree about it.
+    /// `default_agent` is the resolved Agent default — the last one chosen,
+    /// then the launch settings' default, then the first adapter, then
+    /// `None` (Skip); see `app_settings::last_agent`. The dialog only shows
+    /// it; the user can still pick anything, and what they pick is what the
+    /// next open will default to.
     pub fn open_create(
         &mut self,
         projects: Vec<Project>,
         active: Option<Project>,
         existing_slugs: Vec<String>,
+        default_agent: Option<AgentAdapter>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -312,7 +319,7 @@ impl WorkspaceDialog {
         self.projects = projects;
         self.selected_project = active.or_else(|| self.projects.first().cloned());
         self.project_dropdown_open = false;
-        self.selected_agent = None;
+        self.selected_agent = default_agent;
         self.agent_dropdown_open = false;
         self.selected_setup = SetupDecision::Inherit;
         self.setup_dropdown_open = false;

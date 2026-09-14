@@ -989,8 +989,9 @@ impl Render for WorkspaceRoot {
                     &projects,
                 );
                 this.close_modal_overlays(cx);
+                let default_agent = this.default_agent_for_create(cx);
                 this.workspace_dialog.update(cx, |d, cx| {
-                    d.open_create(projects, active, existing_slugs, window, cx)
+                    d.open_create(projects, active, existing_slugs, default_agent, window, cx)
                 });
             }))
             .on_action(cx.listener(|this, _: &OpenAddProjectDialog, window, cx| {

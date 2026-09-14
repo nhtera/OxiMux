@@ -4,6 +4,18 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-14 — The create dialog remembers your agent (`feat/worktree-agent-default-and-retirement`)
+
+- **New workspaces start with the agent you used last.** The create
+  dialog's Agent picker no longer defaults to `Skip (no agent)`. It defaults
+  to whatever the last successful create used — `Skip` included, if that is
+  what you chose — then to the launch settings' default agent, then to the
+  first agent in the list. Creating a workspace and starting an agent is one
+  step again.
+- **Dead code retired.** The rail's unused `WorktreeInfo`-based row painter
+  and its tests are gone; the never-mounted worktree panel went with the
+  previous entry. `merge_branch`'s doc names the row action that calls it.
+
 ### 2026-09-14 — Worktrees made elsewhere show up, and can be adopted (`feat/worktree-discovery`)
 
 - **The rail sees worktrees it did not create.** Each project gains a
