@@ -34,7 +34,7 @@ fn diverged_repo() -> tempfile::TempDir {
 #[tokio::test]
 async fn a_branch_with_no_upstream_is_measured_against_the_default_branch() {
     let tmp = diverged_repo();
-    let got = ahead_behind_vs_base(tmp.path(), None, Some("topic"), "main").await;
+    let got = ahead_behind_vs_base(tmp.path(), None, "main").await;
     assert_eq!(
         got,
         Some(AheadBehind {
@@ -55,7 +55,7 @@ async fn a_pinned_base_wins_over_everything_else() {
     run_git(p, &["checkout", "-q", "release"]);
     commit(p, "r1");
     run_git(p, &["checkout", "-q", "topic"]);
-    let got = ahead_behind_vs_base(p, Some("release"), Some("topic"), "main").await.unwrap();
+    let got = ahead_behind_vs_base(p, Some("release"), "main").await.unwrap();
     assert_eq!((got.base.as_str(), got.ahead, got.behind), ("release", 2, 2));
 }
 
@@ -67,7 +67,7 @@ async fn an_upstream_outranks_the_default_branch_and_is_named() {
     // which is how git itself represents a local-tracking upstream.
     run_git(p, &["branch", "shared", "main"]);
     run_git(p, &["branch", "--set-upstream-to=shared", "topic"]);
-    let got = ahead_behind_vs_base(p, None, Some("topic"), "main").await.unwrap();
+    let got = ahead_behind_vs_base(p, None, "main").await.unwrap();
     assert_eq!(got.base, "shared");
     assert_eq!((got.ahead, got.behind), (2, 1));
 }
@@ -80,8 +80,8 @@ async fn nothing_resolvable_is_none_not_zero() {
     commit(p, "only");
     // No upstream, and the default branch the caller believes in does not
     // exist here under either name.
-    assert_eq!(ahead_behind_vs_base(p, None, Some("main"), "develop").await, None);
-    assert_eq!(ahead_behind_vs_base(p, Some("nope"), None, "").await, None);
+    assert_eq!(ahead_behind_vs_base(p, None, "develop").await, None);
+    assert_eq!(ahead_behind_vs_base(p, Some("nope"), "").await, None);
     assert_eq!(ahead_behind_against(p, "nope").await, None);
 }
 
@@ -92,7 +92,7 @@ async fn level_with_the_base_is_a_zero_pair_not_none() {
     init_repo(p);
     commit(p, "only");
     assert_eq!(
-        ahead_behind_vs_base(p, None, Some("main"), "main").await,
+        ahead_behind_vs_base(p, None, "main").await,
         Some(AheadBehind {
             base: "main".into(),
             ahead: 0,
@@ -111,7 +111,26 @@ async fn a_gone_upstream_falls_through_to_the_default_branch() {
     run_git(p, &["branch", "shared", "main"]);
     run_git(p, &["branch", "--set-upstream-to=shared", "topic"]);
     run_git(p, &["branch", "-D", "shared"]);
-    let got = ahead_behind_vs_base(p, None, Some("topic"), "main").await.unwrap();
+    let got = ahead_behind_vs_base(p, None, "main").await.unwrap();
+    assert_eq!((got.base.as_str(), got.ahead, got.behind), ("main", 2, 1));
+}
+
+/// The upstream step follows the worktree's HEAD, not what a caller believes
+/// is checked out: after a `git switch` the app did not make, the numbers
+/// describe the branch that is actually there.
+#[tokio::test]
+async fn the_upstream_step_follows_head_not_a_remembered_branch() {
+    let tmp = diverged_repo();
+    let p = tmp.path();
+    run_git(p, &["branch", "shared", "main"]);
+    run_git(p, &["branch", "--set-upstream-to=shared", "topic"]);
+    // Leave `topic` (which has an upstream) for `main` (which has none).
+    run_git(p, &["checkout", "-q", "main"]);
+    let got = ahead_behind_vs_base(p, None, "main").await.unwrap();
+    assert_eq!((got.base.as_str(), got.ahead, got.behind), ("main", 0, 0));
+    // And a detached HEAD has no branch to have an upstream: fallback again.
+    run_git(p, &["checkout", "-q", "--detach", "topic"]);
+    let got = ahead_behind_vs_base(p, None, "main").await.unwrap();
     assert_eq!((got.base.as_str(), got.ahead, got.behind), ("main", 2, 1));
 }
 
@@ -124,6 +143,6 @@ async fn a_default_branch_held_only_by_the_remote_is_found_under_origin() {
     // out locally.
     run_git(p, &["update-ref", "refs/remotes/origin/main", "main"]);
     run_git(p, &["branch", "-D", "main"]);
-    let got = ahead_behind_vs_base(p, None, Some("topic"), "main").await.unwrap();
+    let got = ahead_behind_vs_base(p, None, "main").await.unwrap();
     assert_eq!((got.base.as_str(), got.ahead, got.behind), ("origin/main", 2, 1));
 }

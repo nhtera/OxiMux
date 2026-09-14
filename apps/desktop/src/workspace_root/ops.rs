@@ -32,21 +32,17 @@ impl WorkspaceRoot {
         let mut targets: Vec<StatsTarget> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for project in &self.app_state.recent_projects {
-            // The root row is synthesized on the project's default branch
-            // (`workspaces_with_primary_for`); a real root row in the list
-            // replaces it below through the dedup, branch and all.
-            let mut rows = vec![(project.root_path.clone(), project.default_branch.clone())];
+            let mut paths = vec![project.root_path.clone()];
             if let Ok(list) = self.app_state.workspace_repo.list_for_project(&project.id) {
-                rows.extend(list.into_iter().map(|w| (w.worktree_path, w.branch)));
+                paths.extend(list.into_iter().map(|w| w.worktree_path));
             }
-            for (path, branch) in rows {
+            for path in paths {
                 if !seen.insert(path.clone()) {
                     continue;
                 }
                 let pinned_base = self.pinned_base_for(&path);
                 targets.push(StatsTarget {
                     path,
-                    branch: (!branch.is_empty()).then_some(branch),
                     pinned_base,
                     default_branch: project.default_branch.clone(),
                 });
@@ -61,15 +57,18 @@ impl WorkspaceRoot {
     /// `git rev-parse --show-toplevel` — a resolved path — while the row
     /// stores the path it was created with. They agree except through a
     /// symlink, so a miss on the stored path retries the canonicalised one
-    /// before concluding there is no pin. A missing row and a read error both
-    /// mean "no pin": the refresh must not depend on a scratch table.
+    /// before concluding there is no pin. Windows hands back a verbatim
+    /// (`\\?\`) path from `canonicalize`, which git never prints, so that
+    /// prefix is stripped before the retry. A missing row and a read error
+    /// both mean "no pin": the refresh must not depend on a scratch table.
     fn pinned_base_for(&self, path: &str) -> Option<String> {
         let repo = &self.app_state.worktree_settings_repo;
         let by_key = |key: &str| repo.get(key).ok().flatten().and_then(|s| s.base_ref);
         by_key(path).or_else(|| {
             let canonical = std::fs::canonicalize(path).ok()?;
             let canonical = canonical.to_string_lossy();
-            (canonical != path).then(|| by_key(&canonical)).flatten()
+            let canonical = canonical.strip_prefix(r"\\?\").unwrap_or(&canonical);
+            (canonical != path).then(|| by_key(canonical)).flatten()
         })
     }
 
@@ -130,8 +129,7 @@ impl WorkspaceRoot {
             }
         };
         self.diff_refresh_in_flight = true;
-        let (tx, rx) =
-            tokio::sync::oneshot::channel::<Vec<(String, Option<WorktreeStats>)>>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<Vec<(String, Measured)>>();
         handle.spawn(async move {
             let futs = targets.into_iter().map(|target| async move {
                 let stats = measure_worktree(&target).await;
@@ -153,11 +151,20 @@ impl WorkspaceRoot {
                 // worktrees age out of the cache.
                 let current: std::collections::HashSet<String> =
                     results.iter().map(|(p, _)| p.clone()).collect();
-                for (path, stats) in results {
-                    // A failed fetch leaves the prior value intact rather than
-                    // blanking the chips on a transient git error.
-                    if let Some(stats) = stats {
-                        this.worktree_stats.insert(path, stats);
+                for (path, measured) in results {
+                    match measured {
+                        Measured::Stats(stats) => {
+                            this.worktree_stats.insert(path, stats);
+                        }
+                        // A transient git error leaves the prior value intact
+                        // rather than blanking the chips for one tick.
+                        Measured::Transient => {}
+                        // Not a repo any more (directory deleted, project is
+                        // a plain folder): the last numbers must not outlive
+                        // the worktree they described.
+                        Measured::NotARepo => {
+                            this.worktree_stats.remove(&path);
+                        }
                     }
                 }
                 this.worktree_stats.retain(|k, _| current.contains(k));
@@ -1685,44 +1692,51 @@ impl WorkspaceRoot {
 /// ahead/behind should be measured against when nothing better resolves.
 struct StatsTarget {
     path: String,
-    /// The branch the row says this worktree is on; its upstream is the
-    /// second comparison candidate. `None` for a folder project.
-    branch: Option<String>,
     /// The SCM panel's pinned base ref for this worktree, if the user set one.
     pinned_base: Option<String>,
     /// The project's default branch — the last-resort comparison base.
     default_branch: String,
 }
 
+/// What one round learned about one path — three outcomes the write-back
+/// treats differently, so a vanished worktree and a hiccup cannot be confused.
+enum Measured {
+    Stats(WorktreeStats),
+    /// git failed this round; the previous numbers stand until it recovers.
+    Transient,
+    /// There is no repository here to measure; drop whatever was cached.
+    NotARepo,
+}
+
 /// One worktree's numbers, in one batched future. The numstat the diff chip
 /// always needed and HEAD's ahead/behind against the worktree's base are
 /// independent, so they run concurrently rather than back to back.
 ///
-/// The numstat is the gate: without it there is nothing to show, so its
-/// failure yields `None` and the round leaves the prior cache entry in place.
-/// An unresolved base is not a failure — the row simply carries no `↑ ↓`
-/// chip — and the changed-file count is the numstat's own row count, so it
-/// costs no extra process.
-async fn measure_worktree(target: &StatsTarget) -> Option<WorktreeStats> {
+/// The numstat is the gate: without it there is nothing to show. An
+/// unresolved base is not a failure — the row simply carries no `↑ ↓` chip —
+/// and the changed-file count is the numstat's own row count, so it costs no
+/// extra process.
+async fn measure_worktree(target: &StatsTarget) -> Measured {
     let path = std::path::Path::new(&target.path);
     // A folder project (or a worktree whose directory is gone) has nothing to
     // measure; spawning git to learn that, every tick, is the cost this phase
     // must not add. A linked worktree has a `.git` *file*, so `exists` is the
     // right test, not `is_dir`.
     if !path.join(".git").exists() {
-        return None;
+        return Measured::NotARepo;
     }
     let (numstat, ahead_behind) = futures::future::join(
         oximux_git::diff_numstat_head(path),
         oximux_git::ahead_behind_vs_base(
             path,
             target.pinned_base.as_deref(),
-            target.branch.as_deref(),
             &target.default_branch,
         ),
     )
     .await;
-    let map = numstat.ok()?;
+    let Ok(map) = numstat else {
+        return Measured::Transient;
+    };
     let counts = sum_numstat(&map);
     // Instrumentation for an unreproduced defect (see
     // `looks_like_renormalization`). Logged, never suppressed: the recurrence
@@ -1759,7 +1773,7 @@ async fn measure_worktree(target: &StatsTarget) -> Option<WorktreeStats> {
             "worktree stats refreshed"
         );
     }
-    Some(WorktreeStats {
+    Measured::Stats(WorktreeStats {
         diff: counts,
         dirty_files: u32::try_from(map.len()).unwrap_or(u32::MAX),
         ahead_behind,

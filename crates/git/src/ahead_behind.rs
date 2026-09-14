@@ -10,15 +10,15 @@
 //! Resolution order, first hit wins:
 //!
 //! 1. the caller's pinned base — the SCM panel's per-worktree base ref;
-//! 2. the branch's configured upstream, which is what the git panel's own
-//!    ahead/behind is relative to, so the two agree;
+//! 2. the checked-out branch's configured upstream, which is what the git
+//!    panel's own ahead/behind is relative to, so the two agree;
 //! 3. the project's default branch, as a local ref and then as
 //!    `origin/<default>` — the case an upstream cannot answer: a branch
 //!    that was never pushed, or whose upstream is gone after a merge.
 //!
-//! Cost, per call: one `for-each-ref` when a branch name is known (it yields
-//! the upstream's name and its ahead/behind in one process), then one
-//! `rev-list --left-right --count` per remaining candidate until one
+//! Cost, per call: one `for-each-ref` over the local branches (it yields
+//! HEAD's branch, its upstream's name and its ahead/behind in one process),
+//! then one `rev-list --left-right --count` per remaining candidate until one
 //! resolves. Nothing here walks the working tree, and a repo with an
 //! upstream pays exactly one process.
 
@@ -45,14 +45,9 @@ const REV_LIST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// HEAD's ahead/behind against the first base that resolves, in the order
 /// the module docs give. `None` when nothing does.
-///
-/// `branch` is the local branch whose upstream to consult — the branch the
-/// caller believes the worktree is on. `None` skips the upstream step
-/// (a detached checkout, or a caller that does not know the branch).
 pub async fn ahead_behind_vs_base(
     workdir: &Path,
     pinned_base: Option<&str>,
-    branch: Option<&str>,
     default_branch: &str,
 ) -> Option<AheadBehind> {
     if let Some(pinned) = pinned_base.map(str::trim).filter(|s| !s.is_empty())
@@ -60,9 +55,7 @@ pub async fn ahead_behind_vs_base(
     {
         return Some(found);
     }
-    if let Some(branch) = branch.map(str::trim).filter(|s| !s.is_empty())
-        && let Some(found) = ahead_behind_vs_upstream(workdir, branch).await
-    {
+    if let Some(found) = ahead_behind_vs_upstream(workdir).await {
         return Some(found);
     }
     let default_branch = default_branch.trim();
@@ -97,18 +90,26 @@ pub async fn ahead_behind_against(workdir: &Path, base: &str) -> Option<AheadBeh
     })
 }
 
-/// `branch`'s ahead/behind against its configured upstream, from one
-/// `for-each-ref` — the upstream's short name and its track summary
-/// (`ahead 2, behind 1`, empty when level) in a single process. `None` when
-/// the branch does not exist locally, has no upstream, or its upstream is
-/// gone (deleted after a merge). All three mean "compare to something else",
-/// not errors.
-async fn ahead_behind_vs_upstream(workdir: &Path, branch: &str) -> Option<AheadBehind> {
+/// HEAD's ahead/behind against its branch's configured upstream, from one
+/// `for-each-ref` over the local branches: the line flagged `*` is the
+/// branch this worktree has checked out (a linked worktree's own HEAD, since
+/// git resolves it per worktree), and its upstream's short name and track
+/// summary (`ahead 2, behind 1`, empty when level) come in the same process.
+/// `None` when HEAD is detached, the branch has no upstream, or its upstream
+/// is gone (deleted after a merge). All three mean "compare to something
+/// else", not errors.
+///
+/// Enumerating `refs/heads/` rather than naming one ref is deliberate: it is
+/// HEAD-relative, so a checkout the app did not make (a `git switch` in that
+/// worktree's terminal) is measured as it is, not as the row remembers it —
+/// and a one-ref query would match by prefix (`refs/heads/feat` also lists
+/// `feat/x`).
+async fn ahead_behind_vs_upstream(workdir: &Path) -> Option<AheadBehind> {
     let raw = GitCmd::new(workdir)
         .args([
             "for-each-ref",
-            "--format=%(upstream:short)%09%(upstream:track,nobracket)",
-            &format!("refs/heads/{branch}"),
+            "--format=%(HEAD)%09%(upstream:short)%09%(upstream:track,nobracket)",
+            "refs/heads/",
         ])
         .run_raw()
         .await
@@ -116,14 +117,15 @@ async fn ahead_behind_vs_upstream(workdir: &Path, branch: &str) -> Option<AheadB
     if !raw.status.success() {
         return None;
     }
-    parse_upstream_track(&String::from_utf8_lossy(&raw.stdout))
+    parse_head_upstream_track(&String::from_utf8_lossy(&raw.stdout))
 }
 
-/// Parse `<upstream>\t<track>` from the `for-each-ref` format above.
-/// `track` is `ahead N`, `behind M`, `ahead N, behind M`, empty (level) or
-/// `gone`. No upstream prints an empty name.
-fn parse_upstream_track(text: &str) -> Option<AheadBehind> {
-    let line = text.lines().next()?;
+/// Find the `*`-flagged line of the `for-each-ref` format above and parse
+/// its `<upstream>\t<track>`. `track` is `ahead N`, `behind M`,
+/// `ahead N, behind M`, empty (level) or `gone`. No upstream prints an empty
+/// name; a detached HEAD flags no line at all.
+fn parse_head_upstream_track(text: &str) -> Option<AheadBehind> {
+    let line = text.lines().find_map(|l| l.strip_prefix("*\t"))?;
     let (name, track) = line.split_once('\t')?;
     let name = name.trim();
     if name.is_empty() || track.trim() == "gone" {
@@ -157,7 +159,7 @@ fn parse_left_right_count(text: &str) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_left_right_count, parse_upstream_track};
+    use super::{parse_head_upstream_track, parse_left_right_count};
 
     #[test]
     fn parses_the_tab_separated_pair() {
@@ -167,14 +169,22 @@ mod tests {
 
     #[test]
     fn upstream_track_covers_every_shape_git_prints() {
-        let ab = |t: &str| parse_upstream_track(t).map(|a| (a.base, a.ahead, a.behind));
-        assert_eq!(ab("origin/x\tahead 2, behind 1\n"), Some(("origin/x".into(), 2, 1)));
-        assert_eq!(ab("origin/x\tahead 3\n"), Some(("origin/x".into(), 3, 0)));
-        assert_eq!(ab("origin/x\tbehind 4\n"), Some(("origin/x".into(), 0, 4)));
-        assert_eq!(ab("origin/x\t\n"), Some(("origin/x".into(), 0, 0)));
-        assert_eq!(ab("origin/x\tgone\n"), None, "a deleted upstream is not a base");
-        assert_eq!(ab("\t\n"), None, "no upstream configured");
-        assert_eq!(ab(""), None, "the branch does not exist");
+        let ab = |t: &str| parse_head_upstream_track(t).map(|a| (a.base, a.ahead, a.behind));
+        assert_eq!(ab("*\torigin/x\tahead 2, behind 1\n"), Some(("origin/x".into(), 2, 1)));
+        assert_eq!(ab("*\torigin/x\tahead 3\n"), Some(("origin/x".into(), 3, 0)));
+        assert_eq!(ab("*\torigin/x\tbehind 4\n"), Some(("origin/x".into(), 0, 4)));
+        assert_eq!(ab("*\torigin/x\t\n"), Some(("origin/x".into(), 0, 0)));
+        assert_eq!(ab("*\torigin/x\tgone\n"), None, "a deleted upstream is not a base");
+        assert_eq!(ab("*\t\t\n"), None, "no upstream configured");
+        assert_eq!(ab(" \torigin/y\tahead 9\n"), None, "detached HEAD flags no branch");
+        assert_eq!(ab(""), None, "no branches at all");
+    }
+
+    #[test]
+    fn only_the_checked_out_branch_is_read() {
+        let text = " \torigin/other\tahead 7\n*\torigin/mine\tbehind 2\n \t\t\n";
+        let ab = parse_head_upstream_track(text).unwrap();
+        assert_eq!((ab.base.as_str(), ab.ahead, ab.behind), ("origin/mine", 0, 2));
     }
 
     #[test]
