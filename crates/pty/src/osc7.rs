@@ -1,11 +1,15 @@
 //! Out-of-band scanner — runs alongside alacritty's parser to pick up the
 //! sequences alacritty does NOT surface as events: OSC 7 (cwd), OSC 133/633
-//! (shell-integration command marks), OSC 9;4 (progress), and `ESC c` (RIS).
+//! (shell-integration command marks), OSC 9;4 (progress), and the two that
+//! destroy the scrollback — `CSI 3J` (erase saved lines) and `ESC c` (RIS).
 //!
-//! RIS is the one non-OSC here, and it earns its place: alacritty applies it
-//! to the grid and raises nothing, yet it is the single wipe that leaves the
-//! scrollback length unchanged (`clear` and Ctrl-L scroll the erased rows into
-//! history instead, so `history_size` moves and the caller sees it there).
+//! Those last two are not OSCs, and they earn their place here because they
+//! cannot be inferred downstream. Command marks are absolute history lines, so
+//! wiping the scrollback re-bases every one of them — but `clear(1)` sends
+//! `ESC[3J ESC[H ESC[2J`, and alacritty answers the `2J` by scrolling the
+//! erased rows INTO history. Net across one read, `history_size` typically
+//! GROWS (measured: 7 -> 9), so a length check sees no wipe at all. Only the
+//! `3J` itself says the origin moved.
 //!
 //! Everything alacritty already decodes (OSC 0/2 title, OSC 52 clipboard,
 //! OSC 4/10/11/12 color queries, device reports) is captured via the `Term`
@@ -40,6 +44,10 @@ use crate::events::CommandMarkKind;
 /// 4 KiB is several orders of magnitude over any realistic OSC 7 path.
 const MAX_OSC_BYTES: usize = 4096;
 
+/// Cap on a CSI's parameter bytes. `3J` is one; anything longer is some other
+/// sequence (an SGR run, a mouse report) and is dropped at its final byte.
+const MAX_CSI_PARAM_BYTES: usize = 16;
+
 /// A decoded OSC sequence the scanner cares about. Anything else is dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OscHit {
@@ -53,11 +61,16 @@ pub enum OscHit {
     /// OSC 9;4 — progress. `state`: 0 clear, 1 set, 2 error, 3 indeterminate,
     /// 4 warning. `value` is a 0..=100 percentage.
     Progress { state: u8, value: u8 },
-    /// `ESC c` — RIS, a full terminal reset (what `reset(1)` sends). Blanks
-    /// the grid AND the scrollback in place: unlike every other wipe it can
-    /// leave `history_size` exactly where it was (at zero, on a terminal that
-    /// has not scrolled yet), so nothing downstream can infer it from length.
-    FullReset,
+    /// The scrollback was destroyed: `CSI 3J` (erase saved lines, sent by
+    /// `clear(1)`) or `ESC c` (RIS, sent by `reset(1)`). Absolute history
+    /// lines are counted from the start of the scrollback, so both re-base
+    /// every one of them.
+    ///
+    /// Deliberately NOT raised for `CSI 2J` on its own — zsh's Ctrl-L. That
+    /// one scrolls the erased rows into history rather than discarding them,
+    /// so each mark rides up with its own content and keeps pointing at it;
+    /// the commands stay one scroll away, badges and all.
+    HistoryWiped,
 }
 
 const ESC: u8 = 0x1b;
@@ -74,6 +87,38 @@ enum OscState {
     InOsc(Vec<u8>),
     /// Inside OSC, saw ESC; if next byte is `\\` that's String Terminator.
     InOscAfterEsc(Vec<u8>),
+    /// Inside a CSI, collecting parameter/intermediate bytes until the final
+    /// byte says which sequence it was. Only `3J` is acted on; every other
+    /// CSI — and a terminal emits thousands — is counted out and dropped.
+    InCsi(CsiParams),
+}
+
+/// Parameter bytes of an in-flight CSI, capped. `3J` is one byte, so an
+/// overlong run is some other sequence entirely; it is flagged and rejected at
+/// the final byte rather than buffered.
+#[derive(Default)]
+struct CsiParams {
+    buf: [u8; MAX_CSI_PARAM_BYTES],
+    len: usize,
+    overflowed: bool,
+}
+
+impl CsiParams {
+    fn push(&mut self, b: u8) {
+        if self.len < self.buf.len() {
+            self.buf[self.len] = b;
+            self.len += 1;
+        } else {
+            self.overflowed = true;
+        }
+    }
+
+    /// `true` for exactly `CSI 3 J`. `final_byte` terminates the sequence.
+    /// `2J` is excluded on purpose (see [`OscHit::HistoryWiped`]), and so are
+    /// the partial erases and every `J`-less CSI that merely contains a 3.
+    fn erases_scrollback(&self, final_byte: u8) -> bool {
+        !self.overflowed && final_byte == b'J' && &self.buf[..self.len] == b"3"
+    }
 }
 
 /// Stateful scanner: feed bytes via [`OscScanner::feed`]; whenever a handled
@@ -114,13 +159,30 @@ impl OscScanner {
             }
             OscState::AfterEsc => match b {
                 b']' => OscState::InOsc(Vec::new()),
-                // RIS. Two bytes, no parameters, no ambiguity — `ESC c` means
-                // nothing else, so no CSI parsing is needed to recognise it.
+                b'[' => OscState::InCsi(CsiParams::default()),
+                // RIS. Two bytes, no parameters, no ambiguity.
                 b'c' => {
-                    on_hit(OscHit::FullReset);
+                    on_hit(OscHit::HistoryWiped);
                     OscState::Normal
                 }
                 ESC => OscState::AfterEsc, // back-to-back ESCs — stay armed
+                _ => OscState::Normal,
+            },
+            OscState::InCsi(mut params) => match b {
+                // Parameter (0x30..=0x3F) and intermediate (0x20..=0x2F) bytes
+                // accumulate; a final byte (0x40..=0x7E) ends the sequence.
+                0x20..=0x3F => {
+                    params.push(b);
+                    OscState::InCsi(params)
+                }
+                0x40..=0x7E => {
+                    if params.erases_scrollback(b) {
+                        on_hit(OscHit::HistoryWiped);
+                    }
+                    OscState::Normal
+                }
+                // An ESC mid-CSI abandons it; anything else is malformed.
+                ESC => OscState::AfterEsc,
                 _ => OscState::Normal,
             },
             OscState::InOsc(mut buf) => match b {
@@ -586,48 +648,77 @@ mod tests {
         let paths = collect(bytes);
         assert!(paths.is_empty());
     }
-    // RIS is two bytes and means nothing else; a bare `c` in output must not
-    // register, and the sequence has to survive a chunk boundary like any
-    // other.
-    #[test]
-    fn ris_registers_once_and_only_after_an_escape() {
-        assert_eq!(
-            collect_hits(b"\x1bc").len(),
-            1,
-            "ESC c is a full reset"
-        );
-        assert!(
-            !collect_hits(b"clear\r\n").iter().any(|h| matches!(h, OscHit::FullReset)),
-            "a plain `c` in output is not a reset"
-        );
 
-        let mut scanner = OscScanner::new();
-        let mut hits = 0;
-        scanner.feed(b"\x1b", |h| {
-            if matches!(h, OscHit::FullReset) {
-                hits += 1;
-            }
-        });
-        scanner.feed(b"c", |h| {
-            if matches!(h, OscHit::FullReset) {
-                hits += 1;
-            }
-        });
-        assert_eq!(hits, 1, "a split RIS still registers exactly once");
+    fn wipes(bytes: &[u8]) -> usize {
+        collect_hits(bytes)
+            .into_iter()
+            .filter(|h| matches!(h, OscHit::HistoryWiped))
+            .count()
     }
 
-    // A reset does not swallow what follows it: the prompt mark the shell
-    // emits once `reset` returns has to decode in the same chunk.
+    // The two sequences that destroy the scrollback, as their tools send them.
     #[test]
-    fn a_command_mark_after_a_reset_is_still_decoded() {
-        let hits = collect_hits(b"\x1bc\x1b]133;A\x07");
+    fn scrollback_erases_are_hits() {
+        assert_eq!(wipes(b"\x1b[3J\x1b[H\x1b[2J"), 1, "clear(1): the 3J, once");
+        assert_eq!(wipes(b"\x1b[3J"), 1, "a bare 3J");
+        assert_eq!(wipes(b"\x1bc"), 1, "RIS");
+    }
+
+    // Everything else a terminal emits must stay silent. `2J` is the load
+    // bearing one: alacritty scrolls those rows into history, so the marks
+    // stay anchored and a reset would discard good badges.
+    #[test]
+    fn other_sequences_are_not_hits() {
+        for bytes in [
+            &b"\x1b[H\x1b[2J"[..], // Ctrl-L
+            &b"\x1b[2J"[..],
+            &b"\x1b[J"[..],
+            &b"\x1b[0J"[..],
+            &b"\x1b[1J"[..],
+            &b"\x1b[3K"[..],
+            &b"\x1b[33J"[..],
+            &b"\x1b[3;3H"[..],
+            &b"\x1b[0;3;32m"[..],
+            &b"\x1b[?1049h"[..],
+            &b"3J"[..],      // bare text, no CSI at all
+            &b"clear\r\n"[..], // a plain `c` in output is not RIS
+        ] {
+            assert_eq!(wipes(bytes), 0, "{bytes:?} must not register a wipe");
+        }
+    }
+
+    // The kernel hands over ~4 KiB at a time and a sequence can straddle the
+    // boundary; the scanner carries its state across `feed` calls.
+    #[test]
+    fn a_wipe_split_across_chunks_still_registers_once() {
+        for whole in [&b"\x1b[3J"[..], &b"\x1bc"[..]] {
+            for split in 1..whole.len() {
+                let mut scanner = OscScanner::new();
+                let mut hits = 0;
+                let mut count = |h: OscHit| {
+                    if matches!(h, OscHit::HistoryWiped) {
+                        hits += 1;
+                    }
+                };
+                scanner.feed(&whole[..split], &mut count);
+                scanner.feed(&whole[split..], &mut count);
+                assert_eq!(hits, 1, "{whole:?} split at {split} lost or doubled the wipe");
+            }
+        }
+    }
+
+    // A wipe must not swallow what follows it: the prompt mark the shell emits
+    // once `clear` returns arrives in the same read and has to decode.
+    #[test]
+    fn a_command_mark_after_a_wipe_is_still_decoded() {
+        let hits = collect_hits(b"\x1b[3J\x1b[H\x1b[2J\x1b]133;A\x07");
         assert!(
-            matches!(hits.first(), Some(OscHit::FullReset)),
-            "the reset comes first; got {hits:?}"
+            matches!(hits.first(), Some(OscHit::HistoryWiped)),
+            "the wipe comes first; got {hits:?}"
         );
         assert!(
             matches!(hits.last(), Some(OscHit::CommandMark { .. })),
-            "the prompt mark after the reset must survive; got {hits:?}"
+            "the prompt mark after the erases must survive; got {hits:?}"
         );
     }
 

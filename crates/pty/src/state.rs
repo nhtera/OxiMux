@@ -190,21 +190,14 @@ impl TerminalState {
             out.push(TerminalEvent::Bell { id });
         }
 
-        // A scrollback SHRINK unanchors every absolute history line recorded
-        // so far: `ESC[3J` (`clear(1)`) drops history to zero, so a mark taken
-        // at line N now names a row N below the viewport top instead of the
-        // prompt it was pinned to — and any old mark whose N happens to land
-        // inside the fresh viewport repaints as a badge on unrelated output.
-        // Reported before the marks below so a prompt mark arriving in the
-        // same chunk (`clear` returns → `precmd` fires) is kept, not wiped.
-        //
-        // Only the shrink needs reporting. A plain screen erase (`ESC[2J`,
-        // zsh's Ctrl-L) does NOT: alacritty scrolls the erased rows into
-        // history instead of discarding them, so a mark rides up with its own
-        // content and correctly maps above the viewport. Skipped entirely on
-        // the alt screen, which simply HAS no scrollback — entering a pager
-        // would otherwise read as a wipe and cost the badges of every prompt
-        // behind it, for a primary grid that comes back intact on exit.
+        // A scrollback that got SHORTER also unanchors the marks, and this is
+        // the only way to notice that one: a resize whose reflow unwraps rows
+        // back onto the screen. (The erases are caught from the byte stream
+        // below — across one read `clear(1)` nets out as history *growth*, so
+        // a length check cannot see it.) Skipped on the alt screen, which
+        // simply HAS no scrollback: entering a pager would otherwise read as a
+        // wipe and cost the badges of every prompt behind it, for a primary
+        // grid that comes back intact on exit.
         if !self.term.mode().contains(TermMode::ALT_SCREEN) {
             let history = self.term.grid().history_size();
             if history < self.last_history {
@@ -234,10 +227,12 @@ impl TerminalState {
                     OscHit::Progress { state, value } => {
                         out.push(TerminalEvent::Progress { id, state, value })
                     }
-                    // The one wipe the length check above cannot see. Pushed
-                    // in stream order, so a prompt mark that follows the reset
-                    // in the same read still lands after it and survives.
-                    OscHit::FullReset => out.push(TerminalEvent::ScrollbackReset { id }),
+                    // The wipes the length check above cannot see: across one
+                    // read `clear(1)`'s `3J`+`2J` nets out as history GROWTH
+                    // (measured 7 -> 9), and RIS leaves it untouched at zero.
+                    // Pushed in stream order, so a prompt mark that follows the
+                    // wipe in the same read lands after it and survives.
+                    OscHit::HistoryWiped => out.push(TerminalEvent::ScrollbackReset { id }),
                 }
             }
         }
@@ -1107,12 +1102,62 @@ mod tests {
     }
 
 
-    // `reset(1)` on a terminal that has not scrolled yet is the one wipe the
-    // length check cannot see: RIS blanks the grid and the scrollback IN
-    // PLACE, so `history_size` is zero on both sides while the rows the marks
-    // named are gone. It has to be recognised from the sequence itself.
+    // THE regression: the shape from the bug report. A terminal with a modest
+    // scrollback, three finished prompts near the bottom, then `clear(1)`.
+    //
+    // This is why a history-LENGTH check is not enough. `clear` sends
+    // `ESC[3J ESC[H ESC[2J`: the `3J` throws the scrollback away and the `2J`
+    // makes alacritty scroll the erased screen back into it, so across one
+    // read history goes UP (7 -> 9 here), not down. The three marks — absolute
+    // lines 14, 15, 16 — then address rows 5, 6 and 7 of the fresh viewport
+    // and paint their badges over unrelated output. Exactly the green slivers
+    // that were reported.
     #[test]
-    fn a_full_reset_with_an_empty_scrollback_still_reports_a_reset() {
+    fn clear_unanchors_the_marks_even_though_history_grows() {
+        let mut state = TerminalState::new(20, 10, 1000);
+        for i in 0..13 {
+            state.advance_collecting(SID, format!("line{i}\r\n").as_bytes());
+        }
+        let mut marks = Vec::new();
+        for _ in 0..3 {
+            for ev in state.advance_collecting(SID, b"\x1b]133;A\x07p\r\n\x1b]133;D;0\x07") {
+                if let TerminalEvent::CommandMark { line, .. } = ev {
+                    marks.push(line);
+                }
+            }
+        }
+        let before = state.term.grid().history_size();
+
+        let events = state.advance_collecting(SID, b"\x1b[3J\x1b[H\x1b[2J");
+
+        let after = state.term.grid().history_size();
+        assert!(
+            after > before,
+            "precondition: `clear` nets out as growth ({before} -> {after}), \
+             so a length check sees nothing"
+        );
+        let stale_rows: Vec<i64> = marks
+            .iter()
+            .map(|l| *l as i64 - after as i64)
+            .filter(|r| (0..10).contains(r))
+            .collect();
+        assert!(
+            !stale_rows.is_empty(),
+            "precondition: the marks land back ON screen (rows {stale_rows:?})"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, TerminalEvent::ScrollbackReset { .. })),
+            "the `3J` must be reported, or those rows keep their badges"
+        );
+    }
+
+    // `reset(1)` is the other wipe a length check cannot see — RIS blanks the
+    // grid and the scrollback in place, so on a terminal that has not scrolled
+    // `history_size` is zero on both sides while the marked rows are gone.
+    #[test]
+    fn a_full_reset_is_reported_and_the_next_prompt_survives_it() {
         let mut state = TerminalState::new(20, 10, 100);
         state.advance_collecting(SID, b"\x1b]133;A\x07one\r\n\x1b]133;A\x07two\r\n");
         assert_eq!(
@@ -1134,37 +1179,59 @@ mod tests {
             reset_at < mark_at,
             "the reset must precede a mark from the same read"
         );
-        assert_eq!(state.term.grid().history_size(), 0, "RIS leaves history at zero");
     }
 
-    // The counterpart, and the more valuable half: `clear(1)` and zsh's Ctrl-L
-    // on an empty scrollback must NOT report a reset. alacritty scrolls the
-    // erased rows INTO history rather than discarding them (measured: 0 -> 2),
-    // so every mark rides up with its own content and maps above the viewport
-    // on its own. Resetting there would throw away badges that are still
-    // correct — the marked commands are readable again by scrolling up.
+    // The counterpart, and the one worth guarding: zsh's Ctrl-L must NOT
+    // reset. It sends `2J` with no `3J`, and alacritty scrolls those rows into
+    // history rather than discarding them (measured 7 -> 16), so every mark
+    // rides up with its own content and keeps pointing at it. Resetting here
+    // would throw away badges for commands that are one scroll away.
     #[test]
-    fn a_screen_erase_scrolls_into_history_and_is_not_a_reset() {
-        for (name, seq) in [
-            ("clear(1)", &b"\x1b[3J\x1b[H\x1b[2J"[..]),
-            ("ctrl-L", &b"\x1b[H\x1b[2J"[..]),
+    fn a_bare_screen_erase_keeps_the_marks() {
+        let mut state = TerminalState::new(20, 10, 1000);
+        for i in 0..13 {
+            state.advance_collecting(SID, format!("line{i}\r\n").as_bytes());
+        }
+        state.advance_collecting(SID, b"\x1b]133;A\x07p\r\n\x1b]133;D;0\x07");
+        let before = state.term.grid().history_size();
+
+        let events = state.advance_collecting(SID, b"\x1b[H\x1b[2J");
+
+        assert!(
+            state.term.grid().history_size() > before,
+            "precondition: the erased rows scroll into history"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TerminalEvent::ScrollbackReset { .. })),
+            "a bare `2J` leaves the marks anchored to content that still exists"
+        );
+    }
+
+    // Everything a busy shell emits constantly must stay silent — partial
+    // erases (the rows above the cursor, where the marks live, survive), line
+    // erases, and any other CSI whose parameters merely contain a 3.
+    #[test]
+    fn partial_erases_and_ordinary_csi_are_not_resets() {
+        let mut state = TerminalState::new(20, 24, 100);
+        state.advance_collecting(SID, b"\x1b]133;A\x07one\r\n");
+        for seq in [
+            &b"\x1b[J"[..],       // erase below
+            &b"\x1b[0J"[..],      // erase below, explicit
+            &b"\x1b[1J"[..],      // erase above
+            &b"\x1b[3K"[..],      // erase LINE, not display
+            &b"\x1b[0;3;32m"[..], // an SGR run containing a 3
+            &b"\x1b[3;3H"[..],    // cursor addressing
+            &b"\x1b[?1049h"[..],  // alt screen in
+            &b"\x1b[?1049l"[..],  // alt screen out
         ] {
-            let mut state = TerminalState::new(20, 10, 100);
-            state.advance_collecting(SID, b"\x1b]133;A\x07one\r\n\x1b]133;A\x07two\r\n");
-            let before = state.term.grid().history_size();
-
             let events = state.advance_collecting(SID, seq);
-
-            let after = state.term.grid().history_size();
-            assert!(
-                after > before,
-                "{name}: the erased rows should scroll into history ({before} -> {after})"
-            );
             assert!(
                 !events
                     .iter()
                     .any(|e| matches!(e, TerminalEvent::ScrollbackReset { .. })),
-                "{name}: history GREW, so the marks are still anchored — not a reset"
+                "{seq:?} must not read as a wipe"
             );
         }
     }

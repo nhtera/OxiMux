@@ -83,8 +83,12 @@ fn clear_does_not_resurrect_stale_command_badges() {
                 r"printf '\033]133;A\007'",
                 "echo two",
                 r"printf '\033]133;D;0\007'",
-                // Enough output to scroll the marked rows into history.
-                "i=0; while [ $i -lt 30 ]; do echo filler$i; i=$((i+1)); done",
+                // A MODEST scrollback behind the marks — shorter than the
+                // screen. That is the shape that broke: `clear` throws the
+                // scrollback away with `3J` and its `2J` then scrolls the
+                // erased screen back in, so across the read history GROWS and
+                // the old marks land back inside the fresh viewport.
+                "i=0; while [ $i -lt 4 ]; do echo filler$i; i=$((i+1)); done",
                 // The wipe. `clear` is the real thing, terminfo and all.
                 "clear",
                 // The prompt the shell redraws afterwards, also finished.
@@ -145,18 +149,27 @@ fn clear_does_not_resurrect_stale_command_badges() {
         saw_reset,
         "`clear` wiped the scrollback but no reset was reported; got: {transcript:?}"
     );
+    assert!(
+        snapshot.history_len > 0,
+        "precondition: `clear`'s `2J` scrolled the screen back into history, \
+         so no length check could have seen the wipe; got: {transcript:?}"
+    );
 
-    // Row 0 is where the post-clear prompt actually sits. Anything else is a
-    // stale mark painting a badge on unrelated output.
+    // Exactly one badge: the prompt redrawn after the wipe. The other two are
+    // stale and must be gone. The row it lands on is NOT asserted — every mark
+    // in a read shares that read's post-advance cursor position, so where the
+    // chunk boundaries happen to fall shifts it by a row (CI caught this
+    // against a stricter assertion here).
     let rows = badges.rows(
         snapshot.history_len,
         snapshot.display_offset,
         snapshot.rows as usize,
     );
     assert_eq!(
-        rows,
-        vec![0],
-        "only the prompt redrawn after `clear` may badge (history_len={}, offset={})",
+        rows.len(),
+        1,
+        "only the prompt redrawn after `clear` may badge, got rows {rows:?} \
+         (history_len={}, offset={})",
         snapshot.history_len,
         snapshot.display_offset
     );
