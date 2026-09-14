@@ -51,7 +51,7 @@ use crate::shell::left_rail::workspace_row::{
 /// Card height: two content lines plus padding. Expressed as a multiplier of
 /// `density.h_row` rather than an absolute pixel value so it scales with the
 /// density system. Local exception: documented in `design-guidelines.md`
-/// "Approved exceptions" table alongside `ROW_HEIGHT_MULT = 1.6`.
+/// "Approved exceptions" table.
 const CARD_HEIGHT_MULT: f32 = 2.2;
 
 /// Locate-glow duration. Deliberately OUTSIDE the sub-200ms motion

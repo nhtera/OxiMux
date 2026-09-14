@@ -40,6 +40,12 @@ pub const AUTO_STASH_MESSAGE: &str = "oximux: auto-stash before merge";
 impl Repository {
     /// Merge `branch` into the current HEAD with auto-stash recovery.
     ///
+    /// Called by `oximux_worktree_ops::merge::apply_merge`, the one
+    /// non-test caller, which the desktop's `Merge into <default>` row action
+    /// reaches through `shell/workspace/merge_ops.rs`; that layer re-reads
+    /// HEAD and the operation sentinels first and turns the outcome into the
+    /// rail's merge notices.
+    ///
     /// See module docs for the error-recovery contract on merge failure.
     /// `MergeOutcome::AutoStashed` is used for any clean-merge path that
     /// pushed an auto-stash — the `pop_failed` field distinguishes the rare

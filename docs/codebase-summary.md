@@ -294,9 +294,6 @@ src/
     │   ├── branch_commits.rs branch commit log panel
     │   ├── branch_picker.rs branch switch UI
     │   └── [other SCM sub-modules]
-    └── worktree_panel/
-        ├── mod.rs          WorktreePanel entity; refresh/submit_create/pending_remove
-        └── list_render.rs  pure label/suggest-path helpers
 ```
 
 **Tier-1 foldering (2026-06):** the formerly-flat top-level modules are grouped

@@ -289,13 +289,7 @@ pub enum ChatWorktreeOutcome {
 /// built-in agent variant. Inline match — KISS over adding a
 /// method to `oximux-core`.
 fn agent_adapter_id(kind: AgentAdapter) -> &'static str {
-    match kind {
-        AgentAdapter::ClaudeCode => "claude-code",
-        AgentAdapter::Codex => "codex",
-        AgentAdapter::Pi => "pi",
-        AgentAdapter::Omp => "omp",
-        AgentAdapter::Custom => "custom",
-    }
+    crate::app_settings::last_agent::adapter_id(kind)
 }
 
 /// Defer `focus_active` until after GPUI commits the new render tree.
@@ -1286,6 +1280,18 @@ impl WorkspaceRoot {
         self.session_history.update(cx, |m, cx| m.close(cx));
     }
 
+    /// The create dialog's Agent default, resolved through
+    /// `app_settings::last_agent`'s chain: last chosen → the launch settings'
+    /// default agent → the first adapter → Skip.
+    pub(crate) fn default_agent_for_create(&self, cx: &gpui::App) -> Option<AgentAdapter> {
+        let last = crate::app_settings::last_agent::load(&self.app_state.settings_repo);
+        let launch_default = cx
+            .try_global::<oximux_settings::AgentLaunchSettings>()
+            .map(|s| s.default_agent.clone())
+            .unwrap_or_default();
+        crate::app_settings::last_agent::resolve_default(last, &launch_default)
+    }
+
     /// Open the per-row action popover at the given screen coordinates.
     /// Closes any other overlays first so backdrops don't compete.
     pub(crate) fn open_row_menu(
@@ -1800,6 +1806,7 @@ impl WorkspaceRoot {
                     project,
                     submit.name,
                     submit.agent,
+                    true,
                     // The manual dialog doesn't carry the issue URL, so no
                     // prompt prefill (the linked-issue badge still records it).
                     None,
@@ -1826,6 +1833,11 @@ impl WorkspaceRoot {
         project: Project,
         name: String,
         agent: Option<AgentAdapter>,
+        // Whether a successful create makes `agent` the dialog's next default.
+        // Only the create dialog passes `true`: its Agent picker is the
+        // user's choice. A task row's hardcoded agent is the feature's
+        // choice, and remembering it would overwrite a Skip the user set.
+        remember_agent: bool,
         agent_prompt: Option<String>,
         linked_issue: Option<String>,
         // Per-request override for the project's `setup` script. `Inherit` —
@@ -2019,6 +2031,12 @@ impl WorkspaceRoot {
                     let cwd = PathBuf::from(&workspace.worktree_path);
                     let _ = weak.update_in(cx, |this, window, cx| {
                         this.mark_rail_dirty(cx);
+                        // The create succeeded with this Agent choice (Skip
+                        // included): it becomes the dialog's next default —
+                        // when the choice was the user's (see `remember_agent`).
+                        if remember_agent {
+                            crate::app_settings::last_agent::save(&this.app_state.settings_repo, agent);
+                        }
                         cx.notify();
                         // Land on the new workspace (e.g. created from a task):
                         // select it and return the rail to the home list so it's
