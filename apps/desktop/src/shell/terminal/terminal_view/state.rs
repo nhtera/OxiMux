@@ -87,6 +87,14 @@ impl TerminalView {
                 TerminalEvent::CommandMark {
                     kind, exit, line, ..
                 } => self.apply_command_mark(*kind, *exit, *line),
+                // The scrollback these marks count their lines from is gone,
+                // so every one of them is now meaningless. Dropping them here
+                // is what keeps a `clear` from resurrecting old prompt badges
+                // on top of unrelated rows. The PTY orders this against the
+                // marks as the bytes were, so a prompt mark later in the same
+                // batch — the shell's `precmd` once `clear` returns — is
+                // applied after the drop and keeps its badge.
+                TerminalEvent::ScrollbackReset { .. } => self.drop_command_marks(),
                 // OSC 9;4 progress. state 0 clears; error/warning raises
                 // attention on an unfocused pane like a bell.
                 TerminalEvent::Progress { state, value, .. } => {
@@ -215,7 +223,7 @@ impl TerminalView {
     /// prompt-start opens a new mark at its anchor line; a command-end attaches
     /// the exit code to the most recent open mark. Intermediate phases
     /// (B/C / output-start) carry no badge of their own.
-    fn apply_command_mark(&mut self, kind: CommandMarkKind, exit: Option<i32>, line: u64) {
+    pub(super) fn apply_command_mark(&mut self, kind: CommandMarkKind, exit: Option<i32>, line: u64) {
         match kind {
             CommandMarkKind::PromptStart => {
                 self.command_marks.push(CommandMark { line, exit: None });
@@ -231,6 +239,14 @@ impl TerminalView {
             }
             CommandMarkKind::CommandStart | CommandMarkKind::OutputStart => {}
         }
+    }
+
+    /// Forget every retained command mark. Called whenever the grid's history
+    /// is wiped or reflowed — by the child (`clear(1)`, `reset`) or by the
+    /// app's own Clear — because the marks are absolute history lines and a
+    /// history that shrank no longer counts from the same origin.
+    pub(super) fn drop_command_marks(&mut self) {
+        self.command_marks.clear();
     }
 
     /// Command-mark badges for the rows currently visible: `(screen_row,

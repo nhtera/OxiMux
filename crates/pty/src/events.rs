@@ -69,6 +69,19 @@ pub enum TerminalEvent {
         exit: Option<i32>,
         line: u64,
     },
+    /// The scrollback that absolute history lines are counted from is gone:
+    /// `CSI 3J` (erase saved lines — what `clear(1)` and the app's own Clear
+    /// affordance send), `ESC c` (RIS, from `reset(1)`), or a resize whose
+    /// reflow unwrapped rows back onto the screen. Every line recorded before
+    /// it now counts from a new origin, so consumers holding them — the
+    /// command-mark gutter badges — must drop what they have.
+    ///
+    /// Ordered against `CommandMark` as the bytes were, so the prompt the
+    /// shell redraws once `clear` returns keeps its badge. Note this is NOT
+    /// raised for a bare `CSI 2J` (zsh's Ctrl-L): alacritty scrolls those rows
+    /// into history rather than discarding them, so the marks stay anchored to
+    /// content that still exists, one scroll up.
+    ScrollbackReset { id: TerminalSessionId },
     /// OSC 9;4 progress report. `state`: 0 clear, 1 set, 2 error, 3
     /// indeterminate, 4 warning. `value` is a 0..=100 percentage.
     Progress {
@@ -105,6 +118,7 @@ impl TerminalEvent {
             | TerminalEvent::Bell { id }
             | TerminalEvent::CwdChanged { id, .. }
             | TerminalEvent::CommandMark { id, .. }
+            | TerminalEvent::ScrollbackReset { id }
             | TerminalEvent::Progress { id, .. }
             | TerminalEvent::Clipboard { id, .. }
             | TerminalEvent::PtyReply { id, .. } => *id,
