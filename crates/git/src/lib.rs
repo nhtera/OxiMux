@@ -7,6 +7,7 @@
 //!
 //! Domain shapes (`GitState`, `FileStatus`, …) live in `oximux-core`.
 
+pub mod ahead_behind;
 pub mod branch;
 pub mod branch_diff;
 pub mod checkpoint;
@@ -35,6 +36,7 @@ pub mod stash;
 pub mod status;
 pub mod worktree;
 
+pub use ahead_behind::{AheadBehind, ahead_behind_against, ahead_behind_vs_base};
 pub use checkpoint::{CheckpointEngine, CheckpointError, CheckpointSha};
 pub use clone::{clone_repo, repo_name_from_url};
 pub use diff::{DiffParseError, parse_unified_diff};

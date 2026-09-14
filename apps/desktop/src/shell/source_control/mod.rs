@@ -451,6 +451,10 @@ impl SourceControlPanel {
                 // buttons in the toolbar and graph header.
                 commit_area::CommitAreaEvent::OperationCompleted => {
                     panel.commit_graph.update(cx, |g, cx| g.refresh(cx));
+                    // The rail row's `↑ ↓` and diff chips describe the same
+                    // history that just moved; re-measure now rather than
+                    // leaving them one focus-gated tick stale.
+                    window.dispatch_action(Box::new(crate::actions::RefreshWorktreeStats), cx);
                 }
             },
         );

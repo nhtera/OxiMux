@@ -4,6 +4,28 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-14 — Worktree rows show ahead/behind and a changed-file count (`feat/worktree-row-density`)
+
+- **A row says where its branch stands.** Beside the `+A −B` line diff, a
+  worktree row now carries `↑N ↓M` against its base — the SCM panel's pinned
+  base ref if one is set, else the branch's upstream, else the project's
+  default branch (locally or as `origin/<default>`). Hovering the chip
+  names the base (`2 ahead, 1 behind main`), so the number is never
+  ambiguous. A branch level with its base shows no chip, and a branch whose
+  base cannot be resolved shows nothing rather than `↑0 ↓0`.
+- **How many files, not only how many lines.** The diff chip reads
+  `~3 · +120 −40`: the changed-file count is the row count of the numstat
+  the totals were already summed from, so it costs no extra process.
+  Untracked files are not counted; the numstat runs against HEAD.
+- **Compact keeps the numbers.** Compact mode used to drop the whole second
+  line. It now moves the diff and ahead/behind chips up beside the branch
+  chip and drops only the prose, so a one-line row still shows its state.
+- **One refresh loop, kicked eagerly.** The existing focus-gated
+  per-worktree refresher grew the new numbers rather than gaining a
+  sibling timer; a finished commit or remote op in the SCM panel, and an
+  agent session ending, re-measure at once instead of waiting a tick.
+  Nothing runs git on the render path.
+
 ### 2026-09-14 — Live provisioning transcript (`feat/worktree-live-provisioning`)
 
 - **A slow create shows its progress as it happens.** Provisioning events

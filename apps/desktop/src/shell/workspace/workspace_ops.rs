@@ -1673,7 +1673,7 @@ impl WorkspaceRoot {
         // Diff counts are refreshed out-of-band by the periodic, focus-gated
         // refresh loop (see `WorkspaceRoot::run_diff_refresh_round`); here we
         // only read the latest cached snapshot. Render never shells out to git.
-        let diff_counts_snapshot = self.diff_counts.clone();
+        let worktree_stats_snapshot = self.worktree_stats.clone();
         let agent_activity_snapshot = self.agent_activity.clone();
         let agent_sideband_snapshot = self.agent_sideband.clone();
         // Merge live runtime sessions (`live_agents`) with each workspace's DB
@@ -1737,7 +1737,7 @@ impl WorkspaceRoot {
                 live_worktrees,
                 ambient_status,
                 latest_adapter,
-                diff_counts_snapshot,
+                worktree_stats_snapshot,
                 agent_activity_snapshot,
                 agent_sideband_snapshot,
                 last_active,

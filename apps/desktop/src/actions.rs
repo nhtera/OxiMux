@@ -640,6 +640,11 @@ actions!(
         /// palette's custom command list. No file watcher — reload is
         /// manual via this palette entry.
         ReloadCustomCommands,
+        /// Re-measure every worktree's git numbers now (diff totals, changed
+        /// files, ahead/behind) instead of waiting for the next focus-gated
+        /// tick. Dispatched after a commit or remote op finishes in the SCM
+        /// panel; the rail row should move the moment history did.
+        RefreshWorktreeStats,
         /// Open the settings modal (Cmd+,). Toggles closed on a second
         /// dispatch. Surfaces the terminal + AI settings that already
         /// round-trip to disk, a read-only keybindings list, and an

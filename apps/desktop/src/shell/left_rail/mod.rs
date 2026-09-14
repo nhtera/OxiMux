@@ -36,6 +36,7 @@ pub mod workspace_agent_rows;
 pub mod workspace_card;
 pub mod workspace_list_render;
 pub mod workspace_row;
+pub mod worktree_stats;
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -51,7 +52,7 @@ use oximux_core::{AgentStatus, Project, SidebandDetail, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 use oximux_storage::SettingsRepo;
 
-use crate::shell::left_rail::workspace_row::DiffCounts;
+use crate::shell::left_rail::worktree_stats::WorktreeStats;
 
 use crate::left_rail_layout;
 
@@ -168,11 +169,12 @@ pub struct LeftRail {
     /// in this set reads as "live" (green idle dot) even before its
     /// session reports a concrete status.
     live_worktrees: HashSet<String>,
-    /// Cached per-worktree diff counts (keyed by worktree path). Populated
-    /// by `WorkspaceRoot`'s concurrent diff-fetch background tasks and pushed
-    /// down here via `set_sidebar_data`. `None` for a worktree means the
-    /// count is not yet available; the card omits the chip rather than blocking.
-    diff_counts: HashMap<String, DiffCounts>,
+    /// Cached per-worktree git numbers (keyed by worktree path): diff
+    /// totals, changed-file count, ahead/behind. Populated by
+    /// `WorkspaceRoot`'s one batched stats refresher and pushed down here via
+    /// `set_sidebar_data`. A missing worktree means not yet measured; the
+    /// card omits those chips rather than blocking.
+    worktree_stats: HashMap<String, WorktreeStats>,
     /// Live tool-activity lines per workspace id ("Bash: cargo test…"),
     /// tailed from agent session logs by `WorkspaceRoot`'s background tick
     /// and pushed down with the rest of the snapshot. Rendered on Running
@@ -310,7 +312,7 @@ impl LeftRail {
             ambient_status: HashMap::new(),
             latest_adapter: HashMap::new(),
             live_worktrees: HashSet::new(),
-            diff_counts: HashMap::new(),
+            worktree_stats: HashMap::new(),
             agent_activity: HashMap::new(),
             agent_sideband: HashMap::new(),
             last_active: HashMap::new(),
@@ -837,7 +839,7 @@ impl LeftRail {
         live_worktrees: HashSet<String>,
         ambient_status: HashMap<String, AmbientAgent>,
         latest_adapter: HashMap<String, String>,
-        diff_counts: HashMap<String, DiffCounts>,
+        worktree_stats: HashMap<String, WorktreeStats>,
         agent_activity: HashMap<String, String>,
         agent_sideband: HashMap<String, SidebandDetail>,
         last_active: HashMap<String, String>,
@@ -881,7 +883,7 @@ impl LeftRail {
             || self.ambient_status != ambient_status
             || self.latest_adapter != latest_adapter
             || self.live_worktrees != live_worktrees
-            || self.diff_counts != diff_counts
+            || self.worktree_stats != worktree_stats
             || self.agent_activity != agent_activity
             || self.agent_sideband != agent_sideband
             || self.last_active != last_active
@@ -903,7 +905,7 @@ impl LeftRail {
         self.ambient_status = ambient_status;
         self.latest_adapter = latest_adapter;
         self.live_worktrees = live_worktrees;
-        self.diff_counts = diff_counts;
+        self.worktree_stats = worktree_stats;
         self.agent_activity = agent_activity;
         self.agent_sideband = agent_sideband;
         self.last_active = last_active;
@@ -1120,7 +1122,7 @@ impl Render for LeftRail {
                 self.live_worktrees.clone(),
                 self.ambient_status.clone(),
                 self.latest_adapter.clone(),
-                self.diff_counts.clone(),
+                self.worktree_stats.clone(),
                 self.workspace_agents.clone(),
                 self.expanded_workspaces.clone(),
                 self.expanded_archived.clone(),
@@ -1239,7 +1241,7 @@ fn render_workspace_list(
     live_worktrees: HashSet<String>,
     ambient_status: HashMap<String, AmbientAgent>,
     latest_adapter: HashMap<String, String>,
-    diff_counts: HashMap<String, DiffCounts>,
+    worktree_stats: HashMap<String, WorktreeStats>,
     workspace_agents: WorkspaceAgentList,
     expanded_workspaces: HashSet<String>,
     expanded_archived: HashSet<String>,
@@ -1376,7 +1378,7 @@ fn render_workspace_list(
                 row_menu_open,
                 &live_worktrees,
                 &ambient_status,
-                &diff_counts,
+                &worktree_stats,
                 &workspace_agents,
                 &expanded_workspaces,
                 focused_agent.as_ref(),
@@ -1501,7 +1503,7 @@ fn render_workspace_list(
             row_menu_open,
             &live_worktrees,
             &ambient_status,
-            &diff_counts,
+            &worktree_stats,
             &workspace_agents,
             &expanded_workspaces,
             focused_agent.as_ref(),
