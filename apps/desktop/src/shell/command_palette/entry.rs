@@ -10,8 +10,8 @@ use gpui::Action;
 
 use crate::actions::{
     ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseTab, NewTab,
-    OpenCommandPalette, OpenCommitDialog, OpenQuickOpen, ReloadCustomCommands, Search,
-    SelectSourceControlTab, ShowWelcomeWizard, SplitHorizontal, SplitVertical, ToggleLeftSidebar,
+    OpenCommandPalette, OpenCommitDialog, OpenQuickOpen, OpenWorkspaceCreate, ReloadCustomCommands,
+    Search, SelectSourceControlTab, ShowWelcomeWizard, SplitHorizontal, SplitVertical, ToggleLeftSidebar,
     ToggleRightSidebar, UiZoomIn, UiZoomOut, UiZoomReset,
 };
 
@@ -68,9 +68,28 @@ pub enum PaletteItemAction {
 #[derive(Clone)]
 pub struct PaletteItem {
     pub name: String,
+    /// What the fuzzy matcher scores: the name plus any synonyms from
+    /// [`PALETTE_KEYWORDS`], so "worktree" finds *New Workspace*. The
+    /// displayed text stays `name`.
+    pub search_text: String,
     pub keybinding: Option<String>,
     pub action: PaletteItemAction,
     pub display_group: PaletteGroup,
+}
+
+/// Extra words a built-in command answers to, keyed by its catalog name.
+/// Kept beside the catalog rather than on `CommandEntry` so the `const`
+/// table's shape does not change for the handful of rows that need them.
+pub const PALETTE_KEYWORDS: &[(&str, &str)] = &[
+    ("New Workspace", "new workspace worktree branch create"),
+];
+
+/// The text the matcher scores for a built-in command: name + keywords.
+pub fn search_text_for(name: &str) -> String {
+    match PALETTE_KEYWORDS.iter().find(|(n, _)| *n == name) {
+        Some((_, keywords)) => format!("{name} {keywords}"),
+        None => name.to_string(),
+    }
 }
 
 /// Group label for palette rows — controls the visual separator.
@@ -114,6 +133,14 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
         name: "Toggle Left Sidebar",
         action_id: Some("toggle_left_sidebar"),
         make_action: || Box::new(ToggleLeftSidebar),
+    },
+    // The one keystroke the cockpit is built around, findable by name and by
+    // what it makes (see `PALETTE_KEYWORDS`). Dispatches the same action the
+    // rail `+` and ⌘N use, so the no-project refusal lives in one place.
+    CommandEntry {
+        name: "New Workspace",
+        action_id: Some("open_workspace_create"),
+        make_action: || Box::new(OpenWorkspaceCreate),
     },
     CommandEntry {
         name: "Source Control",
@@ -193,6 +220,7 @@ pub fn build_palette_items(custom_commands: &[oximux_settings::CustomCommand]) -
         .iter()
         .map(|c| PaletteItem {
             name: c.name.to_string(),
+            search_text: search_text_for(c.name),
             keybinding: c
                 .action_id
                 .and_then(crate::keymap_registry::display_chord_for),
@@ -207,6 +235,7 @@ pub fn build_palette_items(custom_commands: &[oximux_settings::CustomCommand]) -
         }
         items.push(PaletteItem {
             name: cc.name.clone(),
+            search_text: cc.name.clone(),
             keybinding: None,
             action: PaletteItemAction::Custom(cc.prompt.clone()),
             display_group: PaletteGroup::Custom,
@@ -232,6 +261,27 @@ mod tests {
         }
     }
 
+    /// The create row is findable by what it makes, not only by its name,
+    /// and it carries the registry's PRIMARY chord (⌘N) as its hint.
+    #[test]
+    fn new_workspace_is_found_by_synonyms_and_shows_the_primary_chord() {
+        use crate::shell::command_palette::match_engine::filter_and_rank;
+        let items = build_palette_items(&[]);
+        let texts: Vec<&str> = items.iter().map(|i| i.search_text.as_str()).collect();
+        for query in ["new", "workspace", "worktree", "branch"] {
+            let ranked = filter_and_rank(query, &texts);
+            assert!(
+                ranked.iter().any(|&i| items[i].name == "New Workspace"),
+                "query {query:?} must find New Workspace"
+            );
+        }
+        let row = items.iter().find(|i| i.name == "New Workspace").unwrap();
+        assert_eq!(
+            row.keybinding.as_deref(),
+            Some(crate::keymap_registry::format_chord("secondary-n").as_str())
+        );
+    }
+
     #[test]
     fn built_items_resolve_chords_from_registry() {
         let items = build_palette_items(&[]);
@@ -249,10 +299,10 @@ mod tests {
     }
 
     #[test]
-    fn palette_commands_has_nineteen_entries() {
+    fn palette_commands_has_twenty_entries() {
         // 14 original + "Reload Custom Commands" + "Show Welcome Wizard"
-        // + the three interface-zoom rows.
-        assert_eq!(PALETTE_COMMANDS.len(), 19);
+        // + the three interface-zoom rows + "New Workspace".
+        assert_eq!(PALETTE_COMMANDS.len(), 20);
     }
 
     #[test]

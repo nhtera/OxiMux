@@ -32,12 +32,34 @@ use oximux_editor::{EditorZoomIn, EditorZoomOut, EditorZoomReset, SaveFile};
 /// Shorthand for the per-entry bind fn — each closure is non-capturing so
 /// it coerces to a `fn` pointer and the table stays `const`.
 macro_rules! entry {
+    // The common shape: one default chord ("" = unbound by default).
+    ($id:literal, $label:literal, $cat:ident, "", $action:expr) => {
+        ActionSpec {
+            id: $id,
+            label: $label,
+            category: Category::$cat,
+            default_chords: &[],
+            bind: |chord| KeyBinding::new(chord, $action, None),
+        }
+    };
     ($id:literal, $label:literal, $cat:ident, $chord:literal, $action:expr) => {
         ActionSpec {
             id: $id,
             label: $label,
             category: Category::$cat,
-            default_chord: $chord,
+            default_chords: &[$chord],
+            bind: |chord| KeyBinding::new(chord, $action, None),
+        }
+    };
+    // Several default chords for ONE action, primary first — one pane row,
+    // one `keybindings.toml` key. Rare on purpose: two chords is where
+    // muscle memory from two conventions meets, not a general feature.
+    ($id:literal, $label:literal, $cat:ident, [$($chord:literal),+ $(,)?], $action:expr) => {
+        ActionSpec {
+            id: $id,
+            label: $label,
+            category: Category::$cat,
+            default_chords: &[$($chord),+],
             bind: |chord| KeyBinding::new(chord, $action, None),
         }
     };
@@ -62,9 +84,15 @@ macro_rules! entry {
 pub const ACTIONS: &[ActionSpec] = &[
     // ---- Global -----------------------------------------------------
     entry!("open_settings", "Open settings", Global, "secondary-,", OpenSettings),
-    entry!("new_window", "New window", Global, "secondary-n", NewWindow),
+    // ⌥⌘N: ⌘N now creates a workspace (below), matching the convention
+    // where a new *unit of work* is the primary "new". A cockpit whose point
+    // is one window with tabs rarely needs a second window, so its chord is
+    // the discoverable-but-out-of-the-way one.
+    entry!("new_window", "New window", Global, "alt-secondary-n", NewWindow),
     entry!("open_project_picker", "Open project", Global, "secondary-o", OpenProjectPicker),
-    entry!("open_workspace_create", "New workspace", Global, "secondary-shift-n", OpenWorkspaceCreate),
+    // Both chords: ⌘N is the "new unit of work" convention, ⌘⇧N is the
+    // existing muscle memory. One row, one `keybindings.toml` key.
+    entry!("open_workspace_create", "New workspace", Global, ["secondary-n", "secondary-shift-n"], OpenWorkspaceCreate),
     entry!("new_agent", "New agent", Global, "secondary-shift-a", NewAgent),
     entry!("new_agent_chat", "New agent chat", Global, "secondary-shift-c", NewAgentChat),
     entry!("toggle_dictation", "Toggle voice dictation", Global, "secondary-e", ToggleDictation),

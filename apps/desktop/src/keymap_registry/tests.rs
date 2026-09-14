@@ -24,16 +24,117 @@ fn inventory_ids_are_unique() {
 #[test]
 fn inventory_default_chords_all_parse() {
     for spec in ACTIONS {
-        if spec.default_chord.is_empty() {
-            continue;
+        for chord in spec.default_chords {
+            assert!(
+                normalize_chord(chord).is_some(),
+                "default chord `{chord}` for `{}` does not parse",
+                spec.id
+            );
         }
-        assert!(
-            normalize_chord(spec.default_chord).is_some(),
-            "default chord `{}` for `{}` does not parse",
-            spec.default_chord,
-            spec.id
-        );
     }
+}
+
+/// The one multi-chord action ships both chords, primary first, and they
+/// bind as two separate key bindings under one id.
+#[test]
+fn workspace_create_owns_both_chords() {
+    let spec = spec("open_workspace_create").expect("known id");
+    assert_eq!(spec.default_chords, &["secondary-n", "secondary-shift-n"]);
+    let effective = resolve(&BTreeMap::new()).effective;
+    let chords = effective.get("open_workspace_create").unwrap();
+    assert_eq!(chords.len(), 2);
+    assert_eq!(chords[0], normalize_chord("secondary-n").unwrap());
+    assert_eq!(chords[1], normalize_chord("secondary-shift-n").unwrap());
+    // New Window moved off ⌘N, so the default keymap stays conflict-free.
+    assert_eq!(
+        effective.get("new_window").unwrap(),
+        &vec![normalize_chord("alt-secondary-n").unwrap()]
+    );
+}
+
+/// `chord_for` is the primary; `chords_for` is all of them.
+#[test]
+fn primary_and_all_chords_lookups() {
+    assert_eq!(
+        chord_for("open_workspace_create").as_deref(),
+        normalize_chord("secondary-n").as_deref()
+    );
+    assert_eq!(chords_for("open_workspace_create").len(), 2);
+    assert_eq!(display_chords_for("open_workspace_create").len(), 2);
+    assert!(chords_for("no_such_action").is_empty());
+}
+
+#[test]
+fn chord_list_parses_dedups_and_rejects_as_a_whole() {
+    let list = parse_chord_list("cmd-n, cmd-shift-n,cmd-n").unwrap();
+    assert_eq!(list.len(), 2, "duplicates collapse: {list:?}");
+    assert_eq!(list[0], normalize_chord("cmd-n").unwrap());
+    assert_eq!(parse_chord_list("").unwrap(), Vec::<String>::new());
+    assert_eq!(parse_chord_list("   ").unwrap(), Vec::<String>::new());
+    // A lone comma is the comma KEY, not an empty list — see
+    // `a_comma_key_is_not_a_separator`.
+    assert_eq!(parse_chord_list(" , ").unwrap(), vec![normalize_chord(",").unwrap()]);
+    // One bad chord rejects the whole value — a typo must never silently
+    // drop the other chord.
+    assert_eq!(parse_chord_list("cmd-n, cmd-notakey"), Err("cmd-notakey".to_string()));
+}
+
+/// The comma is a key as well as the separator: `secondary-,` (Open
+/// Settings) must survive the recorder → override → resolve round trip,
+/// and a list may contain it beside other chords.
+#[test]
+fn a_comma_key_is_not_a_separator() {
+    let settings = normalize_chord("secondary-,").unwrap();
+    assert_eq!(parse_chord_list("secondary-,").unwrap(), vec![settings.clone()]);
+    // The recorder stores the normalized form; it must parse back to itself.
+    assert_eq!(parse_chord_list(&settings).unwrap(), vec![settings.clone()]);
+    // A bare comma key, alone and inside a list.
+    assert_eq!(parse_chord_list(",").unwrap(), vec![normalize_chord(",").unwrap()]);
+    let mixed = parse_chord_list("cmd-n, cmd-,, ,").unwrap();
+    assert_eq!(
+        mixed,
+        vec![
+            normalize_chord("cmd-n").unwrap(),
+            normalize_chord("cmd-,").unwrap(),
+            normalize_chord(",").unwrap(),
+        ]
+    );
+    // A bare comma as a LATER STROKE of a multi-stroke chord is a key too —
+    // it follows whitespace, not a key character.
+    let two_stroke = normalize_chord("cmd-k ,").unwrap();
+    assert_eq!(two_stroke.split(' ').count(), 2, "{two_stroke:?} is two strokes");
+    assert_eq!(parse_chord_list("cmd-k ,").unwrap(), vec![two_stroke.clone()]);
+    assert_eq!(
+        parse_chord_list("cmd-k ,, cmd-n").unwrap(),
+        vec![two_stroke, normalize_chord("cmd-n").unwrap()]
+    );
+    // Whitespace AFTER the separator is fine; the separator itself is the
+    // comma attached to the preceding chord.
+    assert_eq!(parse_chord_list("cmd-,, cmd-n").unwrap().len(), 2);
+    assert_eq!(parse_chord_list("cmd-n,cmd-shift-n").unwrap().len(), 2);
+    // And the shipped Open Settings default round-trips through resolve.
+    let out = resolve(&overrides(&[("open_settings", "secondary-,")]));
+    assert_eq!(out.effective.get("open_settings").unwrap(), &vec![settings]);
+    assert!(out.warnings.is_empty());
+}
+
+/// A list override replaces EVERY default chord of the action; a single
+/// override on a multi-chord action leaves it with exactly that one chord.
+#[test]
+fn override_list_reaches_every_chord_of_the_action() {
+    let out = resolve(&overrides(&[("open_workspace_create", "cmd-shift-w, cmd-w")]));
+    let chords = out.effective.get("open_workspace_create").unwrap();
+    assert_eq!(chords.len(), 2);
+    assert_eq!(chords[0], normalize_chord("cmd-shift-w").unwrap());
+    assert!(out.warnings.is_empty());
+
+    let out = resolve(&overrides(&[("open_workspace_create", "cmd-shift-w")]));
+    assert_eq!(
+        out.effective.get("open_workspace_create").unwrap(),
+        &vec![normalize_chord("cmd-shift-w").unwrap()]
+    );
+    let out = resolve(&overrides(&[("open_workspace_create", "")]));
+    assert!(out.effective.get("open_workspace_create").unwrap().is_empty());
 }
 
 #[test]
@@ -71,8 +172,8 @@ fn normalize_rejects_garbage() {
 fn override_replaces_default() {
     let out = resolve(&overrides(&[("new_tab", "cmd-y")]));
     assert_eq!(
-        out.effective.get("new_tab").unwrap().as_deref(),
-        normalize_chord("cmd-y").as_deref()
+        out.effective.get("new_tab").unwrap(),
+        &vec![normalize_chord("cmd-y").unwrap()]
     );
     assert!(out.warnings.is_empty());
 }
@@ -80,7 +181,7 @@ fn override_replaces_default() {
 #[test]
 fn empty_override_unbinds() {
     let out = resolve(&overrides(&[("dismiss_overlay", "")]));
-    assert_eq!(out.effective.get("dismiss_overlay").unwrap(), &None);
+    assert!(out.effective.get("dismiss_overlay").unwrap().is_empty());
 }
 
 #[test]
@@ -91,8 +192,8 @@ fn invalid_chord_keeps_default_and_warns() {
     // this assertion would keep passing here while silently ceasing to check
     // anything real on a platform where they differ.
     assert_eq!(
-        out.effective.get("new_tab").unwrap().as_deref(),
-        normalize_chord("secondary-t").as_deref()
+        out.effective.get("new_tab").unwrap(),
+        &vec![normalize_chord("secondary-t").unwrap()]
     );
     assert_eq!(out.warnings.len(), 1);
     assert!(out.warnings[0].contains("new_tab"));
@@ -121,10 +222,9 @@ fn conflict_detection_flags_duplicate_chords() {
 
 #[test]
 fn default_bindings_cover_every_bound_action() {
-    let bound = ACTIONS
-        .iter()
-        .filter(|s| !s.default_chord.is_empty())
-        .count();
+    // One binding per CHORD, not per action — a multi-chord action binds
+    // each of its chords.
+    let bound: usize = ACTIONS.iter().map(|s| s.default_chords.len()).sum();
     assert_eq!(default_bindings().len(), bound);
 }
 
@@ -161,10 +261,36 @@ mod rebind_plan {
         let mut map = resolve(&BTreeMap::new()).effective;
         for (id, chord) in pairs {
             let spec_id = spec(id).expect("known id").id;
-            let value = (!chord.is_empty()).then(|| normalize_chord(chord).expect("parses"));
+            let value = if chord.is_empty() {
+                Vec::new()
+            } else {
+                vec![normalize_chord(chord).expect("parses")]
+            };
             map.insert(spec_id, value);
         }
         map
+    }
+
+    /// A multi-chord action that DROPS one chord and keeps the other: the
+    /// dropped chord is shadowed, and the kept one is re-bound after its own
+    /// shadow so the surviving binding is the most recent.
+    #[test]
+    fn dropping_one_of_two_chords_shadows_it_and_rebinds_the_survivor() {
+        let prev = effective(&[]);
+        let next = effective(&[("open_workspace_create", "secondary-n")]);
+        let steps = plan_rebind(&prev, &next);
+        assert!(shadow_index(&steps, "secondary-shift-n") < steps.len());
+        assert!(
+            shadow_index(&steps, "secondary-n")
+                < bind_index(&steps, "open_workspace_create", "secondary-n")
+        );
+        let dropped = normalize_chord("secondary-shift-n").expect("parses");
+        assert!(
+            !steps
+                .iter()
+                .any(|s| matches!(s, RebindStep::Bind(_, c) if *c == dropped)),
+            "the dropped chord must not be re-bound"
+        );
     }
 
     fn bind_index(steps: &[RebindStep], id: &str, chord: &str) -> usize {

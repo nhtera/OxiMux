@@ -32,9 +32,12 @@ pub(crate) enum RebindStep {
 pub(crate) fn plan_rebind(prev: &EffectiveMap, next: &EffectiveMap) -> Vec<RebindStep> {
     let mut affected: BTreeSet<String> = BTreeSet::new();
     for spec in ACTIONS {
-        let old = prev.get(spec.id).cloned().flatten();
-        let new = next.get(spec.id).cloned().flatten();
+        let old = prev.get(spec.id).cloned().unwrap_or_default();
+        let new = next.get(spec.id).cloned().unwrap_or_default();
         if old != new {
+            // Every chord on either side of a changed entry — an action that
+            // keeps one chord and drops another still has the dropped one
+            // shadowed and the kept one re-bound after it.
             affected.extend(old);
             affected.extend(new);
         }
@@ -42,10 +45,10 @@ pub(crate) fn plan_rebind(prev: &EffectiveMap, next: &EffectiveMap) -> Vec<Rebin
 
     let mut steps: Vec<RebindStep> = affected.iter().cloned().map(RebindStep::Shadow).collect();
     for spec in ACTIONS {
-        if let Some(chord) = next.get(spec.id).and_then(|c| c.as_ref())
-            && affected.contains(chord)
-        {
-            steps.push(RebindStep::Bind(spec.id, chord.clone()));
+        for chord in next.get(spec.id).into_iter().flatten() {
+            if affected.contains(chord) {
+                steps.push(RebindStep::Bind(spec.id, chord.clone()));
+            }
         }
     }
     steps
