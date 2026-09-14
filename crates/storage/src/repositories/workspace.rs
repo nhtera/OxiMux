@@ -380,6 +380,17 @@ impl WorkspaceRepo {
         branch: &str,
         worktree_path: &str,
     ) -> Result<Workspace, StorageError> {
+        // One row per directory. A second adoption of a path a row already
+        // points at (a scan that started before the first adoption landed,
+        // reporting the worktree as still untracked) is a conflict, not a
+        // suffixed sibling — two rows on one worktree would each believe
+        // they own it.
+        if self.get_by_worktree_path(worktree_path)?.is_some() {
+            return Err(StorageError::Conflict {
+                table: "workspaces".into(),
+                constraint: "worktree_path".into(),
+            });
+        }
         let id = new_id();
         let created_at = now();
         let status = "active";

@@ -353,3 +353,18 @@ fn deleting_an_adopted_row_drops_its_adoption() {
     assert!(!workspaces.is_adopted(&w.id).unwrap());
     assert!(!workspaces.is_unvetted(&w.id).unwrap());
 }
+
+/// Two rows must never point at one directory: a stale scan offering an
+/// already-adopted worktree again is refused, not given a suffixed slug.
+#[test]
+fn adopting_an_already_tracked_path_is_a_conflict() {
+    let (project_id, workspaces, _, _) = project_and_repos();
+    workspaces
+        .adopt(&project_id, "topic", "topic", "topic", "/elsewhere/topic")
+        .expect("first adoption");
+    let err = workspaces
+        .adopt(&project_id, "topic", "topic-2", "topic", "/elsewhere/topic")
+        .expect_err("same directory twice");
+    assert!(matches!(err, StorageError::Conflict { .. }), "got {err:?}");
+    assert_eq!(workspaces.list_for_project(&project_id).unwrap().len(), 1);
+}

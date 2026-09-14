@@ -1451,12 +1451,10 @@ fn render_workspace_list(
         ));
         // The same cross-project treatment for untracked worktrees: flat mode
         // has no project group to nest the disclosure under.
-        let mut flat_untracked: Vec<(Project, UntrackedWorktree)> = Vec::new();
+        let mut flat_untracked: Vec<UntrackedWorktree> = Vec::new();
         for project in projects.iter() {
             if let Some(rows) = untracked_by_project.get(&project.id) {
-                for u in rows {
-                    flat_untracked.push((project.clone(), u.clone()));
-                }
+                flat_untracked.extend(rows.iter().cloned());
             }
         }
         col = col.child(crate::shell::left_rail::untracked_section::render_untracked_section(

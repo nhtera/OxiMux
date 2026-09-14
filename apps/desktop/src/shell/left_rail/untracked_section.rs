@@ -13,7 +13,6 @@ use gpui::{
     Entity, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, WeakEntity, div, prelude::FluentBuilder as _, px, svg,
 };
-use oximux_core::Project;
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::left_rail::LeftRail;
@@ -38,7 +37,7 @@ const ROW_OPACITY: f32 = 0.8;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_untracked_section(
     toggle_key: &str,
-    rows: Vec<(Project, UntrackedWorktree)>,
+    rows: Vec<UntrackedWorktree>,
     expanded: bool,
     rail: &Entity<LeftRail>,
     weak_root: &WeakEntity<WorkspaceRoot>,
@@ -114,7 +113,7 @@ pub(crate) fn render_untracked_section(
         return section;
     }
     let mut list = div().flex().flex_col().w_full().opacity(ROW_OPACITY);
-    for (ix, (_project, u)) in rows.into_iter().enumerate() {
+    for (ix, u) in rows.into_iter().enumerate() {
         list = list.child(render_untracked_row(ix, u, weak_root, theme, density, typography));
     }
     section = section.child(list);
@@ -218,7 +217,7 @@ fn render_untracked_row(
                 )
                 .child(
                     div()
-                        .id(SharedString::from(format!("{}-path", u.project_id)))
+                        .id(SharedString::from(format!("untracked-{}-{ix}-path", u.project_id)))
                         .min_w_0()
                         .overflow_hidden()
                         .whitespace_nowrap()

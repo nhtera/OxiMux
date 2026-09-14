@@ -14,6 +14,7 @@ pub mod project_picker;
 pub mod provision_card;
 pub mod provision_progress;
 pub mod provisioning_transcript;
+pub mod rail_data;
 pub mod rename_ops;
 pub mod session_merge;
 pub mod workspace_dialog;

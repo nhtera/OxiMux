@@ -37,8 +37,9 @@ impl UntrackedWorktree {
 }
 
 /// One path in the shape every comparison here uses: the real directory when
-/// it exists, else its lexical normalisation (so a trailing slash or a `..`
-/// segment does not make two spellings of a gone directory look different).
+/// it exists, else its components (so a trailing slash or a `.` segment does
+/// not make two spellings of a gone directory look different; a `..` segment
+/// is kept as written, since resolving it without the filesystem would guess).
 ///
 /// `canonicalize` is the precedent `Repository::worktree_at` set: git's
 /// `--porcelain` output is not `fs::canonicalize`'s shape (on Windows git

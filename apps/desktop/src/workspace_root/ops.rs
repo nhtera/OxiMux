@@ -150,6 +150,7 @@ impl WorkspaceRoot {
         self.stats_round = self.stats_round.wrapping_add(1);
         self.discovery_due = false;
         let discovery = if scan { self.discovery_targets() } else { Vec::new() };
+        let epoch_at_start = self.adoption_epoch;
         if targets.is_empty() {
             // Nothing left to measure, so nothing cached may survive: the
             // eviction below only runs after a round, and a path re-added
@@ -232,9 +233,17 @@ impl WorkspaceRoot {
                 let open: std::collections::HashSet<&str> =
                     this.app_state.recent_projects.iter().map(|p| p.id.as_str()).collect();
                 this.untracked_by_project.retain(|pid, _| open.contains(pid.as_str()));
-                for (project_id, untracked) in found {
-                    if let Some(list) = untracked {
-                        this.untracked_by_project.insert(project_id, list);
+                if this.adoption_epoch != epoch_at_start {
+                    // An adoption or stop-tracking landed while this scan ran:
+                    // its tracked set is stale, so a worktree just adopted
+                    // would be offered again. Throw the findings away and
+                    // scan afresh next round.
+                    this.discovery_due = !found.is_empty() || this.discovery_due;
+                } else {
+                    for (project_id, untracked) in found {
+                        if let Some(list) = untracked {
+                            this.untracked_by_project.insert(project_id, list);
+                        }
                     }
                 }
                 this.diff_refresh_in_flight = false;

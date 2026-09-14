@@ -444,6 +444,10 @@ pub struct WorkspaceRoot {
     /// tracked, a project un-hid its group): the next round scans regardless
     /// of the cadence.
     pub(crate) discovery_due: bool,
+    /// Bumped by every adoption and stop-tracking. A discovery round records
+    /// it at start and discards its findings if it moved meanwhile: the scan
+    /// subtracted the tracked rows as they were, and they are not any more.
+    pub(crate) adoption_epoch: u64,
     /// Cached latest agent-session status per workspace id — same
     /// lifecycle as [`Self::rail_workspaces_by_project`].
     pub(crate) rail_latest_status: crate::shell::left_rail::LatestStatusMap,
@@ -1371,6 +1375,7 @@ impl WorkspaceRoot {
             untracked_by_project: HashMap::new(),
             stats_round: 0,
             discovery_due: true,
+            adoption_epoch: 0,
             force_delete_offer: None,
             rail_workspaces_by_project: HashMap::new(),
             rail_archived_by_project: HashMap::new(),

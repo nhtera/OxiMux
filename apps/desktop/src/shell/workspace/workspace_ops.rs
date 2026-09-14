@@ -14,12 +14,12 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, WeakEntity, Window};
-use oximux_core::{AgentAdapter, AgentSession, Project, Workspace};
+use oximux_core::{AgentAdapter, Project, Workspace};
 
 use crate::shell::agent_presentation::AmbientAgent;
 use oximux_git::{Repository, derive_slug, validate_slug};
 use oximux_settings::{Density, ScriptKind, Theme, Typography};
-use oximux_storage::{AgentSessionRepo, ProjectRepo, WorkspaceRepo};
+use oximux_storage::ProjectRepo;
 
 use crate::shell::left_rail::open_in;
 use crate::shell::left_rail::row_menu::{RowCapabilities, ScriptAvail};
@@ -30,7 +30,7 @@ use crate::project_panes_factory::{
 };
 use crate::shell::add_project_dialog::{AddProjectDialog, OnPick as OnAddProjectPick};
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
-use crate::shell::left_rail::{LatestStatusMap, RailAgentTarget, WorkspaceAgentList};
+use crate::shell::left_rail::{RailAgentTarget, WorkspaceAgentList};
 use crate::shell::pane_group::FocusedRailAgent;
 use crate::shell::workspace::provisioning_transcript::{
     provisioning_transcript_path, stream_provisioning,
@@ -150,6 +150,7 @@ pub(crate) fn build_add_project_dialog(
 // because this module is the desktop's door to it.
 use crate::shell::workspace::base_choice::BaseChoice;
 use crate::shell::workspace::discovery::UntrackedWorktree;
+use crate::shell::workspace::rail_data::{gather_rail_db_data, workspaces_with_primary_for};
 pub use oximux_worktree_ops::{
     CreateBase, CreateOutcome, HostDerivedLocator, LocateError, Provision, ProvisionEvent,
     SetupTranscript, WorktreeLocator, create_workspace_with_rollback, provisioning_marker,
@@ -166,87 +167,6 @@ const MAX_TAB_TITLE_CHARS: usize = 64;
 
 // The provisioning transcript (its path and the writer that drains the event
 // stream into it) lives in `provisioning_transcript.rs`.
-
-/// Body of [`WorkspaceRoot::workspaces_with_primary`] as a free function so
-/// the rail gather can run it on the background executor (SQLite + a
-/// `.git` stat — never call from a render path).
-fn workspaces_with_primary_for(repo: &WorkspaceRepo, project: &Project) -> Vec<Workspace> {
-    let mut list = match repo.list_for_project(&project.id) {
-        Ok(list) => list,
-        Err(err) => {
-            tracing::warn!(?err, project_id = %project.id, "list_for_project failed");
-            Vec::new()
-        }
-    };
-    let has_root_row = list.iter().any(|w| w.worktree_path == project.root_path);
-    if !has_root_row {
-        // Git repo → branch-based primary ("main"); plain folder → a single
-        // "Folder" row with empty branch. Synthesized for display only;
-        // identified later by `worktree_path == project.root_path`.
-        let is_git = Path::new(&project.root_path).join(".git").exists();
-        let (name, slug, branch) = if is_git {
-            (
-                project.default_branch.clone(),
-                project.default_branch.clone(),
-                project.default_branch.clone(),
-            )
-        } else {
-            (project.name.clone(), String::new(), String::new())
-        };
-        list.insert(
-            0,
-            Workspace {
-                id: format!("primary:{}", project.id),
-                project_id: project.id.clone(),
-                // Not a branch OxiMux minted: a synthesized row or a
-                // fixture. `false` is the reading that never deletes.
-                branch_minted: false,
-                name,
-                slug,
-                branch,
-                worktree_path: project.root_path.clone(),
-                status: "active".to_string(),
-                created_at: String::new(),
-                archived_at: None,
-                linked_issue: None,
-                tint: None,
-                // Synthesized primary row; always pinned first, never reordered.
-                sort_order: 0.0,
-                pinned: false,
-                // Permanently blank: this row is the project root, synthesized
-                // at render time with no `workspaces` row behind it, so there
-                // is nowhere for a progress write to land. `worktree ls` omits
-                // it for the same reason.
-                comment: String::new(),
-                phase: String::new(),
-            },
-        );
-    }
-    list
-}
-
-/// One full pass of the sidebar's DB-backed data across every recent
-/// project: workspace rows (incl. synthesized primaries) + the latest
-/// agent-session status and adapter per workspace. Runs on the background
-/// executor — this is the ONLY place the rail touches SQLite.
-///
-/// The adapter map (workspace id → adapter slug of the latest session)
-/// gates the activity tail: only the primary CLI journals session logs,
-/// so other adapters never get a tail attempt.
-/// Outputs of one rail DB gather, in the order the `WorkspaceRoot::rail_*`
-/// fields consume them: workspaces-by-project, latest status, latest adapter
-/// slug, last-active timestamp, and the FULL per-workspace session list
-/// (workspace id → all `agent_sessions` rows, `started_at` DESC) the
-/// live↔history merge consumes — each keyed as documented on those fields.
-type RailDbData = (
-    HashMap<String, Vec<Workspace>>,
-    HashMap<String, Vec<Workspace>>,
-    LatestStatusMap,
-    HashMap<String, String>,
-    HashMap<String, String>,
-    HashMap<String, Vec<AgentSession>>,
-    HashSet<String>,
-);
 
 /// Find the [`Project`] that owns `workspace`, by its `project_id` — NOT from
 /// `WorkspaceRoot::active_project`.
@@ -317,82 +237,6 @@ fn workspace_delete_target(
     })
 }
 
-fn gather_rail_db_data(
-    workspace_repo: &WorkspaceRepo,
-    agent_repo: &AgentSessionRepo,
-    project_repo: &ProjectRepo,
-    projects: &[Project],
-) -> RailDbData {
-    // Which projects hide their untracked-worktrees group. One indexed point
-    // read per project, beside the archived query below.
-    let mut hidden_untracked: HashSet<String> = HashSet::new();
-    let mut workspaces_by_project: HashMap<String, Vec<Workspace>> =
-        HashMap::with_capacity(projects.len());
-    // Archived rows ride along in this same background pass rather than
-    // loading lazily on group expansion: the group header shows a count, so
-    // they are needed whether or not the group is open, and one extra indexed
-    // SELECT per project is noise beside the per-workspace session query below.
-    let mut archived_by_project: HashMap<String, Vec<Workspace>> =
-        HashMap::with_capacity(projects.len());
-    let mut latest_status: LatestStatusMap = HashMap::new();
-    let mut latest_adapter: HashMap<String, String> = HashMap::new();
-    // Recency key for the dashboard's in-tier sort: a finished session's
-    // `ended_at`, else its `started_at` (still running). Raw RFC-3339 string —
-    // lexicographic ordering matches chronological for these UTC `Z` stamps.
-    let mut last_active: HashMap<String, String> = HashMap::new();
-    // Every session per workspace (not just the most-recent) so the rail can
-    // list multiple agents; the single-row caches above still derive from the
-    // newest (`first()`), preserving today's collapsed-dot behavior.
-    let mut workspace_sessions: HashMap<String, Vec<AgentSession>> = HashMap::new();
-    for project in projects {
-        let list = workspaces_with_primary_for(workspace_repo, project);
-        for workspace in &list {
-            let sessions = match agent_repo.list_for_workspace(&workspace.id) {
-                Ok(sessions) => sessions,
-                Err(err) => {
-                    tracing::warn!(?err, workspace_id = %workspace.id, "list_for_workspace failed");
-                    Vec::new()
-                }
-            };
-            if let Some(session) = sessions.first() {
-                latest_adapter.insert(workspace.id.clone(), session.adapter_id.clone());
-                if let Some(ts) = session
-                    .ended_at
-                    .clone()
-                    .or_else(|| session.started_at.clone())
-                {
-                    last_active.insert(workspace.id.clone(), ts);
-                }
-            }
-            latest_status.insert(
-                workspace.id.clone(),
-                sessions.first().map(|s| s.status.clone()),
-            );
-            workspace_sessions.insert(workspace.id.clone(), sessions);
-        }
-        workspaces_by_project.insert(project.id.clone(), list);
-        let archived = match workspace_repo.list_archived_for_project(&project.id) {
-            Ok(rows) => rows,
-            Err(err) => {
-                tracing::warn!(?err, project_id = %project.id, "list_archived_for_project failed");
-                Vec::new()
-            }
-        };
-        archived_by_project.insert(project.id.clone(), archived);
-        if project_repo.hide_untracked(&project.id).unwrap_or(false) {
-            hidden_untracked.insert(project.id.clone());
-        }
-    }
-    (
-        workspaces_by_project,
-        archived_by_project,
-        latest_status,
-        latest_adapter,
-        last_active,
-        workspace_sessions,
-        hidden_untracked,
-    )
-}
 
 /// Outcome the *New Agent in a fresh worktree* flow hands back to the chat view.
 /// The host resolves the worktree create as a first-class `Workspace` (DB row +
@@ -1458,10 +1302,12 @@ impl WorkspaceRoot {
             return;
         };
         // Adoption state gates the script actions and offers `Stop tracking`.
-        // A lookup failure reads as un-vetted: withholding a script action is
-        // the safe direction, running one unread is not.
+        // Each lookup fails in its own safe direction: an unknown un-vetted
+        // state withholds the script actions (running unread code is the
+        // harm), and an unknown adopted state withholds `Stop tracking` (a
+        // row dropped by mistake orphans a worktree the app created).
         let repo = &self.app_state.workspace_repo;
-        let adopted = repo.is_adopted(&workspace.id).unwrap_or(true);
+        let adopted = repo.is_adopted(&workspace.id).unwrap_or(false);
         let unvetted = repo.is_unvetted(&workspace.id).unwrap_or(true);
         let caps = RowCapabilities {
             is_primary: is_primary_row(&workspace, &project.root_path),
@@ -1469,7 +1315,9 @@ impl WorkspaceRoot {
             adopted,
             unvetted,
             scripts: avail,
-            can_merge: !project.default_branch.is_empty(),
+            // A detached checkout (an adopted worktree with no branch) has
+            // nothing to merge, whatever the project's default is.
+            can_merge: !project.default_branch.is_empty() && !workspace.branch.is_empty(),
             open_in: open_in::effective_apps(&crate::git_settings::settings(cx)),
             project,
         };
@@ -1496,6 +1344,26 @@ impl WorkspaceRoot {
         cx: &mut Context<Self>,
     ) {
         let cwd = PathBuf::from(&workspace.worktree_path);
+        // The menu already withholds these rows on an un-vetted worktree, but
+        // the guard belongs on the operation, not the menu: nothing runs out
+        // of a directory somebody else set up until the user has read it,
+        // whoever the caller is. A lookup failure withholds, never runs.
+        if self
+            .app_state
+            .workspace_repo
+            .is_unvetted(&workspace.id)
+            .unwrap_or(true)
+        {
+            self.push_toast(
+                crate::shell::toast::ToastKind::Info,
+                format!(
+                    "Scripts in \u{201c}{}\u{201d} have not been reviewed. Use Review scripts\u{2026} first.",
+                    workspace.name
+                ),
+                cx,
+            );
+            return;
+        }
         let scripts = crate::project_scripts_loader::load_for_project(&cwd);
         let Some(script) = scripts.script(kind) else {
             tracing::info!(

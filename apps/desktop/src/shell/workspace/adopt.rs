@@ -81,6 +81,11 @@ impl WorkspaceRoot {
                 if let Some(list) = self.untracked_by_project.get_mut(&u.project_id) {
                     list.retain(|x| x.path != u.path);
                 }
+                // A scan that started before this adoption would report the
+                // worktree as still untracked; the round discards results
+                // from before the epoch moved and scans again.
+                self.adoption_epoch = self.adoption_epoch.wrapping_add(1);
+                self.discovery_due = true;
                 self.push_toast(
                     ToastKind::Info,
                     format!(
@@ -128,7 +133,9 @@ impl WorkspaceRoot {
                             cx,
                         );
                         // Let the next round find it again without waiting
-                        // for the discovery cadence.
+                        // for the discovery cadence, and discard a scan that
+                        // ran against the row that no longer exists.
+                        this.adoption_epoch = this.adoption_epoch.wrapping_add(1);
                         this.discovery_due = true;
                     }
                     Err(err) => crate::shell::toast::toast_op_error(
@@ -168,9 +175,14 @@ impl WorkspaceRoot {
             crate::shell::toast::toast_op_error(cx, "Hide untracked worktrees", &err.to_string());
             return;
         }
+        // The gather re-reads the preference, but the next round's scan
+        // consults the cached set before that gather lands — so keep the
+        // cache in step here, or un-hiding would be a no-op for a cadence.
         if hide {
+            self.rail_hidden_untracked.insert(project_id.to_string());
             self.untracked_by_project.remove(project_id);
         } else {
+            self.rail_hidden_untracked.remove(project_id);
             self.discovery_due = true;
         }
         self.mark_rail_dirty(cx);
@@ -199,11 +211,25 @@ impl WorkspaceRoot {
             );
             return;
         }
-        let panes = self
-            .project_panes_by_project
-            .get(&workspace.project_id)
-            .cloned()
-            .or_else(|| self.active_project_panes());
+        // The ROW's project's panes, as `run_workspace_script` does: a project
+        // that has never been activated in this window has no panes yet, so
+        // activate it first; a row whose project is not open gets a decline,
+        // never another project's pane group.
+        let mut panes = self.project_panes_by_project.get(&workspace.project_id).cloned();
+        if panes.is_none() {
+            let Some(project) = crate::shell::workspace::workspace_ops::resolve_project_for_workspace(
+                &self.app_state.recent_projects,
+                &workspace,
+            ) else {
+                tracing::warn!(
+                    project_id = %workspace.project_id,
+                    "review_workspace_scripts: row's project is not open"
+                );
+                return;
+            };
+            self.set_active_project(project, window, cx);
+            panes = self.project_panes_by_project.get(&workspace.project_id).cloned();
+        }
         if let Some(panes) = panes {
             panes.update(cx, |p, cx| {
                 p.open_or_activate_editor_tab(path, window, cx);

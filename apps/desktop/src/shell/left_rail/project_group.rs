@@ -209,10 +209,7 @@ pub fn render_project_group(
     ));
     col = col.child(render_untracked_section(
         &project.id,
-        untracked
-            .into_iter()
-            .map(|u| (project.clone(), u))
-            .collect(),
+        untracked,
         untracked_expanded,
         &rail,
         &weak_root,
