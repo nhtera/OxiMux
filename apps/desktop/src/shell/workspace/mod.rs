@@ -9,6 +9,8 @@ pub mod configured_locator;
 pub mod merge_notices;
 pub mod merge_ops;
 pub mod project_picker;
+pub mod provision_card;
+pub mod provisioning_transcript;
 pub mod rename_ops;
 pub mod session_merge;
 pub mod workspace_dialog;

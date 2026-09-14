@@ -294,6 +294,10 @@ pub struct WorkspaceRoot {
     /// cross-surface events (agent done, commit failed, PR opened, clipboard)
     /// that the status bar's persistent state doesn't cover.
     pub(crate) toast_layer: Entity<ToastLayer>,
+    /// Live provisioning cards (bottom-left), one per in-flight worktree
+    /// create. Fed by a tee off the transcript writer; shown only once a
+    /// create has run longer than a moment or its setup script has started.
+    pub(crate) provision_layer: Entity<crate::shell::workspace::provision_card::ProvisionLayer>,
     /// The global "Listening…" voice-dictation HUD. Renders a floating pill when
     /// ⌘E dictates into a terminal or editor pane (the chat composer has its own
     /// in-line recording bar). Registered with the dictation service so the event
@@ -908,6 +912,13 @@ impl WorkspaceRoot {
         // Register this window's layer as the active toast surface up front so
         // toasts work before the first window-activation event arrives.
         crate::shell::toast::set_active_toast_layer(cx, toast_layer.downgrade());
+        let provision_layer = cx.new(|_| {
+            crate::shell::workspace::provision_card::ProvisionLayer::new(
+                theme,
+                density,
+                typography.clone(),
+            )
+        });
         // This window's voice-dictation HUD (floating "Listening…" pill for
         // terminal/editor panes). Each window owns its own; the session's
         // `DictationTarget::Hud` carries this handle, so no global registration
@@ -1318,6 +1329,7 @@ impl WorkspaceRoot {
             settings_modal,
             onboarding,
             toast_layer,
+            provision_layer,
             dictation_hud,
             workspace_dialog,
             confirm_dialog: None,

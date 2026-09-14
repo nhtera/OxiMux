@@ -32,6 +32,9 @@ use crate::shell::add_project_dialog::{AddProjectDialog, OnPick as OnAddProjectP
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
 use crate::shell::left_rail::{LatestStatusMap, RailAgentTarget, WorkspaceAgentList};
 use crate::shell::pane_group::FocusedRailAgent;
+use crate::shell::workspace::provisioning_transcript::{
+    provisioning_transcript_path, stream_provisioning,
+};
 use crate::shell::workspace_dialog::{WorkspaceDialogMode, WorkspaceDialogSubmit};
 use crate::workspace_root::WorkspaceRoot;
 
@@ -160,106 +163,8 @@ const MAX_DEFAULT_TABS: usize = 8;
 /// Upper bound on one `default_tabs` title, in characters.
 const MAX_TAB_TITLE_CHARS: usize = 64;
 
-/// Provisioning transcripts retained per workspace slug.
-const KEEP_TRANSCRIPTS: usize = 3;
-
-/// Where one worktree's provisioning transcript lives:
-/// `<data_dir>/projects/<project_id>/provisioning/<slug>-<millis>.log`.
-///
-/// Outside the worktree deliberately. The transcript matters most when setup
-/// failed, and that is exactly when the worktree has been rolled back — a file
-/// written inside it would be deleted by the rollback that made it interesting.
-///
-/// A fresh path per attempt, not one file per slug. Overwriting in place looks
-/// tidier and is wrong: the editor activates an already-open tab for a path
-/// without re-reading it, so a second failed create would show the user the
-/// *first* failure's output while the file on disk said otherwise. Older
-/// transcripts for the same slug are pruned so this stays a log and not an
-/// archive.
-pub(crate) fn provisioning_transcript_path(project_id: &str, slug: &str) -> PathBuf {
-    let dir = crate::app_paths::data_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("projects")
-        .join(project_id)
-        .join("provisioning");
-    prune_transcripts(&dir, slug, KEEP_TRANSCRIPTS);
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    dir.join(format!("{slug}-{stamp}.log"))
-}
-
-/// Keep the `keep` newest transcripts for `slug`, delete the rest.
-///
-/// By name, not by mtime: the name carries the timestamp, and lexicographic
-/// order over a fixed-width millisecond stamp is chronological order. Every
-/// failure here is ignored — pruning a log must never be able to affect a
-/// worktree create.
-fn prune_transcripts(dir: &Path, slug: &str, keep: usize) {
-    let prefix = format!("{slug}-");
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return; // first run for this project: nothing to prune
-    };
-    let mut mine: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension().is_some_and(|e| e == "log")
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(&prefix))
-        })
-        .collect();
-    if mine.len() < keep {
-        return;
-    }
-    mine.sort();
-    // `keep - 1`: one slot is about to be taken by the transcript this call is
-    // making a path for.
-    for stale in mine.iter().take(mine.len().saturating_sub(keep - 1)) {
-        let _ = std::fs::remove_file(stale);
-    }
-}
-
-/// Drain [`ProvisionEvent`]s into the transcript file until the sender drops.
-///
-/// Flushed per event rather than at the end so `tail -f` shows a long install
-/// progressing, and so a hard kill mid-setup still leaves the lines that
-/// explain where it got to. Every IO error here is swallowed: failing to write
-/// a log must not be able to fail a worktree creation that otherwise worked.
-pub(crate) async fn stream_provisioning(
-    path: PathBuf,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<ProvisionEvent>,
-) {
-    use std::io::Write as _;
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let mut file = match std::fs::File::create(&path) {
-        Ok(f) => f,
-        Err(err) => {
-            tracing::warn!(?err, path = %path.display(), "provisioning transcript unavailable");
-            // Still drain, or the unbounded channel grows for the whole run.
-            while rx.recv().await.is_some() {}
-            return;
-        }
-    };
-    while let Some(event) = rx.recv().await {
-        let line = match event {
-            ProvisionEvent::IncludeCopied(p) => format!("include: copied {}", p.display()),
-            ProvisionEvent::IncludeSkipped(skip) => format!("include: skipped {skip}"),
-            ProvisionEvent::FreshenStarted(branch) => format!("fetching {branch}…"),
-            ProvisionEvent::FreshenFinished(summary) => format!("== {summary}"),
-            ProvisionEvent::SetupSkipped(reason) => format!("== {reason}"),
-            ProvisionEvent::SetupStarted(script) => format!("$ {script}"),
-            ProvisionEvent::SetupLine(line) => line,
-            ProvisionEvent::SetupFinished(outcome) => format!("== {}", outcome.summary()),
-        };
-        let _ = writeln!(file, "{line}");
-        let _ = file.flush();
-    }
-}
+// The provisioning transcript (its path and the writer that drains the event
+// stream into it) lives in `provisioning_transcript.rs`.
 
 /// Body of [`WorkspaceRoot::workspaces_with_primary`] as a free function so
 /// the rail gather can run it on the background executor (SQLite + a
@@ -2082,6 +1987,16 @@ impl WorkspaceRoot {
             return;
         };
 
+        // The live card for this create, begun on the main thread so the
+        // reveal timer starts with the create. The transcript path is
+        // decided here too, so the card's `Open transcript` and the writer
+        // name the same file.
+        let transcript_path = provisioning_transcript_path(&project_id, &slug);
+        let provision_layer = self.provision_layer.clone();
+        let card_id = provision_layer.update(cx, |layer, cx| {
+            layer.begin(slug.clone(), transcript_path.clone(), cx)
+        });
+
         cx.spawn(async move |weak, cx| {
             if let Some(parent) = worktree_path.parent()
                 && let Err(err) = std::fs::create_dir_all(parent)
@@ -2097,15 +2012,19 @@ impl WorkspaceRoot {
             // into the worktree because the case that most needs reading is
             // the one where the worktree no longer exists — a failed setup
             // rolls it back, and a transcript inside it would go with it.
-            let transcript_path = provisioning_transcript_path(&project_id, &slug);
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ProvisionEvent>();
             // Drained on the background executor so the file grows while setup
             // runs: a 10-minute `pnpm install` is watchable with `tail -f`
-            // instead of appearing as a frozen window.
+            // instead of appearing as a frozen window. The tee feeds the live
+            // card from the same stream, drained on the foreground in batches.
+            let (tee_tx, tee_rx) = tokio::sync::mpsc::unbounded_channel::<ProvisionEvent>();
             let writer = {
                 let transcript_path = transcript_path.clone();
-                cx.background_spawn(async move { stream_provisioning(transcript_path, rx).await })
+                cx.background_spawn(async move {
+                    stream_provisioning(transcript_path, rx, Some(tee_tx)).await
+                })
             };
+            super::provision_card::drain_into(provision_layer.clone(), card_id, tee_rx, cx);
             let outcome = create_workspace_with_rollback(
                 &project,
                 &name_trimmed,
@@ -2127,6 +2046,19 @@ impl WorkspaceRoot {
             // about to; awaiting it means the file is complete before anything
             // below offers to open it.
             writer.await;
+            // The card's terminal state, from the create's own outcome —
+            // every failure shape reaches it the same way, and a fast success
+            // that never showed a card is removed silently.
+            let card_result = match &outcome {
+                CreateOutcome::Created(_) => Ok(()),
+                CreateOutcome::SetupFailed { transcript, .. } => Err(transcript.outcome.summary()),
+                CreateOutcome::GitFailed(msg) => Err(msg.clone()),
+                CreateOutcome::StorageFailedRollbackClean(err) => Err(err.to_string()),
+                CreateOutcome::StorageFailedRollbackDirty { .. } => {
+                    Err("workspace row failed; rollback left files behind".into())
+                }
+            };
+            provision_layer.update(cx, |layer, cx| layer.finish(card_id, card_result, cx));
             match outcome {
                 CreateOutcome::Created(workspace) => {
                     tracing::info!(
