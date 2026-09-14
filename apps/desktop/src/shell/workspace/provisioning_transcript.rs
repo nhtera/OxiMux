@@ -79,17 +79,26 @@ fn prune_transcripts(dir: &Path, slug: &str, keep: usize) {
 /// explain where it got to. Every IO error here is swallowed: failing to write
 /// a log must not be able to fail a worktree creation that otherwise worked.
 ///
-/// `tee`, when given, receives a clone of every event AFTER it has been
-/// written, so the live provisioning card (see `provision_card`) is fed from
-/// the same stream as the file and can never disagree with it. The tee is
+/// `tee`, when given, receives every event AFTER it has been written, so the
+/// live provisioning card (see `provision_card`) is fed from the same stream
+/// as the file and can never disagree with it. The tee is bounded and never
+/// awaited: a card that cannot keep up loses lines from its tail (the file
+/// keeps everything), and the file is never delayed by the UI. The tee is
 /// dropped when the stream ends, which is how the card's drain learns that
 /// provisioning is over.
 pub(crate) async fn stream_provisioning(
     path: PathBuf,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<ProvisionEvent>,
-    tee: Option<tokio::sync::mpsc::UnboundedSender<ProvisionEvent>>,
+    tee: Option<tokio::sync::mpsc::Sender<ProvisionEvent>>,
 ) {
     use std::io::Write as _;
+    let forward = |event: ProvisionEvent| {
+        if let Some(tee) = &tee {
+            // Full (the UI thread is behind) or closed (card dismissed,
+            // window gone): neither is an error for the file.
+            let _ = tee.try_send(event);
+        }
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -100,22 +109,16 @@ pub(crate) async fn stream_provisioning(
             // Still drain — the card can still show what happened — or the
             // unbounded channel grows for the whole run.
             while let Some(event) = rx.recv().await {
-                if let Some(tee) = &tee {
-                    let _ = tee.send(event);
-                }
+                forward(event);
             }
             return;
         }
     };
     while let Some(event) = rx.recv().await {
-        let line = super::provision_card::provision_line(&event);
+        let line = super::provision_progress::provision_line(&event);
         let _ = writeln!(file, "{line}");
         let _ = file.flush();
-        if let Some(tee) = &tee {
-            // A dropped receiver (card dismissed, window closed) is not an
-            // error for the file.
-            let _ = tee.send(event);
-        }
+        forward(event);
     }
 }
 
@@ -130,7 +133,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.log");
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let (tee_tx, mut tee_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tee_tx, mut tee_rx) = tokio::sync::mpsc::channel(8);
         let writer = tokio::spawn(stream_provisioning(path.clone(), rx, Some(tee_tx)));
         tx.send(ProvisionEvent::SetupStarted("make".into())).unwrap();
         tx.send(ProvisionEvent::SetupLine("building".into())).unwrap();
@@ -155,12 +158,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.log");
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let (tee_tx, tee_rx) = tokio::sync::mpsc::unbounded_channel::<ProvisionEvent>();
+        let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<ProvisionEvent>(8);
         drop(tee_rx);
         let writer = tokio::spawn(stream_provisioning(path.clone(), rx, Some(tee_tx)));
         tx.send(ProvisionEvent::SetupLine("still written".into())).unwrap();
         drop(tx);
         writer.await.unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "still written\n");
+    }
+
+    /// A tee the UI cannot keep up with drops lines for the CARD only: the
+    /// file still gets every one, and the writer never blocks on the UI.
+    #[tokio::test]
+    async fn a_full_tee_drops_for_the_card_but_never_for_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.log");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tee_tx, mut tee_rx) = tokio::sync::mpsc::channel::<ProvisionEvent>(2);
+        let writer = tokio::spawn(stream_provisioning(path.clone(), rx, Some(tee_tx)));
+        for i in 0..10 {
+            tx.send(ProvisionEvent::SetupLine(format!("line {i}"))).unwrap();
+        }
+        drop(tx);
+        writer.await.unwrap();
+        let mut seen = 0;
+        while tee_rx.recv().await.is_some() {
+            seen += 1;
+        }
+        assert!(seen <= 2, "the bounded tee held at most its capacity: {seen}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 10);
     }
 }

@@ -4,7 +4,8 @@
 //! Provisioning (`.oximuxinclude` copy, default-branch freshen, the setup
 //! script) already streams [`ProvisionEvent`]s; until now the desktop wrote
 //! them to a file and showed nothing until the create ended. This layer
-//! draws that stream as it happens.
+//! draws that stream as it happens. The model it paints — one create's
+//! progress and the rules for revealing it — is `provision_progress.rs`.
 //!
 //! Placement is a **floating card**, not a rail-row attachment, because the
 //! `workspaces` row is inserted *last* — the rail never lists a half-built
@@ -17,133 +18,36 @@
 //! is itself the signal that this create will be slow. And dismissing a card
 //! never cancels the create — the card is a view of the work, not the work.
 //!
-//! One formatter, [`provision_line`], serves both the file and the card, so
-//! the two can never disagree about what happened.
+//! A card's terminal state comes from the create task and only from it:
+//! every path out of a create finishes its card, so there is no watchdog to
+//! contradict a create that is merely slow.
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use gpui::{
-    AnyElement, ClickEvent, Context, ElementId, IntoElement, ParentElement, Render, Styled,
-    Window, div, px,
-};
 use gpui::prelude::FluentBuilder;
+use gpui::{
+    AnyElement, ClickEvent, Context, ElementId, Entity, IntoElement, ParentElement, Render,
+    Styled, Window, div, px,
+};
 use gpui_component::Sizable;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::spinner::Spinner;
 use oximux_settings::{Density, Theme, Typography};
-use oximux_worktree_ops::{ProvisionEvent, SETUP_TIMEOUT, SetupOutcome};
+use oximux_worktree_ops::ProvisionEvent;
 
+use super::provision_progress::{ProvisionProgress, ProvisionState, SHOW_AFTER};
 use crate::ui::FloatingSurface;
 
-/// How long provisioning must have been running before a card appears.
-pub const SHOW_AFTER: Duration = Duration::from_millis(600);
-/// Lines kept in memory per create. A setup script can emit megabytes; the
-/// file keeps everything, the card keeps a tail.
-pub const MAX_LINES: usize = 200;
 /// Lines the card paints.
 const TAIL_LINES: usize = 8;
 /// How long a successful card lingers before it goes.
 const LINGER_AFTER_SUCCESS: Duration = Duration::from_secs(3);
-/// A create that has produced no terminal state past the setup cap plus a
-/// margin is marked failed rather than spinning forever.
-const HARD_TIMEOUT: Duration = Duration::from_secs(SETUP_TIMEOUT.as_secs() + 120);
-
-/// The one line an event becomes, in the transcript file and on the card.
-pub fn provision_line(event: &ProvisionEvent) -> String {
-    match event {
-        ProvisionEvent::IncludeCopied(p) => format!("include: copied {}", p.display()),
-        ProvisionEvent::IncludeSkipped(skip) => format!("include: skipped {skip}"),
-        ProvisionEvent::FreshenStarted(branch) => format!("fetching {branch}\u{2026}"),
-        ProvisionEvent::FreshenFinished(summary) => format!("== {summary}"),
-        ProvisionEvent::SetupSkipped(reason) => format!("== {reason}"),
-        ProvisionEvent::SetupStarted(script) => format!("$ {script}"),
-        ProvisionEvent::SetupLine(line) => line.clone(),
-        ProvisionEvent::SetupFinished(outcome) => format!("== {}", outcome.summary()),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProvisionState {
-    Running,
-    Finished,
-    Failed { summary: String },
-}
-
-/// One create's progress. No GPUI in here, so the rules are unit-testable.
-#[derive(Debug)]
-pub struct ProvisionProgress {
-    pub id: u64,
-    pub slug: String,
-    /// The durable record, for the failure card's `Open transcript`.
-    pub transcript: PathBuf,
-    lines: VecDeque<String>,
-    pub state: ProvisionState,
-    /// Whether the card paints. Set by the [`SHOW_AFTER`] timer while still
-    /// running, by `SetupStarted`, or by a failure.
-    pub visible: bool,
-}
-
-impl ProvisionProgress {
-    fn new(id: u64, slug: String, transcript: PathBuf) -> Self {
-        Self {
-            id,
-            slug,
-            transcript,
-            lines: VecDeque::new(),
-            state: ProvisionState::Running,
-            visible: false,
-        }
-    }
-
-    /// Record one event. `SetupStarted` reveals the card at once: a setup
-    /// script is the thing that makes a create slow.
-    pub fn push_event(&mut self, event: &ProvisionEvent) {
-        if matches!(event, ProvisionEvent::SetupStarted(_)) {
-            self.visible = true;
-        }
-        if self.lines.len() == MAX_LINES {
-            self.lines.pop_front();
-        }
-        self.lines.push_back(provision_line(event));
-    }
-
-    /// The last `n` lines, oldest first.
-    pub fn tail(&self, n: usize) -> impl Iterator<Item = &String> {
-        self.lines.iter().skip(self.lines.len().saturating_sub(n))
-    }
-
-    pub fn line_count(&self) -> usize {
-        self.lines.len()
-    }
-
-    /// The [`SHOW_AFTER`] timer fired: reveal iff still running. Returns
-    /// whether anything changed.
-    pub fn reveal_if_running(&mut self) -> bool {
-        if self.state == ProvisionState::Running && !self.visible {
-            self.visible = true;
-            return true;
-        }
-        false
-    }
-
-    /// The create ended. A failure always shows — the tail is what explains
-    /// it — even if the create was fast enough never to have appeared.
-    pub fn finish(&mut self, outcome: Result<(), String>) {
-        self.state = match outcome {
-            Ok(()) => ProvisionState::Finished,
-            Err(summary) => {
-                self.visible = true;
-                ProvisionState::Failed { summary }
-            }
-        };
-    }
-
-    pub fn is_running(&self) -> bool {
-        self.state == ProvisionState::Running
-    }
-}
+/// Events the tee may hold before the card starts dropping them. The file
+/// keeps everything; the card shows a tail, so a dropped line under a burst
+/// costs nothing visible. Bounded so a script writing faster than the UI
+/// thread drains cannot grow memory for the length of the run.
+pub const TEE_CAPACITY: usize = 1024;
 
 /// The per-window stack of provisioning cards, mounted by the workspace root
 /// beside the toast layer.
@@ -174,11 +78,17 @@ impl ProvisionLayer {
     }
 
     /// A create is starting. Returns the card id the create task feeds and
-    /// finishes. Arms the reveal timer and the hard-timeout watchdog.
-    pub fn begin(&mut self, slug: String, transcript: PathBuf, cx: &mut Context<Self>) -> u64 {
+    /// finishes, and arms the reveal timer.
+    pub fn begin(
+        &mut self,
+        slug: String,
+        project_id: String,
+        transcript: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.entries.push(ProvisionProgress::new(id, slug, transcript));
+        self.entries.push(ProvisionProgress::new(id, slug, project_id, transcript));
 
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SHOW_AFTER).await;
@@ -187,17 +97,6 @@ impl ProvisionLayer {
                     && e.reveal_if_running()
                 {
                     cx.notify();
-                }
-            });
-        })
-        .detach();
-
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(HARD_TIMEOUT).await;
-            let _ = this.update(cx, |layer, cx| {
-                if layer.entry_mut(id).is_some_and(|e| e.is_running()) {
-                    tracing::warn!(id, "provisioning card hit the hard timeout with no outcome");
-                    layer.finish(id, Err("provisioning produced no outcome in time".into()), cx);
                 }
             });
         })
@@ -226,7 +125,9 @@ impl ProvisionLayer {
             return;
         };
         let was_visible = entry.visible;
-        entry.finish(outcome);
+        if !entry.finish(outcome) {
+            return;
+        }
         match &entry.state {
             ProvisionState::Finished if !was_visible => self.remove(id, cx),
             ProvisionState::Finished => {
@@ -259,8 +160,7 @@ impl ProvisionLayer {
         self.entries.iter_mut().find(|e| e.id == id)
     }
 
-    /// Ids of the cards currently painted — for tests and for the root's
-    /// "anything in flight" questions.
+    /// Ids of the cards currently painted.
     pub fn visible_ids(&self) -> Vec<u64> {
         self.entries.iter().filter(|e| e.visible).map(|e| e.id).collect()
     }
@@ -284,7 +184,7 @@ impl ProvisionLayer {
             ),
         };
 
-        let mut header = div()
+        let header = div()
             .flex()
             .flex_row()
             .items_center()
@@ -303,16 +203,16 @@ impl ProvisionLayer {
                     .font_weight(typo.w_semibold)
                     .text_color(theme.fg_base)
                     .child(title),
+            )
+            .child(
+                Button::new(ElementId::Name(format!("provision-{id}-dismiss").into()))
+                    .ghost()
+                    .xsmall()
+                    .label("\u{00d7}")
+                    .on_click(cx.listener(move |layer, _: &ClickEvent, _window, cx| {
+                        layer.dismiss(id, cx);
+                    })),
             );
-        header = header.child(
-            Button::new(ElementId::Name(format!("provision-{id}-dismiss").into()))
-                .ghost()
-                .xsmall()
-                .label("\u{00d7}")
-                .on_click(cx.listener(move |layer, _: &ClickEvent, _window, cx| {
-                    layer.dismiss(id, cx);
-                })),
-        );
 
         let mut body = div().flex().flex_col().gap(px(2.0)).min_w_0();
         for line in entry.tail(TAIL_LINES) {
@@ -340,6 +240,7 @@ impl ProvisionLayer {
 
         if let ProvisionState::Failed { summary } = &entry.state {
             let path = entry.transcript.clone();
+            let project_id = entry.project_id.clone();
             card_body = card_body.child(
                 div()
                     .flex()
@@ -363,6 +264,7 @@ impl ProvisionLayer {
                             .on_click(move |_: &ClickEvent, window: &mut Window, cx| {
                                 window.dispatch_action(
                                     Box::new(crate::actions::OpenProvisioningTranscript {
+                                        project_id: project_id.clone(),
                                         path: path.clone(),
                                     }),
                                     cx,
@@ -401,16 +303,8 @@ impl Render for ProvisionLayer {
             .collect();
         let mut cards = Vec::with_capacity(visible.len());
         for i in visible {
-            let element = {
-                // Split borrow: the card reads `self` immutably and needs
-                // `cx` for its listeners; collect the entry by index first.
-                let entry = &self.entries[i];
-                // SAFETY of the borrow: `render_card` takes `&self` and
-                // `&mut Context`, which the borrow checker allows since
-                // `cx` is a separate parameter.
-                self.render_card(entry, cx)
-            };
-            cards.push(element);
+            let entry = &self.entries[i];
+            cards.push(self.render_card(entry, cx));
         }
         div()
             .absolute()
@@ -432,9 +326,9 @@ impl Render for ProvisionLayer {
 /// of lines a second costs a repaint per frame, not per line. Ends when the
 /// writer drops the tee (provisioning is over).
 pub fn drain_into(
-    layer: gpui::Entity<ProvisionLayer>,
+    layer: Entity<ProvisionLayer>,
     id: u64,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<ProvisionEvent>,
+    mut rx: tokio::sync::mpsc::Receiver<ProvisionEvent>,
     cx: &mut gpui::AsyncApp,
 ) {
     cx.spawn(async move |cx| {
@@ -449,127 +343,4 @@ pub fn drain_into(
         }
     })
     .detach();
-}
-
-/// A terminal outcome for the card, derived from the create's own outcome so
-/// a hard git failure, a storage failure and a setup failure all reach the
-/// card the same way. `None` means "nothing to say": a fast, silent success.
-pub fn card_outcome_for_setup(outcome: &SetupOutcome) -> Result<(), String> {
-    match outcome {
-        SetupOutcome::Ok => Ok(()),
-        other => Err(other.summary()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use oximux_worktree_ops::include::Skip;
-
-    fn progress() -> ProvisionProgress {
-        ProvisionProgress::new(1, "amber".into(), PathBuf::from("/t/amber.log"))
-    }
-
-    /// Each of the seven skip reasons reads as a distinct sentence — a user
-    /// whose pattern matched nothing learns it here, not an hour later.
-    #[test]
-    fn every_skip_variant_renders_a_distinct_reason() {
-        let skips = [
-            Skip::AlreadyPresent(PathBuf::from(".env")),
-            Skip::SourceIsSymlink(PathBuf::from("link")),
-            Skip::TargetPathCrossesSymlink(PathBuf::from("dir/x")),
-            Skip::MatchedNothing("*.pem".into()),
-            Skip::EscapesProjectRoot("../x".into()),
-            Skip::Failed {
-                path: PathBuf::from("big.bin"),
-                error: "permission denied".into(),
-            },
-            Skip::ScanBudgetExhausted("**/*".into()),
-        ];
-        let lines: Vec<String> = skips
-            .iter()
-            .map(|s| provision_line(&ProvisionEvent::IncludeSkipped(s.clone())))
-            .collect();
-        let distinct: std::collections::HashSet<&String> = lines.iter().collect();
-        assert_eq!(distinct.len(), 7, "{lines:#?}");
-        for line in &lines {
-            assert!(line.starts_with("include: skipped "), "{line}");
-            assert!(line.len() > "include: skipped ".len() + 8, "too terse: {line}");
-        }
-        assert!(lines[3].contains("matched nothing"), "{}", lines[3]);
-    }
-
-    #[test]
-    fn the_buffer_is_bounded_and_the_tail_is_the_newest() {
-        let mut p = progress();
-        for i in 0..(MAX_LINES + 50) {
-            p.push_event(&ProvisionEvent::SetupLine(format!("line {i}")));
-        }
-        assert_eq!(p.line_count(), MAX_LINES);
-        let tail: Vec<&String> = p.tail(3).collect();
-        assert_eq!(tail.len(), 3);
-        assert_eq!(tail[2], &format!("line {}", MAX_LINES + 49));
-    }
-
-    /// Hidden until the timer says so — unless setup starts, which reveals
-    /// at once.
-    #[test]
-    fn reveal_rules() {
-        let mut p = progress();
-        p.push_event(&ProvisionEvent::IncludeCopied(PathBuf::from(".env")));
-        assert!(!p.visible, "an include copy alone does not show a card");
-        assert!(p.reveal_if_running(), "the timer reveals a running create");
-        assert!(p.visible);
-        assert!(!p.reveal_if_running(), "idempotent");
-
-        let mut fast = progress();
-        fast.finish(Ok(()));
-        assert!(!fast.reveal_if_running(), "a create that already finished never appears");
-        assert!(!fast.visible);
-
-        let mut slow = progress();
-        slow.push_event(&ProvisionEvent::SetupStarted("pnpm install".into()));
-        assert!(slow.visible, "setup starting reveals immediately");
-    }
-
-    #[test]
-    fn failure_always_shows_and_carries_the_summary() {
-        let mut p = progress();
-        p.finish(Err("setup exited 7".into()));
-        assert!(p.visible);
-        assert_eq!(
-            p.state,
-            ProvisionState::Failed {
-                summary: "setup exited 7".into()
-            }
-        );
-        assert!(!p.is_running());
-    }
-
-    #[test]
-    fn setup_outcome_maps_to_the_card_outcome() {
-        assert_eq!(card_outcome_for_setup(&SetupOutcome::Ok), Ok(()));
-        assert!(card_outcome_for_setup(&SetupOutcome::NonZero { code: Some(7) })
-            .unwrap_err()
-            .contains("7"));
-        assert!(card_outcome_for_setup(&SetupOutcome::TimedOut).is_err());
-    }
-
-    #[test]
-    fn the_file_and_the_card_share_one_formatter() {
-        // The transcript writer calls `provision_line`; this pins the shapes
-        // the file has always had so the tee cannot drift them.
-        assert_eq!(
-            provision_line(&ProvisionEvent::SetupStarted("make".into())),
-            "$ make"
-        );
-        assert_eq!(
-            provision_line(&ProvisionEvent::SetupFinished(SetupOutcome::Ok)),
-            "== setup succeeded"
-        );
-        assert_eq!(
-            provision_line(&ProvisionEvent::IncludeCopied(PathBuf::from(".env"))),
-            "include: copied .env"
-        );
-    }
 }

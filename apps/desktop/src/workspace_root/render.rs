@@ -545,8 +545,16 @@ impl Render for WorkspaceRoot {
                 |this, action: &crate::actions::OpenProvisioningTranscript, window, cx| {
                     // The provisioning card's `Open transcript`: the same
                     // editor-tab open the failure path performs automatically,
-                    // for a user who closed that tab and wants it back.
-                    if let Some(panes) = this.active_project_panes() {
+                    // for a user who closed that tab and wants it back. Routed
+                    // to the OWNING project's panes — a failed card outlives a
+                    // project switch, and the transcript belongs to the
+                    // project whose create failed, not whichever is active.
+                    let panes = this
+                        .project_panes_by_project
+                        .get(&action.project_id)
+                        .cloned()
+                        .or_else(|| this.active_project_panes());
+                    if let Some(panes) = panes {
                         let path = action.path.clone();
                         panes.update(cx, |p, cx| {
                             p.open_or_activate_editor_tab(path, window, cx);
@@ -631,7 +639,7 @@ impl Render for WorkspaceRoot {
                         );
                     let provision_layer = this.provision_layer.clone();
                     let card_id = provision_layer.update(cx, |layer, cx| {
-                        layer.begin(slug.clone(), transcript_path.clone(), cx)
+                        layer.begin(slug.clone(), project_id.clone(), transcript_path.clone(), cx)
                     });
                     // The same resolved prefix the chat pill previewed with —
                     // read synchronously here so the pill's `<prefix>/<slug>`
@@ -649,7 +657,9 @@ impl Render for WorkspaceRoot {
                         let (provision_tx, provision_rx) = tokio::sync::mpsc::unbounded_channel();
                         // Tee: the background writer keeps the file; the
                         // foreground drain feeds the card in per-wake batches.
-                        let (tee_tx, tee_rx) = tokio::sync::mpsc::unbounded_channel();
+                        let (tee_tx, tee_rx) = tokio::sync::mpsc::channel(
+                            crate::shell::workspace::provision_card::TEE_CAPACITY,
+                        );
                         let writer = {
                             let transcript_path = transcript_path.clone();
                             cx.background_spawn(async move {

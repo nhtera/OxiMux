@@ -383,6 +383,9 @@ pub struct OpenChatSession {
 #[derive(Clone, Debug, Default, PartialEq, Action)]
 #[action(namespace = oximux, no_json)]
 pub struct OpenProvisioningTranscript {
+    /// The project the create belonged to — the tab opens in THAT project's
+    /// panes, even if the user has switched projects since the card appeared.
+    pub project_id: String,
     pub path: std::path::PathBuf,
 }
 

@@ -1994,7 +1994,7 @@ impl WorkspaceRoot {
         let transcript_path = provisioning_transcript_path(&project_id, &slug);
         let provision_layer = self.provision_layer.clone();
         let card_id = provision_layer.update(cx, |layer, cx| {
-            layer.begin(slug.clone(), transcript_path.clone(), cx)
+            layer.begin(slug.clone(), project_id.clone(), transcript_path.clone(), cx)
         });
 
         cx.spawn(async move |weak, cx| {
@@ -2006,6 +2006,15 @@ impl WorkspaceRoot {
                     path = %parent.display(),
                     "create_dir_all worktree parent failed"
                 );
+                // Every way out of a create finishes its card; this is the
+                // one before provisioning even starts.
+                provision_layer.update(cx, |layer, cx| {
+                    layer.finish(
+                        card_id,
+                        Err(format!("create worktree directory: {err}")),
+                        cx,
+                    )
+                });
                 return;
             }
             // Provisioning transcript. Written to the data dir rather than
@@ -2017,7 +2026,9 @@ impl WorkspaceRoot {
             // runs: a 10-minute `pnpm install` is watchable with `tail -f`
             // instead of appearing as a frozen window. The tee feeds the live
             // card from the same stream, drained on the foreground in batches.
-            let (tee_tx, tee_rx) = tokio::sync::mpsc::unbounded_channel::<ProvisionEvent>();
+            let (tee_tx, tee_rx) = tokio::sync::mpsc::channel::<ProvisionEvent>(
+                super::provision_card::TEE_CAPACITY,
+            );
             let writer = {
                 let transcript_path = transcript_path.clone();
                 cx.background_spawn(async move {
