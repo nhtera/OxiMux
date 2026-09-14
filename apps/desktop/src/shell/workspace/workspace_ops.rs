@@ -203,6 +203,40 @@ pub(crate) fn is_primary_row(workspace: &Workspace, project_root: &str) -> bool 
     workspace.id.starts_with("primary:") || workspace.worktree_path == project_root
 }
 
+/// What a delete will do to the row's branch, in the dialog's words. The
+/// delete only removes a branch OxiMux minted (`Workspace::branch_minted`);
+/// an adopted or pre-existing branch stays, and the dialog must say so — a
+/// user reading "deletes branch X" over a branch that survives, or vice
+/// versa, has been told the wrong thing about a destructive act.
+fn delete_prompt_body(workspace: &Workspace) -> String {
+    if workspace.branch_minted {
+        format!(
+            "Removes the worktree at {} and deletes branch {}. This cannot be undone.",
+            workspace.worktree_path, workspace.branch
+        )
+    } else {
+        format!(
+            "Removes the worktree at {}. Branch {} stays: OxiMux did not create it. This cannot be undone.",
+            workspace.worktree_path, workspace.branch
+        )
+    }
+}
+
+/// The force variant's body, with the same branch rule.
+fn force_delete_prompt_body(workspace: &Workspace) -> String {
+    if workspace.branch_minted {
+        format!(
+            "The worktree at {} could not be removed normally. Force delete removes the workspace entry anyway and force-removes the worktree and branch {}; anything that still fails is reported and left on disk.",
+            workspace.worktree_path, workspace.branch
+        )
+    } else {
+        format!(
+            "The worktree at {} could not be removed normally. Force delete removes the workspace entry anyway and force-removes the worktree; branch {} stays, since OxiMux did not create it. Anything that still fails is reported and left on disk.",
+            workspace.worktree_path, workspace.branch
+        )
+    }
+}
+
 /// Everything a workspace delete needs to name, resolved from the row.
 ///
 /// This exists so the wrong-repository guard has something a test can hold.
@@ -2450,11 +2484,7 @@ impl WorkspaceRoot {
         let prompt = if force {
             ConfirmPrompt {
                 title: "Force delete workspace".into(),
-                body: format!(
-                    "The worktree at {} could not be removed normally. Force delete removes the workspace entry anyway and force-removes the worktree and branch {}; anything that still fails is reported and left on disk.",
-                    workspace.worktree_path, workspace.branch
-                )
-                .into(),
+                body: force_delete_prompt_body(&workspace).into(),
                 on_confirm,
                 confirm_label: Some("Force Delete".into()),
                 on_cancel: None,
@@ -2463,11 +2493,7 @@ impl WorkspaceRoot {
         } else {
             ConfirmPrompt {
                 title: "Delete workspace".into(),
-                body: format!(
-                    "Removes the worktree at {} and deletes branch {}. This cannot be undone.",
-                    workspace.worktree_path, workspace.branch
-                )
-                .into(),
+                body: delete_prompt_body(&workspace).into(),
                 on_confirm,
                 confirm_label: None,
                 on_cancel: None,
@@ -2968,3 +2994,41 @@ mod nav_history_tests {
     }
 }
 
+#[cfg(test)]
+mod delete_prompt_tests {
+    use super::*;
+
+    fn row(minted: bool) -> Workspace {
+        Workspace {
+            id: "w".into(),
+            project_id: "p".into(),
+            name: "topic".into(),
+            slug: "topic".into(),
+            branch: "topic".into(),
+            worktree_path: "/wt/topic".into(),
+            status: "active".into(),
+            created_at: String::new(),
+            archived_at: None,
+            linked_issue: None,
+            tint: None,
+            sort_order: 0.0,
+            pinned: false,
+            comment: String::new(),
+            phase: String::new(),
+            branch_minted: minted,
+        }
+    }
+
+    /// The dialog tells the truth about the branch: deleted only when OxiMux
+    /// minted it, kept — and said to be kept — for an adopted one.
+    #[test]
+    fn the_delete_dialog_names_the_branch_outcome_correctly() {
+        assert!(delete_prompt_body(&row(true)).contains("deletes branch topic"));
+        let adopted = delete_prompt_body(&row(false));
+        assert!(adopted.contains("Branch topic stays"), "{adopted}");
+        assert!(!adopted.contains("deletes branch"), "{adopted}");
+        let forced = force_delete_prompt_body(&row(false));
+        assert!(forced.contains("branch topic stays"), "{forced}");
+        assert!(force_delete_prompt_body(&row(true)).contains("worktree and branch topic"));
+    }
+}
