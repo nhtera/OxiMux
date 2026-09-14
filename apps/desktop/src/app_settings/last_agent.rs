@@ -21,8 +21,10 @@ pub const KEY_WORKSPACE_LAST_AGENT: &str = "workspace_last_agent";
 /// default follows the user rather than overriding them.
 pub const SKIP: &str = "skip";
 
-/// The built-in adapters in the dialog's order — the same order the create
-/// dialog lists them. The first is the last-resort default.
+/// The built-in adapters in the dialog's order — the create dialog's
+/// `AGENT_CHOICES` IS this list, and the test below pins it, id by id, to the
+/// adapter registry so a new adapter cannot be offered without being
+/// rememberable. The first is the last-resort default.
 pub const DIALOG_ORDER: &[AgentAdapter] = &[
     AgentAdapter::ClaudeCode,
     AgentAdapter::Codex,
@@ -59,9 +61,12 @@ pub fn load(repo: &SettingsRepo) -> Option<Option<AgentAdapter>> {
         Ok(Some(raw)) if raw.trim() == SKIP => Some(None),
         Ok(Some(raw)) => adapter_from_id(&raw).map(Some),
         Ok(None) => None,
+        // A store that cannot be read says nothing about what the user
+        // wants; spawning an agent on that is the wrong guess, so the error
+        // reads as a remembered Skip for this open only.
         Err(err) => {
-            tracing::warn!(?err, "last-agent preference unreadable; using the fallback chain");
-            None
+            tracing::warn!(?err, "last-agent preference unreadable; defaulting to Skip");
+            Some(None)
         }
     }
 }
@@ -94,6 +99,20 @@ pub fn resolve_default(
 mod tests {
     use super::*;
     use oximux_storage::open_memory;
+
+    /// The registry is the oracle: every built-in adapter, in its order,
+    /// with the id the launch picker and `agent_launch.toml` use. A roster
+    /// change that forgets this module fails here.
+    #[test]
+    fn the_roster_and_its_ids_match_the_adapter_registry() {
+        let registry = oximux_agents::registry::AdapterRegistry::with_builtin_adapters();
+        let entries = registry.entries_without_detection();
+        let kinds: Vec<AgentAdapter> = entries.iter().map(|e| e.adapter_enum).collect();
+        assert_eq!(DIALOG_ORDER, kinds.as_slice());
+        for e in entries {
+            assert_eq!(adapter_id(e.adapter_enum), e.adapter_id, "id spelling for {:?}", e.adapter_enum);
+        }
+    }
 
     #[test]
     fn ids_round_trip_and_unknown_ids_read_as_no_preference() {

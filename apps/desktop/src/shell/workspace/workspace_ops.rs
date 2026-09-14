@@ -1806,6 +1806,7 @@ impl WorkspaceRoot {
                     project,
                     submit.name,
                     submit.agent,
+                    true,
                     // The manual dialog doesn't carry the issue URL, so no
                     // prompt prefill (the linked-issue badge still records it).
                     None,
@@ -1832,6 +1833,11 @@ impl WorkspaceRoot {
         project: Project,
         name: String,
         agent: Option<AgentAdapter>,
+        // Whether a successful create makes `agent` the dialog's next default.
+        // Only the create dialog passes `true`: its Agent picker is the
+        // user's choice. A task row's hardcoded agent is the feature's
+        // choice, and remembering it would overwrite a Skip the user set.
+        remember_agent: bool,
         agent_prompt: Option<String>,
         linked_issue: Option<String>,
         // Per-request override for the project's `setup` script. `Inherit` —
@@ -2026,8 +2032,11 @@ impl WorkspaceRoot {
                     let _ = weak.update_in(cx, |this, window, cx| {
                         this.mark_rail_dirty(cx);
                         // The create succeeded with this Agent choice (Skip
-                        // included): it becomes the dialog's next default.
-                        crate::app_settings::last_agent::save(&this.app_state.settings_repo, agent);
+                        // included): it becomes the dialog's next default —
+                        // when the choice was the user's (see `remember_agent`).
+                        if remember_agent {
+                            crate::app_settings::last_agent::save(&this.app_state.settings_repo, agent);
+                        }
                         cx.notify();
                         // Land on the new workspace (e.g. created from a task):
                         // select it and return the rail to the home list so it's

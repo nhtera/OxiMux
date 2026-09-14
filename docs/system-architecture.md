@@ -150,7 +150,7 @@ One folder per cockpit zone: `agent_ui`, `agents_dashboard`, `browser_view`,
 `file_explorer`, `forge`, `git_panel`, `left_rail`, `onboarding`, `pane_group`,
 `panes`, `pr_dialog`, `project_panes`, `right_sidebar`, `search_panel`, `session_history`,
 `settings_modal`, `source_control`, `stash_panel`, `tasks_view`, `terminal`,
-`usage`, `welcome`, `workspace`, `worktree_panel`. Each re-exports its modules
+`usage`, `welcome`, `workspace`. Each re-exports its modules
 so existing `crate::shell::<name>::…` paths resolve regardless of folder.
 A small set of cross-cutting glue files (`context_env.rs`, `openable_text_file.rs`,
 `open_url.rs`, `cwd_resolver.rs`) stays loose at `shell/` root by design.
@@ -863,9 +863,8 @@ OAuth, live MCP elicitation, live GUI walk-through) stays user-gated.
 - **New-Agent worktree → first-class `Workspace`.** `ChatWorktreeOutcome`
   (`workspace_ops.rs`) now maps down from the richer `CreateOutcome` returned
   by the existing `create_workspace_with_rollback` — the same git-worktree
-  **+** DB `Workspace`-row-insert (with full rollback) the manual
-  `worktree_panel/` form uses — instead of standing up a git-only path with no
-  DB row. The route-up chain: `roster.rs` emits
+  **+** DB `Workspace`-row-insert (with full rollback) the create dialog
+  uses — instead of standing up a git-only path with no DB row. The route-up chain: `roster.rs` emits
   `AgentChatEvent::WorktreeWorkspaceRequested{slug}` → `pane_group/tabs.rs`
   dispatches the new `CreateWorktreeWorkspaceForActiveChat{slug}` action →
   `workspace_root/render.rs`'s handler resolves the active chat view (new

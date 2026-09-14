@@ -424,6 +424,9 @@ pub(super) fn create_action(
                         project.clone(),
                         name.clone(),
                         Some(AgentAdapter::ClaudeCode),
+                        // The row picks the agent, not the user: it must not
+                        // become the create dialog's remembered default.
+                        false,
                         Some(issue_url.clone()),
                         Some(linked_issue.clone()),
                         // No setup picker on a task row — the project's

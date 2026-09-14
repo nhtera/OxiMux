@@ -1,21 +1,15 @@
-//! Pure render helpers + GPUI row painter for one persisted Workspace.
+//! Pure plan helpers for one persisted Workspace's rail row.
 //!
-//! Two-layer split:
-//! 1. `build_workspace_row_plan` + `status_dot_color` are pure functions —
-//!    no GPUI runtime, no IO. Unit-tested without a window.
-//! 2. `render_workspace_row` consumes a `WorkspaceRowPlan` and paints it.
-//!
-//! Rich-card extensions (`WorkspaceCardPlan`, `build_workspace_card_plan`)
-//! live in this same file; the card painter lives in `workspace_card.rs` to
-//! keep both files under the 200-LOC soft cap.
+//! `build_workspace_row_plan`, `build_workspace_card_plan` and
+//! `status_dot_color` are pure functions — no GPUI runtime, no IO — unit-tested
+//! without a window. The painter that consumes the plan lives in
+//! `workspace_card.rs`; the older single-line row painter that used to sit
+//! here had no caller left and was retired.
 
-use gpui::{
-    Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, div, px, svg,
-};
+use gpui::{Hsla, SharedString};
 use oximux_core::{AgentStatus, WorkPhase, Workspace};
 use oximux_git::AheadBehind;
-use oximux_settings::{Density, Theme, Typography};
+use oximux_settings::Theme;
 
 use crate::shell::agent_presentation::{AgentVerb, agent_verb};
 use crate::shell::left_rail::worktree_stats::WorktreeStats;
@@ -26,9 +20,6 @@ use crate::shell::pane_group::TabColor;
 pub(crate) const STATUS_DOT_SIZE: f32 = 8.0;
 /// Folder icon size (matches the workspace header icon). Shared with the card.
 pub(crate) const FOLDER_ICON_SIZE: f32 = 14.0;
-/// Row vertical multiplier — slightly taller than nav rows so the
-/// two-line slug subtext fits without clipping.
-const ROW_HEIGHT_MULT: f32 = 1.6;
 /// Ellipsis trailing-button width. Shared with the card painter.
 pub(crate) const TRAILING_BTN_SIZE: f32 = 18.0;
 
@@ -277,148 +268,6 @@ pub fn build_workspace_card_plan(
         // documented degrade: no chip, never a guess.
         phase: WorkPhase::parse(&workspace.phase),
     }
-}
-
-/// Render one Workspace row. The trailing "…" button is `.invisible()` by
-/// default and revealed on row hover via `group_hover`. `group_name` lets
-/// each row participate in its own hover scope.
-#[allow(clippy::too_many_arguments)]
-pub fn render_workspace_row(
-    plan: WorkspaceRowPlan,
-    row_id: SharedString,
-    group_name: SharedString,
-    show_menu: bool,
-    theme: Theme,
-    density: Density,
-    typography: &Typography,
-    on_row_click: impl Fn(&MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
-    on_menu_click: impl Fn(&MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static,
-) -> impl IntoElement {
-    let menu_id: SharedString = format!("{row_id}-menu").into();
-    // Primary (main worktree) rows have no rename/archive/delete menu —
-    // the main worktree goes away with the project, not on its own.
-    let trailing_btn = show_menu.then(|| {
-        div()
-            .id(menu_id)
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(TRAILING_BTN_SIZE))
-            .rounded(px(density.r_xs))
-            .text_color(theme.fg_muted)
-            .invisible()
-            .group_hover(group_name.clone(), |s| s.visible())
-            .hover(|s| s.bg(theme.bg_overlay).text_color(theme.fg_base))
-            .child(
-                svg()
-                    .path("icons/ellipsis.svg")
-                    .size(px(FOLDER_ICON_SIZE))
-                    .text_color(theme.fg_muted),
-            )
-            .tooltip(|window, cx| {
-                gpui_component::tooltip::Tooltip::new("Workspace actions").build(window, cx)
-            })
-            .on_mouse_down(MouseButton::Left, move |ev, window, cx| {
-                cx.stop_propagation();
-                on_menu_click(ev, window, cx);
-            })
-    });
-
-    // `primary` badge — outline pill in the title row (git main worktree
-    // only; folders show a "Folder" badge in the subtext row instead).
-    let primary_badge = (plan.is_primary && !plan.is_folder).then(|| {
-        div()
-            .flex()
-            .items_center()
-            .px(px(5.0))
-            .h(px(15.0))
-            .rounded(px(density.r_xs))
-            .border_1()
-            .border_color(theme.border_inactive)
-            .text_size(px(typography.t_sub_label))
-            .text_color(theme.fg_subtle)
-            .child("primary")
-    });
-
-    // Subtext row: a "Folder" badge for non-git folder projects, else the
-    // slug/branch text.
-    let subtext = if plan.is_folder {
-        div()
-            .flex()
-            .items_center()
-            .px(px(5.0))
-            .h(px(15.0))
-            .rounded(px(density.r_xs))
-            .bg(theme.bg_overlay)
-            .text_size(px(typography.t_sub_label))
-            .text_color(theme.fg_subtle)
-            .child("Folder")
-            .into_any_element()
-    } else {
-        div()
-            .text_size(px(typography.t_sub_label))
-            .text_color(plan.fg_sub)
-            .child(plan.slug)
-            .into_any_element()
-    };
-
-    // Active rows render as an inset rounded card: small horizontal
-    // margin pulls it off the rail edges, a subtle border + rounded
-    // corners read it as a distinct surface. Inactive rows stay flush
-    // and only tint on hover.
-    let base = div()
-        .id(row_id)
-        .group(group_name)
-        .flex()
-        .flex_row()
-        .items_center()
-        .w_full()
-        .h(px(density.h_row * ROW_HEIGHT_MULT))
-        .px(px(density.pad_panel))
-        .gap(px(density.gap_inline))
-        .cursor_pointer();
-    let shell = if plan.is_active {
-        base.mx(px(density.gap_inline))
-            .rounded(px(density.r_xs))
-            .border_1()
-            .border_color(theme.border_inactive)
-            .bg(plan.bg)
-    } else {
-        base.bg(plan.bg).hover(|s| s.bg(theme.hover_overlay))
-    };
-    shell
-        .child(
-            // Status dot — solid colored circle.
-            div()
-                .size(px(STATUS_DOT_SIZE))
-                .rounded_full()
-                .bg(plan.dot_color)
-                .flex_shrink_0(),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(density.gap_inline))
-                        .child(
-                            div()
-                                .text_size(px(typography.t_body_sm))
-                                .text_color(plan.fg)
-                                .child(plan.name),
-                        )
-                        .children(primary_badge),
-                )
-                .child(div().flex().flex_row().child(subtext)),
-        )
-        .children(trailing_btn)
-        .on_mouse_down(MouseButton::Left, on_row_click)
 }
 
 #[cfg(test)]
