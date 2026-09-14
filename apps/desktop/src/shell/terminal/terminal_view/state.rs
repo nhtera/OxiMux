@@ -87,12 +87,13 @@ impl TerminalView {
                 TerminalEvent::CommandMark {
                     kind, exit, line, ..
                 } => self.apply_command_mark(*kind, *exit, *line),
-                // The grid's scrollback was wiped or reflowed, so every mark
-                // anchored to an absolute history line is now meaningless.
-                // Dropping them here (ahead of any mark that arrived in the
-                // same batch — the PTY orders the reset first) is what keeps
-                // a `clear` from resurrecting old prompt badges on top of
-                // unrelated rows.
+                // The scrollback these marks count their lines from is gone,
+                // so every one of them is now meaningless. Dropping them here
+                // is what keeps a `clear` from resurrecting old prompt badges
+                // on top of unrelated rows. The PTY orders this against the
+                // marks as the bytes were, so a prompt mark later in the same
+                // batch — the shell's `precmd` once `clear` returns — is
+                // applied after the drop and keeps its badge.
                 TerminalEvent::ScrollbackReset { .. } => self.drop_command_marks(),
                 // OSC 9;4 progress. state 0 clears; error/warning raises
                 // attention on an unfocused pane like a bell.
