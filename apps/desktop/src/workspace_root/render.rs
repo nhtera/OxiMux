@@ -714,9 +714,16 @@ impl Render for WorkspaceRoot {
                         // outcome — every failure shape reaches it the same way.
                         let card_result = match &outcome {
                             CreateOutcome::Created(_) => Ok(()),
-                            CreateOutcome::SetupFailed { transcript, .. } => {
-                                Err(transcript.outcome.summary())
-                            }
+                            CreateOutcome::SetupFailed {
+                                transcript,
+                                rollback_error,
+                            } => Err(match rollback_error {
+                                Some(err) => format!(
+                                    "{}. Rollback also failed ({err}) \u{2014} manual cleanup required.",
+                                    transcript.outcome.summary()
+                                ),
+                                None => transcript.outcome.summary(),
+                            }),
                             CreateOutcome::GitFailed(msg) => Err(msg.clone()),
                             CreateOutcome::StorageFailedRollbackClean(err) => Err(err.to_string()),
                             CreateOutcome::StorageFailedRollbackDirty { .. } => {

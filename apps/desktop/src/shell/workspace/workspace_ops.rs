@@ -2062,7 +2062,18 @@ impl WorkspaceRoot {
             // that never showed a card is removed silently.
             let card_result = match &outcome {
                 CreateOutcome::Created(_) => Ok(()),
-                CreateOutcome::SetupFailed { transcript, .. } => Err(transcript.outcome.summary()),
+                // A failed rollback is the one state a human must repair; the
+                // card, which outlives the toast, has to say so too.
+                CreateOutcome::SetupFailed {
+                    transcript,
+                    rollback_error,
+                } => Err(match rollback_error {
+                    Some(err) => format!(
+                        "{}. Rollback also failed ({err}) \u{2014} manual cleanup required.",
+                        transcript.outcome.summary()
+                    ),
+                    None => transcript.outcome.summary(),
+                }),
                 CreateOutcome::GitFailed(msg) => Err(msg.clone()),
                 CreateOutcome::StorageFailedRollbackClean(err) => Err(err.to_string()),
                 CreateOutcome::StorageFailedRollbackDirty { .. } => {
