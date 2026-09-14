@@ -25,6 +25,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::error::Result;
 use crate::process::GitCmd;
 
 /// Commit counts of HEAD relative to a named base.
@@ -44,50 +45,60 @@ pub struct AheadBehind {
 const REV_LIST_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// HEAD's ahead/behind against the first base that resolves, in the order
-/// the module docs give. `None` when nothing does.
+/// the module docs give.
+///
+/// Two kinds of "no answer", kept apart on purpose: `Ok(None)` means every
+/// candidate was consulted and none names a commit — a real property of the
+/// repo, safe to cache. `Err` means git itself could not be run or timed out
+/// at some step, which says nothing about the repo; a caller should keep
+/// whatever it last knew rather than record "no base" or, worse, skip the
+/// upstream and report against the default branch.
 pub async fn ahead_behind_vs_base(
     workdir: &Path,
     pinned_base: Option<&str>,
     default_branch: &str,
-) -> Option<AheadBehind> {
+) -> Result<Option<AheadBehind>> {
     if let Some(pinned) = pinned_base.map(str::trim).filter(|s| !s.is_empty())
-        && let Some(found) = ahead_behind_against(workdir, pinned).await
+        && let Some(found) = ahead_behind_against(workdir, pinned).await?
     {
-        return Some(found);
+        return Ok(Some(found));
     }
-    if let Some(found) = ahead_behind_vs_upstream(workdir).await {
-        return Some(found);
+    if let Some(found) = ahead_behind_vs_upstream(workdir).await? {
+        return Ok(Some(found));
     }
     let default_branch = default_branch.trim();
     if default_branch.is_empty() {
-        return None;
+        return Ok(None);
     }
     for cand in [default_branch.to_string(), format!("origin/{default_branch}")] {
-        if let Some(found) = ahead_behind_against(workdir, &cand).await {
-            return Some(found);
+        if let Some(found) = ahead_behind_against(workdir, &cand).await? {
+            return Ok(Some(found));
         }
     }
-    None
+    Ok(None)
 }
 
-/// `git rev-list --left-right --count <base>...HEAD`, or `None` when `base`
-/// does not name a commit (unknown ref, no HEAD yet, not a repo).
-pub async fn ahead_behind_against(workdir: &Path, base: &str) -> Option<AheadBehind> {
+/// `git rev-list --left-right --count <base>...HEAD`. `Ok(None)` when `base`
+/// does not name a commit (unknown ref, no HEAD yet, not a repo); `Err` when
+/// git could not be run or timed out.
+pub async fn ahead_behind_against(workdir: &Path, base: &str) -> Result<Option<AheadBehind>> {
     let raw = GitCmd::new(workdir)
         .args(["rev-list", "--left-right", "--count", &format!("{base}...HEAD"), "--"])
         .timeout(REV_LIST_TIMEOUT)
         .run_raw()
-        .await
-        .ok()?;
+        .await?;
     if !raw.status.success() {
-        return None;
+        return Ok(None);
     }
-    let (behind, ahead) = parse_left_right_count(&String::from_utf8_lossy(&raw.stdout))?;
-    Some(AheadBehind {
-        base: base.to_string(),
-        ahead,
-        behind,
-    })
+    Ok(
+        parse_left_right_count(&String::from_utf8_lossy(&raw.stdout)).map(|(behind, ahead)| {
+            AheadBehind {
+                base: base.to_string(),
+                ahead,
+                behind,
+            }
+        }),
+    )
 }
 
 /// HEAD's ahead/behind against its branch's configured upstream, from one
@@ -95,16 +106,16 @@ pub async fn ahead_behind_against(workdir: &Path, base: &str) -> Option<AheadBeh
 /// branch this worktree has checked out (a linked worktree's own HEAD, since
 /// git resolves it per worktree), and its upstream's short name and track
 /// summary (`ahead 2, behind 1`, empty when level) come in the same process.
-/// `None` when HEAD is detached, the branch has no upstream, or its upstream
-/// is gone (deleted after a merge). All three mean "compare to something
-/// else", not errors.
+/// `Ok(None)` when HEAD is detached, the branch has no upstream, or its
+/// upstream is gone (deleted after a merge). All three mean "compare to
+/// something else"; only a git that could not run is an `Err`.
 ///
 /// Enumerating `refs/heads/` rather than naming one ref is deliberate: it is
 /// HEAD-relative, so a checkout the app did not make (a `git switch` in that
 /// worktree's terminal) is measured as it is, not as the row remembers it —
 /// and a one-ref query would match by prefix (`refs/heads/feat` also lists
 /// `feat/x`).
-async fn ahead_behind_vs_upstream(workdir: &Path) -> Option<AheadBehind> {
+async fn ahead_behind_vs_upstream(workdir: &Path) -> Result<Option<AheadBehind>> {
     let raw = GitCmd::new(workdir)
         .args([
             "for-each-ref",
@@ -112,12 +123,11 @@ async fn ahead_behind_vs_upstream(workdir: &Path) -> Option<AheadBehind> {
             "refs/heads/",
         ])
         .run_raw()
-        .await
-        .ok()?;
+        .await?;
     if !raw.status.success() {
-        return None;
+        return Ok(None);
     }
-    parse_head_upstream_track(&String::from_utf8_lossy(&raw.stdout))
+    Ok(parse_head_upstream_track(&String::from_utf8_lossy(&raw.stdout)))
 }
 
 /// Find the `*`-flagged line of the `for-each-ref` format above and parse

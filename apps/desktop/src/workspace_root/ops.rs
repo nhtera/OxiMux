@@ -113,6 +113,14 @@ impl WorkspaceRoot {
         }
         let targets = self.worktree_refresh_targets();
         if targets.is_empty() {
+            // Nothing left to measure, so nothing cached may survive: the
+            // eviction below only runs after a round, and a path re-added
+            // before its first measurement would otherwise show its old
+            // numbers.
+            if !self.worktree_stats.is_empty() {
+                self.worktree_stats.clear();
+                cx.notify();
+            }
             return;
         }
         // Bail (leaving the flag clear) when no runtime is entered so a
@@ -1734,7 +1742,10 @@ async fn measure_worktree(target: &StatsTarget) -> Measured {
         ),
     )
     .await;
-    let Ok(map) = numstat else {
+    // Either git failing to run is a hiccup, not a fact about the worktree:
+    // keep the previous numbers rather than blank a chip or, for the
+    // ahead/behind, record "no base" when the base was simply not consulted.
+    let (Ok(map), Ok(ahead_behind)) = (numstat, ahead_behind) else {
         return Measured::Transient;
     };
     let counts = sum_numstat(&map);
