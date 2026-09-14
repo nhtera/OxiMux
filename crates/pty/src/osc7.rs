@@ -1,6 +1,11 @@
-//! Out-of-band OSC scanner — runs alongside alacritty's parser to pick up
-//! the OSC sequences alacritty does NOT surface as events: OSC 7 (cwd),
-//! OSC 133/633 (shell-integration command marks), and OSC 9;4 (progress).
+//! Out-of-band scanner — runs alongside alacritty's parser to pick up the
+//! sequences alacritty does NOT surface as events: OSC 7 (cwd), OSC 133/633
+//! (shell-integration command marks), OSC 9;4 (progress), and `ESC c` (RIS).
+//!
+//! RIS is the one non-OSC here, and it earns its place: alacritty applies it
+//! to the grid and raises nothing, yet it is the single wipe that leaves the
+//! scrollback length unchanged (`clear` and Ctrl-L scroll the erased rows into
+//! history instead, so `history_size` moves and the caller sees it there).
 //!
 //! Everything alacritty already decodes (OSC 0/2 title, OSC 52 clipboard,
 //! OSC 4/10/11/12 color queries, device reports) is captured via the `Term`
@@ -48,6 +53,11 @@ pub enum OscHit {
     /// OSC 9;4 — progress. `state`: 0 clear, 1 set, 2 error, 3 indeterminate,
     /// 4 warning. `value` is a 0..=100 percentage.
     Progress { state: u8, value: u8 },
+    /// `ESC c` — RIS, a full terminal reset (what `reset(1)` sends). Blanks
+    /// the grid AND the scrollback in place: unlike every other wipe it can
+    /// leave `history_size` exactly where it was (at zero, on a terminal that
+    /// has not scrolled yet), so nothing downstream can infer it from length.
+    FullReset,
 }
 
 const ESC: u8 = 0x1b;
@@ -104,6 +114,12 @@ impl OscScanner {
             }
             OscState::AfterEsc => match b {
                 b']' => OscState::InOsc(Vec::new()),
+                // RIS. Two bytes, no parameters, no ambiguity — `ESC c` means
+                // nothing else, so no CSI parsing is needed to recognise it.
+                b'c' => {
+                    on_hit(OscHit::FullReset);
+                    OscState::Normal
+                }
                 ESC => OscState::AfterEsc, // back-to-back ESCs — stay armed
                 _ => OscState::Normal,
             },
@@ -570,4 +586,49 @@ mod tests {
         let paths = collect(bytes);
         assert!(paths.is_empty());
     }
+    // RIS is two bytes and means nothing else; a bare `c` in output must not
+    // register, and the sequence has to survive a chunk boundary like any
+    // other.
+    #[test]
+    fn ris_registers_once_and_only_after_an_escape() {
+        assert_eq!(
+            collect_hits(b"\x1bc").len(),
+            1,
+            "ESC c is a full reset"
+        );
+        assert!(
+            !collect_hits(b"clear\r\n").iter().any(|h| matches!(h, OscHit::FullReset)),
+            "a plain `c` in output is not a reset"
+        );
+
+        let mut scanner = OscScanner::new();
+        let mut hits = 0;
+        scanner.feed(b"\x1b", |h| {
+            if matches!(h, OscHit::FullReset) {
+                hits += 1;
+            }
+        });
+        scanner.feed(b"c", |h| {
+            if matches!(h, OscHit::FullReset) {
+                hits += 1;
+            }
+        });
+        assert_eq!(hits, 1, "a split RIS still registers exactly once");
+    }
+
+    // A reset does not swallow what follows it: the prompt mark the shell
+    // emits once `reset` returns has to decode in the same chunk.
+    #[test]
+    fn a_command_mark_after_a_reset_is_still_decoded() {
+        let hits = collect_hits(b"\x1bc\x1b]133;A\x07");
+        assert!(
+            matches!(hits.first(), Some(OscHit::FullReset)),
+            "the reset comes first; got {hits:?}"
+        );
+        assert!(
+            matches!(hits.last(), Some(OscHit::CommandMark { .. })),
+            "the prompt mark after the reset must survive; got {hits:?}"
+        );
+    }
+
 }

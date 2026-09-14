@@ -234,6 +234,10 @@ impl TerminalState {
                     OscHit::Progress { state, value } => {
                         out.push(TerminalEvent::Progress { id, state, value })
                     }
+                    // The one wipe the length check above cannot see. Pushed
+                    // in stream order, so a prompt mark that follows the reset
+                    // in the same read still lands after it and survives.
+                    OscHit::FullReset => out.push(TerminalEvent::ScrollbackReset { id }),
                 }
             }
         }
@@ -1100,6 +1104,69 @@ mod tests {
                 .any(|e| matches!(e, TerminalEvent::ScrollbackReset { .. })),
             "coming back from the alt screen restores history; not a wipe"
         );
+    }
+
+
+    // `reset(1)` on a terminal that has not scrolled yet is the one wipe the
+    // length check cannot see: RIS blanks the grid and the scrollback IN
+    // PLACE, so `history_size` is zero on both sides while the rows the marks
+    // named are gone. It has to be recognised from the sequence itself.
+    #[test]
+    fn a_full_reset_with_an_empty_scrollback_still_reports_a_reset() {
+        let mut state = TerminalState::new(20, 10, 100);
+        state.advance_collecting(SID, b"\x1b]133;A\x07one\r\n\x1b]133;A\x07two\r\n");
+        assert_eq!(
+            state.term.grid().history_size(),
+            0,
+            "precondition: nothing scrolled, so a length check sees no change"
+        );
+
+        let events = state.advance_collecting(SID, b"\x1bc\x1b]133;A\x07");
+        let reset_at = events
+            .iter()
+            .position(|e| matches!(e, TerminalEvent::ScrollbackReset { .. }))
+            .expect("RIS is a reset");
+        let mark_at = events
+            .iter()
+            .position(|e| matches!(e, TerminalEvent::CommandMark { .. }))
+            .expect("the prompt redrawn after the reset still marks");
+        assert!(
+            reset_at < mark_at,
+            "the reset must precede a mark from the same read"
+        );
+        assert_eq!(state.term.grid().history_size(), 0, "RIS leaves history at zero");
+    }
+
+    // The counterpart, and the more valuable half: `clear(1)` and zsh's Ctrl-L
+    // on an empty scrollback must NOT report a reset. alacritty scrolls the
+    // erased rows INTO history rather than discarding them (measured: 0 -> 2),
+    // so every mark rides up with its own content and maps above the viewport
+    // on its own. Resetting there would throw away badges that are still
+    // correct — the marked commands are readable again by scrolling up.
+    #[test]
+    fn a_screen_erase_scrolls_into_history_and_is_not_a_reset() {
+        for (name, seq) in [
+            ("clear(1)", &b"\x1b[3J\x1b[H\x1b[2J"[..]),
+            ("ctrl-L", &b"\x1b[H\x1b[2J"[..]),
+        ] {
+            let mut state = TerminalState::new(20, 10, 100);
+            state.advance_collecting(SID, b"\x1b]133;A\x07one\r\n\x1b]133;A\x07two\r\n");
+            let before = state.term.grid().history_size();
+
+            let events = state.advance_collecting(SID, seq);
+
+            let after = state.term.grid().history_size();
+            assert!(
+                after > before,
+                "{name}: the erased rows should scroll into history ({before} -> {after})"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, TerminalEvent::ScrollbackReset { .. })),
+                "{name}: history GREW, so the marks are still anchored — not a reset"
+            );
+        }
     }
 
     #[test]
