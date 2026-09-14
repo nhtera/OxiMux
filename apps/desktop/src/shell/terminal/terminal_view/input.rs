@@ -1268,6 +1268,10 @@ impl TerminalView {
         self.selection = None;
         self.hovered_link = None;
         self.scroll_px = 0.0;
+        // The wipe reset the grid's history to zero; the gutter badges are
+        // anchored to absolute history lines, so they no longer point at the
+        // prompts they were taken from.
+        self.drop_command_marks();
         if let Ok(snapshot) = self.with_backend(|be| be.snapshot(id)) {
             self.snapshot = Arc::new(snapshot);
         }

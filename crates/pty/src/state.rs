@@ -121,6 +121,12 @@ pub struct TerminalState {
     bell: Arc<AtomicBool>,
     /// Shared with the `Term`'s sink; drained by `advance_collecting()`.
     sink: Arc<Mutex<Vec<SinkEvent>>>,
+    /// Scrollback length seen at the end of the previous `advance_collecting`.
+    /// Command marks are stored as absolute history lines, which only stay
+    /// meaningful while history grows; a *shrink* (`ESC[3J`, `reset`, a
+    /// reflowing resize) invalidates every one of them, so the drop is
+    /// reported as [`TerminalEvent::ScrollbackReset`].
+    last_history: usize,
 }
 
 impl TerminalState {
@@ -153,6 +159,7 @@ impl TerminalState {
             scanner: OscScanner::new(),
             bell,
             sink,
+            last_history: 0,
         }
     }
 
@@ -181,6 +188,29 @@ impl TerminalState {
 
         if self.take_bell() {
             out.push(TerminalEvent::Bell { id });
+        }
+
+        // A scrollback SHRINK unanchors every absolute history line recorded
+        // so far: `ESC[3J` (`clear(1)`) drops history to zero, so a mark taken
+        // at line N now names a row N below the viewport top instead of the
+        // prompt it was pinned to — and any old mark whose N happens to land
+        // inside the fresh viewport repaints as a badge on unrelated output.
+        // Reported before the marks below so a prompt mark arriving in the
+        // same chunk (`clear` returns → `precmd` fires) is kept, not wiped.
+        //
+        // Only the shrink needs reporting. A plain screen erase (`ESC[2J`,
+        // zsh's Ctrl-L) does NOT: alacritty scrolls the erased rows into
+        // history instead of discarding them, so a mark rides up with its own
+        // content and correctly maps above the viewport. Skipped entirely on
+        // the alt screen, which simply HAS no scrollback — entering a pager
+        // would otherwise read as a wipe and cost the badges of every prompt
+        // behind it, for a primary grid that comes back intact on exit.
+        if !self.term.mode().contains(TermMode::ALT_SCREEN) {
+            let history = self.term.grid().history_size();
+            if history < self.last_history {
+                out.push(TerminalEvent::ScrollbackReset { id });
+            }
+            self.last_history = history;
         }
 
         if !hits.is_empty() {
@@ -974,6 +1004,102 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["hi"], "OSC 52 c → clipboard set");
+    }
+
+    // `clear(1)` drops the scrollback to zero, which unanchors every command
+    // mark taken before it: a mark recorded at absolute line 4 would repaint
+    // its gutter badge on row 4 of the FRESH screen — an arbitrary output row,
+    // which is what put stray green slivers down the left edge. The reset must
+    // be reported so the renderer can forget those marks, and it must come
+    // BEFORE the prompt mark the shell emits in the very same chunk (`clear`
+    // returns → `precmd` fires), or the new prompt loses its badge too.
+    #[test]
+    fn scrollback_wipe_reports_reset_before_the_marks_that_follow_it() {
+        let mut state = TerminalState::new(20, 3, 100);
+        // Early session: a prompt mark at a low absolute line, then enough
+        // output to push real scrollback behind it.
+        let early = state.advance_collecting(SID, b"\x1b]133;A\x07$ one\r\n");
+        assert!(
+            early
+                .iter()
+                .any(|e| matches!(e, TerminalEvent::CommandMark { .. })),
+            "precondition: the early prompt mark is collected"
+        );
+        assert!(
+            !early
+                .iter()
+                .any(|e| matches!(e, TerminalEvent::ScrollbackReset { .. })),
+            "growing history is not a reset"
+        );
+        state.advance_collecting(SID, b"L2\r\nL3\r\nL4\r\nL5\r\nL6\r\n");
+        assert!(
+            state.term.grid().history_size() > 0,
+            "precondition: lines scrolled into history"
+        );
+
+        // `clear(1)`: home, erase display, erase saved lines — then the
+        // shell's post-command marks for the cleared prompt.
+        let events =
+            state.advance_collecting(SID, b"\x1b[H\x1b[2J\x1b[3J\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+
+        let reset_at = events
+            .iter()
+            .position(|e| matches!(e, TerminalEvent::ScrollbackReset { .. }))
+            .expect("the scrollback wipe is reported");
+        let first_mark_at = events
+            .iter()
+            .position(|e| matches!(e, TerminalEvent::CommandMark { .. }))
+            .expect("the post-clear prompt still marks");
+        assert!(
+            reset_at < first_mark_at,
+            "the reset must precede the marks collected from the same chunk"
+        );
+
+        // The surviving mark is anchored at the top of the wiped grid, where
+        // the prompt actually is — not at some stale absolute line.
+        let line = events.iter().find_map(|e| match e {
+            TerminalEvent::CommandMark { line, .. } => Some(*line),
+            _ => None,
+        });
+        assert_eq!(line, Some(0), "post-clear prompt anchors at the fresh top row");
+
+        // Steady output afterwards is not a reset (history only grows again).
+        let after = state.advance_collecting(SID, b"next\r\nmore\r\n");
+        assert!(
+            !after
+                .iter()
+                .any(|e| matches!(e, TerminalEvent::ScrollbackReset { .. })),
+            "only a SHRINK is a reset"
+        );
+    }
+
+    // A pager swaps in the alternate screen, which has no scrollback at all.
+    // The primary grid — and every mark anchored into it — comes back intact
+    // on exit, so the swap must not be mistaken for a wipe.
+    #[test]
+    fn entering_the_alt_screen_does_not_reset() {
+        let mut state = TerminalState::new(20, 3, 100);
+        state.advance_collecting(SID, b"\x1b]133;A\x07$ one\r\n");
+        state.advance_collecting(SID, b"L2\r\nL3\r\nL4\r\nL5\r\n");
+        assert!(
+            state.term.grid().history_size() > 0,
+            "precondition: real scrollback behind the mark"
+        );
+
+        let enter = state.advance_collecting(SID, b"\x1b[?1049h");
+        assert!(
+            !enter
+                .iter()
+                .any(|e| matches!(e, TerminalEvent::ScrollbackReset { .. })),
+            "the alt screen's empty history is not a wipe of the primary grid"
+        );
+        let leave = state.advance_collecting(SID, b"\x1b[?1049l");
+        assert!(
+            !leave
+                .iter()
+                .any(|e| matches!(e, TerminalEvent::ScrollbackReset { .. })),
+            "coming back from the alt screen restores history; not a wipe"
+        );
     }
 
     #[test]

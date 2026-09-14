@@ -1551,3 +1551,74 @@ mod poison_recovery_tests {
         assert_eq!(v, 42, "into_inner recovers the value past poison");
     }
 }
+
+/// Gutter badges for shell-integration command marks. Marks are stored as
+/// absolute history lines, so anything that resets the grid's history has to
+/// invalidate them — otherwise an old mark repaints its badge over whatever
+/// row now sits at that line.
+#[cfg(test)]
+mod command_mark_tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    fn mount_view(cx: &mut TestAppContext) -> gpui::WindowHandle<TerminalView> {
+        let (backend, sid) = spawn_local_pty_dormant(80, 24).expect("dormant spawn (PTY fallback)");
+        cx.add_window(|win, cx| {
+            TerminalView::mount_pending(
+                backend,
+                sid,
+                SurfaceIds::restored("/proj".to_string(), "surface-1".to_string(), "tab-1".to_string()),
+                None,
+                Theme::default(),
+                Density::default(),
+                Typography::default(),
+                win,
+                cx,
+            )
+        })
+    }
+
+    // Marks taken early in a session carry small absolute lines (history was
+    // still short). Once `clear` wipes the scrollback those same small numbers
+    // address rows of the FRESH viewport, so the badges reappear scattered down
+    // the left edge of unrelated output. Dropping the marks on the reset is the
+    // fix; the live prompt's own mark, taken after the wipe, still badges.
+    #[gpui::test]
+    async fn scrollback_reset_drops_stale_badges_and_keeps_the_fresh_one(cx: &mut TestAppContext) {
+        let window = mount_view(cx);
+        cx.run_until_parked();
+
+        window
+            .update(cx, |view, _win, _cx| {
+                // Three finished commands from early in the session.
+                for line in [1_u64, 4, 15] {
+                    view.apply_command_mark(CommandMarkKind::PromptStart, None, line);
+                    view.apply_command_mark(CommandMarkKind::CommandEnd, Some(0), line);
+                }
+                let rows: Vec<usize> = view
+                    .visible_command_badges()
+                    .into_iter()
+                    .map(|(row, _)| row)
+                    .collect();
+                assert_eq!(rows, vec![1, 4, 15], "precondition: badges track their marks");
+
+                // `clear` → history back to zero → the PTY reports the reset.
+                view.drop_command_marks();
+                assert!(
+                    view.visible_command_badges().is_empty(),
+                    "stale marks must not badge rows of the wiped grid"
+                );
+
+                // The prompt the shell redraws after the wipe still badges.
+                view.apply_command_mark(CommandMarkKind::PromptStart, None, 0);
+                view.apply_command_mark(CommandMarkKind::CommandEnd, Some(0), 0);
+                let rows: Vec<usize> = view
+                    .visible_command_badges()
+                    .into_iter()
+                    .map(|(row, _)| row)
+                    .collect();
+                assert_eq!(rows, vec![0], "the post-clear prompt keeps its badge");
+            })
+            .expect("window update");
+    }
+}

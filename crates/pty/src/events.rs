@@ -69,6 +69,16 @@ pub enum TerminalEvent {
         exit: Option<i32>,
         line: u64,
     },
+    /// The emulator's scrollback got SHORTER: `ESC[3J` (what `clear(1)` and
+    /// the app's own Clear affordance send) drops it to nothing, `ESC c`
+    /// (`reset`) wipes the whole terminal, and a resize can reflow rows back
+    /// onto the screen. Absolute history lines recorded before that no longer
+    /// name the row they were anchored to, so consumers holding them — the
+    /// command-mark gutter badges — must drop what they have. Raised BEFORE
+    /// any `CommandMark` collected from the same read, so a prompt mark that
+    /// fires in the wiping chunk (the shell's `precmd` once `clear` returns)
+    /// survives the reset.
+    ScrollbackReset { id: TerminalSessionId },
     /// OSC 9;4 progress report. `state`: 0 clear, 1 set, 2 error, 3
     /// indeterminate, 4 warning. `value` is a 0..=100 percentage.
     Progress {
@@ -105,6 +115,7 @@ impl TerminalEvent {
             | TerminalEvent::Bell { id }
             | TerminalEvent::CwdChanged { id, .. }
             | TerminalEvent::CommandMark { id, .. }
+            | TerminalEvent::ScrollbackReset { id }
             | TerminalEvent::Progress { id, .. }
             | TerminalEvent::Clipboard { id, .. }
             | TerminalEvent::PtyReply { id, .. } => *id,
