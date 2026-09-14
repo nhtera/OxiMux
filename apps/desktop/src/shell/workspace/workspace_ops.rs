@@ -203,9 +203,6 @@ pub(crate) fn is_primary_row(workspace: &Workspace, project_root: &str) -> bool 
     workspace.id.starts_with("primary:") || workspace.worktree_path == project_root
 }
 
-
-
-
 /// Everything a workspace delete needs to name, resolved from the row.
 ///
 /// This exists so the wrong-repository guard has something a test can hold.
@@ -236,7 +233,6 @@ fn workspace_delete_target(
         branch: workspace.branch.clone(),
     })
 }
-
 
 /// Outcome the *New Agent in a fresh worktree* flow hands back to the chat view.
 /// The host resolves the worktree create as a first-class `Workspace` (DB row +
@@ -1486,7 +1482,6 @@ impl WorkspaceRoot {
         live
     }
 
-
     pub(crate) fn refresh_left_rail(&mut self, cx: &mut Context<Self>) {
         let projects = self.app_state.recent_projects.clone();
         let active_project_id = self.active_project.as_ref().map(|p| p.id.clone());
@@ -2162,9 +2157,6 @@ impl WorkspaceRoot {
         .detach();
     }
 
-
-
-
     /// Mount `prompt` as the modal confirm dialog and arrange its teardown.
     ///
     /// The observer, not the callbacks, clears `confirm_dialog`: a callback
@@ -2197,9 +2189,6 @@ impl WorkspaceRoot {
         self.confirm_dialog = Some(dialog);
         cx.notify();
     }
-
-
-
 
     /// Restore an archived workspace to its project's active group.
     ///
@@ -2895,13 +2884,6 @@ mod nav_history_tests {
         assert!(workspace_delete_target(&open, &orphan).is_none());
         assert!(resolve_project_for_workspace(&open, &orphan).is_none());
     }
-
-
-
-
-
-
-
 
     #[test]
     fn append_advances_cursor() {

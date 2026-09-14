@@ -367,4 +367,11 @@ fn adopting_an_already_tracked_path_is_a_conflict() {
         .expect_err("same directory twice");
     assert!(matches!(err, StorageError::Conflict { .. }), "got {err:?}");
     assert_eq!(workspaces.list_for_project(&project_id).unwrap().len(), 1);
+    // An archived row still owns its directory.
+    let first = &workspaces.list_for_project(&project_id).unwrap()[0];
+    workspaces.mark_archived(&first.id).expect("archive");
+    let err = workspaces
+        .adopt(&project_id, "topic", "topic-3", "topic", "/elsewhere/topic")
+        .expect_err("archived row still owns the path");
+    assert!(matches!(err, StorageError::Conflict { .. }), "got {err:?}");
 }

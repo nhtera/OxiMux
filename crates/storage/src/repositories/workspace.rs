@@ -380,12 +380,20 @@ impl WorkspaceRepo {
         branch: &str,
         worktree_path: &str,
     ) -> Result<Workspace, StorageError> {
-        // One row per directory. A second adoption of a path a row already
-        // points at (a scan that started before the first adoption landed,
-        // reporting the worktree as still untracked) is a conflict, not a
-        // suffixed sibling — two rows on one worktree would each believe
-        // they own it.
-        if self.get_by_worktree_path(worktree_path)?.is_some() {
+        // One row per directory, archived rows included. A second adoption of
+        // a path a row already points at (a scan that started before the first
+        // adoption landed, reporting the worktree as still untracked) is a
+        // conflict, not a suffixed sibling — two rows on one worktree would
+        // each believe they own it, and an archived row still owns its
+        // directory.
+        let already: i64 = self.db.with_conn(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM workspaces WHERE worktree_path = ?1",
+                [worktree_path],
+                |r| r.get(0),
+            )
+        })?;
+        if already > 0 {
             return Err(StorageError::Conflict {
                 table: "workspaces".into(),
                 constraint: "worktree_path".into(),
