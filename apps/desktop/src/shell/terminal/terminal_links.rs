@@ -51,6 +51,13 @@ fn is_boundary(c: char) -> bool {
     c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '(' | ')' | '<' | '>' | '[' | ']' | '{' | '}')
 }
 
+/// Sentence punctuation that trails a link in prose rather than belonging to
+/// it — "the journal is at plans/x.md." or "see docs/y.md, then…". Trimmed
+/// from BOTH branches: a path that keeps the period stats as missing, which
+/// silently suppresses the underline and the click, and a trailing `.` also
+/// defeats the `path:line:col` digit peel.
+const TRAILING_PUNCT: [char; 6] = ['.', ',', ';', ':', '!', '?'];
+
 /// Detect a link at character column `col` within `row`. Returns the target
 /// plus its inclusive `[col_start, col_end]` span, or `None`.
 pub fn detect_at(row: &[char], col: usize) -> Option<LinkMatch> {
@@ -66,22 +73,26 @@ pub fn detect_at(row: &[char], col: usize) -> Option<LinkMatch> {
     while end + 1 < row.len() && !is_boundary(row[end + 1]) {
         end += 1;
     }
-    let token: String = row[start..=end].iter().collect();
+    let raw: String = row[start..=end].iter().collect();
+    // Trailing sentence punctuation isn't part of the link, and the span must
+    // shrink with it so the underline covers exactly the clickable text.
+    let token = raw.trim_end_matches(TRAILING_PUNCT);
+    if token.is_empty() {
+        return None;
+    }
+    let end = start + token.chars().count() - 1;
 
-    if let Some(url) = classify_url(&token) {
-        // Trailing sentence punctuation isn't part of the URL.
-        let trimmed_len = url.trim_end_matches(['.', ',', ';', ':', '!', '?']).len();
-        let trimmed = &url[..trimmed_len];
-        if trimmed.len() > scheme_len(trimmed) {
-            return Some(LinkMatch {
-                target: LinkTarget::Url(trimmed.to_string()),
-                col_start: start,
-                col_end: start + trimmed.chars().count() - 1,
-            });
-        }
+    if let Some(url) = classify_url(token)
+        && url.len() > scheme_len(&url)
+    {
+        return Some(LinkMatch {
+            target: LinkTarget::Url(url),
+            col_start: start,
+            col_end: end,
+        });
     }
 
-    classify_path(&token).map(|target| LinkMatch {
+    classify_path(token).map(|target| LinkMatch {
         target,
         col_start: start,
         col_end: end,
@@ -252,6 +263,58 @@ mod tests {
             target_at("visit https://example.com.", 7),
             Some(LinkTarget::Url("https://example.com".into()))
         );
+    }
+
+    #[test]
+    fn trims_trailing_punctuation_from_paths() {
+        // The shape agents actually print: a doc path ending a sentence.
+        // Keeping the period made the existence stat miss, which silently
+        // suppressed both the hover underline and the Cmd-click.
+        let r = row("A journal entry is at plans/journals/2026-09-11-x.md.");
+        let m = detect_at(&r, 25).unwrap();
+        assert_eq!(
+            m.target,
+            LinkTarget::Path {
+                path: PathBuf::from("plans/journals/2026-09-11-x.md"),
+                line: None,
+                col: None,
+            }
+        );
+        // The span stops before the period so the underline matches the link.
+        assert_eq!(
+            r[m.col_start..=m.col_end].iter().collect::<String>(),
+            "plans/journals/2026-09-11-x.md"
+        );
+        // A comma mid-sentence is a boundary too.
+        assert_eq!(
+            target_at("see docs/setup.md, then go", 6),
+            Some(LinkTarget::Path {
+                path: PathBuf::from("docs/setup.md"),
+                line: None,
+                col: None,
+            })
+        );
+    }
+
+    #[test]
+    fn trailing_period_does_not_eat_line_and_col() {
+        // Without the trim the trailing `.` blocks the digit peel, losing the
+        // position AND leaving a path that can never exist on disk.
+        assert_eq!(
+            target_at("open src/foo.rs:42:7.", 5),
+            Some(LinkTarget::Path {
+                path: PathBuf::from("src/foo.rs"),
+                line: Some(42),
+                col: Some(7),
+            })
+        );
+    }
+
+    #[test]
+    fn punctuation_only_token_is_not_a_link() {
+        // Trimming must not manufacture an empty token (or a bare scheme).
+        assert_eq!(target_at("...", 1), None);
+        assert_eq!(target_at("mailto:", 0), None);
     }
 
     #[test]
