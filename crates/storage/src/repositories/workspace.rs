@@ -380,32 +380,30 @@ impl WorkspaceRepo {
         branch: &str,
         worktree_path: &str,
     ) -> Result<Workspace, StorageError> {
-        // One row per directory, archived rows included. A second adoption of
-        // a path a row already points at (a scan that started before the first
-        // adoption landed, reporting the worktree as still untracked) is a
-        // conflict, not a suffixed sibling — two rows on one worktree would
-        // each believe they own it, and an archived row still owns its
-        // directory.
-        let already: i64 = self.db.with_conn(|c| {
-            c.query_row(
-                "SELECT COUNT(*) FROM workspaces WHERE worktree_path = ?1",
-                [worktree_path],
-                |r| r.get(0),
-            )
-        })?;
-        if already > 0 {
-            return Err(StorageError::Conflict {
-                table: "workspaces".into(),
-                constraint: "worktree_path".into(),
-            });
-        }
         let id = new_id();
         let created_at = now();
         let status = "active";
         let sort_order = self.next_sort_order(project_id)?;
-        self.db
+        let inserted = self
+            .db
             .with_conn(|c| {
                 let tx = c.unchecked_transaction()?;
+                // One row per directory, archived rows included, checked
+                // INSIDE the transaction so two adoptions of the same path
+                // cannot both read zero and both commit. A second adoption of
+                // a path a row already points at (a scan that started before
+                // the first adoption landed, reporting the worktree as still
+                // untracked) is a conflict, not a suffixed sibling — two rows
+                // on one worktree would each believe they own it, and an
+                // archived row still owns its directory.
+                let already: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM workspaces WHERE worktree_path = ?1",
+                    [worktree_path],
+                    |r| r.get(0),
+                )?;
+                if already > 0 {
+                    return Ok(false);
+                }
                 tx.execute(
                     "INSERT INTO workspaces (id, project_id, name, slug, branch, worktree_path, status, created_at, archived_at, sort_order, branch_minted) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, 0)",
@@ -415,9 +413,16 @@ impl WorkspaceRepo {
                     "INSERT INTO workspace_adoptions (workspace_id, adopted_at, unvetted) VALUES (?1, ?2, 1)",
                     params![id, created_at],
                 )?;
-                tx.commit()
+                tx.commit()?;
+                Ok(true)
             })
             .map_err(|e| classify_unique("workspaces", "project_id_slug", e))?;
+        if !inserted {
+            return Err(StorageError::Conflict {
+                table: "workspaces".into(),
+                constraint: "worktree_path".into(),
+            });
+        }
         Ok(Workspace {
             id,
             project_id: project_id.to_string(),
