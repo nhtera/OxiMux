@@ -1,0 +1,186 @@
+//! Ahead/behind of HEAD against the ref a worktree is measured from.
+//!
+//! The rail wants one number pair per worktree — `↑2 ↓5` — and, just as
+//! importantly, the *name* of what it was compared to, because a count
+//! against the wrong base is worse than no count. So the answer here is a
+//! [`AheadBehind`] carrying its base, and "no base resolves" is `None`, never
+//! a zero pair: an unpublished branch in a remote-less repo has nothing to be
+//! behind, and the row must be able to show nothing rather than `↑0 ↓0`.
+//!
+//! Resolution order, first hit wins:
+//!
+//! 1. the caller's pinned base — the SCM panel's per-worktree base ref;
+//! 2. the branch's configured upstream, which is what the git panel's own
+//!    ahead/behind is relative to, so the two agree;
+//! 3. the project's default branch, as a local ref and then as
+//!    `origin/<default>` — the case an upstream cannot answer: a branch
+//!    that was never pushed, or whose upstream is gone after a merge.
+//!
+//! Cost, per call: one `for-each-ref` when a branch name is known (it yields
+//! the upstream's name and its ahead/behind in one process), then one
+//! `rev-list --left-right --count` per remaining candidate until one
+//! resolves. Nothing here walks the working tree, and a repo with an
+//! upstream pays exactly one process.
+
+use std::path::Path;
+use std::time::Duration;
+
+use crate::process::GitCmd;
+
+/// Commit counts of HEAD relative to a named base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AheadBehind {
+    /// The ref the counts are against, as the user would name it
+    /// (`origin/main`, `main`, a pinned `release/2.1`).
+    pub base: String,
+    /// Commits on HEAD that are not on `base`.
+    pub ahead: u32,
+    /// Commits on `base` that are not on HEAD.
+    pub behind: u32,
+}
+
+/// `rev-list` is a pure ref walk, but a pathological history can still take
+/// a while; the rail polls, so a slow answer must not pile up.
+const REV_LIST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// HEAD's ahead/behind against the first base that resolves, in the order
+/// the module docs give. `None` when nothing does.
+///
+/// `branch` is the local branch whose upstream to consult — the branch the
+/// caller believes the worktree is on. `None` skips the upstream step
+/// (a detached checkout, or a caller that does not know the branch).
+pub async fn ahead_behind_vs_base(
+    workdir: &Path,
+    pinned_base: Option<&str>,
+    branch: Option<&str>,
+    default_branch: &str,
+) -> Option<AheadBehind> {
+    if let Some(pinned) = pinned_base.map(str::trim).filter(|s| !s.is_empty())
+        && let Some(found) = ahead_behind_against(workdir, pinned).await
+    {
+        return Some(found);
+    }
+    if let Some(branch) = branch.map(str::trim).filter(|s| !s.is_empty())
+        && let Some(found) = ahead_behind_vs_upstream(workdir, branch).await
+    {
+        return Some(found);
+    }
+    let default_branch = default_branch.trim();
+    if default_branch.is_empty() {
+        return None;
+    }
+    for cand in [default_branch.to_string(), format!("origin/{default_branch}")] {
+        if let Some(found) = ahead_behind_against(workdir, &cand).await {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// `git rev-list --left-right --count <base>...HEAD`, or `None` when `base`
+/// does not name a commit (unknown ref, no HEAD yet, not a repo).
+pub async fn ahead_behind_against(workdir: &Path, base: &str) -> Option<AheadBehind> {
+    let raw = GitCmd::new(workdir)
+        .args(["rev-list", "--left-right", "--count", &format!("{base}...HEAD"), "--"])
+        .timeout(REV_LIST_TIMEOUT)
+        .run_raw()
+        .await
+        .ok()?;
+    if !raw.status.success() {
+        return None;
+    }
+    let (behind, ahead) = parse_left_right_count(&String::from_utf8_lossy(&raw.stdout))?;
+    Some(AheadBehind {
+        base: base.to_string(),
+        ahead,
+        behind,
+    })
+}
+
+/// `branch`'s ahead/behind against its configured upstream, from one
+/// `for-each-ref` — the upstream's short name and its track summary
+/// (`ahead 2, behind 1`, empty when level) in a single process. `None` when
+/// the branch does not exist locally, has no upstream, or its upstream is
+/// gone (deleted after a merge). All three mean "compare to something else",
+/// not errors.
+async fn ahead_behind_vs_upstream(workdir: &Path, branch: &str) -> Option<AheadBehind> {
+    let raw = GitCmd::new(workdir)
+        .args([
+            "for-each-ref",
+            "--format=%(upstream:short)%09%(upstream:track,nobracket)",
+            &format!("refs/heads/{branch}"),
+        ])
+        .run_raw()
+        .await
+        .ok()?;
+    if !raw.status.success() {
+        return None;
+    }
+    parse_upstream_track(&String::from_utf8_lossy(&raw.stdout))
+}
+
+/// Parse `<upstream>\t<track>` from the `for-each-ref` format above.
+/// `track` is `ahead N`, `behind M`, `ahead N, behind M`, empty (level) or
+/// `gone`. No upstream prints an empty name.
+fn parse_upstream_track(text: &str) -> Option<AheadBehind> {
+    let line = text.lines().next()?;
+    let (name, track) = line.split_once('\t')?;
+    let name = name.trim();
+    if name.is_empty() || track.trim() == "gone" {
+        return None;
+    }
+    let (mut ahead, mut behind) = (0u32, 0u32);
+    for part in track.split(',') {
+        let mut words = part.split_whitespace();
+        match (words.next(), words.next().and_then(|n| n.parse().ok())) {
+            (Some("ahead"), Some(n)) => ahead = n,
+            (Some("behind"), Some(n)) => behind = n,
+            (None, _) => {}
+            _ => return None,
+        }
+    }
+    Some(AheadBehind {
+        base: name.to_string(),
+        ahead,
+        behind,
+    })
+}
+
+/// Parse `<left>\t<right>` from `rev-list --left-right --count`. Left is the
+/// base's side (commits HEAD is behind), right is HEAD's (commits ahead).
+fn parse_left_right_count(text: &str) -> Option<(u32, u32)> {
+    let mut it = text.split_whitespace();
+    let left = it.next()?.parse().ok()?;
+    let right = it.next()?.parse().ok()?;
+    Some((left, right))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_left_right_count, parse_upstream_track};
+
+    #[test]
+    fn parses_the_tab_separated_pair() {
+        assert_eq!(parse_left_right_count("5\t2\n"), Some((5, 2)));
+        assert_eq!(parse_left_right_count("0\t0\n"), Some((0, 0)));
+    }
+
+    #[test]
+    fn upstream_track_covers_every_shape_git_prints() {
+        let ab = |t: &str| parse_upstream_track(t).map(|a| (a.base, a.ahead, a.behind));
+        assert_eq!(ab("origin/x\tahead 2, behind 1\n"), Some(("origin/x".into(), 2, 1)));
+        assert_eq!(ab("origin/x\tahead 3\n"), Some(("origin/x".into(), 3, 0)));
+        assert_eq!(ab("origin/x\tbehind 4\n"), Some(("origin/x".into(), 0, 4)));
+        assert_eq!(ab("origin/x\t\n"), Some(("origin/x".into(), 0, 0)));
+        assert_eq!(ab("origin/x\tgone\n"), None, "a deleted upstream is not a base");
+        assert_eq!(ab("\t\n"), None, "no upstream configured");
+        assert_eq!(ab(""), None, "the branch does not exist");
+    }
+
+    #[test]
+    fn rejects_anything_that_is_not_two_counts() {
+        assert_eq!(parse_left_right_count(""), None);
+        assert_eq!(parse_left_right_count("7\n"), None);
+        assert_eq!(parse_left_right_count("a\tb\n"), None);
+    }
+}

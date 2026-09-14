@@ -21,7 +21,8 @@ use crate::shell::left_rail::project_drag::{
 };
 use crate::shell::left_rail::workspace_card::{RowRenameConfig, render_workspace_card};
 use crate::shell::left_rail::workspace_list_render::WorkspaceSortMode;
-use crate::shell::left_rail::workspace_row::{DiffCounts, build_workspace_card_plan};
+use crate::shell::left_rail::workspace_row::build_workspace_card_plan;
+use crate::shell::left_rail::worktree_stats::WorktreeStats;
 use crate::workspace_root::WorkspaceRoot;
 
 /// Chevron / folder glyph size in the header.
@@ -95,7 +96,7 @@ pub fn build_project_group_plan(
 /// status for the dot color; the lookup is injected so the caller decides
 /// whether to query a HashMap (cached map) or call the repo directly.
 ///
-/// `diff_counts` is keyed by worktree path; a missing entry means the count
+/// `worktree_stats` is keyed by worktree path; a missing entry means the count
 /// is not yet cached — the card renders without the diff chip.
 #[allow(clippy::too_many_arguments)]
 pub fn render_project_group(
@@ -114,7 +115,7 @@ pub fn render_project_group(
     row_menu_open: bool,
     live_worktrees: &std::collections::HashSet<String>,
     ambient_by_path: &std::collections::HashMap<String, AmbientAgent>,
-    diff_counts: &std::collections::HashMap<String, DiffCounts>,
+    worktree_stats: &std::collections::HashMap<String, WorktreeStats>,
     workspace_agents: &crate::shell::left_rail::WorkspaceAgentList,
     expanded_workspaces: &std::collections::HashSet<String>,
     focused_agent: Option<&crate::shell::left_rail::RailAgentTarget>,
@@ -165,7 +166,7 @@ pub fn render_project_group(
             row_menu_open,
             live_worktrees,
             ambient_by_path,
-            diff_counts,
+            worktree_stats,
             workspace_agents,
             expanded_workspaces,
             focused_agent,
@@ -296,7 +297,7 @@ pub(crate) fn render_archived_section(
     let empty_live: std::collections::HashSet<String> = std::collections::HashSet::new();
     let empty_ambient: std::collections::HashMap<String, AmbientAgent> =
         std::collections::HashMap::new();
-    let empty_diffs: std::collections::HashMap<String, DiffCounts> = std::collections::HashMap::new();
+    let empty_diffs: std::collections::HashMap<String, WorktreeStats> = std::collections::HashMap::new();
     let empty_agents = crate::shell::left_rail::WorkspaceAgentList::new();
     let empty_expanded: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -361,7 +362,7 @@ pub(crate) fn render_workspace_block(
     row_menu_open: bool,
     live_worktrees: &std::collections::HashSet<String>,
     ambient_by_path: &std::collections::HashMap<String, AmbientAgent>,
-    diff_counts: &std::collections::HashMap<String, DiffCounts>,
+    worktree_stats: &std::collections::HashMap<String, WorktreeStats>,
     workspace_agents: &crate::shell::left_rail::WorkspaceAgentList,
     expanded_workspaces: &std::collections::HashSet<String>,
     focused_agent: Option<&crate::shell::left_rail::RailAgentTarget>,
@@ -419,9 +420,9 @@ pub(crate) fn render_workspace_block(
             })
         }
         .map(SharedString::new_static);
-        // Diff counts are looked up from the pushed-down cache; `None` means
-        // not yet available — the card renders without the chip.
-        let diff = diff_counts.get(&workspace.worktree_path).cloned();
+        // Git numbers are looked up from the pushed-down cache; `None` means
+        // not yet measured — the card renders without those chips.
+        let stats = worktree_stats.get(&workspace.worktree_path);
         // A single-agent workspace surfaces the agent's prompt as the card's
         // title (the dot still carries status). This includes a restored,
         // non-live agent: its persisted title shows after a restart instead of
@@ -443,7 +444,7 @@ pub(crate) fn render_workspace_block(
             latest.as_ref(),
             agent_name,
             agent_title,
-            diff,
+            stats,
             theme,
         );
         let row_id: SharedString = format!("ws-row-{}", workspace.id).into();

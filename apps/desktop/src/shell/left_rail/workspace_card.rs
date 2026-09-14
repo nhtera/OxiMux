@@ -5,8 +5,8 @@
 //! under the 200-LOC soft cap.
 //!
 //! Layout (two lines):
-//!   Line 1: [dot] [name] [agent glyph, compact only] [primary badge] [branch chip]
-//!   Line 2: [agent verb (colored)] [+A −B diff chip]
+//!   Line 1: [dot] [name] [agent glyph, compact only] [primary badge] [branch chip] [stat chips, compact only]
+//!   Line 2: [agent verb (colored)] [~F · +A −B diff chip] [↑N ↓M ahead/behind chip]
 //!
 //! Card height is documented as a local exception in `design-guidelines.md`
 //! (2 × `h_row` to fit two lines). Hover quick-actions (the "…" menu button)
@@ -24,6 +24,9 @@ use oximux_core::{WorkPhase, Workspace};
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::left_rail::LeftRail;
+use crate::shell::left_rail::worktree_stats::{
+    ahead_behind_label, ahead_behind_tooltip, dirty_files_label,
+};
 use crate::shell::left_rail::project_drag::{
     SidebarDragPreview, WorkspaceDragConfig, WorkspaceDragPayload, insertion_side,
     paint_insertion_line,
@@ -127,7 +130,8 @@ pub fn render_workspace_card(
     locate_glow_seq: u64,
     drag: Option<WorkspaceDragConfig>,
     rename: Option<RowRenameConfig>,
-    // Single-line compact layout: drops the second line (agent verb / diff)
+    // Single-line compact layout: drops the prose line (agent verb / progress),
+    // keeps the stat chips on line 1,
     // and shrinks the card to one row height. Detailed (two-line) when false.
     compact: bool,
     theme: Theme,
@@ -191,17 +195,21 @@ pub fn render_workspace_card(
     });
 
     // Branch chip: shown when branch is present and this is not a folder project.
+    // On a narrow rail this is the element that yields: it carries an
+    // arbitrary-length name that stays useful truncated, while the numeric
+    // chips beside it refuse to shrink (see `stat_chips`).
     let branch_chip = plan.branch.as_ref().map(|branch| {
         div()
             .flex()
             .items_center()
+            .min_w_0()
             .px(px(5.0))
             .h(px(15.0))
             .rounded(px(density.r_chip))
             .bg(theme.bg_overlay)
             .text_size(px(typography.t_sub_label))
             .text_color(theme.fg_subtle)
-            .child(branch.clone())
+            .child(div().min_w_0().truncate().child(branch.clone()))
     });
 
     // Linked-issue badge: shown when the workspace was created from a task
@@ -318,6 +326,8 @@ pub fn render_workspace_card(
         Some(RowRenameConfig {
             rail, workspace, ..
         }) => div()
+            .min_w_0()
+            .truncate()
             .text_size(px(typography.t_body_sm))
             .text_color(plan.row.fg)
             .child(plan.row.name.clone())
@@ -331,22 +341,100 @@ pub fn render_workspace_card(
             .into_any_element(),
         // Primary / non-renamable row → plain title.
         None => div()
+            .min_w_0()
+            .truncate()
             .text_size(px(typography.t_body_sm))
             .text_color(plan.row.fg)
             .child(plan.row.name.clone())
             .into_any_element(),
     };
 
+    // Diff chip: "~F · +A −B" — changed-file count in the muted tone, then
+    // the line totals in status_added / status_removed. `+120 −40` across 2
+    // files and across 40 files are different situations, so the count rides
+    // with the totals. A clean worktree suppresses the chip — an all-zero
+    // stat row is noise on every resting workspace — but a changed file with
+    // no countable lines (a mode change) still shows its `~1`.
+    let changed_files = plan.dirty_files.unwrap_or(0);
+    let diff_elem = plan
+        .diff
+        .as_ref()
+        .filter(|d| d.added > 0 || d.removed > 0 || changed_files > 0)
+        .map(|d| {
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .flex_shrink_0()
+                .gap(px(2.0))
+                .children(plan.dirty_files.and_then(dirty_files_label).map(|files| {
+                    div()
+                        .text_size(px(typography.t_sub_label))
+                        .text_color(theme.fg_muted)
+                        .child(format!("{files} ·"))
+                }))
+                .child(
+                    div()
+                        .text_size(px(typography.t_sub_label))
+                        .text_color(theme.status_added)
+                        .child(format!("+{}", d.added)),
+                )
+                .child(
+                    div()
+                        .text_size(px(typography.t_sub_label))
+                        .text_color(theme.status_removed)
+                        .child(format!("−{}", d.removed)),
+                )
+                .into_any_element()
+        });
+
+    // Ahead/behind chip: "↑2 ↓5" against the worktree's base; hover names the
+    // base so the number is never ambiguous. Unknown (no base resolved) and
+    // level (0/0) both paint nothing — the label helper owns that rule.
+    let ahead_behind_elem = plan.ahead_behind.as_ref().and_then(|ab| {
+        let label = ahead_behind_label(ab)?;
+        let tip: SharedString = ahead_behind_tooltip(ab).into();
+        Some(
+            div()
+                .id(SharedString::from(format!("{row_id}-ahead-behind")))
+                .flex_shrink_0()
+                .text_size(px(typography.t_sub_label))
+                .text_color(theme.fg_muted)
+                .child(label)
+                .tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                })
+                .into_any_element(),
+        )
+    });
+
+    // Where the numbers go. Detailed: line 2, beside the prose. Compact: line 1
+    // after the branch chip — Compact is about height, not about hiding the
+    // two best things the row knows, so it drops only the prose. Both chips
+    // refuse to shrink; the branch chip beside them is the one that yields.
+    let stat_chips: Vec<gpui::AnyElement> = diff_elem.into_iter().chain(ahead_behind_elem).collect();
+    let (line1_stats, line2_stats) = if compact {
+        (stat_chips, Vec::new())
+    } else {
+        (Vec::new(), stat_chips)
+    };
+
+    // `min_w_0` + `overflow_hidden` so the line clips at the column's edge
+    // instead of painting over the trailing button when the name and branch
+    // have already shrunk as far as they can.
     let line1 = div()
         .flex()
         .flex_row()
         .items_center()
+        .min_w_0()
+        .overflow_hidden()
         .gap(px(density.gap_inline))
         .child(name_element)
         .children(agent_glyph)
         .children(pin_indicator)
         .children(primary_badge)
         .children(branch_chip)
+        .children(line1_stats)
         .children(issue_chip)
         .children(phase_chip)
         .children(folder_pill);
@@ -425,36 +513,9 @@ pub fn render_workspace_card(
             )
     });
 
-    // Diff chip: "+A −B" using status_added / status_removed colors.
-    // Clean worktrees (0/0) suppress the chip — an all-zero stat row is
-    // noise on every resting workspace.
-    let diff_elem = plan
-        .diff
-        .as_ref()
-        .filter(|d| d.added > 0 || d.removed > 0)
-        .map(|d| {
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(2.0))
-                .child(
-                    div()
-                        .text_size(px(typography.t_sub_label))
-                        .text_color(theme.status_added)
-                        .child(format!("+{}", d.added)),
-                )
-                .child(
-                    div()
-                        .text_size(px(typography.t_sub_label))
-                        .text_color(theme.status_removed)
-                        .child(format!("−{}", d.removed)),
-                )
-        });
-
     // When a live title is present it takes the whole line (the prompt is the
-    // headline); otherwise fall back to the `name · verb` summary. The diff
-    // chip rides along either way.
+    // headline); otherwise fall back to the `name · verb` summary. The stat
+    // chips ride along either way.
     let line2 = if comment_elem.is_some() {
         // A progress line the agent wrote about itself outranks the prompt it
         // was handed: the prompt says what was asked, the comment says where
@@ -466,7 +527,7 @@ pub fn render_workspace_card(
             .w_full()
             .gap(px(density.gap_inline))
             .children(comment_elem)
-            .children(diff_elem)
+            .children(line2_stats)
     } else if title_elem.is_some() {
         div()
             .flex()
@@ -475,7 +536,7 @@ pub fn render_workspace_card(
             .w_full()
             .gap(px(density.gap_inline))
             .children(title_elem)
-            .children(diff_elem)
+            .children(line2_stats)
     } else if suppress_agent_summary {
         // Multi-agent: the disclosure below lists each agent, so line 2 drops
         // the `name · verb` summary and carries only the diff chip.
@@ -484,7 +545,7 @@ pub fn render_workspace_card(
             .flex_row()
             .items_center()
             .gap(px(density.gap_inline))
-            .children(diff_elem)
+            .children(line2_stats)
     } else {
         div()
             .flex()
@@ -493,7 +554,7 @@ pub fn render_workspace_card(
             .gap(px(density.gap_inline))
             .children(name_elem)
             .children(verb_elem)
-            .children(diff_elem)
+            .children(line2_stats)
     };
 
     // Card shell — two-line tall. Active cards render inset with a rounded
@@ -577,8 +638,9 @@ pub fn render_workspace_card(
                 .flex_col()
                 .gap(px(2.0))
                 .child(line1)
-                // Compact mode shows only the title line; the second line
-                // (agent verb / diff) is dropped to fit a single row height.
+                // Compact mode shows only the title line to fit a single row
+                // height; the prose (agent verb / progress line) is dropped and
+                // the stat chips have already moved up to line 1.
                 .when(!compact, |c| c.child(line2)),
         )
         .child(trailing_btn)

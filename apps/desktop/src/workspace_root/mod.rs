@@ -129,7 +129,8 @@ use crate::shell::{
         options_menu::WorkspaceOptionsMenu,
         project_menu::ProjectRowMenu,
         row_menu::WorkspaceRowMenu,
-        workspace_row::{DiffCounts, looks_like_renormalization, sum_numstat},
+        workspace_row::{looks_like_renormalization, sum_numstat},
+        worktree_stats::WorktreeStats,
     },
     main_area,
     openable_text_file::is_openable_text_file,
@@ -415,7 +416,7 @@ pub struct WorkspaceRoot {
     /// (`run_diff_refresh_round`) and read in `refresh_left_rail`. Never
     /// written inside `Render` — results flow in from background completions
     /// via weak-entity update + cx.notify().
-    pub(crate) diff_counts: HashMap<String, DiffCounts>,
+    pub(crate) worktree_stats: HashMap<String, WorktreeStats>,
     /// Cached sidebar DB data: each project's workspace rows (incl. the
     /// synthesized primary). Refreshed event-driven via `mark_rail_dirty`
     /// (workspace CRUD, project switch, the periodic diff tick as a
@@ -502,6 +503,10 @@ pub struct WorkspaceRoot {
     /// Guards against overlapping refresh rounds — a slow round must finish
     /// before the next tick starts one, so concurrent shellouts cannot pile up.
     pub(crate) diff_refresh_in_flight: bool,
+    /// An event-driven stats refresh (`request_worktree_stats_refresh`)
+    /// arrived while a round was in flight; that round's completion runs
+    /// another so the kick is honoured rather than dropped.
+    pub(crate) worktree_stats_refresh_owed: bool,
     /// Owns the periodic refresh loop. Dropping it cancels the loop when the
     /// window/root entity goes away.
     _diff_refresh_task: Task<()>,
@@ -1346,7 +1351,7 @@ impl WorkspaceRoot {
             add_project_dialog,
             focus_handle,
             window_id,
-            diff_counts: HashMap::new(),
+            worktree_stats: HashMap::new(),
             force_delete_offer: None,
             rail_workspaces_by_project: HashMap::new(),
             rail_archived_by_project: HashMap::new(),
@@ -1368,6 +1373,7 @@ impl WorkspaceRoot {
             rail_agents_dirty: true,
             diff_refresh_focused: true,
             diff_refresh_in_flight: false,
+            worktree_stats_refresh_owed: false,
             _diff_refresh_task: diff_refresh_task,
             _layout_autosave_task: layout_autosave_task,
             _agent_activity_task: agent_activity_task,

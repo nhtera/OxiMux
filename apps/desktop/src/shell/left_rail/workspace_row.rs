@@ -14,9 +14,11 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, div, px, svg,
 };
 use oximux_core::{AgentStatus, WorkPhase, Workspace};
+use oximux_git::AheadBehind;
 use oximux_settings::{Density, Theme, Typography};
 
 use crate::shell::agent_presentation::{AgentVerb, agent_verb};
+use crate::shell::left_rail::worktree_stats::WorktreeStats;
 use crate::shell::pane_group::TabColor;
 
 /// Side length of the colored status circle. Shared with the card painter
@@ -123,6 +125,13 @@ pub struct WorkspaceCardPlan {
     /// Working-tree diff counts. `None` when not yet fetched or unavailable;
     /// card omits the `+A −B` chip gracefully.
     pub diff: Option<DiffCounts>,
+    /// Tracked files with a diff against HEAD. `None` when not yet measured;
+    /// `Some(0)` is a clean tree. The card shows no chip for either, but the
+    /// two are distinct here so a test can tell "unknown" from "clean".
+    pub dirty_files: Option<u32>,
+    /// HEAD against the worktree's base. `None` when unmeasured **or when no
+    /// base resolved** — never a zero pair standing in for "unknown".
+    pub ahead_behind: Option<AheadBehind>,
     /// GitHub issue/PR reference (e.g. `"#42"`) this workspace was created
     /// from, shown as a small badge. `None` for manually-created workspaces.
     pub linked_issue: Option<String>,
@@ -204,7 +213,7 @@ pub fn build_workspace_card_plan(
     latest_status: Option<&AgentStatus>,
     agent_name: Option<SharedString>,
     agent_title: Option<SharedString>,
-    diff: Option<DiffCounts>,
+    stats: Option<&WorktreeStats>,
     theme: Theme,
 ) -> WorkspaceCardPlan {
     let row = build_workspace_row_plan(
@@ -257,7 +266,9 @@ pub fn build_workspace_card_plan(
         agent_verb: agent_verb_opt,
         agent_name,
         agent_title,
-        diff,
+        diff: stats.map(|s| s.diff.clone()),
+        dirty_files: stats.map(|s| s.dirty_files),
+        ahead_behind: stats.and_then(|s| s.ahead_behind.clone()),
         linked_issue: workspace.linked_issue.clone(),
         tint: workspace.tint.as_deref().and_then(TabColor::from_slug),
         pinned: workspace.pinned,
@@ -756,24 +767,56 @@ mod tests {
         assert!(plan.agent_title.is_none());
     }
 
-    #[test]
-    fn card_plan_diff_present_when_supplied() {
-        let t = Theme::charcoal();
+    fn stats(added: u32, removed: u32, files: u32, ab: Option<(u32, u32)>) -> WorktreeStats {
+        WorktreeStats {
+            diff: DiffCounts { added, removed },
+            dirty_files: files,
+            ahead_behind: ab.map(|(ahead, behind)| AheadBehind {
+                base: "origin/main".into(),
+                ahead,
+                behind,
+            }),
+        }
+    }
+
+    fn card_with(stats: Option<&WorktreeStats>) -> WorkspaceCardPlan {
         let w = ws("X", "x");
-        let diff = Some(DiffCounts { added: 10, removed: 3 });
-        let plan =
-            build_workspace_card_plan(&w, false, false, false, false, None, None, None, diff, t);
-        let d = plan.diff.expect("supplied diff must be carried through");
-        assert_eq!(d.added, 10);
-        assert_eq!(d.removed, 3);
+        build_workspace_card_plan(&w, false, false, false, false, None, None, None, stats, Theme::charcoal())
     }
 
     #[test]
-    fn card_plan_diff_absent_when_not_supplied() {
-        let t = Theme::charcoal();
-        let w = ws("X", "x");
-        let plan = build_workspace_card_plan(&w, false, false, false, false, None, None, None, None, t);
+    fn card_plan_carries_every_stat_when_supplied() {
+        let plan = card_with(Some(&stats(10, 3, 2, Some((2, 5)))));
+        assert_eq!(plan.diff, Some(DiffCounts { added: 10, removed: 3 }));
+        assert_eq!(plan.dirty_files, Some(2));
+        let ab = plan.ahead_behind.expect("a resolved base must reach the card");
+        assert_eq!((ab.base.as_str(), ab.ahead, ab.behind), ("origin/main", 2, 5));
+    }
+
+    #[test]
+    fn card_plan_stats_absent_when_not_measured() {
+        let plan = card_with(None);
         assert!(plan.diff.is_none());
+        assert!(plan.dirty_files.is_none());
+        assert!(plan.ahead_behind.is_none());
+    }
+
+    /// The property the chips rely on: a measured clean tree and a
+    /// never-measured one are different plans, even though both paint nothing.
+    #[test]
+    fn zero_stats_are_present_not_absent() {
+        let plan = card_with(Some(&stats(0, 0, 0, Some((0, 0)))));
+        assert_eq!(plan.diff, Some(DiffCounts { added: 0, removed: 0 }));
+        assert_eq!(plan.dirty_files, Some(0));
+        assert_eq!(plan.ahead_behind.as_ref().map(|a| (a.ahead, a.behind)), Some((0, 0)));
+        assert_ne!(plan, card_with(None));
+    }
+
+    #[test]
+    fn an_unresolved_base_is_absent_even_when_the_diff_is_known() {
+        let plan = card_with(Some(&stats(1, 1, 1, None)));
+        assert!(plan.diff.is_some());
+        assert!(plan.ahead_behind.is_none(), "no base must not become ↑0 ↓0");
     }
 
     #[test]

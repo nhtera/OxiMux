@@ -218,8 +218,13 @@ pub(crate) fn spawn_for_session(
 
         // Terminal status reached. The session is now history (a persisted
         // row); drop the live entry so the rail shows the single history row
-        // rather than a duplicate live + history pair.
-        let _ = weak.update(cx, |this, cx| this.remove_live_agent(&row_id, cx));
+        // rather than a duplicate live + history pair. An agent that just
+        // finished has usually left commits or edits behind, so the row's git
+        // numbers are re-measured now instead of on the next tick.
+        let _ = weak.update(cx, |this, cx| {
+            this.remove_live_agent(&row_id, cx);
+            this.request_worktree_stats_refresh(cx);
+        });
     })
     .detach();
 }

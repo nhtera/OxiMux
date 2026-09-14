@@ -962,6 +962,9 @@ impl Render for WorkspaceRoot {
             .on_action(cx.listener(|this, _: &crate::actions::ReloadCustomCommands, _window, cx| {
                 this.reload_custom_commands(cx);
             }))
+            .on_action(cx.listener(|this, _: &crate::actions::RefreshWorktreeStats, _window, cx| {
+                this.request_worktree_stats_refresh(cx);
+            }))
             .on_action(cx.listener(|this, _: &OpenWorkspaceCreate, window, cx| {
                 let projects = this.app_state.recent_projects.clone();
                 // Every route lands here — ⌘N, ⌘⇧N, the palette row, the

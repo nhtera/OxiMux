@@ -22,40 +22,88 @@ impl WorkspaceRoot {
         paths
     }
 
-    /// Collect every worktree path across all recent projects (the project
-    /// root plus each linked worktree). Same source the rail snapshot uses;
-    /// deduped so a project root that already has a workspace row is counted
-    /// once. Synchronous SQLite reads only — no git, safe to call per round.
-    fn all_worktree_paths(&self) -> Vec<String> {
-        let mut paths: Vec<String> = Vec::new();
+    /// Every worktree the rail shows, across all recent projects (each
+    /// project root plus its linked worktrees), with what its stats refresh
+    /// needs beyond the path: the default branch to fall back to and the base
+    /// ref the SCM panel pinned for it, if any. Deduped so a project root
+    /// that also has a workspace row is measured once. Synchronous SQLite
+    /// reads only — no git, safe to call per round.
+    fn worktree_refresh_targets(&self) -> Vec<StatsTarget> {
+        let mut targets: Vec<StatsTarget> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for project in &self.app_state.recent_projects {
-            paths.push(project.root_path.clone());
+            // The root row is synthesized on the project's default branch
+            // (`workspaces_with_primary_for`); a real root row in the list
+            // replaces it below through the dedup, branch and all.
+            let mut rows = vec![(project.root_path.clone(), project.default_branch.clone())];
             if let Ok(list) = self.app_state.workspace_repo.list_for_project(&project.id) {
-                for w in list {
-                    if w.worktree_path != project.root_path {
-                        paths.push(w.worktree_path);
-                    }
+                rows.extend(list.into_iter().map(|w| (w.worktree_path, w.branch)));
+            }
+            for (path, branch) in rows {
+                if !seen.insert(path.clone()) {
+                    continue;
                 }
+                let pinned_base = self.pinned_base_for(&path);
+                targets.push(StatsTarget {
+                    path,
+                    branch: (!branch.is_empty()).then_some(branch),
+                    pinned_base,
+                    default_branch: project.default_branch.clone(),
+                });
             }
         }
-        paths.sort();
-        paths.dedup();
-        paths
+        targets
     }
 
-    /// Run one concurrent diff-count refresh round. Self-guards against
-    /// overlap via `diff_refresh_in_flight`. Fans out all per-worktree
-    /// `git diff --numstat` shellouts concurrently (serial per-worktree
-    /// shellouts previously froze the rail), then writes the results back on
-    /// the main thread and evicts paths that no longer exist so the cache
-    /// cannot grow without bound.
+    /// The SCM panel's pinned base ref for one worktree, if the user set one.
     ///
-    /// The numstat shellout spawns a child via `tokio::process`, which needs a
-    /// live Tokio reactor. GPUI's background executor has none, so the fan-out
-    /// runs on the app's Tokio runtime (entered on the main thread for the life
-    /// of the app) and results are ferried back over a oneshot to a GPUI task.
-    /// Called only from main-thread GPUI callbacks, where `Handle::try_current`
-    /// resolves to that runtime.
+    /// The panel keys `worktree_settings` by `Repository::workdir()`, which is
+    /// `git rev-parse --show-toplevel` — a resolved path — while the row
+    /// stores the path it was created with. They agree except through a
+    /// symlink, so a miss on the stored path retries the canonicalised one
+    /// before concluding there is no pin. A missing row and a read error both
+    /// mean "no pin": the refresh must not depend on a scratch table.
+    fn pinned_base_for(&self, path: &str) -> Option<String> {
+        let repo = &self.app_state.worktree_settings_repo;
+        let by_key = |key: &str| repo.get(key).ok().flatten().and_then(|s| s.base_ref);
+        by_key(path).or_else(|| {
+            let canonical = std::fs::canonicalize(path).ok()?;
+            let canonical = canonical.to_string_lossy();
+            (canonical != path).then(|| by_key(&canonical)).flatten()
+        })
+    }
+
+    /// Re-measure every worktree now because something just moved history
+    /// — a commit or remote op finished, an agent session ended. Runs a round
+    /// immediately when none is in flight; otherwise marks one as owed, and
+    /// the in-flight round's completion starts it. Only these event-driven
+    /// kicks queue up: the periodic tick still drops on the floor when a
+    /// round is running, so a slow repo cannot chain rounds back to back.
+    pub(crate) fn request_worktree_stats_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.diff_refresh_in_flight {
+            self.worktree_stats_refresh_owed = true;
+            return;
+        }
+        self.run_diff_refresh_round(cx);
+    }
+
+    /// Run one concurrent worktree-stats refresh round. Self-guards against
+    /// overlap via `diff_refresh_in_flight`. Fans out all per-worktree git
+    /// shellouts concurrently (serial per-worktree shellouts previously froze
+    /// the rail), then writes the results back on the main thread and evicts
+    /// paths that no longer exist so the cache cannot grow without bound.
+    ///
+    /// This is the **only** per-worktree git loop in the app. Every number a
+    /// row shows — line totals, changed files, ahead/behind — comes out of one
+    /// batched future per path here (see [`measure_worktree`]); anything that
+    /// wants another number joins this round rather than starting a timer.
+    ///
+    /// The shellouts spawn children via `tokio::process`, which needs a live
+    /// Tokio reactor. GPUI's background executor has none, so the fan-out
+    /// runs on the app's Tokio runtime (entered on the main thread for the
+    /// life of the app) and results are ferried back over a oneshot to a GPUI
+    /// task. Called only from main-thread GPUI callbacks, where
+    /// `Handle::try_current` resolves to that runtime.
     pub(crate) fn run_diff_refresh_round(&mut self, cx: &mut Context<Self>) {
         // Reconciliation net for the sidebar's DB caches: any workspace /
         // agent-session write that missed an explicit `mark_rail_dirty`
@@ -64,8 +112,8 @@ impl WorkspaceRoot {
         if self.diff_refresh_in_flight {
             return;
         }
-        let paths = self.all_worktree_paths();
-        if paths.is_empty() {
+        let targets = self.worktree_refresh_targets();
+        if targets.is_empty() {
             return;
         }
         // Bail (leaving the flag clear) when no runtime is entered so a
@@ -76,60 +124,18 @@ impl WorkspaceRoot {
             Err(_) => {
                 tracing::warn!(
                     target: "oximux_app::workspace_root",
-                    "no tokio runtime; worktree diff counts stay stale this round"
+                    "no tokio runtime; worktree stats stay stale this round"
                 );
                 return;
             }
         };
         self.diff_refresh_in_flight = true;
         let (tx, rx) =
-            tokio::sync::oneshot::channel::<Vec<(String, Option<DiffCounts>)>>();
+            tokio::sync::oneshot::channel::<Vec<(String, Option<WorktreeStats>)>>();
         handle.spawn(async move {
-            let futs = paths.into_iter().map(|path| async move {
-                let counts = oximux_git::diff_numstat_head(std::path::Path::new(&path))
-                    .await
-                    .ok()
-                    .map(|map| {
-                        let counts = sum_numstat(&map);
-                        // Instrumentation for an unreproduced defect (see
-                        // `looks_like_renormalization`). Logged, never
-                        // suppressed: the recurrence is the thing we need, and
-                        // a silently corrected count would destroy the
-                        // evidence. Names the files because "which files did
-                        // git think changed" is the question analysis could not
-                        // answer after the fact.
-                        if looks_like_renormalization(map.len(), &counts) {
-                            let mut names: Vec<String> = map
-                                .keys()
-                                .take(20)
-                                .map(|p| p.display().to_string())
-                                .collect();
-                            names.sort();
-                            tracing::warn!(
-                                target: "oximux_app::workspace_root",
-                                worktree = %path,
-                                files = map.len(),
-                                added = counts.added,
-                                removed = counts.removed,
-                                sample = ?names,
-                                "implausible worktree diff: symmetric line counts across \
-                                 several files. Capture `git status --porcelain` and \
-                                 `git diff --stat HEAD` for this worktree now — this is the \
-                                 unreproduced phantom-diff defect recurring."
-                            );
-                        } else {
-                            tracing::debug!(
-                                target: "oximux_app::workspace_root",
-                                worktree = %path,
-                                files = map.len(),
-                                added = counts.added,
-                                removed = counts.removed,
-                                "worktree diff refreshed"
-                            );
-                        }
-                        counts
-                    });
-                (path, counts)
+            let futs = targets.into_iter().map(|target| async move {
+                let stats = measure_worktree(&target).await;
+                (target.path, stats)
             });
             let _ = tx.send(futures::future::join_all(futs).await);
         });
@@ -147,16 +153,21 @@ impl WorkspaceRoot {
                 // worktrees age out of the cache.
                 let current: std::collections::HashSet<String> =
                     results.iter().map(|(p, _)| p.clone()).collect();
-                for (path, counts) in results {
+                for (path, stats) in results {
                     // A failed fetch leaves the prior value intact rather than
-                    // blanking the chip on a transient git error.
-                    if let Some(counts) = counts {
-                        this.diff_counts.insert(path, counts);
+                    // blanking the chips on a transient git error.
+                    if let Some(stats) = stats {
+                        this.worktree_stats.insert(path, stats);
                     }
                 }
-                this.diff_counts.retain(|k, _| current.contains(k));
+                this.worktree_stats.retain(|k, _| current.contains(k));
                 this.diff_refresh_in_flight = false;
                 cx.notify();
+                // An eager kick landed while this round ran: what it wanted
+                // measured happened after the fan-out started, so go again.
+                if std::mem::take(&mut this.worktree_stats_refresh_owed) {
+                    this.run_diff_refresh_round(cx);
+                }
             });
         })
         .detach();
@@ -1668,4 +1679,89 @@ impl WorkspaceRoot {
         let text = text.into();
         self.toast_layer.update(cx, |layer, cx| layer.push(kind, text, cx));
     }
+}
+
+/// One worktree's line in the refresh round: where it is, and what its
+/// ahead/behind should be measured against when nothing better resolves.
+struct StatsTarget {
+    path: String,
+    /// The branch the row says this worktree is on; its upstream is the
+    /// second comparison candidate. `None` for a folder project.
+    branch: Option<String>,
+    /// The SCM panel's pinned base ref for this worktree, if the user set one.
+    pinned_base: Option<String>,
+    /// The project's default branch — the last-resort comparison base.
+    default_branch: String,
+}
+
+/// One worktree's numbers, in one batched future. The numstat the diff chip
+/// always needed and HEAD's ahead/behind against the worktree's base are
+/// independent, so they run concurrently rather than back to back.
+///
+/// The numstat is the gate: without it there is nothing to show, so its
+/// failure yields `None` and the round leaves the prior cache entry in place.
+/// An unresolved base is not a failure — the row simply carries no `↑ ↓`
+/// chip — and the changed-file count is the numstat's own row count, so it
+/// costs no extra process.
+async fn measure_worktree(target: &StatsTarget) -> Option<WorktreeStats> {
+    let path = std::path::Path::new(&target.path);
+    // A folder project (or a worktree whose directory is gone) has nothing to
+    // measure; spawning git to learn that, every tick, is the cost this phase
+    // must not add. A linked worktree has a `.git` *file*, so `exists` is the
+    // right test, not `is_dir`.
+    if !path.join(".git").exists() {
+        return None;
+    }
+    let (numstat, ahead_behind) = futures::future::join(
+        oximux_git::diff_numstat_head(path),
+        oximux_git::ahead_behind_vs_base(
+            path,
+            target.pinned_base.as_deref(),
+            target.branch.as_deref(),
+            &target.default_branch,
+        ),
+    )
+    .await;
+    let map = numstat.ok()?;
+    let counts = sum_numstat(&map);
+    // Instrumentation for an unreproduced defect (see
+    // `looks_like_renormalization`). Logged, never suppressed: the recurrence
+    // is the thing we need, and a silently corrected count would destroy the
+    // evidence. Names the files because "which files did git think changed"
+    // is the question analysis could not answer after the fact.
+    if looks_like_renormalization(map.len(), &counts) {
+        let mut names: Vec<String> = map
+            .keys()
+            .take(20)
+            .map(|p| p.display().to_string())
+            .collect();
+        names.sort();
+        tracing::warn!(
+            target: "oximux_app::workspace_root",
+            worktree = %target.path,
+            files = map.len(),
+            added = counts.added,
+            removed = counts.removed,
+            sample = ?names,
+            "implausible worktree diff: symmetric line counts across \
+             several files. Capture `git status --porcelain` and \
+             `git diff --stat HEAD` for this worktree now — this is the \
+             unreproduced phantom-diff defect recurring."
+        );
+    } else {
+        tracing::debug!(
+            target: "oximux_app::workspace_root",
+            worktree = %target.path,
+            files = map.len(),
+            added = counts.added,
+            removed = counts.removed,
+            ahead_behind = ?ahead_behind,
+            "worktree stats refreshed"
+        );
+    }
+    Some(WorktreeStats {
+        diff: counts,
+        dirty_files: u32::try_from(map.len()).unwrap_or(u32::MAX),
+        ahead_behind,
+    })
 }
