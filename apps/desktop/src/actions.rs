@@ -376,6 +376,19 @@ pub struct OpenChatSession {
     pub preset_id: Option<String>,
 }
 
+/// Open a provisioning transcript in an editor tab. Raised by the
+/// provisioning card's `Open transcript` button after a setup failure; the
+/// root owns the panes, the card does not. The failure path already opened
+/// this file once — the button re-activates it after the user closed it.
+#[derive(Clone, Debug, Default, PartialEq, Action)]
+#[action(namespace = oximux, no_json)]
+pub struct OpenProvisioningTranscript {
+    /// The project the create belonged to — the tab opens in THAT project's
+    /// panes, even if the user has switched projects since the card appeared.
+    pub project_id: String,
+    pub path: std::path::PathBuf,
+}
+
 /// A chat at `cwd` produced its first generated task summary (never the
 /// hook-captured prompt). Raised by the pane group from
 /// `AgentChatEvent::TaskSummaryReady`; `WorkspaceRoot` maps `cwd` to a

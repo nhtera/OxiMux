@@ -4,6 +4,33 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-14 — Live provisioning transcript (`feat/worktree-live-provisioning`)
+
+- **A slow create shows its progress as it happens.** Provisioning events
+  (include copies and skips, the default-branch freshen, the setup script's
+  own output) were already streamed to a transcript file; the desktop now
+  also draws them on a floating card, bottom-left, one per in-flight
+  create. The card appears once provisioning has run longer than 600 ms,
+  or immediately when the setup script starts, so a fast create with no
+  setup script shows nothing. A spinner, the slug, and the last eight
+  lines in monospace; success lingers three seconds, failure stays with
+  the summary and an `Open transcript` button that re-activates the
+  editor tab the failure path already opens.
+- **One stream, one formatter.** The transcript writer tees each event
+  to the card after writing it, and both use the same line formatter, so
+  the file and the card cannot disagree. The card's drain batches
+  everything queued since its last wake and repaints once, and keeps at
+  most 200 lines; the file keeps everything.
+- **Non-modal and dismissible.** The card is a view of the create, not
+  the create: the rest of the app stays usable under it, and closing it
+  neither cancels nor hides the outcome — the row still lands, and a
+  failure still opens its transcript and toasts.
+- Verified live in a fresh dev build: an eight-second setup script
+  streamed step by step; a no-setup create showed no card; typing into a
+  terminal under a running card worked; a card dismissed mid-create was
+  gone while the row still landed seconds later; a failing setup rolled
+  back with the failure card, its `Open transcript` re-activating the tab.
+
 ### 2026-09-13 — ⌘N creates a workspace; the palette offers it (`feat/worktree-creation-gestures`)
 
 - **⌘N and ⌘⇧N both open the New Workspace dialog.** The keymap registry

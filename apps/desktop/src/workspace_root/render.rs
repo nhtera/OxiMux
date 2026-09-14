@@ -52,6 +52,9 @@ impl Render for WorkspaceRoot {
         self.toast_layer.update(cx, |layer, _| {
             layer.set_tokens(theme, density, typography.clone());
         });
+        self.provision_layer.update(cx, |layer, _| {
+            layer.set_tokens(theme, density, typography.clone());
+        });
         self.dictation_hud.update(cx, |hud, _| {
             hud.set_tokens(theme, density, typography.clone());
         });
@@ -539,6 +542,27 @@ impl Render for WorkspaceRoot {
                 },
             ))
             .on_action(cx.listener(
+                |this, action: &crate::actions::OpenProvisioningTranscript, window, cx| {
+                    // The provisioning card's `Open transcript`: the same
+                    // editor-tab open the failure path performs automatically,
+                    // for a user who closed that tab and wants it back. Routed
+                    // to the OWNING project's panes — a failed card outlives a
+                    // project switch, and the transcript belongs to the
+                    // project whose create failed, not whichever is active.
+                    let panes = this
+                        .project_panes_by_project
+                        .get(&action.project_id)
+                        .cloned()
+                        .or_else(|| this.active_project_panes());
+                    if let Some(panes) = panes {
+                        let path = action.path.clone();
+                        panes.update(cx, |p, cx| {
+                            p.open_or_activate_editor_tab(path, window, cx);
+                        });
+                    }
+                },
+            ))
+            .on_action(cx.listener(
                 |this, action: &crate::actions::OfferWorkspaceAutoRename, _window, cx| {
                     // A chat's first generated summary: offer to rename a
                     // codename worktree from it. Everything that can decline
@@ -606,6 +630,17 @@ impl Render for WorkspaceRoot {
                     };
                     let workspace_repo = this.app_state.workspace_repo.clone();
                     let project_id = project.id.clone();
+                    // The live card for this create. Begun here, on the main
+                    // thread, so the reveal timer starts with the create.
+                    let transcript_path =
+                        crate::shell::workspace::provisioning_transcript::provisioning_transcript_path(
+                            &project_id,
+                            &slug,
+                        );
+                    let provision_layer = this.provision_layer.clone();
+                    let card_id = provision_layer.update(cx, |layer, cx| {
+                        layer.begin(slug.clone(), project_id.clone(), transcript_path.clone(), cx)
+                    });
                     // The same resolved prefix the chat pill previewed with —
                     // read synchronously here so the pill's `<prefix>/<slug>`
                     // line and the branch this creates cannot disagree.
@@ -616,14 +651,27 @@ impl Render for WorkspaceRoot {
                     cx.spawn(async move |weak_root, cx| {
                         use crate::shell::workspace_ops::{
                             ChatWorktreeOutcome, CreateBase, CreateOutcome, Provision,
-                            create_workspace_with_rollback, provisioning_transcript_path,
-                            stream_provisioning,
+                            create_workspace_with_rollback,
                         };
-                        let transcript_path = provisioning_transcript_path(&project_id, &slug);
+                        use crate::shell::workspace::provisioning_transcript::stream_provisioning;
                         let (provision_tx, provision_rx) = tokio::sync::mpsc::unbounded_channel();
-                        let writer = cx.background_spawn(async move {
-                            stream_provisioning(transcript_path, provision_rx).await
-                        });
+                        // Tee: the background writer keeps the file; the
+                        // foreground drain feeds the card in per-wake batches.
+                        let (tee_tx, tee_rx) = tokio::sync::mpsc::channel(
+                            crate::shell::workspace::provision_card::TEE_CAPACITY,
+                        );
+                        let writer = {
+                            let transcript_path = transcript_path.clone();
+                            cx.background_spawn(async move {
+                                stream_provisioning(transcript_path, provision_rx, Some(tee_tx)).await
+                            })
+                        };
+                        crate::shell::workspace::provision_card::drain_into(
+                            provision_layer.clone(),
+                            card_id,
+                            tee_rx,
+                            cx,
+                        );
                         // `name` = slug: the human label derived from the branch
                         // slug (collision handled inside `insert`).
                         // The project's default branch, not "wherever HEAD is" —
@@ -662,6 +710,27 @@ impl Render for WorkspaceRoot {
                         )
                         .await;
                         writer.await;
+                        // The card's terminal state, from the create's own
+                        // outcome — every failure shape reaches it the same way.
+                        let card_result = match &outcome {
+                            CreateOutcome::Created(_) => Ok(()),
+                            CreateOutcome::SetupFailed {
+                                transcript,
+                                rollback_error,
+                            } => Err(match rollback_error {
+                                Some(err) => format!(
+                                    "{}. Rollback also failed ({err}) \u{2014} manual cleanup required.",
+                                    transcript.outcome.summary()
+                                ),
+                                None => transcript.outcome.summary(),
+                            }),
+                            CreateOutcome::GitFailed(msg) => Err(msg.clone()),
+                            CreateOutcome::StorageFailedRollbackClean(err) => Err(err.to_string()),
+                            CreateOutcome::StorageFailedRollbackDirty { .. } => {
+                                Err("workspace row failed; rollback left files behind".into())
+                            }
+                        };
+                        provision_layer.update(cx, |layer, cx| layer.finish(card_id, card_result, cx));
                         let chat_outcome = match outcome {
                             CreateOutcome::Created(ws) => ChatWorktreeOutcome::Created {
                                 path: std::path::PathBuf::from(&ws.worktree_path),
@@ -2123,6 +2192,9 @@ impl Render for WorkspaceRoot {
             // layer is non-interactive and bottom-right, so it doesn't steal
             // clicks from whatever is beneath it.
             .child(self.toast_layer.clone())
+            // Live provisioning cards: bottom-left, one per in-flight create;
+            // renders nothing when no create is running past the threshold.
+            .child(self.provision_layer.clone())
             // Voice-dictation HUD: a pass-through, bottom-center floating
             // "Listening…" pill shown while dictating into a terminal/editor
             // pane. Renders nothing when idle; never steals clicks.
