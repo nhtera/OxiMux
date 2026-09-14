@@ -37,6 +37,8 @@ pub enum ProjectRowAction {
     /// one they are enabling. Picking a path out of a list in a global pane is
     /// how the wrong repository gets enabled.
     ToggleComputerUse,
+    /// Show or hide this project's `Untracked (N)` worktree group.
+    ToggleUntracked,
     Remove,
 }
 
@@ -46,12 +48,21 @@ impl ProjectRowAction {
     /// Takes the state rather than reading it: the menu is rendered from a
     /// snapshot taken when it opened, and a label that re-read global settings
     /// mid-render could disagree with the action the click dispatches.
+    #[cfg(test)]
     fn label(self, computer_use_on: bool) -> &'static str {
+        self.label_with(computer_use_on, false)
+    }
+
+    /// The row's text given both snapshot states: computer use, and whether
+    /// the project currently hides its untracked worktrees.
+    fn label_with(self, computer_use_on: bool, hide_untracked: bool) -> &'static str {
         match self {
             Self::RevealInFinder => "Reveal in Finder",
             Self::CopyPath => "Copy Path",
             Self::ToggleComputerUse if computer_use_on => "Turn off computer use",
             Self::ToggleComputerUse => "Turn on computer use",
+            Self::ToggleUntracked if hide_untracked => "Show untracked worktrees",
+            Self::ToggleUntracked => "Hide untracked worktrees",
             Self::Remove => "Remove Project",
         }
     }
@@ -67,6 +78,7 @@ const ACTIONS: &[ProjectRowAction] = &[
     ProjectRowAction::RevealInFinder,
     ProjectRowAction::CopyPath,
     ProjectRowAction::ToggleComputerUse,
+    ProjectRowAction::ToggleUntracked,
     ProjectRowAction::Remove,
 ];
 
@@ -83,6 +95,9 @@ pub struct ProjectRowMenu {
     /// no tools. The master switch lives in Settings, which is where the
     /// feature is discovered in the first place.
     computer_use: Option<bool>,
+    /// Whether this project hides its untracked-worktrees group, read once
+    /// when the menu opened — same snapshot rule as `computer_use`.
+    hide_untracked: bool,
     weak_root: WeakEntity<WorkspaceRoot>,
     theme: Theme,
     density: Density,
@@ -104,6 +119,7 @@ impl ProjectRowMenu {
         Self {
             open_for: None,
             computer_use: None,
+            hide_untracked: false,
             weak_root,
             theme,
             density,
@@ -112,8 +128,16 @@ impl ProjectRowMenu {
     }
 
     /// Open the menu anchored at (x, y) for the given project.
-    pub fn open(&mut self, project: Project, x: f32, y: f32, cx: &mut Context<Self>) {
+    pub fn open(
+        &mut self,
+        project: Project,
+        x: f32,
+        y: f32,
+        hide_untracked: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.computer_use = computer_use_state(&project, cx);
+        self.hide_untracked = hide_untracked;
         self.open_for = Some((project, x, y + ANCHOR_Y_OFFSET));
         cx.notify();
     }
@@ -128,11 +152,15 @@ impl ProjectRowMenu {
             return;
         };
         let on = self.computer_use.unwrap_or(false);
+        let hidden = self.hide_untracked;
         let _ = self.weak_root.update(cx, |root, cx| match action {
             ProjectRowAction::RevealInFinder => root.reveal_project_in_finder(&project),
             ProjectRowAction::CopyPath => root.copy_project_path(&project, cx),
             ProjectRowAction::ToggleComputerUse => {
                 root.set_computer_use_for_project(&project, !on, cx)
+            }
+            ProjectRowAction::ToggleUntracked => {
+                root.set_hide_untracked_for_project(&project.id, !hidden, cx)
             }
             ProjectRowAction::Remove => root.request_remove_project(project, window, cx),
         });
@@ -172,6 +200,7 @@ impl Render for ProjectRowMenu {
             .shadow_lg();
 
         let computer_use = self.computer_use;
+        let hide_untracked = self.hide_untracked;
         let shown = ACTIONS
             .iter()
             .filter(|a| computer_use.is_some() || **a != ProjectRowAction::ToggleComputerUse);
@@ -205,7 +234,7 @@ impl Render for ProjectRowMenu {
                 .hover(|s| s.bg(theme.hover_overlay))
                 .text_size(px(typography.t_body_md))
                 .text_color(fg)
-                .child(action.label(computer_use.unwrap_or(false)))
+                .child(action.label_with(computer_use.unwrap_or(false), hide_untracked))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -295,12 +324,25 @@ mod tests {
     }
 
     #[test]
+    fn the_untracked_row_names_the_direction_it_will_take() {
+        assert_eq!(
+            ProjectRowAction::ToggleUntracked.label_with(false, false),
+            "Hide untracked worktrees"
+        );
+        assert_eq!(
+            ProjectRowAction::ToggleUntracked.label_with(false, true),
+            "Show untracked worktrees"
+        );
+    }
+
+    #[test]
     fn hiding_the_computer_use_row_leaves_the_others_in_order() {
         assert_eq!(
             shown(None),
             vec![
                 ProjectRowAction::RevealInFinder,
                 ProjectRowAction::CopyPath,
+                ProjectRowAction::ToggleUntracked,
                 ProjectRowAction::Remove,
             ]
         );

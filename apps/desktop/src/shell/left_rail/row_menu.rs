@@ -62,6 +62,12 @@ pub struct RowCapabilities {
     pub is_primary: bool,
     /// An archived row: restore-or-delete, plus the two ways of finding it.
     pub is_archived: bool,
+    /// The row was adopted from a worktree that already existed, so it can
+    /// be un-adopted (`Stop tracking`) without touching disk.
+    pub adopted: bool,
+    /// An adopted row whose scripts the user has not reviewed: no script
+    /// action is offered, and the two review rows are.
+    pub unvetted: bool,
     pub scripts: ScriptAvail,
     /// Whether the project has a default branch to land the work in. The
     /// builder still refuses a merge on a primary or archived row.
@@ -107,6 +113,12 @@ pub enum WorkspaceRowAction {
     Rename,
     Archive,
     Unarchive,
+    /// Adopted rows only: remove the row, leave the worktree on disk.
+    StopTracking,
+    /// Un-vetted rows only: open the worktree's `.oximux/scripts.toml`.
+    ReviewScripts,
+    /// Un-vetted rows only: the explicit act that lets the scripts run.
+    MarkScriptsReviewed,
     Delete,
 }
 
@@ -135,6 +147,9 @@ impl WorkspaceRowAction {
             Self::Rename => "Rename",
             Self::Archive => "Archive",
             Self::Unarchive => "Unarchive",
+            Self::StopTracking => "Stop tracking",
+            Self::ReviewScripts => "Review scripts…",
+            Self::MarkScriptsReviewed => "Mark scripts reviewed",
             Self::Delete => "Delete",
         }
     }
@@ -196,6 +211,13 @@ const ACTIONS: &[WorkspaceRowAction] = &[
 const ARCHIVED_ACTIONS: &[WorkspaceRowAction] =
     &[WorkspaceRowAction::Unarchive, WorkspaceRowAction::Delete];
 
+/// The two rows an un-vetted (adopted, unreviewed) worktree gets in place of
+/// its script actions.
+const REVIEW_ACTIONS: &[WorkspaceRowAction] = &[
+    WorkspaceRowAction::ReviewScripts,
+    WorkspaceRowAction::MarkScriptsReviewed,
+];
+
 /// The menu's action list for one row, in surface order — the pure half of
 /// `Render`, so the gating is testable without a window.
 ///
@@ -210,6 +232,12 @@ const ARCHIVED_ACTIONS: &[WorkspaceRowAction] =
 ///   and tag a row that does not appear in the live list.
 /// - A **live** row gets the defined scripts, the finding rows, the status
 ///   writer, then the management actions.
+/// - An **un-vetted** row (adopted, scripts not yet reviewed) gets **no**
+///   script action, whatever the worktree defines — those scripts are
+///   somebody else's code — and instead `Review scripts…` and `Mark scripts
+///   reviewed`. Reviewing is the only way the script rows appear.
+/// - An **adopted** row also offers `Stop tracking` beside `Delete`: the
+///   row goes, the worktree stays.
 ///
 /// `Open in` appears only when there is at least one app to offer.
 fn menu_actions(caps: &RowCapabilities) -> Vec<WorkspaceRowAction> {
@@ -236,7 +264,10 @@ fn menu_actions(caps: &RowCapabilities) -> Vec<WorkspaceRowAction> {
         .copied()
         .filter(|a| a.script_kind().is_some_and(|k| caps.scripts.has(k)))
         // Only `Run setup` belongs on the project's own checkout.
-        .filter(|a| !caps.is_primary || *a == WorkspaceRowAction::RunSetup);
+        .filter(|a| !caps.is_primary || *a == WorkspaceRowAction::RunSetup)
+        // Nothing from an unreviewed directory runs on the user's behalf.
+        .filter(|_| !caps.unvetted);
+    let review = caps.unvetted.then_some(REVIEW_ACTIONS).into_iter().flatten().copied();
 
     if caps.is_primary {
         return scripts
@@ -245,10 +276,14 @@ fn menu_actions(caps: &RowCapabilities) -> Vec<WorkspaceRowAction> {
             .collect();
     }
 
+    let stop_tracking = caps.adopted.then_some(WorkspaceRowAction::StopTracking);
     scripts
+        .chain(review)
         .chain(finding)
         .chain([WorkspaceRowAction::MoveToStatus])
-        .chain(ACTIONS.iter().copied())
+        .chain(ACTIONS.iter().copied().filter(|a| *a != WorkspaceRowAction::Delete))
+        .chain(stop_tracking)
+        .chain([WorkspaceRowAction::Delete])
         .filter(|a| *a != WorkspaceRowAction::Merge || caps.can_merge)
         .collect()
 }
@@ -366,6 +401,15 @@ impl WorkspaceRowMenu {
                 WorkspaceRowAction::Rename => root.request_rename_workspace(workspace, window, cx),
                 WorkspaceRowAction::Archive => root.archive_workspace(workspace, cx),
                 WorkspaceRowAction::Unarchive => root.unarchive_workspace(workspace, cx),
+                WorkspaceRowAction::StopTracking => {
+                    root.request_stop_tracking_workspace(workspace, window, cx)
+                }
+                WorkspaceRowAction::ReviewScripts => {
+                    root.review_workspace_scripts(workspace, window, cx)
+                }
+                WorkspaceRowAction::MarkScriptsReviewed => {
+                    root.mark_workspace_scripts_reviewed(workspace, cx)
+                }
                 WorkspaceRowAction::Delete => root.request_delete_workspace(workspace, window, cx),
                 // Script actions handled above; submenu headers expand in
                 // place (`toggle_submenu`) and never reach here.
@@ -760,6 +804,8 @@ mod tests {
             project: project("main"),
             is_primary: false,
             is_archived: false,
+            adopted: false,
+            unvetted: false,
             scripts: ALL_SCRIPTS,
             can_merge: true,
             open_in: one_app(),
@@ -1073,5 +1119,61 @@ mod tests {
         menu.update(&mut vcx, |m, cx| m.close(cx));
         vcx.run_until_parked();
         menu.update(&mut vcx, |m, _cx| assert!(!m.is_open()));
+    }
+
+    fn adopted() -> RowCapabilities {
+        RowCapabilities { adopted: true, unvetted: false, ..live() }
+    }
+
+    fn unvetted() -> RowCapabilities {
+        RowCapabilities { adopted: true, unvetted: true, ..live() }
+    }
+
+    /// An un-vetted row offers no script action, whatever the directory
+    /// defines, and offers the two review rows instead.
+    #[test]
+    fn an_unvetted_row_withholds_every_script_and_offers_review() {
+        let actions = menu_actions(&unvetted());
+        assert!(actions.iter().all(|a| a.script_kind().is_none()), "got {actions:?}");
+        assert!(actions.contains(&A::ReviewScripts));
+        assert!(actions.contains(&A::MarkScriptsReviewed));
+        assert!(actions.contains(&A::StopTracking), "an un-vetted row is an adopted row");
+        // The review rows lead, where the script rows would have been.
+        assert_eq!(actions[0], A::ReviewScripts);
+    }
+
+    /// Reviewing restores the script rows and removes the review rows; the
+    /// row stays adopted, so `Stop tracking` stays.
+    #[test]
+    fn a_reviewed_adopted_row_runs_scripts_and_can_stop_tracking() {
+        let actions = menu_actions(&adopted());
+        assert!(actions.iter().any(|a| a.script_kind().is_some()));
+        assert!(!actions.contains(&A::ReviewScripts));
+        assert!(!actions.contains(&A::MarkScriptsReviewed));
+        let stop = actions.iter().position(|a| *a == A::StopTracking).expect("stop tracking");
+        let delete = actions.iter().position(|a| *a == A::Delete).expect("delete");
+        assert_eq!(stop + 1, delete, "stop tracking sits right before delete");
+    }
+
+    /// A provisioned row never offers the adoption rows.
+    #[test]
+    fn a_provisioned_row_has_no_adoption_rows() {
+        let actions = menu_actions(&live());
+        assert!(!actions.contains(&A::StopTracking));
+        assert!(!actions.contains(&A::ReviewScripts));
+        assert!(!actions.contains(&A::MarkScriptsReviewed));
+    }
+
+    /// Archived and primary rows keep their own rules even when adopted.
+    #[test]
+    fn adoption_rows_never_reach_an_archived_or_primary_row() {
+        let archived_adopted = RowCapabilities { is_archived: true, ..unvetted() };
+        let actions = menu_actions(&archived_adopted);
+        assert!(!actions.contains(&A::StopTracking));
+        assert!(actions.iter().all(|a| a.script_kind().is_none()));
+        let primary_unvetted = RowCapabilities { is_primary: true, ..unvetted() };
+        let actions = menu_actions(&primary_unvetted);
+        assert!(!actions.contains(&A::RunSetup), "unreviewed setup is withheld even on primary");
+        assert!(!actions.contains(&A::StopTracking));
     }
 }

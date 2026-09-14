@@ -362,8 +362,19 @@ impl WorktreeService for RepoWorktrees {
         }
         let worktree_dir = std::path::PathBuf::from(&row.worktree_path);
         // The project's cleanup script runs to completion (bounded) before the
-        // directory goes, exactly as the desktop's own delete flow does.
-        run_cleanup_before_remove(&worktree_dir).await;
+        // directory goes, exactly as the desktop's own delete flow does —
+        // unless the row was adopted from a directory somebody else set up
+        // and the user has not reviewed its scripts. Then nothing from that
+        // directory runs on the user's behalf, here or on the desktop.
+        let unvetted = self.workspaces.is_unvetted(&row.id).unwrap_or_else(|err| {
+            tracing::warn!(?err, "worktree service: adoption lookup failed; treating as unvetted");
+            true
+        });
+        if unvetted {
+            tracing::info!(id, "remote worktree remove: adopted worktree unreviewed; cleanup script skipped");
+        } else {
+            run_cleanup_before_remove(&worktree_dir).await;
+        }
         let repo = Repository::open(std::path::Path::new(&project.root_path))
             .await
             .map_err(|err| {
@@ -482,6 +493,98 @@ mod progress_tests {
         service.set_progress(&a, None, Some("shipped")).await.expect("set");
         let rows = service.list_progress(None).await.expect("list");
         assert_eq!(rows[0].phase, "shipped");
+    }
+}
+
+/// The headline safety property of adoption, on the headless removal path:
+/// an adopted worktree's cleanup script does not run on the way out until the
+/// user has reviewed it, while a worktree OxiMux provisioned still gets its
+/// cleanup. Real git, real `sh`; the script leaves a marker file the
+/// assertion looks for.
+#[cfg(unix)]
+#[cfg(test)]
+mod adoption_removal_tests {
+    use super::*;
+    use oximux_storage::db::open_memory;
+    use oximux_storage::repositories::{ProjectRepo, WorkspaceRepo};
+    use std::path::Path;
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@x")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@x")
+            .status()
+            .expect("git on PATH")
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A repo with a linked worktree whose `.oximux/scripts.toml` cleanup
+    /// writes `marker`; returns the service, the project id and the worktree path.
+    fn fixture(tmp: &Path, marker: &Path) -> (RepoWorktrees, String, std::path::PathBuf) {
+        let root = tmp.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        git(&root, &["add", "a.txt"]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        let wt = tmp.join("wt");
+        git(&root, &["worktree", "add", "-q", "-b", "topic", wt.to_str().unwrap()]);
+        std::fs::create_dir_all(wt.join(".oximux")).unwrap();
+        std::fs::write(
+            wt.join(".oximux").join("scripts.toml"),
+            format!("cleanup = \"touch '{}'\"\n", marker.display()),
+        )
+        .unwrap();
+        // Committed, so the non-force removal the service performs is not
+        // refused for an untracked file.
+        git(&wt, &["add", ".oximux"]);
+        git(&wt, &["commit", "-q", "-m", "scripts"]);
+        let db = open_memory().expect("db");
+        let projects = ProjectRepo::new(db.clone());
+        let workspaces = WorkspaceRepo::new(db.clone());
+        let project = projects
+            .insert("p", root.to_str().unwrap(), "main")
+            .expect("project");
+        (RepoWorktrees::new(projects, workspaces, tmp.join("data")), project.id, wt)
+    }
+
+    #[tokio::test]
+    async fn removing_an_unreviewed_adopted_worktree_skips_its_cleanup_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("CLEANUP-RAN");
+        let (service, project_id, wt) = fixture(tmp.path(), &marker);
+        let row = service
+            .workspaces
+            .adopt(&project_id, "topic", "topic", "topic", wt.to_str().unwrap())
+            .expect("adopt");
+
+        service.remove(&row.id).await.expect("remove");
+
+        assert!(!marker.exists(), "an unreviewed adopted worktree's cleanup must not run");
+        assert!(!wt.exists(), "the worktree itself is removed");
+        assert!(service.workspaces.get_by_id(&row.id).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn removing_a_reviewed_adopted_worktree_runs_its_cleanup_script() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("CLEANUP-RAN");
+        let (service, project_id, wt) = fixture(tmp.path(), &marker);
+        let row = service
+            .workspaces
+            .adopt(&project_id, "topic", "topic", "topic", wt.to_str().unwrap())
+            .expect("adopt");
+        service.workspaces.mark_scripts_reviewed(&row.id).expect("review");
+
+        service.remove(&row.id).await.expect("remove");
+
+        assert!(marker.exists(), "once reviewed, the cleanup script is the user's to run");
     }
 }
 

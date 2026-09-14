@@ -24,7 +24,7 @@
 //! reachable — mirrors the `titlebar-left` floating behavior found in
 //! similar workspace shells.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -429,6 +429,25 @@ pub struct WorkspaceRoot {
     /// header has its count without a second query path to invalidate. Usually
     /// empty; archived rows are cold data.
     pub(crate) rail_archived_by_project: HashMap<String, Vec<oximux_core::Workspace>>,
+    /// Projects whose `Untracked (N)` group the user hid — the per-project
+    /// preference, read in the same gather as the rows above.
+    pub(crate) rail_hidden_untracked: HashSet<String>,
+    /// Each project's worktrees that git lists but no row tracks, from the
+    /// discovery scan that rides every few rounds of the stats refresher.
+    /// Hidden projects have no entry. Read by `refresh_left_rail`.
+    pub(crate) untracked_by_project:
+        HashMap<String, Vec<crate::shell::workspace::discovery::UntrackedWorktree>>,
+    /// Rounds of the stats refresher so far; the discovery scan joins every
+    /// `DISCOVERY_EVERY`-th one.
+    pub(crate) stats_round: u64,
+    /// Something changed what discovery would find (a row stopped being
+    /// tracked, a project un-hid its group): the next round scans regardless
+    /// of the cadence.
+    pub(crate) discovery_due: bool,
+    /// Bumped by every adoption and stop-tracking. A discovery round records
+    /// it at start and discards its findings if it moved meanwhile: the scan
+    /// subtracted the tracked rows as they were, and they are not any more.
+    pub(crate) adoption_epoch: u64,
     /// Cached latest agent-session status per workspace id — same
     /// lifecycle as [`Self::rail_workspaces_by_project`].
     pub(crate) rail_latest_status: crate::shell::left_rail::LatestStatusMap,
@@ -1352,6 +1371,11 @@ impl WorkspaceRoot {
             focus_handle,
             window_id,
             worktree_stats: HashMap::new(),
+            rail_hidden_untracked: HashSet::new(),
+            untracked_by_project: HashMap::new(),
+            stats_round: 0,
+            discovery_due: true,
+            adoption_epoch: 0,
             force_delete_offer: None,
             rail_workspaces_by_project: HashMap::new(),
             rail_archived_by_project: HashMap::new(),

@@ -14,12 +14,12 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use gpui::{AppContext, Context, Entity, FocusHandle, Focusable, WeakEntity, Window};
-use oximux_core::{AgentAdapter, AgentSession, Project, Workspace};
+use oximux_core::{AgentAdapter, Project, Workspace};
 
 use crate::shell::agent_presentation::AmbientAgent;
 use oximux_git::{Repository, derive_slug, validate_slug};
 use oximux_settings::{Density, ScriptKind, Theme, Typography};
-use oximux_storage::{AgentSessionRepo, ProjectRepo, WorkspaceRepo};
+use oximux_storage::ProjectRepo;
 
 use crate::shell::left_rail::open_in;
 use crate::shell::left_rail::row_menu::{RowCapabilities, ScriptAvail};
@@ -30,7 +30,7 @@ use crate::project_panes_factory::{
 };
 use crate::shell::add_project_dialog::{AddProjectDialog, OnPick as OnAddProjectPick};
 use crate::shell::confirm_dialog::{ConfirmCallback, ConfirmDialog, ConfirmPrompt};
-use crate::shell::left_rail::{LatestStatusMap, RailAgentTarget, WorkspaceAgentList};
+use crate::shell::left_rail::{RailAgentTarget, WorkspaceAgentList};
 use crate::shell::pane_group::FocusedRailAgent;
 use crate::shell::workspace::provisioning_transcript::{
     provisioning_transcript_path, stream_provisioning,
@@ -149,6 +149,8 @@ pub(crate) fn build_add_project_dialog(
 // second implementation of the same rollback ladder. Re-exported here
 // because this module is the desktop's door to it.
 use crate::shell::workspace::base_choice::BaseChoice;
+use crate::shell::workspace::discovery::UntrackedWorktree;
+use crate::shell::workspace::rail_data::{gather_rail_db_data, workspaces_with_primary_for};
 pub use oximux_worktree_ops::{
     CreateBase, CreateOutcome, HostDerivedLocator, LocateError, Provision, ProvisionEvent,
     SetupTranscript, WorktreeLocator, create_workspace_with_rollback, provisioning_marker,
@@ -165,86 +167,6 @@ const MAX_TAB_TITLE_CHARS: usize = 64;
 
 // The provisioning transcript (its path and the writer that drains the event
 // stream into it) lives in `provisioning_transcript.rs`.
-
-/// Body of [`WorkspaceRoot::workspaces_with_primary`] as a free function so
-/// the rail gather can run it on the background executor (SQLite + a
-/// `.git` stat — never call from a render path).
-fn workspaces_with_primary_for(repo: &WorkspaceRepo, project: &Project) -> Vec<Workspace> {
-    let mut list = match repo.list_for_project(&project.id) {
-        Ok(list) => list,
-        Err(err) => {
-            tracing::warn!(?err, project_id = %project.id, "list_for_project failed");
-            Vec::new()
-        }
-    };
-    let has_root_row = list.iter().any(|w| w.worktree_path == project.root_path);
-    if !has_root_row {
-        // Git repo → branch-based primary ("main"); plain folder → a single
-        // "Folder" row with empty branch. Synthesized for display only;
-        // identified later by `worktree_path == project.root_path`.
-        let is_git = Path::new(&project.root_path).join(".git").exists();
-        let (name, slug, branch) = if is_git {
-            (
-                project.default_branch.clone(),
-                project.default_branch.clone(),
-                project.default_branch.clone(),
-            )
-        } else {
-            (project.name.clone(), String::new(), String::new())
-        };
-        list.insert(
-            0,
-            Workspace {
-                id: format!("primary:{}", project.id),
-                project_id: project.id.clone(),
-                // Not a branch OxiMux minted: a synthesized row or a
-                // fixture. `false` is the reading that never deletes.
-                branch_minted: false,
-                name,
-                slug,
-                branch,
-                worktree_path: project.root_path.clone(),
-                status: "active".to_string(),
-                created_at: String::new(),
-                archived_at: None,
-                linked_issue: None,
-                tint: None,
-                // Synthesized primary row; always pinned first, never reordered.
-                sort_order: 0.0,
-                pinned: false,
-                // Permanently blank: this row is the project root, synthesized
-                // at render time with no `workspaces` row behind it, so there
-                // is nowhere for a progress write to land. `worktree ls` omits
-                // it for the same reason.
-                comment: String::new(),
-                phase: String::new(),
-            },
-        );
-    }
-    list
-}
-
-/// One full pass of the sidebar's DB-backed data across every recent
-/// project: workspace rows (incl. synthesized primaries) + the latest
-/// agent-session status and adapter per workspace. Runs on the background
-/// executor — this is the ONLY place the rail touches SQLite.
-///
-/// The adapter map (workspace id → adapter slug of the latest session)
-/// gates the activity tail: only the primary CLI journals session logs,
-/// so other adapters never get a tail attempt.
-/// Outputs of one rail DB gather, in the order the `WorkspaceRoot::rail_*`
-/// fields consume them: workspaces-by-project, latest status, latest adapter
-/// slug, last-active timestamp, and the FULL per-workspace session list
-/// (workspace id → all `agent_sessions` rows, `started_at` DESC) the
-/// live↔history merge consumes — each keyed as documented on those fields.
-type RailDbData = (
-    HashMap<String, Vec<Workspace>>,
-    HashMap<String, Vec<Workspace>>,
-    LatestStatusMap,
-    HashMap<String, String>,
-    HashMap<String, String>,
-    HashMap<String, Vec<AgentSession>>,
-);
 
 /// Find the [`Project`] that owns `workspace`, by its `project_id` — NOT from
 /// `WorkspaceRoot::active_project`.
@@ -281,8 +203,39 @@ pub(crate) fn is_primary_row(workspace: &Workspace, project_root: &str) -> bool 
     workspace.id.starts_with("primary:") || workspace.worktree_path == project_root
 }
 
+/// What a delete will do to the row's branch, in the dialog's words. The
+/// delete only removes a branch OxiMux minted (`Workspace::branch_minted`);
+/// an adopted or pre-existing branch stays, and the dialog must say so — a
+/// user reading "deletes branch X" over a branch that survives, or vice
+/// versa, has been told the wrong thing about a destructive act.
+fn delete_prompt_body(workspace: &Workspace) -> String {
+    if workspace.branch_minted {
+        format!(
+            "Removes the worktree at {} and deletes branch {}. This cannot be undone.",
+            workspace.worktree_path, workspace.branch
+        )
+    } else {
+        format!(
+            "Removes the worktree at {}. Branch {} stays: OxiMux did not create it. This cannot be undone.",
+            workspace.worktree_path, workspace.branch
+        )
+    }
+}
 
-
+/// The force variant's body, with the same branch rule.
+fn force_delete_prompt_body(workspace: &Workspace) -> String {
+    if workspace.branch_minted {
+        format!(
+            "The worktree at {} could not be removed normally. Force delete removes the workspace entry anyway and force-removes the worktree and branch {}; anything that still fails is reported and left on disk.",
+            workspace.worktree_path, workspace.branch
+        )
+    } else {
+        format!(
+            "The worktree at {} could not be removed normally. Force delete removes the workspace entry anyway and force-removes the worktree; branch {} stays, since OxiMux did not create it. Anything that still fails is reported and left on disk.",
+            workspace.worktree_path, workspace.branch
+        )
+    }
+}
 
 /// Everything a workspace delete needs to name, resolved from the row.
 ///
@@ -313,75 +266,6 @@ fn workspace_delete_target(
         worktree_path: PathBuf::from(&workspace.worktree_path),
         branch: workspace.branch.clone(),
     })
-}
-
-fn gather_rail_db_data(
-    workspace_repo: &WorkspaceRepo,
-    agent_repo: &AgentSessionRepo,
-    projects: &[Project],
-) -> RailDbData {
-    let mut workspaces_by_project: HashMap<String, Vec<Workspace>> =
-        HashMap::with_capacity(projects.len());
-    // Archived rows ride along in this same background pass rather than
-    // loading lazily on group expansion: the group header shows a count, so
-    // they are needed whether or not the group is open, and one extra indexed
-    // SELECT per project is noise beside the per-workspace session query below.
-    let mut archived_by_project: HashMap<String, Vec<Workspace>> =
-        HashMap::with_capacity(projects.len());
-    let mut latest_status: LatestStatusMap = HashMap::new();
-    let mut latest_adapter: HashMap<String, String> = HashMap::new();
-    // Recency key for the dashboard's in-tier sort: a finished session's
-    // `ended_at`, else its `started_at` (still running). Raw RFC-3339 string —
-    // lexicographic ordering matches chronological for these UTC `Z` stamps.
-    let mut last_active: HashMap<String, String> = HashMap::new();
-    // Every session per workspace (not just the most-recent) so the rail can
-    // list multiple agents; the single-row caches above still derive from the
-    // newest (`first()`), preserving today's collapsed-dot behavior.
-    let mut workspace_sessions: HashMap<String, Vec<AgentSession>> = HashMap::new();
-    for project in projects {
-        let list = workspaces_with_primary_for(workspace_repo, project);
-        for workspace in &list {
-            let sessions = match agent_repo.list_for_workspace(&workspace.id) {
-                Ok(sessions) => sessions,
-                Err(err) => {
-                    tracing::warn!(?err, workspace_id = %workspace.id, "list_for_workspace failed");
-                    Vec::new()
-                }
-            };
-            if let Some(session) = sessions.first() {
-                latest_adapter.insert(workspace.id.clone(), session.adapter_id.clone());
-                if let Some(ts) = session
-                    .ended_at
-                    .clone()
-                    .or_else(|| session.started_at.clone())
-                {
-                    last_active.insert(workspace.id.clone(), ts);
-                }
-            }
-            latest_status.insert(
-                workspace.id.clone(),
-                sessions.first().map(|s| s.status.clone()),
-            );
-            workspace_sessions.insert(workspace.id.clone(), sessions);
-        }
-        workspaces_by_project.insert(project.id.clone(), list);
-        let archived = match workspace_repo.list_archived_for_project(&project.id) {
-            Ok(rows) => rows,
-            Err(err) => {
-                tracing::warn!(?err, project_id = %project.id, "list_archived_for_project failed");
-                Vec::new()
-            }
-        };
-        archived_by_project.insert(project.id.clone(), archived);
-    }
-    (
-        workspaces_by_project,
-        archived_by_project,
-        latest_status,
-        latest_adapter,
-        last_active,
-        workspace_sessions,
-    )
 }
 
 /// Outcome the *New Agent in a fresh worktree* flow hands back to the chat view.
@@ -1447,11 +1331,23 @@ impl WorkspaceRoot {
             );
             return;
         };
+        // Adoption state gates the script actions and offers `Stop tracking`.
+        // Each lookup fails in its own safe direction: an unknown un-vetted
+        // state withholds the script actions (running unread code is the
+        // harm), and an unknown adopted state withholds `Stop tracking` (a
+        // row dropped by mistake orphans a worktree the app created).
+        let repo = &self.app_state.workspace_repo;
+        let adopted = repo.is_adopted(&workspace.id).unwrap_or(false);
+        let unvetted = repo.is_unvetted(&workspace.id).unwrap_or(true);
         let caps = RowCapabilities {
             is_primary: is_primary_row(&workspace, &project.root_path),
             is_archived: workspace.archived_at.is_some(),
+            adopted,
+            unvetted,
             scripts: avail,
-            can_merge: !project.default_branch.is_empty(),
+            // A detached checkout (an adopted worktree with no branch) has
+            // nothing to merge, whatever the project's default is.
+            can_merge: !project.default_branch.is_empty() && !workspace.branch.is_empty(),
             open_in: open_in::effective_apps(&crate::git_settings::settings(cx)),
             project,
         };
@@ -1478,6 +1374,26 @@ impl WorkspaceRoot {
         cx: &mut Context<Self>,
     ) {
         let cwd = PathBuf::from(&workspace.worktree_path);
+        // The menu already withholds these rows on an un-vetted worktree, but
+        // the guard belongs on the operation, not the menu: nothing runs out
+        // of a directory somebody else set up until the user has read it,
+        // whoever the caller is. A lookup failure withholds, never runs.
+        if self
+            .app_state
+            .workspace_repo
+            .is_unvetted(&workspace.id)
+            .unwrap_or(true)
+        {
+            self.push_toast(
+                crate::shell::toast::ToastKind::Info,
+                format!(
+                    "Scripts in \u{201c}{}\u{201d} have not been reviewed. Use Review scripts\u{2026} first.",
+                    workspace.name
+                ),
+                cx,
+            );
+            return;
+        }
         let scripts = crate::project_scripts_loader::load_for_project(&cwd);
         let Some(script) = scripts.script(kind) else {
             tracing::info!(
@@ -1533,8 +1449,9 @@ impl WorkspaceRoot {
         cx: &mut Context<Self>,
     ) {
         self.close_modal_overlays(cx);
+        let hide_untracked = self.rail_hidden_untracked.contains(&project.id);
         self.project_menu
-            .update(cx, |m, cx| m.open(project, x, y, cx));
+            .update(cx, |m, cx| m.open(project, x, y, hide_untracked, cx));
     }
 
     /// Open the Agents-page status-filter dropdown at the given screen
@@ -1599,7 +1516,6 @@ impl WorkspaceRoot {
         live
     }
 
-
     pub(crate) fn refresh_left_rail(&mut self, cx: &mut Context<Self>) {
         let projects = self.app_state.recent_projects.clone();
         let active_project_id = self.active_project.as_ref().map(|p| p.id.clone());
@@ -1633,6 +1549,15 @@ impl WorkspaceRoot {
                     .unwrap_or_default(),
             );
         }
+        // Untracked worktrees from the discovery scan, minus any project that
+        // hides the group (the scan already skips those; the filter here
+        // covers the round that was in flight when the preference changed).
+        let untracked_by_project: HashMap<String, Vec<UntrackedWorktree>> = self
+            .untracked_by_project
+            .iter()
+            .filter(|(pid, rows)| !rows.is_empty() && !self.rail_hidden_untracked.contains(*pid))
+            .map(|(pid, rows)| (pid.clone(), rows.clone()))
+            .collect();
         // Ambient agent statuses inferred live from plain-terminal OSC titles
         // (a hand-launched `claude`/`codex`/… with no tracked session). Raw
         // terminal cwd is normalized to the owning workspace root, so a shell
@@ -1733,6 +1658,7 @@ impl WorkspaceRoot {
                 active_workspace_id,
                 workspaces_by_project,
                 archived_by_project,
+                untracked_by_project,
                 latest_status,
                 live_worktrees,
                 ambient_status,
@@ -1765,11 +1691,12 @@ impl WorkspaceRoot {
         self.rail_refresh_inflight = true;
         cx.spawn(async move |weak, cx| {
             loop {
-                let Ok((workspace_repo, agent_repo, projects)) = weak.update(cx, |this, _| {
+                let Ok((workspace_repo, agent_repo, project_repo, projects)) = weak.update(cx, |this, _| {
                     this.rail_dirty = false;
                     (
                         this.app_state.workspace_repo.clone(),
                         this.app_state.agent_session_repo.clone(),
+                        this.app_state.project_repo.clone(),
                         this.app_state.recent_projects.clone(),
                     )
                 }) else {
@@ -1778,15 +1705,16 @@ impl WorkspaceRoot {
                 // All SQLite + the per-project `.git` stat run off the main
                 // thread (cx.spawn itself stays on the main thread — known
                 // footgun).
-                let (workspaces, archived, statuses, adapters, last_active, sessions) = cx
+                let (workspaces, archived, statuses, adapters, last_active, sessions, hidden) = cx
                     .background_executor()
                     .spawn(async move {
-                        gather_rail_db_data(&workspace_repo, &agent_repo, &projects)
+                        gather_rail_db_data(&workspace_repo, &agent_repo, &project_repo, &projects)
                     })
                     .await;
                 let run_again = weak.update(cx, |this, cx| {
                     this.rail_workspaces_by_project = workspaces;
                     this.rail_archived_by_project = archived;
+                    this.rail_hidden_untracked = hidden;
                     this.rail_latest_status = statuses;
                     this.rail_latest_adapter = adapters;
                     this.rail_last_active = last_active;
@@ -2263,9 +2191,6 @@ impl WorkspaceRoot {
         .detach();
     }
 
-
-
-
     /// Mount `prompt` as the modal confirm dialog and arrange its teardown.
     ///
     /// The observer, not the callbacks, clears `confirm_dialog`: a callback
@@ -2298,9 +2223,6 @@ impl WorkspaceRoot {
         self.confirm_dialog = Some(dialog);
         cx.notify();
     }
-
-
-
 
     /// Restore an archived workspace to its project's active group.
     ///
@@ -2419,6 +2341,16 @@ impl WorkspaceRoot {
         // Requesting delete on a different workspace drops the offer.
         let force = self.force_delete_offer.as_deref() == Some(workspace.id.as_str());
         self.force_delete_offer = None;
+        // An adopted worktree whose scripts the user has not reviewed gets no
+        // cleanup script run on the way out: that script is somebody else's
+        // code in somebody else's directory. Read once, here, so the answer
+        // the user saw when they asked is the one the closure acts on. A
+        // lookup failure withholds the script, never runs it.
+        let skip_cleanup = self
+            .app_state
+            .workspace_repo
+            .is_unvetted(&workspace.id)
+            .unwrap_or(true);
         let weak: WeakEntity<WorkspaceRoot> = cx.weak_entity();
         let workspace_for_cb = workspace.clone();
         let target_for_cb = target.clone();
@@ -2445,7 +2377,11 @@ impl WorkspaceRoot {
                 // touching the worktree, bounded by a timeout so a hung teardown
                 // can't trap the user — on timeout the child is killed and the
                 // removal proceeds regardless (the force-remove escape).
-                run_cleanup_before_remove(&worktree_path).await;
+                if skip_cleanup {
+                    tracing::info!(slug = %workspace.slug, "delete: adopted worktree unreviewed; cleanup script skipped");
+                } else {
+                    run_cleanup_before_remove(&worktree_path).await;
+                }
                 let repo = match Repository::open(&project_root).await {
                     Ok(r) => r,
                     Err(err) => {
@@ -2548,11 +2484,7 @@ impl WorkspaceRoot {
         let prompt = if force {
             ConfirmPrompt {
                 title: "Force delete workspace".into(),
-                body: format!(
-                    "The worktree at {} could not be removed normally. Force delete removes the workspace entry anyway and force-removes the worktree and branch {}; anything that still fails is reported and left on disk.",
-                    workspace.worktree_path, workspace.branch
-                )
-                .into(),
+                body: force_delete_prompt_body(&workspace).into(),
                 on_confirm,
                 confirm_label: Some("Force Delete".into()),
                 on_cancel: None,
@@ -2561,11 +2493,7 @@ impl WorkspaceRoot {
         } else {
             ConfirmPrompt {
                 title: "Delete workspace".into(),
-                body: format!(
-                    "Removes the worktree at {} and deletes branch {}. This cannot be undone.",
-                    workspace.worktree_path, workspace.branch
-                )
-                .into(),
+                body: delete_prompt_body(&workspace).into(),
                 on_confirm,
                 confirm_label: None,
                 on_cancel: None,
@@ -2983,13 +2911,6 @@ mod nav_history_tests {
         assert!(resolve_project_for_workspace(&open, &orphan).is_none());
     }
 
-
-
-
-
-
-
-
     #[test]
     fn append_advances_cursor() {
         let mut h = Vec::new();
@@ -3073,3 +2994,41 @@ mod nav_history_tests {
     }
 }
 
+#[cfg(test)]
+mod delete_prompt_tests {
+    use super::*;
+
+    fn row(minted: bool) -> Workspace {
+        Workspace {
+            id: "w".into(),
+            project_id: "p".into(),
+            name: "topic".into(),
+            slug: "topic".into(),
+            branch: "topic".into(),
+            worktree_path: "/wt/topic".into(),
+            status: "active".into(),
+            created_at: String::new(),
+            archived_at: None,
+            linked_issue: None,
+            tint: None,
+            sort_order: 0.0,
+            pinned: false,
+            comment: String::new(),
+            phase: String::new(),
+            branch_minted: minted,
+        }
+    }
+
+    /// The dialog tells the truth about the branch: deleted only when OxiMux
+    /// minted it, kept — and said to be kept — for an adopted one.
+    #[test]
+    fn the_delete_dialog_names_the_branch_outcome_correctly() {
+        assert!(delete_prompt_body(&row(true)).contains("deletes branch topic"));
+        let adopted = delete_prompt_body(&row(false));
+        assert!(adopted.contains("Branch topic stays"), "{adopted}");
+        assert!(!adopted.contains("deletes branch"), "{adopted}");
+        let forced = force_delete_prompt_body(&row(false));
+        assert!(forced.contains("branch topic stays"), "{forced}");
+        assert!(force_delete_prompt_body(&row(true)).contains("worktree and branch topic"));
+    }
+}

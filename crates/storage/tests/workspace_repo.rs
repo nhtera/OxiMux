@@ -297,3 +297,81 @@ fn branch_minted_round_trips_in_both_states() {
     assert!(by_slug("mine"));
     assert!(!by_slug("theirs"));
 }
+
+/// Adoption is one transaction: the row and its un-vetted marker exist
+/// together, the branch is never one OxiMux minted, and clearing the marker
+/// is its own explicit act.
+#[test]
+fn an_adopted_workspace_is_unvetted_until_reviewed() {
+    let (project_id, workspaces, _, _) = project_and_repos();
+    let w = workspaces
+        .adopt(&project_id, "topic", "topic", "topic", "/elsewhere/topic")
+        .expect("adopt");
+    assert!(!w.branch_minted, "an adopted branch was somebody's first");
+    assert!(workspaces.is_adopted(&w.id).unwrap());
+    assert!(workspaces.is_unvetted(&w.id).unwrap());
+
+    workspaces.mark_scripts_reviewed(&w.id).expect("review");
+    assert!(workspaces.is_adopted(&w.id).unwrap(), "reviewing does not un-adopt");
+    assert!(!workspaces.is_unvetted(&w.id).unwrap());
+
+    // A provisioned row is vetted by construction, and never adopted.
+    let minted = workspaces
+        .insert(&project_id, "Feat", "feat", "oximux/feat", "/wt/feat", true)
+        .expect("insert");
+    assert!(!workspaces.is_adopted(&minted.id).unwrap());
+    assert!(!workspaces.is_unvetted(&minted.id).unwrap());
+    // Reviewing a never-adopted row is a harmless no-op.
+    workspaces.mark_scripts_reviewed(&minted.id).expect("no-op");
+    assert!(!workspaces.is_adopted(&minted.id).unwrap());
+}
+
+/// A slug collision on adopt is the same `Conflict` a create sees, and the
+/// failed adoption leaves no half-row behind.
+#[test]
+fn adopt_reports_a_slug_conflict_and_writes_nothing() {
+    let (project_id, workspaces, _, _) = project_and_repos();
+    workspaces
+        .insert(&project_id, "Feat", "feat", "oximux/feat", "/wt/feat", true)
+        .expect("insert");
+    let err = workspaces
+        .adopt(&project_id, "feat", "feat", "feat", "/elsewhere/feat")
+        .expect_err("duplicate slug");
+    assert!(matches!(err, StorageError::Conflict { .. }), "got {err:?}");
+    let rows = workspaces.list_for_project(&project_id).expect("list");
+    assert_eq!(rows.len(), 1);
+}
+
+/// Stop tracking is a plain row delete; the adoption record goes with it.
+#[test]
+fn deleting_an_adopted_row_drops_its_adoption() {
+    let (project_id, workspaces, _, _) = project_and_repos();
+    let w = workspaces
+        .adopt(&project_id, "topic", "topic", "topic", "/elsewhere/topic")
+        .expect("adopt");
+    workspaces.delete(&w.id).expect("delete");
+    assert!(!workspaces.is_adopted(&w.id).unwrap());
+    assert!(!workspaces.is_unvetted(&w.id).unwrap());
+}
+
+/// Two rows must never point at one directory: a stale scan offering an
+/// already-adopted worktree again is refused, not given a suffixed slug.
+#[test]
+fn adopting_an_already_tracked_path_is_a_conflict() {
+    let (project_id, workspaces, _, _) = project_and_repos();
+    workspaces
+        .adopt(&project_id, "topic", "topic", "topic", "/elsewhere/topic")
+        .expect("first adoption");
+    let err = workspaces
+        .adopt(&project_id, "topic", "topic-2", "topic", "/elsewhere/topic")
+        .expect_err("same directory twice");
+    assert!(matches!(err, StorageError::Conflict { .. }), "got {err:?}");
+    assert_eq!(workspaces.list_for_project(&project_id).unwrap().len(), 1);
+    // An archived row still owns its directory.
+    let first = &workspaces.list_for_project(&project_id).unwrap()[0];
+    workspaces.mark_archived(&first.id).expect("archive");
+    let err = workspaces
+        .adopt(&project_id, "topic", "topic-3", "topic", "/elsewhere/topic")
+        .expect_err("archived row still owns the path");
+    assert!(matches!(err, StorageError::Conflict { .. }), "got {err:?}");
+}

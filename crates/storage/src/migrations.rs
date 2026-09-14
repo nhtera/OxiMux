@@ -242,6 +242,13 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "workspace_branch_minted",
         sql: include_str!("../migrations/V029__workspace_branch_minted.sql"),
     },
+    // V030: adopted worktrees stay un-vetted until the user has read their
+    // scripts, and a project can hide its untracked-worktrees group.
+    Migration {
+        version: 30,
+        name: "workspace_adoption_and_project_prefs",
+        sql: include_str!("../migrations/V030__workspace_adoption_and_project_prefs.sql"),
+    },
 ];
 
 /// Returns the absolute path to the `migrations/` directory at runtime.
@@ -651,6 +658,68 @@ mod tests {
             .query_row("SELECT branch_minted FROM workspaces WHERE id = 'ws-1'", [], |r| r.get(0))
             .expect("read back");
         assert_eq!(minted, 1, "a pre-adoption worktree was minted by OxiMux");
+    }
+
+    /// The upgrade proof for V030: the two side tables arrive empty, and both
+    /// follow their parent row out. A pre-V030 workspace has no adoption row —
+    /// which is the vetted reading, the only correct one for a row OxiMux
+    /// provisioned itself.
+    #[test]
+    fn v030_side_tables_arrive_empty_and_cascade() {
+        let mut conn = mem_conn();
+        let upto_29: Vec<Migration> =
+            MIGRATIONS.iter().filter(|m| m.version <= 29).cloned().collect();
+        run_migrations(&mut conn, &upto_29).expect("ladder through V029");
+        conn.execute(
+            "INSERT INTO projects (id, name, root_path, default_branch, created_at) \
+             VALUES ('p-1', 'Acme', '/p', 'main', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("seed project");
+        conn.execute(
+            "INSERT INTO workspaces \
+             (id, project_id, name, slug, branch, worktree_path, status, created_at) \
+             VALUES ('ws-1', 'p-1', 'Feat', 'feat', 'oximux/feat', '/wt/feat', 'active', \
+                     '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("seed workspace");
+        // Guard against a vacuous test: V029 must not already have the tables.
+        let exists = |conn: &Connection, table: &str| -> bool {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |r| r.get::<_, i64>(0),
+            )
+            .expect("sqlite_master")
+                > 0
+        };
+        assert!(!exists(&conn, "workspace_adoptions") && !exists(&conn, "project_prefs"));
+
+        run_migrations(&mut conn, MIGRATIONS).expect("upgrade to head");
+        assert!(exists(&conn, "workspace_adoptions") && exists(&conn, "project_prefs"));
+        let adoptions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM workspace_adoptions", [], |r| r.get(0))
+            .expect("count");
+        assert_eq!(adoptions, 0, "a pre-V030 workspace was provisioned, not adopted");
+
+        conn.execute(
+            "INSERT INTO workspace_adoptions (workspace_id, adopted_at) VALUES ('ws-1', 'now')",
+            [],
+        )
+        .expect("adopt");
+        conn.execute("INSERT INTO project_prefs (project_id, hide_untracked) VALUES ('p-1', 1)", [])
+            .expect("pref");
+        conn.execute("DELETE FROM workspaces WHERE id = 'ws-1'", []).expect("delete workspace");
+        conn.execute("DELETE FROM projects WHERE id = 'p-1'", []).expect("delete project");
+        let left: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM workspace_adoptions) + (SELECT COUNT(*) FROM project_prefs)",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(left, 0, "both side tables cascade with their parent");
     }
 
     /// The same upgrade proof for V028, on the table schedules live in: a

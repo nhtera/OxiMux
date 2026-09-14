@@ -4,6 +4,33 @@ Entries are newest-first. Each entry links to the commit SHA and notes what ship
 
 ---
 
+### 2026-09-14 — Worktrees made elsewhere show up, and can be adopted (`feat/worktree-discovery`)
+
+- **The rail sees worktrees it did not create.** Each project gains a
+  collapsed `Untracked (N)` group listing worktrees git knows about but no
+  OxiMux row points at — one made by `git worktree add` in a terminal, or
+  by another tool. Rows show the directory, its branch, and its path.
+  One `git worktree list` per project rides the existing refresher every
+  ten seconds; there is no new poller and no directory scan, because git
+  keeps every linked worktree's registry in the main repository, wherever
+  the worktree lives.
+- **Adopt writes nothing.** `Adopt` creates a row pointing at the existing
+  directory and branch. No move, no rename, no include copy, no setup
+  script. Adoption never deletes the branch on the way out either: it was
+  the user's before the row existed.
+- **Adopted rows stay un-vetted until reviewed.** Scripts in a directory
+  someone else set up are not run on the user's behalf: the row menu
+  withholds `Run setup` / `Run` / `Run cleanup`, `Delete` skips the cleanup
+  script (on the desktop and on the headless host), and `Review scripts…`
+  opens the file. `Mark scripts reviewed` is the explicit act that lets
+  them run.
+- **Stop tracking and hide.** `Stop tracking` on an adopted row removes the
+  row only; the worktree stays and reappears under Untracked, which the
+  confirmation says. `Hide untracked worktrees` in the project menu, or
+  `Hide` on the group header, silences the group for a repo where it is
+  noise.
+- The never-mounted worktree panel is gone.
+
 ### 2026-09-14 — Worktree rows show ahead/behind and a changed-file count (`feat/worktree-row-density`)
 
 - **A row says where its branch stands.** Beside the `+A −B` line diff, a
