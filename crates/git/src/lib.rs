@@ -37,6 +37,7 @@ pub mod status;
 pub mod worktree;
 
 pub use ahead_behind::{AheadBehind, ahead_behind_against, ahead_behind_vs_base};
+pub use branch::head_branch;
 pub use checkpoint::{CheckpointEngine, CheckpointError, CheckpointSha};
 pub use clone::{clone_repo, repo_name_from_url};
 pub use diff::{DiffParseError, parse_unified_diff};

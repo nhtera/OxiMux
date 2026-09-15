@@ -1823,19 +1823,26 @@ async fn measure_worktree(target: &StatsTarget) -> Measured {
     if !path.join(".git").exists() {
         return Measured::NotARepo;
     }
-    let (numstat, ahead_behind) = futures::future::join(
+    // HEAD's branch rides along with the numbers: the card's branch chip is a
+    // claim about this checkout *now*, and `workspaces.branch` — written once
+    // at create/adopt/rename — cannot be that. One `rev-parse` is the cheapest
+    // call git has, and joining it here is what the module docs ask of any new
+    // per-worktree number: join this round rather than start another timer.
+    let (numstat, ahead_behind, head_branch) = futures::future::join3(
         oximux_git::diff_numstat_head(path),
         oximux_git::ahead_behind_vs_base(
             path,
             target.pinned_base.as_deref(),
             &target.default_branch,
         ),
+        oximux_git::head_branch(path),
     )
     .await;
-    // Either git failing to run is a hiccup, not a fact about the worktree:
-    // keep the previous numbers rather than blank a chip or, for the
-    // ahead/behind, record "no base" when the base was simply not consulted.
-    let (Ok(map), Ok(ahead_behind)) = (numstat, ahead_behind) else {
+    // Any of the three failing to run is a hiccup, not a fact about the
+    // worktree: keep the previous numbers rather than blank a chip, record
+    // "no base" when the base was simply not consulted, or let the branch
+    // chip fall back to the stored name for one tick.
+    let (Ok(map), Ok(ahead_behind), Ok(head_branch)) = (numstat, ahead_behind, head_branch) else {
         return Measured::Transient;
     };
     let counts = sum_numstat(&map);
@@ -1878,5 +1885,6 @@ async fn measure_worktree(target: &StatsTarget) -> Measured {
         diff: counts,
         dirty_files: u32::try_from(map.len()).unwrap_or(u32::MAX),
         ahead_behind,
+        head_branch,
     })
 }

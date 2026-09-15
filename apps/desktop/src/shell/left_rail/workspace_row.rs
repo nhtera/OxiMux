@@ -207,7 +207,7 @@ pub fn build_workspace_card_plan(
     stats: Option<&WorktreeStats>,
     theme: Theme,
 ) -> WorkspaceCardPlan {
-    let row = build_workspace_row_plan(
+    let mut row = build_workspace_row_plan(
         workspace,
         is_active,
         is_primary,
@@ -217,12 +217,38 @@ pub fn build_workspace_card_plan(
         theme,
     );
 
+    // Where this checkout's HEAD is *now*, measured by the refresh round.
+    // `workspaces.branch` is written once — at create, adopt or rename — and
+    // the synthesized primary row carries the project's *default* branch;
+    // neither follows a `git checkout` run in a terminal, so the chip went on
+    // naming a branch the worktree had left, and a restart did not fix it
+    // because the stale name is what the database holds. The stored name stays
+    // the fallback: for the tick before the first measurement lands, and for a
+    // detached HEAD, which has no branch to name.
+    let live_branch = stats.and_then(|s| s.head_branch.clone());
+
     // Folder projects carry no branch; linked worktrees always have one.
-    let branch = if is_folder || workspace.branch.is_empty() {
+    let branch = if is_folder {
         None
     } else {
-        Some(workspace.branch.clone())
+        live_branch
+            .clone()
+            .or_else(|| (!workspace.branch.is_empty()).then(|| workspace.branch.clone()))
     };
+
+    // The synthesized primary row has no `workspaces` row behind it: its title
+    // IS its branch (`rail_data::workspaces_with_primary_for` seeds name, slug
+    // and branch alike from the project's default branch). So the title has to
+    // follow HEAD too, or the row keeps announcing a branch the checkout left
+    // while the chip beside it says otherwise. A real row keeps the name the
+    // user gave it — that is a label they chose, not a claim about HEAD.
+    if is_primary
+        && !is_folder
+        && workspace.id.starts_with("primary:")
+        && let Some(live) = live_branch.as_ref()
+    {
+        row.name = live.clone();
+    }
 
     // Produce an agent verb for every workspace that has had any interaction
     // (live or status-bearing). When neither is true, omit the verb line so
@@ -522,6 +548,75 @@ mod tests {
         assert!(plan.branch.is_none());
     }
 
+    /// The defect this pairing exists to close: someone runs `git checkout` in
+    /// a terminal and the card goes on naming the branch the row was written
+    /// with. The measured HEAD outranks the stored name.
+    #[test]
+    fn card_plan_branch_follows_live_head_over_the_stored_name() {
+        let t = Theme::charcoal();
+        let w = ws_with_branch("Feat", "feat", "oximux/feat");
+        let plan = build_workspace_card_plan(
+            &w, false, false, false, false, None, None, None, Some(&stats_on("main")), t,
+        );
+        assert_eq!(plan.branch, Some("main".to_string()));
+    }
+
+    /// A detached HEAD has no branch to name, so the measurement says nothing
+    /// and the stored name — the last branch this row was known to be on — is
+    /// what the chip keeps. Blanking it would be a worse answer than a stale
+    /// one, and inventing a sha is not a branch.
+    #[test]
+    fn card_plan_branch_keeps_stored_name_when_head_is_detached() {
+        let t = Theme::charcoal();
+        let w = ws_with_branch("Feat", "feat", "oximux/feat");
+        let measured_detached = stats(0, 0, 0, None);
+        let plan = build_workspace_card_plan(
+            &w, false, false, false, false, None, None, None, Some(&measured_detached), t,
+        );
+        assert_eq!(plan.branch, Some("oximux/feat".to_string()));
+    }
+
+    /// The synthesized primary row's title has no source but its branch, so it
+    /// follows HEAD with the chip.
+    #[test]
+    fn primary_row_title_follows_live_head() {
+        let t = Theme::charcoal();
+        let mut w = ws_with_branch("develop", "develop", "develop");
+        w.id = "primary:proj".to_string();
+        let plan = build_workspace_card_plan(
+            &w, false, true, false, false, None, None, None, Some(&stats_on("main")), t,
+        );
+        assert_eq!(plan.row.name, "main");
+        assert_eq!(plan.branch, Some("main".to_string()));
+    }
+
+    /// A real row's name is a label its user chose. The chip tells the truth
+    /// about HEAD; the title is left alone.
+    #[test]
+    fn real_row_title_survives_a_branch_switch() {
+        let t = Theme::charcoal();
+        let w = ws_with_branch("Auth rework", "auth", "oximux/auth");
+        let plan = build_workspace_card_plan(
+            &w, false, false, false, false, None, None, None, Some(&stats_on("main")), t,
+        );
+        assert_eq!(plan.row.name, "Auth rework");
+        assert_eq!(plan.branch, Some("main".to_string()));
+    }
+
+    /// A folder project is not a checkout: no chip, and its title is the
+    /// project name whatever a stray measurement might carry.
+    #[test]
+    fn folder_project_ignores_a_measured_head() {
+        let t = Theme::charcoal();
+        let mut w = ws_with_branch("Notes", "notes", "");
+        w.id = "primary:proj".to_string();
+        let plan = build_workspace_card_plan(
+            &w, false, true, true, false, None, None, None, Some(&stats_on("main")), t,
+        );
+        assert!(plan.branch.is_none());
+        assert_eq!(plan.row.name, "Notes");
+    }
+
     #[test]
     fn card_plan_agent_verb_none_when_dormant() {
         // No status, not live → no verb line (dormant workspace).
@@ -625,6 +720,16 @@ mod tests {
                 ahead,
                 behind,
             }),
+            head_branch: None,
+        }
+    }
+
+    /// The same fixture with a measured HEAD — the live branch the refresh
+    /// round found in the checkout.
+    fn stats_on(branch: &str) -> WorktreeStats {
+        WorktreeStats {
+            head_branch: Some(branch.to_string()),
+            ..stats(0, 0, 0, None)
         }
     }
 

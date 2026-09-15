@@ -239,3 +239,89 @@ async fn list_branches_detached_head_hides_pseudo_entry() {
     assert_eq!(bs[0].name, "main");
     assert!(!bs[0].is_current);
 }
+
+// ── head_branch ───────────────────────────────────────────────────────────────
+
+/// The property the rail's branch chip rests on: `head_branch` answers where
+/// this checkout is *now*, so a plain `git checkout` — the thing a user does in
+/// a terminal, with no OxiMux involvement at all — changes the answer.
+#[tokio::test]
+async fn head_branch_follows_a_checkout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("a.txt"), "v1\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+
+    assert_eq!(
+        oximux_git::head_branch(p).await.unwrap(),
+        Some("main".to_string())
+    );
+
+    run_git(p, &["checkout", "-b", "feat/initial-setup"]);
+    assert_eq!(
+        oximux_git::head_branch(p).await.unwrap(),
+        Some("feat/initial-setup".to_string()),
+        "a checkout in a terminal must change the answer"
+    );
+
+    run_git(p, &["checkout", "main"]);
+    assert_eq!(
+        oximux_git::head_branch(p).await.unwrap(),
+        Some("main".to_string()),
+        "and switching back must change it back"
+    );
+}
+
+/// A detached HEAD is not on a branch, so there is no name to report. The card
+/// falls back to the stored one rather than showing a sha as if it were a
+/// branch.
+#[tokio::test]
+async fn head_branch_is_none_when_detached() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    init_repo(p);
+    write(&p.join("a.txt"), "v1\n");
+    run_git(p, &["add", "a.txt"]);
+    run_git(p, &["commit", "-m", "init"]);
+    run_git(p, &["checkout", "--detach"]);
+
+    assert_eq!(oximux_git::head_branch(p).await.unwrap(), None);
+}
+
+/// Every row in the rail but one is a linked worktree, whose `.git` is a file
+/// rather than a directory. Each must report its own HEAD, not the main
+/// worktree's — one answer for the whole repository would make the chip wrong
+/// on every row at once.
+#[tokio::test]
+async fn head_branch_is_per_worktree_not_per_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    init_repo(&root);
+    write(&root.join("a.txt"), "v1\n");
+    run_git(&root, &["add", "a.txt"]);
+    run_git(&root, &["commit", "-m", "init"]);
+
+    let linked = tmp.path().join("wt-a");
+    run_git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "oximux/task",
+            linked.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(
+        oximux_git::head_branch(&linked).await.unwrap(),
+        Some("oximux/task".to_string())
+    );
+    assert_eq!(
+        oximux_git::head_branch(&root).await.unwrap(),
+        Some("main".to_string())
+    );
+}
