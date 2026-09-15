@@ -1,9 +1,20 @@
 use super::*;
 use std::path::Path;
+use std::time::Duration;
+
+/// Timeout for the git commands that BUILD a fixture, as opposed to the ones
+/// under test. `GitCmd`'s 10 s default exists to stop a wedged git from
+/// deadlocking the UI; a test fixture has no UI to protect, and one of these
+/// setup commands — `submodule add`, which clones — has repeatedly blown
+/// through 10 s on a contended Windows runner and failed the job for reasons
+/// that had nothing to do with the change under test. Long enough that a real
+/// hang still ends the test rather than the job.
+const FIXTURE_TIMEOUT: Duration = Duration::from_secs(120);
 
 async fn git(dir: &Path, args: &[&str]) {
     GitCmd::new(dir)
         .args(args)
+        .timeout(FIXTURE_TIMEOUT)
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
