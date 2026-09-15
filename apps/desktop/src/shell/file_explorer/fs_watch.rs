@@ -126,15 +126,28 @@ pub fn as_project_path(event: &Path, real_root: &Path, repo_root: &Path) -> Opti
     }
 }
 
-/// Every directory whose listing changed, for one debounced batch of `paths`.
+/// Every directory whose listing may have changed, for one debounced batch of
+/// `paths`.
 ///
-/// A path's *parent* is what changed: a created, deleted or renamed entry
-/// changes the listing of the directory holding it. Paths under a name the
-/// explorer never shows (`.git`, `node_modules`, `target`) are dropped, which
-/// is what keeps a running build from turning into work here — measured at
-/// 5000 files written under `target/`: every event is still *delivered*
-/// (`notify` sets no FSEvents exclusion paths, so there is no way to refuse
-/// them), but they resolve to nothing in ~0.66 µs each.
+/// **Both readings of an event path are offered, because the platform uses
+/// both.** An event naming a file means the directory holding it changed, so
+/// the parent is a candidate; an event naming a directory means something
+/// inside it changed, so the directory itself is. FSEvents emits the first
+/// form on this developer's machine and the second — the directory, with a
+/// trailing slash — on GitHub's macOS runners, which is how the difference was
+/// found: taking only the parent resolved a change in the watched root to the
+/// root's *own parent*, so the watch did nothing at all there. Distinguishing
+/// them properly would mean a `stat` per path, on a path that may already be
+/// gone; offering both costs a `HashSet` lookup and cannot be wrong, since the
+/// caller only ever acts on directories it has open or cached and a file path
+/// is neither.
+///
+/// Paths under a name the explorer never shows (`.git`, `node_modules`,
+/// `target`) are dropped, which is what keeps a running build from turning
+/// into work here — measured at 5000 files written under `target/`: every
+/// event is still *delivered* (`notify` sets no FSEvents exclusion paths, so
+/// there is no way to refuse them), but they resolve to nothing in ~0.66 µs
+/// each.
 ///
 /// Whether a touched directory is re-read or merely marked suspect is the
 /// caller's decision, because only it knows which directories are open and
@@ -143,11 +156,20 @@ pub fn as_project_path(event: &Path, real_root: &Path, repo_root: &Path) -> Opti
 /// Deduplicated and sorted: a burst names the same directory many times, and
 /// the order a `HashSet` iterates in is not something a test should depend on.
 pub fn touched_dirs(paths: impl IntoIterator<Item = PathBuf>, root: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = paths
-        .into_iter()
-        .filter(|p| is_inside_the_tree(p, root))
-        .filter_map(|p| p.parent().map(Path::to_path_buf))
-        .collect();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if !is_inside_the_tree(&path, root) {
+            continue;
+        }
+        // Normalised so a trailing slash cannot make one directory look like
+        // two. `Path` compares and hashes by component, so this only tidies
+        // what is stored and logged.
+        let path: PathBuf = path.components().collect();
+        if let Some(parent) = path.parent().filter(|p| p.starts_with(root)) {
+            out.push(parent.to_path_buf());
+        }
+        out.push(path);
+    }
     out.sort();
     out.dedup();
     out
@@ -188,6 +210,16 @@ mod tests {
         paths.iter().map(PathBuf::from).collect()
     }
 
+    /// The directories a batch would actually re-read, with nothing expanded:
+    /// what `apply_fs_events` keeps after the open-directory filter.
+    fn open_dirs_touched(paths: &[PathBuf], root: &Path) -> Vec<PathBuf> {
+        let none = HashSet::new();
+        touched_dirs(paths.iter().cloned(), root)
+            .into_iter()
+            .filter(|d| is_open(d, root, &none))
+            .collect()
+    }
+
     /// What the panel would re-read for a batch: the touched directories it
     /// currently has open. Mirrors the first half of
     /// `FileExplorer::apply_fs_events`, so these tests read as the behaviour
@@ -203,12 +235,17 @@ mod tests {
 
     /// The other half: a touched directory that is NOT open is not re-read,
     /// but the panel must be told its cached listing is now suspect.
-    fn suspects(paths: &[&str], root: &str, expanded: &[&str]) -> Vec<PathBuf> {
+    ///
+    /// `cached` mirrors `invalidate_dir`'s own guard — it acts only on paths
+    /// the cache holds, and the cache holds directories — which is what makes
+    /// it safe for `touched_dirs` to offer a file path as a candidate.
+    fn suspects(paths: &[&str], root: &str, expanded: &[&str], cached: &[&str]) -> Vec<PathBuf> {
         let root = Path::new(root);
         let expanded = set(expanded);
+        let cached = set(cached);
         touched_dirs(paths.iter().map(PathBuf::from), root)
             .into_iter()
-            .filter(|d| !is_open(d, root, &expanded))
+            .filter(|d| !is_open(d, root, &expanded) && cached.contains(d))
             .collect()
     }
 
@@ -239,8 +276,18 @@ mod tests {
     #[test]
     fn a_file_in_a_collapsed_dir_marks_it_suspect() {
         assert_eq!(
-            suspects(&["/r/src/deep/mod.rs"], "/r", &["/r/src"]),
+            suspects(&["/r/src/deep/mod.rs"], "/r", &["/r/src"], &["/r/src/deep"]),
             vec![PathBuf::from("/r/src/deep")]
+        );
+    }
+
+    /// A file path is offered as a candidate but is never in the cache, so
+    /// nothing acts on it.
+    #[test]
+    fn a_file_path_is_never_itself_invalidated() {
+        assert!(
+            suspects(&["/r/src/deep/mod.rs"], "/r", &["/r/src"], &[])
+                .is_empty()
         );
     }
 
@@ -255,7 +302,29 @@ mod tests {
             "/r/node_modules/react/index.js",
         ];
         assert!(reloads(&paths, "/r", &["/r/src"]).is_empty());
-        assert!(suspects(&paths, "/r", &["/r/src"]).is_empty());
+        assert!(suspects(&paths, "/r", &["/r/src"], &["/r/target", "/r/.git"]).is_empty());
+    }
+
+    /// The form GitHub's macOS runners emit: the watched directory itself,
+    /// with a trailing slash, instead of the file that changed inside it.
+    /// Taking only the parent resolved this to the root's own parent and the
+    /// watch silently did nothing.
+    #[test]
+    fn a_directory_granularity_event_reloads_that_directory() {
+        assert_eq!(reloads(&["/r/"], "/r", &[]), vec![PathBuf::from("/r")]);
+        assert_eq!(
+            reloads(&["/r/src/"], "/r", &["/r/src"]),
+            vec![PathBuf::from("/r"), PathBuf::from("/r/src")]
+        );
+    }
+
+    /// A trailing slash must not make one directory look like two.
+    #[test]
+    fn a_trailing_slash_does_not_double_a_directory() {
+        assert_eq!(
+            reloads(&["/r/src/", "/r/src"], "/r", &["/r/src"]),
+            vec![PathBuf::from("/r"), PathBuf::from("/r/src")]
+        );
     }
 
     /// A project is allowed to live at a path that happens to contain one of
@@ -342,14 +411,17 @@ mod tests {
                         .filter_map(|p| as_project_path(&p, &real_root, &root)),
                 );
             }
-            if !touched_dirs(seen.clone(), &root).is_empty() {
+            if !open_dirs_touched(&seen, &root).is_empty() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
+        // Asserted through the caller's own filter: the platform may name the
+        // created file or the directory holding it, and either must come out
+        // as "re-read the root".
         assert_eq!(
-            touched_dirs(seen.clone(), &root),
+            open_dirs_touched(&seen, &root),
             vec![root.clone()],
             "a file created in the watched root must resolve to re-reading it \
              (paths seen: {seen:?})"
