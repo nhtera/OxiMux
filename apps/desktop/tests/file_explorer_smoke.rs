@@ -1,6 +1,12 @@
 //! Smoke test: construct `FileExplorer` with a static watch channel, push a
 //! `PollState::Ready(GitState)` through the channel, and assert that the
 //! entity's status_map is populated after the push.
+//!
+//! Built through `new_unwatched`: `#[gpui::test]` runs a deterministic
+//! scheduler that panics when anything reaches the app from a thread it does
+//! not own, and a live filesystem watch is its own OS thread. See
+//! `FileExplorer::new_unwatched` for the full reasoning and for where the
+//! watch is covered instead.
 
 use gpui::TestAppContext;
 use oximux_app::shell::file_explorer::FileExplorer;
@@ -47,7 +53,7 @@ async fn file_explorer_constructs_without_panic(cx: &mut TestAppContext) {
     let (tx, rx) = watch::channel(PollState::Loading);
 
     let window = cx.add_window(|win, cx| {
-        FileExplorer::new(
+        FileExplorer::new_unwatched(
             tmp.path().to_path_buf(),
             rx,
             Theme::default(),
@@ -104,7 +110,7 @@ async fn file_explorer_renders_without_panic_before_dir_load(cx: &mut TestAppCon
     let (_tx, rx) = watch::channel(PollState::Loading);
 
     let window = cx.add_window(|win, cx| {
-        FileExplorer::new(
+        FileExplorer::new_unwatched(
             tmp.path().to_path_buf(),
             rx,
             Theme::default(),
