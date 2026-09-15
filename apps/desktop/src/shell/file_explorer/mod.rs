@@ -71,6 +71,11 @@ pub struct FileExplorer {
     prev_files: Vec<FileStatus>,
     /// In-flight load tasks. Capped at MAX_LOAD_TASKS; oldest dropped first.
     _load_tasks: Vec<Task<()>>,
+    /// Source of the per-load sequence numbers in `newest_load`.
+    load_seq: u64,
+    /// The newest load issued for each directory. A completed read applies
+    /// only if it still holds this number — see `load_ops::load_is_current`.
+    newest_load: HashMap<PathBuf, u64>,
     /// Poll observer task. Drop to cancel.
     _poll_observer: Task<()>,
     /// Window-activation subscription for focus-regain refresh.
@@ -219,6 +224,8 @@ impl FileExplorer {
             show_ignored: false,
             prev_files: Vec::new(),
             _load_tasks: Vec::new(),
+            load_seq: 0,
+            newest_load: HashMap::new(),
             _poll_observer: poll_observer,
             _activation_sub: activation_sub,
             _watcher: watcher,

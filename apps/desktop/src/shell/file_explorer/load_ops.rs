@@ -8,6 +8,8 @@ use crate::shell::file_explorer::fs_load::load_dir_cache;
 use crate::shell::file_explorer::fs_watch::{as_project_path, is_open, touched_dirs};
 use crate::shell::file_explorer::tree_state::DirCache;
 use gpui::{Context, Task};
+use std::collections::HashMap;
+use std::path::Path;
 use notify_debouncer_full::DebounceEventResult;
 use oximux_git::PollState;
 use std::path::PathBuf;
@@ -32,6 +34,15 @@ impl FileExplorer {
         // Mark as loading so paint_row can show "…" suffix.
         self.cache.entry(dir_path.clone()).or_default().loading = true;
 
+        // Claim this directory for this read. Two reads of one directory can
+        // be in flight at once — the watch fires again while the first is
+        // still running, or a focus-regain refresh overlaps an expand — and
+        // `read_dir` gives no promise about which finishes first. Without a
+        // claim the last *completion* wins, so an older snapshot can land on
+        // top of a newer one and leave a created file missing (or a deleted
+        // one showing) until something else happens to reload that directory.
+        let seq = self.claim_load(&dir_path);
+
         let dir_clone = dir_path.clone();
         let root_clone = repo_root.clone();
 
@@ -47,6 +58,13 @@ impl FileExplorer {
                         return;
                     };
                     let _ = this.update(cx, |me, cx| {
+                        if !load_is_current(&me.newest_load, &dir_path, seq) {
+                            // Superseded while this read ran, by a newer read
+                            // or by an invalidation. Its children describe a
+                            // moment that has already been overtaken.
+                            return;
+                        }
+                        me.newest_load.remove(&dir_path);
                         me.cache.insert(dir_path, cache);
                         if is_root {
                             me.root_loaded = true;
@@ -66,6 +84,31 @@ impl FileExplorer {
                 );
                 cx.spawn(async move |_, _| {})
             }
+        }
+    }
+
+    /// Take the next sequence number for a read of `dir`, making it the newest
+    /// load that directory has outstanding. Any earlier read of the same
+    /// directory is superseded and will be discarded when it completes.
+    fn claim_load(&mut self, dir: &Path) -> u64 {
+        self.load_seq = self.load_seq.wrapping_add(1);
+        let seq = self.load_seq;
+        self.newest_load.insert(dir.to_path_buf(), seq);
+        seq
+    }
+
+    /// Mark a cached-but-collapsed directory's listing as needing a fresh read
+    /// the next time it is expanded, and discard any read of it still in
+    /// flight.
+    ///
+    /// Both halves matter. Clearing `loaded` is what makes `toggle_dir` go back
+    /// to disk. Dropping the claim is what stops a read that *started before*
+    /// the change from landing afterwards and restoring `loaded = true` over
+    /// the very listing we just declared suspect.
+    pub(super) fn invalidate_dir(&mut self, dir: &Path) {
+        if let Some(cached) = self.cache.get_mut(dir) {
+            cached.loaded = false;
+            self.newest_load.remove(dir);
         }
     }
 
@@ -162,13 +205,12 @@ impl FileExplorer {
                 let task = self.spawn_load_dir(dir.clone(), repo_root.clone(), is_root, cx);
                 self.push_task(task);
                 reloaded.push(dir);
-            } else if let Some(cached) = self.cache.get_mut(&dir) {
+            } else {
                 // Collapsed, but its children are still cached from when it
                 // was open, and `toggle_dir` re-reads only what is not
-                // `loaded`. Clearing the flag is what makes the next expand go
-                // back to disk — otherwise a file created while the directory
+                // `loaded`. Without this a file created while the directory
                 // was shut never appears, and a deleted one never leaves.
-                cached.loaded = false;
+                self.invalidate_dir(&dir);
             }
         }
         if !reloaded.is_empty() {
@@ -180,4 +222,54 @@ impl FileExplorer {
         }
     }
 
+}
+
+/// True when a finished read of `dir` may still be applied: it is the newest
+/// one issued for that directory.
+///
+/// A missing entry means "no read of this directory is current" — either a
+/// newer read already landed and cleared it, or an invalidation dropped the
+/// claim — so a completion that finds nothing is stale, not merely unknown.
+fn load_is_current(newest: &HashMap<PathBuf, u64>, dir: &Path, seq: u64) -> bool {
+    newest.get(dir) == Some(&seq)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn newest(entries: &[(&str, u64)]) -> HashMap<PathBuf, u64> {
+        entries
+            .iter()
+            .map(|(p, s)| (PathBuf::from(p), *s))
+            .collect()
+    }
+
+    #[test]
+    fn the_newest_read_of_a_directory_applies() {
+        assert!(load_is_current(&newest(&[("/r/src", 7)]), Path::new("/r/src"), 7));
+    }
+
+    /// The race both review passes caught: a slow first read finishing after a
+    /// fast second one must not put the older listing back.
+    #[test]
+    fn a_superseded_read_does_not_apply() {
+        assert!(!load_is_current(&newest(&[("/r/src", 8)]), Path::new("/r/src"), 7));
+    }
+
+    /// An invalidation drops the claim, so a read that was already running
+    /// when the directory changed cannot restore what it read beforehand.
+    #[test]
+    fn a_read_whose_claim_was_dropped_does_not_apply() {
+        assert!(!load_is_current(&newest(&[]), Path::new("/r/src"), 7));
+    }
+
+    /// Claims are per directory: a read of one does not supersede a read of
+    /// another that happens to have been issued earlier.
+    #[test]
+    fn claims_do_not_cross_directories() {
+        let map = newest(&[("/r/src", 7), ("/r/docs", 8)]);
+        assert!(load_is_current(&map, Path::new("/r/src"), 7));
+        assert!(load_is_current(&map, Path::new("/r/docs"), 8));
+    }
 }
