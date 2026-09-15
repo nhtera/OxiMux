@@ -346,7 +346,8 @@ impl RightSidebar {
     }
 
     /// Test constructor: injects a static watch channel so no tokio thread-pool
-    /// task is spawned — keeps GPUI's test scheduler happy (single-thread only).
+    /// task is spawned, and builds the explorer without its filesystem watch —
+    /// keeps GPUI's test scheduler happy (single-thread only).
     /// `has_repo` controls `_poller`: `true` = `Some(Arc<noop>)`, `false` = `None`.
     /// This drives `visible_tabs` and `select_tab` validation without a real poller.
     #[doc(hidden)]
@@ -413,9 +414,12 @@ impl RightSidebar {
         let repo_root = repo.workdir().to_path_buf();
         // Test constructor: no host on_open callback — pass `None` so
         // file clicks during tests silently no-op (rather than triggering
-        // `std::process::Command::new("open")` like before).
+        // `std::process::Command::new("open")` like before). And no filesystem
+        // watch, for the same reason this constructor exists at all: the watch
+        // is its own OS thread, which the test scheduler counts as
+        // non-determinism the moment it touches the app.
         let file_explorer = cx.new(|cx| {
-            FileExplorer::new(
+            FileExplorer::new_unwatched(
                 repo_root.clone(),
                 explorer_rx,
                 theme,

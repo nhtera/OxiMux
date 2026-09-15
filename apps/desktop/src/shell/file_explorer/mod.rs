@@ -10,6 +10,7 @@ pub mod file_mutations;
 pub mod file_tree_context_menu;
 pub mod file_tree_view;
 pub mod fs_load;
+pub mod fs_watch;
 pub mod header_render;
 pub mod load_ops;
 pub mod paint;
@@ -70,10 +71,27 @@ pub struct FileExplorer {
     prev_files: Vec<FileStatus>,
     /// In-flight load tasks. Capped at MAX_LOAD_TASKS; oldest dropped first.
     _load_tasks: Vec<Task<()>>,
+    /// Source of the per-load sequence numbers in `newest_load`.
+    load_seq: u64,
+    /// The newest load issued for each directory. A completed read applies
+    /// only if it still holds this number — see `load_ops::load_is_current`.
+    newest_load: HashMap<PathBuf, u64>,
     /// Poll observer task. Drop to cancel.
     _poll_observer: Task<()>,
     /// Window-activation subscription for focus-regain refresh.
     _activation_sub: Subscription,
+    /// Keeps the FSEvents stream alive for the panel's lifetime; dropped with
+    /// the entity, which is what stops the watch when the project closes.
+    /// `None` when the watch could not be established — the panel degrades to
+    /// the focus-regain and manual refreshes, never to nothing. Events are
+    /// applied by the task in `_watch_task`.
+    _watcher: Option<fs_watch::ExplorerWatcher>,
+    /// Drains debounced filesystem batches. Drop to cancel.
+    _watch_task: Task<()>,
+    /// `repo_root` as the filesystem resolves it — the spelling watch events
+    /// arrive in. Equal to `repo_root` unless the project was opened through a
+    /// symlink; see `fs_watch::as_project_path` for why the difference matters.
+    watch_root: PathBuf,
     /// Callback to open a clicked file as an editor tab in the active
     /// project's pane group. `None` in test contexts (no host wired) —
     /// falls back to a no-op so unit tests don't accidentally shell out.
@@ -100,6 +118,7 @@ pub struct FileExplorer {
 }
 
 impl FileExplorer {
+    /// Mount the panel on `repo_root`, watching it for changes.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         repo_root: PathBuf,
@@ -111,6 +130,51 @@ impl FileExplorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::build(
+            repo_root, state_rx, theme, density, typography, on_open, true, window, cx,
+        )
+    }
+
+    /// Mount the panel with **no filesystem watch**, for `#[gpui::test]`.
+    ///
+    /// GPUI's test scheduler panics on any activity reaching the app from a
+    /// thread it does not own — that is how it enforces determinism — and a
+    /// live watch is exactly such a thread: `notify` runs its own loop, and
+    /// even its teardown closes the channel the drain task is parked on, which
+    /// wakes that task from the wrong thread. A deterministic test asserting
+    /// "this constructs and renders" cannot also host a real FSEvents stream.
+    ///
+    /// Nothing is left untested by that: the watch's own behaviour — that it
+    /// delivers, and what a delivered batch means for the tree — is covered in
+    /// `fs_watch`, against a real directory and a real watcher.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_unwatched(
+        repo_root: PathBuf,
+        state_rx: tokio::sync::watch::Receiver<PollState>,
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        on_open: Option<OnOpenFile>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::build(
+            repo_root, state_rx, theme, density, typography, on_open, false, window, cx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        repo_root: PathBuf,
+        state_rx: tokio::sync::watch::Receiver<PollState>,
+        theme: Theme,
+        density: Density,
+        typography: Typography,
+        on_open: Option<OnOpenFile>,
+        watch: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let poll_observer = Self::start_poll_observer(state_rx, cx);
 
         // Subscribe to window-activation so focus regain triggers a refresh of
@@ -118,6 +182,28 @@ impl FileExplorer {
         let activation_sub = cx.observe_window_activation(window, |me, window, cx| {
             if window.is_window_active() {
                 me.refresh_expanded(cx);
+            }
+        });
+
+        // The panel's only live signal that disk changed underneath it. Start
+        // it before the struct so the stream is running by the time the root
+        // load below lands: events that arrive during the load queue in the
+        // channel and are applied after, so nothing is missed in the gap.
+        let (watch_tx, mut watch_rx) =
+            tokio::sync::mpsc::unbounded_channel::<notify_debouncer_full::DebounceEventResult>();
+        let watcher = watch
+            .then(|| fs_watch::spawn_watcher(&repo_root, watch_tx))
+            .flatten();
+        let watch_root =
+            std::fs::canonicalize(&repo_root).unwrap_or_else(|_| repo_root.clone());
+        let watch_task = cx.spawn(async move |this, cx| {
+            while let Some(result) = watch_rx.recv().await {
+                if this
+                    .update(cx, |me, cx| me.apply_fs_events(result, cx))
+                    .is_err()
+                {
+                    return;
+                }
             }
         });
 
@@ -138,8 +224,13 @@ impl FileExplorer {
             show_ignored: false,
             prev_files: Vec::new(),
             _load_tasks: Vec::new(),
+            load_seq: 0,
+            newest_load: HashMap::new(),
             _poll_observer: poll_observer,
             _activation_sub: activation_sub,
+            _watcher: watcher,
+            _watch_task: watch_task,
+            watch_root,
             on_open,
             renaming: None,
             creating: None,

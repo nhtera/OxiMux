@@ -9,6 +9,7 @@ use crate::error::{GitError, Result};
 use crate::process::GitCmd;
 use crate::repository::Repository;
 use oximux_core::BranchInfo;
+use std::path::Path;
 
 /// Field separator for `git branch --format`. Picked because the tab character
 /// is rejected by `git check-ref-format` from branch names, so it can't
@@ -279,14 +280,7 @@ impl Repository {
     /// A detached HEAD prints the literal `HEAD`, which is not a branch name,
     /// so it maps to `None` rather than being handed back as one.
     pub async fn current_branch(&self) -> Result<Option<String>> {
-        let out = GitCmd::new(self.workdir())
-            .args(["rev-parse", "--abbrev-ref", "HEAD"])
-            .run()
-            .await?;
-        let text = String::from_utf8(out.stdout)
-            .map_err(|e| GitError::parse(format!("non-utf8 in `git rev-parse HEAD`: {e}")))?;
-        let name = text.trim();
-        Ok((!name.is_empty() && name != "HEAD").then(|| name.to_string()))
+        head_branch(self.workdir()).await
     }
 
     /// Most-recently-visited local branches in MRU order, capped at `limit`.
@@ -406,6 +400,26 @@ fn parse_checkout_destination(line: &str) -> Option<&str> {
     let (_from, to) = rest.rsplit_once(" to ")?;
     let dest = to.trim();
     if dest.is_empty() { None } else { Some(dest) }
+}
+
+/// The branch `HEAD` points at in the checkout at `workdir`; `None` when
+/// `HEAD` is detached, which is not a branch name.
+///
+/// A free function rather than only a [`Repository`] method because the rail's
+/// per-worktree refresh round holds a path, not an open repository, and asks
+/// this of every worktree on every tick — `Repository::open` per path per tick
+/// to answer one `rev-parse` is cost that round must not add.
+/// [`Repository::current_branch`] delegates here, so the two can never
+/// disagree about what "on a branch" means.
+pub async fn head_branch(workdir: &Path) -> Result<Option<String>> {
+    let out = GitCmd::new(workdir)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .run()
+        .await?;
+    let text = String::from_utf8(out.stdout)
+        .map_err(|e| GitError::parse(format!("non-utf8 in `git rev-parse HEAD`: {e}")))?;
+    let name = text.trim();
+    Ok((!name.is_empty() && name != "HEAD").then(|| name.to_string()))
 }
 
 /// True when `s` looks like a git SHA (hex string of length 7..=40).

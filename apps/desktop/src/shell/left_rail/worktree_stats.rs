@@ -24,6 +24,12 @@ pub struct WorktreeStats {
     /// HEAD against the worktree's base, or `None` when no base resolved.
     /// See `oximux_git::ahead_behind` for the resolution order.
     pub ahead_behind: Option<AheadBehind>,
+    /// The branch this checkout is on *right now*, or `None` for a detached
+    /// HEAD. Measured here rather than read from `workspaces.branch` because
+    /// that column records the branch a row was created, adopted or renamed
+    /// with and never moves again — a `git checkout` in a terminal left the
+    /// card naming a branch the worktree had already left, across restarts.
+    pub head_branch: Option<String>,
 }
 
 /// The `↑N ↓M` chip text. Each arrow is dropped at zero so a branch that is
