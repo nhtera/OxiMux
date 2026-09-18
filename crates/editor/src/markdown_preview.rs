@@ -32,7 +32,7 @@ use gpui_component::{
     clipboard::Clipboard,
     h_flex,
     highlighter::HighlightTheme,
-    text::{TextView, TextViewStyle},
+    text::{FrontmatterPlugin, MarkdownExtensions, TextView, TextViewStyle},
 };
 
 /// Callback the host app installs so a clicked document link in the rendered
@@ -163,6 +163,14 @@ pub fn render_preview(
     let lang_tag_size = lang_tag_size * zoom_factor;
     let mut text_view = TextView::markdown(("md-preview-text", view_id), rendered)
         .style(style)
+        // YAML frontmatter is not CommonMark: with the construct off, a plan's
+        // `---` block parses as a thematic rule plus a *setext underline*, so
+        // the whole metadata header renders as one giant `<h2>`. Switching the
+        // construct on and handing the node to the upstream plugin renders it
+        // as a key/value description list instead, with a `yaml` code block as
+        // the fallback for anything the plugin will not flatten.
+        .markdown_extensions(MarkdownExtensions::default().frontmatter())
+        .plugin(FrontmatterPlugin::new())
         // Code blocks get a language tag + one-click copy, the way a
         // polished doc viewer surfaces fenced code.
         .code_block_actions(move |code_block, _window, cx| {
