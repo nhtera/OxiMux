@@ -28,7 +28,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme,
-    input::{Input, InputState, TabSize},
+    input::{Editor, EditorState, InputState, TabSize},
     resizable::{h_resizable, resizable_panel},
 };
 use oximux_settings::AutosaveSettings;
@@ -319,7 +319,7 @@ pub enum EditorContent {
 /// parser instance).
 pub struct TextContent {
     /// gpui-component editor state entity.
-    pub(crate) state: Entity<InputState>,
+    pub(crate) state: Entity<EditorState>,
     /// `true` when the buffer text differs from the last successful save.
     pub(crate) dirty: bool,
     /// Monotonic per-buffer version counter — LSP §3.17.2. didOpen sends
@@ -537,7 +537,7 @@ impl EditorView {
     /// Editor state entity — exposed so callers can install provider
     /// impls. Returns `None` for non-text content (image/binary) since
     /// there's no `InputState` to attach to.
-    pub fn state(&self) -> Option<Entity<InputState>> {
+    pub fn state(&self) -> Option<Entity<EditorState>> {
         match &self.content {
             EditorContent::Text(t) => Some(t.state.clone()),
             _ => None,
@@ -1241,9 +1241,8 @@ fn decide_content(
 
     let language = language_for_path(path);
     let state = cx.new(|cx| {
-        InputState::new(window, cx)
-            .code_editor(language)
-            .multi_line(true)
+        EditorState::new(window, cx)
+            .language(language)
             .tab_size(TabSize {
                 tab_size: 4,
                 ..Default::default()
@@ -1444,7 +1443,7 @@ impl Render for EditorView {
             // `cx.observe(&state)` → `cx.notify()` already keeps it live.
             EditorContent::Text(t) if self.is_markdown => {
                 let dir = self.file_path.parent();
-                let input = Input::new(&t.state)
+                let input = Editor::new(&t.state)
                     .font_family(theme.mono_font_family.clone())
                     .text_size(mono_size)
                     .size_full();
@@ -1498,7 +1497,7 @@ impl Render for EditorView {
                     }
                 }
             }
-            EditorContent::Text(t) => Input::new(&t.state)
+            EditorContent::Text(t) => Editor::new(&t.state)
                 .font_family(theme.mono_font_family.clone())
                 .text_size(mono_size)
                 .size_full()

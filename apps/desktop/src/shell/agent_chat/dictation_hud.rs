@@ -20,7 +20,7 @@ use gpui::{
     WeakEntity, Window, div, px,
 };
 use gpui_component::WindowExt as _;
-use gpui_component::input::InputState;
+use gpui_component::input::EditorState;
 use oximux_dictation::DictationEvent;
 use oximux_settings::{Density, Theme, Typography};
 
@@ -37,7 +37,7 @@ use super::dictation_waveform::{WaveformStyle, render_waveform};
 #[derive(Clone)]
 pub enum HudSink {
     Terminal(WeakEntity<TerminalView>),
-    Editor(WeakEntity<InputState>),
+    Editor(WeakEntity<EditorState>),
 }
 
 impl HudSink {

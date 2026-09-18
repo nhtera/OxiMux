@@ -9,8 +9,8 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use gpui::{Context, Task, Window};
-use gpui_component::input::{CompletionProvider, InputState, Rope, RopeExt as _};
+use gpui::{App, Task, Window};
+use gpui_component::input::{CompletionProvider, Rope, RopeExt as _};
 use lsp_types::{CompletionContext, CompletionResponse, Uri};
 use tokio::runtime::Handle;
 
@@ -41,7 +41,7 @@ impl CompletionProvider for LspCompletionProvider {
         offset: usize,
         trigger: CompletionContext,
         _window: &mut Window,
-        cx: &mut Context<InputState>,
+        cx: &mut App,
     ) -> Task<Result<CompletionResponse>> {
         let position = text.offset_to_position(offset);
         let uri = self.uri.clone();
@@ -64,7 +64,7 @@ impl CompletionProvider for LspCompletionProvider {
         &self,
         _offset: usize,
         new_text: &str,
-        _cx: &mut Context<InputState>,
+        _cx: &mut App,
     ) -> bool {
         new_text
             .chars()

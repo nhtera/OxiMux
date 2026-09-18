@@ -303,21 +303,31 @@ pub fn bridge_component_theme(cx: &mut App) {
     };
     gpui_component::Theme::change(mode, None, cx);
 
-    let component_theme = gpui_component::Theme::global_mut(cx);
-    // Inputs rest on `border_input` (alpha over the surface, stronger than the
-    // hairline dividers so the type-here affordance reads), and `focus_ring`
-    // is the dedicated focus accent — same tokens, single source of truth.
-    component_theme.colors.input = palette.border_input;
-    component_theme.colors.ring = palette.focus_ring;
-    // Radius, bridged for the same reason: the library cannot see our scale.
-    // It happens to default to 6/8 — the same scale — so at 100% this changes
-    // nothing. It is here so the two cannot drift apart silently, which is
-    // precisely what had happened to the radii it does not own: hand-rolled
-    // chrome sat at 4 while every `Input` and `Button` beside it was already 6.
-    component_theme.radius = gpui::px(density.r_xs);
-    component_theme.radius_lg = gpui::px(density.r_card);
-    component_theme.font_family = ui_face.into();
-    component_theme.mono_font_family = mono_face.into();
+    // Through `Theme::update`, never `Theme::global_mut`: the library holds its
+    // palette twice — `colors` as solid colors and `tokens` as renderable
+    // backgrounds that may carry a gradient — and keeps a third projection for
+    // the Base layer, which owns the scrollbar and resize handles. `update` is
+    // the write path that syncs all three; a bare `global_mut` write lands on
+    // one and leaves the others where they were, so a surface can take its
+    // text from the new colors and its background from the old tokens.
+    gpui_component::Theme::update(cx, |component_theme| {
+        // Inputs rest on `border_input` (alpha over the surface, stronger than
+        // the hairline dividers so the type-here affordance reads), and
+        // `focus_ring` is the dedicated focus accent — same tokens, single
+        // source of truth.
+        component_theme.colors.input = palette.border_input;
+        component_theme.colors.ring = palette.focus_ring;
+        // Radius, bridged for the same reason: the library cannot see our
+        // scale. It happens to default to 6/8 — the same scale — so at 100%
+        // this changes nothing. It is here so the two cannot drift apart
+        // silently, which is precisely what had happened to the radii it does
+        // not own: hand-rolled chrome sat at 4 while every `Input` and
+        // `Button` beside it was already 6.
+        component_theme.radius = gpui::px(density.r_xs);
+        component_theme.radius_lg = gpui::px(density.r_card);
+        component_theme.font_family = ui_face.into();
+        component_theme.mono_font_family = mono_face.into();
+    });
 }
 
 /// Persist to `appearance.toml`. Public for tests; production goes through

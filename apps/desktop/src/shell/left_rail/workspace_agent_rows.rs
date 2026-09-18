@@ -528,7 +528,7 @@ fn render_agent_sub_row(
         .child(
             div()
                 .min_w_0()
-                .flex_shrink()
+                .flex_shrink(1.)
                 .text_size(px(typography.t_body_sm))
                 .text_color(primary_color)
                 .truncate()

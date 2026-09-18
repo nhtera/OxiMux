@@ -138,7 +138,7 @@ fn render_untracked_row(
             .flex()
             .items_center()
             .min_w_0()
-            .flex_shrink()
+            .flex_shrink(1.)
             .px(px(5.0))
             .h(px(15.0))
             .rounded(px(density.r_chip))

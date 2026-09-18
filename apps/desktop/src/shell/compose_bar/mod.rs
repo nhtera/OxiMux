@@ -26,7 +26,8 @@ use gpui::{
     Styled, Subscription, Task, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::input::{
-    Enter as InputEnter, Escape as InputEscape, Input, InputEvent, InputState, MoveDown, MoveUp,
+    Enter as InputEnter, Escape as InputEscape, InputEvent, MoveDown, MoveUp, Textarea,
+    TextareaState,
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -44,7 +45,7 @@ pub enum ComposerOutcome {
 }
 
 pub struct ComposerBar {
-    input: Entity<InputState>,
+    input: Entity<TextareaState>,
     /// Cached rg file index for `@` autocomplete; scanned once per composer.
     candidates: Vec<String>,
     candidates_loaded: bool,
@@ -73,8 +74,7 @@ impl ComposerBar {
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
+            TextareaState::new(window, cx)
                 .placeholder("Message the agent…  @ to mention a file")
         });
         let input_sub = cx.subscribe_in(&input, window, |this, _input, ev: &InputEvent, window, cx| {
@@ -336,7 +336,7 @@ impl Render for ComposerBar {
             .gap(px(density.gap_inline))
             .floating_chrome(&theme, &density)
             .when(dropdown, |s| s.child(self.render_dropdown(cx)))
-            .child(Input::new(&self.input))
+            .child(Textarea::new(&self.input))
             .child(
                 div()
                     .flex()

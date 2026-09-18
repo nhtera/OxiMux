@@ -318,7 +318,7 @@ fn dir_row(
                 .xsmall()
                 .text_color(theme.fg_subtle),
         )
-        .child(div().flex_shrink().min_w(px(0.0)).truncate().child(name))
+        .child(div().flex_shrink(1.).min_w(px(0.0)).truncate().child(name))
         .child(
             div()
                 .text_color(theme.fg_subtle)
@@ -377,7 +377,7 @@ fn file_row(
                 .text_color(color)
                 .child(letter.to_string()),
         )
-        .child(div().flex_shrink().min_w(px(0.0)).truncate().child(name));
+        .child(div().flex_shrink(1.).min_w(px(0.0)).truncate().child(name));
     if let Some((added, removed)) = stats {
         row = row
             .child(div().flex_1())

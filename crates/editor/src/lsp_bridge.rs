@@ -125,9 +125,10 @@ pub fn spawn_attach_lsp(
         let definition_provider = Rc::new(LspDefinitionProvider::new(client.clone(), uri.clone()));
         if state_weak
             .update(cx, |state, cx| {
-                state.lsp.hover_provider = Some(hover_provider);
-                state.lsp.completion_provider = Some(completion_provider);
-                state.lsp.definition_provider = Some(definition_provider);
+                let lsp = state.lsp_mut();
+                lsp.hover_provider = Some(hover_provider);
+                lsp.completion_provider = Some(completion_provider);
+                lsp.definition_provider = Some(definition_provider);
                 cx.notify();
             })
             .is_err()

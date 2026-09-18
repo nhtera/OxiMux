@@ -50,7 +50,7 @@ use gpui::{
     App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, Point,
     Subscription, Window, point, px,
 };
-use gpui_component::input::{InputEvent, InputState};
+use gpui_component::input::{InputEvent, InputState, TextareaState};
 
 use crate::shell::left_rail::open_in;
 use oximux_settings::{
@@ -246,7 +246,7 @@ pub struct SettingsModal {
     /// The `KEY=value` editor for `(env_agent, env_profile)`. Lazily built on
     /// `open()` and rebuilt whenever the selection changes — an `InputState`'s
     /// text is owned by the state, so re-seeding it is a rebuild, not a set.
-    pub(super) env_input: Option<Entity<InputState>>,
+    pub(super) env_input: Option<Entity<TextareaState>>,
     _env_sub: Option<Subscription>,
     /// The env map the editor was seeded with, so `close()` can flush an edit
     /// typed but never committed via blur/Enter — same hazard, and same fix, as
@@ -632,7 +632,7 @@ impl SettingsModal {
         let placeholder = pane_agents_launch::env_placeholder(&self.env_agent);
         self.detect_agents(window, cx);
         let env_input = cx.new(|cx| {
-            InputState::new(window, cx)
+            TextareaState::new(window, cx)
                 // `auto_grow`, not `multi_line(true).rows(4)`: `rows()` only
                 // drives the field's height in auto-grow mode. For a plain
                 // multi-line input the element hard-codes `min_size.height` to
@@ -2030,7 +2030,7 @@ mod env_editor_tests {
                 m.begin_profile_name(mode, window, cx);
                 let field = m.profile_name_input.clone().expect("name field");
                 field.update(cx, |s, cx| s.set_value(text, window, cx));
-                field.update(cx, |_, cx| cx.emit(InputEvent::PressEnter { secondary: false }));
+                field.update(cx, |_, cx| cx.emit(InputEvent::PressEnter { secondary: false, shift: false }));
             });
         };
 
@@ -2289,7 +2289,7 @@ mod env_editor_tests {
                 // The event the Input emits on Enter, not a direct call to the
                 // creation code — the subscription is what is under test.
                 field.update(cx, |_, cx| {
-                    cx.emit(InputEvent::PressEnter { secondary: false })
+                    cx.emit(InputEvent::PressEnter { secondary: false, shift: false })
                 });
             });
         })
@@ -2344,7 +2344,7 @@ mod env_editor_tests {
                 m.begin_profile_name(pane_agents_launch::ProfileNameMode::Add, window, cx);
                 let field = m.profile_name_input.clone().expect("name field");
                 field.update(cx, |s, cx| s.set_value(text, window, cx));
-                field.update(cx, |_, cx| cx.emit(InputEvent::PressEnter { secondary: false }));
+                field.update(cx, |_, cx| cx.emit(InputEvent::PressEnter { secondary: false, shift: false }));
             });
         };
 

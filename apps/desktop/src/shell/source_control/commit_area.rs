@@ -19,7 +19,7 @@ use gpui::{
 use gpui_component::{
     Disableable, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants, DropdownButton},
-    input::{Input, InputEvent, InputState},
+    input::{InputEvent, Textarea, TextareaState},
     menu::PopupMenuItem,
 };
 use oximux_core::FileStatus;
@@ -132,7 +132,7 @@ pub struct CommitArea {
     // than `pub(crate)`) keeps the fields out of the wider app surface
     // while still letting the in-module helper module reach them.
     pub(in crate::shell::source_control) repo: Repository,
-    pub message_state: Entity<InputState>,
+    pub message_state: Entity<TextareaState>,
     pub status: CommitStatus,
     pub(in crate::shell::source_control) in_flight: Arc<AtomicBool>,
     /// Set true after a successful `gh pr create` so the panel's state
@@ -219,9 +219,7 @@ impl CommitArea {
         let initial_draft =
             load_initial_commit_draft(worktree_settings_repo.as_ref(), &workspace_id);
         let message_state = cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .multi_line(true)
-                .placeholder("Message");
+            let mut state = TextareaState::new(window, cx).placeholder("Message");
             if let Some(draft) = initial_draft {
                 state = state.default_value(draft);
             }
@@ -672,7 +670,7 @@ impl CommitArea {
             .rounded(px(density.r_xs))
             .bg(theme.bg_base)
             .text_size(px(style.body_text))
-            .child(Input::new(&self.message_state).h_full())
+            .child(Textarea::new(&self.message_state).h_full())
             .children(sparkles_button)
             .children(ai_overlay::render_ai_overlay(
                 generating,

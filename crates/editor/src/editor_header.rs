@@ -88,7 +88,7 @@ pub fn clickable_path(label: String, path: &Path, cx: &Context<EditorView>) -> A
         // The path yields the row to whatever sits beside it — a PDF's page
         // and zoom toolbar is far more useful than the middle of a long
         // path — and elides from the START so the file name survives.
-        .flex_shrink()
+        .flex_shrink(1.)
         .min_w(gpui::px(0.0))
         .overflow_hidden()
         .text_ellipsis_start()

@@ -30,7 +30,7 @@ use gpui::{
 use gpui_component::{
     Disableable,
     button::{Button, ButtonVariants},
-    input::{Input, InputState},
+    input::{Input, InputState, Textarea, TextareaState},
 };
 use oximux_git::Repository;
 use oximux_settings::{Density, Theme, Typography};
@@ -48,7 +48,7 @@ pub struct CommitDialog {
     repo: Repository,
     state: CommitDialogState,
     subject_state: Entity<InputState>,
-    body_state: Entity<InputState>,
+    body_state: Entity<TextareaState>,
     prefix_idx: usize,
     focus_handle: FocusHandle,
     theme: Theme,
@@ -70,9 +70,7 @@ impl CommitDialog {
         let subject_state =
             cx.new(|cx| InputState::new(window, cx).placeholder("Subject (50 char soft limit)"));
         let body_state = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .placeholder("Body (optional)")
+            TextareaState::new(window, cx).placeholder("Body (optional)")
         });
         Self {
             repo,
@@ -199,7 +197,7 @@ impl Render for CommitDialog {
                     .child(div().flex_1().child(Input::new(&self.subject_state)))
                     .child(warn_chip),
             )
-            .child(Input::new(&self.body_state).h(px(160.0)))
+            .child(Textarea::new(&self.body_state).h(px(160.0)))
             .child(status_row)
             .child(
                 div()
