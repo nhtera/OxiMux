@@ -191,10 +191,20 @@ pub fn render_preview(
     if let (Some(opener), Some(dir)) = (opener, base_dir) {
         let base = dir.to_path_buf();
         text_view = text_view.on_link_click(move |url, _event, window, cx| {
-            match resolve_document_link(url, &base).filter(|p| p.is_file()) {
-                Some(path) => opener(path, window, cx),
-                // Not a local document (or it doesn't exist): keep the
-                // renderer's default behavior of handing it to the OS.
+            match resolve_document_link(url, &base) {
+                // A local document. Open it in-app when it is actually there;
+                // when it is not, stop here rather than falling through to the
+                // OS. Handing a schemeless relative path like `missing.md` to
+                // the opener raises a LaunchServices modal over the window
+                // ("The application can't be opened. -50"), which is a worse
+                // answer to a broken link than doing nothing at all.
+                Some(path) => {
+                    if path.is_file() {
+                        opener(path, window, cx);
+                    }
+                }
+                // Not a local document at all — `https:`, `mailto:`, a bare
+                // `#anchor`. The OS opener is the right destination for those.
                 None => cx.open_url(url),
             }
         });
