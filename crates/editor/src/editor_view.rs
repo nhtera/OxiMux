@@ -1430,12 +1430,19 @@ impl Render for EditorView {
         let mono_base = theme.mono_font_size;
         let zoom = current_zoom(cx);
         let mono_size = zoom.effective_px(mono_base);
-        // The markdown preview zooms too, off its own base: the theme's UI
-        // font size, which is what the preview body would inherit (via the
-        // window rem size) if left alone. Headings scale by the ratio so the
-        // preview keeps its proportions.
-        let preview_body = zoom.effective_px(theme.font_size);
-        let preview_factor = f32::from(preview_body) / f32::from(theme.font_size);
+        // The markdown preview zooms too, off its own base. That base is our
+        // own largest body step, NOT the component theme's `font_size`: the
+        // library defaults that to 16px, which is the size the preview body
+        // would inherit (via the window rem size) if left alone, and 16px sits
+        // well above everything around it — the chrome runs at `t_body_sm` and
+        // the source half of the split at the 13px mono size, so the preview
+        // read as a different document. Keying it to `t_body_lg` also makes it
+        // follow the user's density and text-size settings, which a hard-coded
+        // library default never did. Headings scale by the ratio so the
+        // preview keeps its proportions at every zoom level.
+        let preview_base = px(typo.t_body_lg);
+        let preview_body = zoom.effective_px(preview_base);
+        let preview_factor = f32::from(preview_body) / f32::from(preview_base);
         let body: gpui::AnyElement = match &self.content {
             // Markdown text: branch on the active view mode. Source reuses the
             // plain editor; Preview/Split render via the GFM renderer. The
