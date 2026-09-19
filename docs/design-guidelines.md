@@ -647,6 +647,62 @@ contract holds.
 - Contrast: the swatch is a theme-independent hex used only as a thin accent, so
   it never fights the charcoal surfaces or the single status-accent layer.
 
+## Pane tab strip — pinned tabs
+
+Pinning a tab means "I always want to be able to reach this one", so a pinned
+chip is **frozen at the strip's left edge** and the unpinned chips scroll
+*under* it. Anything less is a broken promise: a pinned tab inside the same
+scrolling viewport as everything else is only anchored while the strip happens
+to fit, and the moment it overflows the pinned chips are the first thing
+clipped off the left edge.
+
+- **Three regions, one line** (`pane_group::render::build_tab_strip_from_headers`):
+  the frozen pinned zone, the scrolling remainder, and the trailing `+` / `...`
+  cluster. `toggle_pin` packs pinned tabs at the front of `tab_order`, so the
+  frozen zone is a prefix slice and visible indices stay global across both
+  containers — which is what keeps the drag insertion bar reading as one strip.
+- **Two containers, not sticky offsets.** The zone is a sibling of the scroll
+  viewport with its own `ScrollHandle`, rather than pinned chips inside the
+  viewport nudged by a per-chip `left`. The offset trick needs every pinned tab
+  to be the same fixed width to compute `index × width`; these chips are
+  content-sized, and shrinking them to an icon to buy that is a worse trade
+  than a second container.
+- **The remainder keeps `MIN_SCROLLING_ZONE_PX` (120) at density 1.0**, and the
+  pinned zone shrinks to give it up (`min_w(0)`, since a scroll container's
+  automatic minimum is its own content and would otherwise refuse). Past that
+  the pinned chips scroll *within* their zone — trackpad, or the same
+  wheel-to-horizontal remap the strip uses. An absolute floor, not a fraction:
+  a fraction punishes the case it should leave alone, capping a pinned block
+  that fit comfortably on a wide window.
+- **The seam is a 1px `border_inactive` right edge on the zone**, drawn only
+  while some tab is unpinned — with everything pinned it would be a border
+  around the whole strip, not a boundary between two regions. Borders before
+  backgrounds: no shadow, no second background. The existing left-edge scroll
+  fade sits at the scrolling region's own left edge and doubles as the cue that
+  chips are passing behind the zone.
+- **Reveal what just moved.** Pinning snaps the zone to its end; unpinning
+  snaps the scrolling region back to its start. Either way the chip the user
+  just acted on is on screen, which matters most in exactly the case the zone
+  introduces — a pinned block long enough to scroll on its own.
+
+### Precedent (checked 2026-09-19)
+
+Worth knowing before anyone "simplifies" this, because two of the obvious
+simplifications are known dead ends:
+
+| App | Frozen? | On overflow of the pinned block |
+|---|---|---|
+| Zed (single row) | Yes — `split_off(pinned_tab_count)`, pinned in a plain `h_flex`, unpinned in the `overflow_x_scroll` | **No cap.** The resulting "pinned tabs limit the space for the rest" complaint is what drove its separate-row option |
+| VS Code, `pinnedTabSizing: compact`/`shrink` | Yes — `position: sticky` + `left = index × 38px`/`80px`, over an opaque backdrop | Abandons the freeze wholesale (`disable-sticky-tabs`) once the remainder drops under one full tab (120px) |
+| VS Code, default (`normal`) | **No** — `getStickyTabWidth()` returns 0, so pinned tabs scroll away like any other tab | n/a; a long-standing complaint, and "Pinned Tab Anchoring" was closed as not planned |
+| Firefox | Yes — a separate `arrowscrollbox` sibling of the tab scroller | Own scroll arrows, but no width cap, and a bug trail for pinned tabs crowding out the strip |
+| Chrome | Fixed 24px icon-only pinned tabs, exempt from shrinking | — |
+| JetBrains, Windows Terminal, iTerm2, Sublime | Pinning either groups-left only (JetBrains) or does not exist | — |
+
+This strip takes Zed's structure (it is the same toolkit), VS Code's floor, and
+Firefox's "let the frozen region scroll itself" escape, which together cover
+the gap each one leaves on its own.
+
 ## Top-bar command center
 
 The center chrome zone hosts a single VS Code–style command center — a

@@ -15,8 +15,7 @@ use gpui::{
     AnyElement, App, AppContext, Context, DragMoveEvent, Entity, ExternalPaths, InteractiveElement,
     IntoElement, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Point, Render, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px, relative,
-    svg,
+    StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder, px, svg,
 };
 use oximux_settings::{Density, Theme, Typography};
 
@@ -46,14 +45,20 @@ const CLOSE_GLYPH_PX: f32 = 9.0;
 const STRIP_GLYPH_PX: f32 = 14.0;
 /// The pin that replaces the close button on a pinned tab.
 const PIN_GLYPH_PX: f32 = 10.0;
-/// Largest share of the strip the frozen pinned zone may take while there
-/// are still unpinned tabs to show. Past it the pinned chips scroll inside
-/// their own zone rather than crowding the rest of the strip out, which is
-/// the same bargain VS Code strikes in its single-row pinned mode and
-/// Chrome strikes by shrinking pinned tabs to their favicon: the frozen
-/// region is privileged, never unbounded. Lifted entirely when every tab
-/// is pinned — there is nothing left to leave room for.
-const PINNED_ZONE_MAX_FRACTION: f32 = 0.5;
+/// Width the scrolling remainder keeps no matter how many tabs are pinned —
+/// the floor that stops a wide pinned block from swallowing the strip.
+///
+/// An absolute floor rather than a fraction of the strip, because a
+/// fraction punishes the case it should leave alone: eight pinned tabs on a
+/// wide window fit with room to spare, and a half-the-strip cap would push
+/// some of them behind the zone's own scroll for no reason. The reference
+/// editor reserves exactly one full-size tab (120px) for the remainder and
+/// abandons the freeze entirely below that; this strip has no fixed tab
+/// width to quote, so it borrows the number and — having built the zone as
+/// a separate container rather than as offsets inside the viewport — can
+/// keep the freeze and let the pinned chips scroll within their own zone
+/// instead of giving it up.
+const MIN_SCROLLING_ZONE_PX: f32 = 120.0;
 
 /// The tokens the tab strip draws from, as one value.
 ///
@@ -792,12 +797,17 @@ fn build_tab_strip_from_headers(
 
     // Frozen pinned zone. Outside the scroll viewport, so the strip's
     // horizontal scroll slides the unpinned chips under it instead of
-    // carrying these off the left edge. `flex_shrink_0` holds its natural
-    // width; `max_w` caps that at a share of the strip and its own
-    // `overflow_x_scroll` takes over from there, so a pinned block wider
-    // than the strip scrolls WITHIN the zone rather than swallowing it.
-    // The cap is lifted when nothing is unpinned — capping then would
-    // leave half the strip empty.
+    // carrying these off the left edge.
+    //
+    // It takes its natural width and yields only to the scrolling zone's
+    // `MIN_SCROLLING_ZONE_PX` floor — `min_w(0)` so flexbox is allowed to
+    // shrink it that far, since a scroll container's automatic minimum is
+    // its own content and would refuse — and its `overflow_x_scroll` plus
+    // `ScrollHandle` pick up from there. A pinned block wider than the
+    // strip therefore scrolls WITHIN its zone rather than swallowing the
+    // strip or going unreachable, which is the escape Firefox gives its
+    // pinned container and the reason its unbounded one has an overflow
+    // bug trail.
     let pinned_zone = (!pinned_tabs.is_empty()).then(|| {
         let wheel_pinned_handle = pinned_scroll_handle.clone();
         let mut zone = div()
@@ -808,14 +818,16 @@ fn build_tab_strip_from_headers(
             .flex_row()
             .items_stretch()
             .h_full()
-            .flex_shrink_0()
+            .min_w(px(0.0))
             .overflow_x_scroll()
             .overflow_y_hidden()
             .track_scroll(&pinned_scroll_handle)
+            // The seam, drawn only when there is something on the other
+            // side of it. Both reference editors suppress it when every
+            // tab is pinned, where it would be a border around the whole
+            // strip rather than a boundary between two regions.
             .when(!scrolling_tabs.is_empty(), |s| {
-                s.max_w(relative(PINNED_ZONE_MAX_FRACTION))
-                    .border_r_1()
-                    .border_color(border_color)
+                s.border_r_1().border_color(border_color)
             })
             // Same wheel-to-horizontal remap the scrolling region uses,
             // pointed at this zone's own handle — it only has slack once
@@ -849,13 +861,23 @@ fn build_tab_strip_from_headers(
     let max_offset_x = f32::from(scroll_handle.max_offset().x);
     let show_left_fade = offset_x < -0.5;
     let show_right_fade = offset_x > -(max_offset_x - 0.5);
+    // The floor that caps the pinned zone: flexbox shrinks the pinned block
+    // only once something else refuses to give, and this is that something.
+    // Zero when either region is empty — with nothing pinned the scrolling
+    // zone already owns the strip, and with nothing unpinned a floor would
+    // reserve a band of dead space next to the `+`.
+    let scroll_zone_min_w = if pinned_tabs.is_empty() || scrolling_tabs.is_empty() {
+        0.0
+    } else {
+        density.scale(MIN_SCROLLING_ZONE_PX)
+    };
     let mut scroll_zone = div()
         .flex()
         .flex_row()
         .items_stretch()
         .h_full()
         .flex_1()
-        .min_w(px(0.0))
+        .min_w(px(scroll_zone_min_w))
         .relative()
         .child(chips);
     // Overlays last so they paint on top of the chips.
