@@ -1,5 +1,9 @@
 # OxiMux
 
+[![ci](https://github.com/nhtera/OxiMux/actions/workflows/ci.yml/badge.svg)](https://github.com/nhtera/OxiMux/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Greptile: The War on Bugs](https://www.greptile.com/badge.svg)](https://www.greptile.com/?utm_source=oss_badge&utm_medium=readme&utm_campaign=greptile_for_open_source)
+
 A Rust-native, multi-agent development cockpit for macOS and Windows. Open a repo → spawn isolated worktrees → run CLI coding agents (Claude Code, Codex, Pi, omp) in parallel → review every change through a GitLens-grade Git UX.
 
 - **Stack**: Rust 1.95 (edition 2024) + GPUI + [`longbridge/gpui-kit`](https://github.com/longbridge/gpui-kit) + SQLite + Tokio
