@@ -217,6 +217,10 @@ fn build_dashboard_row(
     let row_id: gpui::SharedString = format!("agent-row-{}", row.db_id).into();
     let is_focused = focused_agent == Some(&row.target);
     let target = row.target.clone();
+    // The row's resolved workspace row id: a `workspaces.id`, or
+    // `primary:<project_id>` for the repo-root row. Either way it names a rail
+    // row, which is what the reveal needs.
+    let workspace_key = row.workspace.id.clone();
 
     let mut card = render_agent_row(&row, theme, density, typography).id(row_id);
     if is_focused {
@@ -225,13 +229,22 @@ fn build_dashboard_row(
     card.on_mouse_down(
         MouseButton::Left,
         move |_ev: &MouseDownEvent, window: &mut Window, cx: &mut App| {
-            let _ = weak_root.update(cx, |root, cx| match &target {
-                RailAgentTarget::AgentSession { db_id } => {
-                    root.focus_agent_by_db_id(db_id, window, cx);
+            let _ = weak_root.update(cx, |root, cx| {
+                match &target {
+                    RailAgentTarget::AgentSession { db_id } => {
+                        root.focus_agent_by_db_id(db_id, window, cx);
+                    }
+                    RailAgentTarget::AmbientTerminal { pty_id } => {
+                        root.focus_ambient_agent_terminal(pty_id, window, cx);
+                    }
                 }
-                RailAgentTarget::AmbientTerminal { pty_id } => {
-                    root.focus_ambient_agent_terminal(pty_id, window, cx);
-                }
+                // Both calls above no-op for a history row — it has no live
+                // session to focus — which used to make the whole card a dead
+                // click. The row's own key always names its workspace, so
+                // select and reveal it regardless; for a live row this just
+                // re-asserts the selection its focus call already made, and
+                // adds the reveal that makes it visible from the Agents page.
+                root.reveal_agent_row_workspace(&workspace_key, window, cx);
             });
         },
     )

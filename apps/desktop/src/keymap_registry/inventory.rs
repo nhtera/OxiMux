@@ -17,7 +17,8 @@ use crate::actions::{
     NewAgentChat, NewBrowserTab, NewTab, NewWindow, NextTab, OpenCommandPalette, OpenCommitDialog,
     OpenComposerBar, OpenProjectPicker, OpenQuickOpen, OpenSessionHistory,
     OpenSettings, OpenWorkspaceCreate, OpenWorkspaceJump, PrevTab, RefreshSourceControl,
-    ReloadCustomCommands, Search, SelectExplorerTab, SelectHistoryTab, SelectSearchTab,
+    ReloadCustomCommands, RevealActiveWorkspace, Search, SelectExplorerTab, SelectHistoryTab,
+    SelectSearchTab,
     SelectSourceControlTab,
     SendLastCommandOutputToAgent, SendTerminalSelectionToAgent, SplitHorizontal,
     SplitSubPaneDown, SplitSubPaneRight, SplitVertical, ToggleChatTerminalView,
@@ -279,6 +280,13 @@ pub const ACTIONS: &[ActionSpec] = &[
     ),
     // Jump to any workspace/worktree across all projects.
     entry!("open_workspace_jump", "Jump to workspace", Navigation, "secondary-j", OpenWorkspaceJump),
+    entry!(
+        "reveal_active_workspace",
+        "Reveal active workspace",
+        Navigation,
+        "secondary-shift-j",
+        RevealActiveWorkspace
+    ),
     entry!("toggle_left_sidebar", "Toggle left sidebar", Navigation, "secondary-b", ToggleLeftSidebar),
     entry!(
         "toggle_right_sidebar",

@@ -789,6 +789,20 @@ impl PaneGroup {
     /// Index of an existing agent tab whose worktree matches `path`, if
     /// any. Lets the sidebar focus the tab already running in a clicked
     /// workspace's worktree instead of spawning a duplicate.
+    /// The worktree the ACTIVE tab belongs to.
+    ///
+    /// An agent tab carries its own `worktree_path` — agents for several
+    /// workspaces can share one group, which is why
+    /// [`Self::agent_tab_index_for_worktree`] has to search — so the group's
+    /// cwd is too coarse to say which workspace is on screen. Every other tab
+    /// kind (terminal, editor, diff, browser…) belongs to the group's cwd.
+    pub fn active_tab_worktree(&self) -> std::path::PathBuf {
+        match self.tabs.get(self.active).map(|t| &t.kind) {
+            Some(PaneGroupTabKind::Agent { worktree_path, .. }) => worktree_path.clone(),
+            _ => self.cwd.clone(),
+        }
+    }
+
     pub fn agent_tab_index_for_worktree(&self, path: &std::path::Path) -> Option<usize> {
         self.tabs.iter().position(|t| {
             matches!(&t.kind, PaneGroupTabKind::Agent { worktree_path, .. } if worktree_path == path)

@@ -571,6 +571,12 @@ actions!(
         UiZoomReset,
         /// Toggle the left rail (workspaces + nav) visibility (Cmd+B).
         ToggleLeftSidebar,
+        /// Scroll the left rail's workspace list to the active workspace and
+        /// replay its locate glow (Cmd+Shift+J) — the keyboard route to the
+        /// rail toolbar's crosshair. Returns the rail to the workspace list
+        /// and opens whatever group or disclosure hides the row first, so it
+        /// answers "where am I?" from any rail state.
+        RevealActiveWorkspace,
         /// Toggle the right sidebar visibility (Cmd+L).
         ToggleRightSidebar,
         /// Switch to the Files tab in the right sidebar (Cmd+Shift+T).
