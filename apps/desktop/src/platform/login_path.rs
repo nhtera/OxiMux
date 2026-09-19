@@ -56,9 +56,9 @@ use std::ffi::OsString;
 use std::io::{IsTerminal, Read};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// How long a shell gets to print its `PATH` before it is killed.
+/// How long the **whole** probe sequence gets before it is abandoned.
 ///
 /// An interactive shell runs the user's whole `rc` file, which may start a
 /// version manager or touch the network; PowerShell loads `$PROFILE`. This is a
@@ -71,6 +71,11 @@ use std::time::Duration;
 /// `conda`, and `gcloud` took 6-7 s on a loaded machine. The cost of being
 /// generous is bounded and only paid when the shell is genuinely that slow; the
 /// cost of being tight is the failure this whole module exists to prevent.
+///
+/// One budget for the sequence, not one per probe. Both Unix probes run the
+/// same program, and on Windows `Auto` resolves to the inbox shell when `pwsh`
+/// is absent, so a profile that hangs would otherwise cost this twice over with
+/// nothing to show for it — and this blocks `main` before any window exists.
 ///
 /// Note the number this replaces in spirit: before any of this, the probe ran
 /// with no timeout at all.
@@ -388,7 +393,13 @@ mod cache {
 
 /// Ask the user's shell what `PATH` it sets up, trying each probe in turn.
 fn user_path() -> Option<OsString> {
-    probes().into_iter().find_map(|probe| probe.run())
+    let deadline = Instant::now() + SHELL_TIMEOUT;
+    probes().into_iter().find_map(|probe| {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // A fallback with no time left is not a fallback; stop rather than
+        // spawn a shell that will only be killed.
+        (!remaining.is_zero()).then(|| probe.run(remaining)).flatten()
+    })
 }
 
 /// One way to ask a shell for its `PATH`.
@@ -398,8 +409,8 @@ struct Probe {
 }
 
 impl Probe {
-    fn run(self) -> Option<OsString> {
-        let printed = run_with_timeout(&self.program, &self.args, SHELL_TIMEOUT)?;
+    fn run(self, budget: Duration) -> Option<OsString> {
+        let printed = run_with_timeout(&self.program, &self.args, budget)?;
         path_between_markers(&printed).map(OsString::from)
     }
 }
@@ -494,6 +505,16 @@ fn probes() -> Vec<Probe> {
             ],
         })
         .collect()
+}
+
+/// Whether the closing marker has arrived, so the read can stop.
+///
+/// Scans the whole buffer rather than the tail: a themed prompt can emit
+/// escapes after the marker, so "ends with" is not literally true of the bytes.
+/// The buffer is a `PATH` plus a banner — kilobytes — so this stays cheap.
+fn ends_with_marker(buf: &[u8]) -> bool {
+    let end = END.as_bytes();
+    buf.len() >= end.len() && buf.windows(end.len()).any(|w| w == end)
 }
 
 /// The text between the two markers, trimmed, or `None` if it is not there.
@@ -591,12 +612,38 @@ fn run_with_timeout(program: &str, args: &[String], timeout: Duration) -> Option
         // Bytes, not `read_to_string`: that returns `Err` and discards
         // everything on invalid UTF-8, and a prompt theme can emit anything.
         let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
+        let mut chunk = [0u8; 4096];
+        loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    // Stop at the closing marker rather than at end-of-file.
+                    // EOF needs *every* copy of the write end closed, and a
+                    // shell whose `rc` file starts a daemon — a prompt theme's
+                    // status worker is the common one — hands that daemon the
+                    // same pipe. Waiting for EOF there means discarding an
+                    // answer we already hold, burning the whole budget, and
+                    // keeping the stub `PATH`: the exact failure this module
+                    // exists to prevent, reached the long way round.
+                    if ends_with_marker(&buf) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
         let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
     });
 
     match rx.recv_timeout(timeout) {
         Ok(printed) => {
+            // The answer is in hand. `kill` before `wait` because the reader
+            // now returns on the marker, so the shell may not have exited yet —
+            // and `wait` on a shell that lingers would reintroduce the block
+            // the marker check just removed. Everything the script had to do
+            // has already happened: printing the `PATH` is its last act.
+            let _ = child.kill();
             let _ = child.wait();
             // Joined, not abandoned: the caller writes the environment a few
             // lines later, and that is only sound while no other thread could
@@ -808,7 +855,7 @@ mod tests {
             return;
         }
         let probe = probes().into_iter().next().expect("at least one probe");
-        let got = probe.run().expect("the user's shell must print a PATH");
+        let got = probe.run(SHELL_TIMEOUT).expect("the user's shell must print a PATH");
         let got = got.to_string_lossy().into_owned();
         assert!(split_paths(&got).next().is_some(), "{got}");
     }
@@ -822,7 +869,7 @@ mod tests {
         // so it has to work on its own.
         for probe in probes() {
             let program = probe.program.clone();
-            assert!(probe.run().is_some(), "{program} printed no PATH");
+            assert!(probe.run(SHELL_TIMEOUT).is_some(), "{program} printed no PATH");
         }
     }
 
@@ -860,6 +907,42 @@ mod tests {
         let posix = unix_script("/bin/zsh");
         assert!(posix.contains("\"$PATH\""), "{posix}");
         assert!(!posix.contains("string join"), "{posix}");
+    }
+
+    /// The regression this guards is the one that makes the whole module
+    /// pointless: a `~/.zshrc` that starts a daemon — a prompt theme's status
+    /// worker is the usual one — hands it the same stdout pipe. The shell
+    /// prints the answer and exits, but the pipe never reaches end-of-file, so
+    /// a reader waiting for EOF discards a `PATH` it already has, spends the
+    /// entire budget, and leaves the launch on its stub `PATH`.
+    #[cfg(unix)]
+    #[test]
+    fn an_answer_arrives_even_when_a_background_child_holds_the_pipe_open() {
+        let script = format!(
+            "printf '%s%s%s' '{BEGIN}' '/opt/homebrew/bin:/usr/bin' '{END}'; sleep 30 &"
+        );
+        let args = vec!["-c".to_string(), script];
+        let started = std::time::Instant::now();
+        let got = run_with_timeout("/bin/sh", &args, SHELL_TIMEOUT)
+            .and_then(|printed| path_between_markers(&printed));
+
+        assert_eq!(got.as_deref(), Some("/opt/homebrew/bin:/usr/bin"));
+        // Promptly, not eventually: the point is that it does not wait out the
+        // budget the lingering child would otherwise consume.
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "waited {:?} for an answer that had already been printed",
+            started.elapsed(),
+        );
+    }
+
+    #[test]
+    fn the_end_marker_is_found_wherever_it_lands() {
+        assert!(!ends_with_marker(b""));
+        assert!(!ends_with_marker(BEGIN.as_bytes()));
+        assert!(ends_with_marker(format!("{BEGIN}/usr/bin{END}").as_bytes()));
+        // A theme that keeps printing after the marker must not hide it.
+        assert!(ends_with_marker(format!("{END}\u{1b}[0m trailing").as_bytes()));
     }
 
     #[test]
