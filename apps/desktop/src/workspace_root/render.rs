@@ -424,6 +424,17 @@ impl Render for WorkspaceRoot {
                 this.left_rail_open = !this.left_rail_open;
                 cx.notify();
             }))
+            // Reveal is pointless against a hidden rail, so open it first —
+            // the reveal's own deferred pass is what lets the newly-shown
+            // rail lay out before the row's bounds are measured.
+            .on_action(cx.listener(|this, _: &RevealActiveWorkspace, window, cx| {
+                if !this.left_rail_open {
+                    this.left_rail_open = true;
+                    cx.notify();
+                }
+                this.left_rail
+                    .update(cx, |rail, cx| rail.scroll_to_active(window, cx));
+            }))
             // Interface zoom. No `cx.notify()` on any of the three: the setter
             // refreshes every window, which is the point — one view notifying
             // itself would leave the other fifty at the old size.

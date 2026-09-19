@@ -11,7 +11,8 @@ use gpui::Action;
 use crate::actions::{
     ApplyLayoutBottomTerminal, ApplyLayoutHorizontal, ApplyLayoutStacked, CloseTab, NewTab,
     OpenCommandPalette, OpenCommitDialog, OpenQuickOpen, OpenWorkspaceCreate, ReloadCustomCommands,
-    Search, SelectSourceControlTab, ShowWelcomeWizard, SplitHorizontal, SplitVertical, ToggleLeftSidebar,
+    RevealActiveWorkspace, Search, SelectSourceControlTab, ShowWelcomeWizard, SplitHorizontal,
+    SplitVertical, ToggleLeftSidebar,
     ToggleRightSidebar, UiZoomIn, UiZoomOut, UiZoomReset,
 };
 
@@ -133,6 +134,11 @@ pub const PALETTE_COMMANDS: &[CommandEntry] = &[
         name: "Toggle Left Sidebar",
         action_id: Some("toggle_left_sidebar"),
         make_action: || Box::new(ToggleLeftSidebar),
+    },
+    CommandEntry {
+        name: "Reveal Active Workspace",
+        action_id: Some("reveal_active_workspace"),
+        make_action: || Box::new(RevealActiveWorkspace),
     },
     // The one keystroke the cockpit is built around, findable by name and by
     // what it makes (see `PALETTE_KEYWORDS`). Dispatches the same action the
@@ -299,10 +305,18 @@ mod tests {
     }
 
     #[test]
-    fn palette_commands_has_twenty_entries() {
+    fn palette_commands_has_twenty_one_entries() {
         // 14 original + "Reload Custom Commands" + "Show Welcome Wizard"
-        // + the three interface-zoom rows + "New Workspace".
-        assert_eq!(PALETTE_COMMANDS.len(), 20);
+        // + the three interface-zoom rows + "New Workspace"
+        // + "Reveal Active Workspace".
+        assert_eq!(PALETTE_COMMANDS.len(), 21);
+    }
+
+    #[test]
+    fn reveal_active_workspace_entry_present() {
+        assert!(PALETTE_COMMANDS
+            .iter()
+            .any(|c| c.name == "Reveal Active Workspace"));
     }
 
     #[test]
