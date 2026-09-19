@@ -743,10 +743,23 @@ fn build_tab_strip_from_headers(
     // unpinned chips slide under matches the rest of the chrome.
     let border_color = theme.border_inactive;
 
-    // One chip, built from its VISIBLE index — which stays global across
-    // both containers so the two-edge insertion bar keeps lining up across
-    // the pinned/unpinned seam.
-    let chip_at = |visible_idx: usize, header: &PaneGroupTabHeader| {
+    // Pinned tabs are packed at the front of the visible order by
+    // `toggle_pin`, so the frozen zone is the prefix `[0, pinned_count)` and
+    // the scrolling remainder is the rest. Counted with `take_while` rather
+    // than `filter` on purpose: if that invariant ever broke, a stray pinned
+    // tab further back renders in the scrolling remainder instead of
+    // silently teleporting to the left edge.
+    let pinned_count = tabs.iter().take_while(|h| h.pinned).count();
+
+    // One chip, addressed by its VISIBLE index — which stays global across
+    // both containers, so the two-edge insertion bar keeps lining up across
+    // the pinned/unpinned seam and every handler keeps the insertion index
+    // it had. Takes the index rather than the header because a closure
+    // returning `impl IntoElement` cannot be generic over its argument's
+    // lifetime; borrowing `tabs` from the environment instead gives the
+    // opaque return type one concrete lifetime.
+    let chip_at = |visible_idx: usize| {
+        let header = &tabs[visible_idx];
         // Two-edge insertion bar: this chip paints a Right bar when the
         // slot is just AFTER it, and a Left bar when the slot is at this
         // chip's position. The two adjacent edges combine into one
@@ -783,16 +796,9 @@ fn build_tab_strip_from_headers(
         )
     };
 
-    // Pinned tabs are packed at the front of the visible order by
-    // `toggle_pin`, so the frozen zone is a prefix slice. Counted with
-    // `take_while` rather than `filter` on purpose: if that invariant ever
-    // broke, a stray pinned tab further back renders in the scrolling
-    // remainder instead of silently teleporting to the left edge.
-    let pinned_count = tabs.iter().take_while(|h| h.pinned).count();
-    let (pinned_tabs, scrolling_tabs) = tabs.split_at(pinned_count);
-
-    for (offset, header) in scrolling_tabs.iter().enumerate() {
-        chips = chips.child(chip_at(pinned_count + offset, header));
+    let any_unpinned = pinned_count < tabs.len();
+    for visible_idx in pinned_count..tabs.len() {
+        chips = chips.child(chip_at(visible_idx));
     }
 
     // Frozen pinned zone. Outside the scroll viewport, so the strip's
@@ -808,7 +814,7 @@ fn build_tab_strip_from_headers(
     // strip or going unreachable, which is the escape Firefox gives its
     // pinned container and the reason its unbounded one has an overflow
     // bug trail.
-    let pinned_zone = (!pinned_tabs.is_empty()).then(|| {
+    let pinned_zone = (pinned_count > 0).then(|| {
         let wheel_pinned_handle = pinned_scroll_handle.clone();
         let mut zone = div()
             .id(SharedString::from(format!(
@@ -826,7 +832,7 @@ fn build_tab_strip_from_headers(
             // side of it. Both reference editors suppress it when every
             // tab is pinned, where it would be a border around the whole
             // strip rather than a boundary between two regions.
-            .when(!scrolling_tabs.is_empty(), |s| {
+            .when(any_unpinned, |s| {
                 s.border_r_1().border_color(border_color)
             })
             // Same wheel-to-horizontal remap the scrolling region uses,
@@ -841,8 +847,8 @@ fn build_tab_strip_from_headers(
                 let current = wheel_pinned_handle.offset();
                 wheel_pinned_handle.set_offset(point(current.x - dy, current.y));
             });
-        for (visible_idx, header) in pinned_tabs.iter().enumerate() {
-            zone = zone.child(chip_at(visible_idx, header));
+        for visible_idx in 0..pinned_count {
+            zone = zone.child(chip_at(visible_idx));
         }
         zone
     });
@@ -866,7 +872,7 @@ fn build_tab_strip_from_headers(
     // Zero when either region is empty — with nothing pinned the scrolling
     // zone already owns the strip, and with nothing unpinned a floor would
     // reserve a band of dead space next to the `+`.
-    let scroll_zone_min_w = if pinned_tabs.is_empty() || scrolling_tabs.is_empty() {
+    let scroll_zone_min_w = if pinned_count == 0 || !any_unpinned {
         0.0
     } else {
         density.scale(MIN_SCROLLING_ZONE_PX)
