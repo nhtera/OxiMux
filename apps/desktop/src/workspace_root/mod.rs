@@ -335,6 +335,12 @@ pub struct WorkspaceRoot {
     /// active-row highlight. `None` until the user clicks a workspace.
     /// Window-local UI selection, not persisted.
     pub(crate) active_workspace_id: Option<String>,
+    /// `(project_id, cwd)` of the focused pane group the last time the rail
+    /// selection was synced to it. Lets the sync fire on CHANGE only: a rail
+    /// click selects a workspace without switching tabs ("spawn deferred"),
+    /// and re-deriving the selection every refresh would snap it straight back
+    /// to the focused group's workspace.
+    pub(crate) last_focused_group: Option<(String, String)>,
     /// Browser-style back/forward history of workspace activations for this
     /// window (Cmd+Alt+←/→). Entries are `(project_id, workspace_id)` refs
     /// re-resolved on navigation so a deleted workspace fails gracefully.
@@ -1361,6 +1367,7 @@ impl WorkspaceRoot {
             rename_tab_dialog: None,
             active_project: None,
             active_workspace_id: None,
+            last_focused_group: None,
             nav_history: Vec::new(),
             nav_cursor: 0,
             nav_replaying: false,
