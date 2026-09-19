@@ -49,8 +49,8 @@ fn locate_active_icon(rail: WeakEntity<LeftRail>, theme: Theme) -> impl IntoElem
         .text_color(theme.fg_muted)
         .hover(|s| s.text_color(theme.fg_base))
         .tooltip(|window, cx| Tooltip::new("Scroll to current workspace").build(window, cx))
-        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, _window, cx| {
-            let _ = rail.update(cx, |r, cx| r.scroll_to_active(cx));
+        .on_mouse_down(MouseButton::Left, move |_: &MouseDownEvent, window, cx| {
+            let _ = rail.update(cx, |r, cx| r.scroll_to_active(window, cx));
         })
         .child(
             svg()
